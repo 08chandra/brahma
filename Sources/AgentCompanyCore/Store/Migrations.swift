@@ -7,7 +7,7 @@ enum Migrations {
             try db.create(table: "company") { t in
                 t.primaryKey("id", .text)
                 t.column("name", .text).notNull()
-                t.column("slug", .text).notNull()
+                t.column("slug", .text).notNull().unique()
                 t.column("goal", .text).notNull()
                 t.column("workspacePath", .text).notNull()
                 t.column("status", .text).notNull()

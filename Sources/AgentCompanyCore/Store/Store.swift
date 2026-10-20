@@ -65,14 +65,24 @@ public final class Store: Sendable {
     }
 
     public func createCompany(name: String, goal: String, workspacesRoot: URL) throws -> Company {
-        let slug = Store.slug(for: name)
-        let dir = workspacesRoot.appending(path: slug, directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let company = Company(
-            id: UUID().uuidString, name: name, slug: slug, goal: goal, workspacePath: dir.path,
-            status: .running, usageMode: .low, priorityWeight: 1, createdAt: Store.now())
-        try writer.write { db in try company.insert(db) }
-        return company
+        let base = Store.slug(for: name).isEmpty ? "company" : Store.slug(for: name)
+        let createdAt = Store.now()
+        return try writer.write { db in
+            var slug = base
+            var n = 2
+            while try Company.filter(Column("slug") == slug).fetchCount(db) > 0 {
+                slug = "\(base)-\(n)"
+                n += 1
+            }
+            let dir = workspacesRoot.appending(path: slug, directoryHint: .isDirectory)
+            let company = Company(
+                id: UUID().uuidString, name: name, slug: slug, goal: goal, workspacePath: dir.path,
+                status: .running, usageMode: .low, priorityWeight: 1, createdAt: createdAt)
+            try company.insert(db)
+            // Directory is created only after the row is in; a failure here rolls the insert back.
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return company
+        }
     }
 
     public func companies() throws -> [Company] {

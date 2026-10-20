@@ -18,6 +18,34 @@ import Foundation
     #expect(try s.companies().count == 1)
 }
 
+@Test func duplicateNamesGetDistinctSlugsAndWorkspaces() throws {
+    let root = try tempDir(); let s = try Store.inMemory()
+    let a = try s.createCompany(name: "Acme", goal: "g", workspacesRoot: root)
+    let b = try s.createCompany(name: "Acme", goal: "g", workspacesRoot: root)
+    #expect(a.slug == "acme"); #expect(b.slug == "acme-2")
+    #expect(a.workspacePath != b.workspacePath)
+    #expect(FileManager.default.fileExists(atPath: b.workspacePath))
+}
+
+@Test func emptySlugFallsBackToCompany() throws {
+    let root = try tempDir(); let s = try Store.inMemory()
+    for name in ["日本", "!!!"] {
+        let c = try s.createCompany(name: name, goal: "g", workspacesRoot: root)
+        #expect(c.slug.hasPrefix("company"))
+        #expect(URL(fileURLWithPath: c.workspacePath).standardizedFileURL != root.standardizedFileURL)
+        #expect(FileManager.default.fileExists(atPath: c.workspacePath))
+    }
+    #expect(try s.companies().map(\.slug) == ["company", "company-2"])
+}
+
+@Test func failedWorkspaceCreationLeavesNoRow() throws {
+    let root = try tempDir(); let s = try Store.inMemory()
+    let blocker = root.appending(path: "file")
+    try Data().write(to: blocker)
+    #expect(throws: (any Error).self) { try s.createCompany(name: "X", goal: "g", workspacesRoot: blocker) }
+    #expect(try s.companies().isEmpty)
+}
+
 @Test func updateCompanyPersists() throws {
     let s = try Store.inMemory()
     var c = try s.createCompany(name: "A", goal: "g", workspacesRoot: try tempDir())
