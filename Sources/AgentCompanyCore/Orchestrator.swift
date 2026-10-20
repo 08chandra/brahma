@@ -231,10 +231,11 @@ public actor Orchestrator {
         attempt { try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id), now: now) }
     }
 
-    /// When a usage-limited agent may try again: never sooner than `usageRetry`, so a stale (past) `resetsAt`
-    /// cannot unblock it on the next tick and re-hit the limit every tick.
+    /// When a usage-limited agent may try again: the real reset if it is still ahead, else `usageRetry` from now,
+    /// so a missing or stale (past) `resetsAt` cannot unblock it on the next tick and re-hit the limit every tick.
     static func usageUntil(_ resetsAt: Date?, now: Date) -> Date {
-        max(resetsAt ?? now, now.addingTimeInterval(usageRetry))
+        if let resetsAt, resetsAt > now { return resetsAt }
+        return now.addingTimeInterval(usageRetry)
     }
 
     private nonisolated func attempt(_ body: () throws -> Void) {
@@ -247,7 +248,7 @@ public actor Orchestrator {
 }
 
 enum TurnEnd {
-    /// `usageHold`: the turn completed but also hit the usage limit; the agent waits until then.
+    /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.
     case succeeded(TurnResult, usageHold: Date?)
     case failed(String)
     case usageLimited(until: Date, summary: String?)
@@ -367,10 +368,13 @@ extension Store {
                         return
                     }
                 }
-                if let usageHold {
+                if senders.isEmpty {
+                    // Nothing left to do: sleep; a new message wakes it and the usage gate holds it if still closed.
+                    try Store.transition(db: db, agentId: agentId, to: .sleeping, now: now)
+                } else if let usageHold {
                     try Store.transition(db: db, agentId: agentId, to: .blocked, blocker: .usageLimit(until: usageHold), now: now)
                 } else {
-                    try Store.transition(db: db, agentId: agentId, to: senders.isEmpty ? .sleeping : .ready, now: now)
+                    try Store.transition(db: db, agentId: agentId, to: .ready, now: now)
                 }
             }
         }

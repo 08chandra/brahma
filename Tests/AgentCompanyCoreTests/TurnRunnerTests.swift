@@ -71,14 +71,15 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
 
     @Test func timeoutKillsProcess() async throws {
         let (script, dir) = try fakeClaude("""
-            cat > /dev/null
             echo $$ > pid.txt
+            cat > /dev/null
             exec sleep 30
             """)
-        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .milliseconds(300))
+        // Long enough for the script to start under a loaded parallel test run.
+        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(1))
         let start = ContinuousClock.now
         await #expect(throws: TurnError.timedOut) { _ = try await collect(runner.run(request(in: dir))) }
-        #expect(ContinuousClock.now - start < .seconds(4))
+        #expect(ContinuousClock.now - start < .seconds(5))
         let pid = try #require(Int32(try String(contentsOf: dir.appending(path: "pid.txt"), encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(kill(pid, 0) == -1)

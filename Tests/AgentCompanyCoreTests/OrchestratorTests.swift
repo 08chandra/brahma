@@ -263,26 +263,33 @@ private struct World {
         #expect(try w.pending(b) == 0)
     }
 
-    @Test(arguments: ["allowed_warning", "rejected"])
-    func successfulTurnThatHitsLimitStillCounts(status: String) async throws {
+    @Test(arguments: [("allowed_warning", false), ("rejected", false), ("rejected", true)])
+    func successfulTurnThatHitsLimitStillCounts(status: String, messageMidTurn: Bool) async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         let t = w.clock.now
         let info = RateLimitInfo(status: status, resetsAt: t.addingTimeInterval(7200), rateLimitType: "five_hour",
                                  isUsingOverage: false, fiveHourUtilization: 0.99, sevenDayUtilization: 0.5, observedAt: t)
+        let router = w.router
         w.fake.script("ceo", .init(events: [
             .initialized(sessionId: ceo.sessionId, model: "sonnet"),
             .rateLimit(info),
             .result(TurnResult(isError: false, subtype: "success", text: "done", costUSD: 0.01, apiErrorStatus: nil,
                                sessionId: ceo.sessionId)),
-        ]))
+        ], sideEffect: { _ in
+            if messageMidTurn { _ = try router.sendDM(companyId: c.id, from: .owner, to: "ceo", text: "more", now: t) }
+        }))
         try w.dm(c, ceo)
         try await w.cycle()
         #expect(try w.turns(ceo).map(\.outcome) == [.succeeded])
-        #expect(try w.pending(ceo) == 0)
+        #expect(try w.pending(ceo) == (messageMidTurn ? 1 : 0))
         let a = try w.agent(ceo)
-        #expect(a.state == .blocked)
-        #expect(a.blocker == .usageLimit(until: t.addingTimeInterval(7200)))
         #expect(a.consecutiveFailures == 0)
+        if messageMidTurn {
+            #expect(a.state == .blocked)
+            #expect(a.blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        } else {
+            #expect(a.state == .sleeping)
+        }
     }
 
     @Test func successResultThenStreamErrorStillSucceeds() async throws {
@@ -313,6 +320,24 @@ private struct World {
         #expect(try w.turns(ceo).count == 1)
         #expect(try w.agent(ceo).state == .blocked)
         w.clock.advance(15 * 60)
+        try await w.cycle()
+        #expect(try w.turns(ceo).map(\.outcome) == [.usageLimited, .succeeded])
+    }
+
+    @Test func futureResetsAtSoonerThanFallbackIsUsed() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let t = w.clock.now
+        let soon = RateLimitInfo(status: "rejected", resetsAt: t.addingTimeInterval(5 * 60), rateLimitType: "five_hour",
+                                 isUsingOverage: false, fiveHourUtilization: 1.0, sevenDayUtilization: 0.5, observedAt: t)
+        w.fake.script("ceo", .init(events: [
+            .rateLimit(soon),
+            .result(TurnResult(isError: true, subtype: "error_during_execution", text: "usage limit reached",
+                               costUSD: nil, apiErrorStatus: 429, sessionId: ceo.sessionId)),
+        ]))
+        try w.dm(c, ceo)
+        try await w.cycle()
+        #expect(try w.agent(ceo).blocker == .usageLimit(until: t.addingTimeInterval(5 * 60)))
+        w.clock.advance(5 * 60)
         try await w.cycle()
         #expect(try w.turns(ceo).map(\.outcome) == [.usageLimited, .succeeded])
     }
