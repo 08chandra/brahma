@@ -14,7 +14,7 @@
 - Plan 2 — Mac app shell: SwiftUI app embedding the Orchestrator; company rail, sidebar, channels/DMs, search, menu bar extra, quit→pause.
 - Plan 3 — Org & work: role catalog and org-chart generation, work items/backlog/sprints, decision gates + Auto mode, hire/kill tools, anti-chatter.
 - Plan 4 — Mission control: agent map, activity feed, workspace git worktrees + merges, preview adapters (web, iOS, macOS, CLI, backend).
-- Plan 5 — Owner requests & safety: requests inbox, Keychain secrets + redaction + pre-commit hook, notifications (macOS/iMessage/email), resources drag-drop, permission profiles incl. Sandboxed.
+- Plan 5 — Owner requests & safety: requests inbox, Keychain secrets + redaction + pre-commit hook, notifications (macOS/iMessage/email), resources drag-drop, permission profiles incl. Sandboxed. Acceptance criterion for Sandboxed: an agent must not be able to write agentco.sqlite, run agentco as another agent, or read other companies' workspaces from Bash.
 - Plan 6 — Scale: 300-agent load test, perf, map collapsing, cap tuning from measured per-process RAM.
 - Plan 7 — External communication: connected email/social accounts, outbox approval queue, inbound `#external`, contacts/opt-outs, per-platform rate limits (spec §6.11a).
 - Plan 8 — Headless server: `agentco serve` daemon on Linux (systemd), authenticated HTTPS+WebSocket API, Linux backends for secrets/notifications/sandbox, Mac app as remote client (spec §6.13).

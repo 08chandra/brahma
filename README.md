@@ -49,7 +49,8 @@ agentco run [--hard-cap 16] [--profile workspace|full]
 - `kill` is permanent. If the agent is mid-turn in a running orchestrator, that turn is allowed to finish and is
   recorded, but the agent stays killed.
 - Usage is gated per company mode: no new turns start when five-hour utilisation reaches 80% (low), 90%
-  (balanced) or 97% (max), or when the account would go into paid overage.
+  (balanced) or 97% (max), when a request is rejected for usage, or once paid overage is in use. A usage
+  warning alone (e.g. on the seven-day window) does not stop turns.
 
 `agentco mcp` is internal: each agent turn launches it as that agent's company-tools MCP server.
 
@@ -62,9 +63,12 @@ agentco run [--hard-cap 16] [--profile workspace|full]
 
 ## Safety
 
-Agents run with `--profile workspace` by default: a fixed tool allowlist (shell, file tools, company tools),
-working in the company workspace, with normal permission checks. Every turn ignores your personal Claude
-settings, plugins and MCP servers.
+Agents run with `--profile workspace` by default: a fixed tool allow-list (shell, file tools, company tools),
+started in the company workspace. **This is a tool allow-list, NOT a sandbox.** The allow-list includes Bash, so
+an agent can run any shell command as your user: it can read and write files anywhere you can, including the
+agentco database (and so impersonate other agents or alter their state) and other companies' workspaces. Only
+the Sandboxed profile (Plan 5) confines agents. Every turn ignores your personal Claude settings, plugins, MCP
+servers and `CLAUDE.md` files (`--setting-sources ""`), and a `CLAUDE.md` in the workspace is not loaded either.
 
 **`--profile full` gives agents your whole Mac** (all permission checks bypassed). Only use it for
 companies and prompts you trust completely.
