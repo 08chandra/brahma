@@ -5,6 +5,8 @@ public enum RouterError: Error, Equatable {
     case unknownChannel(String)
     case unknownAgent(String)
     case notAMember
+    /// Sender is an unknown, killed or other-company agent, or a DM to oneself.
+    case invalidSender
 }
 
 public struct MessageRouter: Sendable {
@@ -15,6 +17,7 @@ public struct MessageRouter: Sendable {
     public func post(companyId: String, channel name: String, from: Sender, text: String, now: Date = .now) throws -> Message {
         let normalized = Store.normalizeChannelName(name)
         return try store.writer.write { db in
+            try validate(from, companyId: companyId, db)
             guard let channel = try Channel.filter(Column("companyId") == companyId && Column("name") == normalized).fetchOne(db)
             else { throw RouterError.unknownChannel(normalized) }
             if from != .owner {
@@ -28,6 +31,7 @@ public struct MessageRouter: Sendable {
     public func sendDM(companyId: String, from: Sender, to handle: String, text: String, now: Date = .now) throws -> Message {
         let target = handle.hasPrefix("@") ? String(handle.dropFirst()).lowercased() : handle.lowercased()
         return try store.writer.write { db in
+            try validate(from, companyId: companyId, db)
             let toMember: String
             if target == "owner" {
                 toMember = "owner"
@@ -37,6 +41,7 @@ public struct MessageRouter: Sendable {
                 toMember = agent.id
             }
             let fromHandle = try senderHandle(from, db)
+            guard fromHandle != target else { throw RouterError.invalidSender }
             let channelName = "dm:" + [fromHandle, target].sorted().joined(separator: ":")
             let channel: Channel
             if let existing = try Channel.filter(Column("companyId") == companyId && Column("name") == channelName).fetchOne(db) {
@@ -47,6 +52,12 @@ public struct MessageRouter: Sendable {
             }
             return try deliver(db, channel: channel, from: from, text: text, now: now)
         }
+    }
+
+    private func validate(_ sender: Sender, companyId: String, _ db: Database) throws {
+        guard case .agent(let id) = sender else { return }
+        guard let agent = try Agent.fetchOne(db, key: id), agent.companyId == companyId, agent.state != .killed
+        else { throw RouterError.invalidSender }
     }
 
     private func senderHandle(_ sender: Sender, _ db: Database) throws -> String {

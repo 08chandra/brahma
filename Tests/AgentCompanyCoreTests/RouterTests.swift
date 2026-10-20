@@ -114,6 +114,41 @@ private struct World {
     #expect(try w.store.searchMessages(companyId: w.company.id, query: "\"( AND").isEmpty)
 }
 
+@Test func invalidSendersAreRejectedAndCreateNothing() throws {
+    let w = try World()
+    let other = try w.store.createCompany(name: "Other", goal: "g", workspacesRoot: try tempDir())
+    let stranger = try w.store.hire(companyId: other.id, name: "evil", role: "r", model: "m")
+    try w.store.transition(agentId: w.eng.id, to: .killed)
+    let before = try w.store.events(afterId: 0).count
+    #expect(throws: RouterError.invalidSender) {
+        try w.router.post(companyId: w.company.id, channel: "general", from: .agent(stranger.id), text: "x")
+    }
+    #expect(throws: RouterError.invalidSender) {
+        try w.router.sendDM(companyId: w.company.id, from: .agent(stranger.id), to: "ceo", text: "x")
+    }
+    #expect(throws: RouterError.invalidSender) {
+        try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.eng.id), text: "x")
+    }
+    #expect(throws: RouterError.invalidSender) {
+        try w.router.sendDM(companyId: w.company.id, from: .agent(w.eng.id), to: "ceo", text: "x")
+    }
+    #expect(throws: RouterError.invalidSender) {
+        try w.router.post(companyId: w.company.id, channel: "general", from: .agent("nope"), text: "x")
+    }
+    let g = try #require(try w.store.channel(companyId: w.company.id, name: "general"))
+    #expect(try w.store.messages(channelId: g.id, limit: 10).isEmpty)
+    #expect(try w.pending(w.ceo) == 0)
+    #expect(try w.store.channels(companyId: w.company.id).filter { $0.kind == .dm }.isEmpty)
+    #expect(try w.store.events(afterId: 0).count == before)
+}
+
+@Test func selfDMIsRejected() throws {
+    let w = try World()
+    #expect(throws: RouterError.invalidSender) { try w.router.sendDM(companyId: w.company.id, from: .agent(w.cto.id), to: "cto", text: "x") }
+    #expect(throws: RouterError.invalidSender) { try w.router.sendDM(companyId: w.company.id, from: .owner, to: "@owner", text: "x") }
+    #expect(try w.store.channels(companyId: w.company.id).filter { $0.kind == .dm }.isEmpty)
+}
+
 @Test func concurrentWritersDoNotLock() async throws {
     let path = try tempDir().appending(path: "c.sqlite").path
     let w = try World(path: path)
