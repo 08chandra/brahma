@@ -108,10 +108,15 @@ subscription, not a per-token API bill.
 - **Bottom: activity feed** — approvals needed, PRs opened/merged, sprint
   progress, requests to the owner, agents' state changes, owner-relevant
   milestones. Filterable.
+- **Company rail (far left) [owner]:** Slack-style column of company icons
+  with a running/paused dot and an unread/requests badge; "+" creates a new
+  company. Selecting one switches the whole window to that company.
 - **Slim left sidebar:** channels (e.g. `#exec-approvals`, `#architecture`,
   `#sprint-N`, one per team), DMs with any agent, the Backlog/Board view,
   Resources library, Requests inbox. Clicking a channel/DM opens the full
   chat view (replacing the top half or as a panel — builder's choice).
+- **Menu bar extra:** totals across all companies (running agents,
+  pending owner requests) and per-company pause/resume.
 - **Top bar:** company name, current sprint + progress, usage mode dial,
   **Auto mode** toggle, global pause, count of agents per state.
 
@@ -239,9 +244,13 @@ every agent these tools, filtered by role:
   extra usage. If the CLI reports the account has moved into paid overage /
   extra usage, treat it exactly like a usage limit (below). Onboarding tells
   the owner to keep "extra usage" off in Claude account settings.
-- **One active company at a time (v1) [call]:** other companies are paused.
-  The scheduler, caps, and usage backoff are nonetheless global (machine- and
-  account-wide) from day one so running several later is cheap.
+- **Multiple companies at once [owner]:** like Slack workspaces, the owner
+  can create any number of companies; each is independently Running or
+  Paused. The scheduler, caps, and usage backoff are global (machine- and
+  account-wide). Concurrency slots are shared across running companies by
+  weighted round-robin; each company has a priority weight (default 1) the
+  owner can change. A company's usage mode (Low/Balanced/Max) sets its own
+  ceiling; the global owner hard cap still bounds the total.
 - **Usage-limit handling:** when a turn fails with a usage/rate-limit
   error, all agents not yet Running go Blocked(usage-limit); scheduler backs
   off and auto-resumes when the limit resets (parse reset time if given,
