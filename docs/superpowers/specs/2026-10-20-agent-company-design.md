@@ -406,6 +406,65 @@ from a Mac companion app (and, later, possibly a phone).
   (or reachable only via Tailscale/WireGuard by default); never exposed
   unauthenticated to the internet.
 
+### 6.14 Personal agent workspaces and experimental modules (**[owner]** asked for this)
+Every agent gets its own lab to tinker in while it works.
+- **Lab folder [call]:** `~/AgentCompany/<company>/labs/<handle>/` — private
+  scratch space with its own version-controlled repo, writable only by that
+  agent (others can read it if granted). Contains `notes/` (persistent
+  working memory the agent curates across turns), `modules/` (experiments),
+  and `scratch/`.
+- **Experimental modules:** an agent can build small tools for itself —
+  scripts, CLIs, prompt snippets, test harnesses, data scrapers, MCP tools —
+  each with a manifest (`module.json`: name, description, entry point, how to
+  run, author, status `experimental|proposed|adopted`).
+- **Using modules:** an agent's own modules are on its PATH / tool list in
+  its later turns. Other agents only see adopted modules.
+- **Promotion:** `propose_module(name)` → reviewed by the agent's manager
+  (plus the architect for anything touching shared code) → `adopted` modules
+  move to the company **Toolbox** (`toolbox/`), available to every agent,
+  with per-module usage stats.
+- **Guardrails:** labs live inside the company workspace, so the company's
+  permission profile (6.5a) applies; disk quota (default 2 GB per agent);
+  modules can't obtain secrets on their own — same request flow as 6.10.
+- **UI:** each agent's detail panel has a Lab tab (files, notes, modules);
+  the Toolbox has its own sidebar entry.
+
+### 6.15 Self-evolving engine (**[owner]** asked for this)
+The app improves itself: an orchestrating agent watches how companies work and
+changes the system to fix what it finds.
+- **The Steward [call]:** a built-in meta-agent per installation (not per
+  company), reporting directly to the owner. It reads engine telemetry —
+  stalled/blocked agents, chatter loops, failed turns, usage burned per work
+  item, time-to-done, review rejection rates, owner overrides — plus agents'
+  retro notes, and identifies workflow and agent problems.
+- **Three levels of change, increasing risk:**
+  1. **Company tuning** — role prompts (take effect for new hires / new
+     sessions, since prompts are snapshotted), org changes, sprint settings,
+     scheduler weights, per-role models. Automatic in Auto mode, otherwise an
+     owner approval. Every change is logged with a before/after metric and
+     auto-reverted if the metric worsens over a set window.
+  2. **Playbooks and role templates** — the shared templates future
+     companies start from. Same approval rules as level 1.
+  3. **Engine code** — the Steward works on the `agentco` source itself (its
+     own clone), on a branch, writing code and tests like any engineer.
+- **Engine-code safety [call — owner may relax later]:**
+  - Each change is a reviewable branch with a written rationale and the
+    telemetry that motivated it. The full test suite must pass, plus a
+    **simulation run**: the new build runs a scripted test company with fake
+    turns and a short live company on Haiku, compared against the current
+    build.
+  - **The owner always approves engine-code changes, even in Auto mode.**
+  - **Protected areas** need a separate, explicitly flagged owner approval:
+    permission profiles/sandbox, secret handling/redaction, owner approval
+    gates, the usage/overage gate, external-communication approvals, and the
+    Steward's own permissions.
+  - **Hot swap with rollback:** the last-known-good build is kept; an
+    approved build is swapped in at a safe point (no turns running); if crash
+    or error rates rise afterwards it rolls back automatically and tells the
+    owner.
+- **Changelog:** a "What changed" view lists every self-made change, why,
+  its measured effect, and a one-click revert.
+
 ## 7. Architecture sketch
 
 ```

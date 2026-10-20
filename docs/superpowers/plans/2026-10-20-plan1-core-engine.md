@@ -18,6 +18,8 @@
 - Plan 6 — Scale: 300-agent load test, perf, map collapsing, cap tuning from measured per-process RAM.
 - Plan 7 — External communication: connected email/social accounts, outbox approval queue, inbound `#external`, contacts/opt-outs, per-platform rate limits (spec §6.11a).
 - Plan 8 — Headless server: `agentco serve` daemon on Linux (systemd), authenticated HTTPS+WebSocket API, Linux backends for secrets/notifications/sandbox, Mac app as remote client (spec §6.13).
+- Plan 9 — Agent labs & modules: per-agent lab folders, notes memory, experimental modules with manifests, promotion to the company Toolbox (spec §6.14).
+- Plan 10 — Self-evolving engine: the Steward meta-agent, telemetry, three change levels, simulation runs, protected areas, hot swap + rollback, changelog (spec §6.15).
 
 ## Global Constraints
 
