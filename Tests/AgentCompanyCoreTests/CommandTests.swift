@@ -1,0 +1,107 @@
+import Foundation
+import Testing
+@testable import AgentCompanyCore
+
+private func makeAgent(started: Bool, name: String = "ceo", role: String = "ceo") -> Agent {
+    Agent(id: "a1", companyId: "c1", name: name, role: role, model: "opus",
+          sessionId: "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0", sessionStarted: started,
+          state: .ready, blocker: nil, requestedBlocker: nil, paused: false,
+          readySince: nil, createdAt: Date(timeIntervalSince1970: 0))
+}
+
+private let company = Company(id: "c1", name: "Acme", slug: "acme", goal: "Sell 1000 widgets",
+                              workspacePath: "/tmp/ws/acme", status: .running, usageMode: .balanced,
+                              priorityWeight: 1, createdAt: Date(timeIntervalSince1970: 0))
+
+private func request(started: Bool, profile: PermissionProfile) -> TurnRequest {
+    TurnRequest(agent: makeAgent(started: started), company: company, prompt: "SECRET PROMPT TEXT",
+                appendSystemPrompt: "ROLE PROMPT", mcpConfigPath: "/tmp/run/a1.mcp.json",
+                workingDirectory: "/tmp/ws/acme", profile: profile)
+}
+
+private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,RemoteTrigger,PushNotification,SendMessage,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ReportFindings,TaskStop"
+
+@Suite struct CommandTests {
+    @Test func firstTurnWorkspaceArgs() {
+        let args = ClaudeCommand.arguments(for: request(started: false, profile: .workspace))
+        #expect(args == [
+            "-p", "--output-format", "stream-json", "--verbose",
+            "--model", "opus", "--fallback-model", "sonnet",
+            "--setting-sources", "project", "--settings", "{\"enabledPlugins\":{}}", "--disable-slash-commands",
+            "--strict-mcp-config", "--mcp-config", "/tmp/run/a1.mcp.json",
+            "--disallowed-tools", disallowed,
+            "--session-id", "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0", "--append-system-prompt", "ROLE PROMPT",
+            "--permission-mode", "acceptEdits",
+            "--allowed-tools", "Bash,Read,Edit,Write,Glob,Grep,mcp__company",
+            "--add-dir", "/tmp/ws/acme",
+        ])
+        #expect(!args.contains("SECRET PROMPT TEXT"))
+    }
+
+    @Test func resumedTurnOmitsSessionIdAndSystemPrompt() throws {
+        let args = ClaudeCommand.arguments(for: request(started: true, profile: .workspace))
+        let i = try #require(args.firstIndex(of: "--resume"))
+        #expect(args[i + 1] == "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0")
+        #expect(!args.contains("--session-id"))
+        #expect(!args.contains("--append-system-prompt"))
+    }
+
+    @Test func fullProfileBypassesPermissions() {
+        let args = ClaudeCommand.arguments(for: request(started: false, profile: .full))
+        #expect(args.contains("bypassPermissions"))
+        #expect(!args.contains("--allowed-tools"))
+        #expect(!args.contains("--add-dir"))
+    }
+
+    @Test func mcpConfigWritesExactJSON() throws {
+        let home = try tempDir()
+        let paths = AgentCoPaths(home: home, workspaces: home)
+        let path = try MCPConfig.write(paths: paths, executable: "/usr/bin/agentco", agent: makeAgent(started: false))
+        #expect(path == paths.runDir.appending(path: "a1.mcp.json").path)
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let obj = try JSONSerialization.jsonObject(with: data) as? NSDictionary
+        let expected: NSDictionary = ["mcpServers": ["company": [
+            "command": "/usr/bin/agentco",
+            "args": ["mcp", "--db", paths.database.path, "--company", "c1", "--agent", "a1"],
+        ] as NSDictionary] as NSDictionary]
+        #expect(obj == expected)
+        let attrs = try FileManager.default.attributesOfItem(atPath: path)
+        #expect((attrs[.posixPermissions] as? Int) == 0o600)
+    }
+
+    @Test func digestRendersItems() {
+        let general = Channel(id: "ch1", companyId: "c1", name: "general", kind: .channel, createdAt: Date())
+        let dm = Channel(id: "ch2", companyId: "c1", name: "dm:ceo:cto", kind: .dm, createdAt: Date())
+        func msg(_ id: String, _ ch: String, _ s: String, _ t: String) -> Message {
+            Message(id: id, companyId: "c1", channelId: ch, senderId: s, text: t, createdAt: Date())
+        }
+        let item = InboxItem(id: 1, agentId: "a1", messageId: "m1", deliveredTurnId: nil)
+        let out = InboxDigest.render(agent: makeAgent(started: true), company: company, items: [
+            (item, msg("m1", "ch1", "owner", "Build a landing page"), general),
+            (item, msg("m2", "ch2", "a2", "Use Stripe webhooks,\nnot polling"), dm),
+            (item, msg("m3", "ch1", "zzz", "hi"), general),
+        ], handles: ["a2": "cto"])
+        #expect(out == """
+        New since your last turn (3 items):
+        - #general @owner: Build a landing page
+        - DM @cto: Use Stripe webhooks, not polling
+        - #general @unknown: hi
+        """)
+    }
+
+    @Test func digestEmpty() {
+        let out = InboxDigest.render(agent: makeAgent(started: true), company: company, items: [], handles: [:])
+        #expect(out == "New since your last turn (0 items):\n- (nothing new — check your work and continue)")
+    }
+
+    @Test func rolePromptContainsFacts() {
+        let cto = makeAgent(started: false, name: "cto", role: "cto")
+        let text = RolePrompt.render(agent: makeAgent(started: false), company: company,
+                                     roster: [makeAgent(started: false), cto])
+        for s in ["@ceo", "@cto — cto", "Sell 1000 widgets", "Acme", "company tools", "@owner", "set_blocked",
+                  "post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel"] {
+            #expect(text.contains(s), "missing \(s)")
+        }
+        #expect(text.count < 2500)
+    }
+}
