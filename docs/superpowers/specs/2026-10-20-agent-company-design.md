@@ -447,7 +447,7 @@ changes the system to fix what it finds.
      companies start from. Same approval rules as level 1.
   3. **Engine code** — the Steward works on the `agentco` source itself (its
      own clone), on a branch, writing code and tests like any engineer.
-- **Engine-code safety [call — owner may relax later]:**
+- **Engine-code safety [call — owner may relax later; strengthened by §6.16]:**
   - Each change is a reviewable branch with a written rationale and the
     telemetry that motivated it. The full test suite must pass, plus a
     **simulation run**: the new build runs a scripted test company with fake
@@ -464,6 +464,28 @@ changes the system to fix what it finds.
     owner.
 - **Changelog:** a "What changed" view lists every self-made change, why,
   its measured effect, and a one-click revert.
+
+### 6.16 Coordination principles from research (**[owner]** approved 2026-10-20)
+The full list — 25+ changes with sources and the plan each lands in — is in
+`docs/superpowers/specs/2026-10-20-improvements-from-research.md`, and is
+binding for Plans 3–10. The core principles:
+- **Work items, files and git are the agents' coordination substrate;**
+  channels/DMs are for discussion and owner visibility. Messages reference
+  artifacts instead of pasting them.
+- **The engine is the referee:** work is Done only on an engine-recorded pass
+  of the item's executable check; agents can't edit their own acceptance
+  criteria or checks; diffs that weaken tests need explicit reviewer
+  approval (anti-reward-hacking).
+- **One writer per work item / area**, read-only helpers in parallel;
+  driver + navigator pairing as an option for hard items.
+- **Structured hand-offs on disk** and turn-start orientation (role card,
+  current item, progress file, recent git log).
+- **Budgets, effort tiers, watchdog, team-size caps** to control cost and
+  liveness.
+- **Steward safety** per the proposal's section F (immutable evaluator,
+  held-out scenarios, separate auditor, no self-granted resources, one
+  change at a time, lineage archive, draining hot-swap); these supersede the
+  rules in §6.15 where stricter.
 
 ## 7. Architecture sketch
 

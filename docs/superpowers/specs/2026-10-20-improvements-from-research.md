@@ -1,6 +1,6 @@
 # Improvements from research — proposal
 
-Date: 2026-10-20 · Status: **proposed, awaiting owner approval** · Sources:
+Date: 2026-10-20 · Status: **approved by owner 2026-10-20 — part of the design (see design doc §6.16)** · Sources:
 `docs/research/2026-10-20-existing-projects.md`,
 `docs/research/2026-10-20-failures-and-self-improvement.md`
 
@@ -77,6 +77,25 @@ visibility and discussion. Agents point to artifacts instead of pasting them.
     hard sub-problem to a stronger model for one turn. → Plan 3.
 16. **Team size caps.** Managers ≤ ~7 direct reports; many-to-many
     messaging discouraged; per-agent post rate limits in channels. → Plan 3.
+
+### D2. Pair programming (owner asked about this)
+15b. **Driver + navigator pairing, as a per-work-item option.** One driver
+     is the single writer; one navigator is read-only — reviews each diff as
+     it lands with clean context (diff + spec only), runs tests, investigates,
+     suggests. Default for Large or risk-tagged items (security, concurrency,
+     core architecture) in Max mode; opt-in in Balanced; off in Low unless
+     the owner turns it on. Never two writers on one item. → Plan 3.
+15c. **Competing hypotheses** template for debugging/architecture: 2–3
+     agents each try to disprove the others before anyone writes the fix.
+     → Plan 3.
+
+### D3. Anti-reward-hacking rules (owner asked about this)
+15d. Any diff that deletes, skips, or weakens a test or check (fewer
+     assertions, `skip`, loosened thresholds, edited fixtures) is detected
+     by the engine and requires the item's reviewer to approve that change
+     explicitly; it can never be auto-merged.
+15e. Agents never see or control the engine's verification records; turn
+     outputs claiming success carry no weight.
 
 ### E. Labs and modules (Plan 9)
 17. **Modules as skill packages** (description + scripts + tests; only the
