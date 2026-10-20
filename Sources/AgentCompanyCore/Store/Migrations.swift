@@ -80,6 +80,16 @@ enum Migrations {
                 t.column("deliveredTurnId", .text)
             }
             try db.create(index: "inbox_agent_pending", on: "inboxItem", columns: ["agentId", "deliveredTurnId"])
+            try db.create(table: "usageState") { t in
+                t.primaryKey("id", .integer)
+                t.column("status", .text).notNull()
+                t.column("resetsAt", .datetime)
+                t.column("rateLimitType", .text)
+                t.column("isUsingOverage", .boolean).notNull()
+                t.column("fiveHourUtilization", .double)
+                t.column("sevenDayUtilization", .double)
+                t.column("observedAt", .datetime).notNull()
+            }
             // Messages are never edited or deleted in Plan 1, so an insert trigger keeps the index current.
             try db.execute(sql: "CREATE VIRTUAL TABLE messageFts USING fts5(text, content='message', content_rowid='rowid')")
             try db.execute(sql: """

@@ -30,3 +30,13 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var readySince: Date?
     public var createdAt: Date
 }
+
+/// Tie-break weight among a company's ready agents: leadership first.
+public func roleWeight(_ role: String) -> Int {
+    switch role {
+    case "ceo", "cto", "cpo": return 3
+    case "architect": return 2
+    case "manager": return 1
+    default: return 0
+    }
+}
