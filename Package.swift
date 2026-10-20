@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "AgentCompany",
+    name: "Brahma",
     platforms: [.macOS(.v14)],
     products: [
-        .library(name: "AgentCompanyCore", targets: ["AgentCompanyCore"]),
-        .executable(name: "agentco", targets: ["agentco"]),
+        .library(name: "BrahmaCore", targets: ["BrahmaCore"]),
+        .executable(name: "brahma", targets: ["brahma"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
@@ -14,19 +14,19 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "AgentCompanyCore",
+            name: "BrahmaCore",
             dependencies: [.product(name: "GRDB", package: "GRDB.swift")]
         ),
         .executableTarget(
-            name: "agentco",
+            name: "brahma",
             dependencies: [
-                "AgentCompanyCore",
+                "BrahmaCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
         .testTarget(
-            name: "AgentCompanyCoreTests",
-            dependencies: ["AgentCompanyCore"],
+            name: "BrahmaCoreTests",
+            dependencies: ["BrahmaCore"],
             resources: [.copy("Fixtures")]
         ),
     ]
