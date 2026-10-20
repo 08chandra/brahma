@@ -14,8 +14,13 @@
 - Plan 2 — Mac app shell: SwiftUI app embedding the Orchestrator; company rail, sidebar, channels/DMs, search, menu bar extra, quit→pause.
 - Plan 3 — Org & work: role catalog and org-chart generation, work items/backlog/sprints, decision gates + Auto mode, hire/kill tools, anti-chatter.
 - Plan 4 — Mission control: agent map, activity feed, workspace git worktrees + merges, preview adapters (web, iOS, macOS, CLI, backend).
-- Plan 5 — Owner requests & safety: requests inbox, Keychain secrets + redaction + pre-commit hook, notifications (macOS/iMessage/email), resources drag-drop, permission profiles incl. Sandboxed.
+- Plan 5 — Owner requests & safety: requests inbox, Keychain secrets + redaction + pre-commit hook, notifications (macOS/iMessage/email), resources drag-drop, permission profiles incl. Sandboxed. Acceptance criterion for Sandboxed: an agent must not be able to write agentco.sqlite, run agentco as another agent, or read other companies' workspaces from Bash.
 - Plan 6 — Scale: 300-agent load test, perf, map collapsing, cap tuning from measured per-process RAM.
+- Plan 7 — External communication: connected email/social accounts, outbox approval queue, inbound `#external`, contacts/opt-outs, per-platform rate limits (spec §6.11a).
+- Plan 8 — Headless server: `agentco serve` daemon on Linux (systemd), authenticated HTTPS+WebSocket API, Linux backends for secrets/notifications/sandbox, Mac app as remote client (spec §6.13).
+- Plan 9 — Agent labs & modules: per-agent lab folders, notes memory, experimental modules with manifests, promotion to the company Toolbox (spec §6.14).
+- Plan 10 — Self-evolving engine: the Steward meta-agent, telemetry, three change levels, simulation runs, protected areas, hot swap + rollback, changelog (spec §6.15).
+- Plan 11 — Running the company: browser automation, connectors/integrations page, funds budget + spend requests, Knowledge Base, business roles, industry packs (spec §6.17, §6.18).
 
 ## Global Constraints
 
@@ -23,12 +28,13 @@
 - Usage modes are exactly `low`, `balanced`, `max`; defaults for Max 20x: low = 2, balanced = 6, max = owner hard cap = 16 (spec §6.7).
 - Never knowingly use paid overage: `isUsingOverage == true` closes the usage gate (spec §6.7).
 - Multiple companies can run at once; scheduler, caps and usage gate are global; slots shared by weighted round-robin with per-company `priorityWeight` default 1 (spec §6.7).
-- Every agent turn must be isolated from the owner's personal Claude setup: `--setting-sources project`, `--settings '{"enabledPlugins":{}}'`, `--disable-slash-commands`, `--strict-mcp-config`. Never use `--bare` (it drops subscription OAuth).
+- Every agent turn must be isolated from the owner's personal Claude setup: `--setting-sources ""` (empty: load NO settings files — `project` would load the agent-writable workspace `.claude/settings.json`, a privilege-escalation path verified 2026-10-20), `--settings '{"enabledPlugins":{}}'`, `--disable-slash-commands`, `--strict-mcp-config`. Never use `--bare` (it drops subscription OAuth).
 - The role prompt is passed with `--append-system-prompt` **only on an agent's first turn**; Claude Code snapshots it for the life of the session.
 - Prompt goes to `claude` on **stdin**, never argv.
 - Every state transition is persisted before it takes effect; on startup, agents recorded `running` with no live turn return to `ready` (spec §6.12).
 - Data home: `~/Library/Application Support/AgentCompany/` (override `AGENTCO_HOME`); single DB `agentco.sqlite`, WAL, busy timeout 5 s. Workspaces: `~/AgentCompany/<company-slug>/` (override `AGENTCO_WORKSPACES`).
 - Owner is addressed as `@owner` everywhere.
+- `AgentCompanyCore` stays Linux-portable (spec §6.13): no AppKit or Apple-only Foundation APIs (e.g. `FileHandle.bytes`); Mac-only features go behind protocols in later plans.
 
 ## Review Focus
 
@@ -325,7 +331,7 @@ loop while globalFree > 0:
 ```
 -p --output-format stream-json --verbose
 --model <agent.model> --fallback-model sonnet
---setting-sources project --settings {"enabledPlugins":{}} --disable-slash-commands
+--setting-sources "" --settings {"enabledPlugins":{}} --disable-slash-commands
 --strict-mcp-config --mcp-config <mcpConfigPath>
 --disallowed-tools <disallowedTools joined by ",">
 ( --session-id <sessionId> --append-system-prompt <appendSystemPrompt> )   if !agent.sessionStarted

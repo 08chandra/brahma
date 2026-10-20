@@ -1,7 +1,13 @@
-# Agent Company — Design
+# Brahma — Design
 
 Date: 2026-10-20
 Status: draft, awaiting owner approval
+
+> **Name [owner, 2026-10-20]:** the product is **Brahma**. Code identifiers
+> follow: CLI `brahma`, library `BrahmaCore`, app `Brahma.app`, data in
+> `~/Library/Application Support/Brahma/` and `~/Brahma/<company>/`, env vars
+> `BRAHMA_HOME` / `BRAHMA_WORKSPACES`. Earlier text that says
+> "Agent Company"/`agentco` refers to the same thing.
 
 ## 1. What this is, and why
 
@@ -51,6 +57,8 @@ subscription, not a per-token API bill.
 - Agents deploying to paid production hosting on their own. They may prepare
   deployment; going live is an owner-approved request.
 - Multi-user / teams of humans sharing one company.
+- Agents operating accounts the owner didn't connect, or scraping/automating
+  platforms outside their official APIs.
 
 ## 4. Anti-goals (failure even if it "works")
 
@@ -326,9 +334,8 @@ every agent these tools, filtered by role:
 - **Sign-ins/permissions:** owner performs the sign-in themselves (e.g. OAuth
   in their browser, or grants access) and marks done; resulting tokens, if
   any, go to Keychain.
-- **Money:** agents never hold payment details. A money request is a request
-  for the owner to purchase/approve a specific charge; the owner does it and
-  marks done. **[call]**
+- **Money:** superseded by §6.17 Funds — agents never see payment details;
+  spending goes through a budgeted funds connector with owner approval.
 - **Notifications [call]:** macOS notifications (always); iMessage text to
   the owner's own number via the Messages app (AppleScript) — no Twilio;
   email via the owner's Gmail (SMTP + app password in Keychain). Each
@@ -340,6 +347,34 @@ every agent these tools, filtered by role:
   wide), a **channel** (team), or a **DM** (one agent). Files are copied
   into the workspace `resources/<scope>/`; agents get the path in their next
   inbox digest and via `--add-dir`. URLs are stored as link resources.
+
+### 6.11a External communication — email and social media (**[owner]** asked for this)
+Agents (e.g. marketing, sales, support, recruiting roles) can talk to people
+outside the company.
+- **Accounts the owner connects [call]:** per company, the owner connects
+  accounts in Settings — an email account (Gmail via OAuth, or any IMAP/SMTP
+  mailbox; a dedicated company address is recommended over the owner's
+  personal one) and social accounts through their official APIs (e.g.
+  Bluesky, X, LinkedIn, Reddit, Discord, Slack). Credentials live in
+  Keychain (6.10). Agents never get raw credentials; they use company tools.
+- **Tools:** `send_email(to, subject, body, thread?)`,
+  `post_social(account, text, media?, reply_to?)`,
+  `send_social_dm(account, to, text)`, `read_external_inbox(account)`.
+- **Approval by default [call]:** every outbound external message is a
+  *draft* in an "Outbox" queue the owner approves, edits, or rejects. Auto
+  mode may auto-send per account only if the owner explicitly enables it for
+  that account, with a daily send cap (default 20) and only to contacts who
+  already replied or were added by the owner. Unsolicited mass outreach is
+  never auto-approved.
+- **Inbound:** replies, mentions, and DMs are polled and appear in a per-
+  company `#external` channel (and as threads per contact), waking the agent
+  that owns the conversation.
+- **Guardrails [call]:** agents disclose they are an AI assistant acting for
+  the company when asked or where a platform requires it; they never pose as
+  a specific real human; per-account rate limits respect each platform's API
+  terms; email includes an unsubscribe line for marketing mail; a contacts
+  list records consent/opt-outs and blocks re-contacting opted-out people.
+- Everything sent/received is stored in history (6.12) and searchable.
 
 ### 6.12 Persistence (**[owner]** asked for local history)
 - SQLite database in `~/Library/Application Support/AgentCompany/` (one DB
@@ -353,6 +388,233 @@ every agent these tools, filtered by role:
 - Crash/quit safe: every state transition is persisted before it takes
   effect; on launch, any agent recorded as Running whose process is gone is
   moved back to Ready.
+
+### 6.13 Headless server mode (**[owner]** asked for this — later phase)
+Eventually the engine runs headless on a Linux VM, and the owner talks to it
+from a Mac companion app (and, later, possibly a phone).
+- **[call]** Same Swift codebase: Swift runs on Linux, so `AgentCompanyCore`
+  is kept Linux-portable from Plan 1 on (no AppKit/Apple-only Foundation APIs
+  in the core; Mac-only features — Keychain, UserNotifications, Messages,
+  ScreenCaptureKit, Simulator — sit behind protocols with Linux alternatives).
+- **Server:** `agentco serve` — a long-running daemon (systemd unit) running
+  the Orchestrator, with `claude` CLI installed and logged in on the VM.
+  Linux equivalents: secrets in an encrypted file or the VM's secret store;
+  notifications via email/push only; sandboxing via bubblewrap/containers;
+  web previews served from the VM (and tunneled), native iOS/macOS previews
+  unavailable (need a Mac build host — out of scope for the server).
+- **Remote API:** the daemon exposes an authenticated API (HTTPS + WebSocket
+  event stream) covering everything the app does: companies, channels/DMs,
+  work items, requests, usage, activity, preview URLs.
+- **Mac companion app:** the same SwiftUI app connects either to its embedded
+  local engine or to a remote server; it's a client of the same API.
+- **Security:** API only over TLS, behind token auth paired from the app
+  (or reachable only via Tailscale/WireGuard by default); never exposed
+  unauthenticated to the internet.
+
+### 6.14 Personal agent workspaces and experimental modules (**[owner]** asked for this)
+Every agent gets its own lab to tinker in while it works.
+- **Lab folder [call]:** `~/AgentCompany/<company>/labs/<handle>/` — private
+  scratch space with its own version-controlled repo, writable only by that
+  agent (others can read it if granted). Contains `notes/` (persistent
+  working memory the agent curates across turns), `modules/` (experiments),
+  and `scratch/`.
+- **Experimental modules:** an agent can build small tools for itself —
+  scripts, CLIs, prompt snippets, test harnesses, data scrapers, MCP tools —
+  each with a manifest (`module.json`: name, description, entry point, how to
+  run, author, status `experimental|proposed|adopted`).
+- **Using modules:** an agent's own modules are on its PATH / tool list in
+  its later turns. Other agents only see adopted modules.
+- **Promotion:** `propose_module(name)` → reviewed by the agent's manager
+  (plus the architect for anything touching shared code) → `adopted` modules
+  move to the company **Toolbox** (`toolbox/`), available to every agent,
+  with per-module usage stats.
+- **Guardrails:** labs live inside the company workspace, so the company's
+  permission profile (6.5a) applies; disk quota (default 2 GB per agent);
+  modules can't obtain secrets on their own — same request flow as 6.10.
+- **UI:** each agent's detail panel has a Lab tab (files, notes, modules);
+  the Toolbox has its own sidebar entry.
+
+### 6.15 Self-evolving engine (**[owner]** asked for this)
+The app improves itself: an orchestrating agent watches how companies work and
+changes the system to fix what it finds.
+- **The Steward [call]:** a built-in meta-agent per installation (not per
+  company), reporting directly to the owner. It reads engine telemetry —
+  stalled/blocked agents, chatter loops, failed turns, usage burned per work
+  item, time-to-done, review rejection rates, owner overrides — plus agents'
+  retro notes, and identifies workflow and agent problems.
+- **Three levels of change, increasing risk:**
+  1. **Company tuning** — role prompts (take effect for new hires / new
+     sessions, since prompts are snapshotted), org changes, sprint settings,
+     scheduler weights, per-role models. Automatic in Auto mode, otherwise an
+     owner approval. Every change is logged with a before/after metric and
+     auto-reverted if the metric worsens over a set window.
+  2. **Playbooks and role templates** — the shared templates future
+     companies start from. Same approval rules as level 1.
+  3. **Engine code** — the Steward works on the `agentco` source itself (its
+     own clone), on a branch, writing code and tests like any engineer.
+- **Engine-code safety [call — owner may relax later; strengthened by §6.16]:**
+  - Each change is a reviewable branch with a written rationale and the
+    telemetry that motivated it. The full test suite must pass, plus a
+    **simulation run**: the new build runs a scripted test company with fake
+    turns and a short live company on Haiku, compared against the current
+    build.
+  - **The owner always approves engine-code changes, even in Auto mode.**
+  - **Protected areas** need a separate, explicitly flagged owner approval:
+    permission profiles/sandbox, secret handling/redaction, owner approval
+    gates, the usage/overage gate, external-communication approvals, and the
+    Steward's own permissions.
+  - **Hot swap with rollback:** the last-known-good build is kept; an
+    approved build is swapped in at a safe point (no turns running); if crash
+    or error rates rise afterwards it rolls back automatically and tells the
+    owner.
+- **Changelog:** a "What changed" view lists every self-made change, why,
+  its measured effect, and a one-click revert.
+
+### 6.16 Coordination principles from research (**[owner]** approved 2026-10-20)
+The full list — 25+ changes with sources and the plan each lands in — is in
+`docs/superpowers/specs/2026-10-20-improvements-from-research.md`, and is
+binding for Plans 3–10. The core principles:
+- **Work items, files and git are the agents' coordination substrate;**
+  channels/DMs are for discussion and owner visibility. Messages reference
+  artifacts instead of pasting them.
+- **The engine is the referee:** work is Done only on an engine-recorded pass
+  of the item's executable check; agents can't edit their own acceptance
+  criteria or checks; diffs that weaken tests need explicit reviewer
+  approval (anti-reward-hacking).
+- **One writer per work item / area**, read-only helpers in parallel;
+  driver + navigator pairing as an option for hard items.
+- **Structured hand-offs on disk** and turn-start orientation (role card,
+  current item, progress file, recent git log).
+- **Budgets, effort tiers, watchdog, team-size caps** to control cost and
+  liveness.
+- **Steward safety** per the proposal's section F (immutable evaluator,
+  held-out scenarios, separate auditor, no self-granted resources, one
+  change at a time, lineage archive, draining hot-swap); these supersede the
+  rules in §6.15 where stricter.
+
+### 6.17 Running the company: research, internet, browser, funds, integrations (**[owner]** asked for this)
+The company doesn't just build the product — it researches, operates, and
+runs it. It plugs in whatever capabilities it needs, where it needs them.
+
+**Internet and research**
+- Agents get web search and page fetching (Claude Code's WebSearch/WebFetch)
+  per role; in the Sandboxed profile, network access follows the company's
+  domain allow-list, which agents can request to widen
+  (`request_from_owner(kind=permission)`; auto-approved in Auto mode for
+  read-only browsing).
+- A **Research** function (analyst/researcher roles) produces cited reports
+  into a company **Knowledge Base** (`kb/`), searchable by every agent, so
+  research is done once and reused.
+
+**Browser [call]**
+- Agents can drive a real browser (Chromium via Playwright, exposed as an
+  MCP tool) for sites without APIs: sign-ups, dashboards, admin consoles,
+  testing the product like a user.
+- Each company has its own browser profile(s), isolated from the owner's
+  personal browser. Agents never see saved passwords.
+- **Sign-in hand-off:** when a site needs a login, 2FA, or a CAPTCHA, the
+  agent files a sign-in request; the owner completes it once in an
+  in-app browser window on that company's profile; the session cookie is
+  then usable by the agent.
+- The preview pane can show an agent's live browser, so the owner watches
+  what it's doing. Submitting payments, accepting terms of service, or
+  sending messages through a browser counts as an action requiring the
+  same approval as the equivalent tool (funds / outbox).
+
+**Integrations (plug-ins) [call]**
+- Capabilities plug in as **connectors** — MCP servers (Gmail, Slack,
+  GitHub, Stripe, Vercel/AWS/Fly, Google Workspace, Notion, Linear, analytics,
+  CRM, …) or REST APIs wrapped as tools.
+- A per-company **Integrations** page: the owner installs a connector,
+  completes its auth (secrets → Keychain), and scopes it to roles (e.g.
+  only DevOps gets the cloud connector, only Support gets the helpdesk).
+- Agents can *propose* a new connector ("we need Stripe for billing") →
+  owner approval → install. Agents may also build small connectors as lab
+  modules (§6.14) and promote them.
+- Every connector call is logged (who, what, when) and counted toward
+  budgets.
+
+**Funds [call — replaces the earlier "agents never hold money" rule with a
+stricter, more useful one]**
+- The owner gives each company a **budget**: monthly limit, per-purchase
+  limit, and optional merchant/category allow-list.
+- Money moves only through a **funds connector** the owner connects — e.g.
+  a virtual-card provider with programmatic spend controls, or a payment
+  platform account. Card numbers and credentials stay in Keychain/the
+  provider; agents never see them.
+- Agents spend via `request_spend(amount, merchant, purpose, work_item)`:
+  within budget and below the auto-approve threshold (default $0 — i.e.
+  every purchase needs approval until the owner raises it) the engine
+  executes it; otherwise it goes to the owner's approval queue. Auto mode
+  never raises spend limits.
+- A **CFO/Finance** role tracks spend vs budget, subscriptions, and revenue;
+  a Finance view shows every charge with its purpose and requesting agent.
+  Refunds/cancellations are tracked as work items.
+- Revenue (e.g. from a Stripe connector) is visible but agents can't move
+  money out of revenue accounts.
+
+**Business roles** added to the role catalog (Plan 3): Research analyst,
+Marketing, Sales, Customer support, Finance (CFO), Legal/compliance
+reviewer (flags terms, privacy, licensing — not legal advice), Operations.
+
+**Guardrails**: everything above respects permission profiles (§6.5a),
+owner gates, the external-communication outbox (§6.11a), and the funds
+budget; all actions are in the activity history; the global kill switch
+stops browsers and connectors too.
+
+### 6.18 Any kind of company — industry packs (**[owner]** asked for this)
+The engine (hierarchy, scheduler, channels, approvals, budgets, labs,
+Steward) is industry-neutral. Everything software-specific becomes a
+pluggable **industry pack**, so a company can be e-commerce, apparel, hard
+tech/hardware, B2B SaaS, CPG, services, media, etc.
+
+**What a pack defines [call]**
+- **Org template:** roles and ratios for that kind of company — e.g. CPG:
+  brand, product development/formulation, sourcing & supply chain,
+  regulatory, marketing, retail/wholesale sales, finance; hard tech:
+  mechanical/electrical/firmware engineers, test, manufacturing engineering,
+  supply chain, compliance/certification; e-commerce: merchandising,
+  storefront, growth marketing, customer support, fulfillment ops.
+- **Work vocabulary:** item types and stages beyond epic/story/task —
+  e.g. SKU, tech pack, BOM, supplier RFQ, prototype build, certification,
+  launch campaign, listing, PO, shipment.
+- **Cadence:** sprints are one option; packs can use stage-gates (concept →
+  prototype → EVT/DVT/PVT → production), seasonal/collection calendars,
+  campaign cycles, or milestones. The scheduler and gates don't change.
+- **Deliverables & previews:** each artifact type has a preview adapter —
+  code/app (as §6.9), storefront/landing page, brand board & mockups,
+  product renders/CAD viewer (STEP/STL/glTF), tech packs & BOM tables,
+  financial models/spreadsheets, decks, documents, ad creatives, dashboards.
+- **Verification:** "done" checks generalize beyond tests: spreadsheet/BOM
+  validators, spec checklists, rubric-graded review by a clean-context
+  reviewer agent, cost/margin targets, compliance checklists, and owner
+  sign-off for subjective work (brand, design). Engine-owned evidence (§6.16)
+  still applies wherever a check can be executed.
+- **Connectors:** pack-suggested integrations — e.g. Shopify/Amazon/Etsy,
+  3PL and shipping, supplier & manufacturing marketplaces, ad platforms,
+  accounting, CAD/PLM tools, QuickBooks/Xero, payment processors.
+- **Playbooks:** starter goals and checklists (e.g. "launch a DTC apparel
+  brand", "take a hardware prototype to DVT", "launch a B2B SaaS MVP").
+
+**The real world [call]**
+- Agents can't physically make, ship, or sign things. Physical-world steps
+  (sample approval, factory visit, signing contracts, legal filings,
+  certifications, receiving inventory) become **human tasks**: a queue the
+  owner (or a contractor/vendor the owner designates) completes, with the
+  agents preparing everything (specs, RFQs, comparison tables, drafted
+  emails, checklists) and tracking status.
+- Talking to suppliers, manufacturers, retailers and customers goes through
+  the external-communication outbox (§6.11a); spending through the funds
+  budget (§6.17); contracts and anything legally binding always need the
+  owner.
+
+**Creating a company**
+- The owner picks a pack (or "custom") and describes the business; the
+  CEO/CPO agents can propose pack adjustments (extra roles, item types) for
+  owner approval. Packs are versioned files, so the Steward (§6.15/§6.16) can
+  improve them over time from what works, and new packs can be added.
+- Plan 1's engine needs no change for this; packs land with the role
+  catalog / work items (Plan 3), previews (Plan 4) and connectors (Plan 11).
 
 ## 7. Architecture sketch
 
