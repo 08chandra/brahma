@@ -263,7 +263,7 @@ private struct World {
         #expect(try w.pending(b) == 0)
     }
 
-    @Test(arguments: [("allowed_warning", false), ("rejected", false), ("rejected", true)])
+    @Test(arguments: [("allowed_warning", false), ("allowed_warning", true), ("rejected", false), ("rejected", true)])
     func successfulTurnThatHitsLimitStillCounts(status: String, messageMidTurn: Bool) async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         let t = w.clock.now
@@ -284,9 +284,12 @@ private struct World {
         #expect(try w.pending(ceo) == (messageMidTurn ? 1 : 0))
         let a = try w.agent(ceo)
         #expect(a.consecutiveFailures == 0)
-        if messageMidTurn {
+        if messageMidTurn && status == "rejected" {
             #expect(a.state == .blocked)
             #expect(a.blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        } else if messageMidTurn {
+            // A warning is not a limit: no usage hold.
+            #expect(a.state == .ready)
         } else {
             #expect(a.state == .sleeping)
         }
@@ -387,6 +390,179 @@ private struct World {
         #expect(try w.turns(a).isEmpty)
         #expect(try w.agent(a).blocker == .usageLimit(until: t.addingTimeInterval(3600)))
         #expect(try w.turns(b).map(\.outcome) == [.succeeded])
+    }
+
+    @Test func sevenDayWarningStopsNobody() async throws {
+        let w = try World()
+        let low = try w.company("Lowco", mode: .low), bal = try w.company("Balco", mode: .balanced)
+        let max = try w.company("Maxco", mode: .max)
+        let a = try w.hire(low, "ceo"), b = try w.hire(bal, "ceo"), m = try w.hire(max, "ceo")
+        let t = w.clock.now
+        let warning = RateLimitInfo(status: "allowed_warning", resetsAt: t.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
+                                    isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.8, observedAt: t,
+                                    fiveHourResetsAt: t.addingTimeInterval(7200), sevenDayResetsAt: t.addingTimeInterval(3 * 86400))
+        let router = w.router
+        w.fake.script("ceo", .init(events: [
+            .initialized(sessionId: a.sessionId, model: "sonnet"),
+            .rateLimit(warning),
+            .result(TurnResult(isError: false, subtype: "success", text: "done", costUSD: 0.01, apiErrorStatus: nil,
+                               sessionId: a.sessionId)),
+        ], sideEffect: { _ in _ = try router.sendDM(companyId: low.id, from: .owner, to: "ceo", text: "more", now: t) }))
+        try w.dm(low, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.succeeded])
+        #expect(try w.agent(a).state == .ready, "a warning must not set a usage hold")
+        #expect(try w.store.latestRateLimit()?.status == "allowed_warning")
+        try w.dm(bal, b); try w.dm(max, m)
+        try await w.cycle()
+        for x in [a, b, m] {
+            #expect(try w.turns(x).last?.outcome == .succeeded)
+            #expect(try w.agent(x).state == .sleeping)
+        }
+        #expect(try w.turns(a).count == 2)
+    }
+
+    @Test func lowModeThresholdWaitsForFiveHourResetNotSevenDay() async throws {
+        let w = try World()
+        let low = try w.company("Lowco", mode: .low); let a = try w.hire(low, "ceo")
+        let t = w.clock.now
+        try w.store.saveRateLimit(RateLimitInfo(status: "allowed_warning", resetsAt: t.addingTimeInterval(3 * 86400),
+                                                rateLimitType: "seven_day", isUsingOverage: false, fiveHourUtilization: 0.85,
+                                                sevenDayUtilization: 0.5, observedAt: t,
+                                                fiveHourResetsAt: t.addingTimeInterval(7200),
+                                                sevenDayResetsAt: t.addingTimeInterval(3 * 86400)))
+        try w.dm(low, a)
+        try await w.cycle()
+        #expect(try w.turns(a).isEmpty)
+        #expect(try w.agent(a).blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        w.clock.advance(7200)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.succeeded])
+    }
+
+    /// Review focus 3: a limit hit while several turns are in flight lets the others finish, starts nothing new
+    /// anywhere until the reset, then resumes.
+    @Test func limitHitMidFlightLetsOtherTurnsFinish() async throws {
+        let w = try World()
+        let c1 = try w.company("Acme", mode: .max); let c2 = try w.company("Beta", mode: .max)
+        let a = try w.hire(c1, "alice"); let b = try w.hire(c1, "bob"); let c = try w.hire(c2, "carol")
+        let t = w.clock.now
+        let rejected = RateLimitInfo(status: "rejected", resetsAt: t.addingTimeInterval(3600), rateLimitType: "five_hour",
+                                     isUsingOverage: false, fiveHourUtilization: 1.0, sevenDayUtilization: 0.4, observedAt: t,
+                                     fiveHourResetsAt: t.addingTimeInterval(3600))
+        w.fake.script("alice", .init(events: [
+            .initialized(sessionId: a.sessionId, model: "sonnet"),
+            .rateLimit(rejected),
+            .result(TurnResult(isError: true, subtype: "error_during_execution", text: "usage limit reached",
+                               costUSD: nil, apiErrorStatus: 429, sessionId: a.sessionId)),
+        ], delay: .milliseconds(20)))
+        w.fake.script("bob", .init(delay: .milliseconds(600)))
+        try w.dm(c1, a); try w.dm(c1, b)
+        await w.orchestrator.tick()
+        #expect(await w.orchestrator.runningCount() == 2)
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while try w.turns(a).first?.outcome == .inProgress, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
+        #expect(try w.turns(b).map(\.outcome) == [.inProgress], "bob must still be mid-turn for this test to mean anything")
+
+        // Gate closed while bob is still running: nothing new starts, in either company.
+        try w.dm(c2, c)
+        await w.orchestrator.tick()
+        #expect(await w.orchestrator.runningCount() == 1)
+        #expect(try w.turns(c).isEmpty)
+        #expect(try w.agent(c).blocker == .usageLimit(until: t.addingTimeInterval(3600)))
+
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        #expect(try w.turns(b).map(\.outcome) == [.succeeded])
+        #expect(try w.pending(b) == 0, "bob's items are delivered")
+        #expect(try w.agent(b).state == .sleeping)
+
+        try w.dm(c1, b)
+        try await w.cycle()
+        #expect(try w.turns(b).count == 1)
+        #expect(try w.agent(b).blocker == .usageLimit(until: t.addingTimeInterval(3600)))
+        #expect(try w.turns(a).count == 1)
+
+        w.clock.advance(3600)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited, .succeeded])
+        #expect(try w.turns(b).map(\.outcome) == [.succeeded, .succeeded])
+        #expect(try w.turns(c).map(\.outcome) == [.succeeded])
+    }
+
+    @Test(arguments: [true, false])
+    func lostSessionStartsFreshNextTurn(viaResult: Bool) async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        try w.dm(c, ceo); try await w.cycle()
+        #expect(try w.agent(ceo).sessionStarted)
+        let message = "No conversation found with session ID: \(ceo.sessionId)"
+        if viaResult {
+            w.fake.script("ceo", .init(events: [.result(TurnResult(isError: true, subtype: "error_during_execution",
+                                                                     text: message, costUSD: 0, apiErrorStatus: nil,
+                                                                     sessionId: ceo.sessionId))]))
+        } else {
+            w.fake.script("ceo", .init(events: [], error: TurnError.exitedWithoutResult(code: 1, stderrTail: message + "\n")))
+        }
+        try w.dm(c, ceo); try await w.cycle()
+        let after = try w.agent(ceo)
+        #expect(try w.turns(ceo).last?.outcome == .failed)
+        #expect(!after.sessionStarted)
+        #expect(after.sessionId != ceo.sessionId)
+        #expect(try w.pending(ceo) == 1)
+
+        w.clock.advance(30)
+        try await w.cycle()
+        let req = try #require(w.fake.requests.last)
+        let args = ClaudeCommand.arguments(for: req)
+        #expect(args.contains("--session-id")); #expect(!args.contains("--resume"))
+        #expect(args.contains(after.sessionId))
+        #expect(req.appendSystemPrompt?.contains("You are @ceo") == true)
+        #expect(try w.agent(ceo).sessionStarted)
+        #expect(try w.pending(ceo) == 0)
+    }
+
+    @Test func ordinaryFailureKeepsSession() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        try w.dm(c, ceo); try await w.cycle()
+        w.fake.script("ceo", .init(events: [], error: FakeError(description: "boom")))
+        try w.dm(c, ceo); try await w.cycle()
+        let after = try w.agent(ceo)
+        #expect(after.sessionStarted); #expect(after.sessionId == ceo.sessionId)
+    }
+
+    @Test func killingTheBlockerReleasesWaiters() async throws {
+        let w = try World(); let c = try w.company("Acme")
+        let ceo = try w.hire(c, "ceo"); let cto = try w.hire(c, "cto")
+        let tools = CompanyTools(store: w.store, companyId: c.id, agentId: ceo.id, diagnostics: { _ in })
+        w.fake.script("ceo", .init(sideEffect: { _ in
+            _ = try tools.call(name: "set_blocked", arguments: ["on": .string("@cto"), "reason": .string("need spec")])
+        }))
+        try w.dm(c, ceo)
+        try await w.cycle()
+        #expect(try w.agent(ceo).blocker == .agent(cto.id))
+        try w.store.transition(agentId: cto.id, to: .killed)
+        #expect(try w.agent(ceo).state == .ready)
+        #expect(try w.agent(ceo).blocker == nil)
+        try await w.cycle()
+        #expect(try w.turns(ceo).count == 2)
+    }
+
+    @Test func killingTheBlockerMidTurnDropsTheRequest() async throws {
+        let w = try World(); let c = try w.company("Acme")
+        let ceo = try w.hire(c, "ceo"); let cto = try w.hire(c, "cto")
+        let tools = CompanyTools(store: w.store, companyId: c.id, agentId: ceo.id, diagnostics: { _ in })
+        let store = w.store
+        w.fake.script("ceo", .init(sideEffect: { _ in
+            _ = try tools.call(name: "set_blocked", arguments: ["on": .string("@cto"), "reason": .string("need spec")])
+            _ = try store.transition(agentId: cto.id, to: .killed)
+        }))
+        try w.dm(c, ceo)
+        try await w.cycle()
+        #expect(try w.agent(ceo).state == .sleeping)
+        #expect(try w.agent(ceo).blocker == nil)
     }
 
     @Test func turnBudgetBlocksChatterbox() async throws {

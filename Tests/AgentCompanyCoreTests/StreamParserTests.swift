@@ -36,6 +36,18 @@ private func fixtureLines(_ name: String) throws -> [String] {
         #expect(info.fiveHourUtilization == 0.38)
         #expect(info.sevenDayUtilization == 0.12)
         #expect(info.observedAt == Date(timeIntervalSince1970: 0))
+        #expect(info.fiveHourResetsAt == Date(timeIntervalSince1970: 1792522800))
+        #expect(info.sevenDayResetsAt == Date(timeIntervalSince1970: 1792677600))
+    }
+
+    @Test func errorResultWithoutResultTextUsesErrors() throws {
+        // Verbatim from `claude -p --resume <unknown id>` (Claude Code 2.1.304), trimmed of usage fields.
+        let line = #"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"11111111-2222-4333-8444-555555555555","total_cost_usd":0,"errors":["No conversation found with session ID: 11111111-2222-4333-8444-555555555555"]}"#
+        guard case .result(let r) = try #require(StreamParser.parse(line: line)) else {
+            Issue.record("expected .result"); return
+        }
+        #expect(r.isError)
+        #expect(r.text == "No conversation found with session ID: 11111111-2222-4333-8444-555555555555")
     }
 
     @Test func parsesSuccessfulResult() throws {

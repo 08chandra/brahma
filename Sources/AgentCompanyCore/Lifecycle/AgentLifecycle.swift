@@ -37,7 +37,22 @@ extension Store {
         try agent.update(db)
         try ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: nil, kind: .stateChanged,
                           text: "\(from.rawValue) -> \(to.rawValue)", createdAt: now).insert(db)
+        if to == .killed { try releaseWaiters(db: db, on: agent, now: now) }
         return agent
+    }
+
+    /// Nobody may wait on a killed agent: teammates blocked on it become ready (sleeping if paused), and a
+    /// pending `set_blocked` request naming it is dropped.
+    private static func releaseWaiters(db: Database, on killed: Agent, now: Date) throws {
+        for var other in try Agent.filter(Column("companyId") == killed.companyId).fetchAll(db) where other.id != killed.id {
+            if other.requestedBlocker == .agent(killed.id) {
+                other.requestedBlocker = nil
+                try other.update(db, columns: ["requestedBlocker"])
+            }
+            if other.state == .blocked, other.blocker == .agent(killed.id) {
+                try transition(db: db, agentId: other.id, to: other.paused ? .sleeping : .ready, now: now)
+            }
+        }
     }
 
     public func startTurn(agentId: String, now: Date = Store.now()) throws -> Turn {

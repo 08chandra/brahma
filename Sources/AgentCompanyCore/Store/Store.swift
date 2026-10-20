@@ -143,7 +143,9 @@ public final class Store: Sendable {
         }
     }
 
-    public func save(_ agent: Agent) throws {
+    /// Whole-row upsert, for tests only: production code must write single columns or go through `transition`,
+    /// because MCP server processes update agent rows concurrently.
+    func save(_ agent: Agent) throws {
         try writer.write { db in try agent.save(db) }
     }
 }

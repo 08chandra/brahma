@@ -11,6 +11,8 @@ private struct UsageStateRow: Codable, FetchableRecord, PersistableRecord {
     var fiveHourUtilization: Double?
     var sevenDayUtilization: Double?
     var observedAt: Date
+    var fiveHourResetsAt: Date?
+    var sevenDayResetsAt: Date?
 }
 
 extension Store {
@@ -19,7 +21,8 @@ extension Store {
         let row = UsageStateRow(
             status: info.status, resetsAt: info.resetsAt, rateLimitType: info.rateLimitType,
             isUsingOverage: info.isUsingOverage, fiveHourUtilization: info.fiveHourUtilization,
-            sevenDayUtilization: info.sevenDayUtilization, observedAt: info.observedAt)
+            sevenDayUtilization: info.sevenDayUtilization, observedAt: info.observedAt,
+            fiveHourResetsAt: info.fiveHourResetsAt, sevenDayResetsAt: info.sevenDayResetsAt)
         try writer.write { db in try row.save(db) }
     }
 
@@ -28,7 +31,8 @@ extension Store {
             try UsageStateRow.fetchOne(db, key: 1).map {
                 RateLimitInfo(status: $0.status, resetsAt: $0.resetsAt, rateLimitType: $0.rateLimitType,
                               isUsingOverage: $0.isUsingOverage, fiveHourUtilization: $0.fiveHourUtilization,
-                              sevenDayUtilization: $0.sevenDayUtilization, observedAt: $0.observedAt)
+                              sevenDayUtilization: $0.sevenDayUtilization, observedAt: $0.observedAt,
+                              fiveHourResetsAt: $0.fiveHourResetsAt, sevenDayResetsAt: $0.sevenDayResetsAt)
             }
         }
     }

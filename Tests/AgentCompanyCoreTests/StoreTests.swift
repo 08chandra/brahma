@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import GRDB
 @testable import AgentCompanyCore
 
 @Test func walModeAndBusyTimeout() throws {
@@ -118,4 +119,13 @@ import Foundation
         #expect(throws: StoreError.invalidName, "\(bad)") { try store.hire(companyId: c.id, name: bad, role: "r", model: "m") }
     }
     #expect(try store.hire(companyId: c.id, name: "Eng-1", role: "r", model: "m").name == "eng-1")
+}
+
+@Test func activityEventFeedUsesCompanyIdIndex() throws {
+    let s = try Store.inMemory()
+    let plan: [String] = try s.writer.read { db in
+        try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN SELECT * FROM activityEvent WHERE companyId = 'c' AND id > 5 ORDER BY id")
+            .map { $0["detail"] as String? ?? "" }
+    }
+    #expect(plan.joined(separator: " ").contains("activityEvent_company_id"), "\(plan)")
 }

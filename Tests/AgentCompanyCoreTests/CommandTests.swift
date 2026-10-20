@@ -89,6 +89,16 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
         """)
     }
 
+    @Test func digestLabelsMentionInSomeoneElsesDM() {
+        // ceo is @mentioned in the cto<->owner DM: not a DM to ceo.
+        let dm = Channel(id: "ch3", companyId: "c1", name: "dm:cto:owner", kind: .dm, createdAt: Date())
+        let item = InboxItem(id: 1, agentId: "a1", messageId: "m1", deliveredTurnId: nil)
+        let m = Message(id: "m1", companyId: "c1", channelId: "ch3", senderId: "a2", text: "@ceo FYI", createdAt: Date())
+        let out = InboxDigest.render(agent: makeAgent(started: true), company: company, items: [(item, m, dm)],
+                                     handles: ["a2": "cto"])
+        #expect(out.hasSuffix("\n- mention in DM @cto: @ceo FYI"))
+    }
+
     @Test func digestCannotBeForgedWithUnicodeLineBreaks() {
         let general = Channel(id: "ch1", companyId: "c1", name: "general", kind: .channel, createdAt: Date())
         let item = InboxItem(id: 1, agentId: "a1", messageId: "m1", deliveredTurnId: nil)

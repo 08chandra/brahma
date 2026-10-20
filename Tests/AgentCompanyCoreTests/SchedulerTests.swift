@@ -37,18 +37,66 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
 
 @Test func gateClosesOnRejectedOverageOrHighUtilization() {
     let reset = now.addingTimeInterval(3600)
+    let fallback = now.addingTimeInterval(900)
     #expect(UsageGate.evaluate(info(status: "rejected"), mode: .max, now: now) == .closed(until: reset))
     #expect(UsageGate.evaluate(info(overage: true), mode: .max, now: now) == .closed(until: reset))
     #expect(UsageGate.evaluate(info(util: 0.85), mode: .low, now: now) == .closed(until: reset))
     #expect(UsageGate.evaluate(info(util: 0.85), mode: .max, now: now) == .open)
     #expect(UsageGate.evaluate(info(util: 0.80), mode: .low, now: now) == .closed(until: reset))
-    #expect(UsageGate.evaluate(info(status: "rejected", resetsAt: now.addingTimeInterval(-1)), mode: .max, now: now) == .open)
-    #expect(UsageGate.evaluate(info(resetsAt: now.addingTimeInterval(-1), overage: true), mode: .max, now: now) == .open)
-    #expect(UsageGate.evaluate(info(resetsAt: now.addingTimeInterval(-1), util: 0.99), mode: .low, now: now) == .open)
+    // A reset already past: the fallback (15 min from observation) applies, not an immediate reopen.
+    #expect(UsageGate.evaluate(info(status: "rejected", resetsAt: now.addingTimeInterval(-1)), mode: .max, now: now)
+            == .closed(until: fallback))
+    #expect(UsageGate.evaluate(info(resetsAt: now.addingTimeInterval(-1), overage: true), mode: .max, now: now)
+            == .closed(until: fallback))
+    #expect(UsageGate.evaluate(info(resetsAt: now.addingTimeInterval(-1), util: 0.99), mode: .low, now: now)
+            == .closed(until: fallback))
     #expect(UsageGate.evaluate(nil, mode: .low, now: now) == .open)
-    #expect(UsageGate.evaluate(info(status: "rejected", resetsAt: nil), mode: .max, now: now)
-            == .closed(until: now.addingTimeInterval(900)))
+    #expect(UsageGate.evaluate(info(status: "rejected", resetsAt: nil), mode: .max, now: now) == .closed(until: fallback))
     #expect(UsageGate.evaluate(info(resetsAt: nil, util: nil), mode: .low, now: now) == .open)
+    // A reset that was ahead when observed reopens the gate the moment it passes (no extra fallback wait).
+    #expect(UsageGate.evaluate(info(status: "rejected", resetsAt: now.addingTimeInterval(300)), mode: .max,
+                               now: now.addingTimeInterval(300)) == .open)
+}
+
+@Test func allowedWarningIsNotALimit() {
+    // Claude Code emits allowed_warning past soft thresholds, e.g. on the seven-day window, days before its reset.
+    let warning = RateLimitInfo(status: "allowed_warning", resetsAt: now.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
+                                isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.81, observedAt: now,
+                                fiveHourResetsAt: now.addingTimeInterval(7200), sevenDayResetsAt: now.addingTimeInterval(3 * 86400))
+    for mode in [UsageMode.low, .balanced, .max] { #expect(UsageGate.evaluate(warning, mode: mode, now: now) == .open) }
+    #expect(!UsageGate.isHardLimit(warning))
+}
+
+@Test func thresholdClosesUntilFiveHourResetNotTopLevelReset() {
+    let i = RateLimitInfo(status: "allowed_warning", resetsAt: now.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
+                          isUsingOverage: false, fiveHourUtilization: 0.85, sevenDayUtilization: 0.81, observedAt: now,
+                          fiveHourResetsAt: now.addingTimeInterval(7200), sevenDayResetsAt: now.addingTimeInterval(3 * 86400))
+    #expect(UsageGate.evaluate(i, mode: .low, now: now) == .closed(until: now.addingTimeInterval(7200)))
+    #expect(UsageGate.evaluate(i, mode: .max, now: now) == .open)
+    // Without a five-hour window reset the top-level one is not borrowed from another window: fallback instead.
+    var noWindow = i; noWindow.fiveHourResetsAt = nil
+    #expect(UsageGate.evaluate(noWindow, mode: .low, now: now) == .closed(until: now.addingTimeInterval(900)))
+}
+
+@Test func rejectedClosesUntilTopLevelReset() {
+    let i = RateLimitInfo(status: "rejected", resetsAt: now.addingTimeInterval(5 * 3600), rateLimitType: "seven_day",
+                          isUsingOverage: false, fiveHourUtilization: 0.2, sevenDayUtilization: 1.0, observedAt: now,
+                          fiveHourResetsAt: now.addingTimeInterval(600), sevenDayResetsAt: now.addingTimeInterval(5 * 3600))
+    for mode in [UsageMode.low, .balanced, .max] {
+        #expect(UsageGate.evaluate(i, mode: mode, now: now) == .closed(until: now.addingTimeInterval(5 * 3600)))
+    }
+}
+
+@Test func staleUsageInfoWithoutResetOpensTheGate() {
+    // High utilization but no reset time: closed for 15 min after observation, then stale, so a probe turn may run.
+    let i = RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                          fiveHourUtilization: 0.99, sevenDayUtilization: nil, observedAt: now)
+    #expect(UsageGate.evaluate(i, mode: .low, now: now.addingTimeInterval(60)) == .closed(until: now.addingTimeInterval(900)))
+    #expect(UsageGate.evaluate(i, mode: .low, now: now.addingTimeInterval(900)) == .open)
+    #expect(UsageGate.evaluate(i, mode: .low, now: now.addingTimeInterval(86400)) == .open)
+    // A known future reset is honoured even when the observation is old.
+    var withReset = i; withReset.fiveHourResetsAt = now.addingTimeInterval(4 * 3600)
+    #expect(UsageGate.evaluate(withReset, mode: .low, now: now.addingTimeInterval(3600)) == .closed(until: now.addingTimeInterval(4 * 3600)))
 }
 
 @Test func rateLimitPersistsAsSingleRow() throws {
@@ -60,6 +108,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     try s.saveRateLimit(a)
     #expect(try s.latestRateLimit() == a)
     var b = a; b.status = "rejected"; b.resetsAt = nil; b.isUsingOverage = true
+    b.fiveHourResetsAt = t.addingTimeInterval(120); b.sevenDayResetsAt = t.addingTimeInterval(86400)
     try s.saveRateLimit(b)
     #expect(try s.latestRateLimit() == b)
     #expect(try s.writer.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM usageState") } == 1)

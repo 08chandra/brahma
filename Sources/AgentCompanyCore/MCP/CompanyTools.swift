@@ -160,18 +160,20 @@ public struct CompanyTools: Sendable {
 
     private func setBlocked(on: String, reason: String) throws -> String {
         let target = Self.handle(on)
-        let blocker: Blocker
-        if target == "owner" {
-            blocker = .owner(reason: reason)
-        } else {
-            guard let other = try store.agent(companyId: companyId, name: target) else {
-                throw ToolError(message: Self.describe(.unknownAgent(target)))
+        // Target check and write share one transaction, so a teammate killed in between cannot be waited on.
+        // Touch only this column so a concurrent orchestrator save is not clobbered.
+        try store.writer.write { [companyId, agentId] db in
+            let blocker: Blocker
+            if target == "owner" {
+                blocker = .owner(reason: reason)
+            } else {
+                guard let other = try Agent.filter(Column("companyId") == companyId && Column("name") == target).fetchOne(db) else {
+                    throw ToolError(message: Self.describe(.unknownAgent(target)))
+                }
+                guard other.id != agentId else { throw ToolError(message: "you cannot be blocked on yourself") }
+                guard other.state != .killed else { throw ToolError(message: "@\(target) has been killed; you cannot wait on them") }
+                blocker = .agent(other.id)
             }
-            guard other.id != agentId else { throw ToolError(message: "you cannot be blocked on yourself") }
-            blocker = .agent(other.id)
-        }
-        // Touch only this column, inside the write transaction, so a concurrent orchestrator save is not clobbered.
-        try store.writer.write { db in
             guard var me = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
             me.requestedBlocker = blocker
             try me.update(db, columns: ["requestedBlocker"])

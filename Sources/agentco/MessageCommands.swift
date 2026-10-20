@@ -44,7 +44,11 @@ struct Log: ParsableCommand {
 
     @Argument var company: String
     @Argument(help: "#channel or @handle.") var target: String
-    @Option(help: "Number of messages.") var limit: Int = 30
+    @Option(help: "Number of messages (1-1000).") var limit: Int = 30
+
+    func validate() throws {
+        guard (1...1000).contains(limit) else { throw ValidationError("--limit must be between 1 and 1000") }
+    }
 
     func run() throws {
         let (store, _) = try openStore()

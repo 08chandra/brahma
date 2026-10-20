@@ -204,7 +204,8 @@ public actor Orchestrator {
         }
 
         let now = clock()
-        let limited = lastInfo.map { $0.status != "allowed" } ?? false
+        // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
+        let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
         if Task.isCancelled {
             end = .interrupted
@@ -229,7 +230,21 @@ public actor Orchestrator {
         } else {
             end = .failed("claude exited without a result")
         }
-        attempt { try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id), now: now) }
+        var resetSession = false
+        if case .failed(let text) = end, agent.sessionStarted {
+            resetSession = Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n"))
+        }
+        attempt {
+            try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id),
+                              resetSession: resetSession, now: now)
+        }
+    }
+
+    /// `claude --resume` of a session it never persisted fails the same way forever; spot that so the next turn
+    /// starts a fresh session instead.
+    static func isSessionNotFound(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return t.contains("no conversation found") || (t.contains("session") && t.contains("not found"))
     }
 
     /// When a usage-limited agent may try again: the real reset if it is still ahead, else `usageRetry` from now,
@@ -305,7 +320,10 @@ extension Store {
 
     /// Records the turn outcome and moves the agent on, in one transaction, so a message that arrives while the
     /// turn ends either lands before the pending-inbox check or wakes the agent from its new state.
-    func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], now: Date) throws {
+    /// `resetSession`: the resumed session no longer exists; give the agent a fresh session id so its next turn
+    /// starts over with `--session-id` and the role prompt.
+    func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], resetSession: Bool = false,
+                 now: Date) throws {
         try writer.write { db in
             var summary: String?
             var cost: Double?
@@ -333,7 +351,16 @@ extension Store {
             // A requested blocker belongs to the turn that set it.
             let requested = agent.requestedBlocker
             agent.requestedBlocker = nil
-            try agent.update(db, columns: ["consecutiveFailures", "requestedBlocker"])
+            var columns = ["consecutiveFailures", "requestedBlocker"]
+            if resetSession {
+                agent.sessionId = UUID().uuidString
+                agent.sessionStarted = false
+                columns += ["sessionId", "sessionStarted"]
+                try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: turn.id, kind: .error,
+                                  text: "@\(agent.name) session not found; next turn starts a fresh session",
+                                  createdAt: now).insert(db)
+            }
+            try agent.update(db, columns: columns)
 
             // Killed (or otherwise moved) mid-turn: the turn is recorded, the state is left alone.
             guard agent.state == .running else { return }

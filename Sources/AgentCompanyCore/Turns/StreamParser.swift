@@ -8,9 +8,14 @@ public struct RateLimitInfo: Codable, Equatable, Sendable {
     public var fiveHourUtilization: Double?
     public var sevenDayUtilization: Double?
     public var observedAt: Date
+    /// Per-window resets (`unifiedWindows.<window>.resetsAt`). The top-level `resetsAt` belongs to whichever
+    /// window `rateLimitType` names, so the five-hour threshold rule must use `fiveHourResetsAt`.
+    public var fiveHourResetsAt: Date?
+    public var sevenDayResetsAt: Date?
 
     public init(status: String, resetsAt: Date?, rateLimitType: String?, isUsingOverage: Bool,
-                fiveHourUtilization: Double?, sevenDayUtilization: Double?, observedAt: Date) {
+                fiveHourUtilization: Double?, sevenDayUtilization: Double?, observedAt: Date,
+                fiveHourResetsAt: Date? = nil, sevenDayResetsAt: Date? = nil) {
         self.status = status
         self.resetsAt = resetsAt
         self.rateLimitType = rateLimitType
@@ -18,6 +23,8 @@ public struct RateLimitInfo: Codable, Equatable, Sendable {
         self.fiveHourUtilization = fiveHourUtilization
         self.sevenDayUtilization = sevenDayUtilization
         self.observedAt = observedAt
+        self.fiveHourResetsAt = fiveHourResetsAt
+        self.sevenDayResetsAt = sevenDayResetsAt
     }
 }
 
@@ -104,15 +111,19 @@ public enum StreamParser {
             isUsingOverage: info["isUsingOverage"] as? Bool ?? false,
             fiveHourUtilization: number(fiveHour?["utilization"]),
             sevenDayUtilization: number(sevenDay?["utilization"]),
-            observedAt: now
+            observedAt: now,
+            fiveHourResetsAt: number(fiveHour?["resetsAt"]).map { Date(timeIntervalSince1970: $0) },
+            sevenDayResetsAt: number(sevenDay?["resetsAt"]).map { Date(timeIntervalSince1970: $0) }
         ))
     }
 
     private static func parseResult(_ object: [String: Any]) -> StreamEvent {
-        .result(TurnResult(
+        // An error result may carry no `result` text, only `errors` (e.g. "No conversation found with session ID").
+        let errors = (object["errors"] as? [Any])?.compactMap { $0 as? String } ?? []
+        return .result(TurnResult(
             isError: object["is_error"] as? Bool ?? false,
             subtype: object["subtype"] as? String ?? "",
-            text: object["result"] as? String,
+            text: object["result"] as? String ?? (errors.isEmpty ? nil : errors.joined(separator: "; ")),
             costUSD: number(object["total_cost_usd"]),
             apiErrorStatus: (object["api_error_status"] as? NSNumber)?.intValue,
             sessionId: object["session_id"] as? String ?? ""

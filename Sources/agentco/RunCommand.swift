@@ -13,7 +13,13 @@ struct Run: AsyncParsableCommand {
     @Option(help: "Maximum concurrent turns across all companies.") var hardCap: Int = 16
     @Option(help: "workspace (default) or full.") var profile: PermissionProfile = .workspace
 
+    func validate() throws {
+        guard hardCap >= 1 else { throw ValidationError("--hard-cap must be at least 1") }
+    }
+
     func run() async throws {
+        // A child or MCP pipe closing under us must surface as EPIPE, not kill the orchestrator.
+        signal(SIGPIPE, SIG_IGN)
         let (store, paths) = try openStore()
         let lock: OrchestratorLock
         do {
@@ -29,6 +35,8 @@ struct Run: AsyncParsableCommand {
             store: store, runner: ClaudeProcessRunner(), paths: paths, config: config,
             mcpExecutable: executable, profile: profile)
         try await orchestrator.start()
+        // Read before the engine starts, so the first tick's events are printed too.
+        let printer = EventPrinter(store: store, startAfter: try store.maxEventId())
 
         // Handle SIGINT/SIGTERM ourselves so in-flight turns are killed and recorded before we exit.
         signal(SIGINT, SIG_IGN)
@@ -41,7 +49,6 @@ struct Run: AsyncParsableCommand {
             return source
         }
 
-        let printer = EventPrinter(store: store, startAfter: try store.maxEventId())
         print("agentco running (hard cap \(hardCap), profile \(profile.rawValue)); Ctrl-C to stop")
         let printing = Task {
             while !Task.isCancelled {

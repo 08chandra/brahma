@@ -188,6 +188,15 @@ private func entries(_ json: String) throws -> [(String, String)] {
     #expect(line.contains(#""isError":true"#))
 }
 
+@Test func setBlockedRejectsKilledTarget() throws {
+    let w = try MCPWorld()
+    try w.store.transition(agentId: w.cto.id, to: .killed)
+    let (isError, text) = try w.call("set_blocked", #"{"on":"@cto","reason":"need spec"}"#)
+    #expect(isError)
+    #expect(text.contains("killed"))
+    #expect(try w.store.agent(id: w.ceo.id)?.requestedBlocker == nil)
+}
+
 final class Lines: @unchecked Sendable {
     private let lock = NSLock(); private var items: [String] = []
     func add(_ s: String) { lock.lock(); items.append(s); lock.unlock() }

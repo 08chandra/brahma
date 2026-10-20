@@ -41,7 +41,14 @@ public enum InboxDigest {
             let text = String(String.UnicodeScalarView(message.text.unicodeScalars.map {
                 blockedInline.contains($0) ? " " : $0
             }))
-            let source = channel.kind == .dm ? "DM" : "#\(channel.name)"
+            let source: String
+            if channel.kind == .dm {
+                // "dm:<a>:<b>": a recipient who is not one of the two parties was @mentioned in someone else's DM.
+                let parties = channel.name.split(separator: ":").dropFirst().map(String.init)
+                source = parties.contains(agent.name) ? "DM" : "mention in DM"
+            } else {
+                source = "#\(channel.name)"
+            }
             out += "\n- \(source) @\(handle): \(text)"
         }
         return out

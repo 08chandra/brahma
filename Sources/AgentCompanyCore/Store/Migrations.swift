@@ -52,6 +52,8 @@ enum Migrations {
                 t.column("text", .text).notNull()
                 t.column("createdAt", .datetime).notNull()
             }
+            // `agentco run` and the event feeds page by (companyId, id).
+            try db.create(index: "activityEvent_company_id", on: "activityEvent", columns: ["companyId", "id"])
             try db.create(table: "channel") { t in
                 t.primaryKey("id", .text)
                 t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
@@ -90,6 +92,8 @@ enum Migrations {
                 t.column("fiveHourUtilization", .double)
                 t.column("sevenDayUtilization", .double)
                 t.column("observedAt", .datetime).notNull()
+                t.column("fiveHourResetsAt", .datetime)
+                t.column("sevenDayResetsAt", .datetime)
             }
             // Messages are never edited or deleted in Plan 1, so an insert trigger keeps the index current.
             try db.execute(sql: "CREATE VIRTUAL TABLE messageFts USING fts5(text, content='message', content_rowid='rowid')")
