@@ -616,6 +616,91 @@ tech/hardware, B2B SaaS, CPG, services, media, etc.
 - Plan 1's engine needs no change for this; packs land with the role
   catalog / work items (Plan 3), previews (Plan 4) and connectors (Plan 11).
 
+### 6.19 Efficiency meter, performance analysis, and earned trust (**[owner]** asked for this)
+**Efficiency meter [call]** — engine-measured, never self-reported, per agent
+and per team, per sprint and rolling:
+- Throughput: work items done, weighted by effort tier.
+- Quality: first-pass rate on the engine-run check, rework count, review
+  rejections, escaped defects (bugs later traced to the item).
+- Cost: usage/tokens per completed item vs the median for that item type.
+- Flow: cycle time, time blocked, time in chatter (messages not followed by
+  progress).
+- Reliability: failed turns, watchdog interventions, budget overruns.
+Shown to the owner as an efficiency meter on each agent (map badge + detail
+panel) and as team/company scorecards.
+
+**Performance analysis [call]** — an Ops/Performance function (per-company
+agent, reporting to the CEO and the owner; the Steward consumes its output
+installation-wide) publishes a scorecard each sprint, flags outliers and
+trends, and proposes concrete changes (prompt/model tweaks, reassignment,
+team splits, pairing, retraining notes). Changes go through the normal
+approval rules (§6.15/§6.16).
+
+**Anti-gaming rules [call]** (§6.16 reward-hacking principles apply):
+- Multiple balanced measures, never a single score to maximize.
+- Agents do not see their raw scores; they get specific, actionable feedback
+  in retro notes instead.
+- Item sizes/tiers are set by the planner/manager, not the worker; splitting
+  or cherry-picking items to inflate counts is itself measured.
+
+**Earned trust instead of "rewards" [call]** — agents don't experience
+rewards, so incentives that work are changes in what an agent is trusted
+with. Engine-granted trust levels based on the meter: promotion → harder/lead
+items, larger budgets, stronger model, lighter (still engine-verified)
+review, mentoring and planning input; sustained low performance → more
+review, smaller items, pairing, reassignment, or replacement. Never
+self-grantable.
+
+**Trust levels — implemented as an engine ladder [owner: build it]:**
+| Level | Gets |
+|---|---|
+| T0 Probation | small items only, pairing with a navigator on every item, every diff reviewed, cheapest adequate model, minimum budget |
+| T1 Standard | normal items for its role, normal review, role-default model and budget |
+| T2 Trusted | larger/lead items, 1.5× budget, lighter review (engine checks still mandatory), may mentor (be a navigator) |
+| T3 Lead | can lead a sub-team or epic, proposes plans, stronger model eligible, 2× budget, input in sprint planning |
+New hires start at T1 (or T0 if the owner chooses). The engine evaluates
+promotion/demotion at each sprint end from the efficiency meter with
+hysteresis (sustained performance over ≥2 sprints, minimum sample size),
+logs the reason, and notifies the agent's manager; the owner can override.
+Trust level feeds the scheduler (priority, model, budget), assignment
+(item size), and review rules. Never self-grantable.
+
+**Digital rewards [owner: build it]** — engine-awarded from the meter, shown in
+the UI, purely cosmetic (no effect on scheduling or prompts, so nothing to
+game): coffee ☕ for a clean first-pass item, a meal 🍜 for finishing a large
+item under budget, a trophy 🏆 for "employee of the sprint", streak flames 🔥
+for consecutive first-pass items, owner-given kudos ⭐. Agents show their
+current perks on the map and in their profile; a company "break room" view
+lists recent awards. (Theme kept to food/drink/trophies.)
+
+**HR function [owner: build it]** — an HR agent (per company, reports to the
+CEO; owner sees everything) runs performance management:
+- **Performance reviews** every sprint from the meter + manager input,
+  written to the agent's file (owner-visible).
+- **Warnings → Performance Improvement Plan (PIP)**: an agent below the bar for
+  a sprint gets a written warning (recorded; corrective notes go into its
+  retro feedback, e.g. "your items fail on missing edge cases — run the
+  edge-case checklist before submitting"); two consecutive sprints → a PIP:
+  demotion to T0 probation with specific, measurable targets for the next
+  sprint.
+- **Root-cause first**: before disciplining, HR + the Performance function
+  check whether the cause is the agent or the system (bad role prompt, wrong
+  model, oversized items, broken tooling) and fix the system when it is —
+  that change goes through the normal approval rules.
+- **Termination & replacement**: failing a PIP → HR proposes termination; the
+  agent is killed and a fresh hire replaces it with a clean session, the
+  role card (improved if the root cause was the prompt), and a written
+  handoff of the departing agent's open work and lessons. Terminations need
+  the manager's sign-off and are owner-approved unless Auto mode is on.
+- **Guardrails**: HR actions are engine-backed facts (meter data cited in each
+  action), every action is logged and reversible by the owner, and HR can't
+  act on agents above its reporting line or on the C-suite without the
+  owner. Agents can't influence their own reviews.
+
+Lands in Plan 3 (metrics collection, trust ladder, rewards, HR agent and
+actions) and Plan 4 (meter, perks and HR views in the UI); the Steward
+(Plan 10) uses it installation-wide.
+
 ## 7. Architecture sketch
 
 ```
