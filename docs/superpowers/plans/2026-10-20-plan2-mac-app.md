@@ -131,7 +131,7 @@ README.md                                       + "Mac app" section
   /* 5 events for A, 2 for B, interleaved → recentEvents(companyId: A, limit: 3).map(\.text) == ["a3","a4","a5"] */
 }
 ```
-  In `CLIValidationTests`, add `runRefusesWhenLockHeld`: hold `OrchestratorLock.acquire(paths:)` on a temp home, launch the built `brahma run` with `BRAHMA_HOME` set to it, and expect exit code ≠ 0 and stderr containing `another Brahma engine (the Brahma app or 'brahma run') is already using`.
+  In `CLIValidationTests`, add `import BrahmaCore`, and give the private `brahma(_:)` helper a `home: URL? = nil` parameter (nil keeps today's fresh `tempDir()`; it sets `BRAHMA_HOME` to `<home>/home`). Then add `runRefusesWhenLockHeld`: create a temp dir `d`, hold `OrchestratorLock.acquire(paths:)` on `BrahmaPaths(home: d/home, workspaces: d/ws)`, call `brahma(["run"], home: d)`, and expect exit code ≠ 0 and stderr containing `another Brahma engine (the Brahma app or 'brahma run') is already using`.
 - [ ] **Step 2:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter OwnerViewTests`. Expected: FAIL (methods missing).
 - [ ] **Step 3:** Implement the migration, the four `Store` methods and the message change.
 - [ ] **Step 4:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`. Expected: all PASS (live test skipped).
@@ -151,7 +151,7 @@ README.md                                       + "Mac app" section
 - Produces:
   - `struct StateCounts: Equatable, Sendable { var running, ready, blocked, sleeping, killed: Int; init(_ agents: [Agent]); var total: Int; var line: String }`. `line` is `"<r> running · <rd> ready · <b> blocked · <s> sleeping"` (killed omitted).
   - `struct CompanySummary: Equatable, Sendable, Identifiable { var company: Company; var counts: StateCounts; var unread: Int /* owner-member channels only */; var waitingOnOwner: Int /* agents blocked(.owner) */; var id: String; var badge: Int /* unread + waitingOnOwner */; var initials: String }`
-  - `struct Snapshot: Equatable, Sendable { var companies: [CompanySummary]; var agents: [Agent] /* selected company */; var channels: [Channel]; var unreadByChannel: [String: Int]; var lastTurns: [String: Turn] /* agentId → lastTurn */; var usage: RateLimitInfo?; static let empty: Snapshot; static func load(store: Store, selectedCompanyId: String?) throws -> Snapshot }`. Owner-member unread for every company comes from `unreadCounts` restricted to `channels(companyId:memberId: "owner")`.
+  - `struct Snapshot: Equatable, Sendable { var companies: [CompanySummary]; var agents: [Agent] /* selected company */; var channels: [Channel] /* all of the selected company's channels: store.channels(companyId:) */; var unreadByChannel: [String: Int] /* raw store.unreadCounts(companyId:) */; var lastTurns: [String: Turn] /* agentId → lastTurn */; var usage: RateLimitInfo?; static let empty: Snapshot; static func load(store: Store, selectedCompanyId: String?) throws -> Snapshot }`. Only `CompanySummary.unread` (the rail badge) is restricted to owner-member channels: it sums `unreadCounts` over `channels(companyId:memberId: "owner")`, computed for every company.
   - `enum SidebarItem: Hashable, Sendable { case missionControl, activity, agents, channel(id: String), dm(handle: String) }`
   - `struct SidebarRow: Equatable, Identifiable, Sendable { var item: SidebarItem; var title: String; var unread: Int; var id: SidebarItem }`, `struct SidebarSections: Equatable, Sendable { var channels: [SidebarRow]; var directMessages: [SidebarRow]; var agentConversations: [SidebarRow] }`. Kind `.channel` goes to `channels` (`.channel(id:)`). A DM whose name has an `owner` component goes to `directMessages` (`.dm(handle:)`). Any other DM goes to `agentConversations` (`.channel(id:)`).
   - `enum ChannelTitle { static func title(_ c: Channel) -> String }` returns `"#general"`; `"dm:ceo:owner"` → `"@ceo"`; `"dm:ceo:cto"` → `"@ceo · @cto"`.
@@ -173,7 +173,7 @@ README.md                                       + "Mac app" section
 
 `tick` algorithm (write it as stated):
 ```
-events = off-main store.events(afterId: cursor, limit: 500); cursor = events.last?.id ?? cursor
+events = []; repeat { batch = off-main store.events(afterId: cursor, limit: 500); events += batch; cursor = batch.last?.id ?? cursor } while batch.count == 500   // one tick drains a burst
 append events whose companyId == selectedCompanyId to activity; drop oldest beyond 500
 ticksSinceSnapshot += 1
 if forceSnapshot || !events.isEmpty || ticksSinceSnapshot >= 4:
@@ -240,7 +240,7 @@ Exact copy: `UsageText.line` returns `"Usage: no data yet"` for nil. Otherwise i
   - `AppModel.apply(_ t: SelectTarget)` resolves names against the snapshot: `.channel(name:)` becomes `select(.channel(id:))`, or, if there is no such channel, sets `errorMessage = "No channel #<name>"`. `.agent(handle:)` becomes `select(.agents)` plus `selectedAgentId`. `.sheet(s)` sets `presentedSheet = s`. Task 6 handles `.search`, which is a no-op until then.
   - The `AppDelegate` (`NSObject, NSApplicationDelegate`) owns `boot: Result<AppModel, BootError>`, where `BootError` is `{ path: String; message: String }`. `AppModel` is built from `BrahmaPaths.fromEnvironment()` after `createDirectory(home)` and `Store(path: paths.database.path)`, which is the same as the CLI's `openStore()`. It also owns `options: LaunchOptions` (parsed from `CommandLine.arguments`) and `var openMainWindow: (() -> Void)?` (set by `MainWindow.onAppear` from `@Environment(\.openWindow)`). `applicationDidFinishLaunching` runs `Task { await model.load(); model.startPolling(); Harness.runIfRequested(...) }`.
   - Smoke output format: one stdout line, flushed: `SMOKE OK companies=<n> agents=<total> engine=<label> windows=<k>` (Task 3 prints `engine=none`; Task 4 prints `EngineStatus.label`; Task 9 appends ` lifecycle=ok`). The line is printed after readiness and `smokeHold` seconds, then the app calls `NSApp.terminate(nil)` and exits 0. If readiness is not reached within 20 s, it prints `SMOKE FAIL <reason>` and calls `exit(1)`. Readiness means `model.loaded` and at least one visible window whose identifier starts with `main`.
-  - Snapshot: once ready, the harness applies `select`, sets the content size to 1280×800, waits 1.5 s, and renders `(window.attachedSheet ?? window)`'s `contentView?.superview ?? contentView` via `bitmapImageRepForCachingDisplay(in:)` and `cacheDisplay(in:to:)` to PNG at `snapshotPath`. It prints `SNAPSHOT <path>` and terminates, or prints `SNAPSHOT FAIL <reason>` and calls `exit(1)`.
+  - Snapshot: once ready, the harness applies `select`, sets the content size to 1280×800, waits `max(1.5, smokeHold)` s, and renders `(window.attachedSheet ?? window)`'s `contentView?.superview ?? contentView` via `bitmapImageRepForCachingDisplay(in:)` and `cacheDisplay(in:to:)` to PNG at `snapshotPath`. It prints `SNAPSHOT <path>` and terminates, or prints `SNAPSHOT FAIL <reason>` and calls `exit(1)`.
 
 Window layout (spec §6.2):
 - Scene: `Window("Brahma", id: "main")`, `.defaultSize(width: 1280, height: 800)`, minimum content 900×600.
@@ -249,6 +249,7 @@ Window layout (spec §6.2):
 - Rail icon: 44×44, corner radius 10, initials in 15 pt semibold. Fill is accent when selected and `.quaternary` otherwise. A 10 pt status dot sits bottom-trailing (green = running, gray = paused). A red capsule badge sits top-trailing when `badge > 0` (shown as `99+` above 99). Add `.help(name)` and a context menu with "Pause"/"Resume". A "+" button at the bottom (`.help("New company")`) opens `.newCompany`.
 - The sidebar is `List(selection:)` bound through `Binding(get: model.sidebarSelection, set: model.select)`. It has rows "Mission Control" (`square.grid.2x2`), "Activity" (`list.bullet.rectangle`) and "Agents" (`person.3`), then sections "Channels", "Direct messages" and "Agent conversations" (the last one collapsed by default). Rows with unread messages are bold, and DM rows show their count.
 - TopBar (`ToolbarItemGroup(placement: .primaryAction)`, shown only when a company is selected) has three items. First, the usage text: `usageGateLine` in orange with `exclamationmark.triangle` if set, otherwise `usageLine` in secondary. Second, a segmented `Picker("Usage mode")` with options "Low", "Balanced", "Max" calling `setUsageMode`. Third, a button labelled "Pause company" (`pause.fill`) or "Run company" (`play.fill`).
+- The `.hire` sheet shows `ContentUnavailableView("Hire Agent", systemImage: "person.badge.plus")` and a Close button until Task 8 replaces it.
 - DetailView switches on `sidebarSelection` and shows `ContentUnavailableView` placeholders (titled with the item name) until Tasks 5, 7 and 8 replace them. With no companies it shows "Create your first company" and a "New Company" button.
 - `NewCompanySheet` has a Name `TextField`, a Goal `TextField(axis: .vertical, lineLimit 3...6)`, the validation message in red, and Cancel/Create buttons (Create is the default and is disabled while `validate() != nil`).
 - `StartupErrorView` shows `"Brahma couldn't open its database at <path>."` with the error and a Quit button. In smoke mode a boot failure prints `SMOKE FAIL store <message>` and exits 1.
@@ -292,7 +293,7 @@ Scripts:
   - `enum ToolLocator`:
     - `static func mcpHelper(appBundle: URL, executable: URL, isExecutable: (String) -> Bool = FileManager.default.isExecutableFile) -> String?`. It returns `<appBundle>/Contents/Helpers/brahma` if executable, else `<executable dir>/brahma` (the `swift run` / `.build/debug` layout), else nil.
     - `static func claude(environment: [String: String], searchPath: String, isExecutable: (String) -> Bool = …) -> String?`. If `BRAHMA_CLAUDE` is set, it returns that value only when it is executable; a bad override returns nil and does not fall back. Otherwise it returns the first `<dir>/claude` on `searchPath`.
-    - `static func loginShellPath(shell: String, timeout: Duration = .seconds(3)) -> String?`. It runs `shell -ilc "printf '__BRAHMA_PATH__%s__END__' \"$PATH\""` with stdin `/dev/null` and stderr discarded, kills the shell at the timeout, and returns `parseMarkedPath`.
+    - `static func loginShellPath(shell: String, timeout: Duration = .seconds(3)) -> String?`. It runs `shell -ilc "printf '__BRAHMA_PATH__%s__END__' \"$PATH\""` with stdin `/dev/null`, stderr discarded and stdout redirected to a temp file (not a pipe: a grandchild such as `sleep` would keep a pipe open and block an EOF read). It waits on `terminationHandler` with a semaphore up to `timeout`, sends SIGKILL to the shell on timeout and returns nil, and otherwise reads the file, deletes it and returns `parseMarkedPath`.
     - `static func parseMarkedPath(_ output: String) -> String?`
     - `static func mergePath(login: String?, current: String) -> String` puts login entries first, then the current ones, de-duplicated with empty entries dropped.
   - `enum EngineStatus: Equatable, Sendable { case starting, embedded, external, stopping, stopped, failed(String); var label: String /* "starting","embedded","external","stopping","stopped","failed" */ }`
@@ -302,7 +303,7 @@ Scripts:
     - `private(set) var status: EngineStatus = .stopped`
     - `func start(tools: Result<EngineTools, EngineSetupError>) async`. If already embedded it does nothing. A tools failure leads to `.failed(msg)` without touching the lock. `OrchestratorLockError.alreadyRunning` leads to `.external`, with the tools remembered for takeover. `.cannotOpen(errno)` leads to `.failed("Can't open the engine lock in <home> (errno <n>).")`. Otherwise it holds the lock, creates the `Orchestrator` (profile `.workspace`), and calls `try await start()`. On error it releases the lock and sets `.failed("Crash recovery failed: <error>")`. On success it sets `engineTask = Task { await orchestrator.runForever(interval: tickInterval) }` and `.embedded`.
     - `func retryTakeover() async` runs `start(tools: remembered)` only while `.external`.
-    - `func stop(timeout: Duration = .seconds(15)) async`. When `.embedded`, it sets `.stopping`, cancels the engine task, and races `await engineTask.value` against `Task.sleep(timeout)`. It then releases the lock (the process is exiting anyway on timeout) and sets `.stopped`. When `.external`, it just sets `.stopped`.
+    - `func stop(timeout: Duration = .seconds(15)) async`. When `.embedded`, it sets `.stopping`, cancels the engine task, and races two **unstructured** tasks: one awaits `engineTask.value`, the other sleeps `timeout`; each signals a resume-once `CheckedContinuation` (guarded by a lock flag) and `stop` returns on the first signal. Do not use `withTaskGroup` or a bare `await engineTask.value`: a task group waits for all children at scope exit, and `runForever` ends with `await runner.waitForChildren()`, which may never return, so neither one bounds the wait. It then releases the lock (the process is exiting anyway on timeout) and sets `.stopped`. When `.external`, it just sets `.stopped`.
   - `AppModel.engine: EngineHost?` (settable). In `tick`, every 10th tick (about 5 s) it calls `await engine.retryTakeover()` if `engine?.status == .external`.
   - Failure copy (exact): `claudeNotFound` → `"Can't find the claude CLI. Install Claude Code, or set BRAHMA_CLAUDE to its path, then relaunch Brahma."`; `helperMissing(p)` → `"Brahma's helper tool is missing at <p>. Rebuild the app with scripts/make-app.sh."`.
   - Banner copy (exact). External (blue, `terminal`): `"Engine running in terminal (brahma run). Brahma shows live state and your messages still go through; scheduling happens in the terminal. Brahma takes over when it stops."`. Failed (orange, `exclamationmark.triangle`): the message plus a "Retry" button, which re-resolves tools and calls `start(tools:)`. Stopping: `"Stopping agents…"` with a small `ProgressView`. Embedded, starting and stopped show no banner.
@@ -315,15 +316,20 @@ App launch order (in `AppDelegate.applicationDidFinishLaunching`):
 
 `applicationShouldTerminate`: call `model.stopPolling()`. If the engine is `.embedded` or `.starting`, return `.terminateLater` and run `Task { await engine.stop(timeout: .seconds(15)); sender.reply(toApplicationShouldTerminate: true) }`. Otherwise return `.terminateNow`. Never write `Company.status`. `applicationShouldTerminateAfterLastWindowClosed` returns `false`.
 
-`fake-claude.sh` (test double used only by scripts):
+`fake-claude.sh` (test double used only by scripts; `chmod +x scripts/fake-claude.sh` and commit it as executable):
 1. Read stdin to EOF.
 2. Take the session id from the argument after `--session-id` or `--resume`, and the MCP config path from the argument after `--mcp-config`.
 3. Read `mcpServers.company.command` and `args.2`, `args.4`, `args.6` (db, company and agent) with `plutil -extract … raw -o - <file>`.
 4. Pipe three JSON-RPC lines into `<command> mcp --db … --company … --agent …`: `initialize` (protocolVersion `2025-06-18`), `notifications/initialized`, and `tools/call` `send_dm` with `{"to":"owner","text":"Acknowledged (fake turn)."}`. This is a DM to the owner, so no other agent wakes up.
-5. Print three stream-json lines: `{"type":"system","subtype":"init","session_id":"<sid>","model":"fake"}`; a `rate_limit_event` with `status "allowed"`, `resetsAt` = now + 3 h and `unifiedWindows` five_hour 0.38 / seven_day 0.12; and `{"type":"result","subtype":"success","is_error":false,"result":"fake turn done","total_cost_usd":0,"api_error_status":null,"session_id":"<sid>"}`.
+5. Print exactly these three lines, with `<sid>` the session id and `<epoch>` = `$(( $(date +%s) + 10800 ))`, which match the keys `StreamParser` reads:
+```
+{"type":"system","subtype":"init","session_id":"<sid>","model":"fake"}
+{"type":"rate_limit_event","session_id":"<sid>","rate_limit_info":{"status":"allowed","resetsAt":<epoch>,"rateLimitType":"five_hour","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.38,"resetsAt":<epoch>},"seven_day":{"utilization":0.12,"resetsAt":<epoch>}}}}
+{"type":"result","subtype":"success","is_error":false,"result":"fake turn done","total_cost_usd":0,"api_error_status":null,"session_id":"<sid>"}
+```
 
-`smoke-app.sh` additions:
-- (A) Export `BRAHMA_CLAUDE=$PWD/scripts/fake-claude.sh` and run `--smoke-test --smoke-hold 8`. Expect `engine=embedded`. Afterwards, `Helpers/brahma status` has no line matching `^  @[a-z0-9_-]+  running`, and `Helpers/brahma log Acme @ceo` contains `Acknowledged (fake turn).` This proves the bundled MCP helper path end to end.
+`smoke-app.sh` additions (export `BRAHMA_CLAUDE=$PWD/scripts/fake-claude.sh` once, at the top of the script, so every case uses it):
+- (A) Run `--smoke-test --smoke-hold 8`. Expect `engine=embedded`. Afterwards, `Helpers/brahma status` has no line matching `^  @[a-z0-9_-]+  running`, and `Helpers/brahma log Acme @ceo` contains `Acknowledged (fake turn).` This proves the bundled MCP helper path end to end.
 - (B) Make a temp `bin/claude` symlink to `fake-claude.sh` and start `PATH=$bin:$PATH Helpers/brahma run &`. After 2 s, run the app with `--smoke-test` and expect `engine=external`. Send `kill -INT` to the CLI and `wait`, which must exit 0.
 - (C) Start `brahma run` again, then start the app in the background with `--smoke-test --smoke-hold 14`. After 3 s, send `kill -INT` to the CLI. The app's line must say `engine=embedded`.
 
@@ -364,7 +370,7 @@ App launch order (in `AppDelegate.applicationDidFinishLaunching`):
 - [ ] **Step 4:** Implement `ToolLocator`, `EngineHost`, the `AppModel` cadence, AppDelegate wiring, the banner, the harness engine label and `--smoke-hold`, `fake-claude.sh`, and the script additions.
 - [ ] **Step 5:** Rerun the filter, then full `swift test` (same prefix). Expected: PASS.
 - [ ] **Step 6:** Run `scripts/smoke-app.sh`. Expected: cases A, B and C pass (lines `SMOKE OK … engine=embedded …`, `SMOKE OK … engine=external …`, `SMOKE OK … engine=embedded …`), then `SMOKE PASSED`.
-- [ ] **Step 7: UI smoke.** Run `scripts/ui-snapshot.sh task4-embedded mission`. Then, with `brahma run` running on a seeded temp home, capture `task4-external` the same way (the script uses the caller's `BRAHMA_HOME` when it is set). Read both. Expected: no banner, and the usage line `5h 38% · 7d 12% · resets HH:mm` after fake turns; the external banner text shown exactly.
+- [ ] **Step 7: UI smoke.** From this task on, `ui-snapshot.sh` passes `--smoke-hold 4` so the fake turns can complete before the render. Run `scripts/ui-snapshot.sh task4-embedded mission`. Then, with `brahma run` running on a seeded temp home, capture `task4-external` the same way (the script uses the caller's `BRAHMA_HOME` when it is set). Read both. Expected: no banner, and the usage line `5h 38% · 7d 12% · resets HH:mm` after fake turns; the external banner text shown exactly.
 - [ ] **Step 8:** Commit `feat(app): embedded engine with lock policy, login PATH, quit pauses and relaunch resumes` with the trailer lines.
 
 ---
@@ -385,6 +391,7 @@ App launch order (in `AppDelegate.applicationDidFinishLaunching`):
     - `static let pageSize = 200`; `init(store: Store, companyId: String, target: ChatTarget)`; `let target: ChatTarget`
     - `private(set) var channel: Channel?; messages: [ChatMessage]; hasEarlier: Bool; title: String; readOnlyReason: String?; handles: [String] /* non-killed, sorted */; sendError: String?`; `var draft: String`
     - `func refresh() async` resolves the channel (`.dm(h)` resolves `"dm:" + ["owner", h].sorted().joined(":")`) and refetches the newest `max(pageSize, messages.count)` messages.
+    - Loads are serialized: `refresh`, `loadEarlier` and `ensureLoaded` bump a `generation` counter when they start and drop their result if the counter changed before they apply it. `ensureLoaded` also sets `isPinned` while it runs, and `refresh` skips while it is set, so a stale tick refresh cannot overwrite what `open(hit)` loaded.
     - `func loadEarlier() async` prepends a page loaded `before: messages.first.createdAt`. `hasEarlier` = page was full.
     - `func ensureLoaded(messageId: String) async` pages earlier until the message is present or there are no earlier pages.
     - `@discardableResult func send() async -> Bool`
@@ -395,7 +402,7 @@ App launch order (in `AppDelegate.applicationDidFinishLaunching`):
   - `AppModel.chat: ChatModel?` (private set). `select(.channel/.dm)` creates a `ChatModel` and calls `Task { await chat.refresh() }`, and any other selection sets it to nil. In `tick`, if `events` contain `.message` for the selected company, it runs `await chat?.refresh()`.
 
 Rules (exact copy):
-- `send` trims whitespace and newlines; an empty draft returns false without writing. Posting is `.channel` → `router.post(channel: channel.name, from: .owner)` and `.dm(h)` → `router.sendDM(from: .owner, to: h)`. On success it clears `draft` and `sendError`, then refreshes and marks read. On failure it keeps the draft and sets `sendError`: `RouterError.unknownChannel(n)` → `"#<n> no longer exists."`, `.unknownAgent(h)` → `"No agent @<h> in this company."`, anything else → `"Couldn't send: <error>"`. When `readOnlyReason != nil`, `send` returns false.
+- `send` trims whitespace and newlines; an empty draft returns false without writing. Posting is `.channel` → `router.post(companyId: companyId, channel: channel.name, from: .owner, text: trimmed)` and `.dm(h)` → `router.sendDM(companyId: companyId, from: .owner, to: h, text: trimmed)`. On success it clears `draft` and `sendError`, then refreshes and marks read. On failure it keeps the draft and sets `sendError`: `RouterError.unknownChannel(n)` → `"#<n> no longer exists."`, `.unknownAgent(h)` → `"No agent @<h> in this company."`, anything else → `"Couldn't send: <error>"`. When `readOnlyReason != nil`, `send` returns false.
 - `readOnlyReason`:
   - a DM channel without an `owner` component → `"Agents' private conversation — read only."`
   - `.dm(h)` with h killed → `"@<h> was killed — history is read only."`
@@ -407,7 +414,7 @@ View notes:
 - `ChatView` uses `ScrollViewReader` and a `LazyVStack` of rows. Each row has an initial circle, the sender in bold (`"You"` for the owner, else `@handle`), the role in secondary text, `TimeText.hm`, and `Text(MessageText.attributed(...)).textSelection(.enabled)`.
 - "Load earlier messages" appears at the top when `hasEarlier`.
 - The view scrolls to the last message on appear and when the last id changes. It calls `markRead()` on appear and on last-id change while `controlActiveState == .key`.
-- Composer: `TextField(axis: .vertical, lineLimit 1...6)`. Return sends and Shift-Return inserts a newline (`onKeyPress(.return)`). The suggestion list sits above the field and Tab accepts the first suggestion. `readOnlyReason` replaces the composer with secondary text, and `sendError` shows in red under it.
+- Composer: `TextField(axis: .vertical, lineLimit 1...6)`. Use `onKeyPress(.return)`: plain Return sends and returns `.handled`; Shift-Return appends `"\n"` to `draft` itself and returns `.handled`. The suggestion list sits above the field; `onKeyPress(.tab)` accepts the first suggestion and returns `.handled` when there is one, else `.ignored`. Check Return, Shift-Return and Tab by running the app (Step 5), because the snapshot cannot show key handling. `readOnlyReason` replaces the composer with secondary text, and `sendError` shows in red under it.
 - `NewDMPicker` is a popover listing non-killed agents (`@handle — role`) that selects `.dm(handle:)`.
 - DetailView, for chat: `VSplitView { ChatView; ActivityFeed placeholder (Task 7 fills it) }`.
 
@@ -445,7 +452,7 @@ View notes:
 - [ ] **Step 2:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ChatModelTests|MessageTextTests"`. Expected: FAIL.
 - [ ] **Step 3:** Implement the model types, then the views.
 - [ ] **Step 4:** Rerun, then full `swift test`. Expected: PASS.
-- [ ] **Step 5: UI smoke.** Run `scripts/make-app.sh debug && scripts/ui-snapshot.sh task5-general channel:general && scripts/ui-snapshot.sh task5-dm dm:cto` and read both. Expected in `task5-general`: the owner's "@ceo please draft…" with "@ceo" and "@cto" bold and the composer "Message #general". Expected in `task5-dm`: "What stack do you suggest?" from "You" and the composer "Message @cto".
+- [ ] **Step 5: UI smoke.** Run `scripts/make-app.sh debug && scripts/ui-snapshot.sh task5-general channel:general && scripts/ui-snapshot.sh task5-dm dm:cto` and read both. Expected in `task5-general`: the owner's "@ceo please draft…" with "@ceo" and "@cto" bold and the composer "Message #general". Expected in `task5-dm`: "What stack do you suggest?" from "You" and the composer "Message @cto". Then launch the app with a seeded temp home and confirm by hand that Return sends, Shift-Return adds a line, and typing `@c` then Tab completes to `@ceo `.
 - [ ] **Step 6:** Commit `feat(app): channel and DM chat with live updates, mentions and read marks` with the trailer lines.
 
 ---
@@ -461,9 +468,9 @@ View notes:
 - Consumes: `Store.searchMessages(companyId:query:limit:)`, `ChannelTitle`, `SidebarItem`, `ChatModel.ensureLoaded(messageId:)`.
 - Produces:
   - `struct SearchHit: Equatable, Identifiable, Sendable { var message: Message; var channelTitle: String; var senderHandle: String; var target: SidebarItem; var id: String }`. `target` is `.channel(id:)` for a channel or agent DM and `.dm(handle:)` for an owner DM.
-  - `@MainActor @Observable final class SearchModel { init(store: Store); var query: String; private(set) var hits: [SearchHit]; private(set) var isSearching: Bool; func run(companyId: String) async }`. It trims the query, and a blank query sets `hits = []` without querying. Otherwise it searches with limit 50, off the main actor.
-  - `AppModel.search: SearchModel`; `AppModel.highlightedMessageId: String?`; `func open(_ hit: SearchHit) async` selects `hit.target`, awaits `chat.refresh()` and `chat.ensureLoaded(messageId:)`, sets `highlightedMessageId`, and clears `search.query`. `selectCompany` clears the query. `apply(.search(q))` sets `search.query = q` and awaits `run`.
-  - UI: `.searchable(text: $model.search.query, placement: .toolbar, prompt: "Search messages")` and `.task(id: query) { 250 ms debounce; await run }`. While the query is non-blank, the top area shows `SearchResultsView`. Each row shows `channelTitle · <sender> · HH:mm`, where sender is `You` for the owner and `@handle` otherwise, and the text verbatim on two lines. The empty state is `Text(verbatim: "No messages match “\(q)”.")`. Clicking a row opens the hit. ChatView scrolls to `highlightedMessageId`, tints the row with accent at 15% for 2 s, and then clears it.
+  - `@MainActor @Observable final class SearchModel { init(store: Store); var query: String; private(set) var hits: [SearchHit]; private(set) var isSearching: Bool; func run(companyId: String) async throws }`. It trims the query, and a blank query sets `hits = []` without querying. Otherwise it searches with limit 50, off the main actor. `run` is `throws`; `AppModel.runSearch() async` wraps it (company = selected) and sets `errorMessage = "Search failed: <error>"` on a throw. The view and `apply(.search)` call `runSearch`, never `run` directly.
+  - `AppModel.search: SearchModel`; `AppModel.highlightedMessageId: String?`; `func open(_ hit: SearchHit) async` selects `hit.target`, awaits `chat.refresh()` and `chat.ensureLoaded(messageId:)`, sets `highlightedMessageId`, and clears `search.query`. `selectCompany` clears the query. `apply(.search(q))` sets `search.query = q` and awaits `runSearch()`.
+  - UI: `.searchable(text: $model.search.query, placement: .toolbar, prompt: "Search messages")` and `.task(id: query) { 250 ms debounce; await model.runSearch() }`. While the query is non-blank, the top area shows `SearchResultsView`. Each row shows `channelTitle · <sender> · HH:mm`, where sender is `You` for the owner and `@handle` otherwise, and the text verbatim on two lines. The empty state is `Text(verbatim: "No messages match “\(q)”.")`. Clicking a row opens the hit. ChatView scrolls to `highlightedMessageId`, tints the row with accent at 15% for 2 s, and then clears it.
 
 - [ ] **Step 1: Write failing tests** `SearchModelTests` (`@MainActor @Suite struct SearchModelTests`):
 ```swift
@@ -595,7 +602,7 @@ func hireValidation(handle: String, role: String, message: String) { /* existing
 - Produces:
   - `struct MenuCompanyRow: Equatable, Identifiable, Sendable { var id: String; var name: String; var statusText: String; var toggleTitle: String; var isRunning: Bool }`
   - `struct MenuBarSummary: Equatable, Sendable { var totals: String; var pending: String; var engine: String; var rows: [MenuCompanyRow]; var anyRunningAgents: Bool; static func make(companies: [CompanySummary], engine: EngineStatus?) -> MenuBarSummary }`
-  - `AppModel.menuBar: MenuBarSummary { get }`
+  - `extension AppModel { var menuBar: MenuBarSummary { get } }`, a computed property in `MenuBarSummary.swift` built from `snapshot.companies` and `engine?.status`.
 
 Exact copy:
 - `totals` is `"<R> running · <RD> ready across <n> companies"` (`"1 company"` when n == 1), or `"No companies yet"` when n == 0.
