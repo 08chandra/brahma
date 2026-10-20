@@ -1,0 +1,75 @@
+import Testing
+import Foundation
+@testable import AgentCompanyCore
+
+@Test func walModeAndBusyTimeout() throws {
+    let dir = try tempDir(); let s = try Store(path: dir.appending(path: "t.sqlite").path)
+    #expect(try s.pragma("journal_mode") == "wal")
+    #expect(try s.pragma("busy_timeout") == "5000")
+}
+
+@Test func createCompanyMakesWorkspaceAndDefaults() throws {
+    let root = try tempDir(); let s = try Store.inMemory()
+    let c = try s.createCompany(name: "Acme Labs", goal: "Build a todo app", workspacesRoot: root)
+    #expect(c.slug == "acme-labs"); #expect(c.status == .running)
+    #expect(c.usageMode == .low); #expect(c.priorityWeight == 1)
+    #expect(FileManager.default.fileExists(atPath: root.appending(path: "acme-labs").path))
+    #expect(try s.company(id: c.id) == c)
+    #expect(try s.companies().count == 1)
+}
+
+@Test func updateCompanyPersists() throws {
+    let s = try Store.inMemory()
+    var c = try s.createCompany(name: "A", goal: "g", workspacesRoot: try tempDir())
+    c.status = .paused; c.usageMode = .max; c.priorityWeight = 3
+    try s.updateCompany(c)
+    #expect(try s.company(id: c.id) == c)
+}
+
+@Test func hireStartsSleepingWithFreshSession() throws {
+    let s = try Store.inMemory(); let c = try s.createCompany(name: "A", goal: "g", workspacesRoot: try tempDir())
+    let a = try s.hire(companyId: c.id, name: "ceo", role: "ceo", model: "opus")
+    #expect(a.state == .sleeping); #expect(a.sessionStarted == false); #expect(UUID(uuidString: a.sessionId) != nil)
+    #expect(throws: StoreError.duplicateName) { try s.hire(companyId: c.id, name: "ceo", role: "cto", model: "opus") }
+}
+
+@Test func agentQueries() throws {
+    let s = try Store.inMemory(); let root = try tempDir()
+    let c1 = try s.createCompany(name: "One", goal: "g", workspacesRoot: root)
+    let c2 = try s.createCompany(name: "Two", goal: "g", workspacesRoot: root)
+    let a = try s.hire(companyId: c1.id, name: "ceo", role: "ceo", model: "opus")
+    var b = try s.hire(companyId: c1.id, name: "dev", role: "dev", model: "sonnet")
+    _ = try s.hire(companyId: c2.id, name: "ceo", role: "ceo", model: "opus")
+    b.state = .ready; try s.save(b)
+    #expect(try s.agent(id: a.id) == a)
+    #expect(try s.agent(companyId: c1.id, name: "dev") == b)
+    #expect(try s.agent(companyId: c1.id, name: "nope") == nil)
+    #expect(try s.agents().count == 3)
+    #expect(try s.agents(companyId: c1.id).count == 2)
+    #expect(try s.agents(states: [.ready]).map(\.id) == [b.id])
+    #expect(try s.agents(companyId: c2.id, states: [.ready]).isEmpty)
+}
+
+@Test func blockerRoundTripsThroughJSON() throws {
+    let s = try Store.inMemory(); let c = try s.createCompany(name: "A", goal: "g", workspacesRoot: try tempDir())
+    var a = try s.hire(companyId: c.id, name: "ceo", role: "ceo", model: "opus")
+    let until = Date(timeIntervalSince1970: 1_800_000_000.5)
+    let blockers: [Blocker] = [.agent("x"), .owner(reason: "need key"), .usageLimit(until: until),
+                               .turnBudget(until: until), .retry(until: until, failures: 2)]
+    for b in blockers {
+        a.state = .blocked; a.blocker = b; a.requestedBlocker = b; try s.save(a)
+        let r = try #require(try s.agent(id: a.id))
+        #expect(r.blocker == b); #expect(r.requestedBlocker == b); #expect(r == a)
+    }
+    a.blocker = nil; a.requestedBlocker = nil; try s.save(a)
+    #expect(try s.agent(id: a.id)?.blocker == nil)
+}
+
+@Test func pathsHonorEnvironment() {
+    let p = AgentCoPaths.from(environment: ["AGENTCO_HOME": "/x", "AGENTCO_WORKSPACES": "/w"])
+    #expect(p.home.path == "/x"); #expect(p.database.path == "/x/agentco.sqlite")
+    #expect(p.workspaces.path == "/w"); #expect(p.runDir.path == "/x/run")
+    let d = AgentCoPaths.from(environment: [:])
+    #expect(d.home.path.hasSuffix("Library/Application Support/AgentCompany"))
+    #expect(d.workspaces.path.hasSuffix("AgentCompany"))
+}
