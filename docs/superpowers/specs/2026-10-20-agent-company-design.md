@@ -701,6 +701,34 @@ Lands in Plan 3 (metrics collection, trust ladder, rewards, HR agent and
 actions) and Plan 4 (meter, perks and HR views in the UI); the Steward
 (Plan 10) uses it installation-wide.
 
+### 6.20 Ideas pipeline — visionaries reach the C-suite through tickets (**[owner]** asked for this)
+- **Idea tickets [call]:** any agent can file an **Idea** work item
+  (`propose_idea`): problem/opportunity, proposal, expected impact, rough
+  cost/effort, evidence (research links, lab prototype, metrics), risks. It
+  lands on a company **Ideas board**, not in anyone's DMs, so it never
+  interrupts the C-suite.
+- **Visionary roles:** an R&D / "Visionary" role (and optionally a
+  per-agent `visionary` flag) gets a small standing budget to research and
+  build a quick lab prototype (§6.14) before pitching. Ideas backed by a
+  prototype or data are scored higher.
+- **Triage [call]:** a duplicate check (search the board + knowledge base)
+  runs on filing; the filer's manager (or the CPO for cross-cutting ideas)
+  adds a triage note within a sprint. Ideas are scored on impact,
+  confidence, and effort (RICE-style) with the reasoning recorded.
+- **C-suite review:** once per sprint, CEO/CPO/CTO hold an **Idea review**
+  over the top-scored ideas and decide: **approve** (becomes an epic in the
+  backlog, the filer credited and often assigned as lead), **prototype
+  further** (small budget, revisit next review), **park** (kept with a
+  reason), or **reject** (reason recorded and sent back to the filer).
+  Owner-gated like other decisions unless Auto mode is on; ideas above a
+  cost threshold always go to the owner.
+- **Owner view:** the Ideas board (status columns, scores, who filed, decision
+  history); the owner can file ideas too and fast-track any idea.
+- **Guardrails:** per-agent idea quota (e.g. 3 open ideas) to prevent spam;
+  idea quality feeds the efficiency meter (approved/shipped ideas count;
+  rejected duplicates don't); approved-and-shipped ideas earn a 💡 perk.
+- Lands in Plan 3 (item type, board, triage, review ceremony) and Plan 4 (UI).
+
 ## 7. Architecture sketch
 
 ```
