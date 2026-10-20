@@ -22,18 +22,22 @@ extension Store {
     /// `paused` and `requestedBlocker` are left untouched.
     @discardableResult
     public func transition(agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date = Store.now()) throws -> Agent {
-        try writer.write { db in
-            guard var agent = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
-            let from = agent.state
-            guard AgentLifecycle.canTransition(from: from, to: to) else { throw LifecycleError.illegal(from: from, to: to) }
-            agent.state = to
-            agent.blocker = to == .blocked ? blocker : nil
-            agent.readySince = to == .ready ? now : nil
-            try agent.update(db)
-            try ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: nil, kind: .stateChanged,
-                              text: "\(from.rawValue) -> \(to.rawValue)", createdAt: now).insert(db)
-            return agent
-        }
+        try writer.write { db in try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now) }
+    }
+
+    /// Same as `transition(agentId:to:blocker:now:)`, for callers already inside a write transaction.
+    @discardableResult
+    static func transition(db: Database, agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date) throws -> Agent {
+        guard var agent = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
+        let from = agent.state
+        guard AgentLifecycle.canTransition(from: from, to: to) else { throw LifecycleError.illegal(from: from, to: to) }
+        agent.state = to
+        agent.blocker = to == .blocked ? blocker : nil
+        agent.readySince = to == .ready ? now : nil
+        try agent.update(db)
+        try ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: nil, kind: .stateChanged,
+                          text: "\(from.rawValue) -> \(to.rawValue)", createdAt: now).insert(db)
+        return agent
     }
 
     public func startTurn(agentId: String, now: Date = Store.now()) throws -> Turn {

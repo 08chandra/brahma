@@ -82,6 +82,7 @@ public final class Store: Sendable {
             try company.insert(db)
             // Directory is created only after the row is in; a failure here rolls the insert back.
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Store.insertChannel(db, companyId: company.id, name: "general", kind: .channel, members: ["owner"], now: createdAt)
             return company
         }
     }
@@ -106,7 +107,12 @@ public final class Store: Sendable {
             sessionId: UUID().uuidString, sessionStarted: false, state: .sleeping,
             blocker: nil, requestedBlocker: nil, paused: false, readySince: nil, createdAt: Store.now())
         do {
-            try writer.write { db in try agent.insert(db) }
+            try writer.write { db in
+                try agent.insert(db)
+                if let general = try Channel.filter(Column("companyId") == companyId && Column("name") == "general").fetchOne(db) {
+                    try ChannelMember(channelId: general.id, member: agent.id).insert(db, onConflict: .ignore)
+                }
+            }
         } catch let error as DatabaseError where error.extendedResultCode == .SQLITE_CONSTRAINT_UNIQUE {
             throw StoreError.duplicateName
         }
