@@ -729,6 +729,48 @@ actions) and Plan 4 (meter, perks and HR views in the UI); the Steward
   rejected duplicates don't); approved-and-shipped ideas earn a 💡 perk.
 - Lands in Plan 3 (item type, board, triage, review ceremony) and Plan 4 (UI).
 
+### 6.21 Agent map — two view modes (**[owner]** asked for this; Plan 4)
+The live agent map (§6.2) has a toggle between two modes driven by the same
+live data (agents, states, teams, messages, hand-offs, perks).
+
+**1. Hive (3D) [call: SceneKit]**
+- A 3D hive: each team is a cluster of hexagonal cells; each agent is a cell
+  (glowing by state: running = bright pulse, ready = steady, blocked = red
+  rim, sleeping = dim, killed = hollow); C-suite at the core, teams around it.
+- Connections drawn as edges between cells (reporting lines faint, recent
+  communication bright); each live message travels as a particle along its
+  edge; busy pairs get thicker edges; owner messages come from a distinct
+  "owner" node.
+- Orbit/zoom/pan; click a cell → agent detail; hover → name, role, current
+  item, efficiency meter. Level-of-detail for hundreds of agents (teams
+  collapse into single cells when zoomed out).
+
+**2. Village (2D isometric) [call: SpriteKit]**
+- A top-down/isometric village in an original cartoon style (no third-party
+  game assets): each department/team is a building (HQ/castle = C-suite,
+  workshop = engineering, studio = design, lab = R&D/visionaries, market =
+  sales/marketing, warehouse = ops/fulfillment, bank = finance, HR office,
+  QA tower); building size/level grows with team size and output.
+- Each agent is a small worker sprite: works at its building while running
+  (hammering/typing animation), idles when ready, sleeps (Zzz) when
+  sleeping, shows a "!" bubble when blocked; killed agents leave.
+- Communication and hand-offs are visible: a worker walks (or a courier/
+  carrier pigeon flies) from one building to another carrying a scroll for a
+  message or a crate for a hand-off; meetings (idea review, sprint planning)
+  gather workers in the town square.
+- Perks show on workers (☕, 🏆, 🔥); trust level shows as outfit/hat; the
+  efficiency meter as a small bar over the head on hover.
+- Click a worker → agent detail; click a building → team view; pan/zoom.
+
+**Shared**
+- Both render from one `MapModel` (positions, events) fed by the activity
+  stream; animations are rate-limited and batched so hundreds of agents and
+  bursts of messages stay smooth; a "follow agent" camera mode; a time
+  scrubber to replay the last hour.
+- Plan 4 may split the two modes into separate tasks/sub-plans; the Village
+  mode needs a sprite asset set (drawn procedurally or as bundled original
+  SVG/PDF art).
+
 ## 7. Architecture sketch
 
 ```
