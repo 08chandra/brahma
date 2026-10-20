@@ -15,6 +15,13 @@ struct Run: AsyncParsableCommand {
 
     func run() async throws {
         let (store, paths) = try openStore()
+        let lock: OrchestratorLock
+        do {
+            lock = try OrchestratorLock.acquire(paths: paths)
+        } catch OrchestratorLockError.alreadyRunning {
+            throw fail("another 'agentco run' is already running (\(paths.home.path))")
+        }
+        defer { withExtendedLifetime(lock) {} }
         var config = SchedulerConfig()
         config.hardCap = hardCap
         let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
@@ -68,7 +75,7 @@ final class EventPrinter: @unchecked Sendable {
         while let events = try? store.events(afterId: lastId, limit: 200), !events.isEmpty {
             for e in events {
                 if slugs[e.companyId] == nil { slugs[e.companyId] = (try? store.company(id: e.companyId))?.slug ?? "?" }
-                print("\(clock(e.createdAt, seconds: true)) [\(slugs[e.companyId] ?? "?")] \(e.text.replacingOccurrences(of: "\n", with: " "))")
+                print(safe("\(clock(e.createdAt, seconds: true)) [\(slugs[e.companyId] ?? "?")] \(e.text)"))
                 lastId = e.id ?? lastId
             }
             fflush(stdout)

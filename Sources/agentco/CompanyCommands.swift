@@ -25,8 +25,8 @@ struct CompanyGroup: ParsableCommand {
             for c in try store.companies() {
                 let agents = try store.agents(companyId: c.id)
                 func n(_ s: AgentState) -> Int { agents.filter { $0.state == s }.count }
-                print("\(c.name)  \(c.status.rawValue)  \(c.usageMode.rawValue)  \(c.priorityWeight)  "
-                      + "\(n(.running))/\(n(.ready))/\(n(.blocked))/\(n(.sleeping))")
+                print(safe("\(c.name)  \(c.status.rawValue)  \(c.usageMode.rawValue)  \(c.priorityWeight)  "
+                      + "\(n(.running))/\(n(.ready))/\(n(.blocked))/\(n(.sleeping))"))
             }
         }
     }
@@ -65,7 +65,7 @@ struct CompanyGroup: ParsableCommand {
         var c = try resolveCompany(store, query)
         change(&c)
         try store.updateCompany(c)
-        print("\(c.name): \(c.status.rawValue), \(c.usageMode.rawValue) mode, weight \(c.priorityWeight)")
+        print(safe("\(c.name): \(c.status.rawValue), \(c.usageMode.rawValue) mode, weight \(c.priorityWeight)"))
     }
 }
 

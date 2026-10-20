@@ -10,7 +10,7 @@ private func handles(_ store: Store, _ company: Company) throws -> [String: Stri
 }
 
 private func line(_ m: Message, handles: [String: String]) -> String {
-    "\(clock(m.createdAt, seconds: true)) @\(handles[m.senderId] ?? m.senderId): \(m.text)"
+    safe("\(clock(m.createdAt, seconds: true)) @\(handles[m.senderId] ?? m.senderId): \(m.text)")
 }
 
 struct Say: ParsableCommand {
@@ -75,7 +75,7 @@ struct Search: ParsableCommand {
         let map = try handles(store, c)
         let channels = Dictionary(uniqueKeysWithValues: try store.channels(companyId: c.id).map { ($0.id, $0.name) })
         for m in try store.searchMessages(companyId: c.id, query: query) {
-            print("#\(channels[m.channelId] ?? "?") \(line(m, handles: map))")
+            print(safe("#\(channels[m.channelId] ?? "?") ") + line(m, handles: map))
         }
     }
 }

@@ -2,8 +2,11 @@ import ArgumentParser
 import Foundation
 import AgentCompanyCore
 
+/// Agent-controlled text must never reach the terminal raw.
+func safe(_ text: String) -> String { TerminalText.sanitize(text) }
+
 func fail(_ message: String) -> ExitCode {
-    FileHandle.standardError.write(Data("agentco: \(message)\n".utf8))
+    FileHandle.standardError.write(Data("agentco: \(safe(message))\n".utf8))
     return .failure
 }
 
@@ -37,8 +40,8 @@ func resolveAgent(_ store: Store, company: Company, handle: String) throws -> Ag
 func describe(_ blocker: Blocker?, names: [String: String] = [:]) -> String {
     switch blocker {
     case nil: return ""
-    case .agent(let id)?: return "waiting on @\(names[id] ?? String(id.prefix(8)))"
-    case .owner(let reason)?: return "waiting on owner: \(reason)"
+    case .agent(let id)?: return "waiting on @\(safe(names[id] ?? String(id.prefix(8))))"
+    case .owner(let reason)?: return "waiting on owner: \(safe(reason))"
     case .usageLimit(let until)?: return "usage limit until \(clock(until))"
     case .turnBudget(let until)?: return "turn budget until \(clock(until))"
     case .retry(let until, let failures)?: return "retry after failure #\(failures) at \(clock(until))"

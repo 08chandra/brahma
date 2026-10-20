@@ -10,7 +10,7 @@ struct Status: ParsableCommand {
         for c in try store.companies() {
             let agents = try store.agents(companyId: c.id)
             let names = Dictionary(uniqueKeysWithValues: agents.map { ($0.id, $0.name) })
-            print("\(c.name) [\(c.slug)]  \(c.status.rawValue)  \(c.usageMode.rawValue) mode  weight \(c.priorityWeight)")
+            print(safe("\(c.name) [\(c.slug)]  \(c.status.rawValue)  \(c.usageMode.rawValue) mode  weight \(c.priorityWeight)"))
             for a in agents {
                 var parts = ["  @\(a.name)", a.state.rawValue]
                 if a.paused { parts.append("paused") }
@@ -21,7 +21,7 @@ struct Status: ParsableCommand {
                 } else {
                     parts.append("no turns yet")
                 }
-                print(parts.joined(separator: "  "))
+                print(safe(parts.joined(separator: "  ")))
             }
         }
         print(usageLine(try store.latestRateLimit()))

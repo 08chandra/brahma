@@ -43,7 +43,7 @@ agentco run [--hard-cap 16] [--profile workspace|full]
 
 `agentco run` is the orchestrator: keep it running in a terminal. It prints every activity event as
 `HH:mm:ss [company] text`. Ctrl-C stops in-flight turns, records them as interrupted, returns the agents to
-`ready` and exits 0.
+`ready` and exits 0. Only one `agentco run` per data home is allowed (a lock on `orchestrator.lock`).
 
 - `pause` on a running agent lets its current turn finish, then it sleeps. `wake` clears the pause.
 - `kill` is permanent. If the agent is mid-turn in a running orchestrator, that turn is allowed to finish and is

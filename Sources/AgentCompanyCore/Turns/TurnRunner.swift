@@ -38,7 +38,10 @@ public struct ClaudeProcessRunner: TurnRunning {
     }
 
     public func waitForChildren() async {
-        while Self.live.count > 0 { try? await Task.sleep(for: .milliseconds(20)) }
+        // Detached so a cancelled caller (the Ctrl-C path) still waits: Task.sleep would throw at once and spin.
+        await Task.detached {
+            while Self.live.count > 0 { try? await Task.sleep(for: .milliseconds(20)) }
+        }.value
     }
 
     public func run(_ request: TurnRequest) -> AsyncThrowingStream<StreamEvent, Error> {

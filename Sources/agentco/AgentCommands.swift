@@ -16,7 +16,7 @@ struct Hire: ParsableCommand {
         let c = try resolveCompany(store, company)
         do {
             let a = try store.hire(companyId: c.id, name: handle, role: role, model: model)
-            print("hired @\(a.name) (\(a.role), \(a.model)) into \(c.name)")
+            print(safe("hired @\(a.name) (\(a.role), \(a.model)) into \(c.name)"))
         } catch StoreError.duplicateName {
             throw fail("@\(handle.lowercased()) already exists in \(c.name)")
         } catch StoreError.invalidName {

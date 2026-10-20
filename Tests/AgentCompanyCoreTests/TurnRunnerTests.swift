@@ -106,4 +106,34 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             .trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(kill(pid, 0) == -1)
     }
+
+    @Test func waitForChildrenFromCancelledTaskStillWaitsWithoutSpinning() async throws {
+        let (script, dir) = try fakeClaude("""
+            echo $$ > pid.txt
+            cat > /dev/null
+            trap '' TERM
+            sleep 2
+            """)
+        let runner = ClaudeProcessRunner(claudePath: script.path)
+        let req = request(in: dir)
+        let turn = Task { _ = try? await collect(runner.run(req)) }
+        let pidFile = dir.appending(path: "pid.txt")
+        for _ in 0..<200 where !FileManager.default.fileExists(atPath: pidFile.path) {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        turn.cancel()
+        await turn.value
+        let start = ContinuousClock.now
+        let cpuStart = clock()
+        let waiter = Task { await runner.waitForChildren() }
+        waiter.cancel()
+        await waiter.value
+        // The child ignores SIGTERM until its sleep ends or the 5 s kill grace; an early return would not wait.
+        #expect(ContinuousClock.now - start > .milliseconds(300))
+        // A busy-spinning waiter would burn about as much CPU as the wall time it waited.
+        #expect(Double(clock() - cpuStart) / Double(CLOCKS_PER_SEC) < 0.25)
+        let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        #expect(kill(pid, 0) == -1)
+    }
 }
