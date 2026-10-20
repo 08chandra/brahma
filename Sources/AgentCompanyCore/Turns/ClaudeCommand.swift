@@ -36,7 +36,7 @@ public enum ClaudeCommand {
         var a = [
             "-p", "--output-format", "stream-json", "--verbose",
             "--model", r.agent.model, "--fallback-model", "sonnet",
-            "--setting-sources", "project", "--settings", "{\"enabledPlugins\":{}}", "--disable-slash-commands",
+            "--setting-sources", "", "--settings", "{\"enabledPlugins\":{}}", "--disable-slash-commands",
             "--strict-mcp-config", "--mcp-config", r.mcpConfigPath,
             "--disallowed-tools", disallowedTools.joined(separator: ","),
         ]
