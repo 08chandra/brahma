@@ -55,6 +55,7 @@ public actor Orchestrator {
         let inFlight = Array(tasks.values)
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
+        await runner.waitForChildren()
     }
 
     /// Synchronous on the actor (no suspension points), so ticks never interleave with each other.

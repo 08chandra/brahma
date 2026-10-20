@@ -84,4 +84,26 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             .trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(kill(pid, 0) == -1)
     }
+
+    @Test func waitForChildrenReturnsOnlyAfterCancelledChildIsReaped() async throws {
+        let (script, dir) = try fakeClaude("""
+            echo $$ > pid.txt
+            cat > /dev/null
+            exec sleep 30
+            """)
+        let runner = ClaudeProcessRunner(claudePath: script.path)
+        let req = request(in: dir)
+        let turn = Task { _ = try? await collect(runner.run(req)) }
+        let pidFile = dir.appending(path: "pid.txt")
+        for _ in 0..<200 where !FileManager.default.fileExists(atPath: pidFile.path) {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        turn.cancel()
+        await turn.value
+        await runner.waitForChildren()
+        let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        #expect(kill(pid, 0) == -1)
+    }
 }

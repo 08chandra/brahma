@@ -3,6 +3,13 @@ import Foundation
 /// Runs one agent turn and streams its parsed events. The stream throws if the turn did not produce a result.
 public protocol TurnRunning: Sendable {
     func run(_ request: TurnRequest) -> AsyncThrowingStream<StreamEvent, Error>
+    /// Returns once every child process this runner started has exited. Cancelling a turn ends its stream at
+    /// once, before the child is reaped; a shutting-down host waits here so it never leaves orphans behind.
+    func waitForChildren() async
+}
+
+extension TurnRunning {
+    public func waitForChildren() async {}
 }
 
 public enum TurnError: Error, Equatable {
@@ -18,6 +25,8 @@ public struct ClaudeProcessRunner: TurnRunning {
     public var claudePath: String
     public var maxTurnDuration: Duration
 
+    private static let live = LiveCount()
+
     static let stderrLimit = 4096
     static let killGrace: TimeInterval = 5
     /// After the process exits, how long to wait for stdout EOF (a grandchild may still hold the pipe).
@@ -28,9 +37,16 @@ public struct ClaudeProcessRunner: TurnRunning {
         self.maxTurnDuration = maxTurnDuration
     }
 
+    public func waitForChildren() async {
+        while Self.live.count > 0 { try? await Task.sleep(for: .milliseconds(20)) }
+    }
+
     public func run(_ request: TurnRequest) -> AsyncThrowingStream<StreamEvent, Error> {
-        AsyncThrowingStream { continuation in
+        // Counted before the stream is handed out, so there is no window where a turn exists but is not tracked.
+        Self.live.begin()
+        return AsyncThrowingStream { continuation in
             let task = Task {
+                defer { Self.live.end() }
                 do {
                     try await execute(request) { continuation.yield($0) }
                     continuation.finish()
@@ -239,4 +255,13 @@ private final class Flag: @unchecked Sendable {
     private var value = false
     func set() { lock.withLock { value = true } }
     var isSet: Bool { lock.withLock { value } }
+}
+
+/// Number of turns whose child process has not been reaped yet.
+private final class LiveCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func begin() { lock.withLock { value += 1 } }
+    func end() { lock.withLock { value -= 1 } }
+    var count: Int { lock.withLock { value } }
 }

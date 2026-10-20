@@ -21,13 +21,3 @@ struct MCP: ParsableCommand {
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }
-
-struct AgentCo: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "agentco",
-        abstract: "Agent Company command line.",
-        subcommands: [MCP.self]
-    )
-}
-
-AgentCo.main()
