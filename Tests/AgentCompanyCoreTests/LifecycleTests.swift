@@ -78,6 +78,18 @@ private func makeAgent(_ s: Store) throws -> Agent {
     #expect(t?.outcome == .succeeded); #expect(t?.summary == "done"); #expect(t?.costUSD == 0.12); #expect(t?.endedAt == end)
 }
 
+@Test func finishTurnOnlyUpdatesInProgressTurns() throws {
+    let s = try Store.inMemory(); let a = try makeAgent(s)
+    let turn = try s.startTurn(agentId: a.id)
+    _ = try s.recoverInterruptedTurns()
+    #expect(try s.finishTurn(id: turn.id, outcome: .succeeded, summary: "late", costUSD: 1) == false)
+    let t = try s.writer.read { db in try Turn.fetchOne(db, key: turn.id) }
+    #expect(t?.outcome == .interrupted); #expect(t?.summary == nil)
+    let live = try s.startTurn(agentId: a.id)
+    #expect(try s.finishTurn(id: live.id, outcome: .succeeded, summary: "ok", costUSD: 1))
+    #expect(try s.writer.read { db in try Turn.fetchOne(db, key: live.id) }?.outcome == .succeeded)
+}
+
 @Test func eventsFilterAndPaginate() throws {
     let s = try Store.inMemory()
     let c1 = try s.createCompany(name: "A", goal: "g", workspacesRoot: try tempDir())

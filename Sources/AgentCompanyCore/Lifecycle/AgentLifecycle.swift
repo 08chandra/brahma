@@ -50,12 +50,21 @@ extension Store {
         }
     }
 
-    public func finishTurn(id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, now: Date = Store.now()) throws {
+    /// Records the end of a turn that is still in progress. Returns false, changing nothing, if the turn was
+    /// already finished (e.g. marked interrupted by crash recovery) so a late finish cannot clobber it.
+    @discardableResult
+    public func finishTurn(id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, now: Date = Store.now()) throws -> Bool {
         try writer.write { db in
-            guard var turn = try Turn.fetchOne(db, key: id) else { throw StoreError.notFound }
-            turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.endedAt = now
-            try turn.update(db)
+            try Store.finishTurn(db: db, id: id, outcome: outcome, summary: summary, costUSD: costUSD, now: now)
         }
+    }
+
+    static func finishTurn(db: Database, id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, now: Date) throws -> Bool {
+        guard var turn = try Turn.fetchOne(db, key: id) else { throw StoreError.notFound }
+        guard turn.outcome == .inProgress else { return false }
+        turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.endedAt = now
+        try turn.update(db)
+        return true
     }
 
     public func turnCount(agentId: String, since: Date) throws -> Int {

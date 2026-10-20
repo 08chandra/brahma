@@ -29,6 +29,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var paused: Bool
     public var readySince: Date?
     public var createdAt: Date
+    /// Failed turns in a row; drives retry backoff. Reset by a successful turn.
+    public var consecutiveFailures: Int = 0
 }
 
 /// Tie-break weight among a company's ready agents: leadership first.

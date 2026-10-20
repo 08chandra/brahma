@@ -29,6 +29,7 @@ enum Migrations {
                 t.column("paused", .boolean).notNull()
                 t.column("readySince", .datetime)
                 t.column("createdAt", .datetime).notNull()
+                t.column("consecutiveFailures", .integer).notNull().defaults(to: 0)
                 t.uniqueKey(["companyId", "name"])
             }
             try db.create(table: "turn") { t in

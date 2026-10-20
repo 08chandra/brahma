@@ -85,9 +85,12 @@ extension Store {
 
     public func markDelivered(itemIds: [Int64], turnId: String) throws {
         guard !itemIds.isEmpty else { return }
-        try writer.write { db in
-            try InboxItem.filter(itemIds.contains(Column("id"))).updateAll(db, Column("deliveredTurnId").set(to: turnId))
-        }
+        try writer.write { db in try Store.markDelivered(db: db, itemIds: itemIds, turnId: turnId) }
+    }
+
+    static func markDelivered(db: Database, itemIds: [Int64], turnId: String) throws {
+        guard !itemIds.isEmpty else { return }
+        try InboxItem.filter(itemIds.contains(Column("id"))).updateAll(db, Column("deliveredTurnId").set(to: turnId))
     }
 
     public func searchMessages(companyId: String, query: String, limit: Int = 50) throws -> [Message] {
