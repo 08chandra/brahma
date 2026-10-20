@@ -24,7 +24,7 @@
 - Usage modes are exactly `low`, `balanced`, `max`; defaults for Max 20x: low = 2, balanced = 6, max = owner hard cap = 16 (spec §6.7).
 - Never knowingly use paid overage: `isUsingOverage == true` closes the usage gate (spec §6.7).
 - Multiple companies can run at once; scheduler, caps and usage gate are global; slots shared by weighted round-robin with per-company `priorityWeight` default 1 (spec §6.7).
-- Every agent turn must be isolated from the owner's personal Claude setup: `--setting-sources project`, `--settings '{"enabledPlugins":{}}'`, `--disable-slash-commands`, `--strict-mcp-config`. Never use `--bare` (it drops subscription OAuth).
+- Every agent turn must be isolated from the owner's personal Claude setup: `--setting-sources ""` (empty: load NO settings files — `project` would load the agent-writable workspace `.claude/settings.json`, a privilege-escalation path verified 2026-10-20), `--settings '{"enabledPlugins":{}}'`, `--disable-slash-commands`, `--strict-mcp-config`. Never use `--bare` (it drops subscription OAuth).
 - The role prompt is passed with `--append-system-prompt` **only on an agent's first turn**; Claude Code snapshots it for the life of the session.
 - Prompt goes to `claude` on **stdin**, never argv.
 - Every state transition is persisted before it takes effect; on startup, agents recorded `running` with no live turn return to `ready` (spec §6.12).
@@ -326,7 +326,7 @@ loop while globalFree > 0:
 ```
 -p --output-format stream-json --verbose
 --model <agent.model> --fallback-model sonnet
---setting-sources project --settings {"enabledPlugins":{}} --disable-slash-commands
+--setting-sources "" --settings {"enabledPlugins":{}} --disable-slash-commands
 --strict-mcp-config --mcp-config <mcpConfigPath>
 --disallowed-tools <disallowedTools joined by ",">
 ( --session-id <sessionId> --append-system-prompt <appendSystemPrompt> )   if !agent.sessionStarted
