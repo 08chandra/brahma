@@ -86,7 +86,8 @@ public actor Orchestrator {
         for c in companies {
             let decision = UsageGate.evaluate(info, mode: c.usageMode, now: now)
             decisions[c.id] = decision
-            guard case .closed(let until) = decision else { continue }
+            guard case .closed(let gateUntil) = decision else { continue }
+            let until = Self.usageUntil(gateUntil, now: now)
             var stopped = 0
             for a in try store.agents(companyId: c.id, states: [.ready]) {
                 attempt {
@@ -202,14 +203,16 @@ public actor Orchestrator {
         }
 
         let now = clock()
+        let limited = lastInfo.map { $0.status != "allowed" } ?? false
         let end: TurnEnd
         if Task.isCancelled {
             end = .interrupted
-        } else if result?.apiErrorStatus == 429 || (lastInfo.map { $0.status != "allowed" } ?? false) {
-            var until = now.addingTimeInterval(Self.usageRetry)
-            if let info = lastInfo, info.status != "allowed" {
-                until = info.resetsAt ?? until
-            } else {
+        } else if let r = result, !r.isError {
+            // A completed turn always counts, even if it also hit the limit: re-running it would repeat its posts.
+            end = .succeeded(r, usageHold: limited ? Self.usageUntil(lastInfo?.resetsAt, now: now) : nil)
+        } else if result?.apiErrorStatus == 429 || limited {
+            let until = Self.usageUntil(limited ? lastInfo?.resetsAt : nil, now: now)
+            if !limited {
                 // HTTP 429 with no rejecting rate-limit event: record one so the gate closes for every company.
                 attempt {
                     try store.saveRateLimit(RateLimitInfo(status: "rejected", resetsAt: until, rateLimitType: nil,
@@ -220,14 +223,18 @@ public actor Orchestrator {
             end = .usageLimited(until: until, summary: result?.text)
         } else if let failure {
             end = .failed(failure)
-        } else if let r = result, !r.isError {
-            end = .succeeded(r)
         } else if let r = result {
             end = .failed(r.text ?? r.subtype)
         } else {
             end = .failed("claude exited without a result")
         }
         attempt { try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id), now: now) }
+    }
+
+    /// When a usage-limited agent may try again: never sooner than `usageRetry`, so a stale (past) `resetsAt`
+    /// cannot unblock it on the next tick and re-hit the limit every tick.
+    static func usageUntil(_ resetsAt: Date?, now: Date) -> Date {
+        max(resetsAt ?? now, now.addingTimeInterval(usageRetry))
     }
 
     private nonisolated func attempt(_ body: () throws -> Void) {
@@ -240,7 +247,8 @@ public actor Orchestrator {
 }
 
 enum TurnEnd {
-    case succeeded(TurnResult)
+    /// `usageHold`: the turn completed but also hit the usage limit; the agent waits until then.
+    case succeeded(TurnResult, usageHold: Date?)
     case failed(String)
     case usageLimited(until: Date, summary: String?)
     case interrupted
@@ -300,7 +308,7 @@ extension Store {
             var summary: String?
             var cost: Double?
             switch end {
-            case .succeeded(let r): summary = r.text; cost = r.costUSD
+            case .succeeded(let r, _): summary = r.text; cost = r.costUSD
             case .failed(let text): summary = text
             case .usageLimited(_, let text): summary = text
             case .interrupted: summary = "interrupted"
@@ -340,21 +348,27 @@ extension Store {
                 let n = agent.consecutiveFailures
                 try Store.transition(db: db, agentId: agentId, to: .blocked,
                                      blocker: .retry(until: now.addingTimeInterval(retryBackoff(failures: n)), failures: n), now: now)
-            case .succeeded:
+            case .succeeded(_, let usageHold):
                 // Anything still pending arrived mid-turn: the router saw `running` and did not wake us.
                 let senders = try String.fetchAll(db, sql: """
                     SELECT message.senderId FROM inboxItem JOIN message ON message.id = inboxItem.messageId
                     WHERE inboxItem.agentId = ? AND inboxItem.deliveredTurnId IS NULL
                     """, arguments: [agentId])
+                var answered = false
                 if let blocker = requested {
-                    let answered: Bool
                     switch blocker {
                     case .agent(let id): answered = senders.contains(id)
                     case .owner: answered = senders.contains("owner")
-                    default: answered = false
+                    default: break
                     }
-                    try Store.transition(db: db, agentId: agentId, to: answered ? .ready : .blocked,
-                                         blocker: blocker, now: now)
+                    // Still waiting on someone: when they answer, the usage gate re-checks before the next turn.
+                    if !answered {
+                        try Store.transition(db: db, agentId: agentId, to: .blocked, blocker: blocker, now: now)
+                        return
+                    }
+                }
+                if let usageHold {
+                    try Store.transition(db: db, agentId: agentId, to: .blocked, blocker: .usageLimit(until: usageHold), now: now)
                 } else {
                     try Store.transition(db: db, agentId: agentId, to: senders.isEmpty ? .sleeping : .ready, now: now)
                 }

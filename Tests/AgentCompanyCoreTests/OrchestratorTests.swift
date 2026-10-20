@@ -165,7 +165,7 @@ private struct World {
 
     @Test func failedTurnBacksOff() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
-        w.fake.script("ceo", .init(error: FakeError(description: "boom")), .init(error: FakeError(description: "boom")))
+        w.fake.script("ceo", .init(events: [], error: FakeError(description: "boom")), .init(events: [], error: FakeError(description: "boom")))
         try w.dm(c, ceo)
         try await w.cycle()
         var a = try w.agent(ceo)
@@ -199,7 +199,7 @@ private struct World {
         let w = try World(); let c = try w.company("Acme"); var ceo = try w.hire(c, "ceo")
         ceo.consecutiveFailures = 9
         try w.store.save(ceo)
-        w.fake.script("ceo", .init(error: FakeError(description: "boom")))
+        w.fake.script("ceo", .init(events: [], error: FakeError(description: "boom")))
         try w.dm(c, ceo)
         try await w.cycle()
         #expect(try w.agent(ceo).blocker == .retry(until: w.clock.now.addingTimeInterval(30 * 60), failures: 10))
@@ -261,6 +261,60 @@ private struct World {
         #expect(try w.turns(b).map(\.outcome) == [.succeeded])
         #expect(try w.pending(a) == 0)
         #expect(try w.pending(b) == 0)
+    }
+
+    @Test(arguments: ["allowed_warning", "rejected"])
+    func successfulTurnThatHitsLimitStillCounts(status: String) async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let t = w.clock.now
+        let info = RateLimitInfo(status: status, resetsAt: t.addingTimeInterval(7200), rateLimitType: "five_hour",
+                                 isUsingOverage: false, fiveHourUtilization: 0.99, sevenDayUtilization: 0.5, observedAt: t)
+        w.fake.script("ceo", .init(events: [
+            .initialized(sessionId: ceo.sessionId, model: "sonnet"),
+            .rateLimit(info),
+            .result(TurnResult(isError: false, subtype: "success", text: "done", costUSD: 0.01, apiErrorStatus: nil,
+                               sessionId: ceo.sessionId)),
+        ]))
+        try w.dm(c, ceo)
+        try await w.cycle()
+        #expect(try w.turns(ceo).map(\.outcome) == [.succeeded])
+        #expect(try w.pending(ceo) == 0)
+        let a = try w.agent(ceo)
+        #expect(a.state == .blocked)
+        #expect(a.blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        #expect(a.consecutiveFailures == 0)
+    }
+
+    @Test func successResultThenStreamErrorStillSucceeds() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        w.fake.script("ceo", .init(error: FakeError(description: "exit 1 after result")))
+        try w.dm(c, ceo)
+        try await w.cycle()
+        #expect(try w.turns(ceo).map(\.outcome) == [.succeeded])
+        #expect(try w.pending(ceo) == 0)
+        #expect(try w.agent(ceo).state == .sleeping)
+    }
+
+    @Test func staleResetsAtStillWaitsFifteenMinutes() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let t = w.clock.now
+        let stale = RateLimitInfo(status: "rejected", resetsAt: t.addingTimeInterval(-60), rateLimitType: "five_hour",
+                                  isUsingOverage: false, fiveHourUtilization: 1.0, sevenDayUtilization: 0.5, observedAt: t)
+        w.fake.script("ceo", .init(events: [
+            .rateLimit(stale),
+            .result(TurnResult(isError: true, subtype: "error_during_execution", text: "usage limit reached",
+                               costUSD: nil, apiErrorStatus: 429, sessionId: ceo.sessionId)),
+        ]))
+        try w.dm(c, ceo)
+        try await w.cycle()
+        #expect(try w.agent(ceo).blocker == .usageLimit(until: t.addingTimeInterval(15 * 60)))
+        w.clock.advance(1)
+        try await w.cycle()
+        #expect(try w.turns(ceo).count == 1)
+        #expect(try w.agent(ceo).state == .blocked)
+        w.clock.advance(15 * 60)
+        try await w.cycle()
+        #expect(try w.turns(ceo).map(\.outcome) == [.usageLimited, .succeeded])
     }
 
     @Test func http429WithoutRateLimitEventClosesGateForEveryone() async throws {
