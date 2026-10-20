@@ -3,6 +3,7 @@ import GRDB
 
 public enum StoreError: Error, Equatable {
     case duplicateName
+    case notFound
 }
 
 public final class Store: Sendable {
@@ -44,7 +45,7 @@ public final class Store: Sendable {
     // MARK: Companies
 
     /// Dates are stored with millisecond precision, so round at creation to keep records Equatable after reload.
-    static func now() -> Date {
+    public static func now() -> Date {
         let now = Date()
         return Date.fromDatabaseValue(now.databaseValue) ?? now
     }

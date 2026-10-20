@@ -31,6 +31,26 @@ enum Migrations {
                 t.column("createdAt", .datetime).notNull()
                 t.uniqueKey(["companyId", "name"])
             }
+            try db.create(table: "turn") { t in
+                t.primaryKey("id", .text)
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("startedAt", .datetime).notNull()
+                t.column("endedAt", .datetime)
+                t.column("outcome", .text).notNull()
+                t.column("summary", .text)
+                t.column("costUSD", .double)
+            }
+            try db.create(index: "turn_agent_started", on: "turn", columns: ["agentId", "startedAt"])
+            try db.create(table: "activityEvent") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text)
+                t.column("turnId", .text)
+                t.column("kind", .text).notNull()
+                t.column("text", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
         }
         return m
     }
