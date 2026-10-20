@@ -384,6 +384,28 @@ outside the company.
   effect; on launch, any agent recorded as Running whose process is gone is
   moved back to Ready.
 
+### 6.13 Headless server mode (**[owner]** asked for this — later phase)
+Eventually the engine runs headless on a Linux VM, and the owner talks to it
+from a Mac companion app (and, later, possibly a phone).
+- **[call]** Same Swift codebase: Swift runs on Linux, so `AgentCompanyCore`
+  is kept Linux-portable from Plan 1 on (no AppKit/Apple-only Foundation APIs
+  in the core; Mac-only features — Keychain, UserNotifications, Messages,
+  ScreenCaptureKit, Simulator — sit behind protocols with Linux alternatives).
+- **Server:** `agentco serve` — a long-running daemon (systemd unit) running
+  the Orchestrator, with `claude` CLI installed and logged in on the VM.
+  Linux equivalents: secrets in an encrypted file or the VM's secret store;
+  notifications via email/push only; sandboxing via bubblewrap/containers;
+  web previews served from the VM (and tunneled), native iOS/macOS previews
+  unavailable (need a Mac build host — out of scope for the server).
+- **Remote API:** the daemon exposes an authenticated API (HTTPS + WebSocket
+  event stream) covering everything the app does: companies, channels/DMs,
+  work items, requests, usage, activity, preview URLs.
+- **Mac companion app:** the same SwiftUI app connects either to its embedded
+  local engine or to a remote server; it's a client of the same API.
+- **Security:** API only over TLS, behind token auth paired from the app
+  (or reachable only via Tailscale/WireGuard by default); never exposed
+  unauthenticated to the internet.
+
 ## 7. Architecture sketch
 
 ```

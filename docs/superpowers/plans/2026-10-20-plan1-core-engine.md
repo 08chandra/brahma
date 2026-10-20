@@ -17,6 +17,7 @@
 - Plan 5 — Owner requests & safety: requests inbox, Keychain secrets + redaction + pre-commit hook, notifications (macOS/iMessage/email), resources drag-drop, permission profiles incl. Sandboxed.
 - Plan 6 — Scale: 300-agent load test, perf, map collapsing, cap tuning from measured per-process RAM.
 - Plan 7 — External communication: connected email/social accounts, outbox approval queue, inbound `#external`, contacts/opt-outs, per-platform rate limits (spec §6.11a).
+- Plan 8 — Headless server: `agentco serve` daemon on Linux (systemd), authenticated HTTPS+WebSocket API, Linux backends for secrets/notifications/sandbox, Mac app as remote client (spec §6.13).
 
 ## Global Constraints
 
@@ -30,6 +31,7 @@
 - Every state transition is persisted before it takes effect; on startup, agents recorded `running` with no live turn return to `ready` (spec §6.12).
 - Data home: `~/Library/Application Support/AgentCompany/` (override `AGENTCO_HOME`); single DB `agentco.sqlite`, WAL, busy timeout 5 s. Workspaces: `~/AgentCompany/<company-slug>/` (override `AGENTCO_WORKSPACES`).
 - Owner is addressed as `@owner` everywhere.
+- `AgentCompanyCore` stays Linux-portable (spec §6.13): no AppKit or Apple-only Foundation APIs (e.g. `FileHandle.bytes`); Mac-only features go behind protocols in later plans.
 
 ## Review Focus
 
