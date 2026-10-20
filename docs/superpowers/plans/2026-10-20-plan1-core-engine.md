@@ -20,6 +20,7 @@
 - Plan 8 — Headless server: `agentco serve` daemon on Linux (systemd), authenticated HTTPS+WebSocket API, Linux backends for secrets/notifications/sandbox, Mac app as remote client (spec §6.13).
 - Plan 9 — Agent labs & modules: per-agent lab folders, notes memory, experimental modules with manifests, promotion to the company Toolbox (spec §6.14).
 - Plan 10 — Self-evolving engine: the Steward meta-agent, telemetry, three change levels, simulation runs, protected areas, hot swap + rollback, changelog (spec §6.15).
+- Plan 11 — Running the company: browser automation, connectors/integrations page, funds budget + spend requests, Knowledge Base, business roles, industry packs (spec §6.17, §6.18).
 
 ## Global Constraints
 

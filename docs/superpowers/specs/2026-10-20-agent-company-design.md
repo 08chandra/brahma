@@ -1,7 +1,13 @@
-# Agent Company — Design
+# Brahma — Design
 
 Date: 2026-10-20
 Status: draft, awaiting owner approval
+
+> **Name [owner, 2026-10-20]:** the product is **Brahma**. Code identifiers
+> follow: CLI `brahma`, library `BrahmaCore`, app `Brahma.app`, data in
+> `~/Library/Application Support/Brahma/` and `~/Brahma/<company>/`, env vars
+> `BRAHMA_HOME` / `BRAHMA_WORKSPACES`. Earlier text that says
+> "Agent Company"/`agentco` refers to the same thing.
 
 ## 1. What this is, and why
 
@@ -328,9 +334,8 @@ every agent these tools, filtered by role:
 - **Sign-ins/permissions:** owner performs the sign-in themselves (e.g. OAuth
   in their browser, or grants access) and marks done; resulting tokens, if
   any, go to Keychain.
-- **Money:** agents never hold payment details. A money request is a request
-  for the owner to purchase/approve a specific charge; the owner does it and
-  marks done. **[call]**
+- **Money:** superseded by §6.17 Funds — agents never see payment details;
+  spending goes through a budgeted funds connector with owner approval.
 - **Notifications [call]:** macOS notifications (always); iMessage text to
   the owner's own number via the Messages app (AppleScript) — no Twilio;
   email via the owner's Gmail (SMTP + app password in Keychain). Each
@@ -486,6 +491,130 @@ binding for Plans 3–10. The core principles:
   held-out scenarios, separate auditor, no self-granted resources, one
   change at a time, lineage archive, draining hot-swap); these supersede the
   rules in §6.15 where stricter.
+
+### 6.17 Running the company: research, internet, browser, funds, integrations (**[owner]** asked for this)
+The company doesn't just build the product — it researches, operates, and
+runs it. It plugs in whatever capabilities it needs, where it needs them.
+
+**Internet and research**
+- Agents get web search and page fetching (Claude Code's WebSearch/WebFetch)
+  per role; in the Sandboxed profile, network access follows the company's
+  domain allow-list, which agents can request to widen
+  (`request_from_owner(kind=permission)`; auto-approved in Auto mode for
+  read-only browsing).
+- A **Research** function (analyst/researcher roles) produces cited reports
+  into a company **Knowledge Base** (`kb/`), searchable by every agent, so
+  research is done once and reused.
+
+**Browser [call]**
+- Agents can drive a real browser (Chromium via Playwright, exposed as an
+  MCP tool) for sites without APIs: sign-ups, dashboards, admin consoles,
+  testing the product like a user.
+- Each company has its own browser profile(s), isolated from the owner's
+  personal browser. Agents never see saved passwords.
+- **Sign-in hand-off:** when a site needs a login, 2FA, or a CAPTCHA, the
+  agent files a sign-in request; the owner completes it once in an
+  in-app browser window on that company's profile; the session cookie is
+  then usable by the agent.
+- The preview pane can show an agent's live browser, so the owner watches
+  what it's doing. Submitting payments, accepting terms of service, or
+  sending messages through a browser counts as an action requiring the
+  same approval as the equivalent tool (funds / outbox).
+
+**Integrations (plug-ins) [call]**
+- Capabilities plug in as **connectors** — MCP servers (Gmail, Slack,
+  GitHub, Stripe, Vercel/AWS/Fly, Google Workspace, Notion, Linear, analytics,
+  CRM, …) or REST APIs wrapped as tools.
+- A per-company **Integrations** page: the owner installs a connector,
+  completes its auth (secrets → Keychain), and scopes it to roles (e.g.
+  only DevOps gets the cloud connector, only Support gets the helpdesk).
+- Agents can *propose* a new connector ("we need Stripe for billing") →
+  owner approval → install. Agents may also build small connectors as lab
+  modules (§6.14) and promote them.
+- Every connector call is logged (who, what, when) and counted toward
+  budgets.
+
+**Funds [call — replaces the earlier "agents never hold money" rule with a
+stricter, more useful one]**
+- The owner gives each company a **budget**: monthly limit, per-purchase
+  limit, and optional merchant/category allow-list.
+- Money moves only through a **funds connector** the owner connects — e.g.
+  a virtual-card provider with programmatic spend controls, or a payment
+  platform account. Card numbers and credentials stay in Keychain/the
+  provider; agents never see them.
+- Agents spend via `request_spend(amount, merchant, purpose, work_item)`:
+  within budget and below the auto-approve threshold (default $0 — i.e.
+  every purchase needs approval until the owner raises it) the engine
+  executes it; otherwise it goes to the owner's approval queue. Auto mode
+  never raises spend limits.
+- A **CFO/Finance** role tracks spend vs budget, subscriptions, and revenue;
+  a Finance view shows every charge with its purpose and requesting agent.
+  Refunds/cancellations are tracked as work items.
+- Revenue (e.g. from a Stripe connector) is visible but agents can't move
+  money out of revenue accounts.
+
+**Business roles** added to the role catalog (Plan 3): Research analyst,
+Marketing, Sales, Customer support, Finance (CFO), Legal/compliance
+reviewer (flags terms, privacy, licensing — not legal advice), Operations.
+
+**Guardrails**: everything above respects permission profiles (§6.5a),
+owner gates, the external-communication outbox (§6.11a), and the funds
+budget; all actions are in the activity history; the global kill switch
+stops browsers and connectors too.
+
+### 6.18 Any kind of company — industry packs (**[owner]** asked for this)
+The engine (hierarchy, scheduler, channels, approvals, budgets, labs,
+Steward) is industry-neutral. Everything software-specific becomes a
+pluggable **industry pack**, so a company can be e-commerce, apparel, hard
+tech/hardware, B2B SaaS, CPG, services, media, etc.
+
+**What a pack defines [call]**
+- **Org template:** roles and ratios for that kind of company — e.g. CPG:
+  brand, product development/formulation, sourcing & supply chain,
+  regulatory, marketing, retail/wholesale sales, finance; hard tech:
+  mechanical/electrical/firmware engineers, test, manufacturing engineering,
+  supply chain, compliance/certification; e-commerce: merchandising,
+  storefront, growth marketing, customer support, fulfillment ops.
+- **Work vocabulary:** item types and stages beyond epic/story/task —
+  e.g. SKU, tech pack, BOM, supplier RFQ, prototype build, certification,
+  launch campaign, listing, PO, shipment.
+- **Cadence:** sprints are one option; packs can use stage-gates (concept →
+  prototype → EVT/DVT/PVT → production), seasonal/collection calendars,
+  campaign cycles, or milestones. The scheduler and gates don't change.
+- **Deliverables & previews:** each artifact type has a preview adapter —
+  code/app (as §6.9), storefront/landing page, brand board & mockups,
+  product renders/CAD viewer (STEP/STL/glTF), tech packs & BOM tables,
+  financial models/spreadsheets, decks, documents, ad creatives, dashboards.
+- **Verification:** "done" checks generalize beyond tests: spreadsheet/BOM
+  validators, spec checklists, rubric-graded review by a clean-context
+  reviewer agent, cost/margin targets, compliance checklists, and owner
+  sign-off for subjective work (brand, design). Engine-owned evidence (§6.16)
+  still applies wherever a check can be executed.
+- **Connectors:** pack-suggested integrations — e.g. Shopify/Amazon/Etsy,
+  3PL and shipping, supplier & manufacturing marketplaces, ad platforms,
+  accounting, CAD/PLM tools, QuickBooks/Xero, payment processors.
+- **Playbooks:** starter goals and checklists (e.g. "launch a DTC apparel
+  brand", "take a hardware prototype to DVT", "launch a B2B SaaS MVP").
+
+**The real world [call]**
+- Agents can't physically make, ship, or sign things. Physical-world steps
+  (sample approval, factory visit, signing contracts, legal filings,
+  certifications, receiving inventory) become **human tasks**: a queue the
+  owner (or a contractor/vendor the owner designates) completes, with the
+  agents preparing everything (specs, RFQs, comparison tables, drafted
+  emails, checklists) and tracking status.
+- Talking to suppliers, manufacturers, retailers and customers goes through
+  the external-communication outbox (§6.11a); spending through the funds
+  budget (§6.17); contracts and anything legally binding always need the
+  owner.
+
+**Creating a company**
+- The owner picks a pack (or "custom") and describes the business; the
+  CEO/CPO agents can propose pack adjustments (extra roles, item types) for
+  owner approval. Packs are versioned files, so the Steward (§6.15/§6.16) can
+  improve them over time from what works, and new packs can be added.
+- Plan 1's engine needs no change for this; packs land with the role
+  catalog / work items (Plan 3), previews (Plan 4) and connectors (Plan 11).
 
 ## 7. Architecture sketch
 
