@@ -51,6 +51,8 @@ subscription, not a per-token API bill.
 - Agents deploying to paid production hosting on their own. They may prepare
   deployment; going live is an owner-approved request.
 - Multi-user / teams of humans sharing one company.
+- Agents operating accounts the owner didn't connect, or scraping/automating
+  platforms outside their official APIs.
 
 ## 4. Anti-goals (failure even if it "works")
 
@@ -340,6 +342,34 @@ every agent these tools, filtered by role:
   wide), a **channel** (team), or a **DM** (one agent). Files are copied
   into the workspace `resources/<scope>/`; agents get the path in their next
   inbox digest and via `--add-dir`. URLs are stored as link resources.
+
+### 6.11a External communication — email and social media (**[owner]** asked for this)
+Agents (e.g. marketing, sales, support, recruiting roles) can talk to people
+outside the company.
+- **Accounts the owner connects [call]:** per company, the owner connects
+  accounts in Settings — an email account (Gmail via OAuth, or any IMAP/SMTP
+  mailbox; a dedicated company address is recommended over the owner's
+  personal one) and social accounts through their official APIs (e.g.
+  Bluesky, X, LinkedIn, Reddit, Discord, Slack). Credentials live in
+  Keychain (6.10). Agents never get raw credentials; they use company tools.
+- **Tools:** `send_email(to, subject, body, thread?)`,
+  `post_social(account, text, media?, reply_to?)`,
+  `send_social_dm(account, to, text)`, `read_external_inbox(account)`.
+- **Approval by default [call]:** every outbound external message is a
+  *draft* in an "Outbox" queue the owner approves, edits, or rejects. Auto
+  mode may auto-send per account only if the owner explicitly enables it for
+  that account, with a daily send cap (default 20) and only to contacts who
+  already replied or were added by the owner. Unsolicited mass outreach is
+  never auto-approved.
+- **Inbound:** replies, mentions, and DMs are polled and appear in a per-
+  company `#external` channel (and as threads per contact), waking the agent
+  that owns the conversation.
+- **Guardrails [call]:** agents disclose they are an AI assistant acting for
+  the company when asked or where a platform requires it; they never pose as
+  a specific real human; per-account rate limits respect each platform's API
+  terms; email includes an unsubscribe line for marketing mail; a contacts
+  list records consent/opt-outs and blocks re-contacting opted-out people.
+- Everything sent/received is stored in history (6.12) and searchable.
 
 ### 6.12 Persistence (**[owner]** asked for local history)
 - SQLite database in `~/Library/Application Support/AgentCompany/` (one DB

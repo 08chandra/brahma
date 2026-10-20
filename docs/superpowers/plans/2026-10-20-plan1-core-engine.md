@@ -16,6 +16,7 @@
 - Plan 4 — Mission control: agent map, activity feed, workspace git worktrees + merges, preview adapters (web, iOS, macOS, CLI, backend).
 - Plan 5 — Owner requests & safety: requests inbox, Keychain secrets + redaction + pre-commit hook, notifications (macOS/iMessage/email), resources drag-drop, permission profiles incl. Sandboxed.
 - Plan 6 — Scale: 300-agent load test, perf, map collapsing, cap tuning from measured per-process RAM.
+- Plan 7 — External communication: connected email/social accounts, outbox approval queue, inbound `#external`, contacts/opt-outs, per-platform rate limits (spec §6.11a).
 
 ## Global Constraints
 
