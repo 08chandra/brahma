@@ -101,3 +101,21 @@ import Foundation
     #expect(d.home.path.hasSuffix("Library/Application Support/AgentCompany"))
     #expect(d.workspaces.path.hasSuffix("AgentCompany"))
 }
+
+@Test func createChannelRejectsReservedNames() throws {
+    let store = try Store.inMemory()
+    let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+    for bad in ["dm:a:b", "a b", "", "#", "x:y", "-x", String(repeating: "a", count: 65)] {
+        #expect(throws: StoreError.invalidName, "\(bad)") { try store.createChannel(companyId: c.id, name: bad, members: []) }
+    }
+    #expect(try store.createChannel(companyId: c.id, name: "#Eng_1-x", members: []).name == "eng_1-x")
+}
+
+@Test func hireRejectsOwnerAndBadHandles() throws {
+    let store = try Store.inMemory()
+    let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+    for bad in ["owner", "OWNER", "a b", "", "@x", "x:y", "-x", String(repeating: "a", count: 33)] {
+        #expect(throws: StoreError.invalidName, "\(bad)") { try store.hire(companyId: c.id, name: bad, role: "r", model: "m") }
+    }
+    #expect(try store.hire(companyId: c.id, name: "Eng-1", role: "r", model: "m").name == "eng-1")
+}

@@ -19,6 +19,9 @@ extension Store {
 
     public func createChannel(companyId: String, name: String, members: [String]) throws -> Channel {
         let normalized = Store.normalizeChannelName(name)
+        // ':' is not allowed, so user-created channels can never collide with "dm:<a>:<b>" names.
+        guard normalized.range(of: "^[a-z0-9][a-z0-9_-]{0,63}$", options: .regularExpression) != nil
+        else { throw StoreError.invalidName }
         let now = Store.now()
         do {
             return try writer.write { db in

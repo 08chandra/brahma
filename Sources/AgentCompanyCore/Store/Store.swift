@@ -4,6 +4,8 @@ import GRDB
 public enum StoreError: Error, Equatable {
     case duplicateName
     case notFound
+    /// Channel or agent name is reserved or not in the allowed alphabet.
+    case invalidName
 }
 
 public final class Store: Sendable {
@@ -102,8 +104,11 @@ public final class Store: Sendable {
     // MARK: Agents
 
     public func hire(companyId: String, name: String, role: String, model: String) throws -> Agent {
+        let handle = name.lowercased()
+        guard handle != "owner", handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
+        else { throw StoreError.invalidName }
         let agent = Agent(
-            id: UUID().uuidString, companyId: companyId, name: name.lowercased(), role: role, model: model,
+            id: UUID().uuidString, companyId: companyId, name: handle, role: role, model: model,
             sessionId: UUID().uuidString, sessionStarted: false, state: .sleeping,
             blocker: nil, requestedBlocker: nil, paused: false, readySince: nil, createdAt: Store.now())
         do {

@@ -7,6 +7,8 @@ public enum RouterError: Error, Equatable {
     case notAMember
     /// Sender is an unknown, killed or other-company agent, or a DM to oneself.
     case invalidSender
+    /// A channel occupying a DM name is not a DM between exactly the two parties.
+    case invalidChannel(String)
 }
 
 public struct MessageRouter: Sendable {
@@ -45,6 +47,10 @@ public struct MessageRouter: Sendable {
             let channelName = "dm:" + [fromHandle, target].sorted().joined(separator: ":")
             let channel: Channel
             if let existing = try Channel.filter(Column("companyId") == companyId && Column("name") == channelName).fetchOne(db) {
+                let parties = Set([from.id, toMember])
+                let actual = Set(try String.fetchAll(db, sql: "SELECT member FROM channelMember WHERE channelId = ?",
+                                                     arguments: [existing.id]))
+                guard existing.kind == .dm, actual == parties else { throw RouterError.invalidChannel(channelName) }
                 channel = existing
             } else {
                 channel = try Store.insertChannel(db, companyId: companyId, name: channelName, kind: .dm,

@@ -166,3 +166,24 @@ private struct World {
     let g = try #require(try w.store.channel(companyId: companyId, name: "general"))
     #expect(try w.store.messages(channelId: g.id, limit: 1000).count == 400)
 }
+
+@Test func sendDMCannotReuseNonDMOrWrongMemberChannel() throws {
+    let w = try World()
+    // A squatted non-DM channel occupying the DM name must not be reused.
+    try w.store.writer.write { db in
+        try Store.insertChannel(db, companyId: w.company.id, name: "dm:cto:owner", kind: .channel,
+                                members: [w.eng.id], now: Date())
+    }
+    #expect(throws: RouterError.invalidChannel("dm:cto:owner")) {
+        try w.router.sendDM(companyId: w.company.id, from: .agent(w.cto.id), to: "owner", text: "secret")
+    }
+    // A DM-kind channel with an extra member is also rejected.
+    try w.store.writer.write { db in
+        try Store.insertChannel(db, companyId: w.company.id, name: "dm:ceo:cto", kind: .dm,
+                                members: [w.ceo.id, w.cto.id, w.eng.id], now: Date())
+    }
+    #expect(throws: RouterError.invalidChannel("dm:ceo:cto")) {
+        try w.router.sendDM(companyId: w.company.id, from: .agent(w.ceo.id), to: "cto", text: "x")
+    }
+    #expect(try w.pending(w.eng) == 0)
+}

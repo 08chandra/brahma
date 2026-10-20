@@ -15,9 +15,17 @@ public struct CompanyTools: Sendable {
     let store: Store
     let companyId: String
     let agentId: String
+    /// Receives diagnostics (stderr by default); stdout is reserved for JSON-RPC.
+    let diagnostics: @Sendable (String) -> Void
 
     public init(store: Store, companyId: String, agentId: String) {
-        self.store = store; self.companyId = companyId; self.agentId = agentId
+        self.init(store: store, companyId: companyId, agentId: agentId, diagnostics: { line in
+            FileHandle.standardError.write(Data((line + "\n").utf8))
+        })
+    }
+
+    init(store: Store, companyId: String, agentId: String, diagnostics: @escaping @Sendable (String) -> Void) {
+        self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
     }
 
     private static func schema(_ properties: [String: JSONValue], required: [String]) -> JSONValue {
@@ -58,13 +66,21 @@ public struct CompanyTools: Sendable {
     /// Runs a tool and returns its text result. Appends one `toolUse` event whether it succeeds or fails.
     public func call(name: String, arguments: [String: JSONValue]) throws -> String {
         defer { logUse(name) }
+        // Validate the caller on every call: it may have been killed or removed since the server started.
+        guard let me = try? store.agent(id: agentId), me.companyId == companyId, me.state != .killed else {
+            throw ToolError(message: "this agent is not active in the company")
+        }
         return try dispatch(name, arguments)
     }
 
     private func logUse(_ tool: String) {
         let handle = (try? store.agent(id: agentId))??.name ?? agentId
-        try? store.appendEvent(ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .toolUse,
-                                             text: "@\(handle) \(tool)", createdAt: Store.now()))
+        do {
+            try store.appendEvent(ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .toolUse,
+                                                text: "@\(handle) \(tool)", createdAt: Store.now()))
+        } catch {
+            diagnostics("agentco mcp: failed to record toolUse event for @\(handle) \(tool): \(error)")
+        }
     }
 
     private func dispatch(_ name: String, _ args: [String: JSONValue]) throws -> String {
@@ -98,6 +114,8 @@ public struct CompanyTools: Sendable {
             throw e
         } catch let e as RouterError {
             throw ToolError(message: Self.describe(e))
+        } catch StoreError.invalidName {
+            throw ToolError(message: "invalid name: use letters, digits, '-' or '_' (max 64 chars)")
         } catch StoreError.duplicateName {
             throw ToolError(message: "a channel with that name already exists")
         } catch {
@@ -115,10 +133,16 @@ public struct CompanyTools: Sendable {
             throw ToolError(message: "you are not a member of #\(channel.name)")
         }
         let handles = Dictionary(try store.agents(companyId: companyId).map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
-        let lines = try store.messages(channelId: channel.id, limit: limit).map { m in
-            "@\(m.senderId == "owner" ? "owner" : handles[m.senderId] ?? m.senderId): \(m.text)"
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        // JSON-encoded so a message body cannot forge another entry or sender.
+        let entries: [JSONValue] = try store.messages(channelId: channel.id, limit: limit).map { m in
+            .object(["sender": .string("@" + (m.senderId == "owner" ? "owner" : handles[m.senderId] ?? m.senderId)),
+                     "text": .string(m.text), "at": .string(iso.string(from: m.createdAt))])
         }
-        return lines.isEmpty ? "No messages in #\(channel.name)." : lines.joined(separator: "\n")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return String(decoding: try encoder.encode(JSONValue.array(entries)), as: UTF8.self)
     }
 
     private func createChannel(name: String, members handles: [String]) throws -> String {
@@ -192,6 +216,7 @@ public struct CompanyTools: Sendable {
         case .unknownChannel(let c): "unknown channel: \(c)"
         case .unknownAgent(let a): "unknown agent: @\(a)"
         case .notAMember: "you are not a member of that channel"
+        case .invalidChannel(let c): "channel \(c) is not a direct message between the two parties"
         case .invalidSender: "invalid sender (you cannot message yourself, and killed agents cannot send)"
         }
     }
