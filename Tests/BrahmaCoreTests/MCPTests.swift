@@ -272,8 +272,12 @@ func endToEndBinary() throws {
     let dir = try tempDir()
     let dbPath = dir.appending(path: "t.sqlite").path
     let w = try MCPWorld(path: dbPath)
+    _ = try w.store.transition(agentId: w.ceo.id, to: .ready)
+    let (_, turn) = try #require(try w.store.beginTurn(agentId: w.ceo.id, now: Store.now()))
+    let token = try w.store.issueTurnCredential(turnId: turn.id)
     let p = Process()
     p.executableURL = bin
+    p.environment = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": token]
     p.arguments = ["mcp", "--db", dbPath, "--company", w.company.id, "--agent", w.ceo.id]
     let inPipe = Pipe(), outPipe = Pipe()
     p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = FileHandle.nullDevice

@@ -9,6 +9,8 @@ struct MCP: ParsableCommand {
     @Option(help: "Path to the SQLite database.") var db: String
     @Option(help: "Company id.") var company: String
     @Option(help: "Agent id.") var agent: String
+    @Option(help: "Credential kind the turn token was issued for.") var kind: String = "work"
+    @Option(help: "Item id the turn token is bound to (review turns).") var item: String?
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
@@ -16,9 +18,19 @@ struct MCP: ParsableCommand {
             FileHandle.standardError.write(Data("brahma mcp: --agent does not match this turn's agent\n".utf8))
             throw ExitCode.failure
         }
+        // Fail closed: the per-turn token (from the 0600 MCP config's env) must match an in-progress turn of
+        // exactly this company, agent, kind and item.
+        guard let token = ProcessInfo.processInfo.environment[MCPConfig.tokenVariable], !token.isEmpty else {
+            FileHandle.standardError.write(Data("brahma mcp: missing turn credential\n".utf8))
+            throw ExitCode.failure
+        }
         let packs = BrahmaPaths.fromEnvironment().packsDir
         let catalog = PackCatalog.loadOrBuiltin(directory: packs) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
         let store = try Store(path: db, catalog: catalog)
+        guard store.verifyTurnCredential(token: token, companyId: company, agentId: agent, kind: kind, itemId: item) else {
+            FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
+            throw ExitCode.failure
+        }
         guard let me = try store.agent(id: agent), me.companyId == company else {
             FileHandle.standardError.write(Data("brahma mcp: unknown agent \(agent) in company \(company)\n".utf8))
             throw ExitCode.failure

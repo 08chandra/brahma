@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import BrahmaCore
+@testable import BrahmaCore
 
 /// Runs the built `brahma` binary against a throwaway data home.
 private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = [:]) throws
@@ -17,6 +17,7 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
     p.environment = e
     let out = Pipe(), err = Pipe()
     p.standardOutput = out; p.standardError = err
+    p.standardInput = FileHandle.nullDevice
     try p.run()
     let o = out.fileHandleForReading.readDataToEndOfFile(), r = err.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
@@ -91,5 +92,96 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
                            home: home, env: ["BRAHMA_AGENT_ID": "a"])
         #expect(r.status == 1)
         #expect(r.stderr.contains("brahma mcp: --agent does not match this turn's agent"))
+    }
+
+    @Test func ownerCommandRefusedWithoutOwnerKey() throws {
+        let home = try tempDir()
+        // Read-only commands don't need the key; an owner-write command on a home without one is refused.
+        let r = try brahma(["kill", "Acme", "ceo"], home: home)
+        #expect(r.status == 1)
+        #expect(r.stderr.contains("brahma: owner key missing or unreadable ("))
+        #expect(r.stderr.contains("start Brahma once with 'brahma run' or the app"))
+        #expect(try brahma(["doctor"], home: home).stderr.contains("owner key missing or unreadable"))
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)   // creates the key
+        #expect(!(try brahma(["kill", "Acme", "ceo"], home: home).stderr.contains("owner key")))
+        let key = home.appending(path: "home/owner.key")
+        try FileManager.default.removeItem(at: key)
+        #expect(try brahma(["pause", "Acme", "ceo"], home: home).stderr.contains("owner key missing"))
+    }
+
+    @Test func ownerKeyCreatedWith0600() throws {
+        let home = try tempDir()
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let key = home.appending(path: "home/owner.key")
+        let attrs = try FileManager.default.attributesOfItem(atPath: key.path)
+        #expect((attrs[.posixPermissions] as? Int) == 0o600)
+        let text = try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(text.count == 64 && text.allSatisfy(\.isHexDigit))
+        let before = text
+        #expect(try brahma(["company", "create", "Two", "--goal", "g"], home: home).status == 0)
+        #expect(try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) == before)
+    }
+
+    // MARK: MCP turn credentials
+
+    private func seedTurn(_ home: URL) throws -> (paths: BrahmaPaths, company: Company, agent: Agent, turn: Turn, token: String, store: Store) {
+        let paths = BrahmaPaths(home: home.appending(path: "home"), workspaces: home.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+        let agent = try store.hire(companyId: company.id, name: "ceo", role: "ceo", model: "sonnet")
+        _ = try store.transition(agentId: agent.id, to: .ready)
+        let (running, turn) = try #require(try store.beginTurn(agentId: agent.id, now: Store.now()))
+        let token = try store.issueTurnCredential(turnId: turn.id)
+        return (paths, company, running, turn, token, store)
+    }
+
+    private func mcp(_ s: (paths: BrahmaPaths, company: Company, agent: Agent, turn: Turn, token: String, store: Store),
+                     home: URL, token: String?, agent: String? = nil, extra: [String] = []) throws -> (status: Int32, stdout: String, stderr: String) {
+        var env: [String: String] = [:]
+        if let token { env["BRAHMA_TURN_TOKEN"] = token }
+        return try brahma(["mcp", "--db", s.paths.database.path, "--company", s.company.id, "--agent", agent ?? s.agent.id] + extra,
+                          home: home, env: env)
+    }
+
+    @Test func mcpMissingTokenRefused() throws {
+        let home = try tempDir(); let s = try seedTurn(home)
+        let r = try mcp(s, home: home, token: nil)
+        #expect(r.status != 0); #expect(r.stderr.contains("brahma mcp: missing turn credential"))
+        #expect(try mcp(s, home: home, token: "deadbeef").status != 0)
+    }
+
+    @Test func mcpWrongAgentRefused() throws {
+        let home = try tempDir(); let s = try seedTurn(home)
+        let other = try s.store.hire(companyId: s.company.id, name: "cto", role: "cto", model: "sonnet")
+        let r = try mcp(s, home: home, token: s.token, agent: other.id)
+        #expect(r.status != 0); #expect(r.stderr.contains("brahma mcp: turn credential invalid or turn ended"))
+        // Wrong kind or item binding is refused too.
+        #expect(try mcp(s, home: home, token: s.token, extra: ["--kind", "review"]).status != 0)
+        #expect(try mcp(s, home: home, token: s.token, extra: ["--item", "i1"]).status != 0)
+    }
+
+    @Test func mcpEndedTurnRefused() throws {
+        let home = try tempDir(); let s = try seedTurn(home)
+        #expect(try s.store.finishTurn(id: s.turn.id, outcome: .succeeded, summary: nil, costUSD: nil))
+        let r = try mcp(s, home: home, token: s.token)
+        #expect(r.status != 0); #expect(r.stderr.contains("turn credential invalid or turn ended"))
+    }
+
+    @Test func mcpValidTokenAccepted() throws {
+        let home = try tempDir(); let s = try seedTurn(home)
+        let r = try mcp(s, home: home, token: s.token)
+        #expect(r.status == 0, "\(r.stderr)")
+        #expect(s.store.verifyTurnCredential(token: s.token, companyId: s.company.id, agentId: s.agent.id))
+        // Recovery closes the turn and the credential with it.
+        _ = try s.store.recoverInterruptedTurns()
+        #expect(!s.store.verifyTurnCredential(token: s.token, companyId: s.company.id, agentId: s.agent.id))
+    }
+
+    @Test func sha256StandardVectors() {
+        #expect(SHA256.hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        #expect(SHA256.hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        #expect(SHA256.hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+                == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
     }
 }

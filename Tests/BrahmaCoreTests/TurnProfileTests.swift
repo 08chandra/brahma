@@ -80,7 +80,9 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
     @Test func childEnvironmentIsAllowlisted() {
         let base = ["FAKE_SECRET_TOKEN": "x", "AWS_X": "x", "SSH_AUTH_SOCK": "/s", "RANDOM_VAR": "x", "MY_API_KEY": "x",
                     "PATH": "/bin", "HOME": "/h", "LANG": "en_US.UTF-8", "LC_ALL": "C", "BRAHMA_DEV": "1",
-                    "ANTHROPIC_API_KEY": "k", "CLAUDE_CODE_OAUTH_TOKEN": "t"]
+                    "ANTHROPIC_API_KEY": "k", "CLAUDE_CODE_OAUTH_TOKEN": "t",
+                    "HTTPS_PROXY": "http://p:3128", "no_proxy": "localhost", "SSL_CERT_FILE": "/c.pem",
+                    "NODE_EXTRA_CA_CERTS": "/ca.pem", "CLAUDE_CONFIG_DIR": "/cfg", "PROXY_API_KEY": "x"]
         let env = ChildEnvironment.make(base: base, extra: ["BRAHMA_AGENT_ID": "a1", "BRAHMA_DEV": "1", "OTHER": "no"],
                                         purpose: .claude)
         for name in ["FAKE_SECRET_TOKEN", "AWS_X", "SSH_AUTH_SOCK", "RANDOM_VAR", "MY_API_KEY", "BRAHMA_DEV", "OTHER"] {
@@ -89,6 +91,10 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
         #expect(env["PATH"] == "/bin"); #expect(env["HOME"] == "/h"); #expect(env["LANG"] == "en_US.UTF-8")
         #expect(env["LC_ALL"] == "C"); #expect(env["BRAHMA_AGENT_ID"] == "a1")
         #expect(env["ANTHROPIC_API_KEY"] == "k"); #expect(env["CLAUDE_CODE_OAUTH_TOKEN"] == "t")
+        for (name, value) in ["HTTPS_PROXY": "http://p:3128", "no_proxy": "localhost", "SSL_CERT_FILE": "/c.pem",
+                              "NODE_EXTRA_CA_CERTS": "/ca.pem", "CLAUDE_CONFIG_DIR": "/cfg"] {
+            #expect(env[name] == value, "\(name) missing")
+        }
         let other = ChildEnvironment.make(base: base, extra: [:], purpose: .general)
         #expect(other["ANTHROPIC_API_KEY"] == nil); #expect(other["CLAUDE_CODE_OAUTH_TOKEN"] == nil)
     }

@@ -55,9 +55,16 @@ func clock(_ date: Date, seconds: Bool = false) -> String {
     return f.string(from: date)
 }
 
-/// Owner-write commands must not run from an agent's shell (the engine sets BRAHMA_AGENT_ID for every turn).
-func requireOwnerShell() throws {
+/// Owner-write commands must not run from an agent's shell: the engine sets BRAHMA_AGENT_ID for every turn, and
+/// `<home>/owner.key` must exist and be readable (default deny). `createKey` is for the commands that may start a
+/// fresh home (`brahma run`, `brahma company create`); the app creates it at launch. Defense in depth, not a sandbox.
+func requireOwnerShell(createKey: Bool = false) throws {
     if ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] != nil {
         throw fail("owner commands can't run inside an agent turn")
+    }
+    let paths = BrahmaPaths.fromEnvironment()
+    if createKey { _ = try? OwnerKey.ensure(paths: paths) }
+    guard OwnerKey.isReadable(paths: paths) else {
+        throw fail("owner key missing or unreadable (\(OwnerKey.url(paths: paths).path)); start Brahma once with 'brahma run' or the app")
     }
 }

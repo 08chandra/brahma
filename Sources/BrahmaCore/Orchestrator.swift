@@ -179,12 +179,13 @@ public actor Orchestrator {
             sent.model = ModelPolicy.resolve(
                 agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
                 mode: company.usageMode, context: ModelContext())
+            let turnToken = try store.issueTurnCredential(turnId: turn.id)
             let request = TurnRequest(
                 agent: sent, company: company,
                 prompt: InboxDigest.render(agent: agent, company: company, items: items, handles: handles,
                                             unread: Store.channelCounts(quiet)),
                 appendSystemPrompt: RolePrompt.render(agent: agent, company: company),
-                mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent),
+                mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken),
                 workingDirectory: company.workspacePath, profile: profile,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])

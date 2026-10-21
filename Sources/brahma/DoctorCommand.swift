@@ -8,6 +8,7 @@ struct Doctor: AsyncParsableCommand {
         abstract: "Check the installed Claude Code CLI with real probe turns (uses a little of your plan).")
 
     func run() async throws {
+        try requireOwnerShell()
         signal(SIGPIPE, SIG_IGN)
         let (store, _) = try openStore()
         let report = await BrahmaCore.Doctor.run(claudePath: "claude", runner: ClaudeProcessRunner())

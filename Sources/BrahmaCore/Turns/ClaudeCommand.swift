@@ -45,12 +45,16 @@ public enum ClaudeCommand {
 }
 
 public enum MCPConfig {
-    /// Writes `<runDir>/<agentId>.mcp.json` (mode 0600, atomic) and returns its path.
-    public static func write(paths: BrahmaPaths, executable: String, agent: Agent) throws -> String {
+    public static let tokenVariable = "BRAHMA_TURN_TOKEN"
+
+    /// Writes `<runDir>/<agentId>.mcp.json` (mode 0600, atomic) and returns its path. The per-turn token travels
+    /// in the server's `env` entry, so it is neither in argv nor in the agent's own process environment.
+    public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String) throws -> String {
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true)
         let config: [String: Any] = ["mcpServers": ["company": [
             "command": executable,
             "args": ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id],
+            "env": [tokenVariable: turnToken],
         ] as [String: Any]]]
         let data = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
         let url = paths.runDir.appending(path: "\(agent.id).mcp.json")

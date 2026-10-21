@@ -94,3 +94,9 @@ an agent turn; as above, neither is tamper-proof until the sandbox lands.
 
 `brahma doctor` checks the installed Claude Code CLI (version, required flags, a real haiku probe turn, and that
 `--resume` keeps the role prompt). `brahma run` and the app require a passing probe, reused for 24 h per CLI version.
+
+**Owner key and MCP turn tokens.** `<data home>/owner.key` (mode 0600, created by the app, `brahma run` or
+`brahma company create`) must exist for owner-write CLI commands to run, and each turn's `brahma mcp` only starts with
+a per-turn token (only its SHA-256 is stored) that is valid while that turn is in progress. Both are defense in depth:
+full protection arrives with 5-lite's sandbox, which read-denies the data home to agents so they can't read
+`owner.key` or the per-turn MCP configs.

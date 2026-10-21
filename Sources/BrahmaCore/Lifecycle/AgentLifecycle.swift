@@ -79,6 +79,7 @@ extension Store {
         guard turn.outcome == .inProgress else { return false }
         turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.endedAt = now
         try turn.update(db)
+        try db.execute(sql: "DELETE FROM turnCredential WHERE turnId = ?", arguments: [id])
         return true
     }
 
@@ -101,6 +102,8 @@ extension Store {
         try writer.write { db in
             try db.execute(sql: "UPDATE turn SET outcome = ?, endedAt = ? WHERE outcome = ?",
                            arguments: [TurnOutcome.interrupted.rawValue, now, TurnOutcome.inProgress.rawValue])
+            try db.execute(sql: "DELETE FROM turnCredential WHERE turnId IN (SELECT id FROM turn WHERE outcome <> ?)",
+                           arguments: [TurnOutcome.inProgress.rawValue])
             let running = try Agent.filter(Column("state") == AgentState.running.rawValue).fetchAll(db)
             for var agent in running {
                 agent.state = .ready; agent.blocker = nil; agent.readySince = now

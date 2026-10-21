@@ -57,13 +57,15 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
     @Test func mcpConfigWritesExactJSON() throws {
         let home = try tempDir()
         let paths = BrahmaPaths(home: home, workspaces: home)
-        let path = try MCPConfig.write(paths: paths, executable: "/usr/bin/brahma", agent: makeAgent(started: false))
+        let path = try MCPConfig.write(paths: paths, executable: "/usr/bin/brahma", agent: makeAgent(started: false),
+                                    turnToken: "tok123")
         #expect(path == paths.runDir.appending(path: "a1.mcp.json").path)
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         let obj = try JSONSerialization.jsonObject(with: data) as? NSDictionary
         let expected: NSDictionary = ["mcpServers": ["company": [
             "command": "/usr/bin/brahma",
             "args": ["mcp", "--db", paths.database.path, "--company", "c1", "--agent", "a1"],
+            "env": ["BRAHMA_TURN_TOKEN": "tok123"] as NSDictionary,
         ] as NSDictionary] as NSDictionary]
         #expect(obj == expected)
         let attrs = try FileManager.default.attributesOfItem(atPath: path)

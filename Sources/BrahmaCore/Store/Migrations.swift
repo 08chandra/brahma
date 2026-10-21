@@ -150,6 +150,18 @@ enum Migrations {
                 t.column("checkedAt", .datetime).notNull()
             }
         }
+        m.registerMigration("v3-mcp-auth") { db in
+            try db.create(table: "turnCredential") { t in
+                t.primaryKey("turnId", .text).references("turn", onDelete: .cascade)
+                t.column("companyId", .text).notNull()
+                t.column("agentId", .text).notNull()
+                t.column("kind", .text).notNull().defaults(to: "work")
+                t.column("itemId", .text)
+                t.column("tokenHash", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "turnCredential_hash", on: "turnCredential", columns: ["tokenHash"])
+        }
         return m
     }
 }

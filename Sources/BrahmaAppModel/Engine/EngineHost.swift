@@ -74,6 +74,8 @@ public final class EngineHost {
     public func start(tools: Result<EngineTools, EngineSetupError>) async {
         guard status != .embedded else { return }
         rememberedTools = tools
+        // Owner CLI commands are default-deny without the owner key; it must predate every agent.
+        try? OwnerKey.ensure(paths: paths)
         let resolved: EngineTools
         switch tools {
         case .failure(let error):

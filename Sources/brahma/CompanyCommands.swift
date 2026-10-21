@@ -15,7 +15,7 @@ struct CompanyGroup: ParsableCommand {
         @Flag(help: "Print the org that would be created and change nothing.") var dryRun = false
 
         func run() throws {
-            try requireOwnerShell()
+            try requireOwnerShell(createKey: true)
             guard agents == 0 || OrgGenerator.range.contains(agents) else {
                 throw fail("--agents must be 0 or between \(OrgGenerator.range.lowerBound) and \(OrgGenerator.range.upperBound)")
             }

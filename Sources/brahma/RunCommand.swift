@@ -20,7 +20,7 @@ struct Run: AsyncParsableCommand {
     }
 
     func run() async throws {
-        try requireOwnerShell()
+        try requireOwnerShell(createKey: true)
         // A child or MCP pipe closing under us must surface as EPIPE, not kill the orchestrator.
         signal(SIGPIPE, SIG_IGN)
         let (store, paths) = try openStore()
