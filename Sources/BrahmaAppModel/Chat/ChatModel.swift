@@ -25,6 +25,8 @@ public final class ChatModel {
     public private(set) var hasEarlier = false
     public private(set) var sendError: String?
     public var draft = ""
+    /// True while a send is in flight; a second Return in that window is ignored instead of posting twice.
+    public private(set) var isSending = false
 
     @ObservationIgnored private let store: Store
     @ObservationIgnored private let companyId: String
@@ -197,11 +199,15 @@ public final class ChatModel {
 
     @discardableResult
     public func send() async -> Bool {
-        guard readOnlyReason == nil else { return false }
+        guard readOnlyReason == nil, !isSending else { return false }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
         let (store, companyId, target) = (self.store, self.companyId, self.target)
         let channelName = channel?.name
+        // Before the first load a channel target has no name yet: nothing to post to, and nothing gone either.
+        if case .channel = target, channelName == nil { return false }
+        isSending = true
+        defer { isSending = false }
         do {
             try await Task.detached {
                 let router = MessageRouter(store: store)
@@ -217,7 +223,8 @@ public final class ChatModel {
             sendError = Self.describe(error)
             return false
         }
-        draft = ""
+        // Keep anything typed while the send was in flight.
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
         sendError = nil
         await refresh()
         await markRead()

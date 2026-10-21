@@ -17,6 +17,12 @@ enum Harness {
         exit(1)
     }
 
+    static func snapshotFail(_ reason: String) -> Never {
+        print("SNAPSHOT FAIL \(reason)")
+        fflush(stdout)
+        exit(1)
+    }
+
     private static func mainWindows() -> [NSWindow] {
         NSApp.windows.filter { ($0.identifier?.rawValue ?? "").hasPrefix("main") && $0.isVisible }
     }
@@ -33,11 +39,7 @@ enum Harness {
     private static func run(options: LaunchOptions, model: AppModel) async {
         let snapshotMode = options.snapshotPath != nil
         guard await waitReady(model: model) else {
-            if snapshotMode {
-                print("SNAPSHOT FAIL window not ready")
-                fflush(stdout)
-                exit(1)
-            }
+            if snapshotMode { snapshotFail("window not ready") }
             finishFail("not ready: loaded=\(model.loaded) windows=\(mainWindows().count)")
         }
         if let path = options.snapshotPath {
@@ -79,11 +81,7 @@ enum Harness {
     }
 
     private static func snapshot(path: String, options: LaunchOptions, model: AppModel) async {
-        func fail(_ reason: String) -> Never {
-            print("SNAPSHOT FAIL \(reason)")
-            fflush(stdout)
-            exit(1)
-        }
+        func fail(_ reason: String) -> Never { snapshotFail(reason) }
         guard let window = mainWindows().first else { fail("no window") }
         if let target = options.select { model.apply(target) }
         window.setContentSize(NSSize(width: 1280, height: 800))

@@ -55,7 +55,9 @@ import Foundation
         #expect(ContinuousClock.now - start < .seconds(3))
     }
 
-    @Test func realZshReturnsPath() {
+    /// Depends on the owner's real login shell and dotfiles, so it is opt-in: BRAHMA_REAL_SHELL_TESTS=1.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_REAL_SHELL_TESTS"] == "1"))
+    func realZshReturnsPath() {
         #expect(ToolLocator.loginShellPath(shell: "/bin/zsh")?.contains("/usr/bin") == true)
     }
 }

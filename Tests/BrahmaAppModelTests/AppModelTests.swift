@@ -158,4 +158,19 @@ import BrahmaCore
         let dmChannel = try #require(try w.store.channel(companyId: w.acme.id, name: "dm:ceo:cto"))
         #expect(sb.agentConversations.first?.item == .channel(id: dmChannel.id))
     }
+
+    @Test func persistentDBErrorAlertsOncePerStreak() async throws {
+        struct Broken: Error {}
+        let w = try world()
+        w.model.report(Broken())
+        let first = try #require(w.model.errorMessage)
+        #expect(first.hasPrefix("Couldn't read the Brahma database"))
+        w.model.errorMessage = nil  // the owner dismisses the alert
+        w.model.report(Broken())    // the next 500 ms tick fails the same way
+        #expect(w.model.errorMessage == nil)
+        await w.model.tick()        // a successful read ends the streak
+        #expect(w.model.errorMessage == nil)
+        w.model.report(Broken())
+        #expect(w.model.errorMessage == first)
+    }
 }

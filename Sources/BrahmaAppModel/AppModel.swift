@@ -30,6 +30,8 @@ public final class AppModel {
     @ObservationIgnored private var cursor: Int64 = 0
     @ObservationIgnored private var ticksSinceSnapshot = 0
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    /// The DB-read error of the current failure streak; an identical one is not re-raised every tick.
+    @ObservationIgnored private var lastDBError: String?
 
     private static let activityCap = 500
 
@@ -121,6 +123,7 @@ public final class AppModel {
             if forceSnapshot || !events.isEmpty || ticksSinceSnapshot >= 4 {
                 try await refreshSnapshot()
             }
+            lastDBError = nil
         } catch {
             report(error)
         }
@@ -269,7 +272,11 @@ public final class AppModel {
         ticksSinceSnapshot = 0
     }
 
-    private func report(_ error: Error) {
-        errorMessage = "Couldn't read the Brahma database: \(error)"
+    func report(_ error: Error) {
+        let message = "Couldn't read the Brahma database: \(error)"
+        // A persistent failure would otherwise re-raise the alert every 500 ms after the owner dismissed it.
+        guard message != lastDBError else { return }
+        lastDBError = message
+        errorMessage = message
     }
 }

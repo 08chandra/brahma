@@ -41,6 +41,43 @@ import BrahmaCore
         #expect(chat.sendError == nil)
     }
 
+    @Test func concurrentSendsPostOnce() async throws {
+        let w = try world()
+        let chat = ChatModel(store: w.store, companyId: w.acme.id, target: .channel(id: w.general.id))
+        await chat.refresh()
+        chat.draft = "@ceo once"
+        async let first = chat.send()
+        async let second = chat.send()
+        let results = await [first, second]
+        #expect(results.filter { $0 }.count == 1)
+        #expect(try w.store.messages(channelId: w.general.id, limit: 10).count == 1)
+        #expect(try w.store.pendingInbox(agentId: w.ceo.id).count == 1)
+        #expect(chat.draft == "")
+    }
+
+    @Test func textTypedDuringSendIsKept() async throws {
+        let w = try world()
+        let chat = ChatModel(store: w.store, companyId: w.acme.id, target: .channel(id: w.general.id))
+        await chat.refresh()
+        chat.draft = "first"
+        let sending = Task { await chat.send() }
+        await Task.yield()
+        chat.draft = "second"
+        #expect(await sending.value)
+        #expect(chat.draft == "second")
+        #expect(try w.store.messages(channelId: w.general.id, limit: 10).map(\.text) == ["first"])
+    }
+
+    @Test func sendBeforeLoadDoesNothing() async throws {
+        let w = try world()
+        let chat = ChatModel(store: w.store, companyId: w.acme.id, target: .channel(id: w.general.id))
+        chat.draft = "too early"
+        #expect(await chat.send() == false)
+        #expect(chat.sendError == nil)
+        #expect(chat.draft == "too early")
+        #expect(try w.store.messages(channelId: w.general.id, limit: 10).isEmpty)
+    }
+
     @Test func blankDraftDoesNothing() async throws {
         let w = try world()
         let chat = ChatModel(store: w.store, companyId: w.acme.id, target: .channel(id: w.general.id))

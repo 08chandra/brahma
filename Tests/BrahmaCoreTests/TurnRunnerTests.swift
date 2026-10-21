@@ -124,16 +124,25 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
         turn.cancel()
         await turn.value
         let start = ContinuousClock.now
-        let cpuStart = clock()
-        let waiter = Task { await runner.waitForChildren() }
+        let polls = PollCounter()
+        let waiter = Task { await runner.waitForChildren(pollInterval: .milliseconds(20)) { polls.increment() } }
         waiter.cancel()
         await waiter.value
+        let elapsed = ContinuousClock.now - start
         // The child ignores SIGTERM until its sleep ends or the 5 s kill grace; an early return would not wait.
-        #expect(ContinuousClock.now - start > .milliseconds(300))
-        // A busy-spinning waiter would burn about as much CPU as the wall time it waited.
-        #expect(Double(clock() - cpuStart) / Double(CLOCKS_PER_SEC) < 0.25)
+        #expect(elapsed > .milliseconds(300))
+        // A busy-spinning waiter would poll thousands of times; a sleeping one about once per 20 ms.
+        // Structural, not CPU time: clock() measures the whole test process, which runs suites in parallel.
+        #expect(polls.value <= Int(elapsed / .milliseconds(20)) * 2 + 5)
         let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(kill(pid, 0) == -1)
     }
+}
+
+private final class PollCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
 }

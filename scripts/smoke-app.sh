@@ -84,4 +84,33 @@ echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case D exit $STATUS"
 echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
 
+# (E) A second SIGTERM while the first quit is stopping the engine must not skip the bounded stop.
+"$CLI" say Acme @ceo "Status update, please." >/dev/null
+FAKE_CLAUDE_SLEEP=60 FAKE_CLAUDE_PIDFILE="$TMP/turn-e.pid" $APP --smoke-test --smoke-hold=120 >"$TMP/app-e.out" 2>&1 &
+APP_PID=$!
+for _ in $(seq 1 100); do
+  "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running' && break
+  sleep 0.2
+done
+RUNNING="$("$CLI" status | grep -Eo '^  @[a-z0-9_-]+  running' | head -1 | awk '{print $1}')"
+[ -n "$RUNNING" ] || fail "case E: no turn in flight"
+kill -TERM "$APP_PID"
+sleep 0.1
+kill -TERM "$APP_PID" 2>/dev/null || true
+START=$(date +%s)
+while kill -0 "$APP_PID" 2>/dev/null; do
+  [ $(( $(date +%s) - START )) -le 15 ] || fail "case E: app still running 15 s after SIGTERM"
+  sleep 0.2
+done
+wait "$APP_PID" || true
+APP_PID=""
+# The bounded stop waits for the turn's process; an early exit would leave the fake claude still lingering.
+[ -s "$TMP/turn-e.pid" ] || fail "case E: fake turn recorded no pid"
+while read -r pid; do
+  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fail "case E: app exited with claude child $pid alive"; fi
+done <"$TMP/turn-e.pid"
+if "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running'; then fail "case E: agents still running after quit"; fi
+"$CLI" status | grep -Eq "^  $RUNNING  .*last turn: interrupted" || fail "case E: $RUNNING's turn not recorded interrupted"
+echo "SMOKE OK case=E double-sigterm exited=$(( $(date +%s) - START ))s agent=$RUNNING turn=interrupted"
+
 echo "SMOKE PASSED"

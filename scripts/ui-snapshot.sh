@@ -1,6 +1,8 @@
 #!/bin/bash
 # Usage: scripts/ui-snapshot.sh <name> [select]. Assumes .build/Brahma.app exists.
-# If BRAHMA_HOME is already set by the caller, that home (and its BRAHMA_WORKSPACES) is used as is.
+# Always uses a fresh seeded temp home, because it runs the engine with the FAKE claude. Set
+# BRAHMA_SNAPSHOT_REUSE_HOME=1 to use the caller's BRAHMA_HOME (and BRAHMA_WORKSPACES) instead; the default
+# data home is always refused.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,7 +14,17 @@ rm -f "$OUT"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-if [ -z "${BRAHMA_HOME:-}" ]; then
+DEFAULT_HOME="$HOME/Library/Application Support/Brahma"
+if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; then
+  RESOLVED="$BRAHMA_HOME"
+  if [ -d "$BRAHMA_HOME" ]; then RESOLVED="$(cd "$BRAHMA_HOME" && pwd -P)"; fi
+  REAL_DEFAULT="$DEFAULT_HOME"
+  if [ -d "$DEFAULT_HOME" ]; then REAL_DEFAULT="$(cd "$DEFAULT_HOME" && pwd -P)"; fi
+  if [ "${BRAHMA_HOME%/}" = "$DEFAULT_HOME" ] || [ "$RESOLVED" = "$REAL_DEFAULT" ]; then
+    echo "ui-snapshot.sh: refusing to run the fake engine against the real data home: $DEFAULT_HOME" >&2
+    exit 1
+  fi
+else
   export BRAHMA_HOME="$TMP/home"
   export BRAHMA_WORKSPACES="$TMP/workspaces"
   mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"

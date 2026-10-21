@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// SwiftUI wraps the adaptor, so `NSApp.delegate` is not this object; the harness reaches it here.
     static private(set) weak var current: AppDelegate?
     private var signalSources: [DispatchSourceSignal] = []
+    /// Set once the bounded engine stop has begun; later quit requests wait on it instead of exiting early.
+    private(set) var quitting = false
 
     override init() {
         options = LaunchOptions.parse(CommandLine.arguments)
@@ -85,7 +87,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Harness.runIfRequested(options: options, model: model)
             }
         case .failure(let error):
-            if options.smokeTest {
+            if options.snapshotPath != nil {
+                Harness.snapshotFail("store \(error.message)")
+            } else if options.smokeTest {
                 Harness.finishFail("store \(error.message)")
             }
         }
@@ -112,17 +116,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// from a main-queue block (a dispatch signal handler, a main-actor task) it would starve the very main-actor
     /// task that stops the engine and replies, so it is issued from a run-loop source instead.
     nonisolated static func requestQuit() {
-        RunLoop.main.perform(inModes: [.common]) { MainActor.assumeIsolated { NSApp.terminate(nil) } }
+        RunLoop.main.perform(inModes: [.common]) {
+            MainActor.assumeIsolated {
+                // A second ⌘Q / menu Quit / SIGTERM while the engine is stopping changes nothing.
+                if AppDelegate.current?.quitting == true { return }
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     /// Quit pauses the engine: in-flight turns are interrupted (their agents return to ready) and the
     /// next launch resumes them. Company status is never written.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Re-entered (e.g. the app menu's ⌘Q) while the stop runs: the pending reply below completes the quit.
+        if quitting { return .terminateLater }
         guard case .success(let model) = boot else { return .terminateNow }
         model.stopPolling()
         guard let engine = model.engine, engine.status == .embedded || engine.status == .starting else {
             return .terminateNow
         }
+        quitting = true
         Task { @MainActor in
             await engine.stop(timeout: .seconds(15))
             sender.reply(toApplicationShouldTerminate: true)
