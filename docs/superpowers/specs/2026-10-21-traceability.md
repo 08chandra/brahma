@@ -2,7 +2,8 @@
 
 Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of v2).
 
-**Plans:** P1, P2 (built, merged) · 3a (building in worktree `plan3a-work`; T1 committed) · 5L, 4a, 4b (written) · 3b (written, shelved/deferred) · L, ML, M, G, 4c, 7, 11, 9, 8, 10 (in the build order, not yet written).
+**Plans:** P1, P2 (built, merged) · 3a (building in worktree `plan3a-work`; T1–T4 committed) · 5L, L, 4a, 4b (written) · 3b (written, shelved/deferred) · ML (lean), Ops, M, G, ML-2, 4c, 7, 11, 9, 8, 10 (in the build order, not yet written). Order and contracts: `../plans/2026-10-21-master-roadmap.md`.
+**Updated 2026-10-21 (chief review):** owner 18:16 homes for the five unplanned items (R-067 → L, R-161 → 5L T7b, R-205 → ML, R-238 → 5L T7c, R-285 → 4a T6), Ops plan after the dogfood week (R-288–R-292), lean Memory-lite with push and reflection deferred to ML-2 (R-208, R-212, R-219, R-221, R-225), artifact preview kept in 4a (R-184, R-192), 4a task renumbering (R-189–R-191, R-241).
 **Status:** `built` · `building` (3a) · `planned` (written plan, not started) · `to-write` (plan in the order, unwritten) · `deferred` (owner deferred) · **`UNPLANNED`** (no plan in the order carries it).
 **Task refs:** `3a T7` = Plan 3a Task 7; `5L T10`; `4a T2`; `L←4a T3` = moves from 4a Task 3 into Plan L.
 
@@ -11,14 +12,14 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-001 | Native macOS SwiftUI app plus `brahma` CLI | 1.1 | P1 T9, P2 T3 | built |
 | R-002 | Agents are headless Claude Code sessions on the owner's subscription | 1.1 | P1 T6–T8 | built |
 | R-003 | Owner can step in at any level (channel, DM, item edit) | 1.1 | P2 T5 (chat/DM); 3a T15–T16a (item edit) | built / building |
-| R-004 | End-to-end demo: goal → live URL → first launch post | 1.2 | L (all tasks) | to-write |
+| R-004 | End-to-end demo: goal → live URL → first launch post | 1.2 | L (T14 live test goal → live URL; first post via T9 launch-post human task) | planned |
 | R-005 | Owner-facing concept budget of five nouns; internals under Insights | 1.3 | 3a T15–T16a; all UI plans | building |
 | R-006 | Non-goal: no automation outside official APIs; browser only on owner accounts + product under test | 1.5 | 11 | to-write |
 | R-007 | No secret in chat, logs, DB, engine-stored transcripts, commits | 1.6 | 5L T4, T13 | planned |
 | R-008 | No money spent / payment details to agents without owner action | 1.6 | 3a T11a (reserved floor); 11 | building / to-write |
 | R-009 | Owner reserve: Brahma never consumes the owner's own share (default 30%) | 1.6, 4.2.3 | 3a T5 | building |
 | R-010 | Plan tier Max 5x default; `planTier` setting max5x/max20x | 1.7, 4.2.2 | 3a T5 | building |
-| R-011 | Verify ToS/subscription/remote-login/distribution/AI-disclosure items before scaling | 1.7 | — (owner checklist) | **UNPLANNED** |
+| R-011 | Verify ToS/subscription/remote-login/distribution/AI-disclosure items before scaling | 1.7 | Dogfood week entry checklist (owner, not code); re-verified at the Plan 8 gate | to-write |
 | R-012 | Brahma naming and data/workspace paths, env vars | 3.3 | P1 T1, P2 | built |
 | R-013 | DB-as-bus: one shared WAL SQLite; MCP server = `brahma mcp` writing the DB | 3.1 | P1 T1, T7 | built |
 | R-014 | One engine per data home (`OrchestratorLock`); app live client + auto-takeover | 3.1 | P2 T4 | built |
@@ -37,7 +38,7 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-027 | Global scheduler; caps and usage gate account-wide | 4.2.1 | P1 T5 | built |
 | R-028 | Multiple companies; weighted round-robin; per-company weight | 4.2.1 | P1 T5; P2 rail | built |
 | R-029 | Priority: critical path > role weight > sprint priority > wait | 4.2.1 | P1 T5 (role/wait); 3a T5/T7 (blockingCount) | built / building |
-| R-030 | Admission refuses under memory pressure; checks/previews counted in safety cap | 4.2.1 | 3a T5; L/4a (previews) | building |
+| R-030 | Admission refuses under memory pressure; checks/previews counted in safety cap | 4.2.1 | 3a T5; L T3 (previews counted); 4a T4 | building |
 | R-031 | Sleep prevention while agents run (`caffeinate`) | 4.2.1 | 5L T7 | planned |
 | R-032 | Usage modes Low/Balanced/Max per company; default Balanced | 4.2.2 | P1 T5; 3a T2 (default) | built / building |
 | R-033 | Mode caps by planTier (1/3/8; 2/6/16) bounded by safety cap | 4.2.2 | 3a T5 | building |
@@ -74,7 +75,7 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-064 | `brahma mcp` refuses foreign `--agent`; owner CLI refuses inside a turn | 4.4, 4.7.2 | 3a T4; 5L T3 | building |
 | R-065 | Company create: goal, size default 6 (5–500), pack, resources; >50 experimental | 4.5.1 | 3a T2, T16a | building |
 | R-066 | Org preview and edit before start and any time | 4.5.1 | 3a T2, T15–T16a | building |
-| R-067 | Start from an existing repo (clone, never commit to original) | 4.5.1 | — | **UNPLANNED** |
+| R-067 | Start from an existing repo (clone, never commit to original) | 4.5.1 | L (existing-repo import; owner 2026-10-21 18:16; planL-4a-notes L1) | to-write |
 | R-068 | New companies: comms, funds, browser, connectors off by default | 4.5.1 | 7, 11 | to-write |
 | R-069 | Org generation from pack ratios, ≤ 7 reports, ≤ 6 engineers/team, directors, merged small mode | 4.5.2 | 3a T2 | building |
 | R-070 | Seats from backlog width and budget; vacancies; trigger-staffed roles | 4.5.2 | 3a T2 | building |
@@ -128,9 +129,9 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-118 | Engine merge into main (ff or rebase + re-check); root-on-main guard | 4.6.7 | 3a T9b | building |
 | R-119 | Done = merged; containers roll up | 4.6.7 | 3a T9b | building |
 | R-120 | Batched merge queue with bisect, main check, journaled idempotent steps | 4.6.7 | 4a T1, T2 | planned |
-| R-121 | `refs/brahma/main-backup` guard; outside writes restored and kept as branch | 4.6.7 | L←4a T3 | to-write |
-| R-122 | Main smoke check after merges; red main blocks release and opens P1 bug | 4.6.7 | L←4a T3 | to-write |
-| R-123 | Release records; rollback command required on deploy asks | 4.6.7 | L←4a T3 | to-write |
+| R-121 | `refs/brahma/main-backup` guard; outside writes restored and kept as branch | 4.6.7 | L T7 (backup ref before deploy); 4a T3 (main guard, foreign refs, adopt-main) | planned |
+| R-122 | Main smoke check after merges; red main blocks release and opens P1 bug | 4.6.7 | L T5 | planned |
+| R-123 | Release records; rollback command required on deploy asks | 4.6.7 | L T6–T8 | planned |
 | R-124 | Tier budgets (turns/tokens/$LE); over budget → blocked, lead-only resume | 4.6.8 | 3a T14 | building |
 | R-125 | Watchdog: no-progress, loops, 3 failed checks, escalation to non-killed ancestor | 4.6.8 | 3a T14 | building |
 | R-126 | Outcome facts only (no scores); `brahma perf facts` | 4.6.8 | 3a T14 | building |
@@ -168,7 +169,7 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-158 | macOS notification for pending owner asks | 4.7.6 | 3a T16a; 5L T7 | building |
 | R-159 | Quiet hours, batching, ask quota (3/agent), engine-set urgency, menu badge | 4.7.6 | 5L T7 | planned |
 | R-160 | Daily digest (plain code) | 4.7.6 | 5L T8 | planned |
-| R-161 | iMessage and email notifications (or a push service) | 4.7.6 | — | **UNPLANNED** |
+| R-161 | iMessage and email notifications (or a push service) | 4.7.6 | 5L T7b (push via ntfy or Pushover; owner 2026-10-21 18:16) | planned |
 | R-162 | Sandboxed profile default; Workspace and Full selectable; Full warning badge | 4.8.1 | 5L T1–T3, T11 | planned |
 | R-163 | README states Workspace is not a sandbox until 5L | 4.8.1 | 3a T16b | building |
 | R-164 | Profile change is reserved; applies next turn | 4.8.1 | 3a T11a (floor); 5L T11 | building / planned |
@@ -190,16 +191,16 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-180 | Redaction at every write path and display; transcript redaction | 4.8.5 | 5L T4, T13 | planned |
 | R-181 | Known-value leak scan at submit, enqueue and merge | 4.8.5 | 5L T4 | planned |
 | R-182 | Sign-in asks completed by owner; one per connector | 4.8.5 | 11 | to-write |
-| R-183 | Web preview from main (port allocation, WKWebView, rebuild on merge, sandboxed) | 4.9 | L←4a T4, T5 | to-write |
-| R-184 | Artifact preview (MD, HTML, images, PDF, MP4/MOV 9:16) and `publish_artifact` | 4.9 | L←4a T7 | to-write |
-| R-185 | `deploy` ask running one hosting CLI with engine-held token, smoke check, rollback | 4.9 | L | to-write |
-| R-186 | `humanTask` asks with checklist, prefilled links, paste-back to Keychain | 4.9, 4.10.5 | L | to-write |
-| R-187 | SaaS launch-kit playbook | 4.9 | L | to-write |
-| R-188 | Critical-path instrumentation as dogfood scorecard | 4.9 | L | to-write |
-| R-189 | CLI and backend preview adapters | 4.9 | 4a T6 | planned |
-| R-190 | iOS Simulator and macOS app adapters; Screen Recording prompt on first use | 4.9 | 4a T8 | planned |
-| R-191 | Sprint-review demos via adapters | 4.9 | 4a T8 | planned |
-| R-192 | Preview pane shows latest artifact before anything runs | 4.9 | L←4a T7, 4a T10 | to-write |
+| R-183 | Web preview from main (port allocation, WKWebView, rebuild on merge, sandboxed) | 4.9 | L T1–T3 | planned |
+| R-184 | Artifact preview (MD, HTML, images, PDF, MP4/MOV 9:16) and `publish_artifact` | 4.9 | 4a T6 (artifact adapter stays in 4a; review resolution of v2 C-32 vs owner 18:16) | planned |
+| R-185 | `deploy` ask running one hosting CLI with engine-held token, smoke check, rollback | 4.9 | L T4, T6–T8 | planned |
+| R-186 | `humanTask` asks with checklist, prefilled links, paste-back to Keychain | 4.9, 4.10.5 | L T9 | planned |
+| R-187 | SaaS launch-kit playbook | 4.9 | L T13 | planned |
+| R-188 | Critical-path instrumentation as dogfood scorecard | 4.9 | L T13 (+ $LE per phase, owner touches: planL-4a-notes L6) | planned |
+| R-189 | CLI and backend preview adapters | 4.9 | 4a T5 | planned |
+| R-190 | iOS Simulator and macOS app adapters; Screen Recording prompt on first use | 4.9 | 4a T7 | planned |
+| R-191 | Sprint-review demos via adapters | 4.9 | 4a T7 | planned |
+| R-192 | Preview pane shows latest artifact before anything runs | 4.9 | 4a T6, T9 (ARTIFACT tab before any preview runs) | planned |
 | R-193 | Connector model (MCP/CLI + credential + role scope + risk + cost); install = reserved ask | 4.10.1 | 11 | to-write |
 | R-194 | Integrations catalog with per-pack suggested bundles | 4.10.1 | 11; 3a T1 (pack field) | to-write |
 | R-195 | Agents request connectors; connector calls logged and budgeted | 4.10.1 | 11 | to-write |
@@ -212,27 +213,27 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-202 | CFO/Finance role and Finance view; revenue read-only | 4.10.4 | 11 | to-write |
 | R-203 | Idempotent spend journaling, vendor register, billing alarms, monthly reconciliation, runway | 4.10.4 | 11 | to-write |
 | R-204 | Business roles (research analyst, marketing, sales, support, CFO, legal reviewer, ops) | 4.10.4, 4.19 | G (packs); M (marketing); 11 (CFO) | to-write |
-| R-205 | Resources drag-and-drop at company/channel/DM scope | 4.10.6 | — | **UNPLANNED** |
+| R-205 | Resources drag-and-drop at company/channel/DM scope | 4.10.6 | ML (resources drop-in; owner 2026-10-21 18:16) | to-write |
 | R-206 | Company Memory: local scoped FTS, auto-ingest with provenance | 4.11.1 | ML | to-write |
 | R-207 | Scope + sensitivity filtering before results reach agents | 4.11.1 | ML | to-write |
-| R-208 | `search_memory`, `recall`, `remember` (key/type/confidence); orientation top-k | 4.11.1 | ML | to-write |
+| R-208 | `search_memory`, `recall`, `remember` (key/type/confidence); orientation top-k | 4.11.1 | ML (`search_memory`/`recall`/`remember`, pull-only); ML-2 (orientation top-k push) | to-write / deferred: ML-2 |
 | R-209 | Memory hygiene (dedupe, TTL, owner browse/delete, retrieved text is data) | 4.11.1 | ML; 5L T10 (taint) | to-write |
 | R-210 | Embeddings and external memory backends | 4.11.1 | 9 | to-write |
 | R-211 | Personal memory: episodic + semantic, recall scoring, forgetting curve | 4.11.2 | ML | to-write |
-| R-212 | End-of-item reflection (plain code + short Haiku turn) | 4.11.2 | ML | to-write |
+| R-212 | End-of-item reflection (plain code + short Haiku turn) | 4.11.2 | ML-2 (after dogfood; owner 2026-10-21 18:16 lean Memory-lite) | deferred: ML-2 |
 | R-213 | Procedural memory and sprint-level reflection | 4.11.2 | 9 | to-write |
 | R-214 | Memory privacy rules; replacement inherits procedural + semantic | 4.11.2 | ML; 3b (HR) | to-write |
 | R-215 | Append-only work record of every message, hand-off, ask, review, decision, tool summary | 4.11.3 | P1 (messages, turns); 3a T6–T11; 5L T13 | building |
 | R-216 | Per-turn transcript capture (redacted, compressed) | 4.11.3 | 5L T13 | planned |
 | R-217 | Replay any agent's day or item history | 4.11.3 | ML | to-write |
 | R-218 | Handbook in SQLite (kbPage, kbRevision, kbLink), FTS, Markdown export | 4.11.4 | ML | to-write |
-| R-219 | `kb_read`/`kb_write`/`search_kb` with scope; orientation links 3–5 pages | 4.11.4 | ML | to-write |
+| R-219 | `kb_read`/`kb_write`/`search_kb` with scope; orientation links 3–5 pages | 4.11.4 | ML (`kb_read`/`kb_write`/`search_kb`); ML-2 (orientation links 3–5 pages) | to-write / deferred: ML-2 |
 | R-220 | Pack-defined handbook structure; engine-rendered auto pages | 4.11.4 | ML | to-write |
-| R-221 | Doc-update check flag; review of significant pages; page lease | 4.11.4 | ML | to-write |
+| R-221 | Doc-update check flag; review of significant pages; page lease | 4.11.4 | ML (page lease); ML-2 (doc-update check flag, page review) | to-write / deferred: ML-2 |
 | R-222 | Librarian staleness jobs | 4.11.4 | 9 | to-write |
 | R-223 | Handbook view (tree, search, backlinks, staleness, export) | 4.11.4 | ML | to-write |
 | R-224 | Hot tier (~30 days) serves all live UI and recall | 4.11.5 | ML | to-write |
-| R-225 | Warm tier monthly archives with FTS, cross-tier search, precomputed summaries | 4.11.5 | ML | to-write |
+| R-225 | Warm tier monthly archives with FTS, cross-tier search, precomputed summaries | 4.11.5 | ML-2 (warm tier, after dogfood) | deferred: ML-2 |
 | R-226 | Hourly and pre-migration `VACUUM INTO`; integrity check at launch | 4.11.5 | 5L T12 | planned |
 | R-227 | Daily git bundles; data-home snapshots; external/rclone-crypt targets; WAL shipping | 4.11.5 | 5L T12, T13 | planned |
 | R-228 | `brahma restore` (dry-run, point in time, exclusive, atomic, adopt main) and `brahma export` | 4.11.5 | 5L T12, T13 | planned |
@@ -245,10 +246,10 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-235 | Top bar: mode control, autonomy, state chips, usage meter, pace, stall line, hold banner | 4.12.2 | P2 T3; 3a T15–T16a | built / building |
 | R-236 | Mission control layout B; chat replaces top half; activity feed at bottom | 4.12.2 | P2 T7 | built |
 | R-237 | Menu bar extra: totals, per-company pause/resume, stall line | 4.12.2 | P2 T9; 3a T16a | built / building |
-| R-238 | Global kill switch / pause all (turns, browsers, connectors) | 4.12.2 | — | **UNPLANNED** |
+| R-238 | Global kill switch / pause all (turns, browsers, connectors) | 4.12.2 | 5L T7c (global kill switch; owner 2026-10-21 18:16) | planned |
 | R-239 | Inbox view with card, options, scope/duration answers, re-plan, rescind | 4.12.2 | 3a T15–T16a; 5L T11 | building |
 | R-240 | People: roster, detail, org editor, vacancies | 4.12.2 | P2 T8; 3a T16a | built / building |
-| R-241 | Work: backlog, kanban, item editor, merge status, releases | 4.12.2 | 3a T16a; 4a T11; L | building |
+| R-241 | Work: backlog, kanban, item editor, merge status, releases | 4.12.2 | 3a T16a; 4a T10; L T10–T11 | building |
 | R-242 | Budget view: weekly share, pace, storage; later funds/runway | 4.12.2 | 3a T15; ML; 11 | building |
 | R-243 | Search across messages (and items/memory) | 4.12.2 | P2 T6; ML | built |
 | R-244 | Org-chart map default with live state, edges, particles, collapse, search, follow, vacancies, dotted review lines | 4.12.3 | 4b T1–T10 | planned |
@@ -292,20 +293,21 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-282 | TLS, revocable expiring paired tokens, Tailscale default, version handshake | 4.18 | 8 | to-write |
 | R-283 | Industry-neutral engine; packs define vocabulary, cadence, deliverables, verification, connectors, playbooks | 4.19 | 3a T1 (schema); G | building / to-write |
 | R-284 | Non-software built-in packs (e-commerce, CPG, apparel, hard tech, services, media) | 4.19 | G | to-write |
-| R-285 | Deliverable preview adapters for non-software packs (CAD, BOM, decks, spreadsheets) | 4.19 | L←4a T7 (documents); rest — | **UNPLANNED** |
+| R-285 | Deliverable preview adapters for non-software packs (CAD, BOM, decks, spreadsheets) | 4.19 | 4a T6 (documents, decks, spreadsheets, CSV/BOM, glTF/STL; STEP/IGES as file card; owner 2026-10-21 18:16) | planned |
 | R-286 | Rubric review by clean-context reviewer for subjective work | 4.19 | G (check templates) | to-write |
 | R-287 | Human tasks for physical/legal steps; contracts always owner | 4.10.5, 4.19 | L (humanTask); 3a T11a (reserved) | to-write |
-| R-288 | Owner away mode / pre-delegation (O-1) | 4.20 | — | **UNPLANNED** |
-| R-289 | Resume brief and stale external threads after long pause (O-10) | 4.20 | — | **UNPLANNED** |
-| R-290 | Secret-leak incident playbook (S-3) | 4.20 | — | **UNPLANNED** |
-| R-291 | Ops: incidents, on-call, health check on deployed URL, launch-readiness gate, change freeze (L-4, L-5) | 4.20, App. A | — | **UNPLANNED** |
-| R-292 | Lifecycle stages, pivot, wind-down checklist, archive/restore/delete (L-1–L-3, L-8) | 4.20, App. A | — | **UNPLANNED** |
+| R-288 | Owner away mode / pre-delegation (O-1) | 4.20 | Ops (after the dogfood week; owner 2026-10-21 18:16) | to-write |
+| R-289 | Resume brief and stale external threads after long pause (O-10) | 4.20 | Ops | to-write |
+| R-290 | Secret-leak incident playbook (S-3) | 4.20 | Ops | to-write |
+| R-291 | Ops: incidents, on-call, health check on deployed URL, launch-readiness gate, change freeze (L-4, L-5) | 4.20, App. A | Ops (after the dogfood week; owner 2026-10-21 18:16) | to-write |
+| R-292 | Lifecycle stages, pivot, wind-down checklist, archive/restore/delete (L-1–L-3, L-8) | 4.20, App. A | Ops | to-write |
 | R-293 | Dogfood protocol and counters | 4.20 | 3a T10/T11 (counters); dogfood week | building |
 | R-294 | Scale: hundreds of agents exist, UI stays fast (old Plan 6) | 1.4, 5 | 3a T3 (N=300); 4b T11 (bench) | building / planned |
 | R-295 | Engine timers (one-shot/recurring, owner TZ) | 4.6.9, 4.7.6 | 5L T6 | planned |
 
 ## Summary
 - Requirements: **295**.
-- Status counts (primary status of each row): built 23 · built/partly building or planned 11 · building (3a) 110 · building + later plan 5 · planned (5L/4a/4b) 40 · planned + to-write 1 · to-write 83 · deferred to 3b 11 · **UNPLANNED 11**.
-- **UNPLANNED (11):** R-011 owner verify-before-scaling checklist · R-067 start a company from an existing repo · R-161 iMessage/email (or push) notifications · R-205 resources drag-and-drop · R-238 global kill switch · R-285 non-software deliverable previews (CAD, BOM, decks, spreadsheets) · R-288 owner away mode · R-289 resume brief after a long pause · R-290 secret-leak incident playbook · R-291 Ops (incidents, on-call, uptime check, launch-readiness gate, change freeze) · R-292 lifecycle stages, pivot, wind-down, archive/delete.
-- Owner-originated among the UNPLANNED: R-161, R-205 (owner 2026-10-20), R-067 and R-285 (owner's "all product types / any industry" scope), R-238 (research proposal G25, owner-approved 2026-10-20). See v2 §7 Q1–Q2.
+- After the 2026-10-21 chief review, **no requirement is UNPLANNED.** R-011 is an owner checklist (dogfood entry, Plan 8 gate), not code.
+- Newly homed (owner 2026-10-21 18:16): R-067 (L), R-161 (5L T7b), R-205 (ML), R-238 (5L T7c), R-285 (4a T6); R-288–R-292 (Ops, after the dogfood week).
+- Deferred by owner decision: 3b rows (R-106, R-263–R-272); ML-2 rows (R-212, R-225 and the push parts of R-208, R-219, R-221).
+- Previous summary (before this review): built 23 · building 110 · planned 40 · to-write 83 · deferred 11 · UNPLANNED 11.
