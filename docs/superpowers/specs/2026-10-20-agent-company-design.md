@@ -1149,6 +1149,40 @@ engine before each turn (`TurnProfile`):
   ask — agents can never grant themselves anything; the compiled profile for
   every turn is recorded in the work record for audit.
 
+### 6.30 Agents design new roles when they hire (**[owner]** asked for this; Plan G)
+When HR, the CTO/CEO or another C-suite agent (or a manager, within its
+subtree) needs a capability the company lacks, it can **generate a new role**
+— not just hire into an existing one.
+- **Tool:** `propose_role(need, evidence, team, headcount)` — the need is
+  grounded in the backlog/blocked items/ideas that require it (cited).
+- **Generator [call]:** produces a complete role definition from the need,
+  the company's pack, Handbook and Company Memory:
+  - **role card v2 = the system prompt** (mission, responsibilities,
+    decision rights, principles, per-item-type playbooks, definition of
+    done, quality bars, escalation, collaboration norms, anti-patterns,
+    output templates) plus the company-wide operating rules;
+  - **toolkit:** built-in tools, skills, plugins, connectors (from the
+    installed catalog), check templates, model policy by turn kind;
+  - **placement:** team, reporting line, seat count, budget/tier.
+- **Validation (plain code, before any approval):** schema complete;
+  authority lint — the role's permissions and decision rights are ≤ the
+  requester's and ≤ the pack's ceilings; no reserved tools; no instructions
+  that claim owner authority or weaken company rules; length within caps;
+  every connector it needs is either installed or becomes a separate
+  connector ask; optional quick evaluation on 3 fixed scenarios (budgeted).
+- **Approval:** an Inbox ask showing the generated card (rendered), the
+  toolkit, the cost estimate and the evidence. New roles change agent
+  instructions, so they are a **reserved matter (owner-required)** unless the
+  owner sets an explicit policy (e.g. "auto-approve new IC roles that only
+  use installed connectors"). Executive, HR, Performance and security roles
+  always need the owner.
+- **On approval:** the role is added to the company's pack (versioned, diffs
+  kept), the hire proceeds within headcount/budget caps, and the new agent
+  starts with the generated card. Roles can later be revised the same way
+  (`propose_role_change`), with before/after metrics.
+- **Reuse:** good generated roles can be promoted into the shared pack
+  library so other companies of that industry start with them.
+
 ## 7. Architecture sketch
 
 ```
