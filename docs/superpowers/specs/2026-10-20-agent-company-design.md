@@ -1098,6 +1098,36 @@ and current — the readable, curated layer above raw chats and memory (§6.25,
   FTS search, `search_kb`, orientation links, Handbook view); librarian
   staleness jobs and semantic search in Plan 9.
 
+### 6.29 Per-agent workstation and permission layering (**[owner]** asked; consolidates §6.5a, §6.22, §6.23, 5-lite)
+Every agent works in its **own sandboxed workstation**, compiled fresh by the
+engine before each turn (`TurnProfile`):
+- **Sandbox:** own `HOME` (shell prefix), writes only to its current item's
+  worktree, its lab and caches; reads deny the owner's home (carve-outs for
+  the company workspace and toolchains), the Brahma data home, credential
+  directories and other companies; network per company allow-list.
+- **Claude Code profile:** the shared `claude` binary and the owner's single
+  subscription login, but a per-turn settings file with the role's built-in
+  tools, skills (company skill library), plugins (company plugin dir), MCP
+  servers (company server + the role's connectors), and model.
+- **AI tools and services** (video/image/voice generation, Figma automation,
+  cloud, DBs, commerce, ads…) are **connectors** installed per company and
+  enabled per role; credentials stay engine-held and are used through
+  connector tools, never handed to the agent.
+- **Permission layers (each can only narrow, except explicit grants):**
+  1. company permission profile (Sandboxed default / Workspace / Full);
+  2. role defaults from the pack — role card + tool bundle (tools, skills,
+     plugins, connectors, risk levels) — gstack-style role cards and the
+     per-industry bundles live here (Plan G generates them);
+  3. trust level (Plan 3b): budget, model, review depth;
+  4. current work item: writable paths/branch, required check;
+  5. owner grants from the Inbox (scope + duration; §6.23);
+  6. taint (§5-lite): a turn that read external content loses send / spend /
+     approve / secret / grant tools for that session.
+- **Invariants:** no access to another agent's private memory or files,
+  other companies, or raw credentials; any missing capability is an Inbox
+  ask — agents can never grant themselves anything; the compiled profile for
+  every turn is recorded in the work record for audit.
+
 ## 7. Architecture sketch
 
 ```
