@@ -131,6 +131,18 @@ enum Migrations {
             }
             try db.create(index: "orgVacancy_company", on: "orgVacancy", columns: ["companyId", "filledAt"])
         }
+        m.registerMigration("v3-wake") { db in
+            try db.alter(table: "inboxItem") { t in
+                t.add(column: "wakes", .boolean).notNull().defaults(to: true)
+            }
+            try db.create(table: "broadcastLog") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("senderId", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "broadcastLog_sender_created", on: "broadcastLog", columns: ["senderId", "createdAt"])
+        }
         return m
     }
 }

@@ -27,7 +27,12 @@ private struct World {
 @Test func channelPostFansOutToMembersExceptSender() throws {
     let w = try World()
     _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "hello")
-    #expect(try w.pending(w.cto) == 1); #expect(try w.pending(w.eng) == 1); #expect(try w.pending(w.ceo) == 0)
+    // Membership no longer wakes: every member gets an inbox item, but a quiet one (counted, not delivered).
+    #expect(try w.pending(w.cto) == 0); #expect(try w.pending(w.eng) == 0); #expect(try w.pending(w.ceo) == 0)
+    #expect(try w.store.pendingChannelCounts(agentId: w.cto.id).map(\.count) == [1])
+    #expect(try w.store.pendingChannelCounts(agentId: w.eng.id).map(\.count) == [1])
+    #expect(try w.store.pendingChannelCounts(agentId: w.ceo.id).isEmpty)
+    #expect(try w.state(w.cto) == .sleeping)
     let ev = try w.store.events(afterId: 0).last { $0.kind == .message }
     #expect(ev?.text == "#general @ceo: hello")
 }
@@ -35,7 +40,7 @@ private struct World {
 @Test func postWakesSleepingButNotPaused() throws {
     let w = try World()
     var eng = w.eng; eng.paused = true; try w.store.save(eng)
-    _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "hi")
+    _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "@cto @eng1 hi")
     #expect(try w.state(w.cto) == .ready)
     #expect(try w.state(w.eng) == .sleeping); #expect(try w.pending(w.eng) == 1)
 }
@@ -97,13 +102,14 @@ private struct World {
 
 @Test func markDeliveredOnlyAffectsGivenItems() throws {
     let w = try World()
-    _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "one")
-    _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "two")
+    _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "@cto one")
+    _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "@cto two")
     let items = try w.store.pendingInbox(agentId: w.cto.id)
-    #expect(items.map { $0.1.text } == ["one", "two"])
+    #expect(items.map { $0.1.text } == ["@cto one", "@cto two"])
     try w.store.markDelivered(itemIds: [items[0].0.id!], turnId: "t1")
-    #expect(try w.store.pendingInbox(agentId: w.cto.id).map { $0.1.text } == ["two"])
-    #expect(try w.pending(w.eng) == 2)
+    #expect(try w.store.pendingInbox(agentId: w.cto.id).map { $0.1.text } == ["@cto two"])
+    #expect(try w.pending(w.eng) == 0)
+    #expect(try w.store.pendingChannelCounts(agentId: w.eng.id).map(\.count) == [2])
 }
 
 @Test func searchFindsByWord() throws {

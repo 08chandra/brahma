@@ -52,7 +52,7 @@ public final class SearchModel {
         let agents = Dictionary(try store.agents(companyId: companyId).map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         return messages.compactMap { m in
             guard let channel = channels[m.channelId] else { return nil }
-            let sender = m.senderId == "owner" ? "owner" : (agents[m.senderId] ?? "unknown")
+            let sender = m.senderId == "owner" ? "owner" : (m.senderId == "system" ? "system" : agents[m.senderId] ?? "unknown")
             return SearchHit(message: m, channelTitle: ChannelTitle.title(channel), senderHandle: sender,
                              target: target(for: channel), id: m.id)
         }

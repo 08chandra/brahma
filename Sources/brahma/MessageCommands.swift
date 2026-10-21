@@ -4,7 +4,7 @@ import BrahmaCore
 
 /// Sender id -> handle for a company, plus the owner.
 private func handles(_ store: Store, _ company: Company) throws -> [String: String] {
-    var map = ["owner": "owner"]
+    var map = ["owner": "owner", "system": "system"]
     for a in try store.agents(companyId: company.id) { map[a.id] = a.name }
     return map
 }

@@ -57,7 +57,7 @@ public final class AppModel {
     /// Selected company's agent id → handle, plus "owner" → "owner".
     public var handles: [String: String] {
         var map = Dictionary(snapshot.agents.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
-        map["owner"] = "owner"
+        map["owner"] = "owner"; map["system"] = "system"
         return map
     }
 

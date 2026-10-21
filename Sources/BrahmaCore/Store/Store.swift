@@ -126,7 +126,7 @@ public final class Store: Sendable {
     static func hire(db: Database, companyId: String, name: String, role: String, model: String, managerId: String?,
                      team: String?, now: Date, honoringVacancy: Bool = false) throws -> Agent {
         let handle = name.lowercased()
-        guard handle != "owner", handle != "system",
+        guard handle != "owner", handle != "system", handle != "here", handle != "team",
               handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
         else { throw StoreError.invalidName }
         if !honoringVacancy,

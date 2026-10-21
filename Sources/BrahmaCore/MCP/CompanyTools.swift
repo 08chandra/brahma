@@ -89,8 +89,10 @@ public struct CompanyTools: Sendable {
             switch name {
             case "post_message":
                 let channel = try string(args, "channel"), text = try string(args, "text")
-                _ = try router.post(companyId: companyId, channel: channel, from: .agent(agentId), text: text)
-                return "Posted to #\(Store.normalizeChannelName(channel))."
+                let result = try router.postDetailed(companyId: companyId, channel: channel, from: .agent(agentId), text: text)
+                var reply = "Posted to #\(Store.normalizeChannelName(channel))."
+                if let refusal = result.broadcastRefusal { reply += " " + refusal }
+                return reply
             case "send_dm":
                 let to = try string(args, "to"), text = try string(args, "text")
                 _ = try router.sendDM(companyId: companyId, from: .agent(agentId), to: to, text: text)

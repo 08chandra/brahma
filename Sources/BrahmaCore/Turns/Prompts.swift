@@ -31,13 +31,18 @@ private let blockedInline = CharacterSet.newlines.union(.controlCharacters)
 public enum InboxDigest {
     public static func render(agent: Agent, company: Company,
                               items: [(InboxItem, Message, Channel)],
-                              handles: [String: String]) -> String {
+                              handles: [String: String], unread: [(channel: String, count: Int)] = []) -> String {
         var out = "New since your last turn (\(items.count) items):"
+        var unreadLine = ""
+        if !unread.isEmpty {
+            let shown = unread.prefix(10).map { "#\($0.channel) \($0.count)" }.joined(separator: ", ")
+            unreadLine = "\nUnread in channels (not addressed to you): \(shown) — use read_channel if relevant."
+        }
         if items.isEmpty {
-            return out + "\n- (nothing new — check your work and continue)"
+            return out + "\n- (nothing new — check your work and continue)" + unreadLine
         }
         for (_, message, channel) in items {
-            let handle = message.senderId == "owner" ? "owner" : (handles[message.senderId] ?? "unknown")
+            let handle = message.senderId == "owner" || message.senderId == "system" ? message.senderId : (handles[message.senderId] ?? "unknown")
             let text = String(String.UnicodeScalarView(message.text.unicodeScalars.map {
                 blockedInline.contains($0) ? " " : $0
             }))
@@ -51,6 +56,6 @@ public enum InboxDigest {
             }
             out += "\n- \(source) @\(handle): \(text)"
         }
-        return out
+        return out + unreadLine
     }
 }

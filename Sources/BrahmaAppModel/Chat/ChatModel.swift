@@ -115,7 +115,7 @@ public final class ChatModel {
         let byId = Dictionary(agents.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         return list.map { m in
             let owner = m.senderId == "owner"
-            return ChatMessage(message: m, senderHandle: owner ? "owner" : (byId[m.senderId] ?? "unknown"), isOwner: owner, id: m.id)
+            return ChatMessage(message: m, senderHandle: owner ? "owner" : (m.senderId == "system" ? "system" : byId[m.senderId] ?? "unknown"), isOwner: owner, id: m.id)
         }
     }
 

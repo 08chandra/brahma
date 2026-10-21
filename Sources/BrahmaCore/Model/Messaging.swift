@@ -24,10 +24,13 @@ struct ChannelMember: Codable, FetchableRecord, PersistableRecord {
 public enum Sender: Equatable, Sendable {
     case owner
     case agent(String)
+    /// The engine itself (notices). Channel posts from it never wake anyone; it needs no membership.
+    case system
 
     var id: String {
         switch self {
         case .owner: "owner"
+        case .system: "system"
         case .agent(let id): id
         }
     }
@@ -52,4 +55,6 @@ public struct InboxItem: Codable, Equatable, Sendable, FetchableRecord, Persista
     public var agentId: String
     public var messageId: String
     public var deliveredTurnId: String?
+    /// False for channel traffic not addressed to the recipient: it is counted, not delivered, and never wakes.
+    public var wakes: Bool = true
 }

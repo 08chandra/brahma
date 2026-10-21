@@ -163,12 +163,15 @@ public actor Orchestrator {
 
     private nonisolated func performTurn(agent: Agent, turn: Turn) async {
         var items: [(InboxItem, Message, Channel)] = []
+        var quietIds: [Int64] = []
         var result: TurnResult?
         var lastInfo: RateLimitInfo?
         var failure: String?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             items = try store.pendingInbox(agentId: agent.id)
+            let quiet = try store.pendingQuietItems(agentId: agent.id)
+            quietIds = quiet.map(\.id)
             let team = try store.agents(companyId: company.id)
             let handles = Dictionary(uniqueKeysWithValues: team.map { ($0.id, $0.name) })
             // `auto` resolves per turn from the role, the company's usage mode and the kind of turn (Tasks 10 and 14 set the context).
@@ -178,7 +181,8 @@ public actor Orchestrator {
                 mode: company.usageMode, context: ModelContext())
             let request = TurnRequest(
                 agent: sent, company: company,
-                prompt: InboxDigest.render(agent: agent, company: company, items: items, handles: handles),
+                prompt: InboxDigest.render(agent: agent, company: company, items: items, handles: handles,
+                                            unread: Store.channelCounts(quiet)),
                 appendSystemPrompt: agent.sessionStarted
                     ? nil : RolePrompt.render(agent: agent, company: company, roster: team.filter { $0.state != .killed }),
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent),
@@ -240,7 +244,7 @@ public actor Orchestrator {
             resetSession = Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n"))
         }
         attempt {
-            try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id),
+            try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id) + quietIds,
                               resetSession: resetSession, now: now)
         }
     }
@@ -386,7 +390,7 @@ extension Store {
                 // Anything still pending arrived mid-turn: the router saw `running` and did not wake us.
                 let senders = try String.fetchAll(db, sql: """
                     SELECT message.senderId FROM inboxItem JOIN message ON message.id = inboxItem.messageId
-                    WHERE inboxItem.agentId = ? AND inboxItem.deliveredTurnId IS NULL
+                    WHERE inboxItem.agentId = ? AND inboxItem.deliveredTurnId IS NULL AND inboxItem.wakes = 1
                     """, arguments: [agentId])
                 var answered = false
                 if let blocker = requested {

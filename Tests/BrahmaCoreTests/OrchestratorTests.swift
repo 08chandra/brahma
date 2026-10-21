@@ -641,7 +641,7 @@ private struct World {
         var agents: [Agent] = []
         for i in 0..<10 { agents.append(try w.hire(c, "eng\(i)", role: "engineer")) }
         w.fake.defaultScript = .init(delay: .milliseconds(200))
-        _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "all hands", now: w.clock.now)
+        _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "@here all hands", now: w.clock.now)
         let deadline = ContinuousClock.now + .seconds(10)
         while try agents.contains(where: { try w.turns($0).first?.outcome != .succeeded }), ContinuousClock.now < deadline {
             await w.orchestrator.tick()
