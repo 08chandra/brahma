@@ -19,6 +19,7 @@ struct TopBar: View {
                 }
                 CountChips(counts: summary.counts)
                 Spacer(minLength: BrahmaTheme.spaceM)
+                searchField
                 usage
                 let running = summary.company.status == .running
                 Button {
@@ -27,6 +28,7 @@ struct TopBar: View {
                     Label(running ? "Pause company" : "Run company", systemImage: running ? "pause.fill" : "play.fill")
                 }
                 .buttonStyle(BrahmaButtonStyle(primary: !running))
+                .fixedSize()
             } else {
                 Spacer()
             }
@@ -37,6 +39,27 @@ struct TopBar: View {
         .frame(maxWidth: .infinity)
         .background(BrahmaTheme.bg2)
         .overlay(alignment: .bottom) { Hairline() }
+        .task(id: model.search.query) {
+            // Debounce: a newer keystroke cancels this task during the sleep.
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            await model.runSearch()
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass").font(.system(size: 10)).foregroundStyle(BrahmaTheme.text2)
+            TextField(text: Bindable(model.search).query, prompt: Text(verbatim: "Search messages")) { EmptyView() }
+                .textFieldStyle(.plain)
+                .font(BrahmaTheme.body)
+                .foregroundStyle(BrahmaTheme.text0)
+                .accessibilityLabel(Text("Search messages"))
+        }
+        .padding(.horizontal, 7)
+        .frame(width: 160, height: 22)
+        .background(RoundedRectangle(cornerRadius: BrahmaTheme.radius).fill(BrahmaTheme.bg1))
+        .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius).strokeBorder(BrahmaTheme.lineStrong, lineWidth: 1))
     }
 
     @ViewBuilder private var usage: some View {

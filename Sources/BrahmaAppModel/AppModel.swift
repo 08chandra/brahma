@@ -18,6 +18,9 @@ public final class AppModel {
     public var selectedAgentId: String?
     public var presentedSheet: AppSheet?
     public var errorMessage: String?
+    public let search: SearchModel
+    /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
+    public var highlightedMessageId: String?
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
@@ -33,6 +36,7 @@ public final class AppModel {
         self.store = store
         self.paths = paths
         self.clock = clock
+        self.search = SearchModel(store: store)
     }
 
     public var selectedCompany: CompanySummary? {
@@ -133,6 +137,8 @@ public final class AppModel {
         chat = nil
         selectedAgentId = nil
         activity = []
+        search.query = ""
+        highlightedMessageId = nil
         do { try await reloadSelected() } catch { report(error) }
     }
 
@@ -170,9 +176,29 @@ public final class AppModel {
                 errorMessage = "No channel #\(name)"
             }
         case .dm(let handle): select(.dm(handle: handle))
-        case .search: break  // Task 6
+        case .search(let q):
+            search.query = q
+            Task { await runSearch() }
         case .sheet(let s): presentedSheet = s
         }
+    }
+
+    // MARK: Search
+
+    /// Runs the current search query against the selected company.
+    public func runSearch() async {
+        guard let companyId = selectedCompanyId else { return }
+        do { try await search.run(companyId: companyId) } catch { errorMessage = "Search failed: \(error)" }
+    }
+
+    /// Opens the hit's conversation, loads back to the message and highlights it.
+    public func open(_ hit: SearchHit) async {
+        select(hit.target)
+        guard let chat else { return }
+        await chat.refresh()
+        await chat.ensureLoaded(messageId: hit.id)
+        highlightedMessageId = hit.id
+        search.query = ""
     }
 
     // MARK: Actions

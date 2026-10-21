@@ -15,6 +15,8 @@ struct DetailView: View {
                         .buttonStyle(.brahmaPrimary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if !model.search.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                SearchResultsView(model: model)
             } else {
                 switch model.sidebarSelection {
                 case .missionControl:
@@ -26,7 +28,7 @@ struct DetailView: View {
                 case .channel, .dm:
                     if let chat = model.chat {
                         VSplitView {
-                            ChatView(chat: chat)
+                            ChatView(chat: chat, highlightedId: Bindable(model).highlightedMessageId)
                                 .id(chat.target)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .frame(minHeight: 200)

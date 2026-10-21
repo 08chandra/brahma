@@ -3,6 +3,8 @@ import BrahmaAppModel
 
 struct ChatView: View {
     @Bindable var chat: ChatModel
+    /// The message a search hit opened: scrolled to, tinted for 2 s, then cleared.
+    @Binding var highlightedId: String?
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
@@ -21,7 +23,8 @@ struct ChatView: View {
                             .frame(maxWidth: .infinity)
                         }
                         ForEach(chat.messages) { item in
-                            MessageRow(item: item, role: chat.role(of: item.senderHandle), handles: Set(chat.handles))
+                            MessageRow(item: item, role: chat.role(of: item.senderHandle), handles: Set(chat.handles),
+                                       highlighted: item.id == highlightedId)
                                 .id(item.id)
                         }
                     }
@@ -31,8 +34,19 @@ struct ChatView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onAppear { scrollToEnd(proxy); markReadIfKey() }
+                .task(id: highlightedId) {
+                    guard let id = highlightedId else { return }
+                    proxy.scrollTo(id, anchor: .center)
+                    // Lazy rows below the target settle their heights a moment later: scroll again.
+                    try? await Task.sleep(for: .milliseconds(80))
+                    guard !Task.isCancelled else { return }
+                    proxy.scrollTo(id, anchor: .center)
+                    try? await Task.sleep(for: .seconds(2))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(BrahmaTheme.medium) { if highlightedId == id { highlightedId = nil } }
+                }
                 .onChange(of: chat.messages.last?.id) {
-                    scrollToEnd(proxy)
+                    if highlightedId == nil { scrollToEnd(proxy) }
                     markReadIfKey()
                 }
                 .onChange(of: controlActiveState) { markReadIfKey() }
@@ -81,6 +95,7 @@ private struct MessageRow: View {
     let item: ChatMessage
     let role: String?
     let handles: Set<String>
+    var highlighted = false
 
     var body: some View {
         HStack(alignment: .top, spacing: BrahmaTheme.spaceS) {
@@ -107,6 +122,9 @@ private struct MessageRow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .padding(.vertical, 2)
+        .background(RoundedRectangle(cornerRadius: BrahmaTheme.radius).fill(BrahmaTheme.accent.opacity(highlighted ? 0.15 : 0)))
+        .animation(BrahmaTheme.medium, value: highlighted)
     }
 
     /// D4: the model marks known @handles `.stronglyEmphasized`; display them in `accent`.
