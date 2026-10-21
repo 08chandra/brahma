@@ -121,6 +121,27 @@ public final class AppModel {
 
     public func select(_ item: SidebarItem) { sidebarSelection = item }
 
+    /// Applies a launch/automation target, resolving names against the current snapshot.
+    public func apply(_ target: SelectTarget) {
+        switch target {
+        case .missionControl: select(.missionControl)
+        case .activity: select(.activity)
+        case .agents: select(.agents)
+        case .agent(let handle):
+            select(.agents)
+            selectedAgentId = snapshot.agents.first { $0.name.lowercased() == handle }?.id
+        case .channel(let name):
+            if let c = snapshot.channels.first(where: { $0.name.lowercased() == name }) {
+                select(.channel(id: c.id))
+            } else {
+                errorMessage = "No channel #\(name)"
+            }
+        case .dm(let handle): select(.dm(handle: handle))
+        case .search: break  // Task 6
+        case .sheet(let s): presentedSheet = s
+        }
+    }
+
     // MARK: Actions
 
     public func createCompany(_ form: CompanyForm) async throws -> Company {
@@ -147,7 +168,7 @@ public final class AppModel {
     private func mutate(_ companyId: String, _ change: @escaping @Sendable (inout Company) -> Void) async {
         let store = self.store
         do {
-            try await Task.detached { try store.updateCompany(id: companyId, change) }.value
+            _ = try await Task.detached { try store.updateCompany(id: companyId, change) }.value
             await tick(forceSnapshot: true)
         } catch {
             report(error)

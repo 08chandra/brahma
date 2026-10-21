@@ -18,6 +18,7 @@ let package = Package(
             dependencies: [.product(name: "GRDB", package: "GRDB.swift")]
         ),
         .target(name: "BrahmaAppModel", dependencies: ["BrahmaCore"]),
+        .executableTarget(name: "BrahmaApp", dependencies: ["BrahmaAppModel"]),
         .executableTarget(
             name: "brahma",
             dependencies: [
