@@ -2,7 +2,7 @@ import Foundation
 
 /// `@handle` completion for the composer. The active token is a trailing `@[A-Za-z0-9_-]*` that starts the text or follows whitespace.
 public enum MentionCompleter {
-    private static let tail = try! NSRegularExpression(pattern: "(?:^|\\s)@([A-Za-z0-9_-]*)$")
+    private static let tail = try! NSRegularExpression(pattern: "(?:^|\\s)@([A-Za-z0-9_-]*)\\z")
 
     /// The characters typed after the trailing `@`, or nil when the cursor is not in a mention.
     public static func activePrefix(in text: String) -> String? {

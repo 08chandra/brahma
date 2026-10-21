@@ -31,6 +31,8 @@ import Foundation
         #expect(MentionCompleter.suggestions(for: "hi @ceo done", handles: ["ceo"]).isEmpty)
         #expect(MentionCompleter.complete("hi @c", with: "cto") == "hi @cto ")
         #expect(MentionCompleter.complete("@", with: "ceo") == "@ceo ")
+        #expect(MentionCompleter.suggestions(for: "hi @c\n", handles: ["ceo", "cto"]).isEmpty)
+        #expect(MentionCompleter.complete("hi @c\n", with: "cto") == "hi @c\n")
         #expect(MentionCompleter.suggestions(for: "line\n@e", handles: ["eng"]) == ["eng"])
     }
 }

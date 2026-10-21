@@ -27,8 +27,10 @@ struct DetailView: View {
                     VSplitView {
                         ChatView(chat: chat)
                             .id(chat.target)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .frame(minHeight: 200)
                         ContentUnavailableView("Activity", systemImage: "list.bullet.rectangle")  // Task 7
+                            .frame(maxWidth: .infinity)
                             .frame(minHeight: 60, idealHeight: 100, maxHeight: 200)
                     }
                 }

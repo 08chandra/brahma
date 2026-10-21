@@ -21,7 +21,9 @@ struct ChatView: View {
                         }
                     }
                     .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onAppear { scrollToEnd(proxy); markReadIfKey() }
                 .onChange(of: chat.messages.last?.id) {
                     scrollToEnd(proxy)
@@ -31,7 +33,9 @@ struct ChatView: View {
             }
             Divider()
             Composer(chat: chat)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(Text(verbatim: chat.title))
     }
 
