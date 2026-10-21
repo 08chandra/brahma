@@ -17,6 +17,10 @@ public final class AppModel {
     public var presentedSheet: AppSheet?
     public var errorMessage: String?
 
+    /// The embedded engine, when this app hosts one. Set by the app delegate.
+    public var engine: EngineHost?
+
+    @ObservationIgnored private var ticksSinceTakeoverCheck = 0
     @ObservationIgnored private var cursor: Int64 = 0
     @ObservationIgnored private var ticksSinceSnapshot = 0
     @ObservationIgnored private var pollTask: Task<Void, Never>?
@@ -62,6 +66,13 @@ public final class AppModel {
     }
 
     public func tick(forceSnapshot: Bool = false) async {
+        // Independent of the snapshot cadence: about every 5 s at the 500 ms poll, try to take over from a
+        // terminal `brahma run` that has stopped.
+        ticksSinceTakeoverCheck += 1
+        if ticksSinceTakeoverCheck >= 10 {
+            ticksSinceTakeoverCheck = 0
+            if let engine, engine.status == .external { await engine.retryTakeover() }
+        }
         let store = self.store
         let start = cursor
         do {

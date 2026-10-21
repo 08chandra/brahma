@@ -38,3 +38,42 @@ func eventually(timeout: Duration = .seconds(3), _ cond: () throws -> Bool) asyn
     struct Timeout: Error {}
     if try !cond() { throw Timeout() }
 }
+
+/// Stub `TurnRunning` for engine tests: either completes every turn at once or hangs until cancelled.
+final class StubRunner: TurnRunning, @unchecked Sendable {
+    enum Mode { case succeed, hangUntilCancelled }
+
+    private let mode: Mode
+    private let childrenNeverExit: Bool
+    private let lock = NSLock()
+    private var _requestCount = 0
+
+    init(mode: Mode, childrenNeverExit: Bool = false) {
+        self.mode = mode
+        self.childrenNeverExit = childrenNeverExit
+    }
+
+    var requestCount: Int { lock.withLock { _requestCount } }
+
+    func run(_ request: TurnRequest) -> AsyncThrowingStream<StreamEvent, Error> {
+        lock.withLock { _requestCount += 1 }
+        let sid = request.agent.sessionId
+        let mode = self.mode
+        return AsyncThrowingStream { continuation in
+            switch mode {
+            case .succeed:
+                continuation.yield(.initialized(sessionId: sid, model: "stub"))
+                continuation.yield(.result(TurnResult(isError: false, subtype: "success", text: "ok", costUSD: 0,
+                                                      apiErrorStatus: nil, sessionId: sid)))
+                continuation.finish()
+            case .hangUntilCancelled:
+                break  // yields nothing; the stream ends when the consumer is cancelled
+            }
+        }
+    }
+
+    func waitForChildren() async {
+        guard childrenNeverExit else { return }
+        await Task.detached { try? await Task.sleep(for: .seconds(60)) }.value
+    }
+}

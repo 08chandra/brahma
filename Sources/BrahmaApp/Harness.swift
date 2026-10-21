@@ -45,11 +45,17 @@ enum Harness {
         } else {
             try? await Task.sleep(for: .seconds(options.smokeHold))
             let agents = model.snapshot.companies.reduce(0) { $0 + $1.counts.running + $1.counts.ready + $1.counts.blocked + $1.counts.sleeping + $1.counts.killed }
-            print("SMOKE OK companies=\(model.snapshot.companies.count) agents=\(agents) engine=none windows=\(mainWindows().count)")
+            print("SMOKE OK companies=\(model.snapshot.companies.count) agents=\(agents) engine=\(model.engine?.status.label ?? "none") windows=\(mainWindows().count)")
             fflush(stdout)
-            NSApp.terminate(nil)
-            exit(0)
+            await terminateAndExit()
         }
+    }
+
+    /// Quit stops the engine first (up to 15 s); only exit once the delegate has had its chance to finish.
+    private static func terminateAndExit() async -> Never {
+        AppDelegate.requestQuit()
+        try? await Task.sleep(for: .seconds(20))
+        exit(0)
     }
 
     private static func snapshot(path: String, options: LaunchOptions, model: AppModel) async {
@@ -68,8 +74,7 @@ enum Harness {
         if window.attachedSheet == nil, screenCapture(window: window, to: path) {
             print("SNAPSHOT \(path)")
             fflush(stdout)
-            NSApp.terminate(nil)
-            exit(0)
+            await terminateAndExit()
         }
         let host = window.attachedSheet ?? window
         guard let content = host.contentView else { fail("no content view") }
@@ -84,8 +89,7 @@ enum Harness {
         }
         print("SNAPSHOT \(path)")
         fflush(stdout)
-        NSApp.terminate(nil)
-        exit(0)
+        await terminateAndExit()
     }
 
     private static func screenCapture(window: NSWindow, to path: String) -> Bool {

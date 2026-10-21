@@ -15,6 +15,12 @@ import BrahmaCore
         #expect(!b.smokeTest)
     }
 
+    @Test func parsesEqualsFormSmokeHold() {
+        let a = LaunchOptions.parse(["/x/Brahma", "--smoke-test", "--smoke-hold=14"])
+        #expect(a.smokeTest)
+        #expect(a.smokeHold == 14)
+    }
+
     @Test func ignoresUnknownAndPsnArgs() {
         #expect(LaunchOptions.parse(["/x", "-psn_0_123", "-NSDocumentRevisionsDebugMode", "YES"]) == LaunchOptions())
     }

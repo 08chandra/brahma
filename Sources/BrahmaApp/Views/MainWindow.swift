@@ -29,7 +29,11 @@ private struct Shell: View {
             NavigationSplitView {
                 Sidebar(model: model)
             } detail: {
-                DetailView(model: model)
+                VStack(spacing: 0) {
+                    EngineBanner(engine: model.engine)
+                    DetailView(model: model)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
             .navigationTitle(Text(verbatim: model.selectedCompany?.company.name ?? "Brahma"))
             .navigationSubtitle(Text(verbatim: model.selectedCompany?.counts.line ?? ""))

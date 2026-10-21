@@ -44,6 +44,13 @@ public struct LaunchOptions: Equatable, Sendable {
         var o = LaunchOptions()
         var i = 1
         while i < args.count {
+            // `--smoke-hold=8` is the form the scripts use: a bare value argument ("8") makes AppKit treat the
+            // launch as an open-file request, and SwiftUI then skips the main window.
+            if args[i].hasPrefix("--smoke-hold="), let v = Double(args[i].dropFirst("--smoke-hold=".count)) {
+                o.smokeHold = v
+                i += 1
+                continue
+            }
             switch args[i] {
             case "--smoke-test": o.smokeTest = true
             case "--smoke-close-window": o.smokeCloseWindow = true
