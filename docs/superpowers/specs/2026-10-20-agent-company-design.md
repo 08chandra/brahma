@@ -908,6 +908,27 @@ API keys, AI-disclosure rules for outbound messages, platform automation ToS.
 **Maps:** the Org Chart is the default and the first map built; Hive and
 Village are optional skins (Plan 4c), exempt from the ops-console brief.
 
+### 6.24a Build order and efficiency decisions (**[owner]** approved 2026-10-21, supersedes §6.24's order)
+Source: `docs/research/2026-10-21-end-goal-efficiency-review.md`.
+**Order:** 3a (amended, building) → 5-lite → **Plan L "Live"** (web preview,
+one-click deploy ask running one hosting CLI with release record + smoke check
++ rollback, owner human-task asks with prefilled links: domain, Stripe test
+keys, launch post) → Memory-lite → rest of 4a (batched merge queue, non-web
+previews) → 4b (org chart) → dogfood week → Plan M (marketing: **text/image
+posts first, video next**) → Plan G (profile/pack generator) → 3b → 4c →
+7, 11, 9, 8, 10.
+**Efficiency rules (in 3a):** cache-aware resume (warm cache only) else fresh
+session + continuity note; wake only on actionable notices with manager
+debounce; engine assigns ready work and skips empty turns; org sized from
+backlog width + weekly budget (extra headcount = vacancies, trigger-staffed
+QA/design/security); one "weekly share" owner slider with burst headroom and
+critical-path exemption, cost measured from per-turn `total_cost_usd`; model
+chosen by turn kind (Opus for PRD/architecture/tier-L only); risk-based
+review (small clean items auto-merge with sampled audits); byte-stable
+cacheable prompt prefix (role card as system prompt every turn, uniform tool
+list, permissions enforced server-side); for ≤ 8-agent companies one combined
+brief+architecture gate while a walking skeleton starts on a reversible branch.
+
 ### 6.25 Company Memory — shared knowledge with permission-scoped access (**[owner]** asked; evaluated supermemory.ai)
 Goal: every agent works with all the company knowledge it is permitted to see.
 **Decision [call]:** build it locally inside Brahma; external memory services
