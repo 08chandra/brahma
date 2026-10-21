@@ -25,7 +25,7 @@ struct Run: AsyncParsableCommand {
         do {
             lock = try OrchestratorLock.acquire(paths: paths)
         } catch OrchestratorLockError.alreadyRunning {
-            throw fail("another 'brahma run' is already running (\(paths.home.path))")
+            throw fail("another Brahma engine (the Brahma app or 'brahma run') is already using \(paths.home.path)")
         }
         defer { withExtendedLifetime(lock) {} }
         var config = SchedulerConfig()

@@ -103,6 +103,12 @@ enum Migrations {
                 END
                 """)
         }
+        m.registerMigration("v2-owner-read") { db in
+            try db.create(table: "ownerReadMark") { t in
+                t.primaryKey("channelId", .text).references("channel", onDelete: .cascade)
+                t.column("lastReadAt", .datetime).notNull()
+            }
+        }
         return m
     }
 }
