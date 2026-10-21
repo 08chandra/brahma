@@ -25,7 +25,7 @@ struct DetailView: View {
                     ActivityFeedView(model: model, compact: false)
                 case .agents:
                     VSplitView {
-                        MonoEmptyState("Agents", detail: "No roster yet")  // Task 8
+                        AgentsView(model: model)
                             .frame(minHeight: 200)
                         ActivityFeedView(model: model, compact: true)
                             .frame(minHeight: 60, idealHeight: 140, maxHeight: 260)

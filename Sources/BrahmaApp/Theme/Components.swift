@@ -211,7 +211,7 @@ struct KeyValueGrid: View {
 
     var body: some View {
         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: BrahmaTheme.spaceM, verticalSpacing: 6) {
-            ForEach(rows) { row in
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                 GridRow {
                     CapsLabel(row.label).gridColumnAlignment(.leading)
                     Text(verbatim: row.value)

@@ -50,7 +50,7 @@ private struct Shell: View {
             Group {
                 switch sheet {
                 case .newCompany: NewCompanySheet(model: model)
-                case .hire: HireSheetPlaceholder(model: model)
+                case .hire: HireSheet(model: model)
                 }
             }
             .background(BrahmaTheme.bg1)
@@ -64,25 +64,5 @@ private struct Shell: View {
         } message: {
             Text(verbatim: model.errorMessage ?? "")
         }
-    }
-}
-
-private struct HireSheetPlaceholder: View {
-    let model: AppModel
-
-    var body: some View {
-        VStack(spacing: 0) {
-            PanelHeader(title: "Hire agent")
-            MonoEmptyState("Hiring opens in a later build")
-            Hairline()
-            HStack {
-                Spacer()
-                Button("Close") { model.presentedSheet = nil }
-                    .buttonStyle(.brahma)
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(BrahmaTheme.spaceM)
-        }
-        .frame(width: 420, height: 300)
     }
 }

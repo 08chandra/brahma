@@ -39,10 +39,39 @@ extension View {
 }
 
 /// Uppercase `text2` column header label for a `bg3` table header row.
+/// With `sorted` set, the header shows an arrow for the direction (`true` = ascending); with `action` it is a button.
 struct ColumnHeader: View {
     let title: String
-    init(_ title: String) { self.title = title }
-    var body: some View { CapsLabel(title) }
+    var sorted: Bool?
+    var action: (() -> Void)?
+
+    init(_ title: String, sorted: Bool? = nil, action: (() -> Void)? = nil) {
+        self.title = title
+        self.sorted = sorted
+        self.action = action
+    }
+
+    var body: some View {
+        if let action {
+            Button(action: action) { label }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(verbatim: "Sort by \(title)"))
+        } else {
+            label
+        }
+    }
+
+    private var label: some View {
+        HStack(spacing: 3) {
+            CapsLabel(title, color: sorted == nil ? BrahmaTheme.text2 : BrahmaTheme.text0)
+            if let sorted {
+                Image(systemName: sorted ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(BrahmaTheme.text0)
+            }
+        }
+        .contentShape(Rectangle())
+    }
 }
 
 // MARK: - Buttons and fields
