@@ -200,7 +200,7 @@ optional per-role override). Three profiles:
 | Profile | What agents can do |
 |---|---|
 | **Sandboxed** (default) | Every turn's tool execution is OS-sandboxed (macOS Seatbelt, via Claude Code's built-in sandbox settings passed with `--settings`, or `sandbox-exec` profiles if that's insufficient). Writes only inside the company workspace + its worktrees + per-project tool caches; reads limited to workspace, resources, and toolchains; network via an allow-list (package registries, docs, the owner-added domains) that the owner can widen; no system-wide installs. |
-| **Workspace** | Not OS-sandboxed, but Claude Code permissions restrict file edits and Bash to the workspace dirs (`--add-dir`, allow/deny rules); project-local installs only (npm/pip/venv/SPM per project); open network. |
+| **Workspace** | Not OS-sandboxed: a tool allow-list only — Claude Code edits go to the workspace, but **Bash is unrestricted** (it can reach the whole home directory and the Brahma database) until 5-lite; project-local installs only; open network. |
 | **Full** | `bypassPermissions`: anything the owner's user account can do, including `brew` and global installs. Shown with a persistent warning badge. |
 
 - Switching profile applies from each agent's next turn.
@@ -615,6 +615,328 @@ tech/hardware, B2B SaaS, CPG, services, media, etc.
   improve them over time from what works, and new packs can be added.
 - Plan 1's engine needs no change for this; packs land with the role
   catalog / work items (Plan 3), previews (Plan 4) and connectors (Plan 11).
+
+### 6.19 Efficiency meter, performance analysis, and earned trust (**[owner]** asked for this)
+**Efficiency meter [call]** — engine-measured, never self-reported, per agent
+and per team, per sprint and rolling:
+- Throughput: work items done, weighted by effort tier.
+- Quality: first-pass rate on the engine-run check, rework count, review
+  rejections, escaped defects (bugs later traced to the item).
+- Cost: usage/tokens per completed item vs the median for that item type.
+- Flow: cycle time, time blocked, time in chatter (messages not followed by
+  progress).
+- Reliability: failed turns, watchdog interventions, budget overruns.
+Shown to the owner as an efficiency meter on each agent (map badge + detail
+panel) and as team/company scorecards.
+
+**Performance analysis [call]** — an Ops/Performance function (per-company
+agent, reporting to the CEO and the owner; the Steward consumes its output
+installation-wide) publishes a scorecard each sprint, flags outliers and
+trends, and proposes concrete changes (prompt/model tweaks, reassignment,
+team splits, pairing, retraining notes). Changes go through the normal
+approval rules (§6.15/§6.16).
+
+**Anti-gaming rules [call]** (§6.16 reward-hacking principles apply):
+- Multiple balanced measures, never a single score to maximize.
+- Agents do not see their raw scores; they get specific, actionable feedback
+  in retro notes instead.
+- Item sizes/tiers are set by the planner/manager, not the worker; splitting
+  or cherry-picking items to inflate counts is itself measured.
+
+**Earned trust instead of "rewards" [call]** — agents don't experience
+rewards, so incentives that work are changes in what an agent is trusted
+with. Engine-granted trust levels based on the meter: promotion → harder/lead
+items, larger budgets, stronger model, lighter (still engine-verified)
+review, mentoring and planning input; sustained low performance → more
+review, smaller items, pairing, reassignment, or replacement. Never
+self-grantable.
+
+**Trust levels — implemented as an engine ladder [owner: build it]:**
+| Level | Gets |
+|---|---|
+| T0 Probation | small items only, pairing with a navigator on every item, every diff reviewed, cheapest adequate model, minimum budget |
+| T1 Standard | normal items for its role, normal review, role-default model and budget |
+| T2 Trusted | larger/lead items, 1.5× budget, lighter review (engine checks still mandatory), may mentor (be a navigator) |
+| T3 Lead | can lead a sub-team or epic, proposes plans, stronger model eligible, 2× budget, input in sprint planning |
+New hires start at T1 (or T0 if the owner chooses). The engine evaluates
+promotion/demotion at each sprint end from the efficiency meter with
+hysteresis (sustained performance over ≥2 sprints, minimum sample size),
+logs the reason, and notifies the agent's manager; the owner can override.
+Trust level feeds the scheduler (priority, model, budget), assignment
+(item size), and review rules. Never self-grantable.
+
+**Digital rewards [owner: build it]** — engine-awarded from the meter, shown in
+the UI, purely cosmetic (no effect on scheduling or prompts, so nothing to
+game): coffee ☕ for a clean first-pass item, a meal 🍜 for finishing a large
+item under budget, a trophy 🏆 for "employee of the sprint", streak flames 🔥
+for consecutive first-pass items, owner-given kudos ⭐. Agents show their
+current perks on the map and in their profile; a company "break room" view
+lists recent awards. (Theme kept to food/drink/trophies.)
+
+**HR function [owner: build it]** — an HR agent (per company, reports to the
+CEO; owner sees everything) runs performance management:
+- **Performance reviews** every sprint from the meter + manager input,
+  written to the agent's file (owner-visible).
+- **Warnings → Performance Improvement Plan (PIP)**: an agent below the bar for
+  a sprint gets a written warning (recorded; corrective notes go into its
+  retro feedback, e.g. "your items fail on missing edge cases — run the
+  edge-case checklist before submitting"); two consecutive sprints → a PIP:
+  demotion to T0 probation with specific, measurable targets for the next
+  sprint.
+- **Root-cause first**: before disciplining, HR + the Performance function
+  check whether the cause is the agent or the system (bad role prompt, wrong
+  model, oversized items, broken tooling) and fix the system when it is —
+  that change goes through the normal approval rules.
+- **Termination & replacement**: failing a PIP → HR proposes termination; the
+  agent is killed and a fresh hire replaces it with a clean session, the
+  role card (improved if the root cause was the prompt), and a written
+  handoff of the departing agent's open work and lessons. Terminations need
+  the manager's sign-off and are owner-approved unless Auto mode is on.
+- **Guardrails**: HR actions are engine-backed facts (meter data cited in each
+  action), every action is logged and reversible by the owner, and HR can't
+  act on agents above its reporting line or on the C-suite without the
+  owner. Agents can't influence their own reviews.
+
+Lands in Plan 3 (metrics collection, trust ladder, rewards, HR agent and
+actions) and Plan 4 (meter, perks and HR views in the UI); the Steward
+(Plan 10) uses it installation-wide.
+
+### 6.20 Ideas pipeline — visionaries reach the C-suite through tickets (**[owner]** asked for this)
+- **Idea tickets [call]:** any agent can file an **Idea** work item
+  (`propose_idea`): problem/opportunity, proposal, expected impact, rough
+  cost/effort, evidence (research links, lab prototype, metrics), risks. It
+  lands on a company **Ideas board**, not in anyone's DMs, so it never
+  interrupts the C-suite.
+- **Visionary roles:** an R&D / "Visionary" role (and optionally a
+  per-agent `visionary` flag) gets a small standing budget to research and
+  build a quick lab prototype (§6.14) before pitching. Ideas backed by a
+  prototype or data are scored higher.
+- **Triage [call]:** a duplicate check (search the board + knowledge base)
+  runs on filing; the filer's manager (or the CPO for cross-cutting ideas)
+  adds a triage note within a sprint. Ideas are scored on impact,
+  confidence, and effort (RICE-style) with the reasoning recorded.
+- **C-suite review:** once per sprint, CEO/CPO/CTO hold an **Idea review**
+  over the top-scored ideas and decide: **approve** (becomes an epic in the
+  backlog, the filer credited and often assigned as lead), **prototype
+  further** (small budget, revisit next review), **park** (kept with a
+  reason), or **reject** (reason recorded and sent back to the filer).
+  Owner-gated like other decisions unless Auto mode is on; ideas above a
+  cost threshold always go to the owner.
+- **Owner view:** the Ideas board (status columns, scores, who filed, decision
+  history); the owner can file ideas too and fast-track any idea.
+- **Guardrails:** per-agent idea quota (e.g. 3 open ideas) to prevent spam;
+  idea quality feeds the efficiency meter (approved/shipped ideas count;
+  rejected duplicates don't); approved-and-shipped ideas earn a 💡 perk.
+- Lands in Plan 3 (item type, board, triage, review ceremony) and Plan 4 (UI).
+
+### 6.21 Agent map — two view modes (**[owner]** asked for this; Plan 4)
+The live agent map (§6.2) has a toggle between two modes driven by the same
+live data (agents, states, teams, messages, hand-offs, perks).
+
+**1. Hive (3D) [call: SceneKit]**
+- A 3D hive: each team is a cluster of hexagonal cells; each agent is a cell
+  (glowing by state: running = bright pulse, ready = steady, blocked = red
+  rim, sleeping = dim, killed = hollow); C-suite at the core, teams around it.
+- Connections drawn as edges between cells (reporting lines faint, recent
+  communication bright); each live message travels as a particle along its
+  edge; busy pairs get thicker edges; owner messages come from a distinct
+  "owner" node.
+- Orbit/zoom/pan; click a cell → agent detail; hover → name, role, current
+  item, efficiency meter. Level-of-detail for hundreds of agents (teams
+  collapse into single cells when zoomed out).
+
+**2. Village (2D isometric) [call: SpriteKit]**
+- A top-down/isometric village in an original cartoon style (no third-party
+  game assets): each department/team is a building (HQ/castle = C-suite,
+  workshop = engineering, studio = design, lab = R&D/visionaries, market =
+  sales/marketing, warehouse = ops/fulfillment, bank = finance, HR office,
+  QA tower); building size/level grows with team size and output.
+- Each agent is a small worker sprite: works at its building while running
+  (hammering/typing animation), idles when ready, sleeps (Zzz) when
+  sleeping, shows a "!" bubble when blocked; killed agents leave.
+- Communication and hand-offs are visible: a worker walks (or a courier/
+  carrier pigeon flies) from one building to another carrying a scroll for a
+  message or a crate for a hand-off; meetings (idea review, sprint planning)
+  gather workers in the town square.
+- Perks show on workers (☕, 🏆, 🔥); trust level shows as outfit/hat; the
+  efficiency meter as a small bar over the head on hover.
+- Click a worker → agent detail; click a building → team view; pan/zoom.
+
+**Shared**
+- Both render from one `MapModel` (positions, events) fed by the activity
+  stream; animations are rate-limited and batched so hundreds of agents and
+  bursts of messages stay smooth; a "follow agent" camera mode; a time
+  scrubber to replay the last hour.
+- Plan 4 may split the two modes into separate tasks/sub-plans; the Village
+  mode needs a sprite asset set (drawn procedurally or as bundled original
+  SVG/PDF art).
+
+### 6.22 Full Claude Code capabilities for every agent (**[owner]** asked for this)
+Every agent is a full Claude Code session, so it can use everything Claude
+Code offers — but from a **company-curated toolkit**, never the owner's
+personal setup (turn isolation, §6.5/§6.16, stays: `--setting-sources ""`, no
+personal plugins/hooks/CLAUDE.md).
+- **Built-in tools:** Read/Edit/Write/Glob/Grep/Bash, WebSearch/WebFetch,
+  Task (sub-agents within its own turn), Todo, NotebookEdit — enabled per
+  role. Harness tools that would bypass the company (Cron, wakeups, remote
+  triggers, push notifications, cross-session messaging, worktree switching)
+  stay disabled; the company provides those functions itself.
+- **Skills:** a company **Skill library** (Anthropic Agent Skills format;
+  includes promoted lab modules §6.14 and pack-provided skills) mounted per
+  role via a company plugin directory (`--plugin-dir`), so agents can invoke
+  skills and slash commands.
+- **Plugins:** curated Claude Code plugins installed into the company plugin
+  directory (not the owner's), enabled per role through generated
+  `--settings`.
+- **MCP servers:** the company MCP server (always) plus installed connector
+  MCP servers (§6.17), merged into each turn's `--mcp-config` filtered by
+  role and grants.
+- **Sub-agents:** agents may spawn Claude Code sub-agents inside a turn;
+  counted against the item budget; depth/concurrency capped per tier.
+- **Hooks:** company-owned hooks (e.g. pre-commit secret scan, test
+  guards) installed by the engine; agents can't edit them.
+- **Permissions:** per role/agent from the permission profile (§6.5a) +
+  grants (§6.23), compiled into each turn's `--settings` permission rules.
+
+### 6.23 Integrations catalog and the Access Center (**[owner]** asked for this)
+**Integrations catalog [call]** — one place to browse and install the
+services any engineer (or any business role) needs, each packaged as a
+connector = MCP server and/or CLI + credentials + role scopes + budget meter:
+- Cloud & deploy: AWS, Google Cloud, Azure, Vercel, Fly.io, Cloudflare,
+  Netlify, Docker/registries.
+- Data: Postgres (incl. Neon/Supabase/RDS), MySQL, SQLite, Redis/Upstash,
+  MongoDB, vector DBs, S3-compatible storage, BigQuery/Snowflake.
+- Dev: GitHub/GitLab, CI, Sentry, Linear/Jira, Figma, package registries.
+- Payments & funds: Stripe, agent wallets (e.g. AgentWallet-style
+  programmatic wallets/virtual cards) as **funds connectors** under the
+  budget rules of §6.17.
+- Comms & business: Gmail/IMAP, Slack, Discord, social, Shopify, CRM,
+  analytics, accounting.
+- Anything else: "Add custom MCP server" (command or URL) or "Add CLI tool".
+Each catalog entry declares: what it can do, the credential it needs, risk
+level (read-only / writes / spends money / external comms), default roles,
+and cost tracking. Agents can **request** a connector (with a reason and the
+work item it unblocks); the owner installs with one click.
+
+**Access Center [call]** — a single owner screen (and menu-bar badge +
+notifications) for every approval the company needs, replacing scattered
+queues:
+- One inbox of **access requests**: tool/permission (e.g. a Bash command
+  class, a network domain, a system install), plugin/skill install, MCP
+  server / connector install, credential/sign-in, secret, spend, outbound
+  message, and decision gates (§6.8) — each card shows who asks, why, the
+  linked work item, risk level, and exactly what will be granted.
+- **One-click answers with scope and duration:** Approve once · for this
+  item · for this agent · for this role · company-wide; for this turn /
+  this sprint / always; or Deny with a reason (sent back to the agent).
+- **Policies and presets** so the owner isn't flooded: e.g. "auto-approve
+  read-only network for engineers", "always ask for spend", "Auto mode may
+  approve low-risk tool grants"; risk-based defaults per permission
+  profile. High-risk classes (money, external messages, deleting data,
+  production deploys, the Steward's protected areas) never auto-approve.
+- **Grants ledger:** every active grant listed with scope, expiry, who
+  approved, and usage; one-click revoke; everything audited.
+- The engine compiles grants into each turn's settings/MCP config, so a
+  grant takes effect on the agent's next turn and a revoke likewise.
+- Same API in the headless server mode (§6.13) so the Mac/phone companion
+  can approve remotely.
+
+Lands in: Plan 5 (Access Center, grants, permission compilation, sandbox),
+Plan 11 (integrations catalog, connectors, funds connectors), with the
+skill/plugin directory mechanics in Plan 5.
+
+### 6.24 Design review decisions (**[owner]** approved 2026-10-21)
+Source: `docs/research/2026-10-21-design-review.md` (architecture critic).
+These **override** earlier sections where they conflict.
+
+**Build order:** Plan 2 → **3a (amended)** → **5-lite** → **Memory-lite (§6.25)** (sandbox via Claude
+Code `--settings`, sandboxed checks, DB unreachable from agents, Inbox
+notifications + daily digest, startup probe, DB backups) → 4a (batched merge
+queue + previews) → 4b (**org chart map only**) → **dogfood one real company
+at N≈8 for a week** → 3b (designed from that data) → 4c (Hive + Village as
+optional skins) → 7, 11, 9, 8, 10.
+
+**Foundation fixes (in 3a):** channel membership never wakes agents (only
+@mention, DM, item notice, or rate-limited @team/@here by managers; system
+posts never wake); one git worktree per work item with checks run there and
+engine merges; weekly-aware usage pacing with an owner reserve (default 30% of
+the 7-day window kept for the owner's own Claude use) and Opus reserved for
+C-suite/architecture/tier-L; fresh Claude session per work item; `brahma
+doctor` startup probe; verification flags modified tests and snapshots check
+scripts; memory-pressure admission; only meter *facts* collected (no scores).
+
+**One Inbox.** Every "needs the owner" thing — decisions, access requests,
+grants, outbound drafts, spend, human tasks, staffing — is one `ask` with a
+kind, a risk level, and a proposed scope/duration (§6.23 Access Center is the
+UI for it). Auto mode is a named policy preset over (kind, risk). Resolves the
+earlier contradictions: **Auto mode never spends money, never sends external
+messages, never approves terminations or prompt changes**; those only
+auto-approve under an explicit owner policy the owner set (e.g. a spend
+threshold, a per-account send policy).
+
+**Owner load defaults ("Important only"):** the owner approves PRD,
+architecture, release, any money, secrets, outbound messages, and
+terminations; sprint plans auto-approve after the C-suite with an FYI;
+standups are engine-generated (no LLM turns); sprints are timeboxed with
+carry-over; pending asks notify on macOS immediately; approval cards show the
+document inline (sanitized Markdown).
+
+**Concept budget.** The owner works with five nouns — **Company, People, Work,
+Inbox, Budget**. Everything else (leases, review turns, hand-offs, trust,
+meter, HR, ideas, pairing, judge…) is an engine internal shown under
+"Insights", never something the owner must operate.
+
+**Defaults:** new company size 6 (merged roles); Balanced mode; comms, funds,
+browser and connectors off until the owner turns each on; >50 agents labelled
+"experimental".
+
+**Steward (§6.15) revised:** the Steward writes a weekly report and opens
+code/config changes as branches for the owner to review and merge; no
+self-hot-swapping runtime. Level-1/2 tuning proposals go through the Inbox
+(owner-required for prompt changes).
+
+**Security notes:** the workspace profile is a tool allow-list, not a
+sandbox, until 5-lite lands; credentials default to engine-held, behind
+connector tools (env-var injection only for keys marked "test"); metered
+connectors (cloud, DB-as-a-service, LLM APIs) count as spend and require a
+provider-side budget cap at install; browser automation is limited to the
+owner's own accounts and the product under test (resolves §3 vs §6.17).
+Items to verify before scaling or distributing: Claude subscription terms
+for sustained automated use, remote-VM login (Plan 8), distribution requiring
+API keys, AI-disclosure rules for outbound messages, platform automation ToS.
+
+**Maps:** the Org Chart is the default and the first map built; Hive and
+Village are optional skins (Plan 4c), exempt from the ops-console brief.
+
+### 6.25 Company Memory — shared knowledge with permission-scoped access (**[owner]** asked; evaluated supermemory.ai)
+Goal: every agent works with all the company knowledge it is permitted to see.
+**Decision [call]:** build it locally inside Brahma; external memory services
+(e.g. supermemory.ai) are optional connector backends, never the source of
+truth — company data stays on the owner's machine/server and permissions are
+Brahma's.
+- **Store:** per company, in the Brahma DB: FTS5 now; optional on-device
+  embeddings (e.g. a local vector index) later. Never leaves the machine
+  unless the owner enables an external backend.
+- **Auto-ingest:** messages, work items, decisions/asks, hand-offs, research
+  reports and the Knowledge Base, retros/lessons, artifacts/documents, plus
+  explicit `remember(fact, scope)` from agents. Each entry keeps provenance
+  (source id, author, time).
+- **Scopes & sensitivity:** every entry has a scope (company · team · role ·
+  agent · item) and a sensitivity label (normal · internal · restricted ·
+  hr/perf · secret-never-stored). Retrieval is filtered by the engine using
+  the asking agent's company, team, role, trust level, current item and
+  grants (§6.23) **before** results reach the agent; HR/performance records
+  only for HR/Performance roles and the owner; no cross-company retrieval.
+- **Tools:** `search_memory(query, scope?)` and `recall(topic)` return cited
+  snippets (quoted, so they can't forge digest lines); `remember`; the
+  turn-start orientation auto-includes the top-k relevant memories for the
+  current item (bounded).
+- **Hygiene:** dedupe on ingest, TTL for ephemeral entries, librarian
+  consolidation (Plan 9), owner can browse/search/delete any memory; prompt-
+  injection guard — retrieved text is always treated as data.
+- **Build:** Memory-lite (scoped FTS, auto-ingest, tools, orientation
+  integration) right after 5-lite and before dogfooding; embeddings,
+  librarian, external backends in Plan 9.
 
 ## 7. Architecture sketch
 

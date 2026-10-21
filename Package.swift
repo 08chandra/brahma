@@ -17,6 +17,8 @@ let package = Package(
             name: "BrahmaCore",
             dependencies: [.product(name: "GRDB", package: "GRDB.swift")]
         ),
+        .target(name: "BrahmaAppModel", dependencies: ["BrahmaCore"]),
+        .executableTarget(name: "BrahmaApp", dependencies: ["BrahmaAppModel"]),
         .executableTarget(
             name: "brahma",
             dependencies: [
@@ -29,5 +31,6 @@ let package = Package(
             dependencies: ["BrahmaCore"],
             resources: [.copy("Fixtures")]
         ),
+        .testTarget(name: "BrahmaAppModelTests", dependencies: ["BrahmaAppModel"]),
     ]
 )

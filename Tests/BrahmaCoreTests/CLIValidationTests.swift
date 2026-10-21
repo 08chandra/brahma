@@ -1,11 +1,12 @@
 import Foundation
 import Testing
+import BrahmaCore
 
 /// Runs the built `brahma` binary (it sits next to the test bundle) against a throwaway data home.
-private func brahma(_ args: [String]) throws -> (status: Int32, stderr: String) {
+private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32, stderr: String) {
     let url = Bundle.module.bundleURL.deletingLastPathComponent().appending(path: "brahma")
     try #require(FileManager.default.isExecutableFile(atPath: url.path), "build the brahma product first")
-    let home = try tempDir()
+    let home = try home ?? tempDir()
     let p = Process()
     p.executableURL = url
     p.arguments = args
@@ -39,5 +40,16 @@ private func brahma(_ args: [String]) throws -> (status: Int32, stderr: String) 
         let r = try brahma(["log", "Acme", "#general", "--limit", "1000"])
         #expect(r.status == 1)
         #expect(r.stderr.contains("no company named 'Acme'"))
+    }
+
+    @Test func runRefusesWhenLockHeld() throws {
+        let d = try tempDir()
+        let paths = BrahmaPaths(home: d.appending(path: "home"), workspaces: d.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let lock = try OrchestratorLock.acquire(paths: paths)
+        defer { withExtendedLifetime(lock) {} }
+        let r = try brahma(["run"], home: d)
+        #expect(r.status != 0)
+        #expect(r.stderr.contains("another Brahma engine (the Brahma app or 'brahma run') is already using"))
     }
 }

@@ -38,9 +38,18 @@ public struct ClaudeProcessRunner: TurnRunning {
     }
 
     public func waitForChildren() async {
+        await waitForChildren(pollInterval: .milliseconds(20))
+    }
+
+    /// `onPoll` runs once per check of the live count; tests use it to prove the wait sleeps between checks.
+    func waitForChildren(pollInterval: Duration = .milliseconds(20), onPoll: @escaping @Sendable () -> Void = {}) async {
         // Detached so a cancelled caller (the Ctrl-C path) still waits: Task.sleep would throw at once and spin.
         await Task.detached {
-            while Self.live.count > 0 { try? await Task.sleep(for: .milliseconds(20)) }
+            while true {
+                onPoll()
+                if Self.live.count == 0 { break }
+                try? await Task.sleep(for: pollInterval)
+            }
         }.value
     }
 

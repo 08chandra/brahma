@@ -6,7 +6,7 @@ through channels and DMs, backed by one SQLite database.
 
 ## Status
 
-This is **Plan 1: the engine and the `brahma` CLI**. The Mac app comes in Plan 2.
+This is **Plan 2: Mac app shell** on top of the Plan 1 engine and `brahma` CLI.
 
 ## Build
 
@@ -20,6 +20,18 @@ BRAHMA_LIVE=1 swift test --filter LiveSmokeTests   # real claude turns (haiku), 
 
 The binary is `.build/debug/brahma` (or `swift run brahma ...`). Companies are addressed by name or slug,
 case-insensitively.
+
+## Mac app
+
+A native SwiftUI app (dark ops-console look) over the same engine.
+
+- Build with `scripts/make-app.sh`, then open `.build/Brahma.app` or copy it to `/Applications`.
+- It uses the same data as the CLI (`BRAHMA_HOME`, `BRAHMA_WORKSPACES`).
+- The engine runs inside the app unless `brahma run` holds the lock; then the app shows a banner and takes over
+  automatically when the terminal engine stops.
+- Closing the window keeps Brahma running in the menu bar (pause/resume companies, open, quit). Quit Brahma
+  stops the agents (in-flight turns are interrupted and the agents return to ready); relaunching resumes.
+- `BRAHMA_CLAUDE` overrides the `claude` path; otherwise `claude` is found on the PATH read from your login shell.
 
 ## Commands
 
