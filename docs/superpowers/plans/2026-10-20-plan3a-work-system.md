@@ -567,6 +567,11 @@ one hold at a time; precedence account > cli > disk > network (a higher reason r
 - Critical-path exemption: when only the weekly pace is closed (not 5-hour limits, holds or memory), candidates with `blockingCount > 0` are still admitted. Test `paceExemptsCriticalPath`.
 - Calibration: `UsageCalibration` (in `Scheduler/Pacing.swift`) keeps an EMA of Δ`sevenDayUtilization` per $LE of `total_cost_usd` (`Turn.costUSD`) from successive usage snapshots, persisted in `ownerSettings.pctPerDollar DOUBLE`; `brahma status` shows ` · ≈<x>% of week today` when calibrated. Test `calibrationFromDeltas`.
 
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 4) `Store.seatBudget()` derived from `planTier()` (max5x → 8, max20x → 24); `Sources/brahma/CompanyCommands.swift` (currently `seatBudget: 8`) and later the app (Task 15) use it. Test `seatBudgetFollowsPlanTier`.
+- (note 10) `Candidate.blockingCount` already exists from Plan 1 — keep it; `paceExemptsCriticalPath` uses an injected count. Task 7 computes the real value per tick (say so in the commit body).
+- (note 12) Kill-switch hook for 5-lite: `Scheduler.select(… held:)` takes a single `held` boolean that callers compute as `hold != nil || <future owner stop>`; `StallInput` gets a `stopped: Bool = false` slot rendered as `"stopped by the owner"` before the hold reason; the active clock's freeze condition is one function `Store.isFrozen(companyId:) -> Bool` (today: engine hold active or company not running).
+
 - [ ] **Step 1: Write failing tests.**
   - `ClockTests`:
     - `accruesOnlyWhileRunning` (a paused company gains 0);
@@ -668,6 +673,9 @@ Denials: `"only the item's author, reviewer, a manager or the owner can change i
 **Efficiency amendments (owner-approved 2026-10-21, end-goal efficiency review; override the text above where they conflict):**
 - Actionable-only, debounced work notices: `workNotice` + `wakes BOOLEAN NOT NULL DEFAULT 0`, `wakeAfterActive DOUBLE`. `recordItemEvent` sets `wakes` from `WakePolicy.noticeWakes` (Task 3). For manager/executive recipients a waking notice gets `wakeAfterActive = lastLeadWake + 600` (agent + `lastNoticeWakeActive DOUBLE`) unless the item blocks others (an undone dependent exists). `hasPendingWork` counts waking notices with `wakeAfterActive <= activeNow`; non-waking notices are delivered in the next turn without waking. The tick wakes sleeping agents whose debounced notices came due. Tests: `fyiNoticesDoNotWake`, `leadNoticeDebounced`, `blockingItemSkipsDebounce`; `noticesFanOutAndWake` uses an actionable kind.
 
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 5) `WakePolicy.noticeWakes(kind: WorkEventKind, recipientRole: NoticeRecipientRole) -> Bool` with the table from Task 3's efficiency amendment (`NoticeRecipientRole { owner, reviewer, author, holder, waiter, other }` or equivalent); later plans extend it by name.
+
 - [ ] **Step 1: Write failing tests.**
   - `WorkPolicyTests`: a table over every rule line, plus `assigneeCannotEditCheckEvenIfAuthor` and `engineStatusesRefused`.
   - `WorkItemTests`:
@@ -751,6 +759,10 @@ Denials: `"only the item's author, reviewer, a manager or the owner can change i
 
 **Merge-safety amendments (owner-approved 2026-10-21: "with multiple engineer agents we need to prevent merge errors"; override the text above):**
 - Path-overlap guard: an item's declared `checkSpec.paths` (plus `WorkItem.touchPaths: [String]`, a new optional glob list stored as JSON in `"v3-leases"` `workItem + touchPaths TEXT NOT NULL DEFAULT '[]'`, editable as a spec field) are its claimed paths; no paths declared = the whole repo (`["."]`, which overlaps everything). `PathOverlap.overlaps(_:_:)` (prefix/glob match on normalized relative paths). `claimLease` and engine dispatch refuse an item whose paths overlap an `inProgress`/`inReview` item's: `"<KEY> overlaps <KEY2> (<path>); wait until it merges"`; dispatch skips it. Hot paths: `ownerSettings.hotPaths TEXT` (JSON globs; default `["Package.swift","Package.resolved","package.json","package-lock.json","yarn.lock","pnpm-lock.yaml","Cargo.lock","go.sum","Podfile.lock","**/migrations/**","**/routes*","**/router*"]`; CLI `brahma settings hot-paths [<glob>…|default]`, owner only): an item touching a hot path may be in progress only while no other in-progress/in-review item of the company touches any hot path. Tests: `overlappingItemsCannotBothBeInProgress`, `disjointItemsRunInParallel`, `hotPathItemsSerialize`, `dispatchSkipsOverlappingItem`.
+
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 3) The orphan-worktree sweep skips every `<ws>/.brahma/wt/` entry whose name starts with `.` (engine checkouts of later plans: `.preview`, `.release`, `.merge`) and only touches registered `git worktree list` entries whose branch is `item/<KEY>`. Test `sweepIgnoresEngineCheckouts`.
+- (note 10) Compute `Candidate.blockingCount` in one query per tick: for an agent, the number of undone items that depend on items it owns or leases, plus the number of agents blocked on it. Say so in the commit body.
 
 - [ ] **Step 1: Write failing tests.**
   - `GitWorkspaceTests`:
@@ -837,6 +849,9 @@ Denials: `"only the item's author, reviewer, a manager or the owner can change i
 **CheckPaths amendment (owner-approved 2026-10-21, 5-lite contract; overrides the text above, including the earlier detached-worktree location):**
 - New `struct CheckPaths { let workspace: URL; func snapshotDir(key:revision:) -> URL /* <ws>/.brahma/checks/<KEY>/rev<n>/ */; func manifest(key:revision:) -> URL; func runWorktree(runId:) -> URL /* <ws>/.brahma/wt-check/<runId> */ }` in `Verify/CheckScripts.swift`. Check-script snapshots (+ `manifest.json`) live under `snapshotDir`, NOT under `<companyDir>/checks/`; temp detached check worktrees live under `runWorktree`. `BrahmaPaths.checksDir` from Task 1 stays unused for checks (leave it; note it). The engine is the only writer of `.brahma/checks` (5-lite write-denies it for agent turns).
 - Integrity guard: before each run (submit and merge), the engine re-hashes the snapshot files against `checkSnapshot.manifest`; on mismatch it refuses the run (status `error`, tail `"check snapshot was modified outside the engine"`), adds review flag `"check snapshot tampered: <file>"`, and returns the item to `inProgress` with a system DM to the holder. Test `tamperedSnapshotRefusesRun`.
+
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 6) `ChildEnvironment.Purpose` gains `case check` (same allowlist as `.general`, no auth variables); checks use `purpose: .check`.
 
 - [ ] **Step 1: Write failing tests.**
   - `CheckRunnerTests`:
@@ -946,6 +961,12 @@ else in worktree: git rebase main
 - (9b) Branch freshness: in the same pass, an in-progress branch more than `MergeSafety.maxBehindCommits = 20` commits behind `main` (`git rev-list --count item/<KEY>..main`) or older than `MergeSafety.maxBehindActiveDays = 2` active days since its merge base was `main`'s head gets one notice per threshold crossing: `"<KEY> is <n> commits behind main; rebase item/<KEY> on main in your worktree and re-run your check."`. Test `staleBranchNotified`.
 - (9b) Conflict hand-off: on a merge-time rebase conflict, the item returns to its owner (`inProgress`, as planned) and the engine writes a conflict-resolution brief `<ws>/.brahma/conflicts/<KEY>-<yyyyMMdd-HHmmss>.md` containing, for each conflicting file, `main`'s diff since the merge base and the item's diff since the merge base (each ≤ 200 lines, quoted with `    | `). The owner DM (and work notice) names its path; `verifiedRevision`/`verifiedCommit` are cleared so the item must re-pass its check after resubmitting. Test `conflictWritesResolutionBriefAndRequiresRecheck`.
 - Planner rule: creating or editing a claimable item to tier L sends its author's manager (else the owner) a notice `"<KEY> is tier L; split it into tier S/M items to keep merges small."`, and the manager/engineer role cards say tier L items are split before work. (Not a hard refusal; ledger ruling.)
+
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 1, 9a) One `TurnKind`: move the enum from `Org/ModelPolicy.swift` to `Model/Turn.swift` as `public enum TurnKind: String, Codable, Sendable, DatabaseValueConvertible { case work, review, audit, notice }`, used for both `ModelContext.turnKind` and the stored `turn.kind` (a notice-only turn is stored `notice`); `ModelPolicy` maps `audit` like `review`.
+- (note 2, 9c) `CompanyToolNames.audit = ["audit"]`, included in `all`, allowed only in audit turns (like `review`); `IndustryPack.validate()` accepts it.
+- (note 7, 9b) Merge-safety lives in `finishMerge`, not the tick step: `finishMerge(itemId:result:now:)` with `.conflict(files)` itself writes the conflict brief, clears `verifiedRevision`/`verifiedCommit` and sends the DM and notice; it receives the merge base and the main-side commit as parameters. The post-merge `merge-tree` dry-run and the freshness pass are one detached entry point `MergeSafety.afterLanding(companyId:mergedKey:)`, triggered by `finishMerge(.merged)`.
+- (note 8, 9a/9c) One approval entry point `approveForMerge(db:item:by:note:)` (flag clearing, `mergeState = pending`, event `reviewApproved`) used by `Store.review` approve and by 9c's auto-approval.
 
 - [ ] **Step 1: Write failing tests** in `ReviewTests`:
   - `passingCheckSchedulesCleanContextReviewTurn`;
@@ -1159,6 +1180,9 @@ paused approver: approver paused and activeNow - pausedActive ≥ 1 day → rero
 **Efficiency amendments (owner-approved 2026-10-21, end-goal efficiency review; override the text above where they conflict):**
 - Combined gate for small companies: when the company has ≤ 8 non-killed agents, an approved `prd` ask also satisfies the architecture gate (`hasApproved(kind: .architecture)` is true), and its kind title reads "Brief & architecture". Test `smallCompanyCombinedGate`.
 
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 9) `AskKind.reserved` also names `deploy` and `role` (titles "Deploy", "Role"), so the list is `request, grant, deploy, humanTask, outbox, spend, staffing, stage, role`; `AskKind(rawValue:)` round-trips them.
+
 - [ ] **Step 1: Write failing tests** in `InboxTests`:
   - `routesToPackApprover`;
   - `presetTable` (all presets × kinds × risks);
@@ -1251,6 +1275,9 @@ Builds the parts of Task 11a's section that 11a excluded (read the Task 11a brie
 **Amendments (owner-approved 2026-10-21; these override the text above where they conflict):**
 - Kill ordering: `offboard` reads the agent's owned/leased item set BEFORE Task 7's unassignment (or the unassignment moves into `offboard`), so the auto hand-offs cover every item it had. Leases are marked expired by kill (Task 7) and removed by the tick.
 
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 12) `StallExplainer` input keeps the `stopped` slot from Task 5; aging and deadlock timers use `Store.isFrozen(companyId:)`'s clock.
+
 - [ ] **Step 1: Write failing tests.**
   - `AttritionTests`:
     - `killReroutesAsksAndReviews`;
@@ -1317,6 +1344,10 @@ Standup — <team|company> — <name> (<d>/<t> done)
 
 **Efficiency amendments (owner-approved 2026-10-21, end-goal efficiency review; override the text above where they conflict):**
 - Gates block only irreversible work: `plan_sprint` no longer refuses for missing gates; instead the sprintPlan ask's summary starts with `Gates not yet approved: <PRD|Architecture>.` when any is missing, and such an ask always needs the owner (`approve`) under every preset. Items can be claimed and built (walking skeleton on item branches) before gates. `planRequiresApprovedGates` becomes `planWithoutGatesNeedsOwner`.
+
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 2) `MCPTests.executiveSeesEveryTool` expects `Set(CompanyToolNames.all).subtracting(["review", "audit"])`.
+- (note 11) Read-only `Store.sprints(companyId:statuses:) -> [Sprint]`.
 
 - [ ] **Step 1: Write failing tests** in `SprintTests`:
   - `planRequiresApprovedGates`;
@@ -1463,6 +1494,10 @@ n = previousCount + 1;  n >= escalateAfter → escalate("no work-item progress i
 **Amendments (owner-approved 2026-10-21; these override the text above where they conflict):**
 - `SafeMarkdown.load` resolves symlinks before the workspace check.
 - `CompanyForm.agentCount` defaults to 6; > 50 shows the warning `Org sizes over 50 are experimental.`; the default mode is Balanced.
+
+**Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
+- (note 11) `WorkSnapshot.openSprints` includes `pendingApproval` and `review` sprints, not only `active`.
+- (note 4) `createCompany` and `CompanyForm.preview` use `Store.seatBudget()`.
 
 - [ ] **Step 1: Write failing tests.**
   - `WorkPresentationTests`:
