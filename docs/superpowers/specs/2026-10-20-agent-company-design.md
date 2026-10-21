@@ -200,7 +200,7 @@ optional per-role override). Three profiles:
 | Profile | What agents can do |
 |---|---|
 | **Sandboxed** (default) | Every turn's tool execution is OS-sandboxed (macOS Seatbelt, via Claude Code's built-in sandbox settings passed with `--settings`, or `sandbox-exec` profiles if that's insufficient). Writes only inside the company workspace + its worktrees + per-project tool caches; reads limited to workspace, resources, and toolchains; network via an allow-list (package registries, docs, the owner-added domains) that the owner can widen; no system-wide installs. |
-| **Workspace** | Not OS-sandboxed, but Claude Code permissions restrict file edits and Bash to the workspace dirs (`--add-dir`, allow/deny rules); project-local installs only (npm/pip/venv/SPM per project); open network. |
+| **Workspace** | Not OS-sandboxed: a tool allow-list only — Claude Code edits go to the workspace, but **Bash is unrestricted** (it can reach the whole home directory and the Brahma database) until 5-lite; project-local installs only; open network. |
 | **Full** | `bypassPermissions`: anything the owner's user account can do, including `brew` and global installs. Shown with a persistent warning badge. |
 
 - Switching profile applies from each agent's next turn.
@@ -844,6 +844,69 @@ queues:
 Lands in: Plan 5 (Access Center, grants, permission compilation, sandbox),
 Plan 11 (integrations catalog, connectors, funds connectors), with the
 skill/plugin directory mechanics in Plan 5.
+
+### 6.24 Design review decisions (**[owner]** approved 2026-10-21)
+Source: `docs/research/2026-10-21-design-review.md` (architecture critic).
+These **override** earlier sections where they conflict.
+
+**Build order:** Plan 2 → **3a (amended)** → **5-lite** (sandbox via Claude
+Code `--settings`, sandboxed checks, DB unreachable from agents, Inbox
+notifications + daily digest, startup probe, DB backups) → 4a (batched merge
+queue + previews) → 4b (**org chart map only**) → **dogfood one real company
+at N≈8 for a week** → 3b (designed from that data) → 4c (Hive + Village as
+optional skins) → 7, 11, 9, 8, 10.
+
+**Foundation fixes (in 3a):** channel membership never wakes agents (only
+@mention, DM, item notice, or rate-limited @team/@here by managers; system
+posts never wake); one git worktree per work item with checks run there and
+engine merges; weekly-aware usage pacing with an owner reserve (default 30% of
+the 7-day window kept for the owner's own Claude use) and Opus reserved for
+C-suite/architecture/tier-L; fresh Claude session per work item; `brahma
+doctor` startup probe; verification flags modified tests and snapshots check
+scripts; memory-pressure admission; only meter *facts* collected (no scores).
+
+**One Inbox.** Every "needs the owner" thing — decisions, access requests,
+grants, outbound drafts, spend, human tasks, staffing — is one `ask` with a
+kind, a risk level, and a proposed scope/duration (§6.23 Access Center is the
+UI for it). Auto mode is a named policy preset over (kind, risk). Resolves the
+earlier contradictions: **Auto mode never spends money, never sends external
+messages, never approves terminations or prompt changes**; those only
+auto-approve under an explicit owner policy the owner set (e.g. a spend
+threshold, a per-account send policy).
+
+**Owner load defaults ("Important only"):** the owner approves PRD,
+architecture, release, any money, secrets, outbound messages, and
+terminations; sprint plans auto-approve after the C-suite with an FYI;
+standups are engine-generated (no LLM turns); sprints are timeboxed with
+carry-over; pending asks notify on macOS immediately; approval cards show the
+document inline (sanitized Markdown).
+
+**Concept budget.** The owner works with five nouns — **Company, People, Work,
+Inbox, Budget**. Everything else (leases, review turns, hand-offs, trust,
+meter, HR, ideas, pairing, judge…) is an engine internal shown under
+"Insights", never something the owner must operate.
+
+**Defaults:** new company size 6 (merged roles); Balanced mode; comms, funds,
+browser and connectors off until the owner turns each on; >50 agents labelled
+"experimental".
+
+**Steward (§6.15) revised:** the Steward writes a weekly report and opens
+code/config changes as branches for the owner to review and merge; no
+self-hot-swapping runtime. Level-1/2 tuning proposals go through the Inbox
+(owner-required for prompt changes).
+
+**Security notes:** the workspace profile is a tool allow-list, not a
+sandbox, until 5-lite lands; credentials default to engine-held, behind
+connector tools (env-var injection only for keys marked "test"); metered
+connectors (cloud, DB-as-a-service, LLM APIs) count as spend and require a
+provider-side budget cap at install; browser automation is limited to the
+owner's own accounts and the product under test (resolves §3 vs §6.17).
+Items to verify before scaling or distributing: Claude subscription terms
+for sustained automated use, remote-VM login (Plan 8), distribution requiring
+API keys, AI-disclosure rules for outbound messages, platform automation ToS.
+
+**Maps:** the Org Chart is the default and the first map built; Hive and
+Village are optional skins (Plan 4c), exempt from the ops-console brief.
 
 ## 7. Architecture sketch
 
