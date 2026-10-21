@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import BrahmaCore
+import BrahmaKeychain
 
 /// Agent-controlled text must never reach the terminal raw.
 func safe(_ text: String) -> String { TerminalText.sanitize(text) }
@@ -56,15 +57,16 @@ func clock(_ date: Date, seconds: Bool = false) -> String {
 }
 
 /// Owner-write commands must not run from an agent's shell: the engine sets BRAHMA_AGENT_ID for every turn, and
-/// `<home>/owner.key` must exist and be readable (default deny). `createKey` is for the commands that may start a
-/// fresh home (`brahma run`, `brahma company create`); the app creates it at launch. Defense in depth, not a sandbox.
-func requireOwnerShell(createKey: Bool = false) throws {
+/// `<home>/owner.key` must hash to the value held in the Keychain (default deny). No owner command ever creates the
+/// key; only the app and `brahma owner init` do. There is no environment variable or flag that skips this check.
+///
+/// This is a deterrent, not a security boundary: until 5-lite read-denies the data home and Keychain services to
+/// agents, an agent shell can still read the key and hash, or fake a TTY with `script`.
+func requireOwnerShell() throws {
     if ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] != nil {
         throw fail("owner commands can't run inside an agent turn")
     }
-    let paths = BrahmaPaths.fromEnvironment()
-    if createKey { _ = try? OwnerKey.ensure(paths: paths) }
-    guard OwnerKey.isReadable(paths: paths) else {
-        throw fail("owner key missing or unreadable (\(OwnerKey.url(paths: paths).path)); start Brahma once with 'brahma run' or the app")
+    guard OwnerKey.verify(paths: BrahmaPaths.fromEnvironment(), store: PlatformOwnerKeyStore.make()) else {
+        throw fail("owner key missing or invalid; run 'brahma owner init' in Terminal or open the app")
     }
 }

@@ -1,11 +1,12 @@
 import Foundation
 import Testing
 @testable import BrahmaCore
+import BrahmaKeychain
 
 /// Runs the built `brahma` binary against a throwaway data home.
 private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = [:]) throws
     -> (status: Int32, stdout: String, stderr: String) {
-    let url = Bundle.module.bundleURL.deletingLastPathComponent().appending(path: "brahma")
+    let url = brahmaExecutableURL()
     try #require(FileManager.default.isExecutableFile(atPath: url.path), "build the brahma product first")
     let home = try home ?? tempDir()
     let p = Process()
@@ -26,7 +27,8 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
 
 @Suite struct WorkCLITests {
     @Test func companyCreateDryRunPrintsTree() throws {
-        let home = try tempDir()
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
         let r = try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "9", "--dry-run"], home: home)
         #expect(r.status == 0, "\(r.stderr)")
         #expect(r.stdout.contains("ceo (CEO & CPO)")); #expect(r.stdout.contains("    eng-1 (Engineer)"))
@@ -39,7 +41,8 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
     }
 
     @Test func companyCreateHiresSeatedPlanAndOrgCommands() throws {
-        let home = try tempDir()
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
         let r = try brahma(["company", "create", "Acme", "--goal", "g"], home: home)
         #expect(r.status == 0, "\(r.stderr)")
         #expect(r.stdout.contains("hired 5 of 6"))
@@ -59,7 +62,8 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
     }
 
     @Test func runRefusesWithoutPassingProbe() throws {
-        let home = try tempDir()
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
         // PATH has no claude, so the doctor cannot pass and run must refuse before taking the lock.
         let r = try brahma(["run"], home: home)
         #expect(r.status == 1)
@@ -69,14 +73,15 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
     }
 
     @Test func ownerCommandsRefuseInsideAgentTurn() throws {
-        let home = try tempDir()
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
         #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
         let agentEnv = ["BRAHMA_AGENT_ID": "a1"]
         let cmds: [[String]] = [
             ["company", "create", "X", "--goal", "g"], ["company", "pause", "Acme"], ["company", "resume", "Acme"],
             ["company", "mode", "Acme", "low"], ["company", "weight", "Acme", "2"], ["hire", "Acme", "bob", "--role", "engineer", "--model", "sonnet"],
             ["kill", "Acme", "ceo"], ["pause", "Acme", "ceo"], ["wake", "Acme", "ceo"], ["say", "Acme", "@ceo", "hi"],
-            ["org", "move", "Acme", "cto", "--manager", "ceo"], ["org", "fill", "Acme", "qa-1"], ["run"],
+            ["org", "move", "Acme", "cto", "--manager", "ceo"], ["org", "fill", "Acme", "qa-1"], ["run"], ["doctor"], ["owner", "init"],
         ]
         for c in cmds {
             let r = try brahma(c, home: home, env: agentEnv)
@@ -94,32 +99,54 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(r.stderr.contains("brahma mcp: --agent does not match this turn's agent"))
     }
 
-    @Test func ownerCommandRefusedWithoutOwnerKey() throws {
-        let home = try tempDir()
-        // Read-only commands don't need the key; an owner-write command on a home without one is refused.
-        let r = try brahma(["kill", "Acme", "ceo"], home: home)
-        #expect(r.status == 1)
-        #expect(r.stderr.contains("brahma: owner key missing or unreadable ("))
-        #expect(r.stderr.contains("start Brahma once with 'brahma run' or the app"))
-        #expect(try brahma(["doctor"], home: home).stderr.contains("owner key missing or unreadable"))
-        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)   // creates the key
-        #expect(!(try brahma(["kill", "Acme", "ceo"], home: home).stderr.contains("owner key")))
-        let key = home.appending(path: "home/owner.key")
-        try FileManager.default.removeItem(at: key)
-        #expect(try brahma(["pause", "Acme", "ceo"], home: home).stderr.contains("owner key missing"))
+    @Test func ownerCommandDoesNotCreateKey() throws {
+        let home = try OwnerTestHome(initOwner: false)
+        for c in [["company", "create", "Acme", "--goal", "g"], ["doctor"], ["run", "--skip-doctor"], ["kill", "Acme", "ceo"]] {
+            let r = try brahma(c, home: home.url)
+            #expect(r.status == 1, "\(c)")
+            #expect(r.stderr.contains("brahma: owner key missing or invalid; run 'brahma owner init' in Terminal or open the app"), "\(c): \(r.stderr)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: home.url.appending(path: "home/owner.key").path))
     }
 
-    @Test func ownerKeyCreatedWith0600() throws {
-        let home = try tempDir()
-        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
-        let key = home.appending(path: "home/owner.key")
+    @Test func ownerInitRequiresTTY() throws {
+        let home = try OwnerTestHome(initOwner: false)
+        let r = try brahma(["owner", "init"], home: home.url)   // stdin/stdout are not a terminal here
+        #expect(r.status == 1); #expect(r.stderr.contains("brahma owner init must be run in an interactive terminal"))
+        #expect(!FileManager.default.fileExists(atPath: home.url.appending(path: "home/owner.key").path))
+        // It also refuses inside an agent turn, even with a terminal.
+        let inAgent = try brahma(["owner", "init"], home: home.url, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
+    }
+
+    @Test func ownerKeyCreatedWith0600AndInitRefusesOverwrite() throws {
+        let home = try OwnerTestHome()
+        let key = home.url.appending(path: "home/owner.key")
         let attrs = try FileManager.default.attributesOfItem(atPath: key.path)
         #expect((attrs[.posixPermissions] as? Int) == 0o600)
         let text = try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(text.count == 64 && text.allSatisfy(\.isHexDigit))
-        let before = text
-        #expect(try brahma(["company", "create", "Two", "--goal", "g"], home: home).status == 0)
-        #expect(try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) == before)
+        #expect(try initOwnerKey(home: home.url) != 0)
+        #expect(try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) == text)
+        #expect(try initOwnerKey(home: home.url, extraArgs: ["--rotate"]) == 0)
+        #expect(try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) != text)
+    }
+
+    @Test func cliWrongKeyAndMissingHashRefusedValidAccepted() throws {
+        let home = try OwnerTestHome()
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home.url).status == 0)   // valid key
+        let key = home.url.appending(path: "home/owner.key")
+        let good = try Data(contentsOf: key)
+        try Data("tampered\n".utf8).write(to: key)
+        let wrong = try brahma(["pause", "Acme", "ceo"], home: home.url)
+        #expect(wrong.status == 1); #expect(wrong.stderr.contains("owner key missing or invalid"))
+        try good.write(to: key)
+        #expect(!(try brahma(["pause", "Acme", "ceo"], home: home.url).stderr.contains("owner key")))
+        KeychainOwnerKeyStore().removeHash(for: ownerPaths(home.url))
+        let nohash = try brahma(["pause", "Acme", "ceo"], home: home.url)
+        #expect(nohash.status == 1); #expect(nohash.stderr.contains("owner key missing or invalid"))
+        // Read-only commands never needed the key.
+        #expect(try brahma(["org", "Acme"], home: home.url).status == 0)
     }
 
     // MARK: MCP turn credentials
@@ -156,6 +183,11 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         let other = try s.store.hire(companyId: s.company.id, name: "cto", role: "cto", model: "sonnet")
         let r = try mcp(s, home: home, token: s.token, agent: other.id)
         #expect(r.status != 0); #expect(r.stderr.contains("brahma mcp: turn credential invalid or turn ended"))
+        // A credential is bound to its company as well.
+        let otherCompany = try s.store.createCompany(name: "Globex", goal: "g", workspacesRoot: s.paths.workspaces)
+        let wrongCompany = try brahma(["mcp", "--db", s.paths.database.path, "--company", otherCompany.id, "--agent", s.agent.id],
+                                      home: home, env: ["BRAHMA_TURN_TOKEN": s.token])
+        #expect(wrongCompany.status != 0); #expect(wrongCompany.stderr.contains("turn credential invalid or turn ended"))
         // Wrong kind or item binding is refused too.
         #expect(try mcp(s, home: home, token: s.token, extra: ["--kind", "review"]).status != 0)
         #expect(try mcp(s, home: home, token: s.token, extra: ["--item", "i1"]).status != 0)

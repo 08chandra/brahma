@@ -84,6 +84,38 @@ private struct World {
         #expect(finished?.text.contains("succeeded") == true)
     }
 
+    @Test func turnTokenIsInTheMCPConfigOnly() async throws {
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock(); private var _token: String?; private var _validDuring = false; private var _mode: Int?
+            func set(token: String, valid: Bool, mode: Int?) { lock.withLock { _token = token; _validDuring = valid; _mode = mode } }
+            var token: String? { lock.withLock { _token } }
+            var validDuring: Bool { lock.withLock { _validDuring } }
+            var mode: Int? { lock.withLock { _mode } }
+        }
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let box = Box(); let store = w.store
+        w.fake.script("ceo", .init(sideEffect: { req in
+            let data = try Data(contentsOf: URL(fileURLWithPath: req.mcpConfigPath))
+            let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let server = try #require((json["mcpServers"] as? [String: Any])?["company"] as? [String: Any])
+            let token = try #require((server["env"] as? [String: String])?["BRAHMA_TURN_TOKEN"])
+            let mode = try FileManager.default.attributesOfItem(atPath: req.mcpConfigPath)[.posixPermissions] as? Int
+            box.set(token: token, valid: store.verifyTurnCredential(token: token, companyId: req.company.id, agentId: req.agent.id),
+                    mode: mode)
+        }))
+        try w.dm(c, ceo); try await w.cycle()
+        let token = try #require(box.token)
+        #expect(token.count == 64)
+        #expect(box.validDuring, "the engine-issued token verifies against the DB while the turn runs")
+        #expect(box.mode == 0o600)
+        let req = try #require(w.fake.requests.first)
+        #expect(!req.environment.values.contains { $0.contains(token) })
+        #expect(!ClaudeCommand.arguments(for: req).contains { $0.contains(token) })
+        let childEnv = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, extra: req.environment, purpose: .claude)
+        #expect(!childEnv.values.contains { $0.contains(token) })
+        #expect(!(w.store.verifyTurnCredential(token: token, companyId: c.id, agentId: ceo.id)), "ended turn")
+    }
+
     @Test func firstTurnSendsRolePromptThenResumes() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         try w.dm(c, ceo); try await w.cycle()

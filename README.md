@@ -95,8 +95,11 @@ an agent turn; as above, neither is tamper-proof until the sandbox lands.
 `brahma doctor` checks the installed Claude Code CLI (version, required flags, a real haiku probe turn, and that
 `--resume` keeps the role prompt). `brahma run` and the app require a passing probe, reused for 24 h per CLI version.
 
-**Owner key and MCP turn tokens.** `<data home>/owner.key` (mode 0600, created by the app, `brahma run` or
-`brahma company create`) must exist for owner-write CLI commands to run, and each turn's `brahma mcp` only starts with
-a per-turn token (only its SHA-256 is stored) that is valid while that turn is in progress. Both are defense in depth:
-full protection arrives with 5-lite's sandbox, which read-denies the data home to agents so they can't read
-`owner.key` or the per-turn MCP configs.
+**Owner key and MCP turn tokens.** Owner-write CLI commands (including `doctor`) refuse to run unless
+`<data home>/owner.key` (mode 0600) hashes to the SHA-256 held in the Keychain (service `dev.brahma.owner`, account =
+the data-home path; on Linux a 0600 hash file under `~/.config/brahma`, which is weaker). No owner command creates
+the key: the Mac app does at launch, or you run `brahma owner init` in Terminal (it needs an interactive terminal;
+`--rotate` replaces a key). Each turn's `brahma mcp` only starts with a per-turn token (only its SHA-256 is stored)
+that is valid while that turn is in progress, delivered in the 0600 per-turn MCP config. Both are a deterrent, not a
+security boundary: until 5-lite's sandbox read-denies the data home and Keychain services to agents, an agent shell
+can still read the key, the hash and the MCP configs, or fake a TTY with `script`.

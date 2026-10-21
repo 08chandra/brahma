@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import BrahmaCore
+import BrahmaKeychain
 
 public enum EngineStatus: Equatable, Sendable {
     case starting, embedded, external, stopping, stopped
@@ -51,6 +52,7 @@ public final class EngineHost {
     @ObservationIgnored private let store: Store
     @ObservationIgnored private let makeRunner: @Sendable (String) -> any TurnRunning
     @ObservationIgnored private let config: SchedulerConfig
+    @ObservationIgnored private let ownerKeyStore: any OwnerKeyStore
     @ObservationIgnored private let probe: @Sendable (String) async -> DoctorReport
     @ObservationIgnored private let tickInterval: Duration
     @ObservationIgnored private var lock: OrchestratorLock?
@@ -60,7 +62,9 @@ public final class EngineHost {
     public init(paths: BrahmaPaths, store: Store,
                 makeRunner: @escaping @Sendable (String) -> any TurnRunning = { ClaudeProcessRunner(claudePath: $0) },
                 config: SchedulerConfig = .init(), tickInterval: Duration = .seconds(1),
-                probe: (@Sendable (String) async -> DoctorReport)? = nil) {
+                probe: (@Sendable (String) async -> DoctorReport)? = nil,
+                ownerKeyStore: any OwnerKeyStore = PlatformOwnerKeyStore.make()) {
+        self.ownerKeyStore = ownerKeyStore
         self.probe = probe ?? { [store] path in
             await Doctor.ensure(store: store, claudePath: path, runner: ClaudeProcessRunner(claudePath: path))
         }
@@ -74,8 +78,8 @@ public final class EngineHost {
     public func start(tools: Result<EngineTools, EngineSetupError>) async {
         guard status != .embedded else { return }
         rememberedTools = tools
-        // Owner CLI commands are default-deny without the owner key; it must predate every agent.
-        try? OwnerKey.ensure(paths: paths)
+        // Owner CLI commands are default-deny without a verified owner key; only the app and `brahma owner init` create it.
+        try? OwnerKey.ensure(paths: paths, store: ownerKeyStore)
         let resolved: EngineTools
         switch tools {
         case .failure(let error):

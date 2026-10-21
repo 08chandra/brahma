@@ -11,7 +11,7 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
 
     func host(_ paths: BrahmaPaths, _ store: Store, _ runner: StubRunner = StubRunner(mode: .succeed)) -> EngineHost {
         EngineHost(paths: paths, store: store, makeRunner: { _ in runner }, tickInterval: .milliseconds(10),
-                   probe: { _ in passingReport })
+                   probe: { _ in passingReport }, ownerKeyStore: InMemoryOwnerKeyStore())
     }
 
     @Test func failedProbeDoesNotTakeLock() async throws {
@@ -21,7 +21,8 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
             DoctorItem(name: "probe", status: .fail, detail: "no result line"),
         ], checkedAt: Date())
         let h = EngineHost(paths: paths, store: store, makeRunner: { _ in StubRunner(mode: .succeed) },
-                           tickInterval: .milliseconds(10), probe: { _ in failing })
+                           tickInterval: .milliseconds(10), probe: { _ in failing },
+                           ownerKeyStore: InMemoryOwnerKeyStore())
         await h.start(tools: tools)
         #expect(h.status == .failed("Claude Code check failed: no result line. Run brahma doctor in Terminal for details."))
         // The lock was never taken: another host can embed at once.
@@ -29,6 +30,20 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         await h2.start(tools: tools)
         #expect(h2.status == .embedded)
         await h2.stop()
+    }
+
+    @Test func appLaunchCreatesVerifiedOwnerKey() async throws {
+        let (store, paths) = try makeHome()
+        let keys = InMemoryOwnerKeyStore()
+        let h = EngineHost(paths: paths, store: store, makeRunner: { _ in StubRunner(mode: .succeed) },
+                           tickInterval: .milliseconds(10), probe: { _ in passingReport }, ownerKeyStore: keys)
+        await h.start(tools: tools)
+        #expect(OwnerKey.verify(paths: paths, store: keys))
+        let first = try String(contentsOf: OwnerKey.url(paths: paths), encoding: .utf8)
+        await h.stop()
+        await h.start(tools: tools)   // a valid key is kept
+        #expect(try String(contentsOf: OwnerKey.url(paths: paths), encoding: .utf8) == first)
+        await h.stop()
     }
 
     func dmCeo(_ store: Store, _ acme: Company) throws {

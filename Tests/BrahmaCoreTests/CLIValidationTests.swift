@@ -4,7 +4,7 @@ import BrahmaCore
 
 /// Runs the built `brahma` binary (it sits next to the test bundle) against a throwaway data home.
 private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32, stderr: String) {
-    let url = Bundle.module.bundleURL.deletingLastPathComponent().appending(path: "brahma")
+    let url = brahmaExecutableURL()
     try #require(FileManager.default.isExecutableFile(atPath: url.path), "build the brahma product first")
     let home = try home ?? tempDir()
     let p = Process()
@@ -43,7 +43,8 @@ private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32
     }
 
     @Test func runRefusesWhenLockHeld() throws {
-        let d = try tempDir()
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let d = owner.url
         let paths = BrahmaPaths(home: d.appending(path: "home"), workspaces: d.appending(path: "ws"))
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         let lock = try OrchestratorLock.acquire(paths: paths)

@@ -17,18 +17,20 @@ let package = Package(
             name: "BrahmaCore",
             dependencies: [.product(name: "GRDB", package: "GRDB.swift")]
         ),
-        .target(name: "BrahmaAppModel", dependencies: ["BrahmaCore"]),
+        // Platform owner-key hash store (macOS Keychain); kept out of BrahmaCore so the core stays portable.
+        .target(name: "BrahmaKeychain", dependencies: ["BrahmaCore"]),
+        .target(name: "BrahmaAppModel", dependencies: ["BrahmaCore", "BrahmaKeychain"]),
         .executableTarget(name: "BrahmaApp", dependencies: ["BrahmaAppModel"]),
         .executableTarget(
             name: "brahma",
             dependencies: [
-                "BrahmaCore",
+                "BrahmaCore", "BrahmaKeychain",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
         .testTarget(
             name: "BrahmaCoreTests",
-            dependencies: ["BrahmaCore"],
+            dependencies: ["BrahmaCore", "BrahmaKeychain"],
             resources: [.copy("Fixtures")]
         ),
         .testTarget(name: "BrahmaAppModelTests", dependencies: ["BrahmaAppModel"]),
