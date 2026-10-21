@@ -849,7 +849,7 @@ skill/plugin directory mechanics in Plan 5.
 Source: `docs/research/2026-10-21-design-review.md` (architecture critic).
 These **override** earlier sections where they conflict.
 
-**Build order:** Plan 2 → **3a (amended)** → **5-lite** (sandbox via Claude
+**Build order:** Plan 2 → **3a (amended)** → **5-lite** → **Memory-lite (§6.25)** (sandbox via Claude
 Code `--settings`, sandboxed checks, DB unreachable from agents, Inbox
 notifications + daily digest, startup probe, DB backups) → 4a (batched merge
 queue + previews) → 4b (**org chart map only**) → **dogfood one real company
@@ -907,6 +907,36 @@ API keys, AI-disclosure rules for outbound messages, platform automation ToS.
 
 **Maps:** the Org Chart is the default and the first map built; Hive and
 Village are optional skins (Plan 4c), exempt from the ops-console brief.
+
+### 6.25 Company Memory — shared knowledge with permission-scoped access (**[owner]** asked; evaluated supermemory.ai)
+Goal: every agent works with all the company knowledge it is permitted to see.
+**Decision [call]:** build it locally inside Brahma; external memory services
+(e.g. supermemory.ai) are optional connector backends, never the source of
+truth — company data stays on the owner's machine/server and permissions are
+Brahma's.
+- **Store:** per company, in the Brahma DB: FTS5 now; optional on-device
+  embeddings (e.g. a local vector index) later. Never leaves the machine
+  unless the owner enables an external backend.
+- **Auto-ingest:** messages, work items, decisions/asks, hand-offs, research
+  reports and the Knowledge Base, retros/lessons, artifacts/documents, plus
+  explicit `remember(fact, scope)` from agents. Each entry keeps provenance
+  (source id, author, time).
+- **Scopes & sensitivity:** every entry has a scope (company · team · role ·
+  agent · item) and a sensitivity label (normal · internal · restricted ·
+  hr/perf · secret-never-stored). Retrieval is filtered by the engine using
+  the asking agent's company, team, role, trust level, current item and
+  grants (§6.23) **before** results reach the agent; HR/performance records
+  only for HR/Performance roles and the owner; no cross-company retrieval.
+- **Tools:** `search_memory(query, scope?)` and `recall(topic)` return cited
+  snippets (quoted, so they can't forge digest lines); `remember`; the
+  turn-start orientation auto-includes the top-k relevant memories for the
+  current item (bounded).
+- **Hygiene:** dedupe on ingest, TTL for ephemeral entries, librarian
+  consolidation (Plan 9), owner can browse/search/delete any memory; prompt-
+  injection guard — retrieved text is always treated as data.
+- **Build:** Memory-lite (scoped FTS, auto-ingest, tools, orientation
+  integration) right after 5-lite and before dogfooding; embeddings,
+  librarian, external backends in Plan 9.
 
 ## 7. Architecture sketch
 
