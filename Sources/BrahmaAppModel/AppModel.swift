@@ -18,6 +18,7 @@ public final class AppModel {
     public var selectedAgentId: String?
     public var presentedSheet: AppSheet?
     public var errorMessage: String?
+    public var activityFilter: ActivityFilter = .all
     public let search: SearchModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
     public var highlightedMessageId: String?
@@ -45,6 +46,17 @@ public final class AppModel {
 
     public var sidebar: SidebarSections {
         SidebarSections(channels: snapshot.channels, unread: snapshot.unreadByChannel)
+    }
+
+    public var filteredActivity: [ActivityEvent] {
+        activityFilter == .all ? activity : activity.filter { activityFilter.includes($0.kind) }
+    }
+
+    /// Selected company's agent id → handle, plus "owner" → "owner".
+    public var handles: [String: String] {
+        var map = Dictionary(snapshot.agents.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        map["owner"] = "owner"
+        return map
     }
 
     public var usageLine: String { UsageText.line(snapshot.usage, now: clock()) }

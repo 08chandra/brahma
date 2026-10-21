@@ -20,11 +20,16 @@ struct DetailView: View {
             } else {
                 switch model.sidebarSelection {
                 case .missionControl:
-                    MonoEmptyState("Mission control", detail: "No panels yet")
+                    MissionControlView(model: model)
                 case .activity:
-                    MonoEmptyState("Activity", detail: "No activity yet")
+                    ActivityFeedView(model: model, compact: false)
                 case .agents:
-                    MonoEmptyState("Agents", detail: "No roster yet")
+                    VSplitView {
+                        MonoEmptyState("Agents", detail: "No roster yet")  // Task 8
+                            .frame(minHeight: 200)
+                        ActivityFeedView(model: model, compact: true)
+                            .frame(minHeight: 60, idealHeight: 140, maxHeight: 260)
+                    }
                 case .channel, .dm:
                     if let chat = model.chat {
                         VSplitView {
@@ -32,13 +37,8 @@ struct DetailView: View {
                                 .id(chat.target)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .frame(minHeight: 200)
-                            Panel(title: "Activity", padded: false) {  // Task 7
-                                MonoEmptyState("No activity yet")
-                            }
-                            .padding(BrahmaTheme.spaceXS)
-                            .frame(maxWidth: .infinity)
-                            .frame(minHeight: 60, idealHeight: 100, maxHeight: 200)
-                            .background(BrahmaTheme.bg0)
+                            ActivityFeedView(model: model, compact: true)
+                                .frame(minHeight: 60, idealHeight: 140, maxHeight: 260)
                         }
                     }
                 }
