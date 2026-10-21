@@ -30,12 +30,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let options: LaunchOptions
     /// Set by `MainWindow.onAppear`; reopens the main window after the user closes it.
     var openMainWindow: (() -> Void)?
+    /// SwiftUI wraps the adaptor, so `NSApp.delegate` is not this object; the harness reaches it here.
+    static private(set) weak var current: AppDelegate?
     private var signalSources: [DispatchSourceSignal] = []
 
     override init() {
         options = LaunchOptions.parse(CommandLine.arguments)
         boot = AppDelegate.makeModel()
         super.init()
+        AppDelegate.current = self
     }
 
     /// Mirrors the CLI's `openStore()`.
@@ -60,6 +63,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             source.resume()
             signalSources.append(source)
         }
+        // Closing the main window leaves the app and engine running in the menu bar; the Dock icon goes away.
+        NotificationCenter.default.addObserver(self, selector: #selector(windowWillClose(_:)),
+                                               name: NSWindow.willCloseNotification, object: nil)
         switch boot {
         case .success(let model):
             let options = self.options
@@ -85,6 +91,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func windowWillClose(_ note: Notification) {
+        guard let window = note.object as? NSWindow, (window.identifier?.rawValue ?? "").hasPrefix("main") else { return }
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    /// Brings the main window back (and the Dock icon) after it was closed into the menu bar.
+    func openMainWindowFromMenu() {
+        NSApp.setActivationPolicy(.regular)
+        openMainWindow?()
+        NSApp.activate()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openMainWindowFromMenu()
+        return true
+    }
+
     /// `terminate` blocks in a nested run loop while `applicationShouldTerminate` answers `.terminateLater`. Called
     /// from a main-queue block (a dispatch signal handler, a main-actor task) it would starve the very main-actor
     /// task that stops the engine and replies, so it is issued from a run-loop source instead.
@@ -108,4 +131,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+}
+
+extension AppDelegate {
+    /// The menu bar summary, or nil when the store failed to open.
+    var menuBarSummary: MenuBarSummary? {
+        if case .success(let model) = boot { return model.menuBar }
+        return nil
+    }
 }

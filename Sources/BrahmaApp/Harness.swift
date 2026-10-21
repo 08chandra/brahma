@@ -45,10 +45,30 @@ enum Harness {
         } else {
             try? await Task.sleep(for: .seconds(options.smokeHold))
             let agents = model.snapshot.companies.reduce(0) { $0 + $1.counts.running + $1.counts.ready + $1.counts.blocked + $1.counts.sleeping + $1.counts.killed }
-            print("SMOKE OK companies=\(model.snapshot.companies.count) agents=\(agents) engine=\(model.engine?.status.label ?? "none") windows=\(mainWindows().count)")
+            var line = "SMOKE OK companies=\(model.snapshot.companies.count) agents=\(agents) engine=\(model.engine?.status.label ?? "none") windows=\(mainWindows().count)"
+            if options.smokeCloseWindow {
+                if let failure = await lifecycleCheck(model: model) { finishFail("lifecycle \(failure)") }
+                line += " lifecycle=ok"
+            }
+            print(line)
             fflush(stdout)
             await terminateAndExit()
         }
+    }
+
+    /// Closes the main window, expects the menu-bar-only state with the engine still up, then reopens it.
+    private static func lifecycleCheck(model: AppModel) async -> String? {
+        guard let delegate = AppDelegate.current else { return "no delegate" }
+        mainWindows().first?.performClose(nil)
+        try? await Task.sleep(for: .seconds(1))
+        guard mainWindows().isEmpty else { return "window still visible after close (\(mainWindows().count))" }
+        guard NSApp.activationPolicy() == .accessory else { return "policy \(NSApp.activationPolicy().rawValue) after close, expected accessory" }
+        guard model.engine?.status == .embedded else { return "engine \(model.engine?.status.label ?? "none") after close, expected embedded" }
+        delegate.openMainWindowFromMenu()
+        try? await Task.sleep(for: .seconds(1))
+        guard mainWindows().count == 1 else { return "\(mainWindows().count) windows after reopen, expected 1" }
+        guard NSApp.activationPolicy() == .regular else { return "policy \(NSApp.activationPolicy().rawValue) after reopen, expected regular" }
+        return nil
     }
 
     /// Quit stops the engine first (up to 15 s); only exit once the delegate has had its chance to finish.

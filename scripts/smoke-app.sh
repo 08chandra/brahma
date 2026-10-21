@@ -75,4 +75,13 @@ APP_PID=""
 cat "$TMP/app.out"
 grep -q '^SMOKE OK companies=2 agents=4 engine=embedded' "$TMP/app.out" || fail "case C: expected engine=embedded after takeover"
 
+# (D) Closing the main window keeps the app and engine alive in the menu bar; reopening restores the window.
+set +e
+OUT="$($APP --smoke-test --smoke-close-window --smoke-hold=2)"
+STATUS=$?
+set -e
+echo "$OUT"
+[ "$STATUS" -eq 0 ] || fail "case D exit $STATUS"
+echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
+
 echo "SMOKE PASSED"
