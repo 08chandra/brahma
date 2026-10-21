@@ -834,6 +834,10 @@ Denials: `"only the item's author, reviewer, a manager or the owner can change i
 **Security amendments (owner-approved 2026-10-21, 5-lite security review items 1–2; override the text above):**
 - Checks get `ChildEnvironment.make(…, purpose: .check)` (allowlist; no auth vars) plus `BRAHMA_AGENT_ID`. `checkEnvironmentIsScoped` sets FAKE_SECRET_TOKEN in the engine env and asserts it is absent from the check's `env` output. Check detached worktrees are created through Task 7's hardened `GitCommand`.
 
+**CheckPaths amendment (owner-approved 2026-10-21, 5-lite contract; overrides the text above, including the earlier detached-worktree location):**
+- New `struct CheckPaths { let workspace: URL; func snapshotDir(key:revision:) -> URL /* <ws>/.brahma/checks/<KEY>/rev<n>/ */; func manifest(key:revision:) -> URL; func runWorktree(runId:) -> URL /* <ws>/.brahma/wt-check/<runId> */ }` in `Verify/CheckScripts.swift`. Check-script snapshots (+ `manifest.json`) live under `snapshotDir`, NOT under `<companyDir>/checks/`; temp detached check worktrees live under `runWorktree`. `BrahmaPaths.checksDir` from Task 1 stays unused for checks (leave it; note it). The engine is the only writer of `.brahma/checks` (5-lite write-denies it for agent turns).
+- Integrity guard: before each run (submit and merge), the engine re-hashes the snapshot files against `checkSnapshot.manifest`; on mismatch it refuses the run (status `error`, tail `"check snapshot was modified outside the engine"`), adds review flag `"check snapshot tampered: <file>"`, and returns the item to `inProgress` with a system DM to the holder. Test `tamperedSnapshotRefusesRun`.
+
 - [ ] **Step 1: Write failing tests.**
   - `CheckRunnerTests`:
     - `passAndFailExitCodes`;
