@@ -9,19 +9,20 @@ struct EngineBanner: View {
         if let engine {
             switch engine.status {
             case .external:
-                bar(color: .blue, icon: "terminal") {
+                bar(color: BrahmaTheme.ready, icon: "terminal") {
                     Text(verbatim: "Engine running in terminal (brahma run). Brahma shows live state and your messages still go through; scheduling happens in the terminal. Brahma takes over when it stops.")
                 }
             case .failed(let message):
-                bar(color: .orange, icon: "exclamationmark.triangle") {
+                bar(color: BrahmaTheme.warning, icon: "exclamationmark.triangle.fill") {
                     Text(verbatim: message)
                     Spacer(minLength: 12)
                     Button("Retry") {
                         Task { @MainActor in await engine.start(tools: EngineSetup.resolveTools()) }
                     }
+                    .buttonStyle(.brahma)
                 }
             case .stopping:
-                bar(color: .secondary, icon: nil) {
+                bar(color: BrahmaTheme.text1, icon: nil) {
                     ProgressView().controlSize(.small)
                     Text(verbatim: "Stopping agents…")
                 }
@@ -33,14 +34,17 @@ struct EngineBanner: View {
 
     private func bar<Content: View>(color: Color, icon: String?, @ViewBuilder content: () -> Content) -> some View {
         HStack(spacing: 8) {
-            if let icon { Image(systemName: icon).foregroundStyle(color) }
+            if let icon { Image(systemName: icon).font(.system(size: 11)).foregroundStyle(color) }
             content()
         }
-        .font(.callout)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(color.opacity(0.12))
-        .overlay(alignment: .bottom) { Divider() }
+        .font(BrahmaTheme.body)
+        .foregroundStyle(BrahmaTheme.text0)
+        .padding(.horizontal, BrahmaTheme.spaceM)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, minHeight: BrahmaTheme.panelHeaderHeight, alignment: .leading)
+        .background(color.opacity(0.15))
+        .background(BrahmaTheme.bg0)
+        .overlay(alignment: .leading) { Rectangle().fill(color).frame(width: 2) }
+        .overlay(alignment: .bottom) { Hairline() }
     }
 }

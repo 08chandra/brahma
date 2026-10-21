@@ -5,36 +5,43 @@ struct DetailView: View {
     let model: AppModel
 
     var body: some View {
-        if model.loaded && model.snapshot.companies.isEmpty {
-            ContentUnavailableView {
-                Label("Create your first company", systemImage: "building.2")
-            } description: {
-                Text("Give it a name and a goal; you can hire agents next.")
-            } actions: {
-                Button("New Company") { model.presentedSheet = .newCompany }
-                    .buttonStyle(.borderedProminent)
-            }
-        } else {
-            switch model.sidebarSelection {
-            case .missionControl:
-                ContentUnavailableView("Mission Control", systemImage: "square.grid.2x2")
-            case .activity:
-                ContentUnavailableView("Activity", systemImage: "list.bullet.rectangle")
-            case .agents:
-                ContentUnavailableView("Agents", systemImage: "person.3")
-            case .channel, .dm:
-                if let chat = model.chat {
-                    VSplitView {
-                        ChatView(chat: chat)
-                            .id(chat.target)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .frame(minHeight: 200)
-                        ContentUnavailableView("Activity", systemImage: "list.bullet.rectangle")  // Task 7
+        Group {
+            if model.loaded && model.snapshot.companies.isEmpty {
+                VStack(spacing: BrahmaTheme.spaceM) {
+                    MonoEmptyState("Create your first company",
+                                   detail: "Give it a name and a goal; you can hire agents next.")
+                        .fixedSize()
+                    Button("New Company") { model.presentedSheet = .newCompany }
+                        .buttonStyle(.brahmaPrimary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                switch model.sidebarSelection {
+                case .missionControl:
+                    MonoEmptyState("Mission control", detail: "No panels yet")
+                case .activity:
+                    MonoEmptyState("Activity", detail: "No activity yet")
+                case .agents:
+                    MonoEmptyState("Agents", detail: "No roster yet")
+                case .channel, .dm:
+                    if let chat = model.chat {
+                        VSplitView {
+                            ChatView(chat: chat)
+                                .id(chat.target)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .frame(minHeight: 200)
+                            Panel(title: "Activity", padded: false) {  // Task 7
+                                MonoEmptyState("No activity yet")
+                            }
+                            .padding(BrahmaTheme.spaceXS)
                             .frame(maxWidth: .infinity)
                             .frame(minHeight: 60, idealHeight: 100, maxHeight: 200)
+                            .background(BrahmaTheme.bg0)
+                        }
                     }
                 }
             }
         }
+        .background(BrahmaTheme.bg0)
     }
 }

@@ -5,13 +5,19 @@ struct CompanyRail: View {
     let model: AppModel
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 0) {
             ScrollView {
-                VStack(spacing: 12) {
+                VStack(spacing: 6) {
                     ForEach(model.snapshot.companies) { summary in
-                        RailIcon(summary: summary, selected: summary.id == model.selectedCompanyId)
+                        RailTile(initials: summary.initials,
+                                 selected: summary.id == model.selectedCompanyId,
+                                 running: summary.company.status == .running,
+                                 badge: summary.badge)
                             .onTapGesture { Task { await model.selectCompany(summary.id) } }
                             .help(summary.company.name)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(Text(verbatim: summary.company.name))
+                            .accessibilityAddTraits(summary.id == model.selectedCompanyId ? [.isButton, .isSelected] : .isButton)
                             .contextMenu {
                                 let running = summary.company.status == .running
                                 Button(running ? "Pause" : "Resume") {
@@ -20,55 +26,25 @@ struct CompanyRail: View {
                             }
                     }
                 }
-                .padding(.top, 12)
+                .padding(.top, BrahmaTheme.spaceS)
             }
+            .scrollIndicators(.never)
             Button {
                 model.presentedSheet = .newCompany
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 16, weight: .semibold))
-                    .frame(width: 44, height: 44)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(BrahmaTheme.text1)
+                    .frame(width: BrahmaTheme.railTile, height: BrahmaTheme.railTile)
+                    .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radiusLarge)
+                        .strokeBorder(BrahmaTheme.lineStrong, style: StrokeStyle(lineWidth: 1, dash: [3, 2])))
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("New company")
-            .padding(.bottom, 12)
+            .padding(.vertical, BrahmaTheme.spaceM)
         }
         .frame(maxHeight: .infinity)
-        .background(.bar)
-    }
-}
-
-private struct RailIcon: View {
-    let summary: CompanySummary
-    let selected: Bool
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10)
-                .fill(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.quaternary))
-            Text(verbatim: summary.initials)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(selected ? Color.white : Color.primary)
-        }
-        .frame(width: 44, height: 44)
-        .overlay(alignment: .bottomTrailing) {
-            Circle()
-                .fill(summary.company.status == .running ? Color.green : Color.gray)
-                .frame(width: 10, height: 10)
-                .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
-                .offset(x: 3, y: 3)
-        }
-        .overlay(alignment: .topTrailing) {
-            if summary.badge > 0 {
-                Text(verbatim: summary.badge > 99 ? "99+" : "\(summary.badge)")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 5)
-                    .frame(minWidth: 16, minHeight: 16)
-                    .background(Capsule().fill(Color.red))
-                    .offset(x: 6, y: -6)
-            }
-        }
-        .contentShape(Rectangle())
+        .background(BrahmaTheme.bg1)
     }
 }

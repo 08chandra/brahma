@@ -6,28 +6,49 @@ struct NewCompanySheet: View {
     @State private var form = CompanyForm()
     @State private var submitError: String?
     @State private var submitting = false
+    @FocusState private var focus: Field?
+
+    private enum Field { case name, goal }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("New Company").font(.title2.bold())
-            TextField("Name", text: $form.name)
-            TextField("Goal", text: $form.goal, axis: .vertical)
-                .lineLimit(3...6)
-            if let message = submitError ?? form.validate() {
-                Text(verbatim: message).foregroundStyle(.red).font(.callout)
+        VStack(alignment: .leading, spacing: 0) {
+            PanelHeader(title: "New company")
+            VStack(alignment: .leading, spacing: BrahmaTheme.spaceM) {
+                VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
+                    CapsLabel("Name")
+                    TextField("Name", text: $form.name, prompt: Text(verbatim: "Company name"))
+                        .focused($focus, equals: .name)
+                        .brahmaField(focused: focus == .name)
+                }
+                VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
+                    CapsLabel("Goal")
+                    TextField("Goal", text: $form.goal, prompt: Text(verbatim: "What should this company achieve?"), axis: .vertical)
+                        .lineLimit(3...6)
+                        .focused($focus, equals: .goal)
+                        .brahmaField(focused: focus == .goal)
+                }
+                if let message = submitError ?? form.validate() {
+                    Text(verbatim: message).foregroundStyle(BrahmaTheme.danger).font(BrahmaTheme.monoSmall)
+                }
             }
-            HStack {
+            .padding(BrahmaTheme.spaceL)
+            Hairline()
+            HStack(spacing: BrahmaTheme.spaceS) {
                 Spacer()
                 Button("Cancel") { model.presentedSheet = nil }
+                    .buttonStyle(.brahma)
                     .keyboardShortcut(.cancelAction)
                 Button("Create") { create() }
+                    .buttonStyle(.brahmaPrimary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(form.validate() != nil || submitting)
             }
+            .padding(BrahmaTheme.spaceM)
+            .background(BrahmaTheme.bg2)
         }
-        .textFieldStyle(.roundedBorder)
-        .padding(24)
         .frame(width: 440)
+        .background(BrahmaTheme.bg1)
+        .onAppear { focus = .name }
     }
 
     private func create() {
