@@ -13,7 +13,12 @@ OUT=".superpowers/ui/$NAME.png"
 rm -f "$OUT"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+OWNER_HOME=""
+cleanup() {
+  [ -n "$OWNER_HOME" ] && security delete-generic-password -s dev.brahma.owner -a "$OWNER_HOME" >/dev/null 2>&1 || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 DEFAULT_HOME="$HOME/Library/Application Support/Brahma"
 if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; then
   RESOLVED="$BRAHMA_HOME"
@@ -28,6 +33,7 @@ else
   export BRAHMA_HOME="$TMP/home"
   export BRAHMA_WORKSPACES="$TMP/workspaces"
   mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"
+  OWNER_HOME="$BRAHMA_HOME"   # the seeded temp home's Keychain item is deleted at exit
   scripts/seed-demo.sh >/dev/null
 fi
 export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"

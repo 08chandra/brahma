@@ -10,6 +10,8 @@ APP_PID=""
 cleanup() {
   [ -n "$CLI_PID" ] && kill -INT "$CLI_PID" 2>/dev/null || true
   [ -n "$APP_PID" ] && kill -KILL "$APP_PID" 2>/dev/null || true
+  # The owner key's hash lives in the Keychain, keyed by the temp data home; remove it with the temp dir.
+  security delete-generic-password -s dev.brahma.owner -a "$TMP/home" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -86,7 +88,9 @@ echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=embedded.* lifecycl
 
 # (E) A second SIGTERM while the first quit is stopping the engine must not skip the bounded stop.
 "$CLI" say Acme @ceo "Status update, please." >/dev/null
-FAKE_CLAUDE_SLEEP=60 FAKE_CLAUDE_PIDFILE="$TMP/turn-e.pid" $APP --smoke-test --smoke-hold=120 >"$TMP/app-e.out" 2>&1 &
+# Turns get an allowlisted environment, so the fake claude reads its settings from this file in the data home.
+printf 'export FAKE_CLAUDE_SLEEP=60\nexport FAKE_CLAUDE_PIDFILE=%q\n' "$TMP/turn-e.pid" >"$BRAHMA_HOME/fake-claude.env"
+$APP --smoke-test --smoke-hold=120 >"$TMP/app-e.out" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 100); do
   "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running' && break

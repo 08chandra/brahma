@@ -10,8 +10,13 @@ if [ -z "${BRAHMA_HOME:-}" ] || [ -z "${BRAHMA_WORKSPACES:-}" ] || [ "$BRAHMA_HO
 fi
 
 B=.build/Brahma.app/Contents/Helpers/brahma
-"$B" company create Acme --goal "Build a todo app"
-"$B" company create Globex --goal "Plan a newsletter"
+# Owner commands need an owner key; `owner init` insists on a terminal, so run it under a pseudo-terminal.
+# (The caller deletes the temp home's Keychain item at exit; see scripts/smoke-app.sh and scripts/ui-snapshot.sh.)
+if [ ! -f "$BRAHMA_HOME/owner.key" ]; then
+  /usr/bin/script -q /dev/null "$B" owner init </dev/null >/dev/null
+fi
+"$B" company create Acme --goal "Build a todo app" --agents 0
+"$B" company create Globex --goal "Plan a newsletter" --agents 0
 "$B" hire Acme ceo --role ceo --model opus
 "$B" hire Acme cto --role cto --model sonnet
 "$B" hire Acme eng1 --role engineer --model sonnet
