@@ -56,4 +56,40 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         let empty = try brahma(["company", "create", "Empty", "--goal", "g", "--agents", "0"], home: home)
         #expect(empty.status == 0); #expect(!empty.stdout.contains("hired"))
     }
+
+    @Test func runRefusesWithoutPassingProbe() throws {
+        let home = try tempDir()
+        // PATH has no claude, so the doctor cannot pass and run must refuse before taking the lock.
+        let r = try brahma(["run"], home: home)
+        #expect(r.status == 1)
+        #expect(r.stderr.contains("Run 'brahma doctor' for details.") || r.stdout.contains("Run 'brahma doctor' for details."))
+        let d = try brahma(["doctor"], home: home)
+        #expect(d.status == 1); #expect(d.stdout.contains("FAIL  version"))
+    }
+
+    @Test func ownerCommandsRefuseInsideAgentTurn() throws {
+        let home = try tempDir()
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let agentEnv = ["BRAHMA_AGENT_ID": "a1"]
+        let cmds: [[String]] = [
+            ["company", "create", "X", "--goal", "g"], ["company", "pause", "Acme"], ["company", "resume", "Acme"],
+            ["company", "mode", "Acme", "low"], ["company", "weight", "Acme", "2"], ["hire", "Acme", "bob", "--role", "engineer", "--model", "sonnet"],
+            ["kill", "Acme", "ceo"], ["pause", "Acme", "ceo"], ["wake", "Acme", "ceo"], ["say", "Acme", "@ceo", "hi"],
+            ["org", "move", "Acme", "cto", "--manager", "ceo"], ["org", "fill", "Acme", "qa-1"], ["run"],
+        ]
+        for c in cmds {
+            let r = try brahma(c, home: home, env: agentEnv)
+            #expect(r.status == 1, "\(c)")
+            #expect(r.stderr.contains("brahma: owner commands can't run inside an agent turn"), "\(c): \(r.stderr)")
+        }
+        #expect(try brahma(["org", "Acme"], home: home, env: agentEnv).status == 0)
+    }
+
+    @Test func mcpRefusesForeignAgent() throws {
+        let home = try tempDir()
+        let r = try brahma(["mcp", "--db", home.appending(path: "x.sqlite").path, "--company", "c", "--agent", "b"],
+                           home: home, env: ["BRAHMA_AGENT_ID": "a"])
+        #expect(r.status == 1)
+        #expect(r.stderr.contains("brahma mcp: --agent does not match this turn's agent"))
+    }
 }

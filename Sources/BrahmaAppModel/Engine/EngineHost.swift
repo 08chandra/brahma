@@ -51,6 +51,7 @@ public final class EngineHost {
     @ObservationIgnored private let store: Store
     @ObservationIgnored private let makeRunner: @Sendable (String) -> any TurnRunning
     @ObservationIgnored private let config: SchedulerConfig
+    @ObservationIgnored private let probe: @Sendable (String) async -> DoctorReport
     @ObservationIgnored private let tickInterval: Duration
     @ObservationIgnored private var lock: OrchestratorLock?
     @ObservationIgnored private var engineTask: Task<Void, Never>?
@@ -58,7 +59,11 @@ public final class EngineHost {
 
     public init(paths: BrahmaPaths, store: Store,
                 makeRunner: @escaping @Sendable (String) -> any TurnRunning = { ClaudeProcessRunner(claudePath: $0) },
-                config: SchedulerConfig = .init(), tickInterval: Duration = .seconds(1)) {
+                config: SchedulerConfig = .init(), tickInterval: Duration = .seconds(1),
+                probe: (@Sendable (String) async -> DoctorReport)? = nil) {
+        self.probe = probe ?? { [store] path in
+            await Doctor.ensure(store: store, claudePath: path, runner: ClaudeProcessRunner(claudePath: path))
+        }
         self.paths = paths
         self.store = store
         self.makeRunner = makeRunner
@@ -78,6 +83,11 @@ public final class EngineHost {
             resolved = t
         }
         status = .starting
+        let report = await probe(resolved.claudePath)
+        if let bad = report.items.first(where: { $0.status == .fail }) {
+            status = .failed("Claude Code check failed: \(bad.detail). Run brahma doctor in Terminal for details.")
+            return
+        }
         let acquired: OrchestratorLock
         do {
             acquired = try OrchestratorLock.acquire(paths: paths)

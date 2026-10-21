@@ -12,10 +12,13 @@ public struct RateLimitInfo: Codable, Equatable, Sendable {
     /// window `rateLimitType` names, so the five-hour threshold rule must use `fiveHourResetsAt`.
     public var fiveHourResetsAt: Date?
     public var sevenDayResetsAt: Date?
+    /// `allowed` when the account may spill into paid overage (doctor warns on it).
+    public var overageStatus: String? = nil
 
     public init(status: String, resetsAt: Date?, rateLimitType: String?, isUsingOverage: Bool,
                 fiveHourUtilization: Double?, sevenDayUtilization: Double?, observedAt: Date,
-                fiveHourResetsAt: Date? = nil, sevenDayResetsAt: Date? = nil) {
+                fiveHourResetsAt: Date? = nil, sevenDayResetsAt: Date? = nil, overageStatus: String? = nil) {
+        self.overageStatus = overageStatus
         self.status = status
         self.resetsAt = resetsAt
         self.rateLimitType = rateLimitType
@@ -35,9 +38,12 @@ public struct TurnResult: Equatable, Sendable {
     public var costUSD: Double?
     public var apiErrorStatus: Int?
     public var sessionId: String
+    /// The result line carried a `usage` object.
+    public var hasUsage: Bool = false
 
     public init(isError: Bool, subtype: String, text: String?, costUSD: Double?,
-                apiErrorStatus: Int?, sessionId: String) {
+                apiErrorStatus: Int?, sessionId: String, hasUsage: Bool = false) {
+        self.hasUsage = hasUsage
         self.isError = isError
         self.subtype = subtype
         self.text = text
@@ -113,7 +119,8 @@ public enum StreamParser {
             sevenDayUtilization: number(sevenDay?["utilization"]),
             observedAt: now,
             fiveHourResetsAt: number(fiveHour?["resetsAt"]).map { Date(timeIntervalSince1970: $0) },
-            sevenDayResetsAt: number(sevenDay?["resetsAt"]).map { Date(timeIntervalSince1970: $0) }
+            sevenDayResetsAt: number(sevenDay?["resetsAt"]).map { Date(timeIntervalSince1970: $0) },
+            overageStatus: info["overageStatus"] as? String
         ))
     }
 
@@ -126,7 +133,8 @@ public enum StreamParser {
             text: object["result"] as? String ?? (errors.isEmpty ? nil : errors.joined(separator: "; ")),
             costUSD: number(object["total_cost_usd"]),
             apiErrorStatus: (object["api_error_status"] as? NSNumber)?.intValue,
-            sessionId: object["session_id"] as? String ?? ""
+            sessionId: object["session_id"] as? String ?? "",
+            hasUsage: object["usage"] is [String: Any]
         ))
     }
 

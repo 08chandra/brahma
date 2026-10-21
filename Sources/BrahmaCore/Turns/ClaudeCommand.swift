@@ -10,9 +10,16 @@ public struct TurnRequest: Sendable {
     public var mcpConfigPath: String
     public var workingDirectory: String
     public var profile: PermissionProfile
+    /// Directories the agent may touch besides its working directory. Empty means `[company.workspacePath]`.
+    public var addDirs: [String] = []
+    /// Engine-set `BRAHMA_*` variables for the child; everything else comes from `ChildEnvironment`.
+    public var environment: [String: String] = [:]
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
-                mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile) {
+                mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,
+                addDirs: [String] = [], environment: [String: String] = [:]) {
+        self.addDirs = addDirs
+        self.environment = environment
         self.agent = agent
         self.company = company
         self.prompt = prompt
@@ -33,28 +40,7 @@ public enum ClaudeCommand {
 
     /// Arguments only; the prompt is sent on stdin, never argv.
     public static func arguments(for r: TurnRequest) -> [String] {
-        var a = [
-            "-p", "--output-format", "stream-json", "--verbose",
-            "--model", r.agent.model, "--fallback-model", "sonnet",
-            "--setting-sources", "", "--settings", "{\"enabledPlugins\":{}}", "--disable-slash-commands",
-            "--strict-mcp-config", "--mcp-config", r.mcpConfigPath,
-            "--disallowed-tools", disallowedTools.joined(separator: ","),
-        ]
-        if r.agent.sessionStarted {
-            a += ["--resume", r.agent.sessionId]
-        } else {
-            a += ["--session-id", r.agent.sessionId]
-            if let system = r.appendSystemPrompt { a += ["--append-system-prompt", system] }
-        }
-        switch r.profile {
-        case .workspace:
-            a += ["--permission-mode", "acceptEdits",
-                  "--allowed-tools", "Bash,Read,Edit,Write,Glob,Grep,mcp__company",
-                  "--add-dir", r.company.workspacePath]
-        case .full:
-            a += ["--permission-mode", "bypassPermissions"]
-        }
-        return a
+        TurnProfileCompiler.arguments(TurnProfileCompiler.profile(for: r))
     }
 }
 

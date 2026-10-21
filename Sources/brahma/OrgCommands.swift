@@ -27,6 +27,7 @@ struct OrgGroup: ParsableCommand {
         @Option(help: "New team name, or 'none'.") var team: String?
 
         func run() throws {
+            try requireOwnerShell()
             guard manager != nil || team != nil else { throw fail("give --manager and/or --team") }
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
@@ -67,6 +68,7 @@ struct OrgGroup: ParsableCommand {
         @Argument var company: String
         @Argument var handle: String
         func run() throws {
+            try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let h = handle.hasPrefix("@") ? String(handle.dropFirst()) : handle

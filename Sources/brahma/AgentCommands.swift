@@ -13,6 +13,7 @@ struct Hire: ParsableCommand {
     @Option(help: "Team name.") var team: String?
 
     func run() throws {
+        try requireOwnerShell()
         guard ["opus", "sonnet", "haiku", "auto"].contains(model) else { throw fail("model must be opus, sonnet, haiku or auto") }
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
@@ -36,6 +37,7 @@ struct Kill: ParsableCommand {
     @Argument var handle: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let a = try resolveAgent(store, company: try resolveCompany(store, company), handle: handle)
         do {
@@ -55,6 +57,7 @@ struct Pause: ParsableCommand {
     @Argument var handle: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let a = try resolveAgent(store, company: try resolveCompany(store, company), handle: handle)
         guard a.state != .killed else { throw fail("@\(a.name) is killed") }
@@ -70,6 +73,7 @@ struct Wake: ParsableCommand {
     @Argument var handle: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let a = try resolveAgent(store, company: try resolveCompany(store, company), handle: handle)
         guard a.state != .killed else { throw fail("@\(a.name) is killed") }

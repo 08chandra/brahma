@@ -143,6 +143,13 @@ enum Migrations {
             }
             try db.create(index: "broadcastLog_sender_created", on: "broadcastLog", columns: ["senderId", "createdAt"])
         }
+        m.registerMigration("v3-engine") { db in
+            try db.create(table: "engineProbe") { t in
+                t.column("id", .integer).primaryKey().check { $0 == 1 }
+                t.column("report", .text).notNull()
+                t.column("checkedAt", .datetime).notNull()
+            }
+        }
         return m
     }
 }

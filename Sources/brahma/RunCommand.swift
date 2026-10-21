@@ -13,14 +13,26 @@ struct Run: AsyncParsableCommand {
     @Option(help: "Maximum concurrent turns across all companies.") var hardCap: Int = 16
     @Option(help: "workspace (default) or full.") var profile: PermissionProfile = .workspace
 
+    @Flag(name: .customLong("skip-doctor"), help: .hidden) var skipDoctor = false
+
     func validate() throws {
         guard hardCap >= 1 else { throw ValidationError("--hard-cap must be at least 1") }
     }
 
     func run() async throws {
+        try requireOwnerShell()
         // A child or MCP pipe closing under us must surface as EPIPE, not kill the orchestrator.
         signal(SIGPIPE, SIG_IGN)
         let (store, paths) = try openStore()
+        if !skipDoctor {
+            let report = await BrahmaCore.Doctor.ensure(store: store, claudePath: "claude", runner: ClaudeProcessRunner())
+            if !report.ok {
+                for item in report.items where item.status == .fail {
+                    FileHandle.standardError.write(Data(safe("FAIL  \(item.name)  \(item.detail)\n").utf8))
+                }
+                throw fail("Run 'brahma doctor' for details.")
+            }
+        }
         let lock: OrchestratorLock
         do {
             lock = try OrchestratorLock.acquire(paths: paths)

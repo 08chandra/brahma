@@ -21,6 +21,7 @@ struct Say: ParsableCommand {
     @Argument(help: "Message text.") var text: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         let router = MessageRouter(store: store)

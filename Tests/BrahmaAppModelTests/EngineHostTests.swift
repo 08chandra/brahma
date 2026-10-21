@@ -3,11 +3,32 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
+private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorItem(name: "probe", status: .pass, detail: "ok")],
+                                         checkedAt: Date())
+
 @MainActor @Suite struct EngineHostTests {
     let tools = Result<EngineTools, EngineSetupError>.success(EngineTools(claudePath: "claude", mcpExecutable: "/tmp/brahma"))
 
     func host(_ paths: BrahmaPaths, _ store: Store, _ runner: StubRunner = StubRunner(mode: .succeed)) -> EngineHost {
-        EngineHost(paths: paths, store: store, makeRunner: { _ in runner }, tickInterval: .milliseconds(10))
+        EngineHost(paths: paths, store: store, makeRunner: { _ in runner }, tickInterval: .milliseconds(10),
+                   probe: { _ in passingReport })
+    }
+
+    @Test func failedProbeDoesNotTakeLock() async throws {
+        let (store, paths) = try makeHome()
+        let failing = DoctorReport(cliVersion: "2.1.306", items: [
+            DoctorItem(name: "version", status: .pass, detail: "ok"),
+            DoctorItem(name: "probe", status: .fail, detail: "no result line"),
+        ], checkedAt: Date())
+        let h = EngineHost(paths: paths, store: store, makeRunner: { _ in StubRunner(mode: .succeed) },
+                           tickInterval: .milliseconds(10), probe: { _ in failing })
+        await h.start(tools: tools)
+        #expect(h.status == .failed("Claude Code check failed: no result line. Run brahma doctor in Terminal for details."))
+        // The lock was never taken: another host can embed at once.
+        let h2 = host(paths, store)
+        await h2.start(tools: tools)
+        #expect(h2.status == .embedded)
+        await h2.stop()
     }
 
     func dmCeo(_ store: Store, _ acme: Company) throws {

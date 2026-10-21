@@ -54,3 +54,10 @@ func clock(_ date: Date, seconds: Bool = false) -> String {
     f.dateFormat = seconds ? "HH:mm:ss" : "HH:mm"
     return f.string(from: date)
 }
+
+/// Owner-write commands must not run from an agent's shell (the engine sets BRAHMA_AGENT_ID for every turn).
+func requireOwnerShell() throws {
+    if ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] != nil {
+        throw fail("owner commands can't run inside an agent turn")
+    }
+}

@@ -15,6 +15,7 @@ struct CompanyGroup: ParsableCommand {
         @Flag(help: "Print the org that would be created and change nothing.") var dryRun = false
 
         func run() throws {
+            try requireOwnerShell()
             guard agents == 0 || OrgGenerator.range.contains(agents) else {
                 throw fail("--agents must be 0 or between \(OrgGenerator.range.lowerBound) and \(OrgGenerator.range.upperBound)")
             }
@@ -59,24 +60,25 @@ struct CompanyGroup: ParsableCommand {
 
     struct Pause: ParsableCommand {
         @Argument var company: String
-        func run() throws { try set(company, .paused) }
+        func run() throws { try requireOwnerShell(); try set(company, .paused) }
     }
 
     struct Resume: ParsableCommand {
         @Argument var company: String
-        func run() throws { try set(company, .running) }
+        func run() throws { try requireOwnerShell(); try set(company, .running) }
     }
 
     struct Mode: ParsableCommand {
         @Argument var company: String
         @Argument(help: "low, balanced or max.") var mode: UsageMode
-        func run() throws { try update(company) { $0.usageMode = mode } }
+        func run() throws { try requireOwnerShell(); try update(company) { $0.usageMode = mode } }
     }
 
     struct Weight: ParsableCommand {
         @Argument var company: String
         @Argument(help: "Scheduling weight (1 or more).") var weight: Int
         func run() throws {
+            try requireOwnerShell()
             guard weight >= 1 else { throw fail("weight must be at least 1") }
             try update(company) { $0.priorityWeight = weight }
         }

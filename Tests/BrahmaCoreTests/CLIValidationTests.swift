@@ -48,7 +48,7 @@ private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         let lock = try OrchestratorLock.acquire(paths: paths)
         defer { withExtendedLifetime(lock) {} }
-        let r = try brahma(["run"], home: d)
+        let r = try brahma(["run", "--skip-doctor"], home: d)
         #expect(r.status != 0)
         #expect(r.stderr.contains("another Brahma engine (the Brahma app or 'brahma run') is already using"))
     }

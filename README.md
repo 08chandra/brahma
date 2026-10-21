@@ -84,3 +84,13 @@ servers and `CLAUDE.md` files (`--setting-sources ""`), and a `CLAUDE.md` in the
 
 **`--profile full` gives agents your whole Mac** (all permission checks bypassed). Only use it for
 companies and prompts you trust completely.
+
+**Agent environment.** Every turn gets an allowlisted environment (`PATH, HOME, LANG, LC_*, TERM, USER, LOGNAME,
+SHELL, DEVELOPER_DIR, TMPDIR`, minus anything named like a token, secret or key), plus `BRAHMA_AGENT_ID`; never
+`BRAHMA_DEV`. `claude` itself also receives `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when you set them
+(keychain login needs neither), and an agent's Bash inherits those from the `claude` process until the 5-lite
+shell prefix unsets them. `brahma mcp` refuses a foreign `--agent`, and owner-write commands refuse to run inside
+an agent turn; as above, neither is tamper-proof until the sandbox lands.
+
+`brahma doctor` checks the installed Claude Code CLI (version, required flags, a real haiku probe turn, and that
+`--resume` keeps the role prompt). `brahma run` and the app require a passing probe, reused for 24 h per CLI version.

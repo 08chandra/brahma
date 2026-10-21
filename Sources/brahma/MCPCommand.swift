@@ -12,6 +12,10 @@ struct MCP: ParsableCommand {
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
+        if let turnAgent = ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"], turnAgent != agent {
+            FileHandle.standardError.write(Data("brahma mcp: --agent does not match this turn's agent\n".utf8))
+            throw ExitCode.failure
+        }
         let packs = BrahmaPaths.fromEnvironment().packsDir
         let catalog = PackCatalog.loadOrBuiltin(directory: packs) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
         let store = try Store(path: db, catalog: catalog)

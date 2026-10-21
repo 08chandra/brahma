@@ -183,10 +183,11 @@ public actor Orchestrator {
                 agent: sent, company: company,
                 prompt: InboxDigest.render(agent: agent, company: company, items: items, handles: handles,
                                             unread: Store.channelCounts(quiet)),
-                appendSystemPrompt: agent.sessionStarted
-                    ? nil : RolePrompt.render(agent: agent, company: company, roster: team.filter { $0.state != .killed }),
+                appendSystemPrompt: RolePrompt.render(agent: agent, company: company),
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent),
-                workingDirectory: company.workspacePath, profile: profile)
+                workingDirectory: company.workspacePath, profile: profile,
+                environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
+                              "BRAHMA_WORKSPACES": paths.workspaces.path])
             var sessionMarked = agent.sessionStarted
             for try await event in runner.run(request) {
                 switch event {

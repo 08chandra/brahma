@@ -24,6 +24,8 @@ public struct ClaudeProcessRunner: TurnRunning {
     /// Command name looked up via `/usr/bin/env`, or an absolute path launched directly.
     public var claudePath: String
     public var maxTurnDuration: Duration
+    /// What `ChildEnvironment` filters. Tests inject one; production uses this process's environment.
+    public var baseEnvironment: [String: String]
 
     private static let live = LiveCount()
 
@@ -32,9 +34,11 @@ public struct ClaudeProcessRunner: TurnRunning {
     /// After the process exits, how long to wait for stdout EOF (a grandchild may still hold the pipe).
     static let drainGrace: TimeInterval = 2
 
-    public init(claudePath: String = "claude", maxTurnDuration: Duration = .seconds(900)) {
+    public init(claudePath: String = "claude", maxTurnDuration: Duration = .seconds(900),
+                baseEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
         self.claudePath = claudePath
         self.maxTurnDuration = maxTurnDuration
+        self.baseEnvironment = baseEnvironment
     }
 
     public func waitForChildren() async {
@@ -80,6 +84,7 @@ public struct ClaudeProcessRunner: TurnRunning {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [claudePath] + args
         }
+        process.environment = ChildEnvironment.make(base: baseEnvironment, extra: request.environment, purpose: .claude)
         process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         process.standardInput = stdin
