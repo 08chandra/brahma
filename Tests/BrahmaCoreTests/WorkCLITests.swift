@@ -132,6 +132,46 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) != text)
     }
 
+    @Test func rotateWithoutValidKeyRefused() throws {
+        let home = try OwnerTestHome()
+        let key = home.url.appending(path: "home/owner.key")
+        try Data("tampered\n".utf8).write(to: key)
+        #expect(try initOwnerKey(home: home.url, extraArgs: ["--rotate"]) != 0)
+        #expect(try String(contentsOf: key, encoding: .utf8) == "tampered\n", "the key must be left untouched")
+        let none = try OwnerTestHome(initOwner: false)
+        #expect(try initOwnerKey(home: none.url, extraArgs: ["--rotate"]) != 0)
+        #expect(!FileManager.default.fileExists(atPath: none.url.appending(path: "home/owner.key").path))
+    }
+
+    @Test func rotateWithValidKeySucceeds() throws {
+        let home = try OwnerTestHome()
+        let key = home.url.appending(path: "home/owner.key")
+        let before = try String(contentsOf: key, encoding: .utf8)
+        #expect(try initOwnerKey(home: home.url, extraArgs: ["--rotate"]) == 0)
+        #expect(try String(contentsOf: key, encoding: .utf8) != before)
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home.url).status == 0)
+    }
+
+    @Test func symlinkedHomeResolvesToSameItem() throws {
+        let home = try OwnerTestHome()
+        let link = home.url.appending(path: "link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: home.url.appending(path: "home"))
+        let r = try brahma(["company", "create", "Acme", "--goal", "g"], home: home.url, env: ["BRAHMA_HOME": link.path])
+        #expect(r.status == 0, "\(r.stderr)")
+        #expect(try brahma(["pause", "Acme", "ceo"], home: home.url, env: ["BRAHMA_HOME": link.path]).stderr.contains("owner key") == false)
+    }
+
+    @Test func symlinkedDBRefused() throws {
+        let home = try OwnerTestHome()
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home.url).status == 0)
+        let db = home.url.appending(path: "home/brahma.sqlite")
+        let moved = home.url.appending(path: "home/real.sqlite")
+        try FileManager.default.moveItem(at: db, to: moved)
+        try FileManager.default.createSymbolicLink(at: db, withDestinationURL: moved)
+        let r = try brahma(["pause", "Acme", "ceo"], home: home.url)
+        #expect(r.status == 1); #expect(r.stderr.contains("the database is a symlink or lies outside the data home"))
+    }
+
     @Test func cliWrongKeyAndMissingHashRefusedValidAccepted() throws {
         let home = try OwnerTestHome()
         #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home.url).status == 0)   // valid key

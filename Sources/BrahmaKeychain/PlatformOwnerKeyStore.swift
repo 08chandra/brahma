@@ -16,7 +16,7 @@ public enum PlatformOwnerKeyStore {
 }
 
 #if canImport(Security)
-/// A generic-password Keychain item: service `dev.brahma.owner`, account = the absolute data-home path (so test
+/// A generic-password Keychain item: service `dev.brahma.owner`, account = the canonical (realpath) data-home path (so test
 /// homes never touch the real owner's item). The item is created with an access list that trusts any application,
 /// so both the app and the `brahma` CLI read it without a prompt. Until 5-lite, an agent shell can read it too.
 public struct KeychainOwnerKeyStore: OwnerKeyStore {
@@ -26,7 +26,7 @@ public struct KeychainOwnerKeyStore: OwnerKeyStore {
 
     private func query(_ paths: BrahmaPaths) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: Self.service,
-         kSecAttrAccount as String: paths.home.path]
+         kSecAttrAccount as String: paths.canonicalHomePath]
     }
 
     public func hash(for paths: BrahmaPaths) -> String? {

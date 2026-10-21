@@ -66,7 +66,12 @@ func requireOwnerShell() throws {
     if ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] != nil {
         throw fail("owner commands can't run inside an agent turn")
     }
-    guard OwnerKey.verify(paths: BrahmaPaths.fromEnvironment(), store: PlatformOwnerKeyStore.make()) else {
+    let paths = BrahmaPaths.fromEnvironment()
+    guard OwnerKey.verify(paths: paths, store: PlatformOwnerKeyStore.make()) else {
         throw fail("owner key missing or invalid; run 'brahma owner init' in Terminal or open the app")
+    }
+    // The key is keyed on the canonical data home; the database we are about to open must really live in it.
+    guard OwnerKey.databaseIsInsideHome(paths: paths) else {
+        throw fail("the database is a symlink or lies outside the data home; refusing owner command")
     }
 }

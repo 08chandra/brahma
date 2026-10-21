@@ -15,7 +15,11 @@ rm -f "$OUT"
 TMP="$(mktemp -d)"
 OWNER_HOME=""
 cleanup() {
-  [ -n "$OWNER_HOME" ] && security delete-generic-password -s dev.brahma.owner -a "$OWNER_HOME" >/dev/null 2>&1 || true
+  # The account is the canonical (symlink-resolved) data home; never delete with an empty account.
+  if [ -n "$OWNER_HOME" ]; then
+    CANON="$(cd "$OWNER_HOME" 2>/dev/null && pwd -P || true)"
+    [ -z "$CANON" ] || security delete-generic-password -s dev.brahma.owner -a "$CANON" >/dev/null 2>&1 || true
+  fi
   rm -rf "$TMP"
 }
 trap cleanup EXIT

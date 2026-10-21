@@ -46,6 +46,35 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         await h.stop()
     }
 
+    @Test func appLaunchNeverReplacesAnInvalidKey() async throws {
+        let (store, paths) = try makeHome()
+        let keys = InMemoryOwnerKeyStore()
+        try OwnerKey.create(paths: paths, store: keys)
+        keys.removeHash(for: paths)   // the key file exists but cannot be verified
+        let before = try String(contentsOf: OwnerKey.url(paths: paths), encoding: .utf8)
+        let h = EngineHost(paths: paths, store: store, makeRunner: { _ in StubRunner(mode: .succeed) },
+                           tickInterval: .milliseconds(10), probe: { _ in passingReport }, ownerKeyStore: keys)
+        await h.start(tools: tools)
+        await h.stop()
+        #expect(try String(contentsOf: OwnerKey.url(paths: paths), encoding: .utf8) == before)
+        #expect(!OwnerKey.verify(paths: paths, store: keys))
+    }
+
+    @Test func rotationNeedsUserPresence() async throws {
+        let (_, paths) = try makeHome()
+        let keys = InMemoryOwnerKeyStore()
+        try OwnerKey.create(paths: paths, store: keys)
+        keys.removeHash(for: paths)   // lost hash: only the app, with user presence, can recover
+        let before = try String(contentsOf: OwnerKey.url(paths: paths), encoding: .utf8)
+        await #expect(throws: OwnerKeyRotationError.notAuthorized) {
+            try await OwnerKeyRotation(authenticate: { _ in false }).rotate(paths: paths, store: keys)
+        }
+        #expect(try String(contentsOf: OwnerKey.url(paths: paths), encoding: .utf8) == before)
+        try await OwnerKeyRotation(authenticate: { _ in true }).rotate(paths: paths, store: keys)
+        #expect(OwnerKey.verify(paths: paths, store: keys))
+        #expect(try String(contentsOf: OwnerKey.url(paths: paths), encoding: .utf8) != before)
+    }
+
     func dmCeo(_ store: Store, _ acme: Company) throws {
         _ = try MessageRouter(store: store).sendDM(companyId: acme.id, from: .owner, to: "ceo", text: "hello")
     }

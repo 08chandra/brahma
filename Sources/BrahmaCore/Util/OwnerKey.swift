@@ -1,5 +1,25 @@
 import Foundation
 
+extension BrahmaPaths {
+    /// The data home with every symlink resolved (realpath of the deepest existing ancestor plus the rest). The
+    /// owner-key hash is keyed on this, so a symlink to the home resolves to the same Keychain item.
+    public var canonicalHomePath: String { BrahmaPaths.canonicalPath(home.path) }
+
+    public static func canonicalPath(_ path: String) -> String {
+        var url = URL(fileURLWithPath: path).standardizedFileURL
+        var tail: [String] = []
+        var base = "/"
+        while true {
+            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+            if realpath(url.path, &buffer) != nil { base = String(cString: buffer); break }
+            if url.path == "/" || url.pathComponents.count <= 1 { break }
+            tail.insert(url.lastPathComponent, at: 0)
+            url.deleteLastPathComponent()
+        }
+        return tail.isEmpty ? base : (base == "/" ? "" : base) + "/" + tail.joined(separator: "/")
+    }
+}
+
 /// Where the SHA-256 of the owner key lives, outside the data home. The macOS implementation (Keychain) is in the
 /// `BrahmaKeychain` target so BrahmaCore stays portable. There is deliberately no environment variable or flag that
 /// redirects a store or skips the check.
@@ -14,9 +34,9 @@ public final class InMemoryOwnerKeyStore: OwnerKeyStore, @unchecked Sendable {
     private let lock = NSLock()
     private var hashes: [String: String] = [:]
     public init() {}
-    public func hash(for paths: BrahmaPaths) -> String? { lock.withLock { hashes[paths.home.path] } }
-    public func setHash(_ hash: String, for paths: BrahmaPaths) throws { lock.withLock { hashes[paths.home.path] = hash } }
-    public func removeHash(for paths: BrahmaPaths) { lock.withLock { hashes[paths.home.path] = nil } }
+    public func hash(for paths: BrahmaPaths) -> String? { lock.withLock { hashes[paths.canonicalHomePath] } }
+    public func setHash(_ hash: String, for paths: BrahmaPaths) throws { lock.withLock { hashes[paths.canonicalHomePath] = hash } }
+    public func removeHash(for paths: BrahmaPaths) { lock.withLock { hashes[paths.canonicalHomePath] = nil } }
 }
 
 /// Linux / no-Keychain fallback: a 0600 hash file outside the data home, `<directory>/owner-<fnv of home>.sha256`.
@@ -30,7 +50,7 @@ public struct FileOwnerKeyStore: OwnerKeyStore {
     }
 
     func file(_ paths: BrahmaPaths) -> URL {
-        directory.appending(path: "owner-\(StableHash.fnv1a64(paths.home.path)).sha256")
+        directory.appending(path: "owner-\(StableHash.fnv1a64(paths.canonicalHomePath)).sha256")
     }
 
     public func hash(for paths: BrahmaPaths) -> String? {
@@ -90,11 +110,13 @@ public enum OwnerKey {
         return file
     }
 
-    /// App launch: keeps a valid key; otherwise (missing, or the stored hash is missing or differs) makes a new one.
+    /// App launch: keeps a valid key and creates one only when none exists. An existing key that fails to verify
+    /// is left alone (replacing it needs `rotate` with proof); returns nil in that case.
     @discardableResult
-    public static func ensure(paths: BrahmaPaths, store: any OwnerKeyStore) throws -> URL {
+    public static func ensure(paths: BrahmaPaths, store: any OwnerKeyStore) throws -> URL? {
         if verify(paths: paths, store: store) { return url(paths: paths) }
-        return try create(paths: paths, store: store, rotate: true)
+        if exists(paths: paths) { return nil }
+        return try create(paths: paths, store: store)
     }
 
     public static func exists(paths: BrahmaPaths) -> Bool { FileManager.default.fileExists(atPath: url(paths: paths).path) }
@@ -108,6 +130,16 @@ public enum OwnerKey {
         let key = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return false }
         return constantTimeEqual(SHA256.hex(key), stored.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// The database must be a regular path inside the canonical data home: not a symlink, and its realpath must not
+    /// leave the home. A database that does not exist yet is fine.
+    public static func databaseIsInsideHome(paths: BrahmaPaths) -> Bool {
+        let db = paths.database.path
+        var info = stat()
+        guard lstat(db, &info) == 0 else { return true }
+        if (info.st_mode & S_IFMT) == S_IFLNK { return false }
+        return BrahmaPaths.canonicalPath(db).hasPrefix(paths.canonicalHomePath + "/")
     }
 
     public static func constantTimeEqual(_ a: String, _ b: String) -> Bool {

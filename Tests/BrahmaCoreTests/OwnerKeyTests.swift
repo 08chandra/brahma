@@ -50,15 +50,58 @@ private func paths() throws -> BrahmaPaths {
         #expect(OwnerKey.verify(paths: p, store: store))
     }
 
-    @Test func ensureKeepsValidAndRepairsInvalid() throws {
+    @Test func ensureCreatesOnlyWhenMissing() throws {
         let p = try paths(); let store = InMemoryOwnerKeyStore()
-        try OwnerKey.ensure(paths: p, store: store)
+        #expect(try OwnerKey.ensure(paths: p, store: store) != nil)
         let first = try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8)
-        try OwnerKey.ensure(paths: p, store: store)
+        #expect(try OwnerKey.ensure(paths: p, store: store) != nil)
         #expect(try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8) == first)
+        // An existing key that fails to verify is never silently replaced.
         store.removeHash(for: p)
-        try OwnerKey.ensure(paths: p, store: store)
-        #expect(OwnerKey.verify(paths: p, store: store))
+        #expect(try OwnerKey.ensure(paths: p, store: store) == nil)
+        #expect(try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8) == first)
+        #expect(!OwnerKey.verify(paths: p, store: store))
+    }
+
+    @Test func symlinkedHomeResolvesToSameItem() throws {
+        let d = try tempDir()
+        let real = d.appending(path: "real")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        let link = d.appending(path: "link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        let viaReal = BrahmaPaths(home: real, workspaces: d.appending(path: "ws"))
+        let viaLink = BrahmaPaths(home: link, workspaces: d.appending(path: "ws"))
+        #expect(viaReal.canonicalHomePath == viaLink.canonicalHomePath)
+        #expect(BrahmaPaths.canonicalPath(link.appending(path: "not/yet").path) == viaReal.canonicalHomePath + "/not/yet")
+        for store in [InMemoryOwnerKeyStore() as any OwnerKeyStore, FileOwnerKeyStore(directory: d.appending(path: "cfg")),
+                      KeychainOwnerKeyStore()] {
+            defer { store.removeHash(for: viaReal) }
+            try OwnerKey.create(paths: viaReal, store: store)
+            #expect(OwnerKey.verify(paths: viaLink, store: store), "\(type(of: store))")
+            #expect(store.hash(for: viaLink) == store.hash(for: viaReal))
+            store.removeHash(for: viaLink)
+            #expect(store.hash(for: viaReal) == nil)
+            try? FileManager.default.removeItem(at: OwnerKey.url(paths: viaReal))
+        }
+    }
+
+    @Test func symlinkedDBRefused() throws {
+        let p = try paths()
+        try FileManager.default.createDirectory(at: p.home, withIntermediateDirectories: true)
+        #expect(OwnerKey.databaseIsInsideHome(paths: p), "a database that doesn't exist yet is fine")
+        try Data("x".utf8).write(to: p.database)
+        #expect(OwnerKey.databaseIsInsideHome(paths: p))
+        let elsewhere = try tempDir().appending(path: "other.sqlite")
+        try Data("y".utf8).write(to: elsewhere)
+        try FileManager.default.removeItem(at: p.database)
+        try FileManager.default.createSymbolicLink(at: p.database, withDestinationURL: elsewhere)
+        #expect(!OwnerKey.databaseIsInsideHome(paths: p))
+        // A symlink that stays inside the home is still a symlink.
+        let inside = p.home.appending(path: "real.sqlite")
+        try Data("z".utf8).write(to: inside)
+        try FileManager.default.removeItem(at: p.database)
+        try FileManager.default.createSymbolicLink(at: p.database, withDestinationURL: inside)
+        #expect(!OwnerKey.databaseIsInsideHome(paths: p))
     }
 
     @Test func constantTimeCompare() {

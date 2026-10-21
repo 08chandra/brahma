@@ -99,7 +99,7 @@ an agent turn; as above, neither is tamper-proof until the sandbox lands.
 `<data home>/owner.key` (mode 0600) hashes to the SHA-256 held in the Keychain (service `dev.brahma.owner`, account =
 the data-home path; on Linux a 0600 hash file under `~/.config/brahma`, which is weaker). No owner command creates
 the key: the Mac app does at launch, or you run `brahma owner init` in Terminal (it needs an interactive terminal;
-`--rotate` replaces a key). Each turn's `brahma mcp` only starts with a per-turn token (only its SHA-256 is stored)
+`--rotate` replaces a key and needs the current key to be valid; a lost or invalid key can only be replaced from the app after a user-presence check). The hash is keyed on the canonical (symlink-resolved) data home, and owner commands refuse a database that is a symlink or lies outside it. Each turn's `brahma mcp` only starts with a per-turn token (only its SHA-256 is stored)
 that is valid while that turn is in progress, delivered in the 0600 per-turn MCP config. Both are a deterrent, not a
 security boundary: until 5-lite's sandbox read-denies the data home and Keychain services to agents, an agent shell
 can still read the key, the hash and the MCP configs, or fake a TTY with `script`.

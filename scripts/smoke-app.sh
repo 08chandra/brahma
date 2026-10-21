@@ -11,7 +11,9 @@ cleanup() {
   [ -n "$CLI_PID" ] && kill -INT "$CLI_PID" 2>/dev/null || true
   [ -n "$APP_PID" ] && kill -KILL "$APP_PID" 2>/dev/null || true
   # The owner key's hash lives in the Keychain, keyed by the temp data home; remove it with the temp dir.
-  security delete-generic-password -s dev.brahma.owner -a "$TMP/home" >/dev/null 2>&1 || true
+  # The account is the canonical (symlink-resolved) data home; never delete with an empty account.
+  CANON="$(cd "$TMP/home" 2>/dev/null && pwd -P || true)"
+  [ -z "$CANON" ] || security delete-generic-password -s dev.brahma.owner -a "$CANON" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
