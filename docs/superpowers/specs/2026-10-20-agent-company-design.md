@@ -950,7 +950,7 @@ Instagram Reels; YouTube Shorts later), produced end to end by a marketing team.
   2. *Ideation → script → storyboard:* hooks, scripts, shot lists, on-screen
      text, captions, hashtags; brand kit (logo, colors, fonts, voice) applied.
   3. *Generation:* video via a **video-generation connector** (e.g.
-     Higgsfield, or alternatives such as Runway, Kling, Luma, Veo, Sora;
+     Higgsfield, or alternatives such as Runway, Kling, Luma, Veo (OpenAI's Sora API was shut down 2026-09-24 — excluded);
      avatars/voice via HeyGen/ElevenLabs-style services) plus product
      footage/screenshots from the preview pane; assembly/edit via an engine
      tool (ffmpeg pipeline: cuts, captions burn-in, aspect 9:16, safe zones,
@@ -977,6 +977,17 @@ Instagram Reels; YouTube Shorts later), produced end to end by a marketing team.
   endorsement/disclosure rules for sponsored or affiliate content; respect
   platform ToS and rate limits; claims checked against a per-company
   approved-claims list (important for CPG: health/efficacy claims).
+- **Platform corrections (research 2026-10-21):** TikTok's Content Posting
+  API needs per-post user consent and an audited app (unaudited apps can only
+  post privately to ≤5 users/day), so **every TikTok post is an owner ask —
+  no auto-post policy for TikTok**; no added logos/watermarks on TikTok; the
+  publish check sets the platforms' AI-content flags (TikTok `is_aigc`,
+  Instagram/Meta AI label, YouTube `containsSyntheticMedia`); music only from
+  a licensed library (e.g. Epidemic Sound-style); metrics are pulled by the
+  engine (not agents); Instagram trial reels are used for A/B tests.
+- **Engine executes approved actions:** for outbound posts/messages, spend,
+  and connector writes, the engine performs exactly the approved payload,
+  once (idempotent); agents never call publish/spend APIs directly.
 - **Where it lands:** a dedicated **Marketing plan (Plan M)** built right after
   the dogfood week begins (so the test company can market itself), depending
   on Memory-lite, the Inbox/outbox, funds budget and the integrations
