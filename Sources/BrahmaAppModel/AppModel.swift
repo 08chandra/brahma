@@ -13,6 +13,8 @@ public final class AppModel {
     public private(set) var activity: [ActivityEvent] = []
     public private(set) var selectedCompanyId: String?
     public private(set) var sidebarSelection: SidebarItem = .missionControl
+    /// The open channel or DM, nil for every other sidebar selection.
+    public private(set) var chat: ChatModel?
     public var selectedAgentId: String?
     public var presentedSheet: AppSheet?
     public var errorMessage: String?
@@ -96,6 +98,9 @@ public final class AppModel {
                 activity += mine
                 if activity.count > Self.activityCap { activity.removeFirst(activity.count - Self.activityCap) }
             }
+            if events.contains(where: { $0.kind == .message && $0.companyId == selectedCompanyId }) {
+                await chat?.refresh()
+            }
             ticksSinceSnapshot += 1
             if forceSnapshot || !events.isEmpty || ticksSinceSnapshot >= 4 {
                 try await refreshSnapshot()
@@ -125,12 +130,29 @@ public final class AppModel {
     public func selectCompany(_ id: String) async {
         selectedCompanyId = id
         sidebarSelection = .missionControl
+        chat = nil
         selectedAgentId = nil
         activity = []
         do { try await reloadSelected() } catch { report(error) }
     }
 
-    public func select(_ item: SidebarItem) { sidebarSelection = item }
+    public func select(_ item: SidebarItem) {
+        sidebarSelection = item
+        let target: ChatTarget?
+        switch item {
+        case .channel(let id): target = .channel(id: id)
+        case .dm(let handle): target = .dm(handle: handle)
+        default: target = nil
+        }
+        guard let target, let companyId = selectedCompanyId else {
+            chat = nil
+            return
+        }
+        if chat?.target == target { return }
+        let model = ChatModel(store: store, companyId: companyId, target: target)
+        chat = model
+        Task { await model.refresh() }
+    }
 
     /// Applies a launch/automation target, resolving names against the current snapshot.
     public func apply(_ target: SelectTarget) {

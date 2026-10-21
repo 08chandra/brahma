@@ -4,6 +4,7 @@ import BrahmaAppModel
 struct Sidebar: View {
     let model: AppModel
     @State private var conversationsExpanded = false
+    @State private var newDMShown = false
 
     var body: some View {
         let sections = model.sidebar
@@ -22,11 +23,18 @@ struct Sidebar: View {
                     }
                 }
             }
-            if !sections.directMessages.isEmpty {
-                Section("Direct messages") {
-                    ForEach(sections.directMessages) { row in
-                        SidebarRowView(row: row, showCount: true)
-                    }
+            Section {
+                ForEach(sections.directMessages) { row in
+                    SidebarRowView(row: row, showCount: true)
+                }
+            } header: {
+                HStack {
+                    Text("Direct messages")
+                    Spacer()
+                    Button { newDMShown = true } label: { Image(systemName: "plus") }
+                        .buttonStyle(.borderless)
+                        .help("New direct message")
+                        .popover(isPresented: $newDMShown) { NewDMPicker(model: model, isPresented: $newDMShown) }
                 }
             }
             if !sections.agentConversations.isEmpty {

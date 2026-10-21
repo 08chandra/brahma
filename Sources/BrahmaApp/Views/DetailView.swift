@@ -22,12 +22,16 @@ struct DetailView: View {
                 ContentUnavailableView("Activity", systemImage: "list.bullet.rectangle")
             case .agents:
                 ContentUnavailableView("Agents", systemImage: "person.3")
-            case .channel(let id):
-                let title = model.sidebar.channels.first { $0.item == .channel(id: id) }?.title
-                    ?? model.sidebar.agentConversations.first { $0.item == .channel(id: id) }?.title ?? "Channel"
-                ContentUnavailableView { Label { Text(verbatim: title) } icon: { Image(systemName: "number") } }
-            case .dm(let handle):
-                ContentUnavailableView { Label { Text(verbatim: "@" + handle) } icon: { Image(systemName: "bubble.left") } }
+            case .channel, .dm:
+                if let chat = model.chat {
+                    VSplitView {
+                        ChatView(chat: chat)
+                            .id(chat.target)
+                            .frame(minHeight: 200)
+                        ContentUnavailableView("Activity", systemImage: "list.bullet.rectangle")  // Task 7
+                            .frame(minHeight: 60, idealHeight: 100, maxHeight: 200)
+                    }
+                }
             }
         }
     }
