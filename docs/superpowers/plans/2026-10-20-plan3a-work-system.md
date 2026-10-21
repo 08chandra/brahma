@@ -468,6 +468,9 @@ otherwise → false
 - Stable cacheable prefix: the role card + rules are passed with `--append-system-prompt` on EVERY turn (start and resume), overriding the Global Constraint "passed only when a session starts"; update the `CommandTests` snapshots in the same commit. The system prompt must be byte-stable across turns: no roster, no timestamps, no counts (Task 10 moves the roster into the digest).
 - Doctor adds check `resume-keeps-role`: after the probe turn (started with `--append-system-prompt "Brahma probe: the codeword is BRAHMA-PROBE-7."`), a second turn `--resume`s it (with the same appended prompt) asking `Reply with the codeword only.`; the result must contain `BRAHMA-PROBE-7`, else fail. Test `resumeLosingRolePromptFails`.
 
+**Security amendments (owner-approved 2026-10-21, 5-lite security review items 1–2; override the text above):**
+- Environment allowlist replaces "owner env minus BRAHMA_DEV": `ChildEnvironment.make(base:extra:purpose:)` copies only `PATH, HOME, LANG, LC_*, TERM, USER, LOGNAME, SHELL, DEVELOPER_DIR, TMPDIR` from `base` (HOME is kept because `claude` and toolchains locate their config through it), then drops any name matching `*TOKEN*|*SECRET*|*KEY*|AWS_*|SSH_AUTH_SOCK` (case-insensitive), then adds the engine-set `BRAHMA_*` vars from `extra` (never `BRAHMA_DEV`). For `purpose: .claude` only, the auth variables `claude` needs are passed through when present in `base`: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` (keychain OAuth needs none; note in the README that agent Bash inherits these from the claude process until 5-lite's shell prefix unsets them). `ClaudeProcessRunner` (fixing Plan 1's full-env inheritance) and every check (Task 8) use it. Tests: `childEnvironmentIsAllowlisted` (FAKE_SECRET_TOKEN, AWS_X, SSH_AUTH_SOCK, RANDOM_VAR absent; PATH/HOME/LANG/LC_ALL present; BRAHMA_AGENT_ID present; BRAHMA_DEV absent), `turnEnvironmentCarriesAgentIdWithoutDev` asserts FAKE_SECRET_TOKEN set in the engine env is absent from the turn's environment.
+
 - [ ] **Step 1: Write failing tests.**
   - `TurnProfileTests`:
     - `plan1ArgvUnchanged` (the four Plan 1 expectations);
@@ -743,6 +746,9 @@ Denials: `"only the item's author, reviewer, a manager or the owner can change i
 - Engine dispatch: each tick (after reaping, not while held), for each idle individual-contributor agent (kind `individual`, state `ready`/`sleeping`, no lease, not paused), the engine leases the next Ready item that is claimable, has a check if its type requires one, has no undone dependencies, is not the agent's review item, and whose `ownerId` is the agent or nil and whose `team` is nil or the agent's team — ordered by priority then age — via `claimLease` + worktree (as a detached task), with event `leaseClaimed` text `"assigned by the engine"`, then wakes the agent. One item per agent per tick; manager assignment (`update_work_item owner`) stays an override. Tests: `engineDispatchesReadyItemToIdleIC`, `dispatchRespectsTeamAndDependencies`.
 - Stable tool schema: `CompanyTools.specs()` returns the SAME tool list for every role (all implemented tools except `review`, which appears only in review turns); `call` enforces the role filter (`"<tool> is not available to your role"`). Replace `MCPTests.toolsListHasExactlySevenTools` with `toolsListIsIdenticalForAllRoles`; `specsAreRoleFiltered` becomes `callIsRoleFiltered`.
 
+**Security amendments (owner-approved 2026-10-21, 5-lite security review items 1–2; override the text above):**
+- Engine git hardening: one shared helper (`GitCommand` in `Git/GitWorkspace.swift`) used by EVERY engine git call (worktrees, commits, diffs, name-status, log, merges, rebases, `isDirty`): never discovers a repo from an agent-writable path — always `GIT_DIR=<ws>/.git` and `GIT_WORK_TREE=<dir>` (for a worktree: `GIT_DIR=<ws>/.git/worktrees/<KEY>` resolved by the engine from its own records, never by reading the worktree's `.git` file), plus `-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat -c diff.external= -c protocol.ext.allow=never` and env `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1` (on top of the existing `user.name/user.email/commit.gpgsign` and an allowlisted environment from `ChildEnvironment`). Test `craftedRepoConfigIgnored`: point a worktree's `.git` file / `commondir` at a crafted repo whose config has `core.fsmonitor = touch <marker>` (and a hooks dir with a marker-touching `pre-commit`); engine `isDirty`, `commitAll`, `diff` and `nameStatus` leave no marker.
+
 - [ ] **Step 1: Write failing tests.**
   - `GitWorkspaceTests`:
     - `ensureRepoInitializesMainAndExcludesBrahma`;
@@ -821,6 +827,9 @@ Denials: `"only the item's author, reviewer, a manager or the owner can change i
 **Amendments (owner-approved 2026-10-21; these override the text above where they conflict):**
 - Checks run in a clean detached worktree of the exact commit: `git worktree add --detach <companyDir>/checks/run/<runId> <commit>`, for both `submit` and `merge` runs; remove it afterwards (`worktree remove --force`). `checkRunsInWorktree` asserts the run's `workingDirectory` is that detached checkout at `commit`.
 - `ProcessCheckRunner` starts the child in its own process group and `killpg`s it (SIGTERM, 5 s, SIGKILL) on timeout; `timeoutKillsAndRecords` uses a command that forks a child (e.g. `sh -c 'sleep 30 & wait'`) and asserts both are gone.
+
+**Security amendments (owner-approved 2026-10-21, 5-lite security review items 1–2; override the text above):**
+- Checks get `ChildEnvironment.make(…, purpose: .check)` (allowlist; no auth vars) plus `BRAHMA_AGENT_ID`. `checkEnvironmentIsScoped` sets FAKE_SECRET_TOKEN in the engine env and asserts it is absent from the check's `env` output. Check detached worktrees are created through Task 7's hardened `GitCommand`.
 
 - [ ] **Step 1: Write failing tests.**
   - `CheckRunnerTests`:
@@ -921,6 +930,9 @@ else in worktree: git rebase main
 **Efficiency amendments (owner-approved 2026-10-21, end-goal efficiency review; override the text above where they conflict):**
 - Model by turn kind: review turns run on `sonnet` for `"auto"` agents; `opus` only for tier L or flagged items.
 - Risk-tiered review (split: this is Task 9c, after 9a/9b): a tier-S item whose engine check passed, with no review flags, a diff under `ReviewPolicy.autoMergeMaxLines = 150` lines, and no sensitive path (`ReviewPolicy.sensitivePatterns`: `.github/`, `Package.swift`, `package.json`, lockfiles, `*.sql`, `migrations/`, any check-script file, `.brahma/`) skips the review turn: `mergeState = pending` with event `reviewApproved` text `"auto-approved (tier S, small diff)"`, unless the author has `agent.fullReview = true`. Every 4th auto-merge per company (`company.autoMergeCount`) is sampled into `reviewAudit(itemId PK, companyId, sampledActive, auditedAt, verdict, notes)`. Every 86 400 active s, unaudited samples (≤ 5) go to one batched `audit` review turn (TurnKind `audit`, fresh session, reviewer resolved as for reviews) whose digest quotes each merged diff; tool `audit {key, ok, notes}`. A failed audit sets the author's `fullReview = true` and DMs the author's manager. Tests: `smallTierSAutoMerges`, `flaggedOrLargeKeepsReview`, `everyFourthAutoMergeSampled`, `failedAuditForcesFullReview`.
+
+**Security amendments (owner-approved 2026-10-21, 5-lite security review items 1–2; override the text above):**
+- Merge, rebase, reset/clean in the item worktree and the root checkout go through Task 7's hardened `GitCommand` only.
 
 - [ ] **Step 1: Write failing tests** in `ReviewTests`:
   - `passingCheckSchedulesCleanContextReviewTurn`;
