@@ -1047,17 +1047,16 @@ promotion and sprint-level reflection in Plan 9.
 As the company runs, it builds and maintains its own documentation, kept clean
 and current — the readable, curated layer above raw chats and memory (§6.25,
 §6.27).
-- **Storage decision [call]:** **Markdown files in git** are the source of
-  truth (`handbook/` in each company's repo): versioned, diffable,
-  reviewable, portable (opens in any editor/Obsidian, publishable as a static
-  site), backed up with the repo, and edited by agents with their normal
-  Claude Code file tools. **Search/index:** SQLite FTS5 in the Brahma DB (same
-  stack, no server) now; a local vector index later for semantic search
-  (custom SQLite build with sqlite-vec via GRDB, or an in-process Swift
-  index — adequate to ~100k passages; LanceDB-embedded as a fallback at
-  larger scale). Rejected: Postgres/pgvector (needs a server; revisit for
-  the Linux server mode), graph DBs (links fit in SQLite tables), hosted
-  wikis (data leaves the machine).
+- **Storage decision [owner: "use what we've been using"]:** the handbook
+  lives in the **existing Brahma SQLite database (GRDB)** — no new store.
+  Tables: `kbPage` (company, path, title, section, body Markdown, owner,
+  status, lastReviewed, sources), `kbRevision` (append-only history with
+  author, item, diff summary — gives versioning and rollback), `kbLink`
+  (backlinks). Search via the same **FTS5** indexing used for messages;
+  semantic search later reuses Company Memory's index (§6.25). Pages are
+  exported to Markdown files on demand (and included in backups) for
+  portability. Agents edit pages through company tools (`kb_read`,
+  `kb_write` with item linkage), not raw files.
 - **Structure (pack-defined, software default):** Company (mission, goals,
   org, policies, glossary) · Product (PRDs, specs, roadmap, release notes) ·
   Engineering (architecture, ADRs, API, data model, runbooks, on-call) ·
@@ -1074,8 +1073,9 @@ and current — the readable, curated layer above raw chats and memory (§6.25,
   messages). Work items that change behavior must update the relevant doc
   (a check flag); a librarian job flags stale pages (not reviewed in N
   sprints, or linked code/decisions changed since) as small work items;
-  duplicate/contradiction detection via search. Doc edits go through the
-  normal item → review → merge flow (one writer per doc).
+  duplicate/contradiction detection via search. Page edits are recorded as revisions linked to the work item;
+  significant pages (policies, architecture, PRDs) require review; one
+  writer per page at a time (lease).
 - **Access:** agents read via `search_kb` / file reads within their scope
   (restricted sections, e.g. HR, finance, legal, only for permitted roles);
   each turn's orientation links the 3–5 most relevant pages. Company
