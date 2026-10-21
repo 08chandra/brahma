@@ -938,6 +938,51 @@ Brahma's.
   integration) right after 5-lite and before dogfooding; embeddings,
   librarian, external backends in Plan 9.
 
+### 6.26 Marketing studio — organic short-form video first (**[owner]** asked for this)
+The first marketing capability is **organic short-form video** (TikTok,
+Instagram Reels; YouTube Shorts later), produced end to end by a marketing team.
+- **Roles (pack roles, any industry):** content strategist, scriptwriter,
+  video producer, social/community manager, growth analyst (merged into one or
+  two seats for small companies).
+- **Pipeline (as work items, verification-first):**
+  1. *Strategy:* audience, positioning, content pillars and a posting
+     calendar derived from the product, the Knowledge Base and Company Memory.
+  2. *Ideation → script → storyboard:* hooks, scripts, shot lists, on-screen
+     text, captions, hashtags; brand kit (logo, colors, fonts, voice) applied.
+  3. *Generation:* video via a **video-generation connector** (e.g.
+     Higgsfield, or alternatives such as Runway, Kling, Luma, Veo, Sora;
+     avatars/voice via HeyGen/ElevenLabs-style services) plus product
+     footage/screenshots from the preview pane; assembly/edit via an engine
+     tool (ffmpeg pipeline: cuts, captions burn-in, aspect 9:16, safe zones,
+     loudness).
+  4. *Review:* an automated check (duration, resolution, aspect, captions
+     present, brand-kit compliance, banned-claims list, AI-content label
+     flag) + clean-context reviewer + owner approval in the **Inbox**
+     (outbound content is always an owner-approved ask unless the owner sets
+     an explicit per-account policy — §6.24).
+  5. *Publish:* via official APIs (TikTok Content Posting API, Instagram
+     Graph API Reels publishing for business/creator accounts) through the
+     external-communication outbox (§6.11a); scheduled per calendar.
+  6. *Learn:* analytics (views, watch time, retention, shares, saves,
+     follows, link clicks) pulled back into Company Memory; the growth analyst
+     proposes the next batch from what worked (A/B hooks, formats, times).
+- **Preview:** generated videos play in the preview pane (the 4a artifact
+  adapter must support MP4/MOV with a phone-frame 9:16 view) and on a
+  content calendar board.
+- **Budget:** generation credits are metered spend under the funds budget
+  (§6.17); per-video and monthly caps; the Inbox shows cost per video.
+- **Guardrails:** label AI-generated content where platforms require it;
+  only licensed/royalty-free music; no real-person likeness or voice without
+  rights; no fake testimonials, fabricated reviews or impersonation; FTC
+  endorsement/disclosure rules for sponsored or affiliate content; respect
+  platform ToS and rate limits; claims checked against a per-company
+  approved-claims list (important for CPG: health/efficacy claims).
+- **Where it lands:** a dedicated **Marketing plan (Plan M)** built right after
+  the dogfood week begins (so the test company can market itself), depending
+  on Memory-lite, the Inbox/outbox, funds budget and the integrations
+  catalog; connectors for the chosen video service and platforms are part of
+  it.
+
 ## 7. Architecture sketch
 
 ```
