@@ -771,6 +771,80 @@ live data (agents, states, teams, messages, hand-offs, perks).
   mode needs a sprite asset set (drawn procedurally or as bundled original
   SVG/PDF art).
 
+### 6.22 Full Claude Code capabilities for every agent (**[owner]** asked for this)
+Every agent is a full Claude Code session, so it can use everything Claude
+Code offers — but from a **company-curated toolkit**, never the owner's
+personal setup (turn isolation, §6.5/§6.16, stays: `--setting-sources ""`, no
+personal plugins/hooks/CLAUDE.md).
+- **Built-in tools:** Read/Edit/Write/Glob/Grep/Bash, WebSearch/WebFetch,
+  Task (sub-agents within its own turn), Todo, NotebookEdit — enabled per
+  role. Harness tools that would bypass the company (Cron, wakeups, remote
+  triggers, push notifications, cross-session messaging, worktree switching)
+  stay disabled; the company provides those functions itself.
+- **Skills:** a company **Skill library** (Anthropic Agent Skills format;
+  includes promoted lab modules §6.14 and pack-provided skills) mounted per
+  role via a company plugin directory (`--plugin-dir`), so agents can invoke
+  skills and slash commands.
+- **Plugins:** curated Claude Code plugins installed into the company plugin
+  directory (not the owner's), enabled per role through generated
+  `--settings`.
+- **MCP servers:** the company MCP server (always) plus installed connector
+  MCP servers (§6.17), merged into each turn's `--mcp-config` filtered by
+  role and grants.
+- **Sub-agents:** agents may spawn Claude Code sub-agents inside a turn;
+  counted against the item budget; depth/concurrency capped per tier.
+- **Hooks:** company-owned hooks (e.g. pre-commit secret scan, test
+  guards) installed by the engine; agents can't edit them.
+- **Permissions:** per role/agent from the permission profile (§6.5a) +
+  grants (§6.23), compiled into each turn's `--settings` permission rules.
+
+### 6.23 Integrations catalog and the Access Center (**[owner]** asked for this)
+**Integrations catalog [call]** — one place to browse and install the
+services any engineer (or any business role) needs, each packaged as a
+connector = MCP server and/or CLI + credentials + role scopes + budget meter:
+- Cloud & deploy: AWS, Google Cloud, Azure, Vercel, Fly.io, Cloudflare,
+  Netlify, Docker/registries.
+- Data: Postgres (incl. Neon/Supabase/RDS), MySQL, SQLite, Redis/Upstash,
+  MongoDB, vector DBs, S3-compatible storage, BigQuery/Snowflake.
+- Dev: GitHub/GitLab, CI, Sentry, Linear/Jira, Figma, package registries.
+- Payments & funds: Stripe, agent wallets (e.g. AgentWallet-style
+  programmatic wallets/virtual cards) as **funds connectors** under the
+  budget rules of §6.17.
+- Comms & business: Gmail/IMAP, Slack, Discord, social, Shopify, CRM,
+  analytics, accounting.
+- Anything else: "Add custom MCP server" (command or URL) or "Add CLI tool".
+Each catalog entry declares: what it can do, the credential it needs, risk
+level (read-only / writes / spends money / external comms), default roles,
+and cost tracking. Agents can **request** a connector (with a reason and the
+work item it unblocks); the owner installs with one click.
+
+**Access Center [call]** — a single owner screen (and menu-bar badge +
+notifications) for every approval the company needs, replacing scattered
+queues:
+- One inbox of **access requests**: tool/permission (e.g. a Bash command
+  class, a network domain, a system install), plugin/skill install, MCP
+  server / connector install, credential/sign-in, secret, spend, outbound
+  message, and decision gates (§6.8) — each card shows who asks, why, the
+  linked work item, risk level, and exactly what will be granted.
+- **One-click answers with scope and duration:** Approve once · for this
+  item · for this agent · for this role · company-wide; for this turn /
+  this sprint / always; or Deny with a reason (sent back to the agent).
+- **Policies and presets** so the owner isn't flooded: e.g. "auto-approve
+  read-only network for engineers", "always ask for spend", "Auto mode may
+  approve low-risk tool grants"; risk-based defaults per permission
+  profile. High-risk classes (money, external messages, deleting data,
+  production deploys, the Steward's protected areas) never auto-approve.
+- **Grants ledger:** every active grant listed with scope, expiry, who
+  approved, and usage; one-click revoke; everything audited.
+- The engine compiles grants into each turn's settings/MCP config, so a
+  grant takes effect on the agent's next turn and a revoke likewise.
+- Same API in the headless server mode (§6.13) so the Mac/phone companion
+  can approve remotely.
+
+Lands in: Plan 5 (Access Center, grants, permission compilation, sandbox),
+Plan 11 (integrations catalog, connectors, funds connectors), with the
+skill/plugin directory mechanics in Plan 5.
+
 ## 7. Architecture sketch
 
 ```
