@@ -85,6 +85,24 @@ import BrahmaCore
         #expect(w.model.selectedCompanyId == globex.id)
     }
 
+    @Test func tickInterleavedWithSelectCompanyStaysConsistent() async throws {
+        let w = try world()
+        await w.model.load()
+        let globex = try #require(try w.store.companies().first { $0.name == "Globex" })
+        try addEvents(w.store, w.acme, 5)
+        try addEvents(w.store, globex, 3)
+        async let t: Void = w.model.tick()
+        await w.model.selectCompany(globex.id)
+        await t
+        await w.model.tick()
+        await w.model.tick()
+        #expect(w.model.activity.count == 3)
+        #expect(w.model.activity.allSatisfy { $0.companyId == globex.id })
+        #expect(Set(w.model.activity.compactMap(\.id)).count == w.model.activity.count)
+        #expect(w.model.selectedCompany?.id == globex.id)
+        #expect(w.model.snapshot.agents.isEmpty)
+    }
+
     @Test func createCompanySelectsIt() async throws {
         let w = try world()
         await w.model.load()

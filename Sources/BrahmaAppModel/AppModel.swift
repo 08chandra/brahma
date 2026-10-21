@@ -64,7 +64,6 @@ public final class AppModel {
     public func tick(forceSnapshot: Bool = false) async {
         let store = self.store
         let start = cursor
-        let companyId = selectedCompanyId
         do {
             let events: [ActivityEvent] = try await Task.detached {
                 var all: [ActivityEvent] = []
@@ -77,8 +76,11 @@ public final class AppModel {
                 } while batch.count == 500
                 return all
             }.value
-            if let last = events.last?.id { cursor = last }
-            let mine = events.filter { $0.companyId == companyId }
+            if let last = events.last?.id { cursor = max(cursor, last) }
+            // Selection may have changed during the await: filter by the current company and skip anything
+            // the selection reload already put in the feed.
+            let newest = activity.last?.id ?? 0
+            let mine = events.filter { $0.companyId == selectedCompanyId && ($0.id ?? 0) > newest }
             if !mine.isEmpty {
                 activity += mine
                 if activity.count > Self.activityCap { activity.removeFirst(activity.count - Self.activityCap) }
@@ -161,7 +163,8 @@ public final class AppModel {
         }.value
         // Keep the cursor ahead of anything already loaded so a tick never replays it.
         if let last = recent.last?.id, last > cursor { cursor = last }
-        if id == selectedCompanyId { activity = recent }
+        guard id == selectedCompanyId else { return }
+        activity = recent
         try await refreshSnapshot()
     }
 
@@ -169,6 +172,7 @@ public final class AppModel {
         let store = self.store
         let id = selectedCompanyId
         let new = try await Task.detached { try Snapshot.load(store: store, selectedCompanyId: id) }.value
+        guard id == selectedCompanyId else { return }  // selection changed mid-load: the stale snapshot is dropped
         if new != snapshot { snapshot = new }
         ticksSinceSnapshot = 0
     }
