@@ -160,17 +160,21 @@ public struct IndustryPack: Codable, Equatable, Sendable {
     /// Additions only: a pack can add reserved categories, never remove built-in ones.
     public var reservedCategories: [String]
     public var connectors: [String] = []
+    /// Roles staffed only when work calls for them: `OrgGenerator.staff` always leaves their seats vacant.
+    public var triggerRoles: [String] = []
+
+    public static let defaultTriggerRoles = ["qa", "designer", "security"]
 
     public init(id: String, version: Int, title: String, roles: [RoleTemplate], itemTypes: [ItemTypeDef], org: OrgShape,
                 defaultCadence: String, askApprovers: [String: [String]], reservedCategories: [String],
-                connectors: [String] = []) {
+                connectors: [String] = [], triggerRoles: [String] = []) {
         self.id = id; self.version = version; self.title = title; self.roles = roles; self.itemTypes = itemTypes
         self.org = org; self.defaultCadence = defaultCadence; self.askApprovers = askApprovers
-        self.reservedCategories = reservedCategories; self.connectors = connectors
+        self.reservedCategories = reservedCategories; self.connectors = connectors; self.triggerRoles = triggerRoles
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, version, title, roles, itemTypes, org, defaultCadence, askApprovers, reservedCategories, connectors
+        case id, version, title, roles, itemTypes, org, defaultCadence, askApprovers, reservedCategories, connectors, triggerRoles
     }
 
     public init(from d: Decoder) throws {
@@ -185,6 +189,10 @@ public struct IndustryPack: Codable, Equatable, Sendable {
         askApprovers = try c.decode([String: [String]].self, forKey: .askApprovers)
         reservedCategories = try c.decode([String].self, forKey: .reservedCategories)
         connectors = try c.decodeIfPresent([String].self, forKey: .connectors) ?? []
+        // Absent: the standard trigger roles, limited to those this pack defines.
+        let known = Set(roles.map(\.id))
+        triggerRoles = try c.decodeIfPresent([String].self, forKey: .triggerRoles)
+            ?? Self.defaultTriggerRoles.filter { known.contains($0) }
     }
 
     public func role(_ id: String) -> RoleTemplate? { roles.first { $0.id == id } }
@@ -230,6 +238,7 @@ public struct IndustryPack: Codable, Equatable, Sendable {
         for (kind, approvers) in askApprovers {
             if let u = approvers.first(where: { !known.contains($0) }) { throw fail("askApprovers[\(kind)] unknown role \(u)") }
         }
+        if let t = triggerRoles.first(where: { !known.contains($0) }) { throw fail("unknown trigger role \(t)") }
         if !["sprint", "milestone"].contains(defaultCadence) { throw fail("bad cadence \(defaultCadence)") }
         if let c = reservedCategories.first(where: { !matches(category, $0) }) { throw fail("bad reserved category \(c)") }
     }

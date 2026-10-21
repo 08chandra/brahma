@@ -10,11 +10,37 @@ struct CompanyGroup: ParsableCommand {
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String
         @Option(help: "What the company is for.") var goal: String
+        @Option(help: "Agents in the full org shape (0 for an empty company, otherwise 5 to 500).") var agents: Int = 6
+        @Option(help: "Industry pack id.") var pack: String = "software"
+        @Flag(help: "Print the org that would be created and change nothing.") var dryRun = false
 
         func run() throws {
-            let (store, paths) = try openStore()
-            let c = try store.createCompany(name: name, goal: goal, workspacesRoot: paths.workspaces)
+            guard agents == 0 || OrgGenerator.range.contains(agents) else {
+                throw fail("--agents must be 0 or between \(OrgGenerator.range.lowerBound) and \(OrgGenerator.range.upperBound)")
+            }
+            let paths = BrahmaPaths.fromEnvironment()
+            let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
+            guard let industry = catalog.pack(pack) else { throw fail("unknown pack '\(pack)'") }
+            var staffed: (seated: OrgPlan, vacancies: [PlannedAgent])?
+            var full: OrgPlan?
+            if agents > 0 {
+                if agents > 50 { print("Note: org sizes over 50 are experimental.") }
+                let plan = try OrgGenerator.generate(goal: goal, count: agents, pack: industry)
+                full = plan
+                staffed = OrgGenerator.staff(plan: plan, pack: industry, readyWidth: 0, seatBudget: 8)
+            }
+            if dryRun {
+                guard let full, let staffed else { print("(empty company)"); return }
+                for line in full.treeLines(vacant: Set(staffed.vacancies.map(\.handle))) { print(safe(line)) }
+                return
+            }
+            let (store, paths2) = try openStore()
+            let c = try store.createCompany(name: name, goal: goal, workspacesRoot: paths2.workspaces, packId: pack)
             print("\(c.id)  \(c.workspacePath)")
+            if let staffed {
+                let hired = try store.applyOrg(companyId: c.id, plan: staffed.seated, pack: industry, vacancies: staffed.vacancies)
+                print("hired \(hired.count) of \(agents); \(staffed.vacancies.count) seats vacant")
+            }
         }
     }
 

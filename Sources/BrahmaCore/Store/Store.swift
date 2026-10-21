@@ -10,8 +10,11 @@ public enum StoreError: Error, Equatable {
 
 public final class Store: Sendable {
     public let writer: any DatabaseWriter
+    /// The industry packs this store knows. Every pack lookup goes through here.
+    public let catalog: PackCatalog
 
-    public init(path: String) throws {
+    public init(path: String, catalog: PackCatalog = .builtin) throws {
+        self.catalog = catalog
         var config = Configuration()
         config.busyMode = .timeout(5)
         config.prepareDatabase { db in
@@ -21,13 +24,14 @@ public final class Store: Sendable {
         try Migrations.migrator().migrate(writer)
     }
 
-    private init(queue: DatabaseQueue) throws {
+    private init(queue: DatabaseQueue, catalog: PackCatalog) throws {
+        self.catalog = catalog
         writer = queue
         try Migrations.migrator().migrate(writer)
     }
 
-    public static func inMemory() throws -> Store {
-        try Store(queue: DatabaseQueue())
+    public static func inMemory(catalog: PackCatalog = .builtin) throws -> Store {
+        try Store(queue: DatabaseQueue(), catalog: catalog)
     }
 
     /// Test helper: current value of a PRAGMA as text.
@@ -67,7 +71,9 @@ public final class Store: Sendable {
         return out
     }
 
-    public func createCompany(name: String, goal: String, workspacesRoot: URL) throws -> Company {
+    public func createCompany(name: String, goal: String, workspacesRoot: URL, packId: String = "software",
+                              packVersion: Int? = nil) throws -> Company {
+        guard let pack = catalog.pack(packId) else { throw OrgError.unknownPack }
         let base = Store.slug(for: name).isEmpty ? "company" : Store.slug(for: name)
         let createdAt = Store.now()
         return try writer.write { db in
@@ -80,7 +86,8 @@ public final class Store: Sendable {
             let dir = workspacesRoot.appending(path: slug, directoryHint: .isDirectory)
             let company = Company(
                 id: UUID().uuidString, name: name, slug: slug, goal: goal, workspacePath: dir.path,
-                status: .running, usageMode: .low, priorityWeight: 1, createdAt: createdAt)
+                status: .running, usageMode: .balanced, priorityWeight: 1, createdAt: createdAt,
+                packId: packId, packVersion: packVersion ?? pack.version)
             try company.insert(db)
             // Directory is created only after the row is in; a failure here rolls the insert back.
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -103,23 +110,38 @@ public final class Store: Sendable {
 
     // MARK: Agents
 
-    public func hire(companyId: String, name: String, role: String, model: String) throws -> Agent {
-        let handle = name.lowercased()
-        guard handle != "owner", handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
-        else { throw StoreError.invalidName }
-        let agent = Agent(
-            id: UUID().uuidString, companyId: companyId, name: handle, role: role, model: model,
-            sessionId: UUID().uuidString, sessionStarted: false, state: .sleeping,
-            blocker: nil, requestedBlocker: nil, paused: false, readySince: nil, createdAt: Store.now())
+    public func hire(companyId: String, name: String, role: String, model: String,
+                     managerId: String? = nil, team: String? = nil) throws -> Agent {
         do {
-            try writer.write { db in
-                try agent.insert(db)
-                if let general = try Channel.filter(Column("companyId") == companyId && Column("name") == "general").fetchOne(db) {
-                    try ChannelMember(channelId: general.id, member: agent.id).insert(db, onConflict: .ignore)
-                }
+            return try writer.write { db in
+                try Store.hire(db: db, companyId: companyId, name: name, role: role, model: model,
+                               managerId: managerId, team: team, now: Store.now())
             }
         } catch let error as DatabaseError where error.extendedResultCode == .SQLITE_CONSTRAINT_UNIQUE {
             throw StoreError.duplicateName
+        }
+    }
+
+    /// `reserved` lets `applyOrg` and `fillVacancy` hire into a handle an open vacancy holds; everyone else is refused.
+    static func hire(db: Database, companyId: String, name: String, role: String, model: String, managerId: String?,
+                     team: String?, now: Date, honoringVacancy: Bool = false) throws -> Agent {
+        let handle = name.lowercased()
+        guard handle != "owner", handle != "system",
+              handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
+        else { throw StoreError.invalidName }
+        if !honoringVacancy,
+           try OrgVacancy.filter(Column("companyId") == companyId && Column("handle") == handle && Column("filledAt") == nil)
+            .fetchCount(db) > 0 {
+            throw StoreError.duplicateName
+        }
+        let agent = Agent(
+            id: UUID().uuidString, companyId: companyId, name: handle, role: role, model: model,
+            sessionId: UUID().uuidString, sessionStarted: false, state: .sleeping,
+            blocker: nil, requestedBlocker: nil, paused: false, readySince: nil, createdAt: now,
+            managerId: managerId, team: team)
+        try agent.insert(db)
+        if let general = try Channel.filter(Column("companyId") == companyId && Column("name") == "general").fetchOne(db) {
+            try ChannelMember(channelId: general.id, member: agent.id).insert(db, onConflict: .ignore)
         }
         return agent
     }

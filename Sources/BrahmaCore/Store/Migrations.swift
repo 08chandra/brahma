@@ -109,6 +109,28 @@ enum Migrations {
                 t.column("lastReadAt", .datetime).notNull()
             }
         }
+        m.registerMigration("v3-org") { db in
+            try db.alter(table: "company") { t in
+                t.add(column: "packId", .text).notNull().defaults(to: "software")
+                t.add(column: "packVersion", .integer).notNull().defaults(to: 1)
+            }
+            try db.alter(table: "agent") { t in
+                t.add(column: "managerId", .text).references("agent", onDelete: .setNull)
+                t.add(column: "team", .text)
+                t.add(column: "trustLevel", .text).notNull().defaults(to: "T1")
+            }
+            try db.create(table: "orgVacancy") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("role", .text).notNull()
+                t.column("handle", .text).notNull()
+                t.column("managerHandle", .text)
+                t.column("team", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("filledAt", .datetime)
+            }
+            try db.create(index: "orgVacancy_company", on: "orgVacancy", columns: ["companyId", "filledAt"])
+        }
         return m
     }
 }

@@ -171,8 +171,13 @@ public actor Orchestrator {
             items = try store.pendingInbox(agentId: agent.id)
             let team = try store.agents(companyId: company.id)
             let handles = Dictionary(uniqueKeysWithValues: team.map { ($0.id, $0.name) })
+            // `auto` resolves per turn from the role, the company's usage mode and the kind of turn (Tasks 10 and 14 set the context).
+            var sent = agent
+            sent.model = ModelPolicy.resolve(
+                agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
+                mode: company.usageMode, context: ModelContext())
             let request = TurnRequest(
-                agent: agent, company: company,
+                agent: sent, company: company,
                 prompt: InboxDigest.render(agent: agent, company: company, items: items, handles: handles),
                 appendSystemPrompt: agent.sessionStarted
                     ? nil : RolePrompt.render(agent: agent, company: company, roster: team.filter { $0.state != .killed }),

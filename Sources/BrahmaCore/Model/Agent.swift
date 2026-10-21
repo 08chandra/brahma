@@ -31,6 +31,11 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var createdAt: Date
     /// Failed turns in a row; drives retry backoff. Reset by a successful turn.
     public var consecutiveFailures: Int = 0
+    /// Reporting line. Nil for the root, or when the manager was removed.
+    public var managerId: String? = nil
+    public var team: String? = nil
+    /// Hook for the trust ladder (Plan 3b).
+    public var trustLevel: String = "T1"
 }
 
 /// Tie-break weight among a company's ready agents: leadership first. Reads the built-in role catalog.

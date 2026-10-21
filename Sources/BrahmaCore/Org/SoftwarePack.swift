@@ -518,5 +518,6 @@ public enum SoftwarePack {
             "release": ["cto", "cto-architect", "ceo", "ceo-cpo"],
             "other": ["ceo", "ceo-cpo"],
         ],
-        reservedCategories: [])
+        reservedCategories: [],
+        triggerRoles: IndustryPack.defaultTriggerRoles)
 }

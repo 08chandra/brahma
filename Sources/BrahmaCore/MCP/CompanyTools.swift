@@ -102,7 +102,12 @@ public struct CompanyTools: Sendable {
                 return channels.isEmpty ? "No channels." : channels.map { "#\($0.name)" }.joined(separator: "\n")
             case "list_agents":
                 let agents = try store.agents(companyId: companyId)
-                return agents.isEmpty ? "No agents." : agents.map { "@\($0.name) — \($0.role) — \($0.state.rawValue)" }.joined(separator: "\n")
+                let handles = Dictionary(agents.map { ($0.id, $0.name) }, uniquingKeysWith: { f, _ in f })
+                return agents.isEmpty ? "No agents." : agents.map { a in
+                    var line = "@\(a.name) — \(a.role) — \(a.state.rawValue)"
+                    if let m = a.managerId, let h = handles[m] { line += " — reports to @\(h)" }
+                    return line
+                }.joined(separator: "\n")
             case "create_channel":
                 return try createChannel(name: try string(args, "name"), members: try stringArray(args, "members"))
             case "set_blocked":

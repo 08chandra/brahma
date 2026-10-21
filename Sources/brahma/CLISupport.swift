@@ -13,7 +13,8 @@ func fail(_ message: String) -> ExitCode {
 func openStore() throws -> (Store, BrahmaPaths) {
     let paths = BrahmaPaths.fromEnvironment()
     try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
-    return (try Store(path: paths.database.path), paths)
+    let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
+    return (try Store(path: paths.database.path, catalog: catalog), paths)
 }
 
 /// Resolves a company by name or slug, case-insensitively. Ambiguity lists the matches.

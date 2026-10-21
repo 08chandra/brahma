@@ -12,7 +12,9 @@ struct MCP: ParsableCommand {
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
-        let store = try Store(path: db)
+        let packs = BrahmaPaths.fromEnvironment().packsDir
+        let catalog = PackCatalog.loadOrBuiltin(directory: packs) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
+        let store = try Store(path: db, catalog: catalog)
         guard let me = try store.agent(id: agent), me.companyId == company else {
             FileHandle.standardError.write(Data("brahma mcp: unknown agent \(agent) in company \(company)\n".utf8))
             throw ExitCode.failure

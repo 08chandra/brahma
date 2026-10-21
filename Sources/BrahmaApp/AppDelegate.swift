@@ -48,7 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let paths = BrahmaPaths.fromEnvironment()
         do {
             try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
-            let store = try Store(path: paths.database.path)
+            let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) {
+                FileHandle.standardError.write(Data(($0 + "\n").utf8))
+            }
+            let store = try Store(path: paths.database.path, catalog: catalog)
             return .success(AppModel(store: store, paths: paths))
         } catch {
             return .failure(BootError(path: paths.database.path, message: "\(error)"))

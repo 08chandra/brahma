@@ -17,4 +17,6 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var usageMode: UsageMode
     public var priorityWeight: Int
     public var createdAt: Date
+    public var packId: String = "software"
+    public var packVersion: Int = 1
 }
