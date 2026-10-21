@@ -983,6 +983,66 @@ Instagram Reels; YouTube Shorts later), produced end to end by a marketing team.
   catalog; connectors for the chosen video service and platforms are part of
   it.
 
+### 6.27 Personal agent memory, full work records, and tiered storage (**[owner]** asked for this)
+**Agents remember like people [call]** (model: the "memory stream + reflection"
+pattern from generative-agents research, adapted). Each agent owns a personal
+memory, in addition to Company Memory (§6.25):
+- **Episodic** — what it did and saw: every turn's summary, items worked,
+  conversations, decisions, outcomes (auto-recorded by the engine).
+- **Semantic** — what it knows: facts, preferences, codebase/domain knowledge,
+  who-knows-what about teammates (written by `remember` and by reflection).
+- **Procedural** — how it works best: learned playbooks/checklists ("before
+  submitting, run the edge-case checklist"), promoted from repeated lessons.
+- **Working** — the current item's context (the orientation digest).
+- **Reflection ("sleep") [call]:** at the end of each item and each sprint, a
+  cheap consolidation step (plain code + one short Haiku turn, budgeted)
+  turns recent episodes into durable semantic/procedural memories, dedupes,
+  and marks contradictions; nothing is deleted, only demoted.
+- **Recall:** each turn, the engine retrieves the top-k memories for the
+  current item scored by **relevance × recency × importance** (importance
+  set at write time and boosted when a memory is reused); the agent can also
+  `recall(query)` explicitly. Old, unused memories fade in ranking (a
+  forgetting curve) but stay searchable.
+- **Privacy:** an agent's personal memory is readable by that agent, its
+  manager chain (summary level), HR/Performance where relevant, and the owner;
+  agents share knowledge by publishing to Company Memory.
+- **Continuity:** a replacement hire can inherit a departing agent's
+  procedural + semantic memory (owner/HR choice), not its private episodes.
+
+**Everything is recorded [call]:** every channel/DM message, every inter-agent
+hand-off, ask, review comment and decision, every turn's tool calls and
+results summary, and each turn's full Claude Code transcript (the session
+JSONL) are kept, linked to agent, item and time — an immutable, append-only
+work record (corrections are new entries). The owner can replay any agent's
+day or any item's full history.
+
+**Storage that grows but stays fast [call] — hot / warm / cold tiers:**
+- **Hot (last ~30 days, configurable):** the main SQLite DB (WAL) holds
+  recent messages, events, memories and turn summaries, with FTS5 indexes
+  and (later) a local vector index; all live UI and agent recall hits only
+  this tier → millisecond queries regardless of total history.
+- **Warm (older):** a background compactor moves aged rows into per-company,
+  per-month archive databases (`archive/<company>/<yyyy-mm>.sqlite`) with
+  their own FTS indexes; raw transcripts are stored zstd-compressed beside
+  them. Search spans tiers transparently (hot first, then warm via
+  `ATTACH`, newest-first, paginated); per-day/per-sprint/per-agent summaries
+  are precomputed so browsing history never scans raw rows.
+- **Cold (backup):** hourly `VACUUM INTO` snapshots (keep 48) + daily backups
+  of the warm archives and transcript files + git bundles of company repos,
+  to a local backup folder and optionally an external drive or an
+  owner-chosen, client-side-encrypted cloud bucket; continuous WAL shipping
+  (Litestream-style) as an option for near-zero data loss. `brahma restore`
+  restores any point; integrity check at launch.
+- **Budgets:** per-company storage meter in the Budget view; transcripts are
+  the bulk and compress ~5–10×; retention is "keep forever" by default with an
+  owner-set cap that archives (never silently deletes).
+
+**Where it lands:** Memory-lite (after 5-lite) ships personal memory
+(episodic + semantic, recall scoring, end-of-item reflection), full work
+recording incl. transcript capture, and the hot/warm split with
+cross-tier search; cold backups ship in 5-lite; vector index, procedural
+promotion and sprint-level reflection in Plan 9.
+
 ## 7. Architecture sketch
 
 ```
