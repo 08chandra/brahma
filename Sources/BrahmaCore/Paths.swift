@@ -12,6 +12,10 @@ public struct BrahmaPaths: Sendable, Equatable {
     public var database: URL { home.appending(path: "brahma.sqlite") }
     public var runDir: URL { home.appending(path: "run", directoryHint: .isDirectory) }
 
+    public var packsDir: URL { home.appending(path: "packs", directoryHint: .isDirectory) }
+    public var checksDir: URL { home.appending(path: "checks", directoryHint: .isDirectory) }
+    public func companyDir(_ id: String) -> URL { home.appending(path: "companies/\(id)", directoryHint: .isDirectory) }
+
     public static func fromEnvironment() -> BrahmaPaths {
         from(environment: ProcessInfo.processInfo.environment)
     }

@@ -33,12 +33,5 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var consecutiveFailures: Int = 0
 }
 
-/// Tie-break weight among a company's ready agents: leadership first.
-public func roleWeight(_ role: String) -> Int {
-    switch role {
-    case "ceo", "cto", "cpo": return 3
-    case "architect": return 2
-    case "manager": return 1
-    default: return 0
-    }
-}
+/// Tie-break weight among a company's ready agents: leadership first. Reads the built-in role catalog.
+public func roleWeight(_ role: String) -> Int { PackCatalog.builtin.roleWeight(role) }
