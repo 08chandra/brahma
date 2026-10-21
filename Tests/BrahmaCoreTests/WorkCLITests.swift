@@ -132,6 +132,15 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try String(contentsOf: key, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) != text)
     }
 
+    @Test func ownerInitAfterDeletingKeyNeedsProof() throws {
+        let home = try OwnerTestHome()
+        let key = home.url.appending(path: "home/owner.key")
+        try FileManager.default.removeItem(at: key)
+        #expect(try initOwnerKey(home: home.url) != 0)
+        #expect(try initOwnerKey(home: home.url, extraArgs: ["--rotate"]) != 0)
+        #expect(!FileManager.default.fileExists(atPath: key.path), "no new key without proof")
+    }
+
     @Test func rotateWithoutValidKeyRefused() throws {
         let home = try OwnerTestHome()
         let key = home.url.appending(path: "home/owner.key")

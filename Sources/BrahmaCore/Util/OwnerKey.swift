@@ -71,6 +71,8 @@ public struct FileOwnerKeyStore: OwnerKeyStore {
 public enum OwnerKeyError: Error, Equatable {
     case alreadyExists
     case cannotWrite(String)
+    /// A hash is stored (or rotation was asked for) and the current key file does not verify against it.
+    case proofRequired
 }
 
 /// `<home>/owner.key`: 32 random bytes, hex, mode 0600, plus SHA-256(key) in an `OwnerKeyStore`.
@@ -94,20 +96,45 @@ public enum OwnerKey {
         if rotate {
             let temp = paths.home.appending(path: ".owner.key.\(UUID().uuidString)")
             try write(bytes, to: temp.path, flags: O_CREAT | O_EXCL | O_WRONLY)
-            guard rename(temp.path, file.path) == 0 else {
+            // Hash first, then swap the file: if either step fails the old key file and old hash are both intact,
+            // so the owner is never locked out.
+            let oldHash = store.hash(for: paths)
+            func restoreHash() {
+                if let oldHash { try? store.setHash(oldHash, for: paths) } else { store.removeHash(for: paths) }
+            }
+            do { try store.setHash(SHA256.hex(key), for: paths) } catch {
                 try? FileManager.default.removeItem(at: temp)
-                throw OwnerKeyError.cannotWrite("rename failed (errno \(errno))")
+                restoreHash()
+                throw error
             }
-        } else {
-            do { try write(bytes, to: file.path, flags: O_CREAT | O_EXCL | O_WRONLY) } catch OwnerKeyError.alreadyExists {
-                throw OwnerKeyError.alreadyExists
+            guard rename(temp.path, file.path) == 0 else {
+                let code = errno
+                try? FileManager.default.removeItem(at: temp)
+                restoreHash()
+                throw OwnerKeyError.cannotWrite("rename failed (errno \(code))")
             }
+            return file
+        }
+        do { try write(bytes, to: file.path, flags: O_CREAT | O_EXCL | O_WRONLY) } catch OwnerKeyError.alreadyExists {
+            throw OwnerKeyError.alreadyExists
         }
         do { try store.setHash(SHA256.hex(key), for: paths) } catch {
             try? FileManager.default.removeItem(at: file)
             throw error
         }
         return file
+    }
+
+    /// `brahma owner init [--rotate]`. Whenever a hash is stored (or rotation is requested) the current key file must
+    /// verify against it, so deleting `owner.key` does not allow re-keying without proof. A lost key is replaced from
+    /// the app (user presence), which calls `create(rotate: true)` directly.
+    @discardableResult
+    public static func initForCLI(paths: BrahmaPaths, store: any OwnerKeyStore, rotate: Bool) throws -> URL {
+        if (rotate || store.hash(for: paths) != nil) && !verify(paths: paths, store: store) {
+            throw OwnerKeyError.proofRequired
+        }
+        if exists(paths: paths) && !rotate { throw OwnerKeyError.alreadyExists }
+        return try create(paths: paths, store: store, rotate: rotate)
     }
 
     /// App launch: keeps a valid key and creates one only when none exists. An existing key that fails to verify
