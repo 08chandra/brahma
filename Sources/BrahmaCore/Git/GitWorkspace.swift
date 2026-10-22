@@ -53,6 +53,8 @@ struct GitCommand: Sendable {
         var stderr: String
         /// The output was longer than the capture limit.
         var cut: Bool
+        /// The 60 s timeout killed git.
+        var timedOut = false
         var text: String { String(decoding: stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 
@@ -130,7 +132,7 @@ struct GitCommand: Sendable {
         let (stdout, cut) = read(outURL, limit: maxOutput)
         var stderr = String(decoding: read(errURL, limit: 64 * 1024).0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if timedOut.cut { stderr = "timed out after \(Int(Self.timeout)) s" + (stderr.isEmpty ? "" : ": \(stderr)") }
-        return Output(status: process.terminationStatus, stdout: stdout, stderr: stderr, cut: cut)
+        return Output(status: process.terminationStatus, stdout: stdout, stderr: stderr, cut: cut, timedOut: timedOut.cut)
     }
 }
 
@@ -459,59 +461,238 @@ public struct GitWorkspace: Sendable {
 
     // MARK: Plan-turn write barrier
 
-    /// What a plan turn must leave exactly as it found it besides tracked and untracked files (which `isDirty` and `HEAD`
-    /// cover): the ignored files of the checkout, and the repository's own config, hooks and exclude file.
-    public struct PlanBarrier: Sendable {
-        var ignored: Set<String>
-        /// Path relative to the git directory → content.
-        var files: [String: Data]
+    /// How much output one barrier git call may produce; more fails closed.
+    public var planBarrierOutputLimit = 32 * 1024 * 1024
+
+    /// The barrier could not tell whether the turn wrote: `found` is what it saw (and put back) before it failed.
+    public struct PlanBarrierError: Error, CustomStringConvertible {
+        public var found: [String]
+        public var reason: String
+        public var description: String { "barrier check failed: \(reason)" }
     }
 
-    /// Ignored files (`git status --ignored --porcelain -uall`, one entry per file) and the integrity files of the common
-    /// directory (`config`, `hooks/*`, `info/exclude`) and of this worktree's admin directory (`config.worktree`).
+    /// What a plan turn must leave exactly as it found it besides tracked and untracked files (which `isDirty` and `HEAD`
+    /// cover): the ignored files of the checkout, every ref, what the index says, and the repository's own files.
+    public struct PlanBarrier: Sendable {
+        /// Ignored file (raw path bytes from `git status -z`, relative to the checkout) → its `lstat` stamp.
+        var ignored: [Data: FileStamp]
+        /// Path relative to the git directory → the file (see `barrierPaths`, plus this worktree's admin directory).
+        var files: [String: RepoFile]
+        /// `for-each-ref` of the checkout: ref → object and symbolic target.
+        var refs: [String: RefValue]
+        /// `ls-files -s -v -z`: entries, modes, ids and the skip-worktree / assume-unchanged bits. The index file itself is
+        /// compared by this, not byte for byte: any `git status` (the CLI's own included) may rewrite its stat cache.
+        var index: Data
+    }
+
+    /// Enough of `lstat` to see that a file changed without reading it (size, modification time, inode, device, mode).
+    struct FileStamp: Equatable, Sendable {
+        var size: Int64, seconds: Int, nanoseconds: Int, inode: UInt64, device: Int32, mode: UInt16
+        static let missing = FileStamp(size: -1, seconds: 0, nanoseconds: 0, inode: 0, device: 0, mode: 0)
+    }
+
+    /// One file of the repository: its content and permission bits, or a symlink's target (`special` for anything else).
+    struct RepoFile: Equatable, Sendable { var data: Data?; var mode: UInt16; var link: String? }
+
+    struct RefValue: Equatable, Sendable { var oid: String; var symref: String }
+
+    /// Common-directory paths the barrier snapshots (a directory: every file in it). `packed-refs` is covered by the ref
+    /// listing (which reads it) and put back ref by ref, never by rewriting the file: another agent's `git gc` may repack
+    /// it during the turn, and old bytes would move their branches back.
+    static let barrierPaths = ["HEAD", "config", "info", "hooks", "objects/info/alternates", "objects/info/http-alternates"]
+
+    /// Snapshot before a plan turn. Throws (and so no plan turn starts) when any listing fails, times out or is cut.
     public func planBarrier(key: String, in dir: URL) throws -> PlanBarrier {
         try Self.validKey(key)
-        let out = try context(for: dir).run(["status", "--porcelain", "--ignored", "-uall"])
-        let ignored = Set(out.text.split(separator: "\n").filter { $0.hasPrefix("!! ") }.map { String($0.dropFirst(3)) })
-        var files: [String: Data] = [:]
-        let fm = FileManager.default
-        func capture(_ relative: String) {
-            let url = gitDir.appending(path: relative)
-            guard !Self.isSymlink(url), let data = fm.contents(atPath: url.path) else { return }
-            files[relative] = data
-        }
-        capture("config"); capture("info/exclude"); capture("worktrees/\(key)/config.worktree")
-        let hooks = gitDir.appending(path: "hooks", directoryHint: .isDirectory)
-        if Self.isSymlink(hooks) { files["hooks"] = Data("symlink".utf8) }
-        for name in (try? fm.contentsOfDirectory(atPath: hooks.path)) ?? [] { capture("hooks/\(name)") }
-        return PlanBarrier(ignored: ignored, files: files)
+        let git = try context(for: dir)
+        let ignored = try ignoredFiles(git, in: dir)
+        let refs = try refList(git, key: key)
+        let index = try barrierRun(git, ["ls-files", "-s", "-v", "-z"])
+        return PlanBarrier(ignored: ignored, files: repoFiles(key: key), refs: refs, index: index)
     }
 
-    /// Compares the checkout with `before`, puts back what a plan turn changed and says what it was (nil when nothing).
-    /// Ignored files that are new are deleted; changed, new or removed config, hooks and exclude files are restored.
+    /// Compares the checkout with `before`, puts back what a plan turn changed and says what it was (empty when nothing).
+    /// Repository files are restored (content and mode), refs are moved back, new refs and new ignored files are deleted;
+    /// changed or removed ignored files are only reported. Throws `PlanBarrierError` (fail closed) when a listing fails,
+    /// times out or is cut, after putting back what it could.
     public func enforcePlanBarrier(_ before: PlanBarrier, key: String, in dir: URL) throws -> [String] {
-        let after = try planBarrier(key: key, in: dir)
-        var found: [String] = []
+        try Self.validKey(key)
+        let git: GitCommand
+        do { git = try context(for: dir) } catch { throw PlanBarrierError(found: [], reason: "\(error)") }
+        var found: [String] = [], failures: [String] = []
         let fm = FileManager.default
-        let base = Self.resolved(dir)
-        for rel in after.ignored.subtracting(before.ignored).sorted() {
-            found.append("new ignored file \(rel)")
-            guard !rel.hasPrefix("/"), !rel.split(separator: "/").contains("..") else { continue }
-            let target = dir.appending(path: rel)
-            guard Self.resolved(target.deletingLastPathComponent()).hasPrefix(base) else { continue }
-            try? fm.removeItem(at: target)
-        }
-        for (rel, data) in before.files where after.files[rel] != data {
-            found.append("changed \(rel)")
-            let url = gitDir.appending(path: rel)
-            if Self.isSymlink(url) { try? fm.removeItem(at: url) }
-            try? data.write(to: url, options: .atomic)
-        }
-        for rel in after.files.keys.sorted() where before.files[rel] == nil {
-            found.append("new \(rel)")
+
+        // The repository's own files. New ones go first, deepest first, so a directory or link put in place of a file goes too.
+        let indexKey = "worktrees/\(key)/index"
+        let after = repoFiles(key: key)
+        for rel in after.keys.filter({ before.files[$0] == nil }).sorted(by: { $0.count > $1.count }) {
+            found.append("new \(Self.shown(rel))")
             try? fm.removeItem(at: gitDir.appending(path: rel))
         }
+        for (rel, file) in before.files.sorted(by: { $0.key < $1.key }) where rel != indexKey && after[rel] != file {
+            found.append(after[rel] == nil ? "removed \(rel)" : "changed \(rel)")
+            Self.restore(file, at: gitDir.appending(path: rel))
+        }
+
+        // The index, by what it says.
+        do {
+            if try barrierRun(git, ["ls-files", "-s", "-v", "-z"]) != before.index {
+                found.append("changed index")
+                if let file = before.files[indexKey] { Self.restore(file, at: gitDir.appending(path: indexKey)) }
+            }
+        } catch {
+            failures.append("index: \(error)")
+            if let file = before.files[indexKey] { Self.restore(file, at: gitDir.appending(path: indexKey)) }
+        }
+
+        // Every ref (loose or packed) but other items' branches.
+        do {
+            let now = try refList(git, key: key)
+            for (ref, value) in before.refs.sorted(by: { $0.key < $1.key }) where now[ref] != value {
+                found.append(now[ref] == nil ? "removed ref \(ref)" : "moved ref \(ref)")
+                if value.symref.isEmpty { try git.run(["update-ref", "--no-deref", ref, value.oid]) }
+                else { try git.run(["symbolic-ref", ref, value.symref]) }
+            }
+            for ref in now.keys.sorted() where before.refs[ref] == nil {
+                found.append("new ref \(Self.shown(ref))")
+                try git.run(["update-ref", "--no-deref", "-d", ref])
+            }
+        } catch { failures.append("refs: \(error)") }
+
+        // Ignored files: new ones are deleted (inside the checkout only), changed or removed ones reported.
+        do {
+            let now = try ignoredFiles(git, in: dir)
+            let base = Self.realPath(Array(dir.path.utf8))
+            for rel in now.keys.filter({ before.ignored[$0] == nil }).sorted(by: { $0.lexicographicallyPrecedes($1) }) {
+                found.append("new ignored file \(Self.shown(rel))")
+                Self.removeInside(dir: dir, base: base, relative: rel)
+            }
+            for (rel, stamp) in before.ignored.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) {
+                if now[rel] == nil { found.append("removed ignored file \(Self.shown(rel))") }
+                else if now[rel] != stamp { found.append("changed ignored file \(Self.shown(rel))") }
+            }
+        } catch { failures.append("ignored files: \(error)") }
+
+        if !failures.isEmpty { throw PlanBarrierError(found: found, reason: failures.joined(separator: "; ")) }
         return found
+    }
+
+    /// One barrier listing: a failure, a timeout or output past `planBarrierOutputLimit` throws.
+    private func barrierRun(_ git: GitCommand, _ args: [String]) throws -> Data {
+        let out = try git.run(args, maxOutput: planBarrierOutputLimit)
+        if out.timedOut { throw GitError.failed(command: args[0], status: -1, stderr: "timed out") }
+        if out.cut { throw GitError.failed(command: args[0], status: -1, stderr: "output longer than \(planBarrierOutputLimit) bytes") }
+        return out.stdout
+    }
+
+    /// `git status --porcelain=v1 -z --ignored -uall`: one `!!` entry per ignored file, raw bytes, nothing quoted.
+    private func ignoredFiles(_ git: GitCommand, in dir: URL) throws -> [Data: FileStamp] {
+        let tokens = try barrierRun(git, ["status", "--porcelain=v1", "-z", "--ignored", "-uall"]).split(separator: 0, omittingEmptySubsequences: true)
+        var ignored: [Data: FileStamp] = [:]
+        let root = Array(dir.path.utf8)
+        var i = 0
+        while i < tokens.count {
+            let entry = Data(tokens[i]); i += 1
+            guard entry.count > 3 else { continue }
+            let xy = entry.prefix(2)
+            // A rename or copy carries its old path as the next token.
+            if xy.contains(UInt8(ascii: "R")) || xy.contains(UInt8(ascii: "C")) { i += 1 }
+            guard xy == Data("!!".utf8) else { continue }
+            let rel = Data(entry.dropFirst(3))
+            ignored[rel] = Self.stamp(root + [UInt8(ascii: "/")] + Array(rel))
+        }
+        return ignored
+    }
+
+    /// Every ref but the branches of other items, which their leaseholders and the engine move while this turn runs (a
+    /// plan turn that moved one is not caught; it cannot touch this checkout or `main`).
+    private func refList(_ git: GitCommand, key: String) throws -> [String: RefValue] {
+        let own = branchRef(key: key)
+        let data = try barrierRun(git, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"])
+        var refs: [String: RefValue] = [:]
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            let parts = line.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 3, parts[0].hasPrefix("refs/") else {
+                throw GitError.failed(command: "for-each-ref", status: -1, stderr: "unexpected line")
+            }
+            try Self.validRef(parts[0])
+            if parts[2].isEmpty { try Self.validCommit(parts[1]) } else { try Self.validRef(parts[2]) }
+            if parts[0].hasPrefix("refs/heads/item/"), parts[0] != own { continue }
+            refs[parts[0]] = RefValue(oid: parts[1], symref: parts[2])
+        }
+        return refs
+    }
+
+    private func repoFiles(key: String) -> [String: RepoFile] {
+        var files: [String: RepoFile] = [:]
+        for rel in Self.barrierPaths + ["worktrees/\(key)"] { Self.capture(gitDir, rel, into: &files) }
+        return files
+    }
+
+    private static func capture(_ base: URL, _ rel: String, into files: inout [String: RepoFile]) {
+        let url = base.appending(path: rel)
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { return }
+        let mode = UInt16(st.st_mode & 0o7777)
+        switch st.st_mode & S_IFMT {
+        case S_IFREG: files[rel] = RepoFile(data: FileManager.default.contents(atPath: url.path) ?? Data(), mode: mode, link: nil)
+        case S_IFDIR:
+            for name in ((try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []).sorted() {
+                capture(base, rel + "/" + name, into: &files)
+            }
+        case S_IFLNK: files[rel] = RepoFile(data: nil, mode: mode, link: (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) ?? "")
+        default: files[rel] = RepoFile(data: nil, mode: mode, link: "special")
+        }
+    }
+
+    /// Puts one repository file back as it was, permission bits included (an executable hook stays executable).
+    private static func restore(_ file: RepoFile, at url: URL) {
+        let fm = FileManager.default
+        var st = stat()
+        if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG || file.data == nil { try? fm.removeItem(at: url) }
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let link = file.link {
+            if link != "special" { try? fm.createSymbolicLink(atPath: url.path, withDestinationPath: link) }
+            return
+        }
+        try? (file.data ?? Data()).write(to: url, options: .atomic)
+        _ = chmod(url.path, mode_t(file.mode))
+    }
+
+    private static func stamp(_ path: [UInt8]) -> FileStamp {
+        var st = stat()
+        let ok = (path + [0]).withUnsafeBytes { raw in lstat(raw.baseAddress!.assumingMemoryBound(to: CChar.self), &st) } == 0
+        guard ok else { return .missing }
+        return FileStamp(size: Int64(st.st_size), seconds: st.st_mtimespec.tv_sec, nanoseconds: st.st_mtimespec.tv_nsec,
+                         inode: UInt64(st.st_ino), device: st.st_dev, mode: st.st_mode)
+    }
+
+    /// Deletes `relative` under `dir` unless it would leave the checkout (absolute, `..`, or a parent that resolves outside).
+    /// `realpath(3)` (Foundation's resolver drops `/private` and would never match it).
+    private static func realPath(_ path: [UInt8]) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+        let real = (path + [0]).withUnsafeBytes { raw in realpath(raw.baseAddress!.assumingMemoryBound(to: CChar.self), &buffer) }
+        return real == nil ? nil : String(cString: buffer)
+    }
+
+    private static func removeInside(dir: URL, base: String?, relative: Data) {
+        let parts = relative.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true)
+        guard relative.first != UInt8(ascii: "/"), !parts.isEmpty, !parts.contains(where: { Data($0) == Data("..".utf8) }) else { return }
+        let path = Array(dir.path.utf8) + [UInt8(ascii: "/")] + Array(relative)
+        let parent = Array(dir.path.utf8) + parts.dropLast().flatMap { [UInt8(ascii: "/")] + Array($0) }
+        guard let base, let resolvedParent = realPath(parent),
+              resolvedParent == base || resolvedParent.hasPrefix(base + "/") else { return }
+        if let text = String(bytes: path, encoding: .utf8) {
+            try? FileManager.default.removeItem(atPath: text)
+        } else {
+            _ = (path + [0]).withUnsafeBytes { raw in unlink(raw.baseAddress!.assumingMemoryBound(to: CChar.self)) }
+        }
+    }
+
+    /// A path for a message: as is when it is plain, else quoted with escapes (no newline or quote reaches a message raw).
+    static func shown(_ path: Data) -> String { shown(String(decoding: path, as: UTF8.self)) }
+    static func shown(_ path: String) -> String {
+        path.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f || $0 == "\"" || $0 == "\\" } ? path.debugDescription : path
     }
 
     public func isDirty(in dir: URL) throws -> Bool {

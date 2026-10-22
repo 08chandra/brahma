@@ -221,4 +221,139 @@ import Foundation
         try ws.addWorktree(key: "K-2")
         try ws.removeWorktree(key: "K-2", keepIf: { false })
     }
+
+    // MARK: Plan-turn write barrier
+
+    /// A workspace with one worktree and `*.log` ignored.
+    private func barrierFixture() throws -> (GitFixture, URL) {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let wt = try f.ws.addWorktree(key: "ACME-1")
+        let exclude = f.root.appending(path: ".git/info/exclude")
+        try (try String(contentsOf: exclude, encoding: .utf8) + "*.log\n").write(to: exclude, atomically: true, encoding: .utf8)
+        return (f, wt)
+    }
+
+    @Test func planBarrierReadsOddPathNames() throws {
+        let (f, wt) = try barrierFixture()
+        let old = ["old one.log", "pre\nline.log", "q\"pre.log", "dir/sub dir/x.log"]
+        for n in old { try f.write(n, "kept", in: wt) }
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        #expect(before.ignored.count == old.count)
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty, "nothing changed, nothing flagged")
+        let new = ["a b.log", "new\nline.log", "q\"uote.log", "tab\there.log"]
+        for n in new { try f.write(n, "x", in: wt) }
+        let found = try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt)
+        #expect(Set(found) == ["new ignored file a b.log", #"new ignored file "new\nline.log""#,
+                               #"new ignored file "q\"uote.log""#, #"new ignored file "tab\there.log""#])
+        for n in new { #expect(!FileManager.default.fileExists(atPath: wt.appending(path: n).path), "\(n)") }
+        for n in old { #expect(FileManager.default.fileExists(atPath: wt.appending(path: n).path), "\(n)") }
+    }
+
+    @Test func planBarrierFailsClosedWhenOutputIsCut() throws {
+        let (f, wt) = try barrierFixture()
+        var ws = f.ws
+        for i in 0..<50 { try f.write("ignored-\(i).log", "x", in: wt) }
+        ws.planBarrierOutputLimit = 256
+        #expect(throws: GitError.self, "no snapshot from a cut listing") { try ws.planBarrier(key: "ACME-1", in: wt) }
+        ws.planBarrierOutputLimit = 1 << 20
+        let before = try ws.planBarrier(key: "ACME-1", in: wt)
+        ws.planBarrierOutputLimit = 256
+        let error = try #require(throws: GitWorkspace.PlanBarrierError.self) { try ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) }
+        #expect(error.reason.contains("longer than 256 bytes"))
+    }
+
+    @Test func planBarrierFlagsChangedAndRemovedIgnoredFiles() throws {
+        let (f, wt) = try barrierFixture()
+        try f.write("same.log", "same", in: wt); try f.write("edit.log", "1234", in: wt); try f.write("gone.log", "x", in: wt)
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        // Rewritten in place with the same size: the modification time gives it away (no content is hashed).
+        let h = try FileHandle(forWritingTo: wt.appending(path: "edit.log"))
+        try h.write(contentsOf: Data("abcd".utf8)); try h.close()
+        try FileManager.default.removeItem(at: wt.appending(path: "gone.log"))
+        let found = try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt)
+        #expect(found.sorted() == ["changed ignored file edit.log", "removed ignored file gone.log"])
+    }
+
+    @Test func planBarrierRestoresMovedAndNewRefs() throws {
+        let (f, wt) = try barrierFixture()
+        let main = try #require(try f.ws.head(of: "refs/heads/main"))
+        let other = try f.git(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "evil"])
+        var before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try f.git(["update-ref", "refs/heads/main", other])
+        try f.git(["tag", "evil", other])
+        var found = try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt)
+        #expect(found.sorted() == ["moved ref refs/heads/main", "new ref refs/tags/evil"])
+        #expect(try f.ws.head(of: "refs/heads/main") == main)
+        #expect(try f.ws.head(of: "refs/tags/evil") == nil)
+        // Packed refs: a loose ref that shadows the packed one, then the packed-refs file itself.
+        try f.git(["pack-refs", "--all"])
+        before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try f.git(["update-ref", "refs/heads/main", other])
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) == ["moved ref refs/heads/main"])
+        #expect(try f.ws.head(of: "refs/heads/main") == main)
+        try f.git(["pack-refs", "--all"])
+        before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        let packed = f.root.appending(path: ".git/packed-refs")
+        let text = try String(contentsOf: packed, encoding: .utf8)
+        #expect(text.contains(main))
+        // (The item's branch sits on the same commit as main, so the edit moves both.)
+        try text.replacingOccurrences(of: main, with: other).write(to: packed, atomically: true, encoding: .utf8)
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) == ["moved ref refs/heads/item/ACME-1", "moved ref refs/heads/main"])
+        #expect(try f.ws.head(of: "refs/heads/main") == main)
+        #expect(try f.ws.head(of: "refs/heads/item/ACME-1") == main)
+        // Other items' branches move under other leaseholders while the turn runs: they are not this turn's doing.
+        try f.ws.addWorktree(key: "ACME-2")
+        before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try f.git(["update-ref", "refs/heads/item/ACME-2", other])
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty)
+        #expect(try f.ws.head(of: "refs/heads/item/ACME-2") == other)
+        // This item's own branch is covered.
+        try f.git(["update-ref", "refs/heads/item/ACME-1", other])
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) == ["moved ref refs/heads/item/ACME-1"])
+        #expect(try f.ws.head(of: "refs/heads/item/ACME-1") == main)
+    }
+
+    @Test func planBarrierRestoresRepositoryFilesWithTheirModes() throws {
+        let (f, wt) = try barrierFixture()
+        let fm = FileManager.default
+        let admin = f.root.appending(path: ".git/worktrees/ACME-1")
+        let script = "#!/bin/sh\nexit 0\n"
+        let hook = try f.write(".git/hooks/post-checkout", script)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+        let head = try String(contentsOf: admin.appending(path: "HEAD"), encoding: .utf8)
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        // Rewritten (and so no longer executable), attributes and an alternate added, the worktree's HEAD repointed and a
+        // tracked file hidden from status with the skip-worktree bit.
+        try "#!/bin/sh\ntouch /tmp/pwned\n".write(to: hook, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: hook.path)
+        try f.write(".git/info/attributes", "* filter=evil\n")
+        try f.write(".git/objects/info/alternates", "/tmp/elsewhere\n")
+        try "ref: refs/heads/main\n".write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8)
+        try f.git(["update-index", "--skip-worktree", "a.txt"], in: wt)
+        let found = try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt)
+        #expect(Set(found) == ["changed hooks/post-checkout", "new info/attributes", "new objects/info/alternates",
+                               "changed worktrees/ACME-1/HEAD", "changed index"])
+        #expect(try String(contentsOf: hook, encoding: .utf8) == script)
+        #expect((try fm.attributesOfItem(atPath: hook.path)[.posixPermissions] as? Int) == 0o755, "the hook stays executable")
+        #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/info/attributes").path))
+        #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/objects/info/alternates").path))
+        #expect(try String(contentsOf: admin.appending(path: "HEAD"), encoding: .utf8) == head)
+        #expect(try f.git(["ls-files", "-v", "a.txt"], in: wt) == "H a.txt")
+        // A mode change alone is a change too.
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hook.path)
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) == ["changed hooks/post-checkout"])
+        #expect((try fm.attributesOfItem(atPath: hook.path)[.posixPermissions] as? Int) == 0o755)
+    }
+
+    @Test func planBarrierIgnoresAnIndexRefresh() throws {
+        let (f, wt) = try barrierFixture()
+        let index = f.root.appending(path: ".git/worktrees/ACME-1/index")
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        let bytes = try Data(contentsOf: index)
+        // The CLI's own `git status` may rewrite the index's stat cache; the index still says the same.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(30)], ofItemAtPath: wt.appending(path: "a.txt").path)
+        try f.git(["update-index", "--refresh"], in: wt)
+        #expect(try Data(contentsOf: index) != bytes, "the refresh really rewrote the index")
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty)
+    }
 }

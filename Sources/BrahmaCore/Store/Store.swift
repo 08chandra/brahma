@@ -30,6 +30,8 @@ public final class Store: Sendable {
     let dataHome: URL?
     /// How long engine git waits for an item's lock before skipping the item (tests shorten it).
     let gitLockTimeout = GitLockTimeout()
+    /// How much output a plan-turn barrier git call may produce before the barrier fails closed (tests shrink it).
+    let planBarrierOutputLimit = GitOutputLimit()
 
     public init(path: String, catalog: PackCatalog = .builtin) throws {
         self.catalog = catalog
@@ -76,6 +78,7 @@ public final class Store: Sendable {
             .appending(path: companyId, directoryHint: .isDirectory)
         var git = GitWorkspace(root: root, lockDirectory: locks)
         git.lockTimeout = gitLockTimeout.seconds
+        git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
         return git
     }
 
@@ -224,6 +227,12 @@ public final class Store: Sendable {
 }
 
 /// A settable timeout shared by a store's git workspaces.
+final class GitOutputLimit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 32 * 1024 * 1024
+    var bytes: Int { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
+}
+
 final class GitLockTimeout: @unchecked Sendable {
     private let lock = NSLock()
     private var value: TimeInterval = 10

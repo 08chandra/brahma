@@ -585,6 +585,14 @@ import GRDB
         #expect(Orchestrator.readPlan(in: dir)?.count == 64 * 1024, "the read is capped")
         try "notes".write(to: dir.appending(path: "notes.txt"), atomically: true, encoding: .utf8)
         #expect(Orchestrator.readPlan(in: dir)?.hasPrefix("aaa") == true, "only .md files count")
+        // A hard link to a file elsewhere is not a plan file either (one link only).
+        try fm.removeItem(at: dir.appending(path: "big.md"))
+        try "outside secret".write(to: outside.appending(path: "b.md"), atomically: true, encoding: .utf8)
+        try fm.linkItem(at: outside.appending(path: "b.md"), to: dir.appending(path: "hard.md"))
+        #expect(Orchestrator.readPlan(in: dir) == nil, "a hard-linked file is never read")
+        try fm.removeItem(at: dir.appending(path: "hard.md"))
+        try "own".write(to: dir.appending(path: "own.md"), atomically: true, encoding: .utf8)
+        #expect(Orchestrator.readPlan(in: dir) == "own")
         // A plans directory that is itself a link is refused, and so is a link in the path to it.
         let linked = root.appending(path: "linked")
         try fm.createSymbolicLink(at: linked, withDestinationURL: outside)
@@ -605,5 +613,57 @@ import GRDB
         try FileManager.default.createSymbolicLink(at: plans.appending(path: i.key), withDestinationURL: outside)
         try s.dm(s.eng); try await s.cycle()
         #expect(s.requests("eng-1").first?.kind == .work)
+    }
+
+    // MARK: Plan-turn barrier (fails closed, refs, ignored files)
+
+    @Test func planTurnModifiedIgnoredFileIsFlagged() async throws {
+        let (s, i, wt) = try planWorld()
+        let exclude = URL(fileURLWithPath: s.company.workspacePath).appending(path: ".git/info/exclude")
+        try (try String(contentsOf: exclude, encoding: .utf8) + "\n*.log\n").write(to: exclude, atomically: true, encoding: .utf8)
+        try "kept".write(to: wt.appending(path: "old.log"), atomically: true, encoding: .utf8)
+        s.world.fake.script("eng-1", .init(sideEffect: { req in
+            try "changed".write(to: URL(fileURLWithPath: req.workingDirectory).appending(path: "old.log"), atomically: true, encoding: .utf8)
+        }, text: "the plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(s.requests("eng-1").first?.kind == .plan)
+        let events = try s.store.itemEvents(itemId: i.id)
+        #expect(events.contains { $0.kind == .planTurnWrote && $0.text.contains("changed ignored file old.log") })
+        #expect(!events.contains { $0.kind == .planWritten })
+    }
+
+    @Test func planTurnMovedRefIsFlaggedAndRestored() async throws {
+        let (s, i, _) = try planWorld()
+        let ws = URL(fileURLWithPath: s.company.workspacePath)
+        let main = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws)
+        s.world.fake.script("eng-1", .init(sideEffect: { _ in
+            let other = try GitFixture.plainGit(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "evil"], in: ws)
+            try GitFixture.plainGit(["update-ref", "refs/heads/main", other], in: ws)
+        }, text: "the plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(s.requests("eng-1").first?.kind == .plan)
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == main, "the engine moved main back")
+        let events = try s.store.itemEvents(itemId: i.id)
+        #expect(events.contains { $0.kind == .planTurnWrote && $0.text.contains("moved ref refs/heads/main") })
+        #expect(!events.contains { $0.kind == .planWritten })
+    }
+
+    @Test func planTurnBarrierWithCutOutputRejectsThePlan() async throws {
+        let (s, i, wt) = try planWorld()
+        let exclude = URL(fileURLWithPath: s.company.workspacePath).appending(path: ".git/info/exclude")
+        try (try String(contentsOf: exclude, encoding: .utf8) + "\n*.log\n").write(to: exclude, atomically: true, encoding: .utf8)
+        s.store.planBarrierOutputLimit.bytes = 8192
+        s.world.fake.script("eng-1", .init(sideEffect: { req in
+            let dir = URL(fileURLWithPath: req.workingDirectory)
+            for n in 0..<400 { try "x".write(to: dir.appending(path: "flood-\(n)-padding-padding.log"), atomically: true, encoding: .utf8) }
+        }, text: "the plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(s.requests("eng-1").first?.kind == .plan, "the snapshot before the turn fit")
+        let events = try s.store.itemEvents(itemId: i.id)
+        let wrote = try #require(events.last { $0.kind == .planTurnWrote })
+        #expect(wrote.text.contains("barrier check failed"))
+        #expect(wrote.text.contains("longer than 8192 bytes"))
+        #expect(!events.contains { $0.kind == .planWritten }, "a barrier that cannot tell is a failed barrier")
+        #expect(try GitFixture.plainGit(["status", "--porcelain"], in: wt).isEmpty)
     }
 }

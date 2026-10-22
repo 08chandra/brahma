@@ -567,10 +567,16 @@ public actor Orchestrator {
         if dirty { wrote.append("uncommitted changes") }
         if head != plan.preHead { wrote.append("a commit") }
         // Ignored files and the repository's own config and hooks are put back as well.
-        do { wrote += try plan.git.enforcePlanBarrier(plan.barrier, key: plan.key, in: plan.worktree) } catch { wrote.append("barrier check failed: \(error)") }
+        // A barrier that cannot tell (a listing failed, timed out or was cut) fails closed: the turn counts as a write.
+        do { wrote += try plan.git.enforcePlanBarrier(plan.barrier, key: plan.key, in: plan.worktree) }
+        catch let e as GitWorkspace.PlanBarrierError { wrote += e.found; wrote.append(e.description) }
+        catch { wrote.append("barrier check failed: \(error)") }
         if !wrote.isEmpty {
             attempt { try plan.git.resetHard(in: plan.worktree, to: plan.preHead) }
-            attempt { try store.recordPlanTurnWrote(itemId: plan.itemId, agentId: agent.id, detail: wrote.joined(separator: ", "), now: now) }
+            let shown = wrote.count > Self.maxBarrierFindings
+                ? wrote.prefix(Self.maxBarrierFindings) + ["\(wrote.count - Self.maxBarrierFindings) more"] : wrote[...]
+            let detail = String(shown.joined(separator: ", ").prefix(Self.maxBarrierDetail))
+            attempt { try store.recordPlanTurnWrote(itemId: plan.itemId, agentId: agent.id, detail: detail, now: now) }
             return
         }
         guard case .succeeded(let r, _) = end else { return }
@@ -580,6 +586,8 @@ public actor Orchestrator {
     }
 
     static let maxPlanBytes = 64 * 1024
+    static let maxBarrierFindings = 20
+    static let maxBarrierDetail = 2000
 
     /// `<ws>/.brahma/plans/<KEY>/`, created step by step; nil when any part of it is a symlink or not a directory (a plan
     /// directory the agent redirected is never used).
@@ -598,21 +606,30 @@ public actor Orchestrator {
         return url
     }
 
-    /// The newest plan file: only regular, non-symlink `.md` files that really sit in `directory`, at most `maxPlanBytes` of it.
+    /// The newest plan file: only regular, non-symlink, single-link `.md` files that really sit in `directory`, at most
+    /// `maxPlanBytes` of it. The file is opened without following a link and must still be the file that was checked.
     nonisolated static func readPlan(in directory: URL, limit: Int = maxPlanBytes) -> String? {
         let fm = FileManager.default
         guard (try? fm.attributesOfItem(atPath: directory.path))?[.type] as? FileAttributeType == .typeDirectory else { return nil }
         let base = directory.resolvingSymlinksInPath().standardizedFileURL.path
-        var best: (url: URL, date: Date)?
+        var best: (url: URL, mtime: timespec, device: dev_t, inode: ino_t)?
         for name in (try? fm.contentsOfDirectory(atPath: directory.path)) ?? [] where name.hasSuffix(".md") {
             let url = directory.appending(path: name)
-            guard let attrs = try? fm.attributesOfItem(atPath: url.path), attrs[.type] as? FileAttributeType == .typeRegular,
+            var st = stat()
+            guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1,
                   url.resolvingSymlinksInPath().standardizedFileURL.deletingLastPathComponent().path == base else { continue }
-            let date = (attrs[.modificationDate] as? Date) ?? .distantPast
-            if best == nil || date > best!.date { best = (url, date) }
+            let m = st.st_mtimespec
+            if let b = best, (m.tv_sec, m.tv_nsec) <= (b.mtime.tv_sec, b.mtime.tv_nsec) { continue }
+            best = (url, m, st.st_dev, st.st_ino)
         }
-        guard let best, let handle = try? FileHandle(forReadingFrom: best.url) else { return nil }
+        guard let best else { return nil }
+        let fd = open(best.url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
+        var st = stat()
+        guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1,
+              st.st_dev == best.device, st.st_ino == best.inode else { return nil }
         guard let data = try? handle.read(upToCount: limit) else { return nil }
         let text = String(decoding: data, as: UTF8.self)
         return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
