@@ -99,7 +99,7 @@ import GRDB
         let root = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
         #expect(record.path.hasPrefix(root.appending(path: ".brahma/handoffs/\(item.key)/").path))
         let text = try String(contentsOfFile: record.path, encoding: .utf8)
-        #expect(text.contains("## Goal\nAuto hand-off: @eng-1 was killed"))
+        #expect(text.contains("## Goal\n    | Auto hand-off: @eng-1 was killed"))
         #expect(text.contains("    | parser half done")); #expect(text.contains("    | ## Goal"))
         #expect(!text.contains("\n## Goal\nfake heading"))
         #expect(text.contains("- .brahma/progress/\(item.key).md")); #expect(text.contains("- item/\(item.key)"))
