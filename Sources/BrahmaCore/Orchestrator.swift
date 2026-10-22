@@ -31,6 +31,7 @@ public actor Orchestrator {
     let planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)?
     /// What each turn asserts about the session the CLI reports (the work modes set it; nil asserts nothing).
     let turnExpectations: @Sendable (Agent, Company) -> TurnExpectations?
+    let timerJobs: TimerJobRegistry
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -69,6 +70,10 @@ public actor Orchestrator {
     var infraCooldown: [String: Date] = [:]
     /// Companies whose weekly-pace closure has been logged (cleared when it reopens).
     var loggedPaceClosed = Set<String>()
+    /// Timer jobs in flight, by timer id (a job never overlaps itself).
+    var timerTasks: [String: Task<Void, Never>] = [:]
+    /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
+    var ensuredTimerCompanies: Set<String>?
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -82,7 +87,9 @@ public actor Orchestrator {
                 checkRunner: any CheckRunning = ProcessCheckRunner(),
                 checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
                 planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)? = nil,
-                turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil }) {
+                turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil },
+                timerJobs: TimerJobRegistry = .system) {
+        self.timerJobs = timerJobs
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
@@ -99,6 +106,8 @@ public actor Orchestrator {
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
             try await recoverMerges()
+            try SystemTimers.ensure(store: store, now: now)
+            ensuredTimerCompanies = Set(try store.companies().map(\.id))
         }
     }
 
@@ -122,7 +131,7 @@ public actor Orchestrator {
     /// Everything the engine owns that is in flight: turns, health, git, check and merge tasks. (Whatever a tick would start
     /// next is started synchronously inside that tick, so nothing is "queued" outside these sets.)
     private var isIdle: Bool {
-        tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty
+        tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -132,7 +141,7 @@ public actor Orchestrator {
     }
 
     private func busyDescription() -> String {
-        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted())"
+        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted())"
     }
 
     private func idleWaiterTimedOut(_ id: Int) {
@@ -178,7 +187,7 @@ public actor Orchestrator {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values)
+        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -249,6 +258,9 @@ public actor Orchestrator {
             guard until <= now else { continue }
             attempt { try store.transition(agentId: a.id, to: .ready, now: now) { $0.state == .blocked && $0.blocker == a.blocker } }
         }
+
+        // 1b. Timers that are due (jobs run detached; a `.turn` timer sends its agent a system DM).
+        attempt { try timersTick(now: now, companies: companies) }
 
         // 2. How many live agents each agent is holding up.
         let all = try store.agents()

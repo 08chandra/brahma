@@ -640,6 +640,30 @@ enum Migrations {
                 t.primaryKey(["turnId", "kind"])
             }
         }
+        registerPlan5(&m)
         return m
+    }
+
+    /// Plan 5-lite migrations, in the plan's order (v5-sandbox, v5-owner-guard, v5-secrets, v5-extensions, v5-timers,
+    /// v5-notices, ...). Called once at the end of `migrator()`, after every 3a migration.
+    static func registerPlan5(_ m: inout DatabaseMigrator) {
+        m.registerMigration("v5-timers") { db in
+            try db.create(table: "timer") { t in
+                t.primaryKey("id", .text)
+                // Nil for engine-wide timers (backups).
+                t.column("companyId", .text).references("company", onDelete: .cascade)
+                t.column("name", .text).notNull()
+                t.column("action", .text).notNull()
+                t.column("schedule", .text).notNull()
+                t.column("nextFireAt", .datetime).notNull()
+                t.column("lastFiredAt", .datetime)
+                t.column("enabled", .boolean).notNull().defaults(to: true)
+                t.column("createdAt", .datetime).notNull()
+                t.uniqueKey(["companyId", "name"])
+            }
+            // UNIQUE(companyId, name) does not constrain engine-wide rows (NULLs are distinct).
+            try db.execute(sql: "CREATE UNIQUE INDEX timer_scope_name ON timer(IFNULL(companyId, ''), name)")
+            try db.create(index: "timer_due", on: "timer", columns: ["enabled", "nextFireAt"])
+        }
     }
 }
