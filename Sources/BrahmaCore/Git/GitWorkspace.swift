@@ -17,7 +17,9 @@ public enum GitError: Error, Equatable, CustomStringConvertible, LocalizedError 
 public struct GitChange: Equatable, Sendable {
     public var status: String
     public var path: String
-    public init(status: String, path: String) { self.status = status; self.path = path }
+    /// For a rename or copy, the path it came from.
+    public var oldPath: String?
+    public init(status: String, path: String, oldPath: String? = nil) { self.status = status; self.path = path; self.oldPath = oldPath }
 }
 
 /// The one way the engine runs git (worktrees, commits, diffs, name-status, log, merges, rebases, `isDirty`).
@@ -369,6 +371,60 @@ public struct GitWorkspace: Sendable {
         try main.run(["branch", "-D", branch(key: key)])
     }
 
+    // MARK: Check checkouts
+
+    private static func validRunId(_ id: String) throws {
+        guard id.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil else {
+            throw GitError.failed(command: "worktree \(id.prefix(40))", status: -1, stderr: "invalid run id")
+        }
+    }
+
+    private static func validCommit(_ commit: String) throws {
+        guard commit.range(of: "^[0-9a-fA-F]{7,64}$", options: .regularExpression) != nil else {
+            throw GitError.failed(command: "commit \(commit.prefix(40))", status: -1, stderr: "invalid commit")
+        }
+    }
+
+    /// A clean detached checkout of exactly `commit` at `<ws>/.brahma/wt-check/<runId>`, for an engine-run check. Anything
+    /// left at that place by a crashed run is removed first.
+    public func addRunWorktree(runId: String, commit: String) throws -> URL {
+        try Self.validRunId(runId); try Self.validCommit(commit)
+        let paths = CheckPaths(workspace: root)
+        if Self.isSymlink(paths.runWorktreesRoot) {
+            throw GitError.failed(command: "worktree add \(runId)", status: -1, stderr: "\(paths.runWorktreesRoot.path) is a link")
+        }
+        try FileManager.default.createDirectory(at: paths.runWorktreesRoot, withIntermediateDirectories: true)
+        removeRunWorktree(runId: runId)
+        let path = paths.runWorktree(runId: runId)
+        try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
+        return path
+    }
+
+    /// Removes one run's checkout (whatever the check left in it); never throws.
+    public func removeRunWorktree(runId: String) {
+        guard (try? Self.validRunId(runId)) != nil else { return }
+        let fm = FileManager.default
+        let path = CheckPaths(workspace: root).runWorktree(runId: runId)
+        if Self.isSymlink(path) {
+            try? fm.removeItem(at: path)
+        } else if fm.fileExists(atPath: path.path) {
+            _ = try? main.run(["worktree", "remove", "--force", path.path], allowFailure: true)
+            if fm.fileExists(atPath: path.path) { try? fm.removeItem(at: path) }
+        }
+        _ = try? main.run(["worktree", "prune"], allowFailure: true)
+    }
+
+    /// Start-up: no check is running, so every leftover run checkout goes.
+    public func removeRunWorktrees() {
+        let dir = CheckPaths(workspace: root).runWorktreesRoot
+        guard !Self.isSymlink(dir), let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
+        for name in names {
+            if (try? Self.validRunId(name)) != nil { removeRunWorktree(runId: name) }
+            else { try? FileManager.default.removeItem(at: dir.appending(path: name)) }
+        }
+        _ = try? main.run(["worktree", "prune"], allowFailure: true)
+    }
+
     // MARK: Commits and refs
 
     /// Stages everything and commits it; the new `HEAD`, or nil when there was nothing to commit.
@@ -416,7 +472,7 @@ public struct GitWorkspace: Sendable {
             guard i + paths < tokens.count else { break }
             let path = tokens[i + paths]
             if entries.count >= limit { truncated = true; break }
-            entries.append(GitChange(status: status, path: path))
+            entries.append(GitChange(status: status, path: path, oldPath: paths == 2 ? tokens[i + 1] : nil))
             i += paths + 1
         }
         return (entries, truncated)

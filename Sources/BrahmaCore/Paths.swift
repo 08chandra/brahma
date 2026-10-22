@@ -13,6 +13,7 @@ public struct BrahmaPaths: Sendable, Equatable {
     public var runDir: URL { home.appending(path: "run", directoryHint: .isDirectory) }
 
     public var packsDir: URL { home.appending(path: "packs", directoryHint: .isDirectory) }
+    /// Not used for checks: their files live in the workspace under `.brahma/checks` and `.brahma/wt-check` (`CheckPaths`).
     public var checksDir: URL { home.appending(path: "checks", directoryHint: .isDirectory) }
     public func companyDir(_ id: String) -> URL { home.appending(path: "companies/\(id)", directoryHint: .isDirectory) }
 

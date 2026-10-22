@@ -58,7 +58,7 @@ private struct MCPWorld {
     let tools = try listing(w.ceo)
     let expected: Set<String> = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked",
         "list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency", "comment_work_item", "claim_lease",
-        "release_lease", "confirm_spec",
+        "release_lease", "submit_for_review", "confirm_spec",
         "propose_decision", "request_from_owner", "escalate_decision", "decide", "request_mode"]
     #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
     #expect(tools.count == expected.count)
