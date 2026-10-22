@@ -84,7 +84,7 @@ extension Store {
         return t.isEmpty ? nil : t
     }
 
-    private static func cleanRequestId(_ id: String?) -> String? {
+    static func cleanRequestId(_ id: String?) -> String? {
         guard let t = id?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
         return String(t.prefix(100))
     }

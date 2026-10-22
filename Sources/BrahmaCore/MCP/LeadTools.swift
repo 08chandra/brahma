@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 
 /// The Inbox tools: `propose_decision`, `request_from_owner`, `decide` and `request_mode`. Registered from `CompanyTools`.
 /// None of them can take an owner decision: that exists only in `Store.ownerDecide` and its siblings.
@@ -117,11 +118,12 @@ extension CompanyTools {
         let payload = AskPayload(documentPath: try optionalText(args, "document_path"), options: try options(args),
                                  recommendation: try optionalText(args, "recommendation"), stakes: try optionalText(args, "stakes"),
                                  reversible: reversible, proposal: try optionalText(args, "proposal"))
+        let deduped = try isRepeat(requestId: try optionalText(args, "request_id"))
         let ask = try store.propose(companyId: companyId, by: .agent(agentId), kind: kind, risk: risk,
                                     category: try optionalText(args, "category"), title: title, summary: summary, payload: payload,
                                     itemId: itemId, supersedes: supersedes, requestId: try optionalText(args, "request_id"),
                                     decisionClass: cls)
-        return try describe(ask, expecting: kind)
+        return try describe(ask, expecting: kind, deduped: deduped)
     }
 
     private func requestFromOwner(_ args: [String: JSONValue]) throws -> String {
@@ -130,10 +132,11 @@ extension CompanyTools {
             guard let n = v.numberValue, n.isFinite else { throw ToolError(message: "argument expires_in_hours must be a number") }
             hours = n
         }
+        let deduped = try isRepeat(requestId: try optionalText(args, "request_id"))
         let ask = try store.requestFromOwner(companyId: companyId, by: .agent(agentId), title: try text(args, "title"),
                                              question: try text(args, "question"), details: try optionalText(args, "details"),
                                              expiresInHours: hours, requestId: try optionalText(args, "request_id"))
-        if ask.kind != .info || ask.status != .pendingOwner { return try describe(ask, expecting: .info) }
+        if deduped || ask.kind != .info || ask.status != .pendingOwner { return try describe(ask, expecting: .info, deduped: deduped) }
         return "Asked the owner (\(ask.ref)). You will get the answer as a DM from the owner."
     }
 
@@ -164,7 +167,7 @@ extension CompanyTools {
 
     /// Says what the ask is now. A repeated `request_id` returns the existing ask, which may be of another kind or already
     /// decided, so the text follows its actual kind and status.
-    private func describe(_ ask: Ask, expecting kind: AskKind) throws -> String {
+    private func describe(_ ask: Ask, expecting kind: AskKind, deduped: Bool) throws -> String {
         let title = try store.displayTitle(ask)
         if ask.kind != kind {
             return "That request_id already belongs to \(ask.ref) (\(title), \(ask.status.rawValue)); nothing new was filed."
@@ -172,10 +175,21 @@ extension CompanyTools {
         if !ask.status.isPending {
             return "\(ask.ref) (\(title)) was already filed with that request_id and is \(ask.status.rawValue); nothing new was filed."
         }
+        if deduped {
+            return "\(ask.ref) (\(title)) already filed (\(ask.status.rawValue)); nothing new was filed."
+        }
         if ask.status == .pendingInternal, let id = ask.internalApproverId, let approver = try store.agent(id: id) {
             return "Filed \(ask.ref) (\(title)) for @\(approver.name) to decide; if it matters to the owner it goes on to them."
         }
         return "Filed \(ask.ref) (\(title)); it waits for the owner. You will get a DM with the outcome."
+    }
+
+    /// True when this requester already filed an ask under `requestId`, so the store will return it instead of filing a new one.
+    private func isRepeat(requestId: String?) throws -> Bool {
+        guard let rid = Store.cleanRequestId(requestId) else { return false }
+        return try store.writer.read { db in
+            try Ask.filter(Column("companyId") == companyId && Column("requesterId") == agentId && Column("requestId") == rid).fetchCount(db) > 0
+        }
     }
 
     private func options(_ args: [String: JSONValue]) throws -> [AskOption] {

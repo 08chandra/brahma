@@ -187,12 +187,17 @@ import GRDB
         #expect(try w.fresh(a).status == .pendingInternal)
         _ = try w.decide(a, by: w.cto)
         #expect(throws: WorkError.conflict("A-1 is already pendingOwner")) { try w.decide(a, by: w.cto) }
-        // The tool path says the same.
+        // The tool path says the same to an executive who is not the approver; an engineer's role has no decide tool at all.
         let b = try w.propose(.architecture)
         let denied = #expect(throws: ToolError.self) {
-            try w.tools(w.eng).call(name: "decide", arguments: ["ask": .string(b.ref), "approve": .bool(true), "note": .string("me")])
+            try w.tools(w.ceo).call(name: "decide", arguments: ["ask": .string(b.ref), "approve": .bool(true), "note": .string("me")])
         }
         #expect(denied?.message.contains("only @cto can decide A-2") == true)
+        let noTool = #expect(throws: ToolError.self) {
+            try w.tools(w.eng).call(name: "decide", arguments: ["ask": .string(b.ref), "approve": .bool(true), "note": .string("me")])
+        }
+        #expect(noTool?.message == "decide is not available to your role")
+        #expect(try w.fresh(b).status == .pendingInternal)
     }
 
     @Test func relayedApprovalDoesNotCount() throws {
@@ -582,8 +587,14 @@ import GRDB
         #expect(throws: WorkError.self) { try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now) }
         #expect(try w.store.documentChanged(a))
         #expect(Date().timeIntervalSince(started) < 5)
-        // Device files are not regular files either.
-        #expect(throws: WorkError.self) { try w.propose(.prd, payload: AskPayload(documentPath: "/dev/null")) }
+        // A device file is not a regular file either. With /dev as the workspace, /dev/null passes containment and reaches
+        // the file-type check; a path outside the workspace is refused earlier, by containment.
+        #expect(throws: WorkError.invalid("document_path is not a regular file")) {
+            try Store.readDocument("/dev/null", workspace: "/dev")
+        }
+        #expect(throws: WorkError.invalid("document_path must be inside the workspace")) {
+            try w.propose(.prd, payload: AskPayload(documentPath: "/dev/null"))
+        }
     }
 
     @Test func controlCharactersAreStrippedAtStoreTime() throws {
@@ -629,6 +640,19 @@ import GRDB
             "title": .string("t"), "question": .string("q"), "request_id": .string("q1")])
         #expect(other.contains("already belongs to A-1")); #expect(other.contains("Architecture"))
         #expect(try w.store.asks(companyId: w.company.id).count == 1)
+    }
+
+    @Test func dedupeHitOnPendingAskSaysItAlreadyExists() throws {
+        let w = try W()
+        let args: [String: JSONValue] = ["kind": .string("architecture"), "title": .string("L"), "summary": .string("s"), "request_id": .string("p1")]
+        #expect(try w.tools(w.eng).call(name: "propose_decision", arguments: args).contains("Filed A-1"))
+        let again = try w.tools(w.eng).call(name: "propose_decision", arguments: args)
+        #expect(again.contains("A-1")); #expect(again.contains("already filed (pendingInternal)")); #expect(!again.contains("Filed A-1"))
+        let ask: [String: JSONValue] = ["title": .string("t"), "question": .string("q"), "request_id": .string("o1")]
+        #expect(try w.tools(w.eng).call(name: "request_from_owner", arguments: ask).contains("Asked the owner (A-2)"))
+        let twice = try w.tools(w.eng).call(name: "request_from_owner", arguments: ask)
+        #expect(twice.contains("A-2 ")); #expect(twice.contains("already filed (pendingOwner)")); #expect(!twice.contains("Asked the owner"))
+        #expect(try w.store.asks(companyId: w.company.id).count == 2)
     }
 
     // MARK: Tools
