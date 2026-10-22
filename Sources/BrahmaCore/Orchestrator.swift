@@ -100,6 +100,9 @@ public actor Orchestrator {
         let calibration = try store.usageCalibration()
         let reservedLE = store.openReservationLE()
 
+        // Sleeping agents whose debounced work notices have come due.
+        attempt { try store.wakeDueNotices(now: now) }
+
         // 1. Timed blockers that have expired.
         for a in try store.agents(states: [.blocked]) {
             let until: Date
@@ -232,6 +235,7 @@ public actor Orchestrator {
     private nonisolated func performTurn(agent: Agent, turn: Turn) async {
         var items: [(InboxItem, Message, Channel)] = []
         var quietIds: [Int64] = []
+        var noticeIds: [Int64] = []
         var result: TurnResult?
         var lastInfo: RateLimitInfo?
         var failure: String?
@@ -243,6 +247,8 @@ public actor Orchestrator {
             quietIds = quiet.map(\.id)
             let team = try store.agents(companyId: company.id)
             let handles = Dictionary(uniqueKeysWithValues: team.map { ($0.id, $0.name) })
+            let notices = try store.pendingNotices(agentId: agent.id, limit: WorkNoticeDigest.maxNotices)
+            noticeIds = notices.compactMap(\.notice.id)
             // `auto` resolves per turn from the role, the company's usage mode and the kind of turn (Tasks 10 and 14 set the context).
             var sent = agent
             sent.model = ModelPolicy.resolve(
@@ -251,8 +257,8 @@ public actor Orchestrator {
             let turnToken = try store.issueTurnCredential(turnId: turn.id)
             let request = TurnRequest(
                 agent: sent, company: company,
-                prompt: InboxDigest.render(agent: agent, company: company, items: items, handles: handles,
-                                            unread: Store.channelCounts(quiet)),
+                prompt: Self.prompt(agent: agent, company: company, items: items, handles: handles,
+                                    unread: Store.channelCounts(quiet), notices: notices),
                 appendSystemPrompt: RolePrompt.render(agent: agent, company: company),
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken),
                 workingDirectory: company.workspacePath, profile: profile,
@@ -329,10 +335,19 @@ public actor Orchestrator {
         var infra = InfraClass.none
         attempt {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id) + quietIds,
-                                      resetSession: resetSession, now: now)
+                                      deliveredNoticeIds: noticeIds, resetSession: resetSession, now: now)
         }
         let outcome = end.outcome
         await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)
+    }
+
+    /// The inbox digest, then the work updates. With only work updates there is no "nothing new" line.
+    static func prompt(agent: Agent, company: Company, items: [(InboxItem, Message, Channel)], handles: [String: String],
+                       unread: [(channel: String, count: Int)], notices: [PendingNotice]) -> String {
+        let work = WorkNoticeDigest.render(notices, handles: handles)
+        if items.isEmpty, unread.isEmpty, let work { return work }
+        let inbox = InboxDigest.render(agent: agent, company: company, items: items, handles: handles, unread: unread)
+        return work.map { inbox + "\n\n" + $0 } ?? inbox
     }
 
     /// `claude --resume` of a session it never persisted fails the same way forever; spot that so the next turn
@@ -424,7 +439,8 @@ extension Store {
     /// The 5th consecutive infra failure of one agent is recorded as an ordinary failure. Returns the infra class
     /// that was applied (`.none` for everything else).
     @discardableResult
-    func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], resetSession: Bool = false,
+    func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], deliveredNoticeIds: [Int64] = [],
+                 resetSession: Bool = false,
                  now: Date) throws -> InfraClass {
         try writer.write { db in
             var summary: String?
@@ -438,7 +454,10 @@ extension Store {
             case .usageLimited(_, let text): summary = text
             case .interrupted: summary = "interrupted"
             }
-            if case .succeeded = end { try Store.markDelivered(db: db, itemIds: deliveredItemIds, turnId: turn.id) }
+            if case .succeeded = end {
+                try Store.markDelivered(db: db, itemIds: deliveredItemIds, turnId: turn.id)
+                try Store.markNoticesDelivered(db: db, ids: deliveredNoticeIds, turnId: turn.id)
+            }
             guard var agent = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
             // The 5th infra failure in a row is an ordinary failure; any non-infra outcome resets the count.
             if infraClass != .none {
@@ -517,7 +536,7 @@ extension Store {
                         return infraClass
                     }
                 }
-                if senders.isEmpty {
+                if senders.isEmpty, !(try Store.hasPendingWork(db: db, agentId: agentId)) {
                     // Nothing left to do: sleep; a new message wakes it and the usage gate holds it if still closed.
                     try Store.transition(db: db, agentId: agentId, to: .sleeping, now: now)
                 } else if let usageHold {

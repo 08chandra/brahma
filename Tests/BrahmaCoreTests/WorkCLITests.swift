@@ -61,6 +61,88 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(empty.status == 0); #expect(!empty.stdout.contains("hired"))
     }
 
+    @Test func itemsAddListShow() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let org = try brahma(["org", "Acme"], home: home).stdout
+        #expect(org.contains("eng-1") && org.contains("cto"), "\(org)")
+        // Nothing yet.
+        #expect(try brahma(["items", "Acme"], home: home).stdout == "(no work items)\n")
+        let add = try brahma(["items", "add", "Acme", "--type", "story", "--title", "Auth epic"], home: home)
+        #expect(add.status == 0, "\(add.stderr)"); #expect(add.stdout == "created ACME-1 (story): Auth epic\n")
+        let task = try brahma(["items", "add", "Acme", "--title", "Parser\u{1B}[2J", "--description", "line one\nline two", "--criteria", "it parses",
+                               "--check", "swift test", "--path", "Sources/Parser", "--path", "Tests", "--timeout", "900", "--tier", "l",
+                               "--priority", "1", "--parent", "acme-1", "--owner", "eng-1", "--reviewer", "cto", "--ready"], home: home)
+        #expect(task.status == 0, "\(task.stderr)"); #expect(task.stdout.hasPrefix("created ACME-2 (task): Parser"))
+        let list = try brahma(["items", "Acme"], home: home)
+        #expect(list.status == 0, "\(list.stderr)")
+        let lines = list.stdout.split(separator: "\n").map(String.init)
+        #expect(lines.count == 2)
+        #expect(lines[0] == "ACME-1  Backlog  story  p2  M  unassigned  Auth epic")
+        #expect(lines[1].hasPrefix("ACME-2  Ready  task  p1  L  @eng-1  Parser"))
+        #expect(!list.stdout.contains("\u{1B}"), "agent-controlled text is sanitized")
+        #expect(try brahma(["items", "list", "Acme", "--status", "ready"], home: home).stdout.split(separator: "\n").count == 1)
+        #expect(try brahma(["items", "list", "Acme", "--owner", "cto"], home: home).stdout == "(no work items)\n")
+        let show = try brahma(["items", "show", "Acme", "acme-2"], home: home)
+        #expect(show.status == 0, "\(show.stderr)")
+        #expect(show.stdout.contains("ACME-2  Parser"))
+        #expect(show.stdout.contains("type: task  status: Ready  priority: 1  tier: L"))
+        #expect(show.stdout.contains("assignee: @eng-1  reviewer: @cto  author: @owner"))
+        #expect(show.stdout.contains("parent: ACME-1"))
+        #expect(show.stdout.contains("check (revision 0): swift test  timeout: 900s  paths: Sources/Parser, Tests"))
+        #expect(show.stdout.contains("    | line one\n    | line two\n"))
+        #expect(show.stdout.contains("spec: confirmed by @owner"))
+        #expect(show.stdout.contains("created by @owner:"))
+        // Edit, depend, confirm.
+        let edit = try brahma(["items", "edit", "Acme", "ACME-2", "--status", "blocked", "--reason", "waiting on api", "--timeout", "1200",
+                               "--reviewer", "none", "--intensity", "thorough"], home: home)
+        #expect(edit.status == 0, "\(edit.stderr)"); #expect(edit.stdout == "updated ACME-2\n")
+        let after = try brahma(["items", "show", "Acme", "ACME-2"], home: home).stdout
+        #expect(after.contains("status: Blocked")); #expect(after.contains("blocked: waiting on api"))
+        #expect(after.contains("reviewer: none")); #expect(after.contains("timeout: 1200s")); #expect(after.contains("(revision 1)"))
+        #expect(after.contains("intensity: thorough"))
+        let dep = try brahma(["items", "depend", "Acme", "ACME-2", "--on", "ACME-1"], home: home)
+        #expect(dep.status == 0, "\(dep.stderr)"); #expect(dep.stdout == "ACME-2 now waits for ACME-1\n")
+        #expect(try brahma(["items", "show", "Acme", "ACME-1"], home: home).stdout.contains("blocks: ACME-2 (Blocked) Parser"))
+        let cycle = try brahma(["items", "depend", "Acme", "ACME-1", "--on", "ACME-2"], home: home)
+        #expect(cycle.status != 0); #expect(cycle.stderr.contains("dependency cycle"))
+        let engine = try brahma(["items", "edit", "Acme", "ACME-2", "--status", "done"], home: home)
+        #expect(engine.status != 0); #expect(engine.stderr.contains("status done is set by the engine"))
+        let confirm = try brahma(["items", "confirm", "Acme", "ACME-1"], home: home)
+        #expect(confirm.status == 0, "\(confirm.stderr)"); #expect(confirm.stdout == "confirmed the spec of ACME-1\n")
+        // Refusals.
+        #expect(try brahma(["items", "show", "Acme", "ACME-99"], home: home).status != 0)
+        #expect(try brahma(["items", "add", "Acme", "--title", "x", "--type", "saga"], home: home).stderr.contains("unknown item type"))
+        #expect(try brahma(["items", "add", "Acme", "--title", "x", "--owner", "ghost"], home: home).status != 0)
+        #expect(try brahma(["items", "add", "Acme", "--title", "x", "--timeout", "5"], home: home).status != 0)
+        #expect(try brahma(["items", "add", "Acme", "--title", "x", "--owner", "eng-1", "--reviewer", "eng-1"], home: home).stderr
+            .contains("assignee cannot be its reviewer"))
+    }
+
+    @Test func itemWriteCommandsRefuseInsideAgentTurn() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        #expect(try brahma(["items", "add", "Acme", "--title", "a"], home: home).status == 0)
+        #expect(try brahma(["items", "add", "Acme", "--title", "b"], home: home).status == 0)
+        let agentEnv = ["BRAHMA_AGENT_ID": "a1"]
+        let cmds: [[String]] = [
+            ["items", "add", "Acme", "--title", "x"], ["items", "edit", "Acme", "ACME-1", "--title", "y"],
+            ["items", "depend", "Acme", "ACME-1", "--on", "ACME-2"], ["items", "confirm", "Acme", "ACME-1"],
+        ]
+        for c in cmds {
+            let r = try brahma(c, home: home, env: agentEnv)
+            #expect(r.status != 0, "\(c)"); #expect(r.stderr.contains("owner commands can't run inside an agent turn"), "\(c)")
+        }
+        // Reads are fine.
+        #expect(try brahma(["items", "list", "Acme"], home: home, env: agentEnv).status == 0)
+        #expect(try brahma(["items", "show", "Acme", "ACME-1"], home: home, env: agentEnv).status == 0)
+        // Without an owner key, the writes refuse too.
+        let bare = try OwnerTestHome(initOwner: false); defer { withExtendedLifetime(bare) {} }
+        #expect(try brahma(["items", "add", "Acme", "--title", "x"], home: bare.url).status != 0)
+    }
+
     @Test func runRefusesWithoutPassingProbe() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url

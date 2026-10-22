@@ -9,6 +9,8 @@ public enum Blocker: Codable, Equatable, Sendable {
     case usageLimit(until: Date)
     case turnBudget(until: Date)
     case retry(until: Date, failures: Int)
+    /// Waiting for a work item to be done (CLI: `waiting on <key>`).
+    case workItem(id: String, key: String)
 }
 
 public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
@@ -38,6 +40,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var team: String? = nil
     /// Hook for the trust ladder (Plan 3b).
     public var trustLevel: String = "T1"
+    /// Company-active time of the last wake caused by a work notice; managers and executives are debounced from it.
+    public var lastNoticeWakeActive: Double? = nil
 }
 
 /// Tie-break weight among a company's ready agents: leadership first. Reads the built-in role catalog.

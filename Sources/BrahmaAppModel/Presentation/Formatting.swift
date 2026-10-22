@@ -30,7 +30,8 @@ public enum ChannelTitle {
             let parts = c.name.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
             let handles = parts.first == "dm" ? Array(parts.dropFirst()) : parts
             let others = handles.filter { $0 != "owner" }
-            return (others.isEmpty ? handles : others).map { "@" + $0 }.joined(separator: " · ")
+            // The engine's own conversation reads "system", not "@system": it is not an agent.
+            return (others.isEmpty ? handles : others).map { $0 == "system" ? $0 : "@" + $0 }.joined(separator: " · ")
         }
     }
 }
@@ -69,6 +70,7 @@ public enum BlockerText {
         case nil: return ""
         case .agent(let id): return "Waiting on @\(handles[id] ?? id)"
         case .owner(let reason): return "Waiting on you: \(reason)"
+        case .workItem(_, let key): return "Waiting on \(key)"
         case .usageLimit(let until): return "Usage limit until \(TimeText.hm(until, timeZone: timeZone))"
         case .turnBudget(let until): return "Turn budget until \(TimeText.hm(until, timeZone: timeZone))"
         case .retry(let until, let failures):

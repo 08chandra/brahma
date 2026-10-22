@@ -92,7 +92,12 @@ extension Store {
     }
 
     public func activeNow(companyId: String) -> TimeInterval {
-        (try? writer.read { db in try CompanyActivity.fetchOne(db, key: companyId)?.activeSeconds }) ?? 0
+        (try? writer.read { db in try Store.activeNow(db: db, companyId: companyId) }) ?? 0
+    }
+
+    /// In-transaction `activeNow`.
+    static func activeNow(db: Database, companyId: String) throws -> TimeInterval {
+        try CompanyActivity.fetchOne(db, key: companyId)?.activeSeconds ?? 0
     }
 
     /// Test helper: moves a company's active time forward without waiting.

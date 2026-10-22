@@ -57,3 +57,26 @@ public enum InboxDigest {
         return out + unreadLine
     }
 }
+
+/// Work-item events delivered with a turn: one line each, newest last. Item text is agent-controlled, so every line is
+/// flattened to a single line and cut; only the engine's own prefix says what kind of event it is.
+public enum WorkNoticeDigest {
+    public static let maxNotices = 30
+    static let maxText = 300
+
+    public static func render(_ notices: [PendingNotice], handles: [String: String]) -> String? {
+        guard !notices.isEmpty else { return nil }
+        var out = "Work updates (\(notices.count)):"
+        for n in notices.prefix(maxNotices) {
+            let actor: String
+            switch n.event.actorId {
+            case "owner", "system": actor = n.event.actorId
+            default: actor = handles[n.event.actorId] ?? "unknown"
+            }
+            let flat = String(String.UnicodeScalarView(n.event.text.unicodeScalars.map { blockedInline.contains($0) ? " " : $0 }))
+            let text = flat.count > maxText ? String(flat.prefix(maxText)) + "…" : flat
+            out += "\n- \(n.itemKey) \(n.event.kind.rawValue) by @\(actor): \(text)"
+        }
+        return out
+    }
+}

@@ -82,4 +82,42 @@ struct LiveSmokeTests {
         #expect(inProgress == 0)
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
+
+    /// One real haiku turn with the engine's own argv: the `system/init` tool list must offer neither `Task` nor `Agent`
+    /// (the sub-agent tool is called `Agent` in newer Claude Code versions).
+    @Test(.timeLimit(.minutes(3)))
+    func subAgentToolsAreNotOffered() throws {
+        let root = try tempDir()
+        let store = try Store.inMemory()
+        let company = try store.createCompany(name: "Tools", goal: "g", workspacesRoot: root.appending(path: "ws"))
+        let agent = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "haiku")
+        let mcp = root.appending(path: "mcp.json")
+        try Data(#"{"mcpServers":{}}"#.utf8).write(to: mcp)
+        let request = TurnRequest(agent: agent, company: company, prompt: "Reply with the single word ok. Do not use any tool.",
+                                  appendSystemPrompt: "You are a test agent.", mcpConfigPath: mcp.path,
+                                  workingDirectory: company.workspacePath, profile: .workspace)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["claude"] + ClaudeCommand.arguments(for: request)
+        process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, extra: [:], purpose: .claude)
+        process.currentDirectoryURL = URL(fileURLWithPath: company.workspacePath)
+        let stdin = Pipe(), stdout = Pipe()
+        process.standardInput = stdin; process.standardOutput = stdout; process.standardError = FileHandle.nullDevice
+        try process.run()
+        try stdin.fileHandleForWriting.write(contentsOf: Data(request.prompt.utf8))
+        try stdin.fileHandleForWriting.close()
+        let out = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        var tools: [String]?
+        for line in out.split(separator: "\n") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  obj["type"] as? String == "system", obj["subtype"] as? String == "init" else { continue }
+            tools = obj["tools"] as? [String]
+        }
+        let list = try #require(tools, "no system/init line in: \(out.prefix(500))")
+        print("OBSERVED system/init tools: \(list.joined(separator: ", "))")
+        #expect(!list.isEmpty)
+        #expect(!list.contains("Task"), "tools: \(list)")
+        #expect(!list.contains("Agent"), "tools: \(list)")
+    }
 }

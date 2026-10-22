@@ -3,63 +3,6 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-private struct World {
-    let store: Store
-    let router: MessageRouter
-    let clock = TestClock()
-    let fake = FakeTurnRunner()
-    let paths: BrahmaPaths
-    let orchestrator: Orchestrator
-
-    init(store: Store? = nil, config: SchedulerConfig = World.config()) throws {
-        self.store = try store ?? Store.inMemory()
-        try self.store.setPlanTier(.max20x)   // Plan 1 tests assume the 2/6/16 mode caps
-        router = MessageRouter(store: self.store)
-        let root = try tempDir()
-        paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
-        orchestrator = Orchestrator(store: self.store, runner: fake, paths: paths, config: config,
-                                    mcpExecutable: "/usr/local/bin/brahma", clock: clock.function)
-    }
-
-    static func config(hardCap: Int = 16, turnBudget: Int = 30) -> SchedulerConfig {
-        var c = SchedulerConfig()
-        c.hardCap = hardCap
-        c.safetyCap = 64
-        c.turnBudgetPerHour = turnBudget
-        return c
-    }
-
-    func company(_ name: String, mode: UsageMode = .low) throws -> Company {
-        var c = try store.createCompany(name: name, goal: "Ship it", workspacesRoot: paths.workspaces)
-        c.usageMode = mode
-        try store.updateCompany(c)
-        return c
-    }
-
-    func hire(_ c: Company, _ name: String, role: String? = nil) throws -> Agent {
-        try store.hire(companyId: c.id, name: name, role: role ?? name, model: "sonnet")
-    }
-
-    func agent(_ a: Agent) throws -> Agent { try #require(try store.agent(id: a.id)) }
-    func pending(_ a: Agent) throws -> Int { try store.pendingInbox(agentId: a.id).count }
-
-    func turns(_ a: Agent) throws -> [Turn] {
-        try store.writer.read { db in
-            try Turn.filter(Column("agentId") == a.id).order(Column("startedAt"), Column.rowID).fetchAll(db)
-        }
-    }
-
-    func dm(_ c: Company, _ to: Agent, _ text: String = "please do it") throws {
-        _ = try router.sendDM(companyId: c.id, from: .owner, to: to.name, text: text, now: clock.now)
-    }
-
-    /// One tick, then wait for every turn it started.
-    func cycle() async throws {
-        await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(5))
-    }
-}
-
 @Suite struct OrchestratorTests {
     @Test func ownerMessageRunsAgentAndSleepsAfter() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
@@ -697,5 +640,102 @@ private struct World {
         await #expect(throws: OrchestratorError.self) { try await w.orchestrator.waitUntilIdle(timeout: .milliseconds(50)) }
         try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
         #expect(await w.orchestrator.runningCount() == 0)
+    }
+
+    // MARK: Work notices
+
+    private func ownedItem(_ w: World, _ c: Company, _ owner: Agent) throws -> WorkItem {
+        try w.store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Do it", ownerId: owner.id),
+                                   now: w.clock.now)
+    }
+
+    private func notice(_ w: World, _ item: WorkItem, _ kind: WorkEventKind, text: String = "x") throws {
+        try w.store.writer.write { db in
+            _ = try w.store.recordItemEvent(db: db, item: item, actor: "system", kind: kind, text: text, now: w.clock.now)
+        }
+    }
+
+    @Test func noticeIsDeliveredOnSuccessOnly() async throws {
+        let w = try World(); let c = try w.company("Acme"); let eng = try w.hire(c, "eng", role: "engineer")
+        let item = try ownedItem(w, c, eng)
+        try notice(w, item, .changesRequested, text: "tighten\nthe parser")
+        #expect(try w.agent(eng).state == .ready)
+        w.fake.script("eng", .init(events: [], error: FakeError(description: "boom")))
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .blocked, "the failed turn backs off")
+        #expect(try w.store.pendingNotices(agentId: eng.id).count == 2, "a failed turn delivers nothing")
+        let first = try #require(w.fake.requests.first?.prompt)
+        #expect(first.hasPrefix("Work updates (2):\n- ACME-1 created by @owner: created task \"Do it\", assigned to @eng"))
+        #expect(first.contains("\n- ACME-1 changesRequested by @system: tighten the parser"))
+        #expect(!first.contains("nothing new"))
+        w.clock.advance(30)
+        try await w.cycle()
+        #expect(w.fake.requests.count == 2); #expect(w.fake.requests[1].prompt == first, "the retry carries the same notices")
+        #expect(try w.store.pendingNotices(agentId: eng.id).isEmpty)
+        #expect(try w.agent(eng).state == .sleeping)
+        let delivered = try await w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT DISTINCT deliveredTurnId FROM workNotice WHERE agentId = ?", arguments: [eng.id])
+        }
+        #expect(delivered == [try w.turns(eng).last?.id])
+    }
+
+    @Test func noticesRideAlongWithInboxItems() async throws {
+        let w = try World(); let c = try w.company("Acme"); let eng = try w.hire(c, "eng", role: "engineer")
+        let item = try ownedItem(w, c, eng)
+        try notice(w, item, .leaseClaimed)
+        #expect(try w.agent(eng).state == .sleeping, "an FYI notice does not wake")
+        try w.dm(c, eng, "status?")
+        try await w.cycle()
+        let prompt = try #require(w.fake.requests.first?.prompt)
+        #expect(prompt.hasPrefix("New since your last turn (1 items):"))
+        #expect(prompt.contains("\n\nWork updates (2):\n"))
+        #expect(try w.store.pendingNotices(agentId: eng.id).isEmpty)
+    }
+
+    @Test func pendingNoticeKeepsAgentReady() async throws {
+        let w = try World(); let c = try w.company("Acme"); let eng = try w.hire(c, "eng", role: "engineer")
+        let item = try ownedItem(w, c, eng)
+        let store = w.store, now = w.clock.now
+        try w.dm(c, eng)
+        // An actionable notice arriving mid-turn: the agent stays ready for another turn.
+        w.fake.script("eng", .init(sideEffect: { _ in
+            try store.writer.write { db in
+                _ = try store.recordItemEvent(db: db, item: item, actor: "system", kind: .verificationFailed, text: "check failed", now: now)
+            }
+        }))
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .ready)
+        #expect(try w.store.pendingNotices(agentId: eng.id).map(\.event.kind) == [.verificationFailed])
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .sleeping)
+        #expect(w.fake.requests.count == 2); #expect(w.fake.requests[1].prompt.contains("verificationFailed by @system: check failed"))
+        // An FYI notice arriving mid-turn does not.
+        w.fake.script("eng", .init(sideEffect: { _ in
+            try store.writer.write { db in
+                _ = try store.recordItemEvent(db: db, item: item, actor: "system", kind: .leaseClaimed, text: "claimed", now: now)
+            }
+        }))
+        try w.dm(c, eng)
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .sleeping)
+        #expect(try w.store.pendingNotices(agentId: eng.id).map(\.event.kind) == [.leaseClaimed], "left for the next turn")
+    }
+
+    @Test func debouncedLeadNoticeWakesOnTick() async throws {
+        let w = try World(); let c = try w.company("Acme"); let mgr = try w.hire(c, "mgr", role: "manager")
+        let item = try ownedItem(w, c, mgr)
+        try w.store.advanceActive(companyId: c.id, by: 1000)
+        try notice(w, item, .changesRequested)
+        try await w.cycle()
+        #expect(try w.agent(mgr).state == .sleeping); #expect(w.fake.requests.count == 1)
+        try w.store.advanceActive(companyId: c.id, by: 100)
+        try notice(w, item, .changesRequested)
+        #expect(try w.agent(mgr).state == .sleeping)
+        try await w.cycle()
+        #expect(w.fake.requests.count == 1, "not due yet")
+        try w.store.advanceActive(companyId: c.id, by: 500)
+        try await w.cycle()
+        #expect(w.fake.requests.count == 2, "the tick woke the lead when the debounce ended")
+        #expect(try w.agent(mgr).state == .sleeping); #expect(try w.store.pendingNotices(agentId: mgr.id).isEmpty)
     }
 }

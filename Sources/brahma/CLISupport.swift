@@ -49,6 +49,7 @@ func describe(_ blocker: Blocker?, names: [String: String] = [:]) -> String {
     case nil: return ""
     case .agent(let id)?: return "waiting on @\(safe(names[id] ?? String(id.prefix(8))))"
     case .owner(let reason)?: return "waiting on owner: \(safe(reason))"
+    case .workItem(_, let key)?: return "waiting on \(safe(key))"
     case .usageLimit(let until)?: return "usage limit until \(clock(until))"
     case .turnBudget(let until)?: return "turn budget until \(clock(until))"
     case .retry(let until, let failures)?: return "retry after failure #\(failures) at \(clock(until))"

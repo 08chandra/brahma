@@ -108,6 +108,7 @@ private struct ActivityRow: View {
         case .stateChanged: "arrow.triangle.swap"
         case .usage: "gauge.with.dots.needle.67percent"
         case .error: "exclamationmark.triangle"
+        case .work: "checklist"
         }
     }
 
@@ -120,6 +121,7 @@ private struct ActivityRow: View {
         case .stateChanged: BrahmaTheme.series[3]
         case .usage: BrahmaTheme.warning
         case .error: BrahmaTheme.danger
+        case .work: BrahmaTheme.accent
         }
     }
 }

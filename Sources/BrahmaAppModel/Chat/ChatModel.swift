@@ -46,13 +46,13 @@ public final class ChatModel {
 
     public var title: String {
         if let channel { return ChannelTitle.title(channel) }
-        if case .dm(let h) = target { return "@" + h }
+        if case .dm(let h) = target { return h == "system" ? h : "@" + h }
         return "Channel"
     }
 
     public var placeholder: String {
         if let channel, channel.kind == .channel { return "Message #" + channel.name }
-        if case .dm(let h) = target { return "Message @" + h }
+        if case .dm(let h) = target { return h == "system" ? "System notices" : "Message @" + h }
         if let channel { return "Message " + ChannelTitle.title(channel) }
         return "Message"
     }
@@ -67,6 +67,7 @@ public final class ChatModel {
             }
             return nil
         case .dm(let h):
+            if h.lowercased() == "system" { return "System notices — read only." }
             guard let agent = agents.first(where: { $0.name.lowercased() == h.lowercased() }) else {
                 return "No agent @\(h) in this company."
             }

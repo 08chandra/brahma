@@ -197,6 +197,82 @@ enum Migrations {
                 t.add(column: "pctPerDollar5h", .double)
             }
         }
+        m.registerMigration("v3-work") { db in
+            try db.create(table: "workItem") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("key", .text).notNull()
+                t.column("type", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("description", .text).notNull().defaults(to: "")
+                t.column("acceptanceCriteria", .text).notNull().defaults(to: "")
+                t.column("checkSpec", .text)
+                t.column("checkRevision", .integer).notNull().defaults(to: 0)
+                t.column("reviewFlags", .text).notNull().defaults(to: "[]")
+                t.column("status", .text).notNull()
+                t.column("blockedReason", .text)
+                t.column("blockedSinceActive", .double)
+                t.column("priority", .integer).notNull().defaults(to: 2)
+                t.column("points", .integer)
+                t.column("tier", .text).notNull().defaults(to: "m")
+                t.column("authorId", .text).notNull()
+                t.column("ownerId", .text)
+                t.column("reviewerId", .text)
+                t.column("team", .text)
+                t.column("parentId", .text).references("workItem", onDelete: .setNull)
+                t.column("sprintId", .text)
+                t.column("linkedBranch", .text)
+                t.column("notes", .text)
+                t.column("everStarted", .boolean).notNull().defaults(to: false)
+                t.column("firstClaimedAt", .datetime)
+                t.column("firstClaimedActive", .double)
+                t.column("verifiedRevision", .integer)
+                t.column("verifiedCommit", .text)
+                t.column("reviewRound", .integer).notNull().defaults(to: 0)
+                t.column("reviewedRound", .integer).notNull().defaults(to: 0)
+                t.column("submitSummary", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.column("doneAt", .datetime)
+                // Work modes (W3): intensity, the engine-raised floor and boost, and who confirmed the spec.
+                t.column("intensity", .text).notNull().defaults(to: "auto")
+                t.column("rungFloor", .integer).notNull().defaults(to: 0)
+                t.column("budgetBoostLE", .double).notNull().defaults(to: 0)
+                t.column("specConfirmedBy", .text)
+                t.uniqueKey(["companyId", "key"])
+            }
+            try db.create(index: "workItem_company_status", on: "workItem", columns: ["companyId", "status"])
+            try db.create(table: "workItemDependency") { t in
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("dependsOnId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("linkedBy", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.primaryKey(["itemId", "dependsOnId"])
+            }
+            try db.create(index: "workItemDependency_on", on: "workItemDependency", columns: ["dependsOnId"])
+            try db.create(table: "workItemEvent") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("actorId", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("text", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("createdActive", .double).notNull()
+            }
+            try db.create(index: "workItemEvent_item", on: "workItemEvent", columns: ["itemId", "id"])
+            try db.create(table: "workNotice") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("eventId", .integer).notNull().references("workItemEvent", onDelete: .cascade)
+                t.column("deliveredTurnId", .text)
+                t.column("wakes", .boolean).notNull().defaults(to: false)
+                t.column("wakeAfterActive", .double)
+            }
+            try db.create(index: "workNotice_agent_pending", on: "workNotice", columns: ["agentId", "deliveredTurnId"])
+            try db.alter(table: "agent") { t in t.add(column: "lastNoticeWakeActive", .double) }
+        }
         return m
     }
 }
