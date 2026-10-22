@@ -638,14 +638,37 @@ import GRDB
         let main = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws)
         s.world.fake.script("eng-1", .init(sideEffect: { _ in
             let other = try GitFixture.plainGit(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "evil"], in: ws)
-            try GitFixture.plainGit(["update-ref", "refs/heads/main", other], in: ws)
+            try GitFixture.plainGit(["tag", "release", other], in: ws)
         }, text: "the plan\nSTATUS: DONE"))
         try s.dm(s.eng); try await s.cycle()
         #expect(s.requests("eng-1").first?.kind == .plan)
-        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == main, "the engine moved main back")
+        #expect(try GitFixture.plainGit(["tag", "--list", "release"], in: ws).isEmpty, "the engine removed the new tag")
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == main)
         let events = try s.store.itemEvents(itemId: i.id)
-        #expect(events.contains { $0.kind == .planTurnWrote && $0.text.contains("moved ref refs/heads/main") })
+        #expect(events.contains { $0.kind == .planTurnWrote && $0.text.contains("new ref refs/tags/release") })
         #expect(!events.contains { $0.kind == .planWritten })
+    }
+
+    @Test func planTurnLeavesAnEngineMoveOfMainAlone() async throws {
+        let (s, i, _) = try planWorld()
+        let ws = URL(fileURLWithPath: s.company.workspacePath)
+        let merged = Flag()
+        let target = try GitFixture.plainGit(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "engine merge"], in: ws)
+        let planFile = ws.appending(path: ".brahma/plans/\(i.key)/plan.md")
+        s.world.fake.script("eng-1", .init(sideEffect: { _ in
+            // The engine merges another item into main while the plan turn runs.
+            try GitFixture.plainGit(["update-ref", "refs/heads/main", target], in: ws)
+            merged.on = true
+            try FileManager.default.createDirectory(at: planFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "1. read\n2. plan".write(to: planFile, atomically: true, encoding: .utf8)
+        }, text: "planned\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(merged.on)
+        #expect(s.requests("eng-1").first?.kind == .plan)
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == target, "main is not reverted")
+        let events = try s.store.itemEvents(itemId: i.id)
+        #expect(!events.contains { $0.kind == .planTurnWrote })
+        #expect(events.last { $0.kind == .planWritten }?.text == "1. read\n2. plan")
     }
 
     @Test func planTurnBarrierWithCutOutputRejectsThePlan() async throws {

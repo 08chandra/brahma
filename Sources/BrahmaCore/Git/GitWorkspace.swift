@@ -545,7 +545,7 @@ public struct GitWorkspace: Sendable {
             if let file = before.files[indexKey] { Self.restore(file, at: gitDir.appending(path: indexKey)) }
         }
 
-        // Every ref (loose or packed) but other items' branches.
+        // Every ref (loose or packed) but the engine-managed ones.
         do {
             let now = try refList(git, key: key)
             for (ref, value) in before.refs.sorted(by: { $0.key < $1.key }) where now[ref] != value {
@@ -604,8 +604,13 @@ public struct GitWorkspace: Sendable {
         return ignored
     }
 
-    /// Every ref but the branches of other items, which their leaseholders and the engine move while this turn runs (a
-    /// plan turn that moved one is not caught; it cannot touch this checkout or `main`).
+    /// Every ref but the engine-managed ones, which the engine and other leaseholders move while this turn runs and which
+    /// the barrier must never put back: `main` (protected by the exact main guard, `checkMain`), `refs/brahma/*` (the
+    /// engine's quarantine refs) and other items' branches. This item's branch, tags and everything else are covered.
+    static func engineManaged(_ ref: String, ownBranch: String) -> Bool {
+        ref == mainRef || ref.hasPrefix("refs/brahma/") || (ref.hasPrefix("refs/heads/item/") && ref != ownBranch)
+    }
+
     private func refList(_ git: GitCommand, key: String) throws -> [String: RefValue] {
         let own = branchRef(key: key)
         let data = try barrierRun(git, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"])
@@ -617,7 +622,7 @@ public struct GitWorkspace: Sendable {
             }
             try Self.validRef(parts[0])
             if parts[2].isEmpty { try Self.validCommit(parts[1]) } else { try Self.validRef(parts[2]) }
-            if parts[0].hasPrefix("refs/heads/item/"), parts[0] != own { continue }
+            if Self.engineManaged(parts[0], ownBranch: own) { continue }
             refs[parts[0]] = RefValue(oid: parts[1], symref: parts[2])
         }
         return refs
