@@ -310,6 +310,7 @@ extension Store {
                 item.blockedReason = nil
                 item.blockedSinceActive = nil
             }
+            if item.status == .done { item.doneAt = nil }
             // Task 7: inProgress → ready also releases the item's lease.
             item.status = to
             if to == .inProgress { item.everStarted = true }
@@ -484,6 +485,7 @@ extension Store {
         guard from != to else { return item }
         item.status = to
         if from == .blocked { item.blockedReason = nil; item.blockedSinceActive = nil }
+        if from == .done { item.doneAt = nil }
         if to == .inProgress { item.everStarted = true }
         if to == .done { item.doneAt = now }
         item.updatedAt = now
@@ -573,17 +575,45 @@ extension Store {
         return event
     }
 
-    /// Undelivered notices, oldest first.
+    /// What one turn takes from an agent's notices: up to `limit` to show, actionable ones first, and the rest of the
+    /// FYIs collapsed to a count. Everything in `deliveredIds` is marked delivered when the turn succeeds.
+    public struct NoticeBatch: Equatable, Sendable {
+        public var shown: [PendingNotice]
+        /// FYI notices past the cap, delivered as a count only.
+        public var collapsedIds: [Int64]
+        public var deliveredIds: [Int64] { shown.compactMap(\.notice.id) + collapsedIds }
+    }
+
+    /// Undelivered notices to show, due waking ones first (oldest first), then the rest oldest first, at most `limit`.
+    /// A waking notice that is not yet due counts as an FYI here. Actionable notices beyond `limit` stay pending.
     public func pendingNotices(agentId: String, limit: Int = 30) throws -> [PendingNotice] {
+        try noticeBatch(agentId: agentId, limit: limit, collapseOverflow: false).shown
+    }
+
+    public func noticeBatch(agentId: String, limit: Int = 30) throws -> NoticeBatch {
+        try noticeBatch(agentId: agentId, limit: limit, collapseOverflow: true)
+    }
+
+    private func noticeBatch(agentId: String, limit: Int, collapseOverflow: Bool) throws -> NoticeBatch {
         try writer.read { db in
-            let notices = try WorkNotice.filter(Column("agentId") == agentId && Column("deliveredTurnId") == nil)
-                .order(Column("id")).limit(limit).fetchAll(db)
-            return try notices.compactMap { n in
+            guard let agent = try Agent.fetchOne(db, key: agentId) else { return NoticeBatch(shown: [], collapsedIds: []) }
+            let active = try Store.activeNow(db: db, companyId: agent.companyId)
+            let all = try WorkNotice.filter(Column("agentId") == agentId && Column("deliveredTurnId") == nil)
+                .order(Column("id")).fetchAll(db)
+            let due = all.filter { $0.wakes && ($0.wakeAfterActive ?? 0) <= active }
+            let dueIds = Set(due.compactMap(\.id))
+            let fyi = all.filter { !dueIds.contains($0.id ?? -1) }
+            let actionable = Array(due.prefix(limit))
+            let room = max(limit - actionable.count, 0)
+            let shownFYI = Array(fyi.prefix(room))
+            let collapsed = collapseOverflow && actionable.count < limit ? fyi.dropFirst(room).compactMap(\.id) : []
+            let shown = try (actionable + shownFYI).compactMap { n -> PendingNotice? in
                 guard let event = try WorkItemEvent.fetchOne(db, key: n.eventId),
                       let key = try String.fetchOne(db, sql: "SELECT key FROM workItem WHERE id = ?", arguments: [event.itemId])
                 else { return nil }
                 return PendingNotice(notice: n, event: event, itemKey: key)
             }
+            return NoticeBatch(shown: shown, collapsedIds: Array(collapsed))
         }
     }
 

@@ -665,8 +665,9 @@ import GRDB
         #expect(try w.agent(eng).state == .blocked, "the failed turn backs off")
         #expect(try w.store.pendingNotices(agentId: eng.id).count == 2, "a failed turn delivers nothing")
         let first = try #require(w.fake.requests.first?.prompt)
-        #expect(first.hasPrefix("Work updates (2):\n- ACME-1 created by @owner: created task \"Do it\", assigned to @eng"))
-        #expect(first.contains("\n- ACME-1 changesRequested by @system: tighten the parser"))
+        // The actionable notice comes first, then the FYI.
+        #expect(first.hasPrefix("Work updates (2):\n- ACME-1 changesRequested by @system: tighten the parser"))
+        #expect(first.contains("\n- ACME-1 created by @owner: created task \"Do it\", assigned to @eng"))
         #expect(!first.contains("nothing new"))
         w.clock.advance(30)
         try await w.cycle()

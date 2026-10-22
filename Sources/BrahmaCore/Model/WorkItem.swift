@@ -73,8 +73,10 @@ public struct CheckSpec: Codable, Equatable, Sendable {
         if command.count > Self.maxCommandLength {
             throw WorkError.invalid("the check command is longer than \(Self.maxCommandLength) characters")
         }
-        guard (1...min(maxTimeout, 3600)).contains(timeoutSeconds) else {
-            throw WorkError.invalid("the check timeout must be between 1 and \(min(maxTimeout, 3600)) seconds")
+        guard maxTimeout >= 1 else { throw WorkError.invalid("the check's maximum timeout must be at least 1 second") }
+        let ceiling = min(maxTimeout, 3600)
+        guard (1...ceiling).contains(timeoutSeconds) else {
+            throw WorkError.invalid("the check timeout must be between 1 and \(ceiling) seconds")
         }
         if paths.count > Self.maxPaths { throw WorkError.invalid("a check lists at most \(Self.maxPaths) paths") }
         for p in paths {

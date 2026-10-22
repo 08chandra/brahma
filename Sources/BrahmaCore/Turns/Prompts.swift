@@ -64,9 +64,9 @@ public enum WorkNoticeDigest {
     public static let maxNotices = 30
     static let maxText = 300
 
-    public static func render(_ notices: [PendingNotice], handles: [String: String]) -> String? {
-        guard !notices.isEmpty else { return nil }
-        var out = "Work updates (\(notices.count)):"
+    public static func render(_ notices: [PendingNotice], collapsed: Int = 0, handles: [String: String]) -> String? {
+        guard !notices.isEmpty || collapsed > 0 else { return nil }
+        var out = "Work updates (\(notices.count + collapsed)):"
         for n in notices.prefix(maxNotices) {
             let actor: String
             switch n.event.actorId {
@@ -77,6 +77,7 @@ public enum WorkNoticeDigest {
             let text = flat.count > maxText ? String(flat.prefix(maxText)) + "…" : flat
             out += "\n- \(n.itemKey) \(n.event.kind.rawValue) by @\(actor): \(text)"
         }
+        if collapsed > 0 { out += "\n- … and \(collapsed) more (use list_work)" }
         return out
     }
 }

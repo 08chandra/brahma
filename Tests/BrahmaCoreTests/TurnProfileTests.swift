@@ -98,6 +98,7 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
     @Test func taskToolIsDisallowed() {
         #expect(ClaudeCommand.disallowedTools.contains("Task"))
         #expect(ClaudeCommand.disallowedTools.contains("Agent"))
+        #expect(ClaudeCommand.disallowedTools.contains("Workflow"))
         let args = ClaudeCommand.arguments(for: request(started: false))
         let i = args.firstIndex(of: "--disallowed-tools")!
         #expect(args[i + 1].split(separator: ",").contains("Task"))

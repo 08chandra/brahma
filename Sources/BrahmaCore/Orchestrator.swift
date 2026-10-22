@@ -236,6 +236,7 @@ public actor Orchestrator {
         var items: [(InboxItem, Message, Channel)] = []
         var quietIds: [Int64] = []
         var noticeIds: [Int64] = []
+        var collapsedNotices = 0
         var result: TurnResult?
         var lastInfo: RateLimitInfo?
         var failure: String?
@@ -247,8 +248,10 @@ public actor Orchestrator {
             quietIds = quiet.map(\.id)
             let team = try store.agents(companyId: company.id)
             let handles = Dictionary(uniqueKeysWithValues: team.map { ($0.id, $0.name) })
-            let notices = try store.pendingNotices(agentId: agent.id, limit: WorkNoticeDigest.maxNotices)
-            noticeIds = notices.compactMap(\.notice.id)
+            let batch = try store.noticeBatch(agentId: agent.id, limit: WorkNoticeDigest.maxNotices)
+            let notices = batch.shown
+            collapsedNotices = batch.collapsedIds.count
+            noticeIds = batch.deliveredIds
             // `auto` resolves per turn from the role, the company's usage mode and the kind of turn (Tasks 10 and 14 set the context).
             var sent = agent
             sent.model = ModelPolicy.resolve(
@@ -258,7 +261,7 @@ public actor Orchestrator {
             let request = TurnRequest(
                 agent: sent, company: company,
                 prompt: Self.prompt(agent: agent, company: company, items: items, handles: handles,
-                                    unread: Store.channelCounts(quiet), notices: notices),
+                                    unread: Store.channelCounts(quiet), notices: notices, collapsedNotices: collapsedNotices),
                 appendSystemPrompt: RolePrompt.render(agent: agent, company: company),
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken),
                 workingDirectory: company.workspacePath, profile: profile,
@@ -343,8 +346,8 @@ public actor Orchestrator {
 
     /// The inbox digest, then the work updates. With only work updates there is no "nothing new" line.
     static func prompt(agent: Agent, company: Company, items: [(InboxItem, Message, Channel)], handles: [String: String],
-                       unread: [(channel: String, count: Int)], notices: [PendingNotice]) -> String {
-        let work = WorkNoticeDigest.render(notices, handles: handles)
+                       unread: [(channel: String, count: Int)], notices: [PendingNotice], collapsedNotices: Int = 0) -> String {
+        let work = WorkNoticeDigest.render(notices, collapsed: collapsedNotices, handles: handles)
         if items.isEmpty, unread.isEmpty, let work { return work }
         let inbox = InboxDigest.render(agent: agent, company: company, items: items, handles: handles, unread: unread)
         return work.map { inbox + "\n\n" + $0 } ?? inbox

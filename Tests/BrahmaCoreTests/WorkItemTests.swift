@@ -130,7 +130,8 @@ import GRDB
         // A review request is actionable for the reviewer only.
         try w.record(i, .verificationPassed)
         #expect(try w.state(w.rev) == .ready); #expect(try w.state(w.eng) == .sleeping); #expect(try w.state(w.mgr) == .sleeping)
-        #expect(try w.notices(w.rev).last?.notice.wakes == true); #expect(try w.notices(w.eng).last?.notice.wakes == false)
+        #expect(try w.notices(w.rev).first { $0.event.kind == .verificationPassed }?.notice.wakes == true)
+        #expect(try w.notices(w.eng).last?.notice.wakes == false)
         #expect(try w.notices(w.mgr).last?.notice.wakes == false, "the author is told, not woken")
         // Returned work wakes the assignee; the actor is never notified of their own event.
         try w.record(i, .changesRequested, actor: w.rev.id)
@@ -140,7 +141,7 @@ import GRDB
         var paused = try w.agent(w.eng2); paused.paused = true; try w.store.save(paused)
         let j = try w.item("j", owner: w.eng2)
         try w.record(j, .mergeConflict)
-        #expect(try w.state(w.eng2) == .sleeping); #expect(try w.notices(w.eng2).last?.notice.wakes == true)
+        #expect(try w.state(w.eng2) == .sleeping); #expect(try w.notices(w.eng2).first { $0.event.kind == .mergeConflict }?.notice.wakes == true)
         _ = try w.store.transition(agentId: w.rev.id, to: .killed)
         let before = try w.notices(w.rev).count
         try w.record(i, .verificationPassed)
@@ -242,7 +243,7 @@ import GRDB
         #expect(done.status == .done); #expect(done.doneAt == w.now + 5)
         #expect(try w.state(w.eng) == .ready, "blocked on the item: ready again")
         #expect(try w.state(w.rev) == .blocked, "blocked on something else: unchanged")
-        let wake = try #require(try w.notices(w.eng).last)
+        let wake = try #require(try w.notices(w.eng).first { $0.event.kind == .dependencyDone })
         #expect(wake.event.kind == .dependencyDone); #expect(wake.notice.wakes); #expect(wake.event.text == "ACME-1 is done")
         // The assignee of the dependent item hears that its dependency finished.
         let events = try w.store.itemEvents(itemId: waiter.id).filter { $0.kind == .dependencyDone }
@@ -471,6 +472,45 @@ import GRDB
         try w.store.markNoticesDelivered(ids: first.compactMap(\.notice.id), turnId: "t1")
         #expect(try w.notices(w.eng).count == 11)
         #expect(WorkNoticeDigest.render([], handles: [:]) == nil)
+    }
+
+    @Test func actionableNoticesAreNotStarvedByFYIs() throws {
+        let w = try W()
+        let i = try w.item(owner: w.eng)
+        for n in 0..<35 { try w.record(i, .edited, text: "fyi \(n)") }
+        try w.record(i, .changesRequested, text: "do this now")
+        // 36 FYIs (incl. created) before one waking notice: the waking one is shown first.
+        let batch = try w.store.noticeBatch(agentId: w.eng.id, limit: 30)
+        #expect(batch.shown.count == 30); #expect(batch.shown.first?.event.text == "do this now")
+        #expect(batch.shown[1].event.kind == .created, "FYIs follow, oldest first")
+        #expect(batch.collapsedIds.count == 7, "37 notices: 30 shown, 7 collapsed")
+        #expect(batch.deliveredIds.count == 37)
+        #expect(try w.store.pendingNotices(agentId: w.eng.id).first?.event.text == "do this now")
+        let digest = try #require(WorkNoticeDigest.render(batch.shown, collapsed: batch.collapsedIds.count, handles: [:]))
+        #expect(digest.hasPrefix("Work updates (37):\n- ACME-1 changesRequested by @system: do this now"))
+        #expect(digest.hasSuffix("\n- … and 7 more (use list_work)"))
+        // Debounced notices that are not due yet are FYIs for ordering; due waking ones beyond the cap stay pending.
+        let few = try w.store.noticeBatch(agentId: w.eng.id, limit: 1)
+        #expect(few.shown.map(\.event.text) == ["do this now"]); #expect(few.collapsedIds.isEmpty, "a full actionable batch collapses nothing")
+        try w.store.markNoticesDelivered(ids: batch.deliveredIds, turnId: "t")
+        #expect(try w.store.noticeBatch(agentId: w.eng.id).shown.isEmpty)
+    }
+
+    @Test func guardsAndReopen() throws {
+        // A check whose own ceiling is below 1 is invalid, not a crash.
+        #expect(throws: WorkError.self) { try CheckSpec(command: "x", timeoutSeconds: 1, maxTimeout: 0).validate() }
+        #expect(throws: WorkError.self) { try CheckSpec(command: "x", timeoutSeconds: 5, maxTimeout: -3).validate() }
+        let w = try W()
+        let i = try w.item(owner: w.eng)
+        let done = try w.store.writer.write { db in try w.store.engineSetStatus(db: db, itemId: i.id, to: .done, now: w.now) }
+        #expect(done.doneAt == w.now)
+        let reopened = try w.store.updateWorkItem(id: i.id, by: .agent(w.mgr.id), patch: WorkItemPatch(status: .ready))
+        #expect(reopened.status == .ready); #expect(reopened.doneAt == nil)
+        #expect(try w.store.workItem(id: i.id)?.doneAt == nil)
+        // The engine reopening clears it too.
+        _ = try w.store.writer.write { db in try w.store.engineSetStatus(db: db, itemId: i.id, to: .done, now: w.now) }
+        let again = try w.store.writer.write { db in try w.store.engineSetStatus(db: db, itemId: i.id, to: .ready, now: w.now) }
+        #expect(again.doneAt == nil)
     }
 
     @Test func noticeTextCannotForgeDigestLines() throws {

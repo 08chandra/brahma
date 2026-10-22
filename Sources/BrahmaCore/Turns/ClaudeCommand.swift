@@ -36,7 +36,7 @@ public enum ClaudeCommand {
     public static let disallowedTools: [String] = [
         "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "Monitor", "RemoteTrigger",
         "PushNotification", "SendMessage", "ListAgents", "EnterWorktree", "ExitWorktree",
-        "DesignSync", "ReportFindings", "Task", "Agent", "TaskStop",
+        "DesignSync", "ReportFindings", "Task", "Agent", "TaskStop", "Workflow",
     ]
 
     /// Arguments only; the prompt is sent on stdin, never argv.

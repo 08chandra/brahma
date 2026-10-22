@@ -119,5 +119,6 @@ struct LiveSmokeTests {
         #expect(!list.isEmpty)
         #expect(!list.contains("Task"), "tools: \(list)")
         #expect(!list.contains("Agent"), "tools: \(list)")
+        #expect(!list.contains("Workflow"), "tools: \(list)")
     }
 }
