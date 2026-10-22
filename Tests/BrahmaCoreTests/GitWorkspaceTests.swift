@@ -664,6 +664,83 @@ import Foundation
         #expect(error.reason.contains("restore hooks/post-commit"))
     }
 
+    // MARK: The item branch is never a symbolic ref
+
+    @Test func itemBranchSymrefToMainNeverMovesMain() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let main = try #require(try ws.head(of: GitWorkspace.mainRef))
+        try f.write("b.txt", "two", in: wt)
+        let first = try #require(try ws.commitAll(in: wt, message: "first"))
+        // Another agent makes this item's branch a symbolic ref to main.
+        try f.git(["symbolic-ref", "refs/heads/item/K-1", GitWorkspace.mainRef])
+        try f.write("c.txt", "three", in: wt)
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "evil") }
+        #expect(try ws.head(of: GitWorkspace.mainRef) == main, "the commit did not land on main")
+        #expect(throws: GitError.self) { try ws.resetHard(in: wt, to: first) }
+        #expect(try ws.head(of: GitWorkspace.mainRef) == main, "the reset did not move main")
+        #expect(log.all.count == 2)
+        #expect(log.all.allSatisfy { $0.contains("refs/heads/item/K-1 is a symbolic ref") })
+        // Put back by the owner: work goes on, on the item branch.
+        try f.git(["update-ref", "--no-deref", "refs/heads/item/K-1", first])
+        #expect(try ws.commitAll(in: wt, message: "after") != nil)
+        #expect(try ws.head(of: GitWorkspace.mainRef) == main)
+    }
+
+    @Test func itemBranchTurnedSymbolicMidOperationLeavesMainAlone() throws {
+        for reset in [false, true] {
+            let f = try GitFixture(files: ["a.txt": "one"])
+            var (ws, _) = watched(f)
+            let wt = try ws.addWorktree(key: "K-1")
+            let main = try #require(try ws.head(of: GitWorkspace.mainRef))
+            // After the engine's check: the item branch (still at main's commit) becomes a symbolic ref to main.
+            ws.testHook = { stage in if stage == "checked" { _ = try? f.git(["symbolic-ref", "refs/heads/item/K-1", GitWorkspace.mainRef]) } }
+            if reset {
+                // The reset reads the ref after the flip: refused, nothing moved.
+                let other = try f.git(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "elsewhere"])
+                #expect(throws: GitError.self) { try ws.resetHard(in: wt, to: other) }
+            } else {
+                // The commit read the tip before the flip: the CAS overwrites the symbolic ref instead of following it.
+                try f.write("b.txt", "two", in: wt)
+                let sha = try ws.commitAll(in: wt, message: "work")
+                #expect(try f.git(["symbolic-ref", "-q", "refs/heads/item/K-1"], allowFailure: true) == "", "the item ref is direct again")
+                #expect(try f.git(["rev-parse", "refs/heads/item/K-1"]) == sha)
+            }
+            #expect(try ws.head(of: GitWorkspace.mainRef) == main, "reset: \(reset)")
+        }
+    }
+
+    @Test func repositoryDirectoryLinkedMidOperationIsReportedAfterwards() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        // After the check: `.git/worktrees` becomes a link to a copy (git still finds everything through it).
+        let worktrees = f.root.appending(path: ".git/worktrees")
+        let moved = f.root.appending(path: ".git/moved-worktrees")
+        ws.testHook = { stage in
+            guard stage == "checked" else { return }
+            try? FileManager.default.moveItem(at: worktrees, to: moved)
+            try? FileManager.default.createSymbolicLink(at: worktrees, withDestinationURL: moved)
+        }
+        try f.write("b.txt", "two", in: wt)
+        let error = try #require(throws: GitError.self) { try ws.commitAll(in: wt, message: "work") }
+        #expect("\(error)".contains("is not a real directory"))
+        #expect(log.all.count == 1 && log.all[0].contains(".git/worktrees is not a real directory"))
+    }
+
+    @Test func planBarrierTakesALargeIndex() throws {
+        let (f, wt) = try barrierFixture()
+        // Long paths make an index past the 1 MB cap of other repository files with few files.
+        let dir = (0..<3).map { "d\($0)" + String(repeating: "x", count: 230) }.joined(separator: "/")
+        for i in 0..<1600 { try f.write("\(dir)/f\(i)", "x", in: wt) }
+        _ = try f.ws.commitAll(in: wt, message: "many")
+        let index = f.root.appending(path: ".git/worktrees/ACME-1/index")
+        #expect((try FileManager.default.attributesOfItem(atPath: index.path)[.size] as? Int ?? 0) > GitWorkspace.repoFileLimit)
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty)
+    }
+
     // MARK: Repository filters, drivers and replace objects
 
     final class Refusals: @unchecked Sendable {

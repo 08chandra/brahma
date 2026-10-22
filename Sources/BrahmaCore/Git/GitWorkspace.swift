@@ -450,7 +450,7 @@ public struct GitWorkspace: Sendable {
             let detail = problems.joined(separator: "; ")
             onWorktreeTamper?(key, detail)
             throw GitError.failed(command: "-C \(key)", status: -1,
-                                  stderr: "the worktree of \(key) was repointed (\(detail)); it was restored and nothing was run in it")
+                                  stderr: "the worktree of \(key) was repointed (\(detail)); what the engine records was put back and nothing was run in it")
         }
         return (GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir, onRefused: onUnsafeRepository), key)
     }
@@ -461,13 +461,36 @@ public struct GitWorkspace: Sendable {
     }
 
     /// After an operation that was started on a checked worktree: if its links were rewritten meanwhile, restore them and
-    /// report (the operation itself never used `HEAD`, so it landed on the item's branch).
-    private func verifyAfter(key: String) {
-        guard Self.isRealDirectory(adminDir(key: key)) else { return }
+    /// report (the operation itself never used `HEAD` and never followed a symbolic item ref, so it landed on the item's
+    /// branch). A repository directory that became a link is reported and fails the operation (there is nothing to restore).
+    private func verifyAfter(key: String) throws {
+        for (url, name) in [(gitDir, ".git"), (gitDir.appending(path: "worktrees"), ".git/worktrees"), (adminDir(key: key), ".git/worktrees/\(key)")]
+        where !Self.isRealDirectory(url) {
+            let detail = "\(name) is not a real directory"
+            onWorktreeTamper?(key, detail)
+            throw GitError.failed(command: "-C \(key)", status: -1, stderr: "the worktree of \(key) was repointed during the operation (\(detail))")
+        }
         let problems = linkProblems(key: key)
         guard !problems.isEmpty else { return }
         heal(key: key)
         onWorktreeTamper?(key, problems.joined(separator: "; "))
+    }
+
+    /// Why `refs/heads/item/<KEY>` is not a plain ref, or nil. A symbolic item ref (`git symbolic-ref refs/heads/item/K
+    /// refs/heads/main`) would make every update of the item branch move its target. Packed refs are never symbolic.
+    private func symbolicItemRef(key: String) -> String? {
+        let ref = branchRef(key: key)
+        let url = gitDir.appending(path: ref)
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { return nil }
+        switch st.st_mode & S_IFMT {
+        case S_IFLNK: return "\(ref) is a symbolic ref (a link)"
+        case S_IFREG:
+            guard let text = Self.regularText(url), text.hasPrefix("ref:") else { return nil }
+            let target = String(text.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
+            return "\(ref) is a symbolic ref to \(Self.shown(target))"
+        default: return "\(ref) is not a ref file"
+        }
     }
 
     /// Test seam: called with a stage name between the worktree check and the operation that follows it.
@@ -497,6 +520,7 @@ public struct GitWorkspace: Sendable {
         if gitdir.map({ !Self.forms(tree).map { "\($0)/.git" }.contains($0) }) ?? true { problems.append("gitdir was changed") }
         let link = Self.regularText(tree.appending(path: ".git"))?.trimmingCharacters(in: .newlines)
         if link.map({ !Self.forms(admin).map { "gitdir: \($0)" }.contains($0) }) ?? true { problems.append(".git was changed") }
+        if let symbolic = symbolicItemRef(key: key) { problems.append(symbolic) }
         return problems
     }
 
@@ -748,7 +772,7 @@ public struct GitWorkspace: Sendable {
             return try git.run(["rev-parse", "HEAD"]).text
         }
         let ref = branchRef(key: key)
-        guard let tip = try head(of: ref) else {
+        guard let tip = try ownTip(git, ref) else {
             throw GitError.failed(command: "commit \(key)", status: -1, stderr: "\(ref) does not exist")
         }
         testHook?("checked")
@@ -758,12 +782,13 @@ public struct GitWorkspace: Sendable {
         try private_.run(["read-tree", tip])
         try private_.run(["add", "-A"])
         let tree = try private_.run(["write-tree"]).text
-        if tree == (try git.run(["rev-parse", "--verify", "\(tip)^{tree}"]).text) { verifyAfter(key: key); return nil }
+        if tree == (try git.run(["rev-parse", "--verify", "\(tip)^{tree}"]).text) { try verifyAfter(key: key); return nil }
         let commit = try git.run(["commit-tree", tree, "-p", tip, "-m", message]).text
-        try git.run(["update-ref", "-m", message, ref, commit, tip])
+        // `--no-deref`: should the item ref have become symbolic meanwhile, it is overwritten, never followed to its target.
+        try git.run(["update-ref", "--no-deref", "-m", message, ref, commit, tip])
         // The worktree's own index follows the branch, so the checkout is clean afterwards.
         try? git.run(["read-tree", commit])
-        verifyAfter(key: key)
+        try verifyAfter(key: key)
         return commit
     }
 
@@ -772,6 +797,23 @@ public struct GitWorkspace: Sendable {
         let (git, key) = try resolve(dir)
         guard let key else { return try git.run(["rev-parse", "HEAD"]).text }
         return try git.run(["rev-parse", "--verify", "\(branchRef(key: key))^{commit}"]).text
+    }
+
+    /// The commit the item ref itself holds, read without following it: a ref that is symbolic now is refused (it was a
+    /// plain ref at the worktree check, so it changed meanwhile), and nil when there is no such ref.
+    private func ownTip(_ git: GitCommand, _ ref: String) throws -> String? {
+        let out = try git.run(["for-each-ref", "--format=%(refname)%00%(symref)%00%(objectname)%00%(objecttype)", ref])
+        for line in out.text.split(separator: "\n") {
+            let parts = line.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 4, parts[0] == ref else { continue }
+            guard parts[1].isEmpty else {
+                throw GitError.failed(command: "update-ref \(ref)", status: -1, stderr: "\(ref) is a symbolic ref to \(Self.shown(parts[1]))")
+            }
+            guard parts[3] == "commit" else { throw GitError.failed(command: "update-ref \(ref)", status: -1, stderr: "\(ref) is not a commit") }
+            try Self.validCommit(parts[2])
+            return parts[2]
+        }
+        return nil
     }
 
     /// Puts the checkout back on `commit` and removes everything untracked (the write barrier of a plan turn). In an item
@@ -787,11 +829,13 @@ public struct GitWorkspace: Sendable {
         }
         let ref = branchRef(key: key)
         testHook?("checked")
-        let current = try git.run(["rev-parse", "--verify", "\(ref)^{commit}"]).text
+        guard let current = try ownTip(git, ref) else {
+            throw GitError.failed(command: "reset \(key)", status: -1, stderr: "\(ref) does not exist")
+        }
         try git.run(["read-tree", "--reset", "-u", commit])
-        if current != commit { try git.run(["update-ref", ref, commit, current]) }
+        if current != commit { try git.run(["update-ref", "--no-deref", ref, commit, current]) }
         try git.run(["clean", "-fdq"])
-        verifyAfter(key: key)
+        try verifyAfter(key: key)
     }
 
     // MARK: Plan-turn write barrier
@@ -1016,6 +1060,9 @@ public struct GitWorkspace: Sendable {
     /// never read; a directory that would take a root past `repoEntryLimit` entries is named in `overflow` and never read.
     struct RepoCapture { var files: [String: RepoFile] = [:]; var oversize: [String] = []; var overflow: [String] = []; var seen = 0 }
     static let repoFileLimit = 1 << 20
+    /// The worktree's own index (compared by what `ls-files` says, but snapshotted to be put back) has its own cap: a
+    /// repository of ten thousand files passes 1 MB.
+    static let indexFileLimit = 256 << 20
     static let repoEntryLimit = 500
 
     private func repoFiles(key: String) -> RepoCapture {
@@ -1053,7 +1100,8 @@ public struct GitWorkspace: Sendable {
         capture.seen += 1
         switch st.st_mode & S_IFMT {
         case S_IFREG:
-            if st.st_size > repoFileLimit { capture.oversize.append(rel); return }
+            let limit = rel.hasPrefix("worktrees/") && rel.hasSuffix("/index") && rel.split(separator: "/").count == 3 ? indexFileLimit : repoFileLimit
+            if st.st_size > limit { capture.oversize.append(rel); return }
             capture.files[rel] = RepoFile(data: FileManager.default.contents(atPath: url.path) ?? Data(), mode: mode, link: nil)
         case S_IFLNK: capture.files[rel] = RepoFile(data: nil, mode: mode, link: (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) ?? "")
         default: capture.files[rel] = RepoFile(data: nil, mode: mode, link: "special")
