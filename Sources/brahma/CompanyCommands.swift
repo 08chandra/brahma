@@ -5,7 +5,7 @@ import BrahmaCore
 struct CompanyGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "company", abstract: "Create and manage companies.",
-        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self])
+        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self])
 
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String
@@ -28,7 +28,10 @@ struct CompanyGroup: ParsableCommand {
                 if agents > 50 { print("Note: org sizes over 50 are experimental.") }
                 let plan = try OrgGenerator.generate(goal: goal, count: agents, pack: industry)
                 full = plan
-                staffed = OrgGenerator.staff(plan: plan, pack: industry, readyWidth: 0, seatBudget: 8)
+                // The seat budget follows the plan tier; a dry run on a fresh home uses the default tier.
+                let seats = FileManager.default.fileExists(atPath: paths.database.path)
+                    ? try openStore().0.seatBudget() : PlanTier.max5x.seatBudget
+                staffed = OrgGenerator.staff(plan: plan, pack: industry, readyWidth: 0, seatBudget: seats)
             }
             if dryRun {
                 guard let full, let staffed else { print("(empty company)"); return }
@@ -81,6 +84,29 @@ struct CompanyGroup: ParsableCommand {
             try requireOwnerShell()
             guard weight >= 1 else { throw fail("weight must be at least 1") }
             try update(company) { $0.priorityWeight = weight }
+        }
+    }
+
+    struct Reserve: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Override the share of the weekly allowance kept for you, for one company (advanced; see 'brahma settings share').")
+        @Argument var company: String
+        @Argument(help: "0.0 to 0.9, or 'default' to follow the owner-wide share.") var reserve: String
+
+        func run() throws {
+            try requireOwnerShell()
+            let value: Double?
+            if reserve.lowercased() == "default" {
+                value = nil
+            } else if let v = Double(reserve), (0.0...0.9).contains(v) {
+                value = v
+            } else {
+                throw fail("reserve must be between 0.0 and 0.9, or 'default'")
+            }
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            try store.setOwnerReserve(companyId: c.id, value)
+            print(safe("\(c.name): reserve \(value.map { String(format: "%.2f", $0) } ?? "default (\(Int(((1 - store.weeklyShare()) * 100).rounded()))%)")"))
         }
     }
 

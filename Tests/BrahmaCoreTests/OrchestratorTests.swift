@@ -13,6 +13,7 @@ private struct World {
 
     init(store: Store? = nil, config: SchedulerConfig = World.config()) throws {
         self.store = try store ?? Store.inMemory()
+        try self.store.setPlanTier(.max20x)   // Plan 1 tests assume the 2/6/16 mode caps
         router = MessageRouter(store: self.store)
         let root = try tempDir()
         paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
@@ -253,7 +254,7 @@ private struct World {
     @Test func errorResultIsFailure() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         w.fake.script("ceo", .init(events: [.result(TurnResult(isError: true, subtype: "error_during_execution",
-                                                                 text: "tool crashed", costUSD: nil, apiErrorStatus: 500,
+                                                                 text: "tool crashed", costUSD: nil, apiErrorStatus: 400,
                                                                  sessionId: ceo.sessionId))]))
         try w.dm(c, ceo)
         try await w.cycle()
@@ -432,7 +433,7 @@ private struct World {
         let a = try w.hire(low, "ceo"), b = try w.hire(bal, "ceo"), m = try w.hire(max, "ceo")
         let t = w.clock.now
         let warning = RateLimitInfo(status: "allowed_warning", resetsAt: t.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
-                                    isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.8, observedAt: t,
+                                    isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.4, observedAt: t,
                                     fiveHourResetsAt: t.addingTimeInterval(7200), sevenDayResetsAt: t.addingTimeInterval(3 * 86400))
         let router = w.router
         w.fake.script("ceo", .init(events: [

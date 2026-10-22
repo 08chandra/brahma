@@ -74,10 +74,11 @@ extension Store {
         }
     }
 
-    static func finishTurn(db: Database, id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, now: Date) throws -> Bool {
+    static func finishTurn(db: Database, id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, infra: Bool = false,
+                           now: Date) throws -> Bool {
         guard var turn = try Turn.fetchOne(db, key: id) else { throw StoreError.notFound }
         guard turn.outcome == .inProgress else { return false }
-        turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.endedAt = now
+        turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.infra = infra; turn.endedAt = now
         try turn.update(db)
         try db.execute(sql: "DELETE FROM turnCredential WHERE turnId = ?", arguments: [id])
         return true
@@ -85,13 +86,13 @@ extension Store {
 
     public func turnCount(agentId: String, since: Date) throws -> Int {
         try writer.read { db in
-            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since).fetchCount(db)
+            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false).fetchCount(db)
         }
     }
 
     public func oldestTurnStart(agentId: String, since: Date) throws -> Date? {
         try writer.read { db in
-            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since)
+            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false)
                 .order(Column("startedAt")).fetchOne(db)?.startedAt
         }
     }

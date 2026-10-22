@@ -19,4 +19,6 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var createdAt: Date
     public var packId: String = "software"
     public var packVersion: Int = 1
+    /// Share of the weekly allowance kept for the owner; nil means the owner-wide setting (`1 - weeklyShare`).
+    public var ownerReserve: Double? = nil
 }

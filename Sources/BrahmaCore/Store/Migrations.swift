@@ -162,6 +162,34 @@ enum Migrations {
             }
             try db.create(index: "turnCredential_hash", on: "turnCredential", columns: ["tokenHash"])
         }
+        m.registerMigration("v3-clock") { db in
+            try db.create(table: "companyActivity") { t in
+                t.primaryKey("companyId", .text).references("company", onDelete: .cascade)
+                t.column("activeSeconds", .double).notNull().defaults(to: 0)
+                t.column("lastAccruedAt", .datetime)
+            }
+            try db.create(table: "ownerSettings") { t in
+                t.column("id", .integer).primaryKey().check { $0 == 1 }
+                t.column("timeZone", .text).notNull()
+                t.column("planTier", .text).notNull().defaults(to: "max5x")
+                t.column("weeklyShare", .double).notNull().defaults(to: 0.7)
+                t.column("pctPerDollar", .double)
+                // Calibration baseline: the last weekly-utilization snapshot and the cost accumulated since.
+                t.column("calibUtil", .double)
+                t.column("calibResetsAt", .datetime)
+                t.column("calibCost", .double).notNull().defaults(to: 0)
+            }
+            try db.create(table: "engineHold") { t in
+                t.column("id", .integer).primaryKey().check { $0 == 1 }
+                t.column("reason", .text).notNull()
+                t.column("detail", .text).notNull()
+                t.column("since", .datetime).notNull()
+                t.column("nextProbeAt", .datetime)
+            }
+            try db.alter(table: "turn") { t in t.add(column: "infra", .boolean).notNull().defaults(to: false) }
+            try db.alter(table: "company") { t in t.add(column: "ownerReserve", .double) }
+            try db.alter(table: "agent") { t in t.add(column: "consecutiveInfraFailures", .integer).notNull().defaults(to: 0) }
+        }
         return m
     }
 }

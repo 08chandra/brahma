@@ -24,14 +24,22 @@ struct Status: ParsableCommand {
                 print(safe(parts.joined(separator: "  ")))
             }
         }
-        print(usageLine(try store.latestRateLimit()))
+        print(usageLine(try store.latestRateLimit(), store: store))
+        if let hold = try store.engineHold() {
+            print(safe("engine paused: \(hold.reason.rawValue) — \(hold.detail)"))
+        }
     }
 
-    func usageLine(_ info: RateLimitInfo?) -> String {
+    func usageLine(_ info: RateLimitInfo?, store: Store) -> String {
         guard let info else { return "usage: no data yet" }
         func pct(_ v: Double?) -> String { v.map { "\(Int(($0 * 100).rounded()))%" } ?? "n/a" }
         var line = "usage: 5h \(pct(info.fiveHourUtilization)) · 7d \(pct(info.sevenDayUtilization))"
         if let resets = info.resetsAt { line += " · resets \(clock(resets))" }
+        if let pace = UsageGate.pace(info, reserve: 1 - store.weeklyShare(), now: Date()) { line += " · 7D \(pace.text)" }
+        if let perDollar = (try? store.usageCalibration())?.pctPerDollar {
+            let today = perDollar * 100 * store.costToday(now: Date())
+            line += " · ≈\(String(format: today < 10 ? "%.1f" : "%.0f", today))% of week today"
+        }
         return line
     }
 }

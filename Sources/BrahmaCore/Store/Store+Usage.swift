@@ -23,7 +23,10 @@ extension Store {
             isUsingOverage: info.isUsingOverage, fiveHourUtilization: info.fiveHourUtilization,
             sevenDayUtilization: info.sevenDayUtilization, observedAt: info.observedAt,
             fiveHourResetsAt: info.fiveHourResetsAt, sevenDayResetsAt: info.sevenDayResetsAt)
-        try writer.write { db in try row.save(db) }
+        try writer.write { db in
+            try row.save(db)
+            try Store.calibrate(db, observing: info)
+        }
     }
 
     public func latestRateLimit() throws -> RateLimitInfo? {

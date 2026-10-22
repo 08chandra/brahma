@@ -14,6 +14,8 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var outcome: TurnOutcome
     public var summary: String?
     public var costUSD: Double?
+    /// True when the turn failed for infrastructure reasons (network, account); never counted against the agent.
+    public var infra: Bool = false
 }
 
 public enum ActivityKind: String, Codable, Sendable { case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error }

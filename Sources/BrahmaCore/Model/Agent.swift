@@ -31,6 +31,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var createdAt: Date
     /// Failed turns in a row; drives retry backoff. Reset by a successful turn.
     public var consecutiveFailures: Int = 0
+    /// Infrastructure failures in a row (not counted in `consecutiveFailures`); the 5th is recorded as an ordinary failure.
+    public var consecutiveInfraFailures: Int = 0
     /// Reporting line. Nil for the root, or when the manager was removed.
     public var managerId: String? = nil
     public var team: String? = nil

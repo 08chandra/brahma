@@ -15,20 +15,36 @@ public actor Orchestrator {
     let mcpExecutable: String
     let profile: PermissionProfile
     let clock: @Sendable () -> Date
+    let memory: any MemoryPressureSource
+    let connectivity: any ConnectivityProbe
+    let disk: any DiskSpace
+    let exec: Doctor.Exec
+    let claudePath: String
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
     /// Agent id → its turn task.
     private var tasks: [String: Task<Void, Never>] = [:]
+    /// Health work that must never block a tick (doctor re-probe, `claude --version`, HTTPS probe, disk checks).
+    var healthTasks: [String: Task<Void, Never>] = [:]
+    var health = HealthState()
+    private var lastPressure: MemoryPressure = .normal
+    /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
+    var infraCooldown: [String: Date] = [:]
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
 
     public init(store: Store, runner: any TurnRunning, paths: BrahmaPaths, config: SchedulerConfig = .init(),
                 mcpExecutable: String, profile: PermissionProfile = .workspace,
-                clock: @escaping @Sendable () -> Date = { .now }) {
+                clock: @escaping @Sendable () -> Date = { .now },
+                memory: any MemoryPressureSource = DispatchMemoryPressureSource(),
+                connectivity: any ConnectivityProbe = HTTPSProbe(), disk: any DiskSpace = SystemDiskSpace(),
+                exec: @escaping Doctor.Exec = Doctor.defaultExec, claudePath: String = "claude") {
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
         self.mcpExecutable = mcpExecutable; self.profile = profile; self.clock = clock
+        self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
+        self.claudePath = claudePath
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -40,7 +56,7 @@ public actor Orchestrator {
 
     public func waitUntilIdle(timeout: Duration) async throws {
         let deadline = ContinuousClock.now + timeout
-        while !tasks.isEmpty {
+        while !tasks.isEmpty || !healthTasks.isEmpty {
             guard ContinuousClock.now < deadline else { throw OrchestratorError.idleTimeout(running: runningCount()) }
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -52,7 +68,7 @@ public actor Orchestrator {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        let inFlight = Array(tasks.values)
+        let inFlight = Array(tasks.values) + Array(healthTasks.values)
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -68,6 +84,16 @@ public actor Orchestrator {
     }
 
     private func schedule(now: Date) throws {
+        // Active time first, so everything below sees the same clock; then health, which may start or end a hold.
+        try store.accrueActiveTime(now: now)
+        try healthTick(now: now)
+        let held = try store.engineHold() != nil
+        let pressure = memory.current
+        logPressure(pressure, now: now)
+        // The owner's plan tier and weekly share apply from the next tick after they are changed.
+        var cfg = config
+        cfg.planTier = store.planTier()
+        cfg.ownerReserve = 1 - store.weeklyShare()
         let companies = try store.companies()
 
         // 1. Timed blockers that have expired.
@@ -81,16 +107,41 @@ public actor Orchestrator {
             attempt { try store.transition(agentId: a.id, to: .ready, now: now) { $0.state == .blocked && $0.blocker == a.blocker } }
         }
 
-        // 2. Usage gate, per company mode.
+        // 2. How many live agents each agent is holding up.
+        let all = try store.agents()
+        var blocking: [String: Int] = [:]
+        for a in all where a.state != .killed {
+            if case .agent(let id)? = a.blocker { blocking[id, default: 0] += 1 }
+        }
+
+        // 3. Usage gate per company: the five-hour limits close a company to everyone; the weekly pace closes it
+        //    to everyone except agents that others are waiting on (the critical path).
         let info = try store.latestRateLimit()
         var decisions: [String: UsageDecision] = [:]
+        var paceClosed = Set<String>()
         for c in companies {
-            let decision = UsageGate.evaluate(info, mode: c.usageMode, now: now)
-            decisions[c.id] = decision
-            guard case .closed(let gateUntil) = decision else { continue }
+            let reserve = cfg.reserve(for: c)
+            let parts = UsageGate.evaluateParts(info, mode: c.usageMode, now: now, reserve: reserve)
+            let exempt: Bool
+            let gateUntil: Date
+            let why: String
+            switch (parts.fiveHour, parts.pace) {
+            case (.closed, _):
+                guard case .closed(let u) = parts.combined else { continue }
+                decisions[c.id] = parts.combined
+                exempt = false; gateUntil = u
+                why = "usage gate closed (\(c.usageMode.rawValue) mode)"
+            case (_, .closed(let u)):
+                paceClosed.insert(c.id)
+                exempt = true; gateUntil = u
+                let text = UsageGate.pace(info, reserve: reserve, now: now)?.text ?? "ahead"
+                why = "weekly pace closed (\(text), \(Int((reserve * 100).rounded()))% reserved)"
+            default:
+                continue
+            }
             let until = Self.usageUntil(gateUntil, now: now)
             var stopped = 0
-            for a in try store.agents(companyId: c.id, states: [.ready]) {
+            for a in try store.agents(companyId: c.id, states: [.ready]) where !(exempt && (blocking[a.id] ?? 0) > 0) {
                 attempt {
                     if try store.transition(agentId: a.id, to: .blocked, blocker: .usageLimit(until: until), now: now,
                                             if: { $0.state == .ready }) != nil { stopped += 1 }
@@ -100,15 +151,15 @@ public actor Orchestrator {
                 attempt {
                     try store.appendEvent(ActivityEvent(
                         companyId: c.id, agentId: nil, turnId: nil, kind: .usage,
-                        text: "usage gate closed (\(c.usageMode.rawValue) mode) until \(until.ISO8601Format()); \(stopped) agent(s) waiting",
+                        text: "\(why) until \(until.ISO8601Format()); \(stopped) agent(s) waiting",
                         createdAt: now))
                 }
             }
         }
 
-        // 3. Per-agent turn budget over the last hour.
+        // 4. Per-agent turn budget over the last hour (infrastructure failures don't count).
         let hourAgo = now.addingTimeInterval(-Self.hour)
-        for a in try store.agents(states: [.ready]) where try store.turnCount(agentId: a.id, since: hourAgo) >= config.turnBudgetPerHour {
+        for a in try store.agents(states: [.ready]) where try store.turnCount(agentId: a.id, since: hourAgo) >= cfg.turnBudgetPerHour {
             let oldest = try store.oldestTurnStart(agentId: a.id, since: hourAgo) ?? now
             attempt {
                 try store.transition(agentId: a.id, to: .blocked, blocker: .turnBudget(until: oldest.addingTimeInterval(Self.hour)),
@@ -116,22 +167,30 @@ public actor Orchestrator {
             }
         }
 
-        // 4. How many live agents each agent is holding up.
-        let all = try store.agents()
-        var blocking: [String: Int] = [:]
-        for a in all where a.state != .killed {
-            if case .agent(let id)? = a.blocker { blocking[id, default: 0] += 1 }
-        }
-
         // 5. Select and launch.
+        infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
-        let candidates = all.compactMap { a -> Candidate? in
-            guard a.state == .ready, !a.paused, tasks[a.id] == nil, let c = byId[a.companyId] else { return nil }
+        let ready = try store.agents(states: [.ready])
+        let candidates = ready.compactMap { a -> Candidate? in
+            guard !a.paused, tasks[a.id] == nil, infraCooldown[a.id] == nil, let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
-        let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: config,
-                                        usage: { decisions[$0.id] ?? .open })
+        let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
+                                        usage: { decisions[$0.id] ?? .open }, otherChildren: 0, pressure: pressure,
+                                        held: held, paceClosed: paceClosed)
         for agent in selected { launch(agent, now: now) }
+    }
+
+    private func logPressure(_ level: MemoryPressure, now: Date) {
+        guard level != lastPressure else { return }
+        lastPressure = level
+        let effect = level == .critical ? "paused" : level == .warning ? "limited" : "resumed"
+        for c in (try? store.companies()) ?? [] {
+            attempt {
+                try store.appendEvent(ActivityEvent(companyId: c.id, agentId: nil, turnId: nil, kind: .usage,
+                                                    text: "memory pressure \(level.rawValue): new turns \(effect)", createdAt: now))
+            }
+        }
     }
 
     private func launch(_ agent: Agent, now: Date) {
@@ -167,6 +226,7 @@ public actor Orchestrator {
         var result: TurnResult?
         var lastInfo: RateLimitInfo?
         var failure: String?
+        var runnerError: (any Error)?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             items = try store.pendingInbox(agentId: agent.id)
@@ -190,7 +250,11 @@ public actor Orchestrator {
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
             var sessionMarked = agent.sessionStarted
-            for try await event in runner.run(request) {
+            var iterator = runner.run(request).makeAsyncIterator()
+            while true {
+                let event: StreamEvent?
+                do { event = try await iterator.next() } catch { runnerError = error; throw error }
+                guard let event else { break }
                 switch event {
                 case .initialized:
                     if !sessionMarked { try store.markSessionStarted(agentId: agent.id); sessionMarked = true }
@@ -235,20 +299,26 @@ public actor Orchestrator {
             }
             end = .usageLimited(until: until, summary: result?.text)
         } else if let failure {
-            end = .failed(failure)
+            // Only the runner's launch error is classifiable; a timeout or "exited without a result" carries stderr.
+            var input: InfraInput?
+            if let runnerError, !(runnerError is TurnError) { input = InfraInput(text: failure, status: nil) }
+            end = .failed(failure, input)
         } else if let r = result {
-            end = .failed(r.text ?? r.subtype)
+            end = .failed(r.text ?? r.subtype, InfraInput(text: r.text ?? "", status: r.apiErrorStatus))
         } else {
             end = .failed("claude exited without a result")
         }
         var resetSession = false
-        if case .failed(let text) = end, agent.sessionStarted {
+        if case .failed(let text, _) = end, agent.sessionStarted {
             resetSession = Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n"))
         }
+        var infra = InfraClass.none
         attempt {
-            try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id) + quietIds,
-                              resetSession: resetSession, now: now)
+            infra = try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id) + quietIds,
+                                      resetSession: resetSession, now: now)
         }
+        let outcome = end.outcome
+        await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)
     }
 
     /// `claude --resume` of a session it never persisted fails the same way forever; spot that so the next turn
@@ -265,11 +335,11 @@ public actor Orchestrator {
         return now.addingTimeInterval(usageRetry)
     }
 
-    private nonisolated func attempt(_ body: () throws -> Void) {
+    nonisolated func attempt(_ body: () throws -> Void) {
         do { try body() } catch { log("\(error)") }
     }
 
-    private nonisolated func log(_ message: String) {
+    nonisolated func log(_ message: String) {
         FileHandle.standardError.write(Data("brahma orchestrator: \(message)\n".utf8))
     }
 }
@@ -277,7 +347,8 @@ public actor Orchestrator {
 enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.
     case succeeded(TurnResult, usageHold: Date?)
-    case failed(String)
+    /// The summary, and the error text the infrastructure classifier may read (an error `result` event or a launch error).
+    case failed(String, InfraInput? = nil)
     case usageLimited(until: Date, summary: String?)
     case interrupted
 
@@ -333,22 +404,44 @@ extension Store {
     /// turn ends either lands before the pending-inbox check or wakes the agent from its new state.
     /// `resetSession`: the resumed session no longer exists; give the agent a fresh session id so its next turn
     /// starts over with `--session-id` and the role prompt.
+    ///
+    /// A failure whose error text classifies as network/account is recorded `failed` with `infra = true`: the agent
+    /// goes back to `ready` with no backoff, `consecutiveFailures` is unchanged and the inbox stays undelivered.
+    /// The 5th consecutive infra failure of one agent is recorded as an ordinary failure. Returns the infra class
+    /// that was applied (`.none` for everything else).
+    @discardableResult
     func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], resetSession: Bool = false,
-                 now: Date) throws {
+                 now: Date) throws -> InfraClass {
         try writer.write { db in
             var summary: String?
             var cost: Double?
+            var infraClass = InfraClass.none
             switch end {
             case .succeeded(let r, _): summary = r.text; cost = r.costUSD
-            case .failed(let text): summary = text
+            case .failed(let text, let input):
+                summary = text
+                if let input { infraClass = EngineHealth.classify(text: input.text, apiErrorStatus: input.status) }
             case .usageLimited(_, let text): summary = text
             case .interrupted: summary = "interrupted"
             }
             if case .succeeded = end { try Store.markDelivered(db: db, itemIds: deliveredItemIds, turnId: turn.id) }
+            guard var agent = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
+            // The 5th infra failure in a row is an ordinary failure; any non-infra outcome resets the count.
+            if infraClass != .none {
+                if agent.consecutiveInfraFailures + 1 >= EngineHealth.maxConsecutiveInfra {
+                    infraClass = .none
+                    agent.consecutiveInfraFailures = 0
+                } else {
+                    agent.consecutiveInfraFailures += 1
+                }
+            } else {
+                agent.consecutiveInfraFailures = 0
+            }
             // False when crash recovery already closed this turn; recovery also moved the agent, so the state
             // guard below leaves it alone.
-            _ = try Store.finishTurn(db: db, id: turn.id, outcome: end.outcome, summary: summary, costUSD: cost, now: now)
-            guard var agent = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
+            let closed = try Store.finishTurn(db: db, id: turn.id, outcome: end.outcome, summary: summary, costUSD: cost,
+                                              infra: infraClass != .none, now: now)
+            if closed, let cost { try Store.recordSpend(db, cost) }
             var text = "@\(agent.name) turn \(end.outcome.rawValue)"
             if let summary, !summary.isEmpty { text += ": \(summary.prefix(200))" }
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: turn.id, kind: .turnFinished,
@@ -356,13 +449,13 @@ extension Store {
 
             switch end {
             case .succeeded: agent.consecutiveFailures = 0
-            case .failed: agent.consecutiveFailures += 1
+            case .failed: if infraClass == .none { agent.consecutiveFailures += 1 }
             default: break
             }
             // A requested blocker belongs to the turn that set it.
             let requested = agent.requestedBlocker
             agent.requestedBlocker = nil
-            var columns = ["consecutiveFailures", "requestedBlocker"]
+            var columns = ["consecutiveFailures", "consecutiveInfraFailures", "requestedBlocker"]
             if resetSession {
                 agent.sessionId = UUID().uuidString
                 agent.sessionStarted = false
@@ -374,16 +467,19 @@ extension Store {
             try agent.update(db, columns: columns)
 
             // Killed (or otherwise moved) mid-turn: the turn is recorded, the state is left alone.
-            guard agent.state == .running else { return }
+            guard agent.state == .running else { return infraClass }
             if agent.paused {
                 try Store.transition(db: db, agentId: agentId, to: .sleeping, now: now)
-                return
+                return infraClass
             }
             switch end {
             case .interrupted:
                 try Store.transition(db: db, agentId: agentId, to: .ready, now: now)
             case .usageLimited(let until, _):
                 try Store.transition(db: db, agentId: agentId, to: .blocked, blocker: .usageLimit(until: until), now: now)
+            case .failed where infraClass != .none:
+                // Not the agent's fault: ready again at once (the orchestrator adds a fixed cooldown), no backoff.
+                try Store.transition(db: db, agentId: agentId, to: .ready, now: now)
             case .failed:
                 let n = agent.consecutiveFailures
                 try Store.transition(db: db, agentId: agentId, to: .blocked,
@@ -404,7 +500,7 @@ extension Store {
                     // Still waiting on someone: when they answer, the usage gate re-checks before the next turn.
                     if !answered {
                         try Store.transition(db: db, agentId: agentId, to: .blocked, blocker: blocker, now: now)
-                        return
+                        return infraClass
                     }
                 }
                 if senders.isEmpty {
@@ -416,6 +512,7 @@ extension Store {
                     try Store.transition(db: db, agentId: agentId, to: .ready, now: now)
                 }
             }
+            return infraClass
         }
     }
 }

@@ -11,11 +11,16 @@ func fail(_ message: String) -> ExitCode {
     return .failure
 }
 
+/// The owner's time zone for `clock()`, set by `openStore()`. A CLI process is single-threaded for output.
+nonisolated(unsafe) var cliTimeZone: TimeZone = .current
+
 func openStore() throws -> (Store, BrahmaPaths) {
     let paths = BrahmaPaths.fromEnvironment()
     try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
     let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
-    return (try Store(path: paths.database.path, catalog: catalog), paths)
+    let store = try Store(path: paths.database.path, catalog: catalog)
+    cliTimeZone = store.ownerTimeZone()
+    return (store, paths)
 }
 
 /// Resolves a company by name or slug, case-insensitively. Ambiguity lists the matches.
@@ -52,6 +57,8 @@ func describe(_ blocker: Blocker?, names: [String: String] = [:]) -> String {
 
 func clock(_ date: Date, seconds: Bool = false) -> String {
     let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = cliTimeZone
     f.dateFormat = seconds ? "HH:mm:ss" : "HH:mm"
     return f.string(from: date)
 }

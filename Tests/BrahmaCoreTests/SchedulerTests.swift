@@ -25,7 +25,7 @@ private func cand(_ c: Company, _ name: String, role: String = "engineer", block
 private func many(_ c: Company, _ n: Int) -> [Candidate] { (0..<n).map { cand(c, "a\($0)", ready: Double($0)) } }
 
 private func config(hard: Int = 16, safety: Int = 100) -> SchedulerConfig {
-    var c = SchedulerConfig(); c.hardCap = hard; c.safetyCap = safety; return c
+    var c = SchedulerConfig(); c.planTier = .max20x; c.hardCap = hard; c.safetyCap = safety; return c
 }
 
 private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
@@ -61,7 +61,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
 @Test func allowedWarningIsNotALimit() {
     // Claude Code emits allowed_warning past soft thresholds, e.g. on the seven-day window, days before its reset.
     let warning = RateLimitInfo(status: "allowed_warning", resetsAt: now.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
-                                isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.81, observedAt: now,
+                                isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.40, observedAt: now,
                                 fiveHourResetsAt: now.addingTimeInterval(7200), sevenDayResetsAt: now.addingTimeInterval(3 * 86400))
     for mode in [UsageMode.low, .balanced, .max] { #expect(UsageGate.evaluate(warning, mode: mode, now: now) == .open) }
     #expect(!UsageGate.isHardLimit(warning))
@@ -69,7 +69,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
 
 @Test func thresholdClosesUntilFiveHourResetNotTopLevelReset() {
     let i = RateLimitInfo(status: "allowed_warning", resetsAt: now.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
-                          isUsingOverage: false, fiveHourUtilization: 0.85, sevenDayUtilization: 0.81, observedAt: now,
+                          isUsingOverage: false, fiveHourUtilization: 0.85, sevenDayUtilization: 0.40, observedAt: now,
                           fiveHourResetsAt: now.addingTimeInterval(7200), sevenDayResetsAt: now.addingTimeInterval(3 * 86400))
     #expect(UsageGate.evaluate(i, mode: .low, now: now) == .closed(until: now.addingTimeInterval(7200)))
     #expect(UsageGate.evaluate(i, mode: .max, now: now) == .open)
@@ -126,6 +126,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
 }
 
 @Test func modeCaps() {
+    // `config()` is max20x: the Plan 1 caps 2 / 6 / hard cap.
     let c = config(hard: 9)
     #expect(c.modeCap(.low) == 2); #expect(c.modeCap(.balanced) == 6); #expect(c.modeCap(.max) == 9)
 }

@@ -121,6 +121,7 @@ import GRDB
 
     @Test func orchestratorSendsResolvedModel() async throws {
         let (s, c) = try make()
+        try s.setPlanTier(.max20x)   // low mode seats two turns, as in Plan 1
         let designer = try s.hire(companyId: c.id, name: "design-1", role: "designer", model: "auto")
         var low = c; low.usageMode = .low; try s.updateCompany(low)
         let eng = try s.hire(companyId: c.id, name: "eng-1", role: "engineer", model: "auto")
