@@ -647,6 +647,28 @@ enum Migrations {
     /// Plan 5-lite migrations, in the plan's order (v5-sandbox, v5-owner-guard, v5-secrets, v5-extensions, v5-timers,
     /// v5-notices, ...). Called once at the end of `migrator()`, after every 3a migration.
     static func registerPlan5(_ m: inout DatabaseMigrator) {
+        m.registerMigration("v5-secrets") { db in
+            // Names and flags only; values live in the Keychain (or another SecretVault), never here.
+            try db.create(table: "secret") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("name", .text).notNull()
+                t.column("isTest", .boolean).notNull().defaults(to: false)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.column("lastUsedAt", .datetime)
+                t.uniqueKey(["companyId", "name"])
+            }
+            try db.create(table: "secretUse") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("secretName", .text).notNull()
+                t.column("itemId", .text)
+                t.column("grantedAt", .datetime).notNull()
+                t.column("endedAt", .datetime)
+            }
+        }
         m.registerMigration("v5-timers") { db in
             try db.create(table: "timer") { t in
                 t.primaryKey("id", .text)

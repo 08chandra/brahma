@@ -80,9 +80,16 @@ struct MCP: ParsableCommand {
         // The turn's mode quotas come from its credential row (the strictest when none were recorded), never from this process's
         // environment, and are counted in the database per turn; review and audit turns have none.
         let quotas = reviewItemId == nil && auditTurnId == nil ? context.quotas ?? .strictest : nil
+        // Secrets added or removed by the owner apply to the next tool call, not the next turn.
+        let vault = SecretVaults.platformDefault()
+        let reload: @Sendable () -> Void = {
+            do { try store.reloadRedactorIfNeeded(vault: vault) }
+            catch { FileHandle.standardError.write(Data("brahma mcp: could not reload secrets: \(error)\n".utf8)) }
+        }
+        reload()
         let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId,
                                                    auditTurnId: auditTurnId, quotas: quotas, quotaTurnId: context.turnId,
-                                                   planTurn: planTurn))
+                                                   planTurn: planTurn), beforeCall: reload)
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

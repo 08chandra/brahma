@@ -93,7 +93,7 @@ extension Store {
     @discardableResult
     public func finishTurn(id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, now: Date = Store.now()) throws -> Bool {
         try writer.write { db in
-            try Store.finishTurn(db: db, id: id, outcome: outcome, summary: summary, costUSD: costUSD, now: now)
+            try Store.finishTurn(db: db, id: id, outcome: outcome, summary: redact(summary), costUSD: costUSD, now: now)
         }
     }
 
@@ -146,7 +146,9 @@ extension Store {
     }
 
     public func appendEvent(_ e: ActivityEvent) throws {
-        try writer.write { db in try e.insert(db) }
+        var event = e
+        event.text = redact(e.text)
+        try writer.write { db in try event.insert(db) }
     }
 
     public func events(afterId: Int64, companyId: String? = nil, limit: Int = 500) throws -> [ActivityEvent] {

@@ -36,6 +36,9 @@ public final class Store: Sendable {
     let lifecycleObservers: [any AgentLifecycleObserver]
     /// Called inside the transaction that completes an item (`completeItem`). The outcome-facts observer is always first.
     let observers: [any WorkItemObserver]
+    /// Secret values the engine knows, redacted from any agent- or tool-produced text before it is stored. Reloaded by
+    /// `reloadRedactorIfNeeded(vault:)`.
+    public let redactor = Redactor()
 
     public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
                 observers: [any WorkItemObserver] = []) throws {

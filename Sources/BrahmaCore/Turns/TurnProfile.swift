@@ -263,8 +263,19 @@ public enum ChildEnvironment {
         return u.contains("TOKEN") || u.contains("SECRET") || u.contains("KEY") || u.hasPrefix("AWS_") || u == "SSH_AUTH_SOCK"
     }
 
+    /// Names a secret may never take: the engine's own variables, the basics every child needs, the Claude auth
+    /// variables and the loader/interpreter hooks that run code in a child.
+    static func isReserved(_ name: String) -> Bool {
+        allowed.contains(name) || claudeAuth.contains(name) || name.hasPrefix("LC_") || name.hasPrefix("BRAHMA_")
+            || name.hasPrefix("CLAUDE_") || name.hasPrefix("ANTHROPIC_") || name.hasPrefix("DYLD_") || name.hasPrefix("LD_")
+            || ["NODE_OPTIONS", "BASH_ENV", "ENV", "SHELLOPTS", "PS4", "IFS", "PYTHONSTARTUP", "PYTHONPATH", "RUBYOPT", "PERL5OPT"].contains(name)
+    }
+
+    /// `secrets` (name → value) are test keys the engine hands to this child, and are applied after the drop step, which
+    /// would otherwise remove them (their names contain KEY, TOKEN or SECRET). A reserved or invalid name is ignored.
     public static func make(base: [String: String], extra: [String: String] = [:],
-                            engineClaudeVars: [String: String] = [:], purpose: Purpose = .general) -> [String: String] {
+                            engineClaudeVars: [String: String] = [:], purpose: Purpose = .general,
+                            secrets: [String: String] = [:]) -> [String: String] {
         var env: [String: String] = [:]
         for (name, value) in base where (allowed.contains(name) || name.hasPrefix("LC_")) && !isSecretName(name) {
             env[name] = value
@@ -276,6 +287,7 @@ public enum ChildEnvironment {
         if purpose == .claude {
             for (name, value) in engineClaudeVars where Self.engineClaudeVars.contains(name) { env[name] = value }
         }
+        for (name, value) in secrets where SecretName.isValid(name) && !isReserved(name) { env[name] = value }
         return env
     }
 }

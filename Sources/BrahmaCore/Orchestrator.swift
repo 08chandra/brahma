@@ -32,6 +32,8 @@ public actor Orchestrator {
     /// What each turn asserts about the session the CLI reports (the work modes set it; nil asserts nothing).
     let turnExpectations: @Sendable (Agent, Company) -> TurnExpectations?
     let timerJobs: TimerJobRegistry
+    /// Where secret values live; read only to reload the store's redactor.
+    let vault: any SecretVault
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -88,8 +90,9 @@ public actor Orchestrator {
                 checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
                 planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)? = nil,
                 turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil },
-                timerJobs: TimerJobRegistry = .system) {
-        self.timerJobs = timerJobs
+                timerJobs: TimerJobRegistry = .system,
+                vault: any SecretVault = SecretVaults.platformDefault()) {
+        self.timerJobs = timerJobs; self.vault = vault
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
@@ -102,6 +105,7 @@ public actor Orchestrator {
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
     public func start() async throws {
         try await EngineGitGuard.$engine.withValue(engineId) {
+            attempt { try store.reloadRedactorIfNeeded(vault: vault) }
             let now = clock()
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
@@ -205,6 +209,8 @@ public actor Orchestrator {
     }
 
     private func schedule(now: Date) throws {
+        // Secrets another process added or removed apply to everything this tick writes.
+        attempt { try store.reloadRedactorIfNeeded(vault: vault) }
         // Active time first, so everything below sees the same clock; then health, which may start or end a hold.
         try store.accrueActiveTime(now: now)
         try healthTick(now: now)
@@ -1022,12 +1028,12 @@ extension Store {
             var cost: Double?
             var infraClass = InfraClass.none
             switch end {
-            case .succeeded(let r, _): summary = r.text
-            case .capped(let r, _): summary = r.text ?? r.subtype
+            case .succeeded(let r, _): summary = redact(r.text)
+            case .capped(let r, _): summary = redact(r.text ?? r.subtype)
             case .failed(let text, let input, _):
-                summary = text
+                summary = redact(text)
                 if let input { infraClass = EngineHealth.classify(input) }
-            case .usageLimited(_, let text): summary = text
+            case .usageLimited(_, let text): summary = redact(text)
             case .interrupted: summary = "interrupted"
             }
             // The result's total is cumulative over `--resume`: the turn's own cost is the difference (Task 14a, L-4).

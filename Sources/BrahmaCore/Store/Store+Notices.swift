@@ -26,23 +26,24 @@ extension Store {
 
     // MARK: Notices
 
-    /// The one place notice text is cleaned before it is stored: newlines and control characters become spaces.
-    /// (Secret redaction joins here with Task 4.)
-    static func noticeText(_ text: String) -> String {
-        String(String.UnicodeScalarView(text.unicodeScalars.map { noticeBlocked.contains($0) ? " " : $0 }))
+    /// The one place notice text is cleaned before it is stored: secrets are redacted (while any newlines are still in,
+    /// so a multi-line secret matches), then newlines and control characters become spaces.
+    func noticeText(_ text: String) -> String {
+        let redacted = redact(text)
+        return String(String.UnicodeScalarView(redacted.unicodeScalars.map { Store.noticeBlocked.contains($0) ? " " : $0 }))
     }
 
-    private static let noticeBlocked = CharacterSet.newlines.union(.controlCharacters)
+    fileprivate static let noticeBlocked = CharacterSet.newlines.union(.controlCharacters)
 
     /// A normal-urgency `system` notice for the owner.
     public func notifyOwner(companyId: String, title: String, body: String, now: Date = Store.now()) throws {
         try writer.write { db in
-            try Store.notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal, title: title, body: body, now: now)
+            try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal, title: title, body: body, now: now)
         }
     }
 
     @discardableResult
-    static func notifyOwner(db: Database, companyId: String?, kind: NoticeKind, urgency: NoticeUrgency,
+    func notifyOwner(db: Database, companyId: String?, kind: NoticeKind, urgency: NoticeUrgency,
                             title: String, body: String, now: Date) throws -> OwnerNotice {
         var notice = OwnerNotice(companyId: companyId, kind: kind, urgency: urgency, title: noticeText(title),
                                  body: noticeText(body), createdAt: now)

@@ -357,6 +357,7 @@ public struct CompanyTools: Sendable {
 
     private func setBlocked(on: String, reason: String) throws -> String {
         let target = Self.handle(on)
+        let reason = store.redact(reason)
         let raw = on.trimmingCharacters(in: .whitespaces)
         if !raw.hasPrefix("@"), raw.range(of: "^[A-Z0-9]{1,8}-[0-9]+$", options: .regularExpression) != nil {
             if let result = try setBlockedOnItem(key: raw) { return result }

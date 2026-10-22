@@ -29,7 +29,7 @@ import GRDB
 
         // The full form takes kind and urgency, inside the caller's transaction.
         try store.writer.write { db in
-            try Store.notifyOwner(db: db, companyId: company.id, kind: .digest, urgency: .urgent, title: "Digest", body: "ready",
+            try store.notifyOwner(db: db, companyId: company.id, kind: .digest, urgency: .urgent, title: "Digest", body: "ready",
                                   now: now.addingTimeInterval(1))
         }
         let pending = try store.undeliveredNotices()

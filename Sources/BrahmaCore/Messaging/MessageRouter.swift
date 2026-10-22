@@ -101,6 +101,7 @@ public struct MessageRouter: Sendable {
     /// Inserts the message, fans out inbox items (waking or not, by `WakePolicy`), wakes the waking recipients and logs the
     /// event, inside the caller's transaction.
     private func deliver(_ db: Database, channel: Channel, from: Sender, text: String, now: Date) throws -> PostResult {
+        let text = store.redact(text)
         let message = Message(id: UUID().uuidString, companyId: channel.companyId, channelId: channel.id,
                               senderId: from.id, text: text, createdAt: now)
         try message.insert(db)

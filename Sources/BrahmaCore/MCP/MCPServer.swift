@@ -9,7 +9,12 @@ public final class MCPServer {
         return e
     }()
 
-    public init(tools: CompanyTools) { self.tools = tools }
+    /// Runs before every tool call (the redactor reload in `brahma mcp`).
+    private let beforeCall: @Sendable () -> Void
+
+    public init(tools: CompanyTools, beforeCall: @escaping @Sendable () -> Void = {}) {
+        self.tools = tools; self.beforeCall = beforeCall
+    }
 
     /// One JSON-RPC response line, or nil for notifications (and blank lines).
     public func handle(line: String) -> String? {
@@ -47,6 +52,7 @@ public final class MCPServer {
             }
             let args = params["arguments"]?.objectValue ?? [:]
             let text: String, isError: Bool
+            beforeCall()
             do { text = try tools.call(name: name, arguments: args); isError = false }
             catch let e as ToolError { text = e.message; isError = true }
             catch { text = "\(error)"; isError = true }
