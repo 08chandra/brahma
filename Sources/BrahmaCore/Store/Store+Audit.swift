@@ -147,10 +147,12 @@ extension Store {
             if let path = paths.sorted().first(where: { !ReviewPolicy.isAllowed($0, under: allowed) }) {
                 return keep("\(Self.flat(path, max: 200)) is outside the auto-merge paths")
             }
-            let tokens = item.checkSpec.map { CheckScripts.checkTokens(command: $0.command) } ?? []
+            let reach = item.checkSpec.map { CheckScripts.checkReach(command: $0.command) } ?? CheckReach()
+            // A check the engine cannot follow could reach any file: every change keeps its review.
+            guard reach.parseable else { return keep("the check command uses shell syntax Brahma does not follow") }
             var scripts = Set<String>()
             if let snapshot = try latestCheckSnapshot(itemId: item.id, upTo: item.checkRevision) { scripts.formUnion(snapshot.manifest.keys) }
-            if let path = paths.sorted().first(where: { ReviewPolicy.isSensitive($0, checkScripts: scripts, checkTokens: tokens) }) {
+            if let path = paths.sorted().first(where: { ReviewPolicy.isSensitive($0, checkScripts: scripts, reach: reach) }) {
                 return keep("sensitive path \(Self.flat(path, max: 200))")
             }
             if lines >= ReviewPolicy.autoMergeMaxLines { return keep("\(lines) changed lines") }

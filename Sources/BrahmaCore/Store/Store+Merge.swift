@@ -318,7 +318,9 @@ extension Store {
     ///
     /// - `.merged`: `done`, `doneAt`, `mergedCommit`, lease deleted, event `merged`, the completion hook; then the worktree and
     ///   branch go and `MergeSafety.afterLanding` looks at everybody else's branch.
-    /// - `.rebased`: `verifying` plus a queued `merge` check on the new head (an item with no check is `pending` at once).
+    /// - `.rebased`: `verifying` plus a queued `merge` check on the new head (an item with no check is `pending` at once). An
+    ///   item whose auto-approval was revoked while the merge ran (`revokeAutoApprovals`) gets the same re-check, then goes to
+    ///   review (`finishVerification`); without a check its review is of the rebased head.
     /// - `.conflict`: the item goes back to its holder with a conflict brief; its verification is cleared.
     /// - `.branchMoved`: the branch is not what was checked and reviewed: the item goes back to its holder, nothing merged.
     func finishMerge(itemId: String, result: MergeResult, now: Date = Store.now()) throws {
@@ -352,12 +354,22 @@ extension Store {
         case .rebased(let head):
             let base = try? git.mergeBase(GitWorkspace.mainRef, head)
             try writer.write { db in
-                guard var current = try WorkItem.fetchOne(db, key: itemId), current.status == .inReview, current.mergeState == .pending
-                else { return }
+                guard var current = try WorkItem.fetchOne(db, key: itemId), current.status == .inReview else { return }
+                // Auto-merge was switched off while this merge ran (`revokeAutoApprovals`): the branch already carries the
+                // rebased commit, so the rebase is applied all the same and the item goes to its reviewer from there.
+                let revoked = current.mergeState == .none && current.reviewedRound < current.reviewRound && current.verifiedCommit != nil
+                guard current.mergeState == .pending || revoked else { return }
                 // Weakening is measured from where the branch now starts.
                 if let base, current.baseCommit != nil { current.baseCommit = base }
                 current.updatedAt = now
-                if let spec = current.checkSpec {
+                if revoked, current.checkSpec == nil {
+                    current.verifiedCommit = head
+                    try current.update(db)
+                    try recordItemEvent(db: db, item: current, actor: "system", kind: .edited,
+                                        text: "rebased onto main at \(head.prefix(7)) as auto-merge was switched off; it needs a review", now: now)
+                    try Store.wakeReviewer(db: db, item: current, now: now)
+                } else if let spec = current.checkSpec {
+                    // A revoked item's passing re-check goes to review (`finishVerification`), not back to `pending`.
                     current.mergeState = .verifying
                     let holder = try Self.leaseHolderId(db: db, itemId: itemId)
                     let scriptHash = try String.fetchOne(db, sql: """
@@ -374,7 +386,8 @@ extension Store {
                         createdAt: now).insert(db)
                     try current.update(db)
                     try recordItemEvent(db: db, item: current, actor: "system", kind: .edited,
-                                        text: "rebased onto main at \(head.prefix(7)); the check runs again before it lands", now: now)
+                                        text: revoked ? "rebased onto main at \(head.prefix(7)) as auto-merge was switched off; the check runs again, then it needs a review"
+                                            : "rebased onto main at \(head.prefix(7)); the check runs again before it lands", now: now)
                 } else {
                     current.mergeState = .pending
                     current.verifiedCommit = head

@@ -144,7 +144,8 @@ public enum ReviewDigest {
 /// - the change, measured by the engine from the engine-recorded base and from `main`'s merge base to the verified commit, is
 ///   under `autoMergeMaxLines` changed lines and `autoMergeMaxBytes` changed bytes, deletes no file, adds no binary, executable,
 ///   symlink or submodule, and every path (both sides of a rename) lies under the allowed directories (`autoMergePaths`) and is
-///   not sensitive (`isSensitive`: no build, CI or agent configuration, no test file, nothing the check command names);
+///   not sensitive (`isSensitive`: no build, CI, runner or agent configuration, no test file, nothing the check command
+///   reaches; a check command the engine cannot parse makes every path sensitive);
 /// - neither the assignee, the lease holder nor the submitter has `fullReview`.
 ///
 /// Every auto-merge is audited: batches of up to `auditBatchMax` per audit turn, routed like reviews.
@@ -167,7 +168,7 @@ public enum ReviewPolicy {
 
     /// Matched case-insensitively against each path component (the workspace file system usually is case-insensitive):
     /// `name/` matches any directory component, anything else the file name; `*` is a wildcard. Test files and the files a
-    /// check references are sensitive as well (`isSensitive(_:checkScripts:checkTokens:)`).
+    /// check reaches are sensitive as well (`isSensitive(_:checkScripts:reach:)`).
     public static let sensitivePatterns = [
         // Version control and CI.
         ".git/", ".gitattributes", ".gitmodules", ".gitignore", ".github/", ".gitlab/", ".gitlab-ci.yml", ".circleci/",
@@ -178,7 +179,13 @@ public enum ReviewPolicy {
         "go.sum", "go.work", "pyproject.toml", "requirements*.txt", "setup.py", "setup.cfg", "Pipfile", "Gemfile", "*.gemspec",
         "build.gradle*", "settings.gradle*", "gradle.properties", "pom.xml", "Makefile", "GNUmakefile", "*.mk", "CMakeLists.txt",
         "*.cmake", "Dockerfile*", "docker-compose*.yml", "docker-compose*.yaml", "tsconfig*.json", "composer.json", "Podfile",
-        "Cartfile", ".npmrc", ".yarnrc*", "conftest.py",
+        "Cartfile", ".npmrc", ".yarnrc*", "Rakefile", "Gruntfile*", "gulpfile*", "Justfile", "Taskfile*", "build.xml", "build.sbt",
+        // Test-runner, compiler and linter configuration: anything a check's runner reads, wherever it lies.
+        "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", ".coveragerc", "mypy.ini", ".flake8", ".pylintrc", "ruff.toml",
+        ".ruff.toml", "jest.config.*", "jest.setup.*", "vitest.config.*", "vitest.workspace.*", "vitest.setup.*", ".mocharc*",
+        "karma.conf.*", "playwright.config.*", "cypress.config.*", ".nycrc*", "phpunit.xml*", ".rspec", ".rubocop.yml",
+        "babel.config.*", ".babelrc*", "jsconfig*.json", ".swcrc", "vite.config.*", "webpack.config.*", "rollup.config.*",
+        ".eslintrc*", "eslint.config.*", ".prettierrc*", "deno.json*", "bunfig.toml", ".swiftlint.yml", "Directory.Build.*",
         // Agent and engine configuration, secrets.
         ".claude/", ".mcp.json", "CLAUDE.md", "AGENTS.md", ".brahma/", ".env*", "*.pem", "*.key", "*.p12",
         // Schema changes and scripts.
@@ -188,11 +195,22 @@ public enum ReviewPolicy {
         "*Test.java",
     ]
 
+    /// Whether a changed path is one a review turn must see, given what the item's check command reaches
+    /// (`CheckScripts.checkReach`): every path when the engine cannot follow the command, else `isSensitive(_:checkScripts:
+    /// checkTokens:checkDirectories:)` with its tokens and script directories.
+    public static func isSensitive(_ path: String, checkScripts: Set<String> = [], reach: CheckReach) -> Bool {
+        guard reach.parseable else { return true }
+        return isSensitive(path, checkScripts: checkScripts, checkTokens: reach.tokens, checkDirectories: reach.directories)
+    }
+
     /// Whether a changed path (repository-relative, as git reports it) is one a review turn must see: a sensitive pattern, a
     /// test file (`PathRules.isTestFile`), one of `checkScripts` (the check's saved scripts, exact paths), or a file the check
-    /// command may reach: its name equals the last component of any of `checkTokens` (`CheckScripts.checkTokens`), or its path
-    /// equals or ends with one (`*` in a token is a wildcard). A check is not weakened from inside an allowed directory.
-    public static func isSensitive(_ path: String, checkScripts: Set<String> = [], checkTokens: Set<String> = []) -> Bool {
+    /// command may reach. That is a path that equals one of `checkTokens`, ends with one, lies under one (`token/…`, also
+    /// `…/token/…`) or has the last component of one as its name, or one that sits directly in one of `checkDirectories` (the
+    /// directories of the scripts the check runs, also as a suffix: `…/dir/name`). `*` in a token is a wildcard. A check is not
+    /// weakened from inside an allowed directory.
+    public static func isSensitive(_ path: String, checkScripts: Set<String> = [], checkTokens: Set<String> = [],
+                                   checkDirectories: Set<String> = []) -> Bool {
         let lower = path.lowercased()
         let parts = lower.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         guard let name = parts.last else { return true }
@@ -201,7 +219,14 @@ public enum ReviewPolicy {
         for token in checkTokens.map({ $0.lowercased() }) {
             guard let last = token.split(separator: "/", omittingEmptySubsequences: true).last.map(String.init) else { continue }
             if lower == token || lower.hasSuffix("/" + token) || name == last { return true }
-            if token.contains("*"), glob(token, lower) || glob("*/" + token, lower) || glob(last, name) { return true }
+            if lower.hasPrefix(token + "/") || lower.contains("/" + token + "/") { return true }
+            if token.contains("*"), glob(token, lower) || glob("*/" + token, lower) || glob(last, name)
+                || glob(token + "/*", lower) || glob("*/" + token + "/*", lower) { return true }
+        }
+        let parent = parts.dropLast().joined(separator: "/")
+        for dir in checkDirectories.map({ $0.lowercased() }) where !dir.isEmpty {
+            if parent == dir || parent.hasSuffix("/" + dir) { return true }
+            if dir.contains("*"), glob(dir, parent) || glob("*/" + dir, parent) { return true }
         }
         for pattern in sensitivePatterns.map({ $0.lowercased() }) {
             if pattern.hasSuffix("/") {
