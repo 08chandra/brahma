@@ -83,6 +83,13 @@ public final class Store: Sendable {
         var git = GitWorkspace(root: root, lockDirectory: locks)
         git.lockTimeout = gitLockTimeout.seconds
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
+        git.onWorktreeTamper = { [self] key, detail in
+            let name = (try? company(id: companyId))?.name ?? companyId
+            try? EngineAlerts.raise(
+                store: self, text: "The worktree of \(key) in \(name) was repointed (\(detail)). Brahma refused to commit, merge or reset "
+                + "there and put it back from its own records. An agent probably rewrote it; look at what \(key) is doing.",
+                now: Store.now(), reason: "worktree:\(companyId):\(key)")
+        }
         return git
     }
 

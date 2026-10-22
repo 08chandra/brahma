@@ -153,6 +153,10 @@ public struct GitWorkspace: Sendable {
     public let lockDirectory: URL
     /// How long to wait for an item's lock before giving up on it (the caller skips the item this pass).
     public var lockTimeout: TimeInterval = 10
+    /// Called once for each time an item worktree is found repointed (its `HEAD` off `item/<KEY>`, or `gitdir`, `commondir`
+    /// or `.git` not as the engine wrote them), with the key and what was wrong. The worktree has been restored by then and
+    /// the operation that found it refused. The store files the engine alert.
+    public var onWorktreeTamper: (@Sendable (_ key: String, _ detail: String) -> Void)?
 
     public init(root: URL, lockDirectory: URL? = nil) {
         self.root = root
@@ -204,18 +208,59 @@ public struct GitWorkspace: Sendable {
         guard !Self.isSymlink(dir), !Self.isSymlink(worktreesDir), FileManager.default.fileExists(atPath: adminDir(key: key).path) else {
             throw GitError.failed(command: "-C \(key)", status: -1, stderr: "\(key) is not a registered worktree")
         }
-        heal(key: key)
+        // The invariant behind every engine commit, merge, reset and rebase here: `HEAD` is the symref to this item's own
+        // branch and the three links are as the engine made them. Anything else (a turn that pointed `HEAD` at `main`, say,
+        // would make the engine's commit move `main`) is refused, reported once and put back from the engine's record.
+        let problems = linkProblems(key: key)
+        if !problems.isEmpty {
+            heal(key: key)
+            let detail = problems.joined(separator: "; ")
+            onWorktreeTamper?(key, detail)
+            throw GitError.failed(command: "-C \(key)", status: -1,
+                                  stderr: "the worktree of \(key) was repointed (\(detail)); it was restored and nothing was run in it")
+        }
         return GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir)
     }
 
-    /// Rewrites the three pointers that tie a worktree to this repository from the engine's own records. Git resolves
-    /// refs through `commondir` whatever `GIT_COMMON_DIR` says, so an agent that repointed it would otherwise make a
-    /// commit move a branch in another repository.
+    /// Every path form the engine accepts for one location: as the engine writes it, and as git writes it (`realpath`).
+    private static func forms(_ url: URL) -> Set<String> {
+        var out: Set<String> = [url.path]
+        if let real = realPath(Array(url.path.utf8)) { out.insert(real) }
+        return out
+    }
+
+    private static func regularText(_ url: URL) -> String? {
+        var st = stat()
+        guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// What differs from the engine's record of one item worktree; empty when it is as the engine created it.
+    private func linkProblems(key: String) -> [String] {
+        let admin = adminDir(key: key), tree = worktreePath(key: key)
+        var problems: [String] = []
+        if Self.regularText(admin.appending(path: "HEAD")) != "ref: \(branchRef(key: key))\n" { problems.append("HEAD is not \(branchRef(key: key))") }
+        let commondir = Self.regularText(admin.appending(path: "commondir"))?.trimmingCharacters(in: .newlines)
+        if commondir != "../.." { problems.append("commondir was changed") }
+        let gitdir = Self.regularText(admin.appending(path: "gitdir"))?.trimmingCharacters(in: .newlines)
+        if gitdir.map({ !Self.forms(tree).map { "\($0)/.git" }.contains($0) }) ?? true { problems.append("gitdir was changed") }
+        let link = Self.regularText(tree.appending(path: ".git"))?.trimmingCharacters(in: .newlines)
+        if link.map({ !Self.forms(admin).map { "gitdir: \($0)" }.contains($0) }) ?? true { problems.append(".git was changed") }
+        return problems
+    }
+
+    /// Rewrites `HEAD` and the three pointers that tie a worktree to this repository from the engine's own records. Git
+    /// resolves refs through `commondir` whatever `GIT_COMMON_DIR` says, so an agent that repointed it would otherwise make
+    /// a commit move a branch in another repository.
     private func heal(key: String) {
         let admin = adminDir(key: key)
         func ensure(_ url: URL, _ text: String) {
-            if (try? String(contentsOf: url, encoding: .utf8)) != text { try? text.write(to: url, atomically: true, encoding: .utf8) }
+            guard Self.regularText(url) != text else { return }
+            var st = stat()
+            if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG { try? FileManager.default.removeItem(at: url) }
+            try? text.write(to: url, atomically: true, encoding: .utf8)
         }
+        ensure(admin.appending(path: "HEAD"), "ref: \(branchRef(key: key))\n")
         ensure(admin.appending(path: "commondir"), "../..\n")
         ensure(admin.appending(path: "gitdir"), "\(worktreePath(key: key).path)/.git\n")
         ensure(worktreePath(key: key).appending(path: ".git"), "gitdir: \(admin.path)\n")
@@ -480,6 +525,8 @@ public struct GitWorkspace: Sendable {
         var files: [String: RepoFile]
         /// `for-each-ref` of the checkout: ref → object and symbolic target.
         var refs: [String: RefValue]
+        /// Every `refs/heads/item/*` branch there was (the engine's; they are not compared, but no new one may appear).
+        var itemBranches: Set<String>
         /// `ls-files -s -v -z`: entries, modes, ids and the skip-worktree / assume-unchanged bits. The index file itself is
         /// compared by this, not byte for byte: any `git status` (the CLI's own included) may rewrite its stat cache.
         var index: Data
@@ -506,9 +553,16 @@ public struct GitWorkspace: Sendable {
         try Self.validKey(key)
         let git = try context(for: dir)
         let ignored = try ignoredFiles(git, in: dir)
-        let refs = try refList(git, key: key)
+        let (refs, itemBranches) = try refList(git, key: key)
         let index = try barrierRun(git, ["ls-files", "-s", "-v", "-z"])
-        return PlanBarrier(ignored: ignored, files: repoFiles(key: key), refs: refs, index: index)
+        let captured = repoFiles(key: key)
+        if let over = captured.oversize.first {
+            throw GitError.failed(command: "barrier", status: -1, stderr: "repository file \(Self.shown(over)) is larger than \(Self.repoFileLimit) bytes")
+        }
+        if let over = captured.overflow.first {
+            throw GitError.failed(command: "barrier", status: -1, stderr: "more than \(Self.repoEntryLimit) repository files (at \(Self.shown(over)))")
+        }
+        return PlanBarrier(ignored: ignored, files: captured.files, refs: refs, itemBranches: itemBranches, index: index)
     }
 
     /// Compares the checkout with `before`, puts back what a plan turn changed and says what it was (empty when nothing).
@@ -523,37 +577,57 @@ public struct GitWorkspace: Sendable {
         let fm = FileManager.default
 
         // The repository's own files. New ones go first, deepest first, so a directory or link put in place of a file goes too.
+        // Files over the size cap and entries over the count cap are not read: new ones are deleted, and either fails the check.
         let indexKey = "worktrees/\(key)/index"
-        let after = repoFiles(key: key)
+        let captured = repoFiles(key: key)
+        let after = captured.files
+        func known(_ rel: String) -> Bool { before.files[rel] != nil || before.files.keys.contains { $0.hasPrefix(rel + "/") } }
+        func put(_ rel: String, _ file: RepoFile) {
+            do { try Self.restore(file, at: gitDir.appending(path: rel)) } catch { failures.append("restore \(Self.shown(rel)): \(error)") }
+        }
+        for rel in captured.oversize.sorted() {
+            failures.append("repository file \(Self.shown(rel)) is larger than \(Self.repoFileLimit) bytes")
+            if let file = before.files[rel] { found.append("changed \(Self.shown(rel))"); put(rel, file) }
+            else { found.append("new \(Self.shown(rel))"); try? fm.removeItem(at: gitDir.appending(path: rel)) }
+        }
+        for rel in captured.overflow.sorted() {
+            failures.append("more than \(Self.repoEntryLimit) repository files (at \(Self.shown(rel)))")
+            if !known(rel) { found.append("new \(Self.shown(rel))"); try? fm.removeItem(at: gitDir.appending(path: rel)) }
+        }
         for rel in after.keys.filter({ before.files[$0] == nil }).sorted(by: { $0.count > $1.count }) {
             found.append("new \(Self.shown(rel))")
-            try? fm.removeItem(at: gitDir.appending(path: rel))
+            do { try fm.removeItem(at: gitDir.appending(path: rel)) } catch { failures.append("remove \(Self.shown(rel)): \(error)") }
         }
-        for (rel, file) in before.files.sorted(by: { $0.key < $1.key }) where rel != indexKey && after[rel] != file {
+        for (rel, file) in before.files.sorted(by: { $0.key < $1.key }) where rel != indexKey && after[rel] != file && !captured.oversize.contains(rel) {
             found.append(after[rel] == nil ? "removed \(rel)" : "changed \(rel)")
-            Self.restore(file, at: gitDir.appending(path: rel))
+            put(rel, file)
         }
 
         // The index, by what it says.
         do {
             if try barrierRun(git, ["ls-files", "-s", "-v", "-z"]) != before.index {
                 found.append("changed index")
-                if let file = before.files[indexKey] { Self.restore(file, at: gitDir.appending(path: indexKey)) }
+                if let file = before.files[indexKey] { put(indexKey, file) }
             }
         } catch {
             failures.append("index: \(error)")
-            if let file = before.files[indexKey] { Self.restore(file, at: gitDir.appending(path: indexKey)) }
+            if let file = before.files[indexKey] { put(indexKey, file) }
         }
 
         // Every ref (loose or packed) but the engine-managed ones.
         do {
-            let now = try refList(git, key: key)
+            let (now, nowBranches) = try refList(git, key: key)
             for (ref, value) in before.refs.sorted(by: { $0.key < $1.key }) where now[ref] != value {
                 found.append(now[ref] == nil ? "removed ref \(ref)" : "moved ref \(ref)")
                 if value.symref.isEmpty { try git.run(["update-ref", "--no-deref", ref, value.oid]) }
                 else { try git.run(["symbolic-ref", ref, value.symref]) }
             }
             for ref in now.keys.sorted() where before.refs[ref] == nil {
+                found.append("new ref \(Self.shown(ref))")
+                try git.run(["update-ref", "--no-deref", "-d", ref])
+            }
+            // An item branch that did not exist is planted: the engine would later claim that item onto whatever it holds.
+            for ref in nowBranches.subtracting(before.itemBranches).sorted() {
                 found.append("new ref \(Self.shown(ref))")
                 try git.run(["update-ref", "--no-deref", "-d", ref])
             }
@@ -599,7 +673,12 @@ public struct GitWorkspace: Sendable {
             if xy.contains(UInt8(ascii: "R")) || xy.contains(UInt8(ascii: "C")) { i += 1 }
             guard xy == Data("!!".utf8) else { continue }
             let rel = Data(entry.dropFirst(3))
-            ignored[rel] = Self.stamp(root + [UInt8(ascii: "/")] + Array(rel))
+            let stamp = Self.stamp(root + [UInt8(ascii: "/")] + Array(rel))
+            // A directory entry (a nested repository, say) stands for contents the stamp cannot vouch for.
+            if rel.last == UInt8(ascii: "/") || stamp.mode & UInt16(S_IFMT) == UInt16(S_IFDIR) {
+                throw GitError.failed(command: "status", status: -1, stderr: "cannot verify ignored directory \(Self.shown(rel))")
+            }
+            ignored[rel] = stamp
         }
         return ignored
     }
@@ -611,10 +690,11 @@ public struct GitWorkspace: Sendable {
         ref == mainRef || ref.hasPrefix("refs/brahma/") || (ref.hasPrefix("refs/heads/item/") && ref != ownBranch)
     }
 
-    private func refList(_ git: GitCommand, key: String) throws -> [String: RefValue] {
+    private func refList(_ git: GitCommand, key: String) throws -> (refs: [String: RefValue], itemBranches: Set<String>) {
         let own = branchRef(key: key)
         let data = try barrierRun(git, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"])
         var refs: [String: RefValue] = [:]
+        var itemBranches: Set<String> = []
         for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
             let parts = line.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
             guard parts.count == 3, parts[0].hasPrefix("refs/") else {
@@ -622,46 +702,75 @@ public struct GitWorkspace: Sendable {
             }
             try Self.validRef(parts[0])
             if parts[2].isEmpty { try Self.validCommit(parts[1]) } else { try Self.validRef(parts[2]) }
+            if parts[0].hasPrefix("refs/heads/item/") { itemBranches.insert(parts[0]) }
             if Self.engineManaged(parts[0], ownBranch: own) { continue }
             refs[parts[0]] = RefValue(oid: parts[1], symref: parts[2])
         }
-        return refs
+        return (refs, itemBranches)
     }
 
-    private func repoFiles(key: String) -> [String: RepoFile] {
-        var files: [String: RepoFile] = [:]
-        for rel in Self.barrierPaths + ["worktrees/\(key)"] { Self.capture(gitDir, rel, into: &files) }
-        return files
+    /// What the barrier reads of the repository's own files. A regular file over `repoFileLimit` is named in `oversize` and
+    /// never read; a directory that would take a root past `repoEntryLimit` entries is named in `overflow` and never read.
+    struct RepoCapture { var files: [String: RepoFile] = [:]; var oversize: [String] = []; var overflow: [String] = []; var seen = 0 }
+    static let repoFileLimit = 1 << 20
+    static let repoEntryLimit = 500
+
+    private func repoFiles(key: String) -> RepoCapture {
+        var capture = RepoCapture()
+        // Each root has its own budget, so a pile planted in one cannot hide what is in another.
+        for rel in Self.barrierPaths + ["worktrees/\(key)"] { capture.seen = 0; Self.capture(gitDir, rel, into: &capture) }
+        return capture
     }
 
-    private static func capture(_ base: URL, _ rel: String, into files: inout [String: RepoFile]) {
+    /// Up to `limit + 1` names of a directory, so a directory of millions of entries is never listed whole.
+    private static func names(of path: String, limit: Int) -> [String] {
+        guard let dir = opendir(path) else { return [] }
+        defer { closedir(dir) }
+        var out: [String] = []
+        while out.count <= limit, let entry = readdir(dir) {
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { $0.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) } }
+            if name != "." && name != ".." { out.append(name) }
+        }
+        return out
+    }
+
+    private static func capture(_ base: URL, _ rel: String, into capture: inout RepoCapture) {
         let url = base.appending(path: rel)
         var st = stat()
         guard lstat(url.path, &st) == 0 else { return }
         let mode = UInt16(st.st_mode & 0o7777)
+        if st.st_mode & S_IFMT == S_IFDIR {
+            // A directory that would take the root over its budget is named whole and not read.
+            let listed = names(of: url.path, limit: repoEntryLimit)
+            guard capture.seen + listed.count <= repoEntryLimit else { capture.overflow.append(rel); return }
+            for name in listed.sorted() { Self.capture(base, rel + "/" + name, into: &capture) }
+            return
+        }
+        guard capture.seen < repoEntryLimit else { capture.overflow.append(rel); return }
+        capture.seen += 1
         switch st.st_mode & S_IFMT {
-        case S_IFREG: files[rel] = RepoFile(data: FileManager.default.contents(atPath: url.path) ?? Data(), mode: mode, link: nil)
-        case S_IFDIR:
-            for name in ((try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []).sorted() {
-                capture(base, rel + "/" + name, into: &files)
-            }
-        case S_IFLNK: files[rel] = RepoFile(data: nil, mode: mode, link: (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) ?? "")
-        default: files[rel] = RepoFile(data: nil, mode: mode, link: "special")
+        case S_IFREG:
+            if st.st_size > repoFileLimit { capture.oversize.append(rel); return }
+            capture.files[rel] = RepoFile(data: FileManager.default.contents(atPath: url.path) ?? Data(), mode: mode, link: nil)
+        case S_IFLNK: capture.files[rel] = RepoFile(data: nil, mode: mode, link: (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) ?? "")
+        default: capture.files[rel] = RepoFile(data: nil, mode: mode, link: "special")
         }
     }
 
     /// Puts one repository file back as it was, permission bits included (an executable hook stays executable).
-    private static func restore(_ file: RepoFile, at url: URL) {
+    private static func restore(_ file: RepoFile, at url: URL) throws {
         let fm = FileManager.default
         var st = stat()
-        if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG || file.data == nil { try? fm.removeItem(at: url) }
-        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG || file.data == nil { try fm.removeItem(at: url) }
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let link = file.link {
-            if link != "special" { try? fm.createSymbolicLink(atPath: url.path, withDestinationPath: link) }
+            if link != "special" { try fm.createSymbolicLink(atPath: url.path, withDestinationPath: link) }
             return
         }
-        try? (file.data ?? Data()).write(to: url, options: .atomic)
-        _ = chmod(url.path, mode_t(file.mode))
+        try (file.data ?? Data()).write(to: url, options: .atomic)
+        guard chmod(url.path, mode_t(file.mode)) == 0 else {
+            throw GitError.failed(command: "chmod", status: errno, stderr: "cannot set the permissions of \(url.lastPathComponent)")
+        }
     }
 
     private static func stamp(_ path: [UInt8]) -> FileStamp {

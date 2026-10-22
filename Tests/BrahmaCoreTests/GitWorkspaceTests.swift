@@ -154,6 +154,9 @@ import Foundation
         try f.write("work.txt", "agent work", in: wt)
 
         let base = try #require(try f.ws.head(of: "main"))
+        // The repointed worktree is refused and restored first; nothing ran.
+        #expect(throws: GitError.self) { try f.ws.isDirty(in: wt) }
+        #expect(!FileManager.default.fileExists(atPath: fsmarker.path))
         #expect(try f.ws.isDirty(in: wt))
         let sha = try #require(try f.ws.commitAll(in: wt, message: "agent commit"))
         #expect(try f.ws.head(of: "item/K-1") == sha)
@@ -314,18 +317,16 @@ import Foundation
         try f.ws.addWorktree(key: "ACME-2")
         try f.git(["update-ref", "refs/brahma/quarantine/old", other])
         let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
-        // The engine merges into main, quarantines a ref and another leaseholder commits, all while the plan turn runs.
+        // The engine merges into main, quarantines a ref and another leaseholder commits (a branch that already existed), all while the plan turn runs.
         try f.git(["update-ref", "refs/heads/main", other])
         try f.git(["update-ref", "refs/brahma/quarantine/new", other])
         try f.git(["update-ref", "-d", "refs/brahma/quarantine/old"])
         try f.git(["update-ref", "refs/heads/item/ACME-2", other])
-        try f.git(["branch", "item/ACME-3", other])
         #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty)
         #expect(try f.ws.head(of: "refs/heads/main") == other, "main is the main guard's, never put back")
         #expect(try f.ws.head(of: "refs/brahma/quarantine/new") == other)
         #expect(try f.ws.head(of: "refs/brahma/quarantine/old") == nil)
         #expect(try f.ws.head(of: "refs/heads/item/ACME-2") == other)
-        #expect(try f.ws.head(of: "refs/heads/item/ACME-3") == other)
         #expect(GitWorkspace.engineManaged("refs/heads/item/ACME-1", ownBranch: "refs/heads/item/ACME-1") == false)
     }
 
@@ -336,24 +337,21 @@ import Foundation
         let script = "#!/bin/sh\nexit 0\n"
         let hook = try f.write(".git/hooks/post-checkout", script)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
-        let head = try String(contentsOf: admin.appending(path: "HEAD"), encoding: .utf8)
         let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
-        // Rewritten (and so no longer executable), attributes and an alternate added, the worktree's HEAD repointed and a
-        // tracked file hidden from status with the skip-worktree bit.
+        // Rewritten (and so no longer executable), attributes and an alternate added and a tracked file hidden from status
+        // with the skip-worktree bit. (A repointed worktree HEAD is the engine's own check, not the barrier's.)
         try "#!/bin/sh\ntouch /tmp/pwned\n".write(to: hook, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: hook.path)
         try f.write(".git/info/attributes", "* filter=evil\n")
         try f.write(".git/objects/info/alternates", "/tmp/elsewhere\n")
-        try "ref: refs/heads/main\n".write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8)
         try f.git(["update-index", "--skip-worktree", "a.txt"], in: wt)
         let found = try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt)
         #expect(Set(found) == ["changed hooks/post-checkout", "new info/attributes", "new objects/info/alternates",
-                               "changed worktrees/ACME-1/HEAD", "changed index"])
+                               "changed index"])
         #expect(try String(contentsOf: hook, encoding: .utf8) == script)
         #expect((try fm.attributesOfItem(atPath: hook.path)[.posixPermissions] as? Int) == 0o755, "the hook stays executable")
         #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/info/attributes").path))
         #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/objects/info/alternates").path))
-        #expect(try String(contentsOf: admin.appending(path: "HEAD"), encoding: .utf8) == head)
         #expect(try f.git(["ls-files", "-v", "a.txt"], in: wt) == "H a.txt")
         // A mode change alone is a change too.
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hook.path)
@@ -371,5 +369,190 @@ import Foundation
         try f.git(["update-index", "--refresh"], in: wt)
         #expect(try Data(contentsOf: index) != bytes, "the refresh really rewrote the index")
         #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty)
+    }
+
+    // MARK: H1: a worktree's HEAD stays on its item branch
+
+    final class TamperLog: @unchecked Sendable {
+        private let lock = NSLock(); private var items: [String] = []
+        func add(_ s: String) { lock.lock(); items.append(s); lock.unlock() }
+        var all: [String] { lock.lock(); defer { lock.unlock() }; return items }
+    }
+
+    private func watched(_ f: GitFixture) -> (GitWorkspace, TamperLog) {
+        let log = TamperLog()
+        var ws = f.ws
+        ws.onWorktreeTamper = { key, detail in log.add("\(key): \(detail)") }
+        return (ws, log)
+    }
+
+    @Test func headRewrittenToMainRefusesAndHeals() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let main = try #require(try ws.head(of: "refs/heads/main"))
+        let admin = f.root.appending(path: ".git/worktrees/K-1")
+        try f.write("b.txt", "two", in: wt)
+        #expect(try ws.commitAll(in: wt, message: "first") != nil)
+        #expect(log.all.isEmpty, "a normal checkout raises nothing")
+        // Another turn rewrites this worktree's HEAD to main.
+        try f.write("c.txt", "three", in: wt)
+        try "ref: refs/heads/main\n".write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8)
+        let branch = try #require(try ws.head(of: "refs/heads/item/K-1"))
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "evil") }
+        #expect(try ws.head(of: "refs/heads/main") == main, "main did not move")
+        #expect(try ws.head(of: "refs/heads/item/K-1") == branch)
+        #expect(log.all.count == 1)
+        #expect(log.all.first?.contains("HEAD") == true)
+        #expect(try String(contentsOf: admin.appending(path: "HEAD"), encoding: .utf8) == "ref: refs/heads/item/K-1\n", "healed from the record")
+        // After the heal the commit lands on the item branch.
+        let sha = try #require(try ws.commitAll(in: wt, message: "after heal"))
+        #expect(try ws.head(of: "refs/heads/item/K-1") == sha)
+        #expect(try ws.head(of: "refs/heads/main") == main)
+        #expect(log.all.count == 1, "one alert for one tamper")
+    }
+
+    @Test func everyEngineEntryPointChecksHead() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let start = try #require(try ws.head(of: "refs/heads/item/K-1"))
+        let admin = f.root.appending(path: ".git/worktrees/K-1")
+        func tamper(_ text: String = "ref: refs/heads/main\n") throws {
+            try text.write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8)
+        }
+        try tamper(); #expect(throws: GitError.self) { try ws.isDirty(in: wt) }
+        try tamper(); #expect(throws: GitError.self) { try ws.headCommit(in: wt) }
+        try tamper(); #expect(throws: GitError.self) { try ws.resetHard(in: wt, to: start) }
+        try tamper(); #expect(throws: GitError.self) { try ws.planBarrier(key: "K-1", in: wt) }
+        let before = try ws.planBarrier(key: "K-1", in: wt)
+        try tamper(); #expect(throws: GitWorkspace.PlanBarrierError.self) { try ws.enforcePlanBarrier(before, key: "K-1", in: wt) }
+        // A detached HEAD is no better.
+        try tamper(start + "\n"); #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "x") }
+        // Removal commits first: refused (the checkout stays), and works after the heal.
+        try f.write("keep.txt", "work", in: wt)
+        try tamper()
+        #expect(throws: GitError.self) { try ws.removeWorktree(key: "K-1", keepIf: { false }) }
+        #expect(FileManager.default.fileExists(atPath: wt.path))
+        try ws.removeWorktree(key: "K-1", keepIf: { false })
+        #expect(!FileManager.default.fileExists(atPath: wt.path))
+        #expect(try f.git(["show", "item/K-1:keep.txt"]) == "work")
+        #expect(try ws.head(of: "refs/heads/main") == start)
+        #expect(log.all.count == 7)
+    }
+
+    @Test func repointedGitdirAndCommondirAreAlertsToo() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let admin = f.root.appending(path: ".git/worktrees/K-1")
+        #expect(try ws.isDirty(in: wt) == false)
+        #expect(log.all.isEmpty, "the paths git wrote itself (resolved or not) are the engine's")
+        try "/tmp/elsewhere/.git\n".write(to: admin.appending(path: "commondir"), atomically: true, encoding: .utf8)
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "x") }
+        #expect(log.all.count == 1 && log.all[0].contains("commondir"))
+        #expect(try String(contentsOf: admin.appending(path: "commondir"), encoding: .utf8) == "../..\n")
+        try "gitdir: /tmp/elsewhere/.git\n".write(to: wt.appending(path: ".git"), atomically: true, encoding: .utf8)
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "x") }
+        #expect(log.all.count == 2 && log.all[1].contains(".git"))
+        try f.write("b.txt", "two", in: wt)
+        #expect(try ws.commitAll(in: wt, message: "ok") != nil)
+        // A symlink in place of HEAD is replaced by a regular file.
+        try FileManager.default.removeItem(at: admin.appending(path: "HEAD"))
+        try FileManager.default.createSymbolicLink(atPath: admin.appending(path: "HEAD").path, withDestinationPath: f.root.appending(path: ".git/HEAD").path)
+        #expect(throws: GitError.self) { try ws.isDirty(in: wt) }
+        #expect(try ws.isDirty(in: wt) == false)
+        #expect(log.all.count == 3)
+    }
+
+    // MARK: H2 and H3
+
+    @Test func planBarrierDeletesANewItemBranch() throws {
+        let (f, wt) = try barrierFixture()
+        let other = try f.git(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "planted"])
+        try f.ws.addWorktree(key: "ACME-2")
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try f.git(["branch", "item/ACME-9", other])
+        try f.git(["update-ref", "refs/heads/item/ACME-2", other])          // existed before: the engine's, left alone
+        let found = try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt)
+        #expect(found == ["new ref refs/heads/item/ACME-9"])
+        #expect(try f.ws.head(of: "refs/heads/item/ACME-9") == nil)
+        #expect(try f.ws.head(of: "refs/heads/item/ACME-2") == other)
+        // Packed refs too.
+        let again = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try f.git(["branch", "item/ACME-8", other])
+        try f.git(["pack-refs", "--all"])
+        #expect(try f.ws.enforcePlanBarrier(again, key: "ACME-1", in: wt) == ["new ref refs/heads/item/ACME-8"])
+        #expect(try f.ws.head(of: "refs/heads/item/ACME-8") == nil)
+    }
+
+    @Test func planBarrierFailsClosedOnIgnoredDirectories() throws {
+        let (f, wt) = try barrierFixture()
+        let exclude = f.root.appending(path: ".git/info/exclude")
+        try (try String(contentsOf: exclude, encoding: .utf8) + "emptydir/\nvendor/\n").write(to: exclude, atomically: true, encoding: .utf8)
+        // A nested repository is listed by git as one entry, `vendor/`, whose contents the barrier cannot see.
+        try FileManager.default.createDirectory(at: wt.appending(path: "vendor"), withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "--quiet"], in: wt.appending(path: "vendor"))
+        try f.write("vendor/x.txt", "hidden", in: wt)
+        let error = try #require(throws: GitError.self) { try f.ws.planBarrier(key: "ACME-1", in: wt) }
+        #expect("\(error)".contains("cannot verify ignored directory"))
+        try FileManager.default.removeItem(at: wt.appending(path: "vendor"))
+        // Created during the turn: the check fails closed (nothing is deleted blindly).
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try FileManager.default.createDirectory(at: wt.appending(path: "vendor"), withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "--quiet"], in: wt.appending(path: "vendor"))
+        try f.write("vendor/x.txt", "hidden", in: wt)
+        let failed = try #require(throws: GitWorkspace.PlanBarrierError.self) { try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) }
+        #expect(failed.reason.contains("cannot verify ignored directory"))
+    }
+
+    // MARK: Bounded repository-file capture
+
+    private func sparse(_ url: URL, size: UInt64) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let h = try FileHandle(forWritingTo: url)
+        try h.truncate(atOffset: size); try h.close()
+    }
+
+    @Test func planBarrierBoundsWhatItReadsOfTheRepository() throws {
+        let (f, wt) = try barrierFixture()
+        let fm = FileManager.default
+        let git = f.root.appending(path: ".git")
+        // Snapshot: a huge file, then too many files, and no plan turn starts.
+        try sparse(git.appending(path: "hooks/big"), size: 64 << 20)
+        let big = try #require(throws: GitError.self) { try f.ws.planBarrier(key: "ACME-1", in: wt) }
+        #expect("\(big)".contains("hooks/big"))
+        try fm.removeItem(at: git.appending(path: "hooks/big"))
+        for i in 0..<600 { try f.write(".git/info/many/f\(i)", "x") }
+        #expect(throws: GitError.self) { try f.ws.planBarrier(key: "ACME-1", in: wt) }
+        try fm.removeItem(at: git.appending(path: "info/many"))
+        // Check: the same plants during the turn are deleted and fail the check; a known file that grew is put back.
+        try f.write(".git/hooks/small", "#!/bin/sh\n")
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try sparse(git.appending(path: "hooks/big"), size: 64 << 20)
+        try sparse(git.appending(path: "hooks/small"), size: 4 << 20)
+        for i in 0..<600 { try f.write(".git/info/many/f\(i)", "x") }
+        let error = try #require(throws: GitWorkspace.PlanBarrierError.self) { try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) }
+        #expect(error.reason.contains("hooks/big") && error.reason.contains("hooks/small") && error.reason.contains("more than 500"))
+        #expect(error.found.contains("new hooks/big") && error.found.contains("changed hooks/small"))
+        #expect(!fm.fileExists(atPath: git.appending(path: "hooks/big").path))
+        #expect(!fm.fileExists(atPath: git.appending(path: "info/many").path), "the planted directory is gone")
+        #expect(try String(contentsOf: git.appending(path: "hooks/small"), encoding: .utf8) == "#!/bin/sh\n")
+        #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty, "clean again")
+    }
+
+    @Test func planBarrierReportsARestoreThatFailed() throws {
+        let (f, wt) = try barrierFixture()
+        let fm = FileManager.default
+        let hooks = f.root.appending(path: ".git/hooks")
+        try f.write(".git/hooks/post-commit", "#!/bin/sh\n")
+        let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
+        try "#!/bin/sh\ntouch /tmp/pwned\n".write(to: hooks.appending(path: "post-commit"), atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: hooks.path)      // the put-back cannot write here
+        defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hooks.path) }
+        let error = try #require(throws: GitWorkspace.PlanBarrierError.self) { try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) }
+        #expect(error.found == ["changed hooks/post-commit"])
+        #expect(error.reason.contains("restore hooks/post-commit"))
     }
 }

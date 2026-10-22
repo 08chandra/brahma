@@ -649,6 +649,35 @@ import GRDB
         #expect(!events.contains { $0.kind == .planWritten })
     }
 
+    @Test func planTurnThatRepointsAnotherWorktreesHeadCannotMoveMain() async throws {
+        let (s, i, wt) = try planWorld()
+        let j = try s.item("Other"); let other = try s.store.hire(companyId: s.company.id, name: "eng-2", role: "engineer", model: "sonnet", managerId: s.mgr.id)
+        try s.claim(j, other)
+        let ws = URL(fileURLWithPath: s.company.workspacePath)
+        let main = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws)
+        let otherWt = s.ws.worktreePath(key: j.key)
+        let otherHead = ws.appending(path: ".git/worktrees/\(j.key)/HEAD")
+        s.world.fake.script("eng-1", .init(sideEffect: { _ in
+            try "ref: refs/heads/main\n".write(to: otherHead, atomically: true, encoding: .utf8)
+            try "ref: refs/heads/main\n".write(to: ws.appending(path: ".git/worktrees/\(i.key)/HEAD"), atomically: true, encoding: .utf8)
+        }, text: "the plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(s.requests("eng-1").first?.kind == .plan)
+        // This item's own HEAD was put back by the barrier (the turn counts as a write); the other worktree is refused and healed.
+        #expect(try String(contentsOf: ws.appending(path: ".git/worktrees/\(i.key)/HEAD"), encoding: .utf8) == "ref: refs/heads/item/\(i.key)\n")
+        #expect(try s.store.itemEvents(itemId: i.id).contains { $0.kind == .planTurnWrote })
+        try "engine work".write(to: otherWt.appending(path: "w.txt"), atomically: true, encoding: .utf8)
+        let git = s.store.gitWorkspace(root: ws, companyId: s.company.id)
+        #expect(throws: GitError.self) { try git.commitAll(in: otherWt, message: "engine commit") }
+        let alerts = try s.store.asks(companyId: s.company.id).filter { $0.kind == .engineAlert && $0.summary.contains("worktree of \(j.key) ") }
+        #expect(alerts.count == 1, "one alert for the one tampered worktree")
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == main, "main did not move")
+        let sha = try #require(try git.commitAll(in: otherWt, message: "engine commit"))
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/item/\(j.key)"], in: ws) == sha)
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == main)
+        _ = wt
+    }
+
     @Test func planTurnLeavesAnEngineMoveOfMainAlone() async throws {
         let (s, i, _) = try planWorld()
         let ws = URL(fileURLWithPath: s.company.workspacePath)
