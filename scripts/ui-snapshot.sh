@@ -2,7 +2,7 @@
 # Usage: scripts/ui-snapshot.sh <name> [select]. Assumes .build/Brahma.app exists.
 # Always uses a fresh seeded temp home, because it runs the engine with the FAKE claude. Set
 # BRAHMA_SNAPSHOT_REUSE_HOME=1 to use the caller's BRAHMA_HOME (and BRAHMA_WORKSPACES) instead; the default
-# data home is always refused.
+# data home is always refused. A reused home uses whatever BRAHMA_OWNER_KEY_STORE the caller exports (unset = Keychain).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,9 +14,6 @@ rm -f "$OUT"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-# Dev/demo only: the owner-key hash lives in the data home, not the login Keychain (which prompts for the password
-# after every rebuild). The CLI and app refuse this for the default data home.
-export BRAHMA_OWNER_KEY_STORE=file
 DEFAULT_HOME="$HOME/Library/Application Support/Brahma"
 if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; then
   RESOLVED="$BRAHMA_HOME"
@@ -28,6 +25,11 @@ if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; the
     exit 1
   fi
 else
+  # Fresh seeded temp home only: its owner-key hash lives in the home, not the login Keychain (which prompts for the
+  # password after every rebuild). The CLI and app refuse this for the default data home. A REUSED home may be
+  # Keychain-keyed, so the file store is never forced onto it (export BRAHMA_OWNER_KEY_STORE=file yourself if it
+  # was seeded that way).
+  export BRAHMA_OWNER_KEY_STORE=file
   export BRAHMA_HOME="$TMP/home"
   export BRAHMA_WORKSPACES="$TMP/workspaces"
   mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"

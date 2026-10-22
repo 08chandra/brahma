@@ -18,6 +18,8 @@ public final class AppModel {
     public var selectedAgentId: String?
     public var presentedSheet: AppSheet?
     public var errorMessage: String?
+    /// A standing startup warning (e.g. the dev/demo owner-key store is in use), shown above the detail pane.
+    public var startupNotice: String?
     public var activityFilter: ActivityFilter = .all
     public let search: SearchModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.

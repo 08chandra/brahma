@@ -28,11 +28,43 @@ public enum PlatformOwnerKeyStore {
         guard value == "file" else {
             throw Refusal(description: "\(environmentVariable)=\(value) is not supported (only 'file'; unset it to use the Keychain)")
         }
-        if paths.canonicalHomePath == BrahmaPaths.canonicalPath(defaultHome.path) {
-            throw Refusal(description: "\(environmentVariable)=file is for temp/demo data homes only; refusing for the default data home \(defaultHome.path)")
+        if let reason = defaultHomeIdentity(paths: paths, defaultHome: defaultHome) {
+            throw Refusal(description: "\(environmentVariable)=file is for temp/demo data homes only; refusing for the default data home \(defaultHome.path) (\(reason))")
         }
         return Selection(store: HomeFileOwnerKeyStore(),
                          warning: "warning: \(environmentVariable)=file stores the hash in \(paths.home.path)/owner/keyhash, not the Keychain (dev/demo only)")
+    }
+
+    /// Why `paths` must be treated as the default data home, or nil when it is a different home. A path-string compare
+    /// is not enough (realpath does not resolve the APFS firmlink `/System/Volumes/Data/...`, and a hard link gives a
+    /// database a second name), so this compares file identity: `(st_dev, st_ino)` of the home directory and of the
+    /// database, and refuses any database with more than one link.
+    static func defaultHomeIdentity(paths: BrahmaPaths, defaultHome: URL) -> String? {
+        let canonical = paths.canonicalHomePath
+        let canonicalDefault = BrahmaPaths.canonicalPath(defaultHome.path)
+        if canonical == canonicalDefault { return "same path" }
+        let defaultStat = fileIdentity(defaultHome.path)
+        // The default home may not exist yet; macOS volumes are case-insensitive by default, so compare that way.
+        if defaultStat == nil, canonical.compare(canonicalDefault, options: .caseInsensitive) == .orderedSame {
+            return "same path ignoring case"
+        }
+        if let defaultStat, let home = fileIdentity(paths.home.path), home.dev == defaultStat.dev, home.ino == defaultStat.ino {
+            return "same directory"
+        }
+        if let db = fileIdentity(paths.database.path) {
+            if db.nlink > 1 { return "the database has more than one hard link" }
+            let defaultDB = defaultHome.appending(path: "brahma.sqlite")
+            if let other = fileIdentity(defaultDB.path), other.dev == db.dev, other.ino == db.ino {
+                return "same database file"
+            }
+        }
+        return nil
+    }
+
+    private static func fileIdentity(_ path: String) -> (dev: dev_t, ino: ino_t, nlink: nlink_t)? {
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        return (st.st_dev, st.st_ino, st.st_nlink)
     }
 
     /// `resolve` against the process environment.
@@ -49,8 +81,8 @@ public enum PlatformOwnerKeyStore {
     }
 }
 
-#if canImport(Security)
-/// Process-wide count of every `SecItem*` / `SecKeychain*` / `SecAccess*` call this module makes. Tests use it to
+/// Process-wide count of every `SecItem*` / `SecKeychain*` / `SecAccess*` call this module makes (always 0 where there is no Keychain, so
+/// tests compile and pass on every platform). Tests use it to
 /// prove they never touch the login Keychain (a rebuilt, ad-hoc-signed binary makes macOS ask for the password on
 /// every access). `forbid()` arms a trap: any later call crashes loudly instead of prompting.
 public enum KeychainAccessLog {
@@ -67,6 +99,7 @@ public enum KeychainAccessLog {
     }
 }
 
+#if canImport(Security)
 /// A generic-password Keychain item: service `dev.brahma.owner`, account = the canonical (realpath) data-home path (so test
 /// homes never touch the real owner's item). The item is created with an access list that trusts any application,
 /// so both the app and the `brahma` CLI read it without a prompt. Until 5-lite, an agent shell can read it too.

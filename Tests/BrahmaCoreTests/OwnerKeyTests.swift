@@ -278,6 +278,65 @@ private final class DeleteThenFailStore: OwnerKeyStore, @unchecked Sendable {
         #expect((try? PlatformOwnerKeyStore.resolve(environment: env, paths: BrahmaPaths(home: d.appending(path: "other"), workspaces: d.appending(path: "ws")), defaultHome: fakeDefault)) != nil)
     }
 
+    @Test func fileStoreRefusedForTheDefaultHomeViaTheDataVolumeFirmlinkAlias() throws {
+        // realpath does not resolve the APFS firmlink, so a string compare of canonical paths misses this alias.
+        let user = NSHomeDirectory()
+        let alias = "/System/Volumes/Data" + user
+        try #require(FileManager.default.fileExists(atPath: alias), "no firmlink alias on this machine")
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        try FileManager.default.createDirectory(at: fakeDefault, withIntermediateDirectories: true)
+        let aliasHome = URL(fileURLWithPath: "/System/Volumes/Data" + BrahmaPaths.canonicalPath(fakeDefault.path), isDirectory: true)
+        try #require(FileManager.default.fileExists(atPath: aliasHome.path), "temp dir has no firmlink alias")
+        try #require(BrahmaPaths.canonicalPath(aliasHome.path) != BrahmaPaths.canonicalPath(fakeDefault.path),
+                     "this is the case a path compare misses")
+        let p = BrahmaPaths(home: aliasHome, workspaces: d.appending(path: "ws"))
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": "file"], paths: p, defaultHome: fakeDefault)
+        }
+    }
+
+    @Test func fileStoreRefusedForAHardLinkedDefaultDatabase() throws {
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        try FileManager.default.createDirectory(at: fakeDefault, withIntermediateDirectories: true)
+        let defaultDB = fakeDefault.appending(path: "brahma.sqlite")
+        try Data("db".utf8).write(to: defaultDB)
+        let other = d.appending(path: "other")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let p = BrahmaPaths(home: other, workspaces: d.appending(path: "ws"))
+        try FileManager.default.linkItem(at: defaultDB, to: p.database)
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": "file"], paths: p, defaultHome: fakeDefault)
+        }
+    }
+
+    @Test func fileStoreRefusedForAnyMultiplyLinkedDatabase() throws {
+        // Even when the other name is not the default database: a database with a second name could be anything.
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        let other = d.appending(path: "other")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let p = BrahmaPaths(home: other, workspaces: d.appending(path: "ws"))
+        try Data("db".utf8).write(to: p.database)
+        let env = ["BRAHMA_OWNER_KEY_STORE": "file"]
+        #expect((try? PlatformOwnerKeyStore.resolve(environment: env, paths: p, defaultHome: fakeDefault)) != nil)
+        try FileManager.default.linkItem(at: p.database, to: d.appending(path: "second-name"))
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: env, paths: p, defaultHome: fakeDefault)
+        }
+    }
+
+    @Test func fileStoreRefusalIsCaseInsensitiveWhenTheDefaultHomeDoesNotExistYet() throws {
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        let shouty = d.appending(path: "LIBRARY/application support/BRAHMA")
+        let p = BrahmaPaths(home: shouty, workspaces: d.appending(path: "ws"))
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": "file"], paths: p, defaultHome: fakeDefault)
+        }
+    }
+
     @Test(arguments: ["keychain", "FILE", "", "1", "memory"])
     func unknownStoreValuesAreRefused(value: String) throws {
         let p = try paths()
