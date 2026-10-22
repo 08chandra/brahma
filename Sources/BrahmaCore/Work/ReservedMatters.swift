@@ -13,13 +13,13 @@ public enum ReservedMatters {
 
     public static func isReserved(_ category: String?, extra: [String]) -> Bool {
         guard let c = normalize(category) else { return false }
-        return categories.contains(c) || extra.contains(c)
+        return categories.contains(c) || extra.contains { normalize($0) == c }
     }
 
     /// Built-in, pack-added and ordinary categories, in the order an error message lists them.
     public static func allowed(extra: [String]) -> [String] {
         var seen = Set<String>()
-        return (categories + extra + ordinary).filter { seen.insert($0).inserted }
+        return (categories + extra.compactMap(normalize) + ordinary).filter { seen.insert($0).inserted }
     }
 
     static func normalize(_ category: String?) -> String? {

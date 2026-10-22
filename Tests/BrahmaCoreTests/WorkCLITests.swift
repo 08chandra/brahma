@@ -216,6 +216,29 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try brahma(["inbox", "Acme", "--all"], home: home).stdout.contains("FYI"))
     }
 
+    @Test func inboxPrintsNoControlCharactersFromOptionLabels() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        // Store-time stripping removes control characters from labels...
+        let p = try brahma(["dev", "propose", "Acme", "--by", "eng-1", "--kind", "architecture", "--title", "T", "--summary", "s",
+                            "--option", "Safe\u{1B}[2J\u{07}", "--option", "Plain"], home: home, env: devEnv)
+        #expect(p.status == 0, "\(p.stderr)")
+        #expect(try brahma(["dev", "decide", "Acme", "A-1", "--by", "cto", "--approve", "--note", "ok"], home: home, env: devEnv).status == 0)
+        let clean = try brahma(["inbox", "Acme"], home: home).stdout
+        #expect(clean.contains("option 1: Safe[2J")); #expect(!clean.contains("\u{1B}")); #expect(!clean.contains("\u{07}"))
+        // ...and the CLI sanitises again, even for a row written behind the store's back.
+        let paths = ownerPaths(home)
+        let store = try Store(path: paths.database.path)
+        try store.writer.write { db in
+            try db.execute(sql: "UPDATE ask SET payload = REPLACE(payload, '\"Plain\"', '\"Evil\\u001b[2J\\u0007\\nforged\"')")
+        }
+        let raw = try brahma(["inbox", "Acme"], home: home).stdout
+        #expect(!raw.contains("\u{1B}")); #expect(!raw.contains("\u{07}"))
+        #expect(raw.contains("option 2: Evil"))
+        #expect(!raw.contains("\nforged"))
+    }
+
     @Test func devRequiresFlag() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url

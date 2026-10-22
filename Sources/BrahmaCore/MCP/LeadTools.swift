@@ -98,7 +98,8 @@ extension CompanyTools {
             itemId = item.id
         }
         if cls == .mechanical {
-            try store.recordMechanicalDecision(companyId: companyId, by: .agent(agentId), kind: kind, title: title, summary: summary, itemId: itemId)
+            try store.recordMechanicalDecision(companyId: companyId, by: .agent(agentId), kind: kind, category: try optionalText(args, "category"), title: title,
+                                                summary: summary, itemId: itemId)
             return "Recorded as a mechanical decision; no approval needed."
         }
         var supersedes: String?
@@ -120,7 +121,7 @@ extension CompanyTools {
                                     category: try optionalText(args, "category"), title: title, summary: summary, payload: payload,
                                     itemId: itemId, supersedes: supersedes, requestId: try optionalText(args, "request_id"),
                                     decisionClass: cls)
-        return try describe(ask)
+        return try describe(ask, expecting: kind)
     }
 
     private func requestFromOwner(_ args: [String: JSONValue]) throws -> String {
@@ -132,6 +133,7 @@ extension CompanyTools {
         let ask = try store.requestFromOwner(companyId: companyId, by: .agent(agentId), title: try text(args, "title"),
                                              question: try text(args, "question"), details: try optionalText(args, "details"),
                                              expiresInHours: hours, requestId: try optionalText(args, "request_id"))
+        if ask.kind != .info || ask.status != .pendingOwner { return try describe(ask, expecting: .info) }
         return "Asked the owner (\(ask.ref)). You will get the answer as a DM from the owner."
     }
 
@@ -160,8 +162,16 @@ extension CompanyTools {
 
     // MARK: Helpers
 
-    private func describe(_ ask: Ask) throws -> String {
+    /// Says what the ask is now. A repeated `request_id` returns the existing ask, which may be of another kind or already
+    /// decided, so the text follows its actual kind and status.
+    private func describe(_ ask: Ask, expecting kind: AskKind) throws -> String {
         let title = try store.displayTitle(ask)
+        if ask.kind != kind {
+            return "That request_id already belongs to \(ask.ref) (\(title), \(ask.status.rawValue)); nothing new was filed."
+        }
+        if !ask.status.isPending {
+            return "\(ask.ref) (\(title)) was already filed with that request_id and is \(ask.status.rawValue); nothing new was filed."
+        }
         if ask.status == .pendingInternal, let id = ask.internalApproverId, let approver = try store.agent(id: id) {
             return "Filed \(ask.ref) (\(title)) for @\(approver.name) to decide; if it matters to the owner it goes on to them."
         }

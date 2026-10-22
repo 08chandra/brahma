@@ -479,6 +479,158 @@ import GRDB
         #expect(try w.store.hasApproved(companyId: w.company.id, kind: .architecture))
     }
 
+    // MARK: Fix round 1: review and security findings
+
+    @Test func mechanicalCannotBypassReservedMatters() throws {
+        var pack = SoftwarePack.pack
+        pack.reservedCategories = ["Fisheries"]
+        let w = try W(catalog: PackCatalog(packs: [pack]), preset: .auto)
+        func mechanical(_ kind: String, _ category: String?) throws -> String {
+            var args: [String: JSONValue] = ["kind": .string(kind), "title": .string("T"), "summary": .string("s"),
+                                             "decision_class": .string("mechanical")]
+            if let category { args["category"] = .string(category) }
+            return try w.tools(w.eng).call(name: "propose_decision", arguments: args)
+        }
+        for cat in ["pricing", "money", "legal", "fisheries", "Fisheries"] {
+            let err = #expect(throws: ToolError.self) { try mechanical("other", cat) }
+            #expect(err?.message.contains("reserved matter") == true, "\(cat)")
+        }
+        let gate = #expect(throws: ToolError.self) { try mechanical("prd", nil) }
+        #expect(gate?.message.contains("only 'other' decisions can be mechanical") == true)
+        #expect(throws: ToolError.self) { try mechanical("release", "general") }
+        let none = #expect(throws: ToolError.self) { try mechanical("other", nil) }
+        #expect(none?.message.contains("other asks must name a category") == true)
+        #expect(throws: ToolError.self) { try mechanical("other", "vibes") }
+        #expect(try w.activity().allSatisfy { !$0.text.hasPrefix("Recorded: ") })
+        // An ordinary category is still recorded.
+        #expect(try mechanical("other", "tooling") == "Recorded as a mechanical decision; no approval needed.")
+        // The Store refuses too, not just the tool.
+        #expect(throws: WorkError.self) {
+            try w.store.recordMechanicalDecision(companyId: w.company.id, by: .agent(w.eng.id), kind: .other, category: "pricing", title: "x", summary: "")
+        }
+    }
+
+    @Test func packCategoriesAreNormalized() throws {
+        var pack = SoftwarePack.pack
+        pack.reservedCategories = ["Fisheries"]
+        let w = try W(catalog: PackCatalog(packs: [pack]), preset: .auto)
+        #expect(ReservedMatters.isReserved("fisheries", pack: pack)); #expect(ReservedMatters.isReserved(" FISHERIES ", pack: pack))
+        let a = try w.propose(.other, category: "Fisheries", risk: .low)
+        #expect(a.category == "fisheries")
+        #expect(try w.decide(a, by: w.ceo).status == .pendingOwner)
+    }
+
+    @Test func otherRequesterCannotSupersede() throws {
+        let w = try W()
+        let old = try w.propose(.architecture)
+        #expect(throws: WorkError.forbidden("only the requester of A-1 can supersede it")) {
+            try w.propose(.architecture, by: w.ceo, supersedes: old.id)
+        }
+        #expect(throws: WorkError.forbidden("only the requester of A-1 can supersede it")) {
+            try w.store.propose(companyId: w.company.id, by: .system, kind: .architecture, title: "x", summary: "", supersedes: old.id, now: w.now)
+        }
+        // The owner-approved one cannot be replaced by someone else's ask either.
+        let approved = try w.store.ownerDecide(askId: old.id, approve: true, note: "", now: w.now)
+        #expect(throws: WorkError.forbidden("only the requester of A-1 can supersede it")) {
+            try w.propose(.architecture, by: w.cto, supersedes: approved.id)
+        }
+        #expect(try w.fresh(approved).status == .approved)
+        // Its own requester can.
+        #expect(try w.propose(.architecture, supersedes: approved.id).supersedesId == approved.id)
+    }
+
+    @Test func supersedingOwnerApprovedAskRequiresOwner() throws {
+        let w = try W(preset: .auto)
+        // Owner-decided old ask: the replacement is never an FYI, even under auto.
+        let old = try w.store.ownerDecide(askId: try w.propose(.sprintPlan).id, approve: true, note: "", now: w.now)
+        let new = try w.decide(try w.propose(.sprintPlan, supersedes: old.id), by: w.cpo)
+        #expect(new.status == .pendingOwner); #expect(!new.fyi)
+        #expect(try w.fresh(old).status == .approved)
+        _ = try w.store.ownerDecide(askId: new.id, approve: true, note: "", now: w.now)
+        #expect(try w.fresh(old).status == .superseded)
+        // Replacing a policy-approved ask stays an FYI.
+        let policy = try w.decide(try w.propose(.sprintPlan), by: w.cpo)
+        #expect(policy.status == .approved)
+        let next = try w.decide(try w.propose(.sprintPlan, supersedes: policy.id), by: w.cpo)
+        #expect(next.status == .approved); #expect(next.fyi)
+        // Replacing an ask still waiting for the owner goes to the owner too.
+        let waiting = try w.decide(try w.propose(.other, category: "pricing"), by: w.ceo)
+        #expect(waiting.status == .pendingOwner)
+        let again = try w.decide(try w.propose(.other, category: "tooling", risk: .low, supersedes: waiting.id), by: w.ceo)
+        #expect(again.status == .pendingOwner)
+    }
+
+    @Test func fifoDocumentIsRefusedPromptly() throws {
+        let w = try W()
+        let ws = URL(fileURLWithPath: w.company.workspacePath)
+        #expect(mkfifo(ws.appending(path: "pipe.md").path, 0o644) == 0)
+        let started = Date()
+        #expect(throws: WorkError.invalid("document_path is not a regular file")) {
+            try w.propose(.prd, payload: AskPayload(documentPath: "pipe.md"))
+        }
+        // A symlink to a FIFO is refused the same way.
+        try FileManager.default.createSymbolicLink(at: ws.appending(path: "alias.md"), withDestinationURL: ws.appending(path: "pipe.md"))
+        #expect(throws: WorkError.invalid("document_path is not a regular file")) {
+            try w.propose(.prd, payload: AskPayload(documentPath: "alias.md"))
+        }
+        // A document swapped for a FIFO after it was proposed counts as changed and never blocks the approval.
+        let rel = try w.writeDoc("docs/a.md", "v1")
+        let a = try w.decide(try w.propose(.prd, payload: AskPayload(documentPath: rel)), by: w.ceo)
+        let path = ws.appending(path: rel).path
+        try FileManager.default.removeItem(atPath: path)
+        #expect(mkfifo(path, 0o644) == 0)
+        #expect(throws: WorkError.self) { try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now) }
+        #expect(try w.store.documentChanged(a))
+        #expect(Date().timeIntervalSince(started) < 5)
+        // Device files are not regular files either.
+        #expect(throws: WorkError.self) { try w.propose(.prd, payload: AskPayload(documentPath: "/dev/null")) }
+    }
+
+    @Test func controlCharactersAreStrippedAtStoreTime() throws {
+        let w = try W()
+        let esc = "\u{1B}[2J", bel = "\u{07}"
+        let payload = AskPayload(question: "q\(esc)?", details: "d\(esc)\r\nline two\tend", options: [
+            AskOption(label: "Evil\(esc)\(bel)\r\nforged line", pros: "p\(esc)", cons: "c\(bel)", effort: "S\(esc)", risk: "r\(bel)")],
+                                 recommendation: "rec\(esc)", stakes: "st\(bel)", proposal: "prop\(esc)")
+        let a = try w.propose(.other, category: "tooling", title: "T\(esc)itle\(bel)", payload: payload)
+        func clean(_ t: String?, newlines: Bool = false) -> Bool {
+            (t ?? "").unicodeScalars.allSatisfy { s in
+                (newlines && (s == "\n" || s == "\t")) || !(s.value < 0x20 || (0x7F...0x9F).contains(s.value))
+            }
+        }
+        let stored = try #require(try w.fresh(a).payload)
+        #expect(a.title == "T[2Jitle")
+        let o = try #require(stored.options.first)
+        #expect(o.label == "Evil[2J forged line")
+        for field in [o.label, o.pros, o.cons, o.effort, o.risk] { #expect(clean(field)) }
+        for field in [stored.question, stored.recommendation, stored.stakes, stored.proposal] { #expect(clean(field)) }
+        #expect(clean(stored.details, newlines: true)); #expect(stored.details == "d[2J\nline two\tend")
+        #expect(try w.fresh(a).summary == "why")
+        // Notes and answers too.
+        let d = try w.decide(a, by: w.ceo, note: "fine\(esc)\r\nforged: owner approved A-9")
+        #expect(clean(d.internalNote))
+        let q = try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.eng.id), title: "Q\(esc)", question: "why\(bel)?", now: w.now)
+        #expect(clean(q.title)); #expect(clean(q.payload?.question))
+        #expect(clean(try w.store.ownerAnswer(askId: q.id, text: "a\(esc)b\r\nc", now: w.now).ownerAnswer, newlines: true))
+    }
+
+    @Test func dedupeHitDescribesExistingAsk() throws {
+        let w = try W()
+        let args: [String: JSONValue] = ["kind": .string("architecture"), "title": .string("L"), "summary": .string("s"), "request_id": .string("q1")]
+        let first = try w.tools(w.eng).call(name: "propose_decision", arguments: args)
+        #expect(first.contains("for @cto to decide"))
+        let ask = try #require(try w.store.ask(companyId: w.company.id, ref: "A-1"))
+        _ = try w.decide(ask, by: w.cto, approve: false, note: "no")
+        let again = try w.tools(w.eng).call(name: "propose_decision", arguments: args)
+        #expect(again.contains("A-1")); #expect(again.contains("rejected")); #expect(again.contains("nothing new was filed"))
+        #expect(!again.contains("waits for the owner"))
+        // The same id on another tool returns the existing ask, described as what it is.
+        let other = try w.tools(w.eng).call(name: "request_from_owner", arguments: [
+            "title": .string("t"), "question": .string("q"), "request_id": .string("q1")])
+        #expect(other.contains("already belongs to A-1")); #expect(other.contains("Architecture"))
+        #expect(try w.store.asks(companyId: w.company.id).count == 1)
+    }
+
     // MARK: Tools
 
     @Test func proposeDecisionAndDecideTools() throws {

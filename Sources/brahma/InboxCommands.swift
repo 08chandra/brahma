@@ -16,7 +16,7 @@ private func resolveAsk(_ store: Store, _ company: Company, _ ref: String) throw
 
 private func block(_ label: String, _ text: String?) {
     guard let text, !text.isEmpty else { return }
-    print("    \(label):")
+    print(safe("    \(label):"))
     for line in text.components(separatedBy: .newlines) { print(safe("      | " + line)) }
 }
 

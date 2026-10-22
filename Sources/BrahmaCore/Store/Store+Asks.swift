@@ -1,5 +1,15 @@
 import Foundation
 import GRDB
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// The owner's Inbox: asks agents file, the internal approver's step, the autonomy preset, and the owner's answers.
 ///
@@ -44,8 +54,18 @@ extension Store {
         return try Agent.fetchOne(db, key: id)?.name ?? "?"
     }
 
+    /// Removes control characters (ESC, BEL, CR, DEL, C1...) so stored text cannot drive a terminal. Newlines and tabs stay
+    /// only when `keepNewlines`.
+    static func stripControls(_ text: String, keepNewlines: Bool = false) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.filter { s in
+            if keepNewlines, s == "\n" || s == "\t" { return true }
+            return !(s.value < 0x20 || (0x7F...0x9F).contains(s.value))
+        }))
+    }
+
     private static func flat(_ text: String, max: Int = 500) -> String {
-        let one = text.components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let spaced = text.components(separatedBy: .newlines).joined(separator: " ")
+        let one = stripControls(spaced).trimmingCharacters(in: .whitespacesAndNewlines)
         return one.count > max ? String(one.prefix(max)) + "…" : one
     }
 
@@ -57,7 +77,8 @@ extension Store {
     }
 
     private static func limitedText(_ text: String?, _ max: Int, _ what: String) throws -> String? {
-        guard let text else { return nil }
+        guard let raw = text else { return nil }
+        let text = stripControls(raw, keepNewlines: true)
         guard text.count <= max else { throw WorkError.invalid("\(what) is longer than \(max) characters") }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? nil : t
@@ -87,9 +108,13 @@ extension Store {
 
     // MARK: Documents
 
-    /// Resolves a document path (relative to the workspace, or absolute) with symlinks followed, and requires it to be a
-    /// regular file inside the workspace. Returns the workspace-relative path and the hash of its bytes.
-    static func resolveDocument(_ raw: String, workspace: String) throws -> (path: String, hash: String) {
+    /// A document read for an ask: the workspace-relative path and the hash of its bytes.
+    struct PreparedDocument: Equatable { var path: String; var hash: String }
+
+    /// Resolves a document path (relative to the workspace, or absolute) with symlinks followed, requires it to lie inside
+    /// the workspace and to be a regular file (never a FIFO or device: opened non-blocking and checked with `fstat`),
+    /// and hashes its bytes. Reads the file, so call it OUTSIDE a database write transaction.
+    static func readDocument(_ raw: String, workspace: String) throws -> PreparedDocument {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.contains("\0") else { throw WorkError.invalid("document_path is empty") }
         let ws = URL(fileURLWithPath: workspace).standardizedFileURL.resolvingSymlinksInPath()
@@ -102,16 +127,24 @@ extension Store {
             throw WorkError.invalid("document_path does not exist")
         }
         guard !isDir.boolValue else { throw WorkError.invalid("document_path is a directory, not a file") }
-        let size = (try? FileManager.default.attributesOfItem(atPath: resolved.path)[.size] as? Int) ?? 0
-        guard size <= maxAskDocumentBytes else { throw WorkError.invalid("the document is larger than 10 MB") }
-        guard let data = FileManager.default.contents(atPath: resolved.path) else { throw WorkError.invalid("document_path cannot be read") }
-        return (String(resolved.path.dropFirst(ws.path.count + 1)), StableHash.fnv1a64(data))
+        let fd = open(resolved.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw WorkError.invalid("document_path cannot be read") }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { close(fd); throw WorkError.invalid("document_path cannot be read") }
+        guard (info.st_mode & S_IFMT) == S_IFREG else { close(fd); throw WorkError.invalid("document_path is not a regular file") }
+        guard info.st_size >= 0, info.st_size <= maxAskDocumentBytes else { close(fd); throw WorkError.invalid("the document is larger than 10 MB") }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        guard let data = try? handle.read(upToCount: maxAskDocumentBytes + 1), data.count <= maxAskDocumentBytes else {
+            throw WorkError.invalid("document_path cannot be read or is larger than 10 MB")
+        }
+        return PreparedDocument(path: String(resolved.path.dropFirst(ws.path.count + 1)), hash: StableHash.fnv1a64(data))
     }
 
-    /// The hash of the document now, or nil when it is gone, unreadable or no longer inside the workspace.
+    /// The hash of the document now, or nil when it is gone, unreadable, not a regular file or outside the workspace.
+    /// Reads the file: call it outside a write transaction.
     private func currentDocumentHash(_ ask: Ask, company: Company) -> String? {
         guard let path = ask.payload?.documentPath else { return nil }
-        return try? Store.resolveDocument(path, workspace: company.workspacePath).hash
+        return try? Store.readDocument(path, workspace: company.workspacePath).hash
     }
 
     /// True when the ask names a document whose bytes differ from those proposed (or that can no longer be read).
@@ -203,16 +236,22 @@ extension Store {
                         title: String, summary: String, payload: AskPayload? = nil, itemId: String? = nil, subjectId: String? = nil,
                         supersedes: String? = nil, requestId: String? = nil, decisionClass: DecisionClass = .taste,
                         viaOwner: Bool = false, now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in
+        // The document is read and hashed before the write transaction opens, so a slow file never holds the database.
+        var document: PreparedDocument?
+        if let raw = payload?.documentPath {
+            guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
+            document = try Store.readDocument(raw, workspace: company.workspacePath)
+        }
+        return try writer.write { db in
             try propose(db: db, companyId: companyId, by: sender, kind: kind, risk: risk, category: category, title: title,
-                        summary: summary, payload: payload, itemId: itemId, subjectId: subjectId, supersedes: supersedes,
-                        requestId: requestId, decisionClass: decisionClass, viaOwner: viaOwner, now: now)
+                        summary: summary, payload: payload, document: document, itemId: itemId, subjectId: subjectId,
+                        supersedes: supersedes, requestId: requestId, decisionClass: decisionClass, viaOwner: viaOwner, now: now)
         }
     }
 
     func propose(db: Database, companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk?, category: String?, title: String,
-                 summary: String, payload: AskPayload?, itemId: String?, subjectId: String?, supersedes: String?, requestId: String?,
-                 decisionClass: DecisionClass, viaOwner: Bool, now: Date) throws -> Ask {
+                 summary: String, payload: AskPayload?, document: PreparedDocument?, itemId: String?, subjectId: String?,
+                 supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool, now: Date) throws -> Ask {
         let company = try requireCompany(db, companyId)
         let requester = try askRequester(db, sender, companyId: companyId)
         let rid = Store.cleanRequestId(requestId)
@@ -231,6 +270,8 @@ extension Store {
             }
         } else if kind.isGate || kind == .boost {
             cat = nil
+        } else {
+            cat = cat.map { Store.flat($0, max: 64).lowercased() }
         }
         let cleanTitle = try Store.cleanAskTitle(title)
         let cleanSummary = try Store.limitedText(summary, Store.maxAskText, "the summary") ?? ""
@@ -243,8 +284,10 @@ extension Store {
             guard let old = try Ask.fetchOne(db, key: supersedes) else { throw WorkError.notFound("no such ask to supersede") }
             guard old.companyId == companyId else { throw WorkError.forbidden("not in your company") }
             guard old.kind == kind else { throw WorkError.invalid("supersedes must name an ask of the same kind") }
+            // Only the agent that filed an ask can replace it; nobody supersedes another requester's (or the owner's) ask.
+            guard old.requesterId == requester.id else { throw WorkError.forbidden("only the requester of \(old.ref) can supersede it") }
         }
-        let (body, hash) = try prepare(payload, company: company)
+        let (body, hash) = try prepare(payload, document: document)
 
         let active = try Store.activeNow(db: db, companyId: companyId)
         let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM ask WHERE companyId = ?", arguments: [companyId])) ?? 1
@@ -269,7 +312,7 @@ extension Store {
     }
 
     /// Checks the brief and resolves the document: returns the payload to store and the document hash.
-    private func prepare(_ payload: AskPayload?, company: Company) throws -> (AskPayload?, String?) {
+    private func prepare(_ payload: AskPayload?, document: PreparedDocument?) throws -> (AskPayload?, String?) {
         guard var p = payload else { return (nil, nil) }
         guard p.options.count <= AskPayload.maxOptions else { throw WorkError.invalid("an ask carries at most \(AskPayload.maxOptions) options") }
         p.question = try Store.limitedText(p.question, Store.maxAskField, "the question")
@@ -279,30 +322,40 @@ extension Store {
         p.proposal = try Store.limitedText(p.proposal, Store.maxAskField, "the proposal")
         p.options = try p.options.map { o in
             var o = o
-            guard let label = try Store.limitedText(o.label, 200, "an option label") else { throw WorkError.invalid("an option needs a label") }
+            guard let label = try Store.limitedText(o.label, 200, "an option label").map({ Store.flat($0, max: 200) }), !label.isEmpty else {
+                throw WorkError.invalid("an option needs a label")
+            }
             o.label = label
             o.pros = try Store.limitedText(o.pros, 1000, "an option's pros") ?? ""
             o.cons = try Store.limitedText(o.cons, 1000, "an option's cons") ?? ""
-            o.effort = try Store.limitedText(o.effort, 200, "an option's effort") ?? ""
-            o.risk = try Store.limitedText(o.risk, 200, "an option's risk") ?? ""
+            o.effort = try Store.limitedText(o.effort, 200, "an option's effort").map { Store.flat($0, max: 200) } ?? ""
+            o.risk = try Store.limitedText(o.risk, 200, "an option's risk").map { Store.flat($0, max: 200) } ?? ""
             return o
         }
         var hash: String?
-        if let raw = p.documentPath {
-            let doc = try Store.resolveDocument(raw, workspace: company.workspacePath)
-            p.documentPath = doc.path
-            hash = doc.hash
+        if p.documentPath != nil {
+            guard let document else { throw WorkError.invalid("document_path was not read") }
+            p.documentPath = document.path
+            hash = document.hash
         }
         return (p, hash)
     }
 
     /// A mechanical decision needs no approval: it is logged to the activity feed (and the item's history).
-    public func recordMechanicalDecision(companyId: String, by sender: Sender, kind: AskKind, title: String, summary: String,
-                                         itemId: String? = nil, now: Date = Store.now()) throws {
+    /// Only an ordinary `other` matter can be mechanical: gate kinds and reserved categories always need approval.
+    public func recordMechanicalDecision(companyId: String, by sender: Sender, kind: AskKind, category: String?, title: String,
+                                         summary: String, itemId: String? = nil, now: Date = Store.now()) throws {
         try writer.write { db in
-            _ = try requireCompany(db, companyId)
+            let company = try requireCompany(db, companyId)
             let requester = try askRequester(db, sender, companyId: companyId)
-            guard kind.isDecision else { throw WorkError.invalid("\(kind.rawValue) is not a decision kind") }
+            guard kind == .other else { throw WorkError.invalid("only 'other' decisions can be mechanical; \(kind.rawValue) needs approval") }
+            let extra = pack(for: company)?.reservedCategories ?? []
+            guard let cat = ReservedMatters.normalize(category), ReservedMatters.allowed(extra: extra).contains(cat) else {
+                throw WorkError.invalid("other asks must name a category: \(ReservedMatters.allowed(extra: extra).joined(separator: ", "))")
+            }
+            guard !ReservedMatters.isReserved(cat, extra: extra) else {
+                throw WorkError.invalid("\(cat) is a reserved matter and can't be mechanical; propose it for approval")
+            }
             let cleanTitle = try Store.cleanAskTitle(title)
             let text = "Recorded: \(kind.title) by @\(requester.handle): \(cleanTitle)"
             try ActivityEvent(companyId: companyId, agentId: requester.id == "system" ? nil : requester.id, turnId: nil, kind: .approval,
@@ -356,7 +409,7 @@ extension Store {
                 .fetchOne(db) { return open }
             return try propose(db: db, companyId: companyId, by: .system, kind: .boost, risk: .high, category: nil,
                                title: "Ultra for \(item.key) after repeated failures", summary: reason,
-                               payload: AskPayload(question: "Allow one Ultra run on \(item.key)?", details: reason), itemId: itemId,
+                               payload: AskPayload(question: "Allow one Ultra run on \(item.key)?", details: reason), document: nil, itemId: itemId,
                                subjectId: itemId, supersedes: nil, requestId: nil, decisionClass: .taste, viaOwner: true, now: now)
         }
     }
@@ -396,8 +449,13 @@ extension Store {
                 try settle(db, ask: &ask, status: .rejected, decidedBy: "@\(agent.name)", now: now)
                 return ask
             }
-            let role = AutonomyPolicy.ownerRole(kind: ask.kind, risk: ask.risk, category: ask.category, preset: company.autonomy,
+            var role = AutonomyPolicy.ownerRole(kind: ask.kind, risk: ask.risk, category: ask.category, preset: company.autonomy,
                                                 extraReserved: extra, decisionClass: ask.decisionClass)
+            // An ask that replaces one the owner decided (or is still deciding) always goes back to the owner.
+            if role == .fyi, let oldId = ask.supersedesId, let old = try Ask.fetchOne(db, key: oldId),
+               old.status == .pendingOwner || old.decidedBy == "owner" || old.ownerDecidedAt != nil {
+                role = .approve
+            }
             switch role {
             case .approve:
                 ask.updatedAt = now
@@ -420,15 +478,20 @@ extension Store {
     @discardableResult
     public func ownerDecide(askId: String, approve: Bool, note: String = "", acknowledgeChange: Bool = false,
                             now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in
+        // Read and hash the document before the write transaction; the proposed path and hash never change.
+        var currentHash: String?? = nil
+        if approve, !acknowledgeChange, let seen = try ask(id: askId), seen.payload?.documentPath != nil,
+           let company = try company(id: seen.companyId) {
+            currentHash = .some(currentDocumentHash(seen, company: company))
+        }
+        return try writer.write { db in
             var ask = try requireAsk(db, askId)
             guard ask.kind.isDecision else {
                 throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
             }
             guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
-            let company = try requireCompany(db, ask.companyId)
             if approve, !acknowledgeChange, ask.payload?.documentPath != nil, let proposed = ask.detailsHash,
-               currentDocumentHash(ask, company: company) != proposed {
+               let current = currentHash, current != proposed {
                 throw WorkError.conflict("\(ask.ref)'s document changed since it was proposed; read it again and approve with --ack-changed")
             }
             ask.ownerNote = Store.flat(note, max: Store.maxAskField)

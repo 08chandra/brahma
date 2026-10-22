@@ -32,6 +32,7 @@ struct DevGroup: ParsableCommand {
         @Option(help: "Document path inside the workspace.") var document: String?
         @Option(help: "Work item key.") var item: String?
         @Option(help: "Ask reference it replaces.") var supersedes: String?
+        @Option(name: .customLong("option"), help: "An option label (repeatable).") var optionLabels: [String] = []
         @Option(name: .customLong("request-id")) var requestId: String?
         @Option(name: .customLong("decision-class"), help: "taste (default) or goalChanging.") var decisionClass: String = "taste"
 
@@ -55,7 +56,8 @@ struct DevGroup: ParsableCommand {
             }
             let ask = try refusing {
                 try store.propose(companyId: c.id, by: .agent(agent.id), kind: AskKind(kind), risk: riskValue, category: category,
-                                  title: title, summary: summary, payload: document.map { AskPayload(documentPath: $0) },
+                                  title: title, summary: summary, payload: (document != nil || !optionLabels.isEmpty)
+                                    ? AskPayload(documentPath: document, options: optionLabels.map { AskOption(label: $0) }) : nil,
                                   itemId: itemId, supersedes: old, requestId: requestId, decisionClass: cls)
             }
             print(safe(describe(ask, store: store)))
