@@ -314,7 +314,7 @@ extension Store {
             let isHolderOrAssignee = actor.id == item.ownerId || (holder != nil && actor.id == holder)
             if let denial = WorkPolicy.statusDenial(from: item.status, to: to, actor: actor.id, actorKind: actor.kind,
                                                     isHolderOrAssignee: isHolderOrAssignee, hasLease: holder != nil,
-                                                    blockedReason: reason) {
+                                                    blockedReason: reason, stopReason: item.stopReason, itemKey: item.key) {
                 throw denial
             }
             statusChange = (item.status, to)
@@ -324,6 +324,7 @@ extension Store {
             } else if item.status == .blocked {
                 item.blockedReason = nil
                 item.blockedSinceActive = nil
+                item.stopReason = nil
             }
             if item.status == .done { item.doneAt = nil }
             item.status = to

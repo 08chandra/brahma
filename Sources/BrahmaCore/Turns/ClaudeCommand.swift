@@ -14,6 +14,10 @@ public struct TurnRequest: Sendable {
     public var addDirs: [String] = []
     /// Engine-set `BRAHMA_*` variables for the child; everything else comes from `ChildEnvironment`.
     public var environment: [String: String] = [:]
+    /// The turn's wall clock; nil means the runner's own limit (900 s unless configured). 14c sets per-mode values.
+    public var wallClock: Duration? = nil
+    /// What the engine asserts about the session the CLI reports; nil asserts nothing.
+    public var expectations: TurnExpectations? = nil
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,

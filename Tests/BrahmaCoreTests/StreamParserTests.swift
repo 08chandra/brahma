@@ -98,7 +98,8 @@ private func fixtureLines(_ name: String) throws -> [String] {
 
     @Test func toolUseBlockWinsOverText() {
         let line = #"{"type":"assistant","message":{"content":[{"type":"text","text":"posting"},{"type":"tool_use","name":"mcp__company__post_message","input":{}}]}}"#
-        #expect(StreamParser.parse(line: line) == .toolUse(name: "mcp__company__post_message"))
+        let digest = StreamParser.digest(of: [String: Any]())
+        #expect(StreamParser.parse(line: line) == .toolUse(name: "mcp__company__post_message", inputDigest: digest))
     }
 
     @Test func concatenatesTextBlocks() {

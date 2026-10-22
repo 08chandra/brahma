@@ -21,6 +21,10 @@ public struct TurnProfile: Equatable, Sendable {
     public var extraSettings: [String: JSONValue] = [:]
     public var disableSlashCommands = true
     public var environment: [String: String] = [:]
+    /// How long the turn may run before the engine kills it. Nil: the runner's `maxTurnDuration` (900 s, the Plan 1
+    /// fallback); the work modes set longer values for deep turns. It is not an argument of the command.
+    public var wallClock: Duration? = nil
+    public var expectations: TurnExpectations? = nil
 
     public init(model: String, session: Session, mcpConfigPath: String, permission: PermissionProfile,
                 workingDirectory: String, addDirs: [String] = []) {
@@ -42,6 +46,8 @@ public enum TurnProfileCompiler {
                             permission: r.profile, workingDirectory: r.workingDirectory,
                             addDirs: r.addDirs.isEmpty ? [r.company.workspacePath] : r.addDirs)
         p.environment = r.environment
+        p.wallClock = r.wallClock
+        p.expectations = r.expectations
         return p
     }
 

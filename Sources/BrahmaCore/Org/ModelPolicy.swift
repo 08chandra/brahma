@@ -6,11 +6,15 @@ public struct ModelContext: Sendable, Equatable {
     public var decidingArchitecture = false
     public var decidingPRD = false
     public var turnKind: TurnKind = .work
+    /// The effort tier of the item the turn works on. A tier with a model of its own (L: opus) picks it for `auto` agents.
+    public var tier: EffortTier? = nil
 
-    public init(decidingArchitecture: Bool = false, decidingPRD: Bool = false, turnKind: TurnKind = .work) {
+    public init(decidingArchitecture: Bool = false, decidingPRD: Bool = false, turnKind: TurnKind = .work,
+                tier: EffortTier? = nil) {
         self.decidingArchitecture = decidingArchitecture
         self.decidingPRD = decidingPRD
         self.turnKind = turnKind
+        self.tier = tier
     }
 }
 
@@ -23,7 +27,9 @@ public enum ModelPolicy {
         switch context.turnKind {
         case .review: return "sonnet"
         case .notice: return "haiku"
-        case .work: return role.models[mode.rawValue] ?? "sonnet"
+        case .work:
+            if let tier = context.tier, let model = TierBudget.of(tier).model { return model }
+            return role.models[mode.rawValue] ?? "sonnet"
         }
     }
 }

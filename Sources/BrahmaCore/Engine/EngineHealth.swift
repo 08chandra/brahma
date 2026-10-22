@@ -167,13 +167,14 @@ extension Store {
     /// probe can vouch for, so a disk hold stays until the disk rule releases it.
     public func clearHoldAfterDoctor(now: Date) throws {
         try resolveDoctorAlerts(now: now)
+        try releaseDoctorHeldAgents(now: now)
         guard let hold = try engineHold(), hold.reason != .disk else { return }
         try clearHold(now: now, onlyIf: hold.reason)
     }
 
     /// A passing doctor report settles the alerts filed for a failing one when no hold named a reason.
     func resolveDoctorAlerts(now: Date) throws {
-        try writer.write { db in try resolveEngineAlerts(db, reasons: [EngineAlerts.generalReason], now: now) }
+        try writer.write { db in try resolveEngineAlerts(db, reasons: [EngineAlerts.generalReason, "model", "init", "fast-mode"], now: now) }
     }
 
     func scheduleNextProbe(at date: Date) throws {

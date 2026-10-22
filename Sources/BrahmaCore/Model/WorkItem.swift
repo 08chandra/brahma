@@ -152,6 +152,9 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var touchPaths: [String] = []
     /// Where the item's branch started (recorded by the engine at claim); weakening is measured against it, never the live `main`.
     public var baseCommit: String? = nil
+    /// Why the engine last stopped work on the item: `budget`, `no-progress`, `loop`, `failed-checks` or `timebox`.
+    /// Cleared at the next claim.
+    public var stopReason: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }
