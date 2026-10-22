@@ -62,7 +62,8 @@ extension Orchestrator {
         }
         let dir: URL
         do {
-            // A merge check runs on a `.git`-free export made by the engine's own repository; a submission's in a worktree.
+            // A merge check runs on a `.git`-free export made by the engine's own repository, under the data home
+            // (`<home>/run/exports/<runId>`); a submission's in a detached worktree under `<ws>/.brahma/wt-check`.
             dir = run.purpose == .merge ? try git.addEngineExport(runId: run.id, commit: run.commit)
                 : try git.addRunWorktree(runId: run.id, commit: run.commit)
             try store.setVerificationDirectory(runId: run.id, path: dir.path)

@@ -170,8 +170,15 @@ public enum EngineFiles {
         fileprivate init(fd: Int32, real: String, shown: URL) { self.fd = fd; self.real = real; self.shown = shown }
         deinit { close(fd) }
 
-        /// True while the directory is still at the path it was opened at (no part of the way to it was moved or swapped).
-        var isInPlace: Bool { EngineFiles.path(of: fd) == real }
+        /// True while the directory is still at the path it was opened at (no part of the way to it was moved or swapped):
+        /// the kernel's path for the descriptor is unchanged, and the path the caller names (`shown`, the last part not
+        /// followed) is this same directory by (device, inode), so a program handed that path reaches this directory.
+        var isInPlace: Bool {
+            guard EngineFiles.path(of: fd) == real else { return false }
+            var held = stat(), named = stat()
+            guard fstat(fd, &held) == 0, lstat(shown.path, &named) == 0 else { return false }
+            return held.st_dev == named.st_dev && held.st_ino == named.st_ino
+        }
 
         /// What is at `name` in it, never following a link.
         func kind(of name: String) -> Kind {

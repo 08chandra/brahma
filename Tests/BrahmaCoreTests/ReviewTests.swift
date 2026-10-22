@@ -705,6 +705,11 @@ import GRDB
         let ready = try r.fresh(b)
         #expect(ready.mergeState == .pending); #expect(ready.verifiedCommit == rebased); #expect(ready.status == .inReview)
         #expect(r.world.checks.calls.count == calls + 1)
+        // The merge check ran on the engine's export under the data home, not in the workspace.
+        let ran = try #require(r.world.checks.calls.last).workingDirectory
+        #expect(ran.path == r.store.gitWorkspace(root: r.root, companyId: r.company.id).exportPath(runId: run.id).path)
+        #expect(ran.path.hasSuffix("/run/exports/\(run.id)") && !ran.path.hasPrefix(r.root.path), "\(ran.path)")
+        #expect(try r.store.latestVerification(itemId: b.id)?.workingDirectory == ran.path)
         try await r.cycle()
         let done = try r.fresh(b)
         #expect(done.status == .done); #expect(try r.mainHead() == rebased)

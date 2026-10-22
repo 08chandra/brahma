@@ -1,7 +1,9 @@
 import Foundation
 
-/// Where the engine keeps the files of a check. Only the engine writes `.brahma/checks`; the temporary detached checkouts
-/// the checks run in live under `.brahma/wt-check`. (`BrahmaPaths.checksDir` is not used for checks.)
+/// Where the engine keeps the files of a check in the workspace. Only the engine writes `.brahma/checks` (the saved
+/// scripts); the temporary detached checkouts a submission's check runs in live under `.brahma/wt-check`. A merge check
+/// runs on a `.git`-free export that is not in the workspace at all: `<home>/run/exports/<runId>` under the data home
+/// (`BrahmaPaths.exportDir(runId:)`, `GitWorkspace.exportPath(runId:)`). (`BrahmaPaths.checksDir` is not used for checks.)
 public struct CheckPaths: Sendable, Equatable {
     public let workspace: URL
 
@@ -22,7 +24,8 @@ public struct CheckPaths: Sendable, Equatable {
         snapshotDir(key: key, revision: revision).appending(path: "manifest.json")
     }
 
-    /// `<ws>/.brahma/wt-check/<runId>`: the clean detached checkout one run executes in.
+    /// `<ws>/.brahma/wt-check/<runId>`: the clean detached checkout a submission's check run executes in. (A merge check's
+    /// export is `GitWorkspace.exportPath(runId:)`, under the data home.)
     public func runWorktree(runId: String) -> URL {
         runWorktreesRoot.appending(path: runId, directoryHint: .isDirectory)
     }
@@ -93,23 +96,6 @@ public enum CheckScripts {
 
     /// The largest saved script that is hashed; a bigger one hashes as missing (so it reads as modified).
     static let maxHashedBytes = 16 << 20
-
-    /// Copies each file (relative to `from`) to the same relative path under `to`, and returns the content hash of each.
-    @discardableResult
-    public static func snapshot(files: [String], from: URL, to: URL) throws -> [String: String] {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
-        try fm.createDirectory(at: to, withIntermediateDirectories: true)
-        var manifest: [String: String] = [:]
-        for file in files {
-            let data = try Data(contentsOf: from.appending(path: file))
-            let target = to.appending(path: file)
-            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: target)
-            manifest[file] = StableHash.fnv1a64(data)
-        }
-        return manifest
-    }
 
     /// The content hash of each file under `dir`; nil where it is missing or not a regular file. Every part of the path
     /// below `root` (by default `dir` itself; the workspace for a saved snapshot) is opened without following a link.

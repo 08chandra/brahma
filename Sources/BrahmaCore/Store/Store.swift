@@ -90,8 +90,12 @@ public final class Store: Sendable {
                 ?? FileManager.default.temporaryDirectory.appending(path: fallback, directoryHint: .isDirectory))
                 .appending(path: companyId, directoryHint: .isDirectory)
         }
+        // Merge-check exports go under the data home (`<home>/run/exports/<runId>`); an in-memory store uses a per-company
+        // stand-in under the temporary directory.
+        let exportHome = dataHome ?? FileManager.default.temporaryDirectory
+            .appending(path: "brahma-exports/\(companyId)", directoryHint: .isDirectory)
         var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
-                               mergeDirectory: engineDir("merge", fallback: "brahma-merge"))
+                               mergeDirectory: engineDir("merge", fallback: "brahma-merge"), exportHome: exportHome)
         git.lockTimeout = gitLockTimeout.seconds
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
         git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }

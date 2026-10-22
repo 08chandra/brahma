@@ -163,11 +163,9 @@ import Foundation
     }
 
     @Test func snapshotAndHashes() throws {
-        let src = try tempDir(), dst = try tempDir().appending(path: "snap")
-        try FileManager.default.createDirectory(at: src.appending(path: "s"), withIntermediateDirectories: true)
-        try "one".write(to: src.appending(path: "s/a.sh"), atomically: true, encoding: .utf8)
-        try "two".write(to: src.appending(path: "b.sh"), atomically: true, encoding: .utf8)
-        let manifest = try CheckScripts.snapshot(files: ["s/a.sh", "b.sh"], from: src, to: dst)
+        let ws = try tempDir()
+        let dst = ws.appending(path: "snap")
+        let manifest = try CheckScripts.write(contents: ["s/a.sh": Data("one".utf8), "b.sh": Data("two".utf8)], workspace: ws, dir: "snap")
         #expect(manifest == ["s/a.sh": StableHash.fnv1a64("one"), "b.sh": StableHash.fnv1a64("two")])
         #expect(try String(contentsOf: dst.appending(path: "s/a.sh"), encoding: .utf8) == "one")
         #expect(CheckScripts.hashes(files: ["s/a.sh", "b.sh", "gone.sh"], in: dst) == ["s/a.sh": manifest["s/a.sh"]!, "b.sh": manifest["b.sh"]!, "gone.sh": nil])
@@ -184,6 +182,10 @@ import Foundation
         #expect(p.snapshotDir(key: "ACME-3", revision: 2).path == "/w/acme/.brahma/checks/ACME-3/rev2")
         #expect(p.manifest(key: "ACME-3", revision: 2).path == "/w/acme/.brahma/checks/ACME-3/rev2/manifest.json")
         #expect(p.runWorktree(runId: "r-1").path == "/w/acme/.brahma/wt-check/r-1")
+        // A merge check's export is not in the workspace: it lives under the data home.
+        let home = BrahmaPaths(home: URL(fileURLWithPath: "/h"), workspaces: URL(fileURLWithPath: "/w"))
+        #expect(home.exportDir(runId: "r-1").path == "/h/run/exports/r-1")
+        #expect(GitWorkspace(root: URL(fileURLWithPath: "/w/acme"), exportHome: home.home).exportPath(runId: "r-1") == home.exportDir(runId: "r-1"))
     }
 
     /// True when the process is gone (the check polls briefly: a killed process may take a moment to be reaped).
