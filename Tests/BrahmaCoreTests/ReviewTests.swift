@@ -55,6 +55,8 @@ import GRDB
             for (path, text) in files { try write(path, text, in: root) }
             try GitFixture.plainGit(["add", "-A"], in: root)
             try GitFixture.plainGit(["commit", "-m", "base"], in: root)
+            // Stands for the owner's own commit (accepted), not an agent moving main.
+            try store.recordMainCommit(companyId: company.id, commit: try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: root))
         }
 
         @discardableResult
@@ -615,27 +617,52 @@ import GRDB
         #expect(try r.ws.head(of: GitWorkspace.mainRef) == tip)
     }
 
-    @Test func mainRewrittenOutsideRefusesClaims() throws {
+    @Test func agentFastForwardOfMainRaisesAlertAndNeverResolves() async throws {
         let r = try R()
         let recorded = try #require(try r.store.company(id: r.company.id)?.mainCommit)
         #expect(recorded == (try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)))
-        // Moving forward outside the engine is fine; rewriting history is not.
-        try r.commitMain(["a.txt": "a\n"])
-        let ok = try r.item()
-        #expect(try r.tools(r.eng).call(name: "claim_lease", arguments: ["key": .string(ok.key)]).hasPrefix("You hold"))
-        try GitFixture.plainGit(["reset", "--hard", recorded], in: r.root)
-        try GitFixture.plainGit(["commit", "--amend", "--allow-empty", "-m", "rewritten"], in: r.root)
+        let first = try r.item()
+        #expect(try r.tools(r.eng).call(name: "claim_lease", arguments: ["key": .string(first.key)]).hasPrefix("You hold"))
+        // An agent fast-forwards main with an unreviewed commit (a plain descendant of the recorded head).
+        try r.write("evil.txt", "unreviewed", in: r.root)
+        try GitFixture.plainGit(["add", "-A"], in: r.root)
+        try GitFixture.plainGit(["commit", "-m", "sneak"], in: r.root)
+        let moved = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)
+        #expect(moved != recorded)
         let i = try r.item("second")
         let message = "main changed outside Brahma; the owner must review it"
         #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
         #expect(try r.store.lease(itemId: i.id) == nil)
+        func alerts() throws -> [Ask] {
+            try r.store.writer.read { try Ask.filter(Column("companyId") == r.company.id && Column("kind") == AskKind.engineAlert).fetchAll($0) }
+        }
+        #expect(try alerts().count == 1); #expect(try alerts().first?.status == .pendingOwner)
+        // Later claims and ticks refuse again and never resolve or duplicate it.
         #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
-        let alerts = try r.store.writer.read { try Ask.filter(Column("companyId") == r.company.id && Column("kind") == AskKind.engineAlert).fetchAll($0) }
-        #expect(alerts.count == 1, "one alert however many claims are refused")
-        // The owner accepts the new main; claims work again.
+        try await r.cycle(); try await r.cycle()
+        #expect(try r.store.lease(itemId: i.id) == nil, "the engine does not dispatch into a changed main either")
+        #expect(try alerts().count == 1); #expect(try alerts().first?.status == .pendingOwner)
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == recorded, "nothing but the engine or the owner moves the record")
+        // A rewrite is refused the same way.
+        try GitFixture.plainGit(["reset", "--hard", recorded], in: r.root)
+        try GitFixture.plainGit(["commit", "--amend", "--allow-empty", "-m", "rewritten"], in: r.root)
+        #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
+        #expect(try alerts().first?.status == .pendingOwner)
+        // The owner accepts the new head: the alert clears and claims work again.
         try r.store.acceptMainCommit(companyId: r.company.id)
+        #expect(try alerts().first?.status != .pendingOwner)
         #expect(try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]).hasPrefix("You hold"))
         #expect(try r.store.company(id: r.company.id)?.mainCommit == (try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)))
+    }
+
+    @Test func companyWithoutRecordedMainRaisesAlert() throws {
+        let r = try R()
+        try r.exec("UPDATE company SET mainCommit = NULL WHERE id = ?", [r.company.id])
+        let i = try r.item()
+        #expect(r.failure { try r.tools(r.eng).call(name: "claim_lease", arguments: ["key": .string(i.key)]) }
+                == "main changed outside Brahma; the owner must review it")
+        let open = try r.store.writer.read { try Ask.filter(Column("companyId") == r.company.id && Column("kind") == AskKind.engineAlert).fetchCount($0) }
+        #expect(open == 1)
     }
 
     @Test func scriptFlagsComeBeforeTestFileFlags() throws {
@@ -675,5 +702,89 @@ import GRDB
 extension Store {
     static func hasPendingWorkForTests(_ store: Store, _ agentId: String) -> Bool {
         (try? store.writer.read { try Store.hasPendingWork(db: $0, agentId: agentId) }) ?? false
+    }
+}
+
+extension ReviewTests {
+    @Test func decidedReviewTurnDeliversTheReviewersPassNotice() async throws {
+        for decision in [ReviewDecision.approve, .requestChanges] {
+            let r = try R()
+            let i = try await r.verified()
+            let notices = try r.store.pendingNotices(agentId: r.rev.id)
+            #expect(notices.contains { $0.event.kind == .verificationPassed && $0.notice.wakes }, "the pass woke the reviewer")
+            let (store, companyId, agentId, itemId) = (r.store, r.company.id, r.rev.id, i.id)
+            _ = companyId
+            r.world.fake.script("rev", .init(sideEffect: { _ in
+                // The reviewer decides inside its own review turn.
+                let turn = try #require(try store.writer.read { try Turn.filter(Column("agentId") == agentId && Column("outcome") == TurnOutcome.inProgress.rawValue).fetchOne($0) })
+                #expect(turn.kind == .review)
+                let item = try #require(try store.workItem(id: itemId))
+                let head = item.verifiedCommit
+                try store.review(itemId: itemId, by: agentId, decision: decision, notes: "n", approveFlags: false, currentHead: head)
+            }))
+            try await r.cycle()
+            let after = try r.fresh(i)
+            #expect(after.reviewedRound == after.reviewRound)
+            let left = try r.store.pendingNotices(agentId: r.rev.id).filter { [.verificationPassed, .submitted].contains($0.event.kind) }
+            #expect(left.isEmpty, "\(decision): no pass notice is left to cost a notice-only turn")
+            #expect(!Store.hasPendingWorkForTests(r.store, r.rev.id))
+            #expect(try r.world.agent(r.rev).state == .sleeping)
+        }
+    }
+
+    @Test func reviewWorktreeFailureCountsAsAttemptAndEscalates() async throws {
+        let r = try R()
+        let i = try await r.verified()
+        // The item's checkout is gone and cannot be recreated: a plain file sits in its place.
+        let wt = r.ws.worktreePath(key: i.key)
+        try GitFixture.plainGit(["worktree", "remove", "--force", wt.path], in: r.root)
+        try "in the way".write(to: wt, atomically: true, encoding: .utf8)
+        for n in 1...3 {
+            r.world.clock.advance(60)
+            try await r.cycle()
+            #expect(try r.fresh(i).reviewAttempts == n, "attempt \(n)")
+        }
+        #expect(try r.dms(r.mgr).contains("@rev has not reviewed \(i.key) after 3 review turns; set another reviewer or talk to them."))
+        #expect(r.world.fake.requests.filter { $0.agent.name == "rev" && $0.prompt.hasPrefix("Review ") }.isEmpty, "no turn started")
+        let events = try r.store.events(afterId: 0, companyId: r.company.id).map(\.text)
+        #expect(events.contains { $0.contains("review of \(i.key) not started") })
+        #expect(!events.contains { $0.contains("lease released") })
+        #expect(try r.store.lease(itemId: i.id)?.agentId == r.eng.id, "the author keeps the lease")
+    }
+
+    @Test func noticeOnlyTurnIsStoredAndUsesHaikuForAuto() async throws {
+        let r = try R()
+        let scribe = try r.store.hire(companyId: r.company.id, name: "scribe", role: "engineer", model: "auto", managerId: r.mgr.id)
+        let i = try r.item()
+        _ = try r.store.commentWorkItem(id: i.id, by: .owner, text: "@scribe please look", now: r.now)
+        #expect(try r.world.agent(scribe).state == .ready)
+        try await r.cycle()
+        let turn = try #require(try r.world.turns(scribe).first)
+        #expect(turn.kind == .notice); #expect(turn.itemId == nil)
+        let req = try #require(r.world.fake.requests.first { $0.agent.name == "scribe" })
+        #expect(req.kind == .notice); #expect(req.agent.model == "haiku")
+        // A direct message is not notice-only.
+        _ = try r.world.router.sendDM(companyId: r.company.id, from: .owner, to: "scribe", text: "hi", now: r.now)
+        r.world.clock.advance(60)
+        try await r.cycle()
+        let turns = try r.world.turns(scribe)
+        #expect(turns.last?.kind == .work)
+    }
+
+    @Test func credentialContextDecidesTheMode() throws {
+        let r = try R()
+        let i = try r.item()
+        let work = try r.store.startTurn(agentId: r.rev.id, now: r.now)
+        let workToken = try r.store.issueTurnCredential(turnId: work.id)
+        let ctx = try #require(r.store.turnCredentialContext(token: workToken, companyId: r.company.id, agentId: r.rev.id))
+        #expect(ctx.kind == "work"); #expect(ctx.itemId == nil)
+        let turn = try r.reviewTurn(r.rev, i)
+        let token = try r.store.issueTurnCredential(turnId: turn.id, kind: "review", itemId: i.id)
+        let rctx = try #require(r.store.turnCredentialContext(token: token, companyId: r.company.id, agentId: r.rev.id))
+        #expect(rctx.kind == "review"); #expect(rctx.itemId == i.id)
+        #expect(r.store.turnCredentialContext(token: token, companyId: r.company.id, agentId: r.eng.id) == nil)
+        #expect(r.store.turnCredentialContext(token: "nope", companyId: r.company.id, agentId: r.rev.id) == nil)
+        try r.store.finishTurn(id: turn.id, outcome: .succeeded, summary: nil, costUSD: nil)
+        #expect(r.store.turnCredentialContext(token: token, companyId: r.company.id, agentId: r.rev.id) == nil)
     }
 }

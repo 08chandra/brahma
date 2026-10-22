@@ -312,6 +312,15 @@ public actor Orchestrator {
             var sent = agent
             var systemPrompt = RolePrompt.render(agent: agent, company: company)
             var context = (try? store.askModelContext(agentId: agent.id)) ?? ModelContext()
+            // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
+            // leaseholder's updates are its work, so its turns stay work turns.
+            var kind = TurnKind.work
+            if review == nil, items.isEmpty, quietIds.isEmpty, !noticeIds.isEmpty,
+               try store.lease(agentId: agent.id) == nil {
+                kind = .notice
+                context.turnKind = .notice
+                try store.setTurnContext(turnId: turn.id, kind: .notice, itemId: nil)
+            }
             if let review {
                 sent.sessionId = UUID().uuidString
                 sent.sessionStarted = false
@@ -356,7 +365,7 @@ public actor Orchestrator {
                 workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
-            request.kind = review == nil ? .work : .review
+            request.kind = review == nil ? kind : .review
             // A review session is never recorded as the agent's own.
             var sessionMarked = agent.sessionStarted || review != nil
             var iterator = runner.run(request).makeAsyncIterator()
@@ -393,7 +402,13 @@ public actor Orchestrator {
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
-        if let unavailable = worktreeUnavailable {
+        if let unavailable = worktreeUnavailable, unavailable.review {
+            // A reviewer holds no lease: the missing worktree is an undecided review attempt (three of them escalate), and the
+            // agent waits out the short fixed infrastructure delay.
+            attempt { try store.noteReviewWorktreeFailure(itemId: unavailable.itemId, agentId: agent.id, reason: unavailable.reason, now: now) }
+            await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            end = .interrupted
+        } else if let unavailable = worktreeUnavailable {
             // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
             // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime.
             if await noteWorktreeFailure(itemId: unavailable.itemId) >= Self.maxWorktreeFailures {
@@ -489,7 +504,7 @@ public actor Orchestrator {
 }
 
 /// A leaseholder's worktree is missing and could not be recreated.
-struct WorktreeUnavailable: Error { var itemId: String; var key: String; var reason: String }
+struct WorktreeUnavailable: Error { var itemId: String; var key: String; var reason: String; var review = false }
 
 enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.

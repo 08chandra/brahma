@@ -53,6 +53,8 @@ import GRDB
             for (path, text) in files { try write(path, text, in: root) }
             try GitFixture.plainGit(["add", "-A"], in: root)
             try GitFixture.plainGit(["commit", "-m", "base"], in: root)
+            // Stands for the owner's own commit (accepted), not an agent moving main.
+            try store.recordMainCommit(companyId: company.id, commit: try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: root))
         }
 
         func write(_ path: String, _ text: String, in dir: URL) throws {

@@ -29,18 +29,26 @@ struct MCP: ParsableCommand {
         let packs = BrahmaPaths.fromEnvironment().packsDir
         let catalog = PackCatalog.loadOrBuiltin(directory: packs) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
         let store = try Store(path: db, catalog: catalog)
-        // A review turn names the item by key; its credential must have been issued for kind `review` and that item.
-        var kind = kind
-        var itemId = item
+        // The credential comes first, and it alone decides the mode: a review token opens the review tools for its own item and
+        // nothing else; no flag can widen it or turn another token into a review server.
+        guard let context = store.turnCredentialContext(token: token, companyId: company, agentId: agent) else {
+            FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
+            throw ExitCode.failure
+        }
         var reviewItemId: String?
-        if let key = reviewItem {
-            guard let found = try store.workItem(companyId: company, key: key) else {
-                FileHandle.standardError.write(Data("brahma mcp: no such work item\n".utf8))
+        if context.kind == "review" {
+            guard let itemId = context.itemId else {
+                FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
                 throw ExitCode.failure
             }
-            kind = "review"; itemId = found.id; reviewItemId = found.id
-        }
-        guard store.verifyTurnCredential(token: token, companyId: company, agentId: agent, kind: kind, itemId: itemId) else {
+            if let key = reviewItem {
+                guard let found = try store.workItem(companyId: company, key: key), found.id == itemId else {
+                    FileHandle.standardError.write(Data("brahma mcp: --review-item does not match this turn's credential\n".utf8))
+                    throw ExitCode.failure
+                }
+            }
+            reviewItemId = itemId
+        } else if reviewItem != nil || context.kind != kind || context.itemId != item {
             FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
             throw ExitCode.failure
         }
