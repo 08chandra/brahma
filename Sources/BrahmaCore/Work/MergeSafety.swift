@@ -3,21 +3,29 @@ import GRDB
 
 /// Keeps several engineers' branches from colliding (Task 9b). After every landing in `main`, `afterLanding` dry-runs each open
 /// item branch against the new `main` and tells holders whose branch has fallen behind.
-public struct MergeSafety: Sendable {
+struct MergeSafety: Sendable {
     /// A branch more than this many commits behind `main` is told to rebase.
-    public static let maxBehindCommits = 20
+    static let maxBehindCommits = 20
     /// ... or one that has been behind `main` for more than this many company-active days.
-    public static let maxBehindActiveDays = 2
+    static let maxBehindActiveDays = 2
     static let conflictFlagPrefix = "conflicts with main: "
     static let maxFlagFiles = 5
     static let maxNoticeFiles = 20
 
     let store: Store
-    public init(store: Store) { self.store = store }
+    init(store: Store) { self.store = store }
 
-    /// One pass over the company's in-progress and in-review branches (the landed item excluded). A failure on one branch is
-    /// skipped; the rest are still looked at.
-    public func afterLanding(companyId: String, mergedKey: String) throws {
+    /// The review flag for a dry run that conflicts on `files`; nil for a clean one.
+    static func flag(files: [String]) -> String? {
+        guard !files.isEmpty else { return nil }
+        let listed = files.prefix(maxFlagFiles).joined(separator: ", ")
+        let more = files.count > maxFlagFiles ? ", and \(files.count - maxFlagFiles) more" : ""
+        return Store.sanitizedFlags([conflictFlagPrefix + listed + more]).first
+    }
+
+    /// One pass over the company's in-progress and in-review branches (the landed item excluded). A failure on one branch
+    /// (a dry run git could not make) is skipped and changes no flag; the rest are still looked at.
+    func afterLanding(companyId: String, mergedKey: String) throws {
         guard let company = try store.company(id: companyId) else { return }
         let git = store.gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: companyId)
         let items = try store.writer.read { db in
@@ -35,14 +43,7 @@ public struct MergeSafety: Sendable {
 
     /// Adds, replaces or clears the item's `conflicts with main` flag. A notice goes out only when the flag changes.
     private func recordDryRun(item: WorkItem, files: [String], mergedKey: String) throws {
-        let flag: String?
-        if files.isEmpty {
-            flag = nil
-        } else {
-            let listed = files.prefix(Self.maxFlagFiles).joined(separator: ", ")
-            let more = files.count > Self.maxFlagFiles ? ", and \(files.count - Self.maxFlagFiles) more" : ""
-            flag = Store.sanitizedFlags([Self.conflictFlagPrefix + listed + more]).first
-        }
+        let flag = Self.flag(files: files)
         let now = Store.now()
         try store.writer.write { db in
             guard var current = try WorkItem.fetchOne(db, key: item.id), current.status == .inProgress || current.status == .inReview,

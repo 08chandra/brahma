@@ -221,4 +221,31 @@ import Foundation
         try ws.addWorktree(key: "K-2")
         try ws.removeWorktree(key: "K-2", keepIf: { false })
     }
+
+    // MARK: Merge helpers (9b fix round 1)
+
+    @Test func diffsSplitCRLFLinesAndUseLiteralPathspecs() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        let base = try #require(try f.ws.head(of: GitWorkspace.mainRef))
+        try f.write("crlf.txt", (0..<300).map { "line \($0)" }.joined(separator: "\r\n") + "\r\n")
+        try f.git(["add", "-A"]); try f.git(["commit", "-qm", "crlf"])
+        let head = try #require(try f.ws.head(of: GitWorkspace.mainRef))
+        let one = try f.ws.fileDiff(base: base, head: head, path: "crlf.txt", maxLines: 200)
+        #expect(one.truncated)
+        #expect(one.text.components(separatedBy: "\n").count == 200, "a CRLF line is one line of the cap")
+        // The path is literal: a glob names no file.
+        #expect(try f.ws.fileDiff(base: base, head: head, path: "*.txt").text.isEmpty)
+        let all = try f.ws.diff(base: base, head: head, maxLines: 50)
+        #expect(all.truncated); #expect(all.text.components(separatedBy: "\n").count == 50)
+    }
+
+    @Test func mergeConflictsThrowsWhenGitCannotTell() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        try f.ws.addWorktree(key: "K-1")
+        #expect(try f.ws.mergeConflicts(key: "K-1") == [])
+        try f.ws.removeWorktree(key: "K-1", keepIf: { false })
+        try f.ws.deleteBranch(key: "K-1")
+        // No branch: git fails (status 128), which is "unknown", never "clean".
+        #expect(throws: GitError.self) { try f.ws.mergeConflicts(key: "K-1") }
+    }
 }

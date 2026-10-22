@@ -173,8 +173,10 @@ extension Store {
     /// The holder hands the item over: it becomes `inReview` with no verified revision, and the engine queues its check
     /// (an item with no check is verified at once). `flags` are weakening signs found by the caller.
     @discardableResult
+    /// `mainConflicts` is a dry run of the submitted branch against `main` (nil when it could not be made): it replaces the
+    /// item's `conflicts with main` flag (an empty list clears it; nil keeps what is there).
     func submitForReview(itemId: String, agentId: String, summary: String, flags: [String], commit: String, scriptHash: String,
-                         workingDirectory: String, now: Date = Store.now()) throws -> SubmitResult {
+                         workingDirectory: String, mainConflicts: [String]? = nil, now: Date = Store.now()) throws -> SubmitResult {
         try writer.write { db in
             guard var item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
             let actor = try resolveActor(db, .agent(agentId), companyId: item.companyId)
@@ -201,6 +203,10 @@ extension Store {
             item.verifiedRevision = nil
             item.verifiedCommit = nil
             for f in Self.sanitizedFlags(flags) where !item.reviewFlags.contains(f) { item.reviewFlags.append(f) }
+            if let mainConflicts {
+                item.reviewFlags.removeAll { $0.hasPrefix(MergeSafety.conflictFlagPrefix) }
+                if let flag = MergeSafety.flag(files: mainConflicts) { item.reviewFlags.append(flag) }
+            }
             // Older queued runs of this item are for work that has been replaced.
             try db.execute(sql: """
                 UPDATE verificationRun SET status = 'error', outputTail = 'superseded by a newer submission', finishedAt = ?
@@ -362,14 +368,30 @@ extension Store {
             let holder = try WorkLease.fetchOne(db, key: item.id)?.agentId ?? run.requestedBy
             switch run.status {
             case .passed where run.purpose == .merge:
-                // The rebased branch passed again: it is approved and waits to land. (Not a new review, so no reviewer is woken.)
+                run.flaky = before.realFailures > 0
                 try run.update(db)
                 item.verifiedCommit = run.commit
-                item.mergeState = .pending
                 item.updatedAt = now
-                try item.update(db)
-                try recordItemEvent(db: db, item: item, actor: "system", kind: .edited,
-                                    text: "check passed after rebase onto main; ready to merge", now: now)
+                if run.flaky {
+                    // A flaky pass is a review flag (Review Focus 4): the approval was for a clean pass, so the item goes back to
+                    // its reviewer, who must approve the flag explicitly before it lands.
+                    if !item.reviewFlags.contains(Self.flakeFlag) { item.reviewFlags.append(Self.flakeFlag) }
+                    item.verifiedRevision = run.checkRevision
+                    item.mergeState = .none
+                    item.reviewAttempts = 0
+                    item.reviewRound += 1
+                    try item.update(db)
+                    try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed,
+                                        text: "check passed on re-run after rebase onto main (flaky); it needs another review",
+                                        alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+                    try Store.wakeReviewer(db: db, item: item, now: now)
+                } else {
+                    // The rebased branch passed again: it is approved and waits to land. (Not a new review, so no reviewer is woken.)
+                    item.mergeState = .pending
+                    try item.update(db)
+                    try recordItemEvent(db: db, item: item, actor: "system", kind: .edited,
+                                        text: "check passed after rebase onto main; ready to merge", now: now)
+                }
             case .passed:
                 run.flaky = before.realFailures > 0
                 try run.update(db)

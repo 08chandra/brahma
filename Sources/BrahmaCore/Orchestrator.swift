@@ -79,6 +79,7 @@ public actor Orchestrator {
         let now = clock()
         _ = try store.recoverInterruptedTurns(now: now)
         try recoverChecks(now: now)
+        try recoverMerges()
     }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
@@ -224,8 +225,10 @@ public actor Orchestrator {
         infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         let ready = try store.agents(states: [.ready])
+        // The holder of an item whose merge is running gets no work turn until the merge ends.
+        let mergingHolders = (try? store.agentsLockedOutByMerges()) ?? []
         let candidates = ready.compactMap { a -> Candidate? in
-            guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil,
+            guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil, !mergingHolders.contains(a.id),
                   let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }

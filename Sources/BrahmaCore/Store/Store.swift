@@ -154,11 +154,14 @@ public final class Store: Sendable {
         try writer.read { db in try Company.fetchOne(db, key: id) }
     }
 
-    /// Whole-row update of the owner-editable fields. `mainCommit` belongs to the engine and is never overwritten from a copy.
+    /// Whole-row update of the owner-editable fields. `mainCommit` and `pendingMainCommit` belong to the engine and are never
+    /// overwritten from a copy.
     public func updateCompany(_ c: Company) throws {
         try writer.write { db in
             var kept = c
-            kept.mainCommit = try String.fetchOne(db, sql: "SELECT mainCommit FROM company WHERE id = ?", arguments: [c.id])
+            let row = try Row.fetchOne(db, sql: "SELECT mainCommit, pendingMainCommit FROM company WHERE id = ?", arguments: [c.id])
+            kept.mainCommit = row?["mainCommit"]
+            kept.pendingMainCommit = row?["pendingMainCommit"]
             try kept.update(db)
         }
     }

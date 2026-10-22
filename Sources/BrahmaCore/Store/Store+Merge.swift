@@ -8,29 +8,195 @@ public protocol WorkItemObserver: Sendable {
 }
 
 /// What the engine's git work for one approved item came to.
-public enum MergeResult: Equatable, Sendable {
-    /// The branch is now part of `main`, whose head is this.
+enum MergeResult: Equatable, Sendable {
+    /// The verified commit is now part of `main`, whose head is this.
     case merged(mainHead: String)
-    /// `main` had moved on: the branch was rebased onto it and must pass its check again.
+    /// `main` had moved on: the verified commit was rebased onto it (in the engine's merge checkout) and the result must pass
+    /// its check before it lands.
     case rebased(head: String)
     /// The rebase conflicted (and was aborted). `mainCommit` is `main`'s head and `itemCommit` the item's verified commit.
     case conflict(files: [String], mergeBase: String, mainCommit: String, itemCommit: String)
+    /// The item's branch is no longer the verified commit (it is `head`): nothing was merged.
+    case branchMoved(head: String?)
 }
 
 extension Store {
-    static let unattributedCommitMessage = "Brahma: unattributed changes on main"
     static let maxBriefFiles = 50
     static let maxBriefDiffLines = 200
+    /// Merge attempts of one item that may fail in a row before it goes back to its holder and the queue moves on.
+    static let maxMergeFailures = 3
+    static let quarantineTitle = "Uncommitted changes found in the main checkout"
+    static let quarantineCategory = "engine-code"
 
     static func mainHeadAlertReason(_ companyId: String) -> String { "mainhead:\(companyId)" }
+    static func mergeFailureAlertReason(_ itemId: String) -> String { "mergefail:\(itemId)" }
+    static func quarantineSubject(_ ref: String) -> String { "quarantine:\(ref)" }
 
-    /// The oldest approved item of the company still waiting to land.
+    /// The oldest approved item of the company still waiting to land (one whose merge is not already running).
     func nextPendingMerge(companyId: String) throws -> WorkItem? {
         try writer.read { db in
             try WorkItem.fetchOne(db, sql: """
-                SELECT * FROM workItem WHERE companyId = ? AND status = 'inReview' AND mergeState = 'pending' AND verifiedCommit IS NOT NULL
+                SELECT * FROM workItem w WHERE companyId = ? AND status = 'inReview' AND mergeState = 'pending' AND verifiedCommit IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM itemMerge m WHERE m.itemId = w.id AND m.running)
                 ORDER BY updatedAt, number LIMIT 1
                 """, arguments: [companyId])
+        }
+    }
+
+    // MARK: Lockout while merging
+
+    /// The merge of this item has started: its holder gets no work turn and the MCP tools refuse the item until `endMerging`.
+    func beginMerging(itemId: String) throws {
+        try writer.write { db in
+            try db.execute(sql: """
+                INSERT INTO itemMerge (itemId, running) VALUES (?, 1) ON CONFLICT(itemId) DO UPDATE SET running = 1
+                """, arguments: [itemId])
+        }
+    }
+
+    func endMerging(itemId: String) throws {
+        try writer.write { db in try db.execute(sql: "UPDATE itemMerge SET running = 0 WHERE itemId = ?", arguments: [itemId]) }
+    }
+
+    func isMerging(itemId: String) throws -> Bool {
+        try writer.read { db in try Bool.fetchOne(db, sql: "SELECT running FROM itemMerge WHERE itemId = ?", arguments: [itemId]) ?? false }
+    }
+
+    /// Agents holding the lease of an item whose merge is running.
+    func agentsLockedOutByMerges() throws -> Set<String> {
+        try writer.read { db in
+            Set(try String.fetchAll(db, sql: """
+                SELECT l.agentId FROM workLease l JOIN itemMerge m ON m.itemId = l.itemId WHERE m.running
+                """))
+        }
+    }
+
+    /// Start-up: no merge is running. A pending head that `main` never reached (a crash before the move) is forgotten.
+    func recoverMerges() throws {
+        try writer.write { db in try db.execute(sql: "UPDATE itemMerge SET running = 0") }
+        for company in try companies() where company.pendingMainCommit != nil {
+            let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+            guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { continue }
+            let head = try? gitWorkspace(root: ws, companyId: company.id).head(of: GitWorkspace.mainRef)
+            if let head, head == company.mainCommit { try clearPendingMainCommit(companyId: company.id, ifEqual: nil) }
+        }
+    }
+
+    // MARK: The expected next head of main (crash recovery)
+
+    func setPendingMainCommit(companyId: String, _ commit: String) throws {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE company SET pendingMainCommit = ? WHERE id = ?", arguments: [commit, companyId])
+        }
+    }
+
+    /// Clears the pending head (only when it is still `ifEqual`, if given).
+    func clearPendingMainCommit(companyId: String, ifEqual: String?) throws {
+        try writer.write { db in
+            if let ifEqual {
+                try db.execute(sql: "UPDATE company SET pendingMainCommit = NULL WHERE id = ? AND pendingMainCommit = ?", arguments: [companyId, ifEqual])
+            } else {
+                try db.execute(sql: "UPDATE company SET pendingMainCommit = NULL WHERE id = ?", arguments: [companyId])
+            }
+        }
+    }
+
+    /// The engine (or the owner's accept) moved `main` to `commit`: it is the recorded head now.
+    func finalizeMainCommit(_ db: Database, companyId: String, commit: String) throws {
+        try db.execute(sql: "UPDATE company SET mainCommit = ?, pendingMainCommit = NULL WHERE id = ?", arguments: [commit, companyId])
+    }
+
+    // MARK: Failures
+
+    /// One merge attempt of the item failed (git failed, not a hold). After `maxMergeFailures` in a row the item goes back to
+    /// its holder with a `mergeFailed` event, the owner gets an engine alert, and the company's queue moves on. True then.
+    @discardableResult
+    func noteMergeFailure(itemId: String, error: String, now: Date = Store.now()) throws -> Bool {
+        let reason = Self.flat(error, max: 300)
+        return try writer.write { db -> Bool in
+            try db.execute(sql: """
+                INSERT INTO itemMerge (itemId, failures, lastError) VALUES (?, 1, ?)
+                ON CONFLICT(itemId) DO UPDATE SET failures = failures + 1, lastError = excluded.lastError
+                """, arguments: [itemId, reason])
+            let failures = try Int.fetchOne(db, sql: "SELECT failures FROM itemMerge WHERE itemId = ?", arguments: [itemId]) ?? 0
+            guard failures >= Self.maxMergeFailures, var item = try WorkItem.fetchOne(db, key: itemId), item.status == .inReview,
+                  item.mergeState == .pending, let company = try Company.fetchOne(db, key: item.companyId) else { return false }
+            try db.execute(sql: "UPDATE itemMerge SET failures = 0 WHERE itemId = ?", arguments: [itemId])
+            item.mergeState = .none
+            item.reviewAttempts = 0
+            item.verifiedRevision = nil
+            item.verifiedCommit = nil
+            item.updatedAt = now
+            try item.update(db)
+            let returned = try engineSetStatus(db: db, itemId: itemId, to: .inProgress, now: now)
+            try Store.refreshLease(db, itemId: itemId, companyId: item.companyId)
+            let holder = try Self.leaseHolderId(db: db, itemId: itemId) ?? item.ownerId
+            try recordItemEvent(db: db, item: returned, actor: "system", kind: .mergeFailed,
+                                text: "could not be merged into main after \(Self.maxMergeFailures) attempts (\(reason)); it is back with its holder",
+                                alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+            if let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed {
+                try MessageRouter(store: self).sendDM(
+                    db: db, companyId: item.companyId, from: .system, to: agent.name,
+                    text: "\(item.key) could not be merged into main after \(Self.maxMergeFailures) attempts; the owner was alerted. "
+                        + "Check item/\(item.key) (rebase it on main if it is behind), run your check and resubmit.", now: now)
+            }
+            try EngineAlerts.raise(
+                store: self, db: db,
+                text: "\(company.name): \(item.key) could not be merged into main after \(Self.maxMergeFailures) attempts (\(reason)). "
+                    + "It went back to its holder and the merge queue moved on.",
+                now: now, reason: Self.mergeFailureAlertReason(itemId))
+            return true
+        }
+    }
+
+    // MARK: Quarantine
+
+    /// A quarantine of this company's root checkout is waiting for the owner: the merge step holds.
+    func quarantineHeld(companyId: String) throws -> Bool {
+        try writer.read { db in
+            try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.other && Column("category") == Self.quarantineCategory
+                           && [AskStatus.pendingOwner.rawValue, AskStatus.pendingInternal.rawValue].contains(Column("status"))
+                           && Column("subjectId").like("quarantine:%")).fetchCount(db) > 0
+        }
+    }
+
+    /// Never commits a dirty root checkout: its changes go to a quarantine ref, the checkout is restored to `main`, and the
+    /// owner gets one ask (reserved category `engine-code`) naming the ref and quoting what changed.
+    private func quarantineRoot(company: Company, git: GitWorkspace, expectedMain: String, now: Date) throws {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        guard let q = try git.quarantineRoot(expectedMain: expectedMain, stamp: f.string(from: now)) else { return }
+        // `<status>\t<path>`, each part one cleaned line (paths are whatever was in the checkout).
+        var files = q.nameStatus.prefix(200).map { line -> String in
+            let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
+            let status = parts.count == 2 ? ReviewDigest.flat(parts[0], max: 8) : "?"
+            return ReviewDigest.quotePrefix + status + "\t" + ReviewDigest.flat(parts.last ?? line, max: 300)
+        }
+        if q.nameStatus.count > 200 { files.append(ReviewDigest.quotePrefix + "… and \(q.nameStatus.count - 200) more") }
+        let summary = """
+            Brahma found uncommitted changes in the main checkout of \(Self.flat(company.name, max: 100)). They were not committed to main: \
+            they are saved as \(q.ref) (\(q.commit.prefix(7))) and the checkout was restored to main (\(expectedMain.prefix(7))). \
+            Merges into main wait until you decide.
+
+            Review them with: git diff refs/heads/main \(q.ref)
+            Merge them into main with: brahma main accept \(Self.flat(company.name, max: 100)) \(q.ref)
+
+            Changed files:
+            \(files.joined(separator: "\n"))
+
+            Summary:
+            \(ReviewDigest.quote(q.stat, maxChars: 4000))
+            """
+        try writer.write { db in
+            _ = try propose(db: db, companyId: company.id, by: .system, kind: .other, risk: .high, category: Self.quarantineCategory,
+                            title: Self.quarantineTitle, summary: summary, payload: nil, document: nil, itemId: nil,
+                            subjectId: Self.quarantineSubject(q.ref), supersedes: nil, requestId: nil, decisionClass: .goalChanging,
+                            viaOwner: true, now: now)
+            try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .error,
+                              text: "the main checkout had uncommitted changes; they were moved to \(q.ref) and merges wait for the owner",
+                              createdAt: now).insert(db)
         }
     }
 
@@ -38,11 +204,13 @@ extension Store {
 
     /// The engine's merge step for one approved item (off the actor: it runs git).
     ///
-    /// 1. The root checkout must be on `refs/heads/main`; otherwise nothing is merged, one engine alert is raised and nil is returned.
-    /// 2. A branch already contained in `main` (the engine stopped between merging and recording it) is `merged`.
-    /// 3. Uncommitted changes on `main` are committed visibly first.
-    /// 4. The item's worktree is put on exactly the verified commit (`reset --hard`, `clean -fd`).
-    /// 5. `main` is the branch's merge base: fast-forward. Otherwise rebase onto `main`; a conflict is aborted and reported.
+    /// 1. `main` must be exactly the recorded head (`checkMain`) and the root checkout on `refs/heads/main`; otherwise nothing
+    ///    is merged (one engine alert) and nil is returned.
+    /// 2. A quarantine waiting for the owner holds the merge step (nil). A dirty root checkout is quarantined, never
+    ///    committed, and the merge step holds (nil).
+    /// 3. `GitWorkspace.landVerified` lands exactly the verified commit: refused when the branch moved, a fast-forward
+    ///    (`pendingMainCommit` written before `main` moves, the record finalized after), or a rebase of the verified commit in
+    ///    the engine's merge checkout.
     func performMerge(item: WorkItem, company: Company, now: Date) throws -> MergeResult? {
         let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let git = gitWorkspace(root: root, companyId: company.id)
@@ -56,24 +224,33 @@ extension Store {
             return nil
         }
         try writer.write { db in try resolveEngineAlerts(db, reasons: [Self.mainHeadAlertReason(company.id)], now: now) }
-        guard let mainBefore = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(company.name) has no main branch") }
-        if try git.isAncestor(verified, of: mainBefore) { return .merged(mainHead: mainBefore) }
-
-        if try git.isDirty(in: root), let sha = try git.commitAll(in: root, message: Self.unattributedCommitMessage) {
-            try writer.write { db in
-                try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [sha, company.id])
-                try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .work,
-                                  text: "main had uncommitted changes; committed as \(sha.prefix(7))", createdAt: now).insert(db)
-            }
+        if try quarantineHeld(companyId: company.id) { return nil }
+        guard let expected = try self.company(id: company.id)?.mainCommit else { return nil }
+        if try git.isDirty(in: root) {
+            try quarantineRoot(company: company, git: git, expectedMain: expected, now: now)
+            return nil
         }
-        try git.resetWorktree(key: item.key, to: verified)
-        guard let mainHead = try git.head(of: GitWorkspace.mainRef), let base = try git.mergeBase(GitWorkspace.mainRef, verified) else {
-            throw WorkError.conflict("\(item.key) shares no history with main")
+        var pending: String?
+        let outcome: GitWorkspace.LandOutcome
+        do {
+            outcome = try git.landVerified(key: item.key, verified: verified, expectedMain: expected, recordPending: { next in
+                try self.setPendingMainCommit(companyId: company.id, next)
+                pending = next
+            })
+        } catch {
+            if let pending { try? clearPendingMainCommit(companyId: company.id, ifEqual: pending) }
+            throw error
         }
-        if base == mainHead { return .merged(mainHead: try git.fastForwardMain(key: item.key)) }
-        switch try git.rebaseOntoMain(key: item.key) {
+        switch outcome {
+        case .fastForwarded(let head):
+            try writer.write { db in try finalizeMainCommit(db, companyId: company.id, commit: head) }
+            return .merged(mainHead: head)
+        case .alreadyLanded(let head): return .merged(mainHead: head)
         case .rebased(let head): return .rebased(head: head)
-        case .conflict(let files): return .conflict(files: files, mergeBase: base, mainCommit: mainHead, itemCommit: verified)
+        case .conflict(let files, let base, let mainHead):
+            return .conflict(files: files, mergeBase: base, mainCommit: mainHead, itemCommit: verified)
+        case .branchMoved(let head): return .branchMoved(head: head)
+        case .mainMoved: return nil    // the guard sees it on the next attempt
         }
     }
 
@@ -99,9 +276,12 @@ extension Store {
     ///   branch go and `MergeSafety.afterLanding` looks at everybody else's branch.
     /// - `.rebased`: `verifying` plus a queued `merge` check on the new head (an item with no check is `pending` at once).
     /// - `.conflict`: the item goes back to its holder with a conflict brief; its verification is cleared.
-    public func finishMerge(itemId: String, result: MergeResult, now: Date = Store.now()) throws {
+    /// - `.branchMoved`: the branch is not what was checked and reviewed: the item goes back to its holder, nothing merged.
+    func finishMerge(itemId: String, result: MergeResult, now: Date = Store.now()) throws {
         guard let item = try workItem(id: itemId), let company = try company(id: item.companyId) else { throw WorkError.notFound("no such work item") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
+        // The attempt did not fail: the failure count starts again.
+        try writer.write { db in try db.execute(sql: "UPDATE itemMerge SET failures = 0, lastError = NULL WHERE itemId = ?", arguments: [itemId]) }
         switch result {
         case .merged(let head):
             let landed = try writer.write { db -> Bool in
@@ -111,7 +291,8 @@ extension Store {
                 current.updatedAt = now
                 try current.update(db)
                 _ = try engineSetStatus(db: db, itemId: itemId, to: .done, text: "merged into main at \(head.prefix(7))", event: .merged, now: now)
-                try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [head, company.id])
+                try finalizeMainCommit(db, companyId: company.id, commit: head)
+                try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId)], now: now)
                 return true
             }
             guard landed else { return }
@@ -184,6 +365,31 @@ extension Store {
                     text: "\(current.key) could not be merged into main. Rebase item/\(current.key) on main, resolve these files, then resubmit:\n"
                         + block + "\nConflict brief: \(brief.path)", now: now)
             }
+
+        case .branchMoved(let head):
+            try writer.write { db in
+                guard var current = try WorkItem.fetchOne(db, key: itemId), current.status == .inReview, current.mergeState == .pending
+                else { return }
+                current.mergeState = .none
+                current.reviewAttempts = 0
+                // What was checked and approved is not what the branch holds now: both happen again.
+                current.verifiedRevision = nil
+                current.verifiedCommit = nil
+                current.updatedAt = now
+                try current.update(db)
+                let returned = try engineSetStatus(db: db, itemId: itemId, to: .inProgress, now: now)
+                try Store.refreshLease(db, itemId: itemId, companyId: current.companyId)
+                let holder = try Self.leaseHolderId(db: db, itemId: itemId) ?? current.ownerId
+                let now7 = head.map { " (now \($0.prefix(7)))" } ?? ""
+                try recordItemEvent(db: db, item: returned, actor: "system", kind: .verificationFailed,
+                                    text: "item/\(current.key) moved after its check passed\(now7); nothing was merged. Resubmit so the check and the review see that work.",
+                                    alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+                guard let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed else { return }
+                try MessageRouter(store: self).sendDM(
+                    db: db, companyId: current.companyId, from: .system, to: agent.name,
+                    text: "\(current.key) changed after its check passed and was approved, so nothing was merged. "
+                        + "Resubmit it; the check and the review run again on what item/\(current.key) holds.", now: now)
+            }
         }
     }
 
@@ -191,9 +397,8 @@ extension Store {
     /// what the item changed, each at most `maxBriefDiffLines` lines and every line quoted with `    | `.
     private func writeConflictBrief(git: GitWorkspace, company: Company, item: WorkItem, files: [String], mergeBase: String,
                                     mainCommit: String, itemCommit: String, now: Date) throws -> URL {
-        func quoted(_ text: String) -> String {
-            text.isEmpty ? "    | (no changes)" : text.split(separator: "\n", omittingEmptySubsequences: false).map { "    | \($0)" }.joined(separator: "\n")
-        }
+        // Every line quoted, control characters (a CRLF's `\r` among them) removed: `ReviewDigest.quote` splits at each `\n`.
+        func quoted(_ text: String) -> String { ReviewDigest.quote(text, maxChars: 1 << 20, empty: "(no changes)") }
         var out = ["# Merge conflict: \(item.key)", "",
                    "item/\(item.key) could not be rebased onto main. Rebase it in your worktree, resolve the files below, run your check and resubmit.",
                    "", "Merge base: \(mergeBase)", "main: \(mainCommit)", "item/\(item.key): \(itemCommit)", ""]

@@ -171,6 +171,21 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(accepted.status == 0, "\(accepted.stderr)"); #expect(accepted.stdout.contains(String(rewritten.prefix(7))))
         #expect(try store.company(id: company.id)?.mainCommit == rewritten)
         #expect(try open() == 0, "the alert is resolved")
+        // A quarantine is merged only from the owner's shell, and only a quarantine ref is accepted.
+        try "q\n".write(to: ws.appending(path: "q.txt"), atomically: true, encoding: .utf8)
+        try GitFixture.plainGit(["add", "-A"], in: ws)
+        let tree = try GitFixture.plainGit(["write-tree"], in: ws)
+        try GitFixture.plainGit(["reset", "-q", "--hard"], in: ws)
+        let q = try GitFixture.plainGit(["commit-tree", tree, "-p", rewritten, "-m", "q"], in: ws)
+        let ref = "refs/brahma/quarantine/20261022-120000"
+        try GitFixture.plainGit(["update-ref", ref, q], in: ws)
+        let agentRef = try brahma(["main", "accept", "Acme", ref], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(agentRef.status != 0); #expect(try store.company(id: company.id)?.mainCommit == rewritten)
+        #expect(try brahma(["main", "accept", "Acme", "refs/heads/main"], home: home).status != 0)
+        let merged = try brahma(["main", "accept", "Acme", ref], home: home)
+        #expect(merged.status == 0, "\(merged.stderr)"); #expect(merged.stdout.contains("merged"))
+        #expect(try store.company(id: company.id)?.mainCommit == q)
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == q)
         // Without an owner key it is refused too.
         let bare = try OwnerTestHome(initOwner: false); defer { withExtendedLifetime(bare) {} }
         #expect(try brahma(["main", "accept", "Acme"], home: bare.url).status != 0)

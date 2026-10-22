@@ -346,6 +346,16 @@ enum Migrations {
                 t.column("behindSinceActive", .double).notNull()
                 t.column("notified", .boolean).notNull().defaults(to: false)
             }
+            // Per approved item: whether its merge is running (its holder is locked out meanwhile) and how many merge
+            // attempts in a row failed (after `Store.maxMergeFailures` it goes back to the holder).
+            try db.create(table: "itemMerge") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("running", .boolean).notNull().defaults(to: false)
+                t.column("failures", .integer).notNull().defaults(to: 0)
+                t.column("lastError", .text)
+            }
+            // The head the engine is about to move main to (crash recovery of the exact main guard).
+            try db.alter(table: "company") { t in t.add(column: "pendingMainCommit", .text) }
         }
         m.registerMigration("v3-asks") { db in
             try db.alter(table: "company") { t in t.add(column: "autonomy", .text).notNull().defaults(to: "important") }
