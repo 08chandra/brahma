@@ -11,7 +11,9 @@ fi
 
 B=.build/Brahma.app/Contents/Helpers/brahma
 # Owner commands need an owner key; `owner init` insists on a terminal, so run it under a pseudo-terminal.
-# (The caller deletes the temp home's Keychain item at exit; see scripts/smoke-app.sh and scripts/ui-snapshot.sh.)
+# BRAHMA_OWNER_KEY_STORE=file keeps the owner-key hash in the temp home (dev/demo only; refused for the default data
+# home), so seeding never touches the login Keychain, which prompts for the password after every rebuild.
+export BRAHMA_OWNER_KEY_STORE=file
 if [ ! -f "$BRAHMA_HOME/owner.key" ]; then
   /usr/bin/script -q /dev/null "$B" owner init </dev/null >/dev/null
 fi

@@ -13,16 +13,10 @@ OUT=".superpowers/ui/$NAME.png"
 rm -f "$OUT"
 
 TMP="$(mktemp -d)"
-OWNER_HOME=""
-cleanup() {
-  # The account is the canonical (symlink-resolved) data home; never delete with an empty account.
-  if [ -n "$OWNER_HOME" ]; then
-    CANON="$(cd "$OWNER_HOME" 2>/dev/null && pwd -P || true)"
-    [ -z "$CANON" ] || security delete-generic-password -s dev.brahma.owner -a "$CANON" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$TMP"
-}
-trap cleanup EXIT
+trap 'rm -rf "$TMP"' EXIT
+# Dev/demo only: the owner-key hash lives in the data home, not the login Keychain (which prompts for the password
+# after every rebuild). The CLI and app refuse this for the default data home.
+export BRAHMA_OWNER_KEY_STORE=file
 DEFAULT_HOME="$HOME/Library/Application Support/Brahma"
 if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; then
   RESOLVED="$BRAHMA_HOME"
@@ -37,7 +31,6 @@ else
   export BRAHMA_HOME="$TMP/home"
   export BRAHMA_WORKSPACES="$TMP/workspaces"
   mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"
-  OWNER_HOME="$BRAHMA_HOME"   # the seeded temp home's Keychain item is deleted at exit
   scripts/seed-demo.sh >/dev/null
 fi
 export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"

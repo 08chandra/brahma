@@ -1,7 +1,6 @@
 import Foundation
 import Testing
 @testable import BrahmaCore
-import BrahmaKeychain
 
 /// Runs the built `brahma` binary against a throwaway data home.
 private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = [:]) throws
@@ -12,8 +11,7 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
     let p = Process()
     p.executableURL = url
     p.arguments = args
-    var e = ["BRAHMA_HOME": home.appending(path: "home").path, "BRAHMA_WORKSPACES": home.appending(path: "ws").path,
-             "PATH": "/usr/bin:/bin"]
+    var e = cliEnvironment(home: home)
     e.merge(env) { _, new in new }
     p.environment = e
     let out = Pipe(), err = Pipe()
@@ -428,7 +426,7 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(wrong.status == 1); #expect(wrong.stderr.contains("owner key missing or invalid"))
         try good.write(to: key)
         #expect(!(try brahma(["pause", "Acme", "ceo"], home: home.url).stderr.contains("owner key")))
-        KeychainOwnerKeyStore().removeHash(for: ownerPaths(home.url))
+        HomeFileOwnerKeyStore().removeHash(for: ownerPaths(home.url))
         let nohash = try brahma(["pause", "Acme", "ceo"], home: home.url)
         #expect(nohash.status == 1); #expect(nohash.stderr.contains("owner key missing or invalid"))
         // Read-only commands never needed the key.

@@ -64,9 +64,19 @@ func clock(_ date: Date, seconds: Bool = false) -> String {
     return f.string(from: date)
 }
 
+/// The owner-key store for this process: the Keychain, or (dev/demo homes only) the file store chosen by
+/// `BRAHMA_OWNER_KEY_STORE=file`, which is refused for the default data home and for unknown values.
+func ownerKeyStore(for paths: BrahmaPaths) throws -> any OwnerKeyStore {
+    let selection: PlatformOwnerKeyStore.Selection
+    do { selection = try PlatformOwnerKeyStore.resolve(paths: paths) } catch { throw fail("\(error)") }
+    if let warning = selection.warning { FileHandle.standardError.write(Data("brahma: \(safe(warning))\n".utf8)) }
+    return selection.store
+}
+
 /// Owner-write commands must not run from an agent's shell: the engine sets BRAHMA_AGENT_ID for every turn, and
 /// `<home>/owner.key` must hash to the value held in the Keychain (default deny). No owner command ever creates the
-/// key; only the app and `brahma owner init` do. There is no environment variable or flag that skips this check.
+/// key; only the app and `brahma owner init` do. Nothing skips this check; `BRAHMA_OWNER_KEY_STORE=file` only moves
+/// the hash into a temp/demo data home.
 ///
 /// This is a deterrent, not a security boundary: until 5-lite read-denies the data home and Keychain services to
 /// agents, an agent shell can still read the key and hash, or fake a TTY with `script`.
@@ -75,7 +85,7 @@ func requireOwnerShell() throws {
         throw fail("owner commands can't run inside an agent turn")
     }
     let paths = BrahmaPaths.fromEnvironment()
-    guard OwnerKey.verify(paths: paths, store: PlatformOwnerKeyStore.make()) else {
+    guard OwnerKey.verify(paths: paths, store: try ownerKeyStore(for: paths)) else {
         throw fail("owner key missing or invalid; run 'brahma owner init' in Terminal or open the app")
     }
     // The key is keyed on the canonical data home; the database we are about to open must really live in it.

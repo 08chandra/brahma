@@ -103,3 +103,5 @@ the key: the Mac app does at launch, or you run `brahma owner init` in Terminal 
 that is valid while that turn is in progress, delivered in the 0600 per-turn MCP config. Both are a deterrent, not a
 security boundary: until 5-lite's sandbox read-denies the data home and Keychain services to agents, an agent shell
 can still read the key, the hash and the MCP configs, or fake a TTY with `script`.
+
+For temp or demo data homes only, `BRAHMA_OWNER_KEY_STORE=file` keeps the owner-key hash in a 0600 file `<data home>/owner/keyhash` instead of the Keychain (a rebuilt dev binary re-prompts for the login password on every Keychain access); the CLI and app refuse it for the default data home and for any other value, and print a warning when it is used.

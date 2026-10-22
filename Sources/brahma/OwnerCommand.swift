@@ -24,7 +24,7 @@ struct OwnerGroup: ParsableCommand {
                 throw ExitCode.failure
             }
             let paths = BrahmaPaths.fromEnvironment()
-            let store = PlatformOwnerKeyStore.make()
+            let store = try ownerKeyStore(for: paths)
             do {
                 try OwnerKey.initForCLI(paths: paths, store: store, rotate: rotate)
             } catch OwnerKeyError.proofRequired {

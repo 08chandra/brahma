@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import BrahmaCore
 import BrahmaAppModel
+import BrahmaKeychain
 
 struct BootError: Error {
     var path: String
@@ -27,6 +28,8 @@ enum EngineSetup {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let boot: Result<AppModel, BootError>
+    /// The Keychain, or the dev/demo file store when `BRAHMA_OWNER_KEY_STORE=file` (never for the default data home).
+    private let ownerKeyStore: (any OwnerKeyStore)?
     let options: LaunchOptions
     /// Set by `MainWindow.onAppear`; reopens the main window after the user closes it.
     var openMainWindow: (() -> Void)?
@@ -38,7 +41,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         options = LaunchOptions.parse(CommandLine.arguments)
-        boot = AppDelegate.makeModel()
+        let paths = BrahmaPaths.fromEnvironment()
+        do {
+            let selection = try PlatformOwnerKeyStore.resolve(paths: paths)
+            if let warning = selection.warning { FileHandle.standardError.write(Data("brahma: \(warning)\n".utf8)) }
+            ownerKeyStore = selection.store
+            boot = AppDelegate.makeModel()
+        } catch {
+            ownerKeyStore = nil
+            boot = .failure(BootError(path: paths.home.path, message: "\(error)"))
+        }
         super.init()
         AppDelegate.current = self
     }
@@ -74,7 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch boot {
         case .success(let model):
             let options = self.options
-            let engine = EngineHost(paths: model.paths, store: model.store)
+            let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: ownerKeyStore ?? InMemoryOwnerKeyStore())
             model.engine = engine
             Task { @MainActor in
                 await model.load()
