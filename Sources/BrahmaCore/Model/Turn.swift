@@ -27,6 +27,13 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     /// `review` turns look at one item (`itemId`); every other kind leaves it nil.
     public var kind: TurnKind = .work
     public var itemId: String? = nil
+    /// Set when the session this turn used no longer existed ("session not found"): the turn is ignored by budgets, the
+    /// watchdog and facts, and the agent is ready again at once.
+    public var sessionResetReason: String? = nil
+    /// The last `STATUS:` line of the turn's result (`DONE`, `DONE_WITH_CONCERNS`, `BLOCKED`, `NEEDS_CONTEXT`).
+    public var reportedStatus: String? = nil
+    /// Why the prompt cache broke on a resume: the model or the tool set changed.
+    public var cacheBreak: String? = nil
 }
 
 public enum ActivityKind: String, Codable, Sendable { case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval }

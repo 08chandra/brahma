@@ -44,6 +44,22 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var lastNoticeWakeActive: Double? = nil
     /// Company-active time when the owner paused the agent; nil while awake. Ask rerouting reads it.
     public var pausedActive: Double? = nil
+    /// What the agent's base session (turns without a current item) ran with last; see `SessionMeta`.
+    public var sessionMeta: SessionMeta? = nil
+}
+
+/// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and
+/// how it last ended. Stored as JSON on the agent (base session) and as columns on `agentSession` (item sessions).
+public struct SessionMeta: Codable, Equatable, Sendable {
+    public var cwd: String?
+    public var model: String?
+    public var tools: String?
+    public var endedAt: Double?
+    public var lastTurnId: String?
+
+    public init(cwd: String? = nil, model: String? = nil, tools: String? = nil, endedAt: Double? = nil, lastTurnId: String? = nil) {
+        self.cwd = cwd; self.model = model; self.tools = tools; self.endedAt = endedAt; self.lastTurnId = lastTurnId
+    }
 }
 
 /// Tie-break weight among a company's ready agents: leadership first. Reads the built-in role catalog.

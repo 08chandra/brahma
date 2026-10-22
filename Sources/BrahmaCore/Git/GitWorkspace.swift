@@ -444,6 +444,19 @@ public struct GitWorkspace: Sendable {
         return try git.run(["rev-parse", "HEAD"]).text
     }
 
+    /// The commit a checkout's `HEAD` points at.
+    public func headCommit(in dir: URL) throws -> String {
+        try context(for: dir).run(["rev-parse", "HEAD"]).text
+    }
+
+    /// Puts the checkout back on `commit` and removes everything untracked (the write barrier of a plan turn).
+    public func resetHard(in dir: URL, to commit: String) throws {
+        try Self.validCommit(commit)
+        let git = try context(for: dir)
+        try git.run(["reset", "--hard", "--quiet", commit])
+        try git.run(["clean", "-fdq"])
+    }
+
     public func isDirty(in dir: URL) throws -> Bool {
         !(try context(for: dir).run(["status", "--porcelain"]).text.isEmpty)
     }

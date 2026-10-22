@@ -288,7 +288,8 @@ import GRDB
         // A teammate without a lease stays in the company workspace.
         try l.world.dm(l.company, l.eng2)
         try await l.world.cycle()
-        let plain = try #require(l.world.fake.requests.last)
+        // (eng-1 still holds its item and keeps working, so pick eng-2's request.)
+        let plain = try #require(l.world.fake.requests.last { $0.agent.name == "eng-2" })
         #expect(plain.workingDirectory == l.company.workspacePath); #expect(plain.addDirs.isEmpty)
     }
 
@@ -511,6 +512,8 @@ import GRDB
 
     @Test func dispatchBoundedByFreeSlots() async throws {
         let l = try L(hardCap: 2)
+        // Holders who say they are stuck sleep (a holder who does not keeps its slot and works on).
+        l.world.fake.defaultScript = .init(text: "stuck\nSTATUS: BLOCKED")
         for n in 0..<4 { _ = try l.world.hire(l.company, "extra-\(n)", role: "engineer") }   // 7 idle engineers
         for n in 0..<7 { try l.item("item \(n)", paths: ["src/d\(n)"]) }
         try await l.world.cycle()

@@ -17,10 +17,12 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
         var error: (any Error)?
         /// Simulated work before the first event.
         var delay: Duration?
+        /// The result text of the default success (`events == nil`); "done" when nil.
+        var text: String?
 
         init(events: [StreamEvent]? = nil, sideEffect: (@Sendable (TurnRequest) throws -> Void)? = nil,
-             error: (any Error)? = nil, delay: Duration? = nil) {
-            self.events = events; self.sideEffect = sideEffect; self.error = error; self.delay = delay
+             error: (any Error)? = nil, delay: Duration? = nil, text: String? = nil) {
+            self.events = events; self.sideEffect = sideEffect; self.error = error; self.delay = delay; self.text = text
         }
     }
 
@@ -63,7 +65,7 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
                 let leave = { self.lock.withLock { self.current -= 1 } }
                 do {
                     if let delay = script.delay { try await Task.sleep(for: delay) }
-                    let events = script.events ?? Self.success(request)
+                    let events = script.events ?? Self.success(request, text: script.text ?? "done")
                     for (i, e) in events.enumerated() {
                         if i == events.count - 1 { try script.sideEffect?(request) }
                         continuation.yield(e)

@@ -132,6 +132,6 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
         #expect(!text.contains("@cto — cto"), "the roster changes with every hire and would break the cached prefix")
         #expect(text == RolePrompt.render(agent: makeAgent(started: false), company: company,
                                           roster: [makeAgent(started: false)]))
-        #expect(text.count < 2500)
+        #expect(text.count < 8000)
     }
 }

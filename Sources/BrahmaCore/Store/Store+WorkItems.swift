@@ -668,8 +668,9 @@ extension Store {
         try WorkNotice.filter(ids.contains(Column("id"))).updateAll(db, Column("deliveredTurnId").set(to: turnId))
     }
 
-    /// Whether the agent has something to act on: a waking inbox item, a pending review, or a waking notice that is due.
-    /// Non-waking notices and debounced notices that are not yet due do not count.
+    /// Whether the agent has something to act on: a waking inbox item, a pending review, a waking notice that is due, or a
+    /// lease on an `inProgress` item whose last turn did not report `BLOCKED` or `NEEDS_CONTEXT` (the work goes on). Non-waking
+    /// notices and debounced notices that are not yet due do not count.
     static func hasPendingWork(db: Database, agentId: String) throws -> Bool {
         if try hasPendingReview(db: db, agentId: agentId) { return true }
         let inbox = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM inboxItem WHERE agentId = ? AND deliveredTurnId IS NULL AND wakes = 1",
@@ -677,10 +678,30 @@ extension Store {
         if inbox > 0 { return true }
         guard let agent = try Agent.fetchOne(db, key: agentId) else { return false }
         let active = try activeNow(db: db, companyId: agent.companyId)
-        return (try Int.fetchOne(db, sql: """
+        let due = (try Int.fetchOne(db, sql: """
             SELECT COUNT(*) FROM workNotice WHERE agentId = ? AND deliveredTurnId IS NULL AND wakes = 1
             AND (wakeAfterActive IS NULL OR wakeAfterActive <= ?)
             """, arguments: [agentId, active]) ?? 0) > 0
+        if due { return true }
+        return try holdsActionableLease(db: db, agentId: agentId)
+    }
+
+    /// The agent holds an `inProgress` item and has not said it is stuck: it keeps working (the watchdog bounds a loop).
+    static func holdsActionableLease(db: Database, agentId: String) throws -> Bool {
+        guard try Int.fetchOne(db, sql: """
+            SELECT COUNT(*) FROM workLease JOIN workItem ON workItem.id = workLease.itemId
+            WHERE workLease.agentId = ? AND workItem.status = 'inProgress'
+            """, arguments: [agentId]) ?? 0 > 0 else { return false }
+        let last = try String.fetchOne(db, sql: """
+            SELECT reportedStatus FROM turn WHERE agentId = ? AND outcome <> 'inProgress' AND kind IN ('work', 'plan', 'notice')
+            ORDER BY startedAt DESC, rowid DESC LIMIT 1
+            """, arguments: [agentId])
+        return !TurnStatus.isBlocked(last)
+    }
+
+    /// Whether launching a turn for this agent would have anything to do (the engine skips an empty turn).
+    func hasActionableWork(agentId: String) throws -> Bool {
+        try writer.read { db in try Store.hasPendingWork(db: db, agentId: agentId) }
     }
 
     /// The tick's wake for debounced notices: sleeping, unpaused agents whose waking notices have come due become ready.

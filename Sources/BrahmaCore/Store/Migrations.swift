@@ -337,6 +337,43 @@ enum Migrations {
             }
             try db.alter(table: "company") { t in t.add(column: "mainCommit", .text) }
         }
+        m.registerMigration("v3-sessions") { db in
+            // One session per (agent, item); a turn in another working directory starts a fresh one. `lastTurnId` points at the
+            // session's newest turn: its end time is the warm rule, its token columns (Task 14) the size rule.
+            try db.create(table: "agentSession") { t in
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("sessionId", .text).notNull()
+                t.column("started", .boolean).notNull().defaults(to: false)
+                t.column("cwd", .text)
+                t.column("sessionModel", .text)
+                t.column("sessionTools", .text)
+                t.column("lastEndedAt", .datetime)
+                t.column("lastTurnId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.primaryKey(["agentId", "itemId"])
+            }
+            try db.create(table: "handoff") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("authorId", .text).notNull()
+                t.column("toAgentId", .text)
+                t.column("path", .text).notNull()
+                t.column("auto", .boolean).notNull().defaults(to: false)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "handoff_item", on: "handoff", columns: ["itemId", "createdAt"])
+            // The base session's cwd, model, tool set and last turn (JSON; the session id and started flag stay on the agent).
+            try db.alter(table: "agent") { t in t.add(column: "sessionMeta", .text) }
+            // `sessionResetReason` may already exist when the budgets migration ran first on a merged database.
+            let existing = Set(try db.columns(in: "turn").map(\.name))
+            try db.alter(table: "turn") { t in
+                if !existing.contains("sessionResetReason") { t.add(column: "sessionResetReason", .text) }
+                t.add(column: "reportedStatus", .text)
+                t.add(column: "cacheBreak", .text)
+            }
+        }
         m.registerMigration("v3-asks") { db in
             try db.alter(table: "company") { t in t.add(column: "autonomy", .text).notNull().defaults(to: "important") }
             try db.alter(table: "agent") { t in t.add(column: "pausedActive", .double) }

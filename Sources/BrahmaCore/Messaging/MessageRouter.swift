@@ -175,6 +175,22 @@ public struct MessageRouter: Sendable {
         return PostResult(message: message, broadcastApplied: applied, broadcastRefusal: refusal)
     }
 
+    /// A waking system DM to one agent, inside the caller's transaction, for code that holds no `Store` (an engine notice that
+    /// must give a released agent something to act on). No broadcast logic: the text is the engine's own.
+    static func systemDM(db: Database, companyId: String, toAgentId: String, text: String, now: Date) throws {
+        guard let agent = try Agent.fetchOne(db, key: toAgentId), agent.companyId == companyId else { return }
+        let name = "dm:" + ["system", agent.name].sorted().joined(separator: ":")
+        let channel: Channel
+        if let existing = try Channel.filter(Column("companyId") == companyId && Column("name") == name).fetchOne(db) {
+            channel = existing
+        } else {
+            channel = try Store.insertChannel(db, companyId: companyId, name: name, kind: .dm, members: ["system", agent.id], now: now)
+        }
+        let message = Message(id: UUID().uuidString, companyId: companyId, channelId: channel.id, senderId: "system", text: text, createdAt: now)
+        try message.insert(db)
+        try InboxItem(id: nil, agentId: agent.id, messageId: message.id, deliveredTurnId: nil, wakes: true).insert(db)
+    }
+
     /// Lowercased handles from `@handle` tokens (`[a-z0-9_-]+`); an `@` glued to a preceding word (an email) is ignored.
     static func mentions(in text: String) -> [String] {
         guard let re = try? NSRegularExpression(pattern: "(?<![A-Za-z0-9_])@([A-Za-z0-9_-]+)") else { return [] }

@@ -21,6 +21,8 @@ public struct TurnProfile: Equatable, Sendable {
     public var extraSettings: [String: JSONValue] = [:]
     public var disableSlashCommands = true
     public var environment: [String: String] = [:]
+    /// Replaces the permission mode of the profile (a plan turn runs in `plan` mode).
+    public var permissionModeOverride: String? = nil
 
     public init(model: String, session: Session, mcpConfigPath: String, permission: PermissionProfile,
                 workingDirectory: String, addDirs: [String] = []) {
@@ -42,6 +44,14 @@ public enum TurnProfileCompiler {
                             permission: r.profile, workingDirectory: r.workingDirectory,
                             addDirs: r.addDirs.isEmpty ? [r.company.workspacePath] : r.addDirs)
         p.environment = r.environment
+        if r.kind == .plan {
+            // Plan mode alone is not trusted (the engine checks the worktree afterwards); the turn gets no editing tools and its
+            // plan file goes to the plans directory.
+            p.permissionModeOverride = "plan"
+            p.allowedTools.removeAll { ["Edit", "NotebookEdit", "Task", "Agent"].contains($0) }
+            for name in ["Edit", "NotebookEdit"] where !p.disallowedTools.contains(name) { p.disallowedTools.append(name) }
+            if let dir = r.planDirectory { p.extraSettings["plansDirectory"] = .string(dir) }
+        }
         return restricted(p, for: r.kind)
     }
 
@@ -85,10 +95,10 @@ public enum TurnProfileCompiler {
         }
         switch p.permission {
         case .workspace:
-            a += ["--permission-mode", "acceptEdits", "--allowed-tools", p.allowedTools.joined(separator: ",")]
+            a += ["--permission-mode", p.permissionModeOverride ?? "acceptEdits", "--allowed-tools", p.allowedTools.joined(separator: ",")]
             for dir in p.addDirs { a += ["--add-dir", dir] }
         case .full:
-            a += ["--permission-mode", "bypassPermissions"]
+            a += ["--permission-mode", p.permissionModeOverride ?? "bypassPermissions"]
         }
         return a
     }

@@ -23,6 +23,8 @@ public actor Orchestrator {
     let checkRunner: any CheckRunning
     /// The environment engine-run checks are built from (filtered by `ChildEnvironment`, purpose `.check`).
     let checkBaseEnvironment: [String: String]
+    /// Whether the next turn of an agent on its leased item is a plan turn (Plan-first selection arrives with Task 14c).
+    let planSelector: @Sendable (Agent, WorkItem, Company) -> Bool
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -62,7 +64,9 @@ public actor Orchestrator {
                 connectivity: any ConnectivityProbe = HTTPSProbe(), disk: any DiskSpace = SystemDiskSpace(),
                 exec: @escaping Doctor.Exec = Doctor.defaultExec, claudePath: String = "claude",
                 checkRunner: any CheckRunning = ProcessCheckRunner(),
-                checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
+                checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+                planSelector: @escaping @Sendable (Agent, WorkItem, Company) -> Bool = { _, _, _ in false }) {
+        self.planSelector = planSelector
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
         self.mcpExecutable = mcpExecutable; self.profile = profile; self.clock = clock
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
@@ -252,6 +256,11 @@ public actor Orchestrator {
     }
 
     private func launch(_ agent: Agent, now: Date) {
+        // No empty turns: nothing to answer, no due notice, no review, no lease to keep working on. No process is started.
+        if (try? store.hasActionableWork(agentId: agent.id)) == false {
+            attempt { try store.transition(agentId: agent.id, to: .sleeping, now: now, if: { $0.state == .ready && !$0.paused }) }
+            return
+        }
         let started: (Agent, Turn)
         do {
             guard let s = try store.beginTurn(agentId: agent.id, now: now) else { return }
@@ -279,84 +288,143 @@ public actor Orchestrator {
     // MARK: Turn (off the actor)
 
     private nonisolated func performTurn(agent: Agent, turn: Turn) async {
-        var items: [(InboxItem, Message, Channel)] = []
-        var quietIds: [Int64] = []
-        var noticeIds: [Int64] = []
-        var collapsedNotices = 0
+        var ctx: TurnContext?
         var result: TurnResult?
         var lastInfo: RateLimitInfo?
         var failure: String?
         var runnerError: (any Error)?
         var worktreeUnavailable: WorktreeUnavailable?
         var isReview = false
+        // The session this turn runs in, whether it resumed one, and what it ran with.
+        var scope = SessionScope.base
+        var wasResume = false
+        var workingDirectory = ""
+        var toolsKey = ""
+        var usedModel = agent.model
+        var keepModel = false
+        var sawInit = false
+        var plan: PlanWatch?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
+            let template = store.catalog.template(role: agent.role, pack: company.packId)
             // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
             let review = try Self.prepareReview(store: store, agent: agent, company: company)
             isReview = review != nil
             var turnPrompt = ""
-            if review == nil {
-                items = try store.pendingInbox(agentId: agent.id)
-                let quiet = try store.pendingQuietItems(agentId: agent.id)
-                quietIds = quiet.map(\.id)
-                let team = try store.agents(companyId: company.id)
-                let handles = Dictionary(uniqueKeysWithValues: team.map { ($0.id, $0.name) })
-                let batch = try store.noticeBatch(agentId: agent.id, limit: WorkNoticeDigest.maxNotices)
-                let notices = batch.shown
-                collapsedNotices = batch.collapsedIds.count
-                noticeIds = batch.deliveredIds
-                turnPrompt = Self.prompt(agent: agent, company: company, items: items, handles: handles,
-                                         unread: Store.channelCounts(quiet), notices: notices, collapsedNotices: collapsedNotices)
-            }
-            // `auto` resolves per turn from the role, the company's usage mode and the kind of turn (Tasks 10 and 14 set the context).
             var sent = agent
-            var systemPrompt = RolePrompt.render(agent: agent, company: company)
+            // The system prompt is byte-stable per agent and role: the roster, items and times ride in the orientation.
+            var systemPrompt = RolePrompt.render(agent: agent, company: company, template: template)
+            // `auto` resolves per turn from the role, the company's usage mode and the kind of turn.
             var context = (try? store.askModelContext(agentId: agent.id)) ?? ModelContext()
-            // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
-            // leaseholder's updates are its work, so its turns stay work turns.
             var kind = TurnKind.work
-            if review == nil, items.isEmpty, quietIds.isEmpty, !noticeIds.isEmpty,
-               try store.lease(agentId: agent.id) == nil {
-                kind = .notice
-                context.turnKind = .notice
-                try store.setTurnContext(turnId: turn.id, kind: .notice, itemId: nil)
-            }
+            workingDirectory = company.workspacePath
+            var addDirs: [String] = []
+            var cacheBreak: String?
+            var slotModel: String?
+            var slotTools: String?
+            toolsKey = "work:" + template.companyTools.joined(separator: ",")
+            var planDirectory: String?
+
             if let review {
                 sent.sessionId = UUID().uuidString
                 sent.sessionStarted = false
                 systemPrompt += "\n\n" + ReviewDigest.instructions(worktree: review.worktree.path)
                 turnPrompt = review.digest
                 context = ModelContext(turnKind: .review, deepReview: review.deep)
+                workingDirectory = review.worktree.path
+                addDirs = [review.worktree.path]
+            } else {
+                var c = try TurnContext.load(store: store, paths: paths, agent: agent, company: company)
+                let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+                var checkout: URL?
+                var git: GitWorkspace?
+                // A leaseholder works inside its item's worktree (with the shared `.brahma` directory); everyone else in the workspace.
+                if c.lease != nil, let leased = c.item {
+                    let g = store.gitWorkspace(root: workspace, companyId: company.id)
+                    let wt = g.worktreePath(key: leased.key)
+                    if !g.hasCheckout(key: leased.key) {
+                        do { try g.addWorktree(key: leased.key) } catch {
+                            // Never run a leaseholder's turn outside its worktree: the turn does not start.
+                            throw WorktreeUnavailable(itemId: leased.id, key: leased.key, reason: "\(error)")
+                        }
+                    }
+                    await clearWorktreeFailures(itemId: leased.id)
+                    workingDirectory = wt.path
+                    addDirs = [wt.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
+                    checkout = wt
+                    git = g
+                }
+                // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
+                // leaseholder's updates are its work, so its turns stay work turns.
+                if c.onlyNotices, c.lease == nil {
+                    kind = .notice
+                    context.turnKind = .notice
+                }
+                scope = kind == .notice ? .base : c.scope
+                if scope != c.scope { c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: scope)) ?? [] }
+
+                // Plan turn mechanics (selection is Task 14c's): only on a clean worktree, so the write barrier can tell.
+                if kind == .work, let leased = c.item, let git, let checkout, planSelector(agent, leased, company),
+                   (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout) {
+                    let dir = workspace.appending(path: ".brahma/plans/\(leased.key)", directoryHint: .isDirectory)
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    kind = .plan
+                    context.turnKind = .plan
+                    planDirectory = dir.path
+                    toolsKey = "plan:" + template.companyTools.joined(separator: ",")
+                    plan = PlanWatch(git: git, worktree: checkout, preHead: head, itemId: leased.id, directory: dir)
+                }
+
+                // Warm-only resume: a cold or large session starts over with the role card, the orientation and Continuity.
+                let slot = try store.sessionSlot(agent: agent, scope: scope)
+                slotModel = slot.model
+                slotTools = slot.tools
+                let decision = SessionPolicy.decide(
+                    started: slot.started, storedCwd: slot.cwd, cwd: workingDirectory, endedAt: slot.endedAt,
+                    tokens: store.sessionTranscriptTokens(turnId: slot.lastTurnId), now: clock())
+                switch decision {
+                case .resume:
+                    sent.sessionId = slot.sessionId
+                    sent.sessionStarted = true
+                    wasResume = true
+                case .fresh(let reason):
+                    if reason != .new {
+                        try store.resetSession(agentId: agent.id, scope: scope)
+                        let renewed = try store.agent(id: agent.id) ?? agent
+                        sent.sessionId = try store.sessionSlot(agent: renewed, scope: scope).sessionId
+                    } else {
+                        sent.sessionId = slot.sessionId
+                    }
+                    sent.sessionStarted = false
+                    c.fresh = true
+                    slotModel = nil
+                    slotTools = nil
+                }
+                turnPrompt = TurnDigest.render(c, agent: agent, company: company)
+                ctx = c
             }
-            sent.model = ModelPolicy.resolve(
-                agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
-                mode: company.usageMode, context: context)
+
+            var model = ModelPolicy.resolve(agentModel: agent.model, role: template, mode: company.usageMode, context: context)
+            // The model of an (agent, item) session is fixed after its first work turn; the effort may vary.
+            if wasResume, scope.itemId != nil, agent.model == "auto", let fixed = slotModel { model = fixed }
+            sent.model = model
+            usedModel = model
+            keepModel = scope.itemId != nil && agent.model == "auto"
+            if wasResume {
+                var changes: [String] = []
+                if let old = slotModel, old != model { changes.append("model \(old) -> \(model)") }
+                if let old = slotTools, old != toolsKey { changes.append("tools changed") }
+                if !changes.isEmpty { cacheBreak = changes.joined(separator: "; ") }
+            }
+
             let turnToken: String
             if let review {
                 try store.setTurnContext(turnId: turn.id, kind: .review, itemId: review.item.id)
                 turnToken = try store.issueTurnCredential(turnId: turn.id, kind: "review", itemId: review.item.id)
             } else {
+                if kind != .work || scope.itemId != nil { try store.setTurnContext(turnId: turn.id, kind: kind, itemId: scope.itemId) }
+                if let cacheBreak { try store.setTurnCacheBreak(turnId: turn.id, cacheBreak) }
                 turnToken = try store.issueTurnCredential(turnId: turn.id)
-            }
-            // A leaseholder works inside its item's worktree (with the shared `.brahma` directory); everyone else in the workspace.
-            var workingDirectory = company.workspacePath
-            var addDirs: [String] = []
-            if let review {
-                workingDirectory = review.worktree.path
-                addDirs = [review.worktree.path]
-            } else if let lease = try store.lease(agentId: agent.id), let leased = try store.workItem(id: lease.itemId) {
-                let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-                let git = store.gitWorkspace(root: workspace, companyId: company.id)
-                let checkout = git.worktreePath(key: leased.key)
-                if !git.hasCheckout(key: leased.key) {
-                    do { try git.addWorktree(key: leased.key) } catch {
-                        // Never run a leaseholder's turn outside its worktree: the turn does not start.
-                        throw WorktreeUnavailable(itemId: leased.id, key: leased.key, reason: "\(error)")
-                    }
-                }
-                await clearWorktreeFailures(itemId: leased.id)
-                workingDirectory = checkout.path
-                addDirs = [checkout.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
             }
             var request = TurnRequest(
                 agent: sent, company: company, prompt: turnPrompt, appendSystemPrompt: systemPrompt,
@@ -366,8 +434,9 @@ public actor Orchestrator {
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
             request.kind = review == nil ? kind : .review
+            request.planDirectory = planDirectory
             // A review session is never recorded as the agent's own.
-            var sessionMarked = agent.sessionStarted || review != nil
+            var sessionMarked = wasResume || review != nil
             var iterator = runner.run(request).makeAsyncIterator()
             while true {
                 let event: StreamEvent?
@@ -375,7 +444,11 @@ public actor Orchestrator {
                 guard let event else { break }
                 switch event {
                 case .initialized:
-                    if !sessionMarked { try store.markSessionStarted(agentId: agent.id); sessionMarked = true }
+                    sawInit = true
+                    if !sessionMarked {
+                        try store.markSessionStarted(agentId: agent.id, scope: scope, cwd: workingDirectory, model: model, tools: toolsKey)
+                        sessionMarked = true
+                    }
                 case .rateLimit(let info):
                     // A garbled event parses as "unknown"; saving it would close the gate for everyone.
                     guard info.status != "unknown" else { continue }
@@ -453,31 +526,59 @@ public actor Orchestrator {
         } else {
             end = .failed("claude exited without a result")
         }
-        var resetSession = false
-        if case .failed(let text, _) = end, agent.sessionStarted, !isReview {
-            resetSession = Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n"))
+
+        // A plan turn must not have changed the worktree: the engine checks and resets before anything else looks at it.
+        if let plan { finishPlanTurn(plan, agent: agent, end: end, now: now) }
+
+        // A resumed session that no longer exists: it is reset and the agent is ready again at once (no penalty). The next
+        // turn starts a fresh session. A fresh session that is "not found" again is an ordinary failure.
+        var sessionLost: SessionScope?
+        if case .failed(let text, _) = end, wasResume, !isReview,
+           Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n")) {
+            sessionLost = scope
         }
         // An infrastructure failure puts the agent on its fixed cooldown before the turn is recorded, so there is no
         // moment at which it is `ready` and eligible again.
         if case .failed(_, let input?) = end, EngineHealth.classify(input) != .none {
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
         }
+        let use = !isReview && (wasResume || sawInit)
+            ? SessionUse(scope: scope, model: keepModel ? nil : usedModel, tools: toolsKey, cwd: workingDirectory) : nil
         var infra = InfraClass.none
         attempt {
-            infra = try store.endTurn(agentId: agent.id, turn: turn, end: end, deliveredItemIds: items.compactMap(\.0.id) + quietIds,
-                                      deliveredNoticeIds: noticeIds, resetSession: resetSession, now: now)
+            infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
+                                      deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
+                                      deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use, now: now)
         }
         let outcome = end.outcome
         await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)
     }
 
-    /// The inbox digest, then the work updates. With only work updates there is no "nothing new" line.
-    static func prompt(agent: Agent, company: Company, items: [(InboxItem, Message, Channel)], handles: [String: String],
-                       unread: [(channel: String, count: Int)], notices: [PendingNotice], collapsedNotices: Int = 0) -> String {
-        let work = WorkNoticeDigest.render(notices, collapsed: collapsedNotices, handles: handles)
-        if items.isEmpty, unread.isEmpty, let work { return work }
-        let inbox = InboxDigest.render(agent: agent, company: company, items: items, handles: handles, unread: unread)
-        return work.map { inbox + "\n\n" + $0 } ?? inbox
+    /// The write barrier of a plan turn: the worktree must be clean and `HEAD` where it was. Otherwise the engine resets it,
+    /// records `planTurnWrote` and does not count the plan. A good plan is read from the plans directory (else the result
+    /// text) and recorded as `planWritten`.
+    private nonisolated func finishPlanTurn(_ plan: PlanWatch, agent: Agent, end: TurnEnd, now: Date) {
+        var wrote: String?
+        let dirty = (try? plan.git.isDirty(in: plan.worktree)) ?? true
+        let head = try? plan.git.headCommit(in: plan.worktree)
+        if dirty { wrote = "uncommitted changes" } else if head != plan.preHead { wrote = "a commit" }
+        if let wrote {
+            attempt { try plan.git.resetHard(in: plan.worktree, to: plan.preHead) }
+            attempt { try store.recordPlanTurnWrote(itemId: plan.itemId, agentId: agent.id, detail: wrote, now: now) }
+            return
+        }
+        guard case .succeeded(let r, _) = end else { return }
+        var text = r.text ?? ""
+        let fm = FileManager.default
+        if let files = try? fm.contentsOfDirectory(at: plan.directory, includingPropertiesForKeys: [.contentModificationDateKey]),
+           let newest = files.filter({ $0.pathExtension == "md" }).max(by: {
+               ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+               < ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }),
+           let written = try? String(contentsOf: newest, encoding: .utf8), !written.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            text = written
+        }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        attempt { try store.recordPlan(itemId: plan.itemId, agentId: agent.id, text: text, now: now) }
     }
 
     /// `claude --resume` of a session it never persisted fails the same way forever; spot that so the next turn
@@ -501,6 +602,24 @@ public actor Orchestrator {
     nonisolated func log(_ message: String) {
         FileHandle.standardError.write(Data("brahma orchestrator: \(message)\n".utf8))
     }
+}
+
+/// What a plan turn needs afterwards: where to look for a write and where to go back to.
+struct PlanWatch {
+    var git: GitWorkspace
+    var worktree: URL
+    var preHead: String
+    var itemId: String
+    var directory: URL
+}
+
+/// The session a turn used, remembered when the turn ends (warm rule, size rule, cache-break detection).
+struct SessionUse: Sendable {
+    var scope: SessionScope
+    /// Nil keeps the stored model (an item session's model is fixed).
+    var model: String?
+    var tools: String
+    var cwd: String
 }
 
 /// A leaseholder's worktree is missing and could not be recreated.
@@ -564,8 +683,10 @@ extension Store {
 
     /// Records the turn outcome and moves the agent on, in one transaction, so a message that arrives while the
     /// turn ends either lands before the pending-inbox check or wakes the agent from its new state.
-    /// `resetSession`: the resumed session no longer exists; give the agent a fresh session id so its next turn
-    /// starts over with `--session-id` and the role prompt.
+    /// `sessionReset`: the resumed session no longer exists. It is reset (a new id, so the next turn starts over with
+    /// `--session-id`, the role prompt and the orientation), the turn is recorded `failed` with `sessionResetReason`, and the
+    /// agent is `ready` again at once: no backoff, `consecutiveFailures` unchanged, the inbox undelivered. Budgets, the watchdog
+    /// and facts ignore the turn. `sessionUse`: the session the turn ran in, noted for the next turn's warm and size rules.
     ///
     /// A failure whose error text classifies as network/account is recorded `failed` with `infra = true`: the agent
     /// goes back to `ready` with no backoff, `consecutiveFailures` is unchanged and the inbox stays undelivered.
@@ -573,7 +694,7 @@ extension Store {
     /// that was applied (`.none` for everything else).
     @discardableResult
     func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], deliveredNoticeIds: [Int64] = [],
-                 resetSession: Bool = false,
+                 sessionReset: SessionScope? = nil, sessionUse: SessionUse? = nil,
                  now: Date) throws -> InfraClass {
         try writer.write { db in
             var summary: String?
@@ -603,10 +724,19 @@ extension Store {
             } else {
                 agent.consecutiveInfraFailures = 0
             }
+            // A session that is gone is no penalty, unless the failure is an infrastructure one.
+            let lostScope = infraClass == .none ? sessionReset : nil
+            var reported: String?
+            if case .succeeded(let r, _) = end { reported = TurnStatus.parse(r.text) }
             // False when crash recovery already closed this turn; recovery also moved the agent, so the state
             // guard below leaves it alone.
             let closed = try Store.finishTurn(db: db, id: turn.id, outcome: end.outcome, summary: summary, costUSD: cost,
-                                              infra: infraClass != .none, now: now)
+                                              infra: infraClass != .none, reportedStatus: reported,
+                                              sessionResetReason: lostScope == nil ? nil : "session not found", now: now)
+            if closed, lostScope == nil, let use = sessionUse {
+                try Store.noteSessionTurn(db: db, agentId: agentId, scope: use.scope, turnId: turn.id, endedAt: now,
+                                          model: use.model, tools: use.tools, cwd: use.cwd)
+            }
             if closed, let cost { try Store.recordSpend(db, cost) }
             if closed {
                 try noteReviewTurnEnd(db: db, turnId: turn.id, agent: agent, end: end, infra: infraClass != .none, now: now)
@@ -618,17 +748,15 @@ extension Store {
 
             switch end {
             case .succeeded: agent.consecutiveFailures = 0
-            case .failed: if infraClass == .none { agent.consecutiveFailures += 1 }
+            case .failed: if infraClass == .none, lostScope == nil { agent.consecutiveFailures += 1 }
             default: break
             }
             // A requested blocker belongs to the turn that set it.
             let requested = agent.requestedBlocker
             agent.requestedBlocker = nil
-            var columns = ["consecutiveFailures", "consecutiveInfraFailures", "requestedBlocker"]
-            if resetSession {
-                agent.sessionId = UUID().uuidString
-                agent.sessionStarted = false
-                columns += ["sessionId", "sessionStarted"]
+            let columns = ["consecutiveFailures", "consecutiveInfraFailures", "requestedBlocker"]
+            if let lostScope {
+                try Store.resetSession(db: db, agentId: agentId, scope: lostScope)
                 try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: turn.id, kind: .error,
                                   text: "@\(agent.name) session not found; next turn starts a fresh session",
                                   createdAt: now).insert(db)
@@ -647,7 +775,7 @@ extension Store {
                 try Store.transition(db: db, agentId: agentId, to: .ready, now: now)
             case .usageLimited(let until, _):
                 try Store.transition(db: db, agentId: agentId, to: .blocked, blocker: .usageLimit(until: until), now: now)
-            case .failed where infraClass != .none:
+            case .failed where infraClass != .none || lostScope != nil:
                 // Not the agent's fault: ready again at once (the orchestrator adds a fixed cooldown), no backoff.
                 try Store.transition(db: db, agentId: agentId, to: .ready, now: now)
             case .failed:

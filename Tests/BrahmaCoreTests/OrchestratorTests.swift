@@ -666,7 +666,7 @@ import GRDB
         #expect(try w.store.pendingNotices(agentId: eng.id).count == 2, "a failed turn delivers nothing")
         let first = try #require(w.fake.requests.first?.prompt)
         // The actionable notice comes first, then the FYI.
-        #expect(first.hasPrefix("Work updates (2):\n- ACME-1 changesRequested by @system: tighten the parser"))
+        #expect(first.contains("\n## Work updates (2)\n- ACME-1 changesRequested by @system: tighten the parser"))
         #expect(first.contains("\n- ACME-1 created by @owner: created task \"Do it\", assigned to @eng"))
         #expect(!first.contains("nothing new"))
         w.clock.advance(30)
@@ -688,8 +688,8 @@ import GRDB
         try w.dm(c, eng, "status?")
         try await w.cycle()
         let prompt = try #require(w.fake.requests.first?.prompt)
-        #expect(prompt.hasPrefix("New since your last turn (1 items):"))
-        #expect(prompt.contains("\n\nWork updates (2):\n"))
+        #expect(prompt.contains("# Inbox\nNew since your last turn (1 items):"))
+        #expect(prompt.contains("\n## Work updates (2)\n"))
         #expect(try w.store.pendingNotices(agentId: eng.id).isEmpty)
     }
 

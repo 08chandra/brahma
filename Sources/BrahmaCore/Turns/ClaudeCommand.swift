@@ -16,6 +16,8 @@ public struct TurnRequest: Sendable {
     public var environment: [String: String] = [:]
     /// Review and audit turns are compiled clean-context: no `Task`, `Agent` or `Workflow` tools.
     public var kind: TurnKind = .work
+    /// A plan turn writes its plan here (`<ws>/.brahma/plans/<KEY>/`), the only place it may write.
+    public var planDirectory: String? = nil
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,

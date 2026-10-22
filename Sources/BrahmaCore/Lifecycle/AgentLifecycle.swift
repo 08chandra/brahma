@@ -58,6 +58,10 @@ extension Store {
             }
             if other.state == .blocked, other.blocker == .agent(killed.id) {
                 try transition(db: db, agentId: other.id, to: other.paused ? .sleeping : .ready, now: now)
+                // Released with nothing else to do would be an empty turn: tell it why it is awake.
+                try MessageRouter.systemDM(db: db, companyId: other.companyId, toAgentId: other.id,
+                                           text: "@\(killed.name) was removed from the company while you were waiting on them. "
+                                               + "Re-plan: ask someone else or continue without them.", now: now)
             }
         }
     }
@@ -82,10 +86,11 @@ extension Store {
     }
 
     static func finishTurn(db: Database, id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, infra: Bool = false,
-                           now: Date) throws -> Bool {
+                           reportedStatus: String? = nil, sessionResetReason: String? = nil, now: Date) throws -> Bool {
         guard var turn = try Turn.fetchOne(db, key: id) else { throw StoreError.notFound }
         guard turn.outcome == .inProgress else { return false }
         turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.infra = infra; turn.endedAt = now
+        turn.reportedStatus = reportedStatus; turn.sessionResetReason = sessionResetReason
         try turn.update(db)
         try db.execute(sql: "DELETE FROM turnCredential WHERE turnId = ?", arguments: [id])
         return true
@@ -93,13 +98,15 @@ extension Store {
 
     public func turnCount(agentId: String, since: Date) throws -> Int {
         try writer.read { db in
-            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false).fetchCount(db)
+            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false
+                             && Column("sessionResetReason") == nil).fetchCount(db)
         }
     }
 
     public func oldestTurnStart(agentId: String, since: Date) throws -> Date? {
         try writer.read { db in
-            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false)
+            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false
+                             && Column("sessionResetReason") == nil)
                 .order(Column("startedAt")).fetchOne(db)?.startedAt
         }
     }

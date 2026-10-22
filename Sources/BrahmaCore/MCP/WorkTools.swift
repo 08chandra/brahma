@@ -11,6 +11,9 @@ extension CompanyTools {
         let key = s.prop("string", "Item key, e.g. ACME-12")
         let strings: JSONValue = .object(["type": .string("array"), "items": .object(["type": .string("string")]),
                                           "description": .string("Repo-relative paths or globs")])
+        func lines(_ what: String) -> JSONValue {
+            .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string(what)])
+        }
         let check: JSONValue = .object([
             "type": .string("object"),
             "description": .string("How the work is judged: a shell command the engine runs in a clean checkout"),
@@ -63,6 +66,11 @@ extension CompanyTools {
             ToolSpec(name: "submit_for_review", description: "Hand your finished work over. The engine commits your worktree, runs the item's check on that commit and, once it passes, asks the reviewer. You are notified of the result; you cannot mark the item in review or done yourself.",
                      inputSchema: s.schema(["key": key, "summary": s.prop("string", "What you did, and anything the reviewer should look at")],
                                            required: ["key", "summary"])),
+            ToolSpec(name: "write_handoff", description: "Write a hand-off file for an item you hold or are assigned when you stop, hand over or finish. It returns the file's path: send the path instead of pasting the content.",
+                     inputSchema: s.schema(["key": key, "goal": s.prop("string", "What the work is for and where it stands"),
+                                            "decisions": lines("Decisions taken, with the reason"),
+                                            "open_questions": lines("What is still open"), "file_refs": lines("Files and paths that matter"),
+                                            "to": s.prop("string", "Handle of the agent who picks it up (optional)")], required: ["key", "goal"])),
             ToolSpec(name: "confirm_spec", description: "Vouch for an item's spec (managers and executives): its tier, priority and type then count for model selection.",
                      inputSchema: s.schema(["key": key], required: ["key"])),
         ]
@@ -87,6 +95,14 @@ extension CompanyTools {
         case "claim_lease": return try claimLease(try item(args))
         case "release_lease": return try releaseLease(try item(args), note: try optString(args, "note"))
         case "submit_for_review": return try submitForReview(try item(args), summary: try string(args, "summary"))
+        case "write_handoff":
+            let i = try item(args)
+            let to = try optString(args, "to").flatMap { isNone($0) ? nil : $0 }
+            let draft = HandoffDraft(goal: try string(args, "goal"), decisions: try optStrings(args, "decisions") ?? [],
+                                     openQuestions: try optStrings(args, "open_questions") ?? [], fileRefs: try optStrings(args, "file_refs") ?? [],
+                                     toAgentId: try to.map { try agentId(handle: $0) })
+            let written = try store.writeHandoff(itemId: i.id, by: .agent(agentId), draft: draft)
+            return "Wrote \(written.path). Send this path instead of pasting the content."
         case "confirm_spec":
             let i = try item(args)
             try store.confirmSpec(id: i.id, by: .agent(agentId))
