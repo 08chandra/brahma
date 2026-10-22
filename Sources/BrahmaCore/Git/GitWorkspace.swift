@@ -156,6 +156,9 @@ public struct GitWorkspace: Sendable {
     /// Called once for each time an item worktree is found repointed (its `HEAD` off `item/<KEY>`, or `gitdir`, `commondir`
     /// or `.git` not as the engine wrote them), with the key and what was wrong. The worktree has been restored by then and
     /// the operation that found it refused. The store files the engine alert.
+    /// Whether the engine's database holds a lease for the item with this key. The plan barrier keeps a new `item/<KEY>`
+    /// branch the engine itself created (a lease, or a worktree it made); without this hook there is no lease record.
+    public var hasLease: (@Sendable (_ key: String) throws -> Bool)?
     public var onWorktreeTamper: (@Sendable (_ key: String, _ detail: String) -> Void)?
 
     public init(root: URL, lockDirectory: URL? = nil) {
@@ -627,7 +630,14 @@ public struct GitWorkspace: Sendable {
                 try git.run(["update-ref", "--no-deref", "-d", ref])
             }
             // An item branch that did not exist is planted: the engine would later claim that item onto whatever it holds.
+            // Unless the engine made it: a claim during the turn creates `item/<K>` with a lease and a worktree. That is checked
+            // again under the key's lock, which a claim in progress holds.
             for ref in nowBranches.subtracting(before.itemBranches).sorted() {
+                let itemKey = String(ref.dropFirst("refs/heads/item/".count))
+                let planted: Bool
+                if (try? Self.validKey(itemKey)) == nil { planted = true }
+                else { planted = try withKeyLock(itemKey) { try !engineRecords(key: itemKey) } }
+                guard planted else { continue }
                 found.append("new ref \(Self.shown(ref))")
                 try git.run(["update-ref", "--no-deref", "-d", ref])
             }
@@ -649,6 +659,12 @@ public struct GitWorkspace: Sendable {
 
         if !failures.isEmpty { throw PlanBarrierError(found: found, reason: failures.joined(separator: "; ")) }
         return found
+    }
+
+    /// The engine has a record of this item: a lease, or a worktree it created (registered, `HEAD` on the item's branch).
+    private func engineRecords(key: String) throws -> Bool {
+        if try hasLease?(key) == true { return true }
+        return hasCheckout(key: key) && linkProblems(key: key).isEmpty
     }
 
     /// One barrier listing: a failure, a timeout or output past `planBarrierOutputLimit` throws.

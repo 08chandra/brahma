@@ -678,6 +678,32 @@ import GRDB
         _ = wt
     }
 
+    @Test func planTurnKeepsABranchAnotherClaimCreatedAndDeletesAPlantedOne() async throws {
+        let (s, i, _) = try planWorld()
+        let j = try s.item("Other")
+        let ws = URL(fileURLWithPath: s.company.workspacePath)
+        let planted = try GitFixture.plainGit(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "planted"], in: ws)
+        let done = Flag()
+        s.world.fake.script("eng-1", .init(sideEffect: { _ in
+            guard !done.on else { return }
+            done.on = true
+            // Another agent claims a new item while the plan turn runs: the engine creates item/<j> with a lease and a worktree.
+            let other = try s.store.hire(companyId: s.company.id, name: "eng-2", role: "engineer", model: "sonnet", managerId: s.mgr.id)
+            try s.claim(j, other)
+            try GitFixture.plainGit(["branch", "item/ZZZ-99", planted], in: ws)
+        }, text: "the plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(done.on)
+        #expect(s.requests("eng-1").first?.kind == .plan)
+        #expect(try GitFixture.plainGit(["rev-parse", "--verify", "refs/heads/item/\(j.key)"], in: ws).isEmpty == false, "the claimed branch survives")
+        #expect(s.ws.hasCheckout(key: j.key))
+        #expect(try GitFixture.plainGit(["branch", "--list", "item/ZZZ-99"], in: ws).isEmpty, "the planted branch is deleted")
+        let events = try s.store.itemEvents(itemId: i.id)
+        #expect(events.contains { $0.kind == .planTurnWrote && $0.text.contains("new ref refs/heads/item/ZZZ-99") && !$0.text.contains(j.key) })
+        try "w".write(to: s.ws.worktreePath(key: j.key).appending(path: "w.txt"), atomically: true, encoding: .utf8)
+        #expect(try s.store.gitWorkspace(root: ws, companyId: s.company.id).commitAll(in: s.ws.worktreePath(key: j.key), message: "work") != nil)
+    }
+
     @Test func planTurnLeavesAnEngineMoveOfMainAlone() async throws {
         let (s, i, _) = try planWorld()
         let ws = URL(fileURLWithPath: s.company.workspacePath)

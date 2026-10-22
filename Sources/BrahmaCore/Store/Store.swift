@@ -83,6 +83,7 @@ public final class Store: Sendable {
         var git = GitWorkspace(root: root, lockDirectory: locks)
         git.lockTimeout = gitLockTimeout.seconds
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
+        git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }
         git.onWorktreeTamper = { [self] key, detail in
             let name = (try? company(id: companyId))?.name ?? companyId
             try? EngineAlerts.raise(

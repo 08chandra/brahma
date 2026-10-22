@@ -486,6 +486,27 @@ import Foundation
         #expect(try f.ws.head(of: "refs/heads/item/ACME-8") == nil)
     }
 
+    @Test func planBarrierKeepsAnItemBranchTheEngineCreated() throws {
+        let (f, wt) = try barrierFixture()
+        let other = try f.git(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "planted"])
+        final class Leases: @unchecked Sendable { var keys: Set<String> = [] }
+        let leases = Leases()
+        var ws = f.ws
+        ws.hasLease = { leases.keys.contains($0) }
+        let before = try ws.planBarrier(key: "ACME-1", in: wt)
+        // Another agent claims new items while the plan turn runs: one with a worktree, one with only a lease.
+        let claimed = try ws.addWorktree(key: "ACME-5")
+        try f.git(["branch", "item/ACME-6", other]); leases.keys.insert("ACME-6")
+        // A planted branch has no record; a planted branch with a bare admin dir is not a worktree either.
+        try f.git(["branch", "item/ACME-9", other])
+        #expect(try ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) == ["new ref refs/heads/item/ACME-9"])
+        #expect(try ws.head(of: "refs/heads/item/ACME-5") != nil && FileManager.default.fileExists(atPath: claimed.path))
+        #expect(try ws.head(of: "refs/heads/item/ACME-6") == other)
+        #expect(try ws.head(of: "refs/heads/item/ACME-9") == nil)
+        try f.write("w.txt", "work", in: claimed)
+        #expect(try ws.commitAll(in: claimed, message: "work") != nil, "the claimed worktree works")
+    }
+
     @Test func planBarrierFailsClosedOnIgnoredDirectories() throws {
         let (f, wt) = try barrierFixture()
         let exclude = f.root.appending(path: ".git/info/exclude")
