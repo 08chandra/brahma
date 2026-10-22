@@ -7,6 +7,8 @@ public struct MenuCompanyRow: Equatable, Identifiable, Sendable {
     public var statusText: String
     public var toggleTitle: String
     public var isRunning: Bool
+    /// Why nothing is running in this company (its first stall reason), nil while anything runs.
+    public var stallLine: String? = nil
 }
 
 public struct MenuBarSummary: Equatable, Sendable {
@@ -15,6 +17,8 @@ public struct MenuBarSummary: Equatable, Sendable {
     public var engine: String
     public var rows: [MenuCompanyRow]
     public var anyRunningAgents: Bool
+    /// Why nothing is running, for the first running company with nothing running; nil when all is well.
+    public var stall: String? = nil
 
     public static func make(companies: [CompanySummary], engine: EngineStatus?) -> MenuBarSummary {
         let running = companies.reduce(0) { $0 + $1.counts.running }
@@ -31,10 +35,13 @@ public struct MenuBarSummary: Equatable, Sendable {
                 id: c.id, name: name,
                 statusText: isRunning ? "Running · \(c.counts.running) running · \(c.counts.ready) ready" : "Paused",
                 toggleTitle: isRunning ? "Pause \(name)" : "Resume \(name)",
-                isRunning: isRunning)
+                isRunning: isRunning, stallLine: c.stallLine)
+        }
+        let stall = rows.first { $0.isRunning && $0.stallLine != nil }.flatMap { row in
+            row.stallLine.map { companies.count > 1 ? "\(row.name): \($0)" : $0 }
         }
         return MenuBarSummary(totals: totals, pending: "\(waiting) waiting on you · \(unread) unread",
-                              engine: engineLine(engine), rows: rows, anyRunningAgents: running > 0)
+                              engine: engineLine(engine), rows: rows, anyRunningAgents: running > 0, stall: stall)
     }
 
     private static func engineLine(_ status: EngineStatus?) -> String {

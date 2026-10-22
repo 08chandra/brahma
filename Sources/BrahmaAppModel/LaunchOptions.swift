@@ -2,6 +2,8 @@ import Foundation
 
 public enum SelectTarget: Equatable, Sendable {
     case missionControl, activity, agents
+    case backlog, board, inbox
+    case item(key: String)
     case agent(handle: String)
     case channel(name: String)
     case dm(handle: String)
@@ -13,6 +15,10 @@ public enum SelectTarget: Equatable, Sendable {
         case "mission": self = .missionControl
         case "activity": self = .activity
         case "agents": self = .agents
+        case "backlog": self = .backlog
+        case "board": self = .board
+        case "inbox": self = .inbox
+        case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)
         default:
@@ -22,6 +28,7 @@ public enum SelectTarget: Equatable, Sendable {
             guard !value.isEmpty else { return nil }
             switch key {
             case "agent": self = .agent(handle: value.lowercased())
+            case "item": self = .item(key: value.uppercased())
             case "channel": self = .channel(name: value.lowercased())
             case "dm": self = .dm(handle: value.lowercased())
             case "search": self = .search(value)

@@ -1,10 +1,13 @@
 import Foundation
+import BrahmaCore
 
 public enum AgentModelChoice: String, CaseIterable, Sendable {
-    case opus, sonnet, haiku
+    /// The engine picks the model for each turn from the work (the default for pack roles).
+    case auto, opus, sonnet, haiku
 
     public var title: String {
         switch self {
+        case .auto: "Auto"
         case .opus: "Opus"
         case .sonnet: "Sonnet"
         case .haiku: "Haiku"
@@ -18,6 +21,12 @@ public struct HireForm: Equatable, Sendable {
     public var model: AgentModelChoice = .sonnet
 
     public static let roleSuggestions = ["ceo", "cto", "cpo", "architect", "manager", "engineer", "designer", "qa"]
+
+    /// The role ids of the company's industry pack, falling back to the built-in suggestions.
+    public static func roles(catalog: PackCatalog, packId: String) -> [String] {
+        guard let pack = catalog.pack(packId), !pack.roles.isEmpty else { return roleSuggestions }
+        return pack.roles.map(\.id)
+    }
 
     public init(handle: String = "", role: String = "engineer", model: AgentModelChoice = .sonnet) {
         self.handle = handle
