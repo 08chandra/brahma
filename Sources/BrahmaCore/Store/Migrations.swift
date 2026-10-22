@@ -337,6 +337,26 @@ enum Migrations {
             }
             try db.alter(table: "company") { t in t.add(column: "mainCommit", .text) }
         }
+        m.registerMigration("v3-merge-safety") { db in
+            // Merge safety (9b): per in-progress item, the merge base it was last measured at, when `main` first moved past it
+            // (company-active seconds) and whether the freshness notice for that base was sent.
+            try db.create(table: "branchFreshness") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("mergeBase", .text).notNull()
+                t.column("behindSinceActive", .double).notNull()
+                t.column("notified", .boolean).notNull().defaults(to: false)
+            }
+            // Per approved item: whether its merge is running (its holder is locked out meanwhile) and how many merge
+            // attempts in a row failed (after `Store.maxMergeFailures` it goes back to the holder).
+            try db.create(table: "itemMerge") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("running", .boolean).notNull().defaults(to: false)
+                t.column("failures", .integer).notNull().defaults(to: 0)
+                t.column("lastError", .text)
+            }
+            // The head the engine is about to move main to (crash recovery of the exact main guard).
+            try db.alter(table: "company") { t in t.add(column: "pendingMainCommit", .text) }
+        }
         m.registerMigration("v3-sessions") { db in
             // One session per (agent, item); a turn in another working directory starts a fresh one. `lastTurnId` points at the
             // session's newest turn: its end time is the warm rule, its token columns (Task 14) the size rule.

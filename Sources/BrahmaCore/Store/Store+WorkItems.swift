@@ -520,7 +520,8 @@ extension Store {
     /// Engine-only status write for `inReview`, `done` and engine moves; no actor policy applies. `done` stamps `doneAt`,
     /// readies agents blocked on the item and tells the items that were waiting for it.
     @discardableResult
-    func engineSetStatus(db: Database, itemId: String, to: WorkItemStatus, text: String? = nil, now: Date) throws -> WorkItem {
+    func engineSetStatus(db: Database, itemId: String, to: WorkItemStatus, text: String? = nil, event: WorkEventKind = .statusChanged,
+                         now: Date) throws -> WorkItem {
         guard var item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
         let from = item.status
         guard from != to else { return item }
@@ -532,13 +533,16 @@ extension Store {
         item.updatedAt = now
         try item.update(db)
         if to == .done { try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id]) }
-        try recordItemEvent(db: db, item: item, actor: "system", kind: .statusChanged,
+        try recordItemEvent(db: db, item: item, actor: "system", kind: event,
                             text: text ?? "\(from.title) → \(to.title)", now: now)
-        if to == .done { try itemDone(db: db, item: item, now: now) }
+        if to == .done { try completeItem(db: db, item: item, now: now) }
         return item
     }
 
-    private func itemDone(db: Database, item: WorkItem, now: Date) throws {
+    /// Everything that follows an item becoming done, in this order: observers, agents blocked on it, the items depending on
+    /// it, then its container. Runs only from `engineSetStatus(to: .done)`, i.e. the merged path and the container rule.
+    func completeItem(db: Database, item: WorkItem, now: Date) throws {
+        for observer in observers { try observer.itemCompleted(item, db: db) }
         var waiters: [String] = []
         for agent in try Agent.filter(Column("companyId") == item.companyId && Column("state") == AgentState.blocked.rawValue).fetchAll(db) {
             guard case .workItem(let id, _)? = agent.blocker, id == item.id else { continue }
@@ -557,6 +561,17 @@ extension Store {
             try recordItemEvent(db: db, item: d, actor: "system", kind: .dependencyDone, text: "\(item.key) is done",
                                 assigneeRole: .waiter, now: now)
         }
+        try rollUpContainer(db: db, of: item, now: now)
+    }
+
+    /// The container rule: an epic or story whose children are all done is done itself (and so on up).
+    private func rollUpContainer(db: Database, of item: WorkItem, now: Date) throws {
+        // A parent is always a container (`requireParent`).
+        guard let parentId = item.parentId, let parent = try WorkItem.fetchOne(db, key: parentId), parent.status != .done else { return }
+        let open = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM workItem WHERE parentId = ? AND status <> 'done'",
+                                    arguments: [parent.id]) ?? 0
+        guard open == 0 else { return }
+        _ = try engineSetStatus(db: db, itemId: parent.id, to: .done, text: "all children are done", now: now)
     }
 
     // MARK: Events and notices

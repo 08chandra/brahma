@@ -270,6 +270,10 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     case leaseClaimed, leaseReleased, leaseExpired, submitted, verificationPassed, verificationFailed
     case reviewApproved, changesRequested, merged, mergeConflict, handoffWritten, budgetExceeded, watchdog, aging
     case sprintChanged
+    /// The item's branch has fallen far behind `main` (merge safety); an FYI, never waking.
+    case branchBehind
+    /// The engine could not merge an approved item `Store.maxMergeFailures` times in a row; it went back to its holder.
+    case mergeFailed
     // Work modes (W3).
     case planWritten, planTurnWrote, modeEscalated, specConfirmed
 
@@ -282,7 +286,7 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     /// Kinds that also appear in the company activity feed.
     static let feed: Set<WorkEventKind> = [
         .statusChanged, .submitted, .verificationPassed, .verificationFailed, .reviewApproved, .merged, .mergeConflict,
-        .budgetExceeded, .watchdog, .leaseExpired, .aging,
+        .mergeFailed, .budgetExceeded, .watchdog, .leaseExpired, .aging,
     ]
 }
 

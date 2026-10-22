@@ -39,6 +39,12 @@ public actor Orchestrator {
     var gitTasks: [String: Task<Void, Never>] = [:]
     /// Run id → its check task. Checks are child processes: they count in the safety cap next to turns.
     var checkTasks: [String: Task<Void, Never>] = [:]
+    /// Company id → its merge task (one approved item lands at a time per company). Merges are child processes too.
+    var mergeTasks: [String: Task<Void, Never>] = [:]
+    /// Companies whose last merge attempt did not land (HEAD not on main, git failed): not tried again before this time.
+    var mergeBackoff: [String: Date] = [:]
+    /// Company id → merge attempts in a row that failed for the company's own reasons (`MergeInfrastructureError`).
+    var mergeFaults: [String: Int] = [:]
     /// Agents the engine has just leased an item to, until their worktree exists (they are not scheduled meanwhile).
     var dispatching = Set<String>()
     /// Items whose dispatch failed in git: not offered again before this time.
@@ -85,13 +91,17 @@ public actor Orchestrator {
         let now = clock()
         _ = try store.recoverInterruptedTurns(now: now)
         try recoverChecks(now: now)
+        try recoverMerges()
     }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
+    /// Child processes that are not turns: engine-run checks and merges. They count against the same safety cap as turns.
+    var otherChildren: Int { checkTasks.count + mergeTasks.count }
+
     public func waitUntilIdle(timeout: Duration) async throws {
         let deadline = ContinuousClock.now + timeout
-        while !tasks.isEmpty || !healthTasks.isEmpty || !gitTasks.isEmpty || !checkTasks.isEmpty {
+        while !tasks.isEmpty || !healthTasks.isEmpty || !gitTasks.isEmpty || !checkTasks.isEmpty || !mergeTasks.isEmpty {
             guard ContinuousClock.now < deadline else { throw OrchestratorError.idleTimeout(running: runningCount()) }
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -103,7 +113,7 @@ public actor Orchestrator {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values)
+        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values)
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -230,24 +240,27 @@ public actor Orchestrator {
 
         // 5. Engine-run checks first (cheap, and they unblock reviews), then select and launch turns around them.
         startChecks(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+        startMerges(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
 
         infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         let ready = try store.agents(states: [.ready])
+        // The holder of an item whose merge is running gets no work turn until the merge ends.
+        let mergingHolders = (try? store.agentsLockedOutByMerges()) ?? []
         let candidates = ready.compactMap { a -> Candidate? in
-            guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil,
+            guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil, !mergingHolders.contains(a.id),
                   let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
-                                        usage: { decisions[$0.id] ?? .open }, otherChildren: checkTasks.count, pressure: pressure,
+                                        usage: { decisions[$0.id] ?? .open }, otherChildren: otherChildren, pressure: pressure,
                                         held: held, paceClosed: paceClosed, paceStrict: paceStrict)
         for agent in selected { launch(agent, now: now) }
 
         // 6. Engine dispatch, after admission: only into the slots admission left over, and only for companies whose gate,
         //    pace and concurrency cap would let a new agent run. Leases are never reserved for agents admission would refuse.
         if !held {
-            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: checkTasks.count,
+            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: otherChildren,
                                            pressure: pressure, held: held)
             var companyFree: [String: Int] = [:]
             for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id) {

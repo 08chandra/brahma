@@ -461,8 +461,11 @@ extension CompanyTools {
             }
         }
         flags += testFlags
+        // A dry run against main now: a stale "conflicts with main" flag is dropped, a real one is set (unknown keeps it).
+        let mainConflicts = try? git.mergeConflicts(key: target.key)
         let result = try store.submitForReview(itemId: target.id, agentId: agentId, summary: summary, flags: flags, commit: commit,
-                                               scriptHash: CheckScripts.scriptHash(current), workingDirectory: worktree.path)
+                                               scriptHash: CheckScripts.scriptHash(current), workingDirectory: worktree.path,
+                                               mainConflicts: mainConflicts)
         let short = String(commit.prefix(7))
         return result.run == nil
             ? "Submitted \(target.key) at \(short). It has no check, so it goes straight to review."

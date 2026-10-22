@@ -143,14 +143,14 @@ import Foundation
         #expect(W.noticeWakes(kind: .verificationPassed, recipientRole: .reviewer))
         #expect(!W.noticeWakes(kind: .verificationPassed, recipientRole: .owner))
         #expect(!W.noticeWakes(kind: .verificationPassed, recipientRole: .author))
-        for k in [WorkEventKind.changesRequested, .verificationFailed, .mergeConflict] {
+        for k in [WorkEventKind.changesRequested, .verificationFailed, .mergeConflict, .mergeFailed] {
             #expect(W.noticeWakes(kind: k, recipientRole: .owner)); #expect(W.noticeWakes(kind: k, recipientRole: .holder))
             #expect(!W.noticeWakes(kind: k, recipientRole: .reviewer)); #expect(!W.noticeWakes(kind: k, recipientRole: .author))
         }
         #expect(W.noticeWakes(kind: .dependencyDone, recipientRole: .waiter))
         #expect(!W.noticeWakes(kind: .dependencyDone, recipientRole: .owner))
         #expect(W.noticeWakes(kind: .commented, recipientRole: .mentioned)); #expect(!W.noticeWakes(kind: .commented, recipientRole: .owner))
-        let waking: Set<WorkEventKind> = [.verificationPassed, .changesRequested, .verificationFailed, .mergeConflict, .dependencyDone, .commented]
+        let waking: Set<WorkEventKind> = [.verificationPassed, .changesRequested, .verificationFailed, .mergeConflict, .mergeFailed, .dependencyDone, .commented]
         let roles: [NoticeRecipientRole] = [.owner, .reviewer, .author, .holder, .waiter, .mentioned, .other]
         for k in WorkEventKind.allCases where !waking.contains(k) {
             for r in roles { #expect(!W.noticeWakes(kind: k, recipientRole: r), "\(k) must never wake (\(r))") }

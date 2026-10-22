@@ -17,7 +17,7 @@ extension Orchestrator {
         guard !held, pressure != .critical else { return }
         for _ in 0..<5 {
             let room = config.maxConcurrentChecks - checkTasks.count
-            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: checkTasks.count,
+            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren,
                                             pressure: pressure, held: held)
             let want = min(room, slots)
             guard want > 0, let runs = try? store.queuedVerifications(limit: want), !runs.isEmpty else { return }
@@ -62,7 +62,9 @@ extension Orchestrator {
         }
         let dir: URL
         do {
-            dir = try git.addRunWorktree(runId: run.id, commit: run.commit)
+            // A merge check runs on a `.git`-free export made by the engine's own repository; a submission's in a worktree.
+            dir = run.purpose == .merge ? try git.addEngineExport(runId: run.id, commit: run.commit)
+                : try git.addRunWorktree(runId: run.id, commit: run.commit)
             try store.setVerificationDirectory(runId: run.id, path: dir.path)
         } catch {
             git.removeRunWorktree(runId: run.id)

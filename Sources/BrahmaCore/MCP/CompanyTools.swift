@@ -93,7 +93,22 @@ public struct CompanyTools: Sendable {
                 throw ToolError(message: "\(name) is not available to your role")
             }
         }
+        try refuseItemsBeingMerged(name, arguments)
         return try dispatch(name, arguments)
+    }
+
+    /// Tools that only read an item stay available while it merges.
+    static let readOnlyItemTools: Set<String> = ["show_work_item", "list_work"]
+
+    /// While the engine merges an item, no tool may act on it (`"<KEY> is being merged"`).
+    private func refuseItemsBeingMerged(_ name: String, _ arguments: [String: JSONValue]) throws {
+        guard !Self.readOnlyItemTools.contains(name) else { return }
+        for field in ["key", "dependsOn"] {
+            guard let raw = arguments[field]?.stringValue else { continue }
+            let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            guard let item = try? store.workItem(companyId: companyId, key: key) else { continue }
+            if try store.isMerging(itemId: item.id) { throw ToolError(message: "\(item.key) is being merged") }
+        }
     }
 
     private func logUse(_ tool: String) {

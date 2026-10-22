@@ -41,7 +41,7 @@ public enum WakePolicy {
     public static func noticeWakes(kind: WorkEventKind, recipientRole: NoticeRecipientRole) -> Bool {
         switch kind {
         case .verificationPassed: recipientRole == .reviewer
-        case .changesRequested, .verificationFailed, .mergeConflict: recipientRole == .owner || recipientRole == .holder
+        case .changesRequested, .verificationFailed, .mergeConflict, .mergeFailed: recipientRole == .owner || recipientRole == .holder
         case .dependencyDone: recipientRole == .waiter
         case .commented: recipientRole == .mentioned
         case .handoffWritten: recipientRole == .recipient

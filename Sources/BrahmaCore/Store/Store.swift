@@ -34,10 +34,14 @@ public final class Store: Sendable {
     let planBarrierOutputLimit = GitOutputLimit()
     /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
     let lifecycleObservers: [any AgentLifecycleObserver]
+    /// Called inside the transaction that completes an item (`completeItem`).
+    let observers: [any WorkItemObserver]
 
-    public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = []) throws {
+    public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
+                observers: [any WorkItemObserver] = []) throws {
         self.catalog = catalog
         self.lifecycleObservers = lifecycleObservers
+        self.observers = observers
         dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
         config.busyMode = .timeout(5)
@@ -48,16 +52,19 @@ public final class Store: Sendable {
         try Migrations.migrator().migrate(writer)
     }
 
-    private init(queue: DatabaseQueue, catalog: PackCatalog, lifecycleObservers: [any AgentLifecycleObserver]) throws {
+    private init(queue: DatabaseQueue, catalog: PackCatalog, lifecycleObservers: [any AgentLifecycleObserver],
+                 observers: [any WorkItemObserver]) throws {
         self.catalog = catalog
         self.lifecycleObservers = lifecycleObservers
+        self.observers = observers
         dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)
     }
 
-    public static func inMemory(catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = []) throws -> Store {
-        try Store(queue: DatabaseQueue(), catalog: catalog, lifecycleObservers: lifecycleObservers)
+    public static func inMemory(catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
+                                observers: [any WorkItemObserver] = []) throws -> Store {
+        try Store(queue: DatabaseQueue(), catalog: catalog, lifecycleObservers: lifecycleObservers, observers: observers)
     }
 
     /// Test helper: current value of a PRAGMA as text.
@@ -74,13 +81,17 @@ public final class Store: Sendable {
         }
     }
 
-    /// The git workspace of a company, with its per-item lock files under the data home (`<home>/run/locks/<companyId>`),
-    /// never in the workspace where an agent could hold a lock forever.
+    /// The git workspace of a company, with its per-item lock files (`<home>/run/locks/<companyId>`) and the engine's merge
+    /// checkout (`<home>/run/merge/<companyId>`) under the data home, never in the workspace, where an agent could hold a
+    /// lock forever or tamper with the checkout a merge runs in.
     func gitWorkspace(root: URL, companyId: String) -> GitWorkspace {
-        let locks = (dataHome?.appending(path: "run/locks", directoryHint: .isDirectory)
-            ?? FileManager.default.temporaryDirectory.appending(path: "brahma-locks", directoryHint: .isDirectory))
-            .appending(path: companyId, directoryHint: .isDirectory)
-        var git = GitWorkspace(root: root, lockDirectory: locks)
+        func engineDir(_ name: String, fallback: String) -> URL {
+            (dataHome?.appending(path: "run/\(name)", directoryHint: .isDirectory)
+                ?? FileManager.default.temporaryDirectory.appending(path: fallback, directoryHint: .isDirectory))
+                .appending(path: companyId, directoryHint: .isDirectory)
+        }
+        var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
+                               mergeDirectory: engineDir("merge", fallback: "brahma-merge"))
         git.lockTimeout = gitLockTimeout.seconds
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
         git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }
@@ -180,11 +191,14 @@ public final class Store: Sendable {
         try writer.read { db in try Company.fetchOne(db, key: id) }
     }
 
-    /// Whole-row update of the owner-editable fields. `mainCommit` belongs to the engine and is never overwritten from a copy.
+    /// Whole-row update of the owner-editable fields. `mainCommit` and `pendingMainCommit` belong to the engine and are never
+    /// overwritten from a copy.
     public func updateCompany(_ c: Company) throws {
         try writer.write { db in
             var kept = c
-            kept.mainCommit = try String.fetchOne(db, sql: "SELECT mainCommit FROM company WHERE id = ?", arguments: [c.id])
+            let row = try Row.fetchOne(db, sql: "SELECT mainCommit, pendingMainCommit FROM company WHERE id = ?", arguments: [c.id])
+            kept.mainCommit = row?["mainCommit"]
+            kept.pendingMainCommit = row?["pendingMainCommit"]
             try kept.update(db)
         }
     }
