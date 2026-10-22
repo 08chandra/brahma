@@ -62,7 +62,7 @@ extension Orchestrator {
         }
         let dir: URL
         do {
-            dir = try git.addRunWorktree(runId: run.id, commit: run.commit)
+            dir = try git.addRunWorktree(runId: run.id, commit: run.commit, fromEngineRepository: run.purpose == .merge)
             try store.setVerificationDirectory(runId: run.id, path: dir.path)
         } catch {
             git.removeRunWorktree(runId: run.id)

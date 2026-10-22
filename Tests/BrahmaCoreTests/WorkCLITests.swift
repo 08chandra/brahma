@@ -186,6 +186,8 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         // The engine's merge checkout belongs under the data home, never in the workspace.
         #expect(store.gitWorkspace(root: ws, companyId: company.id).mergeWorktreePath.path
             .hasPrefix(home.appending(path: "home/run/merge/\(company.id)").path))
+        #expect(store.gitWorkspace(root: ws, companyId: company.id).mergeRepositoryPath.path
+            == home.appending(path: "home/run/merge/\(company.id).git").path)
         let ref = "refs/brahma/quarantine/20270115-080000"
         let q = try GitFixture.plainGit(["rev-parse", ref], in: ws)
         let agentRef = try brahma(["main", "accept", "Acme", ref], home: home, env: ["BRAHMA_AGENT_ID": "a1"])

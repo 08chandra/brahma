@@ -118,7 +118,7 @@ extension Store {
         case .refMoved(let current):
             let now7 = current.map { "it now points at \($0)" } ?? "it was deleted"
             let text = "\(company.name): \(full) moved after Brahma asked you about it (\(now7); Brahma recorded \(commit)). "
-                + "Nothing was merged. Review the recorded commit with: git diff \(expected) \(commit)"
+                + "Nothing was merged. Review the recorded commit with: git --no-replace-objects diff \(expected) \(commit)"
             try writer.write { db in
                 try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: Self.quarantineMovedAlertReason(companyId))
             }

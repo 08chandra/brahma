@@ -193,7 +193,7 @@ extension Store {
             they are saved as \(q.ref) (\(q.commit.prefix(7))) and the checkout was restored to main (\(expectedMain.prefix(7))). \
             Merges into main wait until you decide.
 
-            Review exactly what would be merged with: git diff \(expectedMain) \(q.commit)
+            Review exactly what would be merged with: git --no-replace-objects diff \(expectedMain) \(q.commit)
             Merge them into main with: brahma main accept \(Self.flat(company.name, max: 100)) \(q.ref)
             Only commit \(q.commit) is merged; if \(q.ref) points anywhere else by then, the accept is refused.
 

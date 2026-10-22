@@ -829,7 +829,7 @@ import GRDB
         let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
         #expect(ask.subjectId == "quarantine:\(ref)@\(sha)")
         #expect(ask.payload?.proposal?.contains(sha) == true)
-        #expect(ask.summary.contains("git diff \(before) \(sha)"), "\(ask.summary)")
+        #expect(ask.summary.contains("git --no-replace-objects diff \(before) \(sha)"), "\(ask.summary)")
         // The merge step is held: more passes merge nothing and file nothing new.
         #expect(try r.fresh(i).mergeState == .pending)
         r.world.clock.advance(120); try await r.cycle()
@@ -954,12 +954,14 @@ import GRDB
         #expect(try GitFixture.plainGit(["diff", "--name-only", mainAfterA, rebased], in: r.root) == "src/b.txt")
         #expect(try GitFixture.plainGit(["diff", verifiedB, rebased, "--", "src/b.txt"], in: r.root).isEmpty)
         #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/parked"], in: r.root) == parked, "the agent's branches are left alone")
-        // The rebase happened in the engine's own detached checkout, outside every directory an agent is given.
-        let merge = r.store.gitWorkspace(root: r.root, companyId: r.company.id).mergeWorktreePath
-        #expect(!merge.path.hasPrefix(r.root.path))
+        // The rebase happened in the engine's own repository, outside every directory an agent is given.
+        let engineGit = r.store.gitWorkspace(root: r.root, companyId: r.company.id)
+        #expect(!engineGit.mergeRepositoryPath.path.hasPrefix(r.root.path))
+        #expect(!engineGit.mergeWorktreePath.path.hasPrefix(r.root.path))
         #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: ".brahma/wt/.merge").path))
-        #expect(FileManager.default.fileExists(atPath: merge.path))
-        #expect(try GitFixture.plainGit(["rev-parse", "HEAD"], in: merge) == rebased)
+        #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: ".git/worktrees/-merge").path))
+        #expect(try GitFixture.plainGit(["rev-parse", "HEAD"], in: engineGit.mergeWorktreePath,
+                                        env: ["GIT_DIR": engineGit.mergeRepositoryPath.path]) == rebased)
         _ = try await r.drive(b)
         #expect(try r.fresh(b).status == .done)
         #expect(try r.mainHead() == rebased, "main is exactly the re-verified commit")
@@ -1025,19 +1027,23 @@ import GRDB
         let lock = r.root.appending(path: ".git/refs/heads/main.lock")
         try "".write(to: lock, atomically: true, encoding: .utf8)
         try await r.cycle()
-        for _ in 0..<(Store.maxMergeFailures + 1) {
-            r.world.clock.advance(61)
-            try await r.cycle()
+        // The first two faults are nobody's fault but the company's.
+        r.world.clock.advance(61)
+        try await r.cycle()
+        func failures() async throws -> Int {
+            try await r.store.writer.read { db -> Int in
+                try Int.fetchOne(db, sql: "SELECT failures FROM itemMerge WHERE itemId = ?", arguments: [a.id]) ?? 0
+            }
         }
+        #expect(try await failures() == 0, "no strike for the company's own faults")
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id)) }.isEmpty)
+        r.world.clock.advance(61)
+        try await r.cycle()
         #expect(try r.mainHead() == before)
         #expect(try r.store.company(id: r.company.id)?.pendingMainCommit == nil, "a failed move leaves no pending head")
         let held = try r.fresh(a)
         #expect(held.status == .inReview); #expect(held.mergeState == .pending); #expect(held.verifiedCommit != nil)
-        #expect(try r.events(a, .mergeFailed).isEmpty, "the item is not struck for the company's fault")
-        let failures: Int = try await r.store.writer.read { db -> Int in
-            try Int.fetchOne(db, sql: "SELECT failures FROM itemMerge WHERE itemId = ?", arguments: [a.id]) ?? 0
-        }
-        #expect(failures == 0)
+        #expect(try r.events(a, .mergeFailed).isEmpty, "the item is not returned for the company's fault")
         // The owner hears about the held merges once; it clears when a merge lands.
         let reason = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
         #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == reason }.count == 1)
@@ -1046,6 +1052,25 @@ import GRDB
         let done = try await r.drive(a)
         #expect(done.status == .done)
         #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == reason }.isEmpty)
+    }
+
+    @Test func aCompanyFaultThatNeverClearsStrikesTheHeadOfTheQueue() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let before = try r.mainHead()
+        let lock = r.root.appending(path: ".git/refs/heads/main.lock")
+        try "".write(to: lock, atomically: true, encoding: .utf8)
+        try await r.cycle()
+        // Faults 1 and 2 strike nothing; from the third on each one is a strike, and the third strike returns the item.
+        for _ in 0..<(Store.maxMergeFailures + Store.maxMergeFailures - 1) {
+            r.world.clock.advance(61)
+            try await r.cycle()
+        }
+        #expect(try r.mainHead() == before)
+        let back = try r.fresh(a)
+        #expect(back.status == .inProgress); #expect(back.mergeState == .none); #expect(back.verifiedCommit == nil)
+        #expect(try r.events(a, .mergeFailed).count == 1)
+        try FileManager.default.removeItem(at: lock)
     }
 
     @Test func crashAfterMovingMainIsRecovered() async throws {
