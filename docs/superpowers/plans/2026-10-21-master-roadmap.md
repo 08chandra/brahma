@@ -407,3 +407,8 @@ Checked and found consistent, with nothing to fix:
 ## 6. Open owner questions
 
 None. Every placement above follows an owner decision or a recorded call.
+
+
+## Addendum 2026-10-21 23:17 (owner-approved)
+- **Agent work modes** (`docs/superpowers/specs/2026-10-21-agent-modes-design.md`): Quick/Standard/Deep/Plan-first in 3a (Task 14c + patch notes W1–W12); Ultra + sub-agent gate in 5-lite (Task 14u + F1–F11). Plan tier max5x; defaults accepted.
+- **Brahma Extensions** (`docs/superpowers/specs/2026-10-21-extensions-design.md`): split — **X-core** folded into 5-lite (skill-only extensions, importers, `ext new/lint/try`, `propose_extension`, Inbox card); **X-connectors** (MCP gateway, sandboxed connectors, per-tool routes, sign-in asks) as a new plan placed **after the dogfood week and before Plan M**.
