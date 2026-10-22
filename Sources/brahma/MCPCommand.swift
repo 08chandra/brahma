@@ -11,6 +11,8 @@ struct MCP: ParsableCommand {
     @Option(help: "Agent id.") var agent: String
     @Option(help: "Credential kind the turn token was issued for.") var kind: String = "work"
     @Option(help: "Item id the turn token is bound to (review turns).") var item: String?
+    @Option(name: .customLong("review-item"), help: "Item key of a review turn: the server offers the review tools for that item only.")
+    var reviewItem: String?
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
@@ -27,7 +29,18 @@ struct MCP: ParsableCommand {
         let packs = BrahmaPaths.fromEnvironment().packsDir
         let catalog = PackCatalog.loadOrBuiltin(directory: packs) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
         let store = try Store(path: db, catalog: catalog)
-        guard store.verifyTurnCredential(token: token, companyId: company, agentId: agent, kind: kind, itemId: item) else {
+        // A review turn names the item by key; its credential must have been issued for kind `review` and that item.
+        var kind = kind
+        var itemId = item
+        var reviewItemId: String?
+        if let key = reviewItem {
+            guard let found = try store.workItem(companyId: company, key: key) else {
+                FileHandle.standardError.write(Data("brahma mcp: no such work item\n".utf8))
+                throw ExitCode.failure
+            }
+            kind = "review"; itemId = found.id; reviewItemId = found.id
+        }
+        guard store.verifyTurnCredential(token: token, companyId: company, agentId: agent, kind: kind, itemId: itemId) else {
             FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
             throw ExitCode.failure
         }
@@ -35,7 +48,7 @@ struct MCP: ParsableCommand {
             FileHandle.standardError.write(Data("brahma mcp: unknown agent \(agent) in company \(company)\n".utf8))
             throw ExitCode.failure
         }
-        let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id))
+        let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId))
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

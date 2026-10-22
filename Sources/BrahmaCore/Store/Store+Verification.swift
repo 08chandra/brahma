@@ -107,12 +107,12 @@ extension Store {
         let git = gitWorkspace(root: workspace, companyId: item.companyId)
         var base = item.baseCommit
         if base == nil {
-            base = try git.mergeBase("main", git.branch(key: item.key))
+            base = try git.mergeBase(GitWorkspace.mainRef, git.branchRef(key: item.key))
             if let base { try recordBaseCommit(itemId: item.id, commit: base) }
         }
         guard let spec = item.checkSpec else { return }
         if try checkSnapshot(itemId: item.id, revision: item.checkRevision) != nil { return }
-        let source = try base ?? git.head(of: "main")
+        let source = try base ?? git.head(of: GitWorkspace.mainRef)
         let candidates = CheckScripts.candidatePaths(command: spec.command).filter { $0 != "manifest.json" }
         let contents = try source.map { try git.blobs(at: $0, paths: Array(candidates.prefix(200)), limit: CheckScripts.maxFiles) } ?? [:]
         let paths = CheckPaths(workspace: workspace)
@@ -186,6 +186,15 @@ extension Store {
             }
             let text = try Self.validSummary(summary)
             if commit == item.baseCommit { throw WorkError.conflict("\(item.key) has no changes to submit") }
+            // Someone must be able to review it: the named reviewer, else the owner's manager, a CTO or an executive.
+            var chosenReviewer: Agent?
+            if try !reviewerIsUsable(db: db, item: item) {
+                let reviewer = try resolveReviewer(db: db, item: item)
+                item.reviewerId = reviewer.id
+                chosenReviewer = reviewer
+            }
+            item.reviewAttempts = 0
+            item.mergeState = .none
             item.submitSummary = text
             item.reviewRound += 1
             item.status = .inReview
@@ -213,6 +222,12 @@ extension Store {
             try run?.insert(db)
             try recordItemEvent(db: db, item: item, actor: actor.id, kind: .submitted,
                                 text: "submitted for review (round \(item.reviewRound)) at \(commit.prefix(7))", now: now)
+            if let chosenReviewer {
+                try recordItemEvent(db: db, item: item, actor: "system", kind: .assigned, text: "reviewer is @\(chosenReviewer.name)",
+                                    alsoNotify: [chosenReviewer.id], alsoNotifyRole: .reviewer, now: now)
+            }
+            // An item with no check is reviewable at once; nothing else will tell its reviewer.
+            if run == nil { try Store.wakeReviewer(db: db, item: item, now: now) }
             return SubmitResult(item: item, run: run)
         }
     }
@@ -355,6 +370,7 @@ extension Store {
                 try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed,
                                     text: run.flaky ? "check passed on re-run (flaky)" : "check passed",
                                     alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+                try Store.wakeReviewer(db: db, item: item, now: now)
             case .inconclusive:
                 try run.update(db)
                 if before.inconclusive + 1 >= Self.maxInconclusive {

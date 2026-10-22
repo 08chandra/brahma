@@ -163,6 +163,9 @@ public struct GitWorkspace: Sendable {
     var worktreesDir: URL { root.appending(path: ".brahma/wt", directoryHint: .isDirectory) }
     public func worktreePath(key: String) -> URL { worktreesDir.appending(path: key, directoryHint: .isDirectory) }
     public func branch(key: String) -> String { "item/\(key)" }
+    /// Every ref the engine reads is fully qualified, so a tag named `main` or `item/<KEY>` can never stand in for the branch.
+    public static let mainRef = "refs/heads/main"
+    public func branchRef(key: String) -> String { "refs/heads/item/\(key)" }
     private var gitDir: URL { root.appending(path: ".git", directoryHint: .isDirectory) }
     private func adminDir(key: String) -> URL { gitDir.appending(path: "worktrees/\(key)", directoryHint: .isDirectory) }
     private var main: GitCommand { GitCommand(gitDir: gitDir, workTree: root, commonDir: nil) }
@@ -303,10 +306,10 @@ public struct GitWorkspace: Sendable {
         }
         try main.run(["worktree", "prune"])
         let name = branch(key: key)
-        if try head(of: "refs/heads/\(name)") != nil {
+        if try head(of: branchRef(key: key)) != nil {
             try main.run(["worktree", "add", "--quiet", path.path, name])
         } else {
-            try main.run(["worktree", "add", "--quiet", "-b", name, path.path, "main"])
+            try main.run(["worktree", "add", "--quiet", "-b", name, path.path, Self.mainRef])
         }
         guard fm.fileExists(atPath: adminDir(key: key).path) else {
             throw GitError.failed(command: "worktree add \(key)", status: -1, stderr: "git registered the worktree under another name")
@@ -456,6 +459,12 @@ public struct GitWorkspace: Sendable {
         try Self.validRef(a); try Self.validRef(b)
         let out = try main.run(["merge-base", a, b], allowFailure: true)
         return out.status == 0 && !out.text.isEmpty ? out.text : nil
+    }
+
+    /// True when `ancestor` is `descendant` or one of its ancestors. A missing commit is not an ancestor.
+    public func isAncestor(_ ancestor: String, of descendant: String) throws -> Bool {
+        try Self.validRef(ancestor); try Self.validRef(descendant)
+        return try main.run(["merge-base", "--is-ancestor", ancestor, descendant], allowFailure: true).status == 0
     }
 
     /// Changed paths between two commits, at most `limit`.

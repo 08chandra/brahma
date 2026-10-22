@@ -3,6 +3,14 @@ import GRDB
 
 public enum TurnOutcome: String, Codable, Sendable { case inProgress, succeeded, failed, usageLimited, interrupted }
 
+/// What a turn is for. Stored on the turn (a notice-only turn is stored `notice`) and used by `ModelContext`.
+public enum TurnKind: String, Codable, CaseIterable, Sendable, Equatable, DatabaseValueConvertible {
+    case work, review, audit, notice, plan
+
+    /// Kinds that look at finished work: they run clean-context, with no `Task`/`Agent`/`Workflow` tools.
+    public var isReview: Bool { self == .review || self == .audit }
+}
+
 public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "turn"
 
@@ -16,6 +24,9 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var costUSD: Double?
     /// True when the turn failed for infrastructure reasons (network, account); never counted against the agent.
     public var infra: Bool = false
+    /// `review` turns look at one item (`itemId`); every other kind leaves it nil.
+    public var kind: TurnKind = .work
+    public var itemId: String? = nil
 }
 
 public enum ActivityKind: String, Codable, Sendable { case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval }

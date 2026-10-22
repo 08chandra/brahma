@@ -325,6 +325,18 @@ enum Migrations {
             // work started, used to detect weakened tests and as the source of check-script baselines.
             try db.alter(table: "workItem") { t in t.add(column: "baseCommit", .text) }
         }
+        m.registerMigration("v3-turn-context") { db in
+            try db.alter(table: "turn") { t in
+                t.add(column: "kind", .text).notNull().defaults(to: "work")
+                t.add(column: "itemId", .text)
+            }
+            try db.alter(table: "workItem") { t in
+                t.add(column: "reviewAttempts", .integer).notNull().defaults(to: 0)
+                t.add(column: "mergeState", .text).notNull().defaults(to: "none")
+                t.add(column: "mergedCommit", .text)
+            }
+            try db.alter(table: "company") { t in t.add(column: "mainCommit", .text) }
+        }
         m.registerMigration("v3-asks") { db in
             try db.alter(table: "company") { t in t.add(column: "autonomy", .text).notNull().defaults(to: "important") }
             try db.alter(table: "agent") { t in t.add(column: "pausedActive", .double) }

@@ -39,6 +39,8 @@ public actor Orchestrator {
     var dispatching = Set<String>()
     /// Items whose dispatch failed in git: not offered again before this time.
     var dispatchBackoff: [String: Date] = [:]
+    /// Companies whose `main` changed outside Brahma: no dispatch before this time.
+    var mainBlocked: [String: Date] = [:]
     var lastDispatch: Date?
     /// Consecutive lease turns that could not start for want of a worktree, per item.
     var worktreeFailures: [String: Int] = [:]
@@ -286,27 +288,54 @@ public actor Orchestrator {
         var failure: String?
         var runnerError: (any Error)?
         var worktreeUnavailable: WorktreeUnavailable?
+        var isReview = false
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
-            items = try store.pendingInbox(agentId: agent.id)
-            let quiet = try store.pendingQuietItems(agentId: agent.id)
-            quietIds = quiet.map(\.id)
-            let team = try store.agents(companyId: company.id)
-            let handles = Dictionary(uniqueKeysWithValues: team.map { ($0.id, $0.name) })
-            let batch = try store.noticeBatch(agentId: agent.id, limit: WorkNoticeDigest.maxNotices)
-            let notices = batch.shown
-            collapsedNotices = batch.collapsedIds.count
-            noticeIds = batch.deliveredIds
+            // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
+            let review = try Self.prepareReview(store: store, agent: agent, company: company)
+            isReview = review != nil
+            var turnPrompt = ""
+            if review == nil {
+                items = try store.pendingInbox(agentId: agent.id)
+                let quiet = try store.pendingQuietItems(agentId: agent.id)
+                quietIds = quiet.map(\.id)
+                let team = try store.agents(companyId: company.id)
+                let handles = Dictionary(uniqueKeysWithValues: team.map { ($0.id, $0.name) })
+                let batch = try store.noticeBatch(agentId: agent.id, limit: WorkNoticeDigest.maxNotices)
+                let notices = batch.shown
+                collapsedNotices = batch.collapsedIds.count
+                noticeIds = batch.deliveredIds
+                turnPrompt = Self.prompt(agent: agent, company: company, items: items, handles: handles,
+                                         unread: Store.channelCounts(quiet), notices: notices, collapsedNotices: collapsedNotices)
+            }
             // `auto` resolves per turn from the role, the company's usage mode and the kind of turn (Tasks 10 and 14 set the context).
             var sent = agent
+            var systemPrompt = RolePrompt.render(agent: agent, company: company)
+            var context = (try? store.askModelContext(agentId: agent.id)) ?? ModelContext()
+            if let review {
+                sent.sessionId = UUID().uuidString
+                sent.sessionStarted = false
+                systemPrompt += "\n\n" + ReviewDigest.instructions(worktree: review.worktree.path)
+                turnPrompt = review.digest
+                context = ModelContext(turnKind: .review, deepReview: review.deep)
+            }
             sent.model = ModelPolicy.resolve(
                 agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
-                mode: company.usageMode, context: (try? store.askModelContext(agentId: agent.id)) ?? ModelContext())
-            let turnToken = try store.issueTurnCredential(turnId: turn.id)
+                mode: company.usageMode, context: context)
+            let turnToken: String
+            if let review {
+                try store.setTurnContext(turnId: turn.id, kind: .review, itemId: review.item.id)
+                turnToken = try store.issueTurnCredential(turnId: turn.id, kind: "review", itemId: review.item.id)
+            } else {
+                turnToken = try store.issueTurnCredential(turnId: turn.id)
+            }
             // A leaseholder works inside its item's worktree (with the shared `.brahma` directory); everyone else in the workspace.
             var workingDirectory = company.workspacePath
             var addDirs: [String] = []
-            if let lease = try store.lease(agentId: agent.id), let leased = try store.workItem(id: lease.itemId) {
+            if let review {
+                workingDirectory = review.worktree.path
+                addDirs = [review.worktree.path]
+            } else if let lease = try store.lease(agentId: agent.id), let leased = try store.workItem(id: lease.itemId) {
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 let git = store.gitWorkspace(root: workspace, companyId: company.id)
                 let checkout = git.worktreePath(key: leased.key)
@@ -320,16 +349,16 @@ public actor Orchestrator {
                 workingDirectory = checkout.path
                 addDirs = [checkout.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
             }
-            let request = TurnRequest(
-                agent: sent, company: company,
-                prompt: Self.prompt(agent: agent, company: company, items: items, handles: handles,
-                                    unread: Store.channelCounts(quiet), notices: notices, collapsedNotices: collapsedNotices),
-                appendSystemPrompt: RolePrompt.render(agent: agent, company: company),
-                mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken),
+            var request = TurnRequest(
+                agent: sent, company: company, prompt: turnPrompt, appendSystemPrompt: systemPrompt,
+                mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
+                                                   reviewItem: review?.item.key),
                 workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
-            var sessionMarked = agent.sessionStarted
+            request.kind = review == nil ? .work : .review
+            // A review session is never recorded as the agent's own.
+            var sessionMarked = agent.sessionStarted || review != nil
             var iterator = runner.run(request).makeAsyncIterator()
             while true {
                 let event: StreamEvent?
@@ -410,7 +439,7 @@ public actor Orchestrator {
             end = .failed("claude exited without a result")
         }
         var resetSession = false
-        if case .failed(let text, _) = end, agent.sessionStarted {
+        if case .failed(let text, _) = end, agent.sessionStarted, !isReview {
             resetSession = Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n"))
         }
         // An infrastructure failure puts the agent on its fixed cooldown before the turn is recorded, so there is no
@@ -564,6 +593,9 @@ extension Store {
             let closed = try Store.finishTurn(db: db, id: turn.id, outcome: end.outcome, summary: summary, costUSD: cost,
                                               infra: infraClass != .none, now: now)
             if closed, let cost { try Store.recordSpend(db, cost) }
+            if closed {
+                try noteReviewTurnEnd(db: db, turnId: turn.id, agent: agent, end: end, infra: infraClass != .none, now: now)
+            }
             var text = "@\(agent.name) turn \(end.outcome.rawValue)"
             if let summary, !summary.isEmpty { text += ": \(summary.prefix(200))" }
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: turn.id, kind: .turnFinished,

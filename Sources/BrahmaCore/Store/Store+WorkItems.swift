@@ -239,6 +239,7 @@ extension Store {
 
         var specChanged: [String] = []
         var checkChanged = false
+        let statusBefore = item.status
         if let t = patch.type, t != item.type {
             _ = try itemType(db, t, company: company)
             item.type = t; specChanged.append("type")
@@ -279,9 +280,13 @@ extension Store {
             let v = try Self.validTeam(t)
             if v != item.team { item.team = v; specChanged.append("team") }
         }
+        var reviewerChanged = false
         if let r = patch.reviewerId, r != item.reviewerId {
             if let r { _ = try requireAgent(db, r, companyId: item.companyId) }
             item.reviewerId = r; specChanged.append("reviewer")
+            // A new reviewer starts with fresh attempts.
+            item.reviewAttempts = 0
+            reviewerChanged = true
         }
         if let p = patch.parentId, p != item.parentId {
             if let p { try requireParent(db, parentId: p, company: company, childId: item.id) }
@@ -381,6 +386,12 @@ extension Store {
             try recordItemEvent(db: db, item: item, actor: actor.id, kind: .leaseReleased, text: "lease released: \(released.why)",
                                 alsoNotify: [released.lease.agentId], now: now)
         }
+        // A check edited while the item was in review leaves it unverified: it goes back to its holder to resubmit.
+        if checkChanged, statusBefore == .inReview, item.status == .inReview {
+            try returnForChangedCheck(db: db, item: item, now: now)
+            return try WorkItem.fetchOne(db, key: item.id) ?? item
+        }
+        if reviewerChanged, item.status == .inReview { try Store.wakeReviewer(db: db, item: item, now: now) }
         return item
     }
 
@@ -657,9 +668,10 @@ extension Store {
         try WorkNotice.filter(ids.contains(Column("id"))).updateAll(db, Column("deliveredTurnId").set(to: turnId))
     }
 
-    /// Whether the agent has something to act on: a waking inbox item, or a waking notice that is due. (Task 9 adds
-    /// pending reviews.) Non-waking notices and debounced notices that are not yet due do not count.
+    /// Whether the agent has something to act on: a waking inbox item, a pending review, or a waking notice that is due.
+    /// Non-waking notices and debounced notices that are not yet due do not count.
     static func hasPendingWork(db: Database, agentId: String) throws -> Bool {
+        if try hasPendingReview(db: db, agentId: agentId) { return true }
         let inbox = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM inboxItem WHERE agentId = ? AND deliveredTurnId IS NULL AND wakes = 1",
                                      arguments: [agentId]) ?? 0
         if inbox > 0 { return true }

@@ -152,9 +152,19 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var touchPaths: [String] = []
     /// Where the item's branch started (recorded by the engine at claim); weakening is measured against it, never the live `main`.
     public var baseCommit: String? = nil
+    /// Review turns that ended without a decision (an escalation at `Store.maxReviewAttempts`).
+    public var reviewAttempts: Int = 0
+    /// Where an approved item is on its way into `main`. Written only by the engine.
+    public var mergeState: MergeState = .none
+    public var mergedCommit: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }
+}
+
+/// An item's progress into `main` after review: approved and waiting, or re-verifying after a rebase.
+public enum MergeState: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
+    case none, pending, verifying
 }
 
 public enum WorkIntensity: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {

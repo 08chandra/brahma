@@ -42,6 +42,16 @@ public enum TurnProfileCompiler {
                             permission: r.profile, workingDirectory: r.workingDirectory,
                             addDirs: r.addDirs.isEmpty ? [r.company.workspacePath] : r.addDirs)
         p.environment = r.environment
+        return restricted(p, for: r.kind)
+    }
+
+    /// Review and audit turns never get sub-agent or workflow tools, whatever the profile was widened to.
+    public static func restricted(_ profile: TurnProfile, for kind: TurnKind) -> TurnProfile {
+        guard kind.isReview else { return profile }
+        let banned = ["Task", "Agent", "Workflow"]
+        var p = profile
+        p.allowedTools.removeAll { banned.contains($0) }
+        for name in banned where !p.disallowedTools.contains(name) { p.disallowedTools.append(name) }
         return p
     }
 

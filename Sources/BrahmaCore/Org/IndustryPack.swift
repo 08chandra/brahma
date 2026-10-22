@@ -9,8 +9,8 @@ public enum CompanyToolNames {
                               "propose_decision", "request_from_owner", "escalate_decision", "request_mode"]
     public static let lead = ["plan_sprint", "close_sprint", "confirm_spec"]
     public static let executive = ["decide"]
-    /// Review turns only, regardless of role.
-    public static let review = ["show_work_item", "comment_work_item", "review"]
+    /// Review turns only, regardless of role. `create_work_item` files follow-ups instead of blocking on mechanical fixes.
+    public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review"]
     public static var all: [String] { base + work + lead + executive + ["review"] }
 }
 

@@ -21,9 +21,14 @@ import GRDB
             world = try World(config: config, memory: memory, checkEnvironment: env, checkRunner: runner)
             company = try world.company("Acme")
             mgr = try world.hire(company, "mgr", role: "manager")
-            eng = try world.hire(company, "eng-1", role: "engineer")
-            eng2 = try world.hire(company, "eng-2", role: "engineer")
-            rev = try world.hire(company, "rev", role: "engineer")
+            // The engineers report to the manager, who reviews what has no named reviewer (Task 9a).
+            let (store, companyId, managerId) = (world.store, company.id, mgr.id)
+            func report(_ n: String) throws -> Agent {
+                try store.hire(companyId: companyId, name: n, role: "engineer", model: "sonnet", managerId: managerId)
+            }
+            eng = try report("eng-1")
+            eng2 = try report("eng-2")
+            rev = try report("rev")
         }
 
         func active() -> Double { store.activeNow(companyId: company.id) }
@@ -484,10 +489,12 @@ import GRDB
         }
         try await v.cycle()
         let item = try v.fresh(i)
-        #expect(item.checkRevision == 1); #expect(item.status == .inReview); #expect(item.verifiedRevision == nil)
+        // A check edited during review sends the item back to its holder (Task 9a); the old failure itself has no consequence.
+        #expect(item.checkRevision == 1); #expect(item.status == .inProgress); #expect(item.verifiedRevision == nil)
         #expect(item.reviewFlags == ["check edited (rev 0 → 1)"])
-        #expect(try v.runs(i).map(\.status) == [.failed], "recorded, with no re-run and no consequence")
-        #expect(!(try v.kinds(i).contains(.verificationFailed))); #expect(try v.dms(to: v.eng).isEmpty)
+        #expect(try v.runs(i).map(\.status) == [.failed], "recorded, with no re-run")
+        #expect(try v.store.itemEvents(itemId: i.id).filter { $0.kind == .verificationFailed }.map(\.text) == ["check changed during review; resubmit"])
+        #expect(try v.dms(to: v.eng).isEmpty)
         // An old pass is ignored too.
         let j = try v.item("two")
         _ = try v.claimAndSubmit(j, v.eng2)
@@ -890,7 +897,9 @@ import GRDB
         let v = try V()
         #expect(SchedulerConfig().maxConcurrentChecks == 2)
         var items: [WorkItem] = []
-        let extra = try (0..<2).map { try v.world.hire(v.company, "w-\($0)", role: "engineer") }
+        let extra = try (0..<2).map {
+            try v.store.hire(companyId: v.company.id, name: "w-\($0)", role: "engineer", model: "sonnet", managerId: v.mgr.id)
+        }
         for (n, agent) in ([v.eng, v.eng2, v.rev] + extra).enumerated() {
             let i = try v.item("item \(n)")
             _ = try v.claimAndSubmit(i, agent, file: "src/f\(n).txt")

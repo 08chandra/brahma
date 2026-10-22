@@ -14,6 +14,8 @@ public struct TurnRequest: Sendable {
     public var addDirs: [String] = []
     /// Engine-set `BRAHMA_*` variables for the child; everything else comes from `ChildEnvironment`.
     public var environment: [String: String] = [:]
+    /// Review and audit turns are compiled clean-context: no `Task`, `Agent` or `Workflow` tools.
+    public var kind: TurnKind = .work
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,
@@ -50,18 +52,23 @@ public enum MCPConfig {
 
     /// Writes `<runDir>/<agentId>.mcp.json` (mode 0600, atomic) and returns its path. The per-turn token travels
     /// in the server's `env` entry, so it is neither in argv nor in the agent's own process environment.
-    public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String) throws -> String {
+    /// A review turn passes `reviewItem` (the item key): its server runs `--review-item <KEY>` and writes `<agentId>.review.mcp.json`.
+    public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String,
+                             reviewItem: String? = nil) throws -> String {
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
+        var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
+        if let reviewItem { args += ["--review-item", reviewItem] }
         let config: [String: Any] = ["mcpServers": ["company": [
             "command": executable,
-            "args": ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id],
+            "args": args,
             "env": [tokenVariable: turnToken],
         ] as [String: Any]]]
         let data = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
-        let url = paths.runDir.appending(path: "\(agent.id).mcp.json")
+        let name = reviewItem == nil ? "\(agent.id).mcp.json" : "\(agent.id).review.mcp.json"
+        let url = paths.runDir.appending(path: name)
         // The file holds the turn token, so it is created 0600 (never briefly world-readable) and renamed into place.
-        let temp = paths.runDir.appending(path: ".\(agent.id).mcp.json.\(UUID().uuidString)")
+        let temp = paths.runDir.appending(path: ".\(name).\(UUID().uuidString)")
         let fd = open(temp.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
         guard fd >= 0 else { throw CocoaError(.fileWriteUnknown) }
         let bytes = [UInt8](data)

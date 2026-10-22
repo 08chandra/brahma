@@ -23,4 +23,7 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var ownerReserve: Double? = nil
     /// How much the owner is asked (Task 11a); changing it never touches asks already waiting.
     public var autonomy: AutonomyPreset = .important
+    /// The head of `refs/heads/main` the engine expects: recorded at ensureRepo and after each engine merge. A claim refuses
+    /// when it is not an ancestor of the current head (main was rewritten outside Brahma).
+    public var mainCommit: String? = nil
 }

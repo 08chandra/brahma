@@ -15,6 +15,11 @@ extension Orchestrator {
 
     func clearWorktreeFailures(itemId: String) { worktreeFailures[itemId] = nil }
 
+    /// Seconds before a company whose `main` changed outside Brahma is offered work again (the claim checks it afresh).
+    static let mainBlockedRetry: TimeInterval = 60
+
+    func noteMainBlocked(companyId: String, until: Date) { mainBlocked[companyId] = until }
+
     func gitTaskDone(_ key: String) { gitTasks[key] = nil }
 
     func dispatchDone(agentId: String, failedItem: String?, now: Date) {
@@ -84,10 +89,11 @@ extension Orchestrator {
         if let last = lastDispatch, now.timeIntervalSince(last) < Self.dispatchInterval { return }
         guard let withReady = try? store.companiesWithReadyItems() else { return }
         dispatchBackoff = dispatchBackoff.filter { $0.value > now }
+        mainBlocked = mainBlocked.filter { $0.value > now }
         var skipping = reaped
         skipping.formUnion(dispatchBackoff.keys)
         var ran = false
-        for company in companies where company.status == .running && withReady.contains(company.id) {
+        for company in companies where company.status == .running && withReady.contains(company.id) && mainBlocked[company.id] == nil {
             guard var companyBudget = companyFree[company.id], companyBudget > 0 else { continue }
             ran = true
             guard let agents = try? store.agents(companyId: company.id, states: [.ready, .sleeping]),
@@ -116,11 +122,15 @@ extension Orchestrator {
         spawnGit("dispatch:\(agent.id)") { [self] in
             var failed: String?
             do {
-                try git.ensureRepo()
+                try store.prepareRepo(company: company)
                 try git.addWorktree(key: item.key)
                 try ProgressFile.ensure(workspace: ws, item: item)
                 try store.ensureCheckSnapshot(item: item, workspace: ws)
             } catch {
+                if let e = error as? WorkError, e.message == Store.mainChangedMessage {
+                    // Every claim in this company would fail the same way: stop offering it items for a while.
+                    await noteMainBlocked(companyId: company.id, until: clock().addingTimeInterval(Self.mainBlockedRetry))
+                }
                 log("could not create the worktree of \(item.key): \(error)")
                 _ = try? store.releaseLease(itemId: item.id, agentId: agent.id, note: "the worktree could not be created",
                                             undoOwner: wasUnowned, now: clock())

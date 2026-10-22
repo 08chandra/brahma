@@ -115,7 +115,7 @@ public final class Store: Sendable {
                 n += 1
             }
             let dir = workspacesRoot.appending(path: slug, directoryHint: .isDirectory)
-            let company = Company(
+            var company = Company(
                 id: UUID().uuidString, name: name, slug: slug, goal: goal, workspacePath: dir.path,
                 status: .running, usageMode: .balanced, priorityWeight: 1, createdAt: createdAt,
                 packId: packId, packVersion: packVersion ?? pack.version)
@@ -124,7 +124,13 @@ public final class Store: Sendable {
             let existed = FileManager.default.fileExists(atPath: dir.path)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             do {
-                try GitWorkspace(root: dir).ensureRepo()
+                let git = GitWorkspace(root: dir)
+                try git.ensureRepo()
+                // The head the engine expects `main` to have; every claim checks it is still an ancestor of the real one.
+                if let head = try git.head(of: GitWorkspace.mainRef) {
+                    try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [head, company.id])
+                    company.mainCommit = head
+                }
             } catch {
                 if !existed { try? FileManager.default.removeItem(at: dir) }
                 let detail: String
@@ -144,8 +150,13 @@ public final class Store: Sendable {
         try writer.read { db in try Company.fetchOne(db, key: id) }
     }
 
+    /// Whole-row update of the owner-editable fields. `mainCommit` belongs to the engine and is never overwritten from a copy.
     public func updateCompany(_ c: Company) throws {
-        try writer.write { db in try c.update(db) }
+        try writer.write { db in
+            var kept = c
+            kept.mainCommit = try String.fetchOne(db, sql: "SELECT mainCommit FROM company WHERE id = ?", arguments: [c.id])
+            try kept.update(db)
+        }
     }
 
     // MARK: Agents

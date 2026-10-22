@@ -337,6 +337,12 @@ extension CompanyTools {
 
     private func claimLease(_ target: WorkItem) throws -> String {
         let wasUnowned = target.ownerId == nil
+        // No new work starts on a `main` that was rewritten outside Brahma.
+        if let company = try store.company(id: companyId) {
+            do { try store.prepareRepo(company: company) } catch let e as WorkError { throw e } catch {
+                throw ToolError(message: "could not prepare the workspace: \(error)")
+            }
+        }
         let lease = try store.claimLease(itemId: target.id, agentId: agentId)
         let ws = try workspace()
         let git = gitWorkspace(ws)
@@ -388,27 +394,30 @@ extension CompanyTools {
         }
         // Nothing is committed for a submit that would be refused anyway.
         _ = try Store.validSummary(summary)
+        try store.checkReviewerAvailable(itemId: target.id)
         let git = gitWorkspace(try workspace())
         guard git.hasCheckout(key: target.key) else {
             throw ToolError(message: "your worktree for \(target.key) is missing; release the item and claim it again")
         }
         let worktree = git.worktreePath(key: target.key)
-        let branch = git.branch(key: target.key)
         guard let commit = try git.commitAll(in: worktree, message: "\(target.key): submit round \(target.reviewRound + 1)")
-                ?? git.head(of: branch) else { throw ToolError(message: "\(target.key) has no commit to submit") }
+                ?? git.head(of: git.branchRef(key: target.key)) else { throw ToolError(message: "\(target.key) has no commit to submit") }
         if commit == target.baseCommit { throw ToolError(message: "\(target.key) has no changes to submit") }
 
         // Weakening is measured against the base the engine recorded at claim, never the live `main` (an agent can move that ref).
+        // History and check-script flags come first: the flag list is capped, and test-file flags (one per file) must not push them out.
         var flags: [String] = []
+        var testFlags: [String] = []
         if let base = target.baseCommit {
             do {
                 let changes = try git.nameStatus(base: base, head: commit)
                 for c in changes.entries {
                     switch c.status.first {
-                    case "D" where PathRules.isTestFile(c.path): flags.append("deleted test file \(c.path)")
+                    case "D" where PathRules.isTestFile(c.path): testFlags.append("deleted test file \(c.path)")
                     case "M" where PathRules.isTestFile(c.path), "T" where PathRules.isTestFile(c.path):
-                        flags.append("modified test file \(c.path)")
-                    case "R" where c.oldPath.map(PathRules.isTestFile) == true: flags.append("renamed test file \(c.oldPath ?? "?") → \(c.path)")
+                        testFlags.append("modified test file \(c.path)")
+                    case "R" where c.oldPath.map(PathRules.isTestFile) == true:
+                        testFlags.append("renamed test file \(c.oldPath ?? "?") → \(c.path)")
                     default: break
                     }
                 }
@@ -434,6 +443,7 @@ extension CompanyTools {
                 }
             }
         }
+        flags += testFlags
         let result = try store.submitForReview(itemId: target.id, agentId: agentId, summary: summary, flags: flags, commit: commit,
                                                scriptHash: CheckScripts.scriptHash(current), workingDirectory: worktree.path)
         let short = String(commit.prefix(7))
