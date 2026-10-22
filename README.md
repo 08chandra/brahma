@@ -92,6 +92,13 @@ SHELL, DEVELOPER_DIR, TMPDIR`, minus anything named like a token, secret or key)
 shell prefix unsets them. `brahma mcp` refuses a foreign `--agent`, and owner-write commands refuse to run inside
 an agent turn; as above, neither is tamper-proof until the sandbox lands.
 
+**Engine git.** Every git command the engine runs forces off what a repository could make git run (hooks, fsmonitor,
+gpg, credential helpers, askpass, ssh, editors, submodule recursion, external diff), reads attributes from the empty tree,
+ignores replace refs and grafts, and is refused (with one owner alert) when the workspace's git config holds anything
+beyond a short allowlist. Filters and diff/merge drivers are kept out by the engine's own `.git/info/attributes` plus that
+config check, which an agent rewriting both files between the check and the command could still race: the 5-lite
+sandbox must deny agent writes to `.git/config`, `config.worktree` and `.git/info/`.
+
 `brahma doctor` checks the installed Claude Code CLI (version, required flags, a real haiku probe turn, and that
 `--resume` keeps the role prompt). `brahma run` and the app require a passing probe, reused for 24 h per CLI version.
 

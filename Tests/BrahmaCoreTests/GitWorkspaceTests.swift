@@ -769,9 +769,31 @@ import Foundation
         let f = try GitFixture(files: ["a.txt": "one"])
         let git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
         let env = git.environment()
-        #expect(env["GIT_CONFIG_NOSYSTEM"] == "1"); #expect(env["GIT_CONFIG_GLOBAL"] == "/dev/null")
-        #expect(env["GIT_NO_REPLACE_OBJECTS"] == "1"); #expect(env["GIT_GRAFT_FILE"] == "/dev/null")
+        let forcedEnv = ["GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1",
+                         "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+                         "GIT_ASKPASS": "/usr/bin/false", "SSH_ASKPASS": "/usr/bin/false", "GIT_OPTIONAL_LOCKS": "0",
+                         "GIT_DIR": f.root.appending(path: ".git").path, "GIT_WORK_TREE": f.root.path,
+                         "GIT_COMMON_DIR": f.root.appending(path: ".git").path]
+        for (name, value) in forcedEnv { #expect(env[name] == value, "\(name)") }
+        for name in ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                     "GIT_EXEC_PATH", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR"] { #expect(env[name] == nil, "\(name)") }
+        // Every forced setting, exactly: dropping one fails here.
+        let forced = [
+            "user.name=Brahma", "user.email=engine@brahma.local", "commit.gpgsign=false", "tag.gpgSign=false",
+            "core.fsmonitor=false", "core.hooksPath=/dev/null", "core.pager=cat", "diff.external=",
+            "core.sshCommand=/usr/bin/false", "core.gitProxy=", "core.askPass=/usr/bin/false", "credential.helper=",
+            "gpg.program=/usr/bin/false", "gpg.ssh.program=/usr/bin/false", "gpg.x509.program=/usr/bin/false",
+            "log.showSignature=false", "merge.verifySignatures=false", "submodule.recurse=false", "diff.ignoreSubmodules=dirty",
+            "protocol.allow=never", "protocol.ext.allow=never", "core.alternateRefsCommand=", "uploadpack.packObjectsHook=",
+            "core.editor=/usr/bin/false", "sequence.editor=/usr/bin/false",
+            "core.quotepath=false", "gc.auto=0", "core.attributesFile=/dev/null", "advice.graftFileDeprecated=false",
+        ]
+        #expect(GitCommand.configFlags == forced.flatMap { ["-c", $0] })
+        // A linked worktree pins its own common dir the same way.
+        let linked = GitCommand(gitDir: f.root.appending(path: ".git/worktrees/K"), workTree: f.root, commonDir: f.root.appending(path: ".git"))
+        #expect(linked.environment()["GIT_COMMON_DIR"] == f.root.appending(path: ".git").path)
         let args = git.arguments(["status"], attrSource: GitCommand.emptyTreeSHA1)
+        #expect(Array(args.suffix(args.count - 4)) == forced.flatMap { ["-c", $0] } + ["status"])
         #expect(args.contains("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904"))
         #expect(args.contains("core.attributesFile=/dev/null"))
         #expect(args.firstIndex(of: "--attr-source=\(GitCommand.emptyTreeSHA1)")! < args.firstIndex(of: "status")!)
@@ -783,9 +805,11 @@ import Foundation
         #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == GitCommand.attributesOverride)
     }
 
-    @Test func attrSourceNeedsGit242() throws {
+    @Test func attrSourceNeedsGit243() throws {
+        // 2.43 is where `--attr-source` reaches child git processes (a checkout's) as GIT_ATTR_SOURCE.
         #expect(GitCommand.supportsAttrSource(versionLine: "git version 2.52.0"))
-        #expect(GitCommand.supportsAttrSource(versionLine: "git version 2.42.0.windows.1"))
+        #expect(GitCommand.supportsAttrSource(versionLine: "git version 2.43.0.windows.1"))
+        #expect(!GitCommand.supportsAttrSource(versionLine: "git version 2.42.2"))
         #expect(GitCommand.supportsAttrSource(versionLine: "git version 3.0.1"))
         #expect(!GitCommand.supportsAttrSource(versionLine: "git version 2.41.9"))
         #expect(!GitCommand.supportsAttrSource(versionLine: "git version 2.39.5 (Apple Git-154)"))
@@ -843,6 +867,8 @@ import Foundation
             ("credential.helper", "/tmp/helper"), ("remote.origin.url", "https://example.com/x.git"), ("diff.renames", "true"),
             ("merge.conflictStyle", "diff3"), ("core.autocrlf", "false"), ("alias.st", "!touch /tmp/x"), ("http.proxy", "x"),
             ("core.editor", "x"), ("uploadpack.packObjectsHook", "x"), ("submodule.sub.update", "!touch /tmp/x"),
+            ("extensions.refStorage", "reftable"), ("extensions.partialClone", "origin"), ("gc.recentObjectsHook", "/tmp/x"),
+            ("sequence.editor", "x"),
         ]
         for (key, value) in keys {
             let f = try GitFixture(files: ["a.txt": "one"])
@@ -1020,6 +1046,53 @@ import Foundation
         #expect(error.isRepositoryRefusal, "\(error)")
         #expect(log.all.count == 1)
         _ = ws
+    }
+
+    @Test func redirectedCommonDirIsRefusedAndNeverRead() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        try attributed(f)
+        let (ws, log) = guarded(f)
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        // Another repository with filters, named as the workspace's common dir.
+        let dir = try tempDir()
+        let evil = dir.appending(path: "evil", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: evil, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["clone", "-q", "--bare", f.root.path, evil.appending(path: ".git").path], in: dir)
+        let clean = dir.appending(path: "clean-ran"), smudge = dir.appending(path: "smudge-ran"), textconv = dir.appending(path: "textconv-ran")
+        let evilConfig = "[filter \"evil\"]\n\tclean = touch '\(clean.path)'; cat\n\tsmudge = touch '\(smudge.path)'; cat\n"
+            + "[diff \"evil\"]\n\ttextconv = touch '\(textconv.path)'; cat\n"
+        let config = evil.appending(path: ".git/config")
+        try (try String(contentsOf: config, encoding: .utf8) + evilConfig).write(to: config, atomically: true, encoding: .utf8)
+        try f.write("info/attributes", "* filter=evil diff=evil\n", in: evil.appending(path: ".git"))
+        try "\(evil.appending(path: ".git").path)\n".write(to: f.root.appending(path: ".git/commondir"), atomically: true, encoding: .utf8)
+        try f.write("a.txt", "six\n")
+        #expect(throws: GitError.self) { try ws.isDirty(in: f.root) }
+        #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
+        #expect(throws: GitError.self) { try ws.addRunWorktree(runId: "r1", commit: main) }
+        #expect(!log.all.isEmpty && log.all.allSatisfy { $0.contains("commondir") }, "\(log.all)")
+        // Without the scan the pinned common dir keeps git in the workspace's own repository.
+        var git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
+        git.skipsRepositoryCheck = true
+        try git.run(["status", "--porcelain"])
+        try git.run(["add", "-A"])
+        try git.run(["diff", "--no-ext-diff", "HEAD~1", "HEAD"])
+        try git.run(["worktree", "add", "--quiet", "--detach", dir.appending(path: "check").path, main])
+        #expect(!exists(clean)); #expect(!exists(smudge)); #expect(!exists(textconv))
+        // Plain git follows the file and runs the other repository's filters: the fixture is real.
+        try f.write("a.txt", "ten\n")
+        try f.git(["add", "-A"])
+        try f.git(["diff", "--cached"])
+        #expect(exists(clean)); #expect(exists(textconv))
+    }
+
+    @Test func linkedGitDirectoryIsRefused() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = guarded(f)
+        let elsewhere = try tempDir().appending(path: "real.git")
+        try FileManager.default.moveItem(at: f.root.appending(path: ".git"), to: elsewhere)
+        try FileManager.default.createSymbolicLink(at: f.root.appending(path: ".git"), withDestinationURL: elsewhere)
+        #expect(throws: GitError.self) { try ws.isDirty(in: f.root) }
+        #expect(log.all.count == 1 && log.all[0].contains("is not a real directory"), "\(log.all)")
     }
 
     @Test func worktreeConfigIsCheckedToo() throws {

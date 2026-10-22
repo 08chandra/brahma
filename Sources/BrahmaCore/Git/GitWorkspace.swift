@@ -39,7 +39,7 @@ public struct GitChange: Equatable, Sendable {
 /// Programs a repository can name for git to run (filters, textconv, diff and merge drivers, gpg, credential helpers,
 /// askpass, ssh, proxies, submodule recursion) are kept out in two layers. The guarantee is the command line: every call
 /// forces each such setting off (`configFlags`, `environment()`), and reads attributes from the empty tree
-/// (`--attr-source`, git 2.42+), never from a checkout's `.gitattributes`, with `core.attributesFile=/dev/null` and the
+/// (`--attr-source`, git 2.43+), never from a checkout's `.gitattributes`, with `core.attributesFile=/dev/null` and the
 /// engine's override (`attributesOverride`) as `info/attributes`. On top of that, before every attempt (retries included)
 /// the repository's own config files are read (`RepoConfigGuard`): a key outside a short allowlist of what git and the
 /// engine write refuses the call, nothing runs, and `onRefused` hears what was found (the store files one owner alert).
@@ -77,6 +77,7 @@ struct GitCommand: Sendable {
         "-c", "gpg.x509.program=/usr/bin/false", "-c", "log.showSignature=false", "-c", "merge.verifySignatures=false",
         "-c", "submodule.recurse=false", "-c", "diff.ignoreSubmodules=dirty", "-c", "protocol.allow=never",
         "-c", "protocol.ext.allow=never", "-c", "core.alternateRefsCommand=", "-c", "uploadpack.packObjectsHook=",
+        "-c", "core.editor=/usr/bin/false", "-c", "sequence.editor=/usr/bin/false",
         "-c", "core.quotepath=false", "-c", "gc.auto=0",
         "-c", "core.attributesFile=/dev/null", "-c", "advice.graftFileDeprecated=false",
     ]
@@ -88,12 +89,13 @@ struct GitCommand: Sendable {
     static let emptyTreeSHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
     static let emptyTreeSHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
 
-    /// `--attr-source` arrived in git 2.42.
+    /// `--attr-source` arrived in git 2.42; from 2.43 it also reaches the child git processes a command spawns (a
+    /// checkout's) as `GIT_ATTR_SOURCE`, so 2.43 is the floor.
     static func supportsAttrSource(versionLine: String) -> Bool {
         guard versionLine.hasPrefix("git version ") else { return false }
         let numbers = versionLine.dropFirst("git version ".count).split(whereSeparator: { !$0.isNumber }).prefix(2).compactMap { Int($0) }
         guard numbers.count == 2 else { return false }
-        return numbers[0] > 2 || numbers[0] == 2 && numbers[1] >= 42
+        return numbers[0] > 2 || numbers[0] == 2 && numbers[1] >= 43
     }
 
     /// Asked once per process.
@@ -134,7 +136,9 @@ struct GitCommand: Sendable {
         var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         env["GIT_DIR"] = gitDir.path
         env["GIT_WORK_TREE"] = workTree.path
-        if let commonDir { env["GIT_COMMON_DIR"] = commonDir.path }
+        // Always pinned: without it git follows a `commondir` file in the git dir (the workspace's own `.git` included) to
+        // a config, attributes and refs the engine never checked.
+        env["GIT_COMMON_DIR"] = (commonDir ?? gitDir).path
         if let indexFile { env["GIT_INDEX_FILE"] = indexFile.path }
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -162,12 +166,18 @@ struct GitCommand: Sendable {
     private func prepare(_ args: [String]) throws -> String? {
         if !attrSourceSupported, !Self.isTreeFree(args) {
             throw GitError.failed(command: args.joined(separator: " "), status: -1,
-                                  stderr: "this git is older than 2.42 and cannot be kept from repository attributes; install a newer git")
+                                  stderr: "this git is older than 2.43 and cannot be kept from repository attributes; install a newer git")
         }
         if skipsRepositoryCheck { return attrSourceSupported ? Self.emptyTreeSHA1 : nil }
         let common = commonDir ?? gitDir
         var sha256 = false
         var problems: [String] = []
+        // The workspace's own `.git` never has a `commondir` (only a linked worktree's admin directory does).
+        if commonDir == nil {
+            var st = stat()
+            let file = gitDir.appending(path: "commondir")
+            if lstat(file.path, &st) == 0 { problems.append("\(GitWorkspace.shown(file.path)) exists (a commondir file redirects the repository)") }
+        }
         var seen: Set<String> = []
         for file in [common.appending(path: "config"), common.appending(path: "config.worktree"), gitDir.appending(path: "config.worktree")]
         where seen.insert(file.standardizedFileURL.path).inserted {
@@ -304,11 +314,14 @@ enum RepoConfigGuard {
         case "core":
             return !hasSubsection && ["repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
                                       "precomposeunicode", "symlinks", "worktree"].contains(variable)
-        case "extensions", "pack", "index", "worktree": return !hasSubsection
+        // Only the extensions the engine works with: another ref storage (reftable) or a partial clone breaks its checks.
+        case "extensions": return !hasSubsection && (variable == "worktreeconfig" || variable == "objectformat")
+        case "pack", "index", "worktree": return !hasSubsection
         case "user": return !hasSubsection && (variable == "name" || variable == "email")
         // Tracking only: a remote would need `remote.*`, which is not allowed.
         case "branch": return hasSubsection && (variable == "remote" || variable == "merge")
-        case "gc": return true
+        // `gc.recentObjectsHook` runs a command; every other gc setting is inert.
+        case "gc": return variable != "recentobjectshook"
         case "init": return !hasSubsection && variable == "defaultbranch"
         default: return false
         }
@@ -348,10 +361,12 @@ enum RepoConfigGuard {
     }
 
     /// Writes the engine's `info/attributes` when it is not exactly that. Nil when done (or when there is no repository yet:
-    /// `git init` has not run); else why not.
+    /// `git init` has not run); else why not. A common dir that is a link (or not a directory) is refused: git would read
+    /// the attributes wherever it points.
     static func ensureAttributes(commonDir: URL) -> String? {
         var st = stat()
-        guard lstat(commonDir.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR else { return nil }
+        guard lstat(commonDir.path, &st) == 0 else { return nil }
+        guard st.st_mode & S_IFMT == S_IFDIR else { return "\(GitWorkspace.shown(commonDir.path)) is not a real directory" }
         let info = commonDir.appending(path: "info", directoryHint: .isDirectory)
         if lstat(info.path, &st) == 0 {
             guard st.st_mode & S_IFMT == S_IFDIR else { return "\(GitWorkspace.shown(info.path)) is not a real directory" }
