@@ -150,7 +150,7 @@ import GRDB
         #expect(kinds.contains(.statusChanged)); #expect(kinds.contains(.leaseReleased))
         let dms = try b.dms(to: b.mgr)
         #expect(dms == ["\(item.key) (@eng) is over its tier S budget: 1/6 turns, 350k/300k tokens, $0.50/$3.00. "
-            + "Raise the tier, split the item or reassign it."])
+            + BudgetText.escalationAdvice])
         let dm = try #require(try b.store.pendingInbox(agentId: b.mgr.id).first)
         #expect(dm.1.senderId == "system")
         // The engineer's next turn does not repeat the escalation.
@@ -447,6 +447,108 @@ import GRDB
                                         expectations: TurnExpectations(forbiddenTools: ["Task"]))?.contains("Task") == true)
     }
 
+    // MARK: Fix round 1 (14a review)
+
+    /// I1: an item claimed in the middle of a turn is attributed to that turn and counted.
+    @Test func midTurnClaimAttributesTheTurn() async throws {
+        let b = try B()
+        let item = try b.store.createWorkItem(companyId: b.c.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Do it", checkSpec: CheckSpec(command: "true", paths: ["src/a"]), tier: .s, status: .ready),
+                                              now: b.w.clock.now)
+        let store = b.store, itemId = item.id, engId = b.eng.id, now = b.w.clock.now
+        var script = Self.script(Self.result(tokens: Self.big, cost: 0.5))
+        script.sideEffect = { _ in _ = try store.claimLease(itemId: itemId, agentId: engId, now: now) }
+        try await b.turn(script)
+        let turn = try #require(try b.turns(b.eng).first)
+        #expect(turn.itemId == item.id, "the claim turn is attributed to the item it claimed")
+        let used = try b.store.itemUsage(itemId: item.id)
+        #expect(used.turns == 1); #expect(used.tokens == 350_150)
+        #expect(try b.fresh(item).status == .blocked, "and it counts toward the item's budget")
+        #expect(try b.fresh(item).stopReason == "budget")
+    }
+
+    /// I2: `modelUsage` is cumulative over `--resume`; a model only a previous turn of the session billed is not new.
+    @Test func resumedSessionWithChangingModelIsNotAlerted() async throws {
+        let b = try B()
+        // Turn 1 ran haiku (a notice turn); turn 2 resumes the session on the main model: modelUsage holds both.
+        try await b.turn(.init(events: [.initialized(sessionId: "s-eng", model: "claude-haiku-5-5"),
+                                        Self.result(models: ["claude-haiku-5-5"])]))
+        try await b.turn(Self.script(Self.result(models: ["claude-haiku-5-5", "claude-sonnet-5-5"])))
+        #expect(try alertTexts(b).isEmpty)
+        #expect(try b.w.agent(b.eng).state != .blocked)
+        // A model nobody expected, new in a later turn of the same session, still alerts.
+        try await b.turn(Self.script(Self.result(models: ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-fable-5-0"])))
+        let alerts = try alertTexts(b)
+        #expect(alerts.count == 1); #expect(alerts[0].contains("claude-fable-5-0")); #expect(!alerts[0].contains("haiku"))
+        #expect(try b.w.agent(b.eng).state == .blocked)
+    }
+
+    @Test func auditSkipsModelsAlreadySeenInTheSession() {
+        let result = TurnResult(isError: false, subtype: "success", text: "x", costUSD: nil, apiErrorStatus: nil, sessionId: "s",
+                                modelsUsed: ["claude-haiku-5-5", "claude-sonnet-5-5"])
+        let fresh = TurnAudit.findings(result: result, initModel: "claude-sonnet-5-5", main: "sonnet", fallback: "sonnet", expectations: nil)
+        #expect(fresh.unexpectedModels == ["claude-haiku-5-5"])
+        let resumed = TurnAudit.findings(result: result, initModel: "claude-sonnet-5-5", main: "sonnet", fallback: "sonnet",
+                                         expectations: nil, previouslySeen: ["claude-haiku-5-5"])
+        #expect(resumed.unexpectedModels.isEmpty)
+    }
+
+    /// I3: an engine wall-clock kill is a timeout: failed, normal backoff, budgeted with its usage.
+    @Test func wallClockKillWithPendingWorkIsATimeout() async throws {
+        let b = try B()
+        b.w.fake.cumulativeCosts = false
+        let item = try b.leased(tier: .m)
+        let early = Self.result(tokens: TurnUsage(inputTokens: 3, outputTokens: 40, cacheCreationTokens: 600), cost: 0.5)
+        try await b.turn(.init(events: [.initialized(sessionId: "s-eng", model: "m"),
+                                        .taskStarted(taskId: "w1", taskType: "local_workflow", spawnDepth: nil), early],
+                               error: TurnError.timedOut))
+        let turn = try #require(try b.turns(b.eng).first)
+        #expect(turn.outcome == .failed); #expect(!turn.infra)
+        #expect(abs(try #require(turn.costLE) - 0.5) < 1e-9); #expect(turn.outputTokens == 40)
+        let agent = try b.w.agent(b.eng)
+        #expect(agent.consecutiveFailures == 1)
+        guard case .retry? = agent.blocker else { Issue.record("expected the normal retry backoff, got \(String(describing: agent.blocker))"); return }
+        let used = try b.store.itemUsage(itemId: item.id)
+        #expect(used.turns == 1); #expect(used.tokens == 643)
+    }
+
+    @Test func wallClockKillRunsTheBudgetStep() async throws {
+        let b = try B()
+        let item = try b.leased(tier: .s)
+        try await b.turn(.init(events: [.initialized(sessionId: "s-eng", model: "m"),
+                                        .taskStarted(taskId: "w1", taskType: "local_workflow", spawnDepth: nil),
+                                        Self.result(tokens: Self.big, cost: 0.5)],
+                               error: TurnError.timedOut))
+        #expect(try b.fresh(item).status == .blocked); #expect(try b.fresh(item).stopReason == "budget")
+    }
+
+    /// m1: a failed turn with an error result keeps its tokens and cost, so the next resumed turn's delta is its own.
+    @Test func failedTurnWithErrorResultRecordsUsageAndCost() async throws {
+        let b = try B()
+        b.w.fake.cumulativeCosts = false
+        let item = try b.leased(tier: .m)
+        let usage = TurnUsage(inputTokens: 5, outputTokens: 7, cacheCreationTokens: 90)
+        try await b.turn(Self.script(Self.result(tokens: usage, cost: 0.3, subtype: "error_during_execution", error: true, text: "boom")))
+        b.w.clock.advance(120)   // past the retry backoff of the failed turn
+        try await b.turn(Self.script(Self.result(tokens: usage, cost: 0.5)))
+        let turns = try b.turns(b.eng)
+        try #require(turns.count == 2)
+        #expect(turns[0].outcome == .failed)
+        #expect(abs(try #require(turns[0].costLE) - 0.3) < 1e-9); #expect(turns[0].inputTokens == 5)
+        #expect(abs(try #require(turns[1].costLE) - 0.2) < 1e-9, "the second turn pays only its own share")
+        #expect(abs(try b.store.itemUsage(itemId: item.id).costLE - 0.5) < 1e-9)
+    }
+
+    /// m2: the escalation says usage is per item, so an unblock needs a raise, a boost, a split or a reassignment.
+    @Test func budgetDMExplainsPerItemUsage() async throws {
+        let b = try B()
+        try b.leased(tier: .s)
+        try await b.turn(Self.script(Self.result(tokens: Self.big, cost: 0.5)))
+        let text = try #require(try b.escalations().first)
+        #expect(text.contains("Raise the tier or boost the budget, split the item or reassign it"))
+        #expect(text.contains("per item"))
+    }
+
     // MARK: Migration
 
     @Test func migrationAddsTurnAndItemColumns() throws {
@@ -454,7 +556,7 @@ import GRDB
         let turnColumns = Set(try store.writer.read { try $0.columns(in: "turn").map(\.name) })
         for name in ["kind", "itemId", "sessionResetReason", "sessionId", "sessionTotalUSD", "inputTokens", "outputTokens",
                      "cacheReadTokens", "cacheCreationTokens", "toolSignature", "mode", "rung", "effort", "modeReason", "stopReason",
-                     "subagentsSpawned", "workflowAgents", "costLE"] {
+                     "subagentsSpawned", "workflowAgents", "costLE", "modelsUsed"] {
             #expect(turnColumns.contains(name), "turn.\(name)")
         }
         #expect(try store.writer.read { try $0.columns(in: "workItem").map(\.name) }.contains("stopReason"))

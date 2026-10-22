@@ -413,6 +413,10 @@ enum Migrations {
             // Why the engine stopped work on an item: budget, no-progress, loop, failed-checks or timebox. Cleared at the next claim.
             try db.alter(table: "workItem") { t in t.add(column: "stopReason", .text) }
         }
+        m.registerMigration("v3-budgets-models") { db in
+            // Task 14a fix round 1: the models a turn's result billed, for the per-session model audit.
+            try db.alter(table: "turn") { t in t.add(column: "modelsUsed", .text) }
+        }
         return m
     }
 }

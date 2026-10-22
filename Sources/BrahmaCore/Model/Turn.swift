@@ -41,6 +41,9 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var stopReason: String? = nil
     public var subagentsSpawned: Int = 0
     public var workflowAgents: Int = 0
+    /// The result's `modelUsage` keys, comma-joined. Cumulative over `--resume`, so the audit compares it with the
+    /// session's earlier turns.
+    public var modelsUsed: String? = nil
     /// This turn's cost in `total_cost_usd` list-equivalent dollars.
     public var costLE: Double? = nil
 

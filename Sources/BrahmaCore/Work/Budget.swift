@@ -40,6 +40,10 @@ public struct ItemUsage: Equatable, Sendable {
 }
 
 public enum BudgetText {
+    /// What the over-budget DM tells the manager: usage is counted per item, so an unblock alone re-blocks after one more turn.
+    public static let escalationAdvice = "Usage is counted per item, so unblocking it as is blocks it again after one more turn. "
+        + "Raise the tier or boost the budget, split the item or reassign it."
+
     /// `16/15 turns, 1050k/1000k tokens, $11.20/$10.00`, plus `≈4% of week` once the weekly calibration exists.
     public static func parts(usage: ItemUsage, budget: TierBudget, costCapLE: Double, pctPerDollar: Double?) -> String {
         var text = "\(usage.turns)/\(budget.maxTurns) turns, \(usage.tokens / 1000)k/\(budget.maxTokens / 1000)k tokens, "

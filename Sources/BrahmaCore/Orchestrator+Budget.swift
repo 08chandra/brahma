@@ -21,6 +21,7 @@ struct TurnAccounting: Equatable {
     var sessionId: String?
     var sessionTotal: Double?
     var usage: TurnUsage?
+    var modelsUsed: [String] = []
 }
 
 extension Store {
@@ -58,12 +59,14 @@ extension Store {
         switch end {
         case .succeeded(let r, _), .capped(let r, _): result = r
         case .interrupted(let partial): result = partial
+        case .failed(_, _, let partial): result = partial
         default: result = nil
         }
         guard let result else { return TurnAccounting() }
         let session = result.sessionId.isEmpty ? nil : result.sessionId
         let cost = try result.costUSD.map { try turnCost(db: db, turnId: turnId, sessionId: session, total: $0) }
-        return TurnAccounting(cost: cost, sessionId: session, sessionTotal: result.costUSD, usage: result.usage)
+        return TurnAccounting(cost: cost, sessionId: session, sessionTotal: result.costUSD, usage: result.usage,
+                              modelsUsed: result.modelsUsed)
     }
 
     /// Writes everything the accounting and telemetry add to the closed turn.
@@ -73,6 +76,14 @@ extension Store {
         turn.costLE = a.cost
         turn.sessionId = a.sessionId
         turn.sessionTotalUSD = a.sessionTotal
+        turn.modelsUsed = a.modelsUsed.isEmpty ? nil : a.modelsUsed.joined(separator: ",")
+        // A claim made in the middle of the turn left no item on the row: attribute the turn to the item the agent holds now,
+        // so the item's usage counts it (and the budget step below sees it).
+        if turn.itemId == nil,
+           let leased = try WorkLease.filter(Column("agentId") == turn.agentId).fetchOne(db),
+           let item = try WorkItem.fetchOne(db, key: leased.itemId), item.companyId == turn.companyId {
+            turn.itemId = item.id
+        }
         if let u = a.usage {
             turn.inputTokens = u.inputTokens; turn.outputTokens = u.outputTokens
             turn.cacheReadTokens = u.cacheReadTokens; turn.cacheCreationTokens = u.cacheCreationTokens
@@ -144,7 +155,7 @@ extension Store {
         let assignee = try item.ownerId.flatMap { try Agent.fetchOne(db, key: $0) } ?? agent
         let target = try Store.escalationTarget(db: db, from: assignee)
         let text = "\(item.key) (@\(assignee.name)) is over its tier \(item.tier.label) budget: \(parts). "
-            + "Raise the tier, split the item or reassign it."
+            + BudgetText.escalationAdvice
         try MessageRouter(store: self).sendDM(db: db, companyId: item.companyId, from: .system, to: target, text: text, now: now)
     }
 
@@ -176,8 +187,18 @@ extension Orchestrator {
     /// models are only recorded.
     nonisolated func auditResult(_ result: TurnResult, request: TurnRequest, initModel: String?, agent: Agent,
                                  turn: Turn, now: Date) {
+        // `modelUsage` is cumulative over `--resume`: only models no earlier turn of this session billed are judged.
+        var seen = Set<String>()
+        if !result.sessionId.isEmpty {
+            let rows = (try? store.writer.read { db in
+                try String.fetchAll(db, sql: "SELECT modelsUsed FROM turn WHERE sessionId = ? AND id <> ? AND modelsUsed IS NOT NULL",
+                                    arguments: [result.sessionId, turn.id])
+            }) ?? []
+            for row in rows { seen.formUnion(row.split(separator: ",").map(String.init)) }
+        }
         let f = TurnAudit.findings(result: result, initModel: initModel, main: request.agent.model,
-                                   fallback: TurnProfileCompiler.profile(for: request).fallbackModel, expectations: request.expectations)
+                                   fallback: TurnProfileCompiler.profile(for: request).fallbackModel, expectations: request.expectations,
+                                   previouslySeen: seen)
         if let fast = f.fastMode {
             attempt {
                 try EngineAlerts.raise(store: store, text: "Fast mode is not off for @\(agent.name) (\(fast)). Fast mode bills outside "

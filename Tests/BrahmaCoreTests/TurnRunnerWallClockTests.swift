@@ -60,9 +60,10 @@ private let resultLine = #"{"type":"result","subtype":"success","is_error":false
         #expect(ContinuousClock.now - start < .seconds(10))
     }
 
-    @Test func killedWithPendingWorkflowIsInterruptedDespiteEarlyResult() async throws {
+    @Test func wallClockKillWithPendingWorkflowIsATimeoutDespiteEarlyResult() async throws {
         // Constructed: the first 17 lines are a real workflow recording (init, `task_started`, a non-empty
         // `background_tasks_changed`); the early `result` line is added, as the design observed (the first result said "still running").
+        // The engine's own wall clock killed it: a timeout (failed, backed off), not an interruption.
         let cut = try #require(Bundle.module.url(forResource: "stream-workflow-cut17", withExtension: "jsonl", subdirectory: "Fixtures"))
         let (script, dir) = try fakeClaude("""
             cat > /dev/null
@@ -75,10 +76,27 @@ private let resultLine = #"{"type":"result","subtype":"success","is_error":false
         do {
             for try await e in runner.run(request(in: dir)) { seen.append(e) }
             Issue.record("a killed turn with a workflow pending is not a success")
+        } catch TurnError.timedOut {
+        }
+        #expect(seen.contains { if case .result = $0 { true } else { false } }, "the early result was seen")
+    }
+
+    @Test func sigtermWithPendingWorkflowIsInterruptedDespiteEarlyResult() async throws {
+        let cut = try #require(Bundle.module.url(forResource: "stream-workflow-cut17", withExtension: "jsonl", subdirectory: "Fixtures"))
+        let (script, dir) = try fakeClaude("""
+            cat > /dev/null
+            cat '\(cut.path)'
+            echo '\(resultLine)'
+            kill -TERM $$
+            sleep 5
+            """)
+        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(30))
+        do {
+            _ = try await collect(runner.run(request(in: dir)))
+            Issue.record("a terminated turn with a workflow pending is not a success")
         } catch let TurnError.interrupted(pending) {
             #expect(pending == 1)
         }
-        #expect(seen.contains { if case .result = $0 { true } else { false } }, "the early result was seen")
     }
 
     @Test func earlyResultWithNothingPendingIsStillAuthoritative() async throws {

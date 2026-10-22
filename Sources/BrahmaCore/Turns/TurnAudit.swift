@@ -53,15 +53,18 @@ public enum TurnAudit {
     }
 
     /// `main` and `fallback` are the aliases or ids the request named (`sonnet`, `claude-sonnet-5-5`); `initModel` is the
-    /// resolved id from the init line.
+    /// resolved id from the init line. `modelUsage` is cumulative over `--resume` (probe L-4), so `previouslySeen` names the
+    /// models earlier turns of the same session already billed: they were judged then and are not judged again.
     public static func findings(result: TurnResult, initModel: String?, main: String, fallback: String,
-                                expectations: TurnExpectations?) -> Findings {
+                                expectations: TurnExpectations?, previouslySeen: Set<String> = []) -> Findings {
         var f = Findings()
         if let state = result.fastModeState, state != "off" { f.fastMode = "fast_mode_state is \(state)" }
         else if let speed = result.speed, speed != "standard" { f.fastMode = "usage.speed is \(speed)" }
         let allowed = [initModel, main, fallback].compactMap { $0?.lowercased() } + (expectations?.extraModels ?? []).map { $0.lowercased() }
+        let seen = Set(previouslySeen.map { $0.lowercased() })
         for model in result.modelsUsed {
             let m = model.lowercased()
+            if seen.contains(m) { continue }
             if safetyFallbackModels.contains(m) { f.safetyFallbacks.append(model); continue }
             if !allowed.contains(where: { matches(model: m, allowed: $0) }) { f.unexpectedModels.append(model) }
         }

@@ -410,6 +410,10 @@ public actor Orchestrator {
         } else if case .interrupted? = runnerError as? TurnError {
             // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
             end = .interrupted(partial: result)
+        } else if case .timedOut? = runnerError as? TurnError {
+            // The engine's own wall clock killed it (even after an early result, with background work still pending): the
+            // turn failed like any other timeout (normal backoff) and its usage is still booked and budgeted.
+            end = .failed(failure ?? "timed out", nil, partial: result)
         } else if let r = result, !r.isError {
             // A completed turn always counts, even if it also hit the limit: re-running it would repeat its posts.
             end = .succeeded(r, usageHold: limited ? Self.usageUntil(lastInfo?.resetsAt, now: now) : nil)
@@ -432,19 +436,19 @@ public actor Orchestrator {
             // Only the runner's launch error is classifiable; a timeout or "exited without a result" carries stderr.
             var input: InfraInput?
             if let runnerError, !(runnerError is TurnError) { input = InfraInput(text: failure, status: nil) }
-            end = .failed(failure, input)
+            end = .failed(failure, input, partial: result)
         } else if let r = result {
-            end = .failed(r.text ?? r.subtype, InfraInput(text: r.text ?? "", status: r.apiErrorStatus, subtype: r.subtype))
+            end = .failed(r.text ?? r.subtype, InfraInput(text: r.text ?? "", status: r.apiErrorStatus, subtype: r.subtype), partial: r)
         } else {
             end = .failed("claude exited without a result")
         }
         var resetSession = false
-        if case .failed(let text, _) = end, agent.sessionStarted {
+        if case .failed(let text, _, _) = end, agent.sessionStarted {
             resetSession = Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n"))
         }
         // An infrastructure failure puts the agent on its fixed cooldown before the turn is recorded, so there is no
         // moment at which it is `ready` and eligible again.
-        if case .failed(_, let input?) = end, EngineHealth.classify(input) != .none {
+        if case .failed(_, let input?, _) = end, EngineHealth.classify(input) != .none {
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
         }
         var infra = InfraClass.none
@@ -516,7 +520,9 @@ enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.
     case succeeded(TurnResult, usageHold: Date?)
     /// The summary, and the error text the infrastructure classifier may read (an error `result` event or a launch error).
-    case failed(String, InfraInput? = nil)
+    /// `partial`: the result the turn did print (an error result, or an early result before an engine wall-clock kill). Its
+    /// tokens and cost are still recorded and the budget step runs; the turn stays failed.
+    case failed(String, InfraInput? = nil, partial: TurnResult? = nil)
     /// A controlled stop: the engine's own `--max-turns` or `--max-budget-usd` ended the turn. It did its work, so it is
     /// delivered, billed and budgeted like a success, but recorded `failed` with a `stopReason`; it never counts against the
     /// agent (no backoff) and is never infrastructure.
@@ -594,7 +600,7 @@ extension Store {
             switch end {
             case .succeeded(let r, _): summary = r.text
             case .capped(let r, _): summary = r.text ?? r.subtype
-            case .failed(let text, let input):
+            case .failed(let text, let input, _):
                 summary = text
                 if let input { infraClass = EngineHealth.classify(input) }
             case .usageLimited(_, let text): summary = text
@@ -629,11 +635,13 @@ extension Store {
             let closed = try Store.finishTurn(db: db, id: turn.id, outcome: end.outcome, summary: summary, costUSD: cost,
                                               infra: infraClass != .none, now: now)
             if closed, let cost { try Store.recordSpend(db, cost) }
+            var budgeted = completed
+            if case .failed(_, _, let partial) = end, partial != nil { budgeted = true }
             if closed {
                 try Store.writeAccounting(db: db, turnId: turn.id, accounting: accounting, telemetry: telemetry, end: end,
                                           resetSession: resetSession)
                 // Budget step (Task 14a): a counted work turn can take its item over its tier's budget.
-                if infraClass == .none, completed { try budgetStep(db: db, turnId: turn.id, agent: agent, now: now) }
+                if infraClass == .none, budgeted { try budgetStep(db: db, turnId: turn.id, agent: agent, now: now) }
             }
             var text = "@\(agent.name) turn \(end.outcome.rawValue)"
             if let summary, !summary.isEmpty { text += ": \(summary.prefix(200))" }

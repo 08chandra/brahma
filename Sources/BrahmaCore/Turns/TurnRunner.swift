@@ -15,11 +15,12 @@ extension TurnRunning {
 public enum TurnError: Error, Equatable {
     /// The process ended without emitting a `result` line.
     case exitedWithoutResult(code: Int32, stderrTail: String)
-    /// The turn ran longer than its wall clock and was killed.
+    /// The turn ran longer than its wall clock and was killed by the engine (also after an early `result` with background
+    /// work still pending).
     case timedOut
-    /// The process was stopped (SIGTERM, or killed by the engine) before the turn finished: either it ended with no result
+    /// The process was stopped from outside (SIGTERM, a kill) before the turn finished: either it ended with no result
     /// after a SIGTERM, or it was killed with background work (`pendingTasks`) still running, even if an early `result`
-    /// had been printed. Never counted against the agent.
+    /// had been printed. Never counted against the agent. The engine's own wall-clock kill is `timedOut`.
     case interrupted(pendingTasks: Int)
 }
 
@@ -178,8 +179,11 @@ public struct ClaudeProcessRunner: TurnRunning {
         // The last result is authoritative even if the process lingered past it and had to be killed ...
         if sawResult, !state.hasPendingWork { return }
         // ... unless background work (a workflow, a sub-agent) was still running: an early result then is not the end
-        // of the turn. A process that exited by itself (status 0) is the CLI's own decision and stands.
-        if sawResult, timedOut.isSet || status != 0 { throw TurnError.interrupted(pendingTasks: state.pendingTasks.count) }
+        // of the turn. A process that exited by itself (status 0) is the CLI's own decision and stands. The engine's own wall
+        // clock is a timeout (failed, backed off, budgeted), never an interruption: an interruption has no backoff and would
+        // re-run the turn on every tick for a whole wall clock. Only a kill from outside is an interruption.
+        if sawResult, timedOut.isSet { throw TurnError.timedOut }
+        if sawResult, status != 0 { throw TurnError.interrupted(pendingTasks: state.pendingTasks.count) }
         if sawResult { return }
         if timedOut.isSet { throw TurnError.timedOut }
         // SIGTERM from outside (a shutdown, a kill) ends the turn without a result; the agent is not at fault.
