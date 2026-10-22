@@ -217,7 +217,10 @@ extension CompanyTools {
         guard let sprint = try store.sprint(companyId: companyId, ref: ref) else { throw ToolError(message: "no sprint \(Store.flat(ref, max: 40))") }
         let closed = try store.closeSprint(sprintId: sprint.id, by: .agent(agentId), summary: try text(args, "summary"),
                                            lessons: try optionalText(args, "lessons") ?? "")
-        let head = closed.summary?.components(separatedBy: "\n").first ?? closed.name
+        let head = closed.sprint.summary?.components(separatedBy: "\n").first ?? closed.sprint.name
+        if let problem = closed.notesProblem {
+            return head + " Posted to #general. The lessons could not be added to the team's notes (\(problem)); they are kept in the activity log."
+        }
         return head + " Posted to #general; lessons added to the team's notes."
     }
 

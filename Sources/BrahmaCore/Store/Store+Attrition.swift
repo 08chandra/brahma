@@ -166,6 +166,7 @@ extension Store {
                 }
             } catch {
                 // A workspace that cannot be written never keeps an agent from being killed.
+                if let refused = error as? UnsafeEngineFile { try alertEngineFile(db: db, refused, companyId: company.id, now: now) }
                 try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .error,
                                   text: "could not write the auto hand-off of \(item.key): \(error)", createdAt: now).insert(db)
             }

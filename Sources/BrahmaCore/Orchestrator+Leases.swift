@@ -124,7 +124,7 @@ extension Orchestrator {
             do {
                 try store.prepareRepo(company: company)
                 try git.addWorktree(key: item.key)
-                try ProgressFile.ensure(workspace: ws, item: item)
+                try store.ensureProgressFile(workspace: ws, item: item)
                 try store.ensureCheckSnapshot(item: item, workspace: ws)
             } catch {
                 if let e = error as? WorkError, e.message == Store.mainChangedMessage {

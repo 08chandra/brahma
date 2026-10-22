@@ -6,17 +6,36 @@ public enum NotesFile {
     public static let cap = 8192
     static let trimmedPrefix = "_Earlier notes trimmed: "
 
+    /// What is read of an existing notes file (a file grown past this by hand is read up to here).
+    static let readLimit = 64 * 1024
+    static let directory = ".brahma/notes"
+
     /// The notes file of a team, or of the whole company for `nil`.
     public static func path(workspace: URL, team: String?) -> URL {
-        let name = (team ?? "company").lowercased().filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
-        return workspace.appending(path: ".brahma/notes/\(name.isEmpty ? "company" : name).md")
+        workspace.appending(path: "\(directory)/\(fileName(team: team))")
     }
 
-    /// Appends `## <heading>` and `lines`, then trims to `cap`. `date` and `timeZone` date the trim line (the owner's zone).
-    public static func append(path: URL, heading: String, lines: [String], date: Date = Date(), timeZone: TimeZone = .current) throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
+    static func fileName(team: String?) -> String {
+        let name = (team ?? "company").lowercased().filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        return "\(name.isEmpty ? "company" : name).md"
+    }
+
+    /// Appends `## <heading>` and `lines` to the team's notes file, then trims to `cap`. `date` and `timeZone` date the trim
+    /// line (the owner's zone). Written through `EngineFiles`: a link or odd file in its place is never read or followed but
+    /// replaced by a fresh notes file, and returned so the caller can alert; a notes directory that is a link throws.
+    @discardableResult
+    public static func append(workspace: URL, team: String?, heading: String, lines: [String], date: Date = Date(),
+                              timeZone: TimeZone = .current) throws -> UnsafeEngineFile? {
+        let name = fileName(team: team)
+        var found: UnsafeEngineFile?
+        var existing = ""
+        do {
+            if let data = try EngineFiles.read(workspace: workspace, dir: directory, name: name, limit: readLimit) {
+                existing = String(decoding: data, as: UTF8.self)
+            }
+        } catch let problem as UnsafeEngineFile where problem.path.hasSuffix("/" + name) {
+            found = problem
+        }
         var (trimmed, preamble, sections) = parse(existing)
         let clean = lines.map { Store.stripControls($0) }
         sections.append((["## " + Store.flat(heading, max: 200)] + clean).joined(separator: "\n") + "\n")
@@ -52,7 +71,8 @@ public enum NotesFile {
             sections[sections.count - 1] = kept + "…\n"
             text = render(trimmed)
         }
-        try text.write(to: path, atomically: true, encoding: .utf8)
+        let replaced = try EngineFiles.replace(Data(text.utf8), workspace: workspace, dir: directory, name: name)
+        return found ?? replaced
     }
 
     /// (sections trimmed so far, text before the first section, the sections each with their trailing newline).

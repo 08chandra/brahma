@@ -117,10 +117,17 @@ extension Store {
         let contents = try source.map { try git.blobs(at: $0, paths: Array(candidates.prefix(200)), limit: CheckScripts.maxFiles) } ?? [:]
         let paths = CheckPaths(workspace: workspace)
         let dir = paths.snapshotDir(key: item.key, revision: item.checkRevision)
-        let manifest = try CheckScripts.write(contents: contents, to: dir)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        try encoder.encode(manifest).write(to: paths.manifest(key: item.key, revision: item.checkRevision))
+        let relative = CheckPaths.snapshotRelative(key: item.key, revision: item.checkRevision)
+        let manifest: [String: String]
+        do {
+            manifest = try CheckScripts.write(contents: contents, workspace: workspace, dir: relative)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+            try EngineFiles.replace(try encoder.encode(manifest), workspace: workspace, dir: relative, name: "manifest.json")
+        } catch let refused as UnsafeEngineFile {
+            alertEngineFile(refused, companyId: item.companyId)
+            throw refused
+        }
         try saveCheckSnapshot(itemId: item.id, revision: item.checkRevision, dir: dir.path, manifest: manifest)
     }
 

@@ -245,13 +245,13 @@ extension Store {
         return members.first { catalog.template(role: $0.role, pack: company.packId).kind == .manager }
     }
 
-    /// Work turns of the sprint's team (every agent for a company sprint) since it started. Infrastructure failures, reset
-    /// sessions, usage limits and review turns don't count.
+    /// Work turns of the sprint's team (every agent for a company sprint) since it started. Infrastructure failures don't
+    /// count (nor turns that did not finish, such as usage-limited ones, nor review turns); a turn whose session was reset does.
     static func sprintTeamTurns(_ db: Database, _ sprint: Sprint) throws -> Int {
         guard let started = sprint.startedAt else { return 0 }
         var sql = """
             SELECT COUNT(*) FROM turn JOIN agent ON agent.id = turn.agentId
-            WHERE turn.companyId = ? AND turn.kind = 'work' AND turn.infra = 0 AND turn.sessionResetReason IS NULL
+            WHERE turn.companyId = ? AND turn.kind = 'work' AND turn.infra = 0
               AND turn.outcome IN ('succeeded', 'failed') AND turn.startedAt >= ?
             """
         var args: [DatabaseValueConvertible] = [sprint.companyId, started]
@@ -369,7 +369,7 @@ extension Store {
     /// `"<name> closed: <d> of <t> items done. Carried over: <KEYs|none>."` and the agent's text, posts that to #general,
     /// carries unfinished items over (their `sprintId` cleared) and appends the lessons to the team's notes file.
     @discardableResult
-    public func closeSprint(sprintId: String, by sender: Sender, summary: String, lessons: String, now: Date = Store.now()) throws -> Sprint {
+    public func closeSprint(sprintId: String, by sender: Sender, summary: String, lessons: String, now: Date = Store.now()) throws -> SprintClose {
         let agentSummary = try Store.limitedText(summary, Store.maxSprintSummary, "the summary")
         let lessonText = try Store.limitedText(lessons, Store.maxSprintLessons, "the lessons")
         let (sprint, workspace) = try writer.write { db -> (Sprint, String) in
@@ -390,8 +390,10 @@ extension Store {
             sprint.summary = agentSummary.map { head + "\n" + $0 } ?? head
             try sprint.update(db)
             try releaseSprintItems(db, sprint, text: "carried over from \(sprint.name)", toBacklog: false, now: now)
+            // The agent's words are quoted, never mixed into the engine's text.
+            let post = agentSummary.map { head + "\n" + ReviewDigest.quote($0, maxChars: Store.maxSprintSummary) } ?? head
             _ = try MessageRouter(store: self).post(db: db, companyId: sprint.companyId, channel: "general", from: .system,
-                                                    text: sprint.summary ?? head, now: now)
+                                                    text: post, now: now)
             try ActivityEvent(companyId: sprint.companyId, agentId: actor.id == "owner" ? nil : actor.id, turnId: nil, kind: .work,
                               text: head, createdAt: now).insert(db)
             return (sprint, company.workspacePath)
@@ -405,10 +407,34 @@ extension Store {
                 }
             if !lines.isEmpty {
                 let zone = ownerTimeZone()
-                try NotesFile.append(path: NotesFile.path(workspace: URL(fileURLWithPath: workspace), team: sprint.team),
-                                     heading: "\(sprint.name) retro — \(NotesFile.day(now, zone))", lines: lines, date: now, timeZone: zone)
+                let ws = URL(fileURLWithPath: workspace, isDirectory: true)
+                do {
+                    if let replaced = try NotesFile.append(workspace: ws, team: sprint.team, heading: "\(sprint.name) retro — \(NotesFile.day(now, zone))",
+                                                           lines: lines, date: now, timeZone: zone) {
+                        alertEngineFile(replaced, companyId: sprint.companyId, now: now)
+                    }
+                } catch {
+                    // The sprint is closed already: the lessons go to the activity log instead of being lost.
+                    if let refused = error as? UnsafeEngineFile { alertEngineFile(refused, companyId: sprint.companyId, now: now) }
+                    let problem = Store.flat("\(error)", max: 400)
+                    let path = NotesFile.path(workspace: ws, team: sprint.team).path
+                    try? writer.write { db in
+                        try ActivityEvent(companyId: sprint.companyId, agentId: nil, turnId: nil, kind: .error,
+                                          text: "could not add the lessons of \(sprint.name) to \(path): \(problem). The lessons:\n"
+                                            + ReviewDigest.quote(lines.joined(separator: "\n"), maxChars: Store.maxSprintLessons * 2),
+                                          createdAt: now).insert(db)
+                    }
+                    return SprintClose(sprint: sprint, notesProblem: problem)
+                }
             }
         }
-        return sprint
+        return SprintClose(sprint: sprint, notesProblem: nil)
     }
+}
+
+/// What `closeSprint` did: the closed sprint, and why the lessons could not be added to the notes file (they are then in the
+/// activity log) when that failed.
+public struct SprintClose: Sendable {
+    public var sprint: Sprint
+    public var notesProblem: String?
 }

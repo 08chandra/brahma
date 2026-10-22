@@ -38,7 +38,9 @@ extension Store {
     /// Writes a hand-off for the item. Only the lease holder, the assignee, the owner or the engine may.
     @discardableResult
     public func writeHandoff(itemId: String, by sender: Sender, draft: HandoffDraft, now: Date = Store.now()) throws -> Handoff {
-        try writer.write { db in
+        var companyId: String?
+        do { return try writer.write { db in
+            companyId = try WorkItem.fetchOne(db, key: itemId)?.companyId
             guard let item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
             let actor = try resolveActor(db, sender, companyId: item.companyId)
             if !actor.privileged {
@@ -48,6 +50,10 @@ extension Store {
                 }
             }
             return try writeHandoff(db: db, item: item, authorId: actor.id, authorHandle: actor.handle, draft: draft, auto: false, now: now)
+        } } catch let refused as UnsafeEngineFile {
+            // The transaction is gone; the alert goes in its own.
+            if let companyId { alertEngineFile(refused, companyId: companyId, now: now) }
+            throw refused
         }
     }
 
@@ -75,18 +81,11 @@ extension Store {
         }
 
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-        let dir = workspace.appending(path: ".brahma/handoffs/\(item.key)", directoryHint: .isDirectory)
         let stamp = DateFormatter()
         stamp.locale = Locale(identifier: "en_US_POSIX")
         stamp.timeZone = TimeZone(identifier: "UTC")
         stamp.dateFormat = "yyyyMMdd-HHmmss"
         let base = "\(stamp.string(from: now))-\(Self.handleForFile(authorHandle))"
-        var file = dir.appending(path: base + ".md")
-        var n = 2
-        while FileManager.default.fileExists(atPath: file.path) {
-            file = dir.appending(path: "\(base)-\(n).md")
-            n += 1
-        }
 
         func list(_ xs: [String]) -> String {
             xs.isEmpty ? "- (none)" : xs.map { entry in
@@ -126,8 +125,11 @@ extension Store {
         \(list(draft.fileRefs))
 
         """
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try text.write(to: file, atomically: true, encoding: .utf8)
+        // A new file under a real directory, never through a link (a link on a name it would take is skipped and alerted on).
+        let written = try EngineFiles.createUnique(Data(text.utf8), workspace: workspace, dir: ".brahma/handoffs/\(item.key)",
+                                                   base: base, ext: "md")
+        let file = written.url
+        for problem in written.skipped { try alertEngineFile(db: db, problem, companyId: item.companyId, now: now) }
 
         let handoff = Handoff(id: UUID().uuidString, companyId: item.companyId, itemId: item.id, authorId: authorId,
                               toAgentId: draft.toAgentId, path: file.path, auto: auto, createdAt: now)

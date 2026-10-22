@@ -268,16 +268,19 @@ import GRDB
         let w2 = try W()
         try w2.approveGates()
         let s2 = try w2.start([try w2.item("B").key])
-        func turns(_ n: Int, _ agent: Agent, infra: Bool = false, kind: TurnKind = .work) throws {
+        func turns(_ n: Int, _ agent: Agent, infra: Bool = false, kind: TurnKind = .work, reset: Bool = false) throws {
             try w2.store.writer.write { db in
                 for _ in 0..<n {
-                    try Turn(id: UUID().uuidString, agentId: agent.id, companyId: w2.company.id, startedAt: w2.now.addingTimeInterval(1),
-                             endedAt: w2.now.addingTimeInterval(2), outcome: infra ? .failed : .succeeded, summary: nil, costUSD: nil,
-                             infra: infra, kind: kind).insert(db)
+                    var t = Turn(id: UUID().uuidString, agentId: agent.id, companyId: w2.company.id, startedAt: w2.now.addingTimeInterval(1),
+                                 endedAt: w2.now.addingTimeInterval(2), outcome: infra ? .failed : .succeeded, summary: nil, costUSD: nil,
+                                 infra: infra, kind: kind)
+                    if reset { t.sessionResetReason = "size" }
+                    try t.insert(db)
                 }
             }
         }
-        try turns(150, w2.eng1); try turns(49, w2.eng2); try turns(30, w2.eng2, infra: true); try turns(30, w2.ceo)
+        // A turn whose session was reset still did work: only infra turns are left out.
+        try turns(148, w2.eng1); try turns(2, w2.eng1, reset: true); try turns(49, w2.eng2); try turns(30, w2.eng2, infra: true); try turns(30, w2.ceo)
         try turns(10, w2.eng1, kind: .review)
         #expect(try w2.store.enforceTimeboxes(now: w2.now) == 0)
         try turns(1, w2.mgr)
@@ -341,12 +344,15 @@ import GRDB
         }
         let closed = try w.store.closeSprint(sprintId: sprint.id, by: .agent(w.mgr.id), summary: "Login works.\nSignup slipped.",
                                              lessons: "Smaller stories\n- Write checks first", now: w.now)
-        #expect(closed.status == .closed && closed.closedAt == w.now)
-        #expect(closed.summary == "Sprint 1 closed: 1 of 2 items done. Carried over: \(b.key).\nLogin works.\nSignup slipped.")
+        #expect(closed.sprint.status == .closed && closed.sprint.closedAt == w.now)
+        #expect(closed.notesProblem == nil)
+        #expect(closed.sprint.summary == "Sprint 1 closed: 1 of 2 items done. Carried over: \(b.key).\nLogin works.\nSignup slipped.")
         #expect(try w.fresh(b).sprintId == nil)
         #expect(try w.fresh(a).sprintId == sprint.id)
+        // The agent's words are quoted in the system post.
         let general = try #require(try w.posts("general").last)
-        #expect(general.senderId == "system" && general.text == closed.summary)
+        #expect(general.senderId == "system"
+                && general.text == "Sprint 1 closed: 1 of 2 items done. Carried over: \(b.key).\n    | Login works.\n    | Signup slipped.")
         #expect(try w.store.events(afterId: 0, companyId: w.company.id).contains { $0.kind == .work && $0.text == "Sprint 1 closed: 1 of 2 items done. Carried over: \(b.key)." })
         let notes = try String(contentsOf: NotesFile.path(workspace: URL(fileURLWithPath: w.company.workspacePath), team: "core"), encoding: .utf8)
         // 1_800_000_000 is 2027-01-15 08:00 UTC, 13:30 in Kolkata.
@@ -376,12 +382,12 @@ import GRDB
 
     @Test func notesFileIsCapped() throws {
         let dir = try tempDir()
-        let path = dir.appending(path: "notes/core.md")
+        let path = NotesFile.path(workspace: dir, team: "core")
         let date = Date(timeIntervalSince1970: 1_800_000_000)
         let utc = TimeZone(identifier: "UTC")!
         let line = String(repeating: "x", count: 99)
         for n in 1...30 {
-            try NotesFile.append(path: path, heading: "S\(n)", lines: Array(repeating: line, count: 5), date: date, timeZone: utc)
+            try NotesFile.append(workspace: dir, team: "core", heading: "S\(n)", lines: Array(repeating: line, count: 5), date: date, timeZone: utc)
         }
         let text = try String(contentsOf: path, encoding: .utf8)
         #expect(text.utf8.count <= NotesFile.cap)
@@ -392,13 +398,55 @@ import GRDB
         let kept = text.components(separatedBy: "\n").filter { $0.hasPrefix("## ") }.count
         #expect(first == "_Earlier notes trimmed: \(30 - kept) sections removed on 2027-01-15._")
         // One oversize section is cut at a line boundary.
-        let big = dir.appending(path: "big.md")
-        try NotesFile.append(path: big, heading: "Huge", lines: Array(repeating: line, count: 200), date: date, timeZone: utc)
+        let big = NotesFile.path(workspace: dir, team: "big")
+        try NotesFile.append(workspace: dir, team: "big", heading: "Huge", lines: Array(repeating: line, count: 200), date: date, timeZone: utc)
         let cut = try String(contentsOf: big, encoding: .utf8)
         #expect(cut.utf8.count <= NotesFile.cap)
         #expect(cut.hasPrefix("## Huge\n"))
         #expect(cut.hasSuffix("\n…\n"))
         #expect(cut.components(separatedBy: "\n").allSatisfy { $0.isEmpty || $0 == "…" || $0 == line || $0 == "## Huge" })
+    }
+
+    @Test func notesNeverWrittenThroughALink() throws {
+        let w = try W()
+        try w.approveGates()
+        let fm = FileManager.default
+        let ws = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
+        let outside = try tempDir()
+        let secret = outside.appending(path: "secret.md")
+        try "outside\n".write(to: secret, atomically: true, encoding: .utf8)
+        let notes = NotesFile.path(workspace: ws, team: "core")
+        try fm.createDirectory(at: notes.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: notes, withDestinationURL: secret)
+        let s1 = try w.start([try w.item("A").key])
+        let closed = try w.store.closeSprint(sprintId: s1.id, by: .agent(w.mgr.id), summary: "ok", lessons: "Keep it small", now: w.now)
+        // The outside file is untouched (and never read into the notes); a fresh notes file takes the link's place.
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "outside\n")
+        var st = stat()
+        #expect(lstat(notes.path, &st) == 0 && st.st_mode & S_IFMT == S_IFREG)
+        #expect(try String(contentsOf: notes, encoding: .utf8) == "## Sprint 1 retro — \(NotesFile.day(w.now, w.store.ownerTimeZone()))\n- Keep it small\n")
+        #expect(closed.notesProblem == nil)
+        let alerts = try w.store.writer.read { db in
+            try Ask.filter(Column("companyId") == w.company.id && Column("kind") == AskKind.engineAlert).fetchAll(db)
+        }
+        #expect(alerts.count == 1 && alerts[0].title.contains("core.md"), "\(alerts.map(\.title))")
+
+        // A notes directory that is a link is refused: the close still stands, and the lessons are kept in the log.
+        try fm.removeItem(at: notes.deletingLastPathComponent())
+        try fm.createSymbolicLink(at: notes.deletingLastPathComponent(), withDestinationURL: outside)
+        let s2 = try w.start([try w.item("B").key])
+        let second = try w.store.closeSprint(sprintId: s2.id, by: .agent(w.mgr.id), summary: "ok", lessons: "Write checks first", now: w.now)
+        #expect(second.sprint.status == .closed)
+        #expect(second.notesProblem?.contains("symbolic link") == true, "\(second.notesProblem ?? "nil")")
+        #expect(try fm.contentsOfDirectory(atPath: outside.path) == ["secret.md"])
+        let errors = try w.store.writer.read { db in
+            try ActivityEvent.filter(Column("companyId") == w.company.id && Column("kind") == ActivityKind.error.rawValue).fetchAll(db).map(\.text)
+        }
+        #expect(errors.contains { $0.contains("Sprint 2") && $0.contains("    | - Write checks first") }, "\(errors)")
+        let reply = try CompanyTools(store: w.store, companyId: w.company.id, agentId: w.mgr.id)
+            .call(name: "close_sprint", arguments: ["sprint": .string(try w.start([try w.item("C").key]).name), "summary": .string("ok"),
+                                                    "lessons": .string("More tests")])
+        #expect(reply.contains("could not be added to the team's notes"), "\(reply)")
     }
 
     // MARK: Rescind
