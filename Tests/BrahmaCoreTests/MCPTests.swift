@@ -46,13 +46,14 @@ private struct MCPWorld {
     #expect(r["id"] as? String == "abc-1")
 }
 
-@Test func toolsListHasExactlySevenTools() throws {
+@Test func toolsListHasBaseAndInboxTools() throws {
     let w = try MCPWorld()
     let r = try w.rpc(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
     let tools = try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
     #expect(Set(tools.compactMap { $0["name"] as? String }) ==
-            ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"])
-    #expect(tools.count == 7)
+            ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked",
+             "propose_decision", "request_from_owner", "decide", "request_mode"])
+    #expect(tools.count == 11)
     for t in tools { #expect((t["inputSchema"] as? [String: Any])?["type"] as? String == "object") }
 }
 

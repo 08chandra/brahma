@@ -109,6 +109,7 @@ private struct ActivityRow: View {
         case .usage: "gauge.with.dots.needle.67percent"
         case .error: "exclamationmark.triangle"
         case .work: "checklist"
+        case .approval: "checkmark.seal"
         }
     }
 
@@ -122,6 +123,7 @@ private struct ActivityRow: View {
         case .usage: BrahmaTheme.warning
         case .error: BrahmaTheme.danger
         case .work: BrahmaTheme.accent
+        case .approval: BrahmaTheme.warning
         }
     }
 }

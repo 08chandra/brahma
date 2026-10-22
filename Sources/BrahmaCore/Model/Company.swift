@@ -21,4 +21,6 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var packVersion: Int = 1
     /// Share of the weekly allowance kept for the owner; nil means the owner-wide setting (`1 - weeklyShare`).
     public var ownerReserve: Double? = nil
+    /// How much the owner is asked (Task 11a); changing it never touches asks already waiting.
+    public var autonomy: AutonomyPreset = .important
 }

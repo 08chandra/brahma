@@ -256,7 +256,7 @@ public actor Orchestrator {
             var sent = agent
             sent.model = ModelPolicy.resolve(
                 agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
-                mode: company.usageMode, context: ModelContext())
+                mode: company.usageMode, context: (try? store.askModelContext(agentId: agent.id)) ?? ModelContext())
             let turnToken = try store.issueTurnCredential(turnId: turn.id)
             let request = TurnRequest(
                 agent: sent, company: company,

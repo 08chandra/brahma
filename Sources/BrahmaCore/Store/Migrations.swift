@@ -273,6 +273,64 @@ enum Migrations {
             try db.create(index: "workNotice_agent_pending", on: "workNotice", columns: ["agentId", "deliveredTurnId"])
             try db.alter(table: "agent") { t in t.add(column: "lastNoticeWakeActive", .double) }
         }
+        m.registerMigration("v3-asks") { db in
+            try db.alter(table: "company") { t in t.add(column: "autonomy", .text).notNull().defaults(to: "important") }
+            try db.alter(table: "agent") { t in t.add(column: "pausedActive", .double) }
+            try db.create(table: "ask") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("kind", .text).notNull()
+                t.column("category", .text)
+                t.column("risk", .text).notNull()
+                t.column("requesterId", .text).notNull()
+                t.column("itemId", .text)
+                t.column("title", .text).notNull()
+                t.column("summary", .text).notNull().defaults(to: "")
+                t.column("payload", .text)
+                t.column("detailsHash", .text)
+                t.column("proposedGrant", .text)
+                t.column("status", .text).notNull()
+                t.column("internalApproverId", .text)
+                t.column("internalNote", .text)
+                t.column("internalDecidedAt", .datetime)
+                t.column("ownerNote", .text)
+                t.column("ownerAnswer", .text)
+                t.column("ownerDecidedAt", .datetime)
+                t.column("decidedBy", .text)
+                t.column("fyi", .boolean).notNull().defaults(to: false)
+                t.column("acknowledgedAt", .datetime)
+                t.column("subjectId", .text)
+                t.column("supersedesId", .text)
+                t.column("escalatedAt", .datetime)
+                t.column("rescindedAt", .datetime)
+                t.column("createdActive", .double).notNull().defaults(to: 0)
+                t.column("statusSinceActive", .double).notNull().defaults(to: 0)
+                t.column("expiresActive", .double)
+                t.column("remindCount", .integer).notNull().defaults(to: 0)
+                t.column("notifiedAt", .datetime)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                // Decision brief: a repeat proposal with the same requestId returns the existing ask.
+                t.column("requestId", .text)
+                t.column("decisionClass", .text).notNull().defaults(to: "taste")
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "ask_company_status", on: "ask", columns: ["companyId", "status"])
+            // Assignee requests for a stronger work mode (W6): dedupe by requestId and rate limiting.
+            try db.create(table: "modeRequest") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull()
+                t.column("agentId", .text).notNull()
+                t.column("requestId", .text)
+                t.column("mode", .text).notNull()
+                t.column("turnId", .text)
+                t.column("createdActive", .double).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "modeRequest_item", on: "modeRequest", columns: ["itemId", "id"])
+        }
         return m
     }
 }

@@ -6,7 +6,7 @@ public enum CompanyToolNames {
     public static let base = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"]
     public static let work = ["list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency",
                               "comment_work_item", "claim_lease", "release_lease", "submit_for_review", "write_handoff",
-                              "propose_decision", "request_from_owner", "escalate_decision"]
+                              "propose_decision", "request_from_owner", "escalate_decision", "request_mode"]
     public static let lead = ["plan_sprint", "close_sprint", "confirm_spec"]
     public static let executive = ["decide"]
     /// Review turns only, regardless of role.

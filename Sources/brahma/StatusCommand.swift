@@ -16,6 +16,7 @@ struct Status: ParsableCommand {
                 header += "  7D \(pace.text) (reserve \(Int((reserve * 100).rounded()))%)"
             }
             print(safe(header))
+            print("  inbox: \(try store.ownerWaitingCount(companyId: c.id)) waiting")
             for a in agents {
                 var parts = ["  @\(a.name)", a.state.rawValue]
                 if a.paused { parts.append("paused") }

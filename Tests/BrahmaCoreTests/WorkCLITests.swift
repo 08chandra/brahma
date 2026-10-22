@@ -143,6 +143,116 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try brahma(["items", "add", "Acme", "--title", "x"], home: bare.url).status != 0)
     }
 
+    // MARK: Inbox
+
+    private let devEnv = ["BRAHMA_DEV": "1"]
+
+    @Test func inboxApproveAnswerRescindFlow() throws {
+        // The rescind step lands with Task 11b; this covers propose, decide, approve, answer, replan and autonomy.
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        #expect(try brahma(["inbox", "Acme"], home: home).stdout == "(inbox is empty)\n")
+        let doc = home.appending(path: "ws/acme/docs/arch.md")
+        try FileManager.default.createDirectory(at: doc.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "v1".write(to: doc, atomically: true, encoding: .utf8)
+        let p = try brahma(["dev", "propose", "Acme", "--by", "eng-1", "--kind", "architecture", "--title", "Layers\u{1B}[2J",
+                            "--summary", "how we split it", "--document", "docs/arch.md"], home: home, env: devEnv)
+        #expect(p.status == 0, "\(p.stderr)"); #expect(p.stdout.hasPrefix("A-1 pendingInternal"))
+        // Not yet in the owner's inbox: the internal approver has it.
+        #expect(try brahma(["inbox", "Acme"], home: home).stdout == "(inbox is empty)\n")
+        let d = try brahma(["dev", "decide", "Acme", "A-1", "--by", "cto", "--approve", "--note", "ok"], home: home, env: devEnv)
+        #expect(d.status == 0, "\(d.stderr)"); #expect(d.stdout.hasPrefix("A-1 pendingOwner"))
+        let inbox = try brahma(["inbox", "Acme"], home: home)
+        #expect(inbox.status == 0, "\(inbox.stderr)")
+        #expect(inbox.stdout.contains("A-1  architecture  -  medium  from @eng-1  Layers"))
+        #expect(!inbox.stdout.contains("\u{1B}")); #expect(inbox.stdout.contains("docs/arch.md"))
+        #expect(!inbox.stdout.contains("CHANGED SINCE PROPOSED"))
+        #expect(try brahma(["status"], home: home).stdout.contains("inbox: 1 waiting"))
+        // The document changes after the proposal.
+        try "v2".write(to: doc, atomically: true, encoding: .utf8)
+        #expect(try brahma(["inbox", "Acme"], home: home).stdout.contains("CHANGED SINCE PROPOSED"))
+        let refused = try brahma(["approve", "Acme", "A-1"], home: home)
+        #expect(refused.status != 0)
+        #expect(refused.stderr.contains("A-1's document changed since it was proposed; read it again and approve with --ack-changed"))
+        let ok = try brahma(["approve", "Acme", "A-1", "--ack-changed", "--note", "go"], home: home)
+        #expect(ok.status == 0, "\(ok.stderr)"); #expect(ok.stdout.contains("A-1 approved"))
+        #expect(try brahma(["approve", "Acme", "A-1"], home: home).stderr.contains("A-1 is already approved"))
+        #expect(try brahma(["inbox", "Acme"], home: home).stdout == "(inbox is empty)\n")
+        let all = try brahma(["inbox", "Acme", "--all"], home: home).stdout
+        #expect(all.contains("A-1") && all.contains("approved"))
+        // A question is answered.
+        let q = try brahma(["dev", "request", "Acme", "--by", "eng-1", "--title", "Database?", "--question", "Postgres or SQLite?"],
+                           home: home, env: devEnv)
+        #expect(q.status == 0, "\(q.stderr)")
+        let qi = try brahma(["inbox", "Acme"], home: home).stdout
+        #expect(qi.contains("A-2  info  -  low  from @eng-1  Database?")); #expect(qi.contains("Postgres or SQLite?"))
+        #expect(try brahma(["approve", "Acme", "A-2"], home: home).status != 0)
+        let ans = try brahma(["answer", "Acme", "A-2", "SQLite"], home: home)
+        #expect(ans.status == 0, "\(ans.stderr)"); #expect(ans.stdout.contains("A-2 answered"))
+        #expect(try brahma(["answer", "Acme", "A-2", "again"], home: home).stderr.contains("A-2 is already answered"))
+        #expect(try brahma(["answer", "Acme", "A-9", "x"], home: home).stderr.contains("no ask A-9"))
+        // Re-plan and reject.
+        for n in 3...4 {
+            #expect(try brahma(["dev", "propose", "Acme", "--by", "eng-1", "--kind", "architecture", "--title", "T\(n)", "--summary", "s"],
+                               home: home, env: devEnv).status == 0)
+        }
+        let replan = try brahma(["approve", "Acme", "A-3", "--replan", "split it up"], home: home)
+        #expect(replan.status == 0, "\(replan.stderr)"); #expect(replan.stdout.contains("A-3 rejected"))
+        let reject = try brahma(["approve", "Acme", "A-4", "--reject", "--note", "no"], home: home)
+        #expect(reject.status == 0, "\(reject.stderr)"); #expect(reject.stdout.contains("A-4 rejected"))
+        // Autonomy presets, and the on/off alias.
+        let auto = try brahma(["company", "autonomy", "Acme", "auto"], home: home)
+        #expect(auto.status == 0, "\(auto.stderr)"); #expect(auto.stdout.contains("autonomy: auto"))
+        #expect(try brahma(["company", "autonomy", "Acme", "nonsense"], home: home).status != 0)
+        #expect(try brahma(["company", "auto", "Acme", "off"], home: home).stdout.contains("autonomy: important"))
+        #expect(try brahma(["company", "auto", "Acme", "on"], home: home).stdout.contains("autonomy: auto"))
+        // A sprint plan is only an FYI under auto.
+        #expect(try brahma(["dev", "propose", "Acme", "--by", "eng-1", "--kind", "sprintPlan", "--title", "S1", "--summary", "s"],
+                           home: home, env: devEnv).status == 0)
+        let fyi = try brahma(["dev", "decide", "Acme", "A-5", "--by", "ceo", "--approve", "--note", "ok"], home: home, env: devEnv)
+        #expect(fyi.stdout.hasPrefix("A-5 approved"), "\(fyi.stdout) \(fyi.stderr)")
+        #expect(try brahma(["inbox", "Acme"], home: home).stdout.contains("A-5") == false)
+        #expect(try brahma(["inbox", "Acme", "--all"], home: home).stdout.contains("FYI"))
+    }
+
+    @Test func devRequiresFlag() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let args = ["dev", "propose", "Acme", "--by", "eng-1", "--kind", "prd", "--title", "T", "--summary", "s"]
+        let no = try brahma(args, home: home)
+        #expect(no.status != 0); #expect(no.stderr.contains("BRAHMA_DEV=1"))
+        #expect(try brahma(args, home: home, env: ["BRAHMA_DEV": "0"]).status != 0)
+        #expect(try brahma(args, home: home, env: devEnv).status == 0)
+        // The flag alone is not enough: it still needs the owner key.
+        let bare = try OwnerTestHome(initOwner: false); defer { withExtendedLifetime(bare) {} }
+        #expect(try brahma(args, home: bare.url, env: devEnv).status != 0)
+        // And it is hidden from the help.
+        #expect(try brahma(["--help"], home: home).stdout.contains(" dev ") == false)
+    }
+
+    @Test func ownerInboxCommandsRefuseInsideAgentTurn() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        #expect(try brahma(["dev", "propose", "Acme", "--by", "eng-1", "--kind", "prd", "--title", "T", "--summary", "s"],
+                           home: home, env: devEnv).status == 0)
+        let agentEnv = ["BRAHMA_AGENT_ID": "a1", "BRAHMA_DEV": "1"]
+        let cmds: [[String]] = [
+            ["approve", "Acme", "A-1"], ["approve", "Acme", "A-1", "--reject"], ["answer", "Acme", "A-1", "x"],
+            ["company", "autonomy", "Acme", "auto"], ["company", "auto", "Acme", "on"],
+            ["dev", "propose", "Acme", "--by", "eng-1", "--kind", "prd", "--title", "T", "--summary", "s"],
+            ["dev", "decide", "Acme", "A-1", "--by", "ceo", "--approve", "--note", "x"],
+        ]
+        for c in cmds {
+            let r = try brahma(c, home: home, env: agentEnv)
+            #expect(r.status != 0, "\(c)"); #expect(r.stderr.contains("owner commands can't run inside an agent turn"), "\(c): \(r.stderr)")
+        }
+        // Reading the inbox is fine.
+        #expect(try brahma(["inbox", "Acme"], home: home, env: agentEnv).status == 0)
+    }
+
     @Test func runRefusesWithoutPassingProbe() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url

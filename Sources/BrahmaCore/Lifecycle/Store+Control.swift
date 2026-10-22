@@ -12,6 +12,11 @@ extension Store {
             guard let current = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
             guard current.state != .killed else { return current }
             _ = try Agent.filter(key: agentId).updateAll(db, Column("paused").set(to: paused))
+            // The pause start in company-active time, for ask rerouting; cleared on wake.
+            if paused != current.paused || !paused {
+                let since: Double? = paused ? try Store.activeNow(db: db, companyId: current.companyId) : nil
+                _ = try Agent.filter(key: agentId).updateAll(db, Column("pausedActive").set(to: since))
+            }
             if paused {
                 if current.state == .ready || current.state == .blocked {
                     return try Store.transition(db: db, agentId: agentId, to: .sleeping, now: now)
