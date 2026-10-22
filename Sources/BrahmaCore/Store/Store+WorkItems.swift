@@ -689,6 +689,7 @@ extension Store {
     /// notices and debounced notices that are not yet due do not count.
     static func hasPendingWork(db: Database, agentId: String) throws -> Bool {
         if try hasPendingReview(db: db, agentId: agentId) { return true }
+        if try hasPendingAudit(db: db, agentId: agentId) { return true }
         let inbox = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM inboxItem WHERE agentId = ? AND deliveredTurnId IS NULL AND wakes = 1",
                                      arguments: [agentId]) ?? 0
         if inbox > 0 { return true }

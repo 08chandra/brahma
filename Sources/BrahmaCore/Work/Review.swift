@@ -132,3 +132,106 @@ public enum ReviewDigest {
         return f.string(from: date)
     }
 }
+
+/// Risk-tiered review (9c): which approved-by-the-engine items may skip the review turn, and how they are audited after.
+///
+/// An item skips its review turn only when every one of these holds: tier S, the engine's check passed (no flaky pass), no
+/// review flag, its change (measured by the engine from the engine-recorded base and from `main`'s merge base to the verified
+/// commit) is under `autoMergeMaxLines` lines with no binary file, it touches no sensitive path, and neither its assignee nor
+/// its lease holder has `fullReview`. Every `auditSampleEvery`-th auto-merge of a company is sampled; once per
+/// `auditInterval` company-active seconds up to `auditBatchMax` samples go to one batched audit turn.
+public enum ReviewPolicy {
+    public static let autoMergeMaxLines = 150
+    public static let auditSampleEvery = 4
+    public static let auditInterval: Double = 86_400
+    public static let auditBatchMax = 5
+    public static let autoApprovedNote = "auto-approved (tier S, small diff)"
+
+    /// Directories (`name/`, matched as any directory component), file names, and `*.ext` suffixes, matched case-insensitively
+    /// (the workspace file system usually is). Check-script files are sensitive as well (`isSensitive(_:checkScripts:)`).
+    public static let sensitivePatterns = [
+        ".github/", "migrations/", ".brahma/",
+        "Package.swift", "Package.resolved", "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+        "pnpm-lock.yaml", "Gemfile.lock", "Pipfile.lock", "poetry.lock", "composer.lock", "go.sum", "Makefile",
+        "*.lock", "*.sql",
+    ]
+
+    /// Whether a changed path (repository-relative, as git reports it) is one a human-grade review must see.
+    public static func isSensitive(_ path: String, checkScripts: Set<String> = []) -> Bool {
+        let lower = path.lowercased()
+        let parts = lower.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let name = parts.last else { return true }
+        if checkScripts.contains(where: { $0.lowercased() == lower }) { return true }
+        for pattern in sensitivePatterns.map({ $0.lowercased() }) {
+            if pattern.hasSuffix("/") {
+                if parts.dropLast().contains(String(pattern.dropLast())) { return true }
+            } else if pattern.hasPrefix("*.") {
+                if name.hasSuffix(String(pattern.dropFirst())) { return true }
+            } else if name == pattern {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+/// What the engine measured about a submitted change before deciding on auto-approval. Computed off the database
+/// transaction (it runs git); `finishVerification` re-checks every database condition and that `commit`/`base` still match.
+public struct AutoMergeAssessment: Sendable, Equatable {
+    public var commit: String
+    public var base: String
+    public var lines: Int
+    /// Why the item keeps its review turn; nil when the change qualifies.
+    public var reason: String?
+}
+
+/// The prompt of a batched audit turn: each sampled auto-merged item's spec and its merged diff, quoted.
+public enum AuditDigest {
+    public static let maxCriteria = 1500
+    public static let maxChangedFiles = 100
+
+    public static let instructions = "You are auditing with a clean context: these items were merged into main without a review "
+        + "turn (tier S, small diff, engine check passed). For each one, read the merged diff (and main as needed) and call audit "
+        + "with its key, ok true if the change is correct, within its acceptance criteria and safe, or ok false with concrete "
+        + "notes quoting the lines at fault. A failed audit means every later change by that author gets a full review."
+
+    public struct Entry: Sendable {
+        public var item: WorkItem
+        public var author: String?
+        public var mergedCommit: String?
+        public var nameStatus: (entries: [GitChange], truncated: Bool)
+        public var diff: (text: String, truncated: Bool)
+
+        public init(item: WorkItem, author: String?, mergedCommit: String?, nameStatus: (entries: [GitChange], truncated: Bool),
+                    diff: (text: String, truncated: Bool)) {
+            self.item = item; self.author = author; self.mergedCommit = mergedCommit; self.nameStatus = nameStatus; self.diff = diff
+        }
+    }
+
+    public static func render(entries: [Entry]) -> String {
+        var out: [String] = ["Audit of \(entries.count) auto-merged item\(entries.count == 1 ? "" : "s")"]
+        for e in entries {
+            let item = e.item
+            out.append("")
+            out.append("Item \(item.key) (\(ReviewDigest.flat(item.type.rawValue, max: 40)), tier \(item.tier.label)): "
+                       + ReviewDigest.flat(item.title, max: 200))
+            let author = e.author.map { "@\(ReviewDigest.flat($0, max: 64))" } ?? "unknown"
+            out.append("Merged at \(e.mergedCommit.map { String($0.prefix(7)) } ?? "?"); author \(author)")
+            out.append("Acceptance criteria:")
+            out.append(ReviewDigest.quote(item.acceptanceCriteria, maxChars: maxCriteria))
+            out.append("Changed files:")
+            if e.nameStatus.entries.isEmpty { out.append("- (none)") }
+            for c in e.nameStatus.entries.prefix(maxChangedFiles) {
+                let from = c.oldPath.map { "\(ReviewDigest.flat($0, max: 200)) → " } ?? ""
+                out.append("- \(ReviewDigest.flat(c.status, max: 8)) \(from)\(ReviewDigest.flat(c.path, max: 300))")
+            }
+            if e.nameStatus.entries.count > maxChangedFiles { out.append("- … and \(e.nameStatus.entries.count - maxChangedFiles) more") }
+            out.append("Merged diff of \(item.key):")
+            out.append(ReviewDigest.quote(e.diff.text, maxChars: .max, empty: "(no changes)"))
+            if e.diff.truncated { out.append("[diff truncated]") }
+        }
+        out.append("")
+        out.append(instructions)
+        return out.joined(separator: "\n")
+    }
+}

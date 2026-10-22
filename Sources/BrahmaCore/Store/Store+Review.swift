@@ -98,12 +98,14 @@ extension Store {
 
     /// The one way an item becomes approved for merge: its flags are cleared (the event lists them), the round is closed
     /// and `mergeState` is `pending`. `Store.review` and 9c's auto-approval both come here. `by` is an agent id or "system".
+    /// `auto`: the engine's risk-tiered auto-approval (9c), counted and sampled for audit when the item lands.
     @discardableResult
-    func approveForMerge(db: Database, item current: WorkItem, by: String, note: String, now: Date) throws -> WorkItem {
+    func approveForMerge(db: Database, item current: WorkItem, by: String, note: String, auto: Bool = false, now: Date) throws -> WorkItem {
         var item = current
         var text = note
         if !item.reviewFlags.isEmpty { text += " (approved flags: \(item.reviewFlags.joined(separator: "; ")))" }
         item.reviewFlags = []
+        item.autoApproved = auto
         item.mergeState = .pending
         item.reviewedRound = item.reviewRound
         item.reviewAttempts = 0
@@ -205,7 +207,9 @@ extension Store {
     /// infrastructure reasons) without a decision counts as an attempt; at `maxReviewAttempts` the reviewer's nearest active
     /// manager (else the owner) is told. Interrupted, usage-limited and infrastructure-failed turns count for nothing.
     func noteReviewTurnEnd(db: Database, turnId: String, agent: Agent, end: TurnEnd, infra: Bool, now: Date) throws {
-        guard let turn = try Turn.fetchOne(db, key: turnId), turn.kind == .review, let itemId = turn.itemId else { return }
+        guard let turn = try Turn.fetchOne(db, key: turnId) else { return }
+        if turn.kind == .audit { try noteAuditTurnEnd(db: db, turn: turn, end: end, infra: infra); return }
+        guard turn.kind == .review, let itemId = turn.itemId else { return }
         var succeeded = false
         switch end {
         case .succeeded: succeeded = true

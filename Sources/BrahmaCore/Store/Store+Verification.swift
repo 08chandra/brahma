@@ -197,6 +197,7 @@ extension Store {
             }
             item.reviewAttempts = 0
             item.mergeState = .none
+            item.autoApproved = false
             item.submitSummary = text
             item.reviewRound += 1
             item.status = .inReview
@@ -360,8 +361,14 @@ extension Store {
     /// 3. pass: the item is verified (a pass after a failed first run is a flake and flagged);
     /// 4. first real failure: one immediate re-run;
     /// 5. failure after the re-run: the item goes back to `inProgress` with a system DM to the holder (no output in it).
+    ///
+    /// `autoMerge`: the engine's measurement of the change (`assessAutoMerge`). A clean submit pass of a qualifying item is
+    /// approved here, in the same transaction, through `approveForMerge` (risk-tiered review, 9c): no review turn, no reviewer
+    /// woken. Every database condition is checked again here, and the measurement must be of this run's commit and the item's
+    /// recorded base.
     @discardableResult
-    func finishVerification(runId: String, outcome: CheckOutcome, now: Date = Store.now()) throws -> VerificationRun? {
+    func finishVerification(runId: String, outcome: CheckOutcome, autoMerge: AutoMergeAssessment? = nil,
+                            now: Date = Store.now()) throws -> VerificationRun? {
         try writer.write { db in
             guard var run = try VerificationRun.fetchOne(db, key: runId), run.status == .running else { return nil }
             let active = try Self.activeNow(db: db, companyId: run.companyId)
@@ -391,6 +398,7 @@ extension Store {
                     if !item.reviewFlags.contains(Self.flakeFlag) { item.reviewFlags.append(Self.flakeFlag) }
                     item.verifiedRevision = run.checkRevision
                     item.mergeState = .none
+                    item.autoApproved = false
                     item.reviewAttempts = 0
                     item.reviewRound += 1
                     try item.update(db)
@@ -413,6 +421,14 @@ extension Store {
                 if run.flaky, !item.reviewFlags.contains(Self.flakeFlag) { item.reviewFlags.append(Self.flakeFlag) }
                 item.updatedAt = now
                 try item.update(db)
+                if let autoMerge, autoMerge.reason == nil, autoMerge.commit == run.commit, autoMerge.base == item.baseCommit,
+                   autoMerge.lines < ReviewPolicy.autoMergeMaxLines, try autoMergeCandidate(db: db, item: item, run: run) {
+                    // Risk-tiered review: the pass is the approval. The reviewer is not woken for a review that will not happen.
+                    try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed, text: "check passed",
+                                        alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, onlyAlsoNotify: true, now: now)
+                    try approveForMerge(db: db, item: item, by: "system", note: ReviewPolicy.autoApprovedNote, auto: true, now: now)
+                    return run
+                }
                 try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed,
                                     text: run.flaky ? "check passed on re-run (flaky)" : "check passed",
                                     alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)

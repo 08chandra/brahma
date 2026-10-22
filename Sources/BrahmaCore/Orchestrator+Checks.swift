@@ -92,7 +92,10 @@ extension Orchestrator {
                                             timeout: TimeInterval(run.timeoutSeconds), outputURL: output, environment: environment)
         git.removeRunWorktree(runId: run.id)
         if Task.isCancelled { return }
-        do { try store.finishVerification(runId: run.id, outcome: outcome, now: clock()) }
+        // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
+        let passed = outcome.exitCode == 0 && !outcome.timedOut
+        let autoMerge = passed && run.purpose == .submit ? store.assessAutoMerge(run: run, git: git) : nil
+        do { try store.finishVerification(runId: run.id, outcome: outcome, autoMerge: autoMerge, now: clock()) }
         catch { log("could not record the check of run \(run.id): \(error)") }
     }
 }

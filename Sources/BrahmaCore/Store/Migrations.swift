@@ -357,6 +357,33 @@ enum Migrations {
             // The head the engine is about to move main to (crash recovery of the exact main guard).
             try db.alter(table: "company") { t in t.add(column: "pendingMainCommit", .text) }
         }
+        m.registerMigration("v3-review-audit") { db in
+            // Risk-tiered review (9c): auto-approved items, the company's count of auto-merges (every 4th is sampled), when the
+            // last batched audit went out (company-active seconds), and the authors whose changes always get a full review.
+            try db.alter(table: "workItem") { t in t.add(column: "autoApproved", .boolean).notNull().defaults(to: false) }
+            try db.alter(table: "company") { t in
+                t.add(column: "autoMergeCount", .integer).notNull().defaults(to: 0)
+                t.add(column: "lastAuditActive", .double).notNull().defaults(to: 0)
+            }
+            try db.alter(table: "agent") { t in t.add(column: "fullReview", .boolean).notNull().defaults(to: false) }
+            // One sampled auto-merge: what landed (base → merged commit, both engine-recorded), who wrote it, and the audit.
+            // `auditorId`/`auditTurnId`: the batch it is in and the audit turn that may record its verdict.
+            try db.create(table: "reviewAudit") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("sampledActive", .double).notNull()
+                t.column("auditedAt", .datetime)
+                t.column("verdict", .text)
+                t.column("notes", .text)
+                t.column("authorId", .text)
+                t.column("baseCommit", .text)
+                t.column("mergedCommit", .text)
+                t.column("auditorId", .text)
+                t.column("auditTurnId", .text)
+                t.column("batchedActive", .double)
+            }
+            try db.create(index: "reviewAudit_company", on: "reviewAudit", columns: ["companyId", "auditedAt"], ifNotExists: true)
+        }
         m.registerMigration("v3-sessions") { db in
             // One session per (agent, item); a turn in another working directory starts a fresh one. `lastTurnId` points at the
             // session's newest turn: its end time is the warm rule, its token columns (Task 14) the size rule.

@@ -160,6 +160,8 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     /// Why the engine last stopped work on the item: `budget`, `no-progress`, `loop`, `failed-checks` or `timebox`.
     /// Cleared at the next claim.
     public var stopReason: String? = nil
+    /// The current approval is the engine's risk-tiered auto-approval (tier S, small diff), not a reviewer's.
+    public var autoApproved: Bool = false
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

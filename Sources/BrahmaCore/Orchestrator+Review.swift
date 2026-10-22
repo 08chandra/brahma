@@ -53,3 +53,37 @@ extension Store {
         }
     }
 }
+
+/// What a batched audit turn is built from: the samples batched to the agent and the digest of their merged diffs.
+struct AuditTurnContext {
+    var itemIds: [String]
+    var digest: String
+}
+
+extension Orchestrator {
+    /// The agent's batched audit (9c), ready to run, or nil. Each sample's merged diff is read from the engine-recorded base
+    /// and merged commit. Runs git, so it is called off the actor.
+    nonisolated static func prepareAudit(store: Store, agent: Agent, company: Company) throws -> AuditTurnContext? {
+        let samples = try store.pendingAudits(agentId: agent.id)
+        guard !samples.isEmpty else { return nil }
+        let git = store.gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
+        var entries: [AuditDigest.Entry] = []
+        for sample in samples {
+            guard let item = try store.workItem(id: sample.itemId), item.companyId == company.id else { continue }
+            var names: (entries: [GitChange], truncated: Bool) = ([], false)
+            var diff: (text: String, truncated: Bool) = ("(the merged diff could not be produced)", false)
+            if let base = sample.baseCommit, let merged = sample.mergedCommit {
+                do {
+                    names = try git.nameStatus(base: base, head: merged)
+                    diff = try git.diff(base: base, head: merged)
+                } catch {
+                    diff = ("(the merged diff could not be produced: \(String(describing: error).prefix(200)))", false)
+                }
+            }
+            let author = try sample.authorId.flatMap { try store.agent(id: $0) }?.name
+            entries.append(AuditDigest.Entry(item: item, author: author, mergedCommit: sample.mergedCommit, nameStatus: names, diff: diff))
+        }
+        guard !entries.isEmpty else { return nil }
+        return AuditTurnContext(itemIds: entries.map(\.item.id), digest: AuditDigest.render(entries: entries))
+    }
+}

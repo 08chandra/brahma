@@ -19,17 +19,19 @@ public struct CompanyTools: Sendable {
     let diagnostics: @Sendable (String) -> Void
     /// Set for the MCP server of a review turn: only the review tools, limited to this one item.
     let reviewItemId: String?
+    /// Set for the MCP server of an audit turn (9c): only the `audit` tool, limited to the samples bound to this turn.
+    let auditTurnId: String?
 
-    public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil) {
-        self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, diagnostics: { line in
-            FileHandle.standardError.write(Data((line + "\n").utf8))
-        })
+    public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil) {
+        self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, auditTurnId: auditTurnId,
+                  diagnostics: { line in FileHandle.standardError.write(Data((line + "\n").utf8)) })
     }
 
-    init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil,
+    init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
          diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
         self.reviewItemId = reviewItemId
+        self.auditTurnId = reviewItemId == nil ? auditTurnId : nil
     }
 
     static func schema(_ properties: [String: JSONValue], required: [String]) -> JSONValue {
@@ -43,6 +45,8 @@ public struct CompanyTools: Sendable {
     /// The same list for every role (a stable prompt prefix); `call` enforces what the caller's role may use.
     public func specs() -> [ToolSpec] {
         let all = Self.baseSpecs() + Self.workSpecs() + Self.inboxToolSpecs()
+        // An audit turn sees the audit tool only (`audit` is listed only here).
+        if auditTurnId != nil { return [Self.auditSpec()] }
         guard reviewItemId != nil else { return all }
         // A review turn sees the review tools only (`review` itself is listed only here).
         return all.filter { CompanyToolNames.review.contains($0.name) } + [Self.reviewSpec()]
@@ -85,8 +89,10 @@ public struct CompanyTools: Sendable {
         guard let me = try? store.agent(id: agentId), me.companyId == companyId, me.state != .killed else {
             throw ToolError(message: "this agent is not active in the company")
         }
-        if name == "review", reviewItemId == nil { throw ToolError(message: Store.reviewTurnOnlyMessage) }
+        if auditTurnId != nil { return try callInAuditTurn(name: name, arguments: arguments) }
         if reviewItemId != nil { return try callInReviewTurn(name: name, arguments: arguments) }
+        if name == "review" { throw ToolError(message: Store.reviewTurnOnlyMessage) }
+        if CompanyToolNames.audit.contains(name) { throw ToolError(message: Store.auditTurnOnlyMessage) }
         if Self.implemented.contains(name) {
             let packId = (try? store.company(id: companyId))??.packId ?? "software"
             guard store.catalog.template(role: me.role, pack: packId).companyTools.contains(name) else {
@@ -154,6 +160,8 @@ public struct CompanyTools: Sendable {
                 return try setBlocked(on: try string(args, "on"), reason: try string(args, "reason"))
             case "review":
                 return try reviewTool(args)
+            case "audit":
+                return try auditTool(args)
             default:
                 if let result = try callWork(name, args) { return result }
                 if let result = try dispatchInbox(name, args) { return result }

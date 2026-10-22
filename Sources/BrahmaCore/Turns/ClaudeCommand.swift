@@ -59,19 +59,20 @@ public enum MCPConfig {
     /// Writes `<runDir>/<agentId>.mcp.json` (mode 0600, atomic) and returns its path. The per-turn token travels
     /// in the server's `env` entry, so it is neither in argv nor in the agent's own process environment.
     /// A review turn passes `reviewItem` (the item key): its server runs `--review-item <KEY>` and writes `<agentId>.review.mcp.json`.
+    /// An audit turn passes `audit`: its server runs `--audit` and writes `<agentId>.audit.mcp.json`.
     public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String,
-                             reviewItem: String? = nil) throws -> String {
+                             reviewItem: String? = nil, audit: Bool = false) throws -> String {
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
-        if let reviewItem { args += ["--review-item", reviewItem] }
+        if let reviewItem { args += ["--review-item", reviewItem] } else if audit { args.append("--audit") }
         let config: [String: Any] = ["mcpServers": ["company": [
             "command": executable,
             "args": args,
             "env": [tokenVariable: turnToken],
         ] as [String: Any]]]
         let data = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
-        let name = reviewItem == nil ? "\(agent.id).mcp.json" : "\(agent.id).review.mcp.json"
+        let name = reviewItem != nil ? "\(agent.id).review.mcp.json" : audit ? "\(agent.id).audit.mcp.json" : "\(agent.id).mcp.json"
         let url = paths.runDir.appending(path: name)
         // The file holds the turn token, so it is created 0600 (never briefly world-readable) and renamed into place.
         let temp = paths.runDir.appending(path: ".\(name).\(UUID().uuidString)")

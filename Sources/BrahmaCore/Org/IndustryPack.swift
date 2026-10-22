@@ -11,7 +11,9 @@ public enum CompanyToolNames {
     public static let executive = ["decide"]
     /// Review turns only, regardless of role. `create_work_item` files follow-ups instead of blocking on mechanical fixes.
     public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review"]
-    public static var all: [String] { base + work + lead + executive + ["review"] }
+    /// Audit turns only (9c), regardless of role: the verdict on each sampled auto-merge of the turn's batch.
+    public static let audit = ["audit"]
+    public static var all: [String] { base + work + lead + executive + ["review"] + audit }
 }
 
 public struct RoleTemplate: Codable, Equatable, Sendable {

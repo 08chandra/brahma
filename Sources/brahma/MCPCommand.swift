@@ -13,6 +13,8 @@ struct MCP: ParsableCommand {
     @Option(help: "Item id the turn token is bound to (review turns).") var item: String?
     @Option(name: .customLong("review-item"), help: "Item key of a review turn: the server offers the review tools for that item only.")
     var reviewItem: String?
+    @Flag(name: .customLong("audit"), help: "An audit turn: the server offers the audit tool for the turn's batch only.")
+    var audit = false
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
@@ -36,7 +38,18 @@ struct MCP: ParsableCommand {
             throw ExitCode.failure
         }
         var reviewItemId: String?
-        if context.kind == "review" {
+        var auditTurnId: String?
+        if context.kind == "audit" {
+            // An audit credential is bound to its turn, whose batch the store holds; it names no item and no review.
+            guard context.itemId == nil, reviewItem == nil else {
+                FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
+                throw ExitCode.failure
+            }
+            auditTurnId = context.turnId
+        } else if audit {
+            FileHandle.standardError.write(Data("brahma mcp: --audit does not match this turn's credential\n".utf8))
+            throw ExitCode.failure
+        } else if context.kind == "review" {
             guard let itemId = context.itemId else {
                 FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
                 throw ExitCode.failure
@@ -56,7 +69,8 @@ struct MCP: ParsableCommand {
             FileHandle.standardError.write(Data("brahma mcp: unknown agent \(agent) in company \(company)\n".utf8))
             throw ExitCode.failure
         }
-        let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId))
+        let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId,
+                                                   auditTurnId: auditTurnId))
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

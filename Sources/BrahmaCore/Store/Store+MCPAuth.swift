@@ -24,18 +24,18 @@ extension Store {
 
     /// The kind and item a live token was issued for, when it belongs to an in-progress turn of exactly this company and agent.
     /// The server derives its mode from this, never from its own command line.
-    public func turnCredentialContext(token: String, companyId: String, agentId: String) -> (kind: String, itemId: String?)? {
+    public func turnCredentialContext(token: String, companyId: String, agentId: String) -> (kind: String, itemId: String?, turnId: String)? {
         guard !token.isEmpty else { return nil }
         let row = try? writer.read { db in
             try Row.fetchOne(db, sql: """
-                SELECT c.kind AS kind, c.itemId AS itemId FROM turnCredential c JOIN turn t ON t.id = c.turnId
+                SELECT c.kind AS kind, c.itemId AS itemId, c.turnId AS turnId FROM turnCredential c JOIN turn t ON t.id = c.turnId
                 WHERE c.tokenHash = ? AND c.companyId = ? AND c.agentId = ?
                   AND t.companyId = c.companyId AND t.agentId = c.agentId
                   AND t.outcome = 'inProgress' AND t.endedAt IS NULL
                 """, arguments: [SHA256.hex(token), companyId, agentId])
         }
-        guard let row, let kind: String = row["kind"] else { return nil }
-        return (kind, row["itemId"])
+        guard let row, let kind: String = row["kind"], let turnId: String = row["turnId"] else { return nil }
+        return (kind, row["itemId"], turnId)
     }
 
     /// True only when the token's hash matches a credential whose turn is still in progress for exactly this

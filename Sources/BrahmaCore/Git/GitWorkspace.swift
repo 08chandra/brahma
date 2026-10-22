@@ -2019,6 +2019,24 @@ public struct GitWorkspace: Sendable {
         return (text, truncated)
     }
 
+    /// The size of the change between two commits, for risk-tiered review: added plus deleted lines over all files, every path
+    /// touched (renames are counted as a delete and an add, so both names are listed), and whether a binary file changed or
+    /// the listing was cut (either makes the change unmeasurable).
+    public func changeStats(base: String, head: String) throws -> (lines: Int, paths: [String], binary: Bool, truncated: Bool) {
+        try Self.validRef(base); try Self.validRef(head)
+        let out = try main.run(["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", base, head],
+                               maxOutput: 1 << 20)
+        var lines = 0, binary = false
+        var paths: [String] = []
+        for record in String(decoding: out.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true) {
+            let fields = record.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3 else { return (lines, paths, binary, true) }
+            if let added = Int(fields[0]), let deleted = Int(fields[1]) { lines += added + deleted } else { binary = true }
+            paths.append(String(fields[2]))
+        }
+        return (lines, paths, binary, out.cut)
+    }
+
     /// `"<short sha> <subject>"` for the newest `limit` commits in `base..head`.
     public func log(base: String, head: String, limit: Int = 5) throws -> [String] {
         try Self.validRef(base); try Self.validRef(head)

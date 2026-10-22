@@ -48,6 +48,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var sessionMeta: SessionMeta? = nil
     /// "ceo" while the agent acts as the company's CEO after the CEO left (Task 12); it then counts as covering `ceo` for routing.
     public var actingRole: String? = nil
+    /// Set when an audit of one of the agent's auto-merged items failed (9c): its changes always get a review turn.
+    public var fullReview: Bool = false
 }
 
 /// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and

@@ -162,6 +162,9 @@ public actor Orchestrator {
             attempt { try store.sweepLiveness(companyId: c.id, now: now) }
         }
 
+        // Batched audits of sampled auto-merges, once per `ReviewPolicy.auditInterval` company-active seconds (9c).
+        for c in companies where c.status == .running { attempt { try store.scheduleAudit(companyId: c.id, now: now) } }
+
         // 1. Timed blockers that have expired.
         for a in try store.agents(states: [.blocked]) {
             let until: Date
@@ -339,7 +342,9 @@ public actor Orchestrator {
             let template = store.catalog.template(role: agent.role, pack: company.packId)
             // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
             let review = try Self.prepareReview(store: store, agent: agent, company: company)
-            isReview = review != nil
+            // Otherwise a batched audit of sampled auto-merges (9c) is the same kind of clean-context turn.
+            let audit = review == nil ? try Self.prepareAudit(store: store, agent: agent, company: company) : nil
+            isReview = review != nil || audit != nil
             var turnPrompt = ""
             var sent = agent
             // The system prompt is byte-stable per agent and role: the roster, items and times ride in the orientation.
@@ -363,6 +368,13 @@ public actor Orchestrator {
                 context = ModelContext(turnKind: .review, deepReview: review.deep)
                 workingDirectory = review.worktree.path
                 addDirs = [review.worktree.path]
+            } else if let audit {
+                sent.sessionId = UUID().uuidString
+                sent.sessionStarted = false
+                systemPrompt += "\n\n" + AuditDigest.instructions
+                turnPrompt = audit.digest
+                context = ModelContext(turnKind: .audit)
+                toolsKey = "audit"
             } else {
                 var c = try TurnContext.load(store: store, paths: paths, agent: agent, company: company)
                 context.tier = (try? store.workTier(agentId: agent.id)) ?? nil
@@ -455,6 +467,9 @@ public actor Orchestrator {
             if let review {
                 try store.setTurnContext(turnId: turn.id, kind: .review, itemId: review.item.id)
                 turnToken = try store.issueTurnCredential(turnId: turn.id, kind: "review", itemId: review.item.id)
+            } else if let audit {
+                try store.bindAuditTurn(turnId: turn.id, agentId: agent.id, itemIds: audit.itemIds)
+                turnToken = try store.issueTurnCredential(turnId: turn.id, kind: "audit")
             } else {
                 if kind != .work || scope.itemId != nil { try store.setTurnContext(turnId: turn.id, kind: kind, itemId: scope.itemId) }
                 if let cacheBreak { try store.setTurnCacheBreak(turnId: turn.id, cacheBreak) }
@@ -463,15 +478,15 @@ public actor Orchestrator {
             var request = TurnRequest(
                 agent: sent, company: company, prompt: turnPrompt, appendSystemPrompt: systemPrompt,
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
-                                                   reviewItem: review?.item.key),
+                                                   reviewItem: review?.item.key, audit: audit != nil),
                 workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
-            request.kind = review == nil ? kind : .review
+            request.kind = review != nil ? .review : audit != nil ? .audit : kind
             request.planDirectory = planDirectory
             request.expectations = turnExpectations(agent, company)
             // A review session is never recorded as the agent's own.
-            var sessionMarked = wasResume || review != nil
+            var sessionMarked = wasResume || review != nil || audit != nil
             sentRequest = request
             // Leaving the loop early (`break`) drops the stream, which terminates the child process.
             do {

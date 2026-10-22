@@ -29,4 +29,8 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// The head the engine is about to move `main` to, written before the move. A crash between moving `main` and recording
     /// it leaves `main` here; the guard then accepts it and records it (`Store.checkMain`).
     public var pendingMainCommit: String? = nil
+    /// Auto-approved items that landed in `main` (9c); every `ReviewPolicy.auditSampleEvery`-th is sampled for an audit.
+    public var autoMergeCount: Int = 0
+    /// Company-active seconds when the last batched audit was handed out.
+    public var lastAuditActive: Double = 0
 }
