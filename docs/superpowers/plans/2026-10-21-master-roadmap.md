@@ -173,7 +173,7 @@ Names in the 3a contract are as built or as amended plus the patch notes.
   - **new: start a company from an existing repo** (owner 18:16, note L1).
 - **Consumes:** 3a (git, asks, ops tool group, `approveForMerge`/`finishMerge`), 5L (`SandboxedRunner`, `sharedCache`, vault, redactor, `notifyOwner`, `AskQuota`, `TaintPolicy`, `EmergencyStopObserver`).
 - **Produces:**
-  - `EngineLayout` (`.brahma/wt/.preview`, `.brahma/wt/.release`, `.brahma/preview`, `.brahma/releases`);
+  - `EngineLayout` (`.brahma/preview`, `.brahma/releases`; preview/release/smoke builds use fresh `EngineExport` trees with no `.git` — no persistent `.brahma/wt/.preview` or `.release` checkouts);
   - `PreviewKind`/`Status`/`Surface`/`State`, `PreviewAdapter`, `PreviewRunner`, `PortAllocator`, `HTTPProbing`, `SmokeRequest`/`SmokeResult`, `LoopbackURL`, `PreviewPolicy.server`;
   - `HostingAdapter(s)`, `DeployPlan`, `ReleaseExecutor`, `ReleaseStatus`, `ReleasePolicy.mainIsGreen`;
   - `HumanTask`/`HumanTaskTemplate`, `Store.fileTemplateTask`, `completeHumanTask`;
