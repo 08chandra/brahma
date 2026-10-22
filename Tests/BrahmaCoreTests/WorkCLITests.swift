@@ -529,6 +529,25 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(!s.store.verifyTurnCredential(token: s.token, companyId: s.company.id, agentId: s.agent.id))
     }
 
+    @Test func mcpReviewModeComesFromTheCredential() throws {
+        let home = try tempDir(); let s = try seedTurn(home)
+        let a = try s.store.createWorkItem(companyId: s.company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "a"))
+        let b = try s.store.createWorkItem(companyId: s.company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "b"))
+        // A work token cannot be turned into a review server by a flag, whatever item it names.
+        #expect(try mcp(s, home: home, token: s.token, extra: ["--review-item", a.key]).status != 0)
+        // A review token needs no flag: the credential alone says review of item a.
+        try s.store.setTurnContext(turnId: s.turn.id, kind: .review, itemId: a.id)
+        let token = try s.store.issueTurnCredential(turnId: s.turn.id, kind: "review", itemId: a.id)
+        #expect(try mcp(s, home: home, token: token).status == 0)
+        #expect(try mcp(s, home: home, token: token, extra: ["--review-item", a.key]).status == 0)
+        // A flag naming another item, an unknown key, or no valid token at all is refused before any item is looked up.
+        let other = try mcp(s, home: home, token: token, extra: ["--review-item", b.key])
+        #expect(other.status != 0); #expect(other.stderr.contains("does not match this turn's credential"))
+        #expect(try mcp(s, home: home, token: token, extra: ["--review-item", "NOPE-9"]).status != 0)
+        let bad = try mcp(s, home: home, token: "deadbeef", extra: ["--review-item", "NOPE-9"])
+        #expect(bad.status != 0); #expect(bad.stderr.contains("turn credential invalid or turn ended"))
+    }
+
     @Test func sha256StandardVectors() {
         #expect(SHA256.hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
         #expect(SHA256.hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")

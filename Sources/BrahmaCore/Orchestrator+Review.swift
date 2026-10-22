@@ -19,7 +19,7 @@ extension Orchestrator {
         let git = store.gitWorkspace(root: workspace, companyId: company.id)
         if !git.hasCheckout(key: item.key) {
             do { try git.addWorktree(key: item.key) } catch {
-                throw WorktreeUnavailable(itemId: item.id, key: item.key, reason: "\(error)")
+                throw WorktreeUnavailable(itemId: item.id, key: item.key, reason: "\(error)", review: true)
             }
         }
         // The real change: from where the branch left `main` to the commit the engine verified.

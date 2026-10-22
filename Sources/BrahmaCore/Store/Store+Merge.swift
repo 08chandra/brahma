@@ -49,7 +49,7 @@ extension Store {
         guard let verified = item.verifiedCommit else { throw WorkError.conflict("\(item.key) has no verified commit") }
         // `main` must still be what the engine expects; if it was changed outside Brahma the merge is held (the guard has
         // raised its alert) until the owner accepts it.
-        do { try prepareRepo(company: company) } catch let error as WorkError where error.message == Store.mainChangedMessage { return nil }
+        do { try checkMain(company: company, git: git) } catch let error as WorkError where error.message == Store.mainChangedMessage { return nil }
         let checkedOut = try git.checkedOutRef()
         guard checkedOut == GitWorkspace.mainRef else {
             try raiseMainHeadAlert(company: company, ref: checkedOut)

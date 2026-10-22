@@ -212,15 +212,22 @@ extension Store {
         case .failed: if infra { return }
         default: return
         }
-        guard var item = try WorkItem.fetchOne(db, key: itemId), try Self.hasPendingReviewOf(db: db, itemId: itemId, agentId: agent.id)
-        else { return }
         if succeeded {
-            // The digest was the notice: the reviewer's pass notice for this item does not need a second turn.
+            // The digest was the notice: the reviewer's own pass notice for this item needs no second turn. Done whether or not
+            // the reviewer decided (a decision makes the item non-pending, so this comes before the attempt below).
             try db.execute(sql: """
                 UPDATE workNotice SET deliveredTurnId = ? WHERE agentId = ? AND deliveredTurnId IS NULL AND eventId IN
                 (SELECT id FROM workItemEvent WHERE itemId = ? AND kind IN ('verificationPassed', 'submitted'))
                 """, arguments: [turnId, agent.id, itemId])
         }
+        try countReviewAttempt(db: db, itemId: itemId, agent: agent, now: now)
+    }
+
+    /// One more review turn that ended without a decision, if the item is still waiting for this agent's review. At
+    /// `maxReviewAttempts` the reviewer's nearest active manager (else the owner) is told.
+    func countReviewAttempt(db: Database, itemId: String, agent: Agent, now: Date) throws {
+        guard var item = try WorkItem.fetchOne(db, key: itemId), try Self.hasPendingReviewOf(db: db, itemId: itemId, agentId: agent.id)
+        else { return }
         item.reviewAttempts += 1
         item.updatedAt = now
         try item.update(db)
@@ -236,53 +243,18 @@ extension Store {
         }
         try MessageRouter(store: self).sendDM(db: db, companyId: item.companyId, from: .system, to: target, text: text, now: now)
     }
+}
 
-    // MARK: Main
-
-    static func mainAlertReason(_ companyId: String) -> String { "main:\(companyId)" }
-
-    func recordMainCommit(companyId: String, commit: String) throws {
+extension Store {
+    /// A review turn that could not start because the item's worktree could not be created: an attempt like any other
+    /// undecided review turn (the lease-holder rules do not apply to a reviewer), so the escalation applies.
+    func noteReviewWorktreeFailure(itemId: String, agentId: String, reason: String, now: Date) throws {
         try writer.write { db in
-            try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [commit, companyId])
-        }
-    }
-
-    /// Makes the workspace a repository and checks that `main` is what the engine expects. The recorded head must still be an
-    /// ancestor of `refs/heads/main`; a rewritten or reset `main` refuses the claim with `mainChangedMessage` and raises one
-    /// engine alert. A company with no recorded head (made before this check existed) records the current one.
-    func prepareRepo(company: Company) throws {
-        let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
-        try git.ensureRepo()
-        let current = try git.head(of: GitWorkspace.mainRef)
-        let recorded = try writer.read { try Company.fetchOne($0, key: company.id)?.mainCommit }
-        guard let recorded else {
-            if let current { try recordMainCommit(companyId: company.id, commit: current) }
-            return
-        }
-        let reason = Self.mainAlertReason(company.id)
-        if let current, try git.isAncestor(recorded, of: current) {
-            try writer.write { db in try resolveEngineAlerts(db, reasons: [reason], now: Store.now()) }
-            return
-        }
-        let open = try writer.read { db in
-            try Ask.filter(Column("kind") == AskKind.engineAlert && Column("status") == AskStatus.pendingOwner.rawValue
-                           && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
-        }
-        if open == 0 {
-            try EngineAlerts.raise(store: self, text: "The main branch of \(company.name) changed outside Brahma (it was rewritten or reset). "
-                + "Brahma starts no new work there until you have reviewed main and accepted it.", now: Store.now(), reason: reason)
-        }
-        throw WorkError.conflict(Self.mainChangedMessage)
-    }
-
-    /// The owner has reviewed `main` and accepts its current head: claims work again. Owner-only (the owner CLI and app).
-    public func acceptMainCommit(companyId: String) throws {
-        guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
-        let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
-        guard let head = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(company.name) has no main branch") }
-        try writer.write { db in
-            try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [head, companyId])
-            try resolveEngineAlerts(db, reasons: [Store.mainAlertReason(companyId)], now: Store.now())
+            guard let agent = try Agent.fetchOne(db, key: agentId), let item = try WorkItem.fetchOne(db, key: itemId) else { return }
+            try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: nil, kind: .error,
+                              text: "@\(agent.name) review of \(item.key) not started: the worktree could not be created (\(Store.flat(reason, max: 200)))",
+                              createdAt: now).insert(db)
+            try countReviewAttempt(db: db, itemId: itemId, agent: agent, now: now)
         }
     }
 }
