@@ -21,7 +21,7 @@ private actor Gate {
     func open() { isOpen = true; continuation?.resume(); continuation = nil }
 }
 
-private struct World {
+private struct TimerWorld {
     let store: Store
     let clock = TestClock()
     let fake = FakeTurnRunner()
@@ -68,7 +68,7 @@ private struct World {
         let counter = Counter()
         var jobs = TimerJobRegistry.system
         jobs.register("test.count") { _ in await counter.hit() }
-        let w = try World(jobs: jobs)
+        let w = try TimerWorld(jobs: jobs)
         let c = try w.company()
         let t0 = w.clock.now
         _ = try w.store.upsertTimer(companyId: c.id, name: "count", action: .job("test.count"),
@@ -95,7 +95,7 @@ private struct World {
         let counter = Counter()
         var jobs = TimerJobRegistry.system
         jobs.register("test.count") { _ in await counter.hit() }
-        let w = try World(jobs: jobs)
+        let w = try TimerWorld(jobs: jobs)
         let c = try w.company()
         _ = try w.store.upsertTimer(companyId: c.id, name: "count", action: .job("test.count"),
                                     schedule: .every(seconds: 60), now: w.clock.now)
@@ -134,7 +134,7 @@ private struct World {
         let counter = Counter()
         var jobs = TimerJobRegistry.system
         jobs.register("test.count") { _ in await counter.hit() }
-        let w = try World(jobs: jobs)
+        let w = try TimerWorld(jobs: jobs)
         let c = try w.company()
         _ = try w.store.upsertTimer(companyId: c.id, name: "once", action: .job("test.count"),
                                     schedule: .once(at: w.clock.now.addingTimeInterval(10)), now: w.clock.now)
@@ -146,7 +146,7 @@ private struct World {
     }
 
     @Test func turnTimerWakesAgent() async throws {
-        let w = try World()
+        let w = try TimerWorld()
         let c = try w.company()
         let ceo = try w.store.hire(companyId: c.id, name: "ceo", role: "ceo", model: "sonnet")
         #expect(ceo.state == .sleeping)
@@ -168,7 +168,7 @@ private struct World {
     }
 
     @Test func killedAgentDisablesTurnTimer() async throws {
-        let w = try World()
+        let w = try TimerWorld()
         let c = try w.company()
         let ceo = try w.store.hire(companyId: c.id, name: "ceo", role: "ceo", model: "sonnet")
         _ = try w.store.upsertTimer(companyId: c.id, name: "standup", action: .turn(agentId: ceo.id, prompt: "Hello"),
@@ -186,7 +186,7 @@ private struct World {
         let counter = Counter()
         var jobs = TimerJobRegistry.system
         jobs.register("test.fail") { _ in await counter.hit(); throw FakeError(description: "disk on fire") }
-        let w = try World(jobs: jobs)
+        let w = try TimerWorld(jobs: jobs)
         let c = try w.company()
         _ = try w.store.upsertTimer(companyId: c.id, name: "flaky", action: .job("test.fail"),
                                     schedule: .every(seconds: 60), now: w.clock.now)
@@ -205,7 +205,7 @@ private struct World {
     }
 
     @Test func unknownJobLogsOnceAndDisables() async throws {
-        let w = try World()
+        let w = try TimerWorld()
         let c = try w.company()
         _ = try w.store.upsertTimer(companyId: c.id, name: "ghost", action: .job("no.such.job"),
                                     schedule: .every(seconds: 60), now: w.clock.now)
@@ -222,7 +222,7 @@ private struct World {
         let gate = Gate()
         var jobs = TimerJobRegistry.system
         jobs.register("test.slow") { _ in await counter.start(); await gate.wait() }
-        let w = try World(jobs: jobs)
+        let w = try TimerWorld(jobs: jobs)
         let c = try w.company()
         _ = try w.store.upsertTimer(companyId: c.id, name: "slow", action: .job("test.slow"),
                                     schedule: .every(seconds: 60), now: w.clock.now)
@@ -280,7 +280,7 @@ private struct World {
     }
 
     @Test func startEnsuresSystemTimersAndTickRunsNoOpJobs() async throws {
-        let w = try World()
+        let w = try TimerWorld()
         let c = try w.company()
         try await w.orchestrator.start()
         let names = try w.store.timers(companyId: c.id).map(\.name)
