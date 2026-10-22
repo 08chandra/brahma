@@ -532,6 +532,8 @@ extension Store {
         if from == .done { item.doneAt = nil }
         if to == .inProgress { item.everStarted = true }
         if to == .done { item.doneAt = now }
+        // Merged: the escalation floor belongs to the work that just landed (design §3.4).
+        if to.resetsRungFloor { item.rungFloor = 0 }
         item.updatedAt = now
         try item.update(db)
         if to == .done { try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id]) }

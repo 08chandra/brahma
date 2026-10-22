@@ -324,3 +324,48 @@ func endToEndBinary() throws {
     let g = try #require(try w.store.channel(companyId: w.company.id, name: "general"))
     #expect(try w.store.messages(channelId: g.id, limit: 5).map(\.text) == ["from binary"])
 }
+
+/// Runs the built `brahma mcp` for the CEO with `token` and `extraEnv`, makes `posts` post_message calls and returns, per call,
+/// whether it succeeded.
+private func binaryPosts(_ bin: URL, dbPath: String, _ w: MCPWorld, agent: Agent? = nil, token: String, extraEnv: [String: String],
+                         posts: Int) throws -> [Bool] {
+    let p = Process()
+    p.executableURL = bin
+    p.environment = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": token].merging(extraEnv) { a, _ in a }
+    p.arguments = ["mcp", "--db", dbPath, "--company", w.company.id, "--agent", (agent ?? w.ceo).id]
+    let inPipe = Pipe(), outPipe = Pipe()
+    p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = FileHandle.nullDevice
+    try p.run()
+    let requests = (0..<posts).map { i in
+        #"{"jsonrpc":"2.0","id":\#(i + 1),"method":"tools/call","params":{"name":"post_message","arguments":{"channel":"general","text":"p\#(i)"}}}"#
+    }
+    inPipe.fileHandleForWriting.write(Data((requests.joined(separator: "\n") + "\n").utf8))
+    try inPipe.fileHandleForWriting.close()
+    let out = String(decoding: outPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    p.waitUntilExit()
+    #expect(p.terminationStatus == 0)
+    return out.split(separator: "\n").map { !$0.contains("\"isError\":true") }
+}
+
+/// Fix 1 Q1: a turn's quotas come from its credential row, never from the server's environment, and their counts live in the
+/// database, so every server process of the turn shares them. A work credential with no recorded quotas gets the strictest.
+@Test(.enabled(if: brahmaBinary() != nil, "brahma binary not built; run `swift build` first"))
+func binaryQuotasComeFromTheCredential() throws {
+    let bin = try #require(brahmaBinary())
+    let dir = try tempDir()
+    let dbPath = dir.appending(path: "t.sqlite").path
+    let w = try MCPWorld(path: dbPath)
+    _ = try w.store.transition(agentId: w.ceo.id, to: .ready)
+    let (_, turn) = try #require(try w.store.beginTurn(agentId: w.ceo.id, now: Store.now()))
+    let permissive = ["BRAHMA_MCP_QUOTA_POSTS": "1000", "BRAHMA_MCP_QUOTA_ITEMS": "1000", "BRAHMA_MCP_QUOTA_COMMENTS": "1000"]
+    // No quotas recorded on the work credential: the strictest table row (3 posts), whatever the environment says.
+    let bare = try w.store.issueTurnCredential(turnId: turn.id)
+    #expect(try binaryPosts(bin, dbPath: dbPath, w, token: bare, extraEnv: permissive, posts: 5) == [true, true, true, false, false])
+    // A second server process of the same turn shares the count.
+    #expect(try binaryPosts(bin, dbPath: dbPath, w, token: bare, extraEnv: permissive, posts: 1) == [false])
+    // Quotas recorded on the credential are what the server enforces.
+    _ = try w.store.transition(agentId: w.cto.id, to: .ready)
+    let (_, ctoTurn) = try #require(try w.store.beginTurn(agentId: w.cto.id, now: Store.now()))
+    let recorded = try w.store.issueTurnCredential(turnId: ctoTurn.id, quotas: ModeQuotas(posts: 2, itemsCreated: 0, comments: 0))
+    #expect(try binaryPosts(bin, dbPath: dbPath, w, agent: w.cto, token: recorded, extraEnv: permissive, posts: 3) == [true, true, false])
+}

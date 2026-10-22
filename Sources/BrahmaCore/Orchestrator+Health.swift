@@ -130,9 +130,9 @@ extension Orchestrator {
     }
 
     private func startDoctor() {
-        let (path, exec, runner, now) = (claudePath, self.exec, self.runner, clock())
+        let (path, exec, runner, now, helper) = (claudePath, self.exec, self.runner, clock(), mcpExecutable)
         spawn("doctor") { [self] in
-            await setDoctorReport(await Doctor.run(claudePath: path, runner: runner, exec: exec, now: now))
+            await setDoctorReport(await Doctor.run(claudePath: path, runner: runner, exec: exec, now: now, hookExecutable: helper))
         }
     }
 }

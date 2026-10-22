@@ -625,6 +625,17 @@ enum Migrations {
             }
             try db.create(index: "itemFact_company", on: "itemFact", columns: ["companyId", "completedAt"])
         }
+        m.registerMigration("v3-mode-quotas") { db in
+            // Task 14c fix round 1: a work or plan turn's MCP quotas are recorded on its credential when it is issued, and the
+            // counts live here per turn, shared by every `brahma mcp` process of the turn.
+            try db.alter(table: "turnCredential") { t in t.add(column: "quotas", .text) }
+            try db.create(table: "turnQuotaUsage") { t in
+                t.column("turnId", .text).notNull().references("turn", onDelete: .cascade)
+                t.column("kind", .text).notNull()
+                t.column("used", .integer).notNull().defaults(to: 0)
+                t.primaryKey(["turnId", "kind"])
+            }
+        }
         return m
     }
 }

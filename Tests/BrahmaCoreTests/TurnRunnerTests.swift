@@ -159,11 +159,12 @@ private final class PollCounter: @unchecked Sendable {
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
         ])
         var req = request(in: dir)
-        req.environment = ["BRAHMA_AGENT_ID": "a1", "CLAUDE_CODE_EFFORT_LEVEL": "low"]
+        req.environment = ["BRAHMA_AGENT_ID": "a1", "CLAUDE_CODE_EFFORT_LEVEL": "low", "CLAUDE_CODE_DISABLE_FAST_MODE": "1"]
         _ = try await collect(runner.run(req))
         let env = try String(contentsOf: dir.appending(path: "env.txt"), encoding: .utf8)
-        #expect(env.contains("CLAUDE_CODE_EFFORT_LEVEL=low"), "the engine's per-turn value, not the owner's max")
-        #expect(!env.contains("CLAUDE_CODE_EFFORT_LEVEL=max"))
+        #expect(env.contains("CLAUDE_CODE_DISABLE_FAST_MODE=1"), "an engine control on the allowlist passes")
+        // The effort travels as --effort; CLAUDE_CODE_EFFORT_LEVEL would override it and is never passed, engine-set or not (W1).
+        #expect(!env.contains("CLAUDE_CODE_EFFORT_LEVEL"))
         #expect(!env.contains("MAX_THINKING_TOKENS")); #expect(!env.contains("EXPERIMENTAL_AGENT_TEAMS"))
     }
 

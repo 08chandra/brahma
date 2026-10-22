@@ -39,6 +39,7 @@ struct MCP: ParsableCommand {
         }
         var reviewItemId: String?
         var auditTurnId: String?
+        var planTurn = false
         if context.kind == "audit" {
             // An audit credential is bound to its turn, whose batch the store holds; it names no item and no review.
             guard context.itemId == nil, reviewItem == nil else {
@@ -49,6 +50,13 @@ struct MCP: ParsableCommand {
         } else if audit {
             FileHandle.standardError.write(Data("brahma mcp: --audit does not match this turn's credential\n".utf8))
             throw ExitCode.failure
+        } else if context.kind == "plan" {
+            // A plan turn's token: the read-mostly surface, whatever the flags say.
+            guard reviewItem == nil, context.itemId != nil else {
+                FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
+                throw ExitCode.failure
+            }
+            planTurn = true
         } else if context.kind == "review" {
             guard let itemId = context.itemId else {
                 FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
@@ -69,8 +77,12 @@ struct MCP: ParsableCommand {
             FileHandle.standardError.write(Data("brahma mcp: unknown agent \(agent) in company \(company)\n".utf8))
             throw ExitCode.failure
         }
+        // The turn's mode quotas come from its credential row (the strictest when none were recorded), never from this process's
+        // environment, and are counted in the database per turn; review and audit turns have none.
+        let quotas = reviewItemId == nil && auditTurnId == nil ? context.quotas ?? .strictest : nil
         let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId,
-                                                   auditTurnId: auditTurnId))
+                                                   auditTurnId: auditTurnId, quotas: quotas, quotaTurnId: context.turnId,
+                                                   planTurn: planTurn))
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

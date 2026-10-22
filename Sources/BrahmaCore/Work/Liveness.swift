@@ -99,6 +99,8 @@ public struct StallInput: Equatable, Sendable {
     /// The five-hour part of the usage gate.
     public var usage: UsageDecision = .open
     public var pace: Pace? = nil
+    /// The account may spill into paid extra usage (`overageStatus == "allowed"`): every mode is clamped (Task 14c).
+    public var overageAllowed: Bool = false
     public var memory: MemoryPressure = .normal
     /// Agents per state (`ready`, `running`, ...).
     public var stateCounts: [String: Int] = [:]
@@ -118,6 +120,9 @@ public struct StallInput: Equatable, Sendable {
 }
 
 public enum StallExplainer {
+    /// The stall line while extra usage is on (W11): every mode is clamped to R1, no sub-agents and no Ultra.
+    public static let overageText = "deep modes and Ultra are off while extra usage is on"
+
     /// `5m`, `5h`, `2d`: the largest whole unit.
     public static func age(_ seconds: TimeInterval) -> String {
         if seconds >= Liveness.day { return "\(Int(seconds / Liveness.day))d" }
@@ -146,6 +151,7 @@ public enum StallExplainer {
         if let pace = input.pace, let until = pace.closedUntil {
             reasons.append("weekly pace: \(pace.text) — resumes about \(format("EEE HH:mm", until))")
         }
+        if input.overageAllowed { reasons.append(StallExplainer.overageText) }
         if input.memory != .normal { reasons.append("memory pressure \(input.memory.rawValue)") }
         if input.ownerAskCount > 0 {
             let k = input.ownerAskCount

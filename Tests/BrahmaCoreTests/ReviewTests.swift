@@ -315,13 +315,19 @@ import GRDB
     }
 
     @Test func reviewModelIsSonnetUnlessLargeOrFlagged() {
-        let role = SoftwarePack.pack.role("engineer")!
-        #expect(ModelPolicy.resolve(agentModel: "auto", role: role, mode: .low, context: ModelContext(turnKind: .review)) == "sonnet")
-        #expect(ModelPolicy.resolve(agentModel: "auto", role: role, mode: .low, context: ModelContext(turnKind: .audit)) == "sonnet")
-        #expect(ModelPolicy.resolve(agentModel: "auto", role: role, mode: .low,
-                                    context: ModelContext(turnKind: .review, deepReview: true)) == "opus")
-        #expect(ModelPolicy.resolve(agentModel: "haiku", role: role, mode: .low,
-                                    context: ModelContext(turnKind: .review, deepReview: true)) == "haiku")
+        // `ModePolicy.select` (Task 14c) replaced `ModelPolicy.resolve`: reviews are Standard, Deep R3 on opus for an effective
+        // tier L or a flagged item (in the Low usage mode at most R2 on sonnet), and a pinned model is kept.
+        func review(_ model: String = "auto", kind: TurnKind = .review, tier: EffortTier? = .s, flagged: Bool = false,
+                    mode: UsageMode = .balanced) -> String {
+            var i = ModeInputs()
+            i.agentModel = model; i.turnKind = kind; i.tier = tier; i.usageMode = mode
+            if flagged { i.riskTags = ["flagged"] }
+            return ModePolicy.select(i).model
+        }
+        #expect(review() == "sonnet"); #expect(review(kind: .audit) == "sonnet")
+        #expect(review(tier: .l) == "opus"); #expect(review(flagged: true) == "opus")
+        #expect(review(tier: .l, mode: .low) == "sonnet")
+        #expect(review("haiku", tier: .l) == "haiku")
         #expect(TurnKind.allCases.map(\.rawValue).sorted() == ["audit", "notice", "plan", "review", "work"])
     }
 

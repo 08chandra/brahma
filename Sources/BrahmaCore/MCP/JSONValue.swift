@@ -35,4 +35,5 @@ public enum JSONValue: Codable, Equatable, Sendable {
     var numberValue: Double? { if case .number(let n) = self { n } else { nil } }
     var arrayValue: [JSONValue]? { if case .array(let a) = self { a } else { nil } }
     var objectValue: [String: JSONValue]? { if case .object(let o) = self { o } else { nil } }
+    var boolValue: Bool? { if case .bool(let b) = self { b } else { nil } }
 }

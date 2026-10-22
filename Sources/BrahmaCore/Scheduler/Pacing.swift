@@ -120,6 +120,8 @@ public struct UsageCalibration: Equatable, Sendable, Codable {
 
     public var week = Track()
     public var fiveHour = Track()
+    /// The rung-cost EMA (`modeCalibration`, Task 14c), kept in the same stored JSON.
+    public var modes: ModeCalibration? = nil
 
     public init() {}
 

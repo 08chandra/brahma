@@ -25,6 +25,7 @@ extension Store {
             let info = try Store.latestRateLimit(db: db)
             let share = try Double.fetchOne(db, sql: "SELECT weeklyShare FROM ownerSettings WHERE id = 1") ?? 0.7
             input.usage = UsageGate.evaluateFiveHour(info, mode: company.usageMode, now: now)
+            input.overageAllowed = info.map { $0.overageStatus == "allowed" || $0.isUsingOverage } ?? false
             input.pace = UsageGate.pace(info, reserve: company.ownerReserve ?? (1 - share), now: now)
 
             var groups: [String: Int] = [:]

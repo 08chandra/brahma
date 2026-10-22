@@ -392,29 +392,27 @@ import GRDB
         let s = try S()
         let d = try s.store.hire(companyId: s.company.id, name: "design-1", role: "designer", model: "auto", managerId: s.mgr.id)
         let i = try s.item(); try s.claim(i, d)
-        // A low-usage company runs designers on haiku, a max-usage one on sonnet.
-        let template = s.store.catalog.template(role: "designer", pack: "software")
-        #expect(template.models["low"] != template.models["max"])
-        var company = s.company; company.usageMode = .low
-        try s.store.updateCompany(company)
         try s.dm(d); try await s.cycle()
-        company.usageMode = .max
-        try s.store.updateCompany(company)
+        // Mid-session the spec becomes a confirmed tier L: its rung wants opus, but the model of an (agent, item) session is fixed
+        // after its first work turn. Without an explicit escalation only the effort follows the rung (Task 14c's ModePolicy).
+        _ = try s.store.updateWorkItem(id: i.id, by: .owner, patch: WorkItemPatch(tier: .l), now: s.now)
         try s.dm(d); try await s.cycle()
         let rs = s.requests("design-1")
         #expect(rs.count == 2)
-        #expect(rs[0].agent.model == template.models["low"])
+        #expect(rs[0].agent.model == "sonnet"); #expect(rs[0].mode?.effort == .medium)
         #expect(rs[1].agent.model == rs[0].agent.model, "the model is fixed for the session")
+        #expect(rs[1].mode?.effort == .high, "the effort varies")
         #expect(s.sessionArg(rs[1])?.flag == "--resume")
         #expect(try s.turns(d).last?.cacheBreak == nil, "no model change, no cache break")
-        #expect(try s.itemSession(d, i)?.sessionModel == template.models["low"])
-        // A fresh session (a new item) chooses again.
+        #expect(try s.itemSession(d, i)?.sessionModel == "sonnet")
+        // A fresh session (a new item) chooses again: a confirmed tier L item starts on opus.
         _ = try s.tools(d).call(name: "release_lease", arguments: ["key": .string(i.key)])
-        let j = try s.item("another"); try s.claim(j, d)
+        let j = try s.item("another")
+        _ = try s.store.updateWorkItem(id: j.id, by: .owner, patch: WorkItemPatch(tier: .l), now: s.now)
+        try s.claim(j, d)
         try s.dm(d); try await s.cycle()
-        #expect(s.requests("design-1").last?.agent.model == template.models["max"])
+        #expect(s.requests("design-1").last?.agent.model == "opus")
     }
-
     @Test func cacheBreakRecordedOnModelChange() async throws {
         let s = try S()
         let ceo = try s.world.hire(s.company, "ceo")     // an explicit model: sonnet

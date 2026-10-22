@@ -13,6 +13,9 @@ struct TurnTelemetry: Sendable, Equatable {
     var modeNote: String? = nil
     /// The loop-guard reading of the stream (14b); nil judges the turn from its stored signature only.
     var observation: TurnObservation? = nil
+    /// The model and effort the work mode ran with, for the rung-cost calibration (`modeCalibration`).
+    var modeModel: String? = nil
+    var modeEffort: Effort? = nil
 }
 
 /// One turn's accounting, worked out inside the turn-end transaction.
@@ -27,17 +30,6 @@ struct TurnAccounting: Equatable {
 }
 
 extension Store {
-    /// The effort tier the next work turn of the agent runs under: its leased item's tier. An item whose spec nobody
-    /// trusted yet never gets a tier model (an agent could otherwise author itself onto opus by writing `L`).
-    func workTier(agentId: String) throws -> EffortTier? {
-        try writer.read { db in
-            guard let lease = try WorkLease.filter(Column("agentId") == agentId).fetchOne(db),
-                  let item = try WorkItem.fetchOne(db, key: lease.itemId) else { return nil }
-            if TierBudget.of(item.tier).model != nil, item.specConfirmedBy == nil { return nil }
-            return item.tier
-        }
-    }
-
     /// The cost of a turn that reported `total` for `sessionId`: the total less the largest total any earlier turn of that
     /// session recorded. A total that went down starts over (a new session under a reused id).
     static func turnCost(db: Database, turnId: String, sessionId: String?, total: Double) throws -> Double {
@@ -92,6 +84,16 @@ extension Store {
         }
         if resetSession { turn.stopReason = TurnStop.sessionReset }
         try turn.update(db)
+        // A completed work turn teaches the rung-cost EMA what its (model, effort) costs.
+        var completed = false
+        switch end {
+        case .succeeded, .capped: completed = true
+        default: break
+        }
+        if completed, !resetSession, !turn.infra, turn.kind == .work, let model = t.modeModel, let effort = t.modeEffort,
+           let cost = a.cost {
+            try recordModeCost(db: db, model: model, effort: effort, costLE: cost)
+        }
     }
 
     /// The item a turn worked on: the one recorded at its start, else the agent's lease.
@@ -125,7 +127,23 @@ extension Store {
         let budget = TierBudget.of(item.tier)
         let costCap = budget.maxCostLE + item.budgetBoostLE
         guard usage.turns > budget.maxTurns || usage.tokens > budget.maxTokens || usage.costLE > costCap else { return }
+        try blockOverBudget(db: db, item: &item, agent: agent, now: now)
+    }
 
+    /// The no-launch rule (Task 14c): an item whose remaining $LE cannot pay for even a Quick turn is blocked over budget with
+    /// the same text, lease release and manager DM as a turn that went over.
+    func blockOverBudget(itemId: String, agentId: String, now: Date) throws {
+        try writer.write { db in
+            guard var item = try WorkItem.fetchOne(db, key: itemId), item.status == .inProgress || item.status == .ready,
+                  let agent = try Agent.fetchOne(db, key: agentId) else { return }
+            try blockOverBudget(db: db, item: &item, agent: agent, now: now)
+        }
+    }
+
+    private func blockOverBudget(db: Database, item: inout WorkItem, agent: Agent, now: Date) throws {
+        let usage = try Store.itemUsage(db: db, itemId: item.id)
+        let budget = TierBudget.of(item.tier)
+        let costCap = budget.maxCostLE + item.budgetBoostLE
         let calibration = try Store.calibration(db)
         let parts = BudgetText.parts(usage: usage, budget: budget, costCapLE: costCap, pctPerDollar: calibration.pctPerDollar)
         let from = item.status

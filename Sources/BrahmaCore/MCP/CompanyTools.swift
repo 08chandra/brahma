@@ -5,6 +5,41 @@ public struct ToolSpec: Encodable, Sendable {
     public var name: String
     public var description: String
     public var inputSchema: JSONValue
+    /// Listed with `annotations.readOnlyHint`: the CLI's plan mode lets such tools run and refuses the others (probe V-4).
+    public var readOnly: Bool
+
+    public init(name: String, description: String, inputSchema: JSONValue, readOnly: Bool = false) {
+        self.name = name; self.description = description; self.inputSchema = inputSchema
+        self.readOnly = readOnly || CompanyTools.readOnlyTools.contains(name)
+    }
+
+    private enum CodingKeys: String, CodingKey { case name, description, inputSchema, annotations }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        try c.encode(description, forKey: .description)
+        try c.encode(inputSchema, forKey: .inputSchema)
+        if readOnly { try c.encode(JSONValue.object(["readOnlyHint": .bool(true)]), forKey: .annotations) }
+    }
+}
+
+/// Per-turn MCP quota counts. A real turn's server counts in the database by turn id (`Store.reserveTurnQuota`), so every server
+/// process and every sub-agent of the turn shares one count; this in-memory counter serves tools built without a turn.
+final class TurnQuotaCounter: @unchecked Sendable {
+    enum Kind: String { case posts, items, comments, highRisk }
+    private let lock = NSLock()
+    private var used: [Kind: Int] = [:]
+
+    func used(_ k: Kind) -> Int { lock.withLock { used[k] ?? 0 } }
+    func reserve(_ k: Kind, limit: Int) -> Bool {
+        lock.withLock {
+            guard used[k, default: 0] < limit else { return false }
+            used[k, default: 0] += 1
+            return true
+        }
+    }
+    func release(_ k: Kind) { lock.withLock { used[k] = max(0, (used[k] ?? 0) - 1) } }
 }
 
 /// A failure the agent should see as an `isError` tool result.
@@ -22,16 +57,86 @@ public struct CompanyTools: Sendable {
     /// Set for the MCP server of an audit turn (9c): only the `audit` tool, limited to the samples bound to this turn.
     let auditTurnId: String?
 
-    public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil) {
+    /// The turn's mode quotas, from its credential row; nil: none (review turns, tools built without a turn).
+    let quotas: ModeQuotas?
+    /// The turn whose database counters the quotas use; nil: the in-memory counter.
+    let quotaTurnId: String?
+    /// A plan turn's server: the mutating work and decision tools are not offered.
+    let planTurn: Bool
+    let counter = TurnQuotaCounter()
+
+    public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
+                quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false) {
         self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, auditTurnId: auditTurnId,
-                  diagnostics: { line in FileHandle.standardError.write(Data((line + "\n").utf8)) })
+                  quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, diagnostics: { line in
+            FileHandle.standardError.write(Data((line + "\n").utf8))
+        })
     }
 
     init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
+         quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false,
          diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
         self.reviewItemId = reviewItemId
         self.auditTurnId = reviewItemId == nil ? auditTurnId : nil
+        self.quotas = quotas; self.quotaTurnId = quotaTurnId; self.planTurn = planTurn
+    }
+
+    /// Tools that only read; they carry `readOnlyHint` and are never counted.
+    static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item"]
+    /// High-authority company tools (design §2.2): one call per turn when sub-agents are on, none on a plan turn, denied under
+    /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
+    public static let highRiskTools: Set<String> = ["decide", "propose_decision", "escalate_decision", "request_from_owner",
+                                                    "request_mode", "plan_sprint", "close_sprint", "confirm_spec"]
+    /// What a plan turn's server leaves out: everything that changes work, leases, decisions or channels.
+    static let planTurnExcluded: Set<String> = Set(["claim_lease", "release_lease", "submit_for_review", "update_work_item",
+                                                    "create_work_item", "link_dependency", "write_handoff", "create_channel",
+                                                    "set_blocked"])
+        .union(highRiskTools)
+    static let updateLowRiskFields: Set<String> = ["key", "status", "blockedReason", "notes", "linkedBranch"]
+
+    func quotaKind(_ name: String, _ args: [String: JSONValue]) -> TurnQuotaCounter.Kind? {
+        switch name {
+        case "post_message", "send_dm": return .posts
+        case "create_work_item": return .items
+        case "comment_work_item": return .comments
+        case "update_work_item": return Set(args.keys).isSubset(of: Self.updateLowRiskFields) ? nil : .highRisk
+        default: return Self.highRiskTools.contains(name) ? .highRisk : nil
+        }
+    }
+
+    /// Takes one unit of the turn's quota for this call. Returns whether a unit was taken (to give back if the call fails), or
+    /// throws the refusal when the quota is used up. A counter the database cannot update refuses (fail closed).
+    func reserveQuota(_ kind: TurnQuotaCounter.Kind) throws -> Bool {
+        guard let q = quotas else { return false }
+        let limit: Int?, what: String
+        switch kind {
+        case .posts: limit = q.posts; what = "\(q.posts) posts and DMs per turn"
+        case .items: limit = q.itemsCreated; what = "\(q.itemsCreated) new items per turn"
+        case .comments: limit = q.comments; what = "\(q.comments) comments per turn"
+        case .highRisk: limit = q.highRisk; what = "\(q.highRisk ?? 0) high-risk company calls per turn"
+        }
+        guard let limit else { return false }
+        let taken: Bool
+        if let turnId = quotaTurnId {
+            taken = (try? store.reserveTurnQuota(turnId: turnId, kind: kind.rawValue, limit: limit)) ?? false
+        } else {
+            taken = counter.reserve(kind, limit: limit)
+        }
+        guard taken else {
+            throw ToolError(message: "this turn's limit is reached (\(what)); carry on next turn or say what you need in your final reply")
+        }
+        return true
+    }
+
+    func releaseQuota(_ kind: TurnQuotaCounter.Kind) {
+        if let turnId = quotaTurnId {
+            do { try store.releaseTurnQuota(turnId: turnId, kind: kind.rawValue) } catch {
+                diagnostics("brahma mcp: failed to give back a \(kind.rawValue) quota unit: \(error)")
+            }
+        } else {
+            counter.release(kind)
+        }
     }
 
     static func schema(_ properties: [String: JSONValue], required: [String]) -> JSONValue {
@@ -47,6 +152,7 @@ public struct CompanyTools: Sendable {
         let all = Self.baseSpecs() + Self.workSpecs() + Self.inboxToolSpecs()
         // An audit turn sees the audit tool only (`audit` is listed only here).
         if auditTurnId != nil { return [Self.auditSpec()] }
+        if planTurn, reviewItemId == nil { return all.filter { !Self.planTurnExcluded.contains($0.name) } }
         guard reviewItemId != nil else { return all }
         // A review turn sees the review tools only (`review` itself is listed only here).
         return all.filter { CompanyToolNames.review.contains($0.name) } + [Self.reviewSpec()]
@@ -93,14 +199,26 @@ public struct CompanyTools: Sendable {
         if reviewItemId != nil { return try callInReviewTurn(name: name, arguments: arguments) }
         if name == "review" { throw ToolError(message: Store.reviewTurnOnlyMessage) }
         if CompanyToolNames.audit.contains(name) { throw ToolError(message: Store.auditTurnOnlyMessage) }
+        if planTurn, Self.planTurnExcluded.contains(name) {
+            throw ToolError(message: "\(name) is not available in a plan turn: write the plan; the next turn carries it out")
+        }
         if Self.implemented.contains(name) {
             let packId = (try? store.company(id: companyId))??.packId ?? "software"
             guard store.catalog.template(role: me.role, pack: packId).companyTools.contains(name) else {
                 throw ToolError(message: "\(name) is not available to your role")
             }
         }
+        // Quotas count calls that succeed; a refused or failed call costs nothing. The unit is taken before the call (so two
+        // concurrent calls cannot both take the last one) and given back if it fails.
         try refuseItemsBeingMerged(name, arguments)
-        return try dispatch(name, arguments)
+        let kind = quotaKind(name, arguments)
+        let reserved = try kind.map(reserveQuota) ?? false
+        do {
+            return try dispatch(name, arguments)
+        } catch {
+            if reserved, let kind { releaseQuota(kind) }
+            throw error
+        }
     }
 
     /// Tools that only read an item stay available while it merges.

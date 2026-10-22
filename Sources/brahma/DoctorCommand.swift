@@ -11,7 +11,8 @@ struct Doctor: AsyncParsableCommand {
         try requireOwnerShell()
         signal(SIGPIPE, SIG_IGN)
         let (store, _) = try openStore()
-        let report = await BrahmaCore.Doctor.run(claudePath: "claude", runner: ClaudeProcessRunner())
+        let report = await BrahmaCore.Doctor.run(claudePath: "claude", runner: ClaudeProcessRunner(),
+                                                 hookExecutable: Bundle.main.executablePath ?? CommandLine.arguments[0])
         try? store.saveProbe(report)
         for item in report.items {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")

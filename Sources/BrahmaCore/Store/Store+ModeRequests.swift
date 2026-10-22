@@ -20,7 +20,7 @@ public struct ModeRequestRecord: Codable, Equatable, Sendable, FetchableRecord, 
 }
 
 public struct ModeRequestResult: Equatable, Sendable {
-    public enum Kind: Equatable, Sendable { case raised, alreadyThere, duplicate, ultraUnavailable }
+    public enum Kind: Equatable, Sendable { case raised, alreadyThere, duplicate, ultraUnavailable, coolingDown }
     public var kind: Kind
     /// Text for the agent.
     public var message: String
@@ -34,6 +34,8 @@ extension Store {
     public static let modeRequestTurnGap = 3
     public static let modeRequestsPerDay = 3
     public static let requestableFloor = 2
+    /// A denied (Ultra) request is not repeated on the same item within this many company-active seconds.
+    public static let ultraCooldown: Double = 86_400
 
     @discardableResult
     public func requestMode(companyId: String, by agentId: String, itemKey: String, mode: String, reason: String,
@@ -57,15 +59,33 @@ extension Store {
                try ModeRequestRecord.filter(Column("itemId") == item.id && Column("agentId") == agentId && Column("requestId") == rid).fetchCount(db) > 0 {
                 return ModeRequestResult(kind: .duplicate, message: "Request \(rid) was already recorded for \(item.key); nothing changed.")
             }
+            let active = try Store.activeNow(db: db, companyId: companyId)
             if m == "ultra" {
+                // Recorded and answered: Ultra arrives with the sandbox. A repeat on the same item within an active day is the
+                // denied-request cooldown, unless a new failed check has come in since.
+                if let last = try ModeRequestRecord.filter(Column("itemId") == item.id && Column("mode") == "ultra")
+                    .order(Column("id").desc).fetchOne(db), active - last.createdActive < Store.ultraCooldown {
+                    let failedSince = try VerificationRun.filter(Column("itemId") == item.id && Column("createdAt") > last.createdAt
+                                                                 && ["failed", "timedOut"].contains(Column("status"))).fetchCount(db)
+                    if failedSince == 0 {
+                        return ModeRequestResult(kind: .coolingDown,
+                                                 message: "An Ultra request for \(item.key) was answered less than an active day ago; the cooldown applies until a new failed check.")
+                    }
+                }
+                var record = ModeRequestRecord(id: nil, companyId: companyId, itemId: item.id, agentId: agentId,
+                                               requestId: rid.flatMap { $0.isEmpty ? nil : $0 }, mode: m, turnId: nil,
+                                               createdActive: active, createdAt: now)
+                try record.insert(db)
                 return ModeRequestResult(kind: .ultraUnavailable, message: "Ultra arrives with the sandbox (5-lite)")
             }
-            let active = try Store.activeNow(db: db, companyId: companyId)
-            let today = try ModeRequestRecord.filter(Column("agentId") == agentId && Column("createdActive") > active - 86_400).fetchCount(db)
+            // Ultra requests have their own cooldown and do not use up the Deep request limits.
+            let today = try ModeRequestRecord.filter(Column("agentId") == agentId && Column("createdActive") > active - 86_400
+                                                     && Column("mode") != "ultra").fetchCount(db)
             guard today < Store.modeRequestsPerDay else {
                 throw WorkError.conflict("you have made \(Store.modeRequestsPerDay) mode requests today; ask your manager instead")
             }
-            if let last = try ModeRequestRecord.filter(Column("itemId") == item.id && Column("agentId") == agentId)
+            if let last = try ModeRequestRecord.filter(Column("itemId") == item.id && Column("agentId") == agentId
+                                                       && Column("mode") != "ultra")
                 .order(Column("id").desc).fetchOne(db) {
                 let since: Int
                 if let turnId = last.turnId {
