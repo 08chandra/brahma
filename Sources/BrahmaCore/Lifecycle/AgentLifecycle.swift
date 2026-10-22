@@ -22,7 +22,14 @@ extension Store {
     /// `paused` and `requestedBlocker` are left untouched.
     @discardableResult
     public func transition(agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date = Store.now()) throws -> Agent {
-        try writer.write { db in try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now) }
+        try writer.write { db in try transitionAndRelease(db: db, agentId: agentId, to: to, blocker: blocker, now: now) }
+    }
+
+    /// `transition`, plus what killing an agent does to its work: leases marked expired, items unassigned.
+    func transitionAndRelease(db: Database, agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date) throws -> Agent {
+        let agent = try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
+        if to == .killed { try releaseWork(of: agent, db: db, now: now) }
+        return agent
     }
 
     /// Same as `transition(agentId:to:blocker:now:)`, for callers already inside a write transaction.

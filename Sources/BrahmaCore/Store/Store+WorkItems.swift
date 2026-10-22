@@ -118,8 +118,10 @@ extension Store {
         return letters.isEmpty ? "ITEM" : letters
     }
 
-    /// Task 7 reads the open lease; until it exists nobody holds one.
-    static func leaseHolderId(db: Database, itemId: String) throws -> String? { nil }
+    /// The agent holding the item's lease, if any.
+    static func leaseHolderId(db: Database, itemId: String) throws -> String? {
+        try String.fetchOne(db, sql: "SELECT agentId FROM workLease WHERE itemId = ?", arguments: [itemId])
+    }
 
     // MARK: Create
 
@@ -136,6 +138,7 @@ extension Store {
         let description = try Self.limited(draft.description, Self.maxDescription, "the description")
         let criteria = try Self.limited(draft.acceptanceCriteria, Self.maxCriteria, "the acceptance criteria")
         try draft.checkSpec?.validate()
+        try CheckSpec.validatePaths(draft.touchPaths, what: "touch")
         let priority = try Self.validPriority(draft.priority)
         let points = try Self.validPoints(draft.points)
         let team = try Self.validTeam(draft.team)
@@ -157,7 +160,7 @@ extension Store {
             status: draft.status, priority: priority, points: points, tier: draft.tier, authorId: actor.id,
             ownerId: draft.ownerId, reviewerId: draft.reviewerId, team: team, parentId: draft.parentId,
             createdAt: now, updatedAt: now, intensity: draft.intensity,
-            specConfirmedBy: actor.privileged || actor.isLead ? actor.label : nil)
+            specConfirmedBy: actor.privileged || actor.isLead ? actor.label : nil, touchPaths: draft.touchPaths)
         // The same rules as an edit, applied to the draft's assignee and reviewer.
         if item.ownerId != nil,
            let d = WorkPolicy.denial(.assignee, item: item, actor: actor.id, actorKind: actor.kind, leaseHolderId: nil) {
@@ -254,6 +257,10 @@ extension Store {
             try spec?.validate()
             if spec != item.checkSpec { item.checkSpec = spec; item.checkRevision += 1; checkChanged = true }
         }
+        if let paths = patch.touchPaths {
+            try CheckSpec.validatePaths(paths, what: "touch")
+            if paths != item.touchPaths { item.touchPaths = paths; specChanged.append("touch paths") }
+        }
         if let p = patch.priority, p != item.priority { item.priority = try Self.validPriority(p); specChanged.append("priority") }
         if let p = patch.points {
             let v = try Self.validPoints(p)
@@ -311,7 +318,6 @@ extension Store {
                 item.blockedSinceActive = nil
             }
             if item.status == .done { item.doneAt = nil }
-            // Task 7: inProgress → ready also releases the item's lease.
             item.status = to
             if to == .inProgress { item.everStarted = true }
         } else if patch.status == nil || patch.status == item.status, let reason, !reason.isEmpty, item.status == .blocked,
@@ -322,6 +328,17 @@ extension Store {
 
         guard !specChanged.isEmpty || checkChanged || assignment != nil || !otherChanged.isEmpty || statusChange != nil else {
             return item
+        }
+        // The lease goes when the item leaves the holder's hands: back to ready or backlog, or given to someone else.
+        var releasedLease: (lease: WorkLease, why: String)?
+        if let lease = try WorkLease.fetchOne(db, key: item.id) {
+            if let a = assignment, a.new != lease.agentId {
+                releasedLease = (lease, "reassigned")
+                if item.status == .inProgress, statusChange == nil { item.status = .ready }
+            } else if let s = statusChange, s.to == .ready || s.to == .backlog {
+                releasedLease = (lease, "moved to \(s.to.title)")
+            }
+            if releasedLease != nil { try lease.delete(db) }
         }
         if !specChanged.isEmpty || checkChanged {
             // Whoever changes the spec vouches for it only if they are trusted; anyone else un-confirms it.
@@ -351,6 +368,10 @@ extension Store {
         }
         if !otherChanged.isEmpty {
             try recordItemEvent(db: db, item: item, actor: actor.id, kind: .edited, text: "edited " + otherChanged.joined(separator: ", "), now: now)
+        }
+        if let released = releasedLease {
+            try recordItemEvent(db: db, item: item, actor: actor.id, kind: .leaseReleased, text: "lease released: \(released.why)",
+                                alsoNotify: [released.lease.agentId], now: now)
         }
         return item
     }
@@ -490,6 +511,7 @@ extension Store {
         if to == .done { item.doneAt = now }
         item.updatedAt = now
         try item.update(db)
+        if to == .done { try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id]) }
         try recordItemEvent(db: db, item: item, actor: "system", kind: .statusChanged,
                             text: text ?? "\(from.title) → \(to.title)", now: now)
         if to == .done { try itemDone(db: db, item: item, now: now) }

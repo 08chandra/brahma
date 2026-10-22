@@ -28,6 +28,14 @@ public actor Orchestrator {
     /// Health work that must never block a tick (doctor re-probe, `claude --version`, HTTPS probe, disk checks).
     var healthTasks: [String: Task<Void, Never>] = [:]
     var health = HealthState()
+    /// Git work that must never block a tick: removing worktrees, the orphan sweep, creating a dispatched item's worktree.
+    var gitTasks: [String: Task<Void, Never>] = [:]
+    /// Agents the engine has just leased an item to, until their worktree exists (they are not scheduled meanwhile).
+    var dispatching = Set<String>()
+    /// Items whose dispatch failed in git: not offered again before this time.
+    var dispatchBackoff: [String: Date] = [:]
+    var lastDispatch: Date?
+    var lastSweep: [String: Date] = [:]
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
     var infraCooldown: [String: Date] = [:]
@@ -58,7 +66,7 @@ public actor Orchestrator {
 
     public func waitUntilIdle(timeout: Duration) async throws {
         let deadline = ContinuousClock.now + timeout
-        while !tasks.isEmpty || !healthTasks.isEmpty {
+        while !tasks.isEmpty || !healthTasks.isEmpty || !gitTasks.isEmpty {
             guard ContinuousClock.now < deadline else { throw OrchestratorError.idleTimeout(running: runningCount()) }
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -70,7 +78,7 @@ public actor Orchestrator {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        let inFlight = Array(tasks.values) + Array(healthTasks.values)
+        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values)
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -100,6 +108,11 @@ public actor Orchestrator {
         let calibration = try store.usageCalibration()
         let reservedLE = store.openReservationLE()
 
+        // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
+        // ready items to idle individual contributors. Nothing here waits on git.
+        let reaped = try store.reapLeases(now: now)
+        leaseTick(now: now, companies: companies, reaped: reaped, held: held)
+
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }
 
@@ -116,7 +129,7 @@ public actor Orchestrator {
 
         // 2. How many live agents each agent is holding up.
         let all = try store.agents()
-        var blocking: [String: Int] = [:]
+        var blocking: [String: Int] = (try? store.blockingCounts()) ?? [:]
         for a in all where a.state != .killed {
             if case .agent(let id)? = a.blocker { blocking[id, default: 0] += 1 }
         }
@@ -184,7 +197,8 @@ public actor Orchestrator {
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         let ready = try store.agents(states: [.ready])
         let candidates = ready.compactMap { a -> Candidate? in
-            guard !a.paused, tasks[a.id] == nil, infraCooldown[a.id] == nil, let c = byId[a.companyId] else { return nil }
+            guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil,
+                  let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
@@ -258,13 +272,26 @@ public actor Orchestrator {
                 agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
                 mode: company.usageMode, context: ModelContext())
             let turnToken = try store.issueTurnCredential(turnId: turn.id)
+            // A leaseholder works inside its item's worktree (with the shared `.brahma` directory); everyone else in the workspace.
+            var workingDirectory = company.workspacePath
+            var addDirs: [String] = []
+            if let lease = try store.lease(agentId: agent.id), let leased = try store.workItem(id: lease.itemId) {
+                let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+                let git = GitWorkspace(root: workspace)
+                let checkout = git.worktreePath(key: leased.key)
+                if !FileManager.default.fileExists(atPath: checkout.path) { _ = try? git.addWorktree(key: leased.key) }
+                if FileManager.default.fileExists(atPath: checkout.path) {
+                    workingDirectory = checkout.path
+                    addDirs = [checkout.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
+                }
+            }
             let request = TurnRequest(
                 agent: sent, company: company,
                 prompt: Self.prompt(agent: agent, company: company, items: items, handles: handles,
                                     unread: Store.channelCounts(quiet), notices: notices, collapsedNotices: collapsedNotices),
                 appendSystemPrompt: RolePrompt.render(agent: agent, company: company),
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken),
-                workingDirectory: company.workspacePath, profile: profile,
+                workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
             var sessionMarked = agent.sessionStarted
@@ -407,7 +434,7 @@ extension Store {
                     if condition: (Agent) -> Bool) throws -> Agent? {
         try writer.write { db in
             guard let a = try Agent.fetchOne(db, key: agentId), condition(a) else { return nil }
-            return try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
+            return try transitionAndRelease(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
         }
     }
 
@@ -504,6 +531,7 @@ extension Store {
 
             // Killed (or otherwise moved) mid-turn: the turn is recorded, the state is left alone.
             guard agent.state == .running else { return infraClass }
+            if case .succeeded = end { try Store.renewLeases(db: db, agentId: agentId, now: now) }
             if agent.paused {
                 try Store.transition(db: db, agentId: agentId, to: .sleeping, now: now)
                 return infraClass

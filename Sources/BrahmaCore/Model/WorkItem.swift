@@ -68,6 +68,18 @@ public struct CheckSpec: Codable, Equatable, Sendable {
         self.command = command; self.timeoutSeconds = timeoutSeconds; self.paths = paths; self.maxTimeout = maxTimeout
     }
 
+    /// A list of repo-relative paths or globs: at most `maxPaths`, none empty, absolute or climbing out with "..".
+    static func validatePaths(_ paths: [String], what: String) throws {
+        if paths.count > maxPaths { throw WorkError.invalid("\(what == "check" ? "a check" : "an item") lists at most \(maxPaths) paths") }
+        for p in paths {
+            if p.isEmpty { throw WorkError.invalid("a \(what) path is empty") }
+            if p.hasPrefix("/") { throw WorkError.invalid("\(what) path '\(p)' must be relative") }
+            if p.split(separator: "/", omittingEmptySubsequences: false).contains("..") {
+                throw WorkError.invalid("\(what) path '\(p)' must not contain '..'")
+            }
+        }
+    }
+
     public func validate() throws {
         if command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw WorkError.invalid("the check command is empty") }
         if command.count > Self.maxCommandLength {
@@ -78,14 +90,7 @@ public struct CheckSpec: Codable, Equatable, Sendable {
         guard (1...ceiling).contains(timeoutSeconds) else {
             throw WorkError.invalid("the check timeout must be between 1 and \(ceiling) seconds")
         }
-        if paths.count > Self.maxPaths { throw WorkError.invalid("a check lists at most \(Self.maxPaths) paths") }
-        for p in paths {
-            if p.isEmpty { throw WorkError.invalid("a check path is empty") }
-            if p.hasPrefix("/") { throw WorkError.invalid("check path '\(p)' must be relative") }
-            if p.split(separator: "/", omittingEmptySubsequences: false).contains("..") {
-                throw WorkError.invalid("check path '\(p)' must not contain '..'")
-            }
-        }
+        try Self.validatePaths(paths, what: "check")
     }
 }
 
@@ -140,6 +145,8 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var budgetBoostLE: Double = 0
     /// "<id>:<role kind>" of whoever set or confirmed the spec; nil until someone trusted did.
     public var specConfirmedBy: String? = nil
+    /// Optional globs the item changes besides its check's `paths`; both together are its claimed paths (none = the whole repo).
+    public var touchPaths: [String] = []
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }
@@ -166,11 +173,13 @@ public struct WorkItemDraft: Sendable {
     /// `backlog` (default) or `ready`.
     public var status: WorkItemStatus = .backlog
     public var intensity: WorkIntensity = .auto
+    public var touchPaths: [String] = []
 
     public init(type: WorkItemType, title: String, description: String = "", acceptanceCriteria: String = "",
                 checkSpec: CheckSpec? = nil, priority: Int = 2, points: Int? = nil, tier: EffortTier = .m,
                 ownerId: String? = nil, reviewerId: String? = nil, team: String? = nil, parentId: String? = nil,
-                status: WorkItemStatus = .backlog, intensity: WorkIntensity = .auto) {
+                status: WorkItemStatus = .backlog, intensity: WorkIntensity = .auto, touchPaths: [String] = []) {
+        self.touchPaths = touchPaths
         self.type = type; self.title = title; self.description = description; self.acceptanceCriteria = acceptanceCriteria
         self.checkSpec = checkSpec; self.priority = priority; self.points = points; self.tier = tier; self.ownerId = ownerId
         self.reviewerId = reviewerId; self.team = team; self.parentId = parentId; self.status = status
@@ -197,12 +206,14 @@ public struct WorkItemPatch: Sendable {
     public var notes: String??
     public var linkedBranch: String??
     public var intensity: WorkIntensity?
+    public var touchPaths: [String]?
 
     public init(type: WorkItemType? = nil, title: String? = nil, description: String? = nil, acceptanceCriteria: String? = nil,
                 checkSpec: CheckSpec?? = nil, priority: Int? = nil, points: Int?? = nil, tier: EffortTier? = nil,
                 ownerId: String?? = nil, reviewerId: String?? = nil, team: String?? = nil, parentId: String?? = nil,
                 status: WorkItemStatus? = nil, blockedReason: String? = nil, notes: String?? = nil,
-                linkedBranch: String?? = nil, intensity: WorkIntensity? = nil) {
+                linkedBranch: String?? = nil, intensity: WorkIntensity? = nil, touchPaths: [String]? = nil) {
+        self.touchPaths = touchPaths
         self.type = type; self.title = title; self.description = description; self.acceptanceCriteria = acceptanceCriteria
         self.checkSpec = checkSpec; self.priority = priority; self.points = points; self.tier = tier; self.ownerId = ownerId
         self.reviewerId = reviewerId; self.team = team; self.parentId = parentId; self.status = status
@@ -212,7 +223,7 @@ public struct WorkItemPatch: Sendable {
     /// The edit categories this patch touches, for the policy check.
     var touchesSpec: Bool {
         type != nil || title != nil || description != nil || acceptanceCriteria != nil || checkSpec != nil || priority != nil
-            || points != nil || tier != nil || reviewerId != nil || team != nil || parentId != nil
+            || points != nil || tier != nil || reviewerId != nil || team != nil || parentId != nil || touchPaths != nil
     }
     var touchesOwner: Bool { ownerId != nil }
     var touchesNotes: Bool { notes != nil }

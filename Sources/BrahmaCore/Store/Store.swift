@@ -6,6 +6,20 @@ public enum StoreError: Error, Equatable {
     case notFound
     /// Channel or agent name is reserved or not in the allowed alphabet.
     case invalidName
+    /// The workspace could not be made a git repository. The message is shown as `git is required: <stderr>`.
+    case gitRequired(String)
+}
+
+extension StoreError: LocalizedError, CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .duplicateName: "duplicate name"
+        case .notFound: "not found"
+        case .invalidName: "invalid name"
+        case .gitRequired(let stderr): "git is required: \(stderr)"
+        }
+    }
+    public var errorDescription: String? { description }
 }
 
 public final class Store: Sendable {
@@ -90,7 +104,16 @@ public final class Store: Sendable {
                 packId: packId, packVersion: packVersion ?? pack.version)
             try company.insert(db)
             // Directory is created only after the row is in; a failure here rolls the insert back.
+            let existed = FileManager.default.fileExists(atPath: dir.path)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            do {
+                try GitWorkspace(root: dir).ensureRepo()
+            } catch {
+                if !existed { try? FileManager.default.removeItem(at: dir) }
+                let detail: String
+                if case GitError.failed(_, _, let stderr) = error { detail = stderr } else { detail = "\(error)" }
+                throw StoreError.gitRequired(detail)
+            }
             try Store.insertChannel(db, companyId: company.id, name: "general", kind: .channel, members: ["owner"], now: createdAt)
             return company
         }

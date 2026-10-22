@@ -46,14 +46,27 @@ private struct MCPWorld {
     #expect(r["id"] as? String == "abc-1")
 }
 
-@Test func toolsListHasExactlySevenTools() throws {
+@Test func toolsListIsIdenticalForAllRoles() throws {
     let w = try MCPWorld()
-    let r = try w.rpc(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
-    let tools = try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-    #expect(Set(tools.compactMap { $0["name"] as? String }) ==
-            ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"])
-    #expect(tools.count == 7)
+    func listing(_ agent: Agent) throws -> [[String: Any]] {
+        let server = MCPServer(tools: CompanyTools(store: w.store, companyId: w.company.id, agentId: agent.id))
+        let line = try #require(server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
+        let r = try #require(try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        return try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+    }
+    let engineer = try w.store.hire(companyId: w.company.id, name: "eng-1", role: "engineer", model: "m")
+    let tools = try listing(w.ceo)
+    let expected: Set<String> = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked",
+        "list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency", "comment_work_item", "claim_lease",
+        "release_lease", "confirm_spec"]
+    #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
+    #expect(tools.count == expected.count)
     for t in tools { #expect((t["inputSchema"] as? [String: Any])?["type"] as? String == "object") }
+    // The same list, byte for byte, whatever the caller's role: the cacheable prompt prefix never changes.
+    for agent in [w.cto, engineer] {
+        #expect(try JSONSerialization.data(withJSONObject: listing(agent), options: [.sortedKeys])
+                == JSONSerialization.data(withJSONObject: tools, options: [.sortedKeys]))
+    }
 }
 
 @Test func unknownMethodIsMethodNotFoundAndNotificationsAreSilent() throws {

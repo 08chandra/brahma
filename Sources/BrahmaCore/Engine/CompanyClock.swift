@@ -121,7 +121,7 @@ extension Store {
 
     // MARK: Owner settings
 
-    private static func ensureOwnerSettings(_ db: Database) throws {
+    static func ensureOwnerSettings(_ db: Database) throws {
         try db.execute(sql: "INSERT OR IGNORE INTO ownerSettings(id, timeZone) VALUES (1, ?)",
                        arguments: [TimeZone.current.identifier])
     }
