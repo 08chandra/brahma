@@ -162,6 +162,11 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var stopReason: String? = nil
     /// The current approval is the engine's risk-tiered auto-approval (tier S, small diff), not a reviewer's.
     public var autoApproved: Bool = false
+    /// "<id>:<role kind>" of whoever last set the tier (at creation or by an edit), as `specConfirmedBy`. Risk-tiered review
+    /// (9c) trusts a tier S only when the engine, the owner or a lead other than the item's implementers set it.
+    public var tierSetBy: String? = nil
+    /// "<id>:<role kind>" of whoever last set or edited the check: the item's last check editor.
+    public var checkSpecSetBy: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

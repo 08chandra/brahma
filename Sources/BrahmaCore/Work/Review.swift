@@ -133,30 +133,59 @@ public enum ReviewDigest {
     }
 }
 
-/// Risk-tiered review (9c): which approved-by-the-engine items may skip the review turn, and how they are audited after.
+/// Risk-tiered review (9c): which engine-verified items may skip the review turn, and how every one of them is audited after.
 ///
-/// An item skips its review turn only when every one of these holds: tier S, the engine's check passed (no flaky pass), no
-/// review flag, its change (measured by the engine from the engine-recorded base and from `main`'s merge base to the verified
-/// commit) is under `autoMergeMaxLines` lines with no binary file, it touches no sensitive path, and neither its assignee nor
-/// its lease holder has `fullReview`. Every `auditSampleEvery`-th auto-merge of a company is sampled; once per
-/// `auditInterval` company-active seconds up to `auditBatchMax` samples go to one batched audit turn.
+/// The rule is an allowlist computed by the engine; nothing an implementer sets can make an item qualify. An item skips its
+/// review turn only when every one of these holds:
+/// - auto-merge is on (the owner's switch and the pack's `autoMerge`);
+/// - tier S with an engine check, where the tier, the check and the spec confirmation were each set by the engine, the owner
+///   or a lead who is not the item's assignee, lease holder or submitter (`Store.autoMergeProvenanceHolds`);
+/// - a clean first-round pass: no review flag (a flaky pass is one), no earlier `changesRequested`, review round 1;
+/// - the change, measured by the engine from the engine-recorded base and from `main`'s merge base to the verified commit, is
+///   under `autoMergeMaxLines` changed lines and `autoMergeMaxBytes` changed bytes, deletes no file, adds no binary, executable,
+///   symlink or submodule, and every path (both sides of a rename) lies under the allowed directories (`autoMergePaths`) and is
+///   not sensitive (`isSensitive`);
+/// - neither the assignee, the lease holder nor the submitter has `fullReview`.
+///
+/// Every auto-merge is audited: batches of up to `auditBatchMax` per audit turn, routed like reviews.
 public enum ReviewPolicy {
     public static let autoMergeMaxLines = 150
-    public static let auditSampleEvery = 4
-    public static let auditInterval: Double = 86_400
-    public static let auditBatchMax = 5
+    public static let autoMergeMaxBytes = 8000
+    /// Samples a single audit turn may be given.
+    public static let auditBatchMax = 10
+    /// Company-active seconds an audit that ended without a verdict waits before it is routed again.
+    public static let auditRetryDelay: Double = 3600
+    /// Company-active seconds a sample whose merged diff could not be produced waits before it is tried again.
+    public static let auditDeferral: Double = 3600
+    /// An auto-merge still unaudited after this much company-active time, or after `auditMaxAttempts` audit turns without a
+    /// verdict, raises an engine alert to the owner.
+    public static let auditEscalateAfter: Double = 3 * 86_400
+    public static let auditMaxAttempts = 3
     public static let autoApprovedNote = "auto-approved (tier S, small diff)"
+    /// Where an auto-merged change may lie, unless the owner or the pack says otherwise. Tests and everything else are excluded.
+    public static let defaultAutoMergePaths = ["Sources/", "src/", "lib/", "app/", "docs/"]
 
-    /// Directories (`name/`, matched as any directory component), file names, and `*.ext` suffixes, matched case-insensitively
-    /// (the workspace file system usually is). Check-script files are sensitive as well (`isSensitive(_:checkScripts:)`).
+    /// Matched case-insensitively against each path component (the workspace file system usually is case-insensitive):
+    /// `name/` matches any directory component, anything else the file name; `*` is a wildcard. Check-script files are
+    /// sensitive as well (`isSensitive(_:checkScripts:)`).
     public static let sensitivePatterns = [
-        ".github/", "migrations/", ".brahma/",
-        "Package.swift", "Package.resolved", "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
-        "pnpm-lock.yaml", "Gemfile.lock", "Pipfile.lock", "poetry.lock", "composer.lock", "go.sum", "Makefile",
-        "*.lock", "*.sql",
+        // Version control and CI.
+        ".git/", ".gitattributes", ".gitmodules", ".gitignore", ".github/", ".gitlab/", ".gitlab-ci.yml", ".circleci/",
+        ".buildkite/", "Jenkinsfile", "azure-pipelines.yml", ".travis.yml", ".husky/", ".pre-commit-config.yaml",
+        // Build configuration, manifests and lockfiles.
+        "Package.swift", "Package@swift-*.swift", "Package.resolved", "*.xcodeproj/", "*.xcworkspace/", "package.json",
+        "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "*.lock", "Cargo.toml", "go.mod",
+        "go.sum", "go.work", "pyproject.toml", "requirements*.txt", "setup.py", "setup.cfg", "Pipfile", "Gemfile", "*.gemspec",
+        "build.gradle*", "settings.gradle*", "gradle.properties", "pom.xml", "Makefile", "GNUmakefile", "*.mk", "CMakeLists.txt",
+        "*.cmake", "Dockerfile*", "docker-compose*.yml", "docker-compose*.yaml", "tsconfig*.json", "composer.json", "Podfile",
+        "Cartfile", ".npmrc", ".yarnrc*", "conftest.py",
+        // Agent and engine configuration, secrets.
+        ".claude/", ".mcp.json", "CLAUDE.md", "AGENTS.md", ".brahma/", ".env*", "*.pem", "*.key", "*.p12",
+        // Schema changes and scripts.
+        "migrations/", "migrate/", "*.sql", "*.sh", "*.bash", "*.zsh", "*.ps1", "*.bat", "*.cmd",
     ]
 
-    /// Whether a changed path (repository-relative, as git reports it) is one a human-grade review must see.
+    /// Whether a changed path (repository-relative, as git reports it) is one a review turn must see.
     public static func isSensitive(_ path: String, checkScripts: Set<String> = []) -> Bool {
         let lower = path.lowercased()
         let parts = lower.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
@@ -164,14 +193,39 @@ public enum ReviewPolicy {
         if checkScripts.contains(where: { $0.lowercased() == lower }) { return true }
         for pattern in sensitivePatterns.map({ $0.lowercased() }) {
             if pattern.hasSuffix("/") {
-                if parts.dropLast().contains(String(pattern.dropLast())) { return true }
-            } else if pattern.hasPrefix("*.") {
-                if name.hasSuffix(String(pattern.dropFirst())) { return true }
-            } else if name == pattern {
+                let dir = String(pattern.dropLast())
+                if parts.dropLast().contains(where: { glob(dir, $0) }) { return true }
+            } else if glob(pattern, name) {
                 return true
             }
         }
         return false
+    }
+
+    /// Whether `path` lies under one of `prefixes` (directories, with or without the trailing slash), case-insensitively.
+    public static func isAllowed(_ path: String, under prefixes: [String]) -> Bool {
+        let lower = path.lowercased()
+        return prefixes.contains { p in
+            var dir = p.lowercased()
+            while dir.hasPrefix("./") { dir.removeFirst(2) }
+            guard !dir.isEmpty else { return false }
+            if !dir.hasSuffix("/") { dir += "/" }
+            return lower.hasPrefix(dir) && lower.count > dir.count
+        }
+    }
+
+    /// `*` matches any run of characters (including none); everything else matches itself.
+    static func glob(_ pattern: String, _ text: String) -> Bool {
+        let p = Array(pattern), t = Array(text)
+        var pi = 0, ti = 0, star = -1, mark = 0
+        while ti < t.count {
+            if pi < p.count, p[pi] == t[ti] { pi += 1; ti += 1 }
+            else if pi < p.count, p[pi] == "*" { star = pi; mark = ti; pi += 1 }
+            else if star >= 0 { pi = star + 1; mark += 1; ti = mark }
+            else { return false }
+        }
+        while pi < p.count, p[pi] == "*" { pi += 1 }
+        return pi == p.count
     }
 }
 
@@ -181,11 +235,16 @@ public struct AutoMergeAssessment: Sendable, Equatable {
     public var commit: String
     public var base: String
     public var lines: Int
+    public var bytes: Int = 0
     /// Why the item keeps its review turn; nil when the change qualifies.
     public var reason: String?
+
+    /// The measured size is under both caps.
+    public var withinCaps: Bool { lines < ReviewPolicy.autoMergeMaxLines && bytes < ReviewPolicy.autoMergeMaxBytes }
 }
 
-/// The prompt of a batched audit turn: each sampled auto-merged item's spec and its merged diff, quoted.
+/// The prompt of a batched audit turn: each auto-merged item's spec and its merged diff, quoted. The instructions are the
+/// turn's system prompt (`instructions`), not part of the prompt.
 public enum AuditDigest {
     public static let maxCriteria = 1500
     public static let maxChangedFiles = 100
@@ -193,7 +252,8 @@ public enum AuditDigest {
     public static let instructions = "You are auditing with a clean context: these items were merged into main without a review "
         + "turn (tier S, small diff, engine check passed). For each one, read the merged diff (and main as needed) and call audit "
         + "with its key, ok true if the change is correct, within its acceptance criteria and safe, or ok false with concrete "
-        + "notes quoting the lines at fault. A failed audit means every later change by that author gets a full review."
+        + "notes quoting the lines at fault. A failed audit means every later change by that author gets a full review, and opens a "
+        + "work item to revert or fix the change; the engine never reverts main itself."
 
     public struct Entry: Sendable {
         public var item: WorkItem
@@ -230,8 +290,6 @@ public enum AuditDigest {
             out.append(ReviewDigest.quote(e.diff.text, maxChars: .max, empty: "(no changes)"))
             if e.diff.truncated { out.append("[diff truncated]") }
         }
-        out.append("")
-        out.append(instructions)
         return out.joined(separator: "\n")
     }
 }

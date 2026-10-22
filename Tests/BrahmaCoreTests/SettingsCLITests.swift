@@ -82,6 +82,31 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try brahma(["settings", "hot-paths", "x"], home: nokey.url).stderr.contains("owner key missing or invalid"))
     }
 
+    @Test func autoMergeSwitchAndPathsAreOwnerOnly() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["settings", "auto-merge"], home: home).stdout == "auto-merge: on\n")
+        let off = try brahma(["settings", "auto-merge", "off"], home: home)
+        #expect(off.status == 0, "\(off.stderr)"); #expect(off.stdout == "auto-merge: off\n")
+        #expect(try brahma(["settings", "auto-merge"], home: home).stdout == "auto-merge: off\n")
+        #expect(try brahma(["settings", "auto-merge", "maybe"], home: home).status != 0)
+        let inAgent = try brahma(["settings", "auto-merge", "on"], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
+        #expect(try brahma(["settings", "auto-merge"], home: home).stdout == "auto-merge: off\n")
+        let nokey = try OwnerTestHome(initOwner: false)
+        #expect(try brahma(["settings", "auto-merge", "on"], home: nokey.url).stderr.contains("owner key missing or invalid"))
+        #expect(try brahma(["settings", "auto-merge", "on"], home: home).stdout == "auto-merge: on\n")
+
+        let paths = try brahma(["settings", "auto-merge-paths"], home: home)
+        #expect(paths.stdout.split(separator: "\n").map(String.init) == ReviewPolicy.defaultAutoMergePaths)
+        #expect(try brahma(["settings", "auto-merge-paths", "Sources/App/"], home: home).status == 0)
+        #expect(try brahma(["settings", "auto-merge-paths"], home: home).stdout == "Sources/App/\n")
+        #expect(try brahma(["settings", "auto-merge-paths", "/abs"], home: home).status != 0)
+        #expect(try brahma(["settings", "auto-merge-paths", "x/"], home: home, env: ["BRAHMA_AGENT_ID": "a1"]).status == 1)
+        #expect(try brahma(["settings", "auto-merge-paths", "default"], home: home).status == 0)
+        #expect(try brahma(["settings", "auto-merge-paths"], home: home).stdout.split(separator: "\n").map(String.init)
+                == ReviewPolicy.defaultAutoMergePaths)
+    }
+
     @Test func companyReserveOverride() throws {
         let owner = try OwnerTestHome(); let home = owner.url
         #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)

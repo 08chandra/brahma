@@ -31,6 +31,9 @@ extension CompanyTools {
         }
         let sample = try store.recordAudit(turnId: turnId, agentId: agentId, companyId: companyId, key: key, ok: ok, notes: notes)
         let shown = try store.workItem(id: sample.itemId)?.key ?? key
-        return ok ? "Recorded: \(shown) is ok." : "Recorded: the audit of \(shown) failed; its author's changes now always get a full review."
+        if ok { return "Recorded: \(shown) is ok." }
+        let followUp = try sample.followUpId.flatMap { try store.workItem(id: $0)?.key }
+        return "Recorded: the audit of \(shown) failed; its author's changes now always get a full review"
+            + (followUp.map { ", and \($0) is open to revert or fix it." } ?? ".")
     }
 }

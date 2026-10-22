@@ -162,7 +162,7 @@ public actor Orchestrator {
             attempt { try store.sweepLiveness(companyId: c.id, now: now) }
         }
 
-        // Batched audits of sampled auto-merges, once per `ReviewPolicy.auditInterval` company-active seconds (9c).
+        // Audits of auto-merges (9c): every waiting sample is routed to an auditor (a cheap read when there is nothing to do).
         for c in companies where c.status == .running { attempt { try store.scheduleAudit(companyId: c.id, now: now) } }
 
         // 1. Timed blockers that have expired.
@@ -342,7 +342,7 @@ public actor Orchestrator {
             let template = store.catalog.template(role: agent.role, pack: company.packId)
             // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
             let review = try Self.prepareReview(store: store, agent: agent, company: company)
-            // Otherwise a batched audit of sampled auto-merges (9c) is the same kind of clean-context turn.
+            // Otherwise a batched audit of auto-merges (9c) is the same kind of clean-context turn.
             let audit = review == nil ? try Self.prepareAudit(store: store, agent: agent, company: company) : nil
             isReview = review != nil || audit != nil
             var turnPrompt = ""

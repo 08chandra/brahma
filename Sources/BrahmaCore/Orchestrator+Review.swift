@@ -62,27 +62,25 @@ struct AuditTurnContext {
 
 extension Orchestrator {
     /// The agent's batched audit (9c), ready to run, or nil. Each sample's merged diff is read from the engine-recorded base
-    /// and merged commit. Runs git, so it is called off the actor.
+    /// and merged commit. A sample whose diff cannot be produced is deferred (`Store.deferAudits`), never put to the auditor.
+    /// Runs git, so it is called off the actor.
     nonisolated static func prepareAudit(store: Store, agent: Agent, company: Company) throws -> AuditTurnContext? {
         let samples = try store.pendingAudits(agentId: agent.id)
         guard !samples.isEmpty else { return nil }
         let git = store.gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
         var entries: [AuditDigest.Entry] = []
+        var deferred: [String] = []
         for sample in samples {
             guard let item = try store.workItem(id: sample.itemId), item.companyId == company.id else { continue }
-            var names: (entries: [GitChange], truncated: Bool) = ([], false)
-            var diff: (text: String, truncated: Bool) = ("(the merged diff could not be produced)", false)
-            if let base = sample.baseCommit, let merged = sample.mergedCommit {
-                do {
-                    names = try git.nameStatus(base: base, head: merged)
-                    diff = try git.diff(base: base, head: merged)
-                } catch {
-                    diff = ("(the merged diff could not be produced: \(String(describing: error).prefix(200)))", false)
-                }
+            guard let base = sample.baseCommit, let merged = sample.mergedCommit,
+                  let names = try? git.nameStatus(base: base, head: merged), let diff = try? git.diff(base: base, head: merged) else {
+                deferred.append(sample.itemId)
+                continue
             }
             let author = try sample.authorId.flatMap { try store.agent(id: $0) }?.name
             entries.append(AuditDigest.Entry(item: item, author: author, mergedCommit: sample.mergedCommit, nameStatus: names, diff: diff))
         }
+        try store.deferAudits(itemIds: deferred, agentId: agent.id)
         guard !entries.isEmpty else { return nil }
         return AuditTurnContext(itemIds: entries.map(\.item.id), digest: AuditDigest.render(entries: entries))
     }

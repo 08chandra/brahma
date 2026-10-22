@@ -98,7 +98,7 @@ extension Store {
 
     /// The one way an item becomes approved for merge: its flags are cleared (the event lists them), the round is closed
     /// and `mergeState` is `pending`. `Store.review` and 9c's auto-approval both come here. `by` is an agent id or "system".
-    /// `auto`: the engine's risk-tiered auto-approval (9c), counted and sampled for audit when the item lands.
+    /// `auto`: the engine's risk-tiered auto-approval (9c), counted and queued for audit when the item lands.
     @discardableResult
     func approveForMerge(db: Database, item current: WorkItem, by: String, note: String, auto: Bool = false, now: Date) throws -> WorkItem {
         var item = current

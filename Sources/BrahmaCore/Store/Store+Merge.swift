@@ -334,8 +334,8 @@ extension Store {
                 current.mergedCommit = head
                 current.updatedAt = now
                 try current.update(db)
-                // Risk-tiered review: an auto-approved item that lands is an auto-merge (every 4th is sampled for audit).
-                try sampleAutoMerge(db: db, item: current, mergedCommit: head)
+                // Risk-tiered review: an auto-approved item that lands is an auto-merge, and every one is queued for an audit.
+                try queueAudit(db: db, item: current, mergedCommit: head)
                 _ = try engineSetStatus(db: db, itemId: itemId, to: .done, text: "merged into main at \(head.prefix(7))", event: .merged, now: now)
                 try finalizeMainCommit(db, companyId: company.id, commit: head)
                 try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId), Self.mergeHoldAlertReason(company.id)], now: now)

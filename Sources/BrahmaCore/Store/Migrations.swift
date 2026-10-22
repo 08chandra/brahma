@@ -384,6 +384,31 @@ enum Migrations {
             }
             try db.create(index: "reviewAudit_company", on: "reviewAudit", columns: ["companyId", "auditedAt"], ifNotExists: true)
         }
+        m.registerMigration("v3-review-audit-2") { db in
+            // Who set an item's tier and its check ("<id>:<role kind>", like specConfirmedBy): auto-merge trusts only the
+            // engine, the owner or a lead who is not the item's implementer. NULL (older items) never qualifies.
+            try db.alter(table: "workItem") { t in
+                t.add(column: "tierSetBy", .text)
+                t.add(column: "checkSpecSetBy", .text)
+            }
+            // The owner's switch and allowed directories for auto-merge (NULL paths: the pack's, else the default list).
+            try db.alter(table: "ownerSettings") { t in
+                t.add(column: "autoMerge", .boolean).notNull().defaults(to: true)
+                t.add(column: "autoMergePaths", .text)
+            }
+            // Every auto-merge is audited, routed as soon as it lands (company.lastAuditActive from "v3-review-audit" is no
+            // longer read): who may not audit it (assignee, submitter, besides the author), retries of an
+            // audit that ended without a verdict, a deferral when its diff could not be produced, the owner escalation, and
+            // the follow-up item a failed audit opened.
+            try db.alter(table: "reviewAudit") { t in
+                t.add(column: "assigneeId", .text)
+                t.add(column: "submitterId", .text)
+                t.add(column: "attempts", .integer).notNull().defaults(to: 0)
+                t.add(column: "deferredUntilActive", .double)
+                t.add(column: "escalated", .boolean).notNull().defaults(to: false)
+                t.add(column: "followUpId", .text)
+            }
+        }
         m.registerMigration("v3-sessions") { db in
             // One session per (agent, item); a turn in another working directory starts a fresh one. `lastTurnId` points at the
             // session's newest turn: its end time is the warm rule, its token columns (Task 14) the size rule.

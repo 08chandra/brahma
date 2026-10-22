@@ -11,7 +11,7 @@ public enum CompanyToolNames {
     public static let executive = ["decide"]
     /// Review turns only, regardless of role. `create_work_item` files follow-ups instead of blocking on mechanical fixes.
     public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review"]
-    /// Audit turns only (9c), regardless of role: the verdict on each sampled auto-merge of the turn's batch.
+    /// Audit turns only (9c), regardless of role: the verdict on each auto-merge of the turn's batch.
     public static let audit = ["audit"]
     public static var all: [String] { base + work + lead + executive + ["review"] + audit }
 }
@@ -164,6 +164,10 @@ public struct IndustryPack: Codable, Equatable, Sendable {
     public var connectors: [String] = []
     /// Roles staffed only when work calls for them: `OrgGenerator.staff` always leaves their seats vacant.
     public var triggerRoles: [String] = []
+    /// Risk-tiered review (9c): false switches auto-merge off for every company of the pack (the owner has a switch too).
+    public var autoMerge: Bool = true
+    /// Directories an auto-merged change may touch; nil is `ReviewPolicy.defaultAutoMergePaths`. The owner's list wins.
+    public var autoMergePaths: [String]? = nil
 
     public static let defaultTriggerRoles = ["qa", "designer", "security"]
 
@@ -177,6 +181,7 @@ public struct IndustryPack: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, version, title, roles, itemTypes, org, defaultCadence, askApprovers, reservedCategories, connectors, triggerRoles
+        case autoMerge, autoMergePaths
     }
 
     public init(from d: Decoder) throws {
@@ -195,6 +200,8 @@ public struct IndustryPack: Codable, Equatable, Sendable {
         let known = Set(roles.map(\.id))
         triggerRoles = try c.decodeIfPresent([String].self, forKey: .triggerRoles)
             ?? Self.defaultTriggerRoles.filter { known.contains($0) }
+        autoMerge = try c.decodeIfPresent(Bool.self, forKey: .autoMerge) ?? true
+        autoMergePaths = try c.decodeIfPresent([String].self, forKey: .autoMergePaths)
     }
 
     public func role(_ id: String) -> RoleTemplate? { roles.first { $0.id == id } }
@@ -241,6 +248,9 @@ public struct IndustryPack: Codable, Equatable, Sendable {
             if let u = approvers.first(where: { !known.contains($0) }) { throw fail("askApprovers[\(kind)] unknown role \(u)") }
         }
         if let t = triggerRoles.first(where: { !known.contains($0) }) { throw fail("unknown trigger role \(t)") }
+        if let paths = autoMergePaths {
+            do { try CheckSpec.validatePaths(paths, what: "auto-merge") } catch let e as WorkError { throw fail(e.message) }
+        }
         if !["sprint", "milestone"].contains(defaultCadence) { throw fail("bad cadence \(defaultCadence)") }
         if let c = reservedCategories.first(where: { !matches(category, $0) }) { throw fail("bad reserved category \(c)") }
     }

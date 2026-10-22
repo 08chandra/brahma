@@ -2019,23 +2019,54 @@ public struct GitWorkspace: Sendable {
         return (text, truncated)
     }
 
-    /// The size of the change between two commits, for risk-tiered review: added plus deleted lines over all files, every path
-    /// touched (renames are counted as a delete and an add, so both names are listed), and whether a binary file changed or
-    /// the listing was cut (either makes the change unmeasurable).
-    public func changeStats(base: String, head: String) throws -> (lines: Int, paths: [String], binary: Bool, truncated: Bool) {
+    /// The change between two commits as risk-tiered review measures it (no renames: a rename is a delete and an add, so both
+    /// names are listed). Three listings of the same diff: `--raw` (paths, modes, deletions), `--numstat` (lines, binaries) and
+    /// the zero-context patch (bytes). Any listing cut short sets `truncated`, which makes the change unmeasurable.
+    public func changeStats(base: String, head: String) throws -> ChangeStats {
         try Self.validRef(base); try Self.validRef(head)
-        let out = try main.run(["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", base, head],
-                               maxOutput: 1 << 20)
-        var lines = 0, binary = false
-        var paths: [String] = []
-        for record in String(decoding: out.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true) {
-            let fields = record.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
-            guard fields.count == 3 else { return (lines, paths, binary, true) }
-            if let added = Int(fields[0]), let deleted = Int(fields[1]) { lines += added + deleted } else { binary = true }
-            paths.append(String(fields[2]))
+        let common = ["--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=none"]
+        var stats = ChangeStats()
+
+        let raw = try main.run(["diff", "--raw", "-z", "--no-abbrev"] + common + [base, head], maxOutput: 1 << 20)
+        stats.truncated = stats.truncated || raw.cut
+        let fields = String(decoding: raw.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true)
+        var i = 0
+        while i < fields.count {
+            let meta = fields[i].split(separator: " ")
+            guard fields[i].hasPrefix(":"), meta.count == 5, i + 1 < fields.count else { stats.truncated = true; break }
+            let (old, new, status) = (String(meta[0].dropFirst()), String(meta[1]), String(meta[4]))
+            stats.paths.append(String(fields[i + 1]))
+            if status.hasPrefix("D") || new == "000000" { stats.deleted = true }
+            // Only plain files may change: no executable bit, symlink or submodule on either side.
+            if ![old, new].allSatisfy({ $0 == "100644" || $0 == "000000" }) { stats.specialMode = true }
+            i += 2
         }
-        return (lines, paths, binary, out.cut)
+
+        let numstat = try main.run(["diff", "--numstat", "-z"] + common + [base, head], maxOutput: 1 << 20)
+        stats.truncated = stats.truncated || numstat.cut
+        for record in String(decoding: numstat.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true) {
+            let f = record.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard f.count == 3 else { stats.truncated = true; break }
+            if let added = Int(f[0]), let deleted = Int(f[1]) { stats.lines += added + deleted } else { stats.binary = true }
+        }
+
+        // Bytes: every added or deleted line's content (its newline included), read only inside hunks, so a header line can
+        // never be counted and a content line can never start a header (it begins with +, -, space or \).
+        let patch = try main.run(["diff", "--unified=0", "--no-prefix"] + common + [base, head], maxOutput: Self.statsPatchLimit)
+        if patch.cut { stats.bytes = Int.max } else {
+            var inHunk = false
+            for line in patch.stdout.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false) {
+                if line.starts(with: Array("diff --git ".utf8)) { inHunk = false; continue }
+                if line.starts(with: Array("@@".utf8)) { inHunk = true; continue }
+                guard inHunk, let first = line.first else { continue }
+                if first == UInt8(ascii: "+") || first == UInt8(ascii: "-") { stats.bytes += line.count }
+            }
+        }
+        return stats
     }
+
+    /// Patch output read for `changeStats` byte counting; anything longer is far over any cap.
+    static let statsPatchLimit = 1 << 18
 
     /// `"<short sha> <subject>"` for the newest `limit` commits in `base..head`.
     public func log(base: String, head: String, limit: Int = 5) throws -> [String] {
@@ -2043,4 +2074,23 @@ public struct GitWorkspace: Sendable {
         let out = try main.run(["log", "--no-color", "--no-show-signature", "--format=%h %s", "-n", String(max(limit, 1)), "\(base)..\(head)"])
         return out.text.split(separator: "\n").map(String.init)
     }
+}
+
+/// What `GitWorkspace.changeStats` measured.
+public struct ChangeStats: Sendable, Equatable {
+    /// Added plus deleted lines over all text files.
+    public var lines = 0
+    /// Bytes of the added and deleted lines (newlines included).
+    public var bytes = 0
+    /// Every path touched, old and new names of a rename both listed.
+    public var paths: [String] = []
+    public var binary = false
+    /// A file was deleted (or renamed away).
+    public var deleted = false
+    /// A changed path is (or was) an executable, a symlink or a submodule.
+    public var specialMode = false
+    /// A listing could not be read in full.
+    public var truncated = false
+
+    public init() {}
 }

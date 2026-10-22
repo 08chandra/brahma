@@ -5,7 +5,7 @@ import BrahmaCore
 struct SettingsGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "settings", abstract: "Owner-wide settings: time zone, plan tier and weekly share.",
-        subcommands: [TimeZoneSetting.self, Plan.self, Share.self, HotPaths.self])
+        subcommands: [TimeZoneSetting.self, Plan.self, Share.self, HotPaths.self, AutoMerge.self, AutoMergePaths.self])
 
     struct TimeZoneSetting: ParsableCommand {
         static let configuration = CommandConfiguration(
@@ -82,3 +82,43 @@ extension SettingsGroup {
 }
 
 extension PlanTier: ExpressibleByArgument {}
+
+extension SettingsGroup {
+    enum Switch: String, ExpressibleByArgument, CaseIterable { case on, off }
+
+    struct AutoMerge: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "auto-merge",
+            abstract: "Show or switch risk-tiered auto-merge: small, lead-configured tier S changes that pass their check land without a review turn and are audited after.")
+        @Argument(help: "on or off; omit to show the current setting.") var value: Switch?
+
+        func run() throws {
+            if let value {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                try store.setAutoMerge(value == .on)
+            }
+            let (store, _) = try openStore()
+            print("auto-merge: \(store.autoMergeEnabled() ? "on" : "off")")
+        }
+    }
+
+    struct AutoMergePaths: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "auto-merge-paths",
+            abstract: "Show or set the directories an auto-merged change may touch (every changed path must lie under one).")
+        @Argument(help: "Directories to use instead, or 'default'; omit to show the current ones.") var paths: [String] = []
+
+        func run() throws {
+            if !paths.isEmpty {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                do { try store.setAutoMergePaths(paths.count == 1 && paths[0] == "default" ? nil : paths) }
+                catch let SettingsError.invalid(why) { throw fail("invalid auto-merge paths: \(why)") }
+            }
+            let (store, _) = try openStore()
+            let company = try store.companies().first
+            for p in store.autoMergePaths(companyId: company?.id ?? "") { print(safe(p)) }
+        }
+    }
+}

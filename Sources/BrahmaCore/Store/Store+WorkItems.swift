@@ -160,7 +160,8 @@ extension Store {
             status: draft.status, priority: priority, points: points, tier: draft.tier, authorId: actor.id,
             ownerId: draft.ownerId, reviewerId: draft.reviewerId, team: team, parentId: draft.parentId,
             createdAt: now, updatedAt: now, intensity: draft.intensity,
-            specConfirmedBy: actor.privileged || actor.isLead ? actor.label : nil, touchPaths: draft.touchPaths)
+            specConfirmedBy: actor.privileged || actor.isLead ? actor.label : nil, touchPaths: draft.touchPaths,
+            tierSetBy: actor.label, checkSpecSetBy: draft.checkSpec == nil ? nil : actor.label)
         // The same rules as an edit, applied to the draft's assignee and reviewer.
         if item.ownerId != nil,
            let d = WorkPolicy.denial(.assignee, item: item, actor: actor.id, actorKind: actor.kind, leaseHolderId: nil) {
@@ -263,6 +264,7 @@ extension Store {
                 }
                 let old = item.checkRevision
                 item.checkSpec = spec; item.checkRevision += 1; checkChanged = true
+                item.checkSpecSetBy = spec == nil ? nil : actor.label
                 if item.everStarted { item.reviewFlags.append("check edited (rev \(old) → \(item.checkRevision))") }
             }
         }
@@ -275,7 +277,7 @@ extension Store {
             let v = try Self.validPoints(p)
             if v != item.points { item.points = v; specChanged.append("points") }
         }
-        if let t = patch.tier, t != item.tier { item.tier = t; specChanged.append("tier") }
+        if let t = patch.tier, t != item.tier { item.tier = t; item.tierSetBy = actor.label; specChanged.append("tier") }
         if let t = patch.team {
             let v = try Self.validTeam(t)
             if v != item.team { item.team = v; specChanged.append("team") }

@@ -422,7 +422,7 @@ extension Store {
                 item.updatedAt = now
                 try item.update(db)
                 if let autoMerge, autoMerge.reason == nil, autoMerge.commit == run.commit, autoMerge.base == item.baseCommit,
-                   autoMerge.lines < ReviewPolicy.autoMergeMaxLines, try autoMergeCandidate(db: db, item: item, run: run) {
+                   autoMerge.withinCaps, try autoMergeCandidate(db: db, item: item, run: run) {
                     // Risk-tiered review: the pass is the approval. The reviewer is not woken for a review that will not happen.
                     try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed, text: "check passed",
                                         alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, onlyAlsoNotify: true, now: now)
