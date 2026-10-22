@@ -72,8 +72,12 @@ public enum WorkPolicy {
 
     /// The refusal for a status change requested through a tool, the CLI or the app, or nil when allowed.
     /// `inReview` and `done` are never targets here: the engine writes them.
+    ///
+    /// An item the engine blocked for going over its budget (`stopReason == "budget"`) is unblocked only by a manager, an
+    /// executive or the owner: the assignee cannot spend its way past the cap.
     public static func statusDenial(from: WorkItemStatus, to: WorkItemStatus, actor: String, actorKind: RoleKind,
-                                    isHolderOrAssignee: Bool, hasLease: Bool, blockedReason: String?) -> WorkError? {
+                                    isHolderOrAssignee: Bool, hasLease: Bool, blockedReason: String?,
+                                    stopReason: String? = nil, itemKey: String? = nil) -> WorkError? {
         if to == .inReview || to == .done { return .invalid("status \(to.rawValue) is set by the engine") }
         guard legal.contains([from, to]) else { return .invalid("illegal status change \(from.rawValue) → \(to.rawValue)") }
         if to == .blocked, blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
@@ -83,6 +87,9 @@ public enum WorkPolicy {
             return .invalid("an item moves from blocked to inProgress only while its lease is held")
         }
         if isPrivileged(actor) { return nil }
+        if from == .blocked, stopReason == "budget", !isLead(actorKind) {
+            return .forbidden("\(itemKey ?? "this item") is over budget; ask your manager to raise the tier or reassign it")
+        }
         if from == .done, !isLead(actorKind) {
             return .forbidden("only a manager or the owner can reopen a done item")
         }

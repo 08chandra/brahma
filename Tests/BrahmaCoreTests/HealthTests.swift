@@ -210,7 +210,7 @@ private struct HWorld {
     }
 
     @Test func budgetCappedTurnsAreNeverInfra() async throws {
-        // Classification part of budgetCappedTurnsCountTowardItemBudget; the item-budget accounting lands in 14a.
+        // Classification part of budgetCappedTurnsCountTowardItemBudget (the accounting half is in BudgetTests).
         #expect(EngineHealth.classify(InfraInput(text: "fetch failed", status: nil, subtype: "error_max_budget_usd")) == .none)
         #expect(EngineHealth.classify(InfraInput(text: "getaddrinfo ENOTFOUND", status: 503, subtype: "error_max_turns")) == .none)
         #expect(EngineHealth.classify(InfraInput(text: "fetch failed", status: nil, subtype: "error_during_execution")) == .network)
@@ -220,8 +220,10 @@ private struct HWorld {
                                costUSD: 1.5, apiErrorStatus: nil, sessionId: "s"))]))
         try w.dm(a); try await w.cycle()
         let turn = try #require(try w.turns(a).first)
-        #expect(turn.outcome == .failed); #expect(!turn.infra)
-        #expect(try w.agent(a).consecutiveFailures == 1, "an ordinary, counted failure with normal backoff")
+        #expect(turn.outcome == .failed); #expect(!turn.infra); #expect(turn.stopReason == "budgetCap")
+        // Task 14a: a controlled stop is the engine's own cap, so it is never counted against the agent: no backoff.
+        #expect(try w.agent(a).consecutiveFailures == 0)
+        #expect(try w.agent(a).blocker == nil)
         try await w.cycle()
         #expect(try w.hold() == nil)
     }

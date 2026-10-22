@@ -461,6 +461,40 @@ enum Migrations {
                 t.primaryKey(["companyId", "subject"])
             }
         }
+        m.registerMigration("v3-budgets") { db in
+            // Registered last for now; the controller moves it after "v3-sprints". "v3-turn-context" (Task 9) and
+            // "v3-sessions" (Task 10) add `kind`, `itemId` and `sessionResetReason` first, so each add is conditional.
+            let existing = Set(try db.columns(in: "turn").map(\.name))
+            func add(_ name: String, _ type: Database.ColumnType, notNull fallback: DatabaseValueConvertible? = nil) throws {
+                guard !existing.contains(name) else { return }
+                try db.alter(table: "turn") { t in
+                    if let d = fallback { t.add(column: name, type).notNull().defaults(to: d) } else { t.add(column: name, type) }
+                }
+            }
+            try add("kind", .text, notNull: "work")
+            try add("itemId", .text)
+            try add("sessionResetReason", .text)
+            try add("sessionId", .text)
+            try add("sessionTotalUSD", .double)
+            for column in ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"] { try add(column, .integer, notNull: 0) }
+            try add("toolSignature", .text)
+            try add("mode", .text)
+            try add("rung", .integer)
+            try add("effort", .text)
+            try add("modeReason", .text)
+            try add("stopReason", .text)
+            try add("subagentsSpawned", .integer, notNull: 0)
+            try add("workflowAgents", .integer, notNull: 0)
+            try add("costLE", .double)
+            try db.create(index: "turn_item", on: "turn", columns: ["itemId"], ifNotExists: true)
+            try db.create(index: "turn_session", on: "turn", columns: ["sessionId"], ifNotExists: true)
+            // Why the engine stopped work on an item: budget, no-progress, loop, failed-checks or timebox. Cleared at the next claim.
+            try db.alter(table: "workItem") { t in t.add(column: "stopReason", .text) }
+        }
+        m.registerMigration("v3-budgets-models") { db in
+            // Task 14a fix round 1: the models a turn's result billed, for the per-session model audit.
+            try db.alter(table: "turn") { t in t.add(column: "modelsUsed", .text) }
+        }
         return m
     }
 }

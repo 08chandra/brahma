@@ -177,15 +177,12 @@ extension Store {
 
     // MARK: Size and continuity
 
-    /// The transcript size estimate of a session: the input, cache-read and cache-creation tokens of its last turn. Nil when the
-    /// columns do not exist yet (Task 14 adds them), the turn is unknown or it recorded no usage.
+    /// The transcript size estimate of a session: the input, cache-read and cache-creation tokens Task 14a recorded on its last
+    /// turn. Nil when the turn is unknown or it recorded no usage.
     func sessionTranscriptTokens(turnId: String?) -> Int? {
         guard let turnId else { return nil }
         return try? writer.read { db -> Int? in
-            let columns = Set(try db.columns(in: "turn").map(\.name))
-            let wanted = ["inputTokens", "cacheReadTokens", "cacheCreationTokens"]
-            guard wanted.allSatisfy(columns.contains) else { return nil }
-            let sum = try Int.fetchOne(db, sql: "SELECT \(wanted.map { "COALESCE(\($0), 0)" }.joined(separator: " + ")) FROM turn WHERE id = ?",
+            let sum = try Int.fetchOne(db, sql: "SELECT inputTokens + cacheReadTokens + cacheCreationTokens FROM turn WHERE id = ?",
                                        arguments: [turnId]) ?? 0
             return sum > 0 ? sum : nil
         }

@@ -25,6 +25,8 @@ public actor Orchestrator {
     let checkBaseEnvironment: [String: String]
     /// Whether the next turn of an agent on its leased item is a plan turn (Plan-first selection arrives with Task 14c).
     let planSelector: @Sendable (Agent, WorkItem, Company) -> Bool
+    /// What each turn asserts about the session the CLI reports (the work modes set it; nil asserts nothing).
+    let turnExpectations: @Sendable (Agent, Company) -> TurnExpectations?
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -67,8 +69,10 @@ public actor Orchestrator {
                 exec: @escaping Doctor.Exec = Doctor.defaultExec, claudePath: String = "claude",
                 checkRunner: any CheckRunning = ProcessCheckRunner(),
                 checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-                planSelector: @escaping @Sendable (Agent, WorkItem, Company) -> Bool = { _, _, _ in false }) {
+                planSelector: @escaping @Sendable (Agent, WorkItem, Company) -> Bool = { _, _, _ in false },
+                turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil }) {
         self.planSelector = planSelector
+        self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
         self.mcpExecutable = mcpExecutable; self.profile = profile; self.clock = clock
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
@@ -299,7 +303,10 @@ public actor Orchestrator {
 
     private nonisolated func performTurn(agent: Agent, turn: Turn) async {
         var ctx: TurnContext?
-        var result: TurnResult?
+        var state = TurnStreamState()
+        var abortReason: String?
+        var initModel: String?
+        var sentRequest: TurnRequest?
         var lastInfo: RateLimitInfo?
         var failure: String?
         var runnerError: (any Error)?
@@ -345,6 +352,7 @@ public actor Orchestrator {
                 addDirs = [review.worktree.path]
             } else {
                 var c = try TurnContext.load(store: store, paths: paths, agent: agent, company: company)
+                context.tier = (try? store.workTier(agentId: agent.id)) ?? nil
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 var checkout: URL?
                 var git: GitWorkspace?
@@ -448,36 +456,42 @@ public actor Orchestrator {
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
             request.kind = review == nil ? kind : .review
             request.planDirectory = planDirectory
+            request.expectations = turnExpectations(agent, company)
             // A review session is never recorded as the agent's own.
             var sessionMarked = wasResume || review != nil
-            var iterator = runner.run(request).makeAsyncIterator()
-            while true {
-                let event: StreamEvent?
-                do { event = try await iterator.next() } catch { runnerError = error; throw error }
-                guard let event else { break }
-                switch event {
-                case .initialized:
-                    sawInit = true
-                    if !sessionMarked {
-                        try store.markSessionStarted(agentId: agent.id, scope: scope, cwd: workingDirectory, model: model, tools: toolsKey)
-                        sessionMarked = true
+            sentRequest = request
+            // Leaving the loop early (`break`) drops the stream, which terminates the child process.
+            do {
+                events: for try await event in runner.run(request) {
+                    state.apply(event)
+                    switch event {
+                    case .initialized(_, let reported):
+                        sawInit = true
+                        initModel = reported
+                        if !sessionMarked {
+                            try store.markSessionStarted(agentId: agent.id, scope: scope, cwd: workingDirectory, model: model, tools: toolsKey)
+                            sessionMarked = true
+                        }
+                    case .initInfo(let info):
+                        if let why = TurnAudit.initViolation(info, expectations: request.expectations) {
+                            abortReason = why
+                            break events
+                        }
+                    case .rateLimit(let info):
+                        // A garbled event parses as "unknown"; saving it would close the gate for everyone.
+                        guard info.status != "unknown" else { continue }
+                        lastInfo = info
+                        try store.saveRateLimit(info)
+                    case .toolUse(let name, _):
+                        // Company tools log their own event from the MCP server.
+                        guard !name.hasPrefix("mcp__company__") else { continue }
+                        try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
+                                                            kind: .toolUse, text: "@\(agent.name) \(name)", createdAt: clock()))
+                    default:
+                        break
                     }
-                case .rateLimit(let info):
-                    // A garbled event parses as "unknown"; saving it would close the gate for everyone.
-                    guard info.status != "unknown" else { continue }
-                    lastInfo = info
-                    try store.saveRateLimit(info)
-                case .toolUse(let name):
-                    // Company tools log their own event from the MCP server.
-                    guard !name.hasPrefix("mcp__company__") else { continue }
-                    try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
-                                                        kind: .toolUse, text: "@\(agent.name) \(name)", createdAt: clock()))
-                case .result(let r):
-                    result = r
-                default:
-                    break
                 }
-            }
+            } catch { runnerError = error; throw error }
         } catch let e as WorktreeUnavailable {
             worktreeUnavailable = e
         } catch {
@@ -485,15 +499,30 @@ public actor Orchestrator {
         }
 
         let now = clock()
+        // The last result of the turn (the usage of all of them added up).
+        let result = state.result
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
+        // The hold for an active usage limit; HTTP 429 with no rejecting rate-limit event records one so the gate closes for
+        // every company.
+        func noteUsageLimit() -> Date {
+            let until = Self.usageUntil(limited ? lastInfo?.resetsAt : nil, now: now)
+            if !limited {
+                attempt {
+                    try store.saveRateLimit(RateLimitInfo(status: "rejected", resetsAt: until, rateLimitType: nil,
+                                                          isUsingOverage: false, fiveHourUtilization: nil,
+                                                          sevenDayUtilization: nil, observedAt: now))
+                }
+            }
+            return until
+        }
         if let unavailable = worktreeUnavailable, unavailable.review {
             // A reviewer holds no lease: the missing worktree is an undecided review attempt (three of them escalate), and the
             // agent waits out the short fixed infrastructure delay.
             attempt { try store.noteReviewWorktreeFailure(itemId: unavailable.itemId, agentId: agent.id, reason: unavailable.reason, now: now) }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
-            end = .interrupted
+            end = .interrupted()
         } else if let unavailable = worktreeUnavailable {
             // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
             // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime.
@@ -512,30 +541,39 @@ public actor Orchestrator {
                 log("worktree of \(unavailable.key) unavailable for @\(agent.name): \(unavailable.reason)")
             }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
-            end = .interrupted
+            end = .interrupted()
         } else if Task.isCancelled {
-            end = .interrupted
+            end = .interrupted(partial: result)
+        } else if abortReason != nil {
+            end = .interrupted()
+        } else if case .interrupted? = runnerError as? TurnError {
+            // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
+            end = .interrupted(partial: result)
+        } else if case .timedOut? = runnerError as? TurnError {
+            // The engine's own wall clock killed it (even after an early result, with background work still pending): never a
+            // success. Under an active usage limit it is held until the reset (not the agent's fault); otherwise it failed like
+            // any other timeout (normal backoff) and its usage is still booked and budgeted.
+            if limited || result?.apiErrorStatus == 429 {
+                end = .usageLimited(until: noteUsageLimit(), summary: result?.text)
+            } else {
+                end = .failed(failure ?? "timed out", nil, partial: result)
+            }
         } else if let r = result, !r.isError {
             // A completed turn always counts, even if it also hit the limit: re-running it would repeat its posts.
             end = .succeeded(r, usageHold: limited ? Self.usageUntil(lastInfo?.resetsAt, now: now) : nil)
+        } else if let r = result, r.stopReason != nil {
+            // A controlled stop (`--max-turns`, `--max-budget-usd`) is the engine's own cap, decided before the infrastructure
+            // classifier ever sees the text: not infra, no backoff, counted in the item's usage and judged normally.
+            end = .capped(r, usageHold: limited ? Self.usageUntil(lastInfo?.resetsAt, now: now) : nil)
         } else if result?.apiErrorStatus == 429 || limited {
-            let until = Self.usageUntil(limited ? lastInfo?.resetsAt : nil, now: now)
-            if !limited {
-                // HTTP 429 with no rejecting rate-limit event: record one so the gate closes for every company.
-                attempt {
-                    try store.saveRateLimit(RateLimitInfo(status: "rejected", resetsAt: until, rateLimitType: nil,
-                                                          isUsingOverage: false, fiveHourUtilization: nil,
-                                                          sevenDayUtilization: nil, observedAt: now))
-                }
-            }
-            end = .usageLimited(until: until, summary: result?.text)
+            end = .usageLimited(until: noteUsageLimit(), summary: result?.text)
         } else if let failure {
             // Only the runner's launch error is classifiable; a timeout or "exited without a result" carries stderr.
             var input: InfraInput?
             if let runnerError, !(runnerError is TurnError) { input = InfraInput(text: failure, status: nil) }
-            end = .failed(failure, input)
+            end = .failed(failure, input, partial: result)
         } else if let r = result {
-            end = .failed(r.text ?? r.subtype, InfraInput(text: r.text ?? "", status: r.apiErrorStatus, subtype: r.subtype))
+            end = .failed(r.text ?? r.subtype, InfraInput(text: r.text ?? "", status: r.apiErrorStatus, subtype: r.subtype), partial: r)
         } else {
             end = .failed("claude exited without a result")
         }
@@ -546,22 +584,44 @@ public actor Orchestrator {
         // A resumed session that no longer exists: it is reset and the agent is ready again at once (no penalty). The next
         // turn starts a fresh session. A fresh session that is "not found" again is an ordinary failure.
         var sessionLost: SessionScope?
-        if case .failed(let text, _) = end, wasResume, !isReview,
+        if case .failed(let text, _, _) = end, wasResume, !isReview,
            Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n")) {
             sessionLost = scope
         }
         // An infrastructure failure puts the agent on its fixed cooldown before the turn is recorded, so there is no
         // moment at which it is `ready` and eligible again.
-        if case .failed(_, let input?) = end, EngineHealth.classify(input) != .none {
+        if case .failed(_, let input?, _) = end, EngineHealth.classify(input) != .none {
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
         }
         let use = !isReview && (wasResume || sawInit)
             ? SessionUse(scope: scope, model: keepModel ? nil : usedModel, tools: toolsKey, cwd: workingDirectory) : nil
         var infra = InfraClass.none
+        let telemetry = TurnTelemetry(
+            toolSignature: state.toolSignature, workflowAgents: state.workflowAgentIds.count,
+            subagentsSpawned: state.subagentsSpawned,
+            modeNote: state.effortCapRequested.map { "effort '\($0)' exceeded the org cap and was lowered" })
         attempt {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
-                                      deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use, now: now)
+                                      deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use,
+                                      telemetry: telemetry, now: now)
+        }
+        if let why = abortReason {
+            attempt {
+                try EngineAlerts.raise(store: store, text: "A turn of @\(agent.name) was stopped at start: \(why). Its next turn "
+                                       + "waits until `brahma doctor` passes again.", now: now, reason: "init")
+                try store.holdForDoctor(agentId: agent.id, reason: why, now: now)
+            }
+        } else if let r = result, let sentRequest {
+            auditResult(r, request: sentRequest, initModel: initModel, agent: agent, turn: turn, now: now)
+        }
+        if let requested = state.effortCapRequested {
+            attempt {
+                try store.appendEvent(ActivityEvent(
+                    companyId: agent.companyId, agentId: agent.id, turnId: turn.id, kind: .usage,
+                    text: "@\(agent.name) asked for effort '\(requested)', which exceeds the org cap; the turn ran at the cap",
+                    createdAt: now))
+            }
         }
         let outcome = end.outcome
         await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)
@@ -695,14 +755,22 @@ enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.
     case succeeded(TurnResult, usageHold: Date?)
     /// The summary, and the error text the infrastructure classifier may read (an error `result` event or a launch error).
-    case failed(String, InfraInput? = nil)
+    /// `partial`: the result the turn did print (an error result, or an early result before an engine wall-clock kill). Its
+    /// tokens and cost are still recorded and the budget step runs; the turn stays failed.
+    case failed(String, InfraInput? = nil, partial: TurnResult? = nil)
+    /// A controlled stop: the engine's own `--max-turns` or `--max-budget-usd` ended the turn. It did its work, so it is
+    /// delivered, billed and budgeted like a success, but recorded `failed` with a `stopReason`; it never counts against the
+    /// agent (no backoff) and is never infrastructure.
+    case capped(TurnResult, usageHold: Date?)
     case usageLimited(until: Date, summary: String?)
-    case interrupted
+    /// Stopped before it finished (SIGTERM, a kill with background work pending). An engine wall-clock kill is a `failed` timeout. `partial` is the early
+    /// result, whose tokens and cost are still recorded. Never counted against the agent.
+    case interrupted(partial: TurnResult? = nil)
 
     var outcome: TurnOutcome {
         switch self {
         case .succeeded: .succeeded
-        case .failed: .failed
+        case .failed, .capped: .failed
         case .usageLimited: .usageLimited
         case .interrupted: .interrupted
         }
@@ -760,21 +828,30 @@ extension Store {
     /// that was applied (`.none` for everything else).
     @discardableResult
     func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], deliveredNoticeIds: [Int64] = [],
-                 sessionReset: SessionScope? = nil, sessionUse: SessionUse? = nil,
+                 sessionReset: SessionScope? = nil, sessionUse: SessionUse? = nil, telemetry: TurnTelemetry = TurnTelemetry(),
                  now: Date) throws -> InfraClass {
         try writer.write { db in
             var summary: String?
             var cost: Double?
             var infraClass = InfraClass.none
             switch end {
-            case .succeeded(let r, _): summary = r.text; cost = r.costUSD
-            case .failed(let text, let input):
+            case .succeeded(let r, _): summary = r.text
+            case .capped(let r, _): summary = r.text ?? r.subtype
+            case .failed(let text, let input, _):
                 summary = text
                 if let input { infraClass = EngineHealth.classify(input) }
             case .usageLimited(_, let text): summary = text
             case .interrupted: summary = "interrupted"
             }
-            if case .succeeded = end {
+            // The result's total is cumulative over `--resume`: the turn's own cost is the difference (Task 14a, L-4).
+            let accounting = try Store.accounting(db: db, turnId: turn.id, end: end)
+            cost = accounting.cost
+            var completed = false
+            switch end {
+            case .succeeded, .capped: completed = true
+            default: break
+            }
+            if completed {
                 try Store.markDelivered(db: db, itemIds: deliveredItemIds, turnId: turn.id)
                 try Store.markNoticesDelivered(db: db, ids: deliveredNoticeIds, turnId: turn.id)
             }
@@ -804,8 +881,15 @@ extension Store {
                                           model: use.model, tools: use.tools, cwd: use.cwd)
             }
             if closed, let cost { try Store.recordSpend(db, cost) }
+            var budgeted = completed
+            if case .failed(_, _, let partial) = end, partial != nil { budgeted = true }
             if closed {
+                try Store.writeAccounting(db: db, turnId: turn.id, accounting: accounting, telemetry: telemetry, end: end,
+                                          resetSession: lostScope != nil)
                 try noteReviewTurnEnd(db: db, turnId: turn.id, agent: agent, end: end, infra: infraClass != .none, now: now)
+                // Budget step (Task 14a): a counted work turn can take its item over its tier's budget. Review turns, session
+                // resets and infrastructure failures are never budgeted.
+                if infraClass == .none, lostScope == nil, budgeted { try budgetStep(db: db, turnId: turn.id, agent: agent, now: now) }
             }
             var text = "@\(agent.name) turn \(end.outcome.rawValue)"
             if let summary, !summary.isEmpty { text += ": \(summary.prefix(200))" }
@@ -813,7 +897,7 @@ extension Store {
                               text: text, createdAt: now).insert(db)
 
             switch end {
-            case .succeeded: agent.consecutiveFailures = 0
+            case .succeeded, .capped: agent.consecutiveFailures = 0
             case .failed: if infraClass == .none, lostScope == nil { agent.consecutiveFailures += 1 }
             default: break
             }
@@ -831,7 +915,7 @@ extension Store {
 
             // Killed (or otherwise moved) mid-turn: the turn is recorded, the state is left alone.
             guard agent.state == .running else { return infraClass }
-            if case .succeeded = end { try Store.renewLeases(db: db, agentId: agentId, now: now) }
+            if completed { try Store.renewLeases(db: db, agentId: agentId, now: now) }
             if agent.paused {
                 try Store.transition(db: db, agentId: agentId, to: .sleeping, now: now)
                 return infraClass
@@ -848,7 +932,7 @@ extension Store {
                 let n = agent.consecutiveFailures
                 try Store.transition(db: db, agentId: agentId, to: .blocked,
                                      blocker: .retry(until: now.addingTimeInterval(retryBackoff(failures: n)), failures: n), now: now)
-            case .succeeded(_, let usageHold):
+            case .succeeded(_, let usageHold), .capped(_, let usageHold):
                 // Anything still pending arrived mid-turn: the router saw `running` and did not wake us.
                 let senders = try String.fetchAll(db, sql: """
                     SELECT message.senderId FROM inboxItem JOIN message ON message.id = inboxItem.messageId

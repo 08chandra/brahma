@@ -103,6 +103,7 @@ struct ItemsGroup: ParsableCommand {
             if let p = i.parentId, let parent = try store.workItem(id: p) { print(safe("parent: \(parent.key)")) }
             print(safe("intensity: \(i.intensity.rawValue)  spec: \(i.specConfirmedBy.map { "confirmed by \(who(String($0.split(separator: ":").first ?? "")))" } ?? "unconfirmed")"))
             if i.status == .blocked { print(safe("blocked: \(i.blockedReason ?? "(no reason)")")) }
+            if let stopped = i.stopReason { print(safe("Stopped: \(stopped)")) }
             if let check = i.checkSpec {
                 var line = "check (revision \(i.checkRevision)): \(check.command)  timeout: \(check.timeoutSeconds)s"
                 if !check.paths.isEmpty { line += "  paths: \(check.paths.joined(separator: ", "))" }

@@ -18,6 +18,10 @@ public struct TurnRequest: Sendable {
     public var kind: TurnKind = .work
     /// A plan turn writes its plan here (`<ws>/.brahma/plans/<KEY>/`), the only place it may write.
     public var planDirectory: String? = nil
+    /// The turn's wall clock; nil means the runner's own limit (900 s unless configured). 14c sets per-mode values.
+    public var wallClock: Duration? = nil
+    /// What the engine asserts about the session the CLI reports; nil asserts nothing.
+    public var expectations: TurnExpectations? = nil
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,

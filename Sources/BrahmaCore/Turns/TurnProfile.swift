@@ -23,6 +23,10 @@ public struct TurnProfile: Equatable, Sendable {
     public var environment: [String: String] = [:]
     /// Replaces the permission mode of the profile (a plan turn runs in `plan` mode).
     public var permissionModeOverride: String? = nil
+    /// How long the turn may run before the engine kills it. Nil: the runner's `maxTurnDuration` (900 s, the Plan 1
+    /// fallback); the work modes set longer values for deep turns. It is not an argument of the command.
+    public var wallClock: Duration? = nil
+    public var expectations: TurnExpectations? = nil
 
     public init(model: String, session: Session, mcpConfigPath: String, permission: PermissionProfile,
                 workingDirectory: String, addDirs: [String] = []) {
@@ -44,6 +48,8 @@ public enum TurnProfileCompiler {
                             permission: r.profile, workingDirectory: r.workingDirectory,
                             addDirs: r.addDirs.isEmpty ? [r.company.workspacePath] : r.addDirs)
         p.environment = r.environment
+        p.wallClock = r.wallClock
+        p.expectations = r.expectations
         if r.kind == .plan {
             // Plan mode alone is not trusted (the engine checks the checkout afterwards). The turn may only read: no editing
             // tool, no shell, no file writes. Its plan is its result text (or a file the CLI's plan mode puts into the plans

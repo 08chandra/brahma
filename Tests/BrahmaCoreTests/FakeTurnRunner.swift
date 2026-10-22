@@ -33,6 +33,21 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
     private var _maxConcurrent = 0
     var defaultScript: Script { get { lock.withLock { _default } } set { lock.withLock { _default = newValue } } }
     private var _default = Script()
+    private var totals: [String: Double] = [:]
+    private var _cumulativeCosts = true
+    /// The real CLI reports `total_cost_usd` cumulatively over `--resume` (probe L-4). While this is true (the default) the
+    /// fake turns each scripted `costUSD` into that turn's cost and reports the session's running total, as the CLI does.
+    var cumulativeCosts: Bool { get { lock.withLock { _cumulativeCosts } } set { lock.withLock { _cumulativeCosts = newValue } } }
+
+    private func cumulative(_ event: StreamEvent) -> StreamEvent {
+        guard case .result(var r) = event, let cost = r.costUSD else { return event }
+        return lock.withLock {
+            guard _cumulativeCosts else { return event }
+            totals[r.sessionId, default: 0] += cost
+            r.costUSD = totals[r.sessionId]
+            return .result(r)
+        }
+    }
 
     var requests: [TurnRequest] { lock.withLock { _requests } }
     var maxConcurrent: Int { lock.withLock { _maxConcurrent } }
@@ -68,7 +83,7 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
                     let events = script.events ?? Self.success(request, text: script.text ?? "done")
                     for (i, e) in events.enumerated() {
                         if i == events.count - 1 { try script.sideEffect?(request) }
-                        continuation.yield(e)
+                        continuation.yield(self.cumulative(e))
                     }
                     if events.isEmpty { try script.sideEffect?(request) }
                     if let error = script.error { throw error }

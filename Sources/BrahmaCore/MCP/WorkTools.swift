@@ -262,6 +262,7 @@ extension CompanyTools {
             "owner": optional(i.ownerId.flatMap { names[$0] }), "reviewer": optional(i.reviewerId.flatMap { names[$0] }),
             "team": optional(i.team), "parent": optional(parent), "linkedBranch": optional(i.linkedBranch), "notes": optional(i.notes),
             "reviewFlags": .array(i.reviewFlags.map { .string($0) }), "specConfirmed": .bool(i.specConfirmedBy != nil),
+            "stopped": optional(i.stopReason),
             "lease": lease, "dependencies": .array(try store.dependencies(itemId: i.id).map(link)),
             "dependents": .array(try store.dependents(itemId: i.id).map(link)), "events": .array(events),
         ]))

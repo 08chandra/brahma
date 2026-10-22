@@ -15,14 +15,20 @@ extension TurnRunning {
 public enum TurnError: Error, Equatable {
     /// The process ended without emitting a `result` line.
     case exitedWithoutResult(code: Int32, stderrTail: String)
-    /// The turn ran longer than `maxTurnDuration` and was killed.
+    /// The turn ran longer than its wall clock and was killed by the engine (also after an early `result` with background
+    /// work still pending).
     case timedOut
+    /// The process was stopped from outside (SIGTERM, a kill) before the turn finished: either it ended with no result
+    /// after a SIGTERM, or it was killed with background work (`pendingTasks`) still running, even if an early `result`
+    /// had been printed. Never counted against the agent. The engine's own wall-clock kill is `timedOut`.
+    case interrupted(pendingTasks: Int)
 }
 
 /// Runs `claude -p` as a child process: prompt on stdin, stream-json on stdout.
 public struct ClaudeProcessRunner: TurnRunning {
     /// Command name looked up via `/usr/bin/env`, or an absolute path launched directly.
     public var claudePath: String
+    /// The wall clock of a turn whose request names none (`TurnProfile.wallClock`): the Plan 1 fallback.
     public var maxTurnDuration: Duration
     /// What `ChildEnvironment` filters. Tests inject one; production uses this process's environment.
     public var baseEnvironment: [String: String]
@@ -40,6 +46,9 @@ public struct ClaudeProcessRunner: TurnRunning {
         self.maxTurnDuration = maxTurnDuration
         self.baseEnvironment = baseEnvironment
     }
+
+    /// Exit code of a process that died of SIGTERM: 143 through a shell wrapper, the signal number itself from Foundation.
+    static func isSigterm(_ status: Int32) -> Bool { status == 143 || status == SIGTERM }
 
     public func waitForChildren() async {
         await waitForChildren(pollInterval: .milliseconds(20))
@@ -99,9 +108,10 @@ public struct ClaudeProcessRunner: TurnRunning {
             if data.isEmpty { h.readabilityHandler = nil; splitter.finish() } else { splitter.append(data) }
         }
         let tail = TailBuffer(limit: Self.stderrLimit)
+        let stderrClosed = Flag()
         stderr.fileHandleForReading.readabilityHandler = { h in
             let data = h.availableData
-            if data.isEmpty { h.readabilityHandler = nil } else { tail.append(data) }
+            if data.isEmpty { h.readabilityHandler = nil; stderrClosed.set() } else { tail.append(data) }
         }
         let exit = ExitWaiter()
         let child = ChildProcess(process)
@@ -136,19 +146,22 @@ public struct ClaudeProcessRunner: TurnRunning {
         }
 
         let timedOut = Flag()
-        let watchdog = Task { [maxTurnDuration] in
-            try await Task.sleep(for: maxTurnDuration)
+        let wallClock = TurnProfileCompiler.profile(for: request).wallClock ?? maxTurnDuration
+        let watchdog = Task {
+            try await Task.sleep(for: wallClock)
             timedOut.set()
             child.terminate(grace: Self.killGrace)
         }
         defer { watchdog.cancel() }
 
-        var sawResult = false
+        var state = TurnStreamState()
         await withTaskCancellationHandler {
             for await line in lines {
-                guard let event = StreamParser.parse(line: line) else { continue }
-                if case .result = event { sawResult = true }
-                yield(event)
+                guard let events = StreamParser.parseAll(line: line) else { continue }
+                for event in events {
+                    state.apply(event)
+                    yield(event)
+                }
             }
         } onCancel: {
             child.terminate(grace: Self.killGrace)
@@ -158,10 +171,23 @@ public struct ClaudeProcessRunner: TurnRunning {
         let status = await exit.wait()
         process.waitUntilExit()
 
+        // The last of stderr may still be in its pipe when the process is gone; give it a moment (bounded).
+        for _ in 0..<40 where !stderrClosed.isSet { try? await Task.sleep(for: .milliseconds(5)) }
+        if let requested = TurnAudit.effortCap(in: tail.text) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
-        // A result is authoritative even if the process lingered past it and had to be killed.
+        let sawResult = state.sawResult
+        // The last result is authoritative even if the process lingered past it and had to be killed ...
+        if sawResult, !state.hasPendingWork { return }
+        // ... unless background work (a workflow, a sub-agent) was still running: an early result then is not the end
+        // of the turn. A process that exited by itself (status 0) is the CLI's own decision and stands. The engine's own wall
+        // clock is a timeout (failed, backed off, budgeted), never an interruption: an interruption has no backoff and would
+        // re-run the turn on every tick for a whole wall clock. Only a kill from outside is an interruption.
+        if sawResult, timedOut.isSet { throw TurnError.timedOut }
+        if sawResult, status != 0 { throw TurnError.interrupted(pendingTasks: state.pendingTasks.count) }
         if sawResult { return }
         if timedOut.isSet { throw TurnError.timedOut }
+        // SIGTERM from outside (a shutdown, a kill) ends the turn without a result; the agent is not at fault.
+        if Self.isSigterm(status) { throw TurnError.interrupted(pendingTasks: 0) }
         throw TurnError.exitedWithoutResult(code: status, stderrTail: tail.text)
     }
 }

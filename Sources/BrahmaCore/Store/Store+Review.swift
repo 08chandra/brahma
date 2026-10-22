@@ -210,6 +210,7 @@ extension Store {
         switch end {
         case .succeeded: succeeded = true
         case .failed: if infra { return }
+        case .capped: break
         default: return
         }
         if succeeded {

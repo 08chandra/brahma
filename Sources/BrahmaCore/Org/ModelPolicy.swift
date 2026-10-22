@@ -6,12 +6,16 @@ public struct ModelContext: Sendable, Equatable {
     public var turnKind: TurnKind = .work
     /// A review of a tier L item or of one with review flags: worth the strongest model.
     public var deepReview = false
+    /// The effort tier of the item the turn works on. A tier with a model of its own (L: opus) picks it for `auto` agents.
+    public var tier: EffortTier? = nil
 
-    public init(decidingArchitecture: Bool = false, decidingPRD: Bool = false, turnKind: TurnKind = .work, deepReview: Bool = false) {
+    public init(decidingArchitecture: Bool = false, decidingPRD: Bool = false, turnKind: TurnKind = .work,
+                deepReview: Bool = false, tier: EffortTier? = nil) {
         self.decidingArchitecture = decidingArchitecture
         self.decidingPRD = decidingPRD
         self.turnKind = turnKind
         self.deepReview = deepReview
+        self.tier = tier
     }
 }
 
@@ -24,7 +28,10 @@ public enum ModelPolicy {
         switch context.turnKind {
         case .review, .audit: return context.deepReview ? "opus" : "sonnet"
         case .notice: return "haiku"
-        case .work, .plan: return role.models[mode.rawValue] ?? "sonnet"
+        case .plan: return role.models[mode.rawValue] ?? "sonnet"
+        case .work:
+            if let tier = context.tier, let model = TierBudget.of(tier).model { return model }
+            return role.models[mode.rawValue] ?? "sonnet"
         }
     }
 }

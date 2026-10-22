@@ -34,6 +34,34 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var reportedStatus: String? = nil
     /// Why the prompt cache broke on a resume: the model or the tool set changed.
     public var cacheBreak: String? = nil
+    /// The session the result belongs to, and the raw `total_cost_usd` it reported. That total is cumulative over
+    /// `--resume` (probe L-4), so `costUSD`/`costLE` hold this turn's own share: the total minus the previous total.
+    public var sessionId: String? = nil
+    public var sessionTotalUSD: Double? = nil
+    public var inputTokens: Int = 0
+    public var outputTokens: Int = 0
+    public var cacheReadTokens: Int = 0
+    public var cacheCreationTokens: Int = 0
+    /// Digest of the turn's tool calls, for the loop guard of 14b.
+    public var toolSignature: String? = nil
+    /// Work modes (14c fills mode, rung, effort and modeReason; 14a records the rest).
+    public var mode: String? = nil
+    public var rung: Int? = nil
+    public var effort: String? = nil
+    public var modeReason: String? = nil
+    /// `turnCap`, `budgetCap` or `sessionReset`: why the turn stopped when it was not an ordinary end.
+    public var stopReason: String? = nil
+    public var subagentsSpawned: Int = 0
+    public var workflowAgents: Int = 0
+    /// The result's `modelUsage` keys, comma-joined. Cumulative over `--resume`, so the audit compares it with the
+    /// session's earlier turns.
+    public var modelsUsed: String? = nil
+    /// This turn's cost in `total_cost_usd` list-equivalent dollars.
+    public var costLE: Double? = nil
+
+    /// Tokens that count against a tier: input, output and cache creation. Cache reads are the same context re-read on
+    /// every call and would charge a long conversation many times over, so they stay out.
+    public var countedTokens: Int { inputTokens + outputTokens + cacheCreationTokens }
 }
 
 public enum ActivityKind: String, Codable, Sendable { case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval }

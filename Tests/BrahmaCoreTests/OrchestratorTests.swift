@@ -205,6 +205,75 @@ import GRDB
         #expect(try w.turns(ceo).first?.summary == "tool crashed")
     }
 
+    /// A wall-clock kill while the rate limit is active is a usage limit (held to the reset, not counted against the agent).
+    @Test func wallClockKillWhileRateLimitedIsUsageLimited() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        let t = w.clock.now
+        let rejected = RateLimitInfo(status: "rejected", resetsAt: t.addingTimeInterval(7200), rateLimitType: "five_hour",
+                                     isUsingOverage: false, fiveHourUtilization: 1.0, sevenDayUtilization: 0.5, observedAt: t)
+        w.fake.script("ceo", .init(events: [.initialized(sessionId: a.sessionId, model: "sonnet"), .rateLimit(rejected)],
+                                   error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
+        #expect(try w.agent(a).blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        #expect(try w.agent(a).consecutiveFailures == 0)
+        #expect(try w.pending(a) == 1)
+    }
+
+    /// A timed-out turn is never a success, even with an early non-error result (background work still pending).
+    @Test func wallClockKillAfterEarlySuccessWhileRateLimitedIsUsageLimited() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        let t = w.clock.now
+        let rejected = RateLimitInfo(status: "rejected", resetsAt: t.addingTimeInterval(7200), rateLimitType: "five_hour",
+                                     isUsingOverage: false, fiveHourUtilization: 1.0, sevenDayUtilization: 0.5, observedAt: t)
+        w.fake.script("ceo", .init(events: [
+            .initialized(sessionId: a.sessionId, model: "sonnet"), .rateLimit(rejected),
+            .result(TurnResult(isError: false, subtype: "success", text: "started", costUSD: 0.01, apiErrorStatus: nil,
+                               sessionId: a.sessionId)),
+        ], error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
+        #expect(try w.agent(a).blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        #expect(try w.agent(a).consecutiveFailures == 0)
+        #expect(try w.pending(a) == 1)
+    }
+
+    /// Same with an HTTP 429 on the early result and no rate-limit event: usage-limited, and the gate closes.
+    @Test func wallClockKillAfterEarlyResultWith429IsUsageLimited() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        w.fake.script("ceo", .init(events: [
+            .initialized(sessionId: a.sessionId, model: "sonnet"),
+            .result(TurnResult(isError: false, subtype: "success", text: "started", costUSD: 0.01, apiErrorStatus: 429,
+                               sessionId: a.sessionId)),
+        ], error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
+        #expect(try w.agent(a).consecutiveFailures == 0)
+        #expect(try w.pending(a) == 1)
+    }
+
+    /// A timeout with no rate limit in play stays a plain failure with the normal backoff.
+    @Test func wallClockKillAloneIsAFailure() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        w.fake.script("ceo", .init(events: [.initialized(sessionId: a.sessionId, model: "sonnet")], error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.failed])
+        #expect(try w.agent(a).consecutiveFailures == 1)
+        guard case .retry? = try w.agent(a).blocker else { Issue.record("expected a retry backoff"); return }
+    }
+
     @Test func usageLimitBlocksEveryone() async throws {
         let w = try World()
         let c1 = try w.company("Acme"); let c2 = try w.company("Beta")

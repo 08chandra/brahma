@@ -39,7 +39,7 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             """)
         let runner = ClaudeProcessRunner(claudePath: script.path)
         let events = try await collect(runner.run(request(in: dir)))
-        #expect(events.count == 4)
+        #expect(events.count == 5, "init, its details, assistant text, rate limit, result")
         guard case .initialized(let session, _) = events.first else { Issue.record("no init"); return }
         #expect(session == "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0")
         guard case .result(let r) = events.last else { Issue.record("no result"); return }
@@ -66,7 +66,8 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             #expect(code == 3)
             #expect(stderrTail.contains("something went wrong"))
         }
-        #expect(seen == [.initialized(sessionId: "s1", model: "m")])
+        #expect(seen == [.initialized(sessionId: "s1", model: "m"),
+                         .initInfo(InitInfo(sessionId: "s1", model: "m", tools: [], agents: []))])
     }
 
     @Test func timeoutKillsProcess() async throws {

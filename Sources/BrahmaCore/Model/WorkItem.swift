@@ -157,6 +157,9 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     /// Where an approved item is on its way into `main`. Written only by the engine.
     public var mergeState: MergeState = .none
     public var mergedCommit: String? = nil
+    /// Why the engine last stopped work on the item: `budget`, `no-progress`, `loop`, `failed-checks` or `timebox`.
+    /// Cleared at the next claim.
+    public var stopReason: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }
