@@ -63,15 +63,14 @@ public enum MCPConfig {
     /// Writes `<runDir>/<agentId>.mcp.json` (mode 0600, atomic) and returns its path. The per-turn token travels
     /// in the server's `env` entry, so it is neither in argv nor in the agent's own process environment.
     /// A review turn passes `reviewItem` (the item key): its server runs `--review-item <KEY>` and writes `<agentId>.review.mcp.json`.
-    /// `quotas`: the turn's mode quotas, as `BRAHMA_MCP_QUOTA_*` in the same `env` entry (counted inside that server).
+    /// The turn's mode quotas are not here: they ride on the credential row the token names.
     public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String,
-                             reviewItem: String? = nil, quotas: ModeQuotas? = nil) throws -> String {
+                             reviewItem: String? = nil) throws -> String {
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
         if let reviewItem { args += ["--review-item", reviewItem] }
-        var env = [tokenVariable: turnToken]
-        if reviewItem == nil, let quotas { env.merge(quotas.environment) { a, _ in a } }
+        let env = [tokenVariable: turnToken]
         let config: [String: Any] = ["mcpServers": ["company": [
             "command": executable,
             "args": args,

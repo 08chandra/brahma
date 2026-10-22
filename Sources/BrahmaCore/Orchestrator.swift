@@ -347,6 +347,7 @@ public actor Orchestrator {
             toolsKey = "work:" + template.companyTools.joined(separator: ",")
             var planDirectory: String?
             var facts: ItemModeFacts?
+            var itemBudget = false
 
             if let review {
                 sent.sessionId = UUID().uuidString
@@ -389,6 +390,8 @@ public actor Orchestrator {
                         escalate(itemId: itemId, agent: agent, git: g, now: clock())
                     }
                     facts = try? store.itemModeFacts(itemId: itemId, holderId: c.lease?.agentId ?? agent.id)
+                    itemBudget = c.lease?.agentId == agent.id && c.lease?.itemId == itemId
+                        && facts.map { Self.budgetApplies($0.item) } == true
                 }
 
                 // Plan-first (design §2.4): only on a clean worktree, so the write barrier can tell. The selection is the mode
@@ -396,7 +399,8 @@ public actor Orchestrator {
                 if kind == .work, let leased = c.item, let git, let checkout,
                    planSelector.map({ $0(agent, leased, company) })
                     ?? ModePolicy.select(modeInputs(kind: .work, agent: agent, company: company, template: template, deciding: deciding,
-                                                    facts: facts, hasItem: true, sessionModel: nil, sessionTokens: 0)).planFirst,
+                                                    facts: facts, hasItem: true, itemBudget: itemBudget, sessionModel: nil,
+                                                    sessionTokens: 0)).planFirst,
                    (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout),
                    let barrier = try? git.planBarrier(key: leased.key, in: checkout),
                    let dir = Self.planDirectory(workspace: workspace, key: leased.key) {
@@ -444,7 +448,7 @@ public actor Orchestrator {
             let fixedModel = wasResume && scope.itemId != nil && review == nil ? slotModel : nil
             let inputs = modeInputs(kind: review != nil ? .review : kind, agent: agent, company: company, template: template,
                                     deciding: deciding, facts: facts, hasItem: review != nil || scope.itemId != nil,
-                                    sessionModel: fixedModel, sessionTokens: sessionTokens)
+                                    itemBudget: review == nil && itemBudget, sessionModel: fixedModel, sessionTokens: sessionTokens)
             let mode = ModePolicy.select(inputs)
             if review != nil, inputs.reviewSpendCapped, let f = facts {
                 attempt { try store.noteReviewSpendCap(item: f.item, now: clock()) }
@@ -474,15 +478,16 @@ public actor Orchestrator {
                 if kind != .work || scope.itemId != nil { try store.setTurnContext(turnId: turn.id, kind: kind, itemId: scope.itemId) }
                 if let cacheBreak { try store.setTurnCacheBreak(turnId: turn.id, cacheBreak) }
                 // A plan turn's server offers the read-mostly surface: its credential says so.
+                // The mode's quotas ride on the credential row; `brahma mcp` enforces them from there.
                 turnToken = kind == .plan
-                    ? try store.issueTurnCredential(turnId: turn.id, kind: "plan", itemId: scope.itemId)
-                    : try store.issueTurnCredential(turnId: turn.id)
+                    ? try store.issueTurnCredential(turnId: turn.id, kind: "plan", itemId: scope.itemId, quotas: mode.quotas)
+                    : try store.issueTurnCredential(turnId: turn.id, quotas: mode.quotas)
             }
             try store.setTurnMode(turnId: turn.id, decision: mode)
             var request = TurnRequest(
                 agent: sent, company: company, prompt: turnPrompt, appendSystemPrompt: systemPrompt,
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
-                                                   reviewItem: review?.item.key, quotas: mode.quotas),
+                                                   reviewItem: review?.item.key),
                 workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])

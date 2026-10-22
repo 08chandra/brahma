@@ -6,11 +6,16 @@ struct ModeNotLaunched: Error { var reason: String; var overBudgetItem: String? 
 
 extension Orchestrator {
     /// Everything `ModePolicy.select` reads for one turn (design §3.1), from the store and the latest usage reading.
+    /// `itemBudget`: the turn is the leaseholder's on an item it is working (ready or in progress), so the item's remaining
+    /// budget caps it and the no-launch rule applies. Any other turn about the item (its assignee after the item was blocked over
+    /// budget, answering DMs) runs without it (fix 1 C1).
     nonisolated func modeInputs(kind: TurnKind, agent: Agent, company: Company, template: RoleTemplate, deciding: ModelContext,
-                                facts: ItemModeFacts?, hasItem: Bool, sessionModel: String?, sessionTokens: Int) -> ModeInputs {
+                                facts: ItemModeFacts?, hasItem: Bool, itemBudget: Bool, sessionModel: String?,
+                                sessionTokens: Int) -> ModeInputs {
         var i = ModeInputs()
         i.turnKind = kind
         i.hasItem = hasItem
+        i.leadRole = template.kind == .manager || template.kind == .executive
         i.decidingPRD = deciding.decidingPRD
         i.decidingArchitecture = deciding.decidingArchitecture
         i.agentModel = agent.model
@@ -39,7 +44,7 @@ extension Orchestrator {
             i.planWritten = f.planWritten
             i.replanRequested = f.replanRequested
             i.p2OnlyFix = f.p2OnlyFix
-            if kind == .work || kind == .plan { i.budgetLeftLE = f.budgetLeftLE }
+            if kind == .work || kind == .plan, itemBudget { i.budgetLeftLE = f.budgetLeftLE }
             if kind.isReview { i.reviewSpendCapped = (try? store.reviewSpendCapped(item: f.item)) ?? false }
         }
         i.sessionModel = sessionModel
@@ -52,6 +57,7 @@ extension Orchestrator {
     /// row tell the manager; R4 plus two more counted failures on a confirmed L or P0 item proposes Ultra to the owner.
     nonisolated func escalate(itemId: String, agent: Agent, git: GitWorkspace, now: Date) {
         guard let f = try? store.itemModeFacts(itemId: itemId, holderId: agent.id) else { return }
+        let budgetLeft: Double? = Self.budgetApplies(f.item) ? f.budgetLeftLE : nil
         let runs = (try? store.failedRuns(itemId: itemId, since: f.claimedAt)) ?? []
         let claimed = PathOverlap.claimed(f.item)
         var previous = f.item.baseCommit
@@ -69,7 +75,7 @@ extension Orchestrator {
         let actions = ModePolicy.escalation(
             counted: counted, escalatedSinceClaim: state.failures, currentLevel: level, floor: f.item.rungFloor,
             tierL: f.tier == .l, p0: f.priority == 0, mP0OrRisk: f.tier == .m && (f.priority == 0 || !f.riskTags.isEmpty),
-            rejections: f.reviewRejections, rejectionsApplied: state.rejections, cappedInRow: capped, budgetLeftLE: f.budgetLeftLE,
+            rejections: f.reviewRejections, rejectionsApplied: state.rejections, cappedInRow: capped, budgetLeftLE: budgetLeft,
             estimate: { l in
                 let r = ModeRung.at(level: l)
                 return cal.estimate(rung: r, model: r.isOpus ? "opus" : "sonnet", effort: r.effort)
@@ -79,6 +85,9 @@ extension Orchestrator {
         let kind = counted >= ModePolicy.escalationFailures && !state.failures ? "failures" : "rejections"
         attempt { try store.applyEscalation(itemId: itemId, actions: actions, kind: kind, since: f.claimedAt, now: now) }
     }
+
+    /// The item's budget binds its leaseholder's turns only while it is being worked.
+    nonisolated static func budgetApplies(_ item: WorkItem) -> Bool { item.status == .inProgress || item.status == .ready }
 
     /// The diff from the previous failing commit (or the item's base) touches the item's claimed paths. An item that claims the
     /// whole repo, or a diff git cannot produce, counts as touching it.

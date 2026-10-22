@@ -42,7 +42,7 @@ public struct TurnProfile: Equatable, Sendable {
     public var subagents: SubagentPolicy = .off
     /// Ultra's Workflow policy (5-lite). Always nil in 3a: every 3a turn sets the workflow kill switches.
     public var workflow: WorkflowPolicy? = nil
-    /// The per-turn MCP quotas (they travel in the MCP config's env, not here in argv).
+    /// The per-turn MCP quotas (recorded on the turn's credential row, never in argv or an environment).
     public var quotas: ModeQuotas? = nil
     /// `<quoted brahma> hook pre-tool`: the engine's PreToolUse hook on `Agent|Task|Workflow`, on every mode turn.
     public var hookCommand: String? = nil
@@ -111,12 +111,16 @@ public enum TurnProfileCompiler {
     /// The work-mode part of a profile (design §2.3): `--effort`, `--max-turns`, `--max-budget-usd`, the common settings keys
     /// (`availableModels`, `fastMode:false`, `workflowKeywordTriggerEnabled:false`, `disableWorkflows:true`, `maxEffortLevel`, the
     /// pre-tool hook), the kill-switch environment and, only once the sub-agent gate passes, the forced sub-agent controls.
-    static func apply(_ d: ModeDecision, to p: inout TurnProfile, hookCommand: String?, kind: TurnKind) {
+    static func apply(_ d: ModeDecision, to p: inout TurnProfile, hookCommand: String?, kind: TurnKind,
+                      perModeCaps: Bool = ModeGates.perModeCaps) {
         p.mode = d.mode
         p.effort = d.effort
         p.maxEffortLevel = d.maxEffortLevel
-        p.maxTurns = d.maxTurns
-        p.maxBudgetUSD = d.maxBudgetUSD
+        // `--max-turns` and `--max-budget-usd` only while probe L-4 holds (the cap is per process, the total cumulative).
+        if perModeCaps {
+            p.maxTurns = d.maxTurns
+            p.maxBudgetUSD = d.maxBudgetUSD
+        }
         p.wallClock = p.wallClock ?? d.wallClock
         p.quotas = d.quotas
         p.hookCommand = hookCommand

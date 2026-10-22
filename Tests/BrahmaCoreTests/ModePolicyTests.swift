@@ -345,6 +345,55 @@ import Testing
         #expect(pick(work(.s) { $0.agentModel = "haiku" }).model == "haiku")
     }
 
+    /// Fix 1 C2: opus being scarce never lifts a turn above the extra-usage or closed-pace clamp.
+    @Test func opusScarceNeverLiftsTheOverageOrClosedClamp() {
+        let cases: [(EffortTier, (inout ModeInputs) -> Void)] = [
+            (.l, { $0.overageAllowed = true; $0.opusScarce = true }),
+            (.l, { $0.pace = .closed; $0.opusScarce = true }),
+            (.m, { $0.overageAllowed = true; $0.opusScarce = true; $0.rungFloor = 3 }),
+            (.m, { $0.pace = .closed; $0.opusScarce = true; $0.rungFloor = 4 }),
+            (.m, { $0.overageAllowed = true; $0.opusScarce = true; $0.riskTags = ["hotPath"]; $0.usageMode = .max; $0.priority = 0 }),
+        ]
+        for (tier, edit) in cases {
+            let d = pick(work(tier, edit))
+            #expect(d.rung.level <= 1 && !d.rung.isOpus, "\(d.rung) \(d.reason)")
+            #expect(d.model == "sonnet")
+        }
+        // Without the clamps it still falls to Sonnet high.
+        #expect(pick(work(.l) { $0.opusScarce = true }).rung == .r2)
+    }
+
+    /// Fix 1 Q3: a manager's or executive's itemless turn keeps Quick's model and effort but gets Standard caps, so a lead can
+    /// break work down; everyone else's stays Quick.
+    @Test func leadItemlessTurnsGetStandardCaps() {
+        var i = ModeInputs(); i.turnKind = .work; i.hasItem = false
+        let ic = pick(i)
+        #expect(ic.maxTurns == 10); #expect(ic.quotas == ModeCaps.quick.quotas)
+        i.leadRole = true
+        let lead = pick(i)
+        #expect(lead.mode == .quick); #expect(lead.rung == .r0); #expect(lead.effort == .low)
+        #expect(lead.maxTurns == 40); #expect(lead.maxBudgetUSD == 2.00); #expect(lead.wallClock == .seconds(1200))
+        #expect(lead.quotas == ModeCaps.standard.quotas); #expect(lead.reason.contains("Standard caps"))
+        // A lead's notice turn is still plain Quick.
+        i.turnKind = .notice
+        #expect(pick(i).maxTurns == 10)
+    }
+
+    /// Fix 1 minor: the plan turn is bound by the extra-usage, closed-pace and Pro clamps like a work turn.
+    @Test func planTurnIsClamped() {
+        var plan = work(.l); plan.turnKind = .plan
+        #expect(pick(plan).model == "opus")
+        for edit: (inout ModeInputs) -> Void in [{ $0.overageAllowed = true }, { $0.pace = .closed }, { $0.planTier = .pro }] {
+            var i = plan; edit(&i)
+            let d = pick(i)
+            #expect(d.mode == .plan); #expect(d.rung == .opusLow); #expect(d.effort == .low, "\(d.reason)")
+            #expect(d.reason.contains("plan turn held at opus-low"))
+        }
+        var m = work(.m) { $0.riskTags = ["migration"]; $0.intensity = .thorough }; m.turnKind = .plan; m.overageAllowed = true
+        let d = pick(m)
+        #expect(d.rung == .r1); #expect(d.model == "sonnet"); #expect(d.effort == .medium)
+    }
+
     @Test func calibrationReplacesThePrior() {
         var cal = ModeCalibration()
         #expect(abs(cal.estimate(rung: .r1, model: "sonnet", effort: .medium) - 0.54) < 1e-9)

@@ -29,7 +29,8 @@ public enum ModeCanary {
     }
 
     /// Nil when the runner cannot run control sessions (test fakes).
-    public static func run(runner: any TurnRunning) async -> Result? {
+    /// `hookExecutable`: compiled into each shape's pre-tool hook exactly like a real turn's (the hook never runs: no tool is used).
+    public static func run(runner: any TurnRunning, hookExecutable: String = "brahma") async -> Result? {
         let dir = FileManager.default.temporaryDirectory.appending(path: "brahma-canary-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: dir) }
         let config = dir.appending(path: "empty.mcp.json")
@@ -52,6 +53,7 @@ public enum ModeCanary {
             var request = TurnRequest(agent: agent, company: company, prompt: "", appendSystemPrompt: nil, mcpConfigPath: config.path,
                                       workingDirectory: dir.path, profile: .workspace, environment: ["BRAHMA_AGENT_ID": "doctor-canary"])
             request.mode = d
+            request.hookCommand = TurnProfileCompiler.hookCommand(executable: hookExecutable)
             var messages = [message("i\(index)", "initialize"), message("s\(index)", "get_settings")]
             if index == 0 { messages.append(message("u\(index)", "get_usage", ["skip_behaviors": .bool(true)])) }
             guard let transcript = await runner.control(request, messages: messages, timeout: timeout) else { return nil }

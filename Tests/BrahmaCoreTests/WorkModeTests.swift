@@ -60,7 +60,16 @@ import GRDB
     @Test func turnCarriesAndRecordsTheDecision() async throws {
         let m = try M()
         try m.leased(tier: .s)
-        try await m.turn(Self.result())
+        // Read the live credential mid-turn (it is deleted when the turn ends).
+        let seen = Locked<ModeQuotas?>(nil)
+        var script = Self.result()
+        script.sideEffect = { [store = m.store] r in
+            let config = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: r.mcpConfigPath))) as? [String: Any]
+            let server = (config?["mcpServers"] as? [String: Any])?["company"] as? [String: Any]
+            let token = (server?["env"] as? [String: String])?[MCPConfig.tokenVariable] ?? ""
+            seen.set(store.turnCredentialContext(token: token, companyId: r.company.id, agentId: r.agent.id)?.quotas)
+        }
+        try await m.turn(script)
         let r = try #require(m.w.fake.requests.last)
         let d = try #require(r.mode)
         #expect(d.mode == .standard); #expect(d.model == "sonnet"); #expect(r.agent.model == "sonnet")
@@ -73,10 +82,10 @@ import GRDB
         let t = try m.lastTurn()
         #expect(t.mode == "standard"); #expect(t.rung == 1); #expect(t.effort == "medium")
         #expect(t.modeReason?.contains("tier S: R1") == true)
-        // The per-turn MCP config carries the mode's quotas.
+        // The mode's quotas ride on the turn's credential row, not in the MCP config's env.
         let config = try Data(contentsOf: URL(fileURLWithPath: r.mcpConfigPath))
-        let text = String(decoding: config, as: UTF8.self)
-        #expect(text.contains("\"BRAHMA_MCP_QUOTA_POSTS\":\"10\""))
+        #expect(!String(decoding: config, as: UTF8.self).contains("QUOTA"))
+        #expect(seen.get() == ModeCaps.standard.quotas)
     }
 
     @Test func costByModeRecorded() async throws {
@@ -118,6 +127,65 @@ import GRDB
         let blocked = try m.item(item)
         #expect(blocked.status == .blocked); #expect(blocked.stopReason == "budget")
         #expect(blocked.blockedReason?.hasPrefix("over budget") == true)
+    }
+
+    /// Fix 1 C1: once its item is blocked over budget, the assignee's later turns are no longer the item's leaseholder turns: they
+    /// launch without the item's budget, answer the inbox, and do not loop.
+    @Test func overBudgetAssigneeStillAnswersDMs() async throws {
+        let m = try M()
+        let item = try m.leased(tier: .s)
+        try await m.store.writer.write { db in
+            try db.execute(sql: """
+                INSERT INTO turn (id, agentId, companyId, startedAt, endedAt, outcome, kind, itemId, costLE, costUSD)
+                VALUES ('old', ?, ?, ?, ?, 'succeeded', 'work', ?, 2.9, 2.9)
+                """, arguments: [m.eng.id, m.c.id, m.w.clock.now, m.w.clock.now, item.id])
+        }
+        try await m.turn(Self.result())
+        #expect(try m.item(item).status == .blocked)
+        let mine = { m.w.fake.requests.filter { $0.agent.id == m.eng.id } }
+        let launched = mine().count
+        // The DM is still unanswered; the next turns run (no item budget applies) and deliver it.
+        for _ in 0..<2 {
+            m.w.clock.advance(120)
+            try await m.w.cycle()
+        }
+        #expect(mine().count == launched + 1, "the agent answers its DM once")
+        let last = try #require(mine().last)
+        #expect(last.prompt.contains("please do it"))
+        #expect(try m.store.pendingInbox(agentId: m.eng.id).isEmpty)
+        let rows = try m.w.turns(m.eng).count
+        for _ in 0..<3 {
+            m.w.clock.advance(120)
+            try await m.w.cycle()
+        }
+        #expect(try m.w.turns(m.eng).count == rows, "no turn-row loop")
+        #expect(try m.item(item).status == .blocked)
+    }
+
+    /// Fix 1 Q2: risk keywords and paths in a spec only its implementer wrote do not escalate; review flags (engine-owned) do.
+    @Test func untrustedRiskTagsDoNotEscalate() async throws {
+        let m = try M()
+        let item = try m.store.createWorkItem(companyId: m.c.id, by: .agent(m.eng.id), draft: WorkItemDraft(
+            type: .task, title: "security migration exploit", description: "migrate the auth token injection",
+            checkSpec: CheckSpec(command: "true", paths: ["Package.swift", ".env", "db/migrations/x"]), tier: .m,
+            status: .ready), now: m.w.clock.now)
+        _ = try m.store.claimLease(itemId: item.id, agentId: m.eng.id, now: m.w.clock.now)
+        let facts = try #require(try m.store.itemModeFacts(itemId: item.id, holderId: m.eng.id))
+        #expect(facts.riskTags.isEmpty, "\(facts.riskTags)")
+        try await m.turn(Self.result())
+        let d = try #require(m.w.fake.requests.last?.mode)
+        #expect(d.rung == .r1); #expect(d.mode == .standard)
+        // Engine-owned review flags still count, trusted or not.
+        try await m.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET reviewFlags = ? WHERE id = ?", arguments: ["[\"flaky check\"]", item.id])
+        }
+        #expect(try m.store.itemModeFacts(itemId: item.id, holderId: m.eng.id)?.riskTags == ["flagged"])
+        // A manager's confirmation makes the whole spec count.
+        try await m.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET specConfirmedBy = ? WHERE id = ?", arguments: ["\(m.mgr.id):manager", item.id])
+        }
+        let trusted = try #require(try m.store.itemModeFacts(itemId: item.id, holderId: m.eng.id))
+        #expect(trusted.riskTags.isSuperset(of: ["hotPath", "sensitivePath", "migration", "securityLabel", "flagged"]))
     }
 
     @Test func refusedPinIsNotLaunched() async throws {
@@ -195,4 +263,13 @@ import GRDB
         let r = StallExplainer.explain(input, timeZone: .gmt, now: Date())
         #expect(r.reasons.contains("deep modes and Ultra are off while extra usage is on"))
     }
+}
+
+/// A value shared with a `@Sendable` fake-runner side effect.
+private final class Locked<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T
+    init(_ v: T) { value = v }
+    func get() -> T { lock.withLock { value } }
+    func set(_ v: T) { lock.withLock { value = v } }
 }

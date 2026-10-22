@@ -64,10 +64,11 @@ struct MCP: ParsableCommand {
             FileHandle.standardError.write(Data("brahma mcp: unknown agent \(agent) in company \(company)\n".utf8))
             throw ExitCode.failure
         }
-        // The turn's mode quotas ride in the per-turn MCP config's env; review turns have none.
-        let quotas = reviewItemId == nil ? ModeQuotas(environment: ProcessInfo.processInfo.environment) : nil
+        // The turn's mode quotas come from its credential row (the strictest when none were recorded), never from this process's
+        // environment, and are counted in the database per turn; review turns have none.
+        let quotas = reviewItemId == nil ? context.quotas ?? .strictest : nil
         let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId,
-                                                   quotas: quotas, planTurn: planTurn))
+                                                   quotas: quotas, quotaTurnId: context.turnId, planTurn: planTurn))
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

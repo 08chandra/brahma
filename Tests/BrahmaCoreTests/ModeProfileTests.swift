@@ -49,10 +49,22 @@ private let deepOpus = decision { $0.tier = .l }
 private let allModes = [quick, standard, deep, deepOpus]
 
 @Suite struct ModeProfileTests {
+    /// Fix 1 minor: the L-4 gate really gates the per-mode caps.
+    @Test func perModeCapsGateEmitsTheCaps() {
+        #expect(ModeGates.perModeCaps)
+        var on = TurnProfileCompiler.profile(for: request(standard))
+        #expect(on.maxTurns == 40); #expect(on.maxBudgetUSD == 2.00)
+        on.maxTurns = nil; on.maxBudgetUSD = nil
+        TurnProfileCompiler.apply(standard, to: &on, hookCommand: hook, kind: .work, perModeCaps: false)
+        #expect(on.maxTurns == nil); #expect(on.maxBudgetUSD == nil)
+        let a = TurnProfileCompiler.arguments(on)
+        #expect(!a.contains("--max-turns")); #expect(!a.contains("--max-budget-usd")); #expect(a.contains("--effort"))
+    }
+
     @Test func quickHasNoTaskAndWorkflowKillSwitches() throws {
         let a = args(request(quick))
         let settingsJSON = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disableWorkflows\":true,\"enabledPlugins\":{},"
-            + "\"fastMode\":false,\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"command\":\"\(hook.replacingOccurrences(of: "'", with: "'")) --mode quick\","
+            + "\"fastMode\":false,\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"command\":\"\(hook) --mode quick\","
             + "\"type\":\"command\"}],\"matcher\":\"Agent|Task|Workflow\"}]},\"maxEffortLevel\":\"low\",\"workflowKeywordTriggerEnabled\":false}"
         #expect(a == [
             "-p", "--output-format", "stream-json", "--verbose",

@@ -56,8 +56,9 @@ public enum Doctor {
     /// Runs an executable with arguments and returns its stdout, or nil when it cannot run. Injected by tests.
     public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async -> String?
 
+    /// `hookExecutable`: the `brahma` the mode-canary's profiles name in their pre-tool hook, as real turns do.
     public static func run(claudePath: String, runner: any TurnRunning, exec: @escaping Exec = defaultExec,
-                           now: Date = .now) async -> DoctorReport {
+                           now: Date = .now, hookExecutable: String = "brahma") async -> DoctorReport {
         guard let version = await cliVersion(claudePath: claudePath, exec: exec) else {
             return DoctorReport(cliVersion: nil, items: [
                 DoctorItem(name: "version", status: .fail, detail: "can't run '\(claudePath) --version'; is Claude Code installed?"),
@@ -69,7 +70,7 @@ public enum Doctor {
         items += probe
         var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
         // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
-        if let canary = await ModeCanary.run(runner: runner) {
+        if let canary = await ModeCanary.run(runner: runner, hookExecutable: hookExecutable) {
             report.items.append(canary.item)
             report.builtinAgents = canary.builtinAgents
             report.reportedSubscription = canary.reportedSubscription

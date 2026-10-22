@@ -105,6 +105,7 @@ extension Store {
         turn.reportedStatus = reportedStatus; turn.sessionResetReason = sessionResetReason
         try turn.update(db)
         try db.execute(sql: "DELETE FROM turnCredential WHERE turnId = ?", arguments: [id])
+        try db.execute(sql: "DELETE FROM turnQuotaUsage WHERE turnId = ?", arguments: [id])
         return true
     }
 
@@ -130,6 +131,8 @@ extension Store {
             try db.execute(sql: "UPDATE turn SET outcome = ?, endedAt = ? WHERE outcome = ?",
                            arguments: [TurnOutcome.interrupted.rawValue, now, TurnOutcome.inProgress.rawValue])
             try db.execute(sql: "DELETE FROM turnCredential WHERE turnId IN (SELECT id FROM turn WHERE outcome <> ?)",
+                           arguments: [TurnOutcome.inProgress.rawValue])
+            try db.execute(sql: "DELETE FROM turnQuotaUsage WHERE turnId IN (SELECT id FROM turn WHERE outcome <> ?)",
                            arguments: [TurnOutcome.inProgress.rawValue])
             let running = try Agent.filter(Column("state") == AgentState.running.rawValue).fetchAll(db)
             for var agent in running {

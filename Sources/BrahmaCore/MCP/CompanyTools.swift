@@ -24,15 +24,22 @@ public struct ToolSpec: Encodable, Sendable {
     }
 }
 
-/// Per-turn MCP quota counts, kept by the one `brahma mcp` process of a turn: every sub-agent and workflow agent of the turn
-/// talks to the same process (p8/p9: one pid), so they share the parent's quota.
+/// Per-turn MCP quota counts. A real turn's server counts in the database by turn id (`Store.reserveTurnQuota`), so every server
+/// process and every sub-agent of the turn shares one count; this in-memory counter serves tools built without a turn.
 final class TurnQuotaCounter: @unchecked Sendable {
     enum Kind: String { case posts, items, comments, highRisk }
     private let lock = NSLock()
     private var used: [Kind: Int] = [:]
 
     func used(_ k: Kind) -> Int { lock.withLock { used[k] ?? 0 } }
-    func add(_ k: Kind) { lock.withLock { used[k, default: 0] += 1 } }
+    func reserve(_ k: Kind, limit: Int) -> Bool {
+        lock.withLock {
+            guard used[k, default: 0] < limit else { return false }
+            used[k, default: 0] += 1
+            return true
+        }
+    }
+    func release(_ k: Kind) { lock.withLock { used[k] = max(0, (used[k] ?? 0) - 1) } }
 }
 
 /// A failure the agent should see as an `isError` tool result.
@@ -47,24 +54,26 @@ public struct CompanyTools: Sendable {
     let diagnostics: @Sendable (String) -> Void
     /// Set for the MCP server of a review turn: only the review tools, limited to this one item.
     let reviewItemId: String?
-    /// The turn's mode quotas (`BRAHMA_MCP_QUOTA_*`); nil: none (review turns, Plan 1 turns).
+    /// The turn's mode quotas, from its credential row; nil: none (review turns, tools built without a turn).
     let quotas: ModeQuotas?
+    /// The turn whose database counters the quotas use; nil: the in-memory counter.
+    let quotaTurnId: String?
     /// A plan turn's server: the mutating work and decision tools are not offered.
     let planTurn: Bool
     let counter = TurnQuotaCounter()
 
     public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, quotas: ModeQuotas? = nil,
-                planTurn: Bool = false) {
+                quotaTurnId: String? = nil, planTurn: Bool = false) {
         self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, quotas: quotas,
-                  planTurn: planTurn, diagnostics: { line in
+                  quotaTurnId: quotaTurnId, planTurn: planTurn, diagnostics: { line in
             FileHandle.standardError.write(Data((line + "\n").utf8))
         })
     }
 
     init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, quotas: ModeQuotas? = nil,
-         planTurn: Bool = false, diagnostics: @escaping @Sendable (String) -> Void) {
+         quotaTurnId: String? = nil, planTurn: Bool = false, diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
-        self.reviewItemId = reviewItemId; self.quotas = quotas; self.planTurn = planTurn
+        self.reviewItemId = reviewItemId; self.quotas = quotas; self.quotaTurnId = quotaTurnId; self.planTurn = planTurn
     }
 
     /// Tools that only read; they carry `readOnlyHint` and are never counted.
@@ -75,7 +84,8 @@ public struct CompanyTools: Sendable {
                                                     "request_mode", "plan_sprint", "close_sprint", "confirm_spec"]
     /// What a plan turn's server leaves out: everything that changes work, leases, decisions or channels.
     static let planTurnExcluded: Set<String> = Set(["claim_lease", "release_lease", "submit_for_review", "update_work_item",
-                                                    "create_work_item", "link_dependency", "write_handoff", "create_channel"])
+                                                    "create_work_item", "link_dependency", "write_handoff", "create_channel",
+                                                    "set_blocked"])
         .union(highRiskTools)
     static let updateLowRiskFields: Set<String> = ["key", "status", "blockedReason", "notes", "linkedBranch"]
 
@@ -89,9 +99,10 @@ public struct CompanyTools: Sendable {
         }
     }
 
-    /// The refusal when the turn's quota for this call is used up, else nil.
-    func quotaRefusal(_ kind: TurnQuotaCounter.Kind) -> String? {
-        guard let q = quotas else { return nil }
+    /// Takes one unit of the turn's quota for this call. Returns whether a unit was taken (to give back if the call fails), or
+    /// throws the refusal when the quota is used up. A counter the database cannot update refuses (fail closed).
+    func reserveQuota(_ kind: TurnQuotaCounter.Kind) throws -> Bool {
+        guard let q = quotas else { return false }
         let limit: Int?, what: String
         switch kind {
         case .posts: limit = q.posts; what = "\(q.posts) posts and DMs per turn"
@@ -99,8 +110,27 @@ public struct CompanyTools: Sendable {
         case .comments: limit = q.comments; what = "\(q.comments) comments per turn"
         case .highRisk: limit = q.highRisk; what = "\(q.highRisk ?? 0) high-risk company calls per turn"
         }
-        guard let limit, counter.used(kind) >= limit else { return nil }
-        return "this turn's limit is reached (\(what)); carry on next turn or say what you need in your final reply"
+        guard let limit else { return false }
+        let taken: Bool
+        if let turnId = quotaTurnId {
+            taken = (try? store.reserveTurnQuota(turnId: turnId, kind: kind.rawValue, limit: limit)) ?? false
+        } else {
+            taken = counter.reserve(kind, limit: limit)
+        }
+        guard taken else {
+            throw ToolError(message: "this turn's limit is reached (\(what)); carry on next turn or say what you need in your final reply")
+        }
+        return true
+    }
+
+    func releaseQuota(_ kind: TurnQuotaCounter.Kind) {
+        if let turnId = quotaTurnId {
+            do { try store.releaseTurnQuota(turnId: turnId, kind: kind.rawValue) } catch {
+                diagnostics("brahma mcp: failed to give back a \(kind.rawValue) quota unit: \(error)")
+            }
+        } else {
+            counter.release(kind)
+        }
     }
 
     static func schema(_ properties: [String: JSONValue], required: [String]) -> JSONValue {
@@ -168,12 +198,16 @@ public struct CompanyTools: Sendable {
                 throw ToolError(message: "\(name) is not available to your role")
             }
         }
-        // Quotas count calls that succeed; a refused or failed call costs nothing.
+        // Quotas count calls that succeed; a refused or failed call costs nothing. The unit is taken before the call (so two
+        // concurrent calls cannot both take the last one) and given back if it fails.
         let kind = quotaKind(name, arguments)
-        if let kind, let refusal = quotaRefusal(kind) { throw ToolError(message: refusal) }
-        let result = try dispatch(name, arguments)
-        if let kind { counter.add(kind) }
-        return result
+        let reserved = try kind.map(reserveQuota) ?? false
+        do {
+            return try dispatch(name, arguments)
+        } catch {
+            if reserved, let kind { releaseQuota(kind) }
+            throw error
+        }
     }
 
     private func logUse(_ tool: String) {

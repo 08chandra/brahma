@@ -63,7 +63,7 @@ extension Store {
             item: item,
             tier: EffectiveSpec.tier(stored: item.tier, confirmedBy: item.specConfirmedBy, holderId: holder),
             priority: EffectiveSpec.priority(stored: item.priority, confirmedBy: item.specConfirmedBy, holderId: holder),
-            riskTags: WorkPolicy.riskTags(item),
+            riskTags: EffectiveSpec.riskTags(item, holderId: holder),
             blockingCount: try Store.blockingDependentCount(db: db, item: item),
             budgetLeftLE: budget.maxCostLE + item.budgetBoostLE - usage.costLE,
             planWritten: planWritten, reviewRejections: rejections.count, replanRequested: replan, p2OnlyFix: p2Only,

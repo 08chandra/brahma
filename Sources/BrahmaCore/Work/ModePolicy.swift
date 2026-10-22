@@ -116,8 +116,10 @@ public enum SubagentPolicy: Equatable, Sendable {
     case forced(model: String, depth: Int, concurrent: Int)
 }
 
-/// Per-turn MCP quotas, counted inside the turn's `brahma mcp` process (design §4.1). `highRisk` nil means no quota.
-public struct ModeQuotas: Equatable, Sendable {
+/// Per-turn MCP quotas (design §4.1). `highRisk` nil means no quota. They are stored on the turn's credential row when it is
+/// issued and counted in the database per turn, so no environment variable can widen them and every server process of the turn
+/// shares one count.
+public struct ModeQuotas: Codable, Equatable, Sendable {
     public var posts: Int
     public var itemsCreated: Int
     public var comments: Int
@@ -127,24 +129,11 @@ public struct ModeQuotas: Equatable, Sendable {
         self.posts = posts; self.itemsCreated = itemsCreated; self.comments = comments; self.highRisk = highRisk
     }
 
-    public static let postsVariable = "BRAHMA_MCP_QUOTA_POSTS"
-    public static let itemsVariable = "BRAHMA_MCP_QUOTA_ITEMS"
-    public static let commentsVariable = "BRAHMA_MCP_QUOTA_COMMENTS"
-    public static let highRiskVariable = "BRAHMA_MCP_QUOTA_HIGHRISK"
-
-    /// The `BRAHMA_MCP_QUOTA_*` entries of the per-turn MCP config.
-    public var environment: [String: String] {
-        var env = [Self.postsVariable: "\(posts)", Self.itemsVariable: "\(itemsCreated)", Self.commentsVariable: "\(comments)"]
-        if let highRisk { env[Self.highRiskVariable] = "\(highRisk)" }
-        return env
-    }
-
-    /// Read back by `brahma mcp`; nil when the turn carries no quotas (Plan 1 turns, review turns).
-    public init?(environment env: [String: String]) {
-        func value(_ name: String) -> Int? { env[name].flatMap { Int($0) }.map { max(0, $0) } }
-        guard let posts = value(Self.postsVariable), let items = value(Self.itemsVariable),
-              let comments = value(Self.commentsVariable) else { return nil }
-        self.init(posts: posts, itemsCreated: items, comments: comments, highRisk: value(Self.highRiskVariable))
+    /// What a work or plan credential with no recorded quotas gets (fail closed): the smallest of every mode's row.
+    public static var strictest: ModeQuotas {
+        let rows = WorkMode.allCases.map { ModeCaps.of($0).quotas }
+        return ModeQuotas(posts: rows.map(\.posts).min() ?? 0, itemsCreated: rows.map(\.itemsCreated).min() ?? 0,
+                          comments: rows.map(\.comments).min() ?? 0, highRisk: 0)
     }
 }
 
@@ -273,6 +262,8 @@ public struct ModeInputs: Equatable, Sendable {
     public var turnKind: TurnKind = .work
     /// False for a work turn with no current item (itemless work).
     public var hasItem = false
+    /// A manager or executive: its itemless turns get Standard caps, so it can break work down (controller ruling Q3).
+    public var leadRole = false
     public var decidingPRD = false
     public var decidingArchitecture = false
     public var tier: EffortTier? = nil
@@ -408,6 +399,10 @@ public enum ModePolicy {
         case .review, .audit:
             return review(i, pin: pin, small: small)
         case .work where !i.hasItem && !(i.decidingPRD || i.decidingArchitecture):
+            if i.leadRole {
+                reasons.append("itemless lead work: Quick (\(model(.r0)) low) with Standard caps")
+                return decision(.quick, rung: .r0, model: model(.r0), effort: .low, i: i, reasons: reasons, caps: .standard)
+            }
             reasons.append("itemless work: Quick (\(model(.r0)) low)")
             return decision(.quick, rung: .r0, model: model(.r0), effort: .low, i: i, reasons: reasons)
         default:
@@ -455,7 +450,9 @@ public enum ModePolicy {
             planFirst = true
             reasons.append("\(replanRejections) review rejections: replan")
         }
-        if i.turnKind == .plan { return planTurn(i, base: base, pin: pin, small: small, reasons: reasons) }
+        if i.turnKind == .plan {
+            return planTurn(i, base: base, opusRequired: opusRequired, pin: pin, small: small, reasons: reasons)
+        }
         var rung = base
 
         // 3. Floor (set only by escalation and request_mode).
@@ -482,6 +479,14 @@ public enum ModePolicy {
                 rung = rung.up
                 reasons.append("Max usage mode: +1 rung for \(i.priority == 0 ? "P0" : "critical path")")
             }
+        }
+
+        // Opus is scarce (turns that asked for it billed Sonnet): Sonnet high, and opus no longer counts as required. This comes
+        // before the pressure clamps so they still bind: it can never lift a turn above the extra-usage or closed-pace cap.
+        if i.opusScarce, rung.isOpus, !(i.decidingPRD || i.decidingArchitecture) {
+            rung = .r2
+            opusRequired = false
+            reasons.append("opus scarce: R2")
         }
 
         // 5. Pressure clamps: applied last, can only lower.
@@ -522,11 +527,6 @@ public enum ModePolicy {
             effortSteps += 1
             reasons.append("5-hour use \(Int((u * 100).rounded()))%: effort −1")
         }
-        if i.opusScarce, rung.isOpus, !(i.decidingPRD || i.decidingArchitecture) {
-            rung = .r2
-            reasons.append("opus scarce: R2")
-        }
-
         if let cap = i.roleMaxRung, rung.level > cap {
             rung = lower(rung, clamp(rung, maxLevel: cap))
             reasons.append("role max \(rung.label)")
@@ -637,17 +637,33 @@ public enum ModePolicy {
         return d
     }
 
-    /// The plan turn of Plan-first (design §2.4): the item's session model (else the base rung's), effort medium, Plan caps.
-    static func planTurn(_ i: ModeInputs, base: ModeRung, pin: String?, small: String, reasons: [String]) -> ModeDecision {
-        let model = pin ?? i.sessionModel ?? (base.isOpus ? "opus" : small)
-        var d = decision(.plan, rung: base, model: model, effort: .medium, i: i, reasons: reasons + ["plan turn: medium"])
+    /// The plan turn of Plan-first (design §2.4): the item's session model (else the base rung's), effort medium, Plan caps. The
+    /// extra-usage, Pro and closed-pace clamps bind it like a work turn: at most R1 (R2 on Pro), opus-low when opus is required.
+    static func planTurn(_ i: ModeInputs, base: ModeRung, opusRequired: Bool, pin: String?, small: String,
+                         reasons: [String]) -> ModeDecision {
+        var reasons = reasons
+        var maxLevel: Int?
+        if i.overageAllowed || i.pace == .closed { maxLevel = 1 } else if i.planTier == .pro { maxLevel = PlanTier.pro.maxRung ?? 2 }
+        var rung = base
+        var effort = Effort.medium
+        var model = pin ?? i.sessionModel ?? (base.isOpus ? "opus" : small)
+        if let maxLevel, rung.level > maxLevel || (rung.isOpus && maxLevel < 3) {
+            rung = opusRequired ? .opusLow : ModeRung.at(level: maxLevel)
+            if rung == .opusLow { effort = .low }
+            if pin == nil {
+                let session = i.sessionModel.map(ModelAllowlist.family)
+                model = rung.isOpus ? "opus" : (session == nil || session == "opus" ? small : i.sessionModel ?? small)
+            }
+            reasons.append("plan turn held at \(rung.label) (\(i.overageAllowed ? "extra usage is on" : i.pace == .closed ? "weekly pace closed" : "Pro plan"))")
+        }
+        var d = decision(.plan, rung: rung, model: model, effort: effort, i: i, reasons: reasons + ["plan turn: \(effort.rawValue)"])
         d.subagents = .off
         return d
     }
 
     static func decision(_ mode: WorkMode, rung: ModeRung, model: String, effort: Effort, i: ModeInputs,
-                         reasons: [String]) -> ModeDecision {
-        let caps = ModeCaps.of(mode)
+                         reasons: [String], caps: ModeCaps? = nil) -> ModeDecision {
+        let caps = caps ?? ModeCaps.of(mode)
         var budget = caps.budgetLE(opus: ModelAllowlist.family(model) == "opus")
         if let left = i.budgetLeftLE, i.turnKind == .work || i.turnKind == .plan { budget = min(budget, max(0, left)) }
         return ModeDecision(mode: mode, rung: rung, model: model, effort: effort, maxEffortLevel: effort, maxBudgetUSD: budget,
@@ -730,6 +746,17 @@ public enum EffectiveSpec {
     public static func priority(stored: Int, confirmedBy: String?, holderId: String?) -> Int {
         if trusted(confirmedBy: confirmedBy, holderId: holderId) { return stored }
         return max(stored, 2)
+    }
+
+    /// Risk tags derived from engine-owned fields: review flags are set only by the engine's checks and reviews.
+    static let engineOwnedRiskTags: Set<String> = ["flagged"]
+
+    /// The risk tags that count for mode selection and escalation (fix 1 Q2). The text and check-path tags come from the spec, so
+    /// they count only when the spec is trusted (a check edit by anyone else un-confirms it); otherwise only the engine-owned ones.
+    public static func riskTags(_ item: WorkItem, holderId: String?) -> Set<String> {
+        let all = WorkPolicy.riskTags(item)
+        if trusted(confirmedBy: item.specConfirmedBy, holderId: holderId) { return all }
+        return all.intersection(engineOwnedRiskTags)
     }
 }
 

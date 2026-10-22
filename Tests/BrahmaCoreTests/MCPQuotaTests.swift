@@ -48,9 +48,39 @@ import Testing
         // No quotas (review turns, Plan 1 turns): unlimited.
         let none = q.tools(nil)
         for _ in 0..<12 { #expect(call(none, "post_message", post).ok) }
-        // The quotas travel in the per-turn MCP config's env and are read back by `brahma mcp`.
-        #expect(ModeQuotas(environment: ModeCaps.deep.quotas.environment) == ModeCaps.deep.quotas)
-        #expect(ModeQuotas(environment: [:]) == nil)
+    }
+
+    /// Fix 1 Q1: the quotas ride on the credential row, and the counts live in the database per turn, so two servers of one
+    /// turn share them. A work or plan credential with none recorded gets the strictest; a review credential has none.
+    @Test func quotasRideOnTheCredentialAndCountPerTurn() throws {
+        let q = try Q()
+        _ = try q.store.transition(agentId: q.eng.id, to: .ready)
+        let (_, turn) = try #require(try q.store.beginTurn(agentId: q.eng.id, now: Store.now()))
+        let quotas = ModeQuotas(posts: 2, itemsCreated: 1, comments: 4, highRisk: 1)
+        let token = try q.store.issueTurnCredential(turnId: turn.id, quotas: quotas)
+        let ctx = try #require(q.store.turnCredentialContext(token: token, companyId: q.company.id, agentId: q.eng.id))
+        #expect(ctx.quotas == quotas); #expect(ctx.turnId == turn.id); #expect(ctx.kind == "work")
+        func server() -> CompanyTools {
+            CompanyTools(store: q.store, companyId: q.company.id, agentId: q.eng.id, quotas: ctx.quotas, quotaTurnId: ctx.turnId)
+        }
+        let a = server(), b = server()
+        let post: [String: JSONValue] = ["channel": .string("general"), "text": .string("hi")]
+        #expect(!call(a, "post_message", ["channel": .string("nope"), "text": .string("x")]).ok)
+        #expect(try q.store.turnQuotaUsed(turnId: turn.id, kind: "posts") == 0, "a failed call gives its unit back")
+        #expect(call(a, "post_message", post).ok); #expect(call(b, "post_message", post).ok)
+        let refused = call(a, "post_message", post)
+        #expect(!refused.ok); #expect(refused.text.contains("2 posts and DMs per turn"))
+        #expect(!call(b, "send_dm", ["to": .string("@mgr"), "text": .string("x")]).ok)
+        #expect(try q.store.turnQuotaUsed(turnId: turn.id, kind: "posts") == 2)
+        // Fail closed: no quotas recorded on a work or plan credential.
+        let bare = try q.store.issueTurnCredential(turnId: turn.id)
+        #expect(q.store.turnCredentialContext(token: bare, companyId: q.company.id, agentId: q.eng.id)?.quotas == .strictest)
+        #expect(ModeQuotas.strictest == ModeQuotas(posts: 3, itemsCreated: 0, comments: 5, highRisk: 0))
+        let plan = try q.store.issueTurnCredential(turnId: turn.id, kind: "plan", itemId: "i1")
+        #expect(q.store.turnCredentialContext(token: plan, companyId: q.company.id, agentId: q.eng.id)?.quotas == .strictest)
+        let review = try q.store.issueTurnCredential(turnId: turn.id, kind: "review", itemId: "i1")
+        let rctx = try #require(q.store.turnCredentialContext(token: review, companyId: q.company.id, agentId: q.eng.id))
+        #expect(rctx.quotas == nil)
     }
 
     @Test func subagentCallsShareParentQuota() throws {
@@ -84,7 +114,7 @@ import Testing
         let t = q.tools(ModeCaps.plan.quotas, planTurn: true)
         let names = Set(t.specs().map(\.name))
         for gone in ["claim_lease", "release_lease", "submit_for_review", "update_work_item", "create_work_item", "link_dependency",
-                     "write_handoff", "confirm_spec", "decide", "propose_decision", "request_mode", "create_channel"] {
+                     "write_handoff", "confirm_spec", "decide", "propose_decision", "request_mode", "create_channel", "set_blocked"] {
             #expect(!names.contains(gone), "\(gone)")
         }
         for kept in ["show_work_item", "list_work", "read_channel", "post_message", "comment_work_item"] { #expect(names.contains(kept)) }
