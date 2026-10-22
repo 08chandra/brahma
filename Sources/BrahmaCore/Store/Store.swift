@@ -102,6 +102,7 @@ public final class Store: Sendable {
                 + "there and put it back from its own records. An agent probably rewrote it; look at what \(key) is doing.",
                 now: Store.now(), reason: "worktree:\(companyId):\(key)")
         }
+        git.onUnsafeEngineFile = { [self] problem in alertEngineFile(problem, companyId: companyId) }
         git.onUnsafeRepository = { [self] detail in
             let name = (try? company(id: companyId))?.name ?? companyId
             let reason = "gitconfig:\(companyId)"

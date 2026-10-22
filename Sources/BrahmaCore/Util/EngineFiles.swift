@@ -17,10 +17,12 @@ public struct UnsafeEngineFile: Error, Equatable, CustomStringConvertible, Senda
 }
 
 /// The one way the engine writes and reads its own files under `<workspace>/.brahma/` (notes, progress files, hand-offs,
-/// conflict briefs, plan directories, check snapshots). Every directory on the way is a real directory inside the resolved
-/// workspace (created one part at a time, never through a link); files are opened relative to that directory with
+/// conflict briefs, plan directories, check snapshots, the item and check checkouts' places). Every directory on the way is a
+/// real directory inside the resolved workspace, opened one part at a time relative to the one before with `O_NOFOLLOW` (and
+/// created with `mkdirat` when missing), never through a link; files are opened relative to that directory with
 /// `O_NOFOLLOW`. A new file is created with `O_EXCL`; a rewrite goes to a temporary file that is renamed over the target, so a
-/// link planted at the target is replaced, never followed. Reads are capped.
+/// link planted at the target is replaced, never followed. Reads are capped. Removal works on descriptors only
+/// (`removeEntry`): no path is ever rebuilt, so nothing outside the workspace can be removed through a swapped link.
 public enum EngineFiles {
     public static let defaultReadLimit = 1 << 20
 
@@ -122,32 +124,111 @@ public enum EngineFiles {
         return nil
     }
 
-    /// Removes `name` (a file, a link or a whole directory, never what a link points at) from the directory.
+    /// Removes `name` (a file, a link or a whole directory, never what a link points at) from the directory. Everything is
+    /// done relative to descriptors (`removeEntry`): no path is rebuilt, so a part swapped for a link meanwhile is never
+    /// followed.
     public static func remove(workspace: URL, dir relative: String, name: String) throws {
         let dfd = try openDirectory(workspace: workspace, relative)
         defer { close(dfd) }
-        let shown = logical(workspace, relative).appending(path: name).path
-        try checkName(name, shown)
-        var st = stat()
-        guard fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return }
-        if st.st_mode & S_IFMT == S_IFDIR {
-            // The directory is reached through the real path of the checked directory, so no link is followed on the way.
-            guard let real = path(of: dfd) else { throw UnsafeEngineFile(path: shown, problem: "cannot be removed") }
-            try FileManager.default.removeItem(atPath: real + "/" + name)
-        } else if unlinkat(dfd, name, 0) != 0 {
-            throw UnsafeEngineFile(path: shown, problem: "cannot be removed (\(String(cString: strerror(errno))))")
-        }
+        try removeEntry(dfd: dfd, name: name, shown: logical(workspace, relative).appending(path: name).path)
     }
 
-    /// At most `limit` bytes of the regular, single-link file at `url`, opened without following a link; nil otherwise.
-    public static func readNoFollow(_ url: URL, limit: Int = defaultReadLimit) -> Data? {
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    /// At most `limit` bytes of the regular, single-link file at `url`, which must lie under `root`. `root` is resolved (the
+    /// owner may have put it behind a link); every part of `url` under it is opened without following a link. Nil otherwise.
+    public static func readNoFollow(_ url: URL, under root: URL, limit: Int = defaultReadLimit) -> Data? {
+        let base = root.standardizedFileURL.path, target = url.standardizedFileURL.path
+        guard target.hasPrefix(base + "/"), let real = resolved(base) else { return nil }
+        let parts = target.dropFirst(base.count + 1).split(separator: "/").map(String.init)
+        guard let name = parts.last, !parts.contains(where: { $0 == "." || $0 == ".." }) else { return nil }
+        var dfd = open(real, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard dfd >= 0 else { return nil }
+        defer { close(dfd) }
+        for part in parts.dropLast() {
+            let next = openat(dfd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard next >= 0 else { return nil }
+            close(dfd); dfd = next
+        }
+        let fd = openat(dfd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1 else { return nil }
         return try? readAll(fd: fd, limit: limit, shown: url.path)
     }
+
+    // MARK: Open directories (engine checkouts)
+
+    /// An engine directory opened by the safe walk and held open, so a caller that must hand its path to another program
+    /// (git, tar) can check it is still where the walk found it before and after that program runs.
+    final class OpenDirectory: @unchecked Sendable {
+        let fd: Int32
+        /// The kernel's path for it when it was opened.
+        let real: String
+        /// The path as the caller names it.
+        let shown: URL
+
+        fileprivate init(fd: Int32, real: String, shown: URL) { self.fd = fd; self.real = real; self.shown = shown }
+        deinit { close(fd) }
+
+        /// True while the directory is still at the path it was opened at (no part of the way to it was moved or swapped).
+        var isInPlace: Bool { EngineFiles.path(of: fd) == real }
+
+        /// What is at `name` in it, never following a link.
+        func kind(of name: String) -> Kind {
+            var st = stat()
+            guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return errno == ENOENT ? .missing : .other }
+            switch st.st_mode & S_IFMT {
+            case S_IFDIR: return .directory
+            case S_IFLNK: return .link
+            default: return .other
+            }
+        }
+
+        enum Kind: Equatable { case missing, directory, link, other }
+
+        /// Creates the directory `name` in it (which must not exist) and opens it.
+        func makeDirectory(_ name: String, mode: mode_t = 0o755) throws -> OpenDirectory {
+            let shownChild = shown.appending(path: name, directoryHint: .isDirectory)
+            try EngineFiles.checkName(name, shownChild.path)
+            guard mkdirat(fd, name, mode) == 0 else {
+                throw UnsafeEngineFile(path: shownChild.path, problem: "cannot be created (\(String(cString: strerror(errno))))")
+            }
+            return try child(name)
+        }
+
+        /// The real directory `name` in it, opened without following a link.
+        func child(_ name: String) throws -> OpenDirectory {
+            let shownChild = shown.appending(path: name, directoryHint: .isDirectory)
+            try EngineFiles.checkName(name, shownChild.path)
+            let child = try EngineFiles.openChild(fd, name, shown: shownChild)
+            guard let path = EngineFiles.path(of: child), path.lowercased() == (real + "/" + name).lowercased() else {
+                close(child)
+                throw UnsafeEngineFile(path: shownChild.path, problem: "moved while it was opened")
+            }
+            return OpenDirectory(fd: child, real: path, shown: shownChild)
+        }
+
+        /// The names in it (without `.` and `..`).
+        func names() throws -> [String] { try EngineFiles.entryNames(fd: fd, shown: shown.path) }
+
+        /// Removes `name` from it (`EngineFiles.removeEntry`).
+        func remove(_ name: String) throws {
+            try EngineFiles.removeEntry(dfd: fd, name: name, shown: shown.appending(path: name).path)
+        }
+    }
+
+    /// `<workspace>/<relative>` opened as a real directory (created when missing), as `directory(workspace:_:)` walks it.
+    static func openWalked(workspace: URL, _ relative: String) throws -> OpenDirectory {
+        let fd = try openDirectory(workspace: workspace, relative)
+        guard let real = path(of: fd) else {
+            close(fd)
+            throw UnsafeEngineFile(path: logical(workspace, relative).path, problem: "cannot be opened as a real directory")
+        }
+        return OpenDirectory(fd: fd, real: real, shown: logical(workspace, relative))
+    }
+
+    /// Tests only: called with the directory's path and the name of each directory entry about to be removed.
+    nonisolated(unsafe) static var removalProbe: ((_ parent: String, _ name: String) -> Void)?
 
     // MARK: Internals
 
@@ -161,49 +242,154 @@ public enum EngineFiles {
         }
     }
 
-    /// The directory, opened: the workspace resolved (it may sit behind a link the owner chose), every part under it a real
-    /// directory, created when missing; the opened directory must still be inside the resolved workspace.
+    /// The directory, opened: the workspace resolved (it may sit behind a link the owner chose), then every part under it
+    /// opened relative to the one before with `O_NOFOLLOW` (created with `mkdirat` when missing), so no link is ever
+    /// followed on the way. The opened directory must still be where the walk put it, inside the resolved workspace.
     private static func openDirectory(workspace: URL, _ relative: String) throws -> Int32 {
         let fm = FileManager.default
         if !fm.fileExists(atPath: workspace.path) { try fm.createDirectory(at: workspace, withIntermediateDirectories: true) }
         guard let root = resolved(workspace.path) else {
             throw UnsafeEngineFile(path: workspace.path, problem: "cannot be resolved")
         }
-        let rootPath = root
-        let parts = relative.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-        var current = rootPath
+        var fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { throw UnsafeEngineFile(path: workspace.path, problem: "cannot be opened as a directory") }
+        var expected = root
         var shown = workspace
-        for part in parts {
+        for part in relative.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
             shown = shown.appending(path: part, directoryHint: .isDirectory)
             guard part != ".", part != "..", !part.contains("\0") else {
+                close(fd)
                 throw UnsafeEngineFile(path: shown.path, problem: "is not a valid directory name")
             }
-            let next = current + "/" + part
-            var st = stat()
-            if lstat(next, &st) != 0 {
-                guard errno == ENOENT else { throw UnsafeEngineFile(path: shown.path, problem: "cannot be inspected") }
-                if mkdir(next, 0o755) != 0, errno != EEXIST {
-                    throw UnsafeEngineFile(path: shown.path, problem: "cannot be created (\(String(cString: strerror(errno))))")
+            var next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            if next < 0, errno == ENOENT {
+                if mkdirat(fd, part, 0o755) != 0, errno != EEXIST {
+                    let err = errno
+                    close(fd)
+                    throw UnsafeEngineFile(path: shown.path, problem: "cannot be created (\(String(cString: strerror(err))))")
                 }
-                guard lstat(next, &st) == 0 else { throw UnsafeEngineFile(path: shown.path, problem: "cannot be created") }
+                next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
             }
-            switch st.st_mode & S_IFMT {
-            case S_IFDIR: current = next
-            case S_IFLNK: throw UnsafeEngineFile(path: shown.path, problem: "is a symbolic link, not a real directory")
-            default: throw UnsafeEngineFile(path: shown.path, problem: "is not a directory")
+            if next < 0 {
+                let problem = openProblem(dfd: fd, part, errno: errno)
+                close(fd)
+                throw UnsafeEngineFile(path: shown.path, problem: problem)
             }
+            close(fd)
+            fd = next
+            expected += "/" + part
         }
-        let fd = open(current, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else {
-            throw UnsafeEngineFile(path: shown.path, problem: "cannot be opened as a real directory")
-        }
-        // A part swapped for a link between the walk and the open is caught here: the opened directory must be where it was.
-        guard let opened = path(of: fd), opened == rootPath || opened.hasPrefix(rootPath + "/"),
-              opened.lowercased() == current.lowercased() else {
+        // A part moved while it was walked is caught here: the directory must still be where the walk put it.
+        guard let opened = path(of: fd), opened == root || opened.hasPrefix(root + "/"),
+              opened.lowercased() == expected.lowercased() else {
             close(fd)
             throw UnsafeEngineFile(path: shown.path, problem: "moved outside the workspace while it was opened")
         }
         return fd
+    }
+
+    /// `name` in `dfd` opened as a real directory, never through a link.
+    private static func openChild(_ dfd: Int32, _ name: String, shown: URL) throws -> Int32 {
+        let fd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw UnsafeEngineFile(path: shown.path, problem: openProblem(dfd: dfd, name, errno: errno)) }
+        return fd
+    }
+
+    private static func openProblem(dfd: Int32, _ name: String, errno err: Int32) -> String {
+        var st = stat()
+        if err == ELOOP || (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && st.st_mode & S_IFMT == S_IFLNK) {
+            return "is a symbolic link, not a real directory"
+        }
+        if err == ENOTDIR { return "is not a directory" }
+        if err == ENOENT { return "does not exist" }
+        return "cannot be opened as a real directory (\(String(cString: strerror(err))))"
+    }
+
+    /// Removes `name` from the directory open at `dfd`, never following a link and never rebuilding a path. A directory is
+    /// first renamed to a fresh name in the same directory (so nothing can be put back under its old name while it is
+    /// emptied), then opened with `O_NOFOLLOW` and emptied entry by entry relative to its own descriptor, then removed with
+    /// `AT_REMOVEDIR`. A link (anywhere in the tree) is unlinked; what it points at is never touched.
+    static func removeEntry(dfd: Int32, name: String, shown: String) throws {
+        try checkName(name, shown)
+        removalProbe?(path(of: dfd) ?? "", name)
+        var st = stat()
+        guard fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+            if errno == ENOENT { return }
+            throw UnsafeEngineFile(path: shown, problem: "cannot be inspected")
+        }
+        guard st.st_mode & S_IFMT == S_IFDIR else {
+            if unlinkat(dfd, name, 0) != 0, errno != ENOENT {
+                throw UnsafeEngineFile(path: shown, problem: "cannot be removed (\(String(cString: strerror(errno))))")
+            }
+            return
+        }
+        let temp = ".brahma-removing-\(UUID().uuidString)"
+        guard renameat(dfd, name, dfd, temp) == 0 else {
+            if errno == ENOENT { return }
+            throw UnsafeEngineFile(path: shown, problem: "cannot be removed (\(String(cString: strerror(errno))))")
+        }
+        try removeTree(dfd: dfd, name: temp, shown: shown, depth: 0)
+    }
+
+    private static let maxRemovalDepth = 512
+
+    /// Removes `name` from `dfd`: a real directory is emptied through its own descriptor and then removed; anything else
+    /// (a link included) is unlinked.
+    private static func removeTree(dfd: Int32, name: String, shown: String, depth: Int) throws {
+        guard depth < maxRemovalDepth else { throw UnsafeEngineFile(path: shown, problem: "is nested too deeply to remove") }
+        func failure(_ err: Int32) -> UnsafeEngineFile {
+            UnsafeEngineFile(path: shown, problem: "cannot be removed (\(String(cString: strerror(err))))")
+        }
+        for _ in 0..<8 {
+            let fd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            if fd < 0 {
+                let err = errno
+                if err == ENOENT { return }
+                guard err == ELOOP || err == ENOTDIR else { throw failure(err) }
+                // A link or a file: unlinked, never followed. (It may have become a directory again meanwhile: go round.)
+                if unlinkat(dfd, name, 0) == 0 || errno == ENOENT { return }
+                if errno == EPERM || errno == EISDIR { continue }
+                throw failure(errno)
+            }
+            do {
+                defer { close(fd) }
+                try emptyDirectory(fd: fd, shown: shown, depth: depth)
+            }
+            if unlinkat(dfd, name, AT_REMOVEDIR) == 0 || errno == ENOENT { return }
+            // Something was added meanwhile, or the name now holds something else: go round.
+            if errno == ENOTEMPTY || errno == EEXIST || errno == ENOTDIR { continue }
+            throw failure(errno)
+        }
+        throw UnsafeEngineFile(path: shown, problem: "kept changing while it was removed")
+    }
+
+    private static func emptyDirectory(fd: Int32, shown: String, depth: Int) throws {
+        for _ in 0..<8 {
+            let names = try entryNames(fd: fd, shown: shown)
+            if names.isEmpty { return }
+            for child in names {
+                removalProbe?(path(of: fd) ?? "", child)
+                try removeTree(dfd: fd, name: child, shown: shown, depth: depth + 1)
+            }
+        }
+    }
+
+    /// The names in the directory open at `fd` (without `.` and `..`), read through a fresh descriptor of it.
+    private static func entryNames(fd: Int32, shown: String) throws -> [String] {
+        let own = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard own >= 0, let dir = fdopendir(own) else {
+            if own >= 0 { close(own) }
+            throw UnsafeEngineFile(path: shown, problem: "cannot be listed")
+        }
+        defer { closedir(dir) }
+        var names: [String] = []
+        while let entry = readdir(dir) {
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+            }
+            if name != "." && name != ".." { names.append(name) }
+        }
+        return names
     }
 
     private static func resolved(_ path: String) -> String? {

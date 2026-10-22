@@ -741,6 +741,79 @@ import Foundation
         #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty)
     }
 
+    // MARK: Engine checkouts never leave the workspace
+
+    private func fileWatched(_ f: GitFixture) -> (GitWorkspace, TamperLog) {
+        let log = TamperLog()
+        var ws = f.ws
+        ws.onUnsafeEngineFile = { problem in log.add("\(problem)") }
+        return (ws, log)
+    }
+
+    @Test func linkedBrahmaGetsNoCheckoutAndLosesNothing() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = fileWatched(f)
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        let outside = try tempDir()
+        // Things outside the workspace at the places `.brahma/wt` and `.brahma/wt-check` would name through the link.
+        let kept = ["wt/K-2/keep.txt", "wt/.merge/keep.txt", "wt-check/r2/keep.txt", "wt-check/stray/keep.txt", "wt-check/r3/.git"]
+        for rel in kept { try f.write(rel, "keep", in: outside) }
+        let brahma = f.root.appending(path: ".brahma")
+        if (try? fm.attributesOfItem(atPath: brahma.path)) != nil { try fm.removeItem(at: brahma) }
+        try fm.createSymbolicLink(at: brahma, withDestinationURL: outside)
+        let before = Set(try fm.subpathsOfDirectory(atPath: outside.path))
+        #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
+        #expect(throws: GitError.self) { try ws.addRunWorktree(runId: "r1", commit: main) }
+        #expect(throws: GitError.self) { try ws.addEngineExport(runId: "r4", commit: main) }
+        #expect(throws: GitError.self) { try ws.removeWorktree(key: "K-2", keepIf: { false }) }
+        ws.removeRunWorktree(runId: "r2")
+        ws.removeRunWorktree(runId: "r3")
+        ws.removeRunWorktrees()
+        #expect(Set(try fm.subpathsOfDirectory(atPath: outside.path)) == before, "something was created or deleted outside the workspace")
+        for rel in kept { #expect(exists(outside.appending(path: rel)), "\(rel) was deleted") }
+        #expect(!(try f.git(["worktree", "list"])).contains("wt/K-1"))
+        #expect(log.all.count == 7 && log.all.allSatisfy { $0.contains(".brahma is a symbolic link") }, "\(log.all)")
+    }
+
+    @Test func checkoutPlaceSwappedBeforeGitRunsIsRefused() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        let outside = try tempDir()
+        let brahma = f.root.appending(path: ".brahma"), moved = f.root.appending(path: ".brahma-moved")
+        let calls: [(GitWorkspace) throws -> Void] = [{ _ = try $0.addWorktree(key: "K-1") },
+                                                     { _ = try $0.addRunWorktree(runId: "r1", commit: main) },
+                                                     { _ = try $0.addEngineExport(runId: "r2", commit: main) }]
+        for (n, run) in calls.enumerated() {
+            let made = fileWatched(f)
+            var ws = made.0
+            let log = made.1
+            // Once the place is made, and before git or tar runs, `.brahma` is moved away and replaced by a link outside.
+            ws.checkoutProbe = { _ in
+                try? FileManager.default.moveItem(at: brahma, to: moved)
+                try? FileManager.default.createSymbolicLink(at: brahma, withDestinationURL: outside)
+            }
+            #expect(throws: GitError.self) { try run(ws) }
+            #expect(try fm.contentsOfDirectory(atPath: outside.path).isEmpty, "case \(n): git or tar wrote outside the workspace")
+            #expect(log.all.count == 1 && log.all[0].contains("moved while"), "case \(n): \(log.all)")
+            // The place it made is gone (removed through the moved directory), and git keeps no record of it.
+            let left = try fm.subpathsOfDirectory(atPath: moved.path).filter { ["K-1", "r1", "r2"].contains(URL(fileURLWithPath: $0).lastPathComponent) }
+            #expect(left.isEmpty, "case \(n): \(left)")
+            let listed = try f.git(["worktree", "list"])
+            #expect(!listed.contains("wt-check/r1") && !listed.contains("wt/K-1"), "case \(n): \(listed)")
+            try fm.removeItem(at: brahma)
+            try fm.moveItem(at: moved, to: brahma)
+        }
+        // With nothing swapped, the same calls work.
+        let wt = try f.ws.addWorktree(key: "K-1")
+        #expect(exists(wt.appending(path: "a.txt")))
+        let check = try f.ws.addRunWorktree(runId: "r1", commit: main)
+        #expect(exists(check.appending(path: "a.txt")))
+        f.ws.removeRunWorktree(runId: "r1")
+        #expect(!exists(check))
+    }
+
     // MARK: Repository filters, drivers and replace objects
 
     final class Refusals: @unchecked Sendable {

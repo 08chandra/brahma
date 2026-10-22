@@ -111,13 +111,14 @@ public enum CheckScripts {
         return manifest
     }
 
-    /// The content hash of each file under `dir`; nil where it is missing or not a regular file.
-    public static func hashes(files: [String], in dir: URL) -> [String: String?] {
+    /// The content hash of each file under `dir`; nil where it is missing or not a regular file. Every part of the path
+    /// below `root` (by default `dir` itself; the workspace for a saved snapshot) is opened without following a link.
+    public static func hashes(files: [String], in dir: URL, root: URL? = nil) -> [String: String?] {
         var out: [String: String?] = [:]
         for file in files {
             let url = dir.appending(path: file)
             // Never through a link, and capped: a file past the cap counts as changed.
-            if let data = EngineFiles.readNoFollow(url, limit: maxHashedBytes + 1), data.count <= maxHashedBytes {
+            if let data = EngineFiles.readNoFollow(url, under: root ?? dir, limit: maxHashedBytes + 1), data.count <= maxHashedBytes {
                 out[file] = StableHash.fnv1a64(data)
             } else {
                 out[file] = .some(nil)
