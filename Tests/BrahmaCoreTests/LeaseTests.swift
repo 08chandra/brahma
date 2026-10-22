@@ -615,6 +615,32 @@ import GRDB
         #expect(throws: WorkError.self) { try l.item(touch: (0..<51).map { "p\($0)" }) }
     }
 
+    @Test func repoConfigFilterRefusesClaimsWithOneAlert() throws {
+        let l = try L()
+        let root = URL(fileURLWithPath: l.company.workspacePath)
+        let marker = try tempDir().appending(path: "clean-ran")
+        try GitFixture.plainGit(["config", "filter.evil.clean", "touch '\(marker.path)'; cat"], in: root)
+        let i = try l.item(paths: ["src/a"])
+        for _ in 0..<3 {
+            let (failed, _) = try Self.failure { try l.tools(l.eng).call(name: "claim_lease", arguments: ["key": .string(i.key)]) }
+            #expect(failed)
+        }
+        #expect(try l.store.lease(itemId: i.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: l.ws.worktreePath(key: i.key).path))
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        let alerts = try l.store.asks(companyId: l.company.id).filter { $0.kind == .engineAlert && $0.summary.contains("filter.evil.clean") }
+        #expect(alerts.count == 1)
+        let dms = try l.store.writer.read { db in
+            try Message.filter(Column("senderId") == "system").fetchAll(db).filter { $0.text.contains("filter.evil.clean") }
+        }
+        #expect(dms.count == 1, "one owner alert, not one per refused call")
+        #expect(try l.store.asks(companyId: l.company.id).filter { $0.kind == .engineAlert }.count == 1, "and not a main-changed alert too")
+        // With the definition removed the claim goes through.
+        try GitFixture.plainGit(["config", "--remove-section", "filter.evil"], in: root)
+        let (failed, _) = try Self.failure { try l.tools(l.eng).call(name: "claim_lease", arguments: ["key": .string(i.key)]) }
+        #expect(!failed)
+    }
+
     static func failure(_ body: () throws -> String) throws -> (Bool, String) {
         do { _ = try body(); return (false, "") } catch let e as ToolError { return (true, e.message) }
     }

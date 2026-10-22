@@ -11,6 +11,12 @@ public enum GitError: Error, Equatable, CustomStringConvertible, LocalizedError 
         }
     }
     public var errorDescription: String? { description }
+
+    /// The engine refused to run git because the repository's config names a program (`GitCommand`); nothing ran.
+    var isRepositoryRefusal: Bool {
+        if case .failed(_, -1, let stderr) = self { return stderr.hasPrefix(GitCommand.refusalPrefix) }
+        return false
+    }
 }
 
 /// One line of `git diff --name-status`: `A`, `M`, `D`, `R100`, ...; for a rename or copy, the new path.
@@ -29,6 +35,14 @@ public struct GitChange: Equatable, Sendable {
 /// for an item's worktree. Nothing is read from the worktree's `.git` file or the admin directory's `commondir`. Hooks,
 /// fsmonitor, external diff and pagers are switched off, global and system config are ignored, and the process gets
 /// `ChildEnvironment`'s allowlist, so a crafted `.git`, config or hook inside a worktree cannot run anything.
+///
+/// Programs a repository can name for git to run on content (filters, textconv, diff and merge drivers) are kept out in
+/// two layers. Before every call the repository's own config files are read (`RepoConfigGuard`); one that defines a
+/// filter, a textconv or diff command, a merge driver, `core.hooksPath`, `core.sshCommand`, `core.fsmonitor` or an
+/// include is refused: nothing runs, `onRefused` hears what was found (the store files one owner alert). And every call
+/// reads attributes from the empty tree (`--attr-source`, git 2.42+), never from a checkout's `.gitattributes`, with
+/// `core.attributesFile=/dev/null` and the engine's override (`attributesOverride`) as `info/attributes`. Replace refs and
+/// grafts are ignored, so the objects the engine reviews, checks and merges are the ones their ids name.
 struct GitCommand: Sendable {
     let gitDir: URL
     let workTree: URL
@@ -36,8 +50,14 @@ struct GitCommand: Sendable {
     let commonDir: URL?
     /// A private index (`GIT_INDEX_FILE`) for building a commit without touching the worktree's own index.
     var indexFile: URL? = nil
+    /// Told what was wrong each time the repository is refused (its config names a program git would run).
+    var onRefused: (@Sendable (_ detail: String) -> Void)? = nil
+    /// Test seam: the flags and environment alone, without reading the repository's config first.
+    var skipsRepositoryCheck = false
+    /// Whether this git takes `--attr-source`. Test seam; always the installed git's answer in the engine.
+    var attrSourceSupported = GitCommand.installedSupportsAttrSource
 
-    func withIndex(_ url: URL) -> GitCommand { GitCommand(gitDir: gitDir, workTree: workTree, commonDir: commonDir, indexFile: url) }
+    func withIndex(_ url: URL) -> GitCommand { var copy = self; copy.indexFile = url; return copy }
 
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
@@ -49,7 +69,46 @@ struct GitCommand: Sendable {
         "-c", "user.name=Brahma", "-c", "user.email=engine@brahma.local", "-c", "commit.gpgsign=false",
         "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat", "-c", "diff.external=",
         "-c", "protocol.ext.allow=never", "-c", "core.quotepath=false", "-c", "gc.auto=0",
+        "-c", "core.attributesFile=/dev/null", "-c", "advice.graftFileDeprecated=false",
     ]
+
+    /// The engine's `info/attributes` (it outranks every other attributes file): no filter, no diff driver (git decides text
+    /// or binary as usual), the built-in text merge. `-diff` would make every review diff "Binary files differ".
+    static let attributesOverride = "* -filter !diff merge=text\n"
+    static let refusalPrefix = "Brahma runs no git in this repository: "
+    static let emptyTreeSHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    static let emptyTreeSHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+
+    /// `--attr-source` arrived in git 2.42.
+    static func supportsAttrSource(versionLine: String) -> Bool {
+        guard versionLine.hasPrefix("git version ") else { return false }
+        let numbers = versionLine.dropFirst("git version ".count).split(whereSeparator: { !$0.isNumber }).prefix(2).compactMap { Int($0) }
+        guard numbers.count == 2 else { return false }
+        return numbers[0] > 2 || numbers[0] == 2 && numbers[1] >= 42
+    }
+
+    /// Asked once per process.
+    static let installedSupportsAttrSource: Bool = {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["git", "--version"]
+        process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        let out = Pipe()
+        process.standardOutput = out; process.standardError = FileHandle.nullDevice; process.standardInput = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return false }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return process.terminationStatus == 0 && supportsAttrSource(versionLine: String(decoding: data, as: UTF8.self))
+    }()
+
+    /// What an older git (no `--attr-source`) may still run: ref and object plumbing that never reads attributes, never
+    /// writes a checkout and never compares content. Everything else is refused there.
+    static func isTreeFree(_ args: [String]) -> Bool {
+        guard let sub = args.first else { return false }
+        if sub == "worktree" { return args.dropFirst().first.map { ["list", "prune"].contains($0) } ?? false }
+        return ["rev-parse", "symbolic-ref", "update-ref", "for-each-ref", "merge-base", "branch", "init", "cat-file",
+                "commit-tree", "ls-tree", "config"].contains(sub)
+    }
 
     struct Output {
         var status: Int32
@@ -71,13 +130,56 @@ struct GitCommand: Sendable {
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_ATTR_NOSYSTEM"] = "1"
+        env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        env["GIT_GRAFT_FILE"] = "/dev/null"
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_OPTIONAL_LOCKS"] = "0"
         return env
     }
 
-    func arguments(_ args: [String]) -> [String] {
-        ["git", "-C", workTree.path] + Self.configFlags + args
+    /// `attrSource`: the tree attributes are read from (the empty tree of the repository's hash), nil on an older git.
+    func arguments(_ args: [String], attrSource: String?) -> [String] {
+        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + Self.configFlags + args
+    }
+
+    /// Before any git runs: an older git may only run tree-free plumbing; the repository's config must name no program;
+    /// the engine's attributes override is put back. Returns the attribute source for the call.
+    private func prepare(_ args: [String]) throws -> String? {
+        if !attrSourceSupported, !Self.isTreeFree(args) {
+            throw GitError.failed(command: args.joined(separator: " "), status: -1,
+                                  stderr: "this git is older than 2.42 and cannot be kept from repository attributes; install a newer git")
+        }
+        if skipsRepositoryCheck { return attrSourceSupported ? Self.emptyTreeSHA1 : nil }
+        let common = commonDir ?? gitDir
+        var sha256 = false
+        var problems: [String] = []
+        var seen: Set<String> = []
+        for file in [common.appending(path: "config"), common.appending(path: "config.worktree"), gitDir.appending(path: "config.worktree")]
+        where seen.insert(file.standardizedFileURL.path).inserted {
+            let scan = RepoConfigGuard.scan(file, with: self)
+            if let refused = scan.refused { problems.append("\(GitWorkspace.shown(file.path)) \(refused)") }
+            if file.lastPathComponent == "config", scan.sha256 { sha256 = true }
+        }
+        if problems.isEmpty, let problem = RepoConfigGuard.ensureAttributes(commonDir: common) { problems.append(problem) }
+        if !problems.isEmpty {
+            let detail = problems.joined(separator: "; ")
+            onRefused?(detail)
+            throw GitError.failed(command: args.first ?? "", status: -1,
+                                  stderr: "\(Self.refusalPrefix)\(detail)")
+        }
+        guard attrSourceSupported else { return nil }
+        return sha256 ? Self.emptyTreeSHA256 : Self.emptyTreeSHA1
+    }
+
+    /// `git config --file <file> --list` with nothing else read: no repository, no includes, no other config.
+    fileprivate func listConfig(_ file: URL) throws -> Output {
+        var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_CEILING_DIRECTORIES"] = "/"
+        return try runOnce(["git", "-C", "/", "config", "--file", file.path, "--no-includes", "--null", "--list"],
+                           environment: env, label: "config --list", maxOutput: 1 << 20)
     }
 
     /// Runs git with stdin `/dev/null` and a 60 s timeout. Stderr containing `index.lock` is retried 3 times at 200 ms.
@@ -85,8 +187,10 @@ struct GitCommand: Sendable {
     @discardableResult
     func run(_ args: [String], allowFailure: Bool = false, maxOutput: Int = GitCommand.maxCapture) throws -> Output {
         var attempt = 0
+        let attrSource = try prepare(args)
         while true {
-            let out = try runOnce(args, maxOutput: maxOutput)
+            let out = try runOnce(arguments(args, attrSource: attrSource), environment: environment(),
+                                  label: args.joined(separator: " "), maxOutput: maxOutput)
             if out.status == 0 || allowFailure && !out.stderr.contains("index.lock") { return out }
             if out.stderr.contains("index.lock"), attempt < Self.lockRetries {
                 attempt += 1
@@ -99,11 +203,11 @@ struct GitCommand: Sendable {
         }
     }
 
-    private func runOnce(_ args: [String], maxOutput: Int) throws -> Output {
+    private func runOnce(_ argv: [String], environment: [String: String], label: String, maxOutput: Int) throws -> Output {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = arguments(args)
-        process.environment = environment()
+        process.arguments = argv
+        process.environment = environment
         process.standardInput = FileHandle.nullDevice
         // Output goes to files, not pipes: concurrent children cannot hold each other's pipe ends open, and a grandchild
         // that outlives git cannot keep us waiting for end of file.
@@ -112,7 +216,7 @@ struct GitCommand: Sendable {
         guard FileManager.default.createFile(atPath: outURL.path, contents: nil, attributes: [.posixPermissions: 0o600]),
               FileManager.default.createFile(atPath: errURL.path, contents: nil, attributes: [.posixPermissions: 0o600]),
               let outHandle = FileHandle(forWritingAtPath: outURL.path), let errHandle = FileHandle(forWritingAtPath: errURL.path)
-        else { throw GitError.failed(command: args.joined(separator: " "), status: -1, stderr: "no temporary space for git output") }
+        else { throw GitError.failed(command: label, status: -1, stderr: "no temporary space for git output") }
         defer {
             try? outHandle.close(); try? errHandle.close()
             try? FileManager.default.removeItem(at: outURL); try? FileManager.default.removeItem(at: errURL)
@@ -120,7 +224,7 @@ struct GitCommand: Sendable {
         process.standardOutput = outHandle
         process.standardError = errHandle
         do { try process.run() } catch {
-            throw GitError.failed(command: args.joined(separator: " "), status: -1, stderr: "\(error)")
+            throw GitError.failed(command: label, status: -1, stderr: "\(error)")
         }
         let timedOut = TimeoutFlag()
         let timer = DispatchWorkItem { timedOut.mark(); process.terminate() }
@@ -138,6 +242,110 @@ struct GitCommand: Sendable {
         var stderr = String(decoding: read(errURL, limit: 64 * 1024).0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if timedOut.cut { stderr = "timed out after \(Int(Self.timeout)) s" + (stderr.isEmpty ? "" : ": \(stderr)") }
         return Output(status: process.terminationStatus, stdout: stdout, stderr: stderr, cut: cut, timedOut: timedOut.cut)
+    }
+}
+
+/// Reads a repository's config files for what the engine refuses to run git with. A scan is kept per file while the file's
+/// `lstat` (device, inode, size, modification and change times) stays the same; the stamp is taken before the file is read,
+/// so a write during the read changes it and the file is read again next time.
+enum RepoConfigGuard {
+    struct Scan: Sendable {
+        /// What makes the file refused ("sets filter.x.clean, include.path"), or nil.
+        var refused: String?
+        /// `extensions.objectFormat = sha256`.
+        var sha256 = false
+    }
+
+    private struct Stamp: Hashable, Sendable {
+        var device: Int32, inode: UInt64, size: Int64, mtime: Int, mtimeNS: Int, ctime: Int, ctimeNS: Int
+    }
+
+    private final class Cache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [String: (Stamp, Scan)] = [:]
+        func get(_ path: String, _ stamp: Stamp) -> Scan? {
+            lock.lock(); defer { lock.unlock() }
+            guard let (s, scan) = entries[path], s == stamp else { return nil }
+            return scan
+        }
+        func set(_ path: String, _ stamp: Stamp, _ scan: Scan) {
+            lock.lock(); defer { lock.unlock() }
+            if entries.count > 4096 { entries.removeAll() }
+            entries[path] = (stamp, scan)
+        }
+    }
+    private static let cache = Cache()
+
+    /// Does this config key name a program git would run, or pull in another file? Keys come canonical from
+    /// `git config --list`: section and variable lowercased, a subsection as written (dots and all).
+    static func isRefused(_ key: String) -> Bool {
+        let lower = key.lowercased()
+        guard let firstDot = lower.firstIndex(of: "."), let lastDot = lower.lastIndex(of: ".") else { return false }
+        let section = lower[..<firstDot], variable = lower[lower.index(after: lastDot)...]
+        let hasSubsection = firstDot != lastDot
+        switch section {
+        case "filter", "include", "includeif": return true
+        case "diff": return hasSubsection && (variable == "textconv" || variable == "command")
+        case "merge": return hasSubsection && variable == "driver"
+        case "core": return !hasSubsection && ["hookspath", "sshcommand", "fsmonitor"].contains(variable)
+        default: return false
+        }
+    }
+
+    static func scan(_ file: URL, with git: GitCommand) -> Scan {
+        var st = stat()
+        guard lstat(file.path, &st) == 0 else {
+            return errno == ENOENT ? Scan() : Scan(refused: "cannot be examined")
+        }
+        guard st.st_mode & S_IFMT == S_IFREG else { return Scan(refused: "is not a regular file") }
+        let stamp = Stamp(device: st.st_dev, inode: UInt64(st.st_ino), size: Int64(st.st_size),
+                          mtime: st.st_mtimespec.tv_sec, mtimeNS: st.st_mtimespec.tv_nsec,
+                          ctime: st.st_ctimespec.tv_sec, ctimeNS: st.st_ctimespec.tv_nsec)
+        if let known = cache.get(file.path, stamp) { return known }
+        let result: Scan
+        // A git that could not start or was cut off says nothing about the file: refused this time, asked again next time.
+        guard let out = try? git.listConfig(file), !out.cut, !out.timedOut else { return Scan(refused: "cannot be read by git") }
+        if out.status == 0 {
+            var refused: [String] = []
+            var sha256 = false
+            for entry in out.stdout.split(separator: 0, omittingEmptySubsequences: true) {
+                let text = String(decoding: entry, as: UTF8.self)
+                let key = String(text.prefix { $0 != "\n" })
+                let value = text.contains("\n") ? String(text[text.index(after: text.firstIndex(of: "\n")!)...]) : ""
+                if isRefused(key) { refused.append(GitWorkspace.shown(key)) }
+                if key.lowercased() == "extensions.objectformat", value.lowercased() == "sha256" { sha256 = true }
+            }
+            let unique = refused.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+            let named = unique.prefix(6).joined(separator: ", ") + (unique.count > 6 ? " and \(unique.count - 6) more" : "")
+            result = Scan(refused: unique.isEmpty ? nil : "sets \(named)", sha256: sha256)
+        } else {
+            result = Scan(refused: "cannot be read by git")
+        }
+        cache.set(file.path, stamp, result)
+        return result
+    }
+
+    /// Writes the engine's `info/attributes` when it is not exactly that. Nil when done (or when there is no repository yet:
+    /// `git init` has not run); else why not.
+    static func ensureAttributes(commonDir: URL) -> String? {
+        var st = stat()
+        guard lstat(commonDir.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR else { return nil }
+        let info = commonDir.appending(path: "info", directoryHint: .isDirectory)
+        if lstat(info.path, &st) == 0 {
+            guard st.st_mode & S_IFMT == S_IFDIR else { return "\(GitWorkspace.shown(info.path)) is not a real directory" }
+        } else if (try? FileManager.default.createDirectory(at: info, withIntermediateDirectories: false)) == nil {
+            return "cannot create \(GitWorkspace.shown(info.path))"
+        }
+        let file = info.appending(path: "attributes")
+        if lstat(file.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_size == GitCommand.attributesOverride.utf8.count,
+           FileManager.default.contents(atPath: file.path) == Data(GitCommand.attributesOverride.utf8) {
+            return nil
+        }
+        if lstat(file.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG { try? FileManager.default.removeItem(at: file) }
+        do { try Data(GitCommand.attributesOverride.utf8).write(to: file, options: .atomic) } catch {
+            return "cannot write \(GitWorkspace.shown(file.path))"
+        }
+        return nil
     }
 }
 
@@ -165,6 +373,10 @@ public struct GitWorkspace: Sendable {
     /// branch the engine itself created (a lease, or a worktree it made); without this hook there is no lease record.
     public var hasLease: (@Sendable (_ key: String) throws -> Bool)?
     public var onWorktreeTamper: (@Sendable (_ key: String, _ detail: String) -> Void)?
+    /// Called each time a git call is refused because the repository's config names a program git would run (a filter,
+    /// textconv, diff or merge driver, hooks path, ssh command, fsmonitor) or includes another file; `detail` says which
+    /// file and keys. Nothing ran. The store files one owner alert while it stays that way.
+    public var onUnsafeRepository: (@Sendable (_ detail: String) -> Void)?
 
     public init(root: URL, lockDirectory: URL? = nil) {
         self.root = root
@@ -182,7 +394,7 @@ public struct GitWorkspace: Sendable {
     public func branchRef(key: String) -> String { "refs/heads/item/\(key)" }
     private var gitDir: URL { root.appending(path: ".git", directoryHint: .isDirectory) }
     private func adminDir(key: String) -> URL { gitDir.appending(path: "worktrees/\(key)", directoryHint: .isDirectory) }
-    private var main: GitCommand { GitCommand(gitDir: gitDir, workTree: root, commonDir: nil) }
+    private var main: GitCommand { GitCommand(gitDir: gitDir, workTree: root, commonDir: nil, onRefused: onUnsafeRepository) }
 
     private static func resolved(_ url: URL) -> String { url.resolvingSymlinksInPath().standardizedFileURL.path }
 
@@ -240,7 +452,7 @@ public struct GitWorkspace: Sendable {
             throw GitError.failed(command: "-C \(key)", status: -1,
                                   stderr: "the worktree of \(key) was repointed (\(detail)); it was restored and nothing was run in it")
         }
-        return (GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir), key)
+        return (GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir, onRefused: onUnsafeRepository), key)
     }
 
     private static func isRealDirectory(_ url: URL) -> Bool {

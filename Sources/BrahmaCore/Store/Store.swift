@@ -91,6 +91,21 @@ public final class Store: Sendable {
                 + "there and put it back from its own records. An agent probably rewrote it; look at what \(key) is doing.",
                 now: Store.now(), reason: "worktree:\(companyId):\(key)")
         }
+        git.onUnsafeRepository = { [self] detail in
+            let name = (try? company(id: companyId))?.name ?? companyId
+            let reason = "gitconfig:\(companyId)"
+            let text = "The git repository of \(name) is set up to run programs on its files: \(detail). Brahma runs no git there "
+                + "(no claims, commits, checks or reviews) until that is removed, for example with `git config --unset` or "
+                + "`git config --remove-section`. An agent may have written it; look at who did."
+            // One alert while it stays open: every refused call reports again, and each raise would DM the owner.
+            try? writer.write { db in
+                let open = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
+                                          && Column("status") == AskStatus.pendingOwner.rawValue
+                                          && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
+                guard open == 0 else { return }
+                try EngineAlerts.raise(store: self, db: db, text: text, now: Store.now(), reason: reason)
+            }
+        }
         return git
     }
 

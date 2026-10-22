@@ -346,11 +346,12 @@ import Foundation
         try f.write(".git/objects/info/alternates", "/tmp/elsewhere\n")
         try f.git(["update-index", "--skip-worktree", "a.txt"], in: wt)
         let found = try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt)
-        #expect(Set(found) == ["changed hooks/post-checkout", "new info/attributes", "new objects/info/alternates",
+        #expect(Set(found) == ["changed hooks/post-checkout", "changed info/attributes", "new objects/info/alternates",
                                "changed index"])
         #expect(try String(contentsOf: hook, encoding: .utf8) == script)
         #expect((try fm.attributesOfItem(atPath: hook.path)[.posixPermissions] as? Int) == 0o755, "the hook stays executable")
-        #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/info/attributes").path))
+        #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == GitCommand.attributesOverride,
+                "the engine's own attributes override is put back")
         #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/objects/info/alternates").path))
         #expect(try f.git(["ls-files", "-v", "a.txt"], in: wt) == "H a.txt")
         // A mode change alone is a change too.
@@ -662,4 +663,241 @@ import Foundation
         #expect(error.found == ["changed hooks/post-commit"])
         #expect(error.reason.contains("restore hooks/post-commit"))
     }
+
+    // MARK: Repository filters, drivers and replace objects
+
+    final class Refusals: @unchecked Sendable {
+        private let lock = NSLock(); private var items: [String] = []
+        func add(_ s: String) { lock.lock(); items.append(s); lock.unlock() }
+        var all: [String] { lock.lock(); defer { lock.unlock() }; return items }
+    }
+
+    private func guarded(_ f: GitFixture) -> (GitWorkspace, Refusals) {
+        let log = Refusals()
+        var ws = f.ws
+        ws.onUnsafeRepository = { detail in log.add(detail) }
+        return (ws, log)
+    }
+
+    private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+
+    /// Commits a `.gitattributes` that names the `evil` filter, diff and merge drivers for every path.
+    private func attributed(_ f: GitFixture) throws {
+        try f.write(".gitattributes", "* filter=evil diff=evil merge=evil\n")
+        try f.git(["add", "-A"])
+        try f.git(["commit", "-q", "-m", "attributes"])
+    }
+
+    @Test func everyCallCarriesTheHardening() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
+        let env = git.environment()
+        #expect(env["GIT_CONFIG_NOSYSTEM"] == "1"); #expect(env["GIT_CONFIG_GLOBAL"] == "/dev/null")
+        #expect(env["GIT_NO_REPLACE_OBJECTS"] == "1"); #expect(env["GIT_GRAFT_FILE"] == "/dev/null")
+        let args = git.arguments(["status"], attrSource: GitCommand.emptyTreeSHA1)
+        #expect(args.contains("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904"))
+        #expect(args.contains("core.attributesFile=/dev/null"))
+        #expect(args.firstIndex(of: "--attr-source=\(GitCommand.emptyTreeSHA1)")! < args.firstIndex(of: "status")!)
+        // The engine's attributes override is in place after any engine call.
+        _ = try f.ws.isDirty(in: f.root)
+        #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == "* -filter !diff merge=text\n")
+        try f.write(".git/info/attributes", "* filter=evil\n")
+        _ = try f.ws.isDirty(in: f.root)
+        #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == GitCommand.attributesOverride)
+    }
+
+    @Test func attrSourceNeedsGit242() throws {
+        #expect(GitCommand.supportsAttrSource(versionLine: "git version 2.52.0"))
+        #expect(GitCommand.supportsAttrSource(versionLine: "git version 2.42.0.windows.1"))
+        #expect(GitCommand.supportsAttrSource(versionLine: "git version 3.0.1"))
+        #expect(!GitCommand.supportsAttrSource(versionLine: "git version 2.41.9"))
+        #expect(!GitCommand.supportsAttrSource(versionLine: "git version 2.39.5 (Apple Git-154)"))
+        #expect(!GitCommand.supportsAttrSource(versionLine: "not git"))
+        #expect(GitCommand.installedSupportsAttrSource, "git 2.52 is installed here")
+        // On an older git, anything that reads, writes or compares trees is refused; ref plumbing still works.
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
+        git.attrSourceSupported = false
+        #expect(throws: GitError.self) { try git.run(["status", "--porcelain"]) }
+        #expect(throws: GitError.self) { try git.run(["diff", "HEAD", "HEAD"]) }
+        #expect(throws: GitError.self) { try git.run(["worktree", "add", "--detach", "/tmp/never", "HEAD"]) }
+        #expect(try git.run(["rev-parse", "HEAD"]).status == 0)
+        #expect(try git.run(["worktree", "list", "--porcelain"]).status == 0)
+    }
+
+    @Test func repoFilterIsRefusedAndNeverRuns() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        try attributed(f)
+        let (ws, log) = guarded(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let dir = try tempDir()
+        let smudge = dir.appending(path: "smudged"), clean = dir.appending(path: "cleaned")
+        try f.git(["config", "filter.evil.smudge", "touch '\(smudge.path)'; cat"])
+        try f.git(["config", "filter.evil.clean", "touch '\(clean.path)'; cat"])
+        try f.write("a.txt", "changed\n", in: wt)
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        #expect(throws: GitError.self) { try ws.isDirty(in: wt) }
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "x") }
+        #expect(throws: GitError.self) { try ws.addWorktree(key: "K-2") }
+        #expect(throws: GitError.self) { try ws.addRunWorktree(runId: "r1", commit: main) }
+        #expect(throws: GitError.self) { try ws.resetHard(in: wt, to: main) }
+        #expect(throws: GitError.self) { try ws.planBarrier(key: "K-1", in: wt) }
+        #expect(throws: GitError.self) { try ws.diff(base: main, head: main) }
+        #expect(throws: GitError.self) { try ws.head(of: GitWorkspace.mainRef) }
+        #expect(!exists(smudge), "a smudge filter from the repository config ran"); #expect(!exists(clean), "a clean filter ran")
+        #expect(!exists(f.ws.worktreePath(key: "K-2")))
+        let refusals = log.all.count
+        #expect(refusals >= 8, "every operation was refused and reported")
+        #expect(log.all.allSatisfy { $0.contains("filter.evil.smudge") && $0.contains("filter.evil.clean") })
+        #expect(try f.git(["rev-parse", "refs/heads/item/K-1"]) == main, "nothing was committed")
+        // Once the definition is gone the engine works again, and the committed attributes still name no filter for it.
+        try f.git(["config", "--remove-section", "filter.evil"])
+        #expect(try ws.isDirty(in: wt))
+        #expect(try ws.commitAll(in: wt, message: "work") != nil)
+        #expect(log.all.count == refusals)
+    }
+
+    @Test func everyDangerousRepoConfigKeyIsRefused() throws {
+        let keys: [(String, String)] = [
+            ("filter.x.smudge", "cat"), ("filter.x.process", "x"), ("filter.x.required", "true"), ("diff.x.textconv", "cat"),
+            ("diff.x.command", "x"), ("merge.x.driver", "x"), ("core.hooksPath", "/tmp/hooks"), ("core.sshCommand", "ssh -v"),
+            ("core.fsmonitor", "/tmp/fsm"), ("include.path", "/tmp/included"), ("includeIf.gitdir:/tmp/.path", "/tmp/included"),
+        ]
+        for (key, value) in keys {
+            let f = try GitFixture(files: ["a.txt": "one"])
+            let (ws, log) = guarded(f)
+            try f.git(["config", key, value])
+            #expect(throws: GitError.self, "\(key)") { try ws.isDirty(in: f.root) }
+            #expect(log.all.count == 1, "\(key)")
+            #expect(log.all.first?.lowercased().contains(key.lowercased()) == true, "\(key): \(log.all)")
+        }
+        // Ordinary settings, and drivers' harmless neighbours, are fine.
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = guarded(f)
+        for (key, value) in [("diff.renames", "true"), ("merge.conflictStyle", "diff3"), ("core.autocrlf", "false"),
+                             ("diff.x.binary", "true"), ("merge.x.name", "x"), ("user.name", "Owner")] {
+            try f.git(["config", key, value])
+        }
+        #expect(try ws.isDirty(in: f.root) == false)
+        #expect(log.all.isEmpty)
+    }
+
+    @Test func worktreeConfigIsCheckedToo() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = guarded(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        try f.write(".git/worktrees/K-1/config.worktree", "[filter \"evil\"]\n\tclean = touch /tmp/never\n")
+        #expect(throws: GitError.self) { try ws.isDirty(in: wt) }
+        try FileManager.default.removeItem(at: f.root.appending(path: ".git/worktrees/K-1/config.worktree"))
+        try f.write(".git/config.worktree", "[diff \"evil\"]\n\ttextconv = touch /tmp/never\n")
+        #expect(throws: GitError.self) { try ws.isDirty(in: f.root) }
+        #expect(log.all.count == 2)
+        #expect(log.all[0].contains("config.worktree") && log.all[0].contains("filter.evil.clean"))
+        #expect(log.all[1].contains("diff.evil.textconv"))
+        // A config that git cannot parse is refused, not skipped.
+        try FileManager.default.removeItem(at: f.root.appending(path: ".git/config.worktree"))
+        try f.write(".git/config.worktree", "[filter \"evil\"\n\tclean = x\n")
+        #expect(throws: GitError.self) { try ws.isDirty(in: f.root) }
+        #expect(log.all.count == 3)
+    }
+
+    @Test func includedConfigIsRefusedAndRaisesTheAlert() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        try attributed(f)
+        let (ws, log) = guarded(f)
+        let dir = try tempDir()
+        let marker = dir.appending(path: "included-ran")
+        let included = dir.appending(path: "evil.config")
+        try "[filter \"evil\"]\n\tclean = touch '\(marker.path)'; cat\n\tsmudge = touch '\(marker.path)'; cat\n"
+            .write(to: included, atomically: true, encoding: .utf8)
+        try f.git(["config", "include.path", included.path])
+        try f.write("a.txt", "changed\n")
+        #expect(throws: GitError.self) { try ws.isDirty(in: f.root) }
+        #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
+        #expect(!exists(marker), "the included filter ran")
+        #expect(log.all.count == 2 && log.all.allSatisfy { $0.contains("include.path") })
+    }
+
+    @Test func driversDoNotRunEvenWithoutTheConfigCheck() throws {
+        // The second layer: the empty-tree attribute source alone keeps a committed `.gitattributes` from naming a driver.
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        try attributed(f)
+        let base = try f.git(["rev-parse", "HEAD"])
+        try f.git(["checkout", "-q", "-b", "side"])
+        try f.write("a.txt", "side\n"); try f.git(["commit", "-q", "-am", "side"])
+        try f.git(["checkout", "-q", "main"])
+        try f.write("a.txt", "main\n"); try f.git(["commit", "-q", "-am", "main"])
+        let dir = try tempDir()
+        let smudge = dir.appending(path: "smudged"), clean = dir.appending(path: "cleaned")
+        let textconv = dir.appending(path: "textconv"), driver = dir.appending(path: "driver")
+        try f.git(["config", "filter.evil.smudge", "touch '\(smudge.path)'; cat"])
+        try f.git(["config", "filter.evil.clean", "touch '\(clean.path)'; cat"])
+        try f.git(["config", "diff.evil.textconv", "touch '\(textconv.path)'; cat"])
+        try f.git(["config", "merge.evil.driver", "touch '\(driver.path)'; exit 1"])
+        // Without the engine's info/attributes: the attribute source is all that stands in the way.
+        try? FileManager.default.removeItem(at: f.root.appending(path: ".git/info/attributes"))
+        var git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
+        git.skipsRepositoryCheck = true
+        // `--no-ext-diff` as the engine always passes; textconv is left on.
+        try git.run(["diff", "--no-ext-diff", base, "main"])
+        try git.run(["log", "-p", "--no-ext-diff", "-2", "main"])
+        _ = try git.run(["merge-tree", "--write-tree", "main", "side"], allowFailure: true)
+        try f.write("a.txt", "dirty\n")
+        try git.run(["add", "-A"])
+        try git.run(["worktree", "add", "--quiet", "--detach", dir.appending(path: "check").path, "side"])
+        #expect(!exists(smudge)); #expect(!exists(clean)); #expect(!exists(textconv)); #expect(!exists(driver))
+        #expect(try String(contentsOf: dir.appending(path: "check/a.txt"), encoding: .utf8) == "side\n")
+        // The info/attributes override alone does the same for plain git (the agent's own commands included).
+        try GitCommand.attributesOverride.write(to: f.root.appending(path: ".git/info/attributes"), atomically: true, encoding: .utf8)
+        try f.git(["diff", base, "main"])
+        _ = try f.git(["merge-tree", "--write-tree", "main", "side"], allowFailure: true)
+        try f.write("a.txt", "dirty again\n"); try f.git(["add", "-A"])
+        #expect(!exists(smudge)); #expect(!exists(clean)); #expect(!exists(textconv)); #expect(!exists(driver))
+        // Without either, the same repository runs every one of them: the fixture is real.
+        try FileManager.default.removeItem(at: f.root.appending(path: ".git/info/attributes"))
+        try f.git(["diff", base, "main"])
+        _ = try f.git(["merge-tree", "--write-tree", "main", "side"], allowFailure: true)
+        try f.write("a.txt", "dirty once more\n"); try f.git(["add", "-A"])
+        try f.git(["worktree", "add", "--quiet", "--detach", dir.appending(path: "plain").path, "side"])
+        #expect(exists(textconv)); #expect(exists(driver)); #expect(exists(clean)); #expect(exists(smudge))
+    }
+
+    @Test func replaceObjectsNeverStandInForTheVerifiedCommit() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        let base = try #require(try f.ws.head(of: GitWorkspace.mainRef))
+        let wt = try f.ws.addWorktree(key: "K-1")
+        try f.write("a.txt", "reviewed\n", in: wt)
+        let verified = try #require(try f.ws.commitAll(in: wt, message: "reviewed work"))
+        // The agent builds another commit and tells git to hand it out wherever the verified one is asked for.
+        let evil = try f.plantCommit(parent: base, path: "a.txt", text: "evil payload\n", message: "evil work")
+        try f.git(["replace", verified, evil])
+        #expect(try f.git(["show", "\(verified):a.txt"]) == "evil payload", "plain git follows the replacement")
+        let ws = f.ws
+        #expect(try ws.diff(base: base, head: verified).text.contains("+reviewed"))
+        #expect(!(try ws.diff(base: base, head: verified).text.contains("evil")))
+        #expect(try ws.nameStatus(base: base, head: verified).entries == [GitChange(status: "M", path: "a.txt")])
+        #expect(try ws.log(base: base, head: verified).map { $0.split(separator: " ", maxSplits: 1).last.map(String.init) } == ["reviewed work"])
+        #expect(try ws.blobs(at: verified, paths: ["a.txt"], limit: 5) == ["a.txt": Data("reviewed\n".utf8)])
+        let check = try ws.addRunWorktree(runId: "r1", commit: verified)
+        #expect(try String(contentsOf: check.appending(path: "a.txt"), encoding: .utf8) == "reviewed\n", "the check runs the real commit")
+        ws.removeRunWorktree(runId: "r1")
+        #expect(try ws.headCommit(in: wt) == verified)
+        #expect(try ws.isDirty(in: wt) == false, "the worktree is compared with the real tree")
+        // Grafts are ignored as well.
+        try f.write(".git/info/grafts", "\(verified) \(evil)\n")
+        #expect(try ws.log(base: base, head: verified).count == 1)
+    }
+
+    @Test func sha256WorkspaceUsesItsOwnEmptyTree() throws {
+        let f = try GitFixture(ensure: false)
+        try f.git(["init", "-q", "--object-format=sha256", "-b", "main"])
+        try f.write("a.txt", "one\n")
+        try f.ws.ensureRepo()
+        let wt = try f.ws.addWorktree(key: "K-1")
+        try f.write("b.txt", "two\n", in: wt)
+        let sha = try #require(try f.ws.commitAll(in: wt, message: "work"))
+        #expect(sha.count == 64)
+        #expect(try f.ws.diff(base: GitWorkspace.mainRef, head: sha).text.contains("+two"))
+    }
 }
+

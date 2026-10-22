@@ -28,7 +28,10 @@ extension Store {
     /// Merges (9b) call this too and hold while it throws.
     func checkMain(company: Company, git: GitWorkspace? = nil) throws {
         let git = git ?? gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
-        let current = try? git.head(of: GitWorkspace.mainRef)
+        let current: String?
+        do { current = try git.head(of: GitWorkspace.mainRef) } catch let e as GitError where e.isRepositoryRefusal {
+            throw e      // its own alert; main is not known to have moved
+        } catch { current = nil }
         let recorded = try writer.read { try Company.fetchOne($0, key: company.id)?.mainCommit }
         if let recorded, let current, recorded == current { return }
         let reason = Self.mainAlertReason(company.id)

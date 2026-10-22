@@ -381,6 +381,23 @@ import GRDB
         #expect(still.mergeState == .none); #expect(still.reviewedRound == 0)
     }
 
+    @Test func replacedVerifiedCommitIsNotWhatTheReviewerSees() async throws {
+        let r = try R()
+        let i = try await r.verified()
+        let commit = try #require(i.verifiedCommit)
+        let base = try #require(try r.ws.mergeBase(GitWorkspace.mainRef, commit))
+        // After the pass the agent points refs/replace/<verified> at an unreviewed commit.
+        let fixture = GitFixture(existing: r.root)
+        let evil = try fixture.plantCommit(parent: base, path: "src/work.txt", text: "evil payload\n", message: "evil")
+        try GitFixture.plainGit(["replace", commit, evil], in: r.root)
+        #expect(try GitFixture.plainGit(["show", "\(commit):src/work.txt"], in: r.root) == "evil payload")
+        let context = try #require(try Orchestrator.prepareReview(store: r.store, agent: r.rev, company: r.company))
+        #expect(context.digest.contains("work for \(i.key)"))
+        #expect(!context.digest.contains("evil payload"))
+        #expect(try r.head(i) == commit)
+        #expect(try r.ws.blobs(at: commit, paths: ["src/work.txt"], limit: 1)["src/work.txt"] == Data("work for \(i.key)".utf8))
+    }
+
     @Test func approveGoesThroughOneEntryPoint() async throws {
         let r = try R()
         let i = try await r.verified()

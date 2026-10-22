@@ -14,6 +14,9 @@ struct GitFixture {
         if ensure { try ws.ensureRepo() }
     }
 
+    /// A fixture over a workspace something else created (a company's).
+    init(existing root: URL) { self.root = root }
+
     @discardableResult
     func write(_ path: String, _ text: String, in dir: URL? = nil) throws -> URL {
         let url = (dir ?? root).appending(path: path)
@@ -47,5 +50,19 @@ struct GitFixture {
             throw FakeError(description: "git \(args.joined(separator: " ")) failed: \(String(decoding: r, as: UTF8.self))")
         }
         return String(decoding: o, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A commit on top of `parent` with `path` set to `text`, made with a private index and linked from no ref (what an agent
+    /// can build with plain git and then name in `refs/replace/`).
+    func plantCommit(parent: String, path: String, text: String, message: String) throws -> String {
+        let scratch = try tempDir()
+        let file = scratch.appending(path: "blob")
+        try text.write(to: file, atomically: true, encoding: .utf8)
+        let env = ["GIT_INDEX_FILE": scratch.appending(path: "index").path]
+        let blob = try git(["hash-object", "-w", file.path])
+        try git(["read-tree", parent], env: env)
+        try git(["update-index", "--add", "--cacheinfo", "100644,\(blob),\(path)"], env: env)
+        let tree = try git(["write-tree"], env: env)
+        return try git(["commit-tree", tree, "-p", parent, "-m", message])
     }
 }
