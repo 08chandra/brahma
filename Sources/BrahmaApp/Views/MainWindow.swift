@@ -8,8 +8,8 @@ struct MainWindow: View {
     var body: some View {
         Group {
             switch delegate.boot {
-            case .success(let model):
-                Shell(model: model)
+            case .success(let booted):
+                Shell(model: booted.model)
             case .failure(let error):
                 StartupErrorView(error: error)
             }
@@ -35,7 +35,7 @@ private struct Shell: View {
                 Sidebar(model: model).frame(width: sidebarWidth)
                 SplitDivider(width: $sidebarWidth, range: 180...320)
                 VStack(spacing: 0) {
-                    EngineBanner(engine: model.engine)
+                    EngineBanner(engine: model.engine, notice: model.startupNotice)
                     DetailView(model: model)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }

@@ -4,8 +4,18 @@ import BrahmaAppModel
 /// Shown above the detail pane when the engine is not simply running in this app.
 struct EngineBanner: View {
     let engine: EngineHost?
+    var notice: String?
 
     var body: some View {
+        VStack(spacing: 0) {
+            if let notice {
+                bar(color: BrahmaTheme.warning, icon: "exclamationmark.triangle.fill") { Text(verbatim: notice) }
+            }
+            engineBar
+        }
+    }
+
+    @ViewBuilder private var engineBar: some View {
         if let engine {
             switch engine.status {
             case .external:

@@ -20,7 +20,7 @@ let package = Package(
         // Platform owner-key hash store (macOS Keychain); kept out of BrahmaCore so the core stays portable.
         .target(name: "BrahmaKeychain", dependencies: ["BrahmaCore"]),
         .target(name: "BrahmaAppModel", dependencies: ["BrahmaCore", "BrahmaKeychain"]),
-        .executableTarget(name: "BrahmaApp", dependencies: ["BrahmaAppModel"]),
+        .executableTarget(name: "BrahmaApp", dependencies: ["BrahmaAppModel", "BrahmaKeychain"]),
         .executableTarget(
             name: "brahma",
             dependencies: [
@@ -33,6 +33,6 @@ let package = Package(
             dependencies: ["BrahmaCore", "BrahmaKeychain"],
             resources: [.copy("Fixtures")]
         ),
-        .testTarget(name: "BrahmaAppModelTests", dependencies: ["BrahmaAppModel"]),
+        .testTarget(name: "BrahmaAppModelTests", dependencies: ["BrahmaAppModel", "BrahmaKeychain"]),
     ]
 )

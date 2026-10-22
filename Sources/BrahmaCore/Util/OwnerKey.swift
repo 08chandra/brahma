@@ -21,8 +21,8 @@ extension BrahmaPaths {
 }
 
 /// Where the SHA-256 of the owner key lives, outside the data home. The macOS implementation (Keychain) is in the
-/// `BrahmaKeychain` target so BrahmaCore stays portable. There is deliberately no environment variable or flag that
-/// redirects a store or skips the check.
+/// `BrahmaKeychain` target so BrahmaCore stays portable. The only redirect is `BRAHMA_OWNER_KEY_STORE=file` for
+/// temp/demo data homes (`HomeFileOwnerKeyStore`, refused for the default home); nothing skips the check.
 public protocol OwnerKeyStore: Sendable {
     func hash(for paths: BrahmaPaths) -> String?
     func setHash(_ hash: String, for paths: BrahmaPaths) throws
@@ -60,6 +60,32 @@ public struct FileOwnerKeyStore: OwnerKeyStore {
     public func setHash(_ hash: String, for paths: BrahmaPaths) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
+        let url = file(paths)
+        try Data((hash + "\n").utf8).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    public func removeHash(for paths: BrahmaPaths) { try? FileManager.default.removeItem(at: file(paths)) }
+}
+
+/// Dev/demo/test store: a 0600 file `<dataHome>/owner/keyhash` in a 0700 directory. Selected only by
+/// `BRAHMA_OWNER_KEY_STORE=file`, which the CLI and app refuse for the default data home, so production always uses
+/// the Keychain. Lives inside the data home, so it is weaker still than `FileOwnerKeyStore`.
+public struct HomeFileOwnerKeyStore: OwnerKeyStore {
+    public init() {}
+
+    func directory(_ paths: BrahmaPaths) -> URL { paths.home.appending(path: "owner", directoryHint: .isDirectory) }
+    func file(_ paths: BrahmaPaths) -> URL { directory(paths).appending(path: "keyhash") }
+
+    public func hash(for paths: BrahmaPaths) -> String? {
+        (try? String(contentsOf: file(paths), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public func setHash(_ hash: String, for paths: BrahmaPaths) throws {
+        let dir = directory(paths)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
         let url = file(paths)
         try Data((hash + "\n").utf8).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)

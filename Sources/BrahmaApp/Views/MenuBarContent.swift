@@ -7,7 +7,7 @@ struct MenuBarContent: View {
     let delegate: AppDelegate
 
     var body: some View {
-        if case .success(let model) = delegate.boot {
+        if let model = delegate.model {
             let summary = model.menuBar
             Text(verbatim: summary.totals)
             Text(verbatim: summary.pending)

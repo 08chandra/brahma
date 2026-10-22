@@ -1,7 +1,6 @@
 import Foundation
 import Observation
 import BrahmaCore
-import BrahmaKeychain
 
 public enum EngineStatus: Equatable, Sendable {
     case starting, embedded, external, stopping, stopped
@@ -63,7 +62,7 @@ public final class EngineHost {
                 makeRunner: @escaping @Sendable (String) -> any TurnRunning = { ClaudeProcessRunner(claudePath: $0) },
                 config: SchedulerConfig = .init(), tickInterval: Duration = .seconds(1),
                 probe: (@Sendable (String) async -> DoctorReport)? = nil,
-                ownerKeyStore: any OwnerKeyStore = PlatformOwnerKeyStore.make()) {
+                ownerKeyStore: any OwnerKeyStore) {
         self.ownerKeyStore = ownerKeyStore
         self.probe = probe ?? { [store] path in
             await Doctor.ensure(store: store, claudePath: path, runner: ClaudeProcessRunner(claudePath: path))

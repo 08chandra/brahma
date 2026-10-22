@@ -2,7 +2,6 @@ import Foundation
 import Testing
 @testable import BrahmaCore
 import BrahmaKeychain
-import Security
 
 private func paths() throws -> BrahmaPaths {
     let d = try tempDir()
@@ -63,22 +62,6 @@ private final class DeleteThenFailStore: OwnerKeyStore, @unchecked Sendable {
         #expect(try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8) == before, "the key file is untouched")
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: p.home.path).filter { $0.hasPrefix(".owner.key.") }
         #expect(leftovers.isEmpty)
-    }
-
-    @Test func keychainWriteIsInPlace() throws {
-        let p = try paths(); let store = KeychainOwnerKeyStore()
-        defer { store.removeHash(for: p) }
-        try store.setHash("h1", for: p)
-        try store.setHash("h2", for: p)
-        try store.setHash("h3", for: p)
-        #expect(store.hash(for: p) == "h3")
-        // Exactly one item remains: the write updates rather than deleting and re-adding.
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: KeychainOwnerKeyStore.service,
-                                kSecAttrAccount as String: p.canonicalHomePath, kSecMatchLimit as String: kSecMatchLimitAll,
-                                kSecReturnAttributes as String: true]
-        var out: CFTypeRef?
-        #expect(SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess)
-        #expect((out as? [Any])?.count == 1)
     }
 
     @Test func initNeedsProofWheneverAHashIsStored() throws {
@@ -198,7 +181,7 @@ private final class DeleteThenFailStore: OwnerKeyStore, @unchecked Sendable {
         #expect(viaReal.canonicalHomePath == viaLink.canonicalHomePath)
         #expect(BrahmaPaths.canonicalPath(link.appending(path: "not/yet").path) == viaReal.canonicalHomePath + "/not/yet")
         for store in [InMemoryOwnerKeyStore() as any OwnerKeyStore, FileOwnerKeyStore(directory: d.appending(path: "cfg")),
-                      KeychainOwnerKeyStore()] {
+                      HomeFileOwnerKeyStore()] {
             defer { store.removeHash(for: viaReal) }
             try OwnerKey.create(paths: viaReal, store: store)
             #expect(OwnerKey.verify(paths: viaLink, store: store), "\(type(of: store))")
@@ -246,14 +229,119 @@ private final class DeleteThenFailStore: OwnerKeyStore, @unchecked Sendable {
         #expect(store.hash(for: p) == nil)
     }
 
-    @Test func keychainStoreRoundTrip() throws {
-        let p = try paths(); let store = KeychainOwnerKeyStore()
-        defer { store.removeHash(for: p) }
+    @Test func homeFileStoreIs0600In0700Directory() throws {
+        let p = try paths()
+        let store = HomeFileOwnerKeyStore()
         #expect(store.hash(for: p) == nil)
         try store.setHash("h1", for: p)
         try store.setHash("h2", for: p)
         #expect(store.hash(for: p) == "h2")
+        let dir = p.home.appending(path: "owner"), file = dir.appending(path: "keyhash")
+        #expect((try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int) == 0o600)
+        #expect((try FileManager.default.attributesOfItem(atPath: dir.path)[.posixPermissions] as? Int) == 0o700)
         store.removeHash(for: p)
         #expect(store.hash(for: p) == nil)
+    }
+
+    // MARK: BRAHMA_OWNER_KEY_STORE selection
+
+    @Test func storeSelectionDefaultsToThePlatformStoreAndNeverTouchesIt() throws {
+        let p = try paths()
+        let sel = try PlatformOwnerKeyStore.resolve(environment: [:], paths: p)
+        #expect(sel.warning == nil)
+        #if canImport(Security)
+        #expect(sel.store is KeychainOwnerKeyStore)
+        #endif
+        #expect(KeychainAccessLog.callCount == 0, "choosing a store makes no Keychain call")
+    }
+
+    @Test func fileStoreIsChosenWithAWarningForTempHomes() throws {
+        let p = try paths()
+        let sel = try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": "file"], paths: p)
+        #expect(sel.store is HomeFileOwnerKeyStore)
+        #expect(try #require(sel.warning).contains("BRAHMA_OWNER_KEY_STORE=file"))
+    }
+
+    @Test func fileStoreRefusedForTheDefaultHomeEvenViaASymlink() throws {
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        try FileManager.default.createDirectory(at: fakeDefault, withIntermediateDirectories: true)
+        let link = d.appending(path: "link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fakeDefault)
+        let env = ["BRAHMA_OWNER_KEY_STORE": "file"]
+        for home in [fakeDefault, link] {
+            let p = BrahmaPaths(home: home, workspaces: d.appending(path: "ws"))
+            #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+                try PlatformOwnerKeyStore.resolve(environment: env, paths: p, defaultHome: fakeDefault)
+            }
+        }
+        #expect((try? PlatformOwnerKeyStore.resolve(environment: env, paths: BrahmaPaths(home: d.appending(path: "other"), workspaces: d.appending(path: "ws")), defaultHome: fakeDefault)) != nil)
+    }
+
+    @Test func fileStoreRefusedForTheDefaultHomeViaTheDataVolumeFirmlinkAlias() throws {
+        // realpath does not resolve the APFS firmlink, so a string compare of canonical paths misses this alias.
+        let user = NSHomeDirectory()
+        let alias = "/System/Volumes/Data" + user
+        try #require(FileManager.default.fileExists(atPath: alias), "no firmlink alias on this machine")
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        try FileManager.default.createDirectory(at: fakeDefault, withIntermediateDirectories: true)
+        let aliasHome = URL(fileURLWithPath: "/System/Volumes/Data" + BrahmaPaths.canonicalPath(fakeDefault.path), isDirectory: true)
+        try #require(FileManager.default.fileExists(atPath: aliasHome.path), "temp dir has no firmlink alias")
+        try #require(BrahmaPaths.canonicalPath(aliasHome.path) != BrahmaPaths.canonicalPath(fakeDefault.path),
+                     "this is the case a path compare misses")
+        let p = BrahmaPaths(home: aliasHome, workspaces: d.appending(path: "ws"))
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": "file"], paths: p, defaultHome: fakeDefault)
+        }
+    }
+
+    @Test func fileStoreRefusedForAHardLinkedDefaultDatabase() throws {
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        try FileManager.default.createDirectory(at: fakeDefault, withIntermediateDirectories: true)
+        let defaultDB = fakeDefault.appending(path: "brahma.sqlite")
+        try Data("db".utf8).write(to: defaultDB)
+        let other = d.appending(path: "other")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let p = BrahmaPaths(home: other, workspaces: d.appending(path: "ws"))
+        try FileManager.default.linkItem(at: defaultDB, to: p.database)
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": "file"], paths: p, defaultHome: fakeDefault)
+        }
+    }
+
+    @Test func fileStoreRefusedForAnyMultiplyLinkedDatabase() throws {
+        // Even when the other name is not the default database: a database with a second name could be anything.
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        let other = d.appending(path: "other")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let p = BrahmaPaths(home: other, workspaces: d.appending(path: "ws"))
+        try Data("db".utf8).write(to: p.database)
+        let env = ["BRAHMA_OWNER_KEY_STORE": "file"]
+        #expect((try? PlatformOwnerKeyStore.resolve(environment: env, paths: p, defaultHome: fakeDefault)) != nil)
+        try FileManager.default.linkItem(at: p.database, to: d.appending(path: "second-name"))
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: env, paths: p, defaultHome: fakeDefault)
+        }
+    }
+
+    @Test func fileStoreRefusalIsCaseInsensitiveWhenTheDefaultHomeDoesNotExistYet() throws {
+        let d = try tempDir()
+        let fakeDefault = d.appending(path: "Library/Application Support/Brahma")
+        let shouty = d.appending(path: "LIBRARY/application support/BRAHMA")
+        let p = BrahmaPaths(home: shouty, workspaces: d.appending(path: "ws"))
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": "file"], paths: p, defaultHome: fakeDefault)
+        }
+    }
+
+    @Test(arguments: ["keychain", "FILE", "", "1", "memory"])
+    func unknownStoreValuesAreRefused(value: String) throws {
+        let p = try paths()
+        #expect(throws: PlatformOwnerKeyStore.Refusal.self) {
+            try PlatformOwnerKeyStore.resolve(environment: ["BRAHMA_OWNER_KEY_STORE": value], paths: p)
+        }
     }
 }

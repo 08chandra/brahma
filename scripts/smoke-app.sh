@@ -10,14 +10,14 @@ APP_PID=""
 cleanup() {
   [ -n "$CLI_PID" ] && kill -INT "$CLI_PID" 2>/dev/null || true
   [ -n "$APP_PID" ] && kill -KILL "$APP_PID" 2>/dev/null || true
-  # The owner key's hash lives in the Keychain, keyed by the temp data home; remove it with the temp dir.
-  # The account is the canonical (symlink-resolved) data home; never delete with an empty account.
-  CANON="$(cd "$TMP/home" 2>/dev/null && pwd -P || true)"
-  [ -z "$CANON" ] || security delete-generic-password -s dev.brahma.owner -a "$CANON" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
 export BRAHMA_HOME="$TMP/home"
+# Dev/demo only: keep the owner-key hash in the temp home so nothing here touches the login Keychain (a rebuilt
+# ad-hoc-signed binary makes macOS ask for the login password on every Keychain access). The CLI and app refuse
+# this for the default data home.
+export BRAHMA_OWNER_KEY_STORE=file
 export BRAHMA_WORKSPACES="$TMP/workspaces"
 export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"
 mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"

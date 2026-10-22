@@ -8,8 +8,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
     let p = Process()
     p.executableURL = url
     p.arguments = args
-    var e = ["BRAHMA_HOME": home.appending(path: "home").path, "BRAHMA_WORKSPACES": home.appending(path: "ws").path,
-             "PATH": "/usr/bin:/bin"]
+    var e = cliEnvironment(home: home)
     e.merge(env) { _, new in new }
     p.environment = e
     let out = Pipe(), err = Pipe()

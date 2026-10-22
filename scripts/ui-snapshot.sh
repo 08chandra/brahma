@@ -2,7 +2,7 @@
 # Usage: scripts/ui-snapshot.sh <name> [select]. Assumes .build/Brahma.app exists.
 # Always uses a fresh seeded temp home, because it runs the engine with the FAKE claude. Set
 # BRAHMA_SNAPSHOT_REUSE_HOME=1 to use the caller's BRAHMA_HOME (and BRAHMA_WORKSPACES) instead; the default
-# data home is always refused.
+# data home is always refused. A reused home uses whatever BRAHMA_OWNER_KEY_STORE the caller exports (unset = Keychain).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,16 +13,7 @@ OUT=".superpowers/ui/$NAME.png"
 rm -f "$OUT"
 
 TMP="$(mktemp -d)"
-OWNER_HOME=""
-cleanup() {
-  # The account is the canonical (symlink-resolved) data home; never delete with an empty account.
-  if [ -n "$OWNER_HOME" ]; then
-    CANON="$(cd "$OWNER_HOME" 2>/dev/null && pwd -P || true)"
-    [ -z "$CANON" ] || security delete-generic-password -s dev.brahma.owner -a "$CANON" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$TMP"
-}
-trap cleanup EXIT
+trap 'rm -rf "$TMP"' EXIT
 DEFAULT_HOME="$HOME/Library/Application Support/Brahma"
 if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; then
   RESOLVED="$BRAHMA_HOME"
@@ -34,10 +25,14 @@ if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; the
     exit 1
   fi
 else
+  # Fresh seeded temp home only: its owner-key hash lives in the home, not the login Keychain (which prompts for the
+  # password after every rebuild). The CLI and app refuse this for the default data home. A REUSED home may be
+  # Keychain-keyed, so the file store is never forced onto it (export BRAHMA_OWNER_KEY_STORE=file yourself if it
+  # was seeded that way).
+  export BRAHMA_OWNER_KEY_STORE=file
   export BRAHMA_HOME="$TMP/home"
   export BRAHMA_WORKSPACES="$TMP/workspaces"
   mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"
-  OWNER_HOME="$BRAHMA_HOME"   # the seeded temp home's Keychain item is deleted at exit
   scripts/seed-demo.sh >/dev/null
 fi
 export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"

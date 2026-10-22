@@ -1,7 +1,16 @@
 import Foundation
 import BrahmaCore
+import BrahmaKeychain
+
+/// Any Keychain call in this process crashes instead of prompting the owner (see the BrahmaCoreTests twin).
+let keychainTrapArmed: Bool = {
+    if ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1" { return false }
+    KeychainAccessLog.forbid()
+    return true
+}()
 
 func tempDir() throws -> URL {
+    _ = keychainTrapArmed
     let url = FileManager.default.temporaryDirectory
         .appending(path: "brahma-appmodel-\(UUID().uuidString)", directoryHint: .isDirectory)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

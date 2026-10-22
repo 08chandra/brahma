@@ -10,8 +10,7 @@ private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32
     let p = Process()
     p.executableURL = url
     p.arguments = args
-    p.environment = ["BRAHMA_HOME": home.appending(path: "home").path,
-                     "BRAHMA_WORKSPACES": home.appending(path: "ws").path, "PATH": "/usr/bin:/bin"]
+    p.environment = cliEnvironment(home: home)
     let err = Pipe()
     p.standardError = err
     p.standardOutput = FileHandle.nullDevice
