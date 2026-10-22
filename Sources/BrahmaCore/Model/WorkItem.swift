@@ -150,6 +150,8 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var specConfirmedBy: String? = nil
     /// Optional globs the item changes besides its check's `paths`; both together are its claimed paths (none = the whole repo).
     public var touchPaths: [String] = []
+    /// Where the item's branch started (recorded by the engine at claim); weakening is measured against it, never the live `main`.
+    public var baseCommit: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

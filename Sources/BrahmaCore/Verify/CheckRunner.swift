@@ -31,20 +31,27 @@ public struct ProcessCheckRunner: CheckRunning {
     private static let tailBytes = tailChars * 4
 
     public var termGrace: TimeInterval
+    /// Seconds on a clock that does not advance while the Mac sleeps, so a night's sleep cannot expire a check's timeout.
+    public var clock: @Sendable () -> TimeInterval
 
-    public init(termGrace: TimeInterval = 5) { self.termGrace = termGrace }
+    public init(termGrace: TimeInterval = 5, clock: @escaping @Sendable () -> TimeInterval = ProcessCheckRunner.uptime) {
+        self.termGrace = termGrace; self.clock = clock
+    }
+
+    /// Monotonic uptime (mach absolute time / `CLOCK_MONOTONIC`): excludes time the system spent asleep.
+    public static let uptime: @Sendable () -> TimeInterval = { TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
 
     public func run(command: String, workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
                     environment: [String: String]) async -> CheckOutcome {
         let cancel = CancelFlag()
-        let grace = termGrace
+        let (grace, clock) = (termGrace, self.clock)
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<CheckOutcome, Never>) in
                 // A thread of its own: a check can run for an hour and must not occupy a Dispatch or Swift concurrency worker.
                 let thread = Thread {
                     continuation.resume(returning: Self.runBlocking(command: command, workingDirectory: workingDirectory,
                                                                     timeout: timeout, outputURL: outputURL,
-                                                                    environment: environment, termGrace: grace, cancel: cancel))
+                                                                    environment: environment, termGrace: grace, clock: clock, cancel: cancel))
                 }
                 thread.name = "brahma-check"
                 thread.start()
@@ -94,7 +101,8 @@ public struct ProcessCheckRunner: CheckRunning {
     }
 
     private static func runBlocking(command: String, workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
-                                    environment: [String: String], termGrace: TimeInterval, cancel: CancelFlag) -> CheckOutcome {
+                                    environment: [String: String], termGrace: TimeInterval, clock: @Sendable () -> TimeInterval,
+                                    cancel: CancelFlag) -> CheckOutcome {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: workingDirectory.path, isDirectory: &isDir), isDir.boolValue else {
@@ -183,22 +191,22 @@ public struct ProcessCheckRunner: CheckRunning {
         }
 
         // Wait for the shell, enforcing the timeout and cancellation.
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = clock() + timeout
         var timedOut = false, cancelled = false
-        var termSentAt: Date?, killSent = false
+        var termSentAt: TimeInterval?, killSent = false
         var status: Int32 = 0
         while true {
             let r = waitpid(pid, &status, WNOHANG)
             if r == pid { break }
             if r < 0 && errno != EINTR { status = 0; break }
-            let now = Date()
+            let now = clock()
             if cancel.isSet && !cancelled { cancelled = true; killpg(pid, SIGKILL); killSent = true }
             if !timedOut && !cancelled && now >= deadline {
                 timedOut = true
                 killpg(pid, SIGTERM)
                 termSentAt = now
             }
-            if let sent = termSentAt, !killSent, now.timeIntervalSince(sent) >= termGrace {
+            if let sent = termSentAt, !killSent, now - sent >= termGrace {
                 killpg(pid, SIGKILL)
                 killSent = true
             }

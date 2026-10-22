@@ -320,6 +320,11 @@ enum Migrations {
                 t.primaryKey(["itemId", "checkRevision"])
             }
         }
+        m.registerMigration("v3-verify-2") { db in
+            // Main's head (the merge base) when the item's branch was first claimed: the engine's own record of where the
+            // work started, used to detect weakened tests and as the source of check-script baselines.
+            try db.alter(table: "workItem") { t in t.add(column: "baseCommit", .text) }
+        }
         return m
     }
 }

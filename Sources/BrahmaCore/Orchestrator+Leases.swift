@@ -117,9 +117,9 @@ extension Orchestrator {
             var failed: String?
             do {
                 try git.ensureRepo()
-                let checkout = try git.addWorktree(key: item.key)
+                try git.addWorktree(key: item.key)
                 try ProgressFile.ensure(workspace: ws, item: item)
-                try store.ensureCheckSnapshot(item: item, workspace: ws, root: checkout)
+                try store.ensureCheckSnapshot(item: item, workspace: ws)
             } catch {
                 log("could not create the worktree of \(item.key): \(error)")
                 _ = try? store.releaseLease(itemId: item.id, agentId: agent.id, note: "the worktree could not be created",

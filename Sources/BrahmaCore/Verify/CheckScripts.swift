@@ -31,12 +31,9 @@ public enum CheckScripts {
 
     private static let separators: Set<Character> = [";", "&", "|", "(", ")", "<", ">"]
 
-    /// Relative regular files under `root` that the command mentions: tokens are split on whitespace and `; & | ( ) < >`,
-    /// quotes are stripped, and absolute paths, `..`, directories, symlinks and anything resolving outside `root` are
-    /// ignored. In order of first mention, at most `maxFiles`.
-    public static func referencedFiles(command: String, root: URL) -> [String] {
-        let fm = FileManager.default
-        let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
+    /// The relative paths a command mentions, cleaned: tokens split on whitespace and `; & | ( ) < >`, quotes stripped,
+    /// absolute paths and anything with `..` dropped, in order of first mention.
+    public static func candidatePaths(command: String) -> [String] {
         var seen = Set<String>(), out: [String] = []
         var token = ""
         func flush() {
@@ -46,19 +43,44 @@ public enum CheckScripts {
             let parts = t.split(separator: "/", omittingEmptySubsequences: true).filter { $0 != "." }
             guard !parts.isEmpty, !parts.contains("..") else { return }
             let rel = parts.joined(separator: "/")
-            guard !seen.contains(rel), out.count < maxFiles else { return }
-            let url = root.appending(path: rel)
-            guard (try? fm.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeRegular else { return }
-            let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
-            guard resolved.hasPrefix(rootPath + "/") else { return }
-            seen.insert(rel)
-            out.append(rel)
+            if seen.insert(rel).inserted { out.append(rel) }
         }
         for ch in command {
             if ch.isWhitespace || separators.contains(ch) { flush() } else { token.append(ch) }
         }
         flush()
         return out
+    }
+
+    /// Relative regular files under `root` that the command mentions (see `candidatePaths`); directories, symlinks and
+    /// anything resolving outside `root` are ignored. At most `maxFiles`.
+    public static func referencedFiles(command: String, root: URL) -> [String] {
+        let fm = FileManager.default
+        let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
+        var out: [String] = []
+        for rel in candidatePaths(command: command) where out.count < maxFiles {
+            let url = root.appending(path: rel)
+            guard (try? fm.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeRegular else { continue }
+            guard url.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(rootPath + "/") else { continue }
+            out.append(rel)
+        }
+        return out
+    }
+
+    /// Writes `contents` (relative path → bytes) under `to`, replacing it, and returns the content hash of each.
+    @discardableResult
+    public static func write(contents: [String: Data], to: URL) throws -> [String: String] {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
+        try fm.createDirectory(at: to, withIntermediateDirectories: true)
+        var manifest: [String: String] = [:]
+        for (file, data) in contents {
+            let target = to.appending(path: file)
+            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: target)
+            manifest[file] = StableHash.fnv1a64(data)
+        }
+        return manifest
     }
 
     /// Copies each file (relative to `from`) to the same relative path under `to`, and returns the content hash of each.

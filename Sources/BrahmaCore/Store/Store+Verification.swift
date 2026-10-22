@@ -98,20 +98,41 @@ extension Store {
         }
     }
 
-    /// At claim: saves the scripts the item's check command names, once per check revision, from the claimed checkout
-    /// (`root`) into `<workspace>/.brahma/checks/<KEY>/rev<n>/`. A later claim of the same revision keeps the baseline
-    /// even if the branch has changed the scripts since.
-    func ensureCheckSnapshot(item: WorkItem, workspace: URL, root: URL) throws {
+    /// At claim, after the worktree exists: records where the item's branch started (once) and saves the scripts the check
+    /// command names, once per check revision, into `<workspace>/.brahma/checks/<KEY>/rev<n>/`. The baseline comes from the
+    /// engine-recorded base commit in the object database, never from the agent's worktree, so scripts an agent already
+    /// weakened on its branch cannot become the baseline (submit then flags them as modified). Without a base (no common
+    /// history with `main`) the head of `main` is used. A later claim of the same revision keeps the first baseline.
+    func ensureCheckSnapshot(item: WorkItem, workspace: URL) throws {
+        let git = gitWorkspace(root: workspace, companyId: item.companyId)
+        var base = item.baseCommit
+        if base == nil {
+            base = try git.mergeBase("main", git.branch(key: item.key))
+            if let base { try recordBaseCommit(itemId: item.id, commit: base) }
+        }
         guard let spec = item.checkSpec else { return }
         if try checkSnapshot(itemId: item.id, revision: item.checkRevision) != nil { return }
+        let source = try base ?? git.head(of: "main")
+        let candidates = CheckScripts.candidatePaths(command: spec.command).filter { $0 != "manifest.json" }
+        let contents = try source.map { try git.blobs(at: $0, paths: Array(candidates.prefix(200)), limit: CheckScripts.maxFiles) } ?? [:]
         let paths = CheckPaths(workspace: workspace)
         let dir = paths.snapshotDir(key: item.key, revision: item.checkRevision)
-        let files = CheckScripts.referencedFiles(command: spec.command, root: root).filter { $0 != "manifest.json" }
-        let manifest = try CheckScripts.snapshot(files: files, from: root, to: dir)
+        let manifest = try CheckScripts.write(contents: contents, to: dir)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
         try encoder.encode(manifest).write(to: paths.manifest(key: item.key, revision: item.checkRevision))
         try saveCheckSnapshot(itemId: item.id, revision: item.checkRevision, dir: dir.path, manifest: manifest)
+    }
+
+    func recordBaseCommit(itemId: String, commit: String) throws {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET baseCommit = ? WHERE id = ? AND baseCommit IS NULL", arguments: [commit, itemId])
+        }
+    }
+
+    /// For the merge flow: when an item's branch is deleted (merged) and the item is reopened, the next claim records a new base.
+    func clearBaseCommit(itemId: String) throws {
+        try writer.write { db in try db.execute(sql: "UPDATE workItem SET baseCommit = NULL WHERE id = ?", arguments: [itemId]) }
     }
 
     /// The first saved script that no longer matches its baseline hash (missing counts), or nil. No snapshot, no tampering.
@@ -123,6 +144,31 @@ extension Store {
     }
 
     // MARK: Submit
+
+    static let maxFlagLength = 200
+    static let maxFlagsPerSubmit = 20
+
+    /// The summary as stored: trimmed, not empty, at most `maxSummary` characters.
+    static func validSummary(_ raw: String) throws -> String {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { throw WorkError.invalid("the summary is empty") }
+        guard text.count <= maxSummary else { throw WorkError.invalid("the summary is longer than \(maxSummary) characters") }
+        return text
+    }
+
+    /// Review flags built from agent-controlled text (git paths): one line each, control characters removed, at most
+    /// `maxFlagLength` characters, at most `maxFlagsPerSubmit` of them with the rest counted ("and <k> more").
+    static func sanitizedFlags(_ flags: [String]) -> [String] {
+        func clean(_ f: String) -> String {
+            var line = f.components(separatedBy: .newlines).joined(separator: " ")
+            line = String(String.UnicodeScalarView(line.unicodeScalars.filter { $0.value >= 32 && $0.value != 127 }))
+                .trimmingCharacters(in: .whitespaces)
+            return line.count > maxFlagLength ? String(line.prefix(maxFlagLength - 1)) + "…" : line
+        }
+        let cleaned = flags.map(clean).filter { !$0.isEmpty }
+        guard cleaned.count > maxFlagsPerSubmit else { return cleaned }
+        return Array(cleaned.prefix(maxFlagsPerSubmit)) + ["and \(cleaned.count - maxFlagsPerSubmit) more"]
+    }
 
     /// The holder hands the item over: it becomes `inReview` with no verified revision, and the engine queues its check
     /// (an item with no check is verified at once). `flags` are weakening signs found by the caller.
@@ -138,17 +184,14 @@ extension Store {
             guard item.status == .inProgress else {
                 throw WorkError.conflict("\(item.key) is \(item.status.title.lowercased()), not in progress")
             }
-            let text = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { throw WorkError.invalid("the summary is empty") }
-            guard text.count <= Self.maxSummary else {
-                throw WorkError.invalid("the summary is longer than \(Self.maxSummary) characters")
-            }
+            let text = try Self.validSummary(summary)
+            if commit == item.baseCommit { throw WorkError.conflict("\(item.key) has no changes to submit") }
             item.submitSummary = text
             item.reviewRound += 1
             item.status = .inReview
             item.verifiedRevision = nil
             item.verifiedCommit = nil
-            for f in flags where !item.reviewFlags.contains(f) { item.reviewFlags.append(f) }
+            for f in Self.sanitizedFlags(flags) where !item.reviewFlags.contains(f) { item.reviewFlags.append(f) }
             // Older queued runs of this item are for work that has been replaced.
             try db.execute(sql: """
                 UPDATE verificationRun SET status = 'error', outputTail = 'superseded by a newer submission', finishedAt = ?

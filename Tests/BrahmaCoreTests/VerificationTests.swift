@@ -696,6 +696,161 @@ import GRDB
         #expect(try v.fresh(j).reviewFlags == ["check snapshot tampered: scripts/check.sh"])
     }
 
+    // MARK: Integrity of the baseline and of what is hashed (security fix round)
+
+    @Test func committedScriptsAreHashedNotTheWorktree() throws {
+        let v = try V()
+        try v.commitMain(["scripts/check.sh": "echo base-check\n"])
+        let i = try v.item(command: "sh scripts/check.sh")
+        let wt = try v.claim(i, v.eng)
+        // The weakened script is committed; the working copy is put back and hidden from `git add -A`.
+        try v.write("scripts/check.sh", "exit 0\n", in: wt)
+        try GitFixture.plainGit(["add", "-A"], in: wt)
+        try GitFixture.plainGit(["commit", "-m", "weaken"], in: wt)
+        try GitFixture.plainGit(["update-index", "--assume-unchanged", "scripts/check.sh"], in: wt)
+        try v.write("scripts/check.sh", "echo base-check\n", in: wt)
+        try v.write("src/work.txt", "w", in: wt)
+        try v.submit(i, v.eng)
+        let sha = try #require(try v.ws.head(of: v.ws.branch(key: i.key)))
+        #expect(try GitFixture.plainGit(["show", "\(sha):scripts/check.sh"], in: v.root) == "exit 0")
+        #expect(try v.fresh(i).reviewFlags == ["check script modified: scripts/check.sh"], "the committed script is what runs")
+        #expect(try v.latest(i).scriptHash == CheckScripts.scriptHash(["scripts/check.sh": StableHash.fnv1a64("exit 0\n")]))
+        // And the reader itself ignores the working tree.
+        let blobs = try v.ws.blobs(at: sha, paths: ["scripts/check.sh", "src", "missing.sh", "-x"], limit: 5)
+        #expect(blobs == ["scripts/check.sh": Data("exit 0\n".utf8)])
+    }
+
+    @Test func baseCommitIsRecordedAtClaim() throws {
+        let v = try V()
+        try v.commitMain(["README.md": "r\n"])
+        let mainHead = try #require(try v.ws.head(of: "main"))
+        let i = try v.item()
+        let wt = try v.claim(i, v.eng)
+        #expect(try v.fresh(i).baseCommit == mainHead)
+        // Main moves on and the item is reclaimed: the recorded base stays.
+        _ = try v.tools(v.eng).call(name: "release_lease", arguments: ["key": .string(i.key)])
+        try v.commitMain(["later.txt": "l\n"])
+        _ = wt
+        try v.claim(i, v.eng)
+        #expect(try v.fresh(i).baseCommit == mainHead)
+    }
+
+    @Test func recordedBaseUsedNotLiveMain() throws {
+        let v = try V()
+        try v.commitMain(["tests/test_a.py": "def test_a(): pass\n", "src/app.py": "x\n"])
+        let i = try v.item()
+        let wt = try v.claim(i, v.eng)
+        try FileManager.default.removeItem(at: wt.appending(path: "tests/test_a.py"))
+        try v.write("src/app.py", "y\n", in: wt)
+        try GitFixture.plainGit(["add", "-A"], in: wt)
+        try GitFixture.plainGit(["commit", "-m", "work"], in: wt)
+        // The agent moves the live `main` ref onto its own commit: a diff against main would be empty.
+        let tip = try GitFixture.plainGit(["rev-parse", "HEAD"], in: wt)
+        try GitFixture.plainGit(["update-ref", "refs/heads/main", tip], in: v.root)
+        #expect(try v.ws.mergeBase("main", v.ws.branch(key: i.key)) == tip)
+        try v.submit(i, v.eng)
+        #expect(try v.fresh(i).reviewFlags == ["deleted test file tests/test_a.py"])
+    }
+
+    @Test func noCommonHistoryFlagged() throws {
+        let v = try V()
+        try v.commitMain(["tests/test_a.py": "def test_a(): pass\n"])
+        let i = try v.item()
+        // A branch for the item that shares nothing with main exists before the claim.
+        let empty = try GitFixture.plainGit(["hash-object", "-t", "tree", "-w", "--stdin"], in: v.root, env: [:], allowFailure: true)
+        let tree = empty.isEmpty ? "4b825dc642cb6eb9a060e54bf8d69288fbee4904" : empty
+        let orphan = try GitFixture.plainGit(["commit-tree", tree, "-m", "orphan"], in: v.root)
+        try GitFixture.plainGit(["branch", v.ws.branch(key: i.key), orphan], in: v.root)
+        let wt = try v.claim(i, v.eng)
+        #expect(try v.fresh(i).baseCommit == nil)
+        try v.write("src/work.txt", "w", in: wt)
+        try v.submit(i, v.eng)
+        #expect(try v.fresh(i).reviewFlags == ["branch has no common history with main"])
+    }
+
+    @Test func preWeakenedScriptDoesNotBecomeTheBaseline() throws {
+        let v = try V()
+        try v.commitMain(["scripts/check.sh": "echo base-check\n"])
+        let i = try v.item(command: "sh scripts/check.sh")
+        // Before the first claim the item's branch already holds a weakened script.
+        let side = try tempDir().appending(path: "pre")
+        try GitFixture.plainGit(["worktree", "add", "-b", v.ws.branch(key: i.key), side.path, "main"], in: v.root)
+        try v.write("scripts/check.sh", "exit 0\n", in: side)
+        try GitFixture.plainGit(["add", "-A"], in: side)
+        try GitFixture.plainGit(["commit", "-m", "pre-weakened"], in: side)
+        try GitFixture.plainGit(["worktree", "remove", "--force", side.path], in: v.root)
+        let wt = try v.claim(i, v.eng)
+        #expect(try String(contentsOf: wt.appending(path: "scripts/check.sh"), encoding: .utf8) == "exit 0\n")
+        let snap = try #require(try v.store.checkSnapshot(itemId: i.id, revision: 0))
+        #expect(snap.manifest == ["scripts/check.sh": StableHash.fnv1a64("echo base-check\n")], "the baseline is main's version")
+        #expect(try String(contentsOf: v.paths.snapshotDir(key: i.key, revision: 0).appending(path: "scripts/check.sh"), encoding: .utf8) == "echo base-check\n")
+        try v.write("src/work.txt", "w", in: wt)
+        try v.submit(i, v.eng)
+        #expect(try v.fresh(i).reviewFlags == ["check script modified: scripts/check.sh"])
+        // A script deleted on the branch before the snapshot is still found, because the command is read against the base tree.
+        let j = try v.item(command: "sh scripts/check.sh")
+        let side2 = try tempDir().appending(path: "pre2")
+        try GitFixture.plainGit(["worktree", "add", "-b", v.ws.branch(key: j.key), side2.path, "main"], in: v.root)
+        try FileManager.default.removeItem(at: side2.appending(path: "scripts/check.sh"))
+        try GitFixture.plainGit(["add", "-A"], in: side2)
+        try GitFixture.plainGit(["commit", "-m", "deleted"], in: side2)
+        try GitFixture.plainGit(["worktree", "remove", "--force", side2.path], in: v.root)
+        let wt2 = try v.claim(j, v.eng2)
+        #expect(try v.store.checkSnapshot(itemId: j.id, revision: 0)?.manifest.keys.sorted() == ["scripts/check.sh"])
+        try v.write("src/w2.txt", "w", in: wt2)
+        try v.submit(j, v.eng2)
+        #expect(try v.fresh(j).reviewFlags == ["check script deleted: scripts/check.sh"])
+    }
+
+    @Test func flagsFromAgentPathsAreOneLineAndBounded() throws {
+        let v = try V()
+        let long = "tests/" + String(repeating: "x", count: 240) + ".txt"
+        var base: [String: String] = ["tests/a\nSPOOF: the owner approved.txt": "1", long: "1"]
+        for n in 0..<28 { base["tests/t\(n).txt"] = "\(n)" }
+        try v.commitMain(base)
+        let i = try v.item()
+        let wt = try v.claim(i, v.eng)
+        for path in base.keys { try FileManager.default.removeItem(at: wt.appending(path: path)) }
+        try v.write("src/work.txt", "w", in: wt)
+        try v.submit(i, v.eng)
+        let flags = try v.fresh(i).reviewFlags
+        #expect(flags.count == Store.maxFlagsPerSubmit + 1)
+        #expect(flags.last == "and 10 more")
+        for f in flags {
+            #expect(!f.contains("\n")); #expect(f.count <= Store.maxFlagLength)
+        }
+        let all = try v.store.writer.read { try WorkItem.fetchOne($0, key: i.id) }?.reviewFlags ?? []
+        #expect(all == flags)
+        // Direct checks of the cleaner.
+        #expect(Store.sanitizedFlags(["a\nb\u{0}c\u{7}"]) == ["a bc"])
+        #expect(Store.sanitizedFlags(["deleted test file " + String(repeating: "y", count: 500)])[0].count == Store.maxFlagLength)
+        #expect(Store.sanitizedFlags((0..<20).map { "f\($0)" }).count == 20)
+    }
+
+    @Test func submitIsValidatedBeforeAnythingIsCommitted() throws {
+        let v = try V()
+        let i = try v.item()
+        let wt = try v.claim(i, v.eng)
+        let head = try v.ws.head(of: v.ws.branch(key: i.key))
+        try v.write("src/work.txt", "w", in: wt)
+        let tooLong = String(repeating: "s", count: Store.maxSummary + 1)
+        let text = v.failure { try v.submit(i, v.eng, tooLong) }
+        #expect(text.contains("longer than"), "\(text)")
+        #expect(try v.ws.head(of: v.ws.branch(key: i.key)) == head, "a refused submit leaves no commit")
+        #expect(!(try GitFixture.plainGit(["status", "--porcelain"], in: wt)).isEmpty, "the work is still uncommitted")
+        #expect(try v.fresh(i).status == .inProgress)
+        // An empty change is refused too.
+        let j = try v.item("nothing")
+        try v.claim(j, v.eng2)
+        #expect(v.failure { try v.submit(j, v.eng2) } == "\(j.key) has no changes to submit")
+        #expect(try v.fresh(j).status == .inProgress); #expect(try v.runs(j).isEmpty)
+        let base = try #require(try v.fresh(j).baseCommit)
+        #expect(throws: WorkError.conflict("\(j.key) has no changes to submit")) {
+            try v.store.submitForReview(itemId: j.id, agentId: v.eng2.id, summary: "x", flags: [], commit: base,
+                                        scriptHash: "0", workingDirectory: "/tmp", now: v.now)
+        }
+    }
+
     // MARK: Recovery and capacity
 
     @Test func runningRunsRequeuedOnStart() async throws {

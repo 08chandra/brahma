@@ -88,6 +88,24 @@ import Foundation
         #expect(await gone(pid))
     }
 
+    /// A sleeping Mac must not expire a check: the timeout runs on a clock that stands still in sleep.
+    @Test func timeoutFollowsTheMonotonicClockNotTheWallClock() async throws {
+        // The injected clock does not move: the command outlives its 1 s timeout on the wall clock without timing out.
+        let frozen = ProcessCheckRunner(clock: { 100 })
+        let (steady, _) = try await run("sleep 1.5; echo done", timeout: 1, runner: frozen)
+        #expect(!steady.timedOut); #expect(steady.exitCode == 0)
+        // One that jumps ahead (as the wall clock does after a sleep) times it out.
+        final class Jumpy: @unchecked Sendable {
+            let lock = NSLock(); var t = 0.0
+            func next() -> TimeInterval { lock.withLock { t += 0.5; return t } }
+        }
+        let jumpy = Jumpy()
+        let (cut, _) = try await run("sleep 20", timeout: 1, runner: ProcessCheckRunner(termGrace: 0.5, clock: { jumpy.next() }))
+        #expect(cut.timedOut)
+        // The default is the system uptime clock.
+        let a = ProcessCheckRunner.uptime(); try await Task.sleep(for: .milliseconds(20)); #expect(ProcessCheckRunner.uptime() > a)
+    }
+
     @Test func outputIsCapped() async throws {
         // 3 MB of 'a', then a distinctive last line.
         let (outcome, text) = try await run("head -c 3000000 /dev/zero | tr '\\0' 'a'; echo; echo THE-LAST-LINE")

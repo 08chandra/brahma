@@ -346,7 +346,7 @@ extension CompanyTools {
             path = try git.addWorktree(key: target.key)
             try ProgressFile.ensure(workspace: ws, item: target)
             // The baseline of the check's scripts, once per check revision; a reclaim keeps the first one.
-            try store.ensureCheckSnapshot(item: target, workspace: ws, root: path)
+            try store.ensureCheckSnapshot(item: target, workspace: ws)
         } catch {
             // The claim is undone; nothing this call did not create is removed.
             _ = try? store.releaseLease(itemId: target.id, agentId: agentId, note: "the worktree could not be created",
@@ -386,6 +386,8 @@ extension CompanyTools {
         guard target.status == .inProgress else {
             throw ToolError(message: "\(target.key) is \(target.status.title.lowercased()), not in progress")
         }
+        // Nothing is committed for a submit that would be refused anyway.
+        _ = try Store.validSummary(summary)
         let git = gitWorkspace(try workspace())
         guard git.hasCheckout(key: target.key) else {
             throw ToolError(message: "your worktree for \(target.key) is missing; release the item and claim it again")
@@ -394,27 +396,37 @@ extension CompanyTools {
         let branch = git.branch(key: target.key)
         guard let commit = try git.commitAll(in: worktree, message: "\(target.key): submit round \(target.reviewRound + 1)")
                 ?? git.head(of: branch) else { throw ToolError(message: "\(target.key) has no commit to submit") }
+        if commit == target.baseCommit { throw ToolError(message: "\(target.key) has no changes to submit") }
 
+        // Weakening is measured against the base the engine recorded at claim, never the live `main` (an agent can move that ref).
         var flags: [String] = []
-        if let base = try git.mergeBase("main", branch) {
-            let changes = try git.nameStatus(base: base, head: commit)
-            for c in changes.entries {
-                switch c.status.first {
-                case "D" where PathRules.isTestFile(c.path): flags.append("deleted test file \(c.path)")
-                case "M" where PathRules.isTestFile(c.path), "T" where PathRules.isTestFile(c.path):
-                    flags.append("modified test file \(c.path)")
-                case "R" where c.oldPath.map(PathRules.isTestFile) == true: flags.append("renamed test file \(c.oldPath ?? "?") → \(c.path)")
-                default: break
+        if let base = target.baseCommit {
+            do {
+                let changes = try git.nameStatus(base: base, head: commit)
+                for c in changes.entries {
+                    switch c.status.first {
+                    case "D" where PathRules.isTestFile(c.path): flags.append("deleted test file \(c.path)")
+                    case "M" where PathRules.isTestFile(c.path), "T" where PathRules.isTestFile(c.path):
+                        flags.append("modified test file \(c.path)")
+                    case "R" where c.oldPath.map(PathRules.isTestFile) == true: flags.append("renamed test file \(c.oldPath ?? "?") → \(c.path)")
+                    default: break
+                    }
                 }
+                if changes.truncated { flags.append("change list too long to inspect (more than 2000 files)") }
+            } catch {
+                flags.append("change list could not be inspected")
             }
-            if changes.truncated { flags.append("change list too long to inspect (more than 2000 files)") }
+        } else {
+            flags.append("branch has no common history with main")
         }
+        // Script hashes come from the committed tree: what the check will run, not what the worktree holds now.
         var current: [String: String] = [:]
         if let snapshot = try store.latestCheckSnapshot(itemId: target.id, upTo: target.checkRevision) {
             let names = snapshot.manifest.keys.sorted()
-            let hashes = CheckScripts.hashes(files: names, in: worktree)
+            let committed = try git.blobs(at: commit, paths: names, limit: max(names.count, 1))
             for name in names {
-                if let hash = hashes[name] ?? nil {
+                if let data = committed[name] {
+                    let hash = StableHash.fnv1a64(data)
                     current[name] = hash
                     if hash != snapshot.manifest[name] { flags.append("check script modified: \(name)") }
                 } else {

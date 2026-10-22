@@ -478,6 +478,34 @@ public struct GitWorkspace: Sendable {
         return (entries, truncated)
     }
 
+    /// The contents of the regular files (not links) at `paths` in `commit`'s tree, at most `limit` of them, read from the
+    /// object database. Paths that are not files in that commit are absent from the result. Nothing is read from a working tree.
+    public func blobs(at commit: String, paths: [String], limit: Int) throws -> [String: Data] {
+        try Self.validCommit(commit)
+        let wanted = paths.filter { !$0.isEmpty && !$0.hasPrefix(":") && !$0.hasPrefix("-") }
+        guard !wanted.isEmpty, limit > 0 else { return [:] }
+        let listing = try main.run(["ls-tree", "-z", "--full-tree", commit, "--"] + wanted, allowFailure: true, maxOutput: 1 << 20)
+        guard listing.status == 0 else { return [:] }
+        var hashes: [String: String] = [:]
+        for entry in String(decoding: listing.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true) {
+            let halves = entry.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+            guard halves.count == 2 else { continue }
+            let meta = halves[0].split(separator: " ")
+            let path = String(halves[1])
+            guard meta.count == 3, meta[1] == "blob", meta[0] == "100644" || meta[0] == "100755", wanted.contains(path),
+                  meta[2].range(of: "^[0-9a-f]{40,64}$", options: .regularExpression) != nil else { continue }
+            hashes[path] = String(meta[2])
+        }
+        var out: [String: Data] = [:]
+        for path in wanted where out.count < limit {
+            guard let hash = hashes[path] else { continue }
+            let blob = try main.run(["cat-file", "blob", hash])
+            if blob.cut { throw GitError.failed(command: "cat-file blob", status: -1, stderr: "\(path) is too large to snapshot") }
+            out[path] = blob.stdout
+        }
+        return out
+    }
+
     /// The patch between two commits, cut to `maxLines` lines and `maxChars` characters.
     public func diff(base: String, head: String, maxLines: Int = 400, maxChars: Int = 40_000) throws -> (text: String, truncated: Bool) {
         try Self.validRef(base); try Self.validRef(head)
