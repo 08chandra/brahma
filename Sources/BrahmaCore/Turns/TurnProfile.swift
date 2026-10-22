@@ -45,12 +45,18 @@ public enum TurnProfileCompiler {
                             addDirs: r.addDirs.isEmpty ? [r.company.workspacePath] : r.addDirs)
         p.environment = r.environment
         if r.kind == .plan {
-            // Plan mode alone is not trusted (the engine checks the worktree afterwards); the turn gets no editing tools and its
-            // plan file goes to the plans directory.
+            // Plan mode alone is not trusted (the engine checks the checkout afterwards). The turn may only read: no editing
+            // tool, no shell, no file writes. Its plan is its result text (or a file the CLI's plan mode puts into the plans
+            // directory, the only extra directory it may touch).
             p.permissionModeOverride = "plan"
-            p.allowedTools.removeAll { ["Edit", "NotebookEdit", "Task", "Agent"].contains($0) }
-            for name in ["Edit", "NotebookEdit"] where !p.disallowedTools.contains(name) { p.disallowedTools.append(name) }
-            if let dir = r.planDirectory { p.extraSettings["plansDirectory"] = .string(dir) }
+            p.allowedTools = ["Read", "Glob", "Grep", "mcp__company"]
+            for name in ["Edit", "MultiEdit", "NotebookEdit", "Write", "Bash"] where !p.disallowedTools.contains(name) {
+                p.disallowedTools.append(name)
+            }
+            if let dir = r.planDirectory {
+                p.extraSettings["plansDirectory"] = .string(dir)
+                p.addDirs = [dir]
+            }
         }
         return restricted(p, for: r.kind)
     }

@@ -100,10 +100,10 @@ extension Store {
         Item: \(item.key) · \(ReviewDigest.flat(item.title, max: 200))
 
         ## Goal
-        \(ReviewDigest.clean(goal))
+        \(ReviewDigest.quote(goal, maxChars: Self.maxHandoffField))
 
         ## Acceptance check
-        \(ReviewDigest.clean(item.acceptanceCriteria).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(no acceptance criteria)" : ReviewDigest.clean(item.acceptanceCriteria))
+        \(ReviewDigest.quote(item.acceptanceCriteria, maxChars: ReviewDigest.maxCriteria, empty: "(no acceptance criteria)"))
         \(check)
 
         ## Branch

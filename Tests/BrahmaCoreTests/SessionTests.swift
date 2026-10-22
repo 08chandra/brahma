@@ -488,7 +488,7 @@ import GRDB
         s.world.clock.advance(SessionPolicy.warmSeconds + 1)
         try s.dm(s.eng); try await s.cycle()
         let cold = try #require(s.requests("eng-1").last)
-        #expect(cold.prompt.contains("Plan:\n    | 1. parse\n    | 2. test\n    |## not a heading".replacingOccurrences(of: "    |##", with: "    | ##")))
+        #expect(cold.prompt.contains("Plan:\n    | 1. parse\n    | 2. test\n    | ## not a heading\n"))
     }
 
     @Test func planTurnNeverRunsOnADirtyWorktree() async throws {
@@ -498,5 +498,112 @@ import GRDB
         try s.dm(s.eng); try await s.cycle()
         #expect(s.requests("eng-1").first?.kind == .work, "uncommitted work would be lost by the reset")
         #expect(FileManager.default.fileExists(atPath: s.ws.worktreePath(key: i.key).appending(path: "wip.txt").path))
+    }
+
+    // MARK: Plan-turn lockdown
+
+    private func planWorld() throws -> (S, WorkItem, URL) {
+        let s = try S(planSelector: { _, _, _ in true })
+        let i = try s.item(); try s.claim(i)
+        return (s, i, s.ws.worktreePath(key: i.key))
+    }
+
+    @Test func planTurnCanOnlyRead() async throws {
+        let (s, i, _) = try planWorld()
+        try s.dm(s.eng); try await s.cycle()
+        let r = try #require(s.requests("eng-1").first)
+        let a = s.args(r)
+        let planDir = URL(fileURLWithPath: s.company.workspacePath).appending(path: ".brahma/plans/\(i.key)").path
+        #expect(r.kind == .plan)
+        #expect(a.firstIndex(of: "--allowed-tools").map { a[$0 + 1] } == "Read,Glob,Grep,mcp__company")
+        let disallowed = try #require(a.firstIndex(of: "--disallowed-tools").map { a[$0 + 1].split(separator: ",").map(String.init) })
+        for tool in ["Write", "MultiEdit", "Bash", "Edit", "NotebookEdit", "Task", "Agent"] { #expect(disallowed.contains(tool), "\(tool)") }
+        let dirs = a.indices.filter { a[$0] == "--add-dir" }.map { a[$0 + 1] }
+        #expect(dirs == [planDir], "only the plans directory is added")
+        #expect(r.workingDirectory == s.ws.worktreePath(key: i.key).path)
+    }
+
+    @Test func planTurnIgnoredFilesAreChecked() async throws {
+        let (s, i, wt) = try planWorld()
+        let exclude = URL(fileURLWithPath: s.company.workspacePath).appending(path: ".git/info/exclude")
+        try (try String(contentsOf: exclude, encoding: .utf8) + "\n*.log\n").write(to: exclude, atomically: true, encoding: .utf8)
+        try "kept".write(to: wt.appending(path: "old.log"), atomically: true, encoding: .utf8)      // ignored before the turn
+        s.world.fake.script("eng-1", .init(sideEffect: { req in
+            try "new".write(to: URL(fileURLWithPath: req.workingDirectory).appending(path: "fresh.log"), atomically: true, encoding: .utf8)
+        }, text: "the plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(!FileManager.default.fileExists(atPath: wt.appending(path: "fresh.log").path), "the new ignored file is removed")
+        #expect(FileManager.default.fileExists(atPath: wt.appending(path: "old.log").path), "what was there before stays")
+        let kinds = try s.store.itemEvents(itemId: i.id)
+        #expect(kinds.contains { $0.kind == .planTurnWrote && $0.text.contains("new ignored file fresh.log") })
+        #expect(!kinds.contains { $0.kind == .planWritten })
+    }
+
+    @Test func planTurnGitConfigAndHooksAreRestored() async throws {
+        let (s, i, _) = try planWorld()
+        let gitDir = URL(fileURLWithPath: s.company.workspacePath).appending(path: ".git")
+        let config = gitDir.appending(path: "config"), hook = gitDir.appending(path: "hooks/pre-commit")
+        let before = try String(contentsOf: config, encoding: .utf8)
+        #expect(!FileManager.default.fileExists(atPath: hook.path))
+        s.world.fake.script("eng-1", .init(sideEffect: { _ in
+            try (before + "\n[core]\n\thooksPath = /tmp/evil\n").write(to: config, atomically: true, encoding: .utf8)
+            try FileManager.default.createDirectory(at: hook.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "#!/bin/sh\ntouch /tmp/pwned\n".write(to: hook, atomically: true, encoding: .utf8)
+        }, text: "the plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        #expect(try String(contentsOf: config, encoding: .utf8) == before)
+        #expect(!FileManager.default.fileExists(atPath: hook.path))
+        let wrote = try #require(try s.store.itemEvents(itemId: i.id).last { $0.kind == .planTurnWrote })
+        #expect(wrote.text.contains("changed config")); #expect(wrote.text.contains("new hooks/pre-commit"))
+        #expect(try !s.store.itemEvents(itemId: i.id).contains { $0.kind == .planWritten })
+    }
+
+    @Test func planFileThatIsASymlinkIsNeverRead() async throws {
+        let (s, i, _) = try planWorld()
+        let secret = try tempDir().appending(path: "secret.txt")
+        try "SECRET TOKEN".write(to: secret, atomically: true, encoding: .utf8)
+        let planFile = URL(fileURLWithPath: s.company.workspacePath).appending(path: ".brahma/plans/\(i.key)/plan.md")
+        s.world.fake.script("eng-1", .init(sideEffect: { _ in
+            try FileManager.default.createSymbolicLink(at: planFile, withDestinationURL: secret)
+        }, text: "the real plan\nSTATUS: DONE"))
+        try s.dm(s.eng); try await s.cycle()
+        let planned = try #require(try s.store.itemEvents(itemId: i.id).last { $0.kind == .planWritten })
+        #expect(planned.text == "the real plan\nSTATUS: DONE")
+        #expect(!planned.text.contains("SECRET"))
+    }
+
+    @Test func planReadRules() throws {
+        let fm = FileManager.default
+        let root = try tempDir()
+        let dir = root.appending(path: "plans"), outside = root.appending(path: "outside")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true); try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        #expect(Orchestrator.readPlan(in: dir) == nil)
+        try "x".write(to: outside.appending(path: "a.md"), atomically: true, encoding: .utf8)
+        try fm.createSymbolicLink(at: dir.appending(path: "link.md"), withDestinationURL: outside.appending(path: "a.md"))
+        #expect(Orchestrator.readPlan(in: dir) == nil, "a symlink is not a plan file")
+        try String(repeating: "a", count: 100_000).write(to: dir.appending(path: "big.md"), atomically: true, encoding: .utf8)
+        #expect(Orchestrator.readPlan(in: dir)?.count == 64 * 1024, "the read is capped")
+        try "notes".write(to: dir.appending(path: "notes.txt"), atomically: true, encoding: .utf8)
+        #expect(Orchestrator.readPlan(in: dir)?.hasPrefix("aaa") == true, "only .md files count")
+        // A plans directory that is itself a link is refused, and so is a link in the path to it.
+        let linked = root.appending(path: "linked")
+        try fm.createSymbolicLink(at: linked, withDestinationURL: outside)
+        #expect(Orchestrator.readPlan(in: linked) == nil)
+        let ws = root.appending(path: "ws")
+        try fm.createDirectory(at: ws.appending(path: ".brahma/plans"), withIntermediateDirectories: true)
+        #expect(Orchestrator.planDirectory(workspace: ws, key: "ACME-1") != nil)
+        try fm.createSymbolicLink(at: ws.appending(path: ".brahma/plans/ACME-2"), withDestinationURL: outside)
+        #expect(Orchestrator.planDirectory(workspace: ws, key: "ACME-2") == nil)
+    }
+
+    @Test func planTurnNotStartedWhenItsDirectoryIsALink() async throws {
+        let s = try S(planSelector: { _, _, _ in true })
+        let i = try s.item(); try s.claim(i)
+        let outside = try tempDir()
+        let plans = URL(fileURLWithPath: s.company.workspacePath).appending(path: ".brahma/plans")
+        try FileManager.default.createDirectory(at: plans, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: plans.appending(path: i.key), withDestinationURL: outside)
+        try s.dm(s.eng); try await s.cycle()
+        #expect(s.requests("eng-1").first?.kind == .work)
     }
 }

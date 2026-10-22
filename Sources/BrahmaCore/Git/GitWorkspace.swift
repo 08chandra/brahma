@@ -457,6 +457,63 @@ public struct GitWorkspace: Sendable {
         try git.run(["clean", "-fdq"])
     }
 
+    // MARK: Plan-turn write barrier
+
+    /// What a plan turn must leave exactly as it found it besides tracked and untracked files (which `isDirty` and `HEAD`
+    /// cover): the ignored files of the checkout, and the repository's own config, hooks and exclude file.
+    public struct PlanBarrier: Sendable {
+        var ignored: Set<String>
+        /// Path relative to the git directory → content.
+        var files: [String: Data]
+    }
+
+    /// Ignored files (`git status --ignored --porcelain -uall`, one entry per file) and the integrity files of the common
+    /// directory (`config`, `hooks/*`, `info/exclude`) and of this worktree's admin directory (`config.worktree`).
+    public func planBarrier(key: String, in dir: URL) throws -> PlanBarrier {
+        try Self.validKey(key)
+        let out = try context(for: dir).run(["status", "--porcelain", "--ignored", "-uall"])
+        let ignored = Set(out.text.split(separator: "\n").filter { $0.hasPrefix("!! ") }.map { String($0.dropFirst(3)) })
+        var files: [String: Data] = [:]
+        let fm = FileManager.default
+        func capture(_ relative: String) {
+            let url = gitDir.appending(path: relative)
+            guard !Self.isSymlink(url), let data = fm.contents(atPath: url.path) else { return }
+            files[relative] = data
+        }
+        capture("config"); capture("info/exclude"); capture("worktrees/\(key)/config.worktree")
+        let hooks = gitDir.appending(path: "hooks", directoryHint: .isDirectory)
+        if Self.isSymlink(hooks) { files["hooks"] = Data("symlink".utf8) }
+        for name in (try? fm.contentsOfDirectory(atPath: hooks.path)) ?? [] { capture("hooks/\(name)") }
+        return PlanBarrier(ignored: ignored, files: files)
+    }
+
+    /// Compares the checkout with `before`, puts back what a plan turn changed and says what it was (nil when nothing).
+    /// Ignored files that are new are deleted; changed, new or removed config, hooks and exclude files are restored.
+    public func enforcePlanBarrier(_ before: PlanBarrier, key: String, in dir: URL) throws -> [String] {
+        let after = try planBarrier(key: key, in: dir)
+        var found: [String] = []
+        let fm = FileManager.default
+        let base = Self.resolved(dir)
+        for rel in after.ignored.subtracting(before.ignored).sorted() {
+            found.append("new ignored file \(rel)")
+            guard !rel.hasPrefix("/"), !rel.split(separator: "/").contains("..") else { continue }
+            let target = dir.appending(path: rel)
+            guard Self.resolved(target.deletingLastPathComponent()).hasPrefix(base) else { continue }
+            try? fm.removeItem(at: target)
+        }
+        for (rel, data) in before.files where after.files[rel] != data {
+            found.append("changed \(rel)")
+            let url = gitDir.appending(path: rel)
+            if Self.isSymlink(url) { try? fm.removeItem(at: url) }
+            try? data.write(to: url, options: .atomic)
+        }
+        for rel in after.files.keys.sorted() where before.files[rel] == nil {
+            found.append("new \(rel)")
+            try? fm.removeItem(at: gitDir.appending(path: rel))
+        }
+        return found
+    }
+
     public func isDirty(in dir: URL) throws -> Bool {
         !(try context(for: dir).run(["status", "--porcelain"]).text.isEmpty)
     }

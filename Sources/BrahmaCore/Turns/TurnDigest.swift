@@ -24,7 +24,9 @@ public struct TurnContext {
     public var pendingReviewCount: Int
     public var notices: [PendingNotice]
     public var collapsedNotices: Int
+    /// The waking inbox items shown this turn (at most `TurnDigest.maxInbox`); the rest stay undelivered for the next turn.
     public var inbox: [(InboxItem, Message, Channel)]
+    public var inboxOverflow: Int = 0
     public var channelCounts: [(channel: String, count: Int)]
     public var handles: [String: String]
     public var timeZone: TimeZone
@@ -61,7 +63,8 @@ public struct TurnContext {
         let roster = live.filter { $0.id != agent.id }.sorted { $0.name < $1.name }
             .map { RosterEntry(handle: $0.name, role: $0.role, state: $0.state) }
 
-        let inbox = try store.pendingInbox(agentId: agent.id)
+        let allInbox = try store.pendingInbox(agentId: agent.id)
+        let inbox = Array(allInbox.prefix(TurnDigest.maxInbox))
         let quiet = try store.pendingQuietItems(agentId: agent.id)
         let batch = try store.noticeBatch(agentId: agent.id, limit: WorkNoticeDigest.maxNotices)
 
@@ -78,6 +81,7 @@ public struct TurnContext {
             openAsks: try store.asks(companyId: company.id, statuses: [.pendingInternal, .pendingOwner])
                 .filter { $0.requesterId == agent.id }.prefix(TurnDigest.maxAsks).map { $0 },
             recentSummaries: [], inboxItemIds: inbox.compactMap(\.0.id), quietItemIds: quiet.map(\.id), noticeIds: batch.deliveredIds)
+        c.inboxOverflow = allInbox.count - inbox.count
         c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: c.scope)) ?? []
 
         guard let item else { return c }
@@ -115,6 +119,7 @@ public enum TurnDigest {
     public static let maxSummary = 1000
     public static let maxAsks = 10
     public static let maxReports = 20
+    public static let maxInbox = 20
     static let maxReviewNotes = 8192
 
     public static func render(_ c: TurnContext, agent: Agent, company: Company) -> String {
@@ -156,7 +161,13 @@ public enum TurnDigest {
         // With only work updates there is no "nothing new" line.
         if !(c.inbox.isEmpty && c.channelCounts.isEmpty && !c.notices.isEmpty) {
             out.append("# Inbox")
-            out.append(InboxDigest.render(agent: agent, company: company, items: c.inbox, handles: c.handles, unread: c.channelCounts))
+            var inbox = InboxDigest.render(agent: agent, company: company, items: c.inbox, handles: c.handles, unread: c.channelCounts)
+            if c.inboxOverflow > 0 {
+                // The rest stay pending and arrive with the next turn; the unread line (if any) stays last.
+                let line = "- … and \(c.inboxOverflow) more (they arrive in your next turn)"
+                if let r = inbox.range(of: "\nUnread in channels") { inbox.insert(contentsOf: "\n" + line, at: r.lowerBound) } else { inbox += "\n" + line }
+            }
+            out.append(inbox)
         }
         return out.joined(separator: "\n")
     }
@@ -221,8 +232,9 @@ public enum TurnDigest {
                 out.append("- \(a.ref) · \(ReviewDigest.flat(a.kind.rawValue, max: 40)) · \(a.status.rawValue) · \(ReviewDigest.flat(a.title, max: 200))")
             }
         }
-        guard !out.isEmpty else { return nil }
-        var head = ["Continuity: your previous session ended; this one starts fresh. The files are the truth; read them before you act."]
+        // A fresh session always points at the item's progress file, even with nothing else to carry over.
+        guard !out.isEmpty || c.progressPath != nil else { return nil }
+        var head = ["Continuity: this session starts fresh. The files are the truth; read them before you act."]
         if let path = c.progressPath { head.append("Progress file: \(path)") }
         return (head + out).joined(separator: "\n")
     }

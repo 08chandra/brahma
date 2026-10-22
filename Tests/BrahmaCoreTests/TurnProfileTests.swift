@@ -48,6 +48,26 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
         #expect(!first.contains("P"))
     }
 
+    @Test func planTurnArgv() {
+        var r = request(started: false)
+        r.kind = .plan
+        r.planDirectory = "/tmp/ws/acme/.brahma/plans/ACME-1"
+        r.addDirs = ["/tmp/ws/acme/.brahma/plans/ACME-1"]
+        let args = TurnProfileCompiler.arguments(TurnProfileCompiler.profile(for: r))
+        #expect(args == [
+            "-p", "--output-format", "stream-json", "--verbose",
+            "--model", "opus", "--fallback-model", "sonnet",
+            "--setting-sources", "", "--settings",
+            "{\"enabledPlugins\":{},\"plansDirectory\":\"/tmp/ws/acme/.brahma/plans/ACME-1\"}", "--disable-slash-commands",
+            "--strict-mcp-config", "--mcp-config", "/tmp/run/a1.mcp.json",
+            "--disallowed-tools", disallowed + ",Edit,MultiEdit,NotebookEdit,Write,Bash",
+            "--session-id", "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0", "--append-system-prompt", "ROLE PROMPT",
+            "--permission-mode", "plan",
+            "--allowed-tools", "Read,Glob,Grep,mcp__company",
+            "--add-dir", "/tmp/ws/acme/.brahma/plans/ACME-1",
+        ])
+    }
+
     @Test func multipleAddDirs() {
         var r = request(started: false)
         r.addDirs = ["/a", "/b"]

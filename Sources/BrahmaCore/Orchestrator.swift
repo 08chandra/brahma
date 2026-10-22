@@ -365,14 +365,17 @@ public actor Orchestrator {
 
                 // Plan turn mechanics (selection is Task 14c's): only on a clean worktree, so the write barrier can tell.
                 if kind == .work, let leased = c.item, let git, let checkout, planSelector(agent, leased, company),
-                   (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout) {
-                    let dir = workspace.appending(path: ".brahma/plans/\(leased.key)", directoryHint: .isDirectory)
-                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                   (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout),
+                   let barrier = try? git.planBarrier(key: leased.key, in: checkout),
+                   let dir = Self.planDirectory(workspace: workspace, key: leased.key) {
                     kind = .plan
                     context.turnKind = .plan
                     planDirectory = dir.path
+                    // A plan turn reads the code (its working directory) and writes only into the plans directory.
+                    addDirs = [dir.path]
                     toolsKey = "plan:" + template.companyTools.joined(separator: ",")
-                    plan = PlanWatch(git: git, worktree: checkout, preHead: head, itemId: leased.id, directory: dir)
+                    plan = PlanWatch(git: git, worktree: checkout, preHead: head, itemId: leased.id, key: leased.key, directory: dir,
+                                     barrier: barrier)
                 }
 
                 // Warm-only resume: a cold or large session starts over with the role card, the orientation and Continuity.
@@ -558,27 +561,61 @@ public actor Orchestrator {
     /// records `planTurnWrote` and does not count the plan. A good plan is read from the plans directory (else the result
     /// text) and recorded as `planWritten`.
     private nonisolated func finishPlanTurn(_ plan: PlanWatch, agent: Agent, end: TurnEnd, now: Date) {
-        var wrote: String?
+        var wrote: [String] = []
         let dirty = (try? plan.git.isDirty(in: plan.worktree)) ?? true
         let head = try? plan.git.headCommit(in: plan.worktree)
-        if dirty { wrote = "uncommitted changes" } else if head != plan.preHead { wrote = "a commit" }
-        if let wrote {
+        if dirty { wrote.append("uncommitted changes") }
+        if head != plan.preHead { wrote.append("a commit") }
+        // Ignored files and the repository's own config and hooks are put back as well.
+        do { wrote += try plan.git.enforcePlanBarrier(plan.barrier, key: plan.key, in: plan.worktree) } catch { wrote.append("barrier check failed: \(error)") }
+        if !wrote.isEmpty {
             attempt { try plan.git.resetHard(in: plan.worktree, to: plan.preHead) }
-            attempt { try store.recordPlanTurnWrote(itemId: plan.itemId, agentId: agent.id, detail: wrote, now: now) }
+            attempt { try store.recordPlanTurnWrote(itemId: plan.itemId, agentId: agent.id, detail: wrote.joined(separator: ", "), now: now) }
             return
         }
         guard case .succeeded(let r, _) = end else { return }
-        var text = r.text ?? ""
-        let fm = FileManager.default
-        if let files = try? fm.contentsOfDirectory(at: plan.directory, includingPropertiesForKeys: [.contentModificationDateKey]),
-           let newest = files.filter({ $0.pathExtension == "md" }).max(by: {
-               ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
-               < ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }),
-           let written = try? String(contentsOf: newest, encoding: .utf8), !written.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            text = written
-        }
+        let text = Self.readPlan(in: plan.directory) ?? String((r.text ?? "").prefix(Self.maxPlanBytes))
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         attempt { try store.recordPlan(itemId: plan.itemId, agentId: agent.id, text: text, now: now) }
+    }
+
+    static let maxPlanBytes = 64 * 1024
+
+    /// `<ws>/.brahma/plans/<KEY>/`, created step by step; nil when any part of it is a symlink or not a directory (a plan
+    /// directory the agent redirected is never used).
+    nonisolated static func planDirectory(workspace: URL, key: String) -> URL? {
+        let fm = FileManager.default
+        var url = workspace
+        for part in [".brahma", "plans", key] {
+            url = url.appending(path: part, directoryHint: .isDirectory)
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: url.path, isDirectory: &isDir) || (try? fm.attributesOfItem(atPath: url.path)) != nil {
+                guard (try? fm.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeDirectory else { return nil }
+            } else {
+                do { try fm.createDirectory(at: url, withIntermediateDirectories: false) } catch { return nil }
+            }
+        }
+        return url
+    }
+
+    /// The newest plan file: only regular, non-symlink `.md` files that really sit in `directory`, at most `maxPlanBytes` of it.
+    nonisolated static func readPlan(in directory: URL, limit: Int = maxPlanBytes) -> String? {
+        let fm = FileManager.default
+        guard (try? fm.attributesOfItem(atPath: directory.path))?[.type] as? FileAttributeType == .typeDirectory else { return nil }
+        let base = directory.resolvingSymlinksInPath().standardizedFileURL.path
+        var best: (url: URL, date: Date)?
+        for name in (try? fm.contentsOfDirectory(atPath: directory.path)) ?? [] where name.hasSuffix(".md") {
+            let url = directory.appending(path: name)
+            guard let attrs = try? fm.attributesOfItem(atPath: url.path), attrs[.type] as? FileAttributeType == .typeRegular,
+                  url.resolvingSymlinksInPath().standardizedFileURL.deletingLastPathComponent().path == base else { continue }
+            let date = (attrs[.modificationDate] as? Date) ?? .distantPast
+            if best == nil || date > best!.date { best = (url, date) }
+        }
+        guard let best, let handle = try? FileHandle(forReadingFrom: best.url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: limit) else { return nil }
+        let text = String(decoding: data, as: UTF8.self)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
     }
 
     /// `claude --resume` of a session it never persisted fails the same way forever; spot that so the next turn
@@ -610,7 +647,9 @@ struct PlanWatch {
     var worktree: URL
     var preHead: String
     var itemId: String
+    var key: String
     var directory: URL
+    var barrier: GitWorkspace.PlanBarrier
 }
 
 /// The session a turn used, remembered when the turn ends (warm rule, size rule, cache-break detection).

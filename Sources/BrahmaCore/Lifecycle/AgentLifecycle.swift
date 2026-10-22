@@ -27,8 +27,23 @@ extension Store {
 
     /// `transition`, plus what killing an agent does to its work: leases marked expired, items unassigned.
     func transitionAndRelease(db: Database, agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date) throws -> Agent {
+        // Teammates blocked on an agent that is killed are released by the transition; each is told why it is awake (an
+        // engine DM through the normal path), or it would have nothing to act on.
+        var waiters: [Agent] = []
+        if to == .killed, let target = try Agent.fetchOne(db, key: agentId) {
+            waiters = try Agent.filter(Column("companyId") == target.companyId && Column("state") == AgentState.blocked.rawValue)
+                .fetchAll(db).filter { $0.id != agentId && $0.blocker == .agent(agentId) }
+        }
         let agent = try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
-        if to == .killed { try releaseWork(of: agent, db: db, now: now) }
+        if to == .killed {
+            try releaseWork(of: agent, db: db, now: now)
+            for waiter in waiters {
+                try MessageRouter(store: self).sendDM(
+                    db: db, companyId: waiter.companyId, from: .system, to: waiter.name,
+                    text: "@\(agent.name) was removed from the company while you were waiting on them. "
+                        + "Re-plan: ask someone else or continue without them.", now: now)
+            }
+        }
         return agent
     }
 
@@ -58,10 +73,6 @@ extension Store {
             }
             if other.state == .blocked, other.blocker == .agent(killed.id) {
                 try transition(db: db, agentId: other.id, to: other.paused ? .sleeping : .ready, now: now)
-                // Released with nothing else to do would be an empty turn: tell it why it is awake.
-                try MessageRouter.systemDM(db: db, companyId: other.companyId, toAgentId: other.id,
-                                           text: "@\(killed.name) was removed from the company while you were waiting on them. "
-                                               + "Re-plan: ask someone else or continue without them.", now: now)
             }
         }
     }

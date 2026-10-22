@@ -24,8 +24,8 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var costUSD: Double?
     /// True when the turn failed for infrastructure reasons (network, account); never counted against the agent.
     public var infra: Bool = false
-    /// `review` turns look at one item (`itemId`); every other kind leaves it nil.
     public var kind: TurnKind = .work
+    /// The item a turn is about: the item of a review, plan or item-session work turn; nil for base-session turns.
     public var itemId: String? = nil
     /// Set when the session this turn used no longer existed ("session not found"): the turn is ignored by budgets, the
     /// watchdog and facts, and the agent is ready again at once.
