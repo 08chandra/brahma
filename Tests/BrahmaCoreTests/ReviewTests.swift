@@ -535,7 +535,7 @@ import GRDB
         if try r.world.agent(r.rev).state != .ready { try r.setReady(r.rev) }
         let begun = try #require(try r.store.beginTurn(agentId: r.rev.id, now: r.now))
         try r.store.setTurnContext(turnId: begun.1.id, kind: .review, itemId: i.id)
-        try r.store.endTurn(agentId: r.rev.id, turn: begun.1, end: .interrupted, deliveredItemIds: [], now: r.now)
+        try r.store.endTurn(agentId: r.rev.id, turn: begun.1, end: .interrupted(), deliveredItemIds: [], now: r.now)
         #expect(try r.fresh(i).reviewAttempts == 0, "an interrupted review turn is not an attempt")
         #expect(try r.world.agent(r.rev).state == .ready)
         #expect(try r.store.pendingReviews(agentId: r.rev.id).count == 1)

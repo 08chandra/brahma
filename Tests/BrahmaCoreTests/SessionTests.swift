@@ -240,13 +240,9 @@ import GRDB
     @Test func largeSessionStartsFresh() async throws {
         let s = try S()
         let ceo = try s.world.hire(s.company, "ceo")
-        // Until Task 14 the token columns do not exist: the time rule alone applies.
+        // The size rule reads the token columns Task 14a records on the session's last turn.
         try s.dm(ceo); try await s.cycle()
         let turn = try #require(try s.turns(ceo).last)
-        #expect(s.store.sessionTranscriptTokens(turnId: turn.id) == nil)
-        try s.exec("ALTER TABLE turn ADD COLUMN inputTokens INTEGER NOT NULL DEFAULT 0")
-        try s.exec("ALTER TABLE turn ADD COLUMN cacheReadTokens INTEGER NOT NULL DEFAULT 0")
-        try s.exec("ALTER TABLE turn ADD COLUMN cacheCreationTokens INTEGER NOT NULL DEFAULT 0")
         #expect(s.store.sessionTranscriptTokens(turnId: turn.id) == nil, "no usage recorded: unknown")
         try s.exec("UPDATE turn SET inputTokens = 100, cacheReadTokens = 59000, cacheCreationTokens = 900 WHERE id = ?", [turn.id])
         #expect(s.store.sessionTranscriptTokens(turnId: turn.id) == 60_000)

@@ -79,7 +79,7 @@ import GRDB
         #expect(turns.count == 2)
         #expect(turns[0].inputTokens == 10); #expect(turns[0].outputTokens == 20)
         #expect(turns[0].cacheReadTokens == 1000); #expect(turns[0].cacheCreationTokens == 300)
-        #expect(turns[0].itemId == item.id); #expect(turns[0].kind == "work")
+        #expect(turns[0].itemId == item.id); #expect(turns[0].kind == .work)
         #expect(turns[0].sessionId == "s-eng")
         #expect(turns[0].sessionTotalUSD == 0.10); #expect(turns[1].sessionTotalUSD == 0.25)
         // L-4: a turn's own cost is the cumulative total less the session's previous total.
@@ -130,6 +130,10 @@ import GRDB
         try await b.turn(Self.script(Self.result()))
         #expect(b.w.fake.requests.last?.agent.model != "opus", "an unconfirmed spec cannot buy the better model")
         _ = try b.store.confirmSpec(id: item.id, by: .owner, now: b.w.clock.now)
+        // The model of a warm (agent, item) session is fixed (Task 10); the next fresh session picks the tier's model.
+        try await b.turn(Self.script(Self.result()))
+        #expect(b.w.fake.requests.last?.agent.model != "opus", "a warm item session keeps its model")
+        b.w.clock.advance(SessionPolicy.warmSeconds + 1)
         try await b.turn(Self.script(Self.result()))
         #expect(b.w.fake.requests.last?.agent.model == "opus")
     }
@@ -247,7 +251,7 @@ import GRDB
     @Test func infraTurnsNotCounted() throws {
         let b = try B()
         let item = try b.leased(tier: .s)
-        func row(_ n: Int, infra: Bool = false, reset: String? = nil, kind: String = "work", outcome: TurnOutcome = .succeeded, cost: Double = 1) throws {
+        func row(_ n: Int, infra: Bool = false, reset: String? = nil, kind: TurnKind = .work, outcome: TurnOutcome = .succeeded, cost: Double = 1) throws {
             var t = Turn(id: "t\(n)", agentId: b.eng.id, companyId: b.c.id, startedAt: b.w.clock.now, endedAt: b.w.clock.now,
                          outcome: outcome, summary: nil, costUSD: cost, infra: infra)
             t.itemId = item.id; t.kind = kind; t.inputTokens = 1000; t.costLE = cost; t.sessionResetReason = reset
@@ -256,7 +260,7 @@ import GRDB
         try row(1)
         try row(2, infra: true)
         try row(3, reset: "session not found")
-        try row(4, kind: "review")
+        try row(4, kind: .review)
         try row(5, outcome: .usageLimited, cost: 0)
         try row(6, outcome: .interrupted, cost: 2)
         let used = try b.store.itemUsage(itemId: item.id)
