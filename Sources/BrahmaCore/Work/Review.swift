@@ -137,14 +137,14 @@ public enum ReviewDigest {
 ///
 /// The rule is an allowlist computed by the engine; nothing an implementer sets can make an item qualify. An item skips its
 /// review turn only when every one of these holds:
-/// - auto-merge is on (the owner's switch and the pack's `autoMerge`);
+/// - auto-merge is on (the owner's switch and the pack's `autoMerge`; a company whose pack is missing has it off);
 /// - tier S with an engine check, where the tier, the check and the spec confirmation were each set by the engine, the owner
 ///   or a lead who is not the item's assignee, lease holder or submitter (`Store.autoMergeProvenanceHolds`);
 /// - a clean first-round pass: no review flag (a flaky pass is one), no earlier `changesRequested`, review round 1;
 /// - the change, measured by the engine from the engine-recorded base and from `main`'s merge base to the verified commit, is
 ///   under `autoMergeMaxLines` changed lines and `autoMergeMaxBytes` changed bytes, deletes no file, adds no binary, executable,
 ///   symlink or submodule, and every path (both sides of a rename) lies under the allowed directories (`autoMergePaths`) and is
-///   not sensitive (`isSensitive`);
+///   not sensitive (`isSensitive`: no build, CI or agent configuration, no test file, nothing the check command names);
 /// - neither the assignee, the lease holder nor the submitter has `fullReview`.
 ///
 /// Every auto-merge is audited: batches of up to `auditBatchMax` per audit turn, routed like reviews.
@@ -166,8 +166,8 @@ public enum ReviewPolicy {
     public static let defaultAutoMergePaths = ["Sources/", "src/", "lib/", "app/", "docs/"]
 
     /// Matched case-insensitively against each path component (the workspace file system usually is case-insensitive):
-    /// `name/` matches any directory component, anything else the file name; `*` is a wildcard. Check-script files are
-    /// sensitive as well (`isSensitive(_:checkScripts:)`).
+    /// `name/` matches any directory component, anything else the file name; `*` is a wildcard. Test files and the files a
+    /// check references are sensitive as well (`isSensitive(_:checkScripts:checkTokens:)`).
     public static let sensitivePatterns = [
         // Version control and CI.
         ".git/", ".gitattributes", ".gitmodules", ".gitignore", ".github/", ".gitlab/", ".gitlab-ci.yml", ".circleci/",
@@ -183,14 +183,26 @@ public enum ReviewPolicy {
         ".claude/", ".mcp.json", "CLAUDE.md", "AGENTS.md", ".brahma/", ".env*", "*.pem", "*.key", "*.p12",
         // Schema changes and scripts.
         "migrations/", "migrate/", "*.sql", "*.sh", "*.bash", "*.zsh", "*.ps1", "*.bat", "*.cmd",
+        // Tests: what a check runs (and `PathRules.isTestFile`).
+        "test/", "tests/", "__tests__/", "spec/", "specs/", "*_test.*", "*.test.*", "*.spec.*", "test_*.py", "*Tests.swift",
+        "*Test.java",
     ]
 
-    /// Whether a changed path (repository-relative, as git reports it) is one a review turn must see.
-    public static func isSensitive(_ path: String, checkScripts: Set<String> = []) -> Bool {
+    /// Whether a changed path (repository-relative, as git reports it) is one a review turn must see: a sensitive pattern, a
+    /// test file (`PathRules.isTestFile`), one of `checkScripts` (the check's saved scripts, exact paths), or a file the check
+    /// command may reach: its name equals the last component of any of `checkTokens` (`CheckScripts.checkTokens`), or its path
+    /// equals or ends with one (`*` in a token is a wildcard). A check is not weakened from inside an allowed directory.
+    public static func isSensitive(_ path: String, checkScripts: Set<String> = [], checkTokens: Set<String> = []) -> Bool {
         let lower = path.lowercased()
         let parts = lower.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         guard let name = parts.last else { return true }
         if checkScripts.contains(where: { $0.lowercased() == lower }) { return true }
+        if PathRules.isTestFile(path) { return true }
+        for token in checkTokens.map({ $0.lowercased() }) {
+            guard let last = token.split(separator: "/", omittingEmptySubsequences: true).last.map(String.init) else { continue }
+            if lower == token || lower.hasSuffix("/" + token) || name == last { return true }
+            if token.contains("*"), glob(token, lower) || glob("*/" + token, lower) || glob(last, name) { return true }
+        }
         for pattern in sensitivePatterns.map({ $0.lowercased() }) {
             if pattern.hasSuffix("/") {
                 let dir = String(pattern.dropLast())

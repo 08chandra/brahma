@@ -406,6 +406,16 @@ extension Store {
                                         text: "check passed on re-run after rebase onto main (flaky); it needs another review",
                                         alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
                     try Store.wakeReviewer(db: db, item: item, now: now)
+                } else if item.reviewedRound < item.reviewRound {
+                    // Its auto-approval was taken back while this check ran (auto-merge switched off): it goes to its reviewer.
+                    item.verifiedRevision = run.checkRevision
+                    item.mergeState = .none
+                    item.reviewAttempts = 0
+                    try item.update(db)
+                    try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed,
+                                        text: "check passed after rebase onto main; it needs a review",
+                                        alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+                    try Store.wakeReviewer(db: db, item: item, now: now)
                 } else {
                     // The rebased branch passed again: it is approved and waits to land. (Not a new review, so no reviewer is woken.)
                     item.mergeState = .pending

@@ -52,6 +52,53 @@ public enum CheckScripts {
         return out
     }
 
+    /// Options whose value is a directory the command runs in (`-C X`, `--directory=X` …), besides `cd X`.
+    private static let directoryOptions: Set<String> = ["-C", "--directory", "--dir", "--chdir", "--cwd", "--prefix", "--package-path",
+                                                        "--rootdir", "--working-directory"]
+
+    /// Every relative path a check command could name, for risk-tiered review (9c): each token as `candidatePaths` cleans it;
+    /// the value of each `--option=value`; a Python module run with `-m a.b` as `a/b.py`, `a/b/__main__.py` and `a/b`; and each
+    /// of those again relative to every directory the command changes into (`cd X &&`, `cd X;`, `(cd X && …)`, `-C X`,
+    /// `--directory X` and the like), so `cd src && python3 check.py` names `src/check.py`. Over-inclusive on purpose: a changed
+    /// file whose name or path suffix matches any of these keeps its review (`ReviewPolicy.isSensitive`).
+    public static func checkTokens(command: String) -> Set<String> {
+        var raw: [String] = []
+        var token = ""
+        for ch in command {
+            if ch.isWhitespace || separators.contains(ch) {
+                if !token.isEmpty { raw.append(token); token = "" }
+            } else if ch != "'" && ch != "\"" {
+                token.append(ch)
+            }
+        }
+        if !token.isEmpty { raw.append(token) }
+
+        func clean(_ t: String) -> String? {
+            guard !t.isEmpty, !t.hasPrefix("/") else { return nil }
+            let parts = t.split(separator: "/", omittingEmptySubsequences: true).filter { $0 != "." }
+            guard !parts.isEmpty, !parts.contains("..") else { return nil }
+            return parts.joined(separator: "/")
+        }
+        var tokens = Set<String>(), dirs = Set<String>()
+        for (n, t) in raw.enumerated() {
+            let previous = n > 0 ? raw[n - 1] : ""
+            var values = [t]
+            if let eq = t.firstIndex(of: "="), t.hasPrefix("-") || eq != t.startIndex {
+                let key = String(t[..<eq]), value = String(t[t.index(after: eq)...])
+                values.append(value)
+                if directoryOptions.contains(key), let d = clean(value) { dirs.insert(d) }
+            }
+            if previous == "cd" || directoryOptions.contains(previous), let d = clean(t) { dirs.insert(d) }
+            if previous == "-m", !t.contains("/"), !t.hasPrefix("-") {
+                let module = t.replacingOccurrences(of: ".", with: "/")
+                values += [module + ".py", module + "/__main__.py", module]
+            }
+            tokens.formUnion(values.compactMap(clean))
+        }
+        for d in dirs { for t in Array(tokens) { tokens.insert(d + "/" + t) } }
+        return tokens
+    }
+
     /// Relative regular files under `root` that the command mentions (see `candidatePaths`); directories, symlinks and
     /// anything resolving outside `root` are ignored. At most `maxFiles`.
     public static func referencedFiles(command: String, root: URL) -> [String] {

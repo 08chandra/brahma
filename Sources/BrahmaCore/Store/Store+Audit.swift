@@ -51,10 +51,33 @@ extension Store {
         try Bool.fetchOne(db, sql: "SELECT autoMerge FROM ownerSettings WHERE id = 1") ?? true
     }
 
-    public func setAutoMerge(_ on: Bool) throws {
+    /// Switching it off also takes back every auto-approval that has not landed (`revokeAutoApprovals`).
+    public func setAutoMerge(_ on: Bool, now: Date = Store.now()) throws {
         try writer.write { db in
             try Store.ensureOwnerSettings(db)
             try db.execute(sql: "UPDATE ownerSettings SET autoMerge = ? WHERE id = 1", arguments: [on])
+            if !on { try revokeAutoApprovals(db: db, now: now) }
+        }
+    }
+
+    /// Every auto-approved item still in review goes back to a normal review: its round is reopened, and an item waiting to
+    /// land (`pending`) has its review turn due at once on the commit its check passed on. One re-checking after a rebase
+    /// (`verifying`) goes to its reviewer when that check passes (`finishVerification`). An item whose merge was already under
+    /// way when the switch flipped still lands; it is queued for audit like an auto-merge (`queueAudit`).
+    func revokeAutoApprovals(db: Database, now: Date) throws {
+        let items = try WorkItem.filter(Column("autoApproved") == true && Column("status") == WorkItemStatus.inReview.rawValue
+                                        && [MergeState.pending.rawValue, MergeState.verifying.rawValue].contains(Column("mergeState")))
+            .fetchAll(db)
+        for var item in items {
+            item.autoApproved = false
+            item.reviewedRound = max(item.reviewRound - 1, 0)
+            item.reviewAttempts = 0
+            if item.mergeState == .pending { item.mergeState = .none }
+            item.updatedAt = now
+            try item.update(db)
+            try recordItemEvent(db: db, item: item, actor: "system", kind: .edited,
+                                text: "auto-merge was switched off before it landed; it needs a review", now: now)
+            try Store.wakeReviewer(db: db, item: item, now: now)
         }
     }
 
@@ -124,9 +147,10 @@ extension Store {
             if let path = paths.sorted().first(where: { !ReviewPolicy.isAllowed($0, under: allowed) }) {
                 return keep("\(Self.flat(path, max: 200)) is outside the auto-merge paths")
             }
-            var scripts = Set(item.checkSpec.map { CheckScripts.candidatePaths(command: $0.command) } ?? [])
+            let tokens = item.checkSpec.map { CheckScripts.checkTokens(command: $0.command) } ?? []
+            var scripts = Set<String>()
             if let snapshot = try latestCheckSnapshot(itemId: item.id, upTo: item.checkRevision) { scripts.formUnion(snapshot.manifest.keys) }
-            if let path = paths.sorted().first(where: { ReviewPolicy.isSensitive($0, checkScripts: scripts) }) {
+            if let path = paths.sorted().first(where: { ReviewPolicy.isSensitive($0, checkScripts: scripts, checkTokens: tokens) }) {
                 return keep("sensitive path \(Self.flat(path, max: 200))")
             }
             if lines >= ReviewPolicy.autoMergeMaxLines { return keep("\(lines) changed lines") }
@@ -138,14 +162,14 @@ extension Store {
     }
 
     /// The database half of the auto-approval rule (checked again inside the transaction that records the pass): auto-merge
-    /// on for the owner and the pack; tier S with an engine check, both (and the spec confirmation) set by a trusted
+    /// on for the owner and the pack (off when the company's pack is missing); tier S with an engine check, both (and the spec confirmation) set by a trusted
     /// non-implementer (`autoMergeProvenanceHolds`); the first review round with no review flag and no earlier change request;
     /// no merge pending; a recorded base; and neither the assignee, the lease holder nor the submitter on full review.
     func autoMergeCandidate(db: Database, item: WorkItem, run: VerificationRun) throws -> Bool {
         guard item.tier == .s, item.checkSpec != nil, item.reviewFlags.isEmpty, item.status == .inReview, item.mergeState == .none,
               item.reviewRound == 1, item.reviewedRound == 0, item.baseCommit != nil, run.purpose == .submit, !run.flaky,
               let company = try Company.fetchOne(db, key: item.companyId),
-              try Self.ownerAutoMerge(db: db), catalog.pack(company.packId)?.autoMerge ?? true else { return false }
+              try Self.ownerAutoMerge(db: db), catalog.pack(company.packId)?.autoMerge == true else { return false }
         let returned = try WorkItemEvent.filter(Column("itemId") == item.id && Column("kind") == WorkEventKind.changesRequested.rawValue)
             .fetchCount(db)
         guard returned == 0 else { return false }
@@ -182,9 +206,10 @@ extension Store {
     // MARK: Queueing
 
     /// Called in the transaction that marks an item merged, before its lease goes: an auto-approved item counts as an
-    /// auto-merge of its company, and every one is queued for an audit.
+    /// auto-merge of its company, and every one is queued for an audit. So does an item that landed with its round still open
+    /// (every approval closes it): an auto-approval revoked while its merge was already under way.
     func queueAudit(db: Database, item: WorkItem, mergedCommit: String) throws {
-        guard item.autoApproved else { return }
+        guard item.autoApproved || item.reviewedRound < item.reviewRound else { return }
         try db.execute(sql: "UPDATE company SET autoMergeCount = autoMergeCount + 1 WHERE id = ?", arguments: [item.companyId])
         let author = try Self.leaseHolderId(db: db, itemId: item.id) ?? item.ownerId
         let submitter = try VerificationRun.filter(Column("itemId") == item.id && Column("purpose") == VerificationPurpose.submit.rawValue)
@@ -283,12 +308,16 @@ extension Store {
     }
 
     /// Who audits a sample, resolved like a reviewer: the item's reviewer, else the nearest manager above the author (else the
-    /// assignee), else the CTO, else an executive. Never the author, the assignee or the submitter, and never an agent that is
-    /// killed or paused. Nil when nobody qualifies (the sample waits; the overdue alert tells the owner).
+    /// assignee), else the CTO, else an executive. Never the author, the assignee, the submitter or anyone who held the item's
+    /// lease or submitted it before, and never an agent that is killed or paused. Nil when nobody qualifies (the sample waits; the overdue alert tells the owner).
     func auditorFor(db: Database, sample: ReviewAudit) throws -> Agent? {
         guard let item = try WorkItem.fetchOne(db, key: sample.itemId), item.companyId == sample.companyId,
               let company = try Company.fetchOne(db, key: item.companyId) else { return nil }
-        let excluded = Set([sample.authorId, sample.assigneeId, sample.submitterId].compactMap { $0 })
+        // Anyone who ever held the item's lease or submitted it is one of its implementers as well.
+        let past = try String.fetchAll(db, sql: """
+            SELECT DISTINCT actorId FROM workItemEvent WHERE itemId = ? AND kind IN (?, ?)
+            """, arguments: [item.id, WorkEventKind.leaseClaimed.rawValue, WorkEventKind.submitted.rawValue])
+        let excluded = Set([sample.authorId, sample.assigneeId, sample.submitterId].compactMap { $0 } + past)
         func usable(_ agent: Agent?) -> Agent? {
             guard let agent, agent.companyId == item.companyId, agent.state != .killed, !agent.paused, !excluded.contains(agent.id)
             else { return nil }

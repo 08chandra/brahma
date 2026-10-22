@@ -1835,6 +1835,85 @@ extension ReviewTests {
                           "named python check")
     }
 
+    @Test func aCheckReferencedOrTestFileIsNeverAutoMerged() async throws {
+        let r = try R()
+        try r.commitMain(["src/check.py": "print('ok')\n", "src/__tests__/a.test.ts": "it('ok', () => {})\n"])
+        // The check names `check.py` relative to the directory it changes into: a one-line edit of src/check.py is reviewed.
+        try keptForReview(r, try await submitted(r, command: "cd src && python3 check.py", files: ["src/check.py": "print('ok') # x\n"]),
+                          "check script resolved through cd")
+        // A test file under an allowed directory.
+        try keptForReview(r, try await submitted(r, files: ["src/__tests__/a.test.ts": "it('ok', () => { /* x */ })\n"]), "a test file")
+        // Tokens: as written, resolved against `cd X` / `(cd X; …)` / `-C X`, and Python module names.
+        let tokens = CheckScripts.checkTokens(command: "cd src && python3 check.py; (cd lib/x; node run.js) && tool -C app/gen v.rb "
+                                                  + "&& python3 -m pkg.verify --config=conf/c.yml")
+        for t in ["check.py", "src/check.py", "lib/x/run.js", "app/gen/v.rb", "pkg/verify.py", "conf/c.yml"] {
+            #expect(tokens.contains(t), "\(t) in \(tokens.sorted())")
+        }
+        // Basename or path suffix of a token.
+        #expect(ReviewPolicy.isSensitive("src/deep/check.py", checkTokens: ["check.py"]))
+        #expect(ReviewPolicy.isSensitive("src/a/tools/run.js", checkTokens: ["tools/run.js"]))
+        #expect(ReviewPolicy.isSensitive("src/b/run.js", checkTokens: ["tools/run.js"]), "same basename")
+        #expect(!ReviewPolicy.isSensitive("src/other.py", checkTokens: ["check.py"]))
+        #expect(!ReviewPolicy.isSensitive("src/xcheck.py", checkTokens: ["check.py"]))
+        // Test directories and test-file names.
+        for p in ["src/test/a.txt", "src/tests/a.txt", "src/__tests__/b.js", "src/spec/a.rb", "src/specs/a.rb", "src/foo_test.go",
+                  "src/foo.test.ts", "src/foo.spec.js", "src/test_foo.py", "Sources/App/FooTests.swift", "src/FooTest.java",
+                  "src/conftest.py", "src/foo-spec.js"] {
+            #expect(ReviewPolicy.isSensitive(p), "\(p)")
+        }
+        #expect(!ReviewPolicy.isSensitive("src/contest.txt")); #expect(!ReviewPolicy.isSensitive("src/testing.md"))
+    }
+
+    @Test func aCompanyWhosePackIsMissingDoesNotAutoMerge() async throws {
+        let r = try R()
+        // The pack is gone after the work was claimed (a pack file removed or renamed).
+        let i = try r.item("small change", tier: .s)
+        let wt = try r.claim(i, r.eng)
+        try r.write("src/nopack.txt", "x\n", in: wt)
+        try r.exec("UPDATE company SET packId = 'no-such-pack' WHERE id = ?", [r.company.id])
+        try r.submit(i, r.eng)
+        try await r.cycle()
+        try keptForReview(r, i, "missing pack")
+    }
+
+    @Test func switchingAutoMergeOffRevokesPendingAutoApprovals() async throws {
+        let r = try R()
+        let i = try await submitted(r, files: ["src/pending.txt": "x\n"])
+        #expect(i.mergeState == .pending); #expect(i.autoApproved)
+        try r.store.setAutoMerge(false)
+        let back = try r.fresh(i)
+        #expect(back.status == .inReview); #expect(back.mergeState == .none); #expect(!back.autoApproved)
+        #expect(back.reviewedRound < back.reviewRound)
+        #expect(try r.store.pendingReviews(agentId: r.rev.id).map(\.id).contains(i.id), "back to a normal review")
+        #expect(try r.events(i, .edited).contains { $0.text.contains("auto-merge was switched off") })
+        try await r.cycle()
+        #expect(try r.fresh(i).status == .inReview, "nothing lands without the review")
+        _ = try r.review(r.rev, i, .approve)
+        let done = try await r.drive(i)
+        #expect(done.status == .done); #expect(!done.autoApproved)
+        #expect(try audit(r, i.id) == nil, "a reviewed merge is not audited")
+        #expect(try r.store.company(id: r.company.id)?.autoMergeCount == 0)
+    }
+
+    @Test func switchingAutoMergeOffDuringAReCheckSendsTheItemToReview() async throws {
+        let r = try R()
+        let a = try await submitted(r, files: ["src/first.txt": "x\n"])
+        let b = try await submitted(r, files: ["src/second.txt": "y\n"])
+        #expect(try r.fresh(b).autoApproved)
+        _ = try await r.drive(a)
+        for _ in 0..<4 where try r.fresh(b).mergeState != .verifying { try await r.cycle() }
+        #expect(try r.fresh(b).mergeState == .verifying, "main moved on: b re-checks after its rebase")
+        try r.store.setAutoMerge(false)
+        #expect(try r.fresh(b).mergeState == .verifying); #expect(!(try r.fresh(b).autoApproved))
+        try await r.cycle()
+        let rechecked = try r.fresh(b)
+        #expect(rechecked.mergeState == .none); #expect(rechecked.status == .inReview)
+        #expect(try r.store.pendingReviews(agentId: r.rev.id).map(\.id).contains(b.id), "the passed re-check goes to review")
+        _ = try r.review(r.rev, b, .approve)
+        #expect(try await r.drive(b).status == .done)
+        #expect(try audit(r, b.id) == nil); #expect(try audit(r, a.id) != nil)
+    }
+
     @Test func deletionsModesLinksAndBinariesKeepReview() async throws {
         let r = try R()
         try r.commitMain(["src/gone.txt": "x\n", "src/tool.txt": "y\n"])
@@ -2025,10 +2104,19 @@ extension ReviewTests {
         try r.exec("UPDATE workItem SET reviewerId = ? WHERE id = ?", [r.eng2.id, third.item.id])
         try r.store.scheduleAudit(companyId: r.company.id, now: r.now)
         #expect(try audit(r, third.item.id)?.auditorId == r.cto.id)
+        // Nor anyone who held its lease or submitted it before: the item's reviewer once claimed it.
+        let fourth = try sample(r, author: r.eng, n: 4)
+        try r.exec("""
+            INSERT INTO workItemEvent (companyId, itemId, actorId, kind, text, createdAt, createdActive) VALUES (?, ?, ?, ?, '', ?, 0)
+            """, [r.company.id, fourth.item.id, r.rev.id, WorkEventKind.leaseClaimed.rawValue, r.now])
+        _ = try r.store.setPaused(agentId: r.rev.id, false, now: r.now)
+        try r.store.scheduleAudit(companyId: r.company.id, now: r.now)
+        #expect(try audit(r, fourth.item.id)?.auditorId == r.mgr.id, "a past claimer never audits")
+        _ = try r.store.setPaused(agentId: r.rev.id, true, now: r.now)
         // Killed: re-routed again.
         try r.exec("UPDATE agent SET state = 'killed' WHERE id = ?", [r.mgr.id])
         try r.store.scheduleAudit(companyId: r.company.id, now: r.now)
-        #expect(Set(try r.store.pendingAudits(agentId: r.cto.id).map(\.itemId)) == [s.item.id, own.item.id, third.item.id])
+        #expect(Set(try r.store.pendingAudits(agentId: r.cto.id).map(\.itemId)) == [s.item.id, own.item.id, third.item.id, fourth.item.id])
     }
 
     @Test func anAuditWaitingThreeActiveDaysEscalatesToTheOwner() async throws {
