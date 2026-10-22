@@ -28,6 +28,17 @@ public actor Orchestrator {
     /// Health work that must never block a tick (doctor re-probe, `claude --version`, HTTPS probe, disk checks).
     var healthTasks: [String: Task<Void, Never>] = [:]
     var health = HealthState()
+    /// Git work that must never block a tick: removing worktrees, the orphan sweep, creating a dispatched item's worktree.
+    var gitTasks: [String: Task<Void, Never>] = [:]
+    /// Agents the engine has just leased an item to, until their worktree exists (they are not scheduled meanwhile).
+    var dispatching = Set<String>()
+    /// Items whose dispatch failed in git: not offered again before this time.
+    var dispatchBackoff: [String: Date] = [:]
+    var lastDispatch: Date?
+    /// Consecutive lease turns that could not start for want of a worktree, per item.
+    var worktreeFailures: [String: Int] = [:]
+    static let maxWorktreeFailures = 3
+    var lastSweep: [String: Date] = [:]
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
     var infraCooldown: [String: Date] = [:]
@@ -58,7 +69,7 @@ public actor Orchestrator {
 
     public func waitUntilIdle(timeout: Duration) async throws {
         let deadline = ContinuousClock.now + timeout
-        while !tasks.isEmpty || !healthTasks.isEmpty {
+        while !tasks.isEmpty || !healthTasks.isEmpty || !gitTasks.isEmpty {
             guard ContinuousClock.now < deadline else { throw OrchestratorError.idleTimeout(running: runningCount()) }
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -70,7 +81,7 @@ public actor Orchestrator {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        let inFlight = Array(tasks.values) + Array(healthTasks.values)
+        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values)
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -100,6 +111,11 @@ public actor Orchestrator {
         let calibration = try store.usageCalibration()
         let reservedLE = store.openReservationLE()
 
+        // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
+        // ready items to idle individual contributors. Nothing here waits on git.
+        let reaped = try store.reapLeases(now: now)
+        leaseMaintenance(now: now, companies: companies, reaped: reaped, held: held)
+
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }
 
@@ -116,7 +132,7 @@ public actor Orchestrator {
 
         // 2. How many live agents each agent is holding up.
         let all = try store.agents()
-        var blocking: [String: Int] = [:]
+        var blocking: [String: Int] = (try? store.blockingCounts()) ?? [:]
         for a in all where a.state != .killed {
             if case .agent(let id)? = a.blocker { blocking[id, default: 0] += 1 }
         }
@@ -184,13 +200,25 @@ public actor Orchestrator {
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         let ready = try store.agents(states: [.ready])
         let candidates = ready.compactMap { a -> Candidate? in
-            guard !a.paused, tasks[a.id] == nil, infraCooldown[a.id] == nil, let c = byId[a.companyId] else { return nil }
+            guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil,
+                  let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
                                         usage: { decisions[$0.id] ?? .open }, otherChildren: 0, pressure: pressure,
                                         held: held, paceClosed: paceClosed, paceStrict: paceStrict)
         for agent in selected { launch(agent, now: now) }
+
+        // 6. Engine dispatch, after admission: only into the slots admission left over, and only for companies whose gate,
+        //    pace and concurrency cap would let a new agent run. Leases are never reserved for agents admission would refuse.
+        if !held {
+            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), pressure: pressure, held: held)
+            var companyFree: [String: Int] = [:]
+            for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id) {
+                companyFree[c.id] = max(cfg.modeCap(c.usageMode) - (runningByCompany[c.id] ?? 0), 0)
+            }
+            dispatchTick(now: now, companies: companies, skipping: Set(reaped.map(\.itemId)), freeSlots: free, companyFree: companyFree)
+        }
     }
 
     private func logPressure(_ level: MemoryPressure, now: Date) {
@@ -241,6 +269,7 @@ public actor Orchestrator {
         var lastInfo: RateLimitInfo?
         var failure: String?
         var runnerError: (any Error)?
+        var worktreeUnavailable: WorktreeUnavailable?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             items = try store.pendingInbox(agentId: agent.id)
@@ -258,13 +287,30 @@ public actor Orchestrator {
                 agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
                 mode: company.usageMode, context: (try? store.askModelContext(agentId: agent.id)) ?? ModelContext())
             let turnToken = try store.issueTurnCredential(turnId: turn.id)
+            // A leaseholder works inside its item's worktree (with the shared `.brahma` directory); everyone else in the workspace.
+            var workingDirectory = company.workspacePath
+            var addDirs: [String] = []
+            if let lease = try store.lease(agentId: agent.id), let leased = try store.workItem(id: lease.itemId) {
+                let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+                let git = store.gitWorkspace(root: workspace, companyId: company.id)
+                let checkout = git.worktreePath(key: leased.key)
+                if !git.hasCheckout(key: leased.key) {
+                    do { try git.addWorktree(key: leased.key) } catch {
+                        // Never run a leaseholder's turn outside its worktree: the turn does not start.
+                        throw WorktreeUnavailable(itemId: leased.id, key: leased.key, reason: "\(error)")
+                    }
+                }
+                await clearWorktreeFailures(itemId: leased.id)
+                workingDirectory = checkout.path
+                addDirs = [checkout.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
+            }
             let request = TurnRequest(
                 agent: sent, company: company,
                 prompt: Self.prompt(agent: agent, company: company, items: items, handles: handles,
                                     unread: Store.channelCounts(quiet), notices: notices, collapsedNotices: collapsedNotices),
                 appendSystemPrompt: RolePrompt.render(agent: agent, company: company),
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken),
-                workingDirectory: company.workspacePath, profile: profile,
+                workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
             var sessionMarked = agent.sessionStarted
@@ -292,6 +338,8 @@ public actor Orchestrator {
                     break
                 }
             }
+        } catch let e as WorktreeUnavailable {
+            worktreeUnavailable = e
         } catch {
             failure = String(describing: error)
         }
@@ -300,7 +348,26 @@ public actor Orchestrator {
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
-        if Task.isCancelled {
+        if let unavailable = worktreeUnavailable {
+            // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
+            // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime.
+            if await noteWorktreeFailure(itemId: unavailable.itemId) >= Self.maxWorktreeFailures {
+                await clearWorktreeFailures(itemId: unavailable.itemId)
+                attempt {
+                    try store.appendEvent(ActivityEvent(
+                        companyId: agent.companyId, agentId: agent.id, turnId: turn.id, kind: .error,
+                        text: "@\(agent.name) turn not started: the worktree of \(unavailable.key) is missing and could not be created "
+                            + "(\(Self.maxWorktreeFailures) tries): \(unavailable.reason); lease released",
+                        createdAt: now))
+                    try store.releaseLease(itemId: unavailable.itemId, agentId: agent.id,
+                                           note: "the worktree could not be created", now: now)
+                }
+            } else {
+                log("worktree of \(unavailable.key) unavailable for @\(agent.name): \(unavailable.reason)")
+            }
+            await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            end = .interrupted
+        } else if Task.isCancelled {
             end = .interrupted
         } else if let r = result, !r.isError {
             // A completed turn always counts, even if it also hit the limit: re-running it would repeat its posts.
@@ -376,6 +443,9 @@ public actor Orchestrator {
     }
 }
 
+/// A leaseholder's worktree is missing and could not be recreated.
+struct WorktreeUnavailable: Error { var itemId: String; var key: String; var reason: String }
+
 enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.
     case succeeded(TurnResult, usageHold: Date?)
@@ -407,7 +477,7 @@ extension Store {
                     if condition: (Agent) -> Bool) throws -> Agent? {
         try writer.write { db in
             guard let a = try Agent.fetchOne(db, key: agentId), condition(a) else { return nil }
-            return try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
+            return try transitionAndRelease(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
         }
     }
 
@@ -504,6 +574,7 @@ extension Store {
 
             // Killed (or otherwise moved) mid-turn: the turn is recorded, the state is left alone.
             guard agent.state == .running else { return infraClass }
+            if case .succeeded = end { try Store.renewLeases(db: db, agentId: agentId, now: now) }
             if agent.paused {
                 try Store.transition(db: db, agentId: agentId, to: .sleeping, now: now)
                 return infraClass

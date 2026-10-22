@@ -273,6 +273,19 @@ enum Migrations {
             try db.create(index: "workNotice_agent_pending", on: "workNotice", columns: ["agentId", "deliveredTurnId"])
             try db.alter(table: "agent") { t in t.add(column: "lastNoticeWakeActive", .double) }
         }
+        m.registerMigration("v3-leases") { db in
+            try db.create(table: "workLease") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("acquiredAt", .datetime).notNull()
+                t.column("expiresActive", .double).notNull()
+            }
+            try db.create(index: "workLease_agent", on: "workLease", columns: ["agentId"])
+            try db.alter(table: "workItem") { t in t.add(column: "touchPaths", .text).notNull().defaults(to: "[]") }
+            // Owner-editable hot paths (JSON globs); NULL means `WorkPolicy.defaultHotPaths`.
+            try db.alter(table: "ownerSettings") { t in t.add(column: "hotPaths", .text) }
+        }
         m.registerMigration("v3-asks") { db in
             try db.alter(table: "company") { t in t.add(column: "autonomy", .text).notNull().defaults(to: "important") }
             try db.alter(table: "agent") { t in t.add(column: "pausedActive", .double) }

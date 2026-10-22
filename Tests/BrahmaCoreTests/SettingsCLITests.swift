@@ -65,6 +65,24 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try brahma(["settings", "plan"], home: nokey.url).status == 0)
     }
 
+    @Test func hotPathsShowSetDefaultAndOwnerOnly() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        let defaults = try brahma(["settings", "hot-paths"], home: home)
+        #expect(defaults.status == 0, "\(defaults.stderr)")
+        #expect(defaults.stdout.split(separator: "\n").map(String.init) == WorkPolicy.defaultHotPaths)
+        let set = try brahma(["settings", "hot-paths", "Package.swift", "db/migrations/**"], home: home)
+        #expect(set.status == 0, "\(set.stderr)")
+        #expect(try brahma(["settings", "hot-paths"], home: home).stdout == "Package.swift\ndb/migrations/**\n")
+        #expect(try brahma(["settings", "hot-paths", "/abs"], home: home).status != 0)
+        #expect(try brahma(["settings", "hot-paths"], home: home).stdout == "Package.swift\ndb/migrations/**\n")
+        let inAgent = try brahma(["settings", "hot-paths", "x"], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
+        #expect(try brahma(["settings", "hot-paths", "default"], home: home).status == 0)
+        #expect(try brahma(["settings", "hot-paths"], home: home).stdout.split(separator: "\n").map(String.init) == WorkPolicy.defaultHotPaths)
+        let nokey = try OwnerTestHome(initOwner: false)
+        #expect(try brahma(["settings", "hot-paths", "x"], home: nokey.url).stderr.contains("owner key missing or invalid"))
+    }
+
     @Test func companyReserveOverride() throws {
         let owner = try OwnerTestHome(); let home = owner.url
         #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)

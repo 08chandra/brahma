@@ -28,15 +28,20 @@ public struct CompanyTools: Sendable {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
     }
 
-    private static func schema(_ properties: [String: JSONValue], required: [String]) -> JSONValue {
+    static func schema(_ properties: [String: JSONValue], required: [String]) -> JSONValue {
         .object(["type": .string("object"), "properties": .object(properties),
                  "required": .array(required.map { .string($0) })])
     }
-    private static func prop(_ type: String, _ description: String) -> JSONValue {
+    static func prop(_ type: String, _ description: String) -> JSONValue {
         .object(["type": .string(type), "description": .string(description)])
     }
 
-    public func specs() -> [ToolSpec] {
+    /// The same list for every role (a stable prompt prefix); `call` enforces what the caller's role may use.
+    public func specs() -> [ToolSpec] { Self.baseSpecs() + Self.workSpecs() + Self.inboxToolSpecs() }
+
+    private static let implemented: Set<String> = Set((baseSpecs() + workSpecs() + inboxToolSpecs()).map(\.name))
+
+    private static func baseSpecs() -> [ToolSpec] {
         let s = Self.self
         let handles: JSONValue = .object(["type": .string("array"), "items": .object(["type": .string("string")]),
                                           "description": .string("Teammate handles")])
@@ -57,11 +62,11 @@ public struct CompanyTools: Sendable {
             ToolSpec(name: "create_channel", description: "Create a channel with the given teammates (you are always included).",
                      inputSchema: s.schema(["name": s.prop("string", "Channel name"), "members": handles],
                                            required: ["name", "members"])),
-            ToolSpec(name: "set_blocked", description: "Declare you cannot continue until someone answers. Takes effect when your turn ends.",
-                     inputSchema: s.schema(["on": s.prop("string", "Who you are waiting on: @handle or owner"),
+            ToolSpec(name: "set_blocked", description: "Declare you cannot continue until someone answers or a work item is done. Takes effect when your turn ends.",
+                     inputSchema: s.schema(["on": s.prop("string", "Who or what you are waiting on: @handle, owner, or a work item key such as ACME-12"),
                                             "reason": s.prop("string", "What you need")], required: ["on", "reason"])),
         ]
-        return base + inboxToolSpecs()
+        return base
     }
 
     /// Runs a tool and returns its text result. Appends one `toolUse` event whether it succeeds or fails.
@@ -70,6 +75,12 @@ public struct CompanyTools: Sendable {
         // Validate the caller on every call: it may have been killed or removed since the server started.
         guard let me = try? store.agent(id: agentId), me.companyId == companyId, me.state != .killed else {
             throw ToolError(message: "this agent is not active in the company")
+        }
+        if Self.implemented.contains(name) {
+            let packId = (try? store.company(id: companyId))??.packId ?? "software"
+            guard store.catalog.template(role: me.role, pack: packId).companyTools.contains(name) else {
+                throw ToolError(message: "\(name) is not available to your role")
+            }
         }
         return try dispatch(name, arguments)
     }
@@ -116,11 +127,16 @@ public struct CompanyTools: Sendable {
             case "set_blocked":
                 return try setBlocked(on: try string(args, "on"), reason: try string(args, "reason"))
             default:
+                if let result = try callWork(name, args) { return result }
                 if let result = try dispatchInbox(name, args) { return result }
                 throw ToolError(message: "unknown tool: \(name)")
             }
         } catch let e as ToolError {
             throw e
+        } catch let e as WorkError {
+            throw ToolError(message: e.message)
+        } catch let e as GitError {
+            throw ToolError(message: "\(e)")
         } catch let e as RouterError {
             throw ToolError(message: Self.describe(e))
         } catch StoreError.invalidName {
@@ -169,6 +185,10 @@ public struct CompanyTools: Sendable {
 
     private func setBlocked(on: String, reason: String) throws -> String {
         let target = Self.handle(on)
+        let raw = on.trimmingCharacters(in: .whitespaces)
+        if !raw.hasPrefix("@"), raw.range(of: "^[A-Z0-9]{1,8}-[0-9]+$", options: .regularExpression) != nil {
+            if let result = try setBlockedOnItem(key: raw) { return result }
+        }
         // Target check and write share one transaction, so a teammate killed in between cannot be waited on.
         // Touch only this column so a concurrent orchestrator save is not clobbered.
         try store.writer.write { [companyId, agentId] db in
@@ -192,7 +212,7 @@ public struct CompanyTools: Sendable {
 
     // MARK: Argument helpers
 
-    private func string(_ args: [String: JSONValue], _ key: String) throws -> String {
+    func string(_ args: [String: JSONValue], _ key: String) throws -> String {
         guard let v = args[key], v != .null else { throw ToolError(message: "missing required argument: \(key)") }
         guard let s = v.stringValue else { throw ToolError(message: "argument \(key) must be a string") }
         guard !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -201,7 +221,7 @@ public struct CompanyTools: Sendable {
         return s
     }
 
-    private func stringArray(_ args: [String: JSONValue], _ key: String) throws -> [String] {
+    func stringArray(_ args: [String: JSONValue], _ key: String) throws -> [String] {
         guard let v = args[key], v != .null else { throw ToolError(message: "missing required argument: \(key)") }
         guard let a = v.arrayValue else { throw ToolError(message: "argument \(key) must be an array of strings") }
         return try a.map {
@@ -216,13 +236,13 @@ public struct CompanyTools: Sendable {
         return Int(min(max(n, 1), 100))
     }
 
-    private static func handle(_ s: String) -> String {
+    static func handle(_ s: String) -> String {
         var h = s.trimmingCharacters(in: .whitespaces)
         if h.hasPrefix("@") { h.removeFirst() }
         return h.lowercased()
     }
 
-    private static func describe(_ e: RouterError) -> String {
+    static func describe(_ e: RouterError) -> String {
         switch e {
         case .unknownChannel(let c): "unknown channel: \(c)"
         case .unknownAgent(let a): "unknown agent: @\(a)"

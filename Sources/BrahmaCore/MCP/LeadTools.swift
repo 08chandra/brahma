@@ -3,7 +3,7 @@ import Foundation
 /// The Inbox tools: `propose_decision`, `request_from_owner`, `decide` and `request_mode`. Registered from `CompanyTools`.
 /// None of them can take an owner decision: that exists only in `Store.ownerDecide` and its siblings.
 extension CompanyTools {
-    func inboxToolSpecs() -> [ToolSpec] {
+    static func inboxToolSpecs() -> [ToolSpec] {
         func prop(_ type: String, _ description: String) -> JSONValue {
             .object(["type": .string(type), "description": .string(description)])
         }

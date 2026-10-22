@@ -5,7 +5,7 @@ import BrahmaCore
 struct SettingsGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "settings", abstract: "Owner-wide settings: time zone, plan tier and weekly share.",
-        subcommands: [TimeZoneSetting.self, Plan.self, Share.self])
+        subcommands: [TimeZoneSetting.self, Plan.self, Share.self, HotPaths.self])
 
     struct TimeZoneSetting: ParsableCommand {
         static let configuration = CommandConfiguration(
@@ -57,6 +57,26 @@ struct SettingsGroup: ParsableCommand {
             }
             let (store, _) = try openStore()
             print("weekly share: \(Int((store.weeklyShare() * 100).rounded()))%")
+        }
+    }
+}
+
+extension SettingsGroup {
+    struct HotPaths: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "hot-paths",
+            abstract: "Show or set the globs that serialize merges (lockfiles, manifests, migrations, routers): an item touching one waits for the others that do.")
+        @Argument(help: "Globs to use instead, or 'default'; omit to show the current ones.") var globs: [String] = []
+
+        func run() throws {
+            if !globs.isEmpty {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                do { try store.setHotPaths(globs.count == 1 && globs[0] == "default" ? nil : globs) }
+                catch let SettingsError.invalid(why) { throw fail("invalid hot paths: \(why)") }
+            }
+            let (store, _) = try openStore()
+            for g in store.hotPaths() { print(safe(g)) }
         }
     }
 }

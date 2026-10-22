@@ -141,6 +141,7 @@ struct ItemsGroup: ParsableCommand {
         @Option(help: "Check command, run by the engine in a clean checkout.") var check: String?
         @Option(name: .customLong("path"), help: "A repo-relative path the check covers (repeatable).") var paths: [String] = []
         @Option(help: "Check timeout in seconds (1-3600).") var timeout: Int?
+        @Option(name: .customLong("touch"), help: "A repo-relative path or glob the item changes besides its check's paths (repeatable).") var touch: [String] = []
         @Option(help: "Effort tier: s, m or l.") var tier: String = "m"
         @Option(help: "Priority 0 (most urgent) to 4.") var priority: Int = 2
         @Option(help: "Parent epic or story key.") var parent: String?
@@ -160,7 +161,7 @@ struct ItemsGroup: ParsableCommand {
             var draft = WorkItemDraft(type: WorkItemType(type.lowercased()), title: title, description: description,
                                       acceptanceCriteria: criteria, checkSpec: spec, priority: priority,
                                       tier: try parseTier(tier), team: team, status: ready ? .ready : .backlog,
-                                      intensity: try parseIntensity(intensity))
+                                      intensity: try parseIntensity(intensity), touchPaths: touch)
             if let parent { draft.parentId = try resolveItem(store, c, parent).id }
             if let owner { draft.ownerId = try agentId(store, c, owner) }
             if let reviewer { draft.reviewerId = try agentId(store, c, reviewer) }
@@ -181,6 +182,7 @@ struct ItemsGroup: ParsableCommand {
         @Option(help: "New check command, or 'none'.") var check: String?
         @Option(name: .customLong("path"), help: "Replace the check's paths (repeatable).") var paths: [String] = []
         @Option var timeout: Int?
+        @Option(name: .customLong("touch"), help: "Replace the item's touch paths (repeatable); 'none' clears them.") var touch: [String] = []
         @Option var tier: String?
         @Option var priority: Int?
         @Option(help: "Parent key, or 'none'.") var parent: String?
@@ -211,6 +213,7 @@ struct ItemsGroup: ParsableCommand {
                 if !paths.isEmpty { spec.paths = paths }
                 patch.checkSpec = .some(spec)
             }
+            if !touch.isEmpty { patch.touchPaths = touch.count == 1 && isNone(touch[0]) ? [] : touch }
             if let tier { patch.tier = try parseTier(tier) }
             patch.priority = priority
             if let parent { patch.parentId = .some(isNone(parent) ? nil : try resolveItem(store, c, parent).id) }
