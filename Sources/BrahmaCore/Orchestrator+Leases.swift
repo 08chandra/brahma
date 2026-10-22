@@ -25,7 +25,7 @@ extension Orchestrator {
     }
 
     /// Once per tick, after the clock and health. Never waits on git.
-    func leaseTick(now: Date, companies: [Company], reaped: [WorkLease], held: Bool) {
+    func leaseTick(now: Date, companies: [Company], reaped: [WorkLease], held: Bool, freeSlots: Int) {
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         // 1. Reaped leases lose their worktree (work auto-committed, branch kept).
         for lease in reaped {
@@ -39,15 +39,17 @@ extension Orchestrator {
             sweepLater(company: company)
         }
         // 3. Idle individual contributors get the next claimable ready item.
-        dispatchTick(now: now, companies: companies, skipping: Set(reaped.map(\.itemId)))
+        dispatchTick(now: now, companies: companies, skipping: Set(reaped.map(\.itemId)), freeSlots: freeSlots)
     }
 
     private func removeWorktreeLater(company: Company, key: String) {
         let (store, ws, companyId) = (self.store, URL(fileURLWithPath: company.workspacePath, isDirectory: true), company.id)
         spawnGit("wt:\(companyId):\(key)") { [self] in
-            // A new claim may have taken the item since it was reaped; its worktree is then in use.
-            if (try? store.lease(companyId: companyId, key: key)) != nil { return }
-            do { try GitWorkspace(root: ws).removeWorktree(key: key) } catch { log("could not remove worktree \(key): \(error)") }
+            // Decided under the item's lock: a new claim may have taken the item since it was reaped, and a database
+            // error is not "no lease" (nothing is removed then).
+            do {
+                try GitWorkspace(root: ws).removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
+            } catch { log("could not remove worktree \(key): \(error)") }
         }
     }
 
@@ -58,8 +60,8 @@ extension Orchestrator {
             do {
                 let git = GitWorkspace(root: ws)
                 // Only registered `item/<KEY>` worktrees; engine checkouts (".preview", ".merge", ...) are never listed.
-                for (key, _) in try git.itemWorktrees() where (try? store.lease(companyId: companyId, key: key)) == nil {
-                    try git.removeWorktree(key: key)
+                for (key, _) in try git.itemWorktrees() {
+                    try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
                 }
             } catch {
                 log("worktree sweep failed: \(error)")
@@ -67,7 +69,11 @@ extension Orchestrator {
         }
     }
 
-    private func dispatchTick(now: Date, companies: [Company], skipping reaped: Set<String>) {
+    /// At most as many items as turns can start now: the global free slots, less the agents already dispatched or holding a
+    /// lease and waiting for their turn. Idle agents do not pile up leases that expire unused.
+    private func dispatchTick(now: Date, companies: [Company], skipping reaped: Set<String>, freeSlots: Int) {
+        var budget = freeSlots - dispatching.count
+        guard budget > 0 else { return }
         if let last = lastDispatch, now.timeIntervalSince(last) < Self.dispatchInterval { return }
         guard let withReady = try? store.companiesWithReadyItems() else { return }
         dispatchBackoff = dispatchBackoff.filter { $0.value > now }
@@ -78,11 +84,14 @@ extension Orchestrator {
             ran = true
             guard let agents = try? store.agents(companyId: company.id, states: [.ready, .sleeping]),
                   let leased = try? Set(store.leases(companyId: company.id).map(\.agentId)) else { continue }
+            // Leaseholders that are ready are about to run and will take slots.
+            budget -= agents.filter { $0.state == .ready && !$0.paused && leased.contains($0.id) }.count
             var dispatched = 0
-            for agent in agents where dispatched < 25 && !agent.paused && !leased.contains(agent.id) && !dispatching.contains(agent.id)
+            for agent in agents where dispatched < 25 && budget > 0 && !agent.paused && !leased.contains(agent.id) && !dispatching.contains(agent.id)
                 && store.catalog.template(role: agent.role, pack: company.packId).kind == .individual {
                 guard let claim = try? store.engineClaimNext(agentId: agent.id, skipping: skipping, now: now) else { continue }
                 dispatched += 1
+                budget -= 1
                 skipping.insert(claim.item.id)
                 dispatching.insert(agent.id)
                 startWorktree(company: company, agent: agent, item: claim.item, wasUnowned: claim.wasUnowned)

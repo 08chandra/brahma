@@ -50,6 +50,8 @@ extension Store {
 
     // MARK: Owner setting: hot paths
 
+    static let maxHotPaths = 100
+
     /// Globs that serialize merges: lockfiles, manifests, migrations, routers. The owner may replace them.
     public func hotPaths() -> [String] {
         (try? writer.read { db in try Store.hotPaths(db: db) }) ?? WorkPolicy.defaultHotPaths
@@ -64,8 +66,7 @@ extension Store {
     /// `nil` goes back to `WorkPolicy.defaultHotPaths`.
     public func setHotPaths(_ globs: [String]?) throws {
         if let globs {
-            guard globs.count <= 100 else { throw SettingsError.invalid("at most 100 hot paths") }
-            do { try CheckSpec.validatePaths(globs, what: "hot") } catch let e as WorkError { throw SettingsError.invalid(e.message) }
+            do { try CheckSpec.validatePaths(globs, what: "hot", max: Self.maxHotPaths) } catch let e as WorkError { throw SettingsError.invalid(e.message) }
         }
         let json = globs.map { String(decoding: (try? JSONEncoder().encode($0)) ?? Data("[]".utf8), as: UTF8.self) }
         try writer.write { db in

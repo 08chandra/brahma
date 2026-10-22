@@ -111,7 +111,8 @@ public actor Orchestrator {
         // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
         // ready items to idle individual contributors. Nothing here waits on git.
         let reaped = try store.reapLeases(now: now)
-        leaseTick(now: now, companies: companies, reaped: reaped, held: held)
+        let free = Scheduler.freeSlots(config: cfg, running: runningCount(), pressure: pressure, held: held)
+        leaseTick(now: now, companies: companies, reaped: reaped, held: held, freeSlots: free)
 
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }
@@ -255,6 +256,7 @@ public actor Orchestrator {
         var lastInfo: RateLimitInfo?
         var failure: String?
         var runnerError: (any Error)?
+        var worktreeUnavailable = false
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             items = try store.pendingInbox(agentId: agent.id)
@@ -279,11 +281,18 @@ public actor Orchestrator {
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 let git = GitWorkspace(root: workspace)
                 let checkout = git.worktreePath(key: leased.key)
-                if !FileManager.default.fileExists(atPath: checkout.path) { _ = try? git.addWorktree(key: leased.key) }
-                if FileManager.default.fileExists(atPath: checkout.path) {
-                    workingDirectory = checkout.path
-                    addDirs = [checkout.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
+                if !git.hasCheckout(key: leased.key) {
+                    do { try git.addWorktree(key: leased.key) } catch {
+                        // Never run a leaseholder's turn outside its worktree: the turn does not start.
+                        try? store.appendEvent(ActivityEvent(
+                            companyId: company.id, agentId: agent.id, turnId: turn.id, kind: .error,
+                            text: "@\(agent.name) turn not started: the worktree of \(leased.key) is missing and could not be created: \(error)",
+                            createdAt: clock()))
+                        throw WorktreeUnavailable()
+                    }
                 }
+                workingDirectory = checkout.path
+                addDirs = [checkout.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
             }
             let request = TurnRequest(
                 agent: sent, company: company,
@@ -319,6 +328,8 @@ public actor Orchestrator {
                     break
                 }
             }
+        } catch is WorktreeUnavailable {
+            worktreeUnavailable = true
         } catch {
             failure = String(describing: error)
         }
@@ -327,7 +338,11 @@ public actor Orchestrator {
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
-        if Task.isCancelled {
+        if worktreeUnavailable {
+            // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay.
+            await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            end = .interrupted
+        } else if Task.isCancelled {
             end = .interrupted
         } else if let r = result, !r.isError {
             // A completed turn always counts, even if it also hit the limit: re-running it would repeat its posts.
@@ -402,6 +417,9 @@ public actor Orchestrator {
         FileHandle.standardError.write(Data("brahma orchestrator: \(message)\n".utf8))
     }
 }
+
+/// A leaseholder's worktree is missing and could not be recreated.
+struct WorktreeUnavailable: Error {}
 
 enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.

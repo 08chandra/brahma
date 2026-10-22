@@ -13,8 +13,8 @@ import GRDB
         var now: Date { world.clock.now }
         var ws: GitWorkspace { GitWorkspace(root: URL(fileURLWithPath: company.workspacePath)) }
 
-        init(store: Store? = nil) throws {
-            world = try World(store: store)
+        init(store: Store? = nil, hardCap: Int = 16) throws {
+            world = try World(store: store, config: World.config(hardCap: hardCap))
             company = try world.company("Acme")
             mgr = try world.hire(company, "mgr", role: "manager")
             eng = try world.hire(company, "eng-1", role: "engineer")
@@ -507,6 +507,53 @@ import GRDB
         let own = try l.store.createWorkItem(companyId: l.company.id, by: .agent(l.eng2.id), draft: WorkItemDraft(type: .task, title: "mine"), now: l.now)
         try l.store.addDependency(itemId: own.id, dependsOn: y.id, by: .agent(l.eng2.id))
         #expect(try l.store.blockingCounts()[l.eng2.id] == 1)
+    }
+
+    @Test func dispatchBoundedByFreeSlots() async throws {
+        let l = try L(hardCap: 2)
+        for n in 0..<4 { _ = try l.world.hire(l.company, "extra-\(n)", role: "engineer") }   // 7 idle engineers
+        for n in 0..<7 { try l.item("item \(n)", paths: ["src/d\(n)"]) }
+        try await l.world.cycle()
+        #expect(try l.allLeases().count == 2)
+        // The two are ready to run and hold the slots: a later pass leases nothing more until they have gone.
+        l.world.clock.advance(10)
+        await l.world.orchestrator.tick()
+        #expect(try l.allLeases().count == 2)
+        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        // Their turns are over (the agents sleep, holding their leases); the next pass hands out two more.
+        l.world.clock.advance(10)
+        try await l.world.cycle()
+        #expect(try l.allLeases().count == 4)
+    }
+
+    @Test func leaseTurnNeverRunsOutsideItsWorktree() async throws {
+        let l = try L()
+        let i = try l.item()
+        _ = try l.claim(i, l.eng)
+        // No worktree exists and a file in its place stops git from making one.
+        let wt = l.ws.worktreePath(key: i.key)
+        try FileManager.default.createDirectory(at: wt.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "in the way".write(to: wt, atomically: true, encoding: .utf8)
+        try l.world.dm(l.company, l.eng)
+        try await l.world.cycle()
+        #expect(l.world.fake.requests.filter { $0.agent.id == l.eng.id }.isEmpty)
+        let turn = try #require(try l.world.turns(l.eng).last)
+        #expect(turn.outcome == .interrupted)
+        let events = try l.store.events(afterId: 0).filter { $0.kind == .error }
+        #expect(events.contains { $0.text.contains("turn not started") && $0.text.contains(i.key) })
+        // Not a failure of the agent: ready again, no backoff, and the lease is kept.
+        let agent = try l.world.agent(l.eng)
+        #expect(agent.state == .ready); #expect(agent.consecutiveFailures == 0)
+        #expect(try l.store.lease(itemId: i.id) != nil)
+    }
+
+    @Test func hotPathListCapMatchesValidation() throws {
+        let l = try L()
+        try l.store.setHotPaths((0..<100).map { "dir\($0)/**" })
+        #expect(l.store.hotPaths().count == 100)
+        do { try l.store.setHotPaths((0..<101).map { "dir\($0)/**" }); Issue.record("expected a refusal") }
+        catch SettingsError.invalid(let why) { #expect(why.contains("hot-path list")); #expect(why.contains("100")) }
+        #expect(throws: WorkError.self) { try l.item(touch: (0..<51).map { "p\($0)" }) }
     }
 
     static func failure(_ body: () throws -> String) throws -> (Bool, String) {

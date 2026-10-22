@@ -69,8 +69,11 @@ public struct CheckSpec: Codable, Equatable, Sendable {
     }
 
     /// A list of repo-relative paths or globs: at most `maxPaths`, none empty, absolute or climbing out with "..".
-    static func validatePaths(_ paths: [String], what: String) throws {
-        if paths.count > maxPaths { throw WorkError.invalid("\(what == "check" ? "a check" : "an item") lists at most \(maxPaths) paths") }
+    static func validatePaths(_ paths: [String], what: String, max limit: Int = CheckSpec.maxPaths) throws {
+        if paths.count > limit {
+            let subject = what == "check" ? "a check" : what == "hot" ? "the hot-path list" : "an item"
+            throw WorkError.invalid("\(subject) lists at most \(limit) paths")
+        }
         for p in paths {
             if p.isEmpty { throw WorkError.invalid("a \(what) path is empty") }
             if p.hasPrefix("/") { throw WorkError.invalid("\(what) path '\(p)' must be relative") }

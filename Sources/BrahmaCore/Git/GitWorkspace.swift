@@ -248,6 +248,37 @@ public struct GitWorkspace: Sendable {
     @discardableResult
     public func addWorktree(key: String) throws -> URL {
         try Self.validKey(key)
+        return try withKeyLock(key) { try addWorktreeLocked(key: key) }
+    }
+
+    /// True when `<ws>/.brahma/wt/<KEY>` is a real directory registered as a worktree of this repository.
+    public func hasCheckout(key: String) -> Bool {
+        var isDir: ObjCBool = false
+        let path = worktreePath(key: key)
+        return (try? Self.validKey(key)) != nil && FileManager.default.fileExists(atPath: path.path, isDirectory: &isDir) && isDir.boolValue
+            && !Self.isSymlink(path) && FileManager.default.fileExists(atPath: adminDir(key: key).path)
+    }
+
+    /// Per-item exclusion shared by every process that touches this workspace: an exclusive `flock` on
+    /// `<ws>/.brahma/locks/<KEY>.lock`. Adding and removing the worktree of one item never interleave, so a removal that
+    /// decided "nobody holds this" cannot delete the checkout a new claim has just found and reused.
+    private func withKeyLock<T>(_ key: String, _ body: () throws -> T) throws -> T {
+        let dir = root.appending(path: ".brahma/locks", directoryHint: .isDirectory)
+        if Self.isSymlink(root.appending(path: ".brahma")) || Self.isSymlink(dir) {
+            throw GitError.failed(command: "lock \(key)", status: -1, stderr: "the engine's lock directory is a link")
+        }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fd = open(dir.appending(path: "\(key).lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw GitError.failed(command: "lock \(key)", status: -1, stderr: "cannot open the lock file") }
+        defer { close(fd) }
+        while flock(fd, LOCK_EX) != 0 {
+            if errno != EINTR { throw GitError.failed(command: "lock \(key)", status: -1, stderr: "cannot take the lock") }
+        }
+        defer { flock(fd, LOCK_UN) }
+        return try body()
+    }
+
+    private func addWorktreeLocked(key: String) throws -> URL {
         let fm = FileManager.default
         let path = worktreePath(key: key)
         if Self.isSymlink(worktreesDir) {
@@ -274,8 +305,18 @@ public struct GitWorkspace: Sendable {
 
     /// Commits whatever is in the worktree as `"<KEY>: auto-commit before release"`, removes its directory and keeps the
     /// branch. A directory that is not a registered checkout is left alone; one that was tampered with is deleted.
-    public func removeWorktree(key: String) throws {
+    ///
+    /// `keepIf` is asked under the item's lock, after any concurrent add has finished: when it returns true (a lease exists
+    /// now) nothing is removed, and when it throws nothing is removed either (an unreadable database is not "no lease").
+    public func removeWorktree(key: String, keepIf: (() throws -> Bool)? = nil) throws {
         try Self.validKey(key)
+        try withKeyLock(key) {
+            if let keepIf, try keepIf() { return }
+            try removeWorktreeLocked(key: key)
+        }
+    }
+
+    private func removeWorktreeLocked(key: String) throws {
         let fm = FileManager.default
         let path = worktreePath(key: key)
         if Self.isSymlink(path) {

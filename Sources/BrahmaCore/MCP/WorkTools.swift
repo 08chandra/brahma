@@ -322,7 +322,7 @@ extension CompanyTools {
         var note = ""
         // A lease the update ended (back to ready, or given to someone else) takes its worktree with it; the work stays on the branch.
         if before != nil, try store.lease(itemId: target.id) == nil {
-            do { try GitWorkspace(root: try workspace()).removeWorktree(key: target.key) } catch { note = " (its worktree could not be removed: \(error))" }
+            do { try removeWorktreeUnlessLeased(key: target.key) } catch { note = " (its worktree could not be removed: \(error))" }
         }
         return "Updated \(updated.key)." + note
     }
@@ -350,10 +350,17 @@ extension CompanyTools {
             + "Progress file: \(ProgressFile.path(workspace: ws, key: target.key).path)."
     }
 
+    /// Removes the item's worktree unless a lease exists again by the time the item's lock is taken (a new claim won the
+    /// race), or the lease cannot be read.
+    private func removeWorktreeUnlessLeased(key: String) throws {
+        let (store, companyId) = (self.store, self.companyId)
+        try GitWorkspace(root: try workspace()).removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
+    }
+
     private func releaseLease(_ target: WorkItem, note: String?) throws -> String {
         try store.releaseLease(itemId: target.id, agentId: agentId, note: note)
         var tail = "Your work is saved on branch \(GitWorkspace(root: try workspace()).branch(key: target.key))."
-        do { try GitWorkspace(root: try workspace()).removeWorktree(key: target.key) } catch {
+        do { try removeWorktreeUnlessLeased(key: target.key) } catch {
             tail = "Its worktree could not be removed yet (\(error)); your work stays in it."
         }
         return "Released \(target.key). \(tail)"

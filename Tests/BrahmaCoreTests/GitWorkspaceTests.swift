@@ -165,4 +165,40 @@ import Foundation
         #expect(!FileManager.default.fileExists(atPath: fsmarker.path), "fsmonitor from the crafted config ran")
         #expect(!FileManager.default.fileExists(atPath: hookmarker.path), "a hook from the crafted repo ran")
     }
+
+    @Test func addAndRemoveOfOneItemDoNotInterleave() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let wt = try f.ws.addWorktree(key: "K-1")
+        let inside = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
+        let decided = ResultBox()
+        let ws = f.ws
+        // A removal that has decided "nobody holds it" and is about to delete the checkout...
+        Thread.detachNewThread {
+            try? ws.removeWorktree(key: "K-1", keepIf: {
+                inside.signal(); Thread.sleep(forTimeInterval: 0.3); decided.add(true); return false
+            })
+            done.signal()
+        }
+        inside.wait()
+        // ...while a claim asks for the same checkout: it waits for the removal, then makes a fresh one.
+        let again = try f.ws.addWorktree(key: "K-1")
+        #expect(decided.all == [true])
+        done.wait()
+        #expect(again.path == wt.path)
+        #expect(FileManager.default.fileExists(atPath: wt.appending(path: ".git").path))
+        #expect(try f.ws.isDirty(in: wt) == false)
+    }
+
+    @Test func removalIsSkippedWhenALeaseAppearsOrCannotBeRead() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let wt = try f.ws.addWorktree(key: "K-1")
+        try f.write("keep.txt", "unsaved", in: wt)
+        try f.ws.removeWorktree(key: "K-1", keepIf: { true })
+        #expect(FileManager.default.fileExists(atPath: wt.appending(path: "keep.txt").path))
+        struct Unreadable: Error {}
+        #expect(throws: Unreadable.self) { try f.ws.removeWorktree(key: "K-1", keepIf: { throw Unreadable() }) }
+        #expect(FileManager.default.fileExists(atPath: wt.appending(path: "keep.txt").path))
+        try f.ws.removeWorktree(key: "K-1", keepIf: { false })
+        #expect(!FileManager.default.fileExists(atPath: wt.path))
+    }
 }
