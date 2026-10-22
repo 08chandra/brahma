@@ -99,7 +99,12 @@ public enum ChildEnvironment {
         return u.contains("TOKEN") || u.contains("SECRET") || u.contains("KEY") || u.hasPrefix("AWS_") || u == "SSH_AUTH_SOCK"
     }
 
-    public static func make(base: [String: String], extra: [String: String] = [:], purpose: Purpose = .general) -> [String: String] {
+    /// `CLAUDE_CODE_*` settings the engine itself decides per turn (effort, agent teams, ...). They are admitted only
+    /// from what the engine puts in `TurnRequest.environment`, never inherited from the owner's environment.
+    static func isEngineClaudeVar(_ name: String) -> Bool { name.hasPrefix("CLAUDE_CODE_") && !isSecretName(name) }
+
+    public static func make(base: [String: String], extra: [String: String] = [:],
+                            engineClaudeVars: [String: String] = [:], purpose: Purpose = .general) -> [String: String] {
         var env: [String: String] = [:]
         for (name, value) in base where (allowed.contains(name) || name.hasPrefix("LC_")) && !isSecretName(name) {
             env[name] = value
@@ -108,6 +113,9 @@ public enum ChildEnvironment {
             for name in claudeAuth { if let v = base[name] { env[name] = v } }
         }
         for (name, value) in extra where name.hasPrefix("BRAHMA_") && name != "BRAHMA_DEV" { env[name] = value }
+        if purpose == .claude {
+            for (name, value) in engineClaudeVars where isEngineClaudeVar(name) { env[name] = value }
+        }
         return env
     }
 }

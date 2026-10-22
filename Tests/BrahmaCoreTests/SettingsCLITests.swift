@@ -39,6 +39,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let set = try brahma(["settings", "plan", "max20x"], home: home)
         #expect(set.status == 0, "\(set.stderr)"); #expect(set.stdout.contains("plan: max20x (low 2 / balanced 6 / max 16"))
         #expect(try brahma(["settings", "plan", "max99x"], home: home).status != 0)
+        let pro = try brahma(["settings", "plan", "pro"], home: home)
+        #expect(pro.stdout.contains("plan: pro (low 1 / balanced 1 / max 2"), "\(pro.stdout)")
+        #expect(try brahma(["settings", "plan", "max5x"], home: home).status == 0)
         #expect(try brahma(["settings", "share"], home: home).stdout == "weekly share: 70%\n")
         #expect(try brahma(["settings", "share", "55"], home: home).stdout == "weekly share: 55%\n")
         for bad in ["9", "101", "abc"] { #expect(try brahma(["settings", "share", bad], home: home).status != 0, "\(bad)") }

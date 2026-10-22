@@ -8,10 +8,15 @@ public enum SettingsError: Error, Equatable {
 /// Owner-wide plan setting. It decides the per-mode concurrency caps (Task 5 amendment) and how many agents a new
 /// company seats.
 public enum PlanTier: String, Codable, CaseIterable, Sendable {
-    case max5x, max20x
+    /// `pro` exists as data: the owner may select it, but the default is `max5x` and the CLI-reported plan never
+    /// overrides the setting (the doctor only warns on a mismatch).
+    case pro, max5x, max20x
 
     public func modeCap(_ mode: UsageMode) -> Int {
         switch (self, mode) {
+        case (.pro, .low): 1
+        case (.pro, .balanced): 1
+        case (.pro, .max): 2
         case (.max5x, .low): 1
         case (.max5x, .balanced): 3
         case (.max5x, .max): 8
@@ -25,7 +30,29 @@ public enum PlanTier: String, Codable, CaseIterable, Sendable {
     public var hardCap: Int { modeCap(.max) }
 
     /// Agents a new company seats up front (see `OrgGenerator.staff`).
-    public var seatBudget: Int { self == .max5x ? 8 : 24 }
+    public var seatBudget: Int {
+        switch self {
+        case .pro: 4
+        case .max5x: 8
+        case .max20x: 24
+        }
+    }
+
+    /// Highest model rung the plan may use (nil: no plan limit). Pro tops out at R2 (Opus-required work gets opus-low).
+    public var maxRung: Int? { self == .pro ? 2 : nil }
+    /// Sub-agents (`Task`) are off on every tier in 3a.
+    public var allowsTask: Bool { false }
+    public var allowsUltra: Bool { self != .pro }
+
+    /// Maps the CLI's `subscription_type` (`get_usage`) to a tier, for the doctor's mismatch warning only.
+    public init?(reportedSubscription raw: String) {
+        switch raw.lowercased().replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "") {
+        case "pro": self = .pro
+        case "max5x", "max": self = .max5x
+        case "max20x": self = .max20x
+        default: return nil
+        }
+    }
 }
 
 /// Company-active time: the seconds a company was `running` while no engine hold was active. Leases, timeboxes,

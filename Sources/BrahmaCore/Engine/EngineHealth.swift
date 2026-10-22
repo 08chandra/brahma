@@ -26,7 +26,12 @@ public enum HoldReason: String, Codable, Equatable, Sendable {
 public struct InfraInput: Equatable, Sendable {
     public var text: String
     public var status: Int?
-    public init(text: String, status: Int?) { self.text = text; self.status = status }
+    /// The `result` event's subtype. A controlled stop (`error_max_turns`, `error_max_budget_usd`) is the engine's own
+    /// cap doing its job and is never infrastructure, whatever its text says.
+    public var subtype: String? = nil
+    public init(text: String, status: Int?, subtype: String? = nil) { self.text = text; self.status = status; self.subtype = subtype }
+
+    public static let controlledStops: Set<String> = ["error_max_turns", "error_max_budget_usd"]
 }
 
 public enum EngineHealth {
@@ -49,6 +54,11 @@ public enum EngineHealth {
                                          "network is unreachable", "fetch failed", "socket hang up"]
     public static let accountPatterns = ["not logged in", "/login", "invalid api key", "authentication", "subscription",
                                          "credit balance"]
+
+    public static func classify(_ input: InfraInput) -> InfraClass {
+        if let s = input.subtype, InfraInput.controlledStops.contains(s) { return .none }
+        return classify(text: input.text, apiErrorStatus: input.status)
+    }
 
     /// Account beats network when both match (a login problem is what the owner must act on).
     public static func classify(text: String, apiErrorStatus: Int?) -> InfraClass {

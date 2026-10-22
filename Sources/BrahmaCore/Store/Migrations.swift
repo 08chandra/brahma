@@ -190,6 +190,13 @@ enum Migrations {
             try db.alter(table: "company") { t in t.add(column: "ownerReserve", .double) }
             try db.alter(table: "agent") { t in t.add(column: "consecutiveInfraFailures", .integer).notNull().defaults(to: 0) }
         }
+        m.registerMigration("v3-clock-calibration") { db in
+            // Windowed calibration state (JSON) and the five-hour estimate; the v3-clock calibration columns are unused.
+            try db.alter(table: "ownerSettings") { t in
+                t.add(column: "calibration", .text)
+                t.add(column: "pctPerDollar5h", .double)
+            }
+        }
         return m
     }
 }

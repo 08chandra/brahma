@@ -97,6 +97,8 @@ public actor Orchestrator {
         cfg.planTier = store.planTier()
         cfg.ownerReserve = 1 - store.weeklyShare()
         let companies = try store.companies()
+        let calibration = try store.usageCalibration()
+        let reservedLE = store.openReservationLE()
 
         // 1. Timed blockers that have expired.
         for a in try store.agents(states: [.blocked]) {
@@ -123,9 +125,11 @@ public actor Orchestrator {
         let info = try store.latestRateLimit()
         var decisions: [String: UsageDecision] = [:]
         var paceClosed = Set<String>()
+        var paceStrict = Set<String>()
         for c in companies {
             let reserve = cfg.reserve(for: c)
-            let parts = UsageGate.evaluateParts(info, mode: c.usageMode, now: now, reserve: reserve)
+            let parts = UsageGate.evaluateParts(info, mode: c.usageMode, now: now, reserve: reserve,
+                                                openReservationLE: reservedLE, pctPerDollar5h: calibration.pctPerDollar5h)
             if case .closed(let gateUntil) = parts.fiveHour {
                 decisions[c.id] = parts.fiveHour
                 let until = Self.usageUntil(gateUntil, now: now)
@@ -147,6 +151,8 @@ public actor Orchestrator {
             }
             if case .closed(let paceUntil) = parts.pace {
                 paceClosed.insert(c.id)
+                // Past the owner's reserve nothing runs, not even the critical path.
+                if let pace = UsageGate.pace(info, reserve: reserve, now: now), !pace.criticalPathExempt { paceStrict.insert(c.id) }
                 if loggedPaceClosed.insert(c.id).inserted {
                     let text = UsageGate.pace(info, reserve: reserve, now: now)?.text ?? "ahead"
                     attempt {
@@ -180,7 +186,7 @@ public actor Orchestrator {
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
                                         usage: { decisions[$0.id] ?? .open }, otherChildren: 0, pressure: pressure,
-                                        held: held, paceClosed: paceClosed)
+                                        held: held, paceClosed: paceClosed, paceStrict: paceStrict)
         for agent in selected { launch(agent, now: now) }
     }
 
@@ -307,7 +313,7 @@ public actor Orchestrator {
             if let runnerError, !(runnerError is TurnError) { input = InfraInput(text: failure, status: nil) }
             end = .failed(failure, input)
         } else if let r = result {
-            end = .failed(r.text ?? r.subtype, InfraInput(text: r.text ?? "", status: r.apiErrorStatus))
+            end = .failed(r.text ?? r.subtype, InfraInput(text: r.text ?? "", status: r.apiErrorStatus, subtype: r.subtype))
         } else {
             end = .failed("claude exited without a result")
         }
@@ -317,7 +323,7 @@ public actor Orchestrator {
         }
         // An infrastructure failure puts the agent on its fixed cooldown before the turn is recorded, so there is no
         // moment at which it is `ready` and eligible again.
-        if case .failed(_, let input?) = end, EngineHealth.classify(text: input.text, apiErrorStatus: input.status) != .none {
+        if case .failed(_, let input?) = end, EngineHealth.classify(input) != .none {
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
         }
         var infra = InfraClass.none
@@ -428,7 +434,7 @@ extension Store {
             case .succeeded(let r, _): summary = r.text; cost = r.costUSD
             case .failed(let text, let input):
                 summary = text
-                if let input { infraClass = EngineHealth.classify(text: input.text, apiErrorStatus: input.status) }
+                if let input { infraClass = EngineHealth.classify(input) }
             case .usageLimited(_, let text): summary = text
             case .interrupted: summary = "interrupted"
             }

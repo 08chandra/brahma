@@ -146,6 +146,26 @@ private final class PollCounter: @unchecked Sendable {
     func increment() { lock.lock(); count += 1; lock.unlock() }
     var value: Int { lock.lock(); defer { lock.unlock() }; return count }
 
+    @Test func spawnedEnvironmentCarriesOnlyEngineClaudeVars() async throws {
+        let (script, dir) = try fakeClaude("""
+            cat > /dev/null
+            env > env.txt
+            echo '{"type":"system","subtype":"init","session_id":"s1","model":"m"}'
+            echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s1"}'
+            """)
+        let runner = ClaudeProcessRunner(claudePath: script.path, baseEnvironment: [
+            "PATH": "/usr/bin:/bin", "HOME": "/tmp", "CLAUDE_CODE_EFFORT_LEVEL": "max", "MAX_THINKING_TOKENS": "63999",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        ])
+        var req = request(in: dir)
+        req.environment = ["BRAHMA_AGENT_ID": "a1", "CLAUDE_CODE_EFFORT_LEVEL": "low"]
+        _ = try await collect(runner.run(req))
+        let env = try String(contentsOf: dir.appending(path: "env.txt"), encoding: .utf8)
+        #expect(env.contains("CLAUDE_CODE_EFFORT_LEVEL=low"), "the engine's per-turn value, not the owner's max")
+        #expect(!env.contains("CLAUDE_CODE_EFFORT_LEVEL=max"))
+        #expect(!env.contains("MAX_THINKING_TOKENS")); #expect(!env.contains("EXPERIMENTAL_AGENT_TEAMS"))
+    }
+
     @Test func turnEnvironmentCarriesAgentIdWithoutDev() async throws {
         let (script, dir) = try fakeClaude("""
             cat > /dev/null

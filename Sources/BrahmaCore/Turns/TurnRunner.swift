@@ -84,7 +84,8 @@ public struct ClaudeProcessRunner: TurnRunning {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [claudePath] + args
         }
-        process.environment = ChildEnvironment.make(base: baseEnvironment, extra: request.environment, purpose: .claude)
+        process.environment = ChildEnvironment.make(base: baseEnvironment, extra: request.environment,
+                                                       engineClaudeVars: request.environment, purpose: .claude)
         process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         process.standardInput = stdin

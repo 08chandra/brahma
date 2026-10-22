@@ -31,11 +31,12 @@ public struct TurnRequest: Sendable {
 }
 
 public enum ClaudeCommand {
-    /// Harness tools that would bypass the company's own messaging and scheduling.
+    /// Harness tools that would bypass the company's own messaging and scheduling. `Task` (sub-agents) stays off on the
+    /// Workspace profile: they would run with no model pin and outside the engine's accounting.
     public static let disallowedTools: [String] = [
         "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "Monitor", "RemoteTrigger",
         "PushNotification", "SendMessage", "ListAgents", "EnterWorktree", "ExitWorktree",
-        "DesignSync", "ReportFindings", "TaskStop",
+        "DesignSync", "ReportFindings", "Task", "TaskStop",
     ]
 
     /// Arguments only; the prompt is sent on stdin, never argv.

@@ -19,7 +19,7 @@ private func request(started: Bool, profile: PermissionProfile) -> TurnRequest {
                 workingDirectory: "/tmp/ws/acme", profile: profile)
 }
 
-private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,RemoteTrigger,PushNotification,SendMessage,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ReportFindings,TaskStop"
+private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,RemoteTrigger,PushNotification,SendMessage,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ReportFindings,Task,TaskStop"
 
 @Suite struct CommandTests {
     @Test func firstTurnWorkspaceArgs() {

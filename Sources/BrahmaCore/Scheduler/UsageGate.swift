@@ -12,6 +12,8 @@ public enum UsageGate {
     public static let defaultReserve = 0.30
     /// Headroom above a straight-line spend, as a fraction of the week, so a burst of real work is not choked.
     public static let burst = 0.15
+    /// With paid overage allowed, five-hour utilization at or above this admits nothing in any mode.
+    public static let overageClamp = 0.85
 
     public static func threshold(_ m: UsageMode) -> Double {
         switch m {
@@ -31,12 +33,20 @@ public enum UsageGate {
     /// utilization at or above the mode threshold: closed until the five-hour window resets. With no reset, or one
     /// already past when the info was observed, closed until `observedAt + fallback`; info older than that is
     /// stale and the gate opens, so a probe turn can refresh it.
-    public static func evaluateFiveHour(_ info: RateLimitInfo?, mode: UsageMode, now: Date) -> UsageDecision {
+    ///
+    /// `openReservationLE` (dollars of list-price-equivalent cost reserved by admitted-but-unfinished work, 0 in 3a)
+    /// counts against the five-hour check at `pctPerDollar5h` each. When the account may spill into paid overage
+    /// (`overageStatus == "allowed"`), no mode admits new work at `overageClamp` and above.
+    public static func evaluateFiveHour(_ info: RateLimitInfo?, mode: UsageMode, now: Date,
+                                        openReservationLE: Double = 0, pctPerDollar5h: Double? = nil) -> UsageDecision {
         guard let info else { return .open }
         let reset: Date?
+        var util = info.fiveHourUtilization
+        if let u = util, openReservationLE > 0, let per = pctPerDollar5h { util = u + openReservationLE * per }
+        let limit = info.overageStatus == "allowed" ? min(threshold(mode), overageClamp) : threshold(mode)
         if isHardLimit(info) {
             reset = info.resetsAt
-        } else if let util = info.fiveHourUtilization, util >= threshold(mode) {
+        } else if let util, util >= limit {
             reset = info.fiveHourResetsAt ?? (info.rateLimitType == "five_hour" ? info.resetsAt : nil)
         } else {
             return .open
@@ -62,10 +72,12 @@ public enum UsageGate {
         }
     }
 
-    public static func evaluateParts(_ info: RateLimitInfo?, mode: UsageMode, now: Date,
-                                     reserve: Double = defaultReserve) -> Evaluation {
+    public static func evaluateParts(_ info: RateLimitInfo?, mode: UsageMode, now: Date, reserve: Double = defaultReserve,
+                                     openReservationLE: Double = 0, pctPerDollar5h: Double? = nil) -> Evaluation {
         let paceDecision: UsageDecision = pace(info, reserve: reserve, now: now)?.closedUntil.map { .closed(until: $0) } ?? .open
-        return Evaluation(fiveHour: evaluateFiveHour(info, mode: mode, now: now), pace: paceDecision)
+        return Evaluation(fiveHour: evaluateFiveHour(info, mode: mode, now: now, openReservationLE: openReservationLE,
+                                                     pctPerDollar5h: pctPerDollar5h),
+                          pace: paceDecision)
     }
 
     /// Five-hour gate plus weekly pacing; pacing applies in every mode.

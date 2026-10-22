@@ -17,11 +17,14 @@ public struct DoctorReport: Codable, Equatable, Sendable {
     public var cliVersion: String?
     public var items: [DoctorItem]
     public var checkedAt: Date
+    /// `subscription_type` as the CLI reports it (`get_usage`); nil until a probe reads it.
+    public var reportedSubscription: String? = nil
 
-    public init(cliVersion: String?, items: [DoctorItem], checkedAt: Date) {
+    public init(cliVersion: String?, items: [DoctorItem], checkedAt: Date, reportedSubscription: String? = nil) {
         self.cliVersion = cliVersion
         self.items = items
         self.checkedAt = checkedAt
+        self.reportedSubscription = reportedSubscription
     }
 
     public var ok: Bool { !items.contains { $0.status == .fail } }
@@ -230,6 +233,18 @@ public enum Doctor {
     }
 
     // MARK: default exec
+
+    /// The owner's configured plan tier always wins; a CLI that reports a different subscription only earns a WARN
+    /// (the CLI's value has been stale). Nil when there is nothing to compare or they agree.
+    public static func planTierItem(configured: PlanTier, reported: String?) -> DoctorItem? {
+        guard let reported, !reported.isEmpty else { return nil }
+        guard let tier = PlanTier(reportedSubscription: reported) else {
+            return DoctorItem(name: "plan-tier", status: .warn, detail: "configured \(configured.rawValue); the CLI reports the unknown plan '\(reported)'")
+        }
+        return tier == configured ? nil
+            : DoctorItem(name: "plan-tier", status: .warn,
+                         detail: "configured \(configured.rawValue), CLI reports \(tier.rawValue); keeping \(configured.rawValue) (see `brahma settings plan`)")
+    }
 
     public static let defaultExec: Exec = { executable, arguments in
         await Task.detached { () -> String? in

@@ -77,6 +77,31 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
         #expect(env["BRAHMA_DEV"] == nil)
     }
 
+    @Test func effortEnvNeverInherited() {
+        let base = ["PATH": "/bin", "CLAUDE_CODE_EFFORT_LEVEL": "max", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+                    "MAX_THINKING_TOKENS": "63999", "CLAUDE_CODE_SOMETHING_ELSE": "x"]
+        for purpose in [ChildEnvironment.Purpose.claude, .general] {
+            let env = ChildEnvironment.make(base: base, extra: [:], purpose: purpose)
+            #expect(env["CLAUDE_CODE_EFFORT_LEVEL"] == nil); #expect(env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == nil)
+            #expect(env["MAX_THINKING_TOKENS"] == nil); #expect(env["CLAUDE_CODE_SOMETHING_ELSE"] == nil)
+        }
+        // Only what the engine passes for this turn gets through, and only to claude; secrets never do.
+        let engine = ["CLAUDE_CODE_EFFORT_LEVEL": "low", "CLAUDE_CODE_OAUTH_TOKEN": "t", "MAX_THINKING_TOKENS": "1", "OTHER": "x"]
+        let env = ChildEnvironment.make(base: base, extra: [:], engineClaudeVars: engine, purpose: .claude)
+        #expect(env["CLAUDE_CODE_EFFORT_LEVEL"] == "low")
+        #expect(env["CLAUDE_CODE_OAUTH_TOKEN"] == nil, "auth comes only from the base environment")
+        #expect(env["MAX_THINKING_TOKENS"] == nil); #expect(env["OTHER"] == nil)
+        #expect(env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == nil)
+        #expect(ChildEnvironment.make(base: base, extra: [:], engineClaudeVars: engine, purpose: .general)["CLAUDE_CODE_EFFORT_LEVEL"] == nil)
+    }
+
+    @Test func taskToolIsDisallowed() {
+        #expect(ClaudeCommand.disallowedTools.contains("Task"))
+        let args = ClaudeCommand.arguments(for: request(started: false))
+        let i = args.firstIndex(of: "--disallowed-tools")!
+        #expect(args[i + 1].split(separator: ",").contains("Task"))
+    }
+
     @Test func childEnvironmentIsAllowlisted() {
         let base = ["FAKE_SECRET_TOKEN": "x", "AWS_X": "x", "SSH_AUTH_SOCK": "/s", "RANDOM_VAR": "x", "MY_API_KEY": "x",
                     "PATH": "/bin", "HOME": "/h", "LANG": "en_US.UTF-8", "LC_ALL": "C", "BRAHMA_DEV": "1",

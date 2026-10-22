@@ -209,6 +209,23 @@ private struct HWorld {
         #expect(turn.infra)
     }
 
+    @Test func budgetCappedTurnsAreNeverInfra() async throws {
+        // Classification part of budgetCappedTurnsCountTowardItemBudget; the item-budget accounting lands in 14a.
+        #expect(EngineHealth.classify(InfraInput(text: "fetch failed", status: nil, subtype: "error_max_budget_usd")) == .none)
+        #expect(EngineHealth.classify(InfraInput(text: "getaddrinfo ENOTFOUND", status: 503, subtype: "error_max_turns")) == .none)
+        #expect(EngineHealth.classify(InfraInput(text: "fetch failed", status: nil, subtype: "error_during_execution")) == .network)
+        let w = try HWorld(); let a = try w.hire("ceo")
+        w.fake.script("ceo", .init(events: [.initialized(sessionId: "s", model: "m"),
+            .result(TurnResult(isError: true, subtype: "error_max_budget_usd", text: "Reached the budget; last call: fetch failed",
+                               costUSD: 1.5, apiErrorStatus: nil, sessionId: "s"))]))
+        try w.dm(a); try await w.cycle()
+        let turn = try #require(try w.turns(a).first)
+        #expect(turn.outcome == .failed); #expect(!turn.infra)
+        #expect(try w.agent(a).consecutiveFailures == 1, "an ordinary, counted failure with normal backoff")
+        try await w.cycle()
+        #expect(try w.hold() == nil)
+    }
+
     @Test func accountFailureHoldsAndAlertsOnce() async throws {
         let w = try HWorld()
         let agents = try ["a", "b", "c"].map { try w.hire($0) }

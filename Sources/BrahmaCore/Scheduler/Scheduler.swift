@@ -39,10 +39,12 @@ public enum Scheduler {
     /// - `otherChildren`: child processes that are not turns (checks, merges) and count against the same cap.
     /// - `paceClosed`: companies shut only by the weekly pace; their critical-path candidates
     ///   (`blockingCount > 0`) are still admitted.
+    /// - `paceStrict`: pace-closed companies whose spend has reached the owner's reserve (`util >= 1 - reserve`);
+    ///   the critical-path exemption ends there and nothing is admitted.
     public static func select(candidates: [Candidate], runningByCompany: [String: Int], config: SchedulerConfig,
                               usage: (Company) -> UsageDecision, otherChildren: Int = 0,
                               pressure: MemoryPressure = .normal, held: Bool = false,
-                              paceClosed: Set<String> = []) -> [Agent] {
+                              paceClosed: Set<String> = [], paceStrict: Set<String> = []) -> [Agent] {
         if held || pressure == .critical { return [] }
         var cap = min(config.effectiveHardCap, config.safetyCap)
         if pressure == .warning { cap = max(1, cap / 2) }
@@ -56,6 +58,7 @@ public enum Scheduler {
             let id = cand.company.id
             if gateOpen[id] == nil { gateOpen[id] = usage(cand.company) == .open }
             guard gateOpen[id] == true else { continue }
+            if paceStrict.contains(id) { continue }
             if paceClosed.contains(id), cand.blockingCount <= 0 { continue }
             companies[id] = cand.company
             queues[id, default: []].append(cand)

@@ -27,8 +27,8 @@ struct SettingsGroup: ParsableCommand {
 
     struct Plan: ParsableCommand {
         static let configuration = CommandConfiguration(
-            commandName: "plan", abstract: "Show or set the Claude plan tier, which sets concurrency (max5x: 1/3/8, max20x: 2/6/16).")
-        @Argument(help: "max5x (default) or max20x; omit to show the current one.") var tier: PlanTier?
+            commandName: "plan", abstract: "Show or set the Claude plan tier, which sets concurrency (pro: 1/1/2, max5x: 1/3/8, max20x: 2/6/16).")
+        @Argument(help: "max5x (default), max20x or pro; omit to show the current one.") var tier: PlanTier?
 
         func run() throws {
             if let tier {
