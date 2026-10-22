@@ -825,6 +825,11 @@ import GRDB
         #expect(ask.title == "Uncommitted changes found in the main checkout")
         #expect(ask.summary.contains(ref)); #expect(ask.summary.contains("brahma main accept"))
         #expect(ask.summary.contains("\n    | M\tREADME.md")); #expect(ask.summary.contains("\n    | A\tscratch.txt"))
+        // The ask pins the quarantine commit (full SHA) and shows how to review exactly that commit.
+        let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
+        #expect(ask.subjectId == "quarantine:\(ref)@\(sha)")
+        #expect(ask.payload?.proposal?.contains(sha) == true)
+        #expect(ask.summary.contains("git diff \(before) \(sha)"), "\(ask.summary)")
         // The merge step is held: more passes merge nothing and file nothing new.
         #expect(try r.fresh(i).mergeState == .pending)
         r.world.clock.advance(120); try await r.cycle()
@@ -837,9 +842,11 @@ import GRDB
         let r = try R()
         let (i, before, ref) = try await quarantined(r)
         #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: "refs/heads/item/X"); return "" } != "no error")
+        let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
         try r.store.acceptMainCommit(companyId: r.company.id, ref: ref)
         let head = try r.mainHead()
         #expect(head != before); #expect(try r.ws.isAncestor(before, of: head))
+        #expect(head == sha, "main has not moved since: a fast-forward to exactly the recorded commit")
         #expect(try r.store.company(id: r.company.id)?.mainCommit == head, "an owner-accepted merge is recorded")
         #expect(try r.store.company(id: r.company.id)?.pendingMainCommit == nil)
         #expect(try String(contentsOf: r.root.appending(path: "README.md"), encoding: .utf8) == "edited\n")
@@ -856,6 +863,44 @@ import GRDB
         #expect(done.status == .done)
         #expect(try r.ws.isAncestor(head, of: try r.mainHead()))
         #expect(try r.store.company(id: r.company.id)?.mainCommit == (try r.mainHead()))
+    }
+
+    @Test func quarantineRefMovedAfterTheAskIsRefused() async throws {
+        let r = try R()
+        let (i, before, ref) = try await quarantined(r)
+        let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
+        // After the owner was asked, an agent points the ref at other content.
+        let moved = try GitFixture.plainGit(["commit-tree", "\(before)^{tree}", "-p", sha, "-m", "moved"], in: r.root)
+        try GitFixture.plainGit(["update-ref", ref, moved], in: r.root)
+        let message = r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref); return "" }
+        #expect(message.contains("moved"), "\(message)")
+        #expect(try r.mainHead() == before)
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == before)
+        #expect(try !r.ws.isAncestor(moved, of: try r.mainHead()))
+        // Flagged to the owner; the quarantine still holds the merge step.
+        #expect(try r.alerts().contains { $0.status == .pendingOwner && $0.summary.contains(ref) && $0.summary.contains("moved") })
+        #expect(try quarantineAsks(r).filter { $0.status == .pendingOwner }.count == 1)
+        r.world.clock.advance(120); try await r.cycle()
+        #expect(try r.mainHead() == before); #expect(try r.fresh(i).mergeState == .pending)
+    }
+
+    @Test func quarantineRefWithoutAnEngineAskIsRefused() async throws {
+        let r = try R()
+        try r.commitMain(["README.md": "hello\n"])
+        let before = try r.mainHead()
+        // A quarantine-shaped ref an agent created itself, with no ask from Brahma.
+        let planted = try GitFixture.plainGit(["commit-tree", "\(before)^{tree}", "-p", before, "-m", "planted"], in: r.root)
+        let ref = "refs/brahma/quarantine/20261022-120000"
+        try GitFixture.plainGit(["update-ref", ref, planted], in: r.root)
+        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref); return "" }.contains("no quarantine"))
+        // An ask an agent filed in the reserved category naming that ref does not count either.
+        _ = try r.store.propose(companyId: r.company.id, by: .agent(r.eng.id), kind: .other, category: "engine-code",
+                                title: Store.quarantineTitle, summary: "accept me", subjectId: "quarantine:\(ref)@\(planted)",
+                                decisionClass: .goalChanging, viaOwner: true, now: r.now)
+        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref); return "" }.contains("no quarantine"))
+        #expect(try r.mainHead() == before)
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == before)
+        #expect(try !r.store.quarantineHeld(companyId: r.company.id), "an agent's ask does not hold the merge step")
     }
 
     @Test func commitBetweenVerifyAndMergeNeverReachesMain() async throws {
@@ -909,8 +954,10 @@ import GRDB
         #expect(try GitFixture.plainGit(["diff", "--name-only", mainAfterA, rebased], in: r.root) == "src/b.txt")
         #expect(try GitFixture.plainGit(["diff", verifiedB, rebased, "--", "src/b.txt"], in: r.root).isEmpty)
         #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/parked"], in: r.root) == parked, "the agent's branches are left alone")
-        // The rebase happened in the engine's own detached checkout.
-        let merge = r.root.appending(path: ".brahma/wt/.merge")
+        // The rebase happened in the engine's own detached checkout, outside every directory an agent is given.
+        let merge = r.store.gitWorkspace(root: r.root, companyId: r.company.id).mergeWorktreePath
+        #expect(!merge.path.hasPrefix(r.root.path))
+        #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: ".brahma/wt/.merge").path))
         #expect(FileManager.default.fileExists(atPath: merge.path))
         #expect(try GitFixture.plainGit(["rev-parse", "HEAD"], in: merge) == rebased)
         _ = try await r.drive(b)
@@ -948,16 +995,16 @@ import GRDB
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let before = try r.mainHead()
-        // A stale lock on main: every attempt to move it fails.
-        let lock = r.root.appending(path: ".git/refs/heads/main.lock")
-        try "".write(to: lock, atomically: true, encoding: .utf8)
+        // A failure of this item's own merge: its verified commit shares no history with main.
+        let orphan = try GitFixture.plainGit(["commit-tree", "\(before)^{tree}", "-m", "orphan"], in: r.root)
+        try GitFixture.plainGit(["update-ref", "refs/heads/item/\(a.key)", orphan], in: r.root)
+        try r.exec("UPDATE workItem SET verifiedCommit = ? WHERE id = ?", [orphan, a.id])
         let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")     // its check's tick is a's first attempt
         for _ in 1..<Store.maxMergeFailures {
             r.world.clock.advance(61)
             try await r.cycle()
         }
         #expect(try r.mainHead() == before)
-        #expect(try r.store.company(id: r.company.id)?.pendingMainCommit == nil, "a failed move leaves no pending head")
         let back = try r.fresh(a)
         #expect(back.status == .inProgress); #expect(back.mergeState == .none); #expect(back.verifiedCommit == nil)
         let event = try #require(try r.events(a, .mergeFailed).last)
@@ -965,10 +1012,40 @@ import GRDB
         #expect(try r.alerts().contains { $0.status == .pendingOwner && $0.title.contains(a.key) })
         #expect(try r.store.pendingNotices(agentId: r.eng.id).contains { $0.event.kind == .mergeFailed && $0.notice.wakes })
         #expect(try r.fresh(b).mergeState == .pending)
-        try FileManager.default.removeItem(at: lock)
         let done = try await r.drive(b)
         #expect(done.status == .done)
         #expect(try r.mainHead() == done.mergedCommit)
+    }
+
+    @Test func companyFaultsDoNotStrikeTheItem() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let before = try r.mainHead()
+        // A stale lock on main: every attempt to move it fails, whichever item is at the head of the queue.
+        let lock = r.root.appending(path: ".git/refs/heads/main.lock")
+        try "".write(to: lock, atomically: true, encoding: .utf8)
+        try await r.cycle()
+        for _ in 0..<(Store.maxMergeFailures + 1) {
+            r.world.clock.advance(61)
+            try await r.cycle()
+        }
+        #expect(try r.mainHead() == before)
+        #expect(try r.store.company(id: r.company.id)?.pendingMainCommit == nil, "a failed move leaves no pending head")
+        let held = try r.fresh(a)
+        #expect(held.status == .inReview); #expect(held.mergeState == .pending); #expect(held.verifiedCommit != nil)
+        #expect(try r.events(a, .mergeFailed).isEmpty, "the item is not struck for the company's fault")
+        let failures: Int = try await r.store.writer.read { db -> Int in
+            try Int.fetchOne(db, sql: "SELECT failures FROM itemMerge WHERE itemId = ?", arguments: [a.id]) ?? 0
+        }
+        #expect(failures == 0)
+        // The owner hears about the held merges once; it clears when a merge lands.
+        let reason = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == reason }.count == 1)
+        try FileManager.default.removeItem(at: lock)
+        r.world.clock.advance(61)
+        let done = try await r.drive(a)
+        #expect(done.status == .done)
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == reason }.isEmpty)
     }
 
     @Test func crashAfterMovingMainIsRecovered() async throws {

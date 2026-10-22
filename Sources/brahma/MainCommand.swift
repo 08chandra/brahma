@@ -11,7 +11,7 @@ struct MainGroup: ParsableCommand {
             commandName: "accept",
             abstract: "Accept main as it is now, after it changed outside Brahma, or merge a quarantine of the main checkout into it (owner only). Claims and merges start again.")
         @Argument var company: String
-        @Argument(help: "A quarantine ref (refs/brahma/quarantine/<yyyyMMdd-HHmmss>) to merge into main.") var ref: String?
+        @Argument(help: "A quarantine ref (refs/brahma/quarantine/<yyyyMMdd-HHmmss>) Brahma asked you about: the commit it recorded on that ask is merged into main (refused if the ref has moved).") var ref: String?
 
         func run() throws {
             try requireOwnerShell()

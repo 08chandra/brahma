@@ -171,14 +171,23 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(accepted.status == 0, "\(accepted.stderr)"); #expect(accepted.stdout.contains(String(rewritten.prefix(7))))
         #expect(try store.company(id: company.id)?.mainCommit == rewritten)
         #expect(try open() == 0, "the alert is resolved")
-        // A quarantine is merged only from the owner's shell, and only a quarantine ref is accepted.
+        // A quarantine is merged only from the owner's shell, only a quarantine ref is accepted, and only one Brahma made.
         try "q\n".write(to: ws.appending(path: "q.txt"), atomically: true, encoding: .utf8)
         try GitFixture.plainGit(["add", "-A"], in: ws)
         let tree = try GitFixture.plainGit(["write-tree"], in: ws)
-        try GitFixture.plainGit(["reset", "-q", "--hard"], in: ws)
-        let q = try GitFixture.plainGit(["commit-tree", tree, "-p", rewritten, "-m", "q"], in: ws)
-        let ref = "refs/brahma/quarantine/20261022-120000"
-        try GitFixture.plainGit(["update-ref", ref, q], in: ws)
+        let handMade = try GitFixture.plainGit(["commit-tree", tree, "-p", rewritten, "-m", "q"], in: ws)
+        try GitFixture.plainGit(["update-ref", "refs/brahma/quarantine/20261022-120000", handMade], in: ws)
+        let notBrahmas = try brahma(["main", "accept", "Acme", "refs/brahma/quarantine/20261022-120000"], home: home)
+        #expect(notBrahmas.status != 0); #expect(notBrahmas.stderr.contains("no quarantine"), "\(notBrahmas.stderr)")
+        // The engine quarantines the dirty checkout itself (as a merge pass does) and files the ask.
+        let current = try #require(try store.company(id: company.id))
+        try store.quarantineRoot(company: current, git: store.gitWorkspace(root: ws, companyId: company.id),
+                                 expectedMain: rewritten, now: Date(timeIntervalSince1970: 1_800_000_000))
+        // The engine's merge checkout belongs under the data home, never in the workspace.
+        #expect(store.gitWorkspace(root: ws, companyId: company.id).mergeWorktreePath.path
+            .hasPrefix(home.appending(path: "home/run/merge/\(company.id)").path))
+        let ref = "refs/brahma/quarantine/20270115-080000"
+        let q = try GitFixture.plainGit(["rev-parse", ref], in: ws)
         let agentRef = try brahma(["main", "accept", "Acme", ref], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
         #expect(agentRef.status != 0); #expect(try store.company(id: company.id)?.mainCommit == rewritten)
         #expect(try brahma(["main", "accept", "Acme", "refs/heads/main"], home: home).status != 0)

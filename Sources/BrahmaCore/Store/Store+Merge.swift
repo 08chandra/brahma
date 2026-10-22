@@ -30,7 +30,10 @@ extension Store {
 
     static func mainHeadAlertReason(_ companyId: String) -> String { "mainhead:\(companyId)" }
     static func mergeFailureAlertReason(_ itemId: String) -> String { "mergefail:\(itemId)" }
-    static func quarantineSubject(_ ref: String) -> String { "quarantine:\(ref)" }
+    static func mergeHoldAlertReason(_ companyId: String) -> String { "mergehold:\(companyId)" }
+    static func quarantineMovedAlertReason(_ companyId: String) -> String { "quarantinemoved:\(companyId)" }
+    /// `quarantine:<ref>@<full sha>`: the ask names the exact commit the engine quarantined, which is all an accept merges.
+    static func quarantineSubject(_ ref: String, commit: String) -> String { "quarantine:\(ref)@\(commit)" }
 
     /// The oldest approved item of the company still waiting to land (one whose merge is not already running).
     func nextPendingMerge(companyId: String) throws -> WorkItem? {
@@ -151,18 +154,28 @@ extension Store {
 
     // MARK: Quarantine
 
-    /// A quarantine of this company's root checkout is waiting for the owner: the merge step holds.
+    static let openAskStatuses = [AskStatus.pendingOwner.rawValue, AskStatus.pendingInternal.rawValue]
+
+    /// The quarantine asks the engine itself filed for this company (requester `system`), newest first.
+    func engineQuarantineAsks(_ db: Database, companyId: String, ref: String? = nil) throws -> [Ask] {
+        let subject = ref.map { "quarantine:\($0)@%" } ?? "quarantine:%"
+        return try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.other && Column("category") == Self.quarantineCategory
+                              && Column("requesterId") == "system" && Column("subjectId").like(subject))
+            .order(Column("number").desc).fetchAll(db)
+    }
+
+    /// A quarantine of this company's root checkout is waiting for the owner: the merge step holds. Only asks the engine
+    /// filed count; an agent's ask in the same category holds nothing.
     func quarantineHeld(companyId: String) throws -> Bool {
         try writer.read { db in
-            try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.other && Column("category") == Self.quarantineCategory
-                           && [AskStatus.pendingOwner.rawValue, AskStatus.pendingInternal.rawValue].contains(Column("status"))
-                           && Column("subjectId").like("quarantine:%")).fetchCount(db) > 0
+            try engineQuarantineAsks(db, companyId: companyId).contains { Self.openAskStatuses.contains($0.status.rawValue) }
         }
     }
 
     /// Never commits a dirty root checkout: its changes go to a quarantine ref, the checkout is restored to `main`, and the
-    /// owner gets one ask (reserved category `engine-code`) naming the ref and quoting what changed.
-    private func quarantineRoot(company: Company, git: GitWorkspace, expectedMain: String, now: Date) throws {
+    /// owner gets one ask (reserved category `engine-code`) naming the ref, pinning the quarantine commit's full SHA (subject
+    /// and payload) and quoting what changed.
+    func quarantineRoot(company: Company, git: GitWorkspace, expectedMain: String, now: Date) throws {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(identifier: "UTC")
@@ -180,8 +193,9 @@ extension Store {
             they are saved as \(q.ref) (\(q.commit.prefix(7))) and the checkout was restored to main (\(expectedMain.prefix(7))). \
             Merges into main wait until you decide.
 
-            Review them with: git diff refs/heads/main \(q.ref)
+            Review exactly what would be merged with: git diff \(expectedMain) \(q.commit)
             Merge them into main with: brahma main accept \(Self.flat(company.name, max: 100)) \(q.ref)
+            Only commit \(q.commit) is merged; if \(q.ref) points anywhere else by then, the accept is refused.
 
             Changed files:
             \(files.joined(separator: "\n"))
@@ -191,8 +205,10 @@ extension Store {
             """
         try writer.write { db in
             _ = try propose(db: db, companyId: company.id, by: .system, kind: .other, risk: .high, category: Self.quarantineCategory,
-                            title: Self.quarantineTitle, summary: summary, payload: nil, document: nil, itemId: nil,
-                            subjectId: Self.quarantineSubject(q.ref), supersedes: nil, requestId: nil, decisionClass: .goalChanging,
+                            title: Self.quarantineTitle, summary: summary,
+                            payload: AskPayload(proposal: "Merge \(q.commit) (\(q.ref)) into main at \(expectedMain)"), document: nil,
+                            itemId: nil, subjectId: Self.quarantineSubject(q.ref, commit: q.commit), supersedes: nil, requestId: nil,
+                            decisionClass: .goalChanging,
                             viaOwner: true, now: now)
             try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .error,
                               text: "the main checkout had uncommitted changes; they were moved to \(q.ref) and merges wait for the owner",
@@ -211,30 +227,37 @@ extension Store {
     /// 3. `GitWorkspace.landVerified` lands exactly the verified commit: refused when the branch moved, a fast-forward
     ///    (`pendingMainCommit` written before `main` moves, the record finalized after), or a rebase of the verified commit in
     ///    the engine's merge checkout.
+    ///
+    /// Everything up to the landing (the guard, the checkout, a quarantine) and the locks, moving `main` and the merge checkout
+    /// fail as `MergeInfrastructureError`: the company's fault, never counted against the item.
     func performMerge(item: WorkItem, company: Company, now: Date) throws -> MergeResult? {
         let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let git = gitWorkspace(root: root, companyId: company.id)
         guard let verified = item.verifiedCommit else { throw WorkError.conflict("\(item.key) has no verified commit") }
-        // `main` must still be what the engine expects; if it was changed outside Brahma the merge is held (the guard has
-        // raised its alert) until the owner accepts it.
-        do { try checkMain(company: company, git: git) } catch let error as WorkError where error.message == Store.mainChangedMessage { return nil }
-        let checkedOut = try git.checkedOutRef()
-        guard checkedOut == GitWorkspace.mainRef else {
-            try raiseMainHeadAlert(company: company, ref: checkedOut)
-            return nil
+        let expected: String? = try MergeInfrastructureError.wrapping {
+            // `main` must still be what the engine expects; if it was changed outside Brahma the merge is held (the guard
+            // has raised its alert) until the owner accepts it.
+            do { try checkMain(company: company, git: git) } catch let error as WorkError where error.message == Store.mainChangedMessage { return nil }
+            let checkedOut = try git.checkedOutRef()
+            guard checkedOut == GitWorkspace.mainRef else {
+                try raiseMainHeadAlert(company: company, ref: checkedOut)
+                return nil
+            }
+            try writer.write { db in try resolveEngineAlerts(db, reasons: [Self.mainHeadAlertReason(company.id)], now: now) }
+            if try quarantineHeld(companyId: company.id) { return nil }
+            guard let expected = try self.company(id: company.id)?.mainCommit else { return nil }
+            if try git.isDirty(in: root) {
+                try quarantineRoot(company: company, git: git, expectedMain: expected, now: now)
+                return nil
+            }
+            return expected
         }
-        try writer.write { db in try resolveEngineAlerts(db, reasons: [Self.mainHeadAlertReason(company.id)], now: now) }
-        if try quarantineHeld(companyId: company.id) { return nil }
-        guard let expected = try self.company(id: company.id)?.mainCommit else { return nil }
-        if try git.isDirty(in: root) {
-            try quarantineRoot(company: company, git: git, expectedMain: expected, now: now)
-            return nil
-        }
+        guard let expected else { return nil }
         var pending: String?
         let outcome: GitWorkspace.LandOutcome
         do {
             outcome = try git.landVerified(key: item.key, verified: verified, expectedMain: expected, recordPending: { next in
-                try self.setPendingMainCommit(companyId: company.id, next)
+                try MergeInfrastructureError.wrapping { try self.setPendingMainCommit(companyId: company.id, next) }
                 pending = next
             })
         } catch {
@@ -243,7 +266,7 @@ extension Store {
         }
         switch outcome {
         case .fastForwarded(let head):
-            try writer.write { db in try finalizeMainCommit(db, companyId: company.id, commit: head) }
+            try MergeInfrastructureError.wrapping { try writer.write { db in try finalizeMainCommit(db, companyId: company.id, commit: head) } }
             return .merged(mainHead: head)
         case .alreadyLanded(let head): return .merged(mainHead: head)
         case .rebased(let head): return .rebased(head: head)
@@ -292,7 +315,7 @@ extension Store {
                 try current.update(db)
                 _ = try engineSetStatus(db: db, itemId: itemId, to: .done, text: "merged into main at \(head.prefix(7))", event: .merged, now: now)
                 try finalizeMainCommit(db, companyId: company.id, commit: head)
-                try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId)], now: now)
+                try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId), Self.mergeHoldAlertReason(company.id)], now: now)
                 return true
             }
             guard landed else { return }

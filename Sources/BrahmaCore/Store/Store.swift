@@ -72,13 +72,17 @@ public final class Store: Sendable {
         }
     }
 
-    /// The git workspace of a company, with its per-item lock files under the data home (`<home>/run/locks/<companyId>`),
-    /// never in the workspace where an agent could hold a lock forever.
+    /// The git workspace of a company, with its per-item lock files (`<home>/run/locks/<companyId>`) and the engine's merge
+    /// checkout (`<home>/run/merge/<companyId>`) under the data home, never in the workspace, where an agent could hold a
+    /// lock forever or tamper with the checkout a merge runs in.
     func gitWorkspace(root: URL, companyId: String) -> GitWorkspace {
-        let locks = (dataHome?.appending(path: "run/locks", directoryHint: .isDirectory)
-            ?? FileManager.default.temporaryDirectory.appending(path: "brahma-locks", directoryHint: .isDirectory))
-            .appending(path: companyId, directoryHint: .isDirectory)
-        var git = GitWorkspace(root: root, lockDirectory: locks)
+        func engineDir(_ name: String, fallback: String) -> URL {
+            (dataHome?.appending(path: "run/\(name)", directoryHint: .isDirectory)
+                ?? FileManager.default.temporaryDirectory.appending(path: fallback, directoryHint: .isDirectory))
+                .appending(path: companyId, directoryHint: .isDirectory)
+        }
+        var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
+                               mergeDirectory: engineDir("merge", fallback: "brahma-merge"))
         git.lockTimeout = gitLockTimeout.seconds
         return git
     }

@@ -33,9 +33,31 @@ extension Orchestrator {
     /// Crash recovery: no merge runs at start-up.
     func recoverMerges() throws { try store.recoverMerges() }
 
+    /// A merge of the company failed for the company's own reasons: held for `mergeRetry`, and after `Store.maxMergeFailures`
+    /// of them in a row the owner gets one engine alert (resolved when a merge lands). The item is not struck.
+    func companyMergeFault(company: Company, item: WorkItem, error: MergeInfrastructureError) {
+        let now = clock()
+        holdMerges(companyId: company.id, until: now.addingTimeInterval(Self.mergeRetry))
+        let count = (mergeFaults[company.id] ?? 0) + 1
+        mergeFaults[company.id] = count
+        guard count == Store.maxMergeFailures else { return }
+        do {
+            try EngineAlerts.raise(
+                store: store, text: "\(company.name): merges into main are held (\(Store.flat("\(error)", max: 300))); "
+                    + "\(count) attempts in a row failed. Nothing is counted against \(item.key); Brahma tries again every minute.",
+                now: now, reason: Store.mergeHoldAlertReason(company.id))
+        } catch {
+            log("could not raise the merge hold alert: \(error)")
+        }
+    }
+
+    func companyMergeRan(companyId: String) { mergeFaults[companyId] = nil }
+
     /// The git work for one approved item, then its recording (`finishMerge`), all off the actor. A merge that could not run
-    /// (a hold) is not tried again for `mergeRetry` seconds; its item stays `pending`. A merge that failed counts against the
-    /// item; after `Store.maxMergeFailures` the item goes back to its holder and the company's queue moves on.
+    /// (a hold) is not tried again for `mergeRetry` seconds; its item stays `pending`. A merge that failed for the company's
+    /// own reasons (main's lock, moving main, the merge checkout, a quarantine: `MergeInfrastructureError`) is held the same
+    /// way and never counts against the item. Any other failure counts against the item; after `Store.maxMergeFailures` the
+    /// item goes back to its holder and the company's queue moves on.
     nonisolated func performMerge(company: Company, item: WorkItem) async {
         defer {
             do { try store.endMerging(itemId: item.id) } catch { log("could not end the merge of \(item.key): \(error)") }
@@ -45,7 +67,11 @@ extension Orchestrator {
                 await holdMerges(companyId: company.id, until: clock().addingTimeInterval(Self.mergeRetry))
                 return
             }
+            await companyMergeRan(companyId: company.id)
             try store.finishMerge(itemId: item.id, result: result, now: clock())
+        } catch let error as MergeInfrastructureError {
+            log("could not merge \(item.key) (\(company.name)'s merge step failed): \(error)")
+            await companyMergeFault(company: company, item: item, error: error)
         } catch {
             log("could not merge \(item.key): \(error)")
             let returned = (try? store.noteMergeFailure(itemId: item.id, error: "\(error)", now: clock())) ?? false

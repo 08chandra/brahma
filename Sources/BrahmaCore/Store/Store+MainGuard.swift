@@ -60,8 +60,12 @@ extension Store {
 
     /// Owner-only (`brahma main accept`, the app).
     /// - Without `ref`: the owner has reviewed `main` and accepts its current head.
-    /// - With a quarantine ref (`refs/brahma/quarantine/<stamp>`, or just `<stamp>`): its changes are merged into `main` as an
-    ///   engine-recorded merge (`mainCommit` advances) and the quarantine ask is settled, which releases the merge step.
+    /// - With a quarantine ref (`refs/brahma/quarantine/<stamp>`, or just `<stamp>`): the commit the engine recorded on its
+    ///   own pending quarantine ask for that ref (never what the ref holds now) is merged into `main` as an engine-recorded
+    ///   merge (`mainCommit` advances), and the ask is settled, which releases the merge step. A ref with no such ask (one an
+    ///   agent made, or an ask an agent filed) is refused. A ref that no longer points at the recorded commit is refused and
+    ///   flagged to the owner (an engine alert): what the owner was shown is not what the ref holds. Accepting a quarantine
+    ///   that is already merged changes nothing.
     public func acceptMainCommit(companyId: String, ref: String? = nil) throws {
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
@@ -78,12 +82,29 @@ extension Store {
         guard GitWorkspace.isQuarantineRef(full) else {
             throw WorkError.invalid("\(Self.flat(raw, max: 80)) is not a quarantine ref (refs/brahma/quarantine/<yyyyMMdd-HHmmss>)")
         }
+        // The engine's own ask for this ref, and the commit it recorded there (subject and payload must agree).
+        let asks = try writer.read { db in try engineQuarantineAsks(db, companyId: companyId, ref: full) }
+        func recorded(_ ask: Ask) -> String? {
+            guard let subject = ask.subjectId, subject.hasPrefix("quarantine:\(full)@") else { return nil }
+            let sha = String(subject.dropFirst("quarantine:\(full)@".count))
+            guard sha.range(of: "^[0-9a-f]{40}([0-9a-f]{24})?$", options: .regularExpression) != nil,
+                  ask.payload?.proposal?.contains(sha) == true else { return nil }
+            return sha
+        }
+        guard let ask = asks.first(where: { Self.openAskStatuses.contains($0.status.rawValue) && recorded($0) != nil }),
+              let commit = recorded(ask) else {
+            if let done = asks.first(where: { $0.status == .approved }), let sha = recorded(done),
+               let head = try git.head(of: GitWorkspace.mainRef), try git.isAncestor(sha, of: head) {
+                return    // already accepted and merged
+            }
+            throw WorkError.conflict("no quarantine ask from Brahma is waiting for \(full); only a quarantine the engine made and asked you about can be accepted")
+        }
         try checkMain(company: company, git: git)
         guard let expected = try self.company(id: companyId)?.mainCommit else { throw WorkError.conflict(Self.mainChangedMessage) }
         var pending: String?
-        let head: String
+        let outcome: GitWorkspace.QuarantineOutcome
         do {
-            head = try git.mergeQuarantine(ref: full, expectedMain: expected, recordPending: { next in
+            outcome = try git.mergeQuarantine(ref: full, commit: commit, expectedMain: expected, recordPending: { next in
                 try self.setPendingMainCommit(companyId: companyId, next)
                 pending = next
             })
@@ -93,17 +114,24 @@ extension Store {
             throw error
         }
         let now = Store.now()
-        try writer.write { db in
-            try finalizeMainCommit(db, companyId: companyId, commit: head)
-            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work,
-                              text: "the owner accepted \(full) into main at \(head.prefix(7))", createdAt: now).insert(db)
-            let asks = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.other
-                                      && Column("subjectId") == Self.quarantineSubject(full)
-                                      && [AskStatus.pendingOwner.rawValue, AskStatus.pendingInternal.rawValue].contains(Column("status"))).fetchAll(db)
-            for var ask in asks {
-                ask.ownerNote = "accepted with brahma main accept; merged into main at \(head.prefix(7))"
-                ask.ownerDecidedAt = now
-                try settle(db, ask: &ask, status: .approved, decidedBy: "owner", tellRequesterToo: false, now: now)
+        switch outcome {
+        case .refMoved(let current):
+            let now7 = current.map { "it now points at \($0)" } ?? "it was deleted"
+            let text = "\(company.name): \(full) moved after Brahma asked you about it (\(now7); Brahma recorded \(commit)). "
+                + "Nothing was merged. Review the recorded commit with: git diff \(expected) \(commit)"
+            try writer.write { db in
+                try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: Self.quarantineMovedAlertReason(companyId))
+            }
+            throw WorkError.conflict("\(full) moved since Brahma recorded it (\(now7); recorded \(commit.prefix(12))); nothing was merged")
+        case .merged(let head):
+            try writer.write { db in
+                try finalizeMainCommit(db, companyId: companyId, commit: head)
+                try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work,
+                                  text: "the owner accepted \(full) (\(commit.prefix(12))) into main at \(head.prefix(7))", createdAt: now).insert(db)
+                guard var current = try Ask.fetchOne(db, key: ask.id), Self.openAskStatuses.contains(current.status.rawValue) else { return }
+                current.ownerNote = "accepted with brahma main accept; \(commit.prefix(12)) merged into main at \(head.prefix(7))"
+                current.ownerDecidedAt = now
+                try settle(db, ask: &current, status: .approved, decidedBy: "owner", tellRequesterToo: false, now: now)
             }
         }
     }

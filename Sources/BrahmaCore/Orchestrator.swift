@@ -39,6 +39,8 @@ public actor Orchestrator {
     var mergeTasks: [String: Task<Void, Never>] = [:]
     /// Companies whose last merge attempt did not land (HEAD not on main, git failed): not tried again before this time.
     var mergeBackoff: [String: Date] = [:]
+    /// Company id → merge attempts in a row that failed for the company's own reasons (`MergeInfrastructureError`).
+    var mergeFaults: [String: Int] = [:]
     /// Agents the engine has just leased an item to, until their worktree exists (they are not scheduled meanwhile).
     var dispatching = Set<String>()
     /// Items whose dispatch failed in git: not offered again before this time.

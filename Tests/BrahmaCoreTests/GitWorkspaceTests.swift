@@ -248,4 +248,135 @@ import Foundation
         // No branch: git fails (status 128), which is "unknown", never "clean".
         #expect(throws: GitError.self) { try f.ws.mergeConflicts(key: "K-1") }
     }
+
+    // MARK: Landing on the locked main (9b fix round 2: R1, R2)
+
+    /// Two items branched from the first commit, each with one commit of its own, and `main` moved on after both.
+    private struct Behind {
+        let f: GitFixture
+        let ws: GitWorkspace
+        let mainHead: String
+        let k1: String, k2: String
+
+        init(ws make: (URL) -> GitWorkspace = { GitWorkspace(root: $0) }) throws {
+            f = try GitFixture(files: ["a.txt": "one\n"])
+            ws = make(f.root)
+            for key in ["K-1", "K-2"] {
+                let wt = try ws.addWorktree(key: key)
+                try f.write("\(key).txt", "\(key)\n", in: wt)
+                try f.git(["add", "-A"], in: wt); try f.git(["commit", "-qm", key], in: wt)
+            }
+            k1 = try #require(try ws.head(of: ws.branchRef(key: "K-1")))
+            k2 = try #require(try ws.head(of: ws.branchRef(key: "K-2")))
+            try f.write("m.txt", "main\n"); try f.git(["add", "-A"]); try f.git(["commit", "-qm", "main moves"])
+            mainHead = try #require(try ws.head(of: GitWorkspace.mainRef))
+        }
+
+        /// A commit on top of `main` that nobody reviewed.
+        func evil(on parent: String? = nil) throws -> String {
+            let tree = try f.git(["rev-parse", "\(parent ?? mainHead)^{tree}"])
+            let scratch = try tempDir()
+            let file = scratch.appending(path: "evil.txt")
+            try "unreviewed\n".write(to: file, atomically: true, encoding: .utf8)
+            let blob = try f.git(["hash-object", "-w", file.path])
+            let idx = scratch.appending(path: "evil.index").path
+            try f.git(["read-tree", tree], env: ["GIT_INDEX_FILE": idx])
+            try f.git(["update-index", "--add", "--cacheinfo", "100644,\(blob),evil.txt"], env: ["GIT_INDEX_FILE": idx])
+            let evilTree = try f.git(["write-tree"], env: ["GIT_INDEX_FILE": idx])
+            return try f.git(["commit-tree", evilTree, "-p", parent ?? mainHead, "-m", "evil"])
+        }
+
+        /// The merge checkout's admin directory, from its own `.git` file.
+        func mergeAdmin() throws -> URL {
+            let text = try String(contentsOf: ws.mergeWorktreePath.appending(path: ".git"), encoding: .utf8)
+            return URL(fileURLWithPath: String(text.dropFirst("gitdir: ".count)).trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    @Test func plantedRebaseStateNeverMovesMain() throws {
+        let b = try Behind()
+        guard case .rebased = try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in }) else {
+            Issue.record("K-1 should have been rebased"); return
+        }
+        // An agent plants rebase state in the merge checkout's admin directory: a `rebase --abort` would move main to evil.
+        let evil = try b.evil()
+        let state = try b.mergeAdmin().appending(path: "rebase-merge", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        for (name, text) in ["head-name": "refs/heads/main", "onto": b.mainHead, "orig-head": evil, "interactive": "", "git-rebase-todo": ""] {
+            try (text + "\n").write(to: state.appending(path: name), atomically: true, encoding: .utf8)
+        }
+        let outcome = try b.ws.landVerified(key: "K-2", verified: b.k2, expectedMain: b.mainHead, recordPending: { _ in })
+        #expect(try b.ws.head(of: GitWorkspace.mainRef) == b.mainHead, "main never moves to the planted orig-head")
+        guard case .rebased(let r) = outcome else { Issue.record("\(outcome)"); return }
+        #expect(try !b.ws.isAncestor(evil, of: r))
+        #expect(try b.f.git(["rev-parse", "\(r)^"]) == b.mainHead)
+        #expect(!FileManager.default.fileExists(atPath: state.path), "the engine cleared the planted state itself")
+    }
+
+    @Test func mainFlippedDuringTheRebaseLandsNothingUnreviewed() throws {
+        // main flips to an unreviewed commit while the rebase runs, and back after: the result sits on the locked head.
+        let b = try Behind()
+        let evil = try b.evil()
+        var ws = b.ws
+        let (root, head) = (b.f.root, b.mainHead)
+        ws.rebaseProbe = { phase in
+            _ = try? GitFixture.plainGit(["update-ref", "refs/heads/main", phase == .before ? evil : head], in: root)
+        }
+        guard case .rebased(let r) = try ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in }) else {
+            Issue.record("K-1 should have been rebased"); return
+        }
+        #expect(try b.f.git(["rev-parse", "\(r)^"]) == b.mainHead)
+        #expect(try !b.ws.isAncestor(evil, of: r), "the unreviewed commit is not part of what will be checked and landed")
+        #expect(try b.f.git(["ls-tree", "--name-only", r]).split(separator: "\n").contains("evil.txt") == false)
+        // main flips and stays flipped: nothing moves, the branch is still the verified commit.
+        ws.rebaseProbe = { phase in
+            if phase == .before { _ = try? GitFixture.plainGit(["update-ref", "refs/heads/main", evil], in: root) }
+        }
+        let outcome = try ws.landVerified(key: "K-2", verified: b.k2, expectedMain: b.mainHead, recordPending: { _ in })
+        #expect(outcome == .mainMoved(head: evil))
+        #expect(try b.ws.head(of: b.ws.branchRef(key: "K-2")) == b.k2)
+    }
+
+    @Test func rebaseResultMustMatchTheMergeOfTheVerifiedTree() throws {
+        // The merge checkout's HEAD is swapped after the rebase for a commit with the same shape but other content.
+        let b = try Behind()
+        let evil = try b.evil()
+        var ws = b.ws
+        let mergePath = b.ws.mergeWorktreePath
+        ws.rebaseProbe = { phase in
+            guard phase == .after, let text = try? String(contentsOf: mergePath.appending(path: ".git"), encoding: .utf8) else { return }
+            let admin = URL(fileURLWithPath: String(text.dropFirst("gitdir: ".count)).trimmingCharacters(in: .whitespacesAndNewlines))
+            try? (evil + "\n").write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8)
+        }
+        let error = #expect(throws: GitError.self) {
+            try ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in })
+        }
+        #expect("\(String(describing: error))".contains("does not hold the merge of the verified work"))
+        #expect(try b.ws.head(of: GitWorkspace.mainRef) == b.mainHead)
+        #expect(try b.ws.head(of: b.ws.branchRef(key: "K-1")) == b.k1, "the branch never moves to a result that is not the merge")
+    }
+
+    @Test func mergeCheckoutLivesOutsideTheWorkspace() throws {
+        let engine = try tempDir().appending(path: "run/merge/c1", directoryHint: .isDirectory)
+        let b = try Behind(ws: { GitWorkspace(root: $0, mergeDirectory: engine) })
+        // A checkout left where agents can write by an older engine is retired.
+        let legacy = b.f.root.appending(path: ".brahma/wt/.merge", directoryHint: .isDirectory)
+        try b.f.git(["worktree", "add", "-q", "--detach", legacy.path, "refs/heads/main"])
+        guard case .rebased(let r) = try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in }) else {
+            Issue.record("K-1 should have been rebased"); return
+        }
+        #expect(b.ws.mergeWorktreePath.path.hasPrefix(engine.path))
+        #expect(!b.ws.mergeWorktreePath.path.hasPrefix(b.f.root.path))
+        #expect(try b.f.git(["rev-parse", "HEAD"], in: b.ws.mergeWorktreePath) == r)
+        #expect(!FileManager.default.fileExists(atPath: legacy.path))
+        #expect(try b.ws.itemWorktrees().map(\.key).sorted() == ["K-1", "K-2"])
+        // A link put in place of the checkout is not followed.
+        try FileManager.default.removeItem(at: b.ws.mergeWorktreePath)
+        let elsewhere = try tempDir()
+        try FileManager.default.createSymbolicLink(at: b.ws.mergeWorktreePath, withDestinationURL: elsewhere)
+        guard case .rebased = try b.ws.landVerified(key: "K-2", verified: b.k2, expectedMain: b.mainHead, recordPending: { _ in }) else {
+            Issue.record("K-2 should have been rebased"); return
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: elsewhere.path).isEmpty)
+    }
 }
