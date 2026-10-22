@@ -142,9 +142,10 @@ public enum SystemTimers {
     public static let jobNames = ["backup.hourly", "backup.repos", "backup.home", "backup.targets", "digest.daily"]
 
     /// Upserts the engine-wide backup timers and one `digest.daily` per company. Idempotent: a timer whose action
-    /// and schedule are unchanged keeps its next fire time.
-    public static func ensure(store: Store, now: Date, digestTime: (hour: Int, minute: Int) = (8, 0)) throws {
+    /// and schedule are unchanged keeps its next fire time. `digestTime` defaults to the owner's preference.
+    public static func ensure(store: Store, now: Date, digestTime: (hour: Int, minute: Int)? = nil) throws {
         let zone = store.ownerTimeZone()
+        let digestTime = try digestTime ?? store.ownerPrefs().digestHourMinute
         let global: [(String, TimerSchedule)] = [
             ("backup.hourly", .every(seconds: 3600)),
             ("backup.repos", .daily(hour: 3, minute: 30)),

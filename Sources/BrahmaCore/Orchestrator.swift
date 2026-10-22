@@ -106,7 +106,7 @@ public actor Orchestrator {
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
             try await recoverMerges()
-            try SystemTimers.ensure(store: store, now: now)
+            try SystemTimers.ensure(store: store, now: now, digestTime: store.ownerPrefs().digestHourMinute)
             ensuredTimerCompanies = Set(try store.companies().map(\.id))
         }
     }

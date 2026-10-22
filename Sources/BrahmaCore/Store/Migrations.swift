@@ -665,5 +665,29 @@ enum Migrations {
             try db.execute(sql: "CREATE UNIQUE INDEX timer_scope_name ON timer(IFNULL(companyId, ''), name)")
             try db.create(index: "timer_due", on: "timer", columns: ["enabled", "nextFireAt"])
         }
+        m.registerMigration("v5-notices") { db in
+            try db.create(table: "ownerNotice") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).references("company", onDelete: .cascade)
+                t.column("kind", .text).notNull()
+                t.column("urgency", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("deliveredAt", .datetime)
+            }
+            try db.create(index: "ownerNotice_undelivered", on: "ownerNotice", columns: ["deliveredAt", "id"])
+            try db.execute(sql: """
+                CREATE TABLE ownerPrefs(
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    notificationsEnabled BOOLEAN NOT NULL DEFAULT 1,
+                    quietEnabled BOOLEAN NOT NULL DEFAULT 1,
+                    quietStart TEXT NOT NULL DEFAULT '22:00',
+                    quietEnd TEXT NOT NULL DEFAULT '08:00',
+                    digestTime TEXT NOT NULL DEFAULT '08:00',
+                    preventSleep BOOLEAN NOT NULL DEFAULT 1)
+                """)
+            try db.execute(sql: "INSERT INTO ownerPrefs(id) VALUES (1)")
+        }
     }
 }

@@ -10,7 +10,7 @@ extension Orchestrator {
     func timersTick(now: Date, companies: [Company]) throws {
         let ids = Set(companies.map(\.id))
         if ensuredTimerCompanies != ids {
-            try SystemTimers.ensure(store: store, now: now)
+            try SystemTimers.ensure(store: store, now: now, digestTime: store.ownerPrefs().digestHourMinute)
             ensuredTimerCompanies = ids
         }
         let due = try store.dueTimers(now: now)

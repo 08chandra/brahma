@@ -82,6 +82,8 @@ struct Run: AsyncParsableCommand {
 final class EventPrinter: @unchecked Sendable {
     private let store: Store
     private var lastId: Int64
+    /// Notices already printed by this process. Printing never marks anything: delivery belongs to the app.
+    private var lastNoticeId: Int64 = 0
     private var slugs: [String: String] = [:]
     private let lock = NSLock()
 
@@ -100,5 +102,18 @@ final class EventPrinter: @unchecked Sendable {
             }
             fflush(stdout)
         }
+        drainNotices()
+    }
+
+    /// Prints each undelivered owner notice once, as `notice: [company] title: body`.
+    private func drainNotices() {
+        guard let notices = try? store.undeliveredNotices() else { return }
+        for n in notices where (n.id ?? 0) > lastNoticeId {
+            if let companyId = n.companyId, slugs[companyId] == nil { slugs[companyId] = (try? store.company(id: companyId))?.slug ?? "?" }
+            let slug = n.companyId.flatMap { slugs[$0] } ?? "all"
+            print(safe("notice: [\(slug)] \(n.title): \(n.body)"))
+            lastNoticeId = n.id ?? lastNoticeId
+        }
+        fflush(stdout)
     }
 }
