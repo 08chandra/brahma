@@ -73,6 +73,10 @@ struct GitCommand: Sendable {
     /// `-c protocol.file.allow=always`, for the engine's own fetches from a local repository; every other protocol stays off.
     var allowsLocalFetch = false
 
+    /// What the repository's `info/attributes` must hold (`RepoConfigGuard.ensureAttributes`): the shared override, or for
+    /// the engine's merge repository its own stronger line (`GitWorkspace.engineAttributes`), never something weaker.
+    var attributes = GitCommand.attributesOverride
+
     func withIndex(_ url: URL) -> GitCommand { var copy = self; copy.indexFile = url; return copy }
 
     static let timeout: TimeInterval = 60
@@ -96,8 +100,9 @@ struct GitCommand: Sendable {
     ]
 
     /// The engine's `info/attributes` (it outranks every other attributes file): no filter, no diff driver (git decides text
-    /// or binary as usual), the built-in text merge. `-diff` would make every review diff "Binary files differ".
-    static let attributesOverride = "* -filter !diff merge=text\n"
+    /// or binary as usual), the built-in text merge, and nothing left out of or substituted in what `git archive` writes.
+    /// `-diff` would make every review diff "Binary files differ".
+    static let attributesOverride = "* -filter !diff merge=text -export-ignore -export-subst\n"
     static let refusalPrefix = "Brahma runs no git in this repository: "
     static let emptyTreeSHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
     static let emptyTreeSHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
@@ -224,7 +229,7 @@ struct GitCommand: Sendable {
             if let refused = scan.refused { problems.append("\(GitWorkspace.shown(file.path)) \(refused)") }
             if file.lastPathComponent == "config", scan.sha256 { sha256 = true }
         }
-        if problems.isEmpty, let problem = RepoConfigGuard.ensureAttributes(commonDir: common) { problems.append(problem) }
+        if problems.isEmpty, let problem = RepoConfigGuard.ensureAttributes(commonDir: common, content: attributes) { problems.append(problem) }
         if !problems.isEmpty {
             let detail = problems.joined(separator: "; ")
             onRefused?(detail)
@@ -399,10 +404,10 @@ enum RepoConfigGuard {
         return result
     }
 
-    /// Writes the engine's `info/attributes` when it is not exactly that. Nil when done (or when there is no repository yet:
-    /// `git init` has not run); else why not. A common dir that is a link (or not a directory) is refused: git would read
-    /// the attributes wherever it points.
-    static func ensureAttributes(commonDir: URL) -> String? {
+    /// Writes `content` (the engine's override) as `info/attributes` when it is not exactly that. Nil when done (or when
+    /// there is no repository yet: `git init` has not run); else why not. A common dir that is a link (or not a directory) is
+    /// refused: git would read the attributes wherever it points.
+    static func ensureAttributes(commonDir: URL, content: String = GitCommand.attributesOverride) -> String? {
         var st = stat()
         guard lstat(commonDir.path, &st) == 0 else { return nil }
         guard st.st_mode & S_IFMT == S_IFDIR else { return "\(GitWorkspace.shown(commonDir.path)) is not a real directory" }
@@ -413,12 +418,12 @@ enum RepoConfigGuard {
             return "cannot create \(GitWorkspace.shown(info.path))"
         }
         let file = info.appending(path: "attributes")
-        if lstat(file.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_size == GitCommand.attributesOverride.utf8.count,
-           FileManager.default.contents(atPath: file.path) == Data(GitCommand.attributesOverride.utf8) {
+        if lstat(file.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_size == content.utf8.count,
+           FileManager.default.contents(atPath: file.path) == Data(content.utf8) {
             return nil
         }
         if lstat(file.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG { try? FileManager.default.removeItem(at: file) }
-        do { try Data(GitCommand.attributesOverride.utf8).write(to: file, options: .atomic) } catch {
+        do { try Data(content.utf8).write(to: file, options: .atomic) } catch {
             return "cannot write \(GitWorkspace.shown(file.path))"
         }
         return nil
@@ -823,6 +828,14 @@ public struct GitWorkspace: Sendable {
     var mergeRepositoryPath: URL { URL(fileURLWithPath: mergeDirectory.path + ".git", isDirectory: true) }
     /// The engine repository's private working tree, `<home>/run/merge/<companyId>-wt`.
     var mergeWorktreePath: URL { URL(fileURLWithPath: mergeDirectory.path + "-wt", isDirectory: true) }
+    /// The engine merge repository's git context: the shared `GitCommand` hardening and config allowlist (its git dir is
+    /// pinned as its own common dir), with the engine's stronger attributes line (`engineAttributes`) kept in its
+    /// `info/attributes`. A refusal there is the company's fault (the engine wrote that config), not a workspace alert.
+    private var engineCommand: GitCommand {
+        var git = GitCommand(gitDir: mergeRepositoryPath, workTree: mergeWorktreePath, commonDir: nil)
+        git.attributes = Self.engineAttributes
+        return git
+    }
     /// Where older engines kept the merge checkout, inside the agent-writable `<ws>/.brahma`.
     private var legacyMergeWorktreePath: URL { worktreesDir.appending(path: ".merge", directoryHint: .isDirectory) }
 
@@ -848,7 +861,7 @@ public struct GitWorkspace: Sendable {
     /// 3. all merge work happens in the engine's own repository, made afresh for this landing (`freshEngineRepository`): only
     ///    `mainHead` and `verified` are fetched into it from the workspace, by SHA, fsck'd, over the local file transport only
     ///    (no refs, no tags, nothing from `refs/replace`), and nothing in the workspace's config, attributes, hooks or admin
-    ///    directories is consulted. Its config and attributes are written again right before the rebase and the merge-tree;
+    ///    directories is consulted. Its config and attributes are written again right before the checkout for the rebase, and the merge-tree;
     /// 4. a `verified` already in `main` is `alreadyLanded`;
     /// 5. a `verified` that descends from `mainHead` is fast-forwarded: `recordPending(verified)` runs first, then a
     ///    compare-and-swap `update-ref` of the workspace's `refs/heads/main`, then the root checkout follows;
@@ -898,9 +911,10 @@ public struct GitWorkspace: Sendable {
             try MergeInfrastructureError.wrapping { try moveMainLocked(from: mainHead, to: verified, recordPending: recordPending) }
             return .fastForwarded(mainHead: verified)
         }
-        try git.run(["checkout", "--quiet", "--force", "--detach", verified])
-        try git.run(["clean", "-ffdx", "--quiet"])
+        // The engine repository's config and attributes are written again before anything there touches a tree.
         try MergeInfrastructureError.wrapping { try assertEngineState() }
+        try git.run(["checkout", "--quiet", "--force", "--no-recurse-submodules", "--detach", verified])
+        try git.run(["clean", "-ffdx", "--quiet"])
         rebaseProbe?(.before)
         let out = try git.run(Self.rebaseConfig + [
             "rebase", "--quiet", "--no-update-refs", "--no-autostash", "--no-autosquash", "--reapply-cherry-picks",
@@ -908,10 +922,10 @@ public struct GitWorkspace: Sendable {
         ], allowFailure: true)
         rebaseProbe?(.after)
         guard out.status == 0 else {
-            let listing = try git.run(["diff", "--name-only", "-z", "--diff-filter=U"], allowFailure: true)
+            let listing = try git.run(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "--diff-filter=U"], allowFailure: true)
             let files = String(decoding: listing.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
             try MergeInfrastructureError.wrapping { try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: mainHead) }
-            _ = try? git.run(["checkout", "--quiet", "--force", "--detach", mainHead], allowFailure: true)
+            _ = try? git.run(["checkout", "--quiet", "--force", "--no-recurse-submodules", "--detach", mainHead], allowFailure: true)
             let nowMain = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
             guard nowMain == mainHead else { return .mainMoved(head: nowMain) }
             if files.isEmpty {
@@ -1069,7 +1083,7 @@ public struct GitWorkspace: Sendable {
                                attributes: [.posixPermissions: 0o700])
         for url in [repo, tree] where (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
         try fm.createDirectory(at: tree, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        let git = GitCommand(gitDir: repo, workTree: tree, commonDir: nil)
+        let git = engineCommand
         try git.run(["init", "--quiet", "--template="])
         try assertEngineState()
         return git
@@ -1078,9 +1092,9 @@ public struct GitWorkspace: Sendable {
     /// Writes the engine repository's `config` and `info/attributes` in full (no includes, no hooks, no fsmonitor, no
     /// `merge.*`, `filter.*` or `diff.*` drivers; `* merge=text -filter -diff -text ...`) and removes every file that could
     /// steer git there (`config.worktree`, `commondir`, `shallow`, grafts, alternates, linked worktrees, hooks). Called when
-    /// the repository is made and again right before each rebase, merge-tree and archive. Every command also runs with
-    /// `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`, `core.attributesFile=/dev/null` and `GIT_ATTR_SOURCE` set to the
-    /// empty tree (`GitCommand`).
+    /// the repository is made and again right before the checkout that starts a rebase, the merge-tree and the archive. Every
+    /// command also runs through the shared `GitCommand` hardening (`engineCommand`): the forced `-c` overrides, no global or
+    /// system config, `--attr-source` set to the empty tree, the config allowlist, and `engineAttributes` kept in place.
     private func assertEngineState() throws {
         let fm = FileManager.default
         let repo = mergeRepositoryPath
@@ -1107,21 +1121,19 @@ public struct GitWorkspace: Sendable {
     /// end-of-line or encoding conversion, no `$Id$` expansion, nothing left out of or substituted in an export.
     static let engineAttributes = "* merge=text -filter -diff -text -eol -ident -export-ignore -export-subst -working-tree-encoding\n"
 
+    /// Only keys the shared allowlist (`RepoConfigGuard.isAllowed`) takes, so the engine repository passes the same check as
+    /// every other repository. What the earlier version also wrote is forced on every call instead: `core.hooksPath`,
+    /// `core.fsmonitor` and `core.attributesFile` by `GitCommand.configFlags`, `rerere.enabled` by `rebaseConfig`;
+    /// `core.autocrlf` is off with no global or system config, and the attributes leave no end-of-line conversion.
     static let engineConfig = """
         [core]
         \trepositoryformatversion = 0
         \tfilemode = true
         \tbare = false
         \tlogallrefupdates = false
-        \thooksPath = /dev/null
-        \tfsmonitor = false
-        \tattributesFile = /dev/null
-        \tautocrlf = false
         \tsymlinks = true
         [gc]
         \tauto = 0
-        [rerere]
-        \tenabled = false
 
         """
 
@@ -1154,11 +1166,14 @@ public struct GitWorkspace: Sendable {
     /// (`protocol.allow=never`, `protocol.file.allow=always`, the stock `git-upload-pack`). A commit git cannot hand over (a
     /// missing or corrupt object) fails as a `GitError`.
     private func fetchIntoEngine(_ engine: GitCommand, commits: [String]) throws {
-        try engine.run(Self.fetchFlags + [gitDir.path] + commits)
+        var fetcher = engine
+        fetcher.allowsLocalFetch = true
+        try fetcher.run(Self.fetchFlags + [gitDir.path] + commits)
     }
 
+    /// With `GitCommand.configFlags` (`protocol.allow=never`) and `allowsLocalFetch` (`protocol.file.allow=always`).
     private static let fetchFlags = [
-        "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "-c", "protocol.version=2",
+        "-c", "protocol.version=2",
         "-c", "uploadpack.allowAnySHA1InWant=true",
         "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true", "-c", "fetch.unpackLimit=1", "-c", "transfer.unpackLimit=1",
         "fetch", "--quiet", "--refetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-gc",
@@ -1408,11 +1423,16 @@ public struct GitWorkspace: Sendable {
                 if (try? fm.attributesOfItem(atPath: archive.path)) != nil { try fm.removeItem(at: archive) }
                 try assertEngineState()
             }
-            try git.run(["archive", "--format=tar", "--output=\(archive.path)", "\(commit)^{commit}"])
+            // The commit is in the engine repository by now (fetched and fsck'd): writing it out is the engine's own step.
+            try MergeInfrastructureError.wrapping {
+                _ = try git.run(["archive", "--format=tar", "--output=\(archive.path)", "\(commit)^{commit}"])
+            }
         }
-        try fm.createDirectory(at: path, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         do {
-            try Self.untar(archive, into: path)
+            try MergeInfrastructureError.wrapping {
+                try fm.createDirectory(at: path, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                try Self.untar(archive, into: path)
+            }
             // A tree cannot hold `.git` (fsck refuses it on the fetch); an export never has one either way.
             if (try? fm.attributesOfItem(atPath: path.appending(path: ".git").path)) != nil {
                 throw GitError.failed(command: "archive", status: -1, stderr: "the export of \(commit.prefix(7)) holds a .git")

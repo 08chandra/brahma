@@ -37,11 +37,14 @@ extension Orchestrator {
     /// merge repository, main's history): held for `mergeRetry`. Such a fault is never charged to an item: the item at the head
     /// of the queue keeps its verified commit, its approval and its place, and the queue waits for the fault to clear. After
     /// `Store.maxMergeFailures` of them in a row the owner gets one engine alert (resolved when a merge lands).
-    func companyMergeFault(company: Company, item: WorkItem, error: MergeInfrastructureError) {
+    /// `streak` names the run of faults counted (the company's landings; a merge check's export counts on its own, so landings
+    /// of other items in between never hide its faults).
+    func companyMergeFault(company: Company, item: WorkItem, error: MergeInfrastructureError, streak: String? = nil) {
         let now = clock()
         holdMerges(companyId: company.id, until: now.addingTimeInterval(Self.mergeRetry))
-        let count = (mergeFaults[company.id] ?? 0) + 1
-        mergeFaults[company.id] = count
+        let key = streak ?? company.id
+        let count = (mergeFaults[key] ?? 0) + 1
+        mergeFaults[key] = count
         guard count == Store.maxMergeFailures else { return }
         do {
             try EngineAlerts.raise(
@@ -56,6 +59,19 @@ extension Orchestrator {
     }
 
     func companyMergeRan(companyId: String) { mergeFaults[companyId] = nil }
+    func companyMergeRan(streak: String) { mergeFaults[streak] = nil }
+
+    /// The company's fault, not the item's: the engine's own merge steps (`MergeInfrastructureError`), or git refused to run
+    /// at all because a repository's config is not one the engine runs git with (nothing ran; its own alert).
+    nonisolated static func isCompanyMergeFault(_ error: any Error) -> Bool {
+        if error is MergeInfrastructureError { return true }
+        if let git = error as? GitError, git.isRepositoryRefusal { return true }
+        return false
+    }
+
+    nonisolated static func companyFault(_ error: any Error) -> MergeInfrastructureError {
+        error as? MergeInfrastructureError ?? MergeInfrastructureError(underlying: error)
+    }
 
     /// The git work for one approved item, then its recording (`finishMerge`), all off the actor. A merge that could not run
     /// (a hold) is not tried again for `mergeRetry` seconds; its item stays `pending`. A merge that failed for the company's
@@ -73,9 +89,9 @@ extension Orchestrator {
             }
             await companyMergeRan(companyId: company.id)
             try store.finishMerge(itemId: item.id, result: result, now: clock())
-        } catch let error as MergeInfrastructureError {
+        } catch let error where Self.isCompanyMergeFault(error) {
             log("could not merge \(item.key) (\(company.name)'s merge step failed): \(error)")
-            await companyMergeFault(company: company, item: item, error: error)
+            await companyMergeFault(company: company, item: item, error: Self.companyFault(error))
         } catch {
             log("could not merge \(item.key): \(error)")
             let returned = (try? store.noteMergeFailure(itemId: item.id, error: "\(error)", now: clock())) ?? false

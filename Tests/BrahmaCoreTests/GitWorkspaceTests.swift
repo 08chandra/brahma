@@ -799,7 +799,7 @@ import Foundation
         #expect(args.firstIndex(of: "--attr-source=\(GitCommand.emptyTreeSHA1)")! < args.firstIndex(of: "status")!)
         // The engine's attributes override is in place after any engine call.
         _ = try f.ws.isDirty(in: f.root)
-        #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == "* -filter !diff merge=text\n")
+        #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == "* -filter !diff merge=text -export-ignore -export-subst\n")
         try f.write(".git/info/attributes", "* filter=evil\n")
         _ = try f.ws.isDirty(in: f.root)
         #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == GitCommand.attributesOverride)
@@ -1380,7 +1380,8 @@ import Foundation
     // MARK: Merges in an engine-owned repository (9b fix round 3: E1, E2)
 
     /// `main` and `K-1` each change a different end of `big.txt` (a clean content merge, so any merge driver is asked), with a
-    /// `.gitattributes` that routes every file to an `evil` driver and a repository config that defines it.
+    /// `.gitattributes` that routes every file to an `evil` driver. `plantDriver()` defines it in the workspace's config (which
+    /// the shared allowlist refuses outright: no git runs there while it stays).
     private struct Driven {
         let f: GitFixture
         let ws: GitWorkspace
@@ -1392,7 +1393,6 @@ import Foundation
             f = try GitFixture(files: ["big.txt": lines, ".gitattributes": "* merge=evil\n"])
             ws = make(f.root)
             sentinel = try tempDir().appending(path: "driver-ran")
-            try f.git(["config", "merge.evil.driver", "touch '\(sentinel.path)'; true"])
             let wt = try ws.addWorktree(key: "K-1")
             try f.write("big.txt", lines.replacingOccurrences(of: "line 1\n", with: "line one\n"), in: wt)
             try f.git(["add", "-A"], in: wt); try f.git(["commit", "-qm", "K-1"], in: wt)
@@ -1401,17 +1401,31 @@ import Foundation
             try f.git(["add", "-A"]); try f.git(["commit", "-qm", "main moves"])
             mainHead = try #require(try ws.head(of: GitWorkspace.mainRef))
         }
+
+        func plantDriver() throws { try f.git(["config", "merge.evil.driver", "touch '\(sentinel.path)'; true"]) }
     }
 
     @Test func evilMergeDriverNeverRuns() throws {
         let d = try Driven()
+        // Defined in the workspace's config: the landing is refused before any git runs, as the company's fault.
+        try d.plantDriver()
+        do {
+            let outcome = try d.ws.landVerified(key: "K-1", verified: d.k1, expectedMain: d.mainHead, recordPending: { _ in })
+            Issue.record("a workspace with a merge driver in its config was merged: \(outcome)")
+        } catch let error {
+            #expect(error is MergeInfrastructureError, "\(error)")
+            #expect("\(error)".contains("merge.evil.driver"), "\(error)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: d.sentinel.path), "the workspace's merge driver ran")
+        #expect(try d.f.git(["rev-parse", "refs/heads/main"]) == d.mainHead)
+        // Without it, the tree's `merge=evil` names a driver nothing defines: the built-in text merge runs.
+        try d.f.git(["config", "--unset", "merge.evil.driver"])
         guard case .rebased(let r) = try d.ws.landVerified(key: "K-1", verified: d.k1, expectedMain: d.mainHead, recordPending: { _ in }) else {
             Issue.record("K-1 should have been rebased"); return
         }
         #expect(!FileManager.default.fileExists(atPath: d.sentinel.path), "the workspace's merge driver ran")
         let merged = try d.f.git(["show", "\(r):big.txt"])
         #expect(merged.contains("line one")); #expect(merged.contains("line twenty"))
-        // Nor does the planted driver run in the engine's own repository when the workspace config is the only place it lives.
         #expect(try d.ws.head(of: GitWorkspace.mainRef) == d.mainHead)
     }
 
@@ -1423,7 +1437,7 @@ import Foundation
         }
         let repo = URL(fileURLWithPath: engine.path + ".git", isDirectory: true)
         let config = try String(contentsOf: repo.appending(path: "config"), encoding: .utf8)
-        #expect(config.contains("hooksPath = /dev/null")); #expect(config.contains("fsmonitor = false"))
+        #expect(config == GitWorkspace.engineConfig, "only keys the shared allowlist takes; hooks, fsmonitor and attributes are forced per call")
         for banned in ["include", "merge \"", "filter \"", "diff \"", "[merge", "[filter", "[diff"] { #expect(!config.contains(banned), "\(banned)") }
         let attributes = try String(contentsOf: repo.appending(path: "info/attributes"), encoding: .utf8)
         #expect(attributes == GitWorkspace.engineAttributes)
@@ -1560,8 +1574,8 @@ import Foundation
         let d = try Driven(ws: { GitWorkspace(root: $0, mergeDirectory: engine) })
         // The tree routes every file through a smudge filter the workspace defines, hides a file from exports and asks for a
         // substitution: none of it may change what the check sees.
+        // (A filter the workspace's config defines refuses the workspace outright: `repoFilterIsRefusedAndNeverRuns`.)
         let smudged = try tempDir().appending(path: "smudge-ran")
-        try d.f.git(["config", "filter.evil.smudge", "touch '\(smudged.path)'; cat"])
         try d.f.write(".gitattributes", "* merge=evil filter=evil\nhidden.txt export-ignore\nsubst.txt export-subst\n")
         try d.f.write("hidden.txt", "the test the export must not hide\n")
         try d.f.write("subst.txt", "$Format:%H$\n")
@@ -1691,17 +1705,65 @@ import Foundation
     }
 
     @Test func engineFetchesIgnoreTheWorkspacesURLRewritesAndSSHCommand() throws {
-        // The workspace config (agent-writable) rewrites both repositories' paths to ssh, whose command would run code.
+        // The workspace config (agent-writable) rewrites both repositories' paths to ssh, whose command would run code: the
+        // shared allowlist refuses the workspace before any git runs (the company's fault, not the item's).
         let b = try Behind()
         let sentinel = try tempDir().appending(path: "ssh-ran")
         try b.f.git(["config", "url.ssh://evil.invalid/engine.insteadOf", b.ws.mergeRepositoryPath.path])
         try b.f.git(["config", "url.ssh://evil.invalid/workspace.insteadOf", b.f.root.path])
         try b.f.git(["config", "core.sshCommand", "touch '\(sentinel.path)'; false"])
+        #expect(throws: MergeInfrastructureError.self) {
+            try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in })
+        }
+        #expect(!FileManager.default.fileExists(atPath: sentinel.path), "core.sshCommand ran")
+        // With them gone the landing goes through (the engine repository is made afresh, with config of its own).
+        try b.f.git(["config", "--remove-section", "url.ssh://evil.invalid/engine"])
+        try b.f.git(["config", "--remove-section", "url.ssh://evil.invalid/workspace"])
+        try b.f.git(["config", "--unset", "core.sshCommand"])
         let outcome = try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in })
         guard case .rebased(let r) = outcome else { Issue.record("\(outcome)"); return }
         #expect(!FileManager.default.fileExists(atPath: sentinel.path), "core.sshCommand ran")
         #expect(try b.f.git(["rev-parse", "\(r)^"]) == b.mainHead)
         #expect(try b.ws.head(of: b.ws.branchRef(key: "K-1")) == r)
     }
-}
 
+    // MARK: Integration with the shared git hardening (9b fix round 5)
+
+    @Test func engineConfigPassesTheSharedAllowlistAndAMergeGoesThrough() throws {
+        let dir = try tempDir()
+        let file = dir.appending(path: "config")
+        try GitWorkspace.engineConfig.write(to: file, atomically: true, encoding: .utf8)
+        #expect(RepoConfigGuard.scan(file, with: GitCommand(gitDir: dir, workTree: dir, commonDir: nil)).refused == nil)
+        // A landing and the export of its result go through end to end, the engine repository's config as the engine wrote it.
+        let b = try Behind()
+        guard case .rebased(let r) = try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in }) else {
+            Issue.record("K-1 should have been rebased"); return
+        }
+        let export = try b.ws.addEngineExport(runId: "run-1", commit: r)
+        #expect(try String(contentsOf: export.appending(path: "K-1.txt"), encoding: .utf8) == "K-1\n")
+        #expect(try String(contentsOf: export.appending(path: "m.txt"), encoding: .utf8) == "main\n")
+        #expect(try String(contentsOf: b.ws.mergeRepositoryPath.appending(path: "config"), encoding: .utf8) == GitWorkspace.engineConfig)
+        b.ws.removeRunWorktree(runId: "run-1")
+    }
+
+    @Test func exportIgnoreCannotHideFilesFromTheMergeCheck() throws {
+        let b = try Behind()
+        try b.f.write(".gitattributes", "hidden.txt export-ignore\n*.md export-ignore\nsubst.txt export-subst\n")
+        try b.f.write("hidden.txt", "the test the export must not hide\n")
+        try b.f.write("notes.md", "notes\n")
+        try b.f.write("subst.txt", "$Format:%H$\n")
+        try b.f.git(["add", "-A"]); try b.f.git(["commit", "-qm", "attrs"])
+        let commit = try #require(try b.ws.head(of: GitWorkspace.mainRef))
+        let dir = try b.ws.addEngineExport(runId: "run-1", commit: commit)
+        #expect(try String(contentsOf: dir.appending(path: "hidden.txt"), encoding: .utf8) == "the test the export must not hide\n")
+        #expect(FileManager.default.fileExists(atPath: dir.appending(path: "notes.md").path))
+        #expect(try String(contentsOf: dir.appending(path: "subst.txt"), encoding: .utf8) == "$Format:%H$\n")
+        // The shared attributes rewrite never weakens the engine repository's own line.
+        let engine = try String(contentsOf: b.ws.mergeRepositoryPath.appending(path: "info/attributes"), encoding: .utf8)
+        #expect(engine == GitWorkspace.engineAttributes)
+        // Every other repository's override says the same about exports.
+        #expect(GitCommand.attributesOverride == "* -filter !diff merge=text -export-ignore -export-subst\n")
+        #expect(try String(contentsOf: b.f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == GitCommand.attributesOverride)
+        b.ws.removeRunWorktree(runId: "run-1")
+    }
+}

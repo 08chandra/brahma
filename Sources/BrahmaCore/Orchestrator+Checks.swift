@@ -66,11 +66,23 @@ extension Orchestrator {
             dir = run.purpose == .merge ? try git.addEngineExport(runId: run.id, commit: run.commit)
                 : try git.addRunWorktree(runId: run.id, commit: run.commit)
             try store.setVerificationDirectory(runId: run.id, path: dir.path)
+        } catch let error where run.purpose == .merge && Orchestrator.isCompanyMergeFault(error) {
+            // The engine's own machinery, not the item: held and retried, never charged to the item (`companyMergeFault`).
+            git.removeRunWorktree(runId: run.id)
+            log("could not export \(run.commit.prefix(7)) for its merge check (\(company.name)'s merge step failed): \(error)")
+            do { try store.deferVerification(runId: run.id, delay: Self.mergeRetry) } catch {
+                log("could not put the merge check of run \(run.id) back in the queue: \(error)")
+            }
+            if let item = try? await store.writer.read({ try WorkItem.fetchOne($0, key: run.itemId) }) {
+                await companyMergeFault(company: company, item: item, error: Orchestrator.companyFault(error), streak: "check:\(company.id)")
+            }
+            return
         } catch {
             git.removeRunWorktree(runId: run.id)
             couldNotRun("could not check out the submitted commit: \(error)")
             return
         }
+        if run.purpose == .merge { await companyMergeRan(streak: "check:\(company.id)") }
         let holder = (try? store.lease(itemId: run.itemId))?.agentId ?? run.requestedBy
         let environment = ChildEnvironment.make(base: checkBaseEnvironment, extra: holder.map { ["BRAHMA_AGENT_ID": $0] } ?? [:],
                                                 purpose: .check)

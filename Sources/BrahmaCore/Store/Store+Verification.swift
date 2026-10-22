@@ -294,6 +294,19 @@ extension Store {
         }
     }
 
+    /// A merge check that could not start for the company's own reasons (the engine's merge repository or its lock, a
+    /// shallow workspace: `MergeInfrastructureError`): the same run goes back to the queue, not before `delay` more active
+    /// seconds. It is not an attempt: nothing is recorded as inconclusive and the item keeps its approval and its place.
+    func deferVerification(runId: String, delay: TimeInterval) throws {
+        try writer.write { db in
+            guard let run = try VerificationRun.fetchOne(db, key: runId), run.status == .running else { return }
+            let active = try Self.activeNow(db: db, companyId: run.companyId)
+            try db.execute(sql: """
+                UPDATE verificationRun SET status = 'queued', startedAt = NULL, outputPath = NULL, notBeforeActive = ? WHERE id = ?
+                """, arguments: [active + delay, runId])
+        }
+    }
+
     // MARK: Outcomes
 
     /// A run is stale when the item's check changed, the item left review, or (for a submit run) the item was submitted again.

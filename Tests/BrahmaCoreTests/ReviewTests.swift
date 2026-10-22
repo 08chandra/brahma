@@ -1115,6 +1115,50 @@ import GRDB
         #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
     }
 
+    @Test func aMergeCheckExportFaultHoldsWithoutReturningTheItem() async throws {
+        // A store with a data home of its own, so the engine's merge directory is this test's alone.
+        let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let r = try R(store: try Store(path: home.appending(path: "brahma.db").path))
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
+        _ = try await r.drive(a)
+        try await r.cycle()    // b is rebased onto the new main; its merge check is queued
+        let rebased = try #require(try r.head(b))
+        #expect(try r.fresh(b).mergeState == .verifying)
+        let run = try #require(try r.store.latestVerification(itemId: b.id))
+        #expect(run.purpose == .merge); #expect(run.status == .queued)
+        // The engine's merge repository cannot be made for the check's export (its parent directory is a file).
+        let parent = r.store.gitWorkspace(root: r.root, companyId: r.company.id).mergeDirectory.deletingLastPathComponent()
+        try #require(parent.path.hasPrefix(home.path))
+        if FileManager.default.fileExists(atPath: parent.path) { try FileManager.default.removeItem(at: parent) }
+        try "blocked".write(to: parent, atomically: true, encoding: .utf8)
+        let calls = r.world.checks.calls.count
+        for _ in 0..<(3 * Store.maxInconclusive) {
+            r.world.clock.advance(61)
+            try await r.cycle()
+        }
+        #expect(r.world.checks.calls.count == calls, "no check ran without its export")
+        let held = try r.fresh(b)
+        #expect(held.status == .inReview, "the item is not returned for the company's fault")
+        #expect(held.mergeState == .verifying); #expect(held.verifiedCommit != nil)
+        #expect(try r.events(b, .verificationFailed).isEmpty)
+        let runs = try await r.store.writer.read { db in
+            try VerificationRun.filter(Column("itemId") == b.id && Column("purpose") == "merge").fetchAll(db)
+        }
+        #expect(runs.count == 1, "the same run waits; no inconclusive attempts pile up: \(runs.map(\.status))")
+        #expect(runs.first?.status == .queued)
+        let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.count == 1, "one owner alert")
+        // Once the fault clears the check runs, passes and b lands; the alert resolves.
+        try FileManager.default.removeItem(at: parent)
+        r.world.clock.advance(61)
+        let done = try await r.drive(b)
+        #expect(done.status == .done); #expect(try r.mainHead() == rebased)
+        #expect(r.world.checks.calls.count == calls + 1)
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
+    }
+
     @Test func theGitVersionIsRecordedAtStartUp() async throws {
         let r = try R()
         try r.store.recoverMerges()
