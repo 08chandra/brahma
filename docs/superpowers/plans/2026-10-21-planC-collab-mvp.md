@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** The PREVIEW pane can open any piece of company work by a typed reference; one global search-and-ask bar (⌘K anywhere, and atop the preview) searches everything happening in the company with filters, answers common factual questions by plain code, all with zero LLM turns, and only on an explicit Ask gets a cheap concierge (answers must cite their sources) or an idle agent to answer with `show`; agents and the owner share, quote, thread and request files under per-reader access, taint and secret checks.
+**Goal:** The PREVIEW pane can open any piece of company work by a typed reference; a CHANGES tab shows every engineer's work live as a diff (board, compare modes, inline owner review); one global search-and-ask bar (⌘K anywhere, and atop the preview) searches everything happening in the company with filters, answers common factual questions by plain code, all with zero LLM turns, and only on an explicit Ask gets a cheap concierge (answers must cite their sources) or an idle agent to answer with `show`; agents and the owner share, quote, thread and request files under per-reader access, taint and secret checks.
 
 **Architecture:** Everything authoritative lives in Linux-portable `BrahmaCore`: `WorkRef` (one typed reference) plus `RefAccess`/`RefResolver` (per-reader resolution and pinning), `SafeFS`/`SafeGit` (no confused deputy), an engine **vault** in the data home for every scoped, tainted or private byte, `Store.openRef` as the only read path, and the `ShowResolver`/`ShowRouting`/concierge engine. MCP tools (`share`, `open_ref`, `show`, plus `reply_to`/`attachments`/`thread` parameters) are thin callers. `BrahmaAppModel` turns `ResolvedRef`s into `RefBody` values rendered through L's `PreviewPane` (one OPENED slot, history, steps) and 4a's `FileBodyView`; `BrahmaApp` only draws.
 
@@ -34,7 +34,8 @@ Marks: † 3a, ‡ 5-lite, § L, ◊ 4a, ¶ Memory-lite (being written in parall
 - **The owner-instruction rule is a `RolePrompt` line, not a digest line.** It is the same every turn, so it belongs in the byte-stable prefix (spec v2 §4.3.3).
 - **The Show bar is the global search-and-ask bar (owner request, 2026-10-22).** It searches every kind of company record (messages and threads, items and their events, asks, agents and their current work, KB, memory through `MemoryIndex.search(scope: .owner)`, files, artifacts, resources, commits and diffs, releases, activity, sprints, runs, previews), with filters (`blocked`, `this week`, `by @x`, `kind:`, `in:#ch`), and never starts a turn while typing (C4a). Common factual questions (usage, blocked, who's on X, what shipped, pending asks, sprint progress, failing checks) are answered by plain-code `FactsResolver` queries as an answer card whose every line links a ref (C4b). Open-ended questions go to the concierge, whose answer must cite a ref for every claim; an answer that doesn't is shown UNVERIFIED (C4c). `@handle` questions still go to that agent. Agents get the same engine through a `search` tool limited to their own scope.
 - **Two internal ref kinds.** `sprint:<n>` (a typed ref, company class) and `fact:<query>` (internal only: accepted from the app and deep links, never from `RefScanner` or tool input) let search hits and answers open in the OPENED slot.
-- **Task split.** The design's C1–C7 stay; C1, C2, C3 and C7 are each split in two (a/b) and C4 in three (a/b/c), because each part has its own test cycle and a reviewer could reject one part alone. Migrations: `"vC-refs"` (C2a), `"vC-threads"` (C3a), `"vC-show"` (C4c).
+- **Task split.** The design's C1–C7 stay; C1, C2 and C3 are each split in two (a/b), C4 and C7 in three (a/b/c), and C5 and C6 gain a `b` task for live changes, because each part has its own test cycle and a reviewer could reject one part alone. Migrations: `"vC-refs"` (C2a), `"vC-threads"` (C3a), `"vC-show"` (C4c), `"vC-changes"` (C5b; a fourth Collab migration beyond the roadmap's three, still before 4b).
+- **Live code changes, Codex-style (owner request, 2026-10-22).** A fixed CHANGES preview tab shows a company-wide board of active worktrees and, per item, a live diff that refreshes every 2 s while visible, with unified ⇄ split, highlighting, next/previous change, folded unchanged lines and compare modes (vs main, vs last commit, vs last check, between revisions). Everything is computed by C1a's `worktreeDiff` on a temp index and parsed by C6's `DiffModel`; there is no second diff engine. Diff text is untrusted (quoted, invisible-character markers) and passes `Redactor` and the pattern redaction before display or storage. Live worktree refs are readable only by the owner, the concierge, the holder and the reviewer; pinned shares keep the company class. Owner line comments and "ask to revert this hunk" become item comments plus a waking notice for the holder — the engine never edits a worktree. Agents (including reviewers in review turns) show diffs with `show` and the new refs `ENG-142:changes`, `diff:<sha>..<sha>` and `wt:@handle` (C5b, C6b, C7c).
 
 ## Global Constraints
 
@@ -65,8 +66,8 @@ Copied from Plans 3a and 5-lite (as amended) and still binding:
 - Reserved matters, money, outbound messages, secrets and terminations never auto-approve under any preset. Agent text never sets urgency or risk.
 
 Collab additions:
-- **Execution order:** C1a, C1b, C2a, C2b, C3a, C3b, C4a, C4b, C4c, C5, C6, C7a, C7b.
-- **Migrations** append after 4a's last (`"v4a-demos"`) and before 4b's `"v4b-vacancy-note"`: `"vC-refs"` (C2a), `"vC-threads"` (C3a), `"vC-show"` (C4c). Never edit an earlier migration.
+- **Execution order:** C1a, C1b, C2a, C2b, C3a, C3b, C4a, C4b, C4c, C5, C5b, C6, C6b, C7a, C7c, C7b.
+- **Migrations** append after 4a's last (`"v4a-demos"`) and before 4b's `"v4b-vacancy-note"`: `"vC-refs"` (C2a), `"vC-threads"` (C3a), `"vC-show"` (C4c), `"vC-changes"` (C5b). Never edit an earlier migration.
 - **One read path.** Agent reads of shared content go only through `Store.openRef` (tool `open_ref`); every read writes a `refRead` row. Scoped, tainted, private and redacted bytes live only in the vault `<paths.home>/vault/<companyId>/` and in materialized copies in the reader's own lab.
 - **No confused deputy.** Every agent-named path is opened through `SafeFS`; every Collab git call goes through `SafeGit` (C1a). No other code in this plan opens an agent-named path or builds git argv.
 - **Every lookup has `WHERE companyId = ?`.** A cross-company ref is indistinguishable from a missing one (same text, blank metadata).
@@ -89,7 +90,8 @@ Collab additions:
 | git blob read | text ≤ 2 MB · binary ≤ 50 MB (`cat-file -s` first) | `SafeGit.maxTextBytes`, `.maxBinaryBytes` |
 | Diff | ≤ 5000 lines | `SafeGit.maxDiffLines` |
 | git subprocess | 10 s timeout · 8 MB output cap | `SafeGit.timeout`, `.outputCap` |
-| Live worktree diff | at most once per 5 s per item | `WorktreeDiffCache.minInterval` |
+| Live changes | refresh every 2 s while observed (10 s when the holder isn't running) · ≤ 1 recompute per 2 s per (item, compare) · FSEvents nudge debounce 300 ms · patch ≤ 5000 lines · files > 2 MB or binary summarized · ≤ 1500 lines per file · ≤ 2000 files listed | `ChangesLimits` |
+| Inline review | hunk quote ≤ 20 lines × 200 chars · comment ≤ 2000 chars · re-anchor window ±50 lines | `Store.addDiffComment`, `ReviewDraft` |
 | Archives (scan and extract) | ≤ 200 MB decompressed · ratio ≤ 100 | `ArchiveLimits` |
 | FileIndex | ≤ 200 000 entries per branch · last-touch map from the newest 500 commits | `FileIndex.maxEntries`, `.recencyCommits` |
 | Show bar | debounce 80 ms · ≤ 5 rows per group · query ≤ 300 chars · p95 < 50 ms at 20k files / 50k messages | `ShowBarModel.debounce`, `ShowResolver.groupLimit`, `.maxQuery` |
@@ -151,7 +153,11 @@ Sources/BrahmaCore/
   Show/ShowRouting.swift       ShowRouting, RoutedTarget, ShowCandidates
   Show/ShowRequests.swift      Store show lifecycle, ShowLifecycle, ShowCost, ShowETA, OwnerRequestUsage
   Show/Concierge.swift         ConciergePrompt, ConciergeCaps, OwnerLane, ShowTurnCaps
-  MCP/CollabTools.swift        share, open_ref, show, find_refs (+ reply_to/attachments/thread params on existing tools)
+  Changes/ChangesSnapshot.swift CompareMode, ChangedFile, ChangesSnapshot, ChangesLimits, ItemRevision, Store.changesSnapshot
+  Changes/LiveChanges.swift    LiveChanges (2 s observed refresh, nudge)
+  Changes/ChangesBoard.swift   BoardRow, Store.changesBoard
+  Changes/DiffComments.swift   DiffAnchor, DiffComment, addDiffComment, requestHunkRevert, re-anchoring
+  MCP/CollabTools.swift        share, open_ref, show, find_refs, search (+ reply_to/attachments/thread params on existing tools)
   (modified) Model/Turn.swift (TurnKind.show, ActivityKind cases) Model/Messaging.swift Store/Migrations.swift
              Messaging/MessageRouter.swift Messaging/WakePolicy.swift Turns/Prompts.swift Turns/TurnDigest.swift
              Turns/TurnProfile.swift MCP/CompanyTools.swift Safety/Taint.swift Org/IndustryPack.swift
@@ -169,6 +175,9 @@ Sources/BrahmaAppModel/
   Show/ShowAnswerRouter.swift  AutoOpenDecision, ShowAnswerRouter, WaitingChip
   Chat/AttachmentModel.swift   AttachmentCard, AttachmentCards, PendingDrop, TrustChip
   Presentation/SharingRows.swift SharingRow, SharingRows
+  Changes/ChangesTabModel.swift ChangesTabModel
+  Changes/DiffPresentation.swift SplitRow, DiffRowItem, DiffStop, DiffViewMode, BoardRows
+  Changes/ReviewDraft.swift    ReviewDraft
   (modified) Preview/PreviewPresentation.swift (PreviewBody.ref) LaunchOptions.swift (SelectTarget.ref)
              Presentation/ActivityText.swift (ActivityFilter.sharing) Chat/ChatModel.swift Chat/MentionCompleter.swift
 Sources/BrahmaApp/Views/Refs/
@@ -177,15 +186,17 @@ Sources/BrahmaApp/Views/Refs/
   FileRequestCardView.swift
   (modified) Preview/PreviewPane.swift (accessory + ref arm) ChatView.swift Composer.swift InboxView.swift
              ActivityFeedView.swift BudgetView.swift MissionControlView.swift BrahmaApp.swift (⌘K)
+Sources/BrahmaApp/Views/Changes/
+  ChangesBoardView.swift ChangesDiffView.swift ComparePicker.swift ReviewPopover.swift WorktreeNudger.swift
 Tests/BrahmaCoreTests/
   SafeFSTests SafeGitTests WorkRefTests RefScannerTests RefAccessTests RefResolverTests VaultTests RefTaintTests
   RefPinTests OpenRefTests SecretGateTests PurgeTests ThreadTests ShareTests DigestRefsTests FileIndexTests
   SearchFiltersTests GlobalSearchTests ShowResolverTests FactsTests ShowRoutingTests ShowRequestTests ConciergeTests
-  CitationTests FileFlowTests ExportTests LiveCollabTests
+  CitationTests FileFlowTests ExportTests ChangesSnapshotTests LiveChangesTests ChangesBoardTests DiffCommentTests LiveCollabTests
 Tests/BrahmaAppModelTests/
   PreviewNavTests RefBodiesTests CodeHighlighterTests DiffModelTests ShowBarModelTests ShowAnswerRouterTests
-  AttachmentModelTests SelectTargetRefTests SharingRowsTests LiveShowBarTests
-README.md (Sharing and preview section) scripts/seed-demo.sh (shares, thread, file ask)
+  AttachmentModelTests SelectTargetRefTests SharingRowsTests DiffPresentationTests ChangesTabModelTests LiveShowBarTests
+README.md (Sharing and preview section) scripts/seed-demo.sh (shares, thread, file ask, a live worktree edit)
 ```
 
 ---
@@ -221,7 +232,7 @@ README.md (Sharing and preview section) scripts/seed-demo.sh (shares, thread, fi
     - `func revList(_ from: String, _ to: String) throws -> [String]`, `logShas(range: String, path: String) throws -> [String]`, `recentPaths(rev: String, commits: Int) throws -> [String: Int] /* path → unix time */`.
     - `func hashObject(from file: SafeFile) throws -> String`.
     - `func updateShareRef(_ messageRefId: String, to sha: String) throws`, `deleteShareRef(_:)`, `expireAndPrune() throws` (only `refs/brahma/shares/` names are writable).
-    - `func worktreeDiff(key: String, worktree: URL, tempDir: URL, fs: SafeFS) throws -> WorktreeDiff`; `struct WorktreeDiff { files: [(path, status)]; patch: String; blobShas: [String: String]; truncated: Bool }`.
+    - `func worktreeDiff(key: String, worktree: URL, against: String? = nil /* engine-recorded tree-ish sha; nil = head(item/<KEY>) */, tempDir: URL, fs: SafeFS) throws -> WorktreeDiff`; `struct WorktreeDiff { files: [(path: String, status: String, added: Int?, removed: Int? /* nil = binary */, bytes: Int)]; patch: String; blobShas: [String: String]; truncated: Bool }` (C5b's live CHANGES view and compare modes reuse it; nothing else computes worktree diffs).
   - `protocol GitProcessRunning: Sendable { func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) }`.
 
 - [ ] **Step 1: Write the failing tests.** `SafeFSTests` (temp workspace with `.brahma/{labs/eng-1,labs/qa-2,home/eng-1,notes,artifacts,checks}` and `.brahma/wt/ENG-1/`):
@@ -247,6 +258,7 @@ README.md (Sharing and preview section) scripts/seed-demo.sh (shares, thread, fi
 @Test func unreachableShaRefused() throws { /* commit-tree object on no branch → .unreachable; on item/ENG-1 → ok; on refs/brahma/shares/x → ok */ }
 @Test func sizeCheckedBeforeRead() throws { /* 3 MB text blob → .tooLarge before any cat-file -p call (fake records only cat-file -s) */ }
 @Test func timeoutKillsAndCapsOutput() throws { /* fake sleeps past an injected 0.2 s timeout → .timedOut; 9 MB stdout → .outputTooLarge */ }
+@Test func worktreeDiffAgainstBase() throws { /* against: merge-base(main, item/ENG-1) → committed and uncommitted changes since the base both appear; against nil → only uncommitted */ }
 @Test func worktreeDiffMatchesGitStatus() throws { /* modify, add untracked, delete → file set == `git status --porcelain` paths; untracked read via SafeFS; blobShas match `git hash-object` */ }
 @Test func onlyShareRefsWritable() throws { /* updateShareRef("x/../../heads/main", …) → .badRef */ }
 ```
@@ -256,7 +268,7 @@ README.md (Sharing and preview section) scripts/seed-demo.sh (shares, thread, fi
   - under `labs`, the next inode must equal the own-lab fd, else `.privateTo(<entry name, ASCII-sanitized>)`; under `notes`, the only allowed name is `<own handle>.md`, else `.privateTo(<name minus .md>)`; `home` is always `.notAllowed` (it holds transcripts);
   - the final fd must be `S_ISREG`, `st_nlink == 1`, `st_dev` equal to the workspace's, and `st_size ≤ maxBytes`.
   Reject `..`, empty components, NUL, C0/C1 controls, bidi and zero-width characters before walking. Linux uses `Glibc` for the same calls (`#if canImport(Darwin)` / `#else`).
-- [ ] **Step 4: Implement `SafeGit`.** It always sets `GIT_DIR=<ws>/.git` (the common dir, never `.git/worktrees/<KEY>`) and the env and `-c` flags in the test, through `GitCommand`†. `verifyRev` accepts only `^[0-9a-f]{7,40}$`, resolves with `rev-parse --verify --end-of-options <sha>^{commit}`, then requires `merge-base --is-ancestor` against at least one of `refs` (callers pass `main`, the engine-recorded `item/*` branches and, for stored pins, `refs/brahma/shares/*`). Branch names come only from engine records. `worktreeDiff` uses `GIT_WORK_TREE=<worktree>` with `GIT_INDEX_FILE=<tempDir>/index` after `read-tree item/<KEY>`, then `diff --no-textconv --no-ext-diff` plus `ls-files --others --exclude-standard`; untracked bytes come through `SafeFS.open(_:inWorktree:)`. `hashObject` feeds `hash-object -w --stdin --no-filters` from the `SafeFile` fd.
+- [ ] **Step 4: Implement `SafeGit`.** It always sets `GIT_DIR=<ws>/.git` (the common dir, never `.git/worktrees/<KEY>`) and the env and `-c` flags in the test, through `GitCommand`†. `verifyRev` accepts only `^[0-9a-f]{7,40}$`, resolves with `rev-parse --verify --end-of-options <sha>^{commit}`, then requires `merge-base --is-ancestor` against at least one of `refs` (callers pass `main`, the engine-recorded `item/*` branches and, for stored pins, `refs/brahma/shares/*`). Branch names come only from engine records. `worktreeDiff` uses `GIT_WORK_TREE=<worktree>` with `GIT_INDEX_FILE=<tempDir>/index` after `read-tree <against ?? item/KEY>` (an engine-verified sha, never agent text), then `diff --no-textconv --no-ext-diff` and `--numstat` plus `ls-files --others --exclude-standard`; untracked bytes come through `SafeFS.open(_:inWorktree:)`. `hashObject` feeds `hash-object -w --stdin --no-filters` from the `SafeFile` fd.
 - [ ] **Step 5:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "SafeFSTests|SafeGitTests"`, then `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build`. Expected: PASS; build green.
 - [ ] **Step 6:** Commit `feat(core): SafeFS and SafeGit for agent-named paths and hardened git` with the trailer lines (record any contract renames found).
 
@@ -870,6 +882,97 @@ func exportSanitizesName(_ d: String, _ e: String, _ out: String) { #expect(Expo
 
 ---
 
+### Task C5b: Live changes engine — worktree diffs, compare modes, board, inline review
+
+The preview can show any agent's diff work live, Codex-style (owner request, 2026-10-22). Everything here reuses C1a's `SafeGit.worktreeDiff` on a temp index (never the agent's `.git`/index) and C2b's redaction; the app parses the text with C6's `DiffModel`.
+
+**Files:**
+- Create: `Sources/BrahmaCore/Changes/ChangesSnapshot.swift`, `Changes/LiveChanges.swift`, `Changes/ChangesBoard.swift`, `Changes/DiffComments.swift`; `Tests/BrahmaCoreTests/ChangesSnapshotTests.swift`, `LiveChangesTests.swift`, `ChangesBoardTests.swift`, `DiffCommentTests.swift`
+- Modify: `Store/Migrations.swift` (`"vC-changes"`), `Refs/RefGrammar.swift` (diff forms below), `Refs/RefAccess.swift` (live worktree rule), `Refs/RefResolver.swift` (`wt:`, compare modes, item revisions), `Refs/RefResolver.swift`/C2a pin path (worktree-diff snapshots and the diff cache store redacted text), `Model/WorkItem.swift` (`WorkEventKind.reviewComment`, waking for the holder/assignee in `noticeWakes`†), `Org/IndustryPack.swift` (`CompanyToolNames.review += show`, so a reviewer can show the diff to the owner)
+
+**Interfaces:**
+- Consumes: C1a `SafeGit.worktreeDiff(key:worktree:against:tempDir:fs:)`, `diff(base:head:path:)`, `mergeBase`, `head`; C1b `RefAccess`, `resolveRef`; C2a `Vault`, `refTaint`; C2b `RedactedCopy`, `SecretScan.patterns`‡, `Redactor`‡; C4c `answerShow`, `AutoOpen`; 3a `workLease`, `workItem.reviewerId`/`ownerId`, `verificationRun` (commit per revision), the item comment path† (`comment_work_item`'s Store method), `recordItemEvent`†, `noticeWakes`†.
+- Produces:
+  - **Grammar** (added to the §1.2 table; all parse with the C1b rules):
+
+    | Form | Meaning |
+    |---|---|
+    | `ENG-142:changes` | alias of `ENG-142:diff@worktree` (live, vs main) |
+    | `ENG-142:diff@worktree?vs=head` · `?vs=check` | live worktree vs the item branch's last commit · vs the commit of the item's last check run |
+    | `ENG-142:diff@r2..r5` · `ENG-142:diff@r3..worktree` | between two item revisions (`r<n>` = the commit of the item's n-th `verificationRun`, oldest first) or a revision and the live worktree |
+    | `diff:<sha>..<sha>` | two hex revs (7–40), each verified reachable (C1a) |
+    | `wt:@handle` | that agent's current lease worktree, live; resolves to `<KEY>:diff@worktree` (most recent lease), `.missing` when it holds none |
+  - **Access (live worktree rule).** An unpinned live ref (`@worktree`, `:changes`, `wt:`) is readable by the owner, the concierge, the lease holder and the item's reviewer; any other agent gets `.refused`. Pinned snapshots (shares, show answers' stored copies) keep the company class from C1b.
+  - `enum ChangesLimits { static let refreshInterval: Duration = .seconds(2); static let idleInterval: Duration = .seconds(10) /* holder not running */; static let maxPatchLines = 5000; static let maxFileBytes = 2_097_152; static let maxFileHunkLines = 1500; static let maxFiles = 2000 }`.
+  - `enum CompareMode: Equatable, Sendable, Codable { case main, head, lastCheck, revisions(from: String /* "r2" | "base" */, to: String /* "r5" | "head" | "worktree" */) }`.
+  - `struct ChangedFile: Equatable, Sendable, Codable { var path: String; var oldPath: String?; var status: String /* A M D R */; var added: Int; var removed: Int; var summary: String? /* "binary · 1.2 MB → 1.3 MB" | "large file · 4.1 MB, diff not shown" | "1,500 more lines not shown" */ }`.
+  - `struct ChangesSnapshot: Equatable, Sendable { var key: String; var compare: CompareMode; var base: String /* sha */; var target: String /* sha or "worktree" */; var files: [ChangedFile]; var added: Int; var removed: Int; var patch: String /* redacted, capped */; var truncated: Bool; var tainted: Bool; var taintReason: String?; var lastEdit: Date? /* max mtime of changed files, via SafeFS fstat */; var patchHash: String; var computedAt: Date }`.
+  - `extension Store { func changesSnapshot(companyId: String, key: String, compare: CompareMode, reader: Reader, now: Date) throws -> ChangesSnapshot }`: access first (generic text on refusal); bases come only from engine records (`main` merge-base with `item/<KEY>`, `head(item/<KEY>)`, the last run's commit, run commits by index); live targets use `worktreeDiff(…, against:)`; committed pairs use `SafeGit.diff`. Binary (`numstat` `-\t-`) and over-cap files get a `summary` and no hunks. The patch then passes `Redactor.apply`‡ and, for `SecretScan.patterns`‡ hits, `RedactedCopy.make` before it is returned or stored; worktree-diff snapshots and the diff cache (C2a) store only this redacted text. `tainted` comes from `refTaint`.
+  - `func itemRevisions(companyId: String, key: String) throws -> [ItemRevision]`; `struct ItemRevision { var label: String /* "base", "r1"…, "head", "worktree" */; var sha: String?; var at: Date?; var checkStatus: String? }`.
+  - `actor LiveChanges { init(store: Store, interval: Duration = ChangesLimits.refreshInterval, idle: Duration = ChangesLimits.idleInterval, clock: any Clock<Duration> = ContinuousClock()); func watch(companyId: String, key: String, compare: CompareMode, reader: Reader) -> AsyncStream<ChangesSnapshot>; func nudge(key: String) }` — recomputes every `interval` while a stream is observed (every `idle` when the holder isn't running), yields only when `patchHash` changes, never more than once per `interval` per (key, compare) across observers, and stops when the last observer cancels. `nudge` (the app's optional FSEvents trigger, debounced 300 ms) requests an early recompute within the same rate limit.
+  - `struct BoardRow: Equatable, Sendable { var key: String; var title: String /* SafeTitle */; var agent: String; var agentState: String; var files: Int; var added: Int; var removed: Int; var lastEdit: Date?; var checkStatus: String? /* latest verificationRun: passed|failed|running|none */; var reviewer: String?; var tainted: Bool }`; `extension Store { func changesBoard(companyId: String, reader: Reader, now: Date) throws -> [BoardRow] }` — every active lease with a worktree, sorted by `lastEdit` desc; for `.agent(id)` only rows where it is the holder or the reviewer; owner and concierge see all.
+  - Migration `"vC-changes"`: `diffComment(id TEXT PK, companyId FK cascade, itemId FK cascade, kind TEXT NOT NULL /* comment|revertRequest */, path TEXT NOT NULL, side TEXT NOT NULL /* old|new */, line INT NOT NULL, lineHash TEXT NOT NULL, hunkHeader TEXT NOT NULL, compare TEXT NOT NULL /* canonical ref */, baseSha TEXT, text TEXT NOT NULL, eventId TEXT, createdAt, resolvedAt)`, index `(companyId, itemId)`.
+  - GRDB record `DiffComment` (one property per column).
+  - `struct DiffAnchor: Hashable, Sendable, Codable { var path: String; var side: String; var line: Int; var hunkHeader: String; var lineText: String }`.
+  - `extension Store`:
+    - `func addDiffComment(companyId: String, key: String, compare: CompareMode, anchor: DiffAnchor, text: String, now: Date) throws -> DiffComment` (owner only; app path, never a tool) — writes a `diffComment` row, then an owner item comment through 3a's comment path† with the body below and a waking `reviewComment` item event for the lease holder (else the assignee):
+```
+Owner review comment on <path>:<line> (<compare canonical> @<base sha7>):
+    | <the hunk header>
+    | <up to 20 hunk lines around the line, redacted, invisible characters as ⟦U+XXXX⟧, each line cut to 200 chars>
+<owner text>
+```
+    - `func requestHunkRevert(companyId: String, key: String, compare: CompareMode, anchor: DiffAnchor, note: String?, now: Date) throws -> DiffComment` — the same path with `kind = revertRequest` and the first line `Owner asks you to revert this hunk in <path> (<hunk header>):`. The engine never writes to the worktree, its index or the item branch: no `checkout`, `apply`, `restore`, `reset` or file write is ever issued for it.
+    - `func diffComments(companyId: String, key: String, reader: Reader) throws -> [DiffComment]` (readers who can read the item); `resolveDiffComment(id:now:)` (owner).
+    - Re-anchoring is plain code: a comment shows at the line whose text hashes to `lineHash` within ±50 lines of `line` in the same file and side, else as "outdated" in that file's header.
+  - **Agents show diffs.** `show` (C4c) accepts every form above. A live ref in a show answer opens live; the answer also stores `params["at"] = patchHash` so the card can say "changed since shown". Auto-open follows C4c's rules unchanged. A review turn can call `show` (review tool list), so the reviewer can put the diff in front of the owner.
+
+- [ ] **Step 1: Write the failing tests.** `ChangesSnapshotTests` (temp repo; ENG-1 leased by eng-1 with reviewer qa-2, two check runs r1 and r2, then uncommitted edits):
+```swift
+@Test(arguments: [CompareMode.main, .head, .lastCheck, .revisions(from: "r1", to: "r2"), .revisions(from: "r1", to: "worktree")])
+func compareModes(_ m: CompareMode) throws { /* each snapshot's file set and +/- equal `git diff --numstat <expected base> <expected target>` computed by the test with plain git; base shas come from engine records */ }
+@Test func binarySummarized() throws { /* edited PNG → summary "binary · …", no hunk text */ }
+@Test func largeFileSummarized() throws { /* 3 MB text file → summary "large file · …" */ }
+@Test func diffRedactsSecrets() throws { /* known secret value and an "AKIA…" key added in the worktree → patch shows "[redacted STRIPE_KEY]" and "[redacted aws-key]"; the stored vault snapshot and diff cache contain neither value */ }
+@Test func agentsOwnIndexNeverUsed() throws { /* .git/worktrees/ENG-1/index byte-identical and mtime unchanged after 10 snapshots */ }
+@Test func grammarForms() throws { /* a trailing "?" without "vs=" is punctuation ("see ENG-1:changes?" → ENG-1:changes); ENG-1:changes == ENG-1:diff@worktree; "?vs=head", "@r1..r2", "@r1..worktree", "diff:a1b2c3d..b2c3d4e", "wt:@eng-1" parse; "diff:main..HEAD" and "@r0..r2" don't */ }
+@Test func wtHandleResolvesToCurrentLease() throws { /* wt:@eng-1 → ENG-1:diff@worktree; an agent with no lease → .missing */ }
+@Test func liveWorktreeRefScoped() throws { /* qa-2 (reviewer) and eng-1 → .full; eng-7 → .refused; a pinned share of the same diff → readable by eng-7 */ }
+```
+  `LiveChangesTests` (injected test clock):
+```swift
+@Test func liveDiffUpdatesWithin2s() async throws {
+  // observe ENG-1 vs main; write a new line into the worktree file; advance the clock 2 s →
+  // the stream yields a snapshot whose patch contains the new line, within one interval of the edit
+  #expect(ChangesLimits.refreshInterval == .seconds(2)) }
+@Test func noYieldWithoutChange() async throws { }
+@Test func rateLimitedAcrossObservers() async throws { /* two observers + nudge spam → ≤ 1 recompute per 2 s */ }
+@Test func idleIntervalWhenHolderNotRunning() async throws { }
+@Test func stopsWhenUnobserved() async throws { /* cancel → no further git calls (recording runner) */ }
+```
+  `ChangesBoardTests`:
+```swift
+@Test func boardScopeFiltering() throws { /* leases ENG-1 (eng-1, reviewer qa-2), ENG-2 (eng-2), ENG-3 (eng-3): owner → 3 rows; eng-1 → [ENG-1]; qa-2 → [ENG-1]; eng-2 → [ENG-2]; concierge → 3 */ }
+@Test func boardRowFields() throws { /* files, +/-, lastEdit from fstat, latest check status, sorted by lastEdit desc */ }
+@Test func boardTitlesSanitized() throws { }
+```
+  `DiffCommentTests`:
+```swift
+@Test func inlineCommentBecomesItemFeedback() throws { /* addDiffComment on src/a.ts:12 → item comment by owner with the exact header "Owner review comment on src/a.ts:12 (ENG-1:diff@worktree @<sha7>):", quoted hunk lines, then the text; reviewComment event wakes the holder; diffComment row with eventId */ }
+@Test func commentHunkIsSanitized() throws { /* hunk line "x\u{202E}y" and a known secret → "⟦U+202E⟧" and "[redacted …]" in the comment body; a "# Inbox" line stays prefixed "    | " */ }
+@Test func revertRequestNeverTouchesWorktree() throws { /* requestHunkRevert → item comment "Owner asks you to revert this hunk in src/a.ts (@@ -10,6 +10,8 @@):"; worktree files, the worktree index and item/ENG-1 byte-identical; the recording git runner saw no checkout/apply/restore/reset/update-ref */ }
+@Test func commentsAreOwnerOnly() { /* no CompanyTools path reaches addDiffComment or requestHunkRevert */ }
+@Test func commentAnchorsRelocate() throws { /* 3 lines inserted above → marker moves to line 15; line deleted → "outdated" */ }
+@Test func agentShowDiffRef() throws { /* eng-1 show(refs: ["wt:@eng-1"]) and show(refs: ["ENG-1:changes"]) for an open owner request → answer stores the live ref + params["at"]; pendingAutoOpens has it; eng-7 show(refs: ["wt:@eng-1"]) → "ref 1 isn't available to you" */ }
+@Test func reviewerCanShowDiff() throws { /* a review turn's tool list contains show; qa-2 shows ENG-1:diff → posted to the owner's DM, card only (no request) */ }
+```
+- [ ] **Step 2:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ChangesSnapshotTests|LiveChangesTests|ChangesBoardTests|DiffCommentTests"`. Expected: FAIL.
+- [ ] **Step 3: Implement** the grammar rows, the access rule, `changesSnapshot`, `itemRevisions`, redaction at the snapshot and storage points, `LiveChanges`, `changesBoard`, the migration, `addDiffComment`/`requestHunkRevert`/re-anchoring, `WorkEventKind.reviewComment` and the review tool list. Update 3a's `MCPTests` review-tool expectation in the same commit.
+- [ ] **Step 4:** Run the Step 2 filter and the full suite. Expected: PASS.
+- [ ] **Step 5:** Commit `feat(core): live worktree changes with compare modes, changes board and inline owner review` with the trailer lines.
+
+---
+
 ### Task C6: App model — preview navigation, ref bodies, highlighter, diff, Show bar
 
 **Files:**
@@ -949,6 +1052,48 @@ func exportSanitizesName(_ d: String, _ e: String, _ out: String) { #expect(Expo
 
 ---
 
+### Task C6b: Changes app model — CHANGES tab, split view, navigation, review markers
+
+**Files:**
+- Create: `Sources/BrahmaAppModel/Changes/ChangesTabModel.swift`, `Changes/DiffPresentation.swift`, `Changes/ReviewDraft.swift`; `Tests/BrahmaAppModelTests/DiffPresentationTests.swift`, `ChangesTabModelTests.swift`
+- Modify: C6 `Refs/DiffModel.swift` (no new parser; add the helpers below), L's `Preview/PreviewPresentation.swift`§ (`PreviewTabs.make` adds a fixed `CHANGES` tab with id `PreviewTabID.changes = "changes"` after the surfaces whenever any lease has a worktree), `Refs/RefBodies.swift` (live diff refs render through `ChangesTabModel`), `Refs/AppModel+Refs.swift`, `LaunchOptions.swift` (`SelectTarget` `changes` and `changes:<KEY>`)
+
+**Interfaces:**
+- Consumes: C5b `LiveChanges`, `ChangesSnapshot`, `ChangedFile`, `CompareMode`, `itemRevisions`, `changesBoard`, `BoardRow`, `diffComments`, `addDiffComment`, `requestHunkRevert`, `DiffAnchor`; C6 `DiffModel.parse`, `CodeHighlighter`, `CodeLanguage.detect`, `InvisibleMarkers`, `PreviewNav`.
+- Produces:
+  - On `DiffModel` (C6): `func splitRows(file: Int) -> [SplitRow]` (`struct SplitRow { var left: DiffLine?; var right: DiffLine? }` — a run of deletions pairs line-by-line with the following run of additions; extra lines pair with nil); `func collapsed(context: Int = 3) -> [DiffRowItem]` (`enum DiffRowItem { case line(file: Int, hunk: Int, index: Int); case fold(file: Int, hunk: Int, range: Range<Int>, count: Int) /* "⋯ <count> unchanged lines" */ }`, unchanged runs longer than 2 × context fold, expandable); `var changeStops: [DiffStop]` (`struct DiffStop: Equatable { var file: Int; var hunk: Int; var line: Int }`, the first line of every run of changes, in file order); `func highlighted(file: Int) -> [[CodeSpan]]` (each hunk's lines through `CodeHighlighter` with the file's language, invisible markers applied, ≤ 5000 lines total).
+  - `enum DiffViewMode: String, Codable { case unified, split }`.
+  - `@MainActor @Observable final class ChangesTabModel { init(store: Store, live: LiveChanges, companyId: String); private(set) var board: [BoardRow]; var selectedKey: String?; var compare: CompareMode = .main; private(set) var revisions: [ItemRevision]; private(set) var snapshot: ChangesSnapshot?; private(set) var diff: DiffModel?; var mode: DiffViewMode /* saved per company in UserDefaults, try? */; private(set) var stopIndex: Int?; private(set) var comments: [DiffComment]; private(set) var markers: [DiffAnchor: [DiffComment]]; private(set) var outdated: [String: Int] /* path → count */; var changedSinceShown: Bool; func select(_ key: String?); func setCompare(_ m: CompareMode); func nextChange(); func previousChange(); func start(); func stop() }` — `start()` subscribes to `LiveChanges.watch` only while the tab or a live ref body is visible and `stop()` cancels; each yield re-parses with `DiffModel.parse` off the main actor and keeps the scroll anchor (the current `DiffStop`) when the file still exists.
+  - `struct ReviewDraft { var anchor: DiffAnchor; var text: String; var isRevert: Bool; func validate() -> String? /* "Write a comment first" when empty and not a revert; ≤ 2000 chars */ }`; `AppModel.submitReview(_ draft:, key:, compare:)` → `addDiffComment` or `requestHunkRevert`.
+  - Board presentation: `struct BoardRowView { var key, title, agent, stats /* "+120 −34 · 6 files" */, edited /* "edited 12 s ago" */, check: String; var checkTone: PreviewTone; var agentTone: PreviewTone }`; `enum BoardRows { static func make(_ rows: [BoardRow], now: Date) -> [BoardRowView] }`.
+  - `SelectTarget` `changes` (board) and `changes:<KEY>` (that item's live diff vs main).
+
+- [ ] **Step 1: Write the failing tests.**
+```swift
+// DiffPresentationTests
+@Test func splitViewPairsLines() { /* hunk "-a -b +c +d +e" → rows (a,c), (b,d), (nil,e); context lines on both sides */ }
+@Test func collapseUnchanged() { /* 20 context lines between two changes, context 3 → one fold of 14; a 6-line run stays */ }
+@Test func nextPrevChange() { /* changeStops across two files in order; next past the last stays; previous from the first stays */ }
+@Test func highlightPerFile() { /* .swift file keyword spans; .png summary file has no hunks */ }
+@Test func summariesShownForBinaryAndLarge() { }
+// ChangesTabModelTests (@MainActor, fake LiveChanges stream)
+@Test func changesTabAppearsWithWorktrees() { /* PreviewTabs.make includes id "changes" after surfaces; none without leases */ }
+@Test func boardRowsPresentation() { }
+@Test func selectingRowOpensLiveDiff() async throws { /* select ENG-1 → snapshot and diff set; compare .main */ }
+@Test func compareModePickerListsRevisions() async throws { /* revisions == ["base", "r1", "r2", "head", "worktree"]; setCompare(.revisions("r1","r2")) re-subscribes */ }
+@Test func liveYieldKeepsScrollStop() async throws { }
+@Test func subscribesOnlyWhileVisible() async throws { /* stop() → stream cancelled */ }
+@Test func commentMarkersPlaced() async throws { /* comments map to anchors; an unmatched one counts in outdated[path] */ }
+@Test func reviewDraftValidation() { }
+@Test func changedSinceShownFlag() async throws { /* opened from a show answer with params["at"] ≠ current patchHash → true */ }
+```
+- [ ] **Step 2:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "DiffPresentationTests|ChangesTabModelTests"`. Expected: FAIL.
+- [ ] **Step 3: Implement** the `DiffModel` helpers, `ChangesTabModel`, `ReviewDraft`, `BoardRows`, the CHANGES tab and `SelectTarget` cases, plus placeholder view arms.
+- [ ] **Step 4:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`. Expected: all PASS (L/4a tab-order tests updated for CHANGES only).
+- [ ] **Step 5:** Commit `feat(app-model): CHANGES tab model with live diffs, compare modes, split view and review markers` with the trailer lines.
+
+---
+
 ### Task C7a: App views
 
 **Files:**
@@ -988,6 +1133,33 @@ func exportSanitizesName(_ d: String, _ e: String, _ out: String) { #expect(Expo
 
 ---
 
+### Task C7c: Changes views — board, live diff, compare picker, inline review
+
+**Files:**
+- Create: `Sources/BrahmaApp/Views/Changes/ChangesBoardView.swift`, `Changes/ChangesDiffView.swift`, `Changes/ComparePicker.swift`, `Changes/ReviewPopover.swift`, `Changes/WorktreeNudger.swift`
+- Modify: C7a `Views/Refs/DiffView.swift` (becomes a thin wrapper over `ChangesDiffView` for static diffs), L's `Preview/PreviewPane.swift`§ (the CHANGES tab body), `BrahmaApp.swift` (⌘↓ / ⌘↑ next/previous change, ⌘⇧D unified ⇄ split while the CHANGES tab has focus)
+
+**Interfaces:**
+- Consumes: C6b `ChangesTabModel`, `DiffModel` helpers, `ReviewDraft`, `BoardRows`; C7a `CodeView` spans, `RefHeader` chips, `RefContextMenu`; P2 theme.
+- Produces (all diff text `Text(verbatim:)`, invisible characters as `warning` markers, nothing clickable inside diff text):
+  - `ChangesBoardView`: a `Panel(title: "Changes")` zebra table — KEY (mono), TITLE, AGENT (state dot), FILES, +/− (mono, `success`/`danger`), EDITED, CHECK (chip) — newest edit first, the selected row `bg4` with the accent bar; click opens that item's diff in the tab; empty → `MonoEmptyState("NO ACTIVE WORKTREES")`.
+  - `ChangesDiffView(model:)`: header `<KEY> · <title>` with `LIVE · UNCOMMITTED` (`running` pulse) for worktree targets, `"updated <n> s ago"`, the `ComparePicker` (VS MAIN · VS LAST COMMIT · VS LAST CHECK · REVISIONS… with from/to menus from `revisions`), a UNIFIED/SPLIT segmented control, ‹ › change buttons, total `+<a> −<r> · <n> files`, TAINTED and `CHANGED SINCE SHOWN` chips when set; a left file list (path mono, status letter, per-file +/− and a stat bar, summaries in `text2`, outdated-comment count); the right pane renders `collapsed()` rows (fold rows clickable to expand) in unified or `splitRows` mode with `highlighted()` spans, line numbers in `text2`, add/del tints at 15 %, and comment markers in the gutter (`accent` dot; click shows the thread).
+  - `ReviewPopover`: hovering a line or hunk shows a gutter "+" → popover with a `TextField` (the owner's comment), "Comment" (`.brahmaPrimary`) and "Ask to revert this hunk"; the caption `"Sent to @<holder> as an item comment. Brahma never edits their files."`; errors in `danger`.
+  - `WorktreeNudger` (`#if canImport(CoreServices)`): an FSEvents stream on the selected worktree path calls `LiveChanges.nudge(key:)` after a 300 ms debounce; the 2 s rate limit still applies; without it the 2 s poll alone keeps the view live.
+  - Focus: live updates never steal focus or move the scroll position off the current change stop.
+
+- [ ] **Step 1:** Implement the views and wiring. Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build`. Expected: no warnings in new files.
+- [ ] **Step 2: UI snapshots and a live check.** `scripts/make-app.sh debug && scripts/seed-demo.sh` (C7b's seed adds an uncommitted edit in a leased worktree), then read each PNG:
+  - `scripts/ui-snapshot.sh C-changes-board changes` — the board with the seeded row;
+  - `scripts/ui-snapshot.sh C-changes-unified changes:<KEY>` — file list, stats, folds, LIVE chip;
+  - the same after choosing SPLIT (saved per company), → `C-changes-split`;
+  - `scripts/ui-snapshot.sh C-changes-revs "ref:<co>/<KEY>:diff@r1..worktree"` — the compare picker showing REVISIONS;
+  - with the app running on `changes:<KEY>`, append a line to the worktree file from a shell; within ~2 s the new line appears with a `+` tint (watch the window).
+- [ ] **Step 3:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` and `scripts/smoke-app.sh`. Expected: all PASS; `SMOKE OK … lifecycle=ok`.
+- [ ] **Step 4:** Commit `feat(app): CHANGES tab — live changes board, unified/split diff, compare picker, inline review` with the trailer lines.
+
+---
+
 ### Task C7b: Docs, seed-demo shares and the live end-to-end test
 
 **Files:**
@@ -997,8 +1169,8 @@ func exportSanitizesName(_ d: String, _ e: String, _ out: String) { #expect(Expo
 **Interfaces:**
 - Consumes: everything above; L's seeded web preview (`index.html` "Habit tracker") and 4a's seeded artifacts.
 - Produces:
-  - README section: what refs are and the grammar table; the global search-and-ask bar and ⌘K (what it searches, the filters, the fact questions it answers with zero turns; Ask goes to Brahma by default with its cost in 5H share, and Brahma's answers cite sources or show UNVERIFIED); sharing, quoting, threads, file asks; the vault, taint chips and "I vouch"; Save As quarantine; Purge; and the profile caveat verbatim: `"Resource scopes and lab privacy are enforced only by Brahma's tools; an agent's shell can read them."` (Workspace and Full profiles).
-  - `seed-demo.sh` (Initech) appends, through owner CLI/app-equivalent Store calls already exposed (no new owner CLI): an agent share of `index.html:1-20` from `@devops-1` to `#general`, a diff share of the seeded item, a three-message thread, an owner file ask to `@devops-1`, and one owner-dropped company resource.
+  - README section: what refs are and the grammar table; the global search-and-ask bar and ⌘K (what it searches, the filters, the fact questions it answers with zero turns; Ask goes to Brahma by default with its cost in 5H share, and Brahma's answers cite sources or show UNVERIFIED); the CHANGES tab (live board, compare modes, inline review that never edits an agent's files); sharing, quoting, threads, file asks; the vault, taint chips and "I vouch"; Save As quarantine; Purge; and the profile caveat verbatim: `"Resource scopes and lab privacy are enforced only by Brahma's tools; an agent's shell can read them."` (Workspace and Full profiles).
+  - `seed-demo.sh` (Initech) appends, through owner CLI/app-equivalent Store calls already exposed (no new owner CLI): an agent share of `index.html:1-20` from `@devops-1` to `#general`, a diff share of the seeded item, a three-message thread, an owner file ask to `@devops-1`, one owner-dropped company resource, and an uncommitted edit in a leased item worktree (so the CHANGES tab has a live row).
 
 - [ ] **Step 1: Write the failing live tests** (`BRAHMA_LIVE=1`, haiku, Balanced mode, tier `max5x`, cost abort $5):
 ```swift
@@ -1009,6 +1181,7 @@ func exportSanitizesName(_ d: String, _ e: String, _ out: String) { #expect(Expo
 }
 @Test(.enabled(if: live)) func factQuestionsUseNoTurns() async throws { /* "what's blocked", "what shipped this week", "how's the sprint going" → ANSWER card each, 0 new turns, 0 showRequest rows */ }
 @Test(.enabled(if: live)) func conciergeAnswerIsCited() async throws { /* "what did the team get done today and what looks risky" → Ask Brahma → one concierge run → show answer with ≥ 1 ref; answerVerified == CitationCheck.verify(note:refCount:).verified, and the card shows UNVERIFIED exactly when it is false */ }
+@Test(.enabled(if: live)) func liveChangesEndToEnd() async throws { /* @devops-1 told to edit index.html in its item worktree and then show(refs: ["wt:@devops-1"]) for an open owner request → the answer auto-opens the CHANGES diff; the board row's +/− grows as it edits (observed within 2 s of each yield); an owner line comment reaches its next digest as an item comment */ }
 @Test(.enabled(if: live)) func noTurnForDirectRefs() async throws { /* ENG-1, src/index.html, AR-1, A-1, @devops-1, run:1 → each Enter opens with 0 new turns and 0 showRequest rows */ }
 // LiveCollabTests
 @Test(.enabled(if: live)) func agentSharesAndColleagueOpens() async throws {
@@ -1032,6 +1205,6 @@ func exportSanitizesName(_ d: String, _ e: String, _ out: String) { #expect(Expo
 
 ## Self-review notes (done inline)
 
-- **Spec coverage.** §1.1 WorkRef/pinning → C1b, C2a, C3b (share refs for non-main commits, a pinned decision). §1.2 grammar and reserved prefixes → C1b, with the controller ruling (`A-<n>` ask, `AR-<n>` artifact, `ask:<n>` alias; `A`, `AR`, `F` reserved). §1.3 renderers → C6 `RefBodies`, C7a views (memory and channel stubs as the design marks them Collab-2). §1.4 highlighter → C6. §1.5 state, header actions, deep links, chat inspector → C6/C7a (renamed `PreviewNav` because L owns `PreviewState`). §2.1 placement and keys → C6/C7a. §2.2 resolver → C4a. Owner request of 2026-10-22 (global search-and-ask bar): every-kind search, filters and agent-scoped `search` → C4a; plain-code fact answers → C4b; cited concierge answers and UNVERIFIED → C4c (with `CitationCheck`); bar, answer card and chips → C6/C7a; live zero-turn and citation checks → C7b. §2.3 concierge, routing, `TurnKind.show`, queue, ETA, filtered candidates → C4c. §2.4 `show`, auto-open, lifecycle, Budget line, Ask to explain → C4c, C6, C7a. §3.1 data → `vC-refs` (C2a), `vC-threads` (C3a), `vC-show` (C4c); ML's resource columns consumed. §3.2 tools and taint classification → C3a, C3b, C4c, C5. §3.3 digest → C3a/C3b/C4c/C5. §3.4 share sources → C1a/C3b. §3.5 owner actions → C5/C7a. §4.1 vault and 5L-1 (already in 5-lite) → C2a (+ live canary). §4.2 rules 1–6 → C1b, C3b, C4c (rule 5 is ML-6, consumed). §4.3 taint → C2a/C3b/C5. §4.4 SafeFS/SafeGit → C1a. §4.5 secrets and purge → C2b. §4.6 display safety → C6/C7a (+ L/4a renderers). §4.7 audit → `refRead` (C2a), activity kinds, SHARING filter (C6/C7a). §5 MVP rows → C3a, C3b, C5, C7a. §6.2 key tests → all present under their tasks. §7 efficiency → zero-turn tests (C4a, C4b, C7b), concierge caps and lane (C4c), tool budget (C4c).
+- **Spec coverage.** §1.1 WorkRef/pinning → C1b, C2a, C3b (share refs for non-main commits, a pinned decision). §1.2 grammar and reserved prefixes → C1b, with the controller ruling (`A-<n>` ask, `AR-<n>` artifact, `ask:<n>` alias; `A`, `AR`, `F` reserved). §1.3 renderers → C6 `RefBodies`, C7a views (memory and channel stubs as the design marks them Collab-2). §1.4 highlighter → C6. §1.5 state, header actions, deep links, chat inspector → C6/C7a (renamed `PreviewNav` because L owns `PreviewState`). §2.1 placement and keys → C6/C7a. §2.2 resolver → C4a. Owner request of 2026-10-22 (global search-and-ask bar): every-kind search, filters and agent-scoped `search` → C4a; plain-code fact answers → C4b; cited concierge answers and UNVERIFIED → C4c (with `CitationCheck`); bar, answer card and chips → C6/C7a; live zero-turn and citation checks → C7b. §2.3 concierge, routing, `TurnKind.show`, queue, ETA, filtered candidates → C4c. §2.4 `show`, auto-open, lifecycle, Budget line, Ask to explain → C4c, C6, C7a. §3.1 data → `vC-refs` (C2a), `vC-threads` (C3a), `vC-show` (C4c); ML's resource columns consumed. §3.2 tools and taint classification → C3a, C3b, C4c, C5. §3.3 digest → C3a/C3b/C4c/C5. §3.4 share sources → C1a/C3b. §3.5 owner actions → C5/C7a. §4.1 vault and 5L-1 (already in 5-lite) → C2a (+ live canary). §4.2 rules 1–6 → C1b, C3b, C4c (rule 5 is ML-6, consumed). §4.3 taint → C2a/C3b/C5. §4.4 SafeFS/SafeGit → C1a. §4.5 secrets and purge → C2b. §4.6 display safety → C6/C7a (+ L/4a renderers). §4.7 audit → `refRead` (C2a), activity kinds, SHARING filter (C6/C7a). §5 MVP rows → C3a, C3b, C5, C7a. §6.2 key tests → all present under their tasks. Owner request of 2026-10-22 (live code changes): `worktreeDiff(against:)` → C1a; snapshot, compare modes, revisions, redaction, live refresh, board scope, inline review and revert requests, diff refs in `show` and review turns → C5b; CHANGES tab model, split/collapse/navigation/markers → C6b; views → C7c; live end-to-end → C7b. §7 efficiency → zero-turn tests (C4a, C4b, C7b), concierge caps and lane (C4c), tool budget (C4c).
 - **Type consistency.** `Reader`, `ResolvedRef`, `RefContext`, `Store.resolveRef/pinRef/openRef`, `SafeFS.open(workspacePath:maxBytes:)`, `SafeGit.updateShareRef`, `ShowResult`/`ShowHit`/`ShowIntent`, `RoutedTarget`, `AutoOpen`, `RefBody`/`RefContent`, `PreviewNav`/`OpenedRef` are used with the same names in every task that consumes them.
 - **Proportion.** Signatures, decisions, exact copy and test assertions only; bodies appear only for the fuzzy score and the SafeFS inode rule, which the signatures don't determine.
