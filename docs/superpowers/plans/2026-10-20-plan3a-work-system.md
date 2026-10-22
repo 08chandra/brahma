@@ -676,6 +676,9 @@ Denials: `"only the item's author, reviewer, a manager or the owner can change i
 **Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
 - (note 5) `WakePolicy.noticeWakes(kind: WorkEventKind, recipientRole: NoticeRecipientRole) -> Bool` with the table from Task 3's efficiency amendment (`NoticeRecipientRole { owner, reviewer, author, holder, waiter, other }` or equivalent); later plans extend it by name.
 
+**Work-modes patch notes (owner-approved 2026-10-21; design /Users/chandra/.claude/jobs/6d89b87c/tmp/agent-modes-design.md §6.1; read the cited design sections; override the text above):**
+- W3: `workItem` + `intensity TEXT NOT NULL DEFAULT 'auto'`, `rungFloor INT NOT NULL DEFAULT 0`, `budgetBoostLE DOUBLE NOT NULL DEFAULT 0`, `specConfirmedBy TEXT` (all in `"v3-work"`); `WorkPolicy.riskTags(_:)` (derived); tool schemas exclude intensity/floor/boost/confirmation; `confirm_spec` tool (manager, executive, owner; registered with the work tools, role-enforced); CLI `items add|edit --intensity auto|thorough|ultra`, `items confirm <company> <KEY>`; event kinds `planWritten, planTurnWrote, modeEscalated, specConfirmed`. Tests: `selfLinkedDependentsDontCountForBlocking`, `schemasCannotSetIntensityOrFloor` (and `agentAuthoredTierLNotOpusUntilConfirmed` lands in 14c). `sessionModel` goes on the agentSession record in Task 10.
+
 - [ ] **Step 1: Write failing tests.**
   - `WorkPolicyTests`: a table over every rule line, plus `assigneeCannotEditCheckEvenIfAuthor` and `engineStatusesRefused`.
   - `WorkItemTests`:
@@ -968,6 +971,9 @@ else in worktree: git rebase main
 - (note 7, 9b) Merge-safety lives in `finishMerge`, not the tick step: `finishMerge(itemId:result:now:)` with `.conflict(files)` itself writes the conflict brief, clears `verifiedRevision`/`verifiedCommit` and sends the DM and notice; it receives the merge base and the main-side commit as parameters. The post-merge `merge-tree` dry-run and the freshness pass are one detached entry point `MergeSafety.afterLanding(companyId:mergedKey:)`, triggered by `finishMerge(.merged)`.
 - (note 8, 9a/9c) One approval entry point `approveForMerge(db:item:by:note:)` (flag clearing, `mergeState = pending`, event `reviewApproved`) used by `Store.review` approve and by 9c's auto-approval.
 
+**Work-modes patch notes (owner-approved 2026-10-21; design /Users/chandra/.claude/jobs/6d89b87c/tmp/agent-modes-design.md §6.1; read the cited design sections; override the text above):**
+- W4 (9a): review and audit profiles always compile with no `Task` and no `Workflow`; `TurnKind` also gets `.plan`; the review spend cap is 25% of the item tier's $LE; for auto agents review model selection comes from `ModePolicy.select` once Task 14c lands — until then keep `ModelPolicy` (14c replaces it and updates its tests). Test `reviewTurnHasNoTaskOrWorkflow` (here); `reviewSpendCapDropsToStandard` lands in 14c.
+
 - [ ] **Step 1: Write failing tests** in `ReviewTests`:
   - `passingCheckSchedulesCleanContextReviewTurn`;
   - `reviewTurnToolsAreRestricted`;
@@ -1062,6 +1068,9 @@ Unread in channels (not addressed to you): …   (only if any)
 - Warm-only resume (all sessions, item and base): `--resume` only if the session's last turn ended < `SessionPolicy.warmSeconds = 3000` wall seconds ago AND its transcript estimate is < `SessionPolicy.maxResumeTokens = 60_000` (the last turn's input + cacheRead + cacheCreation tokens when known — Task 14 records them; until then the time rule alone applies); otherwise a fresh session starts with the role card, the orientation and a `Continuity:` block: the session's last 3 turn summaries (quoted), the progress file path and (after Task 11) open asks. Tests: `coldSessionStartsFreshWithContinuity`, `warmSessionResumes`.
 - Stable prefix: `RolePrompt.render` has no roster and no timestamps (byte-stable); the bounded roster (≤ 40 lines) moves into the digest under `Team roster:`. Test `systemPromptIsByteStable`.
 - No empty turns: before launching a work turn, the orchestrator builds the `TurnContext`; if nothing is actionable — no waking inbox items, no due waking notices, no pending review, and no current item that is `inProgress` with a lease whose last turn did not report `BLOCKED`/`NEEDS_CONTEXT` — the turn is skipped and the agent goes to `sleeping` (no process spawned). A turn whose only input is non-waking notices runs with `ModelContext.turnKind = .notice`. Test `nothingActionableSkipsTurn`.
+
+**Work-modes patch notes (owner-approved 2026-10-21; design /Users/chandra/.claude/jobs/6d89b87c/tmp/agent-modes-design.md §6.1; read the cited design sections; override the text above):**
+- W5: the plan turn mechanics of design §2.4 (engine clean-worktree check and reset after a plan turn), the Continuity block quotes the plan, a model or tool change on `--resume` is recorded as `cacheBreak` on the turn, and the session-model rule (agentSession + `sessionModel TEXT`: the model is fixed for an (agent, item) session after its first work turn; effort may vary). Tests: `planTurnWriteIsReverted`, `sessionModelFixedEffortVaries`. (Plan-first selection itself is 14c; Task 10 provides the mechanics and `TurnKind.plan`.)
 
 - [ ] **Step 1: Write failing tests.**
   - `SessionTests`:
@@ -1182,6 +1191,9 @@ paused approver: approver paused and activeNow - pausedActive ≥ 1 day → rero
 
 **Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
 - (note 9) `AskKind.reserved` also names `deploy` and `role` (titles "Deploy", "Role"), so the list is `request, grant, deploy, humanTask, outbox, spend, staffing, stage, role`; `AskKind(rawValue:)` round-trips them.
+
+**Work-modes patch notes (owner-approved 2026-10-21; design /Users/chandra/.claude/jobs/6d89b87c/tmp/agent-modes-design.md §6.1; read the cited design sections; override the text above):**
+- W6: `AskKind.boost` (not reserved); tool `request_mode {key, mode, reason, request_id}` — assignees can raise their own item to R2 at most, applies from the next turn only, rate-limited (1 per item per 3 turns, cooldown) with `request_id` dedupe; failure-path Ultra always files a `boost` ask to the owner (Ultra itself answers "Ultra arrives with the sandbox (5-lite)"). Tests: `boostAskRoutedByPreset`, `requestModeNextTurnOnly`, `assigneeRequestCappedAtR2`, `failurePathUltraAlwaysAsksOwner`.
 
 - [ ] **Step 1: Write failing tests** in `InboxTests`:
   - `routesToPackApprover`;
@@ -1427,6 +1439,10 @@ n = previousCount + 1;  n >= escalateAfter → escalate("no work-item progress i
 - Tier L → `opus` for `"auto"` agents (as planned).
 - Facts record risk-tiered review: `itemFact` + `autoMerged BOOLEAN`, `audited BOOLEAN`, `auditVerdict TEXT`.
 
+**Work-modes patch notes (owner-approved 2026-10-21; design /Users/chandra/.claude/jobs/6d89b87c/tmp/agent-modes-design.md §6.1; read the cited design sections; override the text above):**
+- Split is now mandatory: **14a** (usage parsing, budgets, tier model; plus W7 below), **14b** (watchdog, loop guards, facts, perf CLI), then the new **Task 14c** (below). Three dispatches against this section; 14c has its own section.
+- W7 (14a), design §4.5 in full: `run(request:)` uses `profile.wallClock` (the runner-wide 900 s `maxTurnDuration` becomes only the Plan 1 fallback); accept multiple `system/init` and `result` events, the last result wins; track pending background work so a process killed with work pending is `interrupted`/`timedOut` even after an early result (replace `if sawResult { return }`); controlled stops `error_max_turns` → `stopReason=turnCap`, `error_max_budget_usd` → `budgetCap` short-circuit before the infra classifier (infra=false, counted in itemUsage/costLE, judged by the watchdog — budget and watchdog must not skip non-succeeded capped turns — no backoff); SIGTERM/exit 143 without result → `interrupted`, not counted against the agent; parse fan-out events (`task_started`, `task_progress`, `task_notification`, `background_tasks_changed`, `workflow_progress`); per-turn assertions (`fast_mode_state == "off"`, `usage.speed == "standard"`, init agents/tools match the mode); `modelUsage` check with safety-fallback IDs recorded only; `turn` + `mode, rung, effort, modeReason, stopReason, subagentsSpawned, workflowAgents, costLE` (in `"v3-budgets"`); pin the cost rule (last total vs delta, probe L-4) before per-mode caps are enabled; fixtures `stream-workflow.jsonl`, `stream-workflow-cut17.jsonl`, `stream-max-turns.jsonl`, `stream-max-budget.jsonl` (record real ones where the CLI can produce them cheaply; otherwise construct from the design's observed shapes and say so). Tests: `lastResultWins`, `secondInitAccepted`, `killedWithPendingWorkflowIsInterruptedDespiteEarlyResult`, `deepTurnNotKilledAt15Min`, `maxTurnsIsControlledStop`, `maxBudgetIsControlledStop`, `sigtermWithoutResultInterrupted`, `unexpectedModelInModelUsageAlerts`, `safetyFallbackModelRecordedOnly`, `effortCapWarningRecorded`, `initAgentsMismatchAborts`. `itemFact.reviewCostLE` (W3).
+
 - [ ] **Step 1: Write failing tests.**
   - `StreamParserTests`:
     - update `toolUseBlockWinsOverText`;
@@ -1460,6 +1476,23 @@ n = previousCount + 1;  n >= escalateAfter → escalate("no work-item progress i
 - [ ] **Step 3:** Implement, updating every `.toolUse(` pattern.
 - [ ] **Step 4:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`. Expected: all PASS.
 - [ ] **Step 5:** Commit `feat(core,cli): token accounting, budgets, watchdog and per-item outcome facts` with the trailer lines.
+
+---
+
+### Task 14c: Work modes — Quick, Standard, Deep and Plan-first
+
+Design: /Users/chandra/.claude/jobs/6d89b87c/tmp/agent-modes-design.md (read §0–§4, §6.1 W8/W10/W11, §6.4 and the 3a tests of §7; Ultra and everything marked 5-lite are out of scope). Needs Tasks 5, 6, 8, 11a, 14a.
+
+- `Work/ModePolicy.swift`: `ModeInputs`, `ModeDecision`, pure `ModePolicy.select` (one reason string per step, design §3.2) for Quick, Standard, Deep and the Plan-first modifier; escalation/de-escalation (§3.3–3.4) applied in `endTurn` with the counted-failure rule; the mode table (§2.2), rung ladder and the `pro` row as `static let`s on `ModePolicy`/`ModeCaps` (W10). `ModePolicy.select` replaces `ModelPolicy.resolve` for auto agents (update the ModelPolicy tests in the same commit).
+- `TurnProfile` + `effort`, `maxEffortLevel`, `maxTurns`, `maxBudgetUSD`, `permissionModeOverride`, `subagents`, `workflow?`, `wallClock`, `quotas`; compiler emission per §2.3 (model allowlist, `availableModels`, `engineClaudeVars`, kill switches, `fastMode:false`, keyword trigger off); every argv/settings/env/hook change updates the snapshots (W10).
+- `brahma hook pre-tool` (§4.2, matcher `Agent|Task|Workflow`), present on every turn; in-process MCP quotas (`BRAHMA_MCP_QUOTA_*`); `opusScarce`, `modeCalibration`, the no-launch rule; doctor `mode-canary` (§6.4, zero inference); the sub-agent gate record (always false on the Workspace profile). Ultra requests are recorded and answered "Ultra arrives with the sandbox (5-lite)".
+- Doctor (W11): `requiredFlags` gains `--effort` and `--max-budget-usd`; hidden `--max-turns` is detected by the mode-canary after probe V-11 shows a bogus `--max-turnz` exits non-zero before answering; `overageStatus == "allowed"` stays a warning plus the all-mode clamp and the stall text "deep modes and Ultra are off while extra usage is on".
+- Plan tier: until the owner confirms, the effective tier is the design's `pro` row (§3.7) when the CLI reports `pro` (`planTierEffective` = lower of configured and detected, from Task 5).
+- [ ] **Step 1:** Run probes V-3, V-4, V-5, V-8, V-10, V-11, L-2 and L-4 (design §8; haiku, `--max-budget-usd ≤ 0.05` each) and record results in the commit body. Plan-first compiles only if V-4 passes; per-mode caps are enabled only once L-4 is pinned.
+- [ ] **Step 2: Write failing tests** — every 3a test of design §7 (ModePolicyTests and the other 3a suites listed there), including `reviewSpendCapDropsToStandard` and `agentAuthoredTierLNotOpusUntilConfirmed`.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`. Expected: all PASS.
+- [ ] **Step 5:** Commit `feat(core,cli): work modes — Quick, Standard, Deep and Plan-first selected by ModePolicy and compiled by TurnProfile` with the trailer lines.
 
 ---
 
@@ -1498,6 +1531,9 @@ n = previousCount + 1;  n >= escalateAfter → escalate("no work-item progress i
 **Chief-review patch notes (owner-approved 2026-10-21; /Users/chandra/.claude/jobs/6d89b87c/tmp/plan3a-patch-notes.md; override the text above; record interface changes in the commit body):**
 - (note 11) `WorkSnapshot.openSprints` includes `pendingApproval` and `review` sprints, not only `active`.
 - (note 4) `createCompany` and `CompanyForm.preview` use `Store.seatBudget()`.
+
+**Work-modes patch notes (owner-approved 2026-10-21; design /Users/chandra/.claude/jobs/6d89b87c/tmp/agent-modes-design.md §6.1; read the cited design sections; override the text above):**
+- W9: intensity chip and picker on items (with the "unconfirmed" label when `specConfirmedBy` is nil), a mode chip on running agents, the Budget by-mode breakdown, the Inbox `boost` card, and the plan-tier confirmation alert (model side here; views in 16a).
 
 - [ ] **Step 1: Write failing tests.**
   - `WorkPresentationTests`:
@@ -1551,6 +1587,8 @@ n = previousCount + 1;  n >= escalateAfter → escalate("no work-item progress i
 ---
 
 ### Task 16a: App views and notifications
+
+- W9 views: the intensity chip/picker ("unconfirmed" label), mode chip on running agents, Budget by-mode breakdown, Inbox `boost` card, plan-tier confirmation alert (BrahmaTheme).
 
 **Split (owner-approved):** 16a builds the views, banners, menu bar, notifications and the UI smoke (Steps 2–3 below, plus `swift test` and `scripts/smoke-app.sh` from Step 4). For the UI smoke it may extend `scripts/seed-demo.sh` with the Initech block described below (needed for screenshots). Task 16b does the README section, the live end-to-end test (Step 1 and the live run of Step 4) and any remaining seed changes. 16a commits `feat(app): backlog, board, Inbox with lifecycle and notifications, autonomy, pace, stall and health banners`. Under the `important` preset the CEO-approved PRD shows as waiting for you, internally approved by @ceo (the Inbox card's internal line reads `Approved by @ceo`). The NewCompanySheet stepper defaults to 6 and shows the experimental note above 50.
 
@@ -1639,6 +1677,8 @@ n = previousCount + 1;  n >= escalateAfter → escalate("no work-item progress i
 ---
 
 ### Task 16b: README, live end-to-end test
+
+- W12 (README, Workspace profile limits): nested `claude` from agent Bash can load the owner's settings (`fastMode`, `enableWorkflows`) and Keychain auth; Brahma sets env defusers, but an agent can unset them, which is why sub-agents and Ultra wait for the sandbox.
 
 Read the Task 16a brief for the full section text (README concepts and commands, the exact safety paragraph, the live test steps and expectations). 16b builds: the README "Work system" section, `LiveSmokeTests.workItemLoopEndToEnd` (Step 1 of 16a's text), any remaining `seed-demo.sh` lines.
 
