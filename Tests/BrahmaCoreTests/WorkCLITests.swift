@@ -513,6 +513,28 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(bad.status != 0); #expect(bad.stderr.contains("turn credential invalid or turn ended"))
     }
 
+    @Test func whyCLI() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        // Nothing is ready: it says so, and `why` is read-only (no owner key needed).
+        let why = try brahma(["why", "Acme"], home: home)
+        #expect(why.status == 0, "\(why.stderr)")
+        #expect(why.stdout == "0 running.\nno Ready items in the backlog\n", Comment(rawValue: why.stdout))
+        #expect(try brahma(["status"], home: home).stdout.contains("  0 running: no Ready items in the backlog"))
+        let add = try brahma(["items", "add", "Acme", "--title", "Parser", "--check", "true", "--ready"], home: home)
+        #expect(add.status == 0, "\(add.stderr)")
+        // A Ready item and idle agents: the next dispatch pass hands it out, which is not a stall.
+        let ready = try brahma(["why", "Acme"], home: home).stdout
+        #expect(ready == "0 running.\n", Comment(rawValue: ready))
+        #expect(try brahma(["why", "Nope"], home: home).status != 0)
+        // `org acting` is an owner write.
+        let acting = try brahma(["org", "acting", "Acme", "cto"], home: home)
+        #expect(acting.status == 0, "\(acting.stderr)"); #expect(acting.stdout == "@cto is acting CEO of Acme\n")
+        let bare = try OwnerTestHome(initOwner: false); defer { withExtendedLifetime(bare) {} }
+        #expect(try brahma(["org", "acting", "Acme", "cto"], home: bare.url).status != 0)
+    }
+
     @Test func sha256StandardVectors() {
         #expect(SHA256.hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
         #expect(SHA256.hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")

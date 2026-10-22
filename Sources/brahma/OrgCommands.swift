@@ -5,7 +5,24 @@ import BrahmaCore
 struct OrgGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "org", abstract: "Show and change the org chart.",
-        subcommands: [Show.self, Move.self, Vacancies.self, Fill.self], defaultSubcommand: Show.self)
+        subcommands: [Show.self, Move.self, Vacancies.self, Fill.self, Acting.self], defaultSubcommand: Show.self)
+
+    struct Acting: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Name the acting CEO (owner only).")
+        @Argument var company: String
+        @Argument var handle: String
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let a = try resolveAgent(store, company: c, handle: handle)
+            do { _ = try store.setActingCEO(companyId: c.id, agentId: a.id) } catch OrgError.managerKilled {
+                throw fail("@\(a.name) is killed")
+            }
+            print(safe("@\(a.name) is acting CEO of \(c.name)"))
+        }
+    }
 
     struct Show: ParsableCommand {
         static let configuration = CommandConfiguration(commandName: "show", abstract: "Print the reporting tree.")

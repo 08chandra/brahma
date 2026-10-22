@@ -432,6 +432,35 @@ enum Migrations {
             }
             try db.create(index: "modeRequest_item", on: "modeRequest", columns: ["itemId", "id"])
         }
+        m.registerMigration("v3-liveness") { db in
+            // The acting CEO: set when the CEO (or the root executive) leaves, pending the owner's confirmation.
+            try db.alter(table: "agent") { t in t.add(column: "actingRole", .text) }
+            try db.create(table: "orgIssue") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("kind", .text).notNull()   // overSpan | noRoot
+                t.column("agentId", .text)
+                t.column("detail", .text).notNull().defaults(to: "")
+                t.column("createdAt", .datetime).notNull()
+                t.column("resolvedAt", .datetime)
+            }
+            try db.create(table: "deadlock") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("signature", .text).notNull()
+                t.column("members", .text).notNull()
+                t.column("detectedActive", .double).notNull()
+                t.column("escalatedTo", .text)
+                t.column("ownerEscalated", .boolean).notNull().defaults(to: false)
+                t.column("resolvedAt", .datetime)
+            }
+            try db.create(table: "agingNotice") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("subject", .text).notNull()
+                t.column("level", .integer).notNull()
+                t.primaryKey(["companyId", "subject"])
+            }
+        }
         return m
     }
 }

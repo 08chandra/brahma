@@ -32,9 +32,12 @@ public final class Store: Sendable {
     let gitLockTimeout = GitLockTimeout()
     /// How much output a plan-turn barrier git call may produce before the barrier fails closed (tests shrink it).
     let planBarrierOutputLimit = GitOutputLimit()
+    /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
+    let lifecycleObservers: [any AgentLifecycleObserver]
 
-    public init(path: String, catalog: PackCatalog = .builtin) throws {
+    public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = []) throws {
         self.catalog = catalog
+        self.lifecycleObservers = lifecycleObservers
         dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
         config.busyMode = .timeout(5)
@@ -45,15 +48,16 @@ public final class Store: Sendable {
         try Migrations.migrator().migrate(writer)
     }
 
-    private init(queue: DatabaseQueue, catalog: PackCatalog) throws {
+    private init(queue: DatabaseQueue, catalog: PackCatalog, lifecycleObservers: [any AgentLifecycleObserver]) throws {
         self.catalog = catalog
+        self.lifecycleObservers = lifecycleObservers
         dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)
     }
 
-    public static func inMemory(catalog: PackCatalog = .builtin) throws -> Store {
-        try Store(queue: DatabaseQueue(), catalog: catalog)
+    public static func inMemory(catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = []) throws -> Store {
+        try Store(queue: DatabaseQueue(), catalog: catalog, lifecycleObservers: lifecycleObservers)
     }
 
     /// Test helper: current value of a PRAGMA as text.

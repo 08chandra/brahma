@@ -25,7 +25,8 @@ extension Store {
         try writer.write { db in try transitionAndRelease(db: db, agentId: agentId, to: to, blocker: blocker, now: now) }
     }
 
-    /// `transition`, plus what killing an agent does to its work: leases marked expired, items unassigned.
+    /// `transition`, plus what leaving the company does to the org (`offboard`): asks and reviews re-routed, leases marked
+    /// expired, items unassigned with an auto hand-off, reports reparented, an acting CEO named, observers told.
     func transitionAndRelease(db: Database, agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date) throws -> Agent {
         // Teammates blocked on an agent that is killed are released by the transition; each is told why it is awake (an
         // engine DM through the normal path), or it would have nothing to act on.
@@ -36,7 +37,7 @@ extension Store {
         }
         let agent = try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
         if to == .killed {
-            try releaseWork(of: agent, db: db, now: now)
+            try offboard(db: db, agent: agent, now: now)
             for waiter in waiters {
                 try MessageRouter(store: self).sendDM(
                     db: db, companyId: waiter.companyId, from: .system, to: waiter.name,
