@@ -410,9 +410,10 @@ public actor Orchestrator {
         } else if case .interrupted? = runnerError as? TurnError {
             // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
             end = .interrupted(partial: result)
-        } else if case .timedOut? = runnerError as? TurnError {
+        } else if case .timedOut? = runnerError as? TurnError, !(limited || result?.apiErrorStatus == 429) {
             // The engine's own wall clock killed it (even after an early result, with background work still pending): the
-            // turn failed like any other timeout (normal backoff) and its usage is still booked and budgeted.
+            // turn failed like any other timeout (normal backoff) and its usage is still booked and budgeted. A kill while the
+            // usage limit is active falls through to the usage-limit branch below: held until the reset, not the agent's fault.
             end = .failed(failure ?? "timed out", nil, partial: result)
         } else if let r = result, !r.isError {
             // A completed turn always counts, even if it also hit the limit: re-running it would repeat its posts.
@@ -528,7 +529,7 @@ enum TurnEnd {
     /// agent (no backoff) and is never infrastructure.
     case capped(TurnResult, usageHold: Date?)
     case usageLimited(until: Date, summary: String?)
-    /// Stopped before it finished (SIGTERM, an engine kill, a kill with background work pending). `partial` is the early
+    /// Stopped before it finished (SIGTERM, a kill with background work pending). An engine wall-clock kill is a `failed` timeout. `partial` is the early
     /// result, whose tokens and cost are still recorded. Never counted against the agent.
     case interrupted(partial: TurnResult? = nil)
 
