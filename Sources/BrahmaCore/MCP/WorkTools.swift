@@ -146,6 +146,8 @@ extension CompanyTools {
 
     private func optional(_ s: String?) -> JSONValue { s.map { .string($0) } ?? .null }
 
+    private func gitWorkspace(_ root: URL) -> GitWorkspace { store.gitWorkspace(root: root, companyId: companyId) }
+
     private func workspace() throws -> URL {
         guard let c = try store.company(id: companyId) else { throw ToolError(message: "no such company") }
         return URL(fileURLWithPath: c.workspacePath, isDirectory: true)
@@ -212,7 +214,7 @@ extension CompanyTools {
         var lease: JSONValue = .null
         if let l = try store.lease(itemId: i.id) {
             let ws = try workspace()
-            let git = GitWorkspace(root: ws)
+            let git = gitWorkspace(ws)
             let until = store.formatTime(l.expiresAt(activeNow: store.activeNow(companyId: companyId), now: Store.now()))
             lease = .object(["holder": optional(names[l.agentId]), "until": .string(until),
                              "worktree": .string(git.worktreePath(key: i.key).path), "branch": .string(git.branch(key: i.key)),
@@ -333,7 +335,7 @@ extension CompanyTools {
         let wasUnowned = target.ownerId == nil
         let lease = try store.claimLease(itemId: target.id, agentId: agentId)
         let ws = try workspace()
-        let git = GitWorkspace(root: ws)
+        let git = gitWorkspace(ws)
         let path: URL
         do {
             try git.ensureRepo()
@@ -354,12 +356,12 @@ extension CompanyTools {
     /// race), or the lease cannot be read.
     private func removeWorktreeUnlessLeased(key: String) throws {
         let (store, companyId) = (self.store, self.companyId)
-        try GitWorkspace(root: try workspace()).removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
+        try gitWorkspace(try workspace()).removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
     }
 
     private func releaseLease(_ target: WorkItem, note: String?) throws -> String {
         try store.releaseLease(itemId: target.id, agentId: agentId, note: note)
-        var tail = "Your work is saved on branch \(GitWorkspace(root: try workspace()).branch(key: target.key))."
+        var tail = "Your work is saved on branch \(gitWorkspace(try workspace()).branch(key: target.key))."
         do { try removeWorktreeUnlessLeased(key: target.key) } catch {
             tail = "Its worktree could not be removed yet (\(error)); your work stays in it."
         }

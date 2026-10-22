@@ -35,6 +35,9 @@ public actor Orchestrator {
     /// Items whose dispatch failed in git: not offered again before this time.
     var dispatchBackoff: [String: Date] = [:]
     var lastDispatch: Date?
+    /// Consecutive lease turns that could not start for want of a worktree, per item.
+    var worktreeFailures: [String: Int] = [:]
+    static let maxWorktreeFailures = 3
     var lastSweep: [String: Date] = [:]
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
@@ -111,8 +114,7 @@ public actor Orchestrator {
         // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
         // ready items to idle individual contributors. Nothing here waits on git.
         let reaped = try store.reapLeases(now: now)
-        let free = Scheduler.freeSlots(config: cfg, running: runningCount(), pressure: pressure, held: held)
-        leaseTick(now: now, companies: companies, reaped: reaped, held: held, freeSlots: free)
+        leaseMaintenance(now: now, companies: companies, reaped: reaped, held: held)
 
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }
@@ -206,6 +208,17 @@ public actor Orchestrator {
                                         usage: { decisions[$0.id] ?? .open }, otherChildren: 0, pressure: pressure,
                                         held: held, paceClosed: paceClosed, paceStrict: paceStrict)
         for agent in selected { launch(agent, now: now) }
+
+        // 6. Engine dispatch, after admission: only into the slots admission left over, and only for companies whose gate,
+        //    pace and concurrency cap would let a new agent run. Leases are never reserved for agents admission would refuse.
+        if !held {
+            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), pressure: pressure, held: held)
+            var companyFree: [String: Int] = [:]
+            for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id) {
+                companyFree[c.id] = max(cfg.modeCap(c.usageMode) - (runningByCompany[c.id] ?? 0), 0)
+            }
+            dispatchTick(now: now, companies: companies, skipping: Set(reaped.map(\.itemId)), freeSlots: free, companyFree: companyFree)
+        }
     }
 
     private func logPressure(_ level: MemoryPressure, now: Date) {
@@ -256,7 +269,7 @@ public actor Orchestrator {
         var lastInfo: RateLimitInfo?
         var failure: String?
         var runnerError: (any Error)?
-        var worktreeUnavailable = false
+        var worktreeUnavailable: WorktreeUnavailable?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             items = try store.pendingInbox(agentId: agent.id)
@@ -279,18 +292,15 @@ public actor Orchestrator {
             var addDirs: [String] = []
             if let lease = try store.lease(agentId: agent.id), let leased = try store.workItem(id: lease.itemId) {
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-                let git = GitWorkspace(root: workspace)
+                let git = store.gitWorkspace(root: workspace, companyId: company.id)
                 let checkout = git.worktreePath(key: leased.key)
                 if !git.hasCheckout(key: leased.key) {
                     do { try git.addWorktree(key: leased.key) } catch {
                         // Never run a leaseholder's turn outside its worktree: the turn does not start.
-                        try? store.appendEvent(ActivityEvent(
-                            companyId: company.id, agentId: agent.id, turnId: turn.id, kind: .error,
-                            text: "@\(agent.name) turn not started: the worktree of \(leased.key) is missing and could not be created: \(error)",
-                            createdAt: clock()))
-                        throw WorktreeUnavailable()
+                        throw WorktreeUnavailable(itemId: leased.id, key: leased.key, reason: "\(error)")
                     }
                 }
+                await clearWorktreeFailures(itemId: leased.id)
                 workingDirectory = checkout.path
                 addDirs = [checkout.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
             }
@@ -328,8 +338,8 @@ public actor Orchestrator {
                     break
                 }
             }
-        } catch is WorktreeUnavailable {
-            worktreeUnavailable = true
+        } catch let e as WorktreeUnavailable {
+            worktreeUnavailable = e
         } catch {
             failure = String(describing: error)
         }
@@ -338,8 +348,23 @@ public actor Orchestrator {
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
-        if worktreeUnavailable {
-            // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay.
+        if let unavailable = worktreeUnavailable {
+            // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
+            // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime.
+            if await noteWorktreeFailure(itemId: unavailable.itemId) >= Self.maxWorktreeFailures {
+                await clearWorktreeFailures(itemId: unavailable.itemId)
+                attempt {
+                    try store.appendEvent(ActivityEvent(
+                        companyId: agent.companyId, agentId: agent.id, turnId: turn.id, kind: .error,
+                        text: "@\(agent.name) turn not started: the worktree of \(unavailable.key) is missing and could not be created "
+                            + "(\(Self.maxWorktreeFailures) tries): \(unavailable.reason); lease released",
+                        createdAt: now))
+                    try store.releaseLease(itemId: unavailable.itemId, agentId: agent.id,
+                                           note: "the worktree could not be created", now: now)
+                }
+            } else {
+                log("worktree of \(unavailable.key) unavailable for @\(agent.name): \(unavailable.reason)")
+            }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
             end = .interrupted
         } else if Task.isCancelled {
@@ -419,7 +444,7 @@ public actor Orchestrator {
 }
 
 /// A leaseholder's worktree is missing and could not be recreated.
-struct WorktreeUnavailable: Error {}
+struct WorktreeUnavailable: Error { var itemId: String; var key: String; var reason: String }
 
 enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.

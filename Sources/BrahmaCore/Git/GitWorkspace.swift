@@ -144,8 +144,17 @@ private final class TimeoutFlag: @unchecked Sendable {
 /// worktree at `<ws>/.brahma/wt/<KEY>` on branch `item/<KEY>`.
 public struct GitWorkspace: Sendable {
     public let root: URL
+    /// Where the per-item lock files live. Must not be a place agents can write; the default is a per-workspace directory
+    /// under the system temporary directory.
+    public let lockDirectory: URL
+    /// How long to wait for an item's lock before giving up on it (the caller skips the item this pass).
+    public var lockTimeout: TimeInterval = 10
 
-    public init(root: URL) { self.root = root }
+    public init(root: URL, lockDirectory: URL? = nil) {
+        self.root = root
+        self.lockDirectory = lockDirectory ?? FileManager.default.temporaryDirectory
+            .appending(path: "brahma-locks/\(StableHash.fnv1a64(root.path))", directoryHint: .isDirectory)
+    }
 
     // MARK: Layout
 
@@ -260,19 +269,19 @@ public struct GitWorkspace: Sendable {
     }
 
     /// Per-item exclusion shared by every process that touches this workspace: an exclusive `flock` on
-    /// `<ws>/.brahma/locks/<KEY>.lock`. Adding and removing the worktree of one item never interleave, so a removal that
-    /// decided "nobody holds this" cannot delete the checkout a new claim has just found and reused.
+    /// `<lockDirectory>/<KEY>.lock`. Adding and removing the worktree of one item never interleave, so a removal that
+    /// decided "nobody holds this" cannot delete the checkout a new claim has just found and reused. The wait is bounded.
     private func withKeyLock<T>(_ key: String, _ body: () throws -> T) throws -> T {
-        let dir = root.appending(path: ".brahma/locks", directoryHint: .isDirectory)
-        if Self.isSymlink(root.appending(path: ".brahma")) || Self.isSymlink(dir) {
-            throw GitError.failed(command: "lock \(key)", status: -1, stderr: "the engine's lock directory is a link")
-        }
+        let dir = lockDirectory
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let fd = open(dir.appending(path: "\(key).lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw GitError.failed(command: "lock \(key)", status: -1, stderr: "cannot open the lock file") }
         defer { close(fd) }
-        while flock(fd, LOCK_EX) != 0 {
-            if errno != EINTR { throw GitError.failed(command: "lock \(key)", status: -1, stderr: "cannot take the lock") }
+        let deadline = Date().addingTimeInterval(lockTimeout)
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            if errno != EWOULDBLOCK && errno != EINTR { throw GitError.failed(command: "lock \(key)", status: -1, stderr: "cannot take the lock") }
+            guard Date() < deadline else { throw GitError.failed(command: "lock \(key)", status: -1, stderr: "\(key) is busy; try again later") }
+            Thread.sleep(forTimeInterval: 0.02)
         }
         defer { flock(fd, LOCK_UN) }
         return try body()
@@ -308,10 +317,10 @@ public struct GitWorkspace: Sendable {
     ///
     /// `keepIf` is asked under the item's lock, after any concurrent add has finished: when it returns true (a lease exists
     /// now) nothing is removed, and when it throws nothing is removed either (an unreadable database is not "no lease").
-    public func removeWorktree(key: String, keepIf: (() throws -> Bool)? = nil) throws {
+    public func removeWorktree(key: String, keepIf: () throws -> Bool) throws {
         try Self.validKey(key)
         try withKeyLock(key) {
-            if let keepIf, try keepIf() { return }
+            if try keepIf() { return }
             try removeWorktreeLocked(key: key)
         }
     }

@@ -535,16 +535,72 @@ import GRDB
         try FileManager.default.createDirectory(at: wt.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "in the way".write(to: wt, atomically: true, encoding: .utf8)
         try l.world.dm(l.company, l.eng)
+        for attempt in 1...3 {
+            try await l.world.cycle()
+            #expect(l.world.fake.requests.filter { $0.agent.id == l.eng.id }.isEmpty)
+            #expect(try l.world.turns(l.eng).count == attempt)
+            #expect(try l.world.turns(l.eng).last?.outcome == .interrupted)
+            // Not a failure of the agent: ready again, no backoff.
+            let agent = try l.world.agent(l.eng)
+            #expect(agent.state == .ready); #expect(agent.consecutiveFailures == 0)
+            let errors = try l.store.events(afterId: 0).filter { $0.kind == .error && $0.text.contains("turn not started") }
+            if attempt < 3 {
+                // Tried again after the short delay, with the lease kept and no event yet.
+                #expect(try l.store.lease(itemId: i.id) != nil); #expect(errors.isEmpty)
+                l.world.clock.advance(EngineHealth.infraCooldown + 1)
+            } else {
+                // After three tries in a row the lease is given back, with one error event.
+                #expect(try l.store.lease(itemId: i.id) == nil); #expect(try l.fresh(i).status == .ready)
+                #expect(errors.count == 1); #expect(errors[0].text.contains(i.key)); #expect(errors[0].text.contains("lease released"))
+            }
+        }
+    }
+
+    @Test func dispatchIgnoresLeaseholdersAdmissionWouldRefuse() async throws {
+        let l = try L(hardCap: 1)
+        // Acme's leaseholder is ready but its company is paused, so admission will never run it...
+        let held = try l.item("held")
+        _ = try l.claim(held, l.eng)
+        try l.store.transition(agentId: l.eng.id, to: .ready)
+        var acme = try #require(try l.store.company(id: l.company.id)); acme.status = .paused; try l.store.updateCompany(acme)
+        // ...and must not take the only slot from Beta.
+        let beta = try l.world.company("Beta")
+        let beng = try l.world.hire(beta, "beng", role: "engineer")
+        let work = try l.store.createWorkItem(companyId: beta.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "beta work", checkSpec: CheckSpec(command: "true", paths: ["src/beta"]), status: .ready), now: l.now)
         try await l.world.cycle()
-        #expect(l.world.fake.requests.filter { $0.agent.id == l.eng.id }.isEmpty)
-        let turn = try #require(try l.world.turns(l.eng).last)
-        #expect(turn.outcome == .interrupted)
-        let events = try l.store.events(afterId: 0).filter { $0.kind == .error }
-        #expect(events.contains { $0.text.contains("turn not started") && $0.text.contains(i.key) })
-        // Not a failure of the agent: ready again, no backoff, and the lease is kept.
-        let agent = try l.world.agent(l.eng)
-        #expect(agent.state == .ready); #expect(agent.consecutiveFailures == 0)
-        #expect(try l.store.lease(itemId: i.id) != nil)
+        #expect(try l.store.lease(itemId: work.id)?.agentId == beng.id)
+        #expect(try l.store.lease(itemId: held.id)?.agentId == l.eng.id)
+    }
+
+    @Test func dispatchHoldsBackForCompaniesAtTheirOwnCap() async throws {
+        let l = try L()
+        // Low mode on a max20x plan allows two concurrent turns per company; two are already running.
+        _ = try l.world.hire(l.company, "spare", role: "engineer")
+        for n in 0..<3 { try l.item("w\(n)") }
+        l.world.fake.defaultScript = .init(delay: .seconds(2))
+        try l.world.dm(l.company, l.rev); try l.world.dm(l.company, l.mgr)
+        await l.world.orchestrator.tick()
+        #expect(await l.world.orchestrator.runningCount() == 2)
+        l.world.clock.advance(10)
+        await l.world.orchestrator.tick()
+        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(10))
+        #expect(try l.allLeases().isEmpty)
+    }
+
+    @Test func sweepSkipsOnlyTheBusyItem() async throws {
+        let l = try L()
+        l.store.gitLockTimeout.seconds = 0.3
+        _ = try l.ws.addWorktree(key: "ACME-8")
+        _ = try l.ws.addWorktree(key: "ACME-9")
+        let git = l.store.gitWorkspace(root: l.ws.root, companyId: l.company.id)
+        try FileManager.default.createDirectory(at: git.lockDirectory, withIntermediateDirectories: true)
+        let fd = open(git.lockDirectory.appending(path: "ACME-8.lock").path, O_CREAT | O_RDWR, 0o600)
+        #expect(flock(fd, LOCK_EX) == 0)
+        defer { close(fd) }
+        try await l.world.cycle()
+        #expect(FileManager.default.fileExists(atPath: l.ws.worktreePath(key: "ACME-8").path))
+        #expect(!FileManager.default.fileExists(atPath: l.ws.worktreePath(key: "ACME-9").path))
     }
 
     @Test func hotPathListCapMatchesValidation() throws {

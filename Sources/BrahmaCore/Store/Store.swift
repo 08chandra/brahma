@@ -26,9 +26,14 @@ public final class Store: Sendable {
     public let writer: any DatabaseWriter
     /// The industry packs this store knows. Every pack lookup goes through here.
     public let catalog: PackCatalog
+    /// The directory holding the database (nil for an in-memory store): where the engine keeps its own locks.
+    let dataHome: URL?
+    /// How long engine git waits for an item's lock before skipping the item (tests shorten it).
+    let gitLockTimeout = GitLockTimeout()
 
     public init(path: String, catalog: PackCatalog = .builtin) throws {
         self.catalog = catalog
+        dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
         config.busyMode = .timeout(5)
         config.prepareDatabase { db in
@@ -40,6 +45,7 @@ public final class Store: Sendable {
 
     private init(queue: DatabaseQueue, catalog: PackCatalog) throws {
         self.catalog = catalog
+        dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)
     }
@@ -60,6 +66,17 @@ public final class Store: Sendable {
             default: return ""
             }
         }
+    }
+
+    /// The git workspace of a company, with its per-item lock files under the data home (`<home>/run/locks/<companyId>`),
+    /// never in the workspace where an agent could hold a lock forever.
+    func gitWorkspace(root: URL, companyId: String) -> GitWorkspace {
+        let locks = (dataHome?.appending(path: "run/locks", directoryHint: .isDirectory)
+            ?? FileManager.default.temporaryDirectory.appending(path: "brahma-locks", directoryHint: .isDirectory))
+            .appending(path: companyId, directoryHint: .isDirectory)
+        var git = GitWorkspace(root: root, lockDirectory: locks)
+        git.lockTimeout = gitLockTimeout.seconds
+        return git
     }
 
     // MARK: Companies
@@ -193,4 +210,11 @@ public final class Store: Sendable {
     func save(_ agent: Agent) throws {
         try writer.write { db in try agent.save(db) }
     }
+}
+
+/// A settable timeout shared by a store's git workspaces.
+final class GitLockTimeout: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 10
+    var seconds: TimeInterval { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }
