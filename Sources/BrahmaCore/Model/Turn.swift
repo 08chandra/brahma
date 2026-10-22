@@ -18,7 +18,7 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var infra: Bool = false
 }
 
-public enum ActivityKind: String, Codable, Sendable { case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work }
+public enum ActivityKind: String, Codable, Sendable { case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval }
 
 public struct ActivityEvent: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "activityEvent"

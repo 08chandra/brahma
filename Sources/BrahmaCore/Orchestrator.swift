@@ -129,6 +129,9 @@ public actor Orchestrator {
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }
 
+        // Open asks: expiry, owner reminders, internal aging and paused-approver rerouting (company-active time).
+        attempt { _ = try store.sweepAsks(now: now) }
+
         // 1. Timed blockers that have expired.
         for a in try store.agents(states: [.blocked]) {
             let until: Date
@@ -298,7 +301,7 @@ public actor Orchestrator {
             var sent = agent
             sent.model = ModelPolicy.resolve(
                 agentModel: agent.model, role: store.catalog.template(role: agent.role, pack: company.packId),
-                mode: company.usageMode, context: ModelContext())
+                mode: company.usageMode, context: (try? store.askModelContext(agentId: agent.id)) ?? ModelContext())
             let turnToken = try store.issueTurnCredential(turnId: turn.id)
             // A leaseholder works inside its item's worktree (with the shared `.brahma` directory); everyone else in the workspace.
             var workingDirectory = company.workspacePath

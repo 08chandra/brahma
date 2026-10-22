@@ -42,6 +42,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var trustLevel: String = "T1"
     /// Company-active time of the last wake caused by a work notice; managers and executives are debounced from it.
     public var lastNoticeWakeActive: Double? = nil
+    /// Company-active time when the owner paused the agent; nil while awake. Ask rerouting reads it.
+    public var pausedActive: Double? = nil
 }
 
 /// Tie-break weight among a company's ready agents: leadership first. Reads the built-in role catalog.

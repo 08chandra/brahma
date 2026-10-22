@@ -5,7 +5,7 @@ import BrahmaCore
 struct CompanyGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "company", abstract: "Create and manage companies.",
-        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self])
+        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self, Autonomy.self, Auto.self])
 
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String
@@ -108,6 +108,30 @@ struct CompanyGroup: ParsableCommand {
             try store.setOwnerReserve(companyId: c.id, value)
             print(safe("\(c.name): reserve \(value.map { String(format: "%.2f", $0) } ?? "default (\(Int(((1 - store.weeklyShare()) * 100).rounded()))%)")"))
         }
+    }
+
+    struct Autonomy: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "How much you are asked: everything, important (default) or auto. Reserved matters always come to you.")
+        @Argument var company: String
+        @Argument(help: "everything, important or auto.") var preset: AutonomyPreset
+        func run() throws { try requireOwnerShell(); try CompanyGroup.setAutonomy(company, preset) }
+    }
+
+    struct Auto: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Shorthand: 'auto on' is autonomy auto, 'auto off' is important.")
+        @Argument var company: String
+        @Argument(help: "on or off.") var state: OnOff
+        func run() throws { try requireOwnerShell(); try CompanyGroup.setAutonomy(company, state == .on ? .auto : .important) }
+    }
+
+    enum OnOff: String, ExpressibleByArgument { case on, off }
+
+    private static func setAutonomy(_ query: String, _ preset: AutonomyPreset) throws {
+        let (store, _) = try openStore()
+        let c = try resolveCompany(store, query)
+        try store.setAutonomy(companyId: c.id, preset)
+        print(safe("\(c.name) autonomy: \(preset.rawValue)"))
     }
 
     private static func set(_ query: String, _ status: CompanyStatus) throws {

@@ -8,6 +8,7 @@ struct Brahma: AsyncParsableCommand {
         subcommands: [
             CompanyGroup.self, Hire.self, Say.self, Log.self, Search.self, Status.self,
             Kill.self, Pause.self, Wake.self, Run.self, MCP.self, OrgGroup.self, Doctor.self, OwnerGroup.self, SettingsGroup.self, ItemsGroup.self,
+            Inbox.self, Approve.self, Answer.self, Rescind.self, DevGroup.self,
         ]
     )
 }

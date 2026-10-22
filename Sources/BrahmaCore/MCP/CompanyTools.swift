@@ -37,15 +37,15 @@ public struct CompanyTools: Sendable {
     }
 
     /// The same list for every role (a stable prompt prefix); `call` enforces what the caller's role may use.
-    public func specs() -> [ToolSpec] { Self.baseSpecs() + Self.workSpecs() }
+    public func specs() -> [ToolSpec] { Self.baseSpecs() + Self.workSpecs() + Self.inboxToolSpecs() }
 
-    private static let implemented: Set<String> = Set((baseSpecs() + workSpecs()).map(\.name))
+    private static let implemented: Set<String> = Set((baseSpecs() + workSpecs() + inboxToolSpecs()).map(\.name))
 
     private static func baseSpecs() -> [ToolSpec] {
         let s = Self.self
         let handles: JSONValue = .object(["type": .string("array"), "items": .object(["type": .string("string")]),
                                           "description": .string("Teammate handles")])
-        return [
+        let base: [ToolSpec] = [
             ToolSpec(name: "post_message", description: "Post a message to a channel you are a member of. Use @handle to mention teammates.",
                      inputSchema: s.schema(["channel": s.prop("string", "Channel name, e.g. general"),
                                             "text": s.prop("string", "Message text")], required: ["channel", "text"])),
@@ -66,6 +66,7 @@ public struct CompanyTools: Sendable {
                      inputSchema: s.schema(["on": s.prop("string", "Who or what you are waiting on: @handle, owner, or a work item key such as ACME-12"),
                                             "reason": s.prop("string", "What you need")], required: ["on", "reason"])),
         ]
+        return base
     }
 
     /// Runs a tool and returns its text result. Appends one `toolUse` event whether it succeeds or fails.
@@ -127,6 +128,7 @@ public struct CompanyTools: Sendable {
                 return try setBlocked(on: try string(args, "on"), reason: try string(args, "reason"))
             default:
                 if let result = try callWork(name, args) { return result }
+                if let result = try dispatchInbox(name, args) { return result }
                 throw ToolError(message: "unknown tool: \(name)")
             }
         } catch let e as ToolError {
