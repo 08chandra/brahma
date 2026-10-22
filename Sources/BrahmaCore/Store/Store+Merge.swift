@@ -463,14 +463,20 @@ extension Store {
             out.append("")
         }
         if files.count > Self.maxBriefFiles { out.append("… and \(files.count - Self.maxBriefFiles) more files") }
-        let dir = URL(fileURLWithPath: company.workspacePath, isDirectory: true).appending(path: ".brahma/conflicts", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = ownerTimeZone()
         f.dateFormat = "yyyyMMdd-HHmmss"
-        let url = dir.appending(path: "\(item.key)-\(f.string(from: now)).md")
-        try (out.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
-        return url
+        // A new file under a real directory, never through a link (one planted on its name is skipped and alerted on).
+        do {
+            let written = try EngineFiles.createUnique(Data((out.joined(separator: "\n") + "\n").utf8), workspace: workspace,
+                                                       dir: ".brahma/conflicts", base: "\(item.key)-\(f.string(from: now))", ext: "md")
+            for problem in written.skipped { alertEngineFile(problem, companyId: company.id, now: now) }
+            return written.url
+        } catch let refused as UnsafeEngineFile {
+            alertEngineFile(refused, companyId: company.id, now: now)
+            throw refused
+        }
     }
 }

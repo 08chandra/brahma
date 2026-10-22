@@ -44,6 +44,12 @@ public struct TurnContext {
     public var noticeIds: [Int64]
     /// Set by the orchestrator when the session starts over: the Continuity block is rendered.
     public var fresh: Bool = false
+    /// The agent's active (or in-review) sprint: its team's, else the company's, with done and total item counts.
+    public var sprint: Sprint? = nil
+    public var sprintDone: Int = 0
+    public var sprintTotal: Int = 0
+    /// The team's notes file (retro lessons), when it exists.
+    public var notesPath: String? = nil
 
     public var scope: SessionScope { item.map { .item($0.id) } ?? .base }
 
@@ -83,6 +89,12 @@ public struct TurnContext {
             recentSummaries: [], inboxItemIds: inbox.compactMap(\.0.id), quietItemIds: quiet.map(\.id), noticeIds: batch.deliveredIds)
         c.inboxOverflow = allInbox.count - inbox.count
         c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: c.scope)) ?? []
+        if let sprint = try store.currentSprint(companyId: company.id, team: agent.team) {
+            let progress = try store.sprintProgress(sprint)
+            c.sprint = sprint; c.sprintDone = progress.done; c.sprintTotal = progress.total
+        }
+        let notes = NotesFile.path(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), team: agent.team)
+        if FileManager.default.fileExists(atPath: notes.path) { c.notesPath = notes.path }
 
         guard let item else { return c }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -143,6 +155,10 @@ public enum TurnDigest {
             out.append("- @\(r.handle) — \(ReviewDigest.flat(r.role, max: 40)) — \(r.state.rawValue)")
         }
         if c.roster.count > maxRoster { out.append("(\(c.roster.count - maxRoster) more: use list_agents)") }
+        if let s = c.sprint {
+            out.append("Sprint: \(s.name) · \(s.status.rawValue) · \(c.sprintDone)/\(c.sprintTotal) done · goal: \(ReviewDigest.flat(s.goal, max: 200))")
+        }
+        if let path = c.notesPath { out.append("Your notes: \(path)") }
 
         out.append("## Current work")
         if let item = c.item { out += currentWork(item, c) } else {

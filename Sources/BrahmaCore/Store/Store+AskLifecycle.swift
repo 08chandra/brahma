@@ -237,8 +237,8 @@ extension Store {
                 try settle(db, ask: &plan, status: .rejected, decidedBy: "system", tellRequesterToo: false, now: now)
                 try tellRequester(db, plan, text: "\(plan.ref) rejected: gate \(ask.ref) was rescinded", now: now)
             }
-            // Task 13 closes the rejected plans' sprints and tells the leads of active sprints
-            // "<ref> (<kind>) was rescinded; plan_sprint is blocked until a new one is approved."
+            // Rejecting a plan rejects its sprint and frees its items (`applySprintPlanEffects`); the leads of active sprints are told.
+            try tellLeadsGateRescinded(db, gate: ask, now: now)
         case .release:
             let text = "Release \(ask.ref) was rescinded; roll back the release."
             var told: Set<String> = []
@@ -250,7 +250,7 @@ extension Store {
                 for a in ctos where told.insert(a.id).inserted { try tell(db, companyId: ask.companyId, agentId: a.id, text: text, now: now) }
             }
         case .sprintPlan:
-            break   // Task 13: close the sprint and return its items to the backlog.
+            try reverseSprintPlan(db, ask: ask, now: now)
         default:
             break
         }

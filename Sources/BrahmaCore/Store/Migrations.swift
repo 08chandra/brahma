@@ -533,8 +533,35 @@ enum Migrations {
                 t.primaryKey(["companyId", "subject"])
             }
         }
+        m.registerMigration("v3-sprints") { db in
+            try db.alter(table: "company") { t in t.add(column: "cadence", .text).notNull().defaults(to: "sprint") }
+            try db.create(table: "sprint") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("team", .text)
+                t.column("goal", .text).notNull().defaults(to: "")
+                t.column("cadence", .text).notNull().defaults(to: "sprint")
+                t.column("status", .text).notNull()
+                t.column("milestoneItemId", .text)
+                t.column("askId", .text)
+                t.column("timeboxDays", .integer).notNull().defaults(to: 5)
+                t.column("timeboxTurns", .integer).notNull().defaults(to: 200)
+                t.column("startedActive", .double)
+                t.column("lastStandupActive", .double)
+                t.column("createdAt", .datetime).notNull()
+                t.column("startedAt", .datetime)
+                t.column("closedAt", .datetime)
+                t.column("summary", .text)
+                t.column("leadId", .text)
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "sprint_company_status", on: "sprint", columns: ["companyId", "status"])
+            try db.create(index: "sprint_ask", on: "sprint", columns: ["askId"])
+            try db.create(index: "workItem_sprint", on: "workItem", columns: ["sprintId"], ifNotExists: true)
+        }
         m.registerMigration("v3-budgets") { db in
-            // Registered last for now; the controller moves it after "v3-sprints". "v3-turn-context" (Task 9) and
+            // Registered after "v3-sprints". "v3-turn-context" (Task 9) and
             // "v3-sessions" (Task 10) add `kind`, `itemId` and `sessionResetReason` first, so each add is conditional.
             let existing = Set(try db.columns(in: "turn").map(\.name))
             func add(_ name: String, _ type: Database.ColumnType, notNull fallback: DatabaseValueConvertible? = nil) throws {

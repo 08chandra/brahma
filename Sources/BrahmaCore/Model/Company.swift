@@ -31,4 +31,6 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var pendingMainCommit: String? = nil
     /// Auto-approved items that landed in `main` (9c); every one is audited.
     public var autoMergeCount: Int = 0
+    /// The completion rule new sprints use unless the plan names one (the pack's `defaultCadence` at creation).
+    public var cadence: CadenceKind = .sprint
 }

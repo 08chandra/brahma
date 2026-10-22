@@ -204,8 +204,8 @@ extension Store {
         return by
     }
 
-    /// Writes a final status and runs the effects: the requester's DM and supersession. Effects of sprint plans arrive with
-    /// Task 13 (`applyAskEffects` is the hook); a rescind runs `reverseAskEffects` (Store+AskLifecycle).
+    /// Writes a final status and runs the effects: the requester's DM, supersession and a sprint plan's sprint
+    /// (`applySprintPlanEffects`); a rescind runs `reverseAskEffects` (Store+AskLifecycle).
     func settle(_ db: Database, ask: inout Ask, status: AskStatus, decidedBy: String, tellRequesterToo: Bool = true, now: Date) throws {
         ask.status = status
         ask.decidedBy = decidedBy
@@ -221,9 +221,10 @@ extension Store {
     }
 
     /// Effects of a final status. A newly approved ask supersedes the ask it names (unless that one is already rejected,
-    /// expired or rescinded). Sprint-plan effects are added by Task 13.
+    /// expired or rescinded). A sprint plan starts its sprint when approved and frees its items when rejected or expired.
     func applyAskEffects(_ db: Database, ask: Ask, now: Date) throws {
         if ask.status == .rejected { try actingCEODeclined(db, ask: ask, now: now) }
+        if ask.kind == .sprintPlan { try applySprintPlanEffects(db, ask: ask, now: now) }
         guard ask.status == .approved, let oldId = ask.supersedesId, var old = try Ask.fetchOne(db, key: oldId),
               old.companyId == ask.companyId else { return }
         guard ![AskStatus.rejected, .expired, .rescinded, .superseded].contains(old.status) else { return }

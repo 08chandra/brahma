@@ -367,7 +367,7 @@ extension CompanyTools {
         do {
             try git.ensureRepo()
             path = try git.addWorktree(key: target.key)
-            try ProgressFile.ensure(workspace: ws, item: target)
+            try store.ensureProgressFile(workspace: ws, item: target)
             // The baseline of the check's scripts, once per check revision; a reclaim keeps the first one.
             try store.ensureCheckSnapshot(item: target, workspace: ws)
         } catch {

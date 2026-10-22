@@ -58,7 +58,7 @@ private struct MCPWorld {
     let tools = try listing(w.ceo)
     let expected: Set<String> = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked",
         "list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency", "comment_work_item", "claim_lease",
-        "release_lease", "submit_for_review", "confirm_spec",
+        "release_lease", "submit_for_review", "confirm_spec", "plan_sprint", "close_sprint",
         "propose_decision", "request_from_owner", "escalate_decision", "decide", "request_mode", "write_handoff"]
     #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
     #expect(tools.count == expected.count)
@@ -68,6 +68,17 @@ private struct MCPWorld {
         #expect(try JSONSerialization.data(withJSONObject: listing(agent), options: [.sortedKeys])
                 == JSONSerialization.data(withJSONObject: tools, options: [.sortedKeys]))
     }
+}
+
+@Test func executiveSeesEveryTool() throws {
+    let w = try MCPWorld()
+    let line = try #require(w.server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
+    let r = try #require(try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+    let tools = try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+    #expect(Set(tools.compactMap { $0["name"] as? String }) == Set(CompanyToolNames.all).subtracting(["review", "audit"]))
+    // ...and may call each of them: none is refused for the role.
+    let template = w.store.catalog.template(role: "ceo", pack: "software")
+    #expect(Set(template.companyTools) == Set(CompanyToolNames.all).subtracting(["review", "audit"]))
 }
 
 @Test func unknownMethodIsMethodNotFoundAndNotificationsAreSilent() throws {

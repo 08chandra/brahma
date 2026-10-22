@@ -1,7 +1,9 @@
 import Foundation
 
-/// Where the engine keeps the files of a check. Only the engine writes `.brahma/checks`; the temporary detached checkouts
-/// the checks run in live under `.brahma/wt-check`. (`BrahmaPaths.checksDir` is not used for checks.)
+/// Where the engine keeps the files of a check in the workspace. Only the engine writes `.brahma/checks` (the saved
+/// scripts); the temporary detached checkouts a submission's check runs in live under `.brahma/wt-check`. A merge check
+/// runs on a `.git`-free export that is not in the workspace at all: `<home>/run/exports/<runId>` under the data home
+/// (`BrahmaPaths.exportDir(runId:)`, `GitWorkspace.exportPath(runId:)`). (`BrahmaPaths.checksDir` is not used for checks.)
 public struct CheckPaths: Sendable, Equatable {
     public let workspace: URL
 
@@ -12,14 +14,18 @@ public struct CheckPaths: Sendable, Equatable {
 
     /// `<ws>/.brahma/checks/<KEY>/rev<n>/`: the saved copies of the check's scripts.
     public func snapshotDir(key: String, revision: Int) -> URL {
-        checksRoot.appending(path: "\(key)/rev\(revision)", directoryHint: .isDirectory)
+        workspace.appending(path: Self.snapshotRelative(key: key, revision: revision), directoryHint: .isDirectory)
     }
+
+    /// The same, relative to the workspace (for `EngineFiles`).
+    static func snapshotRelative(key: String, revision: Int) -> String { ".brahma/checks/\(key)/rev\(revision)" }
 
     public func manifest(key: String, revision: Int) -> URL {
         snapshotDir(key: key, revision: revision).appending(path: "manifest.json")
     }
 
-    /// `<ws>/.brahma/wt-check/<runId>`: the clean detached checkout one run executes in.
+    /// `<ws>/.brahma/wt-check/<runId>`: the clean detached checkout a submission's check run executes in. (A merge check's
+    /// export is `GitWorkspace.exportPath(runId:)`, under the data home.)
     public func runWorktree(runId: String) -> URL {
         runWorktreesRoot.appending(path: runId, directoryHint: .isDirectory)
     }
@@ -114,46 +120,38 @@ public enum CheckScripts {
         return out
     }
 
-    /// Writes `contents` (relative path → bytes) under `to`, replacing it, and returns the content hash of each.
+    /// Writes `contents` (relative path → bytes) under `<workspace>/<relative>`, replacing whatever was there (a link
+    /// included, never followed), through `EngineFiles`, and returns the content hash of each.
     @discardableResult
-    public static func write(contents: [String: Data], to: URL) throws -> [String: String] {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
-        try fm.createDirectory(at: to, withIntermediateDirectories: true)
+    public static func write(contents: [String: Data], workspace: URL, dir relative: String) throws -> [String: String] {
+        let parts = relative.split(separator: "/").map(String.init)
+        guard let last = parts.last else { throw UnsafeEngineFile(path: workspace.path, problem: "is not a check snapshot directory") }
+        try EngineFiles.remove(workspace: workspace, dir: parts.dropLast().joined(separator: "/"), name: last)
+        try EngineFiles.directory(workspace: workspace, relative)
         var manifest: [String: String] = [:]
         for (file, data) in contents {
-            let target = to.appending(path: file)
-            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: target)
+            let comps = file.split(separator: "/").map(String.init)
+            guard let name = comps.last else { continue }
+            let sub = ([relative] + comps.dropLast()).joined(separator: "/")
+            guard try EngineFiles.create(data, workspace: workspace, dir: sub, name: name) else {
+                throw UnsafeEngineFile(path: workspace.appending(path: "\(relative)/\(file)").path, problem: "already exists")
+            }
             manifest[file] = StableHash.fnv1a64(data)
         }
         return manifest
     }
 
-    /// Copies each file (relative to `from`) to the same relative path under `to`, and returns the content hash of each.
-    @discardableResult
-    public static func snapshot(files: [String], from: URL, to: URL) throws -> [String: String] {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
-        try fm.createDirectory(at: to, withIntermediateDirectories: true)
-        var manifest: [String: String] = [:]
-        for file in files {
-            let data = try Data(contentsOf: from.appending(path: file))
-            let target = to.appending(path: file)
-            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: target)
-            manifest[file] = StableHash.fnv1a64(data)
-        }
-        return manifest
-    }
+    /// The largest saved script that is hashed; a bigger one hashes as missing (so it reads as modified).
+    static let maxHashedBytes = 16 << 20
 
-    /// The content hash of each file under `dir`; nil where it is missing or not a regular file.
-    public static func hashes(files: [String], in dir: URL) -> [String: String?] {
+    /// The content hash of each file under `dir`; nil where it is missing or not a regular file. Every part of the path
+    /// below `root` (by default `dir` itself; the workspace for a saved snapshot) is opened without following a link.
+    public static func hashes(files: [String], in dir: URL, root: URL? = nil) -> [String: String?] {
         var out: [String: String?] = [:]
         for file in files {
             let url = dir.appending(path: file)
-            if (try? FileManager.default.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeRegular,
-               let data = try? Data(contentsOf: url) {
+            // Never through a link, and capped: a file past the cap counts as changed.
+            if let data = EngineFiles.readNoFollow(url, under: root ?? dir, limit: maxHashedBytes + 1), data.count <= maxHashedBytes {
                 out[file] = StableHash.fnv1a64(data)
             } else {
                 out[file] = .some(nil)

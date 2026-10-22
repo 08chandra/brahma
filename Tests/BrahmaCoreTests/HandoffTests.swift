@@ -168,4 +168,105 @@ import GRDB
         try h.claim(i, h.eng)
         #expect(try String(contentsOf: progress, encoding: .utf8) == "my notes")
     }
+
+    // MARK: Engine files under .brahma are never written through a link
+
+    private func engineFileAlerts(_ h: H) throws -> [Ask] {
+        try h.store.writer.read { db in
+            try Ask.filter(Column("companyId") == h.company.id && Column("kind") == AskKind.engineAlert).fetchAll(db)
+        }
+    }
+
+    @Test func handoffNeverWritesThroughALink() throws {
+        let h = try H()
+        let i = try h.item(); try h.claim(i, h.eng)
+        let fm = FileManager.default
+        let outside = try tempDir()
+        let secret = outside.appending(path: "secret.md")
+        try "outside".write(to: secret, atomically: true, encoding: .utf8)
+        // A link planted at the name the hand-off would take: skipped, never followed, and the owner is alerted.
+        let dir = h.root.appending(path: ".brahma/handoffs/\(i.key)", directoryHint: .isDirectory)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stamp = DateFormatter()
+        stamp.locale = Locale(identifier: "en_US_POSIX"); stamp.timeZone = TimeZone(identifier: "UTC"); stamp.dateFormat = "yyyyMMdd-HHmmss"
+        let planted = dir.appending(path: "\(stamp.string(from: h.now))-eng-1.md")
+        try fm.createSymbolicLink(at: planted, withDestinationURL: secret)
+        let record = try h.store.writeHandoff(itemId: i.id, by: .agent(h.eng.id), draft: HandoffDraft(goal: "Finish"), now: h.now)
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "outside")
+        #expect(record.path == dir.appending(path: "\(stamp.string(from: h.now))-eng-1-2.md").path)
+        var st = stat()
+        #expect(lstat(record.path, &st) == 0 && st.st_mode & S_IFMT == S_IFREG)
+        #expect(try String(contentsOfFile: record.path, encoding: .utf8).contains("## Goal\n    | Finish\n"))
+        let alerts = try engineFileAlerts(h)
+        #expect(alerts.count == 1 && alerts[0].title.contains(planted.lastPathComponent), "\(alerts.map(\.title))")
+
+        // A hand-off directory that is a link to somewhere else is refused; nothing lands there.
+        try fm.removeItem(at: dir)
+        try fm.createSymbolicLink(at: dir, withDestinationURL: outside)
+        #expect(throws: UnsafeEngineFile.self) {
+            try h.store.writeHandoff(itemId: i.id, by: .agent(h.eng.id), draft: HandoffDraft(goal: "Later"), now: h.now.addingTimeInterval(5))
+        }
+        #expect(try fm.contentsOfDirectory(atPath: outside.path) == ["secret.md"])
+        #expect(try h.store.handoffs(itemId: i.id).count == 1)
+        let texts = try h.store.writer.read { db in
+            try ActivityEvent.filter(Column("companyId") == h.company.id && Column("kind") == ActivityKind.error.rawValue).fetchAll(db).map(\.text)
+        }
+        #expect(texts.contains { $0.contains(".brahma/handoffs/\(i.key)") && $0.contains("not a real directory") }, "\(texts)")
+    }
+
+    @Test func progressFileNeverWrittenThroughALink() throws {
+        let h = try H()
+        let i = try h.item()
+        let fm = FileManager.default
+        let outside = try tempDir()
+        let secret = outside.appending(path: "secret.md")
+        try "outside".write(to: secret, atomically: true, encoding: .utf8)
+        let progress = ProgressFile.path(workspace: h.root, key: i.key)
+        try fm.createDirectory(at: progress.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: progress, withDestinationURL: secret)
+        try h.claim(i, h.eng)
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "outside")
+        // The link is replaced by a fresh progress file in place, and the owner is alerted.
+        var st = stat()
+        #expect(lstat(progress.path, &st) == 0 && st.st_mode & S_IFMT == S_IFREG)
+        #expect(try String(contentsOf: progress, encoding: .utf8).hasPrefix("# \(i.key): Parse the thing"))
+        let alerts = try engineFileAlerts(h)
+        #expect(alerts.count == 1 && alerts[0].title.contains("\(i.key).md"), "\(alerts.map(\.title))")
+    }
+
+    @Test func engineFilesStayInsideTheWorkspace() throws {
+        let fm = FileManager.default
+        let ws = try tempDir(), outside = try tempDir()
+        // Missing parts are created as real directories.
+        let dir = try EngineFiles.directory(workspace: ws, ".brahma/a/b")
+        #expect(dir.path == ws.appending(path: ".brahma/a/b").path)
+        #expect(try EngineFiles.create(Data("one".utf8), workspace: ws, dir: ".brahma/a/b", name: "f.md"))
+        #expect(try !EngineFiles.create(Data("two".utf8), workspace: ws, dir: ".brahma/a/b", name: "f.md"), "O_EXCL")
+        #expect(try EngineFiles.replace(Data("three".utf8), workspace: ws, dir: ".brahma/a/b", name: "f.md") == nil)
+        #expect(try EngineFiles.read(workspace: ws, dir: ".brahma/a/b", name: "f.md") == Data("three".utf8))
+        #expect(try EngineFiles.read(workspace: ws, dir: ".brahma/a/b", name: "f.md", limit: 2) == Data("th".utf8), "capped")
+        #expect(try EngineFiles.read(workspace: ws, dir: ".brahma/a/b", name: "none.md") == nil)
+        // A link in the path, even one leading back inside the workspace, is not a real directory.
+        try fm.createSymbolicLink(at: ws.appending(path: ".brahma/out"), withDestinationURL: outside)
+        try fm.createSymbolicLink(at: ws.appending(path: ".brahma/in"), withDestinationURL: ws.appending(path: ".brahma/a"))
+        for rel in [".brahma/out", ".brahma/out/x", ".brahma/in/b"] {
+            #expect(throws: UnsafeEngineFile.self) { try EngineFiles.replace(Data("x".utf8), workspace: ws, dir: rel, name: "f.md") }
+        }
+        #expect(try fm.contentsOfDirectory(atPath: outside.path).isEmpty)
+        // A linked or hard-linked target is never read; a rewrite replaces the link and leaves its target alone.
+        let secret = outside.appending(path: "s")
+        try "secret".write(to: secret, atomically: true, encoding: .utf8)
+        try fm.createSymbolicLink(at: dir.appending(path: "l.md"), withDestinationURL: secret)
+        try fm.linkItem(at: secret, to: dir.appending(path: "h.md"))
+        for name in ["l.md", "h.md"] {
+            #expect(throws: UnsafeEngineFile.self) { try EngineFiles.read(workspace: ws, dir: ".brahma/a/b", name: name) }
+            #expect(try EngineFiles.replace(Data("mine".utf8), workspace: ws, dir: ".brahma/a/b", name: name) != nil)
+            #expect(try EngineFiles.read(workspace: ws, dir: ".brahma/a/b", name: name) == Data("mine".utf8))
+        }
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "secret")
+        // A workspace reached through a link (as /var is on macOS) is resolved first.
+        let alias = try tempDir().appending(path: "alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: ws)
+        #expect(try EngineFiles.read(workspace: alias, dir: ".brahma/a/b", name: "f.md") == Data("three".utf8))
+    }
 }

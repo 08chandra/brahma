@@ -90,8 +90,12 @@ public final class Store: Sendable {
                 ?? FileManager.default.temporaryDirectory.appending(path: fallback, directoryHint: .isDirectory))
                 .appending(path: companyId, directoryHint: .isDirectory)
         }
+        // Merge-check exports go under the data home (`<home>/run/exports/<runId>`); an in-memory store uses a per-company
+        // stand-in under the temporary directory.
+        let exportHome = dataHome ?? FileManager.default.temporaryDirectory
+            .appending(path: "brahma-exports/\(companyId)", directoryHint: .isDirectory)
         var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
-                               mergeDirectory: engineDir("merge", fallback: "brahma-merge"))
+                               mergeDirectory: engineDir("merge", fallback: "brahma-merge"), exportHome: exportHome)
         git.lockTimeout = gitLockTimeout.seconds
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
         git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }
@@ -102,6 +106,7 @@ public final class Store: Sendable {
                 + "there and put it back from its own records. An agent probably rewrote it; look at what \(key) is doing.",
                 now: Store.now(), reason: "worktree:\(companyId):\(key)")
         }
+        git.onUnsafeEngineFile = { [self] problem in alertEngineFile(problem, companyId: companyId) }
         git.onUnsafeRepository = { [self] detail in
             let name = (try? company(id: companyId))?.name ?? companyId
             let reason = "gitconfig:\(companyId)"
@@ -160,6 +165,7 @@ public final class Store: Sendable {
                 id: UUID().uuidString, name: name, slug: slug, goal: goal, workspacePath: dir.path,
                 status: .running, usageMode: .balanced, priorityWeight: 1, createdAt: createdAt,
                 packId: packId, packVersion: packVersion ?? pack.version)
+            company.cadence = CadenceKind(rawValue: pack.defaultCadence) ?? .sprint
             try company.insert(db)
             // Directory is created only after the row is in; a failure here rolls the insert back.
             let existed = FileManager.default.fileExists(atPath: dir.path)

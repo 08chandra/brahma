@@ -117,10 +117,17 @@ extension Store {
         let contents = try source.map { try git.blobs(at: $0, paths: Array(candidates.prefix(200)), limit: CheckScripts.maxFiles) } ?? [:]
         let paths = CheckPaths(workspace: workspace)
         let dir = paths.snapshotDir(key: item.key, revision: item.checkRevision)
-        let manifest = try CheckScripts.write(contents: contents, to: dir)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        try encoder.encode(manifest).write(to: paths.manifest(key: item.key, revision: item.checkRevision))
+        let relative = CheckPaths.snapshotRelative(key: item.key, revision: item.checkRevision)
+        let manifest: [String: String]
+        do {
+            manifest = try CheckScripts.write(contents: contents, workspace: workspace, dir: relative)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+            try EngineFiles.replace(try encoder.encode(manifest), workspace: workspace, dir: relative, name: "manifest.json")
+        } catch let refused as UnsafeEngineFile {
+            alertEngineFile(refused, companyId: item.companyId)
+            throw refused
+        }
         try saveCheckSnapshot(itemId: item.id, revision: item.checkRevision, dir: dir.path, manifest: manifest)
     }
 
@@ -139,7 +146,9 @@ extension Store {
     func snapshotTamper(itemId: String, revision: Int) throws -> String? {
         guard let snap = try latestCheckSnapshot(itemId: itemId, upTo: revision) else { return nil }
         let names = snap.manifest.keys.sorted()
-        let now = CheckScripts.hashes(files: names, in: URL(fileURLWithPath: snap.dir, isDirectory: true))
+        // The snapshot lives at `<workspace>/.brahma/checks/…`: from the workspace down, no part of the way is a link.
+        let root = snap.dir.range(of: "/.brahma/checks/", options: .backwards).map { URL(fileURLWithPath: String(snap.dir[..<$0.lowerBound]), isDirectory: true) }
+        let now = CheckScripts.hashes(files: names, in: URL(fileURLWithPath: snap.dir, isDirectory: true), root: root)
         return names.first { (now[$0] ?? nil) != snap.manifest[$0] }
     }
 

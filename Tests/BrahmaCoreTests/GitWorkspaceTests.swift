@@ -741,6 +741,165 @@ import Foundation
         #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt).isEmpty)
     }
 
+    // MARK: Engine checkouts never leave the workspace
+
+    private func fileWatched(_ f: GitFixture) -> (GitWorkspace, TamperLog) {
+        let log = TamperLog()
+        var ws = f.ws
+        ws.onUnsafeEngineFile = { problem in log.add("\(problem)") }
+        return (ws, log)
+    }
+
+    @Test func linkedBrahmaGetsNoCheckoutAndLosesNothing() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = fileWatched(f)
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        let outside = try tempDir()
+        // Things outside the workspace at the places `.brahma/wt` and `.brahma/wt-check` would name through the link.
+        let kept = ["wt/K-2/keep.txt", "wt/.merge/keep.txt", "wt-check/r2/keep.txt", "wt-check/stray/keep.txt", "wt-check/r3/.git"]
+        for rel in kept { try f.write(rel, "keep", in: outside) }
+        let brahma = f.root.appending(path: ".brahma")
+        if (try? fm.attributesOfItem(atPath: brahma.path)) != nil { try fm.removeItem(at: brahma) }
+        try fm.createSymbolicLink(at: brahma, withDestinationURL: outside)
+        let before = Set(try fm.subpathsOfDirectory(atPath: outside.path))
+        #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
+        #expect(throws: GitError.self) { try ws.addRunWorktree(runId: "r1", commit: main) }
+        // A merge-check export lives under the data home: the link in the workspace has no say in it.
+        let export = try ws.addEngineExport(runId: "r4", commit: main)
+        #expect(export.path == ws.exportPath(runId: "r4").path && exists(export.appending(path: "a.txt")))
+        #expect(throws: GitError.self) { try ws.removeWorktree(key: "K-2", keepIf: { false }) }
+        ws.removeRunWorktree(runId: "r2")
+        ws.removeRunWorktree(runId: "r3")
+        ws.removeRunWorktrees()
+        #expect(Set(try fm.subpathsOfDirectory(atPath: outside.path)) == before, "something was created or deleted outside the workspace")
+        for rel in kept { #expect(exists(outside.appending(path: rel)), "\(rel) was deleted") }
+        #expect(!(try f.git(["worktree", "list"])).contains("wt/K-1"))
+        #expect(log.all.count == 6 && log.all.allSatisfy { $0.contains(".brahma is a symbolic link") }, "\(log.all)")
+    }
+
+    @Test func checkoutPlaceSwappedBeforeGitRunsIsRefused() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        let outside = try tempDir()
+        let brahma = f.root.appending(path: ".brahma"), moved = f.root.appending(path: ".brahma-moved")
+        // (A merge-check export is not under `.brahma`: `exportSwappedForALinkAfterItsLastCheckWritesNothingOutside`.)
+        let calls: [(GitWorkspace) throws -> Void] = [{ _ = try $0.addWorktree(key: "K-1") },
+                                                     { _ = try $0.addRunWorktree(runId: "r1", commit: main) }]
+        for (n, run) in calls.enumerated() {
+            let made = fileWatched(f)
+            var ws = made.0
+            let log = made.1
+            // Once the place is made, and before git or tar runs, `.brahma` is moved away and replaced by a link outside.
+            ws.checkoutProbe = { _ in
+                try? FileManager.default.moveItem(at: brahma, to: moved)
+                try? FileManager.default.createSymbolicLink(at: brahma, withDestinationURL: outside)
+            }
+            #expect(throws: GitError.self) { try run(ws) }
+            #expect(try fm.contentsOfDirectory(atPath: outside.path).isEmpty, "case \(n): git or tar wrote outside the workspace")
+            #expect(log.all.count == 1 && log.all[0].contains("moved while"), "case \(n): \(log.all)")
+            // The place it made is gone (removed through the moved directory), and git keeps no record of it.
+            let left = try fm.subpathsOfDirectory(atPath: moved.path).filter { ["K-1", "r1"].contains(URL(fileURLWithPath: $0).lastPathComponent) }
+            #expect(left.isEmpty, "case \(n): \(left)")
+            let listed = try f.git(["worktree", "list"])
+            #expect(!listed.contains("wt-check/r1") && !listed.contains("wt/K-1"), "case \(n): \(listed)")
+            try fm.removeItem(at: brahma)
+            try fm.moveItem(at: moved, to: brahma)
+        }
+        // With nothing swapped, the same calls work.
+        let wt = try f.ws.addWorktree(key: "K-1")
+        #expect(exists(wt.appending(path: "a.txt")))
+        let check = try f.ws.addRunWorktree(runId: "r1", commit: main)
+        #expect(exists(check.appending(path: "a.txt")))
+        f.ws.removeRunWorktree(runId: "r1")
+        #expect(!exists(check))
+    }
+
+    // MARK: Merge-check exports live under the data home
+
+    /// Every file under `dir` (links not followed) with its bytes, or "link" for a link.
+    private func tree(_ dir: URL) throws -> [String: String] {
+        let fm = FileManager.default
+        var out: [String: String] = [:]
+        for rel in try fm.subpathsOfDirectory(atPath: dir.path) {
+            let url = dir.appending(path: rel)
+            let type = try fm.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
+            if type == .typeSymbolicLink { out[rel] = "link" }
+            else if type == .typeRegular { out[rel] = String(decoding: try Data(contentsOf: url), as: UTF8.self) }
+            else { out[rel] = "dir" }
+        }
+        return out
+    }
+
+    @Test func exportRunsFromTheDataHome() throws {
+        let fm = FileManager.default
+        let home = try tempDir()
+        let f = try GitFixture(files: ["a.txt": "one", "dir/b.txt": "two"])
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        let ws = GitWorkspace(root: f.root, mergeDirectory: home.appending(path: "run/merge/c1"), exportHome: home)
+        let dir = try ws.addEngineExport(runId: "run-1", commit: main)
+        #expect(dir.path == home.appending(path: "run/exports/run-1").path)
+        #expect(dir.path == ws.exportPath(runId: "run-1").path)
+        #expect(dir.path == BrahmaPaths(home: home, workspaces: f.root).exportDir(runId: "run-1").path)
+        #expect((try fm.attributesOfItem(atPath: dir.path)[.posixPermissions] as? Int) == 0o700, "the export is engine-private")
+        #expect(try String(contentsOf: dir.appending(path: "dir/b.txt"), encoding: .utf8) == "two")
+        #expect(!exists(dir.appending(path: ".git")))
+        #expect(!exists(f.root.appending(path: ".brahma/wt-check/run-1")), "nothing of the export is in the workspace")
+        ws.removeRunWorktree(runId: "run-1")
+        #expect(!exists(dir))
+        // What a crashed run left is removed at start-up, and a new export at a taken run id starts clean.
+        let left = try ws.addEngineExport(runId: "run-2", commit: main)
+        try "stale".write(to: left.appending(path: "stale.txt"), atomically: true, encoding: .utf8)
+        let again = try ws.addEngineExport(runId: "run-2", commit: main)
+        #expect(!exists(again.appending(path: "stale.txt")))
+        ws.removeRunWorktrees()
+        #expect(!exists(again))
+    }
+
+    @Test func exportSwappedForALinkAfterItsLastCheckWritesNothingOutside() throws {
+        let fm = FileManager.default
+        let home = try tempDir()
+        let f = try GitFixture(files: ["a.txt": "one", "dir/b.txt": "two"])
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        // The place itself, then its parent (`run/exports`), is moved away and replaced by a link outside once the engine
+        // has checked it and before tar runs.
+        for target in ["place", "parent"] {
+            let outside = try tempDir()
+            try f.write("a.txt", "keep", in: outside)
+            try f.write("run-1/a.txt", "keep", in: outside)
+            let before = try tree(outside)
+            let log = TamperLog()
+            var ws = GitWorkspace(root: f.root, mergeDirectory: home.appending(path: "run/merge/c1"), exportHome: home)
+            ws.onUnsafeEngineFile = { problem in log.add("\(problem)") }
+            let swapped = Swapped()
+            ws.spawnProbe = { place in
+                let victim = target == "place" ? place : place.deletingLastPathComponent()
+                let moved = victim.deletingLastPathComponent().appending(path: victim.lastPathComponent + "-moved")
+                try? FileManager.default.moveItem(at: victim, to: moved)
+                try? FileManager.default.createSymbolicLink(at: victim, withDestinationURL: outside)
+                swapped.set(victim, moved)
+            }
+            #expect(throws: GitError.self) { try ws.addEngineExport(runId: "run-1", commit: main) }
+            #expect(try tree(outside) == before, "\(target): tar wrote or overwrote a file outside")
+            #expect(log.all.count == 1 && log.all[0].contains("moved while"), "\(target): \(log.all)")
+            // The engine removed what it made through its descriptor (for the place, the link that took its name).
+            let (victim, moved) = try #require(swapped.get)
+            if (try? fm.attributesOfItem(atPath: victim.path)) != nil { try fm.removeItem(at: victim) }
+            try fm.moveItem(at: moved, to: victim)
+        }
+        // With nothing swapped, the export works.
+        let dir = try GitWorkspace(root: f.root, mergeDirectory: home.appending(path: "run/merge/c1"), exportHome: home)
+            .addEngineExport(runId: "run-1", commit: main)
+        #expect(try String(contentsOf: dir.appending(path: "a.txt"), encoding: .utf8) == "one")
+    }
+
+    final class Swapped: @unchecked Sendable {
+        private let lock = NSLock(); private var pair: (URL, URL)?
+        func set(_ a: URL, _ b: URL) { lock.lock(); pair = (a, b); lock.unlock() }
+        var get: (URL, URL)? { lock.lock(); defer { lock.unlock() }; return pair }
+    }
+
     // MARK: Repository filters, drivers and replace objects
 
     final class Refusals: @unchecked Sendable {
@@ -1570,8 +1729,9 @@ import Foundation
     }
 
     @Test func mergeCheckRunsOnAGitFreeExport() throws {
-        let engine = try tempDir().appending(path: "run/merge/c1", directoryHint: .isDirectory)
-        let d = try Driven(ws: { GitWorkspace(root: $0, mergeDirectory: engine) })
+        let home = try tempDir()
+        let engine = home.appending(path: "run/merge/c1", directoryHint: .isDirectory)
+        let d = try Driven(ws: { GitWorkspace(root: $0, mergeDirectory: engine, exportHome: home) })
         // The tree routes every file through a smudge filter the workspace defines, hides a file from exports and asks for a
         // substitution: none of it may change what the check sees.
         // (A filter the workspace's config defines refuses the workspace outright: `repoFilterIsRefusedAndNeverRuns`.)
@@ -1582,7 +1742,7 @@ import Foundation
         try d.f.git(["add", "-A"]); try d.f.git(["commit", "-qm", "attrs"])
         let commit = try #require(try d.ws.head(of: GitWorkspace.mainRef))
         let dir = try d.ws.addEngineExport(runId: "run-1", commit: commit)
-        #expect(dir.path == CheckPaths(workspace: d.f.root).runWorktree(runId: "run-1").path, "the check keeps its place under .brahma/wt-check")
+        #expect(dir.path == home.appending(path: "run/exports/run-1").path, "the check runs under the data home, not in the workspace")
         #expect(!FileManager.default.fileExists(atPath: dir.appending(path: ".git").path), "the export has no .git")
         #expect(try String(contentsOf: dir.appending(path: "big.txt"), encoding: .utf8).contains("line twenty"))
         #expect(try String(contentsOf: dir.appending(path: "hidden.txt"), encoding: .utf8) == "the test the export must not hide\n")

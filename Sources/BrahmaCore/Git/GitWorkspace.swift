@@ -449,6 +449,9 @@ public struct GitWorkspace: Sendable {
     /// bundles and exports). Must not be a place agents can write (a leaseholder is given `<ws>/.brahma`); the store uses
     /// `<home>/run/merge/<companyId>`.
     public let mergeDirectory: URL
+    /// The data home merge-check exports are unpacked under, at `<exportHome>/run/exports/<runId>` (`exportPath`). Must not
+    /// be a place agents can write; the store uses its data home.
+    public let exportHome: URL
     /// How long to wait for an item's lock before giving up on it (the caller skips the item this pass).
     public var lockTimeout: TimeInterval = 10
     /// Called once for each time an item worktree is found repointed (its `HEAD` off `item/<KEY>`, or `gitdir`, `commondir`
@@ -462,15 +465,25 @@ public struct GitWorkspace: Sendable {
     /// textconv, diff or merge driver, hooks path, ssh command, fsmonitor) or includes another file; `detail` says which
     /// file and keys. Nothing ran. The store files one owner alert while it stays that way.
     public var onUnsafeRepository: (@Sendable (_ detail: String) -> Void)?
+    /// Called each time a link or an odd file is found on the way to `.brahma/wt`, `.brahma/wt-check` or the data home's
+    /// `run/exports` (or a checkout or export there moved while git or tar wrote into it). Nothing was created or removed
+    /// through it. The store files the engine alert.
+    public var onUnsafeEngineFile: (@Sendable (UnsafeEngineFile) -> Void)?
+    /// Tests only: called with an engine checkout's place once it is created, right before git or tar is run into it.
+    var checkoutProbe: (@Sendable (URL) -> Void)?
+    /// Tests only: called with the place after its last check, the moment before git or tar is started on it.
+    var spawnProbe: (@Sendable (URL) -> Void)?
 
     /// The moments of a rebase in the merge checkout (`rebaseProbe`).
     enum RebasePhase: Sendable { case before, after }
     /// Tests only: called right before `git rebase` runs in the merge checkout and right after it returns.
     var rebaseProbe: (@Sendable (RebasePhase) -> Void)?
 
-    public init(root: URL, lockDirectory: URL? = nil, mergeDirectory: URL? = nil) {
+    public init(root: URL, lockDirectory: URL? = nil, mergeDirectory: URL? = nil, exportHome: URL? = nil) {
         self.root = root
         let hash = StableHash.fnv1a64(root.path)
+        self.exportHome = exportHome ?? FileManager.default.temporaryDirectory
+            .appending(path: "brahma-exports/\(hash)", directoryHint: .isDirectory)
         self.lockDirectory = lockDirectory ?? FileManager.default.temporaryDirectory
             .appending(path: "brahma-locks/\(hash)", directoryHint: .isDirectory)
         self.mergeDirectory = mergeDirectory ?? FileManager.default.temporaryDirectory
@@ -725,21 +738,25 @@ public struct GitWorkspace: Sendable {
     private func addWorktreeLocked(key: String) throws -> URL {
         let fm = FileManager.default
         let path = worktreePath(key: key)
-        if Self.isSymlink(worktreesDir) {
-            throw GitError.failed(command: "worktree add \(key)", status: -1, stderr: "\(worktreesDir.path) is a link")
-        }
-        try fm.createDirectory(at: worktreesDir, withIntermediateDirectories: true)
-        if fm.fileExists(atPath: path.path) || Self.isSymlink(path) {
-            if fm.fileExists(atPath: adminDir(key: key).path), !Self.isSymlink(path) { return path }
-            throw GitError.failed(command: "worktree add \(key)", status: -1,
-                                  stderr: "\(path.path) already exists and is not a checkout of this workspace")
+        let command = "worktree add \(key)"
+        // `.brahma/wt` is walked from the workspace without following a link, so a linked `.brahma` cannot send the checkout
+        // elsewhere; the checkout's own place is created through that directory and checked around git (`intoPlace`).
+        let wt = try engineDirectory(".brahma/wt", command: command)
+        switch wt.kind(of: key) {
+        case .missing: break
+        case .directory where fm.fileExists(atPath: adminDir(key: key).path): return path
+        default:
+            throw GitError.failed(command: command, status: -1, stderr: "\(path.path) already exists and is not a checkout of this workspace")
         }
         try main.run(["worktree", "prune"])
         let name = branch(key: key)
-        if try head(of: branchRef(key: key)) != nil {
-            try main.run(["worktree", "add", "--quiet", path.path, name])
-        } else {
-            try main.run(["worktree", "add", "--quiet", "-b", name, path.path, Self.mainRef])
+        let existing = try head(of: branchRef(key: key)) != nil
+        try intoPlace(key, in: wt, registered: true, command: command) { _ in
+            if existing {
+                try main.run(["worktree", "add", "--quiet", path.path, name])
+            } else {
+                try main.run(["worktree", "add", "--quiet", "-b", name, path.path, Self.mainRef])
+            }
         }
         guard fm.fileExists(atPath: adminDir(key: key).path) else {
             throw GitError.failed(command: "worktree add \(key)", status: -1, stderr: "git registered the worktree under another name")
@@ -761,17 +778,73 @@ public struct GitWorkspace: Sendable {
     }
 
     private func removeWorktreeLocked(key: String) throws {
-        let fm = FileManager.default
-        let path = worktreePath(key: key)
-        if Self.isSymlink(path) {
-            try? fm.removeItem(at: path)
-        } else if fm.fileExists(atPath: path.path), fm.fileExists(atPath: adminDir(key: key).path) {
-            try commitAll(in: path, message: "\(key): auto-commit before release")
-            let removed = try main.run(["worktree", "remove", "--force", path.path], allowFailure: true)
-            // A checkout whose link back was rewritten cannot be removed by git; its work is committed, so delete it.
-            if removed.status != 0 { try? fm.removeItem(at: path) }
+        let command = "worktree remove \(key)"
+        let wt = try engineDirectory(".brahma/wt", command: command)
+        switch wt.kind(of: key) {
+        case .link:
+            try? wt.remove(key)
+        case .directory where FileManager.default.fileExists(atPath: adminDir(key: key).path):
+            try commitAll(in: worktreePath(key: key), message: "\(key): auto-commit before release")
+            // The work is committed. The checkout goes through the walked directory's descriptor, never by a path a link on
+            // the way could send elsewhere (so not `git worktree remove`); git then forgets it (`prune`).
+            try removeEngineEntry(key, in: wt, command: command)
+        default:
+            break
         }
         try? main.run(["worktree", "prune"])
+    }
+
+    // MARK: Engine checkout places under .brahma
+
+    /// `<ws>/<relative>` (`.brahma/wt`, `.brahma/wt-check`) as a real directory, walked from the workspace without following
+    /// a link and created when missing. A link or odd file on the way is reported (`onUnsafeEngineFile`) and refused.
+    private func engineDirectory(_ relative: String, command: String) throws -> EngineFiles.OpenDirectory {
+        do { return try EngineFiles.openWalked(workspace: root, relative) } catch let problem as UnsafeEngineFile {
+            onUnsafeEngineFile?(problem)
+            throw GitError.failed(command: command, status: -1, stderr: "\(problem)")
+        }
+    }
+
+    /// Removes `name` from the engine directory through its descriptor (`EngineFiles.removeEntry`); a problem is reported.
+    private func removeEngineEntry(_ name: String, in dir: EngineFiles.OpenDirectory, command: String) throws {
+        do { try dir.remove(name) } catch let problem as UnsafeEngineFile {
+            onUnsafeEngineFile?(problem)
+            throw GitError.failed(command: command, status: -1, stderr: "\(problem)")
+        }
+    }
+
+    /// Creates the new directory `name` in `parent` and runs `body`, which hands it to git (by path) or tar (by descriptor).
+    /// Right before and right after `body` both directories must still be where the walk found them (`isInPlace`: the
+    /// kernel's path and the (device, inode) at the named path): one that moved (a part of the way swapped for a link) is
+    /// reported and refused. A git worktree (`registered`) must also have its `.git` file in this very directory afterwards:
+    /// a way swapped for a link while git ran and swapped back would have sent the checkout elsewhere. Whenever `body` fails
+    /// or the place moved, the place is removed through `parent`'s descriptor, and for a git worktree git's record of it too.
+    private func intoPlace(_ name: String, in parent: EngineFiles.OpenDirectory, mode: mode_t = 0o755, registered: Bool,
+                           command: String, _ body: (EngineFiles.OpenDirectory) throws -> Void) throws {
+        let place: EngineFiles.OpenDirectory
+        do { place = try parent.makeDirectory(name, mode: mode) } catch let problem as UnsafeEngineFile {
+            onUnsafeEngineFile?(problem)
+            throw GitError.failed(command: command, status: -1, stderr: "\(problem)")
+        }
+        func discard() {
+            try? parent.remove(name)
+            if registered { try? EngineFiles.remove(workspace: root, dir: ".git/worktrees", name: name) }
+        }
+        func moved() -> GitError {
+            discard()
+            let problem = UnsafeEngineFile(path: place.shown.path, problem: "moved while \(command) used it; it was refused and removed")
+            onUnsafeEngineFile?(problem)
+            return GitError.failed(command: command, status: -1, stderr: "\(problem)")
+        }
+        checkoutProbe?(place.shown)
+        guard place.isInPlace, parent.isInPlace else { throw moved() }
+        spawnProbe?(place.shown)
+        do { try body(place) } catch {
+            guard place.isInPlace, parent.isInPlace else { throw moved() }
+            discard()
+            throw error
+        }
+        guard place.isInPlace, parent.isInPlace, !registered || place.kind(of: ".git") == .other else { throw moved() }
     }
 
     /// Registered `item/<KEY>` worktrees under `<ws>/.brahma/wt`. Names starting with "." (engine checkouts such as
@@ -1218,11 +1291,12 @@ public struct GitWorkspace: Sendable {
     private func retireLegacyMergeCheckout() {
         let fm = FileManager.default
         let legacy = legacyMergeWorktreePath
-        guard Self.isSymlink(legacy) || fm.fileExists(atPath: legacy.path) else { return }
-        if !Self.isSymlink(legacy), !Self.isSymlink(worktreesDir) {
-            _ = try? main.run(["worktree", "remove", "--force", "--force", legacy.path], allowFailure: true)
-        }
-        if Self.isSymlink(legacy) || fm.fileExists(atPath: legacy.path) { try? fm.removeItem(at: legacy) }
+        guard Self.isSymlink(legacy) || fm.fileExists(atPath: legacy.path),
+              let wt = try? engineDirectory(".brahma/wt", command: "worktree remove .merge") else { return }
+        // Through the walked directory's descriptor (a link is unlinked, never followed); its admin directory goes with the
+        // others in `retireWorkspaceMergeCheckouts`.
+        try? removeEngineEntry(".merge", in: wt, command: "worktree remove .merge")
+        _ = try? main.run(["worktree", "prune"], allowFailure: true)
     }
 
     // MARK: Quarantine of the root checkout
@@ -1385,6 +1459,13 @@ public struct GitWorkspace: Sendable {
 
     // MARK: Check checkouts
 
+    /// Where the merge check of run `runId` runs: `<exportHome>/run/exports/<runId>` (`BrahmaPaths.exportDir(runId:)`).
+    public func exportPath(runId: String) -> URL {
+        exportHome.appending(path: "\(Self.exportsRelative)/\(runId)", directoryHint: .isDirectory)
+    }
+
+    static let exportsRelative = "run/exports"
+
     private static func validRunId(_ id: String) throws {
         guard id.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil else {
             throw GitError.failed(command: "worktree \(id.prefix(40))", status: -1, stderr: "invalid run id")
@@ -1400,18 +1481,28 @@ public struct GitWorkspace: Sendable {
     /// A clean detached checkout of exactly `commit` at `<ws>/.brahma/wt-check/<runId>`, for an engine-run check of a
     /// submission. Anything left at that place by a crashed run is removed first.
     public func addRunWorktree(runId: String, commit: String) throws -> URL {
-        let path = try freshRunPlace(runId: runId, commit: commit)
-        try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
+        let command = "worktree add \(runId)"
+        let checks = try freshRunPlace(runId: runId, commit: commit, command: command)
+        let path = CheckPaths(workspace: root).runWorktree(runId: runId)
+        try intoPlace(runId, in: checks, registered: true, command: command) { _ in
+            try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
+        }
         return path
     }
 
-    /// The merge check of a rebased commit: a `.git`-free export of exactly `commit` at `<ws>/.brahma/wt-check/<runId>`
-    /// (the same place as a submission's check). Under the engine repository's lock the commit is fetched (fsck'd, by SHA)
-    /// into a fresh engine repository, written out with `git archive` (no attribute of the tree leaves anything out or
-    /// substitutes anything) and unpacked into a new directory. No worktree is linked to the engine repository, so the check
-    /// has no path back to its config or objects. Anything left at that place by a crashed run is removed first.
+    /// The merge check of a rebased commit: a `.git`-free export of exactly `commit` at `<exportHome>/run/exports/<runId>`
+    /// (`exportPath`), under the engine's data home and never in the workspace. Under the engine repository's lock the
+    /// commit is fetched (fsck'd, by SHA) into a fresh engine repository and written out with `git archive` (no attribute of
+    /// the tree leaves anything out or substitutes anything). The export directory is made 0700 through the safe walk from
+    /// the data home, and tar unpacks the archive (read from its descriptor) with its working directory set from that
+    /// directory's descriptor, relative names only and `-k`: it is never handed a path a swapped link could send elsewhere.
+    /// No worktree is linked to the engine repository, so the check has no path back to its config or objects. Anything
+    /// left at that place by a crashed run is removed first.
     public func addEngineExport(runId: String, commit: String) throws -> URL {
-        let path = try freshRunPlace(runId: runId, commit: commit)
+        let command = "archive \(runId)"
+        try Self.validRunId(runId); try Self.validCommit(commit)
+        let exports = try exportsDirectory(command: command)
+        try removeEngineEntry(runId, in: exports, command: command)
         let fm = FileManager.default
         let archive = URL(fileURLWithPath: mergeDirectory.path + "-export-\(runId).tar")
         defer { try? fm.removeItem(at: archive) }
@@ -1428,78 +1519,114 @@ public struct GitWorkspace: Sendable {
                 _ = try git.run(["archive", "--format=tar", "--output=\(archive.path)", "\(commit)^{commit}"])
             }
         }
-        do {
-            try MergeInfrastructureError.wrapping {
-                try fm.createDirectory(at: path, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-                try Self.untar(archive, into: path)
-            }
+        let tarball = open(archive.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard tarball >= 0 else {
+            throw MergeInfrastructureError(underlying: GitError.failed(command: "archive", status: -1,
+                                                                       stderr: "could not open the export of \(commit.prefix(7))"))
+        }
+        defer { close(tarball) }
+        try intoPlace(runId, in: exports, mode: 0o700, registered: false, command: command) { place in
+            try MergeInfrastructureError.wrapping { try Self.untar(tarball, into: place) }
             // A tree cannot hold `.git` (fsck refuses it on the fetch); an export never has one either way.
-            if (try? fm.attributesOfItem(atPath: path.appending(path: ".git").path)) != nil {
+            if place.kind(of: ".git") != .missing {
                 throw GitError.failed(command: "archive", status: -1, stderr: "the export of \(commit.prefix(7)) holds a .git")
             }
-        } catch {
-            try? fm.removeItem(at: path)
-            throw error
         }
-        return path
+        return exportPath(runId: runId)
     }
 
-    /// `<ws>/.brahma/wt-check/<runId>`, with whatever a crashed run left there removed.
-    private func freshRunPlace(runId: String, commit: String) throws -> URL {
+    /// `<exportHome>/run/exports`, walked from the data home without following a link (created when missing); a link or
+    /// odd file on the way is reported and refused.
+    private func exportsDirectory(command: String) throws -> EngineFiles.OpenDirectory {
+        do { return try EngineFiles.openWalked(workspace: exportHome, Self.exportsRelative) } catch let problem as UnsafeEngineFile {
+            onUnsafeEngineFile?(problem)
+            throw GitError.failed(command: command, status: -1, stderr: "\(problem)")
+        }
+    }
+
+    /// The walked `<exportHome>/run/exports`, or nil when nothing is there yet (it is not created just to be emptied) or it
+    /// is refused (reported).
+    private func existingExports(command: String) -> EngineFiles.OpenDirectory? {
+        let dir = exportHome.appending(path: Self.exportsRelative, directoryHint: .isDirectory)
+        guard (try? FileManager.default.attributesOfItem(atPath: dir.path)) != nil || Self.isSymlink(dir) else { return nil }
+        return try? exportsDirectory(command: command)
+    }
+
+    /// `<ws>/.brahma/wt-check` (walked without links), with whatever a crashed run left at `<runId>` in it removed.
+    private func freshRunPlace(runId: String, commit: String, command: String) throws -> EngineFiles.OpenDirectory {
         try Self.validRunId(runId); try Self.validCommit(commit)
-        let paths = CheckPaths(workspace: root)
-        if Self.isSymlink(paths.runWorktreesRoot) {
-            throw GitError.failed(command: "worktree add \(runId)", status: -1, stderr: "\(paths.runWorktreesRoot.path) is a link")
-        }
-        try FileManager.default.createDirectory(at: paths.runWorktreesRoot, withIntermediateDirectories: true)
-        removeRunWorktree(runId: runId)
-        return paths.runWorktree(runId: runId)
+        let checks = try engineDirectory(".brahma/wt-check", command: command)
+        try removeEngineEntry(runId, in: checks, command: command)
+        _ = try? main.run(["worktree", "prune"], allowFailure: true)
+        return checks
     }
 
-    /// Unpacks a tar file made by `git archive` with `/usr/bin/tar`, which refuses absolute paths, `..` and extraction
-    /// through links.
-    private static func untar(_ archive: URL, into dir: URL) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        process.arguments = ["-x", "-f", archive.path, "-C", dir.path]
-        process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch {
-            throw GitError.failed(command: "archive", status: -1, stderr: "could not unpack the export: \(error)")
+    /// Unpacks a tar file made by `git archive` (read from `archive`, a descriptor) with `/usr/bin/tar` into `place`. tar is
+    /// spawned with its working directory set from `place`'s descriptor (`posix_spawn_file_actions_addfchdir_np`), so it
+    /// writes relative to that directory wherever its path now leads; `-k` never overwrites a file, and tar refuses
+    /// absolute paths, `..` and extraction through links. Every other descriptor is closed in the child.
+    static func untar(_ archive: Int32, into place: EngineFiles.OpenDirectory) throws {
+        var actions: posix_spawn_file_actions_t? = nil
+        var attr: posix_spawnattr_t? = nil
+        posix_spawn_file_actions_init(&actions); posix_spawnattr_init(&attr)
+        defer { posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr) }
+        posix_spawn_file_actions_adddup2(&actions, archive, 0)
+        posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addfchdir_np(&actions, place.fd)
+        var defaults = sigset_t(), mask = sigset_t()
+        sigfillset(&defaults); sigemptyset(&mask)
+        posix_spawnattr_setsigdefault(&attr, &defaults)
+        posix_spawnattr_setsigmask(&attr, &mask)
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK))
+        let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        let arguments: [String] = ["/usr/bin/tar", "-x", "-k", "-f", "-"]
+        var argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
+        var envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { for p in argv { free(p) }; for p in envp { free(p) } }
+        var pid: pid_t = 0
+        let spawned = posix_spawn(&pid, "/usr/bin/tar", &actions, &attr, &argv, &envp)
+        guard spawned == 0 else {
+            throw GitError.failed(command: "archive", status: -1, stderr: "could not unpack the export: \(String(cString: strerror(spawned)))")
         }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw GitError.failed(command: "archive", status: process.terminationStatus, stderr: "could not unpack the export")
+        var status: Int32 = 0
+        while waitpid(pid, &status, 0) < 0 {
+            guard errno == EINTR else {
+                throw GitError.failed(command: "archive", status: -1, stderr: "could not wait for tar: \(String(cString: strerror(errno)))")
+            }
+        }
+        guard status == 0 else {
+            throw GitError.failed(command: "archive", status: status, stderr: "could not unpack the export")
         }
     }
 
-    /// Removes one run's checkout or export (whatever the check left in it); never throws.
+    /// Removes one run's checkout (through the walked `.brahma/wt-check`) and its export (through the walked
+    /// `<exportHome>/run/exports`), never by a path; git then forgets a checkout (`prune`). Never throws.
     public func removeRunWorktree(runId: String) {
         guard (try? Self.validRunId(runId)) != nil else { return }
-        let fm = FileManager.default
-        let path = CheckPaths(workspace: root).runWorktree(runId: runId)
-        if Self.isSymlink(path) {
-            try? fm.removeItem(at: path)
-        } else if fm.fileExists(atPath: path.path) {
-            if fm.fileExists(atPath: path.appending(path: ".git").path) {
-                _ = try? main.run(["worktree", "remove", "--force", path.path], allowFailure: true)
-            }
-            if fm.fileExists(atPath: path.path) { try? fm.removeItem(at: path) }
-        }
+        let command = "worktree remove \(runId)"
+        if let exports = existingExports(command: command) { try? removeEngineEntry(runId, in: exports, command: command) }
+        guard let checks = existingRunChecks(command: command) else { return }
+        try? removeEngineEntry(runId, in: checks, command: command)
         _ = try? main.run(["worktree", "prune"], allowFailure: true)
     }
 
-    /// Start-up: no check is running, so every leftover run checkout goes.
+    /// Start-up: no check is running, so every leftover run checkout and export goes.
     public func removeRunWorktrees() {
-        let dir = CheckPaths(workspace: root).runWorktreesRoot
-        guard !Self.isSymlink(dir), let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
-        for name in names {
-            if (try? Self.validRunId(name)) != nil { removeRunWorktree(runId: name) }
-            else { try? FileManager.default.removeItem(at: dir.appending(path: name)) }
+        if let exports = existingExports(command: "export prune") {
+            for name in (try? exports.names()) ?? [] { try? removeEngineEntry(name, in: exports, command: "export prune") }
         }
+        guard let checks = existingRunChecks(command: "worktree prune") else { return }
+        for name in (try? checks.names()) ?? [] { try? removeEngineEntry(name, in: checks, command: "worktree prune") }
         _ = try? main.run(["worktree", "prune"], allowFailure: true)
+    }
+
+    /// The walked `.brahma/wt-check`, or nil when nothing is there yet (it is not created just to be emptied) or it is
+    /// refused (reported).
+    private func existingRunChecks(command: String) -> EngineFiles.OpenDirectory? {
+        let dir = CheckPaths(workspace: root).runWorktreesRoot
+        guard (try? FileManager.default.attributesOfItem(atPath: dir.path)) != nil || Self.isSymlink(dir) else { return nil }
+        return try? engineDirectory(".brahma/wt-check", command: command)
     }
 
     // MARK: Commits and refs

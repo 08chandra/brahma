@@ -154,6 +154,10 @@ public actor Orchestrator {
         // Open asks: expiry, owner reminders, internal aging and paused-approver rerouting (company-active time).
         attempt { _ = try store.sweepAsks(now: now) }
 
+        // Sprints (company-active time): timeboxes, then engine standups (system posts, no LLM turns, nobody wakes).
+        attempt { _ = try store.enforceTimeboxes(now: now) }
+        attempt { _ = try store.postStandups(now: now) }
+
         // Deadlocks and item aging, every `Liveness.scanInterval` company-active seconds (a frozen clock never rescans).
         for c in companies {
             let active = store.activeNow(companyId: c.id)
@@ -410,7 +414,7 @@ public actor Orchestrator {
                 if kind == .work, let leased = c.item, let git, let checkout, planSelector(agent, leased, company),
                    (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout),
                    let barrier = try? git.planBarrier(key: leased.key, in: checkout),
-                   let dir = Self.planDirectory(workspace: workspace, key: leased.key) {
+                   let dir = Self.planDirectory(workspace: workspace, key: leased.key, store: store, companyId: company.id) {
                     kind = .plan
                     context.turnKind = .plan
                     planDirectory = dir.path
@@ -687,21 +691,13 @@ public actor Orchestrator {
     static let maxBarrierFindings = 20
     static let maxBarrierDetail = 2000
 
-    /// `<ws>/.brahma/plans/<KEY>/`, created step by step; nil when any part of it is a symlink or not a directory (a plan
-    /// directory the agent redirected is never used).
-    nonisolated static func planDirectory(workspace: URL, key: String) -> URL? {
-        let fm = FileManager.default
-        var url = workspace
-        for part in [".brahma", "plans", key] {
-            url = url.appending(path: part, directoryHint: .isDirectory)
-            var isDir: ObjCBool = false
-            if fm.fileExists(atPath: url.path, isDirectory: &isDir) || (try? fm.attributesOfItem(atPath: url.path)) != nil {
-                guard (try? fm.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeDirectory else { return nil }
-            } else {
-                do { try fm.createDirectory(at: url, withIntermediateDirectories: false) } catch { return nil }
-            }
+    /// `<ws>/.brahma/plans/<KEY>/`, a real directory inside the workspace (`EngineFiles`); nil when any part of it is a link
+    /// or not a directory (a plan directory the agent redirected is never used; with `store` the owner is alerted).
+    nonisolated static func planDirectory(workspace: URL, key: String, store: Store? = nil, companyId: String? = nil) -> URL? {
+        do { return try EngineFiles.directory(workspace: workspace, ".brahma/plans/\(key)") } catch {
+            if let refused = error as? UnsafeEngineFile, let store, let companyId { store.alertEngineFile(refused, companyId: companyId) }
+            return nil
         }
-        return url
     }
 
     /// The newest plan file: only regular, non-symlink, single-link `.md` files that really sit in `directory`, at most
