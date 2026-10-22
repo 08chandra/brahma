@@ -107,16 +107,19 @@ import GRDB
 
     @Test func tierLUsesOpusForAutoAgents() async throws {
         #expect(TierBudget.of(.l).model == "opus"); #expect(TierBudget.of(.s).model == nil); #expect(TierBudget.of(.m).model == nil)
-        let role = RoleTemplate(id: "engineer", title: "Engineer", kind: .individual, handlePrefix: "eng", prompt: "",
-                                companyTools: [], models: ["low": "haiku", "balanced": "sonnet", "max": "sonnet"], roleWeight: 1)
-        func resolve(_ model: String, _ context: ModelContext) -> String {
-            ModelPolicy.resolve(agentModel: model, role: role, mode: .low, context: context)
+        // `ModePolicy.select` (Task 14c) replaced `ModelPolicy.resolve`: a confirmed tier L work turn is R3 on opus (opus-low
+        // in the Low usage mode), tiers S and M stay on Sonnet, and a pinned model is kept.
+        func resolve(_ model: String, tier: EffortTier?, kind: TurnKind = .work, mode: UsageMode = .low) -> String {
+            var i = ModeInputs()
+            i.agentModel = model; i.roleModel = mode == .low ? "haiku" : "sonnet"; i.usageMode = mode
+            i.turnKind = kind; i.hasItem = true; i.tier = tier
+            return ModePolicy.select(i).model
         }
-        let base = resolve("auto", ModelContext())
-        #expect(resolve("auto", ModelContext(tier: .l)) == "opus")
-        #expect(resolve("auto", ModelContext(tier: .m)) == base); #expect(resolve("auto", ModelContext(tier: .s)) == base)
-        #expect(resolve("haiku", ModelContext(tier: .l)) == "haiku", "an explicit model is kept")
-        #expect(resolve("auto", ModelContext(turnKind: .review, tier: .l)) == "sonnet", "review turns stay on sonnet")
+        #expect(resolve("auto", tier: .l) == "opus"); #expect(resolve("auto", tier: .l, mode: .balanced) == "opus")
+        #expect(resolve("auto", tier: .m) == "sonnet"); #expect(resolve("auto", tier: .s) == "sonnet")
+        #expect(resolve("haiku", tier: .l) == "haiku", "an explicit model is kept")
+        #expect(resolve("auto", tier: .s, kind: .review) == "sonnet", "review turns are Standard on sonnet")
+        #expect(resolve("auto", tier: .l, kind: .review, mode: .balanced) == "opus", "a tier L review is Deep R3")
         // End to end: the request an auto agent's turn is sent with.
         let b = try B(model: "auto")
         try b.leased(tier: .l)
@@ -416,7 +419,7 @@ import GRDB
         let b = try B()
         try await b.turn(Self.script(.effortCapped(requested: "max"), Self.result()))
         let turn = try #require(try b.turns(b.eng).first)
-        #expect(turn.modeReason == "effort 'max' exceeded the org cap and was lowered")
+        #expect(turn.modeReason?.hasSuffix("; effort 'max' exceeded the org cap and was lowered") == true, "after the mode's own reasons")
         let recorded = try b.w.store.events(afterId: 0).filter { $0.kind == .usage }.map(\.text)
         #expect(recorded.contains { $0.contains("effort 'max'") })
     }

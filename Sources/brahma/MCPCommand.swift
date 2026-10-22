@@ -36,7 +36,15 @@ struct MCP: ParsableCommand {
             throw ExitCode.failure
         }
         var reviewItemId: String?
-        if context.kind == "review" {
+        var planTurn = false
+        if context.kind == "plan" {
+            // A plan turn's token: the read-mostly surface, whatever the flags say.
+            guard reviewItem == nil, context.itemId != nil else {
+                FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
+                throw ExitCode.failure
+            }
+            planTurn = true
+        } else if context.kind == "review" {
             guard let itemId = context.itemId else {
                 FileHandle.standardError.write(Data("brahma mcp: turn credential invalid or turn ended\n".utf8))
                 throw ExitCode.failure
@@ -56,7 +64,10 @@ struct MCP: ParsableCommand {
             FileHandle.standardError.write(Data("brahma mcp: unknown agent \(agent) in company \(company)\n".utf8))
             throw ExitCode.failure
         }
-        let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId))
+        // The turn's mode quotas ride in the per-turn MCP config's env; review turns have none.
+        let quotas = reviewItemId == nil ? ModeQuotas(environment: ProcessInfo.processInfo.environment) : nil
+        let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId,
+                                                   quotas: quotas, planTurn: planTurn))
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

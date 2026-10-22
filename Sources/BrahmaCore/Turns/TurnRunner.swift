@@ -6,10 +6,23 @@ public protocol TurnRunning: Sendable {
     /// Returns once every child process this runner started has exited. Cancelling a turn ends its stream at
     /// once, before the child is reaped; a shutting-down host waits here so it never leaves orphans behind.
     func waitForChildren() async
+    /// Starts the compiled argv of `request` with `--input-format stream-json`, writes `messages` (control requests) and
+    /// returns what it printed until each request was answered, the process exited or `timeout` passed. No prompt is sent, so
+    /// no model is called. Nil when the runner cannot (test fakes): the doctor's mode-canary is then skipped.
+    func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript?
 }
 
 extension TurnRunning {
     public func waitForChildren() async {}
+    public func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? { nil }
+}
+
+/// What a control session printed: its stdout lines, and its exit status when it exited by itself.
+public struct ControlTranscript: Equatable, Sendable {
+    public var exitStatus: Int32?
+    public var lines: [String]
+
+    public init(exitStatus: Int32?, lines: [String]) { self.exitStatus = exitStatus; self.lines = lines }
 }
 
 public enum TurnError: Error, Equatable {
@@ -83,9 +96,68 @@ public struct ClaudeProcessRunner: TurnRunning {
         }
     }
 
+    public func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? {
+        let profile = TurnProfileCompiler.profile(for: request)
+        guard (try? TurnProfileCompiler.validate(profile)) != nil else { return ControlTranscript(exitStatus: nil, lines: []) }
+        var args = TurnProfileCompiler.arguments(profile)
+        args.insert(contentsOf: ["--input-format", "stream-json"], at: 1)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let input = messages.compactMap { try? encoder.encode($0) }.map { String(decoding: $0, as: UTF8.self) + "\n" }.joined()
+        let ids = Set(messages.compactMap { $0.objectValue?["request_id"]?.stringValue })
+        let claude = claudePath
+        let env = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment, engineClaudeVars: profile.environment,
+                                        purpose: .claude)
+        let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+        return await Task.detached { () -> ControlTranscript? in
+            let process = Process()
+            if claude.hasPrefix("/") {
+                process.executableURL = URL(fileURLWithPath: claude); process.arguments = args
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = [claude] + args
+            }
+            process.environment = env
+            process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
+            let stdin = Pipe(), stdout = Pipe()
+            process.standardInput = stdin
+            process.standardOutput = stdout
+            process.standardError = FileHandle.nullDevice
+            let collected = ControlLines(waitingFor: ids)
+            stdout.fileHandleForReading.readabilityHandler = { h in
+                let data = h.availableData
+                if data.isEmpty { h.readabilityHandler = nil } else { collected.append(data) }
+            }
+            do { try process.run() } catch {
+                stdout.fileHandleForReading.readabilityHandler = nil
+                return nil
+            }
+            #if canImport(Darwin)
+            _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+            #endif
+            try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8))
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline, process.isRunning, !collected.done { usleep(20_000) }
+            let exitedByItself = !process.isRunning
+            try? stdin.fileHandleForWriting.close()
+            if process.isRunning {
+                process.terminate()
+                let killAt = Date().addingTimeInterval(Self.killGrace)
+                while process.isRunning, Date() < killAt { usleep(20_000) }
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            }
+            process.waitUntilExit()
+            usleep(50_000)
+            stdout.fileHandleForReading.readabilityHandler = nil
+            return ControlTranscript(exitStatus: exitedByItself ? process.terminationStatus : nil, lines: collected.lines)
+        }.value
+    }
+
     private func execute(_ request: TurnRequest, yield: (StreamEvent) -> Void) async throws {
         let process = Process()
-        let args = ClaudeCommand.arguments(for: request)
+        // One compiled profile: its argv and its engine-set environment (the only source of `CLAUDE_CODE_*` controls).
+        let profile = TurnProfileCompiler.profile(for: request)
+        try TurnProfileCompiler.validate(profile)
+        let args = TurnProfileCompiler.arguments(profile)
         if claudePath.hasPrefix("/") {
             process.executableURL = URL(fileURLWithPath: claudePath)
             process.arguments = args
@@ -93,8 +165,8 @@ public struct ClaudeProcessRunner: TurnRunning {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [claudePath] + args
         }
-        process.environment = ChildEnvironment.make(base: baseEnvironment, extra: request.environment,
-                                                       engineClaudeVars: request.environment, purpose: .claude)
+        process.environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
+                                                       engineClaudeVars: profile.environment, purpose: .claude)
         process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         process.standardInput = stdin
@@ -146,7 +218,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         }
 
         let timedOut = Flag()
-        let wallClock = TurnProfileCompiler.profile(for: request).wallClock ?? maxTurnDuration
+        let wallClock = profile.wallClock ?? maxTurnDuration
         let watchdog = Task {
             try await Task.sleep(for: wallClock)
             timedOut.set()
@@ -178,6 +250,9 @@ public struct ClaudeProcessRunner: TurnRunning {
         let sawResult = state.sawResult
         // The last result is authoritative even if the process lingered past it and had to be killed ...
         if sawResult, !state.hasPendingWork { return }
+        // A controlled stop (`--max-budget-usd`, `--max-turns`) is the CLI ending the turn itself, even with a sub-agent still
+        // running (probe L-2): the result stands and is booked as the cap it is.
+        if sawResult, state.result?.stopReason != nil, !timedOut.isSet, !Self.isSigterm(status) { return }
         // ... unless background work (a workflow, a sub-agent) was still running: an early result then is not the end
         // of the turn. A process that exited by itself (status 0) is the CLI's own decision and stands. The engine's own wall
         // clock is a timeout (failed, backed off, budgeted), never an interruption: an interruption has no backoff and would
@@ -299,6 +374,37 @@ private final class Flag: @unchecked Sendable {
     private var value = false
     func set() { lock.withLock { value = true } }
     var isSet: Bool { lock.withLock { value } }
+}
+
+/// A control session's stdout lines, and whether every awaited `control_response` arrived.
+private final class ControlLines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var _lines: [String] = []
+    private var waiting: Set<String>
+    static let maxBytes = 1 << 20
+
+    init(waitingFor ids: Set<String>) { waiting = ids }
+
+    func append(_ data: Data) {
+        lock.withLock {
+            guard buffer.count + data.count < Self.maxBytes else { waiting = []; return }
+            buffer.append(data)
+            while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = String(decoding: buffer[buffer.startIndex..<nl], as: UTF8.self)
+                buffer.removeSubrange(buffer.startIndex...nl)
+                _lines.append(line)
+                if let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                   obj["type"] as? String == "control_response",
+                   let id = (obj["response"] as? [String: Any])?["request_id"] as? String {
+                    waiting.remove(id)
+                }
+            }
+        }
+    }
+
+    var done: Bool { lock.withLock { waiting.isEmpty } }
+    var lines: [String] { lock.withLock { _lines } }
 }
 
 /// Number of turns whose child process has not been reaped yet.

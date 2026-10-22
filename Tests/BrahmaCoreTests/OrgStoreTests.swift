@@ -103,18 +103,23 @@ import GRDB
     }
 
     @Test func modelPolicyResolvesAuto() throws {
+        // `ModePolicy.select` replaced `ModelPolicy.resolve` for auto agents (Task 14c); these are its turns without an item.
         let eng = software.role("engineer")!, designer = software.role("designer")!
-        func r(_ model: String, _ role: RoleTemplate = eng, _ mode: UsageMode = .balanced, _ ctx: ModelContext = .init()) -> String {
-            ModelPolicy.resolve(agentModel: model, role: role, mode: mode, context: ctx)
+        func r(_ model: String, _ role: RoleTemplate = eng, _ mode: UsageMode = .balanced, kind: TurnKind = .work,
+               prd: Bool = false, architecture: Bool = false) -> String {
+            var i = ModeInputs()
+            i.agentModel = model; i.roleModel = role.models[mode.rawValue]; i.usageMode = mode; i.turnKind = kind
+            i.decidingPRD = prd; i.decidingArchitecture = architecture
+            return ModePolicy.select(i).model
         }
-        #expect(r("haiku", eng, .max, ModelContext(decidingArchitecture: true)) == "haiku")
+        #expect(r("haiku", eng, .max, architecture: true) == "haiku")
         #expect(r("auto") == "sonnet"); #expect(r("auto", designer, .low) == "haiku")
-        #expect(r("auto", eng, .balanced, ModelContext(decidingArchitecture: true)) == "opus")
-        #expect(r("auto", eng, .low, ModelContext(decidingPRD: true)) == "opus")
-        #expect(r("auto", designer, .low, ModelContext(turnKind: .review)) == "sonnet")
-        #expect(r("auto", eng, .balanced, ModelContext(turnKind: .notice)) == "haiku")
-        #expect(r("auto", eng, .balanced, ModelContext(decidingPRD: true, turnKind: .notice)) == "opus")
-        #expect(r("opus", eng, .low, ModelContext(turnKind: .notice)) == "opus")
+        #expect(r("auto", eng, .balanced, architecture: true) == "opus")
+        #expect(r("auto", eng, .low, prd: true) == "opus")
+        #expect(r("auto", designer, .low, kind: .review) == "sonnet")
+        #expect(r("auto", eng, .balanced, kind: .notice) == "haiku")
+        #expect(r("auto", eng, .balanced, kind: .notice, prd: true) == "opus")
+        #expect(r("opus", eng, .low, kind: .notice) == "opus")
         var odd = eng; odd.models = [:]
         #expect(r("auto", odd) == "sonnet")
     }

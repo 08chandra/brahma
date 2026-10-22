@@ -17,14 +17,21 @@ public struct DoctorReport: Codable, Equatable, Sendable {
     public var cliVersion: String?
     public var items: [DoctorItem]
     public var checkedAt: Date
-    /// `subscription_type` as the CLI reports it (`get_usage`); nil until a probe reads it.
+    /// `subscription_type` as the CLI reports it (`get_usage`, read by the mode-canary with no model call); nil until read.
     public var reportedSubscription: String? = nil
+    /// The built-in agent types this CLI version lists (`initialize`): every turn's init `agents` must equal them.
+    public var builtinAgents: [String]? = nil
+    /// The sub-agent gate record for this CLI version and profile (design §3.9): always false on the workspace profile.
+    public var subagentGate: Bool? = nil
 
-    public init(cliVersion: String?, items: [DoctorItem], checkedAt: Date, reportedSubscription: String? = nil) {
+    public init(cliVersion: String?, items: [DoctorItem], checkedAt: Date, reportedSubscription: String? = nil,
+                builtinAgents: [String]? = nil, subagentGate: Bool? = nil) {
         self.cliVersion = cliVersion
         self.items = items
         self.checkedAt = checkedAt
         self.reportedSubscription = reportedSubscription
+        self.builtinAgents = builtinAgents
+        self.subagentGate = subagentGate
     }
 
     public var ok: Bool { !items.contains { $0.status == .fail } }
@@ -42,6 +49,8 @@ public enum Doctor {
         "-p", "--output-format", "--verbose", "--resume", "--session-id", "--mcp-config", "--strict-mcp-config",
         "--model", "--fallback-model", "--append-system-prompt", "--permission-mode", "--allowed-tools",
         "--disallowed-tools", "--add-dir", "--settings", "--setting-sources", "--disable-slash-commands",
+        // Work modes (W11): visible in --help. The hidden --max-turns is checked by the mode-canary (probe V-11).
+        "--effort", "--max-budget-usd",
     ]
 
     /// Runs an executable with arguments and returns its stdout, or nil when it cannot run. Injected by tests.
@@ -58,7 +67,16 @@ public enum Doctor {
         items.append(await flagsItem(claudePath: claudePath, exec: exec))
         let probe = await runProbe(runner: runner)
         items += probe
-        return DoctorReport(cliVersion: version, items: items, checkedAt: now)
+        var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
+        // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
+        if let canary = await ModeCanary.run(runner: runner) {
+            report.items.append(canary.item)
+            report.builtinAgents = canary.builtinAgents
+            report.reportedSubscription = canary.reportedSubscription
+            report.subagentGate = SubagentGate.passed(profile: .workspace)
+            report.items.append(DoctorItem(name: "subagent-gate", status: .pass, detail: SubagentGate.workspaceDetail))
+        }
+        return report
     }
 
     /// Reuses the stored report when it passed, is fresh, and was made by the same CLI version.

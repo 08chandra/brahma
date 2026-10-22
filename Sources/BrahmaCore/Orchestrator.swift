@@ -24,7 +24,8 @@ public actor Orchestrator {
     /// The environment engine-run checks are built from (filtered by `ChildEnvironment`, purpose `.check`).
     let checkBaseEnvironment: [String: String]
     /// Whether the next turn of an agent on its leased item is a plan turn (Plan-first selection arrives with Task 14c).
-    let planSelector: @Sendable (Agent, WorkItem, Company) -> Bool
+    /// Forces (or forbids) a plan turn for tests; nil: Plan-first is the mode policy's (compiled once probe V-4 passed).
+    let planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)?
     /// What each turn asserts about the session the CLI reports (the work modes set it; nil asserts nothing).
     let turnExpectations: @Sendable (Agent, Company) -> TurnExpectations?
 
@@ -69,7 +70,7 @@ public actor Orchestrator {
                 exec: @escaping Doctor.Exec = Doctor.defaultExec, claudePath: String = "claude",
                 checkRunner: any CheckRunning = ProcessCheckRunner(),
                 checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-                planSelector: @escaping @Sendable (Agent, WorkItem, Company) -> Bool = { _, _, _ in false },
+                planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)? = nil,
                 turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil }) {
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
@@ -321,6 +322,8 @@ public actor Orchestrator {
         var keepModel = false
         var sawInit = false
         var plan: PlanWatch?
+        var modeDecision: ModeDecision?
+        var notLaunched: ModeNotLaunched?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             let template = store.catalog.template(role: agent.role, pack: company.packId)
@@ -331,28 +334,30 @@ public actor Orchestrator {
             var sent = agent
             // The system prompt is byte-stable per agent and role: the roster, items and times ride in the orientation.
             var systemPrompt = RolePrompt.render(agent: agent, company: company, template: template)
-            // `auto` resolves per turn from the role, the company's usage mode and the kind of turn.
-            var context = (try? store.askModelContext(agentId: agent.id)) ?? ModelContext()
+            // `ModePolicy.select` decides each turn's mode, model and effort from the role, the item's effective spec, the company's
+            // usage mode and the pressure on the plan (design §3.2).
+            let deciding = (try? store.askModelContext(agentId: agent.id)) ?? ModelContext()
             var kind = TurnKind.work
             workingDirectory = company.workspacePath
             var addDirs: [String] = []
             var cacheBreak: String?
             var slotModel: String?
             var slotTools: String?
+            var sessionTokens = 0
             toolsKey = "work:" + template.companyTools.joined(separator: ",")
             var planDirectory: String?
+            var facts: ItemModeFacts?
 
             if let review {
                 sent.sessionId = UUID().uuidString
                 sent.sessionStarted = false
                 systemPrompt += "\n\n" + ReviewDigest.instructions(worktree: review.worktree.path)
                 turnPrompt = review.digest
-                context = ModelContext(turnKind: .review, deepReview: review.deep)
                 workingDirectory = review.worktree.path
                 addDirs = [review.worktree.path]
+                facts = try? store.itemModeFacts(itemId: review.item.id, holderId: nil)
             } else {
                 var c = try TurnContext.load(store: store, paths: paths, agent: agent, company: company)
-                context.tier = (try? store.workTier(agentId: agent.id)) ?? nil
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 var checkout: URL?
                 var git: GitWorkspace?
@@ -374,20 +379,28 @@ public actor Orchestrator {
                 }
                 // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
                 // leaseholder's updates are its work, so its turns stay work turns.
-                if c.onlyNotices, c.lease == nil {
-                    kind = .notice
-                    context.turnKind = .notice
-                }
+                if c.onlyNotices, c.lease == nil { kind = .notice }
                 scope = kind == .notice ? .base : c.scope
                 if scope != c.scope { c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: scope)) ?? [] }
+                if let itemId = scope.itemId {
+                    // A leaseholder's failed checks and review rejections may raise the item's floor before this turn picks
+                    // its rung (design §3.3), so the fix turn already runs at it.
+                    if c.lease != nil, let g = git {
+                        escalate(itemId: itemId, agent: agent, git: g, now: clock())
+                    }
+                    facts = try? store.itemModeFacts(itemId: itemId, holderId: c.lease?.agentId ?? agent.id)
+                }
 
-                // Plan turn mechanics (selection is Task 14c's): only on a clean worktree, so the write barrier can tell.
-                if kind == .work, let leased = c.item, let git, let checkout, planSelector(agent, leased, company),
+                // Plan-first (design §2.4): only on a clean worktree, so the write barrier can tell. The selection is the mode
+                // policy's (compiled only once probe V-4 passed); tests may force it.
+                if kind == .work, let leased = c.item, let git, let checkout,
+                   planSelector.map({ $0(agent, leased, company) })
+                    ?? ModePolicy.select(modeInputs(kind: .work, agent: agent, company: company, template: template, deciding: deciding,
+                                                    facts: facts, hasItem: true, sessionModel: nil, sessionTokens: 0)).planFirst,
                    (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout),
                    let barrier = try? git.planBarrier(key: leased.key, in: checkout),
                    let dir = Self.planDirectory(workspace: workspace, key: leased.key) {
                     kind = .plan
-                    context.turnKind = .plan
                     planDirectory = dir.path
                     // A plan turn reads the code (its working directory) and writes only into the plans directory.
                     addDirs = [dir.path]
@@ -400,14 +413,16 @@ public actor Orchestrator {
                 let slot = try store.sessionSlot(agent: agent, scope: scope)
                 slotModel = slot.model
                 slotTools = slot.tools
+                let transcript = store.sessionTranscriptTokens(turnId: slot.lastTurnId)
                 let decision = SessionPolicy.decide(
                     started: slot.started, storedCwd: slot.cwd, cwd: workingDirectory, endedAt: slot.endedAt,
-                    tokens: store.sessionTranscriptTokens(turnId: slot.lastTurnId), now: clock())
+                    tokens: transcript, now: clock())
                 switch decision {
                 case .resume:
                     sent.sessionId = slot.sessionId
                     sent.sessionStarted = true
                     wasResume = true
+                    sessionTokens = transcript ?? 0
                 case .fresh(let reason):
                     if reason != .new {
                         try store.resetSession(agentId: agent.id, scope: scope)
@@ -425,12 +440,25 @@ public actor Orchestrator {
                 ctx = c
             }
 
-            var model = ModelPolicy.resolve(agentModel: agent.model, role: template, mode: company.usageMode, context: context)
             // The model of an (agent, item) session is fixed after its first work turn; the effort may vary.
-            if wasResume, scope.itemId != nil, agent.model == "auto", let fixed = slotModel { model = fixed }
+            let fixedModel = wasResume && scope.itemId != nil && review == nil ? slotModel : nil
+            let inputs = modeInputs(kind: review != nil ? .review : kind, agent: agent, company: company, template: template,
+                                    deciding: deciding, facts: facts, hasItem: review != nil || scope.itemId != nil,
+                                    sessionModel: fixedModel, sessionTokens: sessionTokens)
+            let mode = ModePolicy.select(inputs)
+            if review != nil, inputs.reviewSpendCapped, let f = facts {
+                attempt { try store.noteReviewSpendCap(item: f.item, now: clock()) }
+            }
+            if let refusal = mode.refusal { throw ModeNotLaunched(reason: refusal, overBudgetItem: nil) }
+            if !mode.launch, review == nil {
+                throw ModeNotLaunched(reason: mode.reason, overBudgetItem: scope.itemId)
+            }
+            let model = mode.model
             sent.model = model
             usedModel = model
-            keepModel = scope.itemId != nil && agent.model == "auto"
+            modeDecision = mode
+            // An explicit escalation to Opus re-pins the session's model; otherwise an item session keeps the one it has.
+            keepModel = scope.itemId != nil && agent.model == "auto" && !mode.cacheBreak
             if wasResume {
                 var changes: [String] = []
                 if let old = slotModel, old != model { changes.append("model \(old) -> \(model)") }
@@ -445,18 +473,25 @@ public actor Orchestrator {
             } else {
                 if kind != .work || scope.itemId != nil { try store.setTurnContext(turnId: turn.id, kind: kind, itemId: scope.itemId) }
                 if let cacheBreak { try store.setTurnCacheBreak(turnId: turn.id, cacheBreak) }
-                turnToken = try store.issueTurnCredential(turnId: turn.id)
+                // A plan turn's server offers the read-mostly surface: its credential says so.
+                turnToken = kind == .plan
+                    ? try store.issueTurnCredential(turnId: turn.id, kind: "plan", itemId: scope.itemId)
+                    : try store.issueTurnCredential(turnId: turn.id)
             }
+            try store.setTurnMode(turnId: turn.id, decision: mode)
             var request = TurnRequest(
                 agent: sent, company: company, prompt: turnPrompt, appendSystemPrompt: systemPrompt,
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
-                                                   reviewItem: review?.item.key),
+                                                   reviewItem: review?.item.key, quotas: mode.quotas),
                 workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
             request.kind = review == nil ? kind : .review
             request.planDirectory = planDirectory
+            request.mode = mode
+            request.hookCommand = TurnProfileCompiler.hookCommand(executable: mcpExecutable)
             request.expectations = turnExpectations(agent, company)
+                ?? TurnProfileCompiler.expectations(for: mode, agents: store.recordedBuiltinAgents())
             // A review session is never recorded as the agent's own.
             var sessionMarked = wasResume || review != nil
             sentRequest = request
@@ -494,6 +529,8 @@ public actor Orchestrator {
             } catch { runnerError = error; throw error }
         } catch let e as WorktreeUnavailable {
             worktreeUnavailable = e
+        } catch let e as ModeNotLaunched {
+            notLaunched = e
         } catch {
             failure = String(describing: error)
         }
@@ -517,7 +554,22 @@ public actor Orchestrator {
             }
             return until
         }
-        if let unavailable = worktreeUnavailable, unavailable.review {
+        if let notLaunched {
+            // Nothing was started. The no-launch rule blocks the item over budget (its lease goes back, the manager is told) and
+            // the agent is ready again with no penalty; a model outside the allowlist is the owner's to fix.
+            if let itemId = notLaunched.overBudgetItem {
+                attempt { try store.blockOverBudget(itemId: itemId, agentId: agent.id, now: now) }
+                end = .interrupted()
+            } else {
+                if agent.consecutiveFailures == 0 {
+                    attempt {
+                        try EngineAlerts.raise(store: store, text: "@\(agent.name)'s turns do not start: \(notLaunched.reason). Set an "
+                                               + "allowed model (haiku, sonnet, opus or auto).", now: now, reason: "model-pin")
+                    }
+                }
+                end = .failed(notLaunched.reason)
+            }
+        } else if let unavailable = worktreeUnavailable, unavailable.review {
             // A reviewer holds no lease: the missing worktree is an undecided review attempt (three of them escalate), and the
             // agent waits out the short fixed infrastructure delay.
             attempt { try store.noteReviewWorktreeFailure(itemId: unavailable.itemId, agentId: agent.id, reason: unavailable.reason, now: now) }
@@ -599,7 +651,8 @@ public actor Orchestrator {
         let telemetry = TurnTelemetry(
             toolSignature: state.toolSignature, workflowAgents: state.workflowAgentIds.count,
             subagentsSpawned: state.subagentsSpawned,
-            modeNote: state.effortCapRequested.map { "effort '\($0)' exceeded the org cap and was lowered" })
+            modeNote: state.effortCapRequested.map { "effort '\($0)' exceeded the org cap and was lowered" },
+            modeModel: modeDecision?.model, modeEffort: modeDecision?.effort)
         attempt {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),

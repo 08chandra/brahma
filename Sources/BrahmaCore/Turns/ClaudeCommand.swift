@@ -22,6 +22,10 @@ public struct TurnRequest: Sendable {
     public var wallClock: Duration? = nil
     /// What the engine asserts about the session the CLI reports; nil asserts nothing.
     public var expectations: TurnExpectations? = nil
+    /// The work mode the engine chose (`ModePolicy.select`); nil for Plan 1 inputs, which compile byte-identically.
+    public var mode: ModeDecision? = nil
+    /// `<quoted brahma> hook pre-tool`, the engine's PreToolUse hook; set with the mode.
+    public var hookCommand: String? = nil
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,
@@ -59,16 +63,19 @@ public enum MCPConfig {
     /// Writes `<runDir>/<agentId>.mcp.json` (mode 0600, atomic) and returns its path. The per-turn token travels
     /// in the server's `env` entry, so it is neither in argv nor in the agent's own process environment.
     /// A review turn passes `reviewItem` (the item key): its server runs `--review-item <KEY>` and writes `<agentId>.review.mcp.json`.
+    /// `quotas`: the turn's mode quotas, as `BRAHMA_MCP_QUOTA_*` in the same `env` entry (counted inside that server).
     public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String,
-                             reviewItem: String? = nil) throws -> String {
+                             reviewItem: String? = nil, quotas: ModeQuotas? = nil) throws -> String {
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
         if let reviewItem { args += ["--review-item", reviewItem] }
+        var env = [tokenVariable: turnToken]
+        if reviewItem == nil, let quotas { env.merge(quotas.environment) { a, _ in a } }
         let config: [String: Any] = ["mcpServers": ["company": [
             "command": executable,
             "args": args,
-            "env": [tokenVariable: turnToken],
+            "env": env,
         ] as [String: Any]]]
         let data = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
         let name = reviewItem == nil ? "\(agent.id).mcp.json" : "\(agent.id).review.mcp.json"

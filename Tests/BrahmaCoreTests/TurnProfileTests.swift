@@ -106,13 +106,13 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
             #expect(env["MAX_THINKING_TOKENS"] == nil); #expect(env["CLAUDE_CODE_SOMETHING_ELSE"] == nil)
         }
         // Only what the engine passes for this turn gets through, and only to claude; secrets never do.
-        let engine = ["CLAUDE_CODE_EFFORT_LEVEL": "low", "CLAUDE_CODE_OAUTH_TOKEN": "t", "MAX_THINKING_TOKENS": "1", "OTHER": "x"]
+        let engine = ["CLAUDE_CODE_EFFORT_LEVEL": "low", "CLAUDE_CODE_DISABLE_FAST_MODE": "1", "CLAUDE_CODE_OAUTH_TOKEN": "t", "MAX_THINKING_TOKENS": "1", "OTHER": "x"]
         let env = ChildEnvironment.make(base: base, extra: [:], engineClaudeVars: engine, purpose: .claude)
-        #expect(env["CLAUDE_CODE_EFFORT_LEVEL"] == "low")
+        #expect(env["CLAUDE_CODE_DISABLE_FAST_MODE"] == "1"); #expect(env["CLAUDE_CODE_EFFORT_LEVEL"] == nil, "never passed, even engine-set (W1)")
         #expect(env["CLAUDE_CODE_OAUTH_TOKEN"] == nil, "auth comes only from the base environment")
         #expect(env["MAX_THINKING_TOKENS"] == nil); #expect(env["OTHER"] == nil)
         #expect(env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == nil)
-        #expect(ChildEnvironment.make(base: base, extra: [:], engineClaudeVars: engine, purpose: .general)["CLAUDE_CODE_EFFORT_LEVEL"] == nil)
+        #expect(ChildEnvironment.make(base: base, extra: [:], engineClaudeVars: engine, purpose: .general)["CLAUDE_CODE_DISABLE_FAST_MODE"] == nil)
     }
 
     @Test func taskToolIsDisallowed() {
