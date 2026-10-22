@@ -712,7 +712,8 @@ import GRDB
         try v.commitMain(["scripts/check.sh": "echo base-check\n"])
         let i = try v.item(command: "sh scripts/check.sh")
         let wt = try v.claim(i, v.eng)
-        // The weakened script is committed; the working copy is put back and hidden from `git add -A`.
+        // The weakened script is committed; the working copy is put back and hidden from the checkout's own index. The engine
+        // builds its commit from a private index, so the hiding does nothing: what is submitted is what the files say.
         try v.write("scripts/check.sh", "exit 0\n", in: wt)
         try GitFixture.plainGit(["add", "-A"], in: wt)
         try GitFixture.plainGit(["commit", "-m", "weaken"], in: wt)
@@ -721,12 +722,12 @@ import GRDB
         try v.write("src/work.txt", "w", in: wt)
         try v.submit(i, v.eng)
         let sha = try #require(try v.ws.head(of: v.ws.branch(key: i.key)))
-        #expect(try GitFixture.plainGit(["show", "\(sha):scripts/check.sh"], in: v.root) == "exit 0")
-        #expect(try v.fresh(i).reviewFlags == ["check script modified: scripts/check.sh"], "the committed script is what runs")
-        #expect(try v.latest(i).scriptHash == CheckScripts.scriptHash(["scripts/check.sh": StableHash.fnv1a64("exit 0\n")]))
-        // And the reader itself ignores the working tree.
+        #expect(try GitFixture.plainGit(["show", "\(sha):scripts/check.sh"], in: v.root) == "echo base-check")
+        #expect(try v.latest(i).scriptHash == CheckScripts.scriptHash(["scripts/check.sh": StableHash.fnv1a64("echo base-check\n")]))
+        // And the reader itself ignores the working tree: the committed script is what is read.
+        try v.write("scripts/check.sh", "exit 0\n", in: wt)
         let blobs = try v.ws.blobs(at: sha, paths: ["scripts/check.sh", "src", "missing.sh", "-x"], limit: 5)
-        #expect(blobs == ["scripts/check.sh": Data("exit 0\n".utf8)])
+        #expect(blobs == ["scripts/check.sh": Data("echo base-check\n".utf8)])
     }
 
     @Test func baseCommitIsRecordedAtClaim() throws {

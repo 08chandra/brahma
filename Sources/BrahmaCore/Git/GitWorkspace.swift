@@ -34,6 +34,10 @@ struct GitCommand: Sendable {
     let workTree: URL
     /// Set for a linked worktree: the workspace's own `.git`.
     let commonDir: URL?
+    /// A private index (`GIT_INDEX_FILE`) for building a commit without touching the worktree's own index.
+    var indexFile: URL? = nil
+
+    func withIndex(_ url: URL) -> GitCommand { GitCommand(gitDir: gitDir, workTree: workTree, commonDir: commonDir, indexFile: url) }
 
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
@@ -63,6 +67,7 @@ struct GitCommand: Sendable {
         env["GIT_DIR"] = gitDir.path
         env["GIT_WORK_TREE"] = workTree.path
         if let commonDir { env["GIT_COMMON_DIR"] = commonDir.path }
+        if let indexFile { env["GIT_INDEX_FILE"] = indexFile.path }
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_ATTR_NOSYSTEM"] = "1"
@@ -198,9 +203,12 @@ public struct GitWorkspace: Sendable {
     }
 
     /// The git context for the workspace itself or one of its item worktrees; any other directory is refused.
-    private func context(for dir: URL) throws -> GitCommand {
+    private func context(for dir: URL) throws -> GitCommand { try resolve(dir).git }
+
+    /// The context and, for an item worktree, its key (nil for the workspace itself).
+    private func resolve(_ dir: URL) throws -> (git: GitCommand, key: String?) {
         let target = Self.resolved(dir)
-        if target == Self.resolved(root) { return main }
+        if target == Self.resolved(root) { return (main, nil) }
         let parent = Self.resolved(dir.deletingLastPathComponent())
         let key = dir.lastPathComponent
         guard parent == Self.resolved(worktreesDir), (try? Self.validKey(key)) != nil,
@@ -211,9 +219,19 @@ public struct GitWorkspace: Sendable {
         guard !Self.isSymlink(dir), !Self.isSymlink(worktreesDir), FileManager.default.fileExists(atPath: adminDir(key: key).path) else {
             throw GitError.failed(command: "-C \(key)", status: -1, stderr: "\(key) is not a registered worktree")
         }
+        // The repository's own directories must be real directories before anything is read or healed through them: a link
+        // there would send the heal (and git) into another repository. Refused and reported; there is nothing to restore.
+        for (url, name) in [(gitDir, ".git"), (gitDir.appending(path: "worktrees"), ".git/worktrees"), (adminDir(key: key), ".git/worktrees/\(key)")]
+        where !Self.isRealDirectory(url) {
+            let detail = "\(name) is not a real directory"
+            onWorktreeTamper?(key, detail)
+            throw GitError.failed(command: "-C \(key)", status: -1, stderr: "the worktree of \(key) was repointed (\(detail)); nothing was run in it")
+        }
         // The invariant behind every engine commit, merge, reset and rebase here: `HEAD` is the symref to this item's own
         // branch and the three links are as the engine made them. Anything else (a turn that pointed `HEAD` at `main`, say,
-        // would make the engine's commit move `main`) is refused, reported once and put back from the engine's record.
+        // would make a plain commit move `main`) is refused, reported once and put back from the engine's record. The check
+        // alone cannot be atomic with the operation, so engine commits and resets never go through `HEAD` at all
+        // (`commitAll`, `resetHard`) and look again afterwards (`verifyAfter`).
         let problems = linkProblems(key: key)
         if !problems.isEmpty {
             heal(key: key)
@@ -222,8 +240,26 @@ public struct GitWorkspace: Sendable {
             throw GitError.failed(command: "-C \(key)", status: -1,
                                   stderr: "the worktree of \(key) was repointed (\(detail)); it was restored and nothing was run in it")
         }
-        return GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir)
+        return (GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir), key)
     }
+
+    private static func isRealDirectory(_ url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0 && st.st_mode & S_IFMT == S_IFDIR
+    }
+
+    /// After an operation that was started on a checked worktree: if its links were rewritten meanwhile, restore them and
+    /// report (the operation itself never used `HEAD`, so it landed on the item's branch).
+    private func verifyAfter(key: String) {
+        guard Self.isRealDirectory(adminDir(key: key)) else { return }
+        let problems = linkProblems(key: key)
+        guard !problems.isEmpty else { return }
+        heal(key: key)
+        onWorktreeTamper?(key, problems.joined(separator: "; "))
+    }
+
+    /// Test seam: called with a stage name between the worktree check and the operation that follows it.
+    var testHook: (@Sendable (String) -> Void)?
 
     /// Every path form the engine accepts for one location: as the engine writes it, and as git writes it (`realpath`).
     private static func forms(_ url: URL) -> Set<String> {
@@ -480,31 +516,70 @@ public struct GitWorkspace: Sendable {
 
     // MARK: Commits and refs
 
-    /// Stages everything and commits it; the new `HEAD`, or nil when there was nothing to commit.
+    /// Stages everything and commits it; the new commit, or nil when there was nothing to commit.
+    ///
+    /// In an item worktree the commit is built outside `HEAD`: a private index is read from the item branch's tip, the work
+    /// is added to it, `write-tree` and `commit-tree` make the commit, and `refs/heads/item/<KEY>` is advanced with
+    /// `update-ref <ref> <new> <expected old>`. Whatever `HEAD` says at that moment (a turn may rewrite it between the check
+    /// and here), no other branch can move, and a branch that moved meanwhile makes the swap fail.
     @discardableResult
     public func commitAll(in dir: URL, message: String) throws -> String? {
-        let git = try context(for: dir)
-        try git.run(["add", "-A"])
-        let staged = try git.run(["diff", "--cached", "--quiet"], allowFailure: true)
-        if staged.status == 0 { return nil }
-        guard staged.status == 1 else {
-            throw GitError.failed(command: "diff --cached --quiet", status: staged.status, stderr: staged.stderr)
+        let (git, key) = try resolve(dir)
+        guard let key else {
+            try git.run(["add", "-A"])
+            let staged = try git.run(["diff", "--cached", "--quiet"], allowFailure: true)
+            if staged.status == 0 { return nil }
+            guard staged.status == 1 else {
+                throw GitError.failed(command: "diff --cached --quiet", status: staged.status, stderr: staged.stderr)
+            }
+            try git.run(["commit", "--quiet", "--no-verify", "-m", message])
+            return try git.run(["rev-parse", "HEAD"]).text
         }
-        try git.run(["commit", "--quiet", "--no-verify", "-m", message])
-        return try git.run(["rev-parse", "HEAD"]).text
+        let ref = branchRef(key: key)
+        guard let tip = try head(of: ref) else {
+            throw GitError.failed(command: "commit \(key)", status: -1, stderr: "\(ref) does not exist")
+        }
+        testHook?("checked")
+        let index = FileManager.default.temporaryDirectory.appending(path: "brahma-index-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: index) }
+        let private_ = git.withIndex(index)
+        try private_.run(["read-tree", tip])
+        try private_.run(["add", "-A"])
+        let tree = try private_.run(["write-tree"]).text
+        if tree == (try git.run(["rev-parse", "--verify", "\(tip)^{tree}"]).text) { verifyAfter(key: key); return nil }
+        let commit = try git.run(["commit-tree", tree, "-p", tip, "-m", message]).text
+        try git.run(["update-ref", "-m", message, ref, commit, tip])
+        // The worktree's own index follows the branch, so the checkout is clean afterwards.
+        try? git.run(["read-tree", commit])
+        verifyAfter(key: key)
+        return commit
     }
 
-    /// The commit a checkout's `HEAD` points at.
+    /// The commit a checkout's branch points at (for an item worktree: `refs/heads/item/<KEY>`, never `HEAD`).
     public func headCommit(in dir: URL) throws -> String {
-        try context(for: dir).run(["rev-parse", "HEAD"]).text
+        let (git, key) = try resolve(dir)
+        guard let key else { return try git.run(["rev-parse", "HEAD"]).text }
+        return try git.run(["rev-parse", "--verify", "\(branchRef(key: key))^{commit}"]).text
     }
 
-    /// Puts the checkout back on `commit` and removes everything untracked (the write barrier of a plan turn).
+    /// Puts the checkout back on `commit` and removes everything untracked (the write barrier of a plan turn). In an item
+    /// worktree the branch is moved with a compare-and-swap and the index and files are reset with `read-tree`; `HEAD` is
+    /// neither read nor written.
     public func resetHard(in dir: URL, to commit: String) throws {
         try Self.validCommit(commit)
-        let git = try context(for: dir)
-        try git.run(["reset", "--hard", "--quiet", commit])
+        let (git, key) = try resolve(dir)
+        guard let key else {
+            try git.run(["reset", "--hard", "--quiet", commit])
+            try git.run(["clean", "-fdq"])
+            return
+        }
+        let ref = branchRef(key: key)
+        testHook?("checked")
+        let current = try git.run(["rev-parse", "--verify", "\(ref)^{commit}"]).text
+        try git.run(["read-tree", "--reset", "-u", commit])
+        if current != commit { try git.run(["update-ref", ref, commit, current]) }
         try git.run(["clean", "-fdq"])
+        verifyAfter(key: key)
     }
 
     // MARK: Plan-turn write barrier

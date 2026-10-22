@@ -465,6 +465,92 @@ import Foundation
         #expect(log.all.count == 3)
     }
 
+    // MARK: Engine commits never go through HEAD
+
+    @Test func commitLandsOnTheItemBranchEvenIfHeadIsFlippedMidOperation() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let main = try #require(try ws.head(of: "refs/heads/main"))
+        let admin = f.root.appending(path: ".git/worktrees/K-1")
+        ws.testHook = { stage in
+            // After the engine's check and before its commit: the turn points HEAD at main.
+            if stage == "checked" { try? "ref: refs/heads/main\n".write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8) }
+        }
+        try f.write("b.txt", "two", in: wt)
+        let sha = try #require(try ws.commitAll(in: wt, message: "work"))
+        #expect(try ws.head(of: "refs/heads/main") == main, "main did not move")
+        #expect(try ws.head(of: "refs/heads/item/K-1") == sha)
+        #expect(try f.git(["show", "\(sha):b.txt"]) == "two")
+        #expect(try f.git(["log", "-1", "--format=%s", sha]) == "work" && (try f.git(["rev-parse", "\(sha)^"])) == main)
+        #expect(log.all.count == 1, "the flip is noticed afterwards and reported once")
+        #expect(try String(contentsOf: admin.appending(path: "HEAD"), encoding: .utf8) == "ref: refs/heads/item/K-1\n")
+        ws.testHook = nil
+        #expect(try ws.isDirty(in: wt) == false, "the worktree's own index follows the branch")
+        #expect(try f.git(["status", "--porcelain"], in: wt) == "")
+        #expect(try ws.commitAll(in: wt, message: "nothing") == nil)
+    }
+
+    @Test func commitFailsWhenTheItemBranchMovedMeanwhile() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var (ws, _) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let other = try f.git(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "raced"])
+        ws.testHook = { stage in if stage == "checked" { _ = try? f.git(["update-ref", "refs/heads/item/K-1", other]) } }
+        try f.write("b.txt", "two", in: wt)
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "work") }
+        #expect(try ws.head(of: "refs/heads/item/K-1") == other, "the compare-and-swap kept the other writer's value")
+    }
+
+    @Test func resetNeverMovesAnotherBranchWhenHeadIsFlipped() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var (ws, _) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let main = try #require(try ws.head(of: "refs/heads/main"))
+        try f.write("b.txt", "two", in: wt)
+        _ = try ws.commitAll(in: wt, message: "work")
+        try f.write("junk.txt", "untracked", in: wt)
+        try f.write("a.txt", "changed", in: wt)
+        let admin = f.root.appending(path: ".git/worktrees/K-1")
+        ws.testHook = { stage in
+            if stage == "checked" { try? "ref: refs/heads/main\n".write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8) }
+        }
+        try ws.resetHard(in: wt, to: main)
+        #expect(try ws.head(of: "refs/heads/main") == main)
+        #expect(try ws.head(of: "refs/heads/item/K-1") == main, "the item branch went back")
+        #expect(try String(contentsOf: wt.appending(path: "a.txt"), encoding: .utf8) == "one")
+        #expect(!FileManager.default.fileExists(atPath: wt.appending(path: "b.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: wt.appending(path: "junk.txt").path))
+        ws.testHook = nil
+        #expect(try ws.isDirty(in: wt) == false)
+    }
+
+    @Test func linkedRepositoryDirectoriesAreRefusedAndReported() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let fm = FileManager.default
+        let admin = f.root.appending(path: ".git/worktrees/K-1")
+        let copy = try tempDir().appending(path: "admin-copy", directoryHint: .isDirectory)
+        try fm.copyItem(at: admin, to: copy)
+        try "ref: refs/heads/main\n".write(to: copy.appending(path: "HEAD"), atomically: true, encoding: .utf8)
+        try fm.removeItem(at: admin)
+        try fm.createSymbolicLink(atPath: admin.path, withDestinationPath: copy.path)
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "x") }
+        #expect(log.all.count == 1 && log.all[0].contains(".git/worktrees/K-1"))
+        #expect(try String(contentsOf: copy.appending(path: "HEAD"), encoding: .utf8) == "ref: refs/heads/main\n", "nothing was healed through the link")
+        // The whole `worktrees` directory as a link.
+        try fm.removeItem(at: admin)
+        try fm.copyItem(at: copy, to: admin)
+        try "ref: refs/heads/item/K-1\n".write(to: admin.appending(path: "HEAD"), atomically: true, encoding: .utf8)
+        let dir = f.root.appending(path: ".git/worktrees")
+        let moved = try tempDir().appending(path: "worktrees", directoryHint: .isDirectory)
+        try fm.moveItem(at: dir, to: moved)
+        try fm.createSymbolicLink(atPath: dir.path, withDestinationPath: moved.path)
+        #expect(throws: GitError.self) { try ws.isDirty(in: wt) }
+        #expect(log.all.count == 2 && log.all[1].contains(".git/worktrees is not"))
+    }
+
     // MARK: H2 and H3
 
     @Test func planBarrierDeletesANewItemBranch() throws {
