@@ -834,11 +834,15 @@ import Foundation
         #expect(log.all.count == refusals)
     }
 
-    @Test func everyDangerousRepoConfigKeyIsRefused() throws {
+    @Test func onlyAllowlistedRepoConfigIsAccepted() throws {
         let keys: [(String, String)] = [
             ("filter.x.smudge", "cat"), ("filter.x.process", "x"), ("filter.x.required", "true"), ("diff.x.textconv", "cat"),
             ("diff.x.command", "x"), ("merge.x.driver", "x"), ("core.hooksPath", "/tmp/hooks"), ("core.sshCommand", "ssh -v"),
             ("core.fsmonitor", "/tmp/fsm"), ("include.path", "/tmp/included"), ("includeIf.gitdir:/tmp/.path", "/tmp/included"),
+            ("gpg.program", "/tmp/gpg"), ("core.askPass", "/tmp/askpass"), ("submodule.recurse", "true"),
+            ("credential.helper", "/tmp/helper"), ("remote.origin.url", "https://example.com/x.git"), ("diff.renames", "true"),
+            ("merge.conflictStyle", "diff3"), ("core.autocrlf", "false"), ("alias.st", "!touch /tmp/x"), ("http.proxy", "x"),
+            ("core.editor", "x"), ("uploadpack.packObjectsHook", "x"), ("submodule.sub.update", "!touch /tmp/x"),
         ]
         for (key, value) in keys {
             let f = try GitFixture(files: ["a.txt": "one"])
@@ -848,15 +852,174 @@ import Foundation
             #expect(log.all.count == 1, "\(key)")
             #expect(log.all.first?.lowercased().contains(key.lowercased()) == true, "\(key): \(log.all)")
         }
-        // Ordinary settings, and drivers' harmless neighbours, are fine.
+        // What git and the engine write, and inert settings, are accepted.
         let f = try GitFixture(files: ["a.txt": "one"])
         let (ws, log) = guarded(f)
-        for (key, value) in [("diff.renames", "true"), ("merge.conflictStyle", "diff3"), ("core.autocrlf", "false"),
-                             ("diff.x.binary", "true"), ("merge.x.name", "x"), ("user.name", "Owner")] {
+        for (key, value) in [("core.symlinks", "true"), ("core.worktree", f.root.path), ("extensions.worktreeConfig", "true"),
+                             ("user.name", "Owner"), ("user.email", "o@example.com"), ("branch.main.remote", "."),
+                             ("branch.main.merge", "refs/heads/main"), ("gc.auto", "0"), ("gc.refs/heads/*.reflogExpire", "never"),
+                             ("pack.threads", "1"), ("index.version", "4"), ("init.defaultBranch", "main"), ("worktree.guessRemote", "false")] {
             try f.git(["config", key, value])
         }
         #expect(try ws.isDirty(in: f.root) == false)
-        #expect(log.all.isEmpty)
+        #expect(log.all.isEmpty, "\(log.all)")
+    }
+
+    /// Runs git as given (argv from `/usr/bin/env`), with this environment and stdin; returns stdout.
+    @discardableResult
+    private func rawGit(_ argv: [String], env: [String: String], stdin: String = "", in dir: URL) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = argv
+        p.environment = env
+        p.currentDirectoryURL = dir
+        let input = Pipe(), out = Pipe()
+        p.standardInput = input; p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        try p.run()
+        input.fileHandleForWriting.write(Data(stdin.utf8)); try input.fileHandleForWriting.close()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func sentinelScript(_ dir: URL, _ name: String) throws -> (script: URL, marker: URL) {
+        let marker = dir.appending(path: "\(name)-ran"), script = dir.appending(path: "\(name).sh")
+        try "#!/bin/sh\ntouch '\(marker.path)'\nexit 1\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return (script, marker)
+    }
+
+    @Test func execOverridesHoldWithoutTheScan() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        let dir = try tempDir()
+        let gpg = try sentinelScript(dir, "gpg"), askpass = try sentinelScript(dir, "askpass"), helper = try sentinelScript(dir, "helper")
+        try f.git(["config", "gpg.program", gpg.script.path])
+        try f.git(["config", "log.showSignature", "true"])
+        try f.git(["config", "core.askPass", askpass.script.path])
+        try f.git(["config", "credential.helper", helper.script.path])
+        // A commit carrying a signature, so showing it asks gpg.
+        let tree = try f.git(["rev-parse", "HEAD^{tree}"]), parent = try f.git(["rev-parse", "HEAD"])
+        let raw = dir.appending(path: "signed")
+        try "tree \(tree)\nparent \(parent)\nauthor A <a@b> 0 +0000\ncommitter A <a@b> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEz\n -----END PGP SIGNATURE-----\n\nsigned\n"
+            .write(to: raw, atomically: true, encoding: .utf8)
+        let signed = try f.git(["hash-object", "-t", "commit", "-w", raw.path])
+        var git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
+        git.skipsRepositoryCheck = true
+        try git.run(["log", "-1", signed])
+        try git.run(["show", "--no-patch", signed])
+        #expect(throws: GitError.self, "the scan, the first layer, refuses this repository") { try f.ws.log(base: parent, head: signed) }
+        let env = git.environment()
+        let fill = "protocol=https\nhost=example.com\n\n"
+        try rawGit(git.arguments(["credential", "fill"], attrSource: nil), env: env, stdin: fill, in: f.root)
+        #expect(!exists(gpg.marker), "gpg.program ran"); #expect(!exists(askpass.marker), "core.askPass ran")
+        #expect(!exists(helper.marker), "credential.helper ran")
+        // The same repository with plain git runs every one of them: the fixture is real.
+        let plain = ["PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin", "HOME": dir.path,
+                     "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"]
+        try rawGit(["git", "log", "-1", signed], env: plain, in: f.root)
+        try rawGit(["git", "credential", "fill"], env: plain, stdin: fill, in: f.root)
+        #expect(exists(gpg.marker)); #expect(exists(helper.marker)); #expect(exists(askpass.marker))
+    }
+
+    @Test func sshAndOtherProtocolsNeverRun() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        let dir = try tempDir()
+        let ssh = try sentinelScript(dir, "ssh")
+        try f.git(["config", "core.sshCommand", ssh.script.path])
+        var git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
+        git.skipsRepositoryCheck = true
+        _ = try git.run(["fetch", "ssh://example.invalid/x.git"], allowFailure: true)
+        _ = try git.run(["ls-remote", "ext::\(ssh.script.path)"], allowFailure: true)
+        #expect(!exists(ssh.marker))
+        let plain = ["PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin", "HOME": dir.path,
+                     "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"]
+        try rawGit(["git", "fetch", "ssh://example.invalid/x.git"], env: plain, in: f.root)
+        #expect(exists(ssh.marker), "the fixture is real")
+    }
+
+    @Test func submoduleRecursionNeverRunsTheSubmodulesFilters() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        let wt = try f.ws.addWorktree(key: "K-1")
+        let dir = try tempDir()
+        let clean = dir.appending(path: "clean-ran")
+        // An agent puts a repository of its own inside the worktree, with a filter that its own attributes name.
+        let sub = wt.appending(path: "sub")
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "-q"], in: sub)
+        try f.write("f", "one\n", in: sub)
+        try GitFixture.plainGit(["add", "f"], in: sub)
+        try GitFixture.plainGit(["commit", "-q", "-m", "s"], in: sub)
+        try GitFixture.plainGit(["config", "filter.evil.clean", "touch '\(clean.path)'; cat"], in: sub)
+        try f.write(".git/info/attributes", "* filter=evil\n", in: sub)
+        #expect(try f.ws.commitAll(in: wt, message: "with a nested repository") != nil)
+        // Same-size contents: git has to hash the file (through its filter) to see the change.
+        for word in ["two", "six"] {
+            try f.write("f", "\(word)\n", in: sub)
+            _ = try f.ws.isDirty(in: wt)
+            _ = try f.ws.commitAll(in: wt, message: "again \(word)")
+            let before = try f.ws.planBarrier(key: "K-1", in: wt)
+            _ = try f.ws.enforcePlanBarrier(before, key: "K-1", in: wt)
+        }
+        #expect(!exists(clean), "a filter of the nested repository ran inside an engine call")
+        try f.write("f", "ten\n", in: sub)
+        try f.git(["status", "--porcelain"], in: wt)
+        #expect(exists(clean), "plain git status runs it: the fixture is real")
+    }
+
+    @Test func submoduleRecurseFromRepoConfigIsRefusedAndOverridden() throws {
+        let f = try GitFixture(files: ["a.txt": "one\n"])
+        let (ws, log) = guarded(f)
+        let dir = try tempDir()
+        let smudge = dir.appending(path: "smudge-ran")
+        let source = dir.appending(path: "subsrc", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "-q"], in: source)
+        try f.write("f", "one\n", in: source); try GitFixture.plainGit(["add", "f"], in: source)
+        try GitFixture.plainGit(["commit", "-q", "-m", "s1"], in: source)
+        let s1 = try GitFixture.plainGit(["rev-parse", "HEAD"], in: source)
+        try f.write("f", "two\n", in: source); try GitFixture.plainGit(["commit", "-q", "-am", "s2"], in: source)
+        try f.git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", source.path, "sub"])
+        try f.git(["commit", "-q", "-m", "with a submodule"])
+        let recorded = try f.git(["rev-parse", "HEAD"])
+        // The submodule's own repository gets a smudge filter its own attributes name, and is moved off the recorded commit.
+        let modules = f.root.appending(path: ".git/modules/sub")
+        try GitFixture.plainGit(["checkout", "-q", s1], in: f.root.appending(path: "sub"))
+        try GitFixture.plainGit(["config", "filter.evil.smudge", "touch '\(smudge.path)'; cat"], in: f.root.appending(path: "sub"))
+        try f.write("info/attributes", "* filter=evil\n", in: modules)
+        try f.git(["config", "submodule.recurse", "true"])
+        #expect(throws: GitError.self) { try ws.resetHard(in: f.root, to: recorded) }
+        #expect(log.all.first?.contains("submodule.recurse") == true, "\(log.all)")
+        // Without the scan the forced settings keep git out of the submodule.
+        var git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil)
+        git.skipsRepositoryCheck = true
+        try git.run(["reset", "--hard", "--quiet", recorded])
+        try git.run(["read-tree", "--reset", "-u", recorded])
+        #expect(!exists(smudge), "git recursed into the submodule and ran its filter")
+        try f.git(["reset", "--hard", "--quiet", recorded])
+        #expect(exists(smudge), "plain git recurses and runs it: the fixture is real")
+    }
+
+    @Test func configIsScannedAgainBeforeARetry() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = guarded(f)
+        try f.write("b.txt", "two")
+        let lock = f.root.appending(path: ".git/index.lock")
+        try Data().write(to: lock)
+        let config = f.root.appending(path: ".git/config")
+        let current = try String(contentsOf: config, encoding: .utf8)
+        // While the engine waits for the lock, the config gains a filter; then the lock goes.
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.08)
+            try? (current + "[filter \"evil\"]\n\tclean = cat\n").write(to: config, atomically: true, encoding: .utf8)
+            Thread.sleep(forTimeInterval: 0.05)
+            try? FileManager.default.removeItem(at: lock)
+        }
+        // One git call whose first attempt meets the lock: the retry is scanned again and refused.
+        let git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil, onRefused: { log.add($0) })
+        let error = try #require(throws: GitError.self) { try git.run(["add", "-A"]) }
+        #expect(error.isRepositoryRefusal, "\(error)")
+        #expect(log.all.count == 1)
+        _ = ws
     }
 
     @Test func worktreeConfigIsCheckedToo() throws {

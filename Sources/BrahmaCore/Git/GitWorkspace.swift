@@ -36,13 +36,14 @@ public struct GitChange: Equatable, Sendable {
 /// fsmonitor, external diff and pagers are switched off, global and system config are ignored, and the process gets
 /// `ChildEnvironment`'s allowlist, so a crafted `.git`, config or hook inside a worktree cannot run anything.
 ///
-/// Programs a repository can name for git to run on content (filters, textconv, diff and merge drivers) are kept out in
-/// two layers. Before every call the repository's own config files are read (`RepoConfigGuard`); one that defines a
-/// filter, a textconv or diff command, a merge driver, `core.hooksPath`, `core.sshCommand`, `core.fsmonitor` or an
-/// include is refused: nothing runs, `onRefused` hears what was found (the store files one owner alert). And every call
-/// reads attributes from the empty tree (`--attr-source`, git 2.42+), never from a checkout's `.gitattributes`, with
-/// `core.attributesFile=/dev/null` and the engine's override (`attributesOverride`) as `info/attributes`. Replace refs and
-/// grafts are ignored, so the objects the engine reviews, checks and merges are the ones their ids name.
+/// Programs a repository can name for git to run (filters, textconv, diff and merge drivers, gpg, credential helpers,
+/// askpass, ssh, proxies, submodule recursion) are kept out in two layers. The guarantee is the command line: every call
+/// forces each such setting off (`configFlags`, `environment()`), and reads attributes from the empty tree
+/// (`--attr-source`, git 2.42+), never from a checkout's `.gitattributes`, with `core.attributesFile=/dev/null` and the
+/// engine's override (`attributesOverride`) as `info/attributes`. On top of that, before every attempt (retries included)
+/// the repository's own config files are read (`RepoConfigGuard`): a key outside a short allowlist of what git and the
+/// engine write refuses the call, nothing runs, and `onRefused` hears what was found (the store files one owner alert).
+/// Replace refs and grafts are ignored, so the objects the engine reviews, checks and merges are the ones their ids name.
 struct GitCommand: Sendable {
     let gitDir: URL
     let workTree: URL
@@ -56,6 +57,8 @@ struct GitCommand: Sendable {
     var skipsRepositoryCheck = false
     /// Whether this git takes `--attr-source`. Test seam; always the installed git's answer in the engine.
     var attrSourceSupported = GitCommand.installedSupportsAttrSource
+    /// `-c protocol.file.allow=always`, for the engine's own fetches from a local repository; every other protocol stays off.
+    var allowsLocalFetch = false
 
     func withIndex(_ url: URL) -> GitCommand { var copy = self; copy.indexFile = url; return copy }
 
@@ -64,11 +67,17 @@ struct GitCommand: Sendable {
     static let lockRetryDelay: TimeInterval = 0.2
     static let maxCapture = 8 * 1024 * 1024
 
-    /// Applied to every call, before the subcommand.
+    /// Applied to every call, before the subcommand: what git may run is switched off whatever any config says (command-line
+    /// config outranks every file, and reaches child git processes, such as one in a nested repository, too).
     static let configFlags = [
-        "-c", "user.name=Brahma", "-c", "user.email=engine@brahma.local", "-c", "commit.gpgsign=false",
+        "-c", "user.name=Brahma", "-c", "user.email=engine@brahma.local", "-c", "commit.gpgsign=false", "-c", "tag.gpgSign=false",
         "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat", "-c", "diff.external=",
-        "-c", "protocol.ext.allow=never", "-c", "core.quotepath=false", "-c", "gc.auto=0",
+        "-c", "core.sshCommand=/usr/bin/false", "-c", "core.gitProxy=", "-c", "core.askPass=/usr/bin/false",
+        "-c", "credential.helper=", "-c", "gpg.program=/usr/bin/false", "-c", "gpg.ssh.program=/usr/bin/false",
+        "-c", "gpg.x509.program=/usr/bin/false", "-c", "log.showSignature=false", "-c", "merge.verifySignatures=false",
+        "-c", "submodule.recurse=false", "-c", "diff.ignoreSubmodules=dirty", "-c", "protocol.allow=never",
+        "-c", "protocol.ext.allow=never", "-c", "core.alternateRefsCommand=", "-c", "uploadpack.packObjectsHook=",
+        "-c", "core.quotepath=false", "-c", "gc.auto=0",
         "-c", "core.attributesFile=/dev/null", "-c", "advice.graftFileDeprecated=false",
     ]
 
@@ -133,17 +142,23 @@ struct GitCommand: Sendable {
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
         env["GIT_GRAFT_FILE"] = "/dev/null"
         env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_ASKPASS"] = "/usr/bin/false"
+        env["SSH_ASKPASS"] = "/usr/bin/false"
         env["GIT_OPTIONAL_LOCKS"] = "0"
+        // Never inherited (the allowlist keeps them out already); named so that no later change lets one through.
+        for name in ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                     "GIT_EXEC_PATH", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR"] { env[name] = nil }
         return env
     }
 
     /// `attrSource`: the tree attributes are read from (the empty tree of the repository's hash), nil on an older git.
     func arguments(_ args: [String], attrSource: String?) -> [String] {
-        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + Self.configFlags + args
+        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + Self.configFlags
+            + (allowsLocalFetch ? ["-c", "protocol.file.allow=always"] : []) + args
     }
 
-    /// Before any git runs: an older git may only run tree-free plumbing; the repository's config must name no program;
-    /// the engine's attributes override is put back. Returns the attribute source for the call.
+    /// Before each attempt: an older git may only run tree-free plumbing; the repository's config must hold only allowed
+    /// keys; the engine's attributes override is put back. Returns the attribute source for the call.
     private func prepare(_ args: [String]) throws -> String? {
         if !attrSourceSupported, !Self.isTreeFree(args) {
             throw GitError.failed(command: args.joined(separator: " "), status: -1,
@@ -187,8 +202,9 @@ struct GitCommand: Sendable {
     @discardableResult
     func run(_ args: [String], allowFailure: Bool = false, maxOutput: Int = GitCommand.maxCapture) throws -> Output {
         var attempt = 0
-        let attrSource = try prepare(args)
         while true {
+            // Scanned again before a retry: the config may have changed while git waited for the lock.
+            let attrSource = try prepare(args)
             let out = try runOnce(arguments(args, attrSource: attrSource), environment: environment(),
                                   label: args.joined(separator: " "), maxOutput: maxOutput)
             if out.status == 0 || allowFailure && !out.stderr.contains("index.lock") { return out }
@@ -276,18 +292,24 @@ enum RepoConfigGuard {
     }
     private static let cache = Cache()
 
-    /// Does this config key name a program git would run, or pull in another file? Keys come canonical from
-    /// `git config --list`: section and variable lowercased, a subsection as written (dots and all).
-    static func isRefused(_ key: String) -> Bool {
+    /// Is this config key one the engine runs git with? Only what git itself and the engine write, and inert settings;
+    /// everything else (any program, helper, driver, include, remote or alias) refuses the repository. Keys come canonical
+    /// from `git config --list`: section and variable lowercased, a subsection as written (dots and all).
+    static func isAllowed(_ key: String) -> Bool {
         let lower = key.lowercased()
         guard let firstDot = lower.firstIndex(of: "."), let lastDot = lower.lastIndex(of: ".") else { return false }
         let section = lower[..<firstDot], variable = lower[lower.index(after: lastDot)...]
         let hasSubsection = firstDot != lastDot
         switch section {
-        case "filter", "include", "includeif": return true
-        case "diff": return hasSubsection && (variable == "textconv" || variable == "command")
-        case "merge": return hasSubsection && variable == "driver"
-        case "core": return !hasSubsection && ["hookspath", "sshcommand", "fsmonitor"].contains(variable)
+        case "core":
+            return !hasSubsection && ["repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
+                                      "precomposeunicode", "symlinks", "worktree"].contains(variable)
+        case "extensions", "pack", "index", "worktree": return !hasSubsection
+        case "user": return !hasSubsection && (variable == "name" || variable == "email")
+        // Tracking only: a remote would need `remote.*`, which is not allowed.
+        case "branch": return hasSubsection && (variable == "remote" || variable == "merge")
+        case "gc": return true
+        case "init": return !hasSubsection && variable == "defaultbranch"
         default: return false
         }
     }
@@ -312,7 +334,7 @@ enum RepoConfigGuard {
                 let text = String(decoding: entry, as: UTF8.self)
                 let key = String(text.prefix { $0 != "\n" })
                 let value = text.contains("\n") ? String(text[text.index(after: text.firstIndex(of: "\n")!)...]) : ""
-                if isRefused(key) { refused.append(GitWorkspace.shown(key)) }
+                if !isAllowed(key) { refused.append(GitWorkspace.shown(key)) }
                 if key.lowercased() == "extensions.objectformat", value.lowercased() == "sha256" { sha256 = true }
             }
             let unique = refused.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
@@ -762,7 +784,7 @@ public struct GitWorkspace: Sendable {
     public func commitAll(in dir: URL, message: String) throws -> String? {
         let (git, key) = try resolve(dir)
         guard let key else {
-            try git.run(["add", "-A"])
+            try addAll(git)
             let staged = try git.run(["diff", "--cached", "--quiet"], allowFailure: true)
             if staged.status == 0 { return nil }
             guard staged.status == 1 else {
@@ -780,7 +802,7 @@ public struct GitWorkspace: Sendable {
         defer { try? FileManager.default.removeItem(at: index) }
         let private_ = git.withIndex(index)
         try private_.run(["read-tree", tip])
-        try private_.run(["add", "-A"])
+        try addAll(private_)
         let tree = try private_.run(["write-tree"]).text
         if tree == (try git.run(["rev-parse", "--verify", "\(tip)^{tree}"]).text) { try verifyAfter(key: key); return nil }
         let commit = try git.run(["commit-tree", tree, "-p", tip, "-m", message]).text
@@ -790,6 +812,28 @@ public struct GitWorkspace: Sendable {
         try? git.run(["read-tree", commit])
         try verifyAfter(key: key)
         return commit
+    }
+
+    /// `git add -A`, but never into a nested repository the index already records (a gitlink): there `add` runs `git status`
+    /// inside it, with that repository's own config and attributes, filters and all. Gitlinks stay as recorded; a new
+    /// nested repository is still added (as a gitlink, without running anything in it).
+    static let maxGitlinks = 1000
+
+    private func addAll(_ git: GitCommand) throws {
+        let listing = try git.run(["ls-files", "-s", "-z"])
+        if listing.cut { throw GitError.failed(command: "ls-files", status: -1, stderr: "the index listing is too long") }
+        var excludes: [String] = []
+        for entry in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) where entry.starts(with: Data("160000 ".utf8)) {
+            guard let tab = entry.firstIndex(of: UInt8(ascii: "\t")),
+                  let path = String(data: Data(entry[entry.index(after: tab)...]), encoding: .utf8) else {
+                throw GitError.failed(command: "add", status: -1, stderr: "a nested repository has a path that is not UTF-8")
+            }
+            excludes.append(":(exclude,literal)\(path)")
+        }
+        guard excludes.count <= Self.maxGitlinks else {
+            throw GitError.failed(command: "add", status: -1, stderr: "more than \(Self.maxGitlinks) nested repositories")
+        }
+        try git.run(["add", "-A", "--", "."] + excludes)
     }
 
     /// The commit a checkout's branch points at (for an item worktree: `refs/heads/item/<KEY>`, never `HEAD`).
@@ -823,7 +867,7 @@ public struct GitWorkspace: Sendable {
         try Self.validCommit(commit)
         let (git, key) = try resolve(dir)
         guard let key else {
-            try git.run(["reset", "--hard", "--quiet", commit])
+            try git.run(["reset", "--hard", "--quiet", "--no-recurse-submodules", commit])
             try git.run(["clean", "-fdq"])
             return
         }
@@ -832,7 +876,7 @@ public struct GitWorkspace: Sendable {
         guard let current = try ownTip(git, ref) else {
             throw GitError.failed(command: "reset \(key)", status: -1, stderr: "\(ref) does not exist")
         }
-        try git.run(["read-tree", "--reset", "-u", commit])
+        try git.run(["read-tree", "--reset", "-u", "--no-recurse-submodules", commit])
         if current != commit { try git.run(["update-ref", "--no-deref", ref, commit, current]) }
         try git.run(["clean", "-fdq"])
         try verifyAfter(key: key)
@@ -1008,7 +1052,7 @@ public struct GitWorkspace: Sendable {
 
     /// `git status --porcelain=v1 -z --ignored -uall`: one `!!` entry per ignored file, raw bytes, nothing quoted.
     private func ignoredFiles(_ git: GitCommand, in dir: URL) throws -> [Data: FileStamp] {
-        let tokens = try barrierRun(git, ["status", "--porcelain=v1", "-z", "--ignored", "-uall"]).split(separator: 0, omittingEmptySubsequences: true)
+        let tokens = try barrierRun(git, ["status", "--porcelain=v1", "-z", "--ignored", "-uall", "--ignore-submodules=dirty"]).split(separator: 0, omittingEmptySubsequences: true)
         var ignored: [Data: FileStamp] = [:]
         let root = Array(dir.path.utf8)
         var i = 0
@@ -1161,7 +1205,7 @@ public struct GitWorkspace: Sendable {
     }
 
     public func isDirty(in dir: URL) throws -> Bool {
-        !(try context(for: dir).run(["status", "--porcelain"]).text.isEmpty)
+        !(try context(for: dir).run(["status", "--porcelain", "--ignore-submodules=dirty"]).text.isEmpty)
     }
 
     /// The commit `ref` points at, or nil when there is no such ref.
@@ -1250,7 +1294,7 @@ public struct GitWorkspace: Sendable {
     /// `"<short sha> <subject>"` for the newest `limit` commits in `base..head`.
     public func log(base: String, head: String, limit: Int = 5) throws -> [String] {
         try Self.validRef(base); try Self.validRef(head)
-        let out = try main.run(["log", "--no-color", "--format=%h %s", "-n", String(max(limit, 1)), "\(base)..\(head)"])
+        let out = try main.run(["log", "--no-color", "--no-show-signature", "--format=%h %s", "-n", String(max(limit, 1)), "\(base)..\(head)"])
         return out.text.split(separator: "\n").map(String.init)
     }
 }
