@@ -267,6 +267,8 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     case leaseClaimed, leaseReleased, leaseExpired, submitted, verificationPassed, verificationFailed
     case reviewApproved, changesRequested, merged, mergeConflict, handoffWritten, budgetExceeded, watchdog, aging
     case sprintChanged
+    /// The item's branch has fallen far behind `main` (merge safety); an FYI, never waking.
+    case branchBehind
     // Work modes (W3).
     case planWritten, planTurnWrote, modeEscalated, specConfirmed
 

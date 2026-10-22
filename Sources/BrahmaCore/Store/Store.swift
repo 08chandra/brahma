@@ -30,9 +30,12 @@ public final class Store: Sendable {
     let dataHome: URL?
     /// How long engine git waits for an item's lock before skipping the item (tests shorten it).
     let gitLockTimeout = GitLockTimeout()
+    /// Called inside the transaction that completes an item (`completeItem`).
+    let observers: [any WorkItemObserver]
 
-    public init(path: String, catalog: PackCatalog = .builtin) throws {
+    public init(path: String, catalog: PackCatalog = .builtin, observers: [any WorkItemObserver] = []) throws {
         self.catalog = catalog
+        self.observers = observers
         dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
         config.busyMode = .timeout(5)
@@ -43,15 +46,16 @@ public final class Store: Sendable {
         try Migrations.migrator().migrate(writer)
     }
 
-    private init(queue: DatabaseQueue, catalog: PackCatalog) throws {
+    private init(queue: DatabaseQueue, catalog: PackCatalog, observers: [any WorkItemObserver]) throws {
         self.catalog = catalog
+        self.observers = observers
         dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)
     }
 
-    public static func inMemory(catalog: PackCatalog = .builtin) throws -> Store {
-        try Store(queue: DatabaseQueue(), catalog: catalog)
+    public static func inMemory(catalog: PackCatalog = .builtin, observers: [any WorkItemObserver] = []) throws -> Store {
+        try Store(queue: DatabaseQueue(), catalog: catalog, observers: observers)
     }
 
     /// Test helper: current value of a PRAGMA as text.

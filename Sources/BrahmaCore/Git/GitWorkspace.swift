@@ -66,6 +66,9 @@ struct GitCommand: Sendable {
         env["GIT_ATTR_NOSYSTEM"] = "1"
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_OPTIONAL_LOCKS"] = "0"
+        // A rebase or merge never waits for an editor.
+        env["GIT_EDITOR"] = "true"
+        env["GIT_SEQUENCE_EDITOR"] = "true"
         return env
     }
 
@@ -372,6 +375,99 @@ public struct GitWorkspace: Sendable {
     public func deleteBranch(key: String) throws {
         try Self.validKey(key)
         try main.run(["branch", "-D", branch(key: key)])
+    }
+
+    // MARK: Merging into main
+
+    /// What a rebase of an item's branch onto `main` came to.
+    public enum RebaseOutcome: Equatable, Sendable {
+        case rebased(head: String)
+        /// Conflicting paths; the rebase was aborted and the branch is as it was.
+        case conflict(files: [String])
+    }
+
+    /// The full ref the root checkout's `HEAD` points at (`refs/heads/main` when all is well); nil for a detached `HEAD`.
+    public func checkedOutRef() throws -> String? {
+        let out = try main.run(["symbolic-ref", "--quiet", "HEAD"], allowFailure: true)
+        return out.status == 0 && !out.text.isEmpty ? out.text : nil
+    }
+
+    /// Puts the item's worktree exactly on `commit` (`reset --hard`, then `clean -fd`): whatever was added after the engine's
+    /// check passed is not merged. Creates the worktree when it is missing.
+    public func resetWorktree(key: String, to commit: String) throws {
+        try Self.validKey(key); try Self.validCommit(commit)
+        try withKeyLock(key) {
+            if !hasCheckout(key: key) { _ = try addWorktreeLocked(key: key) }
+            let git = try context(for: worktreePath(key: key))
+            // A rebase left half-done by a crash is not a state to build on.
+            _ = try git.run(["rebase", "--abort"], allowFailure: true)
+            try git.run(["reset", "--hard", "--quiet", commit])
+            try git.run(["clean", "-fd", "--quiet"])
+        }
+    }
+
+    /// `git rebase refs/heads/main` in the item's worktree. A conflict is reported with the conflicting paths and aborted.
+    public func rebaseOntoMain(key: String) throws -> RebaseOutcome {
+        try Self.validKey(key)
+        return try withKeyLock(key) {
+            let git = try context(for: worktreePath(key: key))
+            let out = try git.run(["rebase", Self.mainRef], allowFailure: true)
+            if out.status == 0 { return .rebased(head: try git.run(["rev-parse", "HEAD"]).text) }
+            let listing = try git.run(["diff", "--name-only", "-z", "--diff-filter=U"], allowFailure: true)
+            let files = String(decoding: listing.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
+            _ = try git.run(["rebase", "--abort"], allowFailure: true)
+            if files.isEmpty {
+                // Not a conflict: git could not rebase at all.
+                throw GitError.failed(command: "rebase \(Self.mainRef)", status: out.status, stderr: String(out.stderr.prefix(2000)))
+            }
+            return .conflict(files: files)
+        }
+    }
+
+    /// `git merge --ff-only item/<KEY>` in the root checkout (which the caller has checked is on `main`); the new head of `main`.
+    @discardableResult
+    public func fastForwardMain(key: String) throws -> String {
+        try Self.validKey(key)
+        try main.run(["merge", "--ff-only", "--quiet", branchRef(key: key)])
+        return try main.run(["rev-parse", "--verify", "\(Self.mainRef)^{commit}"]).text
+    }
+
+    /// A dry-run merge of the item's branch into `main` (`git merge-tree --write-tree`, git 2.38 or newer): the conflicting
+    /// paths, empty when it merges cleanly. A git too old for it, or an unrelated history, reports nothing.
+    public func mergeConflicts(key: String) throws -> [String] {
+        try Self.validKey(key)
+        let out = try main.run(["merge-tree", "--write-tree", "--name-only", "-z", Self.mainRef, branchRef(key: key)],
+                               allowFailure: true, maxOutput: 1 << 20)
+        guard out.status == 1 else { return [] }
+        // `<tree>\0<path>\0<path>\0\0<messages>`: the paths end at the first empty field.
+        var files: [String] = []
+        var fields = String(decoding: out.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
+        guard !fields.isEmpty else { return [] }
+        fields.removeFirst()
+        for field in fields {
+            if field.isEmpty { break }
+            if !files.contains(field) { files.append(field) }
+        }
+        return files
+    }
+
+    /// How many commits `main` has that the item's branch does not.
+    public func commitsBehind(key: String) throws -> Int {
+        try Self.validKey(key)
+        let out = try main.run(["rev-list", "--count", "\(branchRef(key: key))..\(Self.mainRef)"], allowFailure: true)
+        return out.status == 0 ? Int(out.text) ?? 0 : 0
+    }
+
+    /// The patch of one path between two commits, at most `maxLines` lines (the rest is cut and said so).
+    public func fileDiff(base: String, head: String, path: String, maxLines: Int = 200) throws -> (text: String, truncated: Bool) {
+        try Self.validRef(base); try Self.validRef(head)
+        guard !path.isEmpty, !path.hasPrefix("-") else { return ("", false) }
+        let out = try main.run(["diff", "--no-ext-diff", "--no-textconv", "--no-color", base, head, "--", path],
+                               allowFailure: true, maxOutput: 1 << 20)
+        var lines = String(decoding: out.stdout, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.last == "" { lines.removeLast() }
+        let cut = lines.count > maxLines || out.cut
+        return (lines.prefix(maxLines).joined(separator: "\n"), cut)
     }
 
     // MARK: Check checkouts

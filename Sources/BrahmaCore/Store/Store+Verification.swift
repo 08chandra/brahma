@@ -293,6 +293,8 @@ extension Store {
     /// A run is stale when the item's check changed, the item left review, or (for a submit run) the item was submitted again.
     private static func isStale(_ db: Database, run: VerificationRun, item: WorkItem) throws -> Bool {
         if item.checkRevision != run.checkRevision || item.status != .inReview { return true }
+        // A merge run belongs to the rebase that queued it: the item must still be waiting for it.
+        if run.purpose == .merge, item.mergeState != .verifying { return true }
         if run.purpose == .submit,
            let latest = try String.fetchOne(db, sql: """
                SELECT "commit" FROM verificationRun WHERE itemId = ? AND purpose = 'submit' ORDER BY rowid DESC LIMIT 1
@@ -359,6 +361,15 @@ extension Store {
             let before = try Self.history(db, before: run)
             let holder = try WorkLease.fetchOne(db, key: item.id)?.agentId ?? run.requestedBy
             switch run.status {
+            case .passed where run.purpose == .merge:
+                // The rebased branch passed again: it is approved and waits to land. (Not a new review, so no reviewer is woken.)
+                try run.update(db)
+                item.verifiedCommit = run.commit
+                item.mergeState = .pending
+                item.updatedAt = now
+                try item.update(db)
+                try recordItemEvent(db: db, item: item, actor: "system", kind: .edited,
+                                    text: "check passed after rebase onto main; ready to merge", now: now)
             case .passed:
                 run.flaky = before.realFailures > 0
                 try run.update(db)
@@ -395,15 +406,18 @@ extension Store {
     /// The DM never carries output; the holder reads the check tail in its orientation.
     private func returnToHolder(_ db: Database, item: WorkItem, run: VerificationRun, holder: String?, reason: String, now: Date,
                                 dm: String? = nil, event: String? = nil) throws {
+        // A failed re-check after the engine's rebase also ends the pending merge.
+        try db.execute(sql: "UPDATE workItem SET mergeState = 'none', reviewAttempts = 0 WHERE id = ?", arguments: [item.id])
+        let after = run.purpose == .merge ? " after rebase onto main" : ""
         let returned = try engineSetStatus(db: db, itemId: item.id, to: .inProgress, now: now)
         try Store.refreshLease(db, itemId: item.id, companyId: item.companyId)
         try recordItemEvent(db: db, item: returned, actor: "system", kind: .verificationFailed,
-                            text: event ?? "check failed (\(reason))", alsoNotify: [holder].compactMap { $0 },
+                            text: event ?? "check failed\(after) (\(reason))", alsoNotify: [holder].compactMap { $0 },
                             alsoNotifyRole: .holder, now: now)
         guard let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed else { return }
         try MessageRouter(store: self).sendDM(
             db: db, companyId: item.companyId, from: .system, to: agent.name,
-            text: dm ?? "\(item.key) check failed (\(reason)). See the check tail under Current work in your orientation.", now: now)
+            text: dm ?? "\(item.key) check failed\(after) (\(reason)). See the check tail under Current work in your orientation.", now: now)
     }
 
     /// A lease that did not run during review starts a full time-to-live again when the item comes back.

@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Clean-context review turns (Task 9a): the digest, the review turn, `Store.review`, the engine-owned approval and the
-/// refs / main-commit hardening carried from Task 8. Merging (9b) is not tested here: an approved item sits at `pending`.
+/// refs / main-commit hardening carried from Task 8, and (9b) the engine merge into `main`, merge safety and the completion hook.
 @Suite(.serialized) struct ReviewTests {
     private struct R {
         let world: World
@@ -15,8 +15,8 @@ import GRDB
         var root: URL { URL(fileURLWithPath: company.workspacePath, isDirectory: true) }
         var ws: GitWorkspace { GitWorkspace(root: root) }
 
-        init() throws {
-            let w = try World()
+        init(store: Store? = nil, memory: (any MemoryPressureSource)? = nil) throws {
+            let w = try World(store: store, memory: memory)
             let c = try w.company("Acme")
             func hire(_ n: String, _ role: String, _ manager: Agent? = nil) throws -> Agent {
                 try w.store.hire(companyId: c.id, name: n, role: role, model: "sonnet", managerId: manager?.id)
@@ -59,12 +59,13 @@ import GRDB
 
         @discardableResult
         func item(_ title: String = "Do it", type: WorkItemType = .task, command: String? = "true", reviewer: Agent? = nil,
-                  tier: EffortTier = .m, noReviewer: Bool = false) throws -> WorkItem {
+                  tier: EffortTier = .m, noReviewer: Bool = false, parent: WorkItem? = nil,
+                  status: WorkItemStatus = .ready) throws -> WorkItem {
             let n = (try store.workItems(companyId: company.id)).count + 1
             let spec = command.map { CheckSpec(command: $0, paths: ["src/p\(n)"]) }
             return try store.createWorkItem(companyId: company.id, by: .owner, draft: WorkItemDraft(
                 type: type, title: title, checkSpec: spec, tier: tier, reviewerId: noReviewer ? nil : (reviewer ?? rev).id,
-                status: .ready, touchPaths: spec == nil ? ["research\(n)"] : []), now: now)
+                parentId: parent?.id, status: status, touchPaths: spec == nil ? ["research\(n)"] : []), now: now)
         }
 
         @discardableResult
@@ -88,7 +89,7 @@ import GRDB
         }
 
         /// An item that is claimed, submitted and has passed its engine check.
-        func verified(_ title: String = "Do it", flagged: Bool = false, by author: Agent? = nil) async throws -> WorkItem {
+        func verified(_ title: String = "Do it", flagged: Bool = false, by author: Agent? = nil, file: String = "src/work.txt") async throws -> WorkItem {
             let eng = author ?? self.eng
             let i = try item(title)
             if flagged {
@@ -97,7 +98,7 @@ import GRDB
                 try write("Tests/FooTests.swift", "func testFoo() { /* weakened */ }\n", in: wt)
                 try submit(i, eng)
             } else {
-                try claimAndSubmit(i, eng)
+                try claimAndSubmit(i, eng, file: file)
             }
             try await cycle()
             return try fresh(i)
@@ -125,6 +126,42 @@ import GRDB
         }
 
         func head(_ i: WorkItem) throws -> String? { try ws.head(of: ws.branchRef(key: i.key)) }
+        func mainHead() throws -> String { try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: root) }
+
+        /// Claim, write `file`, submit, pass the engine check and approve: ready for the engine to merge.
+        func approved(_ title: String = "Do it", by author: Agent? = nil, file: String = "src/work.txt",
+                      approveFlags: Bool = false) async throws -> WorkItem {
+            try await finish(try item(title), by: author, file: file, approveFlags: approveFlags)
+        }
+
+        func finish(_ i: WorkItem, by author: Agent? = nil, file: String = "src/work.txt", approveFlags: Bool = false) async throws -> WorkItem {
+            try claimAndSubmit(i, author ?? eng, file: file)
+            try await cycle()
+            _ = try review(rev, i, .approve, flags: approveFlags)
+            return try fresh(i)
+        }
+
+        /// Ticks until the item is done (or `limit` cycles have passed).
+        @discardableResult
+        func drive(_ i: WorkItem, limit: Int = 12) async throws -> WorkItem {
+            for _ in 0..<limit {
+                if try fresh(i).status == .done { break }
+                try await cycle()
+            }
+            return try fresh(i)
+        }
+
+        /// Commits what is in an item's worktree onto its branch, as an agent working there would.
+        func commitInWorktree(_ i: WorkItem, _ files: [String: String]) throws {
+            let wt = ws.worktreePath(key: i.key)
+            for (path, text) in files { try write(path, text, in: wt) }
+            try GitFixture.plainGit(["add", "-A"], in: wt)
+            try GitFixture.plainGit(["commit", "-m", "work"], in: wt)
+        }
+
+        func alerts() throws -> [Ask] {
+            try store.writer.read { try Ask.filter(Column("companyId") == company.id && Column("kind") == AskKind.engineAlert).fetchAll($0) }
+        }
 
         func review(_ a: Agent, _ i: WorkItem, _ d: ReviewDecision, notes: String = "looks fine", flags: Bool = false,
                     head: String?? = nil) throws -> WorkItem {
@@ -392,7 +429,7 @@ import GRDB
         // A second review of the same round is refused.
         #expect(r.failure { _ = try r.review(r.rev, i, .approve); return "" }.contains("already"))
         // The single entry point (also used by 9c's auto-approval) sets the same state with its own note.
-        let j = try await r.verified("second", by: r.eng2)
+        let j = try await r.verified("second", by: r.eng2, file: "src/second.txt")
         let auto = try r.autoApprove(j)
         #expect(auto.mergeState == .pending)
         #expect(try r.events(j, .reviewApproved).first?.text == "auto-approved (tier S, small diff)")
@@ -597,6 +634,306 @@ import GRDB
         #expect(try GitFixture.plainGit(["log", "--oneline", "item/\(j.key)"], in: r.root).components(separatedBy: "\n").count == 1, "nothing committed")
     }
 
+    // MARK: Merging into main (9b)
+
+    private struct RecordingObserver: WorkItemObserver {
+        let seen: Box
+        func itemCompleted(_ item: WorkItem, db: Database) throws { seen.add(item.key) }
+    }
+
+    @Test func fastForwardMerge() async throws {
+        let seen = Box()
+        let r = try R(store: try Store.inMemory(observers: [RecordingObserver(seen: seen)]))
+        let i = try await r.approved(file: "src/a.txt")
+        let verified = try #require(try r.fresh(i).verifiedCommit)
+        let before = try r.mainHead()
+        let wt = r.ws.worktreePath(key: i.key)
+        #expect(try r.fresh(i).baseCommit != nil)
+        try await r.cycle()
+        let done = try r.fresh(i)
+        #expect(done.status == .done); #expect(done.mergeState == .none); #expect(done.doneAt != nil)
+        #expect(try r.mainHead() == verified, "a fast-forward: main is exactly the verified commit")
+        #expect(before != verified); #expect(done.mergedCommit == verified)
+        #expect(try String(contentsOf: r.root.appending(path: "src/a.txt"), encoding: .utf8) == "work for \(i.key)")
+        #expect(try r.store.lease(itemId: i.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: wt.path)); #expect(try r.head(i) == nil, "the branch is deleted")
+        #expect(done.baseCommit == nil, "the base is forgotten with the branch")
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == verified)
+        let merged = try r.events(i, .merged)
+        #expect(merged.count == 1); #expect(merged.first?.text == "merged into main at \(verified.prefix(7))")
+        #expect(seen.values == [i.key])
+        #expect(try GitFixture.plainGit(["status", "--porcelain"], in: r.root).isEmpty)
+    }
+
+    @Test func rebaseReverifiesBeforeMerge() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
+        _ = try await r.drive(a)
+        let verifiedB = try #require(try r.fresh(b).verifiedCommit)
+        try await r.cycle()    // main moved on: b is rebased and must pass its check again before it lands
+        let mid = try r.fresh(b)
+        #expect(mid.status == .inReview); #expect(mid.mergeState == .verifying)
+        let rebased = try #require(try r.head(b))
+        #expect(rebased != verifiedB)
+        let run = try #require(try r.store.latestVerification(itemId: b.id))
+        #expect(run.purpose == .merge); #expect(run.status == .queued); #expect(run.commit == rebased)
+        #expect(try r.ws.isAncestor(try r.mainHead(), of: rebased), "the rebased branch sits on main")
+        #expect(mid.baseCommit == (try r.mainHead()))
+        #expect(try r.mainHead() != rebased, "nothing lands before the re-check")
+        let calls = r.world.checks.calls.count
+        try await r.cycle()
+        let ready = try r.fresh(b)
+        #expect(ready.mergeState == .pending); #expect(ready.verifiedCommit == rebased); #expect(ready.status == .inReview)
+        #expect(r.world.checks.calls.count == calls + 1)
+        try await r.cycle()
+        let done = try r.fresh(b)
+        #expect(done.status == .done); #expect(try r.mainHead() == rebased)
+        #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "src/a.txt").path))
+        #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "src/b.txt").path))
+    }
+
+    @Test func failedReverifyReturnsItem() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
+        _ = try await r.drive(a)
+        let mainAfterA = try r.mainHead()
+        r.world.checks.enqueue(FakeCheckRunner.fail(), FakeCheckRunner.fail())
+        try await r.cycle(); try await r.cycle(); try await r.cycle()
+        let back = try r.fresh(b)
+        #expect(back.status == .inProgress); #expect(back.mergeState == .none)
+        let event = try #require(try r.events(b, .verificationFailed).last)
+        #expect(event.text.contains("after rebase onto main"))
+        #expect(try r.mainHead() == mainAfterA)
+        #expect(try r.store.lease(itemId: b.id)?.agentId == r.eng2.id)
+        let notice = try r.store.pendingNotices(agentId: r.eng2.id).first { $0.event.kind == .verificationFailed }
+        #expect(notice?.notice.wakes == true)
+    }
+
+    @Test func conflictReturnsItem() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng)      // both write src/work.txt
+        let b = try await r.approved("b", by: r.eng2, approveFlags: true)     // a's landing flagged b as conflicting
+        _ = try await r.drive(a)
+        let verifiedB = try #require(try r.fresh(b).verifiedCommit)
+        let mainAfterA = try r.mainHead()
+        try await r.cycle()
+        let back = try r.fresh(b)
+        #expect(back.status == .inProgress); #expect(back.mergeState == .none)
+        #expect(try r.mainHead() == mainAfterA)
+        #expect(try r.store.lease(itemId: b.id)?.agentId == r.eng2.id)
+        let event = try #require(try r.events(b, .mergeConflict).first)
+        #expect(event.text.contains("src/work.txt"))
+        let dm = try #require(try r.dms(r.eng2).last { $0.hasPrefix("\(b.key) could not be merged into main. Rebase item/\(b.key) on main, resolve these files, then resubmit:") })
+        #expect(dm.contains("\n    | src/work.txt"))
+        let notice = try r.store.pendingNotices(agentId: r.eng2.id).first { $0.event.kind == .mergeConflict }
+        #expect(notice?.notice.wakes == true)
+        // The rebase was aborted: the worktree is clean, on its branch, at the commit that was verified.
+        let wt = r.ws.worktreePath(key: b.key)
+        #expect(try GitFixture.plainGit(["status", "--porcelain"], in: wt).isEmpty)
+        #expect(try GitFixture.plainGit(["symbolic-ref", "HEAD"], in: wt) == "refs/heads/item/\(b.key)")
+        #expect(try GitFixture.plainGit(["rev-parse", "HEAD"], in: wt) == verifiedB)
+    }
+
+    @Test func conflictWritesResolutionBriefAndRequiresRecheck() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng)
+        let b = try await r.approved("b", by: r.eng2, approveFlags: true)
+        _ = try await r.drive(a)
+        try await r.cycle()
+        let dir = r.root.appending(path: ".brahma/conflicts", directoryHint: .isDirectory)
+        let names = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasPrefix("\(b.key)-") }
+        #expect(names.count == 1)
+        let name = try #require(names.first)
+        #expect(name.range(of: "^\(b.key)-\\d{8}-\\d{6}\\.md$", options: .regularExpression) != nil, "\(name)")
+        let path = dir.appending(path: name)
+        let brief = try String(contentsOf: path, encoding: .utf8)
+        #expect(brief.contains("src/work.txt"))
+        #expect(brief.contains("\n    | +work for \(a.key)"), "main's side")
+        #expect(brief.contains("\n    | +work for \(b.key)"), "the item's side")
+        // Verification is cleared: the item must pass its check again.
+        let back = try r.fresh(b)
+        #expect(back.verifiedRevision == nil); #expect(back.verifiedCommit == nil)
+        let dm = try #require(try r.dms(r.eng2).last { $0.hasPrefix("\(b.key) could not be merged") })
+        #expect(dm.contains(path.path))
+        #expect(try r.events(b, .mergeConflict).last?.text.contains(path.path) == true)
+        // The owner of the item resolves it on its branch and resubmits; nothing is reviewable before the check passes.
+        let wt = r.ws.worktreePath(key: b.key)
+        try GitFixture.plainGit(["reset", "--hard", "refs/heads/main"], in: wt)
+        try r.commitInWorktree(b, ["src/work.txt": "merged by the author\n"])
+        try r.submit(b, r.eng2, "resolved the conflict")
+        #expect(try r.fresh(b).verifiedCommit == nil)
+        #expect(try r.store.pendingReviews(agentId: r.rev.id).isEmpty)
+        let calls = r.world.checks.calls.count
+        try await r.cycle()
+        #expect(r.world.checks.calls.count == calls + 1, "the check runs again")
+        #expect(try r.store.pendingReviews(agentId: r.rev.id).map(\.id) == [b.id])
+        _ = try r.review(r.rev, b, .approve)
+        let done = try await r.drive(b)
+        #expect(done.status == .done)
+        #expect(try String(contentsOf: r.root.appending(path: "src/work.txt"), encoding: .utf8) == "merged by the author\n")
+    }
+
+    @Test func dirtyMainCommittedVisibly() async throws {
+        let r = try R()
+        let i = try await r.approved(file: "src/a.txt")
+        try r.write("scratch.txt", "the owner was here", in: r.root)     // uncommitted work on main
+        try await r.cycle()
+        let subjects = try GitFixture.plainGit(["log", "--format=%s", "refs/heads/main"], in: r.root)
+        #expect(subjects.contains("Brahma: unattributed changes on main"))
+        let sha = try GitFixture.plainGit(["log", "--format=%H", "--grep=Brahma: unattributed changes on main", "-n", "1", "refs/heads/main"], in: r.root)
+        let feed = try r.store.events(afterId: 0).map(\.text)
+        #expect(feed.contains("main had uncommitted changes; committed as \(sha.prefix(7))"), "\(feed)")
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == sha, "the engine's own commit is the expected head")
+        #expect(try r.fresh(i).mergeState == .verifying, "main moved, so the item is rebased and re-checked")
+        let done = try await r.drive(i)
+        #expect(done.status == .done)
+        #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "scratch.txt").path))
+        #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "src/a.txt").path))
+        #expect(try GitFixture.plainGit(["status", "--porcelain"], in: r.root).isEmpty)
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == (try r.mainHead()))
+    }
+
+    @Test func completionRollsUpContainersAndWakesWaiters() async throws {
+        let seen = Box()
+        let r = try R(store: try Store.inMemory(observers: [RecordingObserver(seen: seen)]))
+        let epic = try r.item("Epic", type: .epic, command: nil, noReviewer: true)
+        let story = try r.item("Story", type: .story, command: nil, noReviewer: true, parent: epic)
+        let t1 = try r.item("t1", parent: story)
+        let t2 = try r.item("t2", parent: story, status: .backlog)
+        let dependent = try r.item("dependent", status: .backlog)
+        try r.store.addDependency(itemId: dependent.id, dependsOn: t1.id, by: .owner)
+        try r.store.transition(agentId: r.eng3.id, to: .ready)
+        try r.store.transition(agentId: r.eng3.id, to: .blocked, blocker: .workItem(id: t1.id, key: t1.key))
+        _ = try await r.finish(t1, by: r.eng, file: "src/a.txt")
+        let first = try await r.drive(t1)
+        #expect(first.status == .done)
+        #expect(try r.world.agent(r.eng3).state == .ready, "the agent blocked on the item is ready again")
+        let events = try r.events(dependent, .dependencyDone)
+        #expect(events.map(\.text) == ["\(t1.key) is done"])
+        #expect(try r.fresh(story).status != .done); #expect(try r.fresh(epic).status != .done)
+        #expect(seen.values == [t1.key])
+        _ = try r.store.updateWorkItem(id: t2.id, by: .owner, patch: WorkItemPatch(status: .ready), now: r.now)
+        _ = try await r.finish(t2, by: r.eng2, file: "src/b.txt")
+        _ = try await r.drive(t2)
+        let storyDone = try r.fresh(story), epicDone = try r.fresh(epic)
+        #expect(storyDone.status == .done); #expect(storyDone.doneAt != nil)
+        #expect(epicDone.status == .done); #expect(epicDone.doneAt != nil)
+        #expect(seen.values == [t1.key, t2.key, story.key, epic.key], "observers see every completion, containers last")
+    }
+
+    @Test func mergeWaitsDuringHold() async throws {
+        let memory = StubMemory(.normal)
+        let r = try R(memory: memory)
+        let i = try await r.approved(file: "src/a.txt")
+        let before = try r.mainHead()
+        _ = try r.store.setHold(reason: .account, detail: "logged out", now: r.now)
+        try await r.cycle(); try await r.cycle()
+        #expect(try r.fresh(i).mergeState == .pending); #expect(try r.mainHead() == before, "no merge under an engine hold")
+        try r.store.clearHold(now: r.now)
+        memory.set(.critical)
+        try await r.cycle()
+        #expect(try r.fresh(i).mergeState == .pending, "no merge under critical memory pressure")
+        memory.set(.normal)
+        try await r.cycle()
+        #expect(try r.fresh(i).status == .done)
+        // A paused company waits too.
+        let j = try await r.approved("second", by: r.eng2, file: "src/b.txt")
+        var c = try #require(try r.store.company(id: r.company.id)); c.status = .paused; try r.store.updateCompany(c)
+        try await r.cycle()
+        #expect(try r.fresh(j).mergeState == .pending)
+    }
+
+    @Test func notHeadOfMainRaisesAlert() async throws {
+        let r = try R()
+        let i = try await r.approved(file: "src/a.txt")
+        let before = try r.mainHead()
+        try GitFixture.plainGit(["checkout", "-b", "scratch"], in: r.root)
+        try await r.cycle()
+        #expect(try r.fresh(i).mergeState == .pending); #expect(try r.mainHead() == before)
+        let first = try r.alerts().filter { $0.status == .pendingOwner }
+        #expect(first.count == 1)
+        #expect(first.first?.title.contains("main checkout is on refs/heads/scratch; switch it back to main") == true)
+        r.world.clock.advance(120)
+        try await r.cycle()
+        #expect(try r.alerts().filter { $0.status == .pendingOwner }.count == 1, "one alert however often the merge is tried")
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/scratch"], in: r.root) == before, "nothing was committed to the other branch")
+        try GitFixture.plainGit(["checkout", "main"], in: r.root)
+        r.world.clock.advance(120)
+        let done = try await r.drive(i)
+        #expect(done.status == .done)
+        #expect(try r.alerts().filter { $0.status == .pendingOwner }.isEmpty, "the alert resolves itself")
+    }
+
+    // MARK: Merge safety (9b)
+
+    @Test func mergeDryRunFlagsConflictingBranch() async throws {
+        let r = try R()
+        let c = try r.item("c")
+        try r.claim(c, r.eng3)
+        try r.commitInWorktree(c, ["src/work.txt": "c version\n"])
+        let d = try r.item("d")
+        try r.claim(d, r.eng2)
+        try r.commitInWorktree(d, ["src/other.txt": "d version\n"])
+        let a = try await r.approved("a", by: r.eng, file: "src/work.txt")
+        _ = try await r.drive(a)
+        #expect(try r.fresh(c).reviewFlags == ["conflicts with main: src/work.txt"])
+        let event = try #require(try r.events(c, .mergeConflict).first)
+        #expect(event.text.hasPrefix("would conflict with main after \(a.key)")); #expect(event.text.contains("\n    | src/work.txt"))
+        let notice = try r.store.pendingNotices(agentId: r.eng3.id).first { $0.event.kind == .mergeConflict }
+        #expect(notice?.notice.wakes == true, "the holder is woken")
+        #expect(try r.fresh(d).reviewFlags.isEmpty); #expect(try r.events(d, .mergeConflict).isEmpty)
+        // Still conflicting: no second notice.
+        let safety = MergeSafety(store: r.store)
+        try safety.afterLanding(companyId: r.company.id, mergedKey: a.key)
+        #expect(try r.events(c, .mergeConflict).count == 1)
+        // Resolved by moving onto main: the next pass clears the flag.
+        let wt = r.ws.worktreePath(key: c.key)
+        try GitFixture.plainGit(["reset", "--hard", "refs/heads/main"], in: wt)
+        try r.commitInWorktree(c, ["src/c.txt": "c\n"])
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try r.fresh(c).reviewFlags.isEmpty)
+    }
+
+    @Test func staleBranchNotified() async throws {
+        let r = try R()
+        let s = try r.item("s")
+        try r.claim(s, r.eng)
+        try r.commitInWorktree(s, ["src/s.txt": "s\n"])
+        for n in 0..<21 { try r.commitMain(["m\(n).txt": "\(n)\n"]) }
+        let safety = MergeSafety(store: r.store)
+        func texts(_ i: WorkItem) throws -> [String] { try r.events(i, .branchBehind).map(\.text) }
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try texts(s) == ["\(s.key) is 21 commits behind main; rebase item/\(s.key) on main in your worktree and re-run your check."])
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try texts(s).count == 1, "one notice per crossing")
+        let notice = try r.store.pendingNotices(agentId: r.eng.id).first { $0.event.kind == .branchBehind }
+        #expect(notice != nil)
+        // Age: a branch one commit behind is told once it has been behind for more than two active days.
+        let t = try r.item("t")
+        try r.claim(t, r.eng2)
+        try r.commitInWorktree(t, ["src/t.txt": "t\n"])
+        try r.commitMain(["later.txt": "1\n"])
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try texts(t).isEmpty)
+        try r.store.advanceActive(companyId: r.company.id, by: 2 * 86_400 + 1)
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try texts(t) == ["\(t.key) is 1 commits behind main; rebase item/\(t.key) on main in your worktree and re-run your check."])
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try texts(t).count == 1)
+        // After a rebase the next time it falls behind is a new crossing.
+        let wt = r.ws.worktreePath(key: t.key)
+        try GitFixture.plainGit(["reset", "--hard", "refs/heads/main"], in: wt)
+        try r.commitInWorktree(t, ["src/t2.txt": "t\n"])
+        try r.commitMain(["later2.txt": "2\n"])
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try texts(t).count == 1)
+        try r.store.advanceActive(companyId: r.company.id, by: 3 * 86_400)
+        try safety.afterLanding(companyId: r.company.id, mergedKey: "ACME-99")
+        #expect(try texts(t).count == 2)
+    }
+
     // MARK: Refs and main
 
     @Test func engineRefsAreFullyQualified() throws {
@@ -665,6 +1002,7 @@ import GRDB
         let item = try columns("workItem")
         #expect(item["reviewAttempts"] == "0"); #expect(item["mergeState"] == "'none'"); #expect(item.keys.contains("mergedCommit"))
         #expect(try columns("company").keys.contains("mainCommit"))
+        #expect(Set(try columns("branchFreshness").keys) == ["itemId", "mergeBase", "behindSinceActive", "notified"])
         let names = Migrations.migrator().migrations
         let at = { (n: String) in names.firstIndex(of: n) }
         #expect(at("v3-verify-2")! < at("v3-turn-context")!); #expect(at("v3-turn-context")! < at("v3-asks")!)

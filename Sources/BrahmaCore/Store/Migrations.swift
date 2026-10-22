@@ -337,6 +337,16 @@ enum Migrations {
             }
             try db.alter(table: "company") { t in t.add(column: "mainCommit", .text) }
         }
+        m.registerMigration("v3-merge-safety") { db in
+            // Merge safety (9b): per in-progress item, the merge base it was last measured at, when `main` first moved past it
+            // (company-active seconds) and whether the freshness notice for that base was sent.
+            try db.create(table: "branchFreshness") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("mergeBase", .text).notNull()
+                t.column("behindSinceActive", .double).notNull()
+                t.column("notified", .boolean).notNull().defaults(to: false)
+            }
+        }
         m.registerMigration("v3-asks") { db in
             try db.alter(table: "company") { t in t.add(column: "autonomy", .text).notNull().defaults(to: "important") }
             try db.alter(table: "agent") { t in t.add(column: "pausedActive", .double) }

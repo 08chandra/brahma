@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import GRDB
 @testable import BrahmaCore
 import BrahmaKeychain
 
@@ -141,6 +142,38 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         // Without an owner key, the writes refuse too.
         let bare = try OwnerTestHome(initOwner: false); defer { withExtendedLifetime(bare) {} }
         #expect(try brahma(["items", "add", "Acme", "--title", "x"], home: bare.url).status != 0)
+    }
+
+    @Test func mainAcceptCLI() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let store = try Store(path: home.appending(path: "home/brahma.sqlite").path)
+        let company = try #require(try store.companies().first)
+        let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        let recorded = try #require(company.mainCommit)
+        // main is rewritten outside Brahma: the next claim check raises the alert.
+        try GitFixture.plainGit(["commit", "--amend", "--allow-empty", "-m", "rewritten"], in: ws)
+        let rewritten = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws)
+        #expect(rewritten != recorded)
+        #expect(throws: WorkError.self) { try store.prepareRepo(company: company) }
+        func open() throws -> Int {
+            try store.writer.read { try Ask.filter(Column("kind") == AskKind.engineAlert && Column("status") == AskStatus.pendingOwner.rawValue).fetchCount($0) }
+        }
+        #expect(try open() == 1)
+        // Not from an agent's shell, and not for an unknown company.
+        let refused = try brahma(["main", "accept", "Acme"], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(refused.status != 0); #expect(refused.stderr.contains("owner commands can't run inside an agent turn"))
+        #expect(try store.company(id: company.id)?.mainCommit == recorded)
+        #expect(try brahma(["main", "accept", "Nope"], home: home).status != 0)
+        // The owner accepts the current head.
+        let accepted = try brahma(["main", "accept", "Acme"], home: home)
+        #expect(accepted.status == 0, "\(accepted.stderr)"); #expect(accepted.stdout.contains(String(rewritten.prefix(7))))
+        #expect(try store.company(id: company.id)?.mainCommit == rewritten)
+        #expect(try open() == 0, "the alert is resolved")
+        // Without an owner key it is refused too.
+        let bare = try OwnerTestHome(initOwner: false); defer { withExtendedLifetime(bare) {} }
+        #expect(try brahma(["main", "accept", "Acme"], home: bare.url).status != 0)
     }
 
     // MARK: Inbox
