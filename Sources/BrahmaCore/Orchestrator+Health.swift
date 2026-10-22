@@ -60,6 +60,7 @@ extension Orchestrator {
             health.doctorReport = nil
             try store.saveProbe(report)
             if report.ok {
+                try store.resolveDoctorAlerts(now: now)
                 try store.clearHold(now: now, onlyIf: .cli)
             } else {
                 let first = report.items.first { $0.status == .fail }
@@ -80,7 +81,7 @@ extension Orchestrator {
                 if free < EngineHealth.diskHoldBytes {
                     let gb = String(format: "%.1f", Double(free) / 1_000_000_000)
                     if try store.setHold(reason: .disk, detail: "\(gb) GB free", now: now) {
-                        try EngineAlerts.raise(store: store, text: "Disk space is low (\(gb) GB free). Free space; Brahma resumes at 6 GB.", now: now)
+                        try EngineAlerts.raise(store: store, text: "Disk space is low (\(gb) GB free). Free space; Brahma resumes at 6 GB.", now: now, reason: HoldReason.disk.rawValue)
                     }
                 } else if free >= EngineHealth.diskReleaseBytes {
                     try store.clearHold(now: now, onlyIf: .disk)
@@ -103,7 +104,7 @@ extension Orchestrator {
         if health.accountStreak >= EngineHealth.accountFailuresToHold {
             health.accountStreak = 0
             if try store.setHold(reason: .account, detail: "Claude Code is logged out or the plan changed", now: now) {
-                try EngineAlerts.raise(store: store, text: "Claude Code is logged out or the plan changed. Log in with `claude`, then run `brahma doctor` (or press Retry in the app).", now: now)
+                try EngineAlerts.raise(store: store, text: "Claude Code is logged out or the plan changed. Log in with `claude`, then run `brahma doctor` (or press Retry in the app).", now: now, reason: HoldReason.account.rawValue)
             }
         }
 

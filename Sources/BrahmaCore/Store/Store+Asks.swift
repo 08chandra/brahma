@@ -26,12 +26,12 @@ extension Store {
 
     // MARK: Helpers
 
-    private func requireCompany(_ db: Database, _ id: String) throws -> Company {
+    func requireCompany(_ db: Database, _ id: String) throws -> Company {
         guard let c = try Company.fetchOne(db, key: id) else { throw WorkError.notFound("no such company") }
         return c
     }
 
-    private func requireAsk(_ db: Database, _ id: String) throws -> Ask {
+    func requireAsk(_ db: Database, _ id: String) throws -> Ask {
         guard let a = try Ask.fetchOne(db, key: id) else { throw WorkError.notFound("no such ask") }
         return a
     }
@@ -48,7 +48,7 @@ extension Store {
         }
     }
 
-    private static func handle(_ db: Database, _ id: String?) throws -> String {
+    static func handle(_ db: Database, _ id: String?) throws -> String {
         guard let id else { return "?" }
         if id == "system" || id == "owner" { return id }
         return try Agent.fetchOne(db, key: id)?.name ?? "?"
@@ -63,7 +63,7 @@ extension Store {
         }))
     }
 
-    private static func flat(_ text: String, max: Int = 500) -> String {
+    static func flat(_ text: String, max: Int = 500) -> String {
         let spaced = text.components(separatedBy: .newlines).joined(separator: " ")
         let one = stripControls(spaced).trimmingCharacters(in: .whitespacesAndNewlines)
         return one.count > max ? String(one.prefix(max)) + "…" : one
@@ -76,7 +76,7 @@ extension Store {
         return t
     }
 
-    private static func limitedText(_ text: String?, _ max: Int, _ what: String) throws -> String? {
+    static func limitedText(_ text: String?, _ max: Int, _ what: String) throws -> String? {
         guard let raw = text else { return nil }
         let text = stripControls(raw, keepNewlines: true)
         guard text.count <= max else { throw WorkError.invalid("\(what) is longer than \(max) characters") }
@@ -158,7 +158,7 @@ extension Store {
 
     /// The first non-killed, non-paused agent (other than the requester and `excluding`) whose role is in the pack's
     /// approver list for the kind, in list order. A `boost` follows the `other` list.
-    private func internalApprover(_ db: Database, company: Company, kind: AskKind, requesterId: String,
+    func internalApprover(_ db: Database, company: Company, kind: AskKind, requesterId: String,
                                   excluding: Set<String> = []) throws -> Agent? {
         guard let pack = pack(for: company) else { return nil }
         let roles = pack.askApprovers[kind.rawValue] ?? (kind == .boost ? pack.askApprovers["other"] : nil) ?? []
@@ -172,7 +172,7 @@ extension Store {
     }
 
     /// Moves the ask to `pendingOwner`, logs the activity line and DMs the owner.
-    private func enterPendingOwner(_ db: Database, ask: inout Ask, company: Company, now: Date) throws {
+    func enterPendingOwner(_ db: Database, ask: inout Ask, company: Company, now: Date) throws {
         ask.status = .pendingOwner
         ask.statusSinceActive = try Store.activeNow(db: db, companyId: company.id)
         ask.remindCount = 0
@@ -184,13 +184,13 @@ extension Store {
     }
 
     /// DMs the requester when the ask reaches a final status (unless the engine filed it).
-    private func tellRequester(_ db: Database, _ ask: Ask, text: String, now: Date) throws {
+    func tellRequester(_ db: Database, _ ask: Ask, text: String, now: Date) throws {
         guard ask.requesterId != "system", let requester = try Agent.fetchOne(db, key: ask.requesterId),
               requester.state != .killed else { return }
         try MessageRouter(store: self).sendDM(db: db, companyId: ask.companyId, from: .system, to: requester.name, text: text, now: now)
     }
 
-    private static func deciderText(_ ask: Ask) -> String {
+    static func deciderText(_ ask: Ask) -> String {
         guard let by = ask.decidedBy else { return "the owner" }
         if by == "owner" { return "the owner" }
         if by.hasPrefix("policy:") { return "policy (\(by.dropFirst("policy:".count)))" }
@@ -198,8 +198,8 @@ extension Store {
     }
 
     /// Writes a final status and runs the effects: the requester's DM and supersession. Effects of sprint plans arrive with
-    /// Task 13 (`applyAskEffects` is the hook); a reversal on rescind is Task 11b.
-    private func settle(_ db: Database, ask: inout Ask, status: AskStatus, decidedBy: String, tellRequesterToo: Bool = true, now: Date) throws {
+    /// Task 13 (`applyAskEffects` is the hook); a rescind runs `reverseAskEffects` (Store+AskLifecycle).
+    func settle(_ db: Database, ask: inout Ask, status: AskStatus, decidedBy: String, tellRequesterToo: Bool = true, now: Date) throws {
         ask.status = status
         ask.decidedBy = decidedBy
         ask.statusSinceActive = try Store.activeNow(db: db, companyId: ask.companyId)

@@ -123,4 +123,21 @@ struct Answer: ParsableCommand {
     }
 }
 
+struct Rescind: ParsableCommand {
+    static let configuration = CommandConfiguration(abstract: "Take back an approved ask and reverse what it set in motion.")
+
+    @Argument(help: "Company name or slug.") var company: String
+    @Argument(help: "Ask reference, e.g. A-3.") var ask: String
+    @Option(help: "Why. The requester and the approver are told.") var note: String
+
+    func run() throws {
+        try requireOwnerShell()
+        let (store, _) = try openStore()
+        let c = try resolveCompany(store, company)
+        let a = try resolveAsk(store, c, ask)
+        let done = try refusing { try store.ownerRescind(askId: a.id, note: note) }
+        print("\(done.ref) \(done.status.rawValue)")
+    }
+}
+
 extension AutonomyPreset: ExpressibleByArgument {}

@@ -119,6 +119,9 @@ public actor Orchestrator {
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }
 
+        // Open asks: expiry, owner reminders, internal aging and paused-approver rerouting (company-active time).
+        attempt { _ = try store.sweepAsks(now: now) }
+
         // 1. Timed blockers that have expired.
         for a in try store.agents(states: [.blocked]) {
             let until: Date

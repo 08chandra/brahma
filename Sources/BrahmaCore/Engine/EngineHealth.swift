@@ -135,7 +135,10 @@ extension Store {
     @discardableResult
     public func setHold(reason: HoldReason, detail: String, now: Date) throws -> Bool {
         try writer.write { db in
-            if let current = try EngineHold.fetchOne(db, key: 1), current.reason.rank >= reason.rank { return false }
+            let current = try EngineHold.fetchOne(db, key: 1)
+            if let current, current.reason.rank >= reason.rank { return false }
+            // The replaced hold is over: its alert asks answer themselves.
+            if let current { try resolveEngineAlerts(db, reasons: [current.reason.rawValue], now: now) }
             let next: Date? = reason == .network ? now.addingTimeInterval(EngineHealth.probeInterval) : nil
             try EngineHold(reason: reason, detail: detail, since: now, nextProbeAt: next).save(db)
             for c in try Company.fetchAll(db) {
@@ -152,6 +155,7 @@ extension Store {
             guard let current = try EngineHold.fetchOne(db, key: 1) else { return }
             if let reason, current.reason != reason { return }
             try db.execute(sql: "DELETE FROM engineHold WHERE id = 1")
+            try resolveEngineAlerts(db, reasons: [current.reason.rawValue], now: now)
             for c in try Company.fetchAll(db) {
                 try ActivityEvent(companyId: c.id, agentId: nil, turnId: nil, kind: .usage, text: "engine resumed",
                                   createdAt: now).insert(db)
@@ -162,8 +166,14 @@ extension Store {
     /// `brahma doctor` / the app's Retry, after a passing report. Free disk space is not something a doctor
     /// probe can vouch for, so a disk hold stays until the disk rule releases it.
     public func clearHoldAfterDoctor(now: Date) throws {
+        try resolveDoctorAlerts(now: now)
         guard let hold = try engineHold(), hold.reason != .disk else { return }
         try clearHold(now: now, onlyIf: hold.reason)
+    }
+
+    /// A passing doctor report settles the alerts filed for a failing one when no hold named a reason.
+    func resolveDoctorAlerts(now: Date) throws {
+        try writer.write { db in try resolveEngineAlerts(db, reasons: [EngineAlerts.generalReason], now: now) }
     }
 
     func scheduleNextProbe(at date: Date) throws {

@@ -775,6 +775,226 @@ import GRDB
         }
     }
 
+    // MARK: Lifecycle (Task 11b)
+
+    private static let day = 86_400.0
+
+    private func question(_ w: W, hours: Double? = nil) throws -> Ask {
+        try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.eng.id), title: "Which db?", question: "Postgres or SQLite?",
+                                     expiresInHours: hours, now: w.now)
+    }
+
+    @Test func ownerRemindersAtOneAndThreeActiveDays() throws {
+        let w = try W()
+        let q = try question(w)
+        try w.store.advanceActive(companyId: w.company.id, by: Self.day - 1)
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+        try w.store.markAskNotified(ids: [q.id], now: w.now)
+        try w.store.advanceActive(companyId: w.company.id, by: 1)
+        #expect(try w.store.sweepAsks(now: w.now) == 1)
+        var a = try w.fresh(q)
+        #expect(a.remindCount == 1); #expect(a.notifiedAt == nil); #expect(a.status == .pendingOwner)
+        #expect(try w.dms("owner").contains("Reminder: A-1 has waited 1 day: Which db?"))
+        #expect(try w.activity().contains { $0.kind == .approval && $0.text.hasPrefix("Reminder: A-1 has waited 1 day") })
+        // Once per threshold.
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+        try w.store.advanceActive(companyId: w.company.id, by: 2 * Self.day)
+        #expect(try w.store.sweepAsks(now: w.now) == 1)
+        a = try w.fresh(q)
+        #expect(a.remindCount == 2)
+        #expect(try w.dms("owner").contains("Reminder: A-1 has waited 3 days: Which db?"))
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+        #expect(try w.dms("owner").filter { $0.hasPrefix("Reminder:") }.count == 2)
+        // A decided ask is not reminded.
+        _ = try w.store.ownerAnswer(askId: q.id, text: "SQLite", now: w.now)
+        try w.store.advanceActive(companyId: w.company.id, by: 10 * Self.day)
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+    }
+
+    @Test func pausedCompanyTimeDoesNotAgeAsks() throws {
+        let w = try W()
+        _ = try question(w)
+        try w.store.accrueActiveTime(now: w.now)
+        var paused = w.company; paused.status = .paused
+        try w.store.updateCompany(paused)
+        try w.store.accrueActiveTime(now: w.now.addingTimeInterval(5 * Self.day))
+        #expect(try w.store.sweepAsks(now: w.now.addingTimeInterval(5 * Self.day)) == 0)
+        #expect(try w.dms("owner").filter { $0.hasPrefix("Reminder:") }.isEmpty)
+    }
+
+    @Test func internalAgingEscalates() throws {
+        let w = try W()
+        // The CEO reports to the CTO here, so the CEO's nearest ancestor is the CTO.
+        try w.store.writer.write { db in
+            try db.execute(sql: "UPDATE agent SET managerId = ? WHERE id = ?", arguments: [w.cto.id, w.ceo.id])
+        }
+        let a = try w.propose(.other, category: "general")
+        #expect(a.internalApproverId == w.ceo.id)
+        try w.store.advanceActive(companyId: w.company.id, by: Self.day)
+        #expect(try w.store.sweepAsks(now: w.now) == 1)
+        #expect(try w.dms("ceo").contains("Reminder: A-1 waits for your decision"))
+        #expect(try w.fresh(a).status == .pendingInternal); #expect(try w.fresh(a).internalApproverId == w.ceo.id)
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+        #expect(try w.dms("ceo").filter { $0.hasPrefix("Reminder:") }.count == 1)
+        // Three days: rerouted to the nearest ancestor that is not the requester.
+        try w.store.advanceActive(companyId: w.company.id, by: 2 * Self.day)
+        #expect(try w.store.sweepAsks(now: w.now) == 1)
+        var f = try w.fresh(a)
+        #expect(f.status == .pendingInternal); #expect(f.internalApproverId == w.cto.id); #expect(f.remindCount == 0)
+        #expect(try w.dms("cto").contains { $0.contains("A-1") })
+        #expect(try w.decide(f, by: w.cto).status == .approved)   // the new approver can decide (other/medium under important is an FYI)
+        // With no ancestor left, the owner gets it.
+        let b = try w.propose(.other, category: "general")
+        #expect(b.internalApproverId == w.ceo.id)
+        try w.store.writer.write { db in try db.execute(sql: "UPDATE agent SET managerId = NULL WHERE id = ?", arguments: [w.ceo.id]) }
+        try w.store.advanceActive(companyId: w.company.id, by: 3 * Self.day)
+        #expect(try w.store.sweepAsks(now: w.now) >= 1)
+        f = try w.fresh(b)
+        #expect(f.status == .pendingOwner)
+        #expect(try w.activity().contains { $0.kind == .approval && $0.text.hasPrefix("Owner approval needed: A-2") })
+    }
+
+    @Test func pausedApproverRerouted() throws {
+        let w = try W()
+        let a = try w.propose(.architecture)
+        #expect(a.internalApproverId == w.cto.id)
+        try w.store.setPaused(agentId: w.cto.id, true, now: w.now)
+        try w.store.advanceActive(companyId: w.company.id, by: Self.day - 1)
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+        #expect(try w.fresh(a).internalApproverId == w.cto.id)
+        try w.store.advanceActive(companyId: w.company.id, by: 1)
+        #expect(try w.store.sweepAsks(now: w.now) == 1)
+        var f = try w.fresh(a)
+        #expect(f.status == .pendingInternal); #expect(f.internalApproverId == w.ceo.id)
+        #expect(try w.dms("ceo").contains { $0.contains("A-1") })
+        // No other approver: straight to the owner.
+        let b = try w.propose(.architecture)
+        #expect(b.internalApproverId == w.ceo.id)
+        try w.store.setPaused(agentId: w.ceo.id, true, now: w.now)
+        try w.store.advanceActive(companyId: w.company.id, by: Self.day)
+        _ = try w.store.sweepAsks(now: w.now)
+        f = try w.fresh(b)
+        #expect(f.status == .pendingOwner)
+    }
+
+    @Test func expiredAsk() throws {
+        let w = try W()
+        let q = try question(w, hours: 1)
+        try w.store.advanceActive(companyId: w.company.id, by: 3599)
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+        try w.store.advanceActive(companyId: w.company.id, by: 1)
+        #expect(try w.store.sweepAsks(now: w.now) == 1)
+        let e = try w.fresh(q)
+        #expect(e.status == .expired)
+        #expect(try w.dms("eng-1").contains("A-1 expired (not approved)"))
+        #expect(throws: WorkError.conflict("A-1 is already expired")) { try w.store.ownerAnswer(askId: q.id, text: "late", now: w.now) }
+        #expect(try w.store.sweepAsks(now: w.now) == 0)
+        // An expired gate never counts as approved.
+        let g = try w.propose(.architecture)
+        try w.store.writer.write { db in
+            try db.execute(sql: "UPDATE ask SET expiresActive = 0 WHERE id = ?", arguments: [g.id])
+        }
+        _ = try w.store.sweepAsks(now: w.now)
+        #expect(try w.fresh(g).status == .expired)
+        #expect(try !w.store.hasApproved(companyId: w.company.id, kind: .architecture))
+    }
+
+    @Test func escalationToCEOOnce() throws {
+        let w = try W()
+        let a = try w.propose(.architecture)
+        #expect(a.internalApproverId == w.cto.id)
+        // Only the approver (or the requester after a rejection) may escalate.
+        #expect(throws: WorkError.self) { try w.store.escalate(askId: a.id, by: .agent(w.cpo.id), reason: "x", now: w.now) }
+        #expect(throws: WorkError.self) { try w.store.escalate(askId: a.id, by: .agent(w.eng.id), reason: "x", now: w.now) }
+        let e = try w.store.escalate(askId: a.id, by: .agent(w.cto.id), reason: "needs a business call", now: w.now)
+        #expect(e.status == .pendingInternal); #expect(e.internalApproverId == w.ceo.id); #expect(e.escalatedAt == w.now)
+        #expect(try w.dms("ceo").contains { $0.contains("A-1") && $0.contains("needs a business call") })
+        #expect(throws: WorkError.conflict("A-1 was already escalated")) {
+            try w.store.escalate(askId: a.id, by: .agent(w.ceo.id), reason: "again", now: w.now)
+        }
+        #expect(try w.decide(e, by: w.ceo).status == .pendingOwner)
+        // The requester can escalate after an internal rejection.
+        let b = try w.propose(.architecture)
+        _ = try w.decide(b, by: w.cto, approve: false, note: "no")
+        #expect(throws: WorkError.self) { try w.store.escalate(askId: b.id, by: .agent(w.cpo.id), reason: "x", now: w.now) }
+        let eb = try w.store.escalate(askId: b.id, by: .agent(w.eng.id), reason: "please reconsider", now: w.now)
+        #expect(eb.status == .pendingInternal); #expect(eb.internalApproverId == w.ceo.id)
+        // The tool path, and no CEO-covering agent left: the owner.
+        let c = try w.propose(.architecture)
+        _ = try w.store.transition(agentId: w.ceo.id, to: .killed)
+        let out = try w.tools(w.cto).call(name: "escalate_decision", arguments: ["ask": .string(c.ref), "reason": .string("stuck")])
+        #expect(out.contains("owner"))
+        #expect(try w.fresh(c).status == .pendingOwner); #expect(try w.fresh(c).escalatedAt != nil)
+    }
+
+    @Test func engineAlertAskFiledAndResolved() throws {
+        let w = try W()
+        #expect(try w.store.setHold(reason: .disk, detail: "1.0 GB free", now: w.now))
+        try EngineAlerts.raise(store: w.store, text: "Disk space is low (1.0 GB free).", now: w.now)
+        try EngineAlerts.raise(store: w.store, text: "Disk space is low (0.9 GB free).", now: w.now)
+        let alerts = try w.store.asks(companyId: w.company.id).filter { $0.kind == .engineAlert }
+        #expect(alerts.count == 1)
+        let a = try #require(alerts.first)
+        #expect(a.requesterId == "system"); #expect(a.status == .pendingOwner); #expect(a.summary.contains("Disk space is low"))
+        #expect(try w.store.ownerWaitingCount(companyId: w.company.id) == 1)
+        // The hold clears: the ask answers itself.
+        try w.store.clearHold(now: w.now, onlyIf: .disk)
+        let done = try w.fresh(a)
+        #expect(done.status == .answered); #expect(done.ownerAnswer == "resolved"); #expect(done.ownerNote == "resolved")
+        #expect(try w.store.ownerWaitingCount(companyId: w.company.id) == 0)
+        // A later hold files a new ask.
+        #expect(try w.store.setHold(reason: .account, detail: "logged out", now: w.now))
+        try EngineAlerts.raise(store: w.store, text: "Claude Code is logged out.", now: w.now)
+        let again = try w.store.asks(companyId: w.company.id).filter { $0.kind == .engineAlert }
+        #expect(again.count == 2); #expect(again.last?.status == .pendingOwner)
+        // The owner acknowledging it also closes it.
+        let ack = try w.store.acknowledge(askId: try #require(again.last).id, now: w.now)
+        #expect(ack.status == .answered)
+    }
+
+    @Test func rescindOtherNotifiesRequester() throws {
+        let w = try W()
+        let a = try w.decide(try w.propose(.other, category: "pricing"), by: w.ceo)
+        #expect(throws: WorkError.self) { try w.store.ownerRescind(askId: a.id, note: "too early", now: w.now) }   // still pending
+        let ok = try w.store.ownerDecide(askId: a.id, approve: true, note: "go", now: w.now)
+        #expect(ok.status == .approved)
+        let r = try w.store.ownerRescind(askId: a.id, note: "changed my mind", now: w.now)
+        #expect(r.status == .rescinded); #expect(r.rescindedAt == w.now)
+        #expect(try w.dms("eng-1").contains("A-1 was rescinded by the owner: changed my mind"))
+        #expect(try w.dms("ceo").contains("A-1 was rescinded by the owner: changed my mind"))
+        #expect(throws: WorkError.conflict("A-1 is already rescinded")) { try w.store.ownerRescind(askId: a.id, note: "", now: w.now) }
+        #expect(try w.activity().contains { $0.kind == .approval && $0.text.contains("A-1") && $0.text.contains("rescinded") })
+        // FYIs (policy-approved) can be rescinded too.
+        let fyi = try w.decide(try w.propose(.other, category: "tooling"), by: w.ceo)
+        #expect(fyi.status == .approved && fyi.fyi)
+        #expect(try w.store.ownerRescind(askId: fyi.id, note: "no", now: w.now).status == .rescinded)
+    }
+
+    @Test func rescindGateRegatesPendingSprintPlans() throws {
+        let w = try W()
+        let arch = try w.store.ownerDecide(askId: try w.propose(.architecture).id, approve: true, note: "", now: w.now)
+        let prd = try w.store.ownerDecide(askId: try w.propose(.prd).id, approve: true, note: "", now: w.now)
+        let plan = try w.propose(.sprintPlan)
+        #expect(plan.status == .pendingInternal)
+        // The PRD still stands in a small company, so rescinding only the architecture keeps the gate satisfied.
+        _ = try w.store.ownerRescind(askId: arch.id, note: "redo", now: w.now)
+        #expect(try w.fresh(plan).status == .pendingInternal)
+        _ = try w.store.ownerRescind(askId: prd.id, note: "redo", now: w.now)
+        let rejected = try w.fresh(plan)
+        #expect(rejected.status == .rejected)
+        #expect(try w.dms("eng-1").contains { $0.contains("A-3") && $0.contains("gate A-2 was rescinded") })
+        #expect(try !w.store.hasApproved(companyId: w.company.id, kind: .prd))
+    }
+
+    @Test func rescindReleaseTellsRollBack() throws {
+        let w = try W()
+        let rel = try w.store.ownerDecide(askId: try w.propose(.release).id, approve: true, note: "", now: w.now)
+        _ = try w.store.ownerRescind(askId: rel.id, note: "bad build", now: w.now)
+        for who in ["eng-1", "cto"] {
+            #expect(try w.dms(who).contains("Release A-1 was rescinded; roll back the release."), "\(who)")
+        }
+    }
+
     // MARK: Model context
 
     @Test func architectureApproverTurnUsesOpus() async throws {

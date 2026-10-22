@@ -148,7 +148,7 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
     private let devEnv = ["BRAHMA_DEV": "1"]
 
     @Test func inboxApproveAnswerRescindFlow() throws {
-        // The rescind step lands with Task 11b; this covers propose, decide, approve, answer, replan and autonomy.
+        // Covers propose, decide, approve, answer, replan and autonomy (rescind is in rescindFlow).
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url
         #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
@@ -255,6 +255,27 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try brahma(["--help"], home: home).stdout.contains(" dev ") == false)
     }
 
+    @Test func rescindFlow() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        #expect(try brahma(["dev", "propose", "Acme", "--by", "eng-1", "--kind", "other", "--category", "pricing", "--title", "Raise prices",
+                            "--summary", "s"], home: home, env: devEnv).status == 0)
+        // Nothing to rescind while the ask is still pending.
+        let early = try brahma(["rescind", "Acme", "A-1", "--note", "nope"], home: home)
+        #expect(early.status != 0); #expect(early.stderr.contains("A-1"))
+        #expect(try brahma(["dev", "decide", "Acme", "A-1", "--by", "ceo", "--approve", "--note", "ok"], home: home, env: devEnv).status == 0)
+        #expect(try brahma(["approve", "Acme", "A-1", "--note", "go"], home: home).stdout.contains("A-1 approved"))
+        // A note is required.
+        #expect(try brahma(["rescind", "Acme", "A-1"], home: home).status != 0)
+        let r = try brahma(["rescind", "Acme", "A-1", "--note", "market changed"], home: home)
+        #expect(r.status == 0, "\(r.stderr)"); #expect(r.stdout.contains("A-1 rescinded"))
+        let again = try brahma(["rescind", "Acme", "A-1", "--note", "x"], home: home)
+        #expect(again.status != 0); #expect(again.stderr.contains("A-1 is already rescinded"))
+        #expect(try brahma(["rescind", "Acme", "A-9", "--note", "x"], home: home).stderr.contains("no ask A-9"))
+        #expect(try brahma(["inbox", "Acme", "--all"], home: home).stdout.contains("rescinded"))
+    }
+
     @Test func ownerInboxCommandsRefuseInsideAgentTurn() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url
@@ -264,6 +285,7 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         let agentEnv = ["BRAHMA_AGENT_ID": "a1", "BRAHMA_DEV": "1"]
         let cmds: [[String]] = [
             ["approve", "Acme", "A-1"], ["approve", "Acme", "A-1", "--reject"], ["answer", "Acme", "A-1", "x"],
+            ["rescind", "Acme", "A-1", "--note", "x"],
             ["company", "autonomy", "Acme", "auto"], ["company", "auto", "Acme", "on"],
             ["dev", "propose", "Acme", "--by", "eng-1", "--kind", "prd", "--title", "T", "--summary", "s"],
             ["dev", "decide", "Acme", "A-1", "--by", "ceo", "--approve", "--note", "x"],

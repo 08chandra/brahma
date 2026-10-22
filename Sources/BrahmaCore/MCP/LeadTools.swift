@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-/// The Inbox tools: `propose_decision`, `request_from_owner`, `decide` and `request_mode`. Registered from `CompanyTools`.
+/// The Inbox tools: `propose_decision`, `request_from_owner`, `escalate_decision`, `decide` and `request_mode`. Registered from `CompanyTools`.
 /// None of them can take an owner decision: that exists only in `Store.ownerDecide` and its siblings.
 extension CompanyTools {
     static func inboxToolSpecs() -> [ToolSpec] {
@@ -42,6 +42,11 @@ extension CompanyTools {
                                           "expires_in_hours": prop("number", "Stop waiting after this many active hours"),
                                           "request_id": prop("string", "Your own id; repeating it returns the same ask")],
                                          required: ["title", "question"])),
+            ToolSpec(name: "escalate_decision", description: """
+                Send an ask to the CEO (or the owner when no one else can take it), once per ask. The internal approver can escalate \
+                a decision it cannot make; the requester can escalate after an internal rejection.
+                """, inputSchema: schema(["ask": prop("string", "Ask ref, e.g. A-3"), "reason": prop("string", "Why it needs a higher decision")],
+                                         required: ["ask", "reason"])),
             ToolSpec(name: "decide", description: "Decide an ask routed to you. You may raise its risk or move it to a reserved category, never lower them.",
                      inputSchema: schema(["ask": prop("string", "Ask ref, e.g. A-3"), "approve": prop("boolean", "true to approve, false to reject"),
                                           "note": prop("string", "Why"), "risk": prop("string", "low, medium or high (raise only)"),
@@ -64,6 +69,7 @@ extension CompanyTools {
             case "propose_decision": return try proposeDecision(args)
             case "request_from_owner": return try requestFromOwner(args)
             case "decide": return try decide(args)
+            case "escalate_decision": return try escalateDecision(args)
             case "request_mode": return try requestMode(args)
             default: return nil
             }
@@ -156,6 +162,16 @@ extension CompanyTools {
         case .rejected: return "\(done.ref) rejected; the requester has been told."
         default: return "\(done.ref) is now \(done.status.rawValue)."
         }
+    }
+
+    private func escalateDecision(_ args: [String: JSONValue]) throws -> String {
+        let ref = try text(args, "ask")
+        guard let ask = try store.ask(companyId: companyId, ref: ref) else { throw ToolError(message: "no ask \(ref)") }
+        let done = try store.escalate(askId: ask.id, by: .agent(agentId), reason: try text(args, "reason"))
+        if done.status == .pendingInternal, let id = done.internalApproverId, let target = try store.agent(id: id) {
+            return "Escalated \(done.ref) to @\(target.name)."
+        }
+        return "Escalated \(done.ref); no one else can decide it, so it waits for the owner."
     }
 
     private func requestMode(_ args: [String: JSONValue]) throws -> String {
