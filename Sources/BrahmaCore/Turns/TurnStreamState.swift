@@ -31,6 +31,12 @@ public struct TurnStreamState: Equatable, Sendable {
         toolCalls.isEmpty ? nil : StableHash.fnv1a64(toolCalls.joined(separator: "\n"))
     }
 
+    /// What the watchdog's loop guard reads from the turn.
+    public var observation: TurnObservation {
+        TurnObservation(maxRepeatedCall: TurnObservation.longestRun(toolCalls),
+                        maxRepeatedResult: TurnObservation.longestRun(toolResults), signature: toolSignature)
+    }
+
     /// Sub-agents the turn spawned: the CLI's own count when the result carries one, else the tasks seen.
     public var subagentsSpawned: Int { max(result?.subagentsSpawned ?? 0, subagentIds.count) }
 

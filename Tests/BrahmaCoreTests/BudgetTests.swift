@@ -166,9 +166,18 @@ import GRDB
     @Test func overBudgetByTurnsAndByCost() async throws {
         let b = try B()
         let item = try b.leased(tier: .s)
-        for _ in 0..<6 { try await b.turn(Self.script(Self.result(tokens: TurnUsage(inputTokens: 100), cost: 0.01))) }
+        // Each turn makes progress (a notes edit), so the watchdog (14b) stays out of it.
+        let (store, eng, clock) = (b.store, b.eng, b.w.clock)
+        func working() -> FakeTurnRunner.Script {
+            var s = Self.script(Self.result(tokens: TurnUsage(inputTokens: 100), cost: 0.01))
+            s.sideEffect = { _ in
+                _ = try store.updateWorkItem(id: item.id, by: .agent(eng.id), patch: WorkItemPatch(notes: "step \(clock.now)"), now: clock.now)
+            }
+            return s
+        }
+        for _ in 0..<6 { try await b.turn(working()) }
         #expect(try b.fresh(item).status == .inProgress, "six turns are within tier S")
-        try await b.turn(Self.script(Self.result(tokens: TurnUsage(inputTokens: 100), cost: 0.01)))
+        try await b.turn(working())
         let blocked = try b.fresh(item)
         #expect(blocked.status == .blocked)
         #expect(blocked.blockedReason?.hasPrefix("over budget: 7/6 turns") == true)

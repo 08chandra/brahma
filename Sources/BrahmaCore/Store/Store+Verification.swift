@@ -455,7 +455,7 @@ extension Store {
             case .inconclusive:
                 try run.update(db)
                 if before.inconclusive + 1 >= Self.maxInconclusive {
-                    try returnToHolder(db, item: item, run: run, holder: holder, reason: Self.infraReason, now: now)
+                    try returnToHolder(db, item: item, run: run, holder: holder, reason: Self.infraReason, counted: false, now: now)
                 } else {
                     try queueAgain(db, after: run, notBeforeActive: active + Self.inconclusiveDelay, now: now)
                 }
@@ -474,8 +474,9 @@ extension Store {
 
     /// The item goes back to `inProgress` with its lease refreshed, a `verificationFailed` event and a DM to the holder.
     /// The DM never carries output; the holder reads the check tail in its orientation.
-    private func returnToHolder(_ db: Database, item: WorkItem, run: VerificationRun, holder: String?, reason: String, now: Date,
-                                dm: String? = nil, event: String? = nil) throws {
+    /// `counted`: a real failure (not inconclusive), which counts toward the failed-check loop guard (`noteFailedCheck`).
+    private func returnToHolder(_ db: Database, item: WorkItem, run: VerificationRun, holder: String?, reason: String,
+                                counted: Bool = true, now: Date, dm: String? = nil, event: String? = nil) throws {
         // A failed re-check after the engine's rebase also ends the pending merge.
         try db.execute(sql: "UPDATE workItem SET mergeState = 'none', reviewAttempts = 0 WHERE id = ?", arguments: [item.id])
         let after = run.purpose == .merge ? " after rebase onto main" : ""
@@ -484,10 +485,12 @@ extension Store {
         try recordItemEvent(db: db, item: returned, actor: "system", kind: .verificationFailed,
                             text: event ?? "check failed\(after) (\(reason))", alsoNotify: [holder].compactMap { $0 },
                             alsoNotifyRole: .holder, now: now)
-        guard let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed else { return }
-        try MessageRouter(store: self).sendDM(
-            db: db, companyId: item.companyId, from: .system, to: agent.name,
-            text: dm ?? "\(item.key) check failed\(after) (\(reason)). See the check tail under Current work in your orientation.", now: now)
+        if let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed {
+            try MessageRouter(store: self).sendDM(
+                db: db, companyId: item.companyId, from: .system, to: agent.name,
+                text: dm ?? "\(item.key) check failed\(after) (\(reason)). See the check tail under Current work in your orientation.", now: now)
+        }
+        if counted { try noteFailedCheck(db: db, itemId: item.id, holderId: holder, now: now) }
     }
 
     /// A lease that did not run during review starts a full time-to-live again when the item comes back.

@@ -451,6 +451,7 @@ extension Store {
             sample.notes = body
             try sample.update(db)
             try resolveEngineAlerts(db, reasons: [Self.auditOverdueAlertReason(item.id)], now: now)
+            try Store.recordAuditFact(db: db, itemId: item.id, verdict: sample.verdict ?? "ok")
             try ActivityEvent(companyId: companyId, agentId: agentId, turnId: turnId, kind: .work,
                               text: "@\(actor.handle) audited \(item.key): \(ok ? "ok" : "failed")", createdAt: now).insert(db)
             guard !ok else { return sample }

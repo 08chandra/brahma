@@ -11,6 +11,8 @@ struct TurnTelemetry: Sendable, Equatable {
     var subagentsSpawned = 0
     /// Appended to the turn's `modeReason` (for example that the org's effort cap lowered the requested effort).
     var modeNote: String? = nil
+    /// The loop-guard reading of the stream (14b); nil judges the turn from its stored signature only.
+    var observation: TurnObservation? = nil
 }
 
 /// One turn's accounting, worked out inside the turn-end transaction.

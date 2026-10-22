@@ -106,6 +106,7 @@ extension Store {
         if item.firstClaimedAt == nil { item.firstClaimedAt = now; item.firstClaimedActive = active }
         item.blockedReason = nil; item.blockedSinceActive = nil
         item.stopReason = nil
+        item.failedChecksSinceClaim = 0
         item.updatedAt = now
         try item.update(db)
         let lease = WorkLease(itemId: item.id, companyId: item.companyId, agentId: agentId, acquiredAt: now,

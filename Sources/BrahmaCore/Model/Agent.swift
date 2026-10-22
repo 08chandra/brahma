@@ -50,6 +50,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var actingRole: String? = nil
     /// Set when an audit of one of the agent's auto-merged items failed (9c): its changes always get a review turn.
     public var fullReview: Bool = false
+    /// Judged work turns in a row without work-item progress (the watchdog, 14b).
+    public var turnsWithoutProgress: Int = 0
 }
 
 /// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and

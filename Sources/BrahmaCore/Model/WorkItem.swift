@@ -167,6 +167,8 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var tierSetBy: String? = nil
     /// "<id>:<role kind>" of whoever last set or edited the check: the item's last check editor.
     public var checkSpecSetBy: String? = nil
+    /// Failed (non-inconclusive) check outcomes since the latest claim; the third takes the item back (loop guard, 14b).
+    public var failedChecksSinceClaim: Int = 0
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }
