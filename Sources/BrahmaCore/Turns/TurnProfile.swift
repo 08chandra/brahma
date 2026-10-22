@@ -86,7 +86,8 @@ public enum TurnProfileCompiler {
 
 /// The environment a child process (an agent turn or a check) gets: an allowlist, never the owner's full environment.
 public enum ChildEnvironment {
-    public enum Purpose: Sendable { case claude, general }
+    /// `check` is the engine-run verification command: the `general` allowlist and no auth variables (secrets never reach it).
+    public enum Purpose: Sendable { case claude, general, check }
 
     static let allowed: Set<String> = ["PATH", "HOME", "LANG", "TERM", "USER", "LOGNAME", "SHELL", "DEVELOPER_DIR", "TMPDIR",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",

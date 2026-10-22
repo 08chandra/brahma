@@ -286,6 +286,40 @@ enum Migrations {
             // Owner-editable hot paths (JSON globs); NULL means `WorkPolicy.defaultHotPaths`.
             try db.alter(table: "ownerSettings") { t in t.add(column: "hotPaths", .text) }
         }
+        m.registerMigration("v3-verify") { db in
+            try db.create(table: "verificationRun") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("checkRevision", .integer).notNull()
+                t.column("scriptHash", .text).notNull().defaults(to: "")
+                t.column("commit", .text).notNull()
+                t.column("command", .text).notNull()
+                t.column("workingDirectory", .text).notNull().defaults(to: "")
+                t.column("timeoutSeconds", .integer).notNull()
+                t.column("purpose", .text).notNull()
+                t.column("attempt", .integer).notNull().defaults(to: 1)
+                t.column("status", .text).notNull()
+                t.column("flaky", .boolean).notNull().defaults(to: false)
+                t.column("exitCode", .integer)
+                t.column("outputPath", .text)
+                t.column("outputTail", .text)
+                t.column("requestedBy", .text)
+                t.column("notBeforeActive", .double)
+                t.column("createdAt", .datetime).notNull()
+                t.column("startedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "verificationRun_item", on: "verificationRun", columns: ["itemId"])
+            try db.create(index: "verificationRun_status", on: "verificationRun", columns: ["status"])
+            try db.create(table: "checkSnapshot") { t in
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("checkRevision", .integer).notNull()
+                t.column("dir", .text).notNull()
+                t.column("manifest", .text).notNull()
+                t.primaryKey(["itemId", "checkRevision"])
+            }
+        }
         return m
     }
 }

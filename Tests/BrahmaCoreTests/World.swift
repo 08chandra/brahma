@@ -9,17 +9,21 @@ struct World {
     let router: MessageRouter
     let clock = TestClock()
     let fake = FakeTurnRunner()
+    let checks = FakeCheckRunner()
     let paths: BrahmaPaths
     let orchestrator: Orchestrator
 
-    init(store: Store? = nil, config: SchedulerConfig = World.config()) throws {
+    init(store: Store? = nil, config: SchedulerConfig = World.config(), memory: (any MemoryPressureSource)? = nil,
+         checkEnvironment: [String: String]? = nil, checkRunner: (any CheckRunning)? = nil) throws {
         self.store = try store ?? Store.inMemory()
         try self.store.setPlanTier(.max20x)   // Plan 1 tests assume the 2/6/16 mode caps
         router = MessageRouter(store: self.store)
         let root = try tempDir()
         paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
         orchestrator = Orchestrator(store: self.store, runner: fake, paths: paths, config: config,
-                                    mcpExecutable: "/usr/local/bin/brahma", clock: clock.function)
+                                    mcpExecutable: "/usr/local/bin/brahma", clock: clock.function,
+                                    memory: memory ?? DispatchMemoryPressureSource(), checkRunner: checkRunner ?? checks,
+                                    checkBaseEnvironment: checkEnvironment ?? ProcessInfo.processInfo.environment)
     }
 
     static func config(hardCap: Int = 16, turnBudget: Int = 30) -> SchedulerConfig {

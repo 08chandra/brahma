@@ -10,6 +10,8 @@ public struct SchedulerConfig: Sendable {
     /// Weekly owner reserve (`1 - weeklyShare`); a company may override it. The orchestrator re-reads the stored
     /// share every tick.
     public var ownerReserve: Double = UsageGate.defaultReserve
+    /// Engine-run checks in flight at once. They count against the same safety cap as turns (`otherChildren`).
+    public var maxConcurrentChecks: Int = 2
 
     public init() {}
 

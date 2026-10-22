@@ -20,6 +20,9 @@ public actor Orchestrator {
     let disk: any DiskSpace
     let exec: Doctor.Exec
     let claudePath: String
+    let checkRunner: any CheckRunning
+    /// The environment engine-run checks are built from (filtered by `ChildEnvironment`, purpose `.check`).
+    let checkBaseEnvironment: [String: String]
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -30,6 +33,8 @@ public actor Orchestrator {
     var health = HealthState()
     /// Git work that must never block a tick: removing worktrees, the orphan sweep, creating a dispatched item's worktree.
     var gitTasks: [String: Task<Void, Never>] = [:]
+    /// Run id → its check task. Checks are child processes: they count in the safety cap next to turns.
+    var checkTasks: [String: Task<Void, Never>] = [:]
     /// Agents the engine has just leased an item to, until their worktree exists (they are not scheduled meanwhile).
     var dispatching = Set<String>()
     /// Items whose dispatch failed in git: not offered again before this time.
@@ -53,23 +58,28 @@ public actor Orchestrator {
                 clock: @escaping @Sendable () -> Date = { .now },
                 memory: any MemoryPressureSource = DispatchMemoryPressureSource(),
                 connectivity: any ConnectivityProbe = HTTPSProbe(), disk: any DiskSpace = SystemDiskSpace(),
-                exec: @escaping Doctor.Exec = Doctor.defaultExec, claudePath: String = "claude") {
+                exec: @escaping Doctor.Exec = Doctor.defaultExec, claudePath: String = "claude",
+                checkRunner: any CheckRunning = ProcessCheckRunner(),
+                checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
         self.mcpExecutable = mcpExecutable; self.profile = profile; self.clock = clock
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
         self.claudePath = claudePath
+        self.checkRunner = checkRunner; self.checkBaseEnvironment = checkBaseEnvironment
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
     public func start() throws {
-        _ = try store.recoverInterruptedTurns(now: clock())
+        let now = clock()
+        _ = try store.recoverInterruptedTurns(now: now)
+        try recoverChecks(now: now)
     }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
     public func waitUntilIdle(timeout: Duration) async throws {
         let deadline = ContinuousClock.now + timeout
-        while !tasks.isEmpty || !healthTasks.isEmpty || !gitTasks.isEmpty {
+        while !tasks.isEmpty || !healthTasks.isEmpty || !gitTasks.isEmpty || !checkTasks.isEmpty {
             guard ContinuousClock.now < deadline else { throw OrchestratorError.idleTimeout(running: runningCount()) }
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -81,7 +91,7 @@ public actor Orchestrator {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values)
+        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values)
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -195,7 +205,9 @@ public actor Orchestrator {
             }
         }
 
-        // 5. Select and launch.
+        // 5. Engine-run checks first (cheap, and they unblock reviews), then select and launch turns around them.
+        startChecks(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+
         infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         let ready = try store.agents(states: [.ready])
@@ -205,14 +217,15 @@ public actor Orchestrator {
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
-                                        usage: { decisions[$0.id] ?? .open }, otherChildren: 0, pressure: pressure,
+                                        usage: { decisions[$0.id] ?? .open }, otherChildren: checkTasks.count, pressure: pressure,
                                         held: held, paceClosed: paceClosed, paceStrict: paceStrict)
         for agent in selected { launch(agent, now: now) }
 
         // 6. Engine dispatch, after admission: only into the slots admission left over, and only for companies whose gate,
         //    pace and concurrency cap would let a new agent run. Leases are never reserved for agents admission would refuse.
         if !held {
-            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), pressure: pressure, held: held)
+            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: checkTasks.count,
+                                           pressure: pressure, held: held)
             var companyFree: [String: Int] = [:]
             for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id) {
                 companyFree[c.id] = max(cfg.modeCap(c.usageMode) - (runningByCompany[c.id] ?? 0), 0)

@@ -1,0 +1,118 @@
+import Foundation
+
+/// Where the engine keeps the files of a check. Only the engine writes `.brahma/checks`; the temporary detached checkouts
+/// the checks run in live under `.brahma/wt-check`. (`BrahmaPaths.checksDir` is not used for checks.)
+public struct CheckPaths: Sendable, Equatable {
+    public let workspace: URL
+
+    public init(workspace: URL) { self.workspace = workspace }
+
+    var checksRoot: URL { workspace.appending(path: ".brahma/checks", directoryHint: .isDirectory) }
+    var runWorktreesRoot: URL { workspace.appending(path: ".brahma/wt-check", directoryHint: .isDirectory) }
+
+    /// `<ws>/.brahma/checks/<KEY>/rev<n>/`: the saved copies of the check's scripts.
+    public func snapshotDir(key: String, revision: Int) -> URL {
+        checksRoot.appending(path: "\(key)/rev\(revision)", directoryHint: .isDirectory)
+    }
+
+    public func manifest(key: String, revision: Int) -> URL {
+        snapshotDir(key: key, revision: revision).appending(path: "manifest.json")
+    }
+
+    /// `<ws>/.brahma/wt-check/<runId>`: the clean detached checkout one run executes in.
+    public func runWorktree(runId: String) -> URL {
+        runWorktreesRoot.appending(path: runId, directoryHint: .isDirectory)
+    }
+}
+
+/// The scripts a check command names, and their saved baseline.
+public enum CheckScripts {
+    public static let maxFiles = 20
+
+    private static let separators: Set<Character> = [";", "&", "|", "(", ")", "<", ">"]
+
+    /// Relative regular files under `root` that the command mentions: tokens are split on whitespace and `; & | ( ) < >`,
+    /// quotes are stripped, and absolute paths, `..`, directories, symlinks and anything resolving outside `root` are
+    /// ignored. In order of first mention, at most `maxFiles`.
+    public static func referencedFiles(command: String, root: URL) -> [String] {
+        let fm = FileManager.default
+        let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
+        var seen = Set<String>(), out: [String] = []
+        var token = ""
+        func flush() {
+            defer { token = "" }
+            let t = token.filter { $0 != "'" && $0 != "\"" }
+            guard !t.isEmpty, !t.hasPrefix("/") else { return }
+            let parts = t.split(separator: "/", omittingEmptySubsequences: true).filter { $0 != "." }
+            guard !parts.isEmpty, !parts.contains("..") else { return }
+            let rel = parts.joined(separator: "/")
+            guard !seen.contains(rel), out.count < maxFiles else { return }
+            let url = root.appending(path: rel)
+            guard (try? fm.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeRegular else { return }
+            let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
+            guard resolved.hasPrefix(rootPath + "/") else { return }
+            seen.insert(rel)
+            out.append(rel)
+        }
+        for ch in command {
+            if ch.isWhitespace || separators.contains(ch) { flush() } else { token.append(ch) }
+        }
+        flush()
+        return out
+    }
+
+    /// Copies each file (relative to `from`) to the same relative path under `to`, and returns the content hash of each.
+    @discardableResult
+    public static func snapshot(files: [String], from: URL, to: URL) throws -> [String: String] {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
+        try fm.createDirectory(at: to, withIntermediateDirectories: true)
+        var manifest: [String: String] = [:]
+        for file in files {
+            let data = try Data(contentsOf: from.appending(path: file))
+            let target = to.appending(path: file)
+            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: target)
+            manifest[file] = StableHash.fnv1a64(data)
+        }
+        return manifest
+    }
+
+    /// The content hash of each file under `dir`; nil where it is missing or not a regular file.
+    public static func hashes(files: [String], in dir: URL) -> [String: String?] {
+        var out: [String: String?] = [:]
+        for file in files {
+            let url = dir.appending(path: file)
+            if (try? FileManager.default.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeRegular,
+               let data = try? Data(contentsOf: url) {
+                out[file] = StableHash.fnv1a64(data)
+            } else {
+                out[file] = .some(nil)
+            }
+        }
+        return out
+    }
+
+    /// One hash over names and contents, independent of order.
+    public static func scriptHash(_ hashes: [String: String]) -> String {
+        StableHash.fnv1a64(hashes.keys.sorted().map { "\($0)\u{0}\(hashes[$0] ?? "")" }.joined(separator: "\n"))
+    }
+
+    public static func scriptHash(_ hashes: [String: String?]) -> String {
+        scriptHash(hashes.compactMapValues { $0 })
+    }
+}
+
+/// Which paths count as tests, for spotting a weakened verification.
+public enum PathRules {
+    private static let testDirs: Set<String> = ["test", "tests", "__tests__", "spec", "specs"]
+    private static let testName = try! NSRegularExpression(
+        pattern: "(?i)(^test_.*|.*[._-](test|spec)s?\\.[a-z0-9]+$|.*Tests?\\.swift$)")
+
+    public static func isTestFile(_ path: String) -> Bool {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let name = parts.last else { return false }
+        if parts.dropLast().contains(where: { testDirs.contains($0.lowercased()) }) { return true }
+        return testName.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
+    }
+}

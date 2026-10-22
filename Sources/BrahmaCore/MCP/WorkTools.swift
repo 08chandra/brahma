@@ -60,6 +60,9 @@ extension CompanyTools {
                      inputSchema: s.schema(["key": key], required: ["key"])),
             ToolSpec(name: "release_lease", description: "Give the item back. Your work is committed to its branch and the item returns to ready.",
                      inputSchema: s.schema(["key": key, "note": s.prop("string", "Why, and where you stopped")], required: ["key"])),
+            ToolSpec(name: "submit_for_review", description: "Hand your finished work over. The engine commits your worktree, runs the item's check on that commit and, once it passes, asks the reviewer. You are notified of the result; you cannot mark the item in review or done yourself.",
+                     inputSchema: s.schema(["key": key, "summary": s.prop("string", "What you did, and anything the reviewer should look at")],
+                                           required: ["key", "summary"])),
             ToolSpec(name: "confirm_spec", description: "Vouch for an item's spec (managers and executives): its tier, priority and type then count for model selection.",
                      inputSchema: s.schema(["key": key], required: ["key"])),
         ]
@@ -83,6 +86,7 @@ extension CompanyTools {
             return "Commented on \(i.key)."
         case "claim_lease": return try claimLease(try item(args))
         case "release_lease": return try releaseLease(try item(args), note: try optString(args, "note"))
+        case "submit_for_review": return try submitForReview(try item(args), summary: try string(args, "summary"))
         case "confirm_spec":
             let i = try item(args)
             try store.confirmSpec(id: i.id, by: .agent(agentId))
@@ -341,6 +345,8 @@ extension CompanyTools {
             try git.ensureRepo()
             path = try git.addWorktree(key: target.key)
             try ProgressFile.ensure(workspace: ws, item: target)
+            // The baseline of the check's scripts, once per check revision; a reclaim keeps the first one.
+            try store.ensureCheckSnapshot(item: target, workspace: ws, root: path)
         } catch {
             // The claim is undone; nothing this call did not create is removed.
             _ = try? store.releaseLease(itemId: target.id, agentId: agentId, note: "the worktree could not be created",
@@ -366,6 +372,62 @@ extension CompanyTools {
             tail = "Its worktree could not be removed yet (\(error)); your work stays in it."
         }
         return "Released \(target.key). \(tail)"
+    }
+
+    // MARK: Submit
+
+    /// Commits the worktree, notes anything that weakens the verification (deleted, modified or renamed test files, edited
+    /// or deleted check scripts), and queues the engine's check on that commit. The agent never supplies the commit or flags.
+    private func submitForReview(_ target: WorkItem, summary: String) throws -> String {
+        // Refusals first, so nothing is committed on behalf of someone who does not hold the item.
+        guard let lease = try store.lease(itemId: target.id), lease.agentId == agentId else {
+            throw ToolError(message: "you do not hold \(target.key)")
+        }
+        guard target.status == .inProgress else {
+            throw ToolError(message: "\(target.key) is \(target.status.title.lowercased()), not in progress")
+        }
+        let git = gitWorkspace(try workspace())
+        guard git.hasCheckout(key: target.key) else {
+            throw ToolError(message: "your worktree for \(target.key) is missing; release the item and claim it again")
+        }
+        let worktree = git.worktreePath(key: target.key)
+        let branch = git.branch(key: target.key)
+        guard let commit = try git.commitAll(in: worktree, message: "\(target.key): submit round \(target.reviewRound + 1)")
+                ?? git.head(of: branch) else { throw ToolError(message: "\(target.key) has no commit to submit") }
+
+        var flags: [String] = []
+        if let base = try git.mergeBase("main", branch) {
+            let changes = try git.nameStatus(base: base, head: commit)
+            for c in changes.entries {
+                switch c.status.first {
+                case "D" where PathRules.isTestFile(c.path): flags.append("deleted test file \(c.path)")
+                case "M" where PathRules.isTestFile(c.path), "T" where PathRules.isTestFile(c.path):
+                    flags.append("modified test file \(c.path)")
+                case "R" where c.oldPath.map(PathRules.isTestFile) == true: flags.append("renamed test file \(c.oldPath ?? "?") → \(c.path)")
+                default: break
+                }
+            }
+            if changes.truncated { flags.append("change list too long to inspect (more than 2000 files)") }
+        }
+        var current: [String: String] = [:]
+        if let snapshot = try store.latestCheckSnapshot(itemId: target.id, upTo: target.checkRevision) {
+            let names = snapshot.manifest.keys.sorted()
+            let hashes = CheckScripts.hashes(files: names, in: worktree)
+            for name in names {
+                if let hash = hashes[name] ?? nil {
+                    current[name] = hash
+                    if hash != snapshot.manifest[name] { flags.append("check script modified: \(name)") }
+                } else {
+                    flags.append("check script deleted: \(name)")
+                }
+            }
+        }
+        let result = try store.submitForReview(itemId: target.id, agentId: agentId, summary: summary, flags: flags, commit: commit,
+                                               scriptHash: CheckScripts.scriptHash(current), workingDirectory: worktree.path)
+        let short = String(commit.prefix(7))
+        return result.run == nil
+            ? "Submitted \(target.key) at \(short). It has no check, so it goes straight to review."
+            : "Submitted \(target.key) at \(short). The engine is running its check; you will be notified."
     }
 
     /// `set_blocked` on a work item key. Nil when the text names no item but an agent has that handle.

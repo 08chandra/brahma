@@ -255,7 +255,15 @@ extension Store {
         }
         if let spec = patch.checkSpec {
             try spec?.validate()
-            if spec != item.checkSpec { item.checkSpec = spec; item.checkRevision += 1; checkChanged = true }
+            if spec != item.checkSpec {
+                // Once started, the check can be reshaped (and the change is flagged) but not dropped where the type needs one.
+                if spec == nil, item.everStarted, try itemType(db, item.type, company: company).requiresCheck {
+                    throw WorkError.invalid("a started \(item.type.rawValue) must keep a check; edit it instead")
+                }
+                let old = item.checkRevision
+                item.checkSpec = spec; item.checkRevision += 1; checkChanged = true
+                if item.everStarted { item.reviewFlags.append("check edited (rev \(old) → \(item.checkRevision))") }
+            }
         }
         if let paths = patch.touchPaths {
             try CheckSpec.validatePaths(paths, what: "touch")
