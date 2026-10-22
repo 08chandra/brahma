@@ -627,7 +627,8 @@ public actor Orchestrator {
         let telemetry = TurnTelemetry(
             toolSignature: state.toolSignature, workflowAgents: state.workflowAgentIds.count,
             subagentsSpawned: state.subagentsSpawned,
-            modeNote: state.effortCapRequested.map { "effort '\($0)' exceeded the org cap and was lowered" })
+            modeNote: state.effortCapRequested.map { "effort '\($0)' exceeded the org cap and was lowered" },
+            observation: state.observation)
         attempt {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
@@ -909,6 +910,7 @@ extension Store {
                                           model: use.model, tools: use.tools, cwd: use.cwd)
             }
             if closed, let cost { try Store.recordSpend(db, cost) }
+            var watchdogBlock: Blocker?
             var budgeted = completed
             if case .failed(_, _, let partial) = end, partial != nil { budgeted = true }
             if closed {
@@ -918,6 +920,12 @@ extension Store {
                 // Budget step (Task 14a): a counted work turn can take its item over its tier's budget. Review turns, session
                 // resets and infrastructure failures are never budgeted.
                 if infraClass == .none, lostScope == nil, budgeted { try budgetStep(db: db, turnId: turn.id, agent: agent, now: now) }
+                // Watchdog step (14b): completed turns (controlled stops included) are judged; infrastructure failures and session
+                // resets never are.
+                if infraClass == .none, lostScope == nil, completed {
+                    let observation = telemetry.observation ?? TurnObservation(signature: telemetry.toolSignature)
+                    watchdogBlock = try watchdogStep(db: db, turnId: turn.id, agent: agent, observation: observation, now: now)
+                }
             }
             var text = "@\(agent.name) turn \(end.outcome.rawValue)"
             if let summary, !summary.isEmpty { text += ": \(summary.prefix(200))" }
@@ -960,6 +968,9 @@ extension Store {
                 let n = agent.consecutiveFailures
                 try Store.transition(db: db, agentId: agentId, to: .blocked,
                                      blocker: .retry(until: now.addingTimeInterval(retryBackoff(failures: n)), failures: n), now: now)
+            case .succeeded where watchdogBlock != nil, .capped where watchdogBlock != nil:
+                // The watchdog took the work back: the agent waits for whoever was told.
+                try Store.transition(db: db, agentId: agentId, to: .blocked, blocker: watchdogBlock, now: now)
             case .succeeded(_, let usageHold), .capped(_, let usageHold):
                 // Anything still pending arrived mid-turn: the router saw `running` and did not wake us.
                 let senders = try String.fetchAll(db, sql: """

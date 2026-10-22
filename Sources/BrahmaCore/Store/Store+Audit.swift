@@ -255,6 +255,7 @@ extension Store {
             sample.verdict = ok ? "ok" : "failed"
             sample.notes = body
             try sample.update(db)
+            try Store.recordAuditFact(db: db, itemId: item.id, verdict: sample.verdict ?? "ok")
             try ActivityEvent(companyId: companyId, agentId: agentId, turnId: turnId, kind: .work,
                               text: "@\(actor.handle) audited \(item.key): \(ok ? "ok" : "failed")", createdAt: now).insert(db)
             guard !ok else { return sample }

@@ -44,6 +44,8 @@ public struct TurnContext {
     public var noticeIds: [Int64]
     /// Set by the orchestrator when the session starts over: the Continuity block is rendered.
     public var fresh: Bool = false
+    /// The current item's spending against its tier (`BudgetText.parts`), for the budget line.
+    public var budget: String? = nil
 
     public var scope: SessionScope { item.map { .item($0.id) } ?? .base }
 
@@ -102,6 +104,9 @@ public struct TurnContext {
             c.reviewNotes = returned.text
         }
         c.plan = events.last(where: { $0.kind == .planWritten })?.text
+        let tier = TierBudget.of(item.tier)
+        c.budget = BudgetText.parts(usage: try store.itemUsage(itemId: item.id), budget: tier, costCapLE: tier.maxCostLE + item.budgetBoostLE,
+                                    pctPerDollar: (try? store.usageCalibration())?.pctPerDollar)
         return c
     }
 }
@@ -179,6 +184,8 @@ public enum TurnDigest {
         if let until = c.leaseUntil { head += " · lease until \(ReviewDigest.clock(until, zone))" }
         out.append(head)
         out.append("Title: \(ReviewDigest.flat(item.title, max: 200))")
+        if let budget = c.budget { out.append("Budget (tier \(item.tier.label)): \(budget)") }
+        if let stopped = item.stopReason { out.append("Stopped: \(ReviewDigest.flat(stopped, max: 40))") }
         out.append("Acceptance criteria:")
         out.append(ReviewDigest.quote(item.acceptanceCriteria, maxChars: maxCriteria))
         if let spec = item.checkSpec {

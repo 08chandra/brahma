@@ -34,14 +34,14 @@ public final class Store: Sendable {
     let planBarrierOutputLimit = GitOutputLimit()
     /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
     let lifecycleObservers: [any AgentLifecycleObserver]
-    /// Called inside the transaction that completes an item (`completeItem`).
+    /// Called inside the transaction that completes an item (`completeItem`). The outcome-facts observer is always first.
     let observers: [any WorkItemObserver]
 
     public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
                 observers: [any WorkItemObserver] = []) throws {
         self.catalog = catalog
         self.lifecycleObservers = lifecycleObservers
-        self.observers = observers
+        self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
         dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
         config.busyMode = .timeout(5)
@@ -56,7 +56,7 @@ public final class Store: Sendable {
                  observers: [any WorkItemObserver]) throws {
         self.catalog = catalog
         self.lifecycleObservers = lifecycleObservers
-        self.observers = observers
+        self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
         dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)

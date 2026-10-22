@@ -542,6 +542,37 @@ enum Migrations {
             // Task 14a fix round 1: the models a turn's result billed, for the per-session model audit.
             try db.alter(table: "turn") { t in t.add(column: "modelsUsed", .text) }
         }
+        m.registerMigration("v3-facts") { db in
+            // Task 14b: the watchdog's counter, the failed-check loop guard and the per-item outcome facts.
+            try db.alter(table: "agent") { t in t.add(column: "turnsWithoutProgress", .integer).notNull().defaults(to: 0) }
+            try db.alter(table: "workItem") { t in t.add(column: "failedChecksSinceClaim", .integer).notNull().defaults(to: 0) }
+            try db.create(table: "itemFact") { t in
+                t.column("itemId", .text).primaryKey().references("workItem", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("type", .text).notNull()
+                t.column("tier", .text).notNull()
+                t.column("ownerId", .text)
+                t.column("reviewerId", .text)
+                t.column("firstPass", .boolean).notNull()
+                for c in ["verificationRuns", "failedRuns", "flakyRuns", "inconclusiveRuns", "reworkRounds", "reviewRejections",
+                          "turnsUsed", "tokensUsed", "tierMaxTurns", "tierMaxTokens", "blockedActiveSeconds", "mergeConflicts"] {
+                    t.column(c, .integer).notNull().defaults(to: 0)
+                }
+                t.column("cycleActiveSeconds", .integer)
+                t.column("checkAuthorId", .text)
+                t.column("checkAuthorRole", .text)
+                t.column("costLE", .double).notNull().defaults(to: 0)
+                t.column("tierMaxCostLE", .double).notNull().defaults(to: 0)
+                t.column("reviewCostLE", .double).notNull().defaults(to: 0)
+                t.column("autoMerged", .boolean).notNull().defaults(to: false)
+                t.column("audited", .boolean).notNull().defaults(to: false)
+                t.column("auditVerdict", .text)
+                t.column("rungAtPass", .integer)
+                t.column("modesUsed", .text)
+                t.column("completedAt", .datetime).notNull()
+            }
+            try db.create(index: "itemFact_company", on: "itemFact", columns: ["companyId", "completedAt"])
+        }
         return m
     }
 }

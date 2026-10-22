@@ -162,6 +162,8 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var stopReason: String? = nil
     /// The current approval is the engine's risk-tiered auto-approval (tier S, small diff), not a reviewer's.
     public var autoApproved: Bool = false
+    /// Failed (non-inconclusive) check outcomes since the latest claim; the third takes the item back (loop guard, 14b).
+    public var failedChecksSinceClaim: Int = 0
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }
