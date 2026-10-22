@@ -74,9 +74,10 @@ extension Store {
         try rerouteAsks(db, of: agent, company: company, now: now)
         try reassignReviews(db, of: agent, company: company, now: now)
         try releaseWork(of: agent, db: db, now: now)
-        try autoHandoffs(db, for: held, killed: agent, company: company, now: now)
         var touched = try reparentReports(db, of: agent, now: now)
         if let acting = try succeed(db, agent: agent, company: company, now: now) { touched.insert(acting) }
+        // After succession, so a root agent's hand-offs go to the acting CEO it just named.
+        try autoHandoffs(db, for: held, killed: agent, company: company, now: now)
         for managerId in touched.sorted() { try checkSpan(db, managerId: managerId, left: agent, company: company, now: now) }
         for observer in lifecycleObservers { try observer.agentKilled(agent, db: db) }
     }
@@ -137,7 +138,9 @@ extension Store {
 
     private func autoHandoffs(_ db: Database, for items: [WorkItem], killed agent: Agent, company: Company, now: Date) throws {
         guard !items.isEmpty else { return }
-        let manager = try nearestAncestor(db, of: agent, notRequester: "")
+        // Its manager; a root agent (no live ancestor) hands over to the acting CEO, else to the owner.
+        var manager = try nearestAncestor(db, of: agent, notRequester: "")
+        if manager == nil { manager = try Store.actingCEOs(db, companyId: company.id).first(where: { $0.id != agent.id }) }
         let summary = try Turn.filter(Column("agentId") == agent.id && Column("summary") != nil)
             .order(Column("startedAt").desc, Column.rowID.desc).fetchOne(db)?.summary ?? ""
         for item in items {
@@ -151,7 +154,13 @@ extension Store {
                                      toAgentId: manager?.id)
             do {
                 // The row the hand-off describes: the item as it stood while the agent held it.
-                try writeHandoff(db: db, item: item, authorId: "system", authorHandle: "system", draft: draft, auto: true, now: now)
+                let handoff = try writeHandoff(db: db, item: item, authorId: "system", authorHandle: "system", draft: draft, auto: true, now: now)
+                if manager == nil {
+                    try MessageRouter(store: self).sendDM(
+                        db: db, companyId: company.id, from: .system, to: "owner",
+                        text: "@\(agent.name) was killed and nobody manages them: \(item.key) is unassigned. Auto hand-off: \(handoff.path)",
+                        now: now)
+                }
             } catch {
                 // A workspace that cannot be written never keeps an agent from being killed.
                 try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .error,
@@ -202,14 +211,15 @@ extension Store {
         // Someone else still covers the CEO: nothing to fill.
         let ceoRoles = Set(pack?.rolesCovering("ceo") ?? [])
         if live.contains(where: { ceoRoles.contains($0.role) || $0.actingRole == "ceo" }) { return nil }
-        let ranked = live.compactMap { a in execRoles.firstIndex(of: a.role).map { (a, $0) } }.sorted { $0.1 < $1.1 }
+        // The next executive in pack order; one already at the top is preferred, so no root has to move under its own report.
+        let ranked = live.compactMap { a in execRoles.firstIndex(of: a.role).map { (a, $0) } }
+            .sorted { ($0.0.managerId == nil ? 0 : 1, $0.1) < ($1.0.managerId == nil ? 0 : 1, $1.1) }
         guard let next = ranked.first?.0 else {
             try raiseNoRoot(db, company: company, agentId: nil, detail: "@\(agent.name) left and no executive can act as CEO", now: now)
             return nil
         }
         try db.execute(sql: "UPDATE agent SET actingRole = 'ceo' WHERE id = ?", arguments: [next.id])
-        try db.execute(sql: "UPDATE agent SET managerId = ? WHERE companyId = ? AND managerId IS NULL AND id <> ? AND state <> ?",
-                       arguments: [next.id, company.id, next.id, AgentState.killed.rawValue])
+        try reparentRoots(db, companyId: company.id, under: next)
         try ActivityEvent(companyId: company.id, agentId: next.id, turnId: nil, kind: .work,
                           text: "@\(next.name) is acting CEO after @\(agent.name) left (waiting for the owner to confirm)",
                           createdAt: now).insert(db)
@@ -223,6 +233,16 @@ extension Store {
                                    text: "@\(agent.name) left the company. You are acting CEO until the owner confirms or names someone else; "
                                        + "the other top-level agents now report to you.", now: now)
         return next.id
+    }
+
+    /// Every other live top-level agent reports to `next`, except one that sits above `next` (that would be a cycle).
+    private func reparentRoots(_ db: Database, companyId: String, under next: Agent) throws {
+        let above = Set(try managerChain(db, of: next.id).map(\.id))
+        let roots = try Agent.filter(Column("companyId") == companyId && Column("managerId") == nil && Column("id") != next.id
+                                     && Column("state") != AgentState.killed.rawValue).fetchAll(db)
+        for root in roots where !above.contains(root.id) {
+            try db.execute(sql: "UPDATE agent SET managerId = ? WHERE id = ?", arguments: [next.id, root.id])
+        }
     }
 
     private func raiseNoRoot(_ db: Database, company: Company, agentId: String?, detail: String, now: Date) throws {
@@ -257,6 +277,16 @@ extension Store {
             guard agent.state != .killed else { throw OrgError.managerKilled }
             try db.execute(sql: "UPDATE agent SET actingRole = NULL WHERE companyId = ? AND actingRole = 'ceo'", arguments: [companyId])
             try db.execute(sql: "UPDATE agent SET actingRole = 'ceo' WHERE id = ?", arguments: [agentId])
+            // With no real CEO in the company the acting one is the top of the org, as in a succession: it is detached from
+            // its own manager and the other top-level agents report to it (never one that sat above it).
+            let ceoRoles = Set(catalog.pack(try requireCompany(db, companyId).packId)?.rolesCovering("ceo") ?? [])
+            let realCEO = try Agent.filter(Column("companyId") == companyId && Column("id") != agentId
+                                           && Column("state") != AgentState.killed.rawValue).fetchAll(db)
+                .contains { ceoRoles.contains($0.role) }
+            if !realCEO {
+                try db.execute(sql: "UPDATE agent SET managerId = NULL WHERE id = ?", arguments: [agentId])
+                try reparentRoots(db, companyId: companyId, under: agent)
+            }
             try db.execute(sql: "UPDATE orgIssue SET resolvedAt = ? WHERE companyId = ? AND kind = ? AND resolvedAt IS NULL",
                            arguments: [now, companyId, OrgIssueRecord.noRoot])
             let open = try Ask.filter(Column("companyId") == companyId && Column("status") == AskStatus.pendingOwner.rawValue

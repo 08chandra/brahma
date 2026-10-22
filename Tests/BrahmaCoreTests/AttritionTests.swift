@@ -59,6 +59,7 @@ import GRDB
         let moved = try #require(try w.store.ask(id: ask.id))
         #expect(moved.status == .pendingInternal); #expect(moved.internalApproverId == ceo.id)
         #expect(try w.dms("ceo").contains { $0.contains(ask.ref) })
+        #expect(try w.fresh(ceo).state == .ready)   // a sleeping approver is woken, so it gets a turn to decide
         let reviewed = try #require(try w.store.workItem(id: item.id))
         #expect(reviewed.reviewerId == mgr.id); #expect(reviewed.reviewAttempts == 0)
         // Nobody left to approve: the owner decides.
@@ -133,6 +134,101 @@ import GRDB
         // The acting CEO leaving passes the role on.
         try w.kill(cpo)
         #expect(try w.fresh(cto).actingRole == "ceo")
+    }
+
+    /// No agent is its own ancestor.
+    private func assertNoCycles(_ w: W) throws {
+        let all = try w.store.agents(companyId: w.company.id)
+        let byId = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
+        for a in all {
+            var cursor = a.managerId, steps = 0
+            while let c = cursor, steps <= 50 { cursor = byId[c]?.managerId; steps += 1 }
+            #expect(steps <= 50, "\(a.name) sits in a reporting cycle")
+        }
+    }
+
+    @Test func successionNeverCreatesACycle() throws {
+        // cpo was moved under cto: killing the CEO leaves cto at the top, so cto is the acting CEO and cpo stays under it.
+        let w = try W()
+        let ceo = try w.hire("ceo", "ceo"), cto = try w.hire("cto", "cto", manager: ceo)
+        let cpo = try w.hire("cpo", "cpo", manager: cto), eng = try w.hire("eng-1", "engineer", manager: cpo)
+        try w.kill(ceo)
+        try assertNoCycles(w)
+        #expect(try w.fresh(cto).actingRole == "ceo"); #expect(try w.fresh(cto).managerId == nil)
+        #expect(try w.fresh(cpo).managerId == cto.id); #expect(try w.fresh(eng).managerId == cpo.id)
+
+        // No executive at the top: the first executive acts, and the root above it is left where it is.
+        let v = try W()
+        let top = try v.hire("top", "ceo"), boss = try v.hire("boss", "manager", manager: top)
+        let cpo2 = try v.hire("cpo", "cpo", manager: boss), loose = try v.hire("designer-1", "designer")
+        try v.kill(top)
+        try assertNoCycles(v)
+        #expect(try v.fresh(cpo2).actingRole == "ceo"); #expect(try v.fresh(boss).managerId == nil)
+        #expect(try v.fresh(loose).managerId == cpo2.id)
+        #expect(try v.fresh(cpo2).managerId == boss.id)
+    }
+
+    @Test func namedActingCEOBecomesTheTopWithoutCycles() throws {
+        let w = try W()
+        let ceo = try w.hire("ceo", "ceo"), cto = try w.hire("cto", "cto", manager: ceo)
+        let cpo = try w.hire("cpo", "cpo", manager: cto), eng = try w.hire("eng-1", "engineer", manager: cpo)
+        try w.kill(ceo)   // cto acts
+        try w.store.setActingCEO(companyId: w.company.id, agentId: cpo.id, now: w.now)
+        try assertNoCycles(w)
+        #expect(try w.fresh(cpo).actingRole == "ceo"); #expect(try w.fresh(cto).actingRole == nil)
+        #expect(try w.fresh(cpo).managerId == nil); #expect(try w.fresh(cto).managerId == cpo.id)
+        #expect(try w.fresh(eng).managerId == cpo.id)
+        // Another top-level agent joins the named one.
+        let loose = try w.hire("designer-1", "designer")
+        try w.store.setActingCEO(companyId: w.company.id, agentId: cto.id, now: w.now)
+        try assertNoCycles(w)
+        #expect(try w.fresh(cto).managerId == nil); #expect(try w.fresh(loose).managerId == cto.id)
+        #expect(try w.fresh(cpo).managerId == cto.id)
+    }
+
+    @Test func rootAgentHandoffGoesToTheOwnerThenTheActingCEO() throws {
+        // A top-level engineer: nobody manages it, no acting CEO yet: the owner is told.
+        let w = try W()
+        let solo = try w.hire("solo-1", "engineer")
+        let item = try w.item(owner: solo)
+        try w.kill(solo)
+        let record = try #require(try w.store.latestHandoff(itemId: item.id))
+        #expect(record.auto); #expect(record.toAgentId == nil)
+        #expect(try w.dms("owner").contains { $0.contains(item.key) && $0.contains(record.path) })
+
+        // The CEO itself, with an acting CEO named by the same kill: the hand-off goes to the acting CEO.
+        let v = try W()
+        let ceo = try v.hire("ceo", "ceo"), cpo = try v.hire("cpo", "cpo", manager: ceo)
+        let held = try v.item(owner: ceo)
+        try v.kill(ceo)
+        let handoff = try #require(try v.store.latestHandoff(itemId: held.id))
+        #expect(handoff.toAgentId == cpo.id)
+        #expect(try v.fresh(cpo).state == .ready)
+    }
+
+    @Test func sleepingApproverIsWokenAndGetsATurn() async throws {
+        let world = try World()
+        let c = try world.company("Acme")
+        let ceo = try world.hire(c, "ceo", role: "ceo"), eng = try world.hire(c, "eng-1", role: "engineer")
+        let cto = try world.hire(c, "cto", role: "cto")
+        #expect(try world.agent(ceo).state == .sleeping)
+        let ask = try world.store.propose(companyId: c.id, by: .agent(eng.id), kind: .prd, title: "PRD", summary: "s", now: world.clock.now)
+        #expect(ask.internalApproverId == ceo.id)
+        #expect(try world.agent(ceo).state == .ready)
+        #expect(try world.store.hasActionableWork(agentId: ceo.id))
+        try await world.cycle()
+        #expect(try world.turns(ceo).count == 1)
+        // A rerouted ask wakes its new approver the same way (the old one is killed).
+        let second = try world.store.propose(companyId: c.id, by: .agent(eng.id), kind: .architecture, title: "A", summary: "s",
+                                             now: world.clock.now)
+        #expect(second.internalApproverId == cto.id)
+        #expect(try world.agent(ceo).state == .sleeping)
+        _ = try world.store.transition(agentId: cto.id, to: .killed, now: world.clock.now)
+        let moved = try #require(try world.store.ask(id: second.id))
+        #expect(moved.internalApproverId == ceo.id)
+        #expect(try world.agent(ceo).state == .ready)
+        try await world.cycle()
+        #expect(try world.turns(ceo).count == 2)
     }
 
     @Test func actingCEORejectedRaisesNoRoot() throws {

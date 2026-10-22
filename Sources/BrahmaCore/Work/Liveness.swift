@@ -164,7 +164,10 @@ public enum StallExplainer {
             reasons.append("\(k) \(plural(k, "item", "items")) blocked over 3 days (oldest \(key), \(age(input.oldestBlockedAge)))")
         }
         if input.readyItems > 0 {
-            reasons.append("\(input.readyItems) Ready \(plural(input.readyItems, "item", "items")) and no idle agent picked them up")
+            // With an idle agent the next dispatch pass hands them out: that is not a stall.
+            if input.idleAgents == 0 {
+                reasons.append("\(input.readyItems) Ready \(plural(input.readyItems, "item", "items")) and no idle agent picked them up")
+            }
         } else {
             reasons.append("no Ready items in the backlog")
         }

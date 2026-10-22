@@ -523,11 +523,12 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         let why = try brahma(["why", "Acme"], home: home)
         #expect(why.status == 0, "\(why.stderr)")
         #expect(why.stdout == "0 running.\nno Ready items in the backlog\n", Comment(rawValue: why.stdout))
+        #expect(try brahma(["status"], home: home).stdout.contains("  0 running: no Ready items in the backlog"))
         let add = try brahma(["items", "add", "Acme", "--title", "Parser", "--check", "true", "--ready"], home: home)
         #expect(add.status == 0, "\(add.stderr)")
+        // A Ready item and idle agents: the next dispatch pass hands it out, which is not a stall.
         let ready = try brahma(["why", "Acme"], home: home).stdout
-        #expect(ready == "0 running.\n1 Ready item and no idle agent picked them up\n", Comment(rawValue: ready))
-        #expect(try brahma(["status"], home: home).stdout.contains("  0 running: 1 Ready item and no idle agent picked them up"))
+        #expect(ready == "0 running.\n", Comment(rawValue: ready))
         #expect(try brahma(["why", "Nope"], home: home).status != 0)
         // `org acting` is an owner write.
         let acting = try brahma(["org", "acting", "Acme", "cto"], home: home)

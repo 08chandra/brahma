@@ -83,6 +83,15 @@ import GRDB
         #expect(small.reasons == ["1 ask waits for you (oldest 10m)", "1 agent blocked on @a", "no Ready items in the backlog"])
     }
 
+    @Test func readyItemsAreAStallOnlyWithoutIdleAgents() {
+        var input = StallInput()
+        input.readyItems = 2; input.idleAgents = 1
+        #expect(StallExplainer.explain(input, timeZone: Self.utc, now: Self.now).reasons.isEmpty)
+        input.idleAgents = 0
+        #expect(StallExplainer.explain(input, timeZone: Self.utc, now: Self.now).reasons
+                == ["2 Ready items and no idle agent picked them up"])
+    }
+
     @Test func explainerHoldFirst() {
         var input = StallInput()
         input.hold = StallHold(reason: "account", detail: "not logged in", since: Self.now)
