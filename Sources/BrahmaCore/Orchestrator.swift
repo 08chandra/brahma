@@ -31,6 +31,8 @@ public actor Orchestrator {
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
     var infraCooldown: [String: Date] = [:]
+    /// Companies whose weekly-pace closure has been logged (cleared when it reopens).
+    var loggedPaceClosed = Set<String>()
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -114,47 +116,48 @@ public actor Orchestrator {
             if case .agent(let id)? = a.blocker { blocking[id, default: 0] += 1 }
         }
 
-        // 3. Usage gate per company: the five-hour limits close a company to everyone; the weekly pace closes it
-        //    to everyone except agents that others are waiting on (the critical path).
+        // 3. Usage gate per company. The five-hour limits close a company to everyone and are persisted as blockers
+        //    (their reset is a fact). The weekly pace is NOT persisted: it is re-evaluated every tick and applied in
+        //    `select`, so raising the share, a company reserve or the plan tier reopens work at once and an agent that
+        //    becomes critical-path is admitted without waiting for a stored blocker to expire.
         let info = try store.latestRateLimit()
         var decisions: [String: UsageDecision] = [:]
         var paceClosed = Set<String>()
         for c in companies {
             let reserve = cfg.reserve(for: c)
             let parts = UsageGate.evaluateParts(info, mode: c.usageMode, now: now, reserve: reserve)
-            let exempt: Bool
-            let gateUntil: Date
-            let why: String
-            switch (parts.fiveHour, parts.pace) {
-            case (.closed, _):
-                guard case .closed(let u) = parts.combined else { continue }
-                decisions[c.id] = parts.combined
-                exempt = false; gateUntil = u
-                why = "usage gate closed (\(c.usageMode.rawValue) mode)"
-            case (_, .closed(let u)):
+            if case .closed(let gateUntil) = parts.fiveHour {
+                decisions[c.id] = parts.fiveHour
+                let until = Self.usageUntil(gateUntil, now: now)
+                var stopped = 0
+                for a in try store.agents(companyId: c.id, states: [.ready]) {
+                    attempt {
+                        if try store.transition(agentId: a.id, to: .blocked, blocker: .usageLimit(until: until), now: now,
+                                                if: { $0.state == .ready }) != nil { stopped += 1 }
+                    }
+                }
+                if stopped > 0 {
+                    attempt {
+                        try store.appendEvent(ActivityEvent(
+                            companyId: c.id, agentId: nil, turnId: nil, kind: .usage,
+                            text: "usage gate closed (\(c.usageMode.rawValue) mode) until \(until.ISO8601Format()); \(stopped) agent(s) waiting",
+                            createdAt: now))
+                    }
+                }
+            }
+            if case .closed(let paceUntil) = parts.pace {
                 paceClosed.insert(c.id)
-                exempt = true; gateUntil = u
-                let text = UsageGate.pace(info, reserve: reserve, now: now)?.text ?? "ahead"
-                why = "weekly pace closed (\(text), \(Int((reserve * 100).rounded()))% reserved)"
-            default:
-                continue
-            }
-            let until = Self.usageUntil(gateUntil, now: now)
-            var stopped = 0
-            for a in try store.agents(companyId: c.id, states: [.ready]) where !(exempt && (blocking[a.id] ?? 0) > 0) {
-                attempt {
-                    if try store.transition(agentId: a.id, to: .blocked, blocker: .usageLimit(until: until), now: now,
-                                            if: { $0.state == .ready }) != nil { stopped += 1 }
+                if loggedPaceClosed.insert(c.id).inserted {
+                    let text = UsageGate.pace(info, reserve: reserve, now: now)?.text ?? "ahead"
+                    attempt {
+                        try store.appendEvent(ActivityEvent(
+                            companyId: c.id, agentId: nil, turnId: nil, kind: .usage,
+                            text: "weekly pace closed (\(text), \(Int((reserve * 100).rounded()))% reserved) until about \(paceUntil.ISO8601Format()); only work others wait on runs",
+                            createdAt: now))
+                    }
                 }
             }
-            if stopped > 0 {
-                attempt {
-                    try store.appendEvent(ActivityEvent(
-                        companyId: c.id, agentId: nil, turnId: nil, kind: .usage,
-                        text: "\(why) until \(until.ISO8601Format()); \(stopped) agent(s) waiting",
-                        createdAt: now))
-                }
-            }
+            if !paceClosed.contains(c.id) { loggedPaceClosed.remove(c.id) }
         }
 
         // 4. Per-agent turn budget over the last hour (infrastructure failures don't count).
@@ -311,6 +314,11 @@ public actor Orchestrator {
         var resetSession = false
         if case .failed(let text, _) = end, agent.sessionStarted {
             resetSession = Self.isSessionNotFound([text, failure, result?.text].compactMap { $0 }.joined(separator: "\n"))
+        }
+        // An infrastructure failure puts the agent on its fixed cooldown before the turn is recorded, so there is no
+        // moment at which it is `ready` and eligible again.
+        if case .failed(_, let input?) = end, EngineHealth.classify(text: input.text, apiErrorStatus: input.status) != .none {
+            await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
         }
         var infra = InfraClass.none
         attempt {

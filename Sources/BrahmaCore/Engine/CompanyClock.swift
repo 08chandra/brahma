@@ -96,9 +96,13 @@ extension Store {
 
     /// The owner's time zone for every calendar-facing string. Persists `TimeZone.current` on first read.
     public func ownerTimeZone() -> TimeZone {
-        let id: String? = try? writer.write { db in
-            try Store.ensureOwnerSettings(db)
-            return try String.fetchOne(db, sql: "SELECT timeZone FROM ownerSettings WHERE id = 1")
+        // Read first; only a first-ever read opens a write transaction (it persists the current zone).
+        var id: String? = try? writer.read { db in try String.fetchOne(db, sql: "SELECT timeZone FROM ownerSettings WHERE id = 1") }
+        if id == nil {
+            id = try? writer.write { db in
+                try Store.ensureOwnerSettings(db)
+                return try String.fetchOne(db, sql: "SELECT timeZone FROM ownerSettings WHERE id = 1")
+            }
         }
         return id.flatMap { TimeZone(identifier: $0) } ?? .current
     }

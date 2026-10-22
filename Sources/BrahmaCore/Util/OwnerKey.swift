@@ -73,6 +73,9 @@ public enum OwnerKeyError: Error, Equatable {
     case cannotWrite(String)
     /// A hash is stored (or rotation was asked for) and the current key file does not verify against it.
     case proofRequired
+    /// Storing the new hash failed and the previous hash could not be put back: the stored hash no longer matches
+    /// the (untouched) key file. The owner must replace the key from the app.
+    case restoreFailed(String)
 }
 
 /// `<home>/owner.key`: 32 random bytes, hex, mode 0600, plus SHA-256(key) in an `OwnerKeyStore`.
@@ -99,19 +102,28 @@ public enum OwnerKey {
             // Hash first, then swap the file: if either step fails the old key file and old hash are both intact,
             // so the owner is never locked out.
             let oldHash = store.hash(for: paths)
-            func restoreHash() {
-                if let oldHash { try? store.setHash(oldHash, for: paths) } else { store.removeHash(for: paths) }
+            /// Puts the old hash back (only if the store no longer holds it); a failure here is surfaced, never swallowed.
+            func restoreHash(after cause: any Error) throws -> Never {
+                if store.hash(for: paths) != oldHash {
+                    do {
+                        if let oldHash { try store.setHash(oldHash, for: paths) } else { store.removeHash(for: paths) }
+                    } catch {
+                        throw OwnerKeyError.restoreFailed("\(cause); restoring the previous hash failed: \(error)")
+                    }
+                    if store.hash(for: paths) != oldHash {
+                        throw OwnerKeyError.restoreFailed("\(cause); the previous hash was not restored")
+                    }
+                }
+                throw cause
             }
             do { try store.setHash(SHA256.hex(key), for: paths) } catch {
                 try? FileManager.default.removeItem(at: temp)
-                restoreHash()
-                throw error
+                try restoreHash(after: error)
             }
             guard rename(temp.path, file.path) == 0 else {
                 let code = errno
                 try? FileManager.default.removeItem(at: temp)
-                restoreHash()
-                throw OwnerKeyError.cannotWrite("rename failed (errno \(code))")
+                try restoreHash(after: OwnerKeyError.cannotWrite("rename failed (errno \(code))"))
             }
             return file
         }

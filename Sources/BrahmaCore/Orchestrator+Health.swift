@@ -30,11 +30,13 @@ extension Orchestrator {
         case .none:
             if !interrupted { health.accountStreak = 0 }
         }
-        if infra != .none { infraCooldown[agentId] = now.addingTimeInterval(EngineHealth.infraCooldown) }
+        // The cooldown itself is set before the turn is recorded (`setInfraCooldown`).
+        if infra == .none { infraCooldown[agentId] = nil }
     }
 
     // MARK: Background results
 
+    func setInfraCooldown(agentId: String, until: Date) { infraCooldown[agentId] = until }
     func setVersion(_ v: String?) { health.version = v; health.versionReady = true }
     func setDoctorReport(_ r: DoctorReport) { health.doctorReport = r }
     func setDisk(_ free: Int64?) { health.minFreeBytes = free; health.diskReady = true }

@@ -38,8 +38,28 @@ public struct KeychainOwnerKeyStore: OwnerKeyStore {
         return String(data: data, encoding: .utf8)
     }
 
+    /// Never destructive: an existing item is updated in place, so a failure leaves the old hash exactly as it was.
+    /// (Deleting first and re-adding would lose the old hash whenever the add failed.)
     public func setHash(_ hash: String, for paths: BrahmaPaths) throws {
-        removeHash(for: paths)
+        let data = Data(hash.utf8)
+        let found = SecItemCopyMatching(query(paths) as CFDictionary, nil)
+        if found == errSecSuccess {
+            if SecItemUpdate(query(paths) as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecSuccess { return }
+            // The item was created by the other binary (app vs CLI) and the modern update refuses the owner edit;
+            // the legacy modify does not check the owner and also changes the data in place.
+            var q = query(paths)
+            q[kSecReturnRef as String] = true
+            q[kSecMatchLimit as String] = kSecMatchLimitOne
+            var ref: CFTypeRef?
+            guard SecItemCopyMatching(q as CFDictionary, &ref) == errSecSuccess, let ref else {
+                throw OwnerKeyError.cannotWrite("Keychain item could not be read for update")
+            }
+            let status = data.withUnsafeBytes { raw in
+                SecKeychainItemModifyAttributesAndData(ref as! SecKeychainItem, nil, UInt32(data.count), raw.baseAddress)
+            }
+            guard status == errSecSuccess else { throw OwnerKeyError.cannotWrite("Keychain update failed (OSStatus \(status))") }
+            return
+        }
         var access: SecAccess?
         guard SecAccessCreate("Brahma owner key" as CFString, nil, &access) == errSecSuccess, let access else {
             throw OwnerKeyError.cannotWrite("Keychain access list could not be created")

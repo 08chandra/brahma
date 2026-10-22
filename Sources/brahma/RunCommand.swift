@@ -61,7 +61,8 @@ struct Run: AsyncParsableCommand {
             return source
         }
 
-        print("brahma running (hard cap \(hardCap), profile \(profile.rawValue)); Ctrl-C to stop")
+        let tier = store.planTier()
+        print("brahma running (plan \(tier.rawValue), up to \(min(hardCap, tier.hardCap)) concurrent turns, profile \(profile.rawValue)); Ctrl-C to stop")
         let printing = Task {
             while !Task.isCancelled {
                 printer.drain()

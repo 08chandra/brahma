@@ -10,7 +10,12 @@ struct Status: ParsableCommand {
         for c in try store.companies() {
             let agents = try store.agents(companyId: c.id)
             let names = Dictionary(uniqueKeysWithValues: agents.map { ($0.id, $0.name) })
-            print(safe("\(c.name) [\(c.slug)]  \(c.status.rawValue)  \(c.usageMode.rawValue) mode  weight \(c.priorityWeight)"))
+            var header = "\(c.name) [\(c.slug)]  \(c.status.rawValue)  \(c.usageMode.rawValue) mode  weight \(c.priorityWeight)"
+            // A company with its own reserve is paced against that, not the owner-wide share.
+            if let reserve = c.ownerReserve, let pace = UsageGate.pace(try store.latestRateLimit(), reserve: reserve, now: Date()) {
+                header += "  7D \(pace.text) (reserve \(Int((reserve * 100).rounded()))%)"
+            }
+            print(safe(header))
             for a in agents {
                 var parts = ["  @\(a.name)", a.state.rawValue]
                 if a.paused { parts.append("paused") }

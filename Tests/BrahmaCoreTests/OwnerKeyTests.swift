@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import BrahmaCore
 import BrahmaKeychain
+import Security
 
 private func paths() throws -> BrahmaPaths {
     let d = try tempDir()
@@ -21,7 +22,65 @@ private final class FlakyOwnerKeyStore: OwnerKeyStore, @unchecked Sendable {
     func removeHash(for paths: BrahmaPaths) { inner.removeHash(for: paths) }
 }
 
+/// Models the old Keychain behavior: `setHash` deletes the stored hash and then fails to add the new one.
+private final class DeleteThenFailStore: OwnerKeyStore, @unchecked Sendable {
+    struct Failure: Error {}
+    let inner = InMemoryOwnerKeyStore()
+    nonisolated(unsafe) var failures: Int   // how many setHash calls delete-then-fail before one succeeds
+    init(failures: Int) { self.failures = failures }
+    func hash(for paths: BrahmaPaths) -> String? { inner.hash(for: paths) }
+    func setHash(_ hash: String, for paths: BrahmaPaths) throws {
+        if failures > 0 { failures -= 1; inner.removeHash(for: paths); throw Failure() }
+        try inner.setHash(hash, for: paths)
+    }
+    func removeHash(for paths: BrahmaPaths) { inner.removeHash(for: paths) }
+}
+
 @Suite struct OwnerKeyTests {
+    @Test func rotationRestoresAHashThatTheFailedWriteDeleted() throws {
+        let p = try paths(); let store = DeleteThenFailStore(failures: 0)
+        try OwnerKey.create(paths: p, store: store)
+        let before = try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8)
+        let hash = store.hash(for: p)
+        store.failures = 1       // the new write deletes the old hash and fails; the restore succeeds
+        #expect(throws: DeleteThenFailStore.Failure.self) { try OwnerKey.create(paths: p, store: store, rotate: true) }
+        #expect(store.hash(for: p) == hash, "old hash restored")
+        #expect(try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8) == before)
+        #expect(OwnerKey.verify(paths: p, store: store))
+    }
+
+    @Test func failedRestoreIsSurfacedNotSwallowed() throws {
+        let p = try paths(); let store = DeleteThenFailStore(failures: 0)
+        try OwnerKey.create(paths: p, store: store)
+        let before = try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8)
+        store.failures = 2       // the write and the restore both fail
+        do {
+            try OwnerKey.create(paths: p, store: store, rotate: true)
+            Issue.record("expected an error")
+        } catch OwnerKeyError.restoreFailed(let why) {
+            #expect(why.contains("restoring the previous hash failed"))
+        }
+        #expect(try String(contentsOf: OwnerKey.url(paths: p), encoding: .utf8) == before, "the key file is untouched")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: p.home.path).filter { $0.hasPrefix(".owner.key.") }
+        #expect(leftovers.isEmpty)
+    }
+
+    @Test func keychainWriteIsInPlace() throws {
+        let p = try paths(); let store = KeychainOwnerKeyStore()
+        defer { store.removeHash(for: p) }
+        try store.setHash("h1", for: p)
+        try store.setHash("h2", for: p)
+        try store.setHash("h3", for: p)
+        #expect(store.hash(for: p) == "h3")
+        // Exactly one item remains: the write updates rather than deleting and re-adding.
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: KeychainOwnerKeyStore.service,
+                                kSecAttrAccount as String: p.canonicalHomePath, kSecMatchLimit as String: kSecMatchLimitAll,
+                                kSecReturnAttributes as String: true]
+        var out: CFTypeRef?
+        #expect(SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess)
+        #expect((out as? [Any])?.count == 1)
+    }
+
     @Test func initNeedsProofWheneverAHashIsStored() throws {
         let p = try paths(); let store = InMemoryOwnerKeyStore()
         try OwnerKey.initForCLI(paths: p, store: store, rotate: false)   // first run: nothing stored

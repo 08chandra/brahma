@@ -184,7 +184,15 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
         func cycle() async throws { await o.tick(); try await o.waitUntilIdle(timeout: .seconds(5)) }
     }
 
-    @Test func paceClosedBlocksIdleWorkButNotTheCriticalPath() async throws {
+    private func usage(_ w: W, util: Double, fiveHour: Double = 0.1) throws {
+        let now = w.clock.now
+        try w.store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                                                fiveHourUtilization: fiveHour, sevenDayUtilization: util, observedAt: now,
+                                                fiveHourResetsAt: now.addingTimeInterval(3600),
+                                                sevenDayResetsAt: now.addingTimeInterval(3.5 * 86_400)))
+    }
+
+    @Test func paceClosedHoldsIdleWorkButNotTheCriticalPath() async throws {
         let w = try W()
         let boss = try w.store.hire(companyId: w.c.id, name: "boss", role: "engineer", model: "sonnet")
         let idle = try w.store.hire(companyId: w.c.id, name: "idle", role: "engineer", model: "sonnet")
@@ -192,14 +200,16 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
         // `waiter` is blocked on `boss`, so `boss` is on the critical path.
         _ = try w.store.transition(agentId: waiter.id, to: .blocked, blocker: .agent(boss.id), now: w.clock.now)
         for a in [boss, idle] { _ = try w.router.sendDM(companyId: w.c.id, from: .owner, to: a.name, text: "go", now: w.clock.now) }
-        let now = w.clock.now
-        try w.store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
-                                                fiveHourUtilization: 0.1, sevenDayUtilization: 0.6, observedAt: now,
-                                                sevenDayResetsAt: now.addingTimeInterval(3.5 * 86_400)))
+        try usage(w, util: 0.6)
         try await w.cycle()
         #expect(w.fake.requests.map(\.agent.name) == ["boss"])
-        guard case .usageLimit? = try w.store.agent(id: idle.id)?.blocker else { Issue.record("idle should wait for the pace"); return }
+        // Nothing is persisted for the pace: the idle agent is simply still ready.
+        #expect(try w.store.agent(id: idle.id)?.state == .ready)
+        #expect(try w.store.agent(id: idle.id)?.blocker == nil)
         #expect(try w.store.events(afterId: 0).contains { $0.text.hasPrefix("weekly pace closed (ahead by ") })
+        // Logged once, not every tick.
+        try await w.cycle(); try await w.cycle()
+        #expect(try w.store.events(afterId: 0).filter { $0.text.hasPrefix("weekly pace closed") }.count == 1)
     }
 
     @Test func fiveHourLimitStillStopsTheCriticalPath() async throws {
@@ -208,28 +218,52 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
         let waiter = try w.store.hire(companyId: w.c.id, name: "waiter", role: "engineer", model: "sonnet")
         _ = try w.store.transition(agentId: waiter.id, to: .blocked, blocker: .agent(boss.id), now: w.clock.now)
         _ = try w.router.sendDM(companyId: w.c.id, from: .owner, to: "boss", text: "go", now: w.clock.now)
-        let now = w.clock.now
-        try w.store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: now.addingTimeInterval(3600), rateLimitType: "five_hour",
-                                                isUsingOverage: false, fiveHourUtilization: 0.99, sevenDayUtilization: 0.6,
-                                                observedAt: now, fiveHourResetsAt: now.addingTimeInterval(3600),
-                                                sevenDayResetsAt: now.addingTimeInterval(3.5 * 86_400)))
+        try usage(w, util: 0.6, fiveHour: 0.99)
         try await w.cycle()
         #expect(w.fake.requests.isEmpty)
+        // The persisted blocker ends with the five-hour window, not with the (days long) pace closure.
+        guard case .usageLimit(let until)? = try w.store.agent(id: boss.id)?.blocker else { Issue.record("boss should be blocked"); return }
+        #expect(until <= w.clock.now.addingTimeInterval(3600 + 1))
     }
 
     @Test func paceReopensWhenTheShareIsRaised() async throws {
         let w = try W()
         let a = try w.store.hire(companyId: w.c.id, name: "a", role: "engineer", model: "sonnet")
         _ = try w.router.sendDM(companyId: w.c.id, from: .owner, to: "a", text: "go", now: w.clock.now)
-        let now = w.clock.now
-        // 60% used at the halfway point: closed at the default 70% share (allowed 45.5%), open at 100% share.
-        try w.store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
-                                                fiveHourUtilization: 0.1, sevenDayUtilization: 0.6, observedAt: now,
-                                                sevenDayResetsAt: now.addingTimeInterval(3.5 * 86_400)))
-        try w.store.setWeeklyShare(1.0)
+        // 60% used at the halfway point: closed at the default 70% share (allowed 45.5%).
+        try usage(w, util: 0.6)
+        try await w.cycle()
+        #expect(w.fake.requests.isEmpty, "paced")
+        try w.store.setWeeklyShare(1.0)                      // allowed becomes 65%
+        try await w.cycle()
+        #expect(w.fake.requests.count == 1, "the next tick sees the new share")
+        _ = a
+    }
+
+    @Test func companyReserveOverrideReopensToo() async throws {
+        let w = try W()
+        _ = try w.store.hire(companyId: w.c.id, name: "a", role: "engineer", model: "sonnet")
+        _ = try w.router.sendDM(companyId: w.c.id, from: .owner, to: "a", text: "go", now: w.clock.now)
+        try usage(w, util: 0.6)
+        try await w.cycle()
+        #expect(w.fake.requests.isEmpty)
+        try w.store.setOwnerReserve(companyId: w.c.id, 0.0)
         try await w.cycle()
         #expect(w.fake.requests.count == 1)
-        _ = a
+    }
+
+    @Test func becomesCriticalPathWhileBlocked() async throws {
+        let w = try W()
+        let boss = try w.store.hire(companyId: w.c.id, name: "boss", role: "engineer", model: "sonnet")
+        let waiter = try w.store.hire(companyId: w.c.id, name: "waiter", role: "engineer", model: "sonnet")
+        _ = try w.router.sendDM(companyId: w.c.id, from: .owner, to: "boss", text: "go", now: w.clock.now)
+        try usage(w, util: 0.6)
+        try await w.cycle()
+        #expect(w.fake.requests.isEmpty, "boss is idle work while the pace is closed")
+        // Now someone starts waiting on boss: it is critical path and runs on the next tick.
+        _ = try w.store.transition(agentId: waiter.id, to: .blocked, blocker: .agent(boss.id), now: w.clock.now)
+        try await w.cycle()
+        #expect(w.fake.requests.map(\.agent.name) == ["boss"])
     }
 
     @Test func planTierIsAppliedEveryTick() async throws {

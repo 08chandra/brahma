@@ -89,6 +89,22 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(s.stdout.contains("engine paused: disk — 4.0 GB free"), "\(s.stdout)")
     }
 
+    @Test func statusPacesACompanyAgainstItsOwnReserve() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let store = try Store(path: ownerPaths(home).database.path)
+        let now = Date()
+        // Halfway through the week at 30% used: on pace at the default reserve, ahead at a 0.8 reserve.
+        try store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                                              fiveHourUtilization: 0.1, sevenDayUtilization: 0.3, observedAt: now,
+                                              sevenDayResetsAt: now.addingTimeInterval(3.5 * 86_400)))
+        var s = try brahma(["status"], home: home)
+        #expect(s.stdout.contains(" · 7D on pace")); #expect(!s.stdout.contains("(reserve"))
+        #expect(try brahma(["company", "reserve", "Acme", "0.8"], home: home).status == 0)
+        s = try brahma(["status"], home: home)
+        #expect(s.stdout.contains("7D ahead by ") && s.stdout.contains("(reserve 80%)"), "\(s.stdout)")
+    }
+
     @Test func clockUsesOwnerTimeZoneInStatusLastTurn() throws {
         let owner = try OwnerTestHome(); let home = owner.url
         #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
