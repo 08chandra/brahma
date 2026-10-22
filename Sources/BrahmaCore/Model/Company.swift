@@ -29,4 +29,6 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// The head the engine is about to move `main` to, written before the move. A crash between moving `main` and recording
     /// it leaves `main` here; the guard then accepts it and records it (`Store.checkMain`).
     public var pendingMainCommit: String? = nil
+    /// The completion rule new sprints use unless the plan names one (the pack's `defaultCadence` at creation).
+    public var cadence: CadenceKind = .sprint
 }

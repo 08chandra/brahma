@@ -273,6 +273,31 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try brahma(["inbox", "Acme", "--all"], home: home).stdout.contains("FYI"))
     }
 
+    @Test func sprintShowsProgress() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        #expect(try brahma(["sprint", "Acme"], home: home).stdout == "(no open sprint)\n")
+        let store = try Store(path: ownerPaths(home).database.path)
+        let c = try #require(try store.companies().first)
+        let ceo = try #require(try store.agent(companyId: c.id, name: "ceo"))
+        let a = try store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Login"))
+        let b = try store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Signup\u{1B}[2J"))
+        let (sprint, ask) = try store.planSprint(companyId: c.id, by: .agent(ceo.id), goal: "Accounts\u{07}", itemKeys: [a.key, b.key],
+                                                 team: nil, cadence: nil, milestoneKey: nil)
+        _ = try store.ownerDecide(askId: ask.id, approve: true)
+        try store.writer.write { db in _ = try store.engineSetStatus(db: db, itemId: a.id, to: .done, text: "merged", event: .merged, now: Store.now()) }
+        let show = try brahma(["sprint", "Acme"], home: home)
+        #expect(show.status == 0, "\(show.stderr)")
+        #expect(show.stdout.hasPrefix("\(sprint.name) · company · active · 1/2 done · goal: Accounts\n"), "\(show.stdout)")
+        #expect(show.stdout.contains("  \(a.key)  Done  Login"))
+        #expect(show.stdout.contains("  \(b.key)  Ready  Signup [2J"), "control characters never reach the terminal")
+        #expect(!show.stdout.contains("\u{1B}") && !show.stdout.contains("\u{07}"))
+        let list = try brahma(["sprint", "list", "Acme"], home: home)
+        #expect(list.status == 0, "\(list.stderr)")
+        #expect(list.stdout == "\(sprint.name)  company  active  1/2  Accounts\n")
+    }
+
     @Test func inboxPrintsNoControlCharactersFromOptionLabels() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url

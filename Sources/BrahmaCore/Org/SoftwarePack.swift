@@ -68,7 +68,7 @@ public enum SoftwarePack {
 
     ## Responsibilities
     - Break approved PRD scope into epics and stories with create_work_item, each with acceptance criteria a check can verify.
-    - Own the backlog order and propose the sprint plan with propose_decision (kind sprintPlan).
+    - Own the backlog order and propose the sprint plan with plan_sprint.
     - Review designs and stories for user value before engineering starts; use comment_work_item.
     - Keep the not-doing list current and link dependencies with link_dependency.
 
@@ -146,7 +146,7 @@ public enum SoftwarePack {
     """
 
     static let ceoCpoBody = ceoBody.replacingOccurrences(of: "You are the CEO.", with: "You are the CEO & CPO (combined role).")
-        .replacingOccurrences(of: "## Collaboration\n", with: "## Collaboration\nYou also own the backlog: break approved scope into stories with create_work_item and propose the sprint plan (kind sprintPlan). ")
+        .replacingOccurrences(of: "## Collaboration\n", with: "## Collaboration\nYou also own the backlog: break approved scope into stories with create_work_item and propose the sprint plan with plan_sprint. ")
 
     static let ctoArchitectBody = ctoBody.replacingOccurrences(of: "You are the CTO.", with: "You are the CTO & Architect (combined role).")
         .replacingOccurrences(of: "## Collaboration\n", with: "## Collaboration\nYou also write the ADRs and interface contracts yourself with write_handoff and comment_work_item. ")

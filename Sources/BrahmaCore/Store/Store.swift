@@ -160,6 +160,7 @@ public final class Store: Sendable {
                 id: UUID().uuidString, name: name, slug: slug, goal: goal, workspacePath: dir.path,
                 status: .running, usageMode: .balanced, priorityWeight: 1, createdAt: createdAt,
                 packId: packId, packVersion: packVersion ?? pack.version)
+            company.cadence = CadenceKind(rawValue: pack.defaultCadence) ?? .sprint
             try company.insert(db)
             // Directory is created only after the row is in; a failure here rolls the insert back.
             let existed = FileManager.default.fileExists(atPath: dir.path)

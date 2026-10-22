@@ -154,6 +154,10 @@ public actor Orchestrator {
         // Open asks: expiry, owner reminders, internal aging and paused-approver rerouting (company-active time).
         attempt { _ = try store.sweepAsks(now: now) }
 
+        // Sprints (company-active time): timeboxes, then engine standups (system posts, no LLM turns, nobody wakes).
+        attempt { _ = try store.enforceTimeboxes(now: now) }
+        attempt { _ = try store.postStandups(now: now) }
+
         // Deadlocks and item aging, every `Liveness.scanInterval` company-active seconds (a frozen clock never rescans).
         for c in companies {
             let active = store.activeNow(companyId: c.id)

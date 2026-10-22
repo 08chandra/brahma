@@ -80,7 +80,7 @@ extension Store {
         return p
     }
 
-    private static func validTeam(_ t: String?) throws -> String? {
+    static func validTeam(_ t: String?) throws -> String? {
         guard let t else { return nil }
         let v = t.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !v.isEmpty else { return nil }
@@ -539,10 +539,11 @@ extension Store {
         return item
     }
 
-    /// Everything that follows an item becoming done, in this order: observers, agents blocked on it, the items depending on
-    /// it, then its container. Runs only from `engineSetStatus(to: .done)`, i.e. the merged path and the container rule.
+    /// Everything that follows an item becoming done, in this order: observers, its sprint's cadence, agents blocked on it, the
+    /// items depending on it, then its container. Runs only from `engineSetStatus(to: .done)`, i.e. the merged path and the container rule.
     func completeItem(db: Database, item: WorkItem, now: Date) throws {
         for observer in observers { try observer.itemCompleted(item, db: db) }
+        try sprintItemCompleted(db, item: item, now: now)
         var waiters: [String] = []
         for agent in try Agent.filter(Column("companyId") == item.companyId && Column("state") == AgentState.blocked.rawValue).fetchAll(db) {
             guard case .workItem(let id, _)? = agent.blocker, id == item.id else { continue }

@@ -1,7 +1,8 @@
 import Foundation
 import GRDB
 
-/// The Inbox tools: `propose_decision`, `request_from_owner`, `escalate_decision`, `decide` and `request_mode`. Registered from `CompanyTools`.
+/// The Inbox tools: `propose_decision`, `request_from_owner`, `escalate_decision`, `decide` and `request_mode`, and the sprint
+/// tools `plan_sprint` and `close_sprint` (managers and executives). Registered from `CompanyTools`.
 /// None of them can take an owner decision: that exists only in `Store.ownerDecide` and its siblings.
 extension CompanyTools {
     static func inboxToolSpecs() -> [ToolSpec] {
@@ -18,13 +19,32 @@ extension CompanyTools {
                                    "risk": prop("string", "What could go wrong")]),
             "required": .array([.string("label")])])
         let options: JSONValue = .object(["type": .string("array"), "items": option, "description": .string("Up to four alternatives")])
+        let keys: JSONValue = .object(["type": .string("array"), "items": .object(["type": .string("string")]),
+                                       "description": .string("Work item keys committed to the sprint, e.g. ACME-12")])
         return [
+            ToolSpec(name: "plan_sprint", description: """
+                Plan the next sprint of your team (or the company): a goal and the items committed to it. It files a sprint-plan \
+                ask; once approved, backlog items become Ready. It is done when every item is done (or, with cadence milestone, \
+                the milestone item) or after 5 active days or 200 team turns. One open sprint per team.
+                """, inputSchema: schema([
+                    "goal": prop("string", "What the sprint delivers, in one line"), "items": keys,
+                    "team": prop("string", "Team name; omit for a company-wide sprint"),
+                    "cadence": prop("string", "sprint (default: all items done) or milestone"),
+                    "milestone_key": prop("string", "With cadence milestone: the item whose completion ends the sprint"),
+                ], required: ["goal", "items"])),
+            ToolSpec(name: "close_sprint", description: """
+                Close a sprint that is complete or reached its timebox: the review summary (what shipped, what slipped and why) \
+                and the retro lessons, which go into the team's notes file. Unfinished items carry over to the backlog.
+                """, inputSchema: schema([
+                    "sprint": prop("string", "Sprint, e.g. Sprint 3"), "summary": prop("string", "Review summary"),
+                    "lessons": prop("string", "Retro lessons, one per line"),
+                ], required: ["sprint", "summary", "lessons"])),
             ToolSpec(name: "propose_decision", description: """
-                File a decision for approval: a PRD, an architecture, a sprint plan, a release, or any other choice. \
+                File a decision for approval: a PRD, an architecture, a release, or any other choice (sprint plans use plan_sprint). \
                 Write it as a brief: stakes in plain language, your recommendation, up to four options, whether it is \
                 reversible, and the exact proposal. Mechanical matters are recorded without an approval.
                 """, inputSchema: schema([
-                    "kind": prop("string", "prd, architecture, sprintPlan, release or other"),
+                    "kind": prop("string", "prd, architecture, release or other"),
                     "title": prop("string", "One line"), "summary": prop("string", "What and why"),
                     "category": prop("string", "Required for other: e.g. general, tooling, pricing, legal"),
                     "risk": prop("string", "low, medium or high"),
@@ -71,6 +91,8 @@ extension CompanyTools {
             case "decide": return try decide(args)
             case "escalate_decision": return try escalateDecision(args)
             case "request_mode": return try requestMode(args)
+            case "plan_sprint": return try planSprint(args)
+            case "close_sprint": return try closeSprint(args)
             default: return nil
             }
         } catch let e as WorkError {
@@ -84,7 +106,10 @@ extension CompanyTools {
 
     private func proposeDecision(_ args: [String: JSONValue]) throws -> String {
         let kindName = try text(args, "kind")
-        let allowed: [AskKind] = [.prd, .architecture, .sprintPlan, .release, .other]
+        if kindName.lowercased() == AskKind.sprintPlan.rawValue.lowercased() {
+            throw ToolError(message: "sprint plans are filed with plan_sprint")
+        }
+        let allowed: [AskKind] = [.prd, .architecture, .release, .other]
         guard let kind = allowed.first(where: { $0.rawValue.lowercased() == kindName.lowercased() }) else {
             throw ToolError(message: "kind must be one of: \(allowed.map(\.rawValue).joined(separator: ", "))")
         }
@@ -172,6 +197,28 @@ extension CompanyTools {
             return "Escalated \(done.ref) to @\(target.name)."
         }
         return "Escalated \(done.ref); no one else can decide it, so it waits for the owner."
+    }
+
+    private func planSprint(_ args: [String: JSONValue]) throws -> String {
+        let cadence = try optionalText(args, "cadence").map { c -> CadenceKind in
+            guard let v = CadenceKind(rawValue: c.lowercased()) else { throw ToolError(message: "cadence must be sprint or milestone") }
+            return v
+        }
+        let (sprint, ask) = try store.planSprint(companyId: companyId, by: .agent(agentId), goal: try text(args, "goal"),
+                                                 itemKeys: try stringArray(args, "items"), team: try optionalText(args, "team"),
+                                                 cadence: cadence, milestoneKey: try optionalText(args, "milestone_key"))
+        var waitingOn = "owner"
+        if ask.status == .pendingInternal, let id = ask.internalApproverId, let approver = try store.agent(id: id) { waitingOn = approver.name }
+        return "Planned \(sprint.name) (\(ask.ref)); waiting on @\(waitingOn)."
+    }
+
+    private func closeSprint(_ args: [String: JSONValue]) throws -> String {
+        let ref = try text(args, "sprint")
+        guard let sprint = try store.sprint(companyId: companyId, ref: ref) else { throw ToolError(message: "no sprint \(Store.flat(ref, max: 40))") }
+        let closed = try store.closeSprint(sprintId: sprint.id, by: .agent(agentId), summary: try text(args, "summary"),
+                                           lessons: try optionalText(args, "lessons") ?? "")
+        let head = closed.summary?.components(separatedBy: "\n").first ?? closed.name
+        return head + " Posted to #general; lessons added to the team's notes."
     }
 
     private func requestMode(_ args: [String: JSONValue]) throws -> String {
