@@ -1023,20 +1023,20 @@ import GRDB
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let before = try r.mainHead()
-        // A stale lock on main: every attempt to move it fails, whichever item is at the head of the queue.
+        // A lock on main that something other than Brahma holds right now: every attempt to move main fails.
         let lock = r.root.appending(path: ".git/refs/heads/main.lock")
         try "".write(to: lock, atomically: true, encoding: .utf8)
-        try await r.cycle()
-        // The first two faults are nobody's fault but the company's.
-        r.world.clock.advance(61)
         try await r.cycle()
         func failures() async throws -> Int {
             try await r.store.writer.read { db -> Int in
                 try Int.fetchOne(db, sql: "SELECT failures FROM itemMerge WHERE itemId = ?", arguments: [a.id]) ?? 0
             }
         }
+        let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
+        r.world.clock.advance(61)
+        try await r.cycle()
         #expect(try await failures() == 0, "no strike for the company's own faults")
-        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id)) }.isEmpty)
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
         r.world.clock.advance(61)
         try await r.cycle()
         #expect(try r.mainHead() == before)
@@ -1044,33 +1044,68 @@ import GRDB
         let held = try r.fresh(a)
         #expect(held.status == .inReview); #expect(held.mergeState == .pending); #expect(held.verifiedCommit != nil)
         #expect(try r.events(a, .mergeFailed).isEmpty, "the item is not returned for the company's fault")
-        // The owner hears about the held merges once; it clears when a merge lands.
-        let reason = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
-        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == reason }.count == 1)
-        try FileManager.default.removeItem(at: lock)
+        #expect(try await failures() == 0)
+        // The owner hears about the held merges once.
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.count == 1)
+        // The lock is left behind (nobody holds it any more): agent-writable state that blocks merges is cleaned up, the
+        // owner is told, and the item lands.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-3600)], ofItemAtPath: lock.path)
         r.world.clock.advance(61)
         let done = try await r.drive(a)
         #expect(done.status == .done)
-        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == reason }.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: lock.path))
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
+        let tamper = Store.engineAlertKey("mergetamper:\(r.company.id)")
+        let cleaned = try r.alerts().filter { $0.subjectId == tamper }
+        #expect(cleaned.count == 1); #expect(cleaned.first?.summary.contains("refs/heads/main.lock") == true)
     }
 
-    @Test func aCompanyFaultThatNeverClearsStrikesTheHeadOfTheQueue() async throws {
-        let r = try R()
+    @Test func aCompanyFaultThatNeverClearsHoldsTheQueueWithoutStrikes() async throws {
+        // A store with a data home of its own, so the engine's merge directory is this test's alone.
+        let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let r = try R(store: try Store(path: home.appending(path: "brahma.db").path))
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let before = try r.mainHead()
-        let lock = r.root.appending(path: ".git/refs/heads/main.lock")
-        try "".write(to: lock, atomically: true, encoding: .utf8)
-        try await r.cycle()
-        // Faults 1 and 2 strike nothing; from the third on each one is a strike, and the third strike returns the item.
-        for _ in 0..<(Store.maxMergeFailures + Store.maxMergeFailures - 1) {
+        let verified = try #require(try r.fresh(a).verifiedCommit)
+        // The engine's own merge repository cannot be made (its parent directory is a file): the company's fault, forever.
+        let parent = r.store.gitWorkspace(root: r.root, companyId: r.company.id).mergeDirectory.deletingLastPathComponent()
+        try #require(parent.path.hasPrefix(home.path))
+        if FileManager.default.fileExists(atPath: parent.path) { try FileManager.default.removeItem(at: parent) }
+        try FileManager.default.createDirectory(at: parent.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "blocked".write(to: parent, atomically: true, encoding: .utf8)
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")     // its check's tick is a's first attempt
+        for _ in 0..<(3 * Store.maxMergeFailures) {
             r.world.clock.advance(61)
             try await r.cycle()
         }
         #expect(try r.mainHead() == before)
-        let back = try r.fresh(a)
-        #expect(back.status == .inProgress); #expect(back.mergeState == .none); #expect(back.verifiedCommit == nil)
-        #expect(try r.events(a, .mergeFailed).count == 1)
-        try FileManager.default.removeItem(at: lock)
+        for i in [a, b] {
+            let held = try r.fresh(i)
+            #expect(held.status == .inReview); #expect(held.mergeState == .pending); #expect(held.verifiedCommit != nil)
+            #expect(try r.events(i, .mergeFailed).isEmpty, "an item is never struck for the company's fault")
+        }
+        #expect(try r.fresh(a).verifiedCommit == verified, "approval and verified commit are intact")
+        let strikes = try await r.store.writer.read { db in try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(failures), 0) FROM itemMerge") ?? 0 }
+        #expect(strikes == 0)
+        let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.count == 1, "one owner alert for the held queue")
+        // Once the fault clears the queue moves again, in order.
+        try FileManager.default.removeItem(at: parent)
+        r.world.clock.advance(61)
+        #expect(try await r.drive(a).status == .done)
+        #expect(try await r.drive(b).status == .done)
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
+    }
+
+    @Test func theGitVersionIsRecordedAtStartUp() async throws {
+        let r = try R()
+        try r.store.recoverMerges()
+        // "git version 2.52.0" (Apple's git appends a parenthesised build).
+        let words = try GitFixture.plainGit(["--version"], in: r.root).split(separator: " ").map(String.init)
+        let version = try #require(words.dropFirst(2).first)
+        let lines = try r.store.events(afterId: 0, companyId: r.company.id).map(\.text)
+        #expect(lines.contains { $0.contains("git \(version)") && $0.contains("2.42") }, "\(lines)")
     }
 
     @Test func crashAfterMovingMainIsRecovered() async throws {

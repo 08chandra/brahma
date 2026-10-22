@@ -75,8 +75,8 @@ struct GitCommand: Sendable {
     /// The empty tree of a SHA-1 repository (git knows it without the object being stored).
     static let emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-    /// The installed git's version as `(major, minor)`, read once; nil when it cannot be read.
-    static let gitVersion: (major: Int, minor: Int)? = {
+    /// The installed git's version as `git --version` prints it (`2.52.0`), read once; nil when it cannot be read.
+    static let gitVersionText: String? = {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["git", "--version"]
@@ -88,9 +88,15 @@ struct GitCommand: Sendable {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         let text = String(decoding: data, as: UTF8.self)
-        guard let match = text.range(of: "[0-9]+\\.[0-9]+", options: .regularExpression) else { return nil }
-        let parts = text[match].split(separator: ".").compactMap { Int($0) }
-        return parts.count == 2 ? (parts[0], parts[1]) : nil
+        guard process.terminationStatus == 0, let match = text.range(of: "[0-9]+\\.[0-9]+(\\.[0-9]+)?", options: .regularExpression)
+        else { return nil }
+        return String(text[match])
+    }()
+
+    /// The installed git's version as `(major, minor)`; nil when it cannot be read.
+    static let gitVersion: (major: Int, minor: Int)? = {
+        guard let parts = gitVersionText?.split(separator: ".").compactMap({ Int($0) }), parts.count >= 2 else { return nil }
+        return (parts[0], parts[1])
     }()
 
     /// `GIT_ATTR_SOURCE` needs git 2.42 (earlier versions misread it in some commands). Where it is missing, work that
@@ -220,8 +226,9 @@ public struct GitWorkspace: Sendable {
     /// Where the per-item lock files live. Must not be a place agents can write; the default is a per-workspace directory
     /// under the system temporary directory.
     public let lockDirectory: URL
-    /// Where the engine's own merge checkout lives (`<mergeDirectory>/.merge`). Must not be a place agents can write (a
-    /// leaseholder is given `<ws>/.brahma`); the store uses `<home>/run/merge/<companyId>`.
+    /// The base of the engine's own merge repository (`<mergeDirectory>.git`, its working tree `<mergeDirectory>-wt`, its
+    /// bundles and exports). Must not be a place agents can write (a leaseholder is given `<ws>/.brahma`); the store uses
+    /// `<home>/run/merge/<companyId>`.
     public let mergeDirectory: URL
     /// How long to wait for an item's lock before giving up on it (the caller skips the item this pass).
     public var lockTimeout: TimeInterval = 10
@@ -490,7 +497,7 @@ public struct GitWorkspace: Sendable {
         case conflict(files: [String], mergeBase: String, mainHead: String)
     }
 
-    /// Where the engine's own repository for merge work lives (see `engineRepository`): `<mergeDirectory>.git`, i.e.
+    /// Where the engine's own repository for merge work lives (see `freshEngineRepository`): `<mergeDirectory>.git`, i.e.
     /// `<home>/run/merge/<companyId>.git`. Nothing in it is ever read from the workspace and no agent is given a path to it.
     var mergeRepositoryPath: URL { URL(fileURLWithPath: mergeDirectory.path + ".git", isDirectory: true) }
     /// The engine repository's private working tree, `<home>/run/merge/<companyId>-wt`.
@@ -512,92 +519,107 @@ public struct GitWorkspace: Sendable {
     ]
 
     /// Lands exactly `verified`, never whatever the branch or the author's worktree holds, inside one critical section (the
-    /// item's lock, then main's). Every commit it names is the SHA read under those locks, never a live ref:
-    /// 1. `refs/heads/item/<KEY>` must still be `verified` and `refs/heads/main` must be `expectedMain` (`mainHead`);
-    /// 2. all merge work happens in the engine's own repository (`engineRepository`): only `verified` and `mainHead` are
-    ///    fetched into it from the workspace, by SHA (no refs, no tags, nothing from `refs/replace`), and nothing in the
-    ///    workspace's config, attributes, hooks or admin directories is consulted;
-    /// 3. a `verified` already in `main` is `alreadyLanded`;
-    /// 4. a `verified` that descends from `mainHead` is fast-forwarded: `recordPending(verified)` runs first, then a
+    /// item's lock, then main's, then the engine repository's). Every commit it names is the SHA read under those locks, never
+    /// a live ref:
+    /// 1. git lock files in the workspace repository that nobody has held for `staleLockAge` (agent-writable state that would
+    ///    block the merge) are removed and reported through `tamper`;
+    /// 2. `refs/heads/item/<KEY>` must still be `verified` and `refs/heads/main` must be `expectedMain` (`mainHead`);
+    /// 3. all merge work happens in the engine's own repository, made afresh for this landing (`freshEngineRepository`): only
+    ///    `mainHead` and `verified` are fetched into it from the workspace, by SHA, fsck'd, over the local file transport only
+    ///    (no refs, no tags, nothing from `refs/replace`), and nothing in the workspace's config, attributes, hooks or admin
+    ///    directories is consulted. Its config and attributes are written again right before the rebase and the merge-tree;
+    /// 4. a `verified` already in `main` is `alreadyLanded`;
+    /// 5. a `verified` that descends from `mainHead` is fast-forwarded: `recordPending(verified)` runs first, then a
     ///    compare-and-swap `update-ref` of the workspace's `refs/heads/main`, then the root checkout follows;
-    /// 5. otherwise `git rebase --onto <mainHead> <merge base> <verified>` runs in the engine repository, after the engine
-    ///    itself has cleared any rebase state there (it never runs `rebase --abort`). The result `R` is accepted only when
-    ///    `main` is still `mainHead`, `mainHead` is an ancestor of `R`, `R` has as many commits on `mainHead` as `verified` has
-    ///    (merges aside) on the merge base, and `R`'s tree is the tree of `git merge-tree --write-tree --merge-base=<base>
-    ///    <mainHead> <verified>`. Then `R` is fetched back into the workspace and its branch moved (compare-and-swap) to `R`.
-    ///    `main` does not move.
+    /// 6. otherwise `git rebase --onto <mainHead> <merge base> <verified>` runs in the engine repository (it never runs
+    ///    `rebase --abort`; the engine clears rebase state itself). The result `R` is accepted only when `main` is still
+    ///    `mainHead`, `mainHead` is an ancestor of `R`, `R` has as many commits on `mainHead` as `verified` has (merges aside)
+    ///    on the merge base, and `R`'s tree is the tree of `git merge-tree --write-tree --merge-base=<base> <mainHead>
+    ///    <verified>`. Then `R`'s objects are handed to the workspace as a bundle (`handBack`: no transport) and its branch is
+    ///    moved (compare-and-swap) to `R`. `main` does not move.
     ///
-    /// Failures are the company's (`MergeInfrastructureError`) only when they are the engine's own steps: the locks, reading
-    /// and moving the workspace's refs, creating and updating the engine repository, handing a result back to the workspace.
-    /// A commit git cannot fetch, check out, rebase or merge, a branch with no history in common with `main` and a result that
-    /// fails its checks fail as `GitError`: they count against the item.
-    func landVerified(key: String, verified: String, expectedMain: String, recordPending: (String) throws -> Void) throws -> LandOutcome {
+    /// Failures are the company's (`MergeInfrastructureError`) when they are the engine's own steps or main's: the locks,
+    /// reading and moving the workspace's refs, making and steering the engine repository, a shallow workspace, `main`'s
+    /// history that cannot be fetched, handing a result back to the workspace. A verified commit git cannot fetch (fsck
+    /// refuses it, an object is missing), check out, rebase or merge, a branch with no history in common with `main` and a
+    /// result that fails its checks fail as `GitError`: they count against the item.
+    func landVerified(key: String, verified: String, expectedMain: String, recordPending: (String) throws -> Void,
+                      tamper: ([String]) -> Void = { _ in }) throws -> LandOutcome {
         try Self.validKey(key); try Self.validCommit(verified); try Self.validCommit(expectedMain)
         return try withKeyLock(key, infrastructure: true) {
             try withMainLock(infrastructure: true) {
+                let removed = try MergeInfrastructureError.wrapping { try clearStaleWorkspaceLocks(key: key) }
+                if !removed.isEmpty { tamper(removed) }
                 let branchHead = try MergeInfrastructureError.wrapping { try head(of: branchRef(key: key)) }
                 guard branchHead == verified else { return .branchMoved(head: branchHead) }
                 let mainHead = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
                 guard let mainHead, mainHead == expectedMain else { return .mainMoved(head: mainHead) }
-                let git = try MergeInfrastructureError.wrapping { () throws -> GitCommand in
-                    let git = try engineRepository()
-                    retireWorkspaceMergeCheckouts()
-                    try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: mainHead)
-                    return git
+                return try withEngineLock {
+                    try landLocked(key: key, verified: verified, mainHead: mainHead, recordPending: recordPending)
                 }
-                try fetchIntoEngine(git, commits: [verified, mainHead])
-                if try Self.isAncestor(git, verified, of: mainHead) { return .alreadyLanded(mainHead: mainHead) }
-                guard let base = try Self.mergeBase(git, mainHead, verified) else {
-                    throw GitError.failed(command: "merge-base", status: -1, stderr: "item/\(key) shares no history with main")
-                }
-                if base == mainHead {
-                    try MergeInfrastructureError.wrapping { try moveMainLocked(from: mainHead, to: verified, recordPending: recordPending) }
-                    return .fastForwarded(mainHead: verified)
-                }
-                try git.run(["checkout", "--quiet", "--force", "--detach", verified])
-                try git.run(["clean", "-ffdx", "--quiet"])
-                rebaseProbe?(.before)
-                let out = try git.run(Self.rebaseConfig + [
-                    "rebase", "--quiet", "--no-update-refs", "--no-autostash", "--no-autosquash", "--reapply-cherry-picks",
-                    "--empty=keep", "--no-fork-point", "--onto", mainHead, base, verified,
-                ], allowFailure: true)
-                rebaseProbe?(.after)
-                guard out.status == 0 else {
-                    let listing = try git.run(["diff", "--name-only", "-z", "--diff-filter=U"], allowFailure: true)
-                    let files = String(decoding: listing.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
-                    try MergeInfrastructureError.wrapping { try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: mainHead) }
-                    _ = try? git.run(["checkout", "--quiet", "--force", "--detach", mainHead], allowFailure: true)
-                    let nowMain = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
-                    guard nowMain == mainHead else { return .mainMoved(head: nowMain) }
-                    if files.isEmpty {
-                        // Not a conflict: git could not rebase at all.
-                        throw GitError.failed(command: "rebase --onto \(mainHead.prefix(7))", status: out.status, stderr: String(out.stderr.prefix(2000)))
-                    }
-                    return .conflict(files: files, mergeBase: base, mainHead: mainHead)
-                }
-                // HEAD is read once and from then on only that SHA is used; the checks below decide whether it is the merge.
-                let rebased = try git.run(["rev-parse", "--verify", "HEAD^{commit}"]).text
-                try Self.validCommit(rebased)
-                try MergeInfrastructureError.wrapping { try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: rebased) }
-                let nowMain = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
-                guard nowMain == mainHead else { return .mainMoved(head: nowMain) }
-                try checkRebase(git, rebased, of: verified, base: base, onto: mainHead, key: key)
-                // The result object goes back into the workspace (by SHA, from the engine's own repository); the branch then
-                // carries what will be checked and landed. An author who moved it meanwhile wins nothing.
-                let moved = try MergeInfrastructureError.wrapping { () throws -> GitCommand.Output in
-                    try fetchFromEngine(commit: rebased)
-                    return try main.run(["update-ref", branchRef(key: key), rebased, verified], allowFailure: true)
-                }
-                guard moved.status == 0 else { return .branchMoved(head: try MergeInfrastructureError.wrapping { try head(of: branchRef(key: key)) }) }
-                syncItemCheckout(key: key, to: rebased)
-                return .rebased(head: rebased)
             }
         }
     }
 
+    /// `landVerified` from step 3 on; the caller holds the item's, main's and the engine repository's locks.
+    private func landLocked(key: String, verified: String, mainHead: String, recordPending: (String) throws -> Void) throws -> LandOutcome {
+        let git = try MergeInfrastructureError.wrapping { () throws -> GitCommand in
+            let git = try freshEngineRepository()
+            retireWorkspaceMergeCheckouts()
+            return git
+        }
+        try fetchLandingInputs(git, mainHead: mainHead, verified: verified)
+        if try Self.isAncestor(git, verified, of: mainHead) { return .alreadyLanded(mainHead: mainHead) }
+        guard let base = try Self.mergeBase(git, mainHead, verified) else {
+            throw GitError.failed(command: "merge-base", status: -1, stderr: "item/\(key) shares no history with main")
+        }
+        if base == mainHead {
+            try MergeInfrastructureError.wrapping { try moveMainLocked(from: mainHead, to: verified, recordPending: recordPending) }
+            return .fastForwarded(mainHead: verified)
+        }
+        try git.run(["checkout", "--quiet", "--force", "--detach", verified])
+        try git.run(["clean", "-ffdx", "--quiet"])
+        try MergeInfrastructureError.wrapping { try assertEngineState() }
+        rebaseProbe?(.before)
+        let out = try git.run(Self.rebaseConfig + [
+            "rebase", "--quiet", "--no-update-refs", "--no-autostash", "--no-autosquash", "--reapply-cherry-picks",
+            "--empty=keep", "--no-fork-point", "--onto", mainHead, base, verified,
+        ], allowFailure: true)
+        rebaseProbe?(.after)
+        guard out.status == 0 else {
+            let listing = try git.run(["diff", "--name-only", "-z", "--diff-filter=U"], allowFailure: true)
+            let files = String(decoding: listing.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
+            try MergeInfrastructureError.wrapping { try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: mainHead) }
+            _ = try? git.run(["checkout", "--quiet", "--force", "--detach", mainHead], allowFailure: true)
+            let nowMain = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
+            guard nowMain == mainHead else { return .mainMoved(head: nowMain) }
+            if files.isEmpty {
+                // Not a conflict: git could not rebase at all.
+                throw GitError.failed(command: "rebase --onto \(mainHead.prefix(7))", status: out.status, stderr: String(out.stderr.prefix(2000)))
+            }
+            return .conflict(files: files, mergeBase: base, mainHead: mainHead)
+        }
+        // HEAD is read once and from then on only that SHA is used; the checks below decide whether it is the merge.
+        let rebased = try git.run(["rev-parse", "--verify", "HEAD^{commit}"]).text
+        try Self.validCommit(rebased)
+        try MergeInfrastructureError.wrapping { try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: rebased) }
+        let nowMain = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
+        guard nowMain == mainHead else { return .mainMoved(head: nowMain) }
+        try checkRebase(git, rebased, of: verified, base: base, onto: mainHead, key: key)
+        // The result's objects go back into the workspace (a bundle made by the engine's own repository); the branch then
+        // carries what will be checked and landed. An author who moved it meanwhile wins nothing.
+        let moved = try MergeInfrastructureError.wrapping { () throws -> GitCommand.Output in
+            try handBack(git, result: rebased, prerequisites: [mainHead, verified])
+            return try main.run(["update-ref", branchRef(key: key), rebased, verified], allowFailure: true)
+        }
+        guard moved.status == 0 else { return .branchMoved(head: try MergeInfrastructureError.wrapping { try head(of: branchRef(key: key)) }) }
+        syncItemCheckout(key: key, to: rebased)
+        return .rebased(head: rebased)
+    }
+
     /// Throws unless `rebased` is exactly `verified` replayed on `onto`: `onto` is its ancestor, it adds as many commits as
     /// `verified` has (merges aside) since `base`, and its tree is what git merges `base..verified` into `onto` to. Everything
-    /// is asked of the engine repository.
+    /// is asked of the engine repository (whose config and attributes are written again right before the merge-tree).
     private func checkRebase(_ git: GitCommand, _ rebased: String, of verified: String, base: String, onto: String, key: String) throws {
         func refuse(_ why: String) -> GitError {
             GitError.failed(command: "rebase item/\(key)", status: -1, stderr: "the rebased commit \(rebased.prefix(7)) \(why); nothing was moved")
@@ -606,6 +628,7 @@ public struct GitWorkspace: Sendable {
         let added = try git.run(["rev-list", "--count", "\(onto)..\(rebased)"]).text
         let carried = try git.run(["rev-list", "--count", "--no-merges", "\(base)..\(verified)"]).text
         guard let a = Int(added), let c = Int(carried), a == c else { throw refuse("adds \(added) commits where the verified work has \(carried)") }
+        try MergeInfrastructureError.wrapping { try assertEngineState() }
         let merged = try git.run(["merge-tree", "--write-tree", "--merge-base=\(base)", onto, verified], allowFailure: true)
         let tree = String(merged.text.split(separator: "\n").first ?? "")
         guard merged.status == 0, tree.range(of: "^[0-9a-f]{40,64}$", options: .regularExpression) != nil else {
@@ -658,8 +681,8 @@ public struct GitWorkspace: Sendable {
         _ = try? git.run(["clean", "-fd", "--quiet"], allowFailure: true)
     }
 
-    /// Removes every in-progress operation's state from the merge checkout's admin directory (the engine's own rebase, or one
-    /// an agent planted) without asking git to undo it, and points its `HEAD` straight at `commit` (detached).
+    /// Removes every in-progress operation's state from the merge repository's git dir (the engine's own rebase, or one
+    /// planted there) without asking git to undo it, and points its `HEAD` straight at `commit` (detached).
     private static func clearMergeState(admin: URL, detachAt commit: String) throws {
         let fm = FileManager.default
         for name in ["rebase-merge", "rebase-apply", "sequencer", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_RR",
@@ -673,44 +696,95 @@ public struct GitWorkspace: Sendable {
         try (commit + "\n").write(to: head, atomically: true, encoding: .utf8)
     }
 
+    // MARK: Agent-writable state that blocks a merge
+
+    /// A git lock file nobody has touched for this long is left behind, not held: git holds its locks for milliseconds.
+    static let staleLockAge: TimeInterval = 30
+
+    /// Removes the lock files of the workspace repository that a landing of `key` needs (`main`'s and the item branch's ref
+    /// locks, `packed-refs.lock`, `HEAD.lock`, the root checkout's `index.lock`) when nobody has touched them for
+    /// `staleLockAge`. The workspace repository is agent-writable, so such a file is tampering, not the company's fault: the
+    /// names removed are returned for the owner's alert. A lock younger than that is left alone (git may be using it); the
+    /// step that needs it then fails as the company's fault and is retried. Links are removed, never followed.
+    private func clearStaleWorkspaceLocks(key: String) throws -> [String] {
+        let fm = FileManager.default
+        var removed: [String] = []
+        for name in ["refs/heads/main.lock", "refs/heads/item/\(key).lock", "packed-refs.lock", "HEAD.lock", "index.lock"] {
+            // Never through a directory that was swapped for a link.
+            var parent = (name as NSString).deletingLastPathComponent
+            var linked = false
+            while !parent.isEmpty {
+                if Self.isSymlink(gitDir.appending(path: parent)) { linked = true }
+                parent = (parent as NSString).deletingLastPathComponent
+            }
+            let url = gitDir.appending(path: name)
+            guard !linked, let attributes = try? fm.attributesOfItem(atPath: url.path) else { continue }
+            let touched = attributes[.modificationDate] as? Date ?? .distantPast
+            guard Date().timeIntervalSince(touched) >= Self.staleLockAge else { continue }
+            try fm.removeItem(at: url)
+            removed.append(name)
+        }
+        return removed
+    }
+
     // MARK: The engine's merge repository
 
-    /// The engine's own repository for merge work: a git dir at `<home>/run/merge/<companyId>.git` with a private working tree
-    /// at `<home>/run/merge/<companyId>-wt`, outside the workspace and every directory an agent is given. Its config is
-    /// written here, in full, every time it is used (no includes, no hooks, no fsmonitor, no `merge.*`, `filter.*` or `diff.*`
-    /// drivers) and its `info/attributes` says `* merge=text -filter -diff -text`; every command also runs with
-    /// `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`, `core.attributesFile=/dev/null` and `GIT_ATTR_SOURCE` set to the
-    /// empty tree (`GitCommand`), so no attribute or config of the workspace can reach a merge. Objects come in only through
-    /// `fetchIntoEngine`. Refuses to run on a git older than 2.42.
-    private func engineRepository() throws -> GitCommand {
+    /// Exclusion for the engine's merge repository (landings and merge-check exports), across processes. Taken after main's
+    /// lock when both are needed. A lock that cannot be taken is the company's fault.
+    private func withEngineLock<T>(_ body: () throws -> T) throws -> T {
+        try withLockFile(name: "+engine", what: "the merge repository", infrastructure: true, body)
+    }
+
+    /// The engine's own repository for merge work, made afresh (the caller holds the engine lock): whatever was at
+    /// `<home>/run/merge/<companyId>.git` and its private working tree `<home>/run/merge/<companyId>-wt` is deleted (a link is
+    /// removed, never followed) and a new repository is initialized there, outside the workspace and every directory an agent
+    /// is given. No object, ref, rebase state or setting from an earlier use (or written into it since) survives; objects come
+    /// in only through `fetchIntoEngine`. Refuses to run on a git older than 2.42.
+    private func freshEngineRepository() throws -> GitCommand {
         try GitCommand.requireAttributeSource()
-        return try withLockFile(name: "+engine", what: "the merge repository") {
-            let fm = FileManager.default
-            let repo = mergeRepositoryPath, tree = mergeWorktreePath
-            try fm.createDirectory(at: mergeDirectory.deletingLastPathComponent(), withIntermediateDirectories: true,
-                                   attributes: [.posixPermissions: 0o700])
-            for url in [repo, tree] where Self.isSymlink(url) { try fm.removeItem(at: url) }
-            try fm.createDirectory(at: tree, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let git = GitCommand(gitDir: repo, workTree: tree, commonDir: nil)
-            if !fm.fileExists(atPath: repo.appending(path: "objects").path) || !fm.fileExists(atPath: repo.appending(path: "HEAD").path) {
-                if fm.fileExists(atPath: repo.path) { try fm.removeItem(at: repo) }
-                try git.run(["init", "--quiet", "--template="])
-            }
-            try Self.engineConfig.write(to: repo.appending(path: "config"), atomically: true, encoding: .utf8)
-            let info = repo.appending(path: "info", directoryHint: .isDirectory)
-            if Self.isSymlink(info) { try fm.removeItem(at: info) }
-            try fm.createDirectory(at: info, withIntermediateDirectories: true)
-            try Self.engineAttributes.write(to: info.appending(path: "attributes"), atomically: true, encoding: .utf8)
-            // Nothing but the engine's own files may steer git here.
-            for name in ["config.worktree", "commondir", "shallow", "info/grafts", "objects/info/alternates", "objects/info/http-alternates"] {
-                let url = repo.appending(path: name)
-                if (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
-            }
-            return git
+        let fm = FileManager.default
+        let repo = mergeRepositoryPath, tree = mergeWorktreePath
+        try fm.createDirectory(at: mergeDirectory.deletingLastPathComponent(), withIntermediateDirectories: true,
+                               attributes: [.posixPermissions: 0o700])
+        for url in [repo, tree] where (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
+        try fm.createDirectory(at: tree, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let git = GitCommand(gitDir: repo, workTree: tree, commonDir: nil)
+        try git.run(["init", "--quiet", "--template="])
+        try assertEngineState()
+        return git
+    }
+
+    /// Writes the engine repository's `config` and `info/attributes` in full (no includes, no hooks, no fsmonitor, no
+    /// `merge.*`, `filter.*` or `diff.*` drivers; `* merge=text -filter -diff -text ...`) and removes every file that could
+    /// steer git there (`config.worktree`, `commondir`, `shallow`, grafts, alternates, linked worktrees, hooks). Called when
+    /// the repository is made and again right before each rebase, merge-tree and archive. Every command also runs with
+    /// `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`, `core.attributesFile=/dev/null` and `GIT_ATTR_SOURCE` set to the
+    /// empty tree (`GitCommand`).
+    private func assertEngineState() throws {
+        let fm = FileManager.default
+        let repo = mergeRepositoryPath
+        guard !Self.isSymlink(repo), fm.fileExists(atPath: repo.appending(path: "objects").path) else {
+            throw GitError.failed(command: "merge repository", status: -1, stderr: "the engine's merge repository is missing")
+        }
+        let config = repo.appending(path: "config")
+        if Self.isSymlink(config) { try fm.removeItem(at: config) }
+        try Self.engineConfig.write(to: config, atomically: true, encoding: .utf8)
+        let info = repo.appending(path: "info", directoryHint: .isDirectory)
+        if Self.isSymlink(info) { try fm.removeItem(at: info) }
+        try fm.createDirectory(at: info, withIntermediateDirectories: true)
+        let attributes = info.appending(path: "attributes")
+        if Self.isSymlink(attributes) { try fm.removeItem(at: attributes) }
+        try Self.engineAttributes.write(to: attributes, atomically: true, encoding: .utf8)
+        for name in ["config.worktree", "commondir", "shallow", "info/grafts", "objects/info/alternates", "objects/info/http-alternates",
+                     "worktrees", "hooks"] {
+            let url = repo.appending(path: name)
+            if (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
         }
     }
 
-    static let engineAttributes = "* merge=text -filter -diff -text\n"
+    /// No attribute of a tree can change what the engine merges or what a merge check sees: no drivers, no filters, no
+    /// end-of-line or encoding conversion, no `$Id$` expansion, nothing left out of or substituted in an export.
+    static let engineAttributes = "* merge=text -filter -diff -text -eol -ident -export-ignore -export-subst -working-tree-encoding\n"
 
     static let engineConfig = """
         [core]
@@ -730,22 +804,63 @@ public struct GitWorkspace: Sendable {
 
         """
 
+    /// A shallow workspace repository cannot hand over full history: the company's fault, never the item's.
+    private func refuseShallowWorkspace() throws {
+        if (try? FileManager.default.attributesOfItem(atPath: gitDir.appending(path: "shallow").path)) != nil {
+            throw GitError.failed(command: "fetch", status: -1, stderr: "the workspace repository is shallow; merges need its full history")
+        }
+    }
+
+    /// Fetches `mainHead` and `verified` into the engine repository. When that fails, `mainHead` alone decides whose fault it
+    /// is: `main`'s history that cannot be fetched (and a shallow workspace) is the company's (`MergeInfrastructureError`),
+    /// anything else is the verified commit's (`GitError`).
+    private func fetchLandingInputs(_ engine: GitCommand, mainHead: String, verified: String) throws {
+        try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
+        do {
+            try fetchIntoEngine(engine, commits: [mainHead, verified])
+        } catch {
+            do { try fetchIntoEngine(engine, commits: [mainHead]) } catch let mainError {
+                throw MergeInfrastructureError(underlying: GitError.failed(
+                    command: "fetch main", status: -1, stderr: "main's history (\(mainHead.prefix(7))) could not be fetched: \(mainError)"))
+            }
+            throw error
+        }
+    }
+
     /// Fetches exactly `commits` from the workspace repository into the engine repository, by SHA: no refs, no tags, no
-    /// `FETCH_HEAD`, so `refs/replace/*` and every other agent-made ref stay behind. A commit git cannot hand over (a missing
-    /// or corrupt object) fails as a `GitError`: it is the item's.
+    /// `FETCH_HEAD`, so `refs/replace/*` and every other agent-made ref stay behind. Always a real transfer (`--refetch`: git
+    /// never skips a commit because it seems to be there), every object checked by fsck, over the local file transport only
+    /// (`protocol.allow=never`, `protocol.file.allow=always`, the stock `git-upload-pack`). A commit git cannot hand over (a
+    /// missing or corrupt object) fails as a `GitError`.
     private func fetchIntoEngine(_ engine: GitCommand, commits: [String]) throws {
         try engine.run(Self.fetchFlags + [gitDir.path] + commits)
     }
 
-    /// The engine's own step of handing the result of a rebase to the workspace: its objects, by SHA, from the engine repository.
-    private func fetchFromEngine(commit: String) throws {
-        try main.run(Self.fetchFlags + [mergeRepositoryPath.path, commit])
-    }
-
     private static let fetchFlags = [
-        "-c", "protocol.version=2", "-c", "uploadpack.allowAnySHA1InWant=true", "-c", "fetch.fsckObjects=false",
-        "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-gc",
+        "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "-c", "protocol.version=2",
+        "-c", "uploadpack.allowAnySHA1InWant=true",
+        "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true", "-c", "fetch.unpackLimit=1", "-c", "transfer.unpackLimit=1",
+        "fetch", "--quiet", "--refetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-gc",
+        "--upload-pack=git-upload-pack",
     ]
+
+    /// The engine's own step of handing the result of a rebase to the workspace: the engine repository bundles `result`'s
+    /// objects on top of `prerequisites` and the workspace repository unbundles them (`git bundle unbundle`, which only runs
+    /// `index-pack`). No transport runs in the workspace, so nothing in its config (`url.*.insteadOf`, `core.sshCommand`,
+    /// remotes) takes part.
+    private func handBack(_ engine: GitCommand, result: String, prerequisites: [String]) throws {
+        let fm = FileManager.default
+        let ref = "refs/brahma/result"
+        try engine.run(["update-ref", "--no-deref", ref, result])
+        let bundle = URL(fileURLWithPath: mergeDirectory.path + "-result.bundle")
+        if (try? fm.attributesOfItem(atPath: bundle.path)) != nil { try fm.removeItem(at: bundle) }
+        defer { try? fm.removeItem(at: bundle) }
+        try engine.run(["bundle", "create", "--quiet", bundle.path, ref] + prerequisites.map { "^\($0)" })
+        try main.run(["bundle", "unbundle", bundle.path])
+        guard try main.run(["cat-file", "-e", "\(result)^{commit}"], allowFailure: true).status == 0 else {
+            throw GitError.failed(command: "bundle unbundle", status: -1, stderr: "\(result.prefix(7)) did not reach the workspace")
+        }
+    }
 
     /// Retires every merge checkout older engines registered in the workspace (`<ws>/.brahma/wt/.merge`, and the one that
     /// lived at `<mergeDirectory>/.merge` with its admin directory `<ws>/.git/worktrees/-merge`). Links are removed, never
@@ -946,11 +1061,50 @@ public struct GitWorkspace: Sendable {
         }
     }
 
-    /// A clean detached checkout of exactly `commit` at `<ws>/.brahma/wt-check/<runId>`, for an engine-run check. Anything
-    /// left at that place by a crashed run is removed first. `fromEngineRepository`: the checkout is made by the engine's own
-    /// repository (the merge-purpose re-check of a rebased commit: no config or attributes of the workspace take part), the
-    /// commit being fetched into it by SHA first when it is not there.
-    public func addRunWorktree(runId: String, commit: String, fromEngineRepository: Bool = false) throws -> URL {
+    /// A clean detached checkout of exactly `commit` at `<ws>/.brahma/wt-check/<runId>`, for an engine-run check of a
+    /// submission. Anything left at that place by a crashed run is removed first.
+    public func addRunWorktree(runId: String, commit: String) throws -> URL {
+        let path = try freshRunPlace(runId: runId, commit: commit)
+        try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
+        return path
+    }
+
+    /// The merge check of a rebased commit: a `.git`-free export of exactly `commit` at `<ws>/.brahma/wt-check/<runId>`
+    /// (the same place as a submission's check). Under the engine repository's lock the commit is fetched (fsck'd, by SHA)
+    /// into a fresh engine repository, written out with `git archive` (no attribute of the tree leaves anything out or
+    /// substitutes anything) and unpacked into a new directory. No worktree is linked to the engine repository, so the check
+    /// has no path back to its config or objects. Anything left at that place by a crashed run is removed first.
+    public func addEngineExport(runId: String, commit: String) throws -> URL {
+        let path = try freshRunPlace(runId: runId, commit: commit)
+        let fm = FileManager.default
+        let archive = URL(fileURLWithPath: mergeDirectory.path + "-export-\(runId).tar")
+        defer { try? fm.removeItem(at: archive) }
+        try withEngineLock {
+            let git = try MergeInfrastructureError.wrapping { try freshEngineRepository() }
+            try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
+            try fetchIntoEngine(git, commits: [commit])
+            try MergeInfrastructureError.wrapping {
+                if (try? fm.attributesOfItem(atPath: archive.path)) != nil { try fm.removeItem(at: archive) }
+                try assertEngineState()
+            }
+            try git.run(["archive", "--format=tar", "--output=\(archive.path)", "\(commit)^{commit}"])
+        }
+        try fm.createDirectory(at: path, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        do {
+            try Self.untar(archive, into: path)
+            // A tree cannot hold `.git` (fsck refuses it on the fetch); an export never has one either way.
+            if (try? fm.attributesOfItem(atPath: path.appending(path: ".git").path)) != nil {
+                throw GitError.failed(command: "archive", status: -1, stderr: "the export of \(commit.prefix(7)) holds a .git")
+            }
+        } catch {
+            try? fm.removeItem(at: path)
+            throw error
+        }
+        return path
+    }
+
+    /// `<ws>/.brahma/wt-check/<runId>`, with whatever a crashed run left there removed.
+    private func freshRunPlace(runId: String, commit: String) throws -> URL {
         try Self.validRunId(runId); try Self.validCommit(commit)
         let paths = CheckPaths(workspace: root)
         if Self.isSymlink(paths.runWorktreesRoot) {
@@ -958,30 +1112,29 @@ public struct GitWorkspace: Sendable {
         }
         try FileManager.default.createDirectory(at: paths.runWorktreesRoot, withIntermediateDirectories: true)
         removeRunWorktree(runId: runId)
-        let path = paths.runWorktree(runId: runId)
-        guard fromEngineRepository else {
-            try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
-            return path
-        }
-        let engine = try engineRepository()
-        if try engine.run(["cat-file", "-e", "\(commit)^{commit}"], allowFailure: true).status != 0 {
-            try fetchIntoEngine(engine, commits: [commit])
-        }
-        try engine.run(["worktree", "prune"])
-        try engine.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
-        return path
+        return paths.runWorktree(runId: runId)
     }
 
-    /// The engine repository's git context when it exists (nothing is created or rewritten); nil otherwise.
-    private var existingEngineRepository: GitCommand? {
-        let fm = FileManager.default
-        guard !Self.isSymlink(mergeRepositoryPath), !Self.isSymlink(mergeWorktreePath),
-              fm.fileExists(atPath: mergeRepositoryPath.appending(path: "HEAD").path), fm.fileExists(atPath: mergeWorktreePath.path)
-        else { return nil }
-        return GitCommand(gitDir: mergeRepositoryPath, workTree: mergeWorktreePath, commonDir: nil)
+    /// Unpacks a tar file made by `git archive` with `/usr/bin/tar`, which refuses absolute paths, `..` and extraction
+    /// through links.
+    private static func untar(_ archive: URL, into dir: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        process.arguments = ["-x", "-f", archive.path, "-C", dir.path]
+        process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch {
+            throw GitError.failed(command: "archive", status: -1, stderr: "could not unpack the export: \(error)")
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw GitError.failed(command: "archive", status: process.terminationStatus, stderr: "could not unpack the export")
+        }
     }
 
-    /// Removes one run's checkout (whatever the check left in it), whichever repository made it; never throws.
+    /// Removes one run's checkout or export (whatever the check left in it); never throws.
     public func removeRunWorktree(runId: String) {
         guard (try? Self.validRunId(runId)) != nil else { return }
         let fm = FileManager.default
@@ -989,12 +1142,12 @@ public struct GitWorkspace: Sendable {
         if Self.isSymlink(path) {
             try? fm.removeItem(at: path)
         } else if fm.fileExists(atPath: path.path) {
-            _ = try? existingEngineRepository?.run(["worktree", "remove", "--force", path.path], allowFailure: true)
-            if fm.fileExists(atPath: path.path) { _ = try? main.run(["worktree", "remove", "--force", path.path], allowFailure: true) }
+            if fm.fileExists(atPath: path.appending(path: ".git").path) {
+                _ = try? main.run(["worktree", "remove", "--force", path.path], allowFailure: true)
+            }
             if fm.fileExists(atPath: path.path) { try? fm.removeItem(at: path) }
         }
         _ = try? main.run(["worktree", "prune"], allowFailure: true)
-        _ = try? existingEngineRepository?.run(["worktree", "prune"], allowFailure: true)
     }
 
     /// Start-up: no check is running, so every leftover run checkout goes.
@@ -1006,7 +1159,6 @@ public struct GitWorkspace: Sendable {
             else { try? FileManager.default.removeItem(at: dir.appending(path: name)) }
         }
         _ = try? main.run(["worktree", "prune"], allowFailure: true)
-        _ = try? existingEngineRepository?.run(["worktree", "prune"], allowFailure: true)
     }
 
     // MARK: Commits and refs

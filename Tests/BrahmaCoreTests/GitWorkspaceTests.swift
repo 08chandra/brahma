@@ -435,7 +435,8 @@ import Foundation
         #expect(config.contains("hooksPath = /dev/null")); #expect(config.contains("fsmonitor = false"))
         for banned in ["include", "merge \"", "filter \"", "diff \"", "[merge", "[filter", "[diff"] { #expect(!config.contains(banned), "\(banned)") }
         let attributes = try String(contentsOf: repo.appending(path: "info/attributes"), encoding: .utf8)
-        #expect(attributes == "* merge=text -filter -diff -text\n")
+        #expect(attributes == GitWorkspace.engineAttributes)
+        #expect(attributes == "* merge=text -filter -diff -text -eol -ident -export-ignore -export-subst -working-tree-encoding\n")
         #expect(try d.f.git(["rev-parse", "HEAD"], env: ["GIT_DIR": repo.path, "GIT_WORK_TREE": engine.path + "-wt"]) == r)
         // Nothing was written in the workspace but the objects and the result's ref.
         #expect(!FileManager.default.fileExists(atPath: d.f.root.appending(path: ".git/worktrees/-merge").path))
@@ -534,25 +535,181 @@ import Foundation
         }
     }
 
-    @Test func mergeCheckRunsInACheckoutOfTheEngineRepository() throws {
+    // MARK: 9b fix round 4 (X2, X3 and the round-3 re-review)
+
+    /// A loose object at `oid`'s path in `repo` whose content is `text` (so its name lies about it).
+    private func forge(_ oid: String, as text: String, in repo: URL) throws {
+        let scratch = try GitFixture(files: [:], ensure: false)
+        try GitFixture.plainGit(["init", "-q"], in: scratch.root)
+        let file = try scratch.write("forged.txt", text)
+        let real = try scratch.git(["hash-object", "-w", file.path])
+        let dir = repo.appending(path: "objects/\(oid.prefix(2))", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let target = dir.appending(path: String(oid.dropFirst(2)))
+        if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) }
+        try FileManager.default.copyItem(at: scratch.root.appending(path: ".git/objects/\(real.prefix(2))/\(real.dropFirst(2))"), to: target)
+    }
+
+    /// Every regular file and link under `dir`, with its contents (a link: its target).
+    private func snapshot(_ dir: URL) -> [String: Data] {
+        var out: [String: Data] = [:]
+        let fm = FileManager.default
+        guard let walk = fm.enumerator(atPath: dir.path) else { return out }
+        for case let rel as String in walk {
+            let path = dir.appending(path: rel).path
+            if let target = try? fm.destinationOfSymbolicLink(atPath: path) { out[rel] = Data(("-> " + target).utf8); continue }
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue { out[rel] = fm.contents(atPath: path) ?? Data() }
+        }
+        return out
+    }
+
+    @Test func mergeCheckRunsOnAGitFreeExport() throws {
         let engine = try tempDir().appending(path: "run/merge/c1", directoryHint: .isDirectory)
         let d = try Driven(ws: { GitWorkspace(root: $0, mergeDirectory: engine) })
-        // The workspace also routes every file through a smudge filter that must never run in a check's checkout.
+        // The tree routes every file through a smudge filter the workspace defines, hides a file from exports and asks for a
+        // substitution: none of it may change what the check sees.
         let smudged = try tempDir().appending(path: "smudge-ran")
         try d.f.git(["config", "filter.evil.smudge", "touch '\(smudged.path)'; cat"])
-        try d.f.write(".gitattributes", "* merge=evil filter=evil\n")
+        try d.f.write(".gitattributes", "* merge=evil filter=evil\nhidden.txt export-ignore\nsubst.txt export-subst\n")
+        try d.f.write("hidden.txt", "the test the export must not hide\n")
+        try d.f.write("subst.txt", "$Format:%H$\n")
         try d.f.git(["add", "-A"]); try d.f.git(["commit", "-qm", "attrs"])
         let commit = try #require(try d.ws.head(of: GitWorkspace.mainRef))
-        let dir = try d.ws.addRunWorktree(runId: "run-1", commit: commit, fromEngineRepository: true)
+        let dir = try d.ws.addEngineExport(runId: "run-1", commit: commit)
         #expect(dir.path == CheckPaths(workspace: d.f.root).runWorktree(runId: "run-1").path, "the check keeps its place under .brahma/wt-check")
-        #expect(FileManager.default.fileExists(atPath: dir.appending(path: "big.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: dir.appending(path: ".git").path), "the export has no .git")
+        #expect(try String(contentsOf: dir.appending(path: "big.txt"), encoding: .utf8).contains("line twenty"))
+        #expect(try String(contentsOf: dir.appending(path: "hidden.txt"), encoding: .utf8) == "the test the export must not hide\n")
+        #expect(try String(contentsOf: dir.appending(path: "subst.txt"), encoding: .utf8) == "$Format:%H$\n")
         #expect(!FileManager.default.fileExists(atPath: smudged.path), "the workspace's filter ran")
-        let pointer = try String(contentsOf: dir.appending(path: ".git"), encoding: .utf8)
-        #expect(pointer.contains(d.ws.mergeRepositoryPath.path), "\(pointer)")
-        #expect(try d.f.git(["rev-parse", "HEAD"], in: dir) == commit)
+        let repo = d.ws.mergeRepositoryPath
+        #expect(!FileManager.default.fileExists(atPath: repo.appending(path: "worktrees").path), "no worktree is linked to the engine repository")
+        // The check writes next to its directory and into whatever repository git finds from there.
+        let before = snapshot(repo)
+        #expect(!before.isEmpty)
+        let script = """
+            echo escaped > ../escaped.txt
+            git rev-parse --absolute-git-dir > ../found.txt 2>&1
+            cat .git >> ../found.txt 2>&1
+            git config merge.evil.driver 'touch planted' 2>/dev/null
+            echo planted > planted.txt; git hash-object -w planted.txt 2>/dev/null
+            git update-ref refs/heads/planted HEAD 2>/dev/null
+            true
+            """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script]
+        p.currentDirectoryURL = dir
+        var env = ProcessInfo.processInfo.environment
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"] { env[k] = nil }
+        p.environment = env
+        p.standardInput = FileHandle.nullDevice; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        try p.run(); p.waitUntilExit()
+        #expect(FileManager.default.fileExists(atPath: dir.deletingLastPathComponent().appending(path: "escaped.txt").path), "the script ran")
+        let found = (try? String(contentsOf: dir.deletingLastPathComponent().appending(path: "found.txt"), encoding: .utf8)) ?? ""
+        #expect(!found.contains(repo.path), "the check found the engine repository: \(found)")
+        #expect(snapshot(repo) == before, "the check changed the engine repository's config or objects")
         d.ws.removeRunWorktree(runId: "run-1")
         #expect(!FileManager.default.fileExists(atPath: dir.path))
-        let registered = (try? FileManager.default.contentsOfDirectory(atPath: d.ws.mergeRepositoryPath.appending(path: "worktrees").path)) ?? []
-        #expect(registered.isEmpty, "the engine repository forgot the check's checkout")
+    }
+
+    @Test func staleWorkspaceLocksAreRemovedAndReported() throws {
+        let b = try Behind()
+        // main goes back to K-1's parent, so K-1 fast-forwards it.
+        let verified = try b.f.git(["rev-parse", "refs/heads/item/K-1"])
+        try b.f.git(["update-ref", "refs/heads/main", try b.f.git(["rev-parse", "\(verified)^"])])
+        try b.f.git(["reset", "-q", "--hard"])
+        let base = try b.f.git(["rev-parse", "refs/heads/main"])
+        // A lock somebody may be using right now is left alone: the move fails as the company's fault.
+        let lock = b.f.root.appending(path: ".git/refs/heads/main.lock")
+        try "".write(to: lock, atomically: true, encoding: .utf8)
+        var reported: [[String]] = []
+        #expect(throws: MergeInfrastructureError.self) {
+            try b.ws.landVerified(key: "K-1", verified: verified, expectedMain: base, recordPending: { _ in }, tamper: { reported.append($0) })
+        }
+        #expect(reported.isEmpty); #expect(FileManager.default.fileExists(atPath: lock.path))
+        // Left behind (untouched for an hour): removed, reported, and the merge goes through.
+        let old = Date().addingTimeInterval(-3600)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: lock.path)
+        let branchLock = b.f.root.appending(path: ".git/refs/heads/item/K-1.lock")
+        try "".write(to: branchLock, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: branchLock.path)
+        let outcome = try b.ws.landVerified(key: "K-1", verified: verified, expectedMain: base, recordPending: { _ in }, tamper: { reported.append($0) })
+        #expect(outcome == .fastForwarded(mainHead: verified))
+        #expect(reported == [["refs/heads/main.lock", "refs/heads/item/K-1.lock"]])
+        #expect(!FileManager.default.fileExists(atPath: lock.path)); #expect(!FileManager.default.fileExists(atPath: branchLock.path))
+    }
+
+    @Test func objectsWrittenStraightIntoTheEngineRepositoryNeverReachAMerge() throws {
+        let engine = try tempDir().appending(path: "run/merge/c1", directoryHint: .isDirectory)
+        let d = try Driven(ws: { GitWorkspace(root: $0, mergeDirectory: engine) })
+        // Something with the engine repository's path writes into it before the merge: a lying object for the verified
+        // commit's `big.txt`, a merge driver in its config and attributes that route every file to it.
+        let repo = d.ws.mergeRepositoryPath
+        try GitFixture.plainGit(["init", "-q", "--bare", repo.path], in: try tempDir())
+        let blob = try d.f.git(["rev-parse", "\(d.k1):big.txt"])
+        try forge(blob, as: "evil\n", in: repo)
+        let sentinel = try tempDir().appending(path: "planted-driver-ran")
+        try "[merge \"evil\"]\n\tdriver = touch '\(sentinel.path)'; true\n".write(to: repo.appending(path: "config"), atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: repo.appending(path: "info"), withIntermediateDirectories: true)
+        try "* merge=evil\n".write(to: repo.appending(path: "info/attributes"), atomically: true, encoding: .utf8)
+        let outcome = try d.ws.landVerified(key: "K-1", verified: d.k1, expectedMain: d.mainHead, recordPending: { _ in })
+        guard case .rebased(let r) = outcome else { Issue.record("K-1 should have been rebased: \(outcome)"); return }
+        let merged = try d.f.git(["show", "\(r):big.txt"])
+        #expect(!merged.contains("evil"), "a planted object reached the merge")
+        #expect(merged.contains("line one")); #expect(merged.contains("line twenty"))
+        #expect(!FileManager.default.fileExists(atPath: sentinel.path), "a planted merge driver ran")
+        #expect(try String(contentsOf: repo.appending(path: "config"), encoding: .utf8) == GitWorkspace.engineConfig)
+    }
+
+    @Test func aCorruptObjectIsRefusedByTheEngineFetch() throws {
+        // A verified commit fsck rejects (no e-mail in its author line), on top of main: it must not fast-forward main.
+        let b = try Behind()
+        let body = try b.f.write("bad-commit", "tree \(try b.f.git(["rev-parse", "\(b.mainHead)^{tree}"]))\nparent \(b.mainHead)\n"
+                                 + "author nobody\ncommitter nobody\n\nbad\n", in: try tempDir())
+        let bad = try b.f.git(["hash-object", "-t", "commit", "-w", "--literally", body.path])
+        try b.f.git(["update-ref", "refs/heads/item/K-9", bad])
+        do {
+            let outcome = try b.ws.landVerified(key: "K-9", verified: bad, expectedMain: b.mainHead, recordPending: { _ in })
+            Issue.record("a commit fsck refuses landed: \(outcome)")
+        } catch let error {
+            #expect(!(error is MergeInfrastructureError), "the item's own commit is the item's fault: \(error)")
+            #expect("\(error)".contains("fsck") || "\(error)".contains("missingEmail"), "\(error)")
+        }
+        #expect(try b.ws.head(of: GitWorkspace.mainRef) == b.mainHead)
+    }
+
+    @Test func mainsHistoryOrAShallowWorkspaceIsTheCompanysFault() throws {
+        // A blob only main's history has is gone: main cannot be fetched, which is not K-1's doing.
+        let b = try Behind()
+        let blob = try b.f.git(["rev-parse", "\(b.mainHead):m.txt"])
+        try FileManager.default.removeItem(at: b.f.root.appending(path: ".git/objects/\(blob.prefix(2))/\(blob.dropFirst(2))"))
+        #expect(throws: MergeInfrastructureError.self) {
+            try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in })
+        }
+        // A shallow workspace repository.
+        let s = try Behind()
+        let first = try s.f.git(["rev-parse", "\(s.k1)^"])
+        try (first + "\n").write(to: s.f.root.appending(path: ".git/shallow"), atomically: true, encoding: .utf8)
+        #expect(throws: MergeInfrastructureError.self) {
+            try s.ws.landVerified(key: "K-1", verified: s.k1, expectedMain: s.mainHead, recordPending: { _ in })
+        }
+        #expect(try s.ws.head(of: GitWorkspace.mainRef) == s.mainHead)
+    }
+
+    @Test func engineFetchesIgnoreTheWorkspacesURLRewritesAndSSHCommand() throws {
+        // The workspace config (agent-writable) rewrites both repositories' paths to ssh, whose command would run code.
+        let b = try Behind()
+        let sentinel = try tempDir().appending(path: "ssh-ran")
+        try b.f.git(["config", "url.ssh://evil.invalid/engine.insteadOf", b.ws.mergeRepositoryPath.path])
+        try b.f.git(["config", "url.ssh://evil.invalid/workspace.insteadOf", b.f.root.path])
+        try b.f.git(["config", "core.sshCommand", "touch '\(sentinel.path)'; false"])
+        let outcome = try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in })
+        guard case .rebased(let r) = outcome else { Issue.record("\(outcome)"); return }
+        #expect(!FileManager.default.fileExists(atPath: sentinel.path), "core.sshCommand ran")
+        #expect(try b.f.git(["rev-parse", "\(r)^"]) == b.mainHead)
+        #expect(try b.ws.head(of: b.ws.branchRef(key: "K-1")) == r)
     }
 }

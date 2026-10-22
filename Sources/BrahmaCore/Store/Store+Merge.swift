@@ -31,6 +31,7 @@ extension Store {
     static func mainHeadAlertReason(_ companyId: String) -> String { "mainhead:\(companyId)" }
     static func mergeFailureAlertReason(_ itemId: String) -> String { "mergefail:\(itemId)" }
     static func mergeHoldAlertReason(_ companyId: String) -> String { "mergehold:\(companyId)" }
+    static func mergeTamperAlertReason(_ companyId: String) -> String { "mergetamper:\(companyId)" }
     static func quarantineMovedAlertReason(_ companyId: String) -> String { "quarantinemoved:\(companyId)" }
     /// `quarantine:<ref>@<full sha>`: the ask names the exact commit the engine quarantined, which is all an accept merges.
     static func quarantineSubject(_ ref: String, commit: String) -> String { "quarantine:\(ref)@\(commit)" }
@@ -74,9 +75,18 @@ extension Store {
         }
     }
 
-    /// Start-up: no merge is running. A pending head that `main` never reached (a crash before the move) is forgotten.
+    /// Start-up: no merge is running. A pending head that `main` never reached (a crash before the move) is forgotten. Each
+    /// company's activity records the git the engine found (merges need 2.42 or newer).
     func recoverMerges() throws {
-        try writer.write { db in try db.execute(sql: "UPDATE itemMerge SET running = 0") }
+        let gitLine: (ActivityKind, String) = GitCommand.attributeSourceSupported
+            ? (.work, "git \(GitCommand.gitVersionText ?? "?") found; merges into main need git 2.42 or newer")
+            : (.error, "git \(GitCommand.gitVersionText ?? "was not found"): merges into main need git 2.42 or newer and are refused")
+        try writer.write { db in
+            try db.execute(sql: "UPDATE itemMerge SET running = 0")
+            for company in try Company.fetchAll(db) {
+                try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: gitLine.0, text: gitLine.1, createdAt: Store.now()).insert(db)
+            }
+        }
         for company in try companies() where company.pendingMainCommit != nil {
             let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
             guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { continue }
@@ -228,8 +238,9 @@ extension Store {
     ///    (`pendingMainCommit` written before `main` moves, the record finalized after), or a rebase of the verified commit in
     ///    the engine's merge checkout.
     ///
-    /// Everything up to the landing (the guard, the checkout, a quarantine) and the locks, moving `main` and the merge checkout
-    /// fail as `MergeInfrastructureError`: the company's fault, never counted against the item.
+    /// Everything up to the landing (the guard, the checkout, a quarantine) and the locks, moving `main`, the merge repository
+    /// and `main`'s history fail as `MergeInfrastructureError`: the company's fault, never counted against the item. Stale
+    /// lock files left in the workspace repository are removed and reported to the owner (`reportMergeTamper`).
     func performMerge(item: WorkItem, company: Company, now: Date) throws -> MergeResult? {
         let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let git = gitWorkspace(root: root, companyId: company.id)
@@ -259,7 +270,7 @@ extension Store {
             outcome = try git.landVerified(key: item.key, verified: verified, expectedMain: expected, recordPending: { next in
                 try MergeInfrastructureError.wrapping { try self.setPendingMainCommit(companyId: company.id, next) }
                 pending = next
-            })
+            }, tamper: { removed in self.reportMergeTamper(company: company, removed: removed, now: now) })
         } catch {
             if let pending { try? clearPendingMainCommit(companyId: company.id, ifEqual: pending) }
             throw error
@@ -275,6 +286,16 @@ extension Store {
         case .branchMoved(let head): return .branchMoved(head: head)
         case .mainMoved: return nil    // the guard sees it on the next attempt
         }
+    }
+
+    /// Agent-writable state that blocked the merge (stale git lock files in the workspace repository) was removed: the owner
+    /// hears about it (one open alert at a time), since Brahma did not leave it there.
+    private func reportMergeTamper(company: Company, removed: [String], now: Date) {
+        let names = removed.map { Self.flat($0, max: 100) }.joined(separator: ", ")
+        try? EngineAlerts.raise(
+            store: self, text: "\(company.name): Brahma removed git lock files nobody was using from the workspace repository (\(names)). "
+                + "They blocked merges into main and Brahma did not leave them; something with access to the workspace did.",
+            now: now, reason: Self.mergeTamperAlertReason(company.id))
     }
 
     /// One alert per company however often the merge is retried; it resolves itself when the checkout is back on `main`.
