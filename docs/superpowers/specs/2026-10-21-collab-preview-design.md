@@ -17,7 +17,7 @@ Facts this design relies on (checked in the plans):
 ## 0. Decisions in one screen
 
 1. **One typed reference for all work: `WorkRef`.** Messages, previews, Inbox cards and Show answers carry refs, never copies. When a ref is stored, the engine resolves it, checks the reader's access and pins it to an immutable revision.
-2. **One preview, any work.** The PREVIEW pane keeps L/4a's fixed product tabs (WEB, CLI, …, ARTIFACTS, LIVE). It adds one **OPENED** slot that can show any ref, with back/forward history. Ref kinds include live work: an item's uncommitted worktree diff, and an agent's "now" view (current item, live diff, LIVE turn stream).
+2. **One preview, any work.** The PREVIEW pane keeps L/4a's fixed product tabs (WEB, CLI, …, ARTIFACTS, LIVE). It adds one **OPENED** slot that can show any ref, with back/forward history. Ref kinds include live work: an item's uncommitted worktree diff, and an agent's "now" view (current item, live diff, TURN stream (Plan L TurnStreamView; LIVE = deployed site)).
 3. **The Show bar runs without an LLM unless the owner presses Enter on an Ask row.** It sits above the preview and is also a global ⌘K palette over any view. Plain code strips filler words ("show me", "on mobile") and resolves direct refs, a phrase table, and fuzzy search over files, items, the handbook, artifacts, people and previews. When candidates exist, Enter opens them at zero cost. An LLM turn starts only on an explicit, visible **Ask** row.
 4. **Ask goes to a cheap concierge by default.** It is an engine Haiku turn with no session and no role card, read-only tools only, and its own lane. A real agent is asked only for explain/why/how questions or when the owner names a `@handle`. In that case an idle agent is preferred and the request jumps the queue. Cost is shown as a percentage of the 5H window.
 5. **Sharing and requesting use 3 new tools.** The new tools are `share`, `open_ref` and `show`. `post_message`/`send_dm` gain `attachments` and `reply_to`, and `read_channel` gains `thread`. Quoting is `share(msg:<id>)`. File requests are DM cards answered with `share(reply_to:)`, and agent→owner file requests are Inbox `request` asks with a drop zone. No FR-n tool exists.
@@ -136,7 +136,7 @@ Cards show "as shared @a1b2c3d · view latest" when `newer` is set.
 | run | 3a `verificationRun` log + check spec rev | 4a `TerminalPreviewView` + `AnsiText.parse`; exit, duration, flake/infra flags | 4a Task 8–9 | yes |
 | release | L `Release` | L release inspector | L Task 11 | yes |
 | message / thread | `message` + replies + refs (per-reader) | `ThreadView`: read view, owner reply box, "Open in chat" | new | yes |
-| agent ("now") | `Agent` + current item + **live worktree diff of that item** + LIVE turn stream (L) + last 30 activity lines + today's usage share + open requests | `AgentNowView`: actions DM, Request a file, Ask to explain | P2 agent detail + L LIVE | yes |
+| agent ("now") | `Agent` + current item + **live worktree diff of that item** + TURN stream (Plan L TurnStreamView; LIVE = deployed site) (L) + last 30 activity lines + today's usage share + open requests | `AgentNowView`: actions DM, Request a file, Ask to explain | P2 agent detail + L LIVE | yes |
 | memory | `memoryEntry` | inspector + owner Delete | ML memory browser | Collab-2 |
 | channel | — | "Open in chat" (no preview body) | P2 chat | Collab-2 |
 
@@ -559,7 +559,7 @@ Enforced in `CompanyTools`/`Store`, never by hiding things in the UI. Every look
 **L (written, being amended).**
 1. **Task 10:** `PreviewTab.id` uses namespaced strings (`surface:<id>`, `live`, `artifacts`, `ref`). `PreviewBody` stays an open enum. `PreviewPane` exposes a header accessory slot above the tab strip and an `inspector(body:)` entry point that chat can host.
 2. **Task 11:** `WebPreviewView(url:path:viewport:)` loads a validated path on the loopback origin (§4.6 rules plus the host/port assertion) and sizes to a viewport preset (desktop, ipad, iphone, or WxH ≤ 4096), with a VIEWPORT chip in the WEB tab. It draws the engine **AGENT-BUILT CONTENT** frame, and loading never takes focus. Test: `previewPathCannotLeaveLoopback`.
-3. **Task 11:** the LIVE turn stream view can be embedded, filtered to one agent, for the agent "now" body.
+3. **Task 11:** the TURN stream (Plan L TurnStreamView; LIVE = deployed site) view can be embedded, filtered to one agent, for the agent "now" body.
 
 **ML Memory-lite (to write): build these right the first time.**
 1. **ML-1 Resource storage in the vault.** `<dataHome>/vault/<companyId>/resources/F-n.<ext>`, with engine-generated names, 0444 and a stored `sha256` verified on open. Only untainted company-scope files are mirrored into `<ws>/.brahma/resources/company/`. This replaces roadmap §2.6's "copied into `resources/<scope>/`… 5L readOnlyDirs covers it".
