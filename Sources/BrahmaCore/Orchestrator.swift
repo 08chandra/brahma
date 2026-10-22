@@ -384,6 +384,19 @@ public actor Orchestrator {
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
+        // The hold for an active usage limit; HTTP 429 with no rejecting rate-limit event records one so the gate closes for
+        // every company.
+        func noteUsageLimit() -> Date {
+            let until = Self.usageUntil(limited ? lastInfo?.resetsAt : nil, now: now)
+            if !limited {
+                attempt {
+                    try store.saveRateLimit(RateLimitInfo(status: "rejected", resetsAt: until, rateLimitType: nil,
+                                                          isUsingOverage: false, fiveHourUtilization: nil,
+                                                          sevenDayUtilization: nil, observedAt: now))
+                }
+            }
+            return until
+        }
         if let unavailable = worktreeUnavailable {
             // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
             // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime.
@@ -410,11 +423,15 @@ public actor Orchestrator {
         } else if case .interrupted? = runnerError as? TurnError {
             // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
             end = .interrupted(partial: result)
-        } else if case .timedOut? = runnerError as? TurnError, !(limited || result?.apiErrorStatus == 429) {
-            // The engine's own wall clock killed it (even after an early result, with background work still pending): the
-            // turn failed like any other timeout (normal backoff) and its usage is still booked and budgeted. A kill while the
-            // usage limit is active falls through to the usage-limit branch below: held until the reset, not the agent's fault.
-            end = .failed(failure ?? "timed out", nil, partial: result)
+        } else if case .timedOut? = runnerError as? TurnError {
+            // The engine's own wall clock killed it (even after an early result, with background work still pending): never a
+            // success. Under an active usage limit it is held until the reset (not the agent's fault); otherwise it failed like
+            // any other timeout (normal backoff) and its usage is still booked and budgeted.
+            if limited || result?.apiErrorStatus == 429 {
+                end = .usageLimited(until: noteUsageLimit(), summary: result?.text)
+            } else {
+                end = .failed(failure ?? "timed out", nil, partial: result)
+            }
         } else if let r = result, !r.isError {
             // A completed turn always counts, even if it also hit the limit: re-running it would repeat its posts.
             end = .succeeded(r, usageHold: limited ? Self.usageUntil(lastInfo?.resetsAt, now: now) : nil)
@@ -423,16 +440,7 @@ public actor Orchestrator {
             // classifier ever sees the text: not infra, no backoff, counted in the item's usage and judged normally.
             end = .capped(r, usageHold: limited ? Self.usageUntil(lastInfo?.resetsAt, now: now) : nil)
         } else if result?.apiErrorStatus == 429 || limited {
-            let until = Self.usageUntil(limited ? lastInfo?.resetsAt : nil, now: now)
-            if !limited {
-                // HTTP 429 with no rejecting rate-limit event: record one so the gate closes for every company.
-                attempt {
-                    try store.saveRateLimit(RateLimitInfo(status: "rejected", resetsAt: until, rateLimitType: nil,
-                                                          isUsingOverage: false, fiveHourUtilization: nil,
-                                                          sevenDayUtilization: nil, observedAt: now))
-                }
-            }
-            end = .usageLimited(until: until, summary: result?.text)
+            end = .usageLimited(until: noteUsageLimit(), summary: result?.text)
         } else if let failure {
             // Only the runner's launch error is classifiable; a timeout or "exited without a result" carries stderr.
             var input: InfraInput?
