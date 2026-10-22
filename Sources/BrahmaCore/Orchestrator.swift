@@ -48,6 +48,8 @@ public actor Orchestrator {
     var worktreeFailures: [String: Int] = [:]
     static let maxWorktreeFailures = 3
     var lastSweep: [String: Date] = [:]
+    /// Company-active time of each company's last deadlock/aging scan.
+    var lastLiveness: [String: Double] = [:]
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
     var infraCooldown: [String: Date] = [:]
@@ -137,6 +139,14 @@ public actor Orchestrator {
 
         // Open asks: expiry, owner reminders, internal aging and paused-approver rerouting (company-active time).
         attempt { _ = try store.sweepAsks(now: now) }
+
+        // Deadlocks and item aging, every `Liveness.scanInterval` company-active seconds (a frozen clock never rescans).
+        for c in companies {
+            let active = store.activeNow(companyId: c.id)
+            guard active - (lastLiveness[c.id] ?? -.infinity) >= Liveness.scanInterval else { continue }
+            lastLiveness[c.id] = active
+            attempt { try store.sweepLiveness(companyId: c.id, now: now) }
+        }
 
         // 1. Timed blockers that have expired.
         for a in try store.agents(states: [.blocked]) {

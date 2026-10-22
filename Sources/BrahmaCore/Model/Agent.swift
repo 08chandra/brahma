@@ -46,6 +46,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var pausedActive: Double? = nil
     /// What the agent's base session (turns without a current item) ran with last; see `SessionMeta`.
     public var sessionMeta: SessionMeta? = nil
+    /// "ceo" while the agent acts as the company's CEO after the CEO left (Task 12); it then counts as covering `ceo` for routing.
+    public var actingRole: String? = nil
 }
 
 /// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and

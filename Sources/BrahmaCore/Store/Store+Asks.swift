@@ -162,10 +162,17 @@ extension Store {
                                   excluding: Set<String> = []) throws -> Agent? {
         guard let pack = pack(for: company) else { return nil }
         let roles = pack.askApprovers[kind.rawValue] ?? (kind == .boost ? pack.askApprovers["other"] : nil) ?? []
+        let ceoRoles = Set(pack.rolesCovering("ceo"))
+        var actingTried = false
         for role in roles {
-            let found = try Agent.filter(Column("companyId") == company.id && Column("role") == role && Column("state") != "killed"
+            var found = try Agent.filter(Column("companyId") == company.id && Column("role") == role && Column("state") != "killed"
                                          && Column("paused") == false)
                 .order(Column("createdAt"), Column.rowID).fetchAll(db)
+            // The acting CEO covers `ceo`: it answers where the pack names a CEO-covering role.
+            if ceoRoles.contains(role), !actingTried {
+                actingTried = true
+                found = try Store.actingCEOs(db, companyId: company.id).filter { !$0.paused } + found
+            }
             if let a = found.first(where: { $0.id != requesterId && !excluding.contains($0.id) }) { return a }
         }
         return nil
@@ -216,6 +223,7 @@ extension Store {
     /// Effects of a final status. A newly approved ask supersedes the ask it names (unless that one is already rejected,
     /// expired or rescinded). Sprint-plan effects are added by Task 13.
     func applyAskEffects(_ db: Database, ask: Ask, now: Date) throws {
+        if ask.status == .rejected { try actingCEODeclined(db, ask: ask, now: now) }
         guard ask.status == .approved, let oldId = ask.supersedesId, var old = try Ask.fetchOne(db, key: oldId),
               old.companyId == ask.companyId else { return }
         guard ![AskStatus.rejected, .expired, .rescinded, .superseded].contains(old.status) else { return }

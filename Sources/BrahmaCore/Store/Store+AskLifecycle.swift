@@ -93,7 +93,7 @@ extension Store {
     }
 
     /// The agent's nearest non-killed ancestor (by manager) who is not the requester.
-    private func nearestAncestor(_ db: Database, of agent: Agent, notRequester requesterId: String) throws -> Agent? {
+    func nearestAncestor(_ db: Database, of agent: Agent, notRequester requesterId: String) throws -> Agent? {
         var seen: Set<String> = [agent.id]
         var next = agent.managerId
         for _ in 0..<AskLifecycle.maxAncestorHops {
@@ -105,7 +105,7 @@ extension Store {
     }
 
     /// Hands a `pendingInternal` ask to another approver (clock and reminders restart), or to the owner when there is none.
-    private func reroute(_ db: Database, ask: inout Ask, company: Company, to approver: Agent?, now: Date) throws {
+    func reroute(_ db: Database, ask: inout Ask, company: Company, to approver: Agent?, now: Date) throws {
         guard let approver else {
             ask.updatedAt = now
             try enterPendingOwner(db, ask: &ask, company: company, now: now)
@@ -124,14 +124,15 @@ extension Store {
     // MARK: Escalation
 
     /// The agent that takes an escalated ask: a non-killed, non-paused agent covering the CEO role who is neither the requester
-    /// nor the approver. (Task 12 adds the acting CEO, which then comes first.)
+    /// nor the approver. The acting CEO covers the role and comes first.
     private func escalationTarget(_ db: Database, company: Company, excluding: Set<String>) throws -> Agent? {
         guard let pack = catalog.pack(company.packId) else { return nil }
         let roles = pack.rolesCovering("ceo")
         let found = try Agent.filter(Column("companyId") == company.id && roles.contains(Column("role")) && Column("state") != "killed"
                                      && Column("paused") == false)
             .order(Column("createdAt"), Column.rowID).fetchAll(db)
-        return found.first { !excluding.contains($0.id) }
+        let acting = try Store.actingCEOs(db, companyId: company.id).filter { !$0.paused }
+        return (acting + found).first { !excluding.contains($0.id) }
     }
 
     /// `escalate_decision`: once per ask. The internal approver may escalate while the ask is `pendingInternal`, the requester

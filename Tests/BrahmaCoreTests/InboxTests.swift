@@ -921,7 +921,9 @@ import GRDB
         #expect(eb.status == .pendingInternal); #expect(eb.internalApproverId == w.ceo.id)
         // The tool path, and no CEO-covering agent left: the owner.
         let c = try w.propose(.architecture)
+        // (Killing the CEO makes the cpo acting CEO, who covers `ceo`; killing it too passes the role to the approver, the cto.)
         _ = try w.store.transition(agentId: w.ceo.id, to: .killed)
+        _ = try w.store.transition(agentId: w.cpo.id, to: .killed)
         let out = try w.tools(w.cto).call(name: "escalate_decision", arguments: ["ask": .string(c.ref), "reason": .string("stuck")])
         #expect(out.contains("owner"))
         #expect(try w.fresh(c).status == .pendingOwner); #expect(try w.fresh(c).escalatedAt != nil)

@@ -89,7 +89,14 @@ extension Store {
         }
 
         func list(_ xs: [String]) -> String {
-            xs.isEmpty ? "- (none)" : xs.map { "- " + ReviewDigest.flat($0, max: 2000) }.joined(separator: "\n")
+            xs.isEmpty ? "- (none)" : xs.map { entry in
+                // A block the engine quoted (every line prefixed) keeps its lines; anything else is one flattened line.
+                let lines = entry.components(separatedBy: "\n")
+                if lines.allSatisfy({ $0.hasPrefix(ReviewDigest.quotePrefix) }) {
+                    return "-\n" + lines.prefix(200).map { String(ReviewDigest.clean($0).prefix(2000)) }.joined(separator: "\n")
+                }
+                return "- " + ReviewDigest.flat(entry, max: 2000)
+            }.joined(separator: "\n")
         }
         let check = item.checkSpec.map { "Check (rev \(item.checkRevision)): `\(ReviewDigest.flat($0.command, max: 400))`" } ?? "Check: none"
         let from = "From: @\(authorHandle)" + (recipientHandle.map { " to @\($0)" } ?? "") + (auto ? " (written by the engine)" : "")

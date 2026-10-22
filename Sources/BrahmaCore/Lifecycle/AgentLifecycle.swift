@@ -25,10 +25,11 @@ extension Store {
         try writer.write { db in try transitionAndRelease(db: db, agentId: agentId, to: to, blocker: blocker, now: now) }
     }
 
-    /// `transition`, plus what killing an agent does to its work: leases marked expired, items unassigned.
+    /// `transition`, plus what leaving the company does to the org (`offboard`): asks and reviews re-routed, leases marked
+    /// expired, items unassigned with an auto hand-off, reports reparented, an acting CEO named, observers told.
     func transitionAndRelease(db: Database, agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date) throws -> Agent {
         let agent = try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
-        if to == .killed { try releaseWork(of: agent, db: db, now: now) }
+        if to == .killed { try offboard(db: db, agent: agent, now: now) }
         return agent
     }
 

@@ -17,6 +17,10 @@ struct Status: ParsableCommand {
             }
             print(safe(header))
             print("  inbox: \(try store.ownerWaitingCount(companyId: c.id)) waiting")
+            if !agents.contains(where: { $0.state == .running }) {
+                let report = try store.stallReport(companyId: c.id)
+                if let first = report.reasons.first { print(safe("  0 running: \(first)")) }
+            }
             for a in agents {
                 var parts = ["  @\(a.name)", a.state.rawValue]
                 if a.paused { parts.append("paused") }
