@@ -70,6 +70,33 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
                          .initInfo(InitInfo(sessionId: "s1", model: "m", tools: [], agents: []))])
     }
 
+    /// A grandchild that outlives the turn keeps stderr open: the pipe never reaches end of file, so the turn ends through
+    /// the bounded drain, and the tail still holds what the process wrote.
+    @Test func stderrTailCapturedWhileGrandchildHoldsStderr() async throws {
+        let (script, dir) = try fakeClaude("""
+            cat > /dev/null
+            echo '{"type":"system","subtype":"init","session_id":"s1","model":"m"}'
+            sleep 30 > /dev/null &
+            echo $! > grandchild.txt
+            echo "fatal: grandchild kept stderr" >&2
+            exit 4
+            """)
+        let runner = ClaudeProcessRunner(claudePath: script.path)
+        let start = ContinuousClock.now
+        do {
+            _ = try await collect(runner.run(request(in: dir)))
+            Issue.record("expected an error")
+        } catch let TurnError.exitedWithoutResult(code, stderrTail) {
+            #expect(code == 4)
+            #expect(stderrTail.contains("fatal: grandchild kept stderr"))
+        }
+        #expect(ContinuousClock.now - start < .seconds(20), "bounded by the drain grace, not the grandchild")
+        let grandchild = try #require(Int32(try String(contentsOf: dir.appending(path: "grandchild.txt"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        #expect(kill(grandchild, 0) == 0, "the grandchild was still holding stderr when the turn ended")
+        kill(grandchild, SIGKILL)
+    }
+
     @Test func timeoutKillsProcess() async throws {
         let (script, dir) = try fakeClaude("""
             echo $$ > pid.txt

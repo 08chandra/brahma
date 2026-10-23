@@ -63,21 +63,6 @@ public struct ClaudeProcessRunner: TurnRunning {
         self.baseEnvironment = baseEnvironment
     }
 
-    /// What is in the pipe at `fd` right now (up to `stderrLimit` × 16 bytes), read without blocking.
-    static func readWithoutWaiting(_ fd: Int32) -> Data {
-        let flags = fcntl(fd, F_GETFL)
-        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-        var out = Data()
-        var buffer = [UInt8](repeating: 0, count: 4096)
-        while out.count < stderrLimit * 16 {
-            let n = read(fd, &buffer, buffer.count)
-            if n < 0, errno == EINTR { continue }
-            guard n > 0 else { break }
-            out.append(contentsOf: buffer[0..<n])
-        }
-        return out
-    }
-
     /// Exit code of a process that died of SIGTERM: 143 through a shell wrapper, the signal number itself from Foundation.
     static func isSigterm(_ status: Int32) -> Bool { status == 143 || status == SIGTERM }
 
@@ -197,12 +182,8 @@ public struct ClaudeProcessRunner: TurnRunning {
             let data = h.availableData
             if data.isEmpty { h.readabilityHandler = nil; splitter.finish() } else { splitter.append(data) }
         }
-        let tail = TailBuffer(limit: Self.stderrLimit)
-        let stderrClosed = Flag()
-        stderr.fileHandleForReading.readabilityHandler = { h in
-            let data = h.availableData
-            if data.isEmpty { h.readabilityHandler = nil; stderrClosed.set() } else { tail.append(data) }
-        }
+        let stderrReader = StderrReader(stderr.fileHandleForReading, limit: Self.stderrLimit)
+        stderrReader.start()
         let exit = ExitWaiter()
         let child = ChildProcess(process)
         process.terminationHandler = { p in
@@ -218,7 +199,7 @@ public struct ClaudeProcessRunner: TurnRunning {
             try process.run()
         } catch {
             stdout.fileHandleForReading.readabilityHandler = nil
-            stderr.fileHandleForReading.readabilityHandler = nil
+            stderrReader.drain()
             throw error
         }
 
@@ -265,14 +246,13 @@ public struct ClaudeProcessRunner: TurnRunning {
         // The last of stderr may still be in its pipe when the process is gone; give it until the drain grace (bounded by the
         // clock, not by a count of sleeps, which stretch on a loaded machine).
         let stderrDeadline = ContinuousClock.now + .seconds(Self.drainGrace) + .milliseconds(500)
-        while !stderrClosed.isSet, ContinuousClock.now < stderrDeadline { try? await Task.sleep(for: .milliseconds(5)) }
-        if !stderrClosed.isSet {
-            // Not closed in time (a grandchild may hold the pipe, or the handler is slow on a loaded machine): whatever the
-            // process wrote before it exited is still in the pipe, so it is read now, without waiting, and nothing is lost.
-            stderr.fileHandleForReading.readabilityHandler = nil
-            tail.append(Self.readWithoutWaiting(stderr.fileHandleForReading.fileDescriptor))
-        }
-        if let requested = TurnAudit.effortCap(in: tail.text) { yield(.effortCapped(requested: requested)) }
+        while !stderrReader.isClosed, ContinuousClock.now < stderrDeadline { try? await Task.sleep(for: .milliseconds(5)) }
+        // Not closed in time (a grandchild may hold the pipe, or the handler is slow on a loaded machine): whatever the
+        // process wrote before it exited is still in the pipe, so it is read now, without waiting, and nothing is lost.
+        // The drain stops the handler first, so no handler read can race it (a no-op once the pipe has closed).
+        stderrReader.drain()
+        let stderrTail = stderrReader.text
+        if let requested = TurnAudit.effortCap(in: stderrTail) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
         let sawResult = state.sawResult
         // The last result is authoritative even if the process lingered past it and had to be killed ...
@@ -290,7 +270,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         if timedOut.isSet { throw TurnError.timedOut }
         // SIGTERM from outside (a shutdown, a kill) ends the turn without a result; the agent is not at fault.
         if Self.isSigterm(status) { throw TurnError.interrupted(pendingTasks: 0) }
-        throw TurnError.exitedWithoutResult(code: status, stderrTail: tail.text)
+        throw TurnError.exitedWithoutResult(code: status, stderrTail: stderrTail)
     }
 }
 
@@ -326,6 +306,89 @@ private final class LineSplitter: @unchecked Sendable {
     private func emit(_ bytes: Data) {
         let line = String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if !line.isEmpty { sink.yield(line) }
+    }
+}
+
+/// Collects a child's stderr into a bounded tail, never through `FileHandle.availableData`: that raises an uncatchable
+/// exception on a read error, and a handler already running when its `readabilityHandler` is cleared still reads. The
+/// readability handler and the final `drain()` read the pipe under one lock, each only what `poll` reports is there, so
+/// the fd stays blocking, neither reader can wait on the other, and once `drain()` has run a handler still in flight
+/// returns without reading.
+final class StderrReader: @unchecked Sendable {
+    /// Where a readability handler is; tests pause it at `.entered` to force the drain to run while it is in flight.
+    enum HandlerPhase: Sendable { case entered, returned }
+
+    private let handle: FileHandle
+    private let fd: Int32
+    private let tail: TailBuffer
+    private let maxRead: Int
+    private let onHandler: @Sendable (HandlerPhase) -> Void
+    private let lock = NSLock()
+    private var stopped = false
+    private var eof = false
+    private var errors = 0
+
+    init(_ handle: FileHandle, limit: Int, onHandler: @escaping @Sendable (HandlerPhase) -> Void = { _ in }) {
+        self.handle = handle
+        fd = handle.fileDescriptor
+        tail = TailBuffer(limit: limit)
+        maxRead = limit * 16
+        self.onHandler = onHandler
+    }
+
+    func start() {
+        // The closure holds `self` until the handler is cleared: at end of file or in `drain()`, which every turn reaches.
+        handle.readabilityHandler = { [self] _ in pump() }
+    }
+
+    /// The pipe reached end of file (every writer closed it).
+    var isClosed: Bool { lock.withLock { eof } }
+    /// The last `limit` bytes read.
+    var text: String { tail.text }
+    /// Reads that failed (EAGAIN, EBADF ...). Always 0: a read happens only when `poll` says it will not block.
+    var readErrors: Int { lock.withLock { errors } }
+
+    /// Stops the handler and reads what is in the pipe right now (bounded), without waiting for end of file. Idempotent.
+    func drain() {
+        handle.readabilityHandler = nil
+        lock.withLock {
+            guard !stopped else { return }
+            stopped = true
+            if !eof { readAvailable() }
+        }
+    }
+
+    private func pump() {
+        onHandler(.entered)
+        defer { onHandler(.returned) }
+        let closed = lock.withLock { () -> Bool in
+            guard !stopped, !eof else { return true }
+            readAvailable()
+            return eof
+        }
+        if closed { handle.readabilityHandler = nil }
+    }
+
+    /// Lock held. Reads while `poll` reports data (or end of file), up to `maxRead` bytes; never blocks.
+    private func readAvailable() {
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        var total = 0
+        while total < maxRead {
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pfd, 1, 0)
+            if ready < 0, errno == EINTR { continue }
+            guard ready > 0 else { return }
+            if pfd.revents & Int16(POLLNVAL | POLLERR) != 0 { eof = true; return }
+            guard pfd.revents & Int16(POLLIN | POLLHUP) != 0 else { return }
+            let n = read(fd, &buffer, min(buffer.count, maxRead - total))
+            if n < 0 {
+                if errno == EINTR { continue }
+                errors += 1; eof = true; return
+            }
+            if n == 0 { eof = true; return }
+            tail.append(Data(buffer[0..<n]))
+            total += n
+        }
     }
 }
 
