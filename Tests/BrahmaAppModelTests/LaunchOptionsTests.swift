@@ -19,6 +19,10 @@ import BrahmaCore
         let a = LaunchOptions.parse(["/x/Brahma", "--smoke-test", "--smoke-hold=14"])
         #expect(a.smokeTest)
         #expect(a.smokeHold == 14)
+        #expect(a.smokeRelease == nil)
+        let b = LaunchOptions.parse(["/x/Brahma", "--smoke-test", "--smoke-hold=90", "--smoke-release=/tmp/x/release-a"])
+        #expect(b.smokeHold == 90)
+        #expect(b.smokeRelease == "/tmp/x/release-a")
     }
 
     @Test func ignoresUnknownAndPsnArgs() {

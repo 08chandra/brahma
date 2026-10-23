@@ -45,15 +45,28 @@ stop_cli() {
 }
 
 # (A) App embeds the engine; quitting pauses it; the bundled MCP helper path works end to end.
-set +e
-OUT="$($APP --smoke-test --smoke-hold=8)"
-STATUS=$?
-set -e
+# The app is held until @ceo's fake-turn DM is in the log (a first launch after a clean build can take well over a fixed
+# hold before the engine's first turn finishes), then released; 90 s is only the upper bound.
+$APP --smoke-test --smoke-hold=90 --smoke-release="$TMP/release-a" >"$TMP/app-a.out" 2>&1 &
+APP_PID=$!
+START=$(date +%s)
+SEEN=""
+while kill -0 "$APP_PID" 2>/dev/null && [ $(( $(date +%s) - START )) -lt 80 ]; do
+  if "$CLI" log Acme @ceo 2>/dev/null | grep -q 'Acknowledged (fake turn).'; then SEEN=1; break; fi
+  sleep 0.2
+done
+touch "$TMP/release-a"
+STATUS=0
+wait "$APP_PID" || STATUS=$?
+APP_PID=""
+OUT="$(cat "$TMP/app-a.out")"
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case A exit $STATUS"
-echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded' || fail "case A: expected engine=embedded"
+[ -n "$SEEN" ] || fail "case A: no fake-turn DM from @ceo within 80 s"
+echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded.* released=yes' || fail "case A: expected engine=embedded, released"
 if "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running'; then fail "case A: agents still running after quit"; fi
 "$CLI" log Acme @ceo | grep -q 'Acknowledged (fake turn).' || fail "case A: no fake-turn DM from @ceo"
+echo "SMOKE OK case=A fake-turn-dm after $(( $(date +%s) - START ))s"
 
 # (B) A terminal engine holds the lock: the app shows it as external.
 start_cli

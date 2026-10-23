@@ -42,6 +42,9 @@ public struct LaunchOptions: Equatable, Sendable {
     public var smokeTest = false
     public var smokeHold: Double = 0
     public var smokeCloseWindow = false
+    /// `--smoke-release=<path>`: the smoke hold ends as soon as this file exists (the script creates it once it has seen
+    /// what it waits for); `smokeHold` is then only the upper bound.
+    public var smokeRelease: String?
     public var snapshotPath: String?
     public var select: SelectTarget?
     /// Company name to select first (snapshots of the work screens use the seeded Initech).
@@ -57,6 +60,12 @@ public struct LaunchOptions: Equatable, Sendable {
             // launch as an open-file request, and SwiftUI then skips the main window.
             if args[i].hasPrefix("--smoke-hold="), let v = Double(args[i].dropFirst("--smoke-hold=".count)) {
                 o.smokeHold = v
+                i += 1
+                continue
+            }
+            if args[i].hasPrefix("--smoke-release=") {
+                let path = String(args[i].dropFirst("--smoke-release=".count))
+                if !path.isEmpty { o.smokeRelease = path }
                 i += 1
                 continue
             }
