@@ -9,8 +9,31 @@ case "${1:-}" in
   --help)
     for f in -p --output-format --verbose --resume --session-id --mcp-config --strict-mcp-config --model \
              --fallback-model --append-system-prompt --permission-mode --allowed-tools --disallowed-tools \
-             --add-dir --settings --setting-sources --disable-slash-commands; do
+             --add-dir --settings --setting-sources --disable-slash-commands --effort --max-budget-usd; do
       echo "  $f <value>  fake"
+    done
+    exit 0 ;;
+esac
+
+# The doctor's mode-canary (no model call): `--input-format stream-json` plus control requests on stdin; answer
+# initialize, get_settings and get_usage like a minimal real claude, echoing back the --model and --effort it was given.
+case " $* " in
+  *" --input-format stream-json "*)
+    M=""; E=""; p=""
+    for a in "$@"; do
+      [ "$p" = "--model" ] && M="$a"
+      [ "$p" = "--effort" ] && E="$a"
+      p="$a"
+    done
+    while IFS= read -r line; do
+      id="$(printf '%s' "$line" | sed -n 's/.*"request_id" *: *"\([^"]*\)".*/\1/p')"
+      case "$line" in
+        *'"initialize"'*) body='{"fast_mode_state":"off","agents":[{"name":"general-purpose"},{"name":"Explore"}]}' ;;
+        *'"get_settings"'*) body="{\"applied\":{\"model\":\"$M\",\"effort\":\"$E\",\"ultracode\":false,\"advisor\":null},\"effective\":{\"disableWorkflows\":true,\"fastMode\":false}}" ;;
+        *'"get_usage"'*) body='{"subscription_type":"max_5x"}' ;;
+        *) continue ;;
+      esac
+      echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":$body}}"
     done
     exit 0 ;;
 esac
@@ -70,6 +93,6 @@ case "$PROMPT" in
 esac
 
 EPOCH=$(( $(date +%s) + 10800 ))
-echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$SID\",\"model\":\"fake\"}"
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$SID\",\"model\":\"fake\",\"agents\":[\"Explore\",\"general-purpose\"],\"tools\":[]}"
 echo "{\"type\":\"rate_limit_event\",\"session_id\":\"$SID\",\"rate_limit_info\":{\"status\":\"allowed\",\"resetsAt\":$EPOCH,\"rateLimitType\":\"five_hour\",\"isUsingOverage\":false,\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.38,\"resetsAt\":$EPOCH},\"seven_day\":{\"utilization\":0.12,\"resetsAt\":$EPOCH}}}}"
 echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"$RESULT\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"total_cost_usd\":0,\"api_error_status\":null,\"session_id\":\"$SID\"}"

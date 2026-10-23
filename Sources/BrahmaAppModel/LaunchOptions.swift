@@ -44,6 +44,8 @@ public struct LaunchOptions: Equatable, Sendable {
     public var smokeCloseWindow = false
     public var snapshotPath: String?
     public var select: SelectTarget?
+    /// Company name to select first (snapshots of the work screens use the seeded Initech).
+    public var company: String?
 
     public init() {}
 
@@ -65,6 +67,8 @@ public struct LaunchOptions: Equatable, Sendable {
                 if i + 1 < args.count, let v = Double(args[i + 1]) { o.smokeHold = v; i += 1 }
             case "--ui-snapshot":
                 if i + 1 < args.count { o.snapshotPath = args[i + 1]; i += 1 }
+            case "--company":
+                if i + 1 < args.count { o.company = args[i + 1]; i += 1 }
             case "--select":
                 if i + 1 < args.count { o.select = SelectTarget(args[i + 1]); i += 1 }
             default: break

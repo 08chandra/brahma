@@ -83,6 +83,10 @@ enum Harness {
     private static func snapshot(path: String, options: LaunchOptions, model: AppModel) async {
         func fail(_ reason: String) -> Never { snapshotFail(reason) }
         guard let window = mainWindows().first else { fail("no window") }
+        if let name = options.company,
+           let company = model.snapshot.companies.first(where: { $0.company.name.lowercased() == name.lowercased() }) {
+            await model.selectCompany(company.id)
+        }
         if let target = options.select { model.apply(target) }
         window.setContentSize(NSSize(width: 1280, height: 800))
         window.makeKeyAndOrderFront(nil)

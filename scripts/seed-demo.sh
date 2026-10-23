@@ -28,3 +28,30 @@ fi
 "$B" company pause Globex
 "$B" say Acme '#general' "@ceo please draft a plan and ask @cto for a stack"
 "$B" say Acme @cto "What stack do you suggest?"
+
+# Initech: a 12-agent org with the work system seeded (asks need BRAHMA_DEV=1; auto-merge-small stays off).
+"$B" company create Initech --goal "Build a habit tracker" --agents 12
+W="$BRAHMA_WORKSPACES/initech"
+if [ ! -d "$W" ]; then W="$(find "$BRAHMA_WORKSPACES" -maxdepth 1 -iname 'initech*' -type d | head -1)"; fi
+mkdir -p "$W/docs"
+cat >"$W/docs/prd.md" <<'DOC'
+# Habit tracker PRD
+
+Goals for the first release:
+
+- Daily streaks per habit
+- Reminders at a time you choose
+- A weekly summary
+
+Research notes live at [the shared notes](https://example.com/notes).
+DOC
+BRAHMA_DEV=1 "$B" dev propose Initech --by cpo --kind prd --title "Habit tracker PRD" --summary "Daily streaks, reminders" \
+  --document docs/prd.md >/dev/null
+BRAHMA_DEV=1 "$B" dev decide Initech A-1 --by ceo --approve >/dev/null
+BRAHMA_DEV=1 "$B" dev propose Initech --by cto --kind other --category pricing --title "Freemium tier" \
+  --summary "Free up to 3 habits" >/dev/null
+BRAHMA_DEV=1 "$B" dev decide Initech A-2 --by ceo --approve >/dev/null
+"$B" items add Initech --type epic --title "Streaks" --description "Daily streak tracking" >/dev/null
+"$B" items add Initech --type task --title "Streak counter" --parent INITE-1 --tier s --priority 1 \
+  --check "test -f streak.txt" --path . --description "Count consecutive days" >/dev/null
+"$B" items add Initech --type bug --title "Reminder fires twice" --owner eng-1 --priority 1 >/dev/null

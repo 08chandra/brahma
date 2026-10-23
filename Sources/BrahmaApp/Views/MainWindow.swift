@@ -25,6 +25,8 @@ struct MainWindow: View {
 private struct Shell: View {
     @Bindable var model: AppModel
     @State private var sidebarWidth: CGFloat = 220
+    /// The plan-tier alert is shown once per reported mismatch; "Not now" hides it until the text changes.
+    @State private var dismissedPlanAlert: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,7 +37,8 @@ private struct Shell: View {
                 Sidebar(model: model).frame(width: sidebarWidth)
                 SplitDivider(width: $sidebarWidth, range: 180...320)
                 VStack(spacing: 0) {
-                    EngineBanner(engine: model.engine, notice: model.startupNotice)
+                    EngineBanner(engine: model.engine, notice: model.startupNotice, hold: model.holdBanner,
+                                 canRetryHold: model.canRetryEngine, retryHold: { Task { await model.retryEngine() } })
                     DetailView(model: model)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -51,12 +54,20 @@ private struct Shell: View {
                 switch sheet {
                 case .newCompany: NewCompanySheet(model: model)
                 case .hire: HireSheet(model: model)
-                case .newItem: MonoEmptyState("Coming soon", detail: "The new-item form arrives in the next update.")
-                    .frame(width: 360, height: 160)
+                case .newItem: ItemEditorSheet(model: model)
                 }
             }
             .background(BrahmaTheme.bg1)
             .preferredColorScheme(.dark)
+        }
+        .alert("Confirm your Claude plan", isPresented: Binding(
+            get: { model.planMismatchAlert != nil && model.planMismatchAlert != dismissedPlanAlert && model.errorMessage == nil },
+            set: { if !$0 { dismissedPlanAlert = model.planMismatchAlert } }
+        )) {
+            Button("Use the reported plan") { Task { await model.confirmReportedPlan() } }
+            Button("Not now", role: .cancel) {}
+        } message: {
+            Text(verbatim: model.planMismatchAlert ?? "")
         }
         .alert("Something went wrong", isPresented: Binding(
             get: { model.errorMessage != nil },

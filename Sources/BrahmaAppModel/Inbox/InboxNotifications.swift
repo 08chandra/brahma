@@ -32,7 +32,7 @@ public enum InboxNotifications {
         let kind = ask.kind == .info ? "Question" : ask.kind == .engineAlert ? "Engine alert" : "Needs your decision"
         let title = flatten("\(companyName): \(kind)", max: 80)
         let body = flatten("\(ask.ref) \(ask.title)", max: maxBody)
-        return InboxNotification(askId: ask.id, companyId: ask.companyId, identifier: "\(ask.id)#\(ask.remindCount)",
+        return InboxNotification(askId: ask.id, companyId: ask.companyId, identifier: "ask-\(ask.id)-\(ask.remindCount)",
                                  title: title, body: body)
     }
 }

@@ -39,8 +39,8 @@ import BrahmaCore
         try w.setStatus(d, .blocked); try w.setStatus(e, .done)
         await w.refresh()
         let columns = w.model.boardColumns
-        #expect(columns.map(\.title) == ["Ready", "In progress", "In review", "Blocked", "Done"])
-        #expect(columns.map { $0.rows.map(\.title) } == [["A"], ["B"], ["C"], ["D"], ["E"]])
+        #expect(columns.map(\.title) == ["Backlog", "Ready", "In progress", "In review", "Blocked", "Done"])
+        #expect(columns.map { $0.rows.map(\.title) } == [[], ["A"], ["B"], ["C"], ["D"], ["E"]])
         // A sprint filter keeps only that sprint's items.
         let sprintId = "sprint-1"
         try await w.store.writer.write { db in

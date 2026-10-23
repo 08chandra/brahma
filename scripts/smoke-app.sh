@@ -51,7 +51,7 @@ STATUS=$?
 set -e
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case A exit $STATUS"
-echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=embedded' || fail "case A: expected engine=embedded"
+echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded' || fail "case A: expected engine=embedded"
 if "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running'; then fail "case A: agents still running after quit"; fi
 "$CLI" log Acme @ceo | grep -q 'Acknowledged (fake turn).' || fail "case A: no fake-turn DM from @ceo"
 
@@ -64,7 +64,7 @@ STATUS=$?
 set -e
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case B exit $STATUS"
-echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=external' || fail "case B: expected engine=external"
+echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=external' || fail "case B: expected engine=external"
 stop_cli
 
 # (C) The terminal engine stops while the app runs: the app takes over.
@@ -77,7 +77,7 @@ stop_cli
 wait "$APP_PID" || fail "case C: app exited non-zero"
 APP_PID=""
 cat "$TMP/app.out"
-grep -q '^SMOKE OK companies=2 agents=4 engine=embedded' "$TMP/app.out" || fail "case C: expected engine=embedded after takeover"
+grep -q '^SMOKE OK companies=3 agents=10 engine=embedded' "$TMP/app.out" || fail "case C: expected engine=embedded after takeover"
 
 # (D) Closing the main window keeps the app and engine alive in the menu bar; reopening restores the window.
 set +e
@@ -86,7 +86,7 @@ STATUS=$?
 set -e
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case D exit $STATUS"
-echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
+echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
 
 # (E) A second SIGTERM while the first quit is stopping the engine must not skip the bounded stop.
 "$CLI" say Acme @ceo "Status update, please." >/dev/null
