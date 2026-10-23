@@ -5,7 +5,8 @@ import BrahmaCore
 struct CompanyGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "company", abstract: "Create and manage companies.",
-        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self, Autonomy.self, Auto.self])
+        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self, Autonomy.self, Auto.self,
+                      SetSetting.self])
 
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String
@@ -126,6 +127,29 @@ struct CompanyGroup: ParsableCommand {
     }
 
     enum OnOff: String, ExpressibleByArgument { case on, off }
+
+    struct SetSetting: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "set",
+            abstract: "Change a company setting. auto-merge-small: small, lead-configured tier S changes whose allowlisted check "
+                + "passes land without a review turn and are audited after (off until you switch it on; 'brahma settings "
+                + "auto-merge' must be on too).")
+        enum Setting: String, ExpressibleByArgument { case autoMergeSmall = "auto-merge-small" }
+        @Argument var company: String
+        @Argument(help: "auto-merge-small.") var setting: Setting
+        @Argument(help: "on or off.") var value: OnOff
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            switch setting {
+            case .autoMergeSmall:
+                try store.setAutoMergeSmall(companyId: c.id, value == .on)
+                print(safe("\(c.name): auto-merge-small \(value.rawValue) (owner-wide auto-merge: \(store.autoMergeEnabled() ? "on" : "off"))"))
+            }
+        }
+    }
 
     private static func setAutonomy(_ query: String, _ preset: AutonomyPreset) throws {
         let (store, _) = try openStore()

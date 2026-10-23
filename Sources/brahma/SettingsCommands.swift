@@ -89,7 +89,7 @@ extension SettingsGroup {
     struct AutoMerge: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "auto-merge",
-            abstract: "Show or switch risk-tiered auto-merge: small, lead-configured tier S changes that pass their check land without a review turn and are audited after.")
+            abstract: "Show or switch risk-tiered auto-merge owner-wide: small, lead-configured tier S changes that pass an allowlisted check land without a review turn and are audited after. The master switch: each company must also be switched on ('brahma company set <company> auto-merge-small on').")
         @Argument(help: "on or off; omit to show the current setting.") var value: Switch?
 
         func run() throws {

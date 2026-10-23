@@ -141,7 +141,7 @@ extension Store {
             guard item.status == .inReview else {
                 throw WorkError.conflict("\(item.key) is \(item.status.title.lowercased()), not in review")
             }
-            guard item.mergeState != .verifying else {
+            guard item.mergeState != .verifying || item.reviewedRound >= item.reviewRound else {
                 throw WorkError.conflict("\(item.key) is being checked again after a rebase onto main; review it when that check passes")
             }
             guard item.mergeState == .none else { throw WorkError.conflict("\(item.key) is already approved and waiting to merge") }

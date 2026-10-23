@@ -409,6 +409,10 @@ enum Migrations {
                 t.add(column: "followUpId", .text)
             }
         }
+        m.registerMigration("v3-review-audit-3") { db in
+            // The company's own auto-merge switch: off for every company until the owner switches it on.
+            try db.alter(table: "company") { t in t.add(column: "autoMergeSmall", .boolean).notNull().defaults(to: false) }
+        }
         m.registerMigration("v3-sessions") { db in
             // One session per (agent, item); a turn in another working directory starts a fresh one. `lastTurnId` points at the
             // session's newest turn: its end time is the warm rule, its token columns (Task 14) the size rule.

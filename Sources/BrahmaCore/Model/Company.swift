@@ -31,6 +31,9 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var pendingMainCommit: String? = nil
     /// Auto-approved items that landed in `main` (9c); every one is audited.
     public var autoMergeCount: Int = 0
+    /// Risk-tiered auto-merge (9c) for this company: off until the owner switches it on (`Store.setAutoMergeSmall`, the CLI
+    /// `brahma company set <company> auto-merge-small on`). The owner-wide switch (`Store.setAutoMerge`) must be on as well.
+    public var autoMergeSmall: Bool = false
     /// The completion rule new sprints use unless the plan names one (the pack's `defaultCadence` at creation).
     public var cadence: CadenceKind = .sprint
 }

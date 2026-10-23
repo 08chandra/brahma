@@ -15,9 +15,11 @@ import GRDB
         var root: URL { URL(fileURLWithPath: company.workspacePath, isDirectory: true) }
         var ws: GitWorkspace { GitWorkspace(root: root) }
 
-        init(store: Store? = nil, memory: (any MemoryPressureSource)? = nil) throws {
+        /// `autoMergeSmall`: the company's auto-merge switch (off for a new company), switched on as the owner would.
+        init(store: Store? = nil, memory: (any MemoryPressureSource)? = nil, autoMergeSmall: Bool = true) throws {
             let w = try World(store: store, memory: memory)
             let c = try w.company("Acme")
+            if autoMergeSmall { try w.store.setAutoMergeSmall(companyId: c.id, true) }
             func hire(_ n: String, _ role: String, _ manager: Agent? = nil) throws -> Agent {
                 try w.store.hire(companyId: c.id, name: n, role: role, model: "sonnet", managerId: manager?.id)
             }
@@ -29,6 +31,9 @@ import GRDB
             eng3 = try hire("eng-3", "engineer", lead)
             rev = try hire("rev", "engineer", lead)
         }
+
+        /// An allowlisted check command (`CheckScripts.checkReach`); the fake check runner never runs it.
+        static let check = "make test"
 
         func tools(_ a: Agent) -> CompanyTools { CompanyTools(store: store, companyId: company.id, agentId: a.id) }
         func reviewTools(_ a: Agent, _ i: WorkItem) -> CompanyTools {
@@ -60,7 +65,7 @@ import GRDB
         }
 
         @discardableResult
-        func item(_ title: String = "Do it", type: WorkItemType = .task, command: String? = "true", reviewer: Agent? = nil,
+        func item(_ title: String = "Do it", type: WorkItemType = .task, command: String? = Self.check, reviewer: Agent? = nil,
                   tier: EffortTier = .m, noReviewer: Bool = false, parent: WorkItem? = nil,
                   status: WorkItemStatus = .ready) throws -> WorkItem {
             let n = (try store.workItems(companyId: company.id)).count + 1
@@ -225,7 +230,7 @@ import GRDB
         #expect(req.workingDirectory == wt.path)
         #expect(req.prompt.hasPrefix("Review \(i.key) (task, tier M, round 1)"))
         #expect(req.prompt.contains("src/work.txt")); #expect(req.prompt.contains("Diff (main...item/\(i.key)):"))
-        #expect(req.prompt.contains("    | did the work")); #expect(req.prompt.contains("Check (rev 0): true"))
+        #expect(req.prompt.contains("    | did the work")); #expect(req.prompt.contains("Check (rev 0): make test"))
         #expect(!req.prompt.contains("New since your last turn")); #expect(!req.prompt.contains("unrelated chatter"))
         let system = try #require(req.appendSystemPrompt)
         #expect(system.contains("@rev, the engineer of Acme"), "role prompt first")
@@ -699,6 +704,9 @@ import GRDB
         try await r.cycle()    // main moved on: b is rebased and must pass its check again before it lands
         let mid = try r.fresh(b)
         #expect(mid.status == .inReview); #expect(mid.mergeState == .verifying)
+        // Approved already: its reviewer is told so, not that it awaits a review after the re-check.
+        let again = r.failure { _ = try r.review(r.rev, b, .approve); return "" }
+        #expect(again.contains("already approved"), "\(again)")
         let rebased = try #require(try r.head(b))
         #expect(rebased != verifiedB)
         let run = try #require(try r.store.latestVerification(itemId: b.id))
@@ -1611,7 +1619,7 @@ extension ReviewTests {
     /// Claim a tier S item (made by the owner unless `item` is given), write `files` in its worktree, run `edit` there, submit,
     /// and let the engine check it.
     /// `author` nil: a new engineer under @mgr (an agent holds one lease at a time, and items kept for review keep theirs).
-    private func submitted(_ r: R, tier: EffortTier = .s, by author: Agent? = nil, command: String? = "true", item: WorkItem? = nil,
+    private func submitted(_ r: R, tier: EffortTier = .s, by author: Agent? = nil, command: String? = R.check, item: WorkItem? = nil,
                            files: [String: String] = [:], edit: ((URL) throws -> Void)? = nil) async throws -> WorkItem {
         let i = try item ?? r.item("small change", type: command == nil ? .spike : .task, command: command, tier: tier)
         let n = try r.store.agents(companyId: r.company.id).count
@@ -1625,7 +1633,7 @@ extension ReviewTests {
     }
 
     /// An item an agent filed itself through `create_work_item`: tier `tier`, an engine check, ready to claim.
-    private func made(_ r: R, by creator: Agent, tier: EffortTier = .s, command: String = "true") throws -> WorkItem {
+    private func made(_ r: R, by creator: Agent, tier: EffortTier = .s, command: String = R.check) throws -> WorkItem {
         let n = try r.store.workItems(companyId: r.company.id).count + 1
         _ = try r.tools(creator).call(name: "create_work_item", arguments: [
             "type": .string("task"), "title": .string("small change"), "tier": .string(tier.rawValue), "status": .string("ready"),
@@ -1849,17 +1857,18 @@ extension ReviewTests {
     @Test func aCheckReferencedOrTestFileIsNeverAutoMerged() async throws {
         let r = try R()
         try r.commitMain(["src/check.py": "print('ok')\n", "src/__tests__/a.test.ts": "it('ok', () => {})\n"])
-        // The check names `check.py` relative to the directory it changes into: a one-line edit of src/check.py is reviewed.
-        try keptForReview(r, try await submitted(r, command: "cd src && python3 check.py", files: ["src/check.py": "print('ok') # x\n"]),
-                          "check script resolved through cd")
+        // The check names src/check.py: a one-line edit of it is reviewed.
+        try keptForReview(r, try await submitted(r, command: "pytest src/check.py", files: ["src/check.py": "print('ok') # x\n"]),
+                          "a file the check names")
         // A test file under an allowed directory.
         try keptForReview(r, try await submitted(r, files: ["src/__tests__/a.test.ts": "it('ok', () => { /* x */ })\n"]), "a test file")
-        // Tokens: as written, resolved against `cd X` / `(cd X; …)` / `-C X`, and Python module names.
-        let tokens = CheckScripts.checkTokens(command: "cd src && python3 check.py; (cd lib/x; node run.js) && tool -C app/gen v.rb "
-                                                  + "&& python3 -m pkg.verify --config=conf/c.yml")
-        for t in ["check.py", "src/check.py", "lib/x/run.js", "app/gen/v.rb", "pkg/verify.py", "conf/c.yml"] {
+        // Tokens: as written, option values, and each resolved against a directory option.
+        let tokens = CheckScripts.checkReach(command: "pytest src/check.py --confcutdir=conf/c --rootdir lib/x v.py").tokens
+        for t in ["src/check.py", "conf/c", "lib/x", "v.py", "lib/x/v.py", "lib/x/src/check.py"] {
             #expect(tokens.contains(t), "\(t) in \(tokens.sorted())")
         }
+        // `python -m pytest` imports a `pytest` module from the workspace first.
+        #expect(CheckScripts.checkReach(command: "python3 -m pytest").tokens.isSuperset(of: ["pytest.py", "pytest"]))
         // Basename or path suffix of a token.
         #expect(ReviewPolicy.isSensitive("src/deep/check.py", checkTokens: ["check.py"]))
         #expect(ReviewPolicy.isSensitive("src/a/tools/run.js", checkTokens: ["tools/run.js"]))
@@ -1875,28 +1884,24 @@ extension ReviewTests {
         #expect(!ReviewPolicy.isSensitive("src/contest.txt")); #expect(!ReviewPolicy.isSensitive("src/testing.md"))
     }
 
-    @Test func aCheckDirectoryRunnerConfigOrUnparseableCheckIsNeverAutoMerged() async throws {
+    @Test func aCheckDirectoryOrRunnerConfigIsNeverAutoMerged() async throws {
         let r = try R()
-        try r.commitMain(["src/checks/helper.py": "OK = True\n", "src/pkg/check.py": "print('ok')\n", "src/pkg/util.py": "X = 1\n",
-                          "src/run": "ok\n", "src/main.c": "int main(){}\n"])
+        try r.commitMain(["src/checks/helper.py": "OK = True\n", "src/pkg/util.py": "X = 1\n", "src/main.c": "int main(){}\n"])
         // A file under a directory the check names (pytest collects and imports it) is reviewed.
         try keptForReview(r, try await submitted(r, command: "pytest src/checks", files: ["src/checks/helper.py": "OK = False\n"]),
                           "under a check directory")
         // A test-runner configuration file is sensitive anywhere: `addopts = --co` only collects, so every test "passes".
         try keptForReview(r, try await submitted(r, command: "pytest src/checks", files: ["src/pytest.ini": "[pytest]\naddopts = --co\n"]),
                           "a new pytest.ini")
-        // `python3 -m pkg.check`: the module's directory (also as a suffix, wherever the check runs from).
-        try keptForReview(r, try await submitted(r, command: "cd src && python3 -m pkg.check", files: ["src/pkg/util.py": "X = 2\n"]),
-                          "beside the module a check runs")
-        // `pushd src && ./run`: everything under the directory the check changes into.
-        try keptForReview(r, try await submitted(r, command: "pushd src && ./run", files: ["src/main.c": "int main(){return 0;}\n"]),
-                          "under a pushd directory")
-        // `sh -c "cd src && make"`: the inner command is parsed the same way.
-        try keptForReview(r, try await submitted(r, command: "sh -c \"cd src && make\"", files: ["src/main.c": "int main(){return 1;}\n"]),
-                          "under a cd inside sh -c")
-        // A command that cannot be parsed keeps every change's review.
-        try keptForReview(r, try await submitted(r, command: "python3 $CHECK", files: ["lib/far.txt": "x\n"]), "a variable")
-        // Unrelated paths still auto-merge under a parseable check.
+        try keptForReview(r, try await submitted(r, command: "python3 -m pytest src/pkg", files: ["src/pkg/util.py": "X = 2\n"]),
+                          "under the directory python -m pytest collects")
+        // `make test -C src`: everything under the directory the check runs in.
+        try keptForReview(r, try await submitted(r, command: "make test -C src", files: ["src/main.c": "int main(){return 0;}\n"]),
+                          "under a -C directory")
+        // A workspace module that would shadow pytest.
+        try keptForReview(r, try await submitted(r, command: "python -m pytest", files: ["src/pytest.py": "raise SystemExit(0)\n"]),
+                          "a pytest.py shadowing the runner")
+        // Unrelated paths still auto-merge.
         #expect(try await submitted(r, command: "pytest src/checks", files: ["lib/other.py": "x = 1\n"]).mergeState == .pending)
 
         func sensitive(_ path: String, _ command: String) -> Bool {
@@ -1906,38 +1911,76 @@ extension ReviewTests {
         #expect(sensitive("src/checks", "pytest src/checks")); #expect(sensitive("src/checks/a/b.py", "pytest src/checks"))
         #expect(sensitive("app/src/checks/b.py", "pytest src/checks")); #expect(!sensitive("src/checksum.py", "pytest src/checks"))
         // Beside a referenced script.
-        #expect(sensitive("src/tools/lib.py", "python3 src/tools/check.py")); #expect(!sensitive("src/other/lib.py", "python3 src/tools/check.py"))
-        // `-m value` and `-mvalue`.
-        for command in ["python3 -m pkg.check", "python3 -mpkg.check"] {
-            #expect(sensitive("src/pkg/util.py", command), "\(command)"); #expect(sensitive("src/pkg/check/__main__.py", command), "\(command)")
-            #expect(sensitive("pkg/check.py", command), "\(command)"); #expect(!sensitive("src/other/util.py", command), "\(command)")
-        }
-        // pushd, `cd x &&`, `sh -c "…"` and `bash -c '…'`, also with an outer cd.
-        #expect(sensitive("src/a.txt", "pushd src && ./run")); #expect(sensitive("src/run", "pushd src && ./run"))
-        #expect(sensitive("lib/x/y.rb", "cd lib/x && rake")); #expect(!sensitive("lib/y.rb", "cd lib/x && rake"))
-        #expect(sensitive("src/main.c", "sh -c \"cd src && make\"")); #expect(sensitive("src/main.c", "bash -c 'cd src && make'"))
-        #expect(sensitive("app/gen/v.py", "cd app && bash -lc 'python3 gen/v.py'")); #expect(sensitive("app/gen/w.py", "cd app && bash -lc 'python3 gen/v.py'"))
-        #expect(!sensitive("lib/a.txt", "sh -c \"cd src && make\""))
-        // Unparseable: every path is sensitive.
-        for command in ["python3 $CHECK", "sh -c \"$(cat run)\"", "pytest `ls`", "eval make", "pytest 'src", "pytest \"src",
-                        "sh -c 'cd \"src && make'", "cd ${DIR} && make", "pytest src/{a,b}", "make check\\", "cd .. && make", "cd /tmp && make",
-                        "cd - && make", "cat <<EOF | sh", "python3 -c 'import os'", "node -e 'x'"] {
-            #expect(!CheckScripts.checkReach(command: command).parseable, "\(command)")
-            #expect(sensitive("lib/anything.txt", command), "\(command)")
-        }
-        for command in ["true", "pytest src/checks", "cd src && swift test", "sh -c 'cd src && make'", "make -C lib check", "npm test -- --runInBand",
-                        "pytest -k 'not slow'", "go test ./src/..."] {
-            #expect(CheckScripts.checkReach(command: command).parseable, "\(command)")
-        }
+        #expect(sensitive("src/tools/lib.py", "pytest src/tools/check.py")); #expect(!sensitive("src/other/lib.py", "pytest src/tools/check.py"))
+        // A directory option, as a separate word or with `=`.
+        #expect(sensitive("lib/x/y.rb", "make test -C lib/x")); #expect(!sensitive("lib/y.rb", "make test -C lib/x"))
+        #expect(sensitive("app/web/a.js", "npm test --prefix=app/web")); #expect(!sensitive("app/a.js", "npm test --prefix=app/web"))
         #expect(sensitive("src/pkg/a.go", "go test ./src/...")); #expect(!sensitive("lib/a.go", "go test ./src/..."))
-        // Test-runner configuration files, anywhere and whatever the check.
+        // A check outside the allowlist makes every path sensitive.
+        #expect(sensitive("lib/anything.txt", "cd src && make test")); #expect(!sensitive("lib/anything.txt", "make test"))
+        // Test-runner configuration and test-support files, anywhere and whatever the check.
         for p in ["lib/pytest.ini", "src/tox.ini", "src/noxfile.py", "src/setup.cfg", "src/conftest.py", "src/jest.config.js", "src/vitest.config.ts",
                   "src/.mocharc.yml", "src/karma.conf.js", "src/phpunit.xml.dist", "src/.rspec", "src/babel.config.json", "src/.babelrc",
                   "src/tsconfig.base.json", "src/vite.config.mjs", "src/webpack.config.js", "src/.eslintrc.cjs", "src/eslint.config.js",
-                  "src/playwright.config.ts", "src/.coveragerc", "src/Rakefile", "src/gulpfile.js"] {
+                  "src/playwright.config.ts", "src/.coveragerc", "src/Rakefile", "src/gulpfile.js", "src/pkg/testdata/golden.txt",
+                  "src/__mocks__/fs.js", "src/__fixtures__/a.json", "src/fixtures/a.json", "src/__snapshots__/a.txt", "src/App.test.js.snap",
+                  "src/ui/Button.snap", "src/build.rs"] {
             #expect(ReviewPolicy.isSensitive(p), "\(p)")
         }
         #expect(!ReviewPolicy.isSensitive("src/jester.js")); #expect(!ReviewPolicy.isSensitive("src/config.ts"))
+        #expect(!ReviewPolicy.isSensitive("src/fixture.txt")); #expect(!ReviewPolicy.isSensitive("src/snapshot.swift"))
+    }
+
+    // MARK: The check grammar (G1)
+
+    /// Check commands outside the allowlisted grammar (`CheckScripts.checkReach`): never auto-merged, whatever they change.
+    static let refusedChecks = [
+        // Quotes, escapes, expansions and globs.
+        "make test 'x'", "make test \"x\"", "make test x\\ y", "make test $X", "make test ${X}", "make test `x`", "make test $(x)",
+        "pytest src/*.py", "pytest src/a?.py", "pytest src/[ab].py", "pytest src/{a,b}", "pytest ~/x", "make test # c",
+        // Separators, redirections and subshells.
+        "make test; true", "make test && true", "make test & true", "make test | cat", "make test || true", "make test < in",
+        "make test > out", "make test 2>&1", "(make test)", "make test\ntrue", "make test\rtrue",
+        // Environment assignments (also make variables) and wrappers.
+        "CI=1 make test", "make test CC=src/cc", "env make test", "timeout 60 make test", "nice make test", "npx jest", "uv run pytest",
+        "poetry run pytest", "pipenv run pytest", "sh -c make", "bash run.sh", "sh src/check.sh", "exec make test",
+        // Programs and subcommands outside the list.
+        "true", "", "make", "make check", "npm run lint", "npm run test:unit", "./run-tests", "python3 src/check.py", "python -m pkg.check",
+        "node src/x.js", "swift run", "go vet ./...", "cargo build", "yarn", "jest", "pytest3", "/usr/bin/make test", "Make test",
+        // Module, plugin and import-path forms.
+        "pytest -p myplugin", "pytest -pmyplugin", "pytest --pyargs pkg", "pytest -m slow", "python -m pytest -m slow",
+        "python -m pytest -mfoo", "go test example.com/app/x", "go test mypkg", "go test src/x", "pytest pkg.mod", "pytest pkg.mod/x",
+        "npm test --prefix=example.com/x",
+        // Paths outside the workspace.
+        "go test ../x", "pytest /etc", "make test -C ..", "swift test --package-path=/tmp/x", "pytest --rootdir=../x", "pytest src/../..",
+    ]
+
+    /// The allowlisted check forms, with plain arguments.
+    static let eligibleChecks = [
+        "swift test", "swift build", "npm test", "npm run test", "pnpm test", "yarn test", "pytest", "python -m pytest",
+        "python3 -m pytest", "go test ./...", "cargo test", "make test",
+        "swift test --filter=ReviewTests --parallel", "pytest src/checks -k smoke -x", "npm test -- --runInBand",
+        "go test ./src/... -run=TestX", "pytest tests/test_a.py::test_b", "cargo test --release my_mod::case", "go test .",
+        "pytest .", "make test -C lib/x", "yarn test --ci", "swift build -c release",
+    ]
+
+    @Test func aCheckOutsideTheAllowlistedGrammarIsNeverAutoMerged() async throws {
+        let r = try R()
+        for (n, command) in Self.refusedChecks.enumerated() {
+            #expect(!CheckScripts.checkReach(command: command).parseable, "\(command.debugDescription)")
+            #expect(ReviewPolicy.isSensitive("lib/anything.txt", reach: CheckScripts.checkReach(command: command)), "\(command.debugDescription)")
+            guard !command.isEmpty else { continue }    // an empty check command cannot be saved
+            try keptForReview(r, try await submitted(r, command: command, files: ["lib/refused\(n).txt": "x\n"]), command.debugDescription)
+        }
+    }
+
+    @Test func anAllowlistedCheckIsEligible() async throws {
+        let r = try R()
+        for (n, command) in Self.eligibleChecks.enumerated() {
+            #expect(CheckScripts.checkReach(command: command).parseable, "\(command)")
+            let i = try await submitted(r, command: command, files: ["lib/eligible\(n).txt": "x\n"])
+            #expect(i.mergeState == .pending, "\(command)"); #expect(i.autoApproved, "\(command)")
+        }
     }
 
     @Test func switchingAutoMergeOffWhileItsRebaseIsInFlightReChecksTheRebasedCommit() async throws {
@@ -2053,6 +2096,41 @@ extension ReviewTests {
     }
 
     // MARK: Switches (E5)
+
+    @Test func autoMergeIsOffForANewCompanyUntilTheOwnerSwitchesItOn() async throws {
+        let r = try R(autoMergeSmall: false)
+        #expect(r.store.autoMergeEnabled(), "the owner-wide master switch is on")
+        #expect(try r.store.company(id: r.company.id)?.autoMergeSmall == false)
+        try keptForReview(r, try await submitted(r, files: ["src/default.txt": "x\n"]), "a new company has auto-merge off")
+        // Off for a new company of every pack.
+        for pack in PackCatalog.builtin.packs {
+            let c = try r.store.createCompany(name: "New \(pack.id)", goal: "g", workspacesRoot: r.world.paths.workspaces,
+                                              packId: pack.id)
+            #expect(!c.autoMergeSmall, "\(pack.id)"); #expect(try r.store.company(id: c.id)?.autoMergeSmall == false, "\(pack.id)")
+        }
+        // The owner switches it on for the company: eligible.
+        try r.store.setAutoMergeSmall(companyId: r.company.id, true)
+        #expect(try r.store.company(id: r.company.id)?.autoMergeSmall == true)
+        #expect(try await submitted(r, files: ["src/on.txt": "x\n"]).mergeState == .pending)
+        // Both switches must be on.
+        try r.store.setAutoMerge(false)
+        try keptForReview(r, try await submitted(r, files: ["src/master-off.txt": "x\n"]), "owner-wide switch off")
+        try r.store.setAutoMerge(true)
+        // A whole-row update from a copy never switches it (only `setAutoMergeSmall` does).
+        var copy = try #require(try r.store.company(id: r.company.id))
+        copy.autoMergeSmall = false; copy.priorityWeight = 3
+        try r.store.updateCompany(copy)
+        #expect(try r.store.company(id: r.company.id)?.autoMergeSmall == true)
+        // Switching the company off takes back its auto-approvals that have not landed.
+        let pending = try await submitted(r, files: ["src/pending.txt": "x\n"])
+        #expect(pending.mergeState == .pending); #expect(pending.autoApproved)
+        try r.store.setAutoMergeSmall(companyId: r.company.id, false)
+        let back = try r.fresh(pending)
+        #expect(back.mergeState == .none); #expect(!back.autoApproved)
+        #expect(try r.store.pendingReviews(agentId: r.rev.id).map(\.id).contains(pending.id), "back to a normal review")
+        try keptForReview(r, try await submitted(r, files: ["src/off-again.txt": "x\n"]), "switched off again")
+        #expect(throws: WorkError.self) { try r.store.setAutoMergeSmall(companyId: "no-such-company", true) }
+    }
 
     @Test func theOwnerOrPackSwitchDisablesAutoMerge() async throws {
         let r = try R()
@@ -2311,6 +2389,8 @@ extension ReviewTests {
         let at = { (n: String) in names.firstIndex(of: n)! }
         #expect(at("v3-review-audit") == at("v3-merge-safety") + 1)
         #expect(at("v3-review-audit-2") == at("v3-review-audit") + 1)
+        #expect(at("v3-review-audit-3") == at("v3-review-audit-2") + 1)
+        #expect(try columns("company").contains("autoMergeSmall"))
         #expect(try r.store.company(id: r.company.id)?.autoMergeCount == 0); #expect(!(try r.world.agent(r.eng).fullReview))
     }
 }

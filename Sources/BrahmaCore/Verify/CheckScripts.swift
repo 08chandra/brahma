@@ -33,11 +33,11 @@ public struct CheckPaths: Sendable, Equatable {
 
 /// What a check command could reach (`CheckScripts.checkReach`), for risk-tiered review's sensitive paths.
 public struct CheckReach: Sendable, Equatable {
-    /// Relative paths the command names, resolved against every directory it changes into.
+    /// Relative paths the command names, resolved against every directory it runs in.
     public var tokens: Set<String>
     /// The directories of the scripts it runs.
     public var directories: Set<String>
-    /// False when the engine cannot follow the command: every changed file is then sensitive.
+    /// False unless the command is in the allowlisted grammar (`CheckScripts.checkReach`): every changed file is then sensitive.
     public var parseable: Bool
 
     public init(tokens: Set<String> = [], directories: Set<String> = [], parseable: Bool = true) {
@@ -72,213 +72,99 @@ public enum CheckScripts {
         return out
     }
 
-    /// Options whose value is a directory the command runs in (`-C X`, `--directory=X` …), besides `cd X` and `pushd X`.
+    /// Options whose value is a directory the check runs in (`-C X`, `--prefix=X` …): what the check reaches is resolved
+    /// against it as well.
     private static let directoryOptions: Set<String> = ["-C", "--directory", "--dir", "--chdir", "--cwd", "--prefix", "--package-path",
                                                         "--rootdir", "--working-directory"]
-    /// Words that run the next word as a script (`sh x`, `python3 x`, `source x` …).
-    private static let interpreters = try! NSRegularExpression(
-        pattern: "^(sh|bash|zsh|dash|ksh|ash|python[0-9.]*|pypy[0-9.]*|node|nodejs|deno|bun|ruby|perl|php|source|\\.)$")
-    private static let shells: Set<String> = ["sh", "bash", "zsh", "dash", "ksh", "ash"]
-    /// Words that run the rest of the command (`env x`, `timeout 60 x` …), skipped to find the program.
-    private static let wrappers: Set<String> = ["env", "exec", "command", "builtin", "nohup", "time", "sudo", "nice", "xargs", "timeout",
-                                                "stdbuf", "caffeinate"]
-    private static let moduleName = try! NSRegularExpression(pattern: "^[A-Za-z_][A-Za-z0-9_.]*$")
+
+    /// The only check commands risk-tiered review (9c) follows: a program and subcommand from this list, then plain arguments.
+    /// Anything else (a wrapper, an environment assignment, another program) is not followed, and the item keeps its review.
+    public static let autoMergePrograms: [[String]] = [
+        ["swift", "test"], ["swift", "build"], ["npm", "test"], ["npm", "run", "test"], ["pnpm", "test"], ["yarn", "test"], ["pytest"],
+        ["python", "-m", "pytest"], ["python3", "-m", "pytest"], ["go", "test"], ["cargo", "test"], ["make", "test"],
+    ]
+
+    /// One plain argument: no quote, backslash, `$`, backtick, glob, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `~`, `#`, `{` or `,`.
+    private static let plainWord = try! NSRegularExpression(pattern: "^[A-Za-z0-9_./:=@+-]+$")
+    /// A shell variable assignment (`X=y`), which also sets a `make` variable.
+    private static let assignment = try! NSRegularExpression(pattern: "^[A-Za-z_][A-Za-z0-9_]*=")
+    /// File extensions a bare dotted operand may end in (`test_a.py`); any other dotted name (`pkg.mod`) reads as a module.
+    private static let fileExtensions: Set<String> = ["py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "mts", "cts", "go", "rs", "swift"]
 
     private static func matches(_ re: NSRegularExpression, _ s: String) -> Bool {
         re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
     }
 
-    /// The relative paths of every token a check command could name, for risk-tiered review (9c); `checkReach(command:).tokens`.
-    public static func checkTokens(command: String) -> Set<String> { checkReach(command: command).tokens }
+    /// The command's words, or nil unless it is only plain words (`plainWord`) separated by spaces or tabs. The one tokenizer
+    /// for risk-tiered review: nothing it accepts means anything special to `/bin/sh`.
+    private static func lex(_ command: String) -> [String]? {
+        let words = command.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard !words.isEmpty, words.allSatisfy({ matches(plainWord, $0) }) else { return nil }
+        return words
+    }
 
-    /// What a check command could reach, for risk-tiered review (9c), over-inclusive on purpose (`ReviewPolicy.isSensitive`):
+    /// A relative path inside the workspace, cleaned (`./` and empty components dropped, a Go `/...` suffix too), or nil when
+    /// it is not a plain one: absolute, `..` anywhere, `...` other than a Go pattern's end, a dotted directory component
+    /// (`example.com/x`), or, for Go, anything not written `.` or `./…` (Go reads every other operand as an import path).
+    private static func plainPath(_ word: String, go: Bool, operand: Bool) -> String?? {
+        guard !word.hasPrefix("/") else { return nil }
+        if go, operand, word != ".", !word.hasPrefix("./") { return nil }
+        var parts = word.split(separator: "/", omittingEmptySubsequences: true).filter { $0 != "." }.map(String.init)
+        if go, parts.last == "..." { parts.removeLast() }
+        guard !parts.contains(where: { $0 == ".." || $0 == "..." }) else { return nil }
+        if parts.dropLast().contains(where: { $0.contains(".") }) { return nil }
+        // A bare dotted operand (`pkg.mod`) is a module name unless it ends in a source file extension.
+        if operand, !word.contains("/"), let last = parts.last, let dot = last.lastIndex(of: "."),
+           !fileExtensions.contains(String(last[last.index(after: dot)...]).lowercased()) { return nil }
+        return .some(parts.isEmpty ? nil : parts.joined(separator: "/"))
+    }
+
+    /// What a check command could reach, for risk-tiered review (9c). Deny by default: `parseable` is true only for one of
+    /// `autoMergePrograms` followed by plain arguments (`lex`), none of them an environment or `make` variable assignment
+    /// (`X=y`), a plugin or module option (`-p…`, `-m…`, `--pyargs`) or a path that is not a plain relative one (`plainPath`).
+    /// Every changed file is sensitive for any other command.
     ///
-    /// - `tokens`: the command split on whitespace and `; & | ( ) < >` with quotes stripped (so the inside of `sh -c "…"` counts
-    ///   too), each cleaned like `candidatePaths`; the value of each `--option=value` / `VAR=value`; a Python module run with
-    ///   `-m a.b` or `-ma.b` as `a/b.py`, `a/b/__main__.py` and `a/b`; a Go pattern `x/...` as `x`; and each of those again
-    ///   relative to every directory the command changes into (`cd X`, `pushd X`, `-C X`, `--directory X`, `=X` …).
-    /// - `directories`: the directory of every referenced script (a token with a file extension, the program of a command, or
-    ///   the word after an interpreter such as `sh`, `python3` or `source`): the files beside a check script are its helpers.
-    /// - `parseable`: false when the command uses shell syntax the engine does not follow (`$` expansions or `$(…)`, backticks,
-    ///   `eval`, unbalanced quotes, a trailing `\`, globs other than `*`, brace expansion, here-documents, process substitution,
-    ///   comments), changes into a directory it cannot resolve (none, `-`, absolute, `~` or `..`), or runs inline code
-    ///   (`python -c`, `node -e`, `perl -e`, `ruby -e`, `php -r`, `deno eval`). Such a check makes every changed file sensitive.
-    ///   The inside of `sh -c '…'` / `bash -lc "…"` is checked the same way.
+    /// For a followed command, over-inclusive on purpose (`ReviewPolicy.isSensitive`):
+    /// - `tokens`: every argument and every `--option=value` value, cleaned, and each again relative to every directory the
+    ///   command runs in (`-C X`, `--prefix=X` …); `python -m pytest` adds `pytest.py` and `pytest` (a workspace module of
+    ///   that name would shadow the runner).
+    /// - `directories`: the directory of every argument naming a file (one with an extension): the files beside it are its
+    ///   helpers.
     public static func checkReach(command: String) -> CheckReach {
-        var raw: [(text: String, program: Bool)] = []
-        var token = "", atStart = true
-        func flush() {
-            if !token.isEmpty { raw.append((token, atStart)); atStart = false }
-            token = ""
-        }
-        for ch in command {
-            if separators.contains(ch) || ch.isNewline {
-                flush(); atStart = true
-            } else if ch.isWhitespace {
-                flush()
-            } else if ch != "'" && ch != "\"" {
-                token.append(ch)
+        let refused = CheckReach(parseable: false)
+        guard let words = lex(command), let program = autoMergePrograms.first(where: { words.starts(with: $0) }) else { return refused }
+        let go = program[0] == "go"
+        var tokens = Set<String>(), files = Set<String>(), dirs = Set<String>()
+        if program.count == 3 { tokens.formUnion(["pytest.py", "pytest"]) }
+        var previous = ""
+        for word in words.dropFirst(program.count) {
+            defer { previous = word }
+            var value: String?, key = word
+            if word.hasPrefix("-") {
+                if word == "--pyargs" { return refused }
+                if !word.hasPrefix("--"), word.hasPrefix("-p") || word.hasPrefix("-m") { return refused }
+                guard let eq = word.firstIndex(of: "=") else { continue }
+                key = String(word[..<eq])
+                guard let v = plainPath(String(word[word.index(after: eq)...]), go: go, operand: false) else { return refused }
+                value = v
+            } else {
+                if matches(assignment, word) || word.contains("=") { return refused }
+                guard let v = plainPath(word, go: go, operand: !directoryOptions.contains(previous)) else { return refused }
+                value = v
+                key = previous
             }
-        }
-        flush()
-
-        func clean(_ t: String) -> String? {
-            guard !t.isEmpty, !t.hasPrefix("/") else { return nil }
-            var parts = t.split(separator: "/", omittingEmptySubsequences: true).filter { $0 != "." }
-            if parts.count > 1, parts.last == "..." { parts.removeLast() }    // go test ./x/...
-            guard !parts.isEmpty, !parts.contains("..") else { return nil }
-            return parts.joined(separator: "/")
-        }
-        var tokens = Set<String>(), scripts = Set<String>(), dirs = Set<String>()
-        for (n, entry) in raw.enumerated() {
-            let t = entry.text
-            let previous = n > 0 ? raw[n - 1].text : ""
-            let base = previous.split(separator: "/").last.map(String.init) ?? previous
-            var values = [t]
-            if let eq = t.firstIndex(of: "="), t.hasPrefix("-") || eq != t.startIndex {
-                let key = String(t[..<eq]), value = String(t[t.index(after: eq)...])
-                values.append(value)
-                if directoryOptions.contains(key), let d = clean(value) { dirs.insert(d) }
-            }
-            let changesDirectory = previous == "cd" || previous == "pushd" || directoryOptions.contains(previous)
-            if changesDirectory, let d = clean(t) { dirs.insert(d) }
-            var module: String?
-            if previous == "-m", !t.hasPrefix("-") { module = t }
-            if t.hasPrefix("-m"), t.count > 2 { module = String(t.dropFirst(2)) }
-            if let module, matches(moduleName, module) {
-                let path = module.split(separator: ".", omittingEmptySubsequences: true).joined(separator: "/")
-                values += [path + ".py", path + "/__main__.py", path]
-            }
-            let cleaned = values.compactMap(clean)
-            tokens.formUnion(cleaned)
-            for c in cleaned where !changesDirectory {
-                let last = c.split(separator: "/").last.map(String.init) ?? c
-                if entry.program || matches(interpreters, base) || last.dropFirst().contains(".") { scripts.insert(c) }
-            }
+            guard let path = value else { continue }
+            if directoryOptions.contains(key) { dirs.insert(path); continue }
+            tokens.insert(path)
+            if path.split(separator: "/").last?.dropFirst().contains(".") == true { files.insert(path) }
         }
         for d in dirs {
-            for t in Array(tokens) { tokens.insert(d + "/" + t) }
-            for s in Array(scripts) { scripts.insert(d + "/" + s) }
+            tokens.insert(d)
+            for t in Array(tokens) where t != d { tokens.insert(d + "/" + t) }
+            for f in Array(files) { files.insert(d + "/" + f) }
         }
-        let directories = Set(scripts.compactMap { s -> String? in
-            guard let slash = s.lastIndex(of: "/") else { return nil }
-            return String(s[..<slash])
-        })
-        return CheckReach(tokens: tokens, directories: directories, parseable: parseable(command))
-    }
-
-    /// One shell word: its text with quotes removed, and the characters that were not quoted.
-    private struct Word { var text = "", unquoted = "", quoted = false }
-
-    /// The command split into simple commands of words (`; & | ( )` and newlines separate them), or nil for syntax the engine
-    /// does not follow (see `checkReach`).
-    private static func lex(_ command: String) -> [[Word]]? {
-        enum Quote { case none, single, double }
-        var commands: [[Word]] = [[]], word = Word(), inWord = false, quote = Quote.none
-        var chars = Array(command)[...]
-        func end() {
-            if inWord { commands[commands.count - 1].append(word) }
-            word = Word(); inWord = false
-        }
-        while let ch = chars.popFirst() {
-            switch quote {
-            case .single:
-                if ch == "'" { quote = .none } else { word.text.append(ch) }
-            case .double:
-                if ch == "\"" { quote = .none }
-                else if ch == "$" || ch == "`" { return nil }
-                else if ch == "\\" {
-                    guard let next = chars.popFirst() else { return nil }
-                    if !"$`\"\\\n".contains(next) { word.text.append(ch) }
-                    word.text.append(next)
-                } else { word.text.append(ch) }
-            case .none:
-                if ch == "$" || ch == "`" { return nil }
-                if ch == "#", !inWord { return nil }
-                if ch == "'" || ch == "\"" { quote = ch == "'" ? .single : .double; inWord = true; word.quoted = true; continue }
-                if ch == "\\" {
-                    guard let next = chars.popFirst() else { return nil }
-                    word.text.append(next); inWord = true; continue
-                }
-                if ch == "<" || ch == ">" {
-                    if let next = chars.first, next == "(" || (ch == "<" && next == "<") { return nil }
-                    end(); continue
-                }
-                if ch.isNewline || ";&|()".contains(ch) { end(); commands.append([]); continue }
-                if ch.isWhitespace { end(); continue }
-                word.text.append(ch); word.unquoted.append(ch); inWord = true
-            }
-        }
-        guard quote == .none else { return nil }
-        end()
-        for w in commands.joined() {
-            let u = w.unquoted
-            if u.contains("?") { return nil }
-            if u.contains("["), !["[", "[["].contains(w.text) { return nil }
-            if u.contains("{"), u.contains("}"), u.contains(",") || u.contains("..") { return nil }
-        }
-        return commands.filter { !$0.isEmpty }
-    }
-
-    /// Whether the engine follows every part of `command` (see `checkReach`).
-    static func parseable(_ command: String, depth: Int = 0) -> Bool {
-        guard depth < 4, let commands = lex(command) else { return false }
-        func isAssignment(_ w: Word) -> Bool {
-            guard let eq = w.text.firstIndex(of: "="), eq != w.text.startIndex else { return false }
-            return w.text[..<eq].allSatisfy { $0 == "_" || $0.isLetter || $0.isNumber }
-        }
-        func unresolvable(_ dir: String) -> Bool {
-            dir.isEmpty || dir == "-" || dir.hasPrefix("/") || dir.hasPrefix("~") || dir.split(separator: "/").contains("..")
-        }
-        for words in commands {
-            var i = 0
-            while i < words.count, isAssignment(words[i]) { i += 1 }
-            while i < words.count, wrappers.contains(words[i].text) {
-                let wrapper = words[i].text
-                i += 1
-                while i < words.count, words[i].text.hasPrefix("-") || isAssignment(words[i]) { i += 1 }
-                if wrapper == "timeout" || wrapper == "nice" { i += 1 }
-            }
-            guard i < words.count else { continue }
-            let program = words[i].text.split(separator: "/").last.map(String.init) ?? words[i].text
-            let args = words[(i + 1)...].map(\.text)
-            // Options before the first operand (the script, a module, a subcommand).
-            let options = Array(args.prefix { $0.hasPrefix("-") && $0 != "-" && $0 != "--" })
-            switch program {
-            case "eval":
-                return false
-            case "cd", "pushd":
-                guard let dir = args.first(where: { !["-P", "-L", "-e", "-@"].contains($0) }), !unresolvable(dir) else { return false }
-            case _ where shells.contains(program):
-                // `sh -c '…'`, `bash -lc "…"`: the script is the word after the option, followed the same way.
-                if let k = options.firstIndex(where: { !$0.hasPrefix("--") && $0.dropFirst().contains("c") }) {
-                    guard k + 1 < args.count, parseable(args[k + 1], depth: depth + 1) else { return false }
-                }
-            case _ where program.hasPrefix("python") || program.hasPrefix("pypy"):
-                for option in options {
-                    if option.hasPrefix("-m") { break }
-                    if !option.hasPrefix("--"), option.dropFirst().contains("c") { return false }
-                }
-            case "node", "nodejs", "bun", "perl", "ruby":
-                for option in options {
-                    if ["--eval", "--print"].contains(where: { option.hasPrefix($0) }) { return false }
-                    if !option.hasPrefix("--"), option.dropFirst().contains(where: { $0 == "e" || $0 == "E" || $0 == "p" }) { return false }
-                }
-            case "php":
-                if options.contains(where: { !$0.hasPrefix("--") && $0.dropFirst().contains("r") }) { return false }
-            case "deno":
-                if args.contains("eval") { return false }
-            default:
-                break
-            }
-            // A directory option (`-C X`, `--directory=X` …) the engine cannot resolve.
-            for (n, a) in args.enumerated() {
-                if let eq = a.firstIndex(of: "="), directoryOptions.contains(String(a[..<eq])),
-                   unresolvable(String(a[a.index(after: eq)...])) { return false }
-                if directoryOptions.contains(a), n + 1 < args.count, unresolvable(args[n + 1]) { return false }
-            }
-        }
-        return true
+        let directories = Set(files.compactMap { f -> String? in f.lastIndex(of: "/").map { String(f[..<$0]) } })
+        return CheckReach(tokens: tokens, directories: directories, parseable: true)
     }
 
     /// Relative regular files under `root` that the command mentions (see `candidatePaths`); directories, symlinks and

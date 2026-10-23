@@ -107,6 +107,31 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
                 == ReviewPolicy.defaultAutoMergePaths)
     }
 
+    @Test func companyAutoMergeSmallIsOffUntilTheOwnerSwitchesItOn() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        func flag() throws -> Bool? {
+            let store = try Store(path: ownerPaths(home).database.path)
+            return try store.companies().first { $0.name == "Acme" }?.autoMergeSmall
+        }
+        #expect(try flag() == false, "a new company starts with auto-merge off")
+        let on = try brahma(["company", "set", "Acme", "auto-merge-small", "on"], home: home)
+        #expect(on.status == 0, "\(on.stderr)"); #expect(on.stdout == "Acme: auto-merge-small on (owner-wide auto-merge: on)\n", "\(on.stdout)")
+        #expect(try flag() == true)
+        let inAgent = try brahma(["company", "set", "Acme", "auto-merge-small", "off"], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
+        #expect(try flag() == true)
+        let nokey = try OwnerTestHome(initOwner: false)
+        #expect(try brahma(["company", "set", "Acme", "auto-merge-small", "off"], home: nokey.url).status != 0)
+        #expect(try brahma(["company", "set", "Acme", "auto-merge-small", "maybe"], home: home).status != 0)
+        #expect(try brahma(["company", "set", "Acme", "auto-merge-big", "on"], home: home).status != 0)
+        #expect(try brahma(["company", "set", "Nope", "auto-merge-small", "on"], home: home).status != 0)
+        #expect(try brahma(["settings", "auto-merge", "off"], home: home).status == 0)
+        let off = try brahma(["company", "set", "Acme", "auto-merge-small", "off"], home: home)
+        #expect(off.status == 0, "\(off.stderr)"); #expect(off.stdout == "Acme: auto-merge-small off (owner-wide auto-merge: off)\n", "\(off.stdout)")
+        #expect(try flag() == false)
+    }
+
     @Test func companyReserveOverride() throws {
         let owner = try OwnerTestHome(); let home = owner.url
         #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)

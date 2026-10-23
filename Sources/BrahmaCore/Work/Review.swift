@@ -137,7 +137,8 @@ public enum ReviewDigest {
 ///
 /// The rule is an allowlist computed by the engine; nothing an implementer sets can make an item qualify. An item skips its
 /// review turn only when every one of these holds:
-/// - auto-merge is on (the owner's switch and the pack's `autoMerge`; a company whose pack is missing has it off);
+/// - auto-merge is on: the owner-wide switch, the company's own `autoMergeSmall` (off until the owner switches it on) and the
+///   pack's `autoMerge` (a company whose pack is missing has it off);
 /// - tier S with an engine check, where the tier, the check and the spec confirmation were each set by the engine, the owner
 ///   or a lead who is not the item's assignee, lease holder or submitter (`Store.autoMergeProvenanceHolds`);
 /// - a clean first-round pass: no review flag (a flaky pass is one), no earlier `changesRequested`, review round 1;
@@ -145,7 +146,7 @@ public enum ReviewDigest {
 ///   under `autoMergeMaxLines` changed lines and `autoMergeMaxBytes` changed bytes, deletes no file, adds no binary, executable,
 ///   symlink or submodule, and every path (both sides of a rename) lies under the allowed directories (`autoMergePaths`) and is
 ///   not sensitive (`isSensitive`: no build, CI, runner or agent configuration, no test file, nothing the check command
-///   reaches; a check command the engine cannot parse makes every path sensitive);
+///   reaches; a check command outside the allowlisted grammar, `CheckScripts.checkReach`, makes every path sensitive);
 /// - neither the assignee, the lease holder nor the submitter has `fullReview`.
 ///
 /// Every auto-merge is audited: batches of up to `auditBatchMax` per audit turn, routed like reviews.
@@ -193,11 +194,13 @@ public enum ReviewPolicy {
         // Tests: what a check runs (and `PathRules.isTestFile`).
         "test/", "tests/", "__tests__/", "spec/", "specs/", "*_test.*", "*.test.*", "*.spec.*", "test_*.py", "*Tests.swift",
         "*Test.java",
+        // Test support a root-wide check (`go test ./...`, `pytest .`, `npm test`) reads, and Cargo's build script.
+        "testdata/", "__mocks__/", "__fixtures__/", "fixtures/", "__snapshots__/", "*.snap", "build.rs",
     ]
 
     /// Whether a changed path is one a review turn must see, given what the item's check command reaches
-    /// (`CheckScripts.checkReach`): every path when the engine cannot follow the command, else `isSensitive(_:checkScripts:
-    /// checkTokens:checkDirectories:)` with its tokens and script directories.
+    /// (`CheckScripts.checkReach`): every path when the command is outside the allowlisted grammar, else `isSensitive(_:
+    /// checkScripts:checkTokens:checkDirectories:)` with its tokens and the directories of the files it names.
     public static func isSensitive(_ path: String, checkScripts: Set<String> = [], reach: CheckReach) -> Bool {
         guard reach.parseable else { return true }
         return isSensitive(path, checkScripts: checkScripts, checkTokens: reach.tokens, checkDirectories: reach.directories)

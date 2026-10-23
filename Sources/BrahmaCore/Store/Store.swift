@@ -198,16 +198,18 @@ public final class Store: Sendable {
     }
 
     /// Whole-row update of the owner-editable fields. `mainCommit`, `pendingMainCommit` and `autoMergeCount` belong to the
-    /// engine and are never overwritten from a copy.
+    /// engine and are never overwritten from a copy; `autoMergeSmall` changes only through `setAutoMergeSmall` (which takes
+    /// back pending auto-approvals).
     public func updateCompany(_ c: Company) throws {
         try writer.write { db in
             var kept = c
             let row = try Row.fetchOne(db, sql: """
-                SELECT mainCommit, pendingMainCommit, autoMergeCount FROM company WHERE id = ?
+                SELECT mainCommit, pendingMainCommit, autoMergeCount, autoMergeSmall FROM company WHERE id = ?
                 """, arguments: [c.id])
             kept.mainCommit = row?["mainCommit"]
             kept.pendingMainCommit = row?["pendingMainCommit"]
             kept.autoMergeCount = row?["autoMergeCount"] ?? 0
+            kept.autoMergeSmall = row?["autoMergeSmall"] ?? false
             try kept.update(db)
         }
     }

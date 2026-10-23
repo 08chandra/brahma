@@ -42,7 +42,8 @@ extension Store {
 
     // MARK: Owner settings
 
-    /// The owner's switch for risk-tiered auto-merge (on by default). The pack's `autoMerge` must allow it as well.
+    /// The owner-wide master switch for risk-tiered auto-merge (on by default). Each company's own switch (`autoMergeSmall`, off
+    /// until the owner switches it on) and the pack's `autoMerge` must allow it as well.
     public func autoMergeEnabled() -> Bool {
         (try? writer.read { db in try Self.ownerAutoMerge(db: db) }) ?? true
     }
@@ -56,18 +57,30 @@ extension Store {
         try writer.write { db in
             try Store.ensureOwnerSettings(db)
             try db.execute(sql: "UPDATE ownerSettings SET autoMerge = ? WHERE id = 1", arguments: [on])
-            if !on { try revokeAutoApprovals(db: db, now: now) }
+            if !on { try revokeAutoApprovals(db: db, companyId: nil, now: now) }
+        }
+    }
+
+    /// The company's auto-merge switch (off for a new company). Switching it off takes back the company's auto-approvals that
+    /// have not landed (`revokeAutoApprovals`).
+    public func setAutoMergeSmall(companyId: String, _ on: Bool, now: Date = Store.now()) throws {
+        try writer.write { db in
+            guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+            _ = try Company.filter(key: companyId).updateAll(db, Column("autoMergeSmall").set(to: on))
+            if !on { try revokeAutoApprovals(db: db, companyId: companyId, now: now) }
         }
     }
 
     /// Every auto-approved item still in review goes back to a normal review: its round is reopened, and an item waiting to
     /// land (`pending`) has its review turn due at once on the commit its check passed on. One re-checking after a rebase
     /// (`verifying`) goes to its reviewer when that check passes (`finishVerification`). An item whose merge was already under
-    /// way when the switch flipped still lands; it is queued for audit like an auto-merge (`queueAudit`).
-    func revokeAutoApprovals(db: Database, now: Date) throws {
-        let items = try WorkItem.filter(Column("autoApproved") == true && Column("status") == WorkItemStatus.inReview.rawValue
-                                        && [MergeState.pending.rawValue, MergeState.verifying.rawValue].contains(Column("mergeState")))
-            .fetchAll(db)
+    /// way when the switch flipped still lands; it is queued for audit like an auto-merge (`queueAudit`). `companyId` nil: every
+    /// company's.
+    func revokeAutoApprovals(db: Database, companyId: String?, now: Date) throws {
+        var request = WorkItem.filter(Column("autoApproved") == true && Column("status") == WorkItemStatus.inReview.rawValue
+                                      && [MergeState.pending.rawValue, MergeState.verifying.rawValue].contains(Column("mergeState")))
+        if let companyId { request = request.filter(Column("companyId") == companyId) }
+        let items = try request.fetchAll(db)
         for var item in items {
             item.autoApproved = false
             item.reviewedRound = max(item.reviewRound - 1, 0)
@@ -148,8 +161,10 @@ extension Store {
                 return keep("\(Self.flat(path, max: 200)) is outside the auto-merge paths")
             }
             let reach = item.checkSpec.map { CheckScripts.checkReach(command: $0.command) } ?? CheckReach()
-            // A check the engine cannot follow could reach any file: every change keeps its review.
-            guard reach.parseable else { return keep("the check command uses shell syntax Brahma does not follow") }
+            // A check outside the allowlisted grammar could reach any file: every change keeps its review.
+            guard reach.parseable else {
+                return keep("the check command is not an allowlisted test or build command with plain arguments")
+            }
             var scripts = Set<String>()
             if let snapshot = try latestCheckSnapshot(itemId: item.id, upTo: item.checkRevision) { scripts.formUnion(snapshot.manifest.keys) }
             if let path = paths.sorted().first(where: { ReviewPolicy.isSensitive($0, checkScripts: scripts, reach: reach) }) {
@@ -164,14 +179,15 @@ extension Store {
     }
 
     /// The database half of the auto-approval rule (checked again inside the transaction that records the pass): auto-merge
-    /// on for the owner and the pack (off when the company's pack is missing); tier S with an engine check, both (and the spec confirmation) set by a trusted
+    /// on owner-wide, for the company (`autoMergeSmall`) and for the pack (off when the company's pack is missing); tier S with an engine check, both (and the spec confirmation) set by a trusted
     /// non-implementer (`autoMergeProvenanceHolds`); the first review round with no review flag and no earlier change request;
     /// no merge pending; a recorded base; and neither the assignee, the lease holder nor the submitter on full review.
     func autoMergeCandidate(db: Database, item: WorkItem, run: VerificationRun) throws -> Bool {
         guard item.tier == .s, item.checkSpec != nil, item.reviewFlags.isEmpty, item.status == .inReview, item.mergeState == .none,
               item.reviewRound == 1, item.reviewedRound == 0, item.baseCommit != nil, run.purpose == .submit, !run.flaky,
               let company = try Company.fetchOne(db, key: item.companyId),
-              try Self.ownerAutoMerge(db: db), catalog.pack(company.packId)?.autoMerge == true else { return false }
+              company.autoMergeSmall, try Self.ownerAutoMerge(db: db), catalog.pack(company.packId)?.autoMerge == true
+        else { return false }
         let returned = try WorkItemEvent.filter(Column("itemId") == item.id && Column("kind") == WorkEventKind.changesRequested.rawValue)
             .fetchCount(db)
         guard returned == 0 else { return false }
