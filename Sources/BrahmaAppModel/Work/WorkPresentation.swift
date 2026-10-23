@@ -115,7 +115,7 @@ public struct BoardColumn: Equatable, Identifiable, Sendable {
 }
 
 public enum BoardColumns {
-    public static let order: [WorkItemStatus] = [.ready, .inProgress, .inReview, .blocked, .done]
+    public static let order: [WorkItemStatus] = [.backlog, .ready, .inProgress, .inReview, .blocked, .done]
     /// The Done column shows the newest this many.
     public static let doneLimit = 30
 
@@ -188,4 +188,21 @@ public enum OrgErrorText {
         case .invalidPlan(let issues): return issues.map(\.message).joined(separator: "; ")
         }
     }
+}
+
+/// The status changes the owner can make by hand. `inReview` and `done` are written only by the engine, and a blocked item
+/// goes back to `inProgress` only while its holder has the lease, so neither is ever offered here.
+public enum OwnerMoves {
+    public static func targets(from status: WorkItemStatus) -> [WorkItemStatus] {
+        switch status {
+        case .backlog: [.ready, .blocked]
+        case .ready: [.backlog, .blocked]
+        case .inProgress: [.ready, .blocked]
+        case .inReview: [.blocked]
+        case .blocked: [.ready]
+        case .done: [.ready]
+        }
+    }
+
+    public static func allows(from: WorkItemStatus, to: WorkItemStatus) -> Bool { targets(from: from).contains(to) }
 }

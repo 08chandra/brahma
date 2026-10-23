@@ -43,7 +43,7 @@ struct SearchResultsView: View {
 
     private func row(_ hit: SearchHit) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(verbatim: "\(hit.channelTitle) · \(hit.isOwner ? "You" : "@" + hit.senderHandle) · \(TimeText.hm(hit.message.createdAt))")
+            Text(verbatim: "\(hit.channelTitle) · \(hit.isOwner ? "You" : "@" + hit.senderHandle) · \(TimeText.hm(hit.message.createdAt, timeZone: model.ownerTimeZone))")
                 .font(BrahmaTheme.monoTiny)
                 .foregroundStyle(BrahmaTheme.text2)
                 .lineLimit(1)

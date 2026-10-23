@@ -5,6 +5,7 @@ struct ChatView: View {
     @Bindable var chat: ChatModel
     /// The message a search hit opened: scrolled to, tinted for 2 s, then cleared.
     @Binding var highlightedId: String?
+    var timeZone: TimeZone = .current
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
@@ -24,7 +25,7 @@ struct ChatView: View {
                         }
                         ForEach(chat.messages) { item in
                             MessageRow(item: item, role: chat.role(of: item.senderHandle), handles: Set(chat.handles),
-                                       highlighted: item.id == highlightedId)
+                                       highlighted: item.id == highlightedId, timeZone: timeZone)
                                 .id(item.id)
                         }
                     }
@@ -96,6 +97,7 @@ private struct MessageRow: View {
     let role: String?
     let handles: Set<String>
     var highlighted = false
+    var timeZone: TimeZone = .current
 
     var body: some View {
         HStack(alignment: .top, spacing: BrahmaTheme.spaceS) {
@@ -110,7 +112,7 @@ private struct MessageRow: View {
                     if let role, !item.isOwner {
                         Text(verbatim: role).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text2)
                     }
-                    Text(verbatim: TimeText.hm(item.message.createdAt))
+                    Text(verbatim: TimeText.hm(item.message.createdAt, timeZone: timeZone))
                         .font(BrahmaTheme.monoSmall)
                         .foregroundStyle(BrahmaTheme.text2)
                 }

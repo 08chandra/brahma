@@ -134,7 +134,7 @@ import BrahmaCore
         let channel = try #require(try w.store.channel(companyId: w.acme.id, name: "dm:owner:system"))
         let byTarget = ChatModel(store: w.store, companyId: w.acme.id, target: .dm(handle: "system"))
         await byTarget.refresh()
-        #expect(byTarget.readOnlyReason == "System notices — read only.")
+        #expect(byTarget.readOnlyReason == "Brahma engine notices can't be replied to")
         #expect(byTarget.title == "system")
         #expect(byTarget.messages.map(\.senderHandle) == ["system"])
         let byChannel = ChatModel(store: w.store, companyId: w.acme.id, target: .channel(id: channel.id))

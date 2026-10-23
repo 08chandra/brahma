@@ -67,7 +67,7 @@ public final class ChatModel {
             }
             return nil
         case .dm(let h):
-            if h.lowercased() == "system" { return "System notices — read only." }
+            if h.lowercased() == "system" { return "Brahma engine notices can't be replied to" }
             guard let agent = agents.first(where: { $0.name.lowercased() == h.lowercased() }) else {
                 return "No agent @\(h) in this company."
             }

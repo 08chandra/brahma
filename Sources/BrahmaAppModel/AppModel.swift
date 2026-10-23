@@ -33,6 +33,8 @@ public final class AppModel {
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
+    /// Runs after each tick that read the database without error (the app posts the Inbox notifications here).
+    @ObservationIgnored public var afterTick: (@MainActor () async -> Void)?
 
     @ObservationIgnored private var ticksSinceTakeoverCheck = 0
     @ObservationIgnored private var cursor: Int64 = 0
@@ -139,6 +141,7 @@ public final class AppModel {
                 try await refreshSnapshot()
             }
             lastDBError = nil
+            await afterTick?()
         } catch {
             report(error)
         }

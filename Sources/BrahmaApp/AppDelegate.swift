@@ -44,6 +44,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// SwiftUI wraps the adaptor, so `NSApp.delegate` is not this object; the harness reaches it here.
     static private(set) weak var current: AppDelegate?
     private var signalSources: [DispatchSourceSignal] = []
+    /// Posts the Inbox banners; created at launch once the model exists.
+    private var notifier: OwnerNotifier?
     /// Set once the bounded engine stop has begun; later quit requests wait on it instead of exiting early.
     private(set) var quitting = false
 
@@ -102,6 +104,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let options = self.options
             let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: booted.ownerKeyStore)
             model.engine = engine
+            let notifier = OwnerNotifier(model: model)
+            notifier.openMainWindow = { [weak self] in self?.openMainWindowFromMenu() }
+            // Smoke and snapshot runs must never raise the system permission dialog.
+            notifier.start(prompt: !options.smokeTest && options.snapshotPath == nil)
+            self.notifier = notifier
             Task { @MainActor in
                 await model.load()
                 model.startPolling()

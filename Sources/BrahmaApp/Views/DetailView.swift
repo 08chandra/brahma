@@ -30,14 +30,16 @@ struct DetailView: View {
                         ActivityFeedView(model: model, compact: true)
                             .frame(minHeight: 60, idealHeight: 140, maxHeight: 260)
                     }
-                case .backlog, .board, .inbox:
-                    // Task 16a builds these views; the model layer behind them is in place.
-                    MonoEmptyState("Coming soon", detail: "This screen arrives in the next update.")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .backlog:
+                    BacklogView(model: model)
+                case .board:
+                    BoardView(model: model)
+                case .inbox:
+                    InboxView(model: model)
                 case .channel, .dm:
                     if let chat = model.chat {
                         VSplitView {
-                            ChatView(chat: chat, highlightedId: Bindable(model).highlightedMessageId)
+                            ChatView(chat: chat, highlightedId: Bindable(model).highlightedMessageId, timeZone: model.ownerTimeZone)
                                 .id(chat.target)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .frame(minHeight: 200)

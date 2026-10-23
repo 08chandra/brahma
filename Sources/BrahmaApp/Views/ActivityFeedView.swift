@@ -24,7 +24,7 @@ struct ActivityFeedView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(events, id: \.id) { event in
-                                ActivityRow(event: event, handles: handles, flashing: event.id == flashId)
+                                ActivityRow(event: event, handles: handles, flashing: event.id == flashId, timeZone: model.ownerTimeZone)
                                     .id(event.id)
                             }
                         }
@@ -77,10 +77,11 @@ private struct ActivityRow: View {
     let event: ActivityEvent
     let handles: [String: String]
     let flashing: Bool
+    var timeZone: TimeZone = .current
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: BrahmaTheme.spaceS) {
-            Text(verbatim: TimeText.hms(event.createdAt))
+            Text(verbatim: TimeText.hms(event.createdAt, timeZone: timeZone))
                 .font(BrahmaTheme.monoSmall)
                 .foregroundStyle(BrahmaTheme.text2)
             Image(systemName: Self.symbol(event.kind))

@@ -19,6 +19,8 @@ struct MenuBarContent: View {
                 } label: {
                     Text(verbatim: row.toggleTitle)
                 }
+                // Why nothing is running, under the company's name.
+                if row.isRunning, let stall = row.stallLine { Text(verbatim: "    " + stall) }
             }
             if !summary.rows.isEmpty { Divider() }
         }

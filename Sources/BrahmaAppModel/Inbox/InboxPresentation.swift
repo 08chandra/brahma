@@ -57,7 +57,7 @@ public enum InboxRows {
             var internalLine = ""
             if let approver = a.internalApproverId, a.internalDecidedAt != nil {
                 let note = (a.internalNote ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                internalLine = "\(handle(approver)) reviewed it" + (note.isEmpty ? "" : ": \(note)")
+                internalLine = "Approved by \(handle(approver))" + (note.isEmpty ? "" : ": \(note)")
             } else if let approver = a.internalApproverId, a.status == .pendingInternal {
                 internalLine = "Waiting for \(handle(approver))"
             }

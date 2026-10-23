@@ -2,11 +2,37 @@ import SwiftUI
 import BrahmaCore
 import BrahmaAppModel
 
-/// 40 pt `bg2` top bar with a bottom hairline: company name · usage mode · state counts · usage meter · run control.
+/// `bg2` top bar with a bottom hairline. Row 1 (40 pt): company name · usage mode · state counts · search · run control.
+/// Row 2 (30 pt): the sprint line · AUTONOMY · why nothing runs · usage meter and 7-day pace.
 struct TopBar: View {
     let model: AppModel
+    @State private var confirmAuto = false
+    @State private var showWhy = false
+    @State private var showSettings = false
 
     var body: some View {
+        VStack(spacing: 0) {
+            primaryRow
+            if let summary = model.selectedCompany { contextRow(summary) }
+        }
+        .frame(maxWidth: .infinity)
+        .background(BrahmaTheme.bg2)
+        .overlay(alignment: .bottom) { Hairline() }
+        .task(id: model.search.query) {
+            // Debounce: a newer keystroke cancels this task during the sleep.
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            await model.runSearch()
+        }
+        .alert("Switch to Auto?", isPresented: $confirmAuto) {
+            Button("Switch") { Task { await model.setAutonomy(.auto) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(verbatim: "PRD, architecture, sprint plan and release asks will no longer wait for you once the C-suite approves; you get an FYI instead. Reserved matters (money, contracts, pricing, legal, staffing, stage changes and similar) and questions always need you. Asks already waiting still need you.")
+        }
+    }
+
+    private var primaryRow: some View {
         HStack(spacing: BrahmaTheme.spaceL) {
             Text(verbatim: model.selectedCompany?.company.name ?? "Brahma")
                 .font(BrahmaTheme.companyTitle)
@@ -14,13 +40,21 @@ struct TopBar: View {
                 .lineLimit(1)
                 .layoutPriority(1)
             if let summary = model.selectedCompany {
-                UsageModeControl(mode: summary.company.usageMode) { mode in
+                Segmented(options: [(UsageMode.low, "Low"), (.balanced, "Balanced"), (.max, "Max")],
+                          selection: summary.company.usageMode, label: "Usage mode") { mode in
                     Task { await model.setUsageMode(mode) }
                 }
                 CountChips(counts: summary.counts)
                 Spacer(minLength: BrahmaTheme.spaceM)
                 searchField
-                usage
+                Button { showSettings = true } label: {
+                    Image(systemName: "slider.horizontal.3").font(.system(size: 11)).foregroundStyle(BrahmaTheme.text1)
+                        .frame(width: 22, height: 22).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Company settings")
+                .accessibilityLabel(Text("Company settings"))
+                .popover(isPresented: $showSettings, arrowEdge: .bottom) { CompanySettingsPopover(model: model) }
                 let running = summary.company.status == .running
                 Button {
                     Task { await model.setCompanyRunning(!running, companyId: summary.id) }
@@ -36,15 +70,60 @@ struct TopBar: View {
         .padding(.leading, BrahmaTheme.trafficLightInset)
         .padding(.trailing, BrahmaTheme.spaceM)
         .frame(height: BrahmaTheme.topBarHeight)
-        .frame(maxWidth: .infinity)
-        .background(BrahmaTheme.bg2)
-        .overlay(alignment: .bottom) { Hairline() }
-        .task(id: model.search.query) {
-            // Debounce: a newer keystroke cancels this task during the sleep.
-            try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled else { return }
-            await model.runSearch()
+    }
+
+    private func contextRow(_ summary: CompanySummary) -> some View {
+        HStack(spacing: BrahmaTheme.spaceL) {
+            Text(verbatim: model.sprintLine ?? "No active sprint")
+                .font(BrahmaTheme.monoSmall)
+                .foregroundStyle(model.sprintLine == nil ? BrahmaTheme.text2 : BrahmaTheme.text1)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(-1)
+            HStack(spacing: BrahmaTheme.spaceS) {
+                CapsLabel("Autonomy")
+                Segmented(options: [(AutonomyPreset.everything, "Everything"), (.important, "Important"), (.auto, "Auto")],
+                          selection: model.autonomy, label: "Autonomy") { preset in
+                    if preset == .auto { confirmAuto = true } else { Task { await model.setAutonomy(preset) } }
+                }
+                .help(model.autonomy.title)
+            }
+            Spacer(minLength: BrahmaTheme.spaceM)
+            if let why = model.stallLine { whyChip(why) }
+            usage
+            if let pace = model.paceLine {
+                let ahead = model.work.pace.map { $0.state == .ahead || $0.state == .closed } ?? false
+                Text(verbatim: pace.uppercased())
+                    .font(BrahmaTheme.monoSmall)
+                    .foregroundStyle(ahead ? BrahmaTheme.warning : BrahmaTheme.text1)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
         }
+        .padding(.leading, BrahmaTheme.trafficLightInset)
+        .padding(.trailing, BrahmaTheme.spaceM)
+        .frame(height: 30)
+        .overlay(alignment: .top) { Hairline(color: BrahmaTheme.line.opacity(0.6)) }
+    }
+
+    /// `WHY: <first reason>`; the popover lists them all.
+    private func whyChip(_ why: String) -> some View {
+        Button { showWhy = true } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "questionmark.circle.fill").font(.system(size: 10))
+                Text(verbatim: "WHY: " + why).font(BrahmaTheme.label).tracking(BrahmaTheme.labelTracking).lineLimit(1)
+            }
+            .foregroundStyle(BrahmaTheme.warning)
+            .padding(.horizontal, 6)
+            .frame(height: BrahmaTheme.chipHeight)
+            .frame(maxWidth: 380)
+            .background(RoundedRectangle(cornerRadius: BrahmaTheme.radius).fill(BrahmaTheme.warning.opacity(0.15)))
+            .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius).strokeBorder(BrahmaTheme.warning, lineWidth: 1))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(verbatim: "Why nothing is running: " + why))
+        .popover(isPresented: $showWhy, arrowEdge: .bottom) { WhyPopover(reasons: model.work.stall.reasons) }
     }
 
     private var searchField: some View {
@@ -72,23 +151,23 @@ struct TopBar: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(Text(verbatim: gate))
         } else {
-            UsageMeter(info: model.snapshot.usage, accessibilityText: model.usageLine)
+            UsageMeter(info: model.snapshot.usage, timeZone: model.ownerTimeZone, accessibilityText: model.usageLine)
         }
     }
 }
 
-/// Segmented LOW | BALANCED | MAX control (the modes display as "Low", "Balanced", "Max", uppercased here).
-private struct UsageModeControl: View {
-    let mode: UsageMode
-    let select: (UsageMode) -> Void
-
-    private static let modes: [(UsageMode, String)] = [(.low, "Low"), (.balanced, "Balanced"), (.max, "Max")]
+/// Segmented control (LOW | BALANCED | MAX, EVERYTHING | IMPORTANT | AUTO): uppercase labels, accent for the selected one.
+private struct Segmented<Value: Hashable>: View {
+    let options: [(Value, String)]
+    let selection: Value
+    let label: String
+    let select: (Value) -> Void
 
     var body: some View {
         HStack(spacing: 0) {
-            ForEach(Array(Self.modes.enumerated()), id: \.offset) { index, entry in
+            ForEach(Array(options.enumerated()), id: \.offset) { index, entry in
                 let (value, title) = entry
-                let selected = value == mode
+                let selected = value == selection
                 if index > 0 { Hairline(axis: .vertical, color: BrahmaTheme.lineStrong) }
                 Button { if !selected { select(value) } } label: {
                     Text(verbatim: title.uppercased())
@@ -109,7 +188,53 @@ private struct UsageModeControl: View {
         .clipShape(RoundedRectangle(cornerRadius: BrahmaTheme.radius))
         .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius).strokeBorder(BrahmaTheme.lineStrong, lineWidth: 1))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(Text("Usage mode"))
-        .help("Usage mode")
+        .accessibilityLabel(Text(verbatim: label))
+        .help(label)
+    }
+}
+
+/// Every reason nothing is running, as the engine reports them (derived from agent text, so shown verbatim).
+private struct WhyPopover: View {
+    let reasons: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: BrahmaTheme.spaceS) {
+            CapsLabel("Why nothing is running")
+            ForEach(Array(reasons.enumerated()), id: \.offset) { _, reason in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(verbatim: "·").foregroundStyle(BrahmaTheme.text2)
+                    Text(verbatim: reason).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text0)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(BrahmaTheme.spaceM)
+        .frame(width: 340, alignment: .leading)
+        .background(BrahmaTheme.bg1)
+    }
+}
+
+/// Company-level switches: the auto-merge toggle (off by default) and where this week's budget went, by work mode.
+private struct CompanySettingsPopover: View {
+    let model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: BrahmaTheme.spaceM) {
+            CapsLabel("Company settings")
+            Toggle(isOn: Binding(get: { model.autoMergeSmall }, set: { on in Task { await model.setAutoMergeSmall(on) } })) {
+                Text(verbatim: "Auto-merge small changes").font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text0)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Text(verbatim: "Tier S items with a passing, allowlisted check merge without waiting for you. Turning it off stops pending auto-merges.")
+                .font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2).fixedSize(horizontal: false, vertical: true)
+            Hairline()
+            CapsLabel("Budget by mode")
+            Text(verbatim: model.modeBreakdownLine ?? "No spend recorded this week.")
+                .font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(BrahmaTheme.spaceM)
+        .frame(width: 340, alignment: .leading)
+        .background(BrahmaTheme.bg1)
     }
 }
