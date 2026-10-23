@@ -111,7 +111,7 @@ failures), the Claude Code CLI changes version (it is re-probed) or the disk fal
 turns do not count against agents, retries do not spin, active time freezes, and everything resumes when the probe
 passes. `brahma doctor` runs the probe by hand.
 
-**Sprints.** `brahma sprint` plans, starts and closes sprints. A sprint has a timebox of 5 active days or 200 team work
+**Sprints.** `brahma sprint` shows open sprints and `brahma sprint list` lists all of them. Agents plan and close sprints (`plan_sprint`, `close_sprint`), and sprint plans are approved through the Inbox. A sprint has a timebox of 5 active days or 200 team work
 turns, and the engine writes a standup every 86 400 active seconds.
 
 **Inbox.** Agents propose things (a PRD, an architecture, a sprint plan, a release, or any other ask) that go to an
