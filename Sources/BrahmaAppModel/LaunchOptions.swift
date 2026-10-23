@@ -2,6 +2,8 @@ import Foundation
 
 public enum SelectTarget: Equatable, Sendable {
     case missionControl, activity, agents
+    case backlog, board, inbox
+    case item(key: String)
     case agent(handle: String)
     case channel(name: String)
     case dm(handle: String)
@@ -13,6 +15,10 @@ public enum SelectTarget: Equatable, Sendable {
         case "mission": self = .missionControl
         case "activity": self = .activity
         case "agents": self = .agents
+        case "backlog": self = .backlog
+        case "board": self = .board
+        case "inbox": self = .inbox
+        case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)
         default:
@@ -22,6 +28,7 @@ public enum SelectTarget: Equatable, Sendable {
             guard !value.isEmpty else { return nil }
             switch key {
             case "agent": self = .agent(handle: value.lowercased())
+            case "item": self = .item(key: value.uppercased())
             case "channel": self = .channel(name: value.lowercased())
             case "dm": self = .dm(handle: value.lowercased())
             case "search": self = .search(value)
@@ -35,8 +42,13 @@ public struct LaunchOptions: Equatable, Sendable {
     public var smokeTest = false
     public var smokeHold: Double = 0
     public var smokeCloseWindow = false
+    /// `--smoke-release=<path>`: the smoke hold ends as soon as this file exists (the script creates it once it has seen
+    /// what it waits for); `smokeHold` is then only the upper bound.
+    public var smokeRelease: String?
     public var snapshotPath: String?
     public var select: SelectTarget?
+    /// Company name to select first (snapshots of the work screens use the seeded Initech).
+    public var company: String?
 
     public init() {}
 
@@ -51,6 +63,12 @@ public struct LaunchOptions: Equatable, Sendable {
                 i += 1
                 continue
             }
+            if args[i].hasPrefix("--smoke-release=") {
+                let path = String(args[i].dropFirst("--smoke-release=".count))
+                if !path.isEmpty { o.smokeRelease = path }
+                i += 1
+                continue
+            }
             switch args[i] {
             case "--smoke-test": o.smokeTest = true
             case "--smoke-close-window": o.smokeCloseWindow = true
@@ -58,6 +76,8 @@ public struct LaunchOptions: Equatable, Sendable {
                 if i + 1 < args.count, let v = Double(args[i + 1]) { o.smokeHold = v; i += 1 }
             case "--ui-snapshot":
                 if i + 1 < args.count { o.snapshotPath = args[i + 1]; i += 1 }
+            case "--company":
+                if i + 1 < args.count { o.company = args[i + 1]; i += 1 }
             case "--select":
                 if i + 1 < args.count { o.select = SelectTarget(args[i + 1]); i += 1 }
             default: break

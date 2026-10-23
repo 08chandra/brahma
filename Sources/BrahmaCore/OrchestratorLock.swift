@@ -17,7 +17,7 @@ public final class OrchestratorLock: @unchecked Sendable {
     public static func acquire(paths: BrahmaPaths) throws -> OrchestratorLock {
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         let path = paths.home.appending(path: "orchestrator.lock").path
-        let fd = open(path, O_CREAT | O_RDWR, 0o600)
+        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw OrchestratorLockError.cannotOpen(errno: errno) }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
             let code = errno

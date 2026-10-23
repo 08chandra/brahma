@@ -23,17 +23,23 @@ extension Store {
             isUsingOverage: info.isUsingOverage, fiveHourUtilization: info.fiveHourUtilization,
             sevenDayUtilization: info.sevenDayUtilization, observedAt: info.observedAt,
             fiveHourResetsAt: info.fiveHourResetsAt, sevenDayResetsAt: info.sevenDayResetsAt)
-        try writer.write { db in try row.save(db) }
+        try writer.write { db in
+            try row.save(db)
+            try Store.calibrate(db, observing: info)
+        }
     }
 
     public func latestRateLimit() throws -> RateLimitInfo? {
-        try writer.read { db in
-            try UsageStateRow.fetchOne(db, key: 1).map {
-                RateLimitInfo(status: $0.status, resetsAt: $0.resetsAt, rateLimitType: $0.rateLimitType,
-                              isUsingOverage: $0.isUsingOverage, fiveHourUtilization: $0.fiveHourUtilization,
-                              sevenDayUtilization: $0.sevenDayUtilization, observedAt: $0.observedAt,
-                              fiveHourResetsAt: $0.fiveHourResetsAt, sevenDayResetsAt: $0.sevenDayResetsAt)
-            }
+        try writer.read { db in try Store.latestRateLimit(db: db) }
+    }
+
+    /// In-transaction `latestRateLimit`.
+    static func latestRateLimit(db: Database) throws -> RateLimitInfo? {
+        try UsageStateRow.fetchOne(db, key: 1).map {
+            RateLimitInfo(status: $0.status, resetsAt: $0.resetsAt, rateLimitType: $0.rateLimitType,
+                          isUsingOverage: $0.isUsingOverage, fiveHourUtilization: $0.fiveHourUtilization,
+                          sevenDayUtilization: $0.sevenDayUtilization, observedAt: $0.observedAt,
+                          fiveHourResetsAt: $0.fiveHourResetsAt, sevenDayResetsAt: $0.sevenDayResetsAt)
         }
     }
 }

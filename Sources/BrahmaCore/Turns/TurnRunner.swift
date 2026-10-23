@@ -6,24 +6,48 @@ public protocol TurnRunning: Sendable {
     /// Returns once every child process this runner started has exited. Cancelling a turn ends its stream at
     /// once, before the child is reaped; a shutting-down host waits here so it never leaves orphans behind.
     func waitForChildren() async
+    /// Starts the compiled argv of `request` with `--input-format stream-json`, writes `messages` (control requests) and
+    /// returns what it printed until each request was answered, the process exited or `timeout` passed. No prompt is sent, so
+    /// no model is called. Nil when the runner cannot (test fakes): the doctor's mode-canary is then skipped.
+    func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript?
 }
 
 extension TurnRunning {
     public func waitForChildren() async {}
+    public func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? { nil }
+}
+
+/// What a control session printed: its stdout lines, and its exit status when it exited by itself.
+public struct ControlTranscript: Equatable, Sendable {
+    public var exitStatus: Int32?
+    public var lines: [String]
+
+    public init(exitStatus: Int32?, lines: [String]) { self.exitStatus = exitStatus; self.lines = lines }
 }
 
 public enum TurnError: Error, Equatable {
     /// The process ended without emitting a `result` line.
     case exitedWithoutResult(code: Int32, stderrTail: String)
-    /// The turn ran longer than `maxTurnDuration` and was killed.
+    /// The turn ran longer than its wall clock and was killed by the engine (also after an early `result` with background
+    /// work still pending).
     case timedOut
+    /// The process was stopped from outside (SIGTERM, a kill) before the turn finished: either it ended with no result
+    /// after a SIGTERM, or it was killed with background work (`pendingTasks`) still running, even if an early `result`
+    /// had been printed. Never counted against the agent. The engine's own wall-clock kill is `timedOut`.
+    case interrupted(pendingTasks: Int)
 }
 
 /// Runs `claude -p` as a child process: prompt on stdin, stream-json on stdout.
 public struct ClaudeProcessRunner: TurnRunning {
     /// Command name looked up via `/usr/bin/env`, or an absolute path launched directly.
     public var claudePath: String
+    /// The wall clock of a turn whose request names none (`TurnProfile.wallClock`): the Plan 1 fallback.
     public var maxTurnDuration: Duration
+    /// What `ChildEnvironment` filters. Tests inject one; production uses this process's environment.
+    public var baseEnvironment: [String: String]
+    /// Waits out a turn's wall clock before the engine kills it. Production sleeps; tests inject one that returns when their
+    /// condition holds, so the kill is deterministic rather than a race against a real timer.
+    public var wallClockSleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
 
     private static let live = LiveCount()
 
@@ -32,10 +56,15 @@ public struct ClaudeProcessRunner: TurnRunning {
     /// After the process exits, how long to wait for stdout EOF (a grandchild may still hold the pipe).
     static let drainGrace: TimeInterval = 2
 
-    public init(claudePath: String = "claude", maxTurnDuration: Duration = .seconds(900)) {
+    public init(claudePath: String = "claude", maxTurnDuration: Duration = .seconds(900),
+                baseEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
         self.claudePath = claudePath
         self.maxTurnDuration = maxTurnDuration
+        self.baseEnvironment = baseEnvironment
     }
+
+    /// Exit code of a process that died of SIGTERM: 143 through a shell wrapper, the signal number itself from Foundation.
+    static func isSigterm(_ status: Int32) -> Bool { status == 143 || status == SIGTERM }
 
     public func waitForChildren() async {
         await waitForChildren(pollInterval: .milliseconds(20))
@@ -70,9 +99,68 @@ public struct ClaudeProcessRunner: TurnRunning {
         }
     }
 
+    public func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? {
+        let profile = TurnProfileCompiler.profile(for: request)
+        guard (try? TurnProfileCompiler.validate(profile)) != nil else { return ControlTranscript(exitStatus: nil, lines: []) }
+        var args = TurnProfileCompiler.arguments(profile)
+        args.insert(contentsOf: ["--input-format", "stream-json"], at: 1)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let input = messages.compactMap { try? encoder.encode($0) }.map { String(decoding: $0, as: UTF8.self) + "\n" }.joined()
+        let ids = Set(messages.compactMap { $0.objectValue?["request_id"]?.stringValue })
+        let claude = claudePath
+        let env = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment, engineClaudeVars: profile.environment,
+                                        purpose: .claude)
+        let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+        return await Task.detached { () -> ControlTranscript? in
+            let process = Process()
+            if claude.hasPrefix("/") {
+                process.executableURL = URL(fileURLWithPath: claude); process.arguments = args
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = [claude] + args
+            }
+            process.environment = env
+            process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
+            let stdin = Pipe(), stdout = Pipe()
+            process.standardInput = stdin
+            process.standardOutput = stdout
+            process.standardError = FileHandle.nullDevice
+            let collected = ControlLines(waitingFor: ids)
+            stdout.fileHandleForReading.readabilityHandler = { h in
+                let data = h.availableData
+                if data.isEmpty { h.readabilityHandler = nil } else { collected.append(data) }
+            }
+            do { try process.run() } catch {
+                stdout.fileHandleForReading.readabilityHandler = nil
+                return nil
+            }
+            #if canImport(Darwin)
+            _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+            #endif
+            try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8))
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline, process.isRunning, !collected.done { usleep(20_000) }
+            let exitedByItself = !process.isRunning
+            try? stdin.fileHandleForWriting.close()
+            if process.isRunning {
+                process.terminate()
+                let killAt = Date().addingTimeInterval(Self.killGrace)
+                while process.isRunning, Date() < killAt { usleep(20_000) }
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            }
+            process.waitUntilExit()
+            usleep(50_000)
+            stdout.fileHandleForReading.readabilityHandler = nil
+            return ControlTranscript(exitStatus: exitedByItself ? process.terminationStatus : nil, lines: collected.lines)
+        }.value
+    }
+
     private func execute(_ request: TurnRequest, yield: (StreamEvent) -> Void) async throws {
         let process = Process()
-        let args = ClaudeCommand.arguments(for: request)
+        // One compiled profile: its argv and its engine-set environment (the only source of `CLAUDE_CODE_*` controls).
+        let profile = TurnProfileCompiler.profile(for: request)
+        try TurnProfileCompiler.validate(profile)
+        let args = TurnProfileCompiler.arguments(profile)
         if claudePath.hasPrefix("/") {
             process.executableURL = URL(fileURLWithPath: claudePath)
             process.arguments = args
@@ -80,6 +168,8 @@ public struct ClaudeProcessRunner: TurnRunning {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [claudePath] + args
         }
+        process.environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
+                                                       engineClaudeVars: profile.environment, purpose: .claude)
         process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         process.standardInput = stdin
@@ -92,18 +182,15 @@ public struct ClaudeProcessRunner: TurnRunning {
             let data = h.availableData
             if data.isEmpty { h.readabilityHandler = nil; splitter.finish() } else { splitter.append(data) }
         }
-        let tail = TailBuffer(limit: Self.stderrLimit)
-        stderr.fileHandleForReading.readabilityHandler = { h in
-            let data = h.availableData
-            if data.isEmpty { h.readabilityHandler = nil } else { tail.append(data) }
-        }
+        let stderrReader = StderrReader(stderr.fileHandleForReading, limit: Self.stderrLimit)
+        stderrReader.start()
         let exit = ExitWaiter()
         let child = ChildProcess(process)
         process.terminationHandler = { p in
             exit.signal(p.terminationStatus)
+            // Stderr is not cut here: the turn drains what is left of it itself once the process is gone (below).
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.drainGrace) {
                 stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
                 splitter.finish()
             }
         }
@@ -112,7 +199,7 @@ public struct ClaudeProcessRunner: TurnRunning {
             try process.run()
         } catch {
             stdout.fileHandleForReading.readabilityHandler = nil
-            stderr.fileHandleForReading.readabilityHandler = nil
+            stderrReader.drain()
             throw error
         }
 
@@ -130,19 +217,23 @@ public struct ClaudeProcessRunner: TurnRunning {
         }
 
         let timedOut = Flag()
-        let watchdog = Task { [maxTurnDuration] in
-            try await Task.sleep(for: maxTurnDuration)
+        let wallClock = profile.wallClock ?? maxTurnDuration
+        let sleep = wallClockSleep
+        let watchdog = Task {
+            try await sleep(wallClock)
             timedOut.set()
             child.terminate(grace: Self.killGrace)
         }
         defer { watchdog.cancel() }
 
-        var sawResult = false
+        var state = TurnStreamState()
         await withTaskCancellationHandler {
             for await line in lines {
-                guard let event = StreamParser.parse(line: line) else { continue }
-                if case .result = event { sawResult = true }
-                yield(event)
+                guard let events = StreamParser.parseAll(line: line) else { continue }
+                for event in events {
+                    state.apply(event)
+                    yield(event)
+                }
             }
         } onCancel: {
             child.terminate(grace: Self.killGrace)
@@ -152,11 +243,34 @@ public struct ClaudeProcessRunner: TurnRunning {
         let status = await exit.wait()
         process.waitUntilExit()
 
+        // The last of stderr may still be in its pipe when the process is gone; give it until the drain grace (bounded by the
+        // clock, not by a count of sleeps, which stretch on a loaded machine).
+        let stderrDeadline = ContinuousClock.now + .seconds(Self.drainGrace) + .milliseconds(500)
+        while !stderrReader.isClosed, ContinuousClock.now < stderrDeadline { try? await Task.sleep(for: .milliseconds(5)) }
+        // Not closed in time (a grandchild may hold the pipe, or the handler is slow on a loaded machine): whatever the
+        // process wrote before it exited is still in the pipe, so it is read now, without waiting, and nothing is lost.
+        // The drain stops the handler first, so no handler read can race it (a no-op once the pipe has closed).
+        stderrReader.drain()
+        let stderrTail = stderrReader.text
+        if let requested = TurnAudit.effortCap(in: stderrTail) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
-        // A result is authoritative even if the process lingered past it and had to be killed.
+        let sawResult = state.sawResult
+        // The last result is authoritative even if the process lingered past it and had to be killed ...
+        if sawResult, !state.hasPendingWork { return }
+        // A controlled stop (`--max-budget-usd`, `--max-turns`) is the CLI ending the turn itself, even with a sub-agent still
+        // running (probe L-2): the result stands and is booked as the cap it is.
+        if sawResult, state.result?.stopReason != nil, !timedOut.isSet, !Self.isSigterm(status) { return }
+        // ... unless background work (a workflow, a sub-agent) was still running: an early result then is not the end
+        // of the turn. A process that exited by itself (status 0) is the CLI's own decision and stands. The engine's own wall
+        // clock is a timeout (failed, backed off, budgeted), never an interruption: an interruption has no backoff and would
+        // re-run the turn on every tick for a whole wall clock. Only a kill from outside is an interruption.
+        if sawResult, timedOut.isSet { throw TurnError.timedOut }
+        if sawResult, status != 0 { throw TurnError.interrupted(pendingTasks: state.pendingTasks.count) }
         if sawResult { return }
         if timedOut.isSet { throw TurnError.timedOut }
-        throw TurnError.exitedWithoutResult(code: status, stderrTail: tail.text)
+        // SIGTERM from outside (a shutdown, a kill) ends the turn without a result; the agent is not at fault.
+        if Self.isSigterm(status) { throw TurnError.interrupted(pendingTasks: 0) }
+        throw TurnError.exitedWithoutResult(code: status, stderrTail: stderrTail)
     }
 }
 
@@ -192,6 +306,89 @@ private final class LineSplitter: @unchecked Sendable {
     private func emit(_ bytes: Data) {
         let line = String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if !line.isEmpty { sink.yield(line) }
+    }
+}
+
+/// Collects a child's stderr into a bounded tail, never through `FileHandle.availableData`: that raises an uncatchable
+/// exception on a read error, and a handler already running when its `readabilityHandler` is cleared still reads. The
+/// readability handler and the final `drain()` read the pipe under one lock, each only what `poll` reports is there, so
+/// the fd stays blocking, neither reader can wait on the other, and once `drain()` has run a handler still in flight
+/// returns without reading.
+final class StderrReader: @unchecked Sendable {
+    /// Where a readability handler is; tests pause it at `.entered` to force the drain to run while it is in flight.
+    enum HandlerPhase: Sendable { case entered, returned }
+
+    private let handle: FileHandle
+    private let fd: Int32
+    private let tail: TailBuffer
+    private let maxRead: Int
+    private let onHandler: @Sendable (HandlerPhase) -> Void
+    private let lock = NSLock()
+    private var stopped = false
+    private var eof = false
+    private var errors = 0
+
+    init(_ handle: FileHandle, limit: Int, onHandler: @escaping @Sendable (HandlerPhase) -> Void = { _ in }) {
+        self.handle = handle
+        fd = handle.fileDescriptor
+        tail = TailBuffer(limit: limit)
+        maxRead = limit * 16
+        self.onHandler = onHandler
+    }
+
+    func start() {
+        // The closure holds `self` until the handler is cleared: at end of file or in `drain()`, which every turn reaches.
+        handle.readabilityHandler = { [self] _ in pump() }
+    }
+
+    /// The pipe reached end of file (every writer closed it).
+    var isClosed: Bool { lock.withLock { eof } }
+    /// The last `limit` bytes read.
+    var text: String { tail.text }
+    /// Reads that failed (EAGAIN, EBADF ...). Always 0: a read happens only when `poll` says it will not block.
+    var readErrors: Int { lock.withLock { errors } }
+
+    /// Stops the handler and reads what is in the pipe right now (bounded), without waiting for end of file. Idempotent.
+    func drain() {
+        handle.readabilityHandler = nil
+        lock.withLock {
+            guard !stopped else { return }
+            stopped = true
+            if !eof { readAvailable() }
+        }
+    }
+
+    private func pump() {
+        onHandler(.entered)
+        defer { onHandler(.returned) }
+        let closed = lock.withLock { () -> Bool in
+            guard !stopped, !eof else { return true }
+            readAvailable()
+            return eof
+        }
+        if closed { handle.readabilityHandler = nil }
+    }
+
+    /// Lock held. Reads while `poll` reports data (or end of file), up to `maxRead` bytes; never blocks.
+    private func readAvailable() {
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        var total = 0
+        while total < maxRead {
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pfd, 1, 0)
+            if ready < 0, errno == EINTR { continue }
+            guard ready > 0 else { return }
+            if pfd.revents & Int16(POLLNVAL | POLLERR) != 0 { eof = true; return }
+            guard pfd.revents & Int16(POLLIN | POLLHUP) != 0 else { return }
+            let n = read(fd, &buffer, min(buffer.count, maxRead - total))
+            if n < 0 {
+                if errno == EINTR { continue }
+                errors += 1; eof = true; return
+            }
+            if n == 0 { eof = true; return }
+            tail.append(Data(buffer[0..<n]))
+            total += n
+        }
     }
 }
 
@@ -267,6 +464,37 @@ private final class Flag: @unchecked Sendable {
     private var value = false
     func set() { lock.withLock { value = true } }
     var isSet: Bool { lock.withLock { value } }
+}
+
+/// A control session's stdout lines, and whether every awaited `control_response` arrived.
+private final class ControlLines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var _lines: [String] = []
+    private var waiting: Set<String>
+    static let maxBytes = 1 << 20
+
+    init(waitingFor ids: Set<String>) { waiting = ids }
+
+    func append(_ data: Data) {
+        lock.withLock {
+            guard buffer.count + data.count < Self.maxBytes else { waiting = []; return }
+            buffer.append(data)
+            while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = String(decoding: buffer[buffer.startIndex..<nl], as: UTF8.self)
+                buffer.removeSubrange(buffer.startIndex...nl)
+                _lines.append(line)
+                if let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                   obj["type"] as? String == "control_response",
+                   let id = (obj["response"] as? [String: Any])?["request_id"] as? String {
+                    waiting.remove(id)
+                }
+            }
+        }
+    }
+
+    var done: Bool { lock.withLock { waiting.isEmpty } }
+    var lines: [String] { lock.withLock { _lines } }
 }
 
 /// Number of turns whose child process has not been reaped yet.

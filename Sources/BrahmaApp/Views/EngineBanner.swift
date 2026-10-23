@@ -4,8 +4,30 @@ import BrahmaAppModel
 /// Shown above the detail pane when the engine is not simply running in this app.
 struct EngineBanner: View {
     let engine: EngineHost?
+    var notice: String?
+    /// The engine hold (offline, logged out, CLI changed, disk low), in `danger`.
+    var hold: String?
+    /// An account or CLI hold has something to retry.
+    var canRetryHold = false
+    var retryHold: () -> Void = {}
 
     var body: some View {
+        VStack(spacing: 0) {
+            if let notice {
+                bar(color: BrahmaTheme.warning, icon: "exclamationmark.triangle.fill") { Text(verbatim: notice) }
+            }
+            if let hold {
+                bar(color: BrahmaTheme.danger, icon: "exclamationmark.octagon.fill") {
+                    Text(verbatim: hold)
+                    Spacer(minLength: 12)
+                    if canRetryHold { Button("Retry", action: retryHold).buttonStyle(.brahma) }
+                }
+            }
+            engineBar
+        }
+    }
+
+    @ViewBuilder private var engineBar: some View {
         if let engine {
             switch engine.status {
             case .external:

@@ -4,14 +4,13 @@ import BrahmaCore
 
 /// Runs the built `brahma` binary (it sits next to the test bundle) against a throwaway data home.
 private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32, stderr: String) {
-    let url = Bundle.module.bundleURL.deletingLastPathComponent().appending(path: "brahma")
+    let url = brahmaExecutableURL()
     try #require(FileManager.default.isExecutableFile(atPath: url.path), "build the brahma product first")
     let home = try home ?? tempDir()
     let p = Process()
     p.executableURL = url
     p.arguments = args
-    p.environment = ["BRAHMA_HOME": home.appending(path: "home").path,
-                     "BRAHMA_WORKSPACES": home.appending(path: "ws").path, "PATH": "/usr/bin:/bin"]
+    p.environment = cliEnvironment(home: home)
     let err = Pipe()
     p.standardError = err
     p.standardOutput = FileHandle.nullDevice
@@ -43,12 +42,13 @@ private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32
     }
 
     @Test func runRefusesWhenLockHeld() throws {
-        let d = try tempDir()
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let d = owner.url
         let paths = BrahmaPaths(home: d.appending(path: "home"), workspaces: d.appending(path: "ws"))
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         let lock = try OrchestratorLock.acquire(paths: paths)
         defer { withExtendedLifetime(lock) {} }
-        let r = try brahma(["run"], home: d)
+        let r = try brahma(["run", "--skip-doctor"], home: d)
         #expect(r.status != 0)
         #expect(r.stderr.contains("another Brahma engine (the Brahma app or 'brahma run') is already using"))
     }

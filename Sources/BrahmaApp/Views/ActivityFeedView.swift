@@ -24,7 +24,7 @@ struct ActivityFeedView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(events, id: \.id) { event in
-                                ActivityRow(event: event, handles: handles, flashing: event.id == flashId)
+                                ActivityRow(event: event, handles: handles, flashing: event.id == flashId, timeZone: model.ownerTimeZone)
                                     .id(event.id)
                             }
                         }
@@ -77,10 +77,11 @@ private struct ActivityRow: View {
     let event: ActivityEvent
     let handles: [String: String]
     let flashing: Bool
+    var timeZone: TimeZone = .current
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: BrahmaTheme.spaceS) {
-            Text(verbatim: TimeText.hms(event.createdAt))
+            Text(verbatim: TimeText.hms(event.createdAt, timeZone: timeZone))
                 .font(BrahmaTheme.monoSmall)
                 .foregroundStyle(BrahmaTheme.text2)
             Image(systemName: Self.symbol(event.kind))
@@ -108,6 +109,8 @@ private struct ActivityRow: View {
         case .stateChanged: "arrow.triangle.swap"
         case .usage: "gauge.with.dots.needle.67percent"
         case .error: "exclamationmark.triangle"
+        case .work: "checklist"
+        case .approval: "checkmark.seal"
         }
     }
 
@@ -120,6 +123,8 @@ private struct ActivityRow: View {
         case .stateChanged: BrahmaTheme.series[3]
         case .usage: BrahmaTheme.warning
         case .error: BrahmaTheme.danger
+        case .work: BrahmaTheme.accent
+        case .approval: BrahmaTheme.warning
         }
     }
 }

@@ -1,0 +1,192 @@
+import Foundation
+import Testing
+@testable import BrahmaCore
+
+private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
+    let url = brahmaExecutableURL()
+    try #require(FileManager.default.isExecutableFile(atPath: url.path), "build the brahma product first")
+    let p = Process()
+    p.executableURL = url
+    p.arguments = args
+    var e = cliEnvironment(home: home)
+    e.merge(env) { _, new in new }
+    p.environment = e
+    let out = Pipe(), err = Pipe()
+    p.standardOutput = out; p.standardError = err
+    p.standardInput = FileHandle.nullDevice
+    try p.run()
+    let o = out.fileHandleForReading.readDataToEndOfFile(), r = err.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))
+}
+
+@Suite struct SettingsCLITests {
+    @Test func timezoneShowsSetsAndValidates() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["settings", "timezone"], home: home).stdout.contains("time zone: "))
+        let set = try brahma(["settings", "timezone", "Asia/Kolkata"], home: home)
+        #expect(set.status == 0, "\(set.stderr)"); #expect(set.stdout.contains("Asia/Kolkata"))
+        #expect(try brahma(["settings", "timezone"], home: home).stdout == "time zone: Asia/Kolkata\n")
+        let bad = try brahma(["settings", "timezone", "Mars/Olympus"], home: home)
+        #expect(bad.status == 1); #expect(bad.stderr.contains("unknown time zone"))
+        #expect(try brahma(["settings", "timezone"], home: home).stdout == "time zone: Asia/Kolkata\n")
+    }
+
+    @Test func planAndShare() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["settings", "plan"], home: home).stdout.contains("plan: max5x (low 1 / balanced 3 / max 8"))
+        let set = try brahma(["settings", "plan", "max20x"], home: home)
+        #expect(set.status == 0, "\(set.stderr)"); #expect(set.stdout.contains("plan: max20x (low 2 / balanced 6 / max 16"))
+        #expect(try brahma(["settings", "plan", "max99x"], home: home).status != 0)
+        let pro = try brahma(["settings", "plan", "pro"], home: home)
+        #expect(pro.stdout.contains("plan: pro (low 1 / balanced 1 / max 2"), "\(pro.stdout)")
+        #expect(try brahma(["settings", "plan", "max5x"], home: home).status == 0)
+        #expect(try brahma(["settings", "share"], home: home).stdout == "weekly share: 70%\n")
+        #expect(try brahma(["settings", "share", "55"], home: home).stdout == "weekly share: 55%\n")
+        for bad in ["9", "101", "abc"] { #expect(try brahma(["settings", "share", bad], home: home).status != 0, "\(bad)") }
+        #expect(try brahma(["settings", "share"], home: home).stdout == "weekly share: 55%\n")
+    }
+
+    @Test func writesNeedTheOwnerShell() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        for args in [["settings", "timezone", "UTC"], ["settings", "plan", "max20x"], ["settings", "share", "50"],
+                     ["company", "reserve", "Acme", "0.2"]] {
+            let inAgent = try brahma(args, home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+            #expect(inAgent.status == 1, "\(args)")
+            #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"), "\(args): \(inAgent.stderr)")
+        }
+        let nokey = try OwnerTestHome(initOwner: false)
+        for args in [["settings", "timezone", "UTC"], ["settings", "plan", "max20x"], ["settings", "share", "50"]] {
+            let r = try brahma(args, home: nokey.url)
+            #expect(r.status == 1, "\(args)"); #expect(r.stderr.contains("owner key missing or invalid"), "\(args)")
+        }
+        // Reading needs no key.
+        #expect(try brahma(["settings", "plan"], home: nokey.url).status == 0)
+    }
+
+    @Test func hotPathsShowSetDefaultAndOwnerOnly() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        let defaults = try brahma(["settings", "hot-paths"], home: home)
+        #expect(defaults.status == 0, "\(defaults.stderr)")
+        #expect(defaults.stdout.split(separator: "\n").map(String.init) == WorkPolicy.defaultHotPaths)
+        let set = try brahma(["settings", "hot-paths", "Package.swift", "db/migrations/**"], home: home)
+        #expect(set.status == 0, "\(set.stderr)")
+        #expect(try brahma(["settings", "hot-paths"], home: home).stdout == "Package.swift\ndb/migrations/**\n")
+        #expect(try brahma(["settings", "hot-paths", "/abs"], home: home).status != 0)
+        #expect(try brahma(["settings", "hot-paths"], home: home).stdout == "Package.swift\ndb/migrations/**\n")
+        let inAgent = try brahma(["settings", "hot-paths", "x"], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
+        #expect(try brahma(["settings", "hot-paths", "default"], home: home).status == 0)
+        #expect(try brahma(["settings", "hot-paths"], home: home).stdout.split(separator: "\n").map(String.init) == WorkPolicy.defaultHotPaths)
+        let nokey = try OwnerTestHome(initOwner: false)
+        #expect(try brahma(["settings", "hot-paths", "x"], home: nokey.url).stderr.contains("owner key missing or invalid"))
+    }
+
+    @Test func autoMergeSwitchAndPathsAreOwnerOnly() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["settings", "auto-merge"], home: home).stdout == "auto-merge: on\n")
+        let off = try brahma(["settings", "auto-merge", "off"], home: home)
+        #expect(off.status == 0, "\(off.stderr)"); #expect(off.stdout == "auto-merge: off\n")
+        #expect(try brahma(["settings", "auto-merge"], home: home).stdout == "auto-merge: off\n")
+        #expect(try brahma(["settings", "auto-merge", "maybe"], home: home).status != 0)
+        let inAgent = try brahma(["settings", "auto-merge", "on"], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
+        #expect(try brahma(["settings", "auto-merge"], home: home).stdout == "auto-merge: off\n")
+        let nokey = try OwnerTestHome(initOwner: false)
+        #expect(try brahma(["settings", "auto-merge", "on"], home: nokey.url).stderr.contains("owner key missing or invalid"))
+        #expect(try brahma(["settings", "auto-merge", "on"], home: home).stdout == "auto-merge: on\n")
+
+        let paths = try brahma(["settings", "auto-merge-paths"], home: home)
+        #expect(paths.stdout.split(separator: "\n").map(String.init) == ReviewPolicy.defaultAutoMergePaths)
+        #expect(try brahma(["settings", "auto-merge-paths", "Sources/App/"], home: home).status == 0)
+        #expect(try brahma(["settings", "auto-merge-paths"], home: home).stdout == "Sources/App/\n")
+        #expect(try brahma(["settings", "auto-merge-paths", "/abs"], home: home).status != 0)
+        #expect(try brahma(["settings", "auto-merge-paths", "x/"], home: home, env: ["BRAHMA_AGENT_ID": "a1"]).status == 1)
+        #expect(try brahma(["settings", "auto-merge-paths", "default"], home: home).status == 0)
+        #expect(try brahma(["settings", "auto-merge-paths"], home: home).stdout.split(separator: "\n").map(String.init)
+                == ReviewPolicy.defaultAutoMergePaths)
+    }
+
+    @Test func companyAutoMergeSmallIsOffUntilTheOwnerSwitchesItOn() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        func flag() throws -> Bool? {
+            let store = try Store(path: ownerPaths(home).database.path)
+            return try store.companies().first { $0.name == "Acme" }?.autoMergeSmall
+        }
+        #expect(try flag() == false, "a new company starts with auto-merge off")
+        let on = try brahma(["company", "set", "Acme", "auto-merge-small", "on"], home: home)
+        #expect(on.status == 0, "\(on.stderr)"); #expect(on.stdout == "Acme: auto-merge-small on (owner-wide auto-merge: on)\n", "\(on.stdout)")
+        #expect(try flag() == true)
+        let inAgent = try brahma(["company", "set", "Acme", "auto-merge-small", "off"], home: home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
+        #expect(try flag() == true)
+        let nokey = try OwnerTestHome(initOwner: false)
+        #expect(try brahma(["company", "set", "Acme", "auto-merge-small", "off"], home: nokey.url).status != 0)
+        #expect(try brahma(["company", "set", "Acme", "auto-merge-small", "maybe"], home: home).status != 0)
+        #expect(try brahma(["company", "set", "Acme", "auto-merge-big", "on"], home: home).status != 0)
+        #expect(try brahma(["company", "set", "Nope", "auto-merge-small", "on"], home: home).status != 0)
+        #expect(try brahma(["settings", "auto-merge", "off"], home: home).status == 0)
+        let off = try brahma(["company", "set", "Acme", "auto-merge-small", "off"], home: home)
+        #expect(off.status == 0, "\(off.stderr)"); #expect(off.stdout == "Acme: auto-merge-small off (owner-wide auto-merge: off)\n", "\(off.stdout)")
+        #expect(try flag() == false)
+    }
+
+    @Test func companyReserveOverride() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let set = try brahma(["company", "reserve", "Acme", "0.5"], home: home)
+        #expect(set.status == 0, "\(set.stderr)"); #expect(set.stdout.contains("reserve 0.50"))
+        for bad in ["0.95", "-0.1", "lots"] { #expect(try brahma(["company", "reserve", "Acme", bad], home: home).status != 0, "\(bad)") }
+        let reset = try brahma(["company", "reserve", "Acme", "default"], home: home)
+        #expect(reset.stdout.contains("default (30%)"), "\(reset.stdout)")
+        #expect(try brahma(["company", "reserve", "Nope", "0.2"], home: home).status != 0)
+    }
+
+    @Test func statusShowsPaceAndHold() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let store = try Store(path: ownerPaths(home).database.path)
+        let now = Date()
+        try store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                                              fiveHourUtilization: 0.1, sevenDayUtilization: 0.9, observedAt: now,
+                                              sevenDayResetsAt: now.addingTimeInterval(3 * 86_400)))
+        var s = try brahma(["status"], home: home)
+        #expect(s.stdout.contains(" · 7D ahead by "), "\(s.stdout)")
+        #expect(!s.stdout.contains("engine paused"))
+        try store.setHold(reason: .disk, detail: "4.0 GB free", now: now)
+        s = try brahma(["status"], home: home)
+        #expect(s.stdout.contains("engine paused: disk — 4.0 GB free"), "\(s.stdout)")
+    }
+
+    @Test func statusPacesACompanyAgainstItsOwnReserve() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let store = try Store(path: ownerPaths(home).database.path)
+        let now = Date()
+        // Halfway through the week at 30% used: on pace at the default reserve, ahead at a 0.8 reserve.
+        try store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                                              fiveHourUtilization: 0.1, sevenDayUtilization: 0.3, observedAt: now,
+                                              sevenDayResetsAt: now.addingTimeInterval(3.5 * 86_400)))
+        var s = try brahma(["status"], home: home)
+        #expect(s.stdout.contains(" · 7D on pace")); #expect(!s.stdout.contains("(reserve"))
+        #expect(try brahma(["company", "reserve", "Acme", "0.8"], home: home).status == 0)
+        s = try brahma(["status"], home: home)
+        #expect(s.stdout.contains("7D ahead by ") && s.stdout.contains("(reserve 80%)"), "\(s.stdout)")
+    }
+
+    @Test func clockUsesOwnerTimeZoneInStatusLastTurn() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let store = try Store(path: ownerPaths(home).database.path)
+        let c = try #require(try store.companies().first)
+        let ceo = try store.hire(companyId: c.id, name: "ceo", role: "ceo", model: "sonnet")
+        let noon = Date(timeIntervalSince1970: TimeInterval(Int(1_800_000_000) - Int(1_800_000_000) % 86_400 + 12 * 3600))
+        let t = try store.startTurn(agentId: ceo.id, now: noon)
+        _ = try store.finishTurn(id: t.id, outcome: .succeeded, summary: nil, costUSD: nil, now: noon)
+        try store.setOwnerTimeZone("UTC")
+        #expect(try brahma(["status"], home: home).stdout.contains("last turn: succeeded 12:00"))
+        try store.setOwnerTimeZone("Asia/Kolkata")
+        #expect(try brahma(["status"], home: home).stdout.contains("last turn: succeeded 17:30"))
+    }
+}

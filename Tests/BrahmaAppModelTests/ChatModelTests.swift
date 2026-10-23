@@ -128,6 +128,22 @@ import BrahmaCore
         #expect(chat.readOnlyReason == "No agent @ghost in this company.")
     }
 
+    @Test func systemConversationIsReadOnlyAndTitledSystem() async throws {
+        let w = try world()
+        _ = try MessageRouter(store: w.store).sendDM(companyId: w.acme.id, from: .system, to: "owner", text: "heads up")
+        let channel = try #require(try w.store.channel(companyId: w.acme.id, name: "dm:owner:system"))
+        let byTarget = ChatModel(store: w.store, companyId: w.acme.id, target: .dm(handle: "system"))
+        await byTarget.refresh()
+        #expect(byTarget.readOnlyReason == "Brahma engine notices can't be replied to")
+        #expect(byTarget.title == "system")
+        #expect(byTarget.messages.map(\.senderHandle) == ["system"])
+        let byChannel = ChatModel(store: w.store, companyId: w.acme.id, target: .channel(id: channel.id))
+        await byChannel.refresh()
+        #expect(byChannel.title == "system")
+        let rows = SidebarSections(channels: try w.store.channels(companyId: w.acme.id), unread: [:])
+        #expect(rows.directMessages.map(\.title).contains("system"))
+    }
+
     @Test func missingChannelIsReadOnly() async throws {
         let w = try world()
         let chat = ChatModel(store: w.store, companyId: w.acme.id, target: .channel(id: "missing"))

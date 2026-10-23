@@ -2,7 +2,7 @@ import Foundation
 import BrahmaCore
 
 public enum ActivityFilter: String, CaseIterable, Sendable {
-    case all, messages, turns, states, problems
+    case all, messages, turns, states, work, problems
 
     public var title: String {
         switch self {
@@ -10,6 +10,7 @@ public enum ActivityFilter: String, CaseIterable, Sendable {
         case .messages: "Messages"
         case .turns: "Turns"
         case .states: "State changes"
+        case .work: "Work"
         case .problems: "Problems"
         }
     }
@@ -20,6 +21,7 @@ public enum ActivityFilter: String, CaseIterable, Sendable {
         case .messages: k == .message
         case .turns: k == .turnStarted || k == .turnFinished || k == .toolUse
         case .states: k == .stateChanged
+        case .work: k == .work || k == .approval
         case .problems: k == .usage || k == .error
         }
     }

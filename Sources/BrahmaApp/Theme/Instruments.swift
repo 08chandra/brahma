@@ -58,6 +58,8 @@ struct RailTile: View {
 struct UsageMeter: View {
     let info: RateLimitInfo?
     var now: Date = .now
+    /// The owner's time zone, for the reset time.
+    var timeZone: TimeZone = .current
     /// Accessibility text (the model's `usageLine`).
     var accessibilityText: String
 
@@ -70,7 +72,7 @@ struct UsageMeter: View {
                 if let reset = info.resetsAt, reset > now {
                     separator
                     label("RESETS")
-                    Text(verbatim: TimeText.hm(reset)).foregroundStyle(BrahmaTheme.text0)
+                    Text(verbatim: TimeText.hm(reset, timeZone: timeZone)).foregroundStyle(BrahmaTheme.text0)
                 }
             } else {
                 label("USAGE")

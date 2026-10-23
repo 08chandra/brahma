@@ -27,6 +27,41 @@ struct NewCompanySheet: View {
                         .focused($focus, equals: .goal)
                         .brahmaField(focused: focus == .goal)
                 }
+                HStack(alignment: .top, spacing: BrahmaTheme.spaceM) {
+                    VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
+                        CapsLabel("Agents")
+                        HStack(spacing: BrahmaTheme.spaceS) {
+                            TextField("Agents", value: $form.agentCount, format: .number)
+                                .multilineTextAlignment(.trailing)
+                                .font(BrahmaTheme.mono)
+                                .brahmaField()
+                                .frame(width: 64)
+                                .accessibilityLabel(Text("Agents"))
+                            // 0 means an empty company; the first step up lands on the smallest org (5).
+                            Stepper("", onIncrement: { form.agentCount = form.agentCount < 5 ? 5 : min(500, form.agentCount + 1) },
+                                    onDecrement: { form.agentCount = form.agentCount <= 5 ? 0 : form.agentCount - 1 })
+                                .labelsHidden()
+                        }
+                        Text(verbatim: "0 for none, or 5 to 500").font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2)
+                    }
+                    VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
+                        CapsLabel("Industry pack")
+                        Picker("Industry pack", selection: $form.packId) {
+                            ForEach(model.store.catalog.packs, id: \.id) { Text(verbatim: $0.title).tag($0.id) }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .fixedSize()
+                    }
+                }
+                if let warning = form.warning {
+                    HStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 10))
+                        Text(verbatim: warning).font(BrahmaTheme.monoSmall)
+                    }
+                    .foregroundStyle(BrahmaTheme.warning)
+                }
+                OrgPreviewView(preview: model.orgPreview(form), agentCount: form.agentCount)
                 if let message = submitError ?? form.validate() {
                     Text(verbatim: message).foregroundStyle(BrahmaTheme.danger).font(BrahmaTheme.monoSmall)
                 }
@@ -46,7 +81,7 @@ struct NewCompanySheet: View {
             .padding(BrahmaTheme.spaceM)
             .background(BrahmaTheme.bg2)
         }
-        .frame(width: 440)
+        .frame(width: 480)
         .background(BrahmaTheme.bg1)
         .onAppear { focus = .name }
     }

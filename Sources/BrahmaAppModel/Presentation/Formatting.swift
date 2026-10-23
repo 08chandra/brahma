@@ -30,7 +30,8 @@ public enum ChannelTitle {
             let parts = c.name.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
             let handles = parts.first == "dm" ? Array(parts.dropFirst()) : parts
             let others = handles.filter { $0 != "owner" }
-            return (others.isEmpty ? handles : others).map { "@" + $0 }.joined(separator: " · ")
+            // The engine's own conversation reads "system", not "@system": it is not an agent.
+            return (others.isEmpty ? handles : others).map { $0 == "system" ? $0 : "@" + $0 }.joined(separator: " · ")
         }
     }
 }
@@ -57,6 +58,11 @@ public enum UsageText {
         return s
     }
 
+    /// The 7-day pace line: "7D on pace" or "7D ahead by 12%". Nil until a usage reading exists.
+    public static func pace(_ pace: Pace?) -> String? {
+        pace.map { "7D \($0.text)" }
+    }
+
     public static func gateLine(_ info: RateLimitInfo?, mode: UsageMode, now: Date, timeZone: TimeZone = .current) -> String? {
         guard case .closed(let until) = UsageGate.evaluate(info, mode: mode, now: now) else { return nil }
         return "Usage limit — new turns resume at \(TimeText.hm(until, timeZone: timeZone))"
@@ -69,6 +75,7 @@ public enum BlockerText {
         case nil: return ""
         case .agent(let id): return "Waiting on @\(handles[id] ?? id)"
         case .owner(let reason): return "Waiting on you: \(reason)"
+        case .workItem(_, let key): return "Waiting on \(key)"
         case .usageLimit(let until): return "Usage limit until \(TimeText.hm(until, timeZone: timeZone))"
         case .turnBudget(let until): return "Turn budget until \(TimeText.hm(until, timeZone: timeZone))"
         case .retry(let until, let failures):

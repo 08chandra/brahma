@@ -53,6 +53,7 @@ import Foundation
         #expect(d(.usageLimit(until: at(14))) == "Usage limit until 14:00")
         #expect(d(.turnBudget(until: at(15))) == "Turn budget until 15:00")
         #expect(d(.retry(until: at(16), failures: 2)) == "Retrying after failure 2 at 16:00")
+        #expect(d(.workItem(id: "i1", key: "ACME-7")) == "Waiting on ACME-7")
         #expect(d(nil) == "")
     }
 
@@ -68,6 +69,7 @@ import Foundation
         #expect(ChannelTitle.title(ch("general", .channel)) == "#general")
         #expect(ChannelTitle.title(ch("dm:ceo:owner", .dm)) == "@ceo")
         #expect(ChannelTitle.title(ch("dm:ceo:cto", .dm)) == "@ceo · @cto")
+        #expect(ChannelTitle.title(ch("dm:owner:system", .dm)) == "system")
     }
 
     @Test func timeText() {

@@ -109,6 +109,537 @@ enum Migrations {
                 t.column("lastReadAt", .datetime).notNull()
             }
         }
+        m.registerMigration("v3-org") { db in
+            try db.alter(table: "company") { t in
+                t.add(column: "packId", .text).notNull().defaults(to: "software")
+                t.add(column: "packVersion", .integer).notNull().defaults(to: 1)
+            }
+            try db.alter(table: "agent") { t in
+                t.add(column: "managerId", .text).references("agent", onDelete: .setNull)
+                t.add(column: "team", .text)
+                t.add(column: "trustLevel", .text).notNull().defaults(to: "T1")
+            }
+            try db.create(table: "orgVacancy") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("role", .text).notNull()
+                t.column("handle", .text).notNull()
+                t.column("managerHandle", .text)
+                t.column("team", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("filledAt", .datetime)
+            }
+            try db.create(index: "orgVacancy_company", on: "orgVacancy", columns: ["companyId", "filledAt"])
+        }
+        m.registerMigration("v3-wake") { db in
+            try db.alter(table: "inboxItem") { t in
+                t.add(column: "wakes", .boolean).notNull().defaults(to: true)
+            }
+            try db.create(table: "broadcastLog") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("senderId", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "broadcastLog_sender_created", on: "broadcastLog", columns: ["senderId", "createdAt"])
+        }
+        m.registerMigration("v3-engine") { db in
+            try db.create(table: "engineProbe") { t in
+                t.column("id", .integer).primaryKey().check { $0 == 1 }
+                t.column("report", .text).notNull()
+                t.column("checkedAt", .datetime).notNull()
+            }
+        }
+        m.registerMigration("v3-mcp-auth") { db in
+            try db.create(table: "turnCredential") { t in
+                t.primaryKey("turnId", .text).references("turn", onDelete: .cascade)
+                t.column("companyId", .text).notNull()
+                t.column("agentId", .text).notNull()
+                t.column("kind", .text).notNull().defaults(to: "work")
+                t.column("itemId", .text)
+                t.column("tokenHash", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "turnCredential_hash", on: "turnCredential", columns: ["tokenHash"])
+        }
+        m.registerMigration("v3-clock") { db in
+            try db.create(table: "companyActivity") { t in
+                t.primaryKey("companyId", .text).references("company", onDelete: .cascade)
+                t.column("activeSeconds", .double).notNull().defaults(to: 0)
+                t.column("lastAccruedAt", .datetime)
+            }
+            try db.create(table: "ownerSettings") { t in
+                t.column("id", .integer).primaryKey().check { $0 == 1 }
+                t.column("timeZone", .text).notNull()
+                t.column("planTier", .text).notNull().defaults(to: "max5x")
+                t.column("weeklyShare", .double).notNull().defaults(to: 0.7)
+                t.column("pctPerDollar", .double)
+                // Calibration baseline: the last weekly-utilization snapshot and the cost accumulated since.
+                t.column("calibUtil", .double)
+                t.column("calibResetsAt", .datetime)
+                t.column("calibCost", .double).notNull().defaults(to: 0)
+            }
+            try db.create(table: "engineHold") { t in
+                t.column("id", .integer).primaryKey().check { $0 == 1 }
+                t.column("reason", .text).notNull()
+                t.column("detail", .text).notNull()
+                t.column("since", .datetime).notNull()
+                t.column("nextProbeAt", .datetime)
+            }
+            try db.alter(table: "turn") { t in t.add(column: "infra", .boolean).notNull().defaults(to: false) }
+            try db.alter(table: "company") { t in t.add(column: "ownerReserve", .double) }
+            try db.alter(table: "agent") { t in t.add(column: "consecutiveInfraFailures", .integer).notNull().defaults(to: 0) }
+        }
+        m.registerMigration("v3-clock-calibration") { db in
+            // Windowed calibration state (JSON) and the five-hour estimate; the v3-clock calibration columns are unused.
+            try db.alter(table: "ownerSettings") { t in
+                t.add(column: "calibration", .text)
+                t.add(column: "pctPerDollar5h", .double)
+            }
+        }
+        m.registerMigration("v3-work") { db in
+            try db.create(table: "workItem") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("key", .text).notNull()
+                t.column("type", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("description", .text).notNull().defaults(to: "")
+                t.column("acceptanceCriteria", .text).notNull().defaults(to: "")
+                t.column("checkSpec", .text)
+                t.column("checkRevision", .integer).notNull().defaults(to: 0)
+                t.column("reviewFlags", .text).notNull().defaults(to: "[]")
+                t.column("status", .text).notNull()
+                t.column("blockedReason", .text)
+                t.column("blockedSinceActive", .double)
+                t.column("priority", .integer).notNull().defaults(to: 2)
+                t.column("points", .integer)
+                t.column("tier", .text).notNull().defaults(to: "m")
+                t.column("authorId", .text).notNull()
+                t.column("ownerId", .text)
+                t.column("reviewerId", .text)
+                t.column("team", .text)
+                t.column("parentId", .text).references("workItem", onDelete: .setNull)
+                t.column("sprintId", .text)
+                t.column("linkedBranch", .text)
+                t.column("notes", .text)
+                t.column("everStarted", .boolean).notNull().defaults(to: false)
+                t.column("firstClaimedAt", .datetime)
+                t.column("firstClaimedActive", .double)
+                t.column("verifiedRevision", .integer)
+                t.column("verifiedCommit", .text)
+                t.column("reviewRound", .integer).notNull().defaults(to: 0)
+                t.column("reviewedRound", .integer).notNull().defaults(to: 0)
+                t.column("submitSummary", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.column("doneAt", .datetime)
+                // Work modes (W3): intensity, the engine-raised floor and boost, and who confirmed the spec.
+                t.column("intensity", .text).notNull().defaults(to: "auto")
+                t.column("rungFloor", .integer).notNull().defaults(to: 0)
+                t.column("budgetBoostLE", .double).notNull().defaults(to: 0)
+                t.column("specConfirmedBy", .text)
+                t.uniqueKey(["companyId", "key"])
+            }
+            try db.create(index: "workItem_company_status", on: "workItem", columns: ["companyId", "status"])
+            try db.create(table: "workItemDependency") { t in
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("dependsOnId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("linkedBy", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.primaryKey(["itemId", "dependsOnId"])
+            }
+            try db.create(index: "workItemDependency_on", on: "workItemDependency", columns: ["dependsOnId"])
+            try db.create(table: "workItemEvent") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("actorId", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("text", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("createdActive", .double).notNull()
+            }
+            try db.create(index: "workItemEvent_item", on: "workItemEvent", columns: ["itemId", "id"])
+            try db.create(table: "workNotice") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("eventId", .integer).notNull().references("workItemEvent", onDelete: .cascade)
+                t.column("deliveredTurnId", .text)
+                t.column("wakes", .boolean).notNull().defaults(to: false)
+                t.column("wakeAfterActive", .double)
+            }
+            try db.create(index: "workNotice_agent_pending", on: "workNotice", columns: ["agentId", "deliveredTurnId"])
+            try db.alter(table: "agent") { t in t.add(column: "lastNoticeWakeActive", .double) }
+        }
+        m.registerMigration("v3-leases") { db in
+            try db.create(table: "workLease") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("acquiredAt", .datetime).notNull()
+                t.column("expiresActive", .double).notNull()
+            }
+            try db.create(index: "workLease_agent", on: "workLease", columns: ["agentId"])
+            try db.alter(table: "workItem") { t in t.add(column: "touchPaths", .text).notNull().defaults(to: "[]") }
+            // Owner-editable hot paths (JSON globs); NULL means `WorkPolicy.defaultHotPaths`.
+            try db.alter(table: "ownerSettings") { t in t.add(column: "hotPaths", .text) }
+        }
+        m.registerMigration("v3-verify") { db in
+            try db.create(table: "verificationRun") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("checkRevision", .integer).notNull()
+                t.column("scriptHash", .text).notNull().defaults(to: "")
+                t.column("commit", .text).notNull()
+                t.column("command", .text).notNull()
+                t.column("workingDirectory", .text).notNull().defaults(to: "")
+                t.column("timeoutSeconds", .integer).notNull()
+                t.column("purpose", .text).notNull()
+                t.column("attempt", .integer).notNull().defaults(to: 1)
+                t.column("status", .text).notNull()
+                t.column("flaky", .boolean).notNull().defaults(to: false)
+                t.column("exitCode", .integer)
+                t.column("outputPath", .text)
+                t.column("outputTail", .text)
+                t.column("requestedBy", .text)
+                t.column("notBeforeActive", .double)
+                t.column("createdAt", .datetime).notNull()
+                t.column("startedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "verificationRun_item", on: "verificationRun", columns: ["itemId"])
+            try db.create(index: "verificationRun_status", on: "verificationRun", columns: ["status"])
+            try db.create(table: "checkSnapshot") { t in
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("checkRevision", .integer).notNull()
+                t.column("dir", .text).notNull()
+                t.column("manifest", .text).notNull()
+                t.primaryKey(["itemId", "checkRevision"])
+            }
+        }
+        m.registerMigration("v3-verify-2") { db in
+            // Main's head (the merge base) when the item's branch was first claimed: the engine's own record of where the
+            // work started, used to detect weakened tests and as the source of check-script baselines.
+            try db.alter(table: "workItem") { t in t.add(column: "baseCommit", .text) }
+        }
+        m.registerMigration("v3-turn-context") { db in
+            try db.alter(table: "turn") { t in
+                t.add(column: "kind", .text).notNull().defaults(to: "work")
+                t.add(column: "itemId", .text)
+            }
+            try db.alter(table: "workItem") { t in
+                t.add(column: "reviewAttempts", .integer).notNull().defaults(to: 0)
+                t.add(column: "mergeState", .text).notNull().defaults(to: "none")
+                t.add(column: "mergedCommit", .text)
+            }
+            try db.alter(table: "company") { t in t.add(column: "mainCommit", .text) }
+        }
+        m.registerMigration("v3-merge-safety") { db in
+            // Merge safety (9b): per in-progress item, the merge base it was last measured at, when `main` first moved past it
+            // (company-active seconds) and whether the freshness notice for that base was sent.
+            try db.create(table: "branchFreshness") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("mergeBase", .text).notNull()
+                t.column("behindSinceActive", .double).notNull()
+                t.column("notified", .boolean).notNull().defaults(to: false)
+            }
+            // Per approved item: whether its merge is running (its holder is locked out meanwhile) and how many merge
+            // attempts in a row failed (after `Store.maxMergeFailures` it goes back to the holder).
+            try db.create(table: "itemMerge") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("running", .boolean).notNull().defaults(to: false)
+                t.column("failures", .integer).notNull().defaults(to: 0)
+                t.column("lastError", .text)
+            }
+            // The head the engine is about to move main to (crash recovery of the exact main guard).
+            try db.alter(table: "company") { t in t.add(column: "pendingMainCommit", .text) }
+        }
+        m.registerMigration("v3-review-audit") { db in
+            // Risk-tiered review (9c): auto-approved items, the company's count of auto-merges (every 4th is sampled), when the
+            // last batched audit went out (company-active seconds), and the authors whose changes always get a full review.
+            try db.alter(table: "workItem") { t in t.add(column: "autoApproved", .boolean).notNull().defaults(to: false) }
+            try db.alter(table: "company") { t in
+                t.add(column: "autoMergeCount", .integer).notNull().defaults(to: 0)
+                t.add(column: "lastAuditActive", .double).notNull().defaults(to: 0)
+            }
+            try db.alter(table: "agent") { t in t.add(column: "fullReview", .boolean).notNull().defaults(to: false) }
+            // One sampled auto-merge: what landed (base → merged commit, both engine-recorded), who wrote it, and the audit.
+            // `auditorId`/`auditTurnId`: the batch it is in and the audit turn that may record its verdict.
+            try db.create(table: "reviewAudit") { t in
+                t.primaryKey("itemId", .text).references("workItem", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("sampledActive", .double).notNull()
+                t.column("auditedAt", .datetime)
+                t.column("verdict", .text)
+                t.column("notes", .text)
+                t.column("authorId", .text)
+                t.column("baseCommit", .text)
+                t.column("mergedCommit", .text)
+                t.column("auditorId", .text)
+                t.column("auditTurnId", .text)
+                t.column("batchedActive", .double)
+            }
+            try db.create(index: "reviewAudit_company", on: "reviewAudit", columns: ["companyId", "auditedAt"], ifNotExists: true)
+        }
+        m.registerMigration("v3-review-audit-2") { db in
+            // Who set an item's tier and its check ("<id>:<role kind>", like specConfirmedBy): auto-merge trusts only the
+            // engine, the owner or a lead who is not the item's implementer. NULL (older items) never qualifies.
+            try db.alter(table: "workItem") { t in
+                t.add(column: "tierSetBy", .text)
+                t.add(column: "checkSpecSetBy", .text)
+            }
+            // The owner's switch and allowed directories for auto-merge (NULL paths: the pack's, else the default list).
+            try db.alter(table: "ownerSettings") { t in
+                t.add(column: "autoMerge", .boolean).notNull().defaults(to: true)
+                t.add(column: "autoMergePaths", .text)
+            }
+            // Every auto-merge is audited, routed as soon as it lands (company.lastAuditActive from "v3-review-audit" is no
+            // longer read): who may not audit it (assignee, submitter, besides the author), retries of an
+            // audit that ended without a verdict, a deferral when its diff could not be produced, the owner escalation, and
+            // the follow-up item a failed audit opened.
+            try db.alter(table: "reviewAudit") { t in
+                t.add(column: "assigneeId", .text)
+                t.add(column: "submitterId", .text)
+                t.add(column: "attempts", .integer).notNull().defaults(to: 0)
+                t.add(column: "deferredUntilActive", .double)
+                t.add(column: "escalated", .boolean).notNull().defaults(to: false)
+                t.add(column: "followUpId", .text)
+            }
+        }
+        m.registerMigration("v3-review-audit-3") { db in
+            // The company's own auto-merge switch: off for every company until the owner switches it on.
+            try db.alter(table: "company") { t in t.add(column: "autoMergeSmall", .boolean).notNull().defaults(to: false) }
+        }
+        m.registerMigration("v3-sessions") { db in
+            // One session per (agent, item); a turn in another working directory starts a fresh one. `lastTurnId` points at the
+            // session's newest turn: its end time is the warm rule, its token columns (Task 14) the size rule.
+            try db.create(table: "agentSession") { t in
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("sessionId", .text).notNull()
+                t.column("started", .boolean).notNull().defaults(to: false)
+                t.column("cwd", .text)
+                t.column("sessionModel", .text)
+                t.column("sessionTools", .text)
+                t.column("lastEndedAt", .datetime)
+                t.column("lastTurnId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.primaryKey(["agentId", "itemId"])
+            }
+            try db.create(table: "handoff") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("authorId", .text).notNull()
+                t.column("toAgentId", .text)
+                t.column("path", .text).notNull()
+                t.column("auto", .boolean).notNull().defaults(to: false)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "handoff_item", on: "handoff", columns: ["itemId", "createdAt"])
+            // The base session's cwd, model, tool set and last turn (JSON; the session id and started flag stay on the agent).
+            try db.alter(table: "agent") { t in t.add(column: "sessionMeta", .text) }
+            // `sessionResetReason` may already exist when the budgets migration ran first on a merged database.
+            let existing = Set(try db.columns(in: "turn").map(\.name))
+            try db.alter(table: "turn") { t in
+                if !existing.contains("sessionResetReason") { t.add(column: "sessionResetReason", .text) }
+                t.add(column: "reportedStatus", .text)
+                t.add(column: "cacheBreak", .text)
+            }
+        }
+        m.registerMigration("v3-asks") { db in
+            try db.alter(table: "company") { t in t.add(column: "autonomy", .text).notNull().defaults(to: "important") }
+            try db.alter(table: "agent") { t in t.add(column: "pausedActive", .double) }
+            try db.create(table: "ask") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("kind", .text).notNull()
+                t.column("category", .text)
+                t.column("risk", .text).notNull()
+                t.column("requesterId", .text).notNull()
+                t.column("itemId", .text)
+                t.column("title", .text).notNull()
+                t.column("summary", .text).notNull().defaults(to: "")
+                t.column("payload", .text)
+                t.column("detailsHash", .text)
+                t.column("proposedGrant", .text)
+                t.column("status", .text).notNull()
+                t.column("internalApproverId", .text)
+                t.column("internalNote", .text)
+                t.column("internalDecidedAt", .datetime)
+                t.column("ownerNote", .text)
+                t.column("ownerAnswer", .text)
+                t.column("ownerDecidedAt", .datetime)
+                t.column("decidedBy", .text)
+                t.column("fyi", .boolean).notNull().defaults(to: false)
+                t.column("acknowledgedAt", .datetime)
+                t.column("subjectId", .text)
+                t.column("supersedesId", .text)
+                t.column("escalatedAt", .datetime)
+                t.column("rescindedAt", .datetime)
+                t.column("createdActive", .double).notNull().defaults(to: 0)
+                t.column("statusSinceActive", .double).notNull().defaults(to: 0)
+                t.column("expiresActive", .double)
+                t.column("remindCount", .integer).notNull().defaults(to: 0)
+                t.column("notifiedAt", .datetime)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                // Decision brief: a repeat proposal with the same requestId returns the existing ask.
+                t.column("requestId", .text)
+                t.column("decisionClass", .text).notNull().defaults(to: "taste")
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "ask_company_status", on: "ask", columns: ["companyId", "status"])
+            // Assignee requests for a stronger work mode (W6): dedupe by requestId and rate limiting.
+            try db.create(table: "modeRequest") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull()
+                t.column("agentId", .text).notNull()
+                t.column("requestId", .text)
+                t.column("mode", .text).notNull()
+                t.column("turnId", .text)
+                t.column("createdActive", .double).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "modeRequest_item", on: "modeRequest", columns: ["itemId", "id"])
+        }
+        m.registerMigration("v3-liveness") { db in
+            // The acting CEO: set when the CEO (or the root executive) leaves, pending the owner's confirmation.
+            try db.alter(table: "agent") { t in t.add(column: "actingRole", .text) }
+            try db.create(table: "orgIssue") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("kind", .text).notNull()   // overSpan | noRoot
+                t.column("agentId", .text)
+                t.column("detail", .text).notNull().defaults(to: "")
+                t.column("createdAt", .datetime).notNull()
+                t.column("resolvedAt", .datetime)
+            }
+            try db.create(table: "deadlock") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("signature", .text).notNull()
+                t.column("members", .text).notNull()
+                t.column("detectedActive", .double).notNull()
+                t.column("escalatedTo", .text)
+                t.column("ownerEscalated", .boolean).notNull().defaults(to: false)
+                t.column("resolvedAt", .datetime)
+            }
+            try db.create(table: "agingNotice") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("subject", .text).notNull()
+                t.column("level", .integer).notNull()
+                t.primaryKey(["companyId", "subject"])
+            }
+        }
+        m.registerMigration("v3-sprints") { db in
+            try db.alter(table: "company") { t in t.add(column: "cadence", .text).notNull().defaults(to: "sprint") }
+            try db.create(table: "sprint") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("team", .text)
+                t.column("goal", .text).notNull().defaults(to: "")
+                t.column("cadence", .text).notNull().defaults(to: "sprint")
+                t.column("status", .text).notNull()
+                t.column("milestoneItemId", .text)
+                t.column("askId", .text)
+                t.column("timeboxDays", .integer).notNull().defaults(to: 5)
+                t.column("timeboxTurns", .integer).notNull().defaults(to: 200)
+                t.column("startedActive", .double)
+                t.column("lastStandupActive", .double)
+                t.column("createdAt", .datetime).notNull()
+                t.column("startedAt", .datetime)
+                t.column("closedAt", .datetime)
+                t.column("summary", .text)
+                t.column("leadId", .text)
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "sprint_company_status", on: "sprint", columns: ["companyId", "status"])
+            try db.create(index: "sprint_ask", on: "sprint", columns: ["askId"])
+            try db.create(index: "workItem_sprint", on: "workItem", columns: ["sprintId"], ifNotExists: true)
+        }
+        m.registerMigration("v3-budgets") { db in
+            // Registered after "v3-sprints". "v3-turn-context" (Task 9) and
+            // "v3-sessions" (Task 10) add `kind`, `itemId` and `sessionResetReason` first, so each add is conditional.
+            let existing = Set(try db.columns(in: "turn").map(\.name))
+            func add(_ name: String, _ type: Database.ColumnType, notNull fallback: DatabaseValueConvertible? = nil) throws {
+                guard !existing.contains(name) else { return }
+                try db.alter(table: "turn") { t in
+                    if let d = fallback { t.add(column: name, type).notNull().defaults(to: d) } else { t.add(column: name, type) }
+                }
+            }
+            try add("kind", .text, notNull: "work")
+            try add("itemId", .text)
+            try add("sessionResetReason", .text)
+            try add("sessionId", .text)
+            try add("sessionTotalUSD", .double)
+            for column in ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"] { try add(column, .integer, notNull: 0) }
+            try add("toolSignature", .text)
+            try add("mode", .text)
+            try add("rung", .integer)
+            try add("effort", .text)
+            try add("modeReason", .text)
+            try add("stopReason", .text)
+            try add("subagentsSpawned", .integer, notNull: 0)
+            try add("workflowAgents", .integer, notNull: 0)
+            try add("costLE", .double)
+            try db.create(index: "turn_item", on: "turn", columns: ["itemId"], ifNotExists: true)
+            try db.create(index: "turn_session", on: "turn", columns: ["sessionId"], ifNotExists: true)
+            // Why the engine stopped work on an item: budget, no-progress, loop, failed-checks or timebox. Cleared at the next claim.
+            try db.alter(table: "workItem") { t in t.add(column: "stopReason", .text) }
+        }
+        m.registerMigration("v3-budgets-models") { db in
+            // Task 14a fix round 1: the models a turn's result billed, for the per-session model audit.
+            try db.alter(table: "turn") { t in t.add(column: "modelsUsed", .text) }
+        }
+        m.registerMigration("v3-facts") { db in
+            // Task 14b: the watchdog's counter, the failed-check loop guard and the per-item outcome facts.
+            try db.alter(table: "agent") { t in t.add(column: "turnsWithoutProgress", .integer).notNull().defaults(to: 0) }
+            try db.alter(table: "workItem") { t in t.add(column: "failedChecksSinceClaim", .integer).notNull().defaults(to: 0) }
+            try db.create(table: "itemFact") { t in
+                t.column("itemId", .text).primaryKey().references("workItem", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("type", .text).notNull()
+                t.column("tier", .text).notNull()
+                t.column("ownerId", .text)
+                t.column("reviewerId", .text)
+                t.column("firstPass", .boolean).notNull()
+                for c in ["verificationRuns", "failedRuns", "flakyRuns", "inconclusiveRuns", "reworkRounds", "reviewRejections",
+                          "turnsUsed", "tokensUsed", "tierMaxTurns", "tierMaxTokens", "blockedActiveSeconds", "mergeConflicts"] {
+                    t.column(c, .integer).notNull().defaults(to: 0)
+                }
+                t.column("cycleActiveSeconds", .integer)
+                t.column("checkAuthorId", .text)
+                t.column("checkAuthorRole", .text)
+                t.column("costLE", .double).notNull().defaults(to: 0)
+                t.column("tierMaxCostLE", .double).notNull().defaults(to: 0)
+                t.column("reviewCostLE", .double).notNull().defaults(to: 0)
+                t.column("autoMerged", .boolean).notNull().defaults(to: false)
+                t.column("audited", .boolean).notNull().defaults(to: false)
+                t.column("auditVerdict", .text)
+                t.column("rungAtPass", .integer)
+                t.column("modesUsed", .text)
+                t.column("completedAt", .datetime).notNull()
+            }
+            try db.create(index: "itemFact_company", on: "itemFact", columns: ["companyId", "completedAt"])
+        }
+        m.registerMigration("v3-mode-quotas") { db in
+            // Task 14c fix round 1: a work or plan turn's MCP quotas are recorded on its credential when it is issued, and the
+            // counts live here per turn, shared by every `brahma mcp` process of the turn.
+            try db.alter(table: "turnCredential") { t in t.add(column: "quotas", .text) }
+            try db.create(table: "turnQuotaUsage") { t in
+                t.column("turnId", .text).notNull().references("turn", onDelete: .cascade)
+                t.column("kind", .text).notNull()
+                t.column("used", .integer).notNull().defaults(to: 0)
+                t.primaryKey(["turnId", "kind"])
+            }
+        }
         return m
     }
 }

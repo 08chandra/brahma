@@ -29,7 +29,10 @@ struct LiveSmokeTests {
         let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         let store = try Store(path: paths.database.path)
-        let company = try store.createCompany(name: "Smoke", goal: "Exchange a ping and a pong.", workspacesRoot: paths.workspaces)
+        var company = try store.createCompany(name: "Smoke", goal: "Exchange a ping and a pong.", workspacesRoot: paths.workspaces)
+        // Weekly pacing depends on the real account's usage and can park bob; a negative reserve switches it off for this test.
+        company.ownerReserve = -1
+        try store.updateCompany(company)
         let alice = try store.hire(companyId: company.id, name: "alice", role: "engineer", model: "haiku")
         let bob = try store.hire(companyId: company.id, name: "bob", role: "engineer", model: "haiku")
         // The workspace is agent-writable and shared; a CLAUDE.md there must never reach an agent's context.
@@ -80,6 +83,124 @@ struct LiveSmokeTests {
             try Turn.filter(Column("outcome") == TurnOutcome.inProgress.rawValue).fetchCount(db)
         }
         #expect(inProgress == 0)
+        #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
+    }
+
+    /// One real haiku turn with the engine's own argv: the `system/init` tool list must offer neither `Task` nor `Agent`
+    /// (the sub-agent tool is called `Agent` in newer Claude Code versions).
+    @Test(.timeLimit(.minutes(3)))
+    func subAgentToolsAreNotOffered() throws {
+        let root = try tempDir()
+        let store = try Store.inMemory()
+        let company = try store.createCompany(name: "Tools", goal: "g", workspacesRoot: root.appending(path: "ws"))
+        let agent = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "haiku")
+        let mcp = root.appending(path: "mcp.json")
+        try Data(#"{"mcpServers":{}}"#.utf8).write(to: mcp)
+        let request = TurnRequest(agent: agent, company: company, prompt: "Reply with the single word ok. Do not use any tool.",
+                                  appendSystemPrompt: "You are a test agent.", mcpConfigPath: mcp.path,
+                                  workingDirectory: company.workspacePath, profile: .workspace)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["claude"] + ClaudeCommand.arguments(for: request)
+        process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, extra: [:], purpose: .claude)
+        process.currentDirectoryURL = URL(fileURLWithPath: company.workspacePath)
+        let stdin = Pipe(), stdout = Pipe()
+        process.standardInput = stdin; process.standardOutput = stdout; process.standardError = FileHandle.nullDevice
+        try process.run()
+        try stdin.fileHandleForWriting.write(contentsOf: Data(request.prompt.utf8))
+        try stdin.fileHandleForWriting.close()
+        let out = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        var tools: [String]?
+        for line in out.split(separator: "\n") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  obj["type"] as? String == "system", obj["subtype"] as? String == "init" else { continue }
+            tools = obj["tools"] as? [String]
+        }
+        let list = try #require(tools, "no system/init line in: \(out.prefix(500))")
+        print("OBSERVED system/init tools: \(list.joined(separator: ", "))")
+        #expect(!list.isEmpty)
+        #expect(!list.contains("Task"), "tools: \(list)")
+        #expect(!list.contains("Agent"), "tools: \(list)")
+        #expect(!list.contains("Workflow"), "tools: \(list)")
+    }
+
+    /// The work-item loop with real haiku turns: an engine-leased item is claimed, worked in its worktree, checked by the
+    /// engine, reviewed in a fresh session, merged to `main`, and recorded as an outcome fact.
+    @Test(.timeLimit(.minutes(6)))
+    func workItemLoopEndToEnd() async throws {
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        let mcp = try brahmaExecutable()
+        let runner = ClaudeProcessRunner(maxTurnDuration: .seconds(150))
+
+        // The mode-canary's 20 s control sessions can miss their deadline on a busy machine: allow one retry.
+        var report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp)
+        if !report.ok { report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp) }
+        #expect(report.ok, "doctor: \(report.items.map { "\($0.name)=\($0.status) \($0.detail)" })")
+        guard report.ok else { return }
+        try store.saveProbe(report)
+
+        var company = try store.createCompany(name: "Smoke", goal: "Ship small files.", workspacesRoot: paths.workspaces)
+        // The weekly pacing gate depends on the real account's usage (when the account is ahead of its line, only critical-path
+        // agents run, and a reviewer is not one). This test is about the loop, so a negative reserve switches pacing off here.
+        company.ownerReserve = -1
+        try store.updateCompany(company)
+        let lead = try store.hire(companyId: company.id, name: "lead", role: "manager", model: "haiku")
+        let eng = try store.hire(companyId: company.id, name: "eng", role: "engineer", model: "haiku", managerId: lead.id)
+        let item = try store.createWorkItem(companyId: company.id, by: .owner, draft: WorkItemDraft(
+            type: "task", title: "Create hello.txt containing hello",
+            checkSpec: CheckSpec(command: "grep -qx hello hello.txt", paths: ["."]), tier: .s,
+            ownerId: eng.id, reviewerId: lead.id, status: .ready))
+        _ = try MessageRouter(store: store).sendDM(
+            companyId: company.id, from: .owner, to: "eng",
+            text: "Claim \(item.key) with claim_lease, work in the worktree it gives you, make its check pass, then call submit_for_review.")
+
+        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp)
+        try await orchestrator.start()
+        let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
+        let deadline = ContinuousClock.now + .seconds(330)
+        var finished = false
+        while ContinuousClock.now < deadline {
+            if try store.workItem(id: item.id)?.status == .done { finished = true; break }
+            try await Task.sleep(for: .seconds(2))
+        }
+        if finished {
+            // Let the post-merge bookkeeping and any running turn settle before looking.
+            try await Task.sleep(for: .seconds(3))
+        }
+        loop.cancel()
+        await loop.value   // cancels and awaits in-flight turns, checks and merges
+        let dump = try store.events(afterId: 0).map(\.text).joined(separator: "\n")
+        guard finished else { Issue.record("timed out; item not done. Events:\n\(dump)"); return }
+
+        let done = try #require(try store.workItem(id: item.id))
+        #expect(done.status == .done, "events:\n\(dump)")
+        let companyId = company.id
+        let (runs, turns) = try await store.writer.read { db in
+            (try VerificationRun.filter(Column("itemId") == item.id).fetchAll(db),
+             try Turn.filter(Column("companyId") == companyId).fetchAll(db))
+        }
+        #expect(runs.contains { $0.status == .passed && $0.workingDirectory.contains("/") }, "runs: \(runs.map(\.status))\n\(dump)")
+        let reviews = turns.filter { $0.kind == .review && $0.itemId == item.id }
+        #expect(reviews.count == 1, "review turns: \(reviews.count)\n\(dump)")
+        if let review = reviews.first, let rs = review.sessionId {
+            #expect(!turns.contains { $0.id != review.id && $0.sessionId == rs }, "review session was reused")
+        }
+        let itemTurns = turns.filter { $0.kind == .work && $0.itemId == item.id && $0.agentId == eng.id }
+        #expect(!itemTurns.isEmpty, "no item-session turns for eng\n\(dump)")
+        #expect(turns.contains { $0.inputTokens + $0.outputTokens + $0.cacheReadTokens + $0.cacheCreationTokens > 0 })
+        let merged = try #require(done.mergedCommit, "no mergedCommit\n\(dump)")
+        let shown = try GitFixture.plainGit(["show", "\(merged):hello.txt"], in: URL(fileURLWithPath: company.workspacePath))
+        #expect(shown == "hello")
+        _ = try GitFixture.plainGit(["merge-base", "--is-ancestor", merged, "main"], in: URL(fileURLWithPath: company.workspacePath))
+        #expect(try store.itemFact(itemId: item.id) != nil)
+        let stall = try store.stallReport(companyId: company.id)
+        #expect(stall.running == 0)
+        #expect(stall.reasons.contains { $0.contains("no Ready items in the backlog") }, "stall: \(stall.reasons)")
+        #expect(await orchestrator.runningCount() == 0)
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
 }

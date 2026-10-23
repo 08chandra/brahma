@@ -46,13 +46,13 @@ public final class ChatModel {
 
     public var title: String {
         if let channel { return ChannelTitle.title(channel) }
-        if case .dm(let h) = target { return "@" + h }
+        if case .dm(let h) = target { return h == "system" ? h : "@" + h }
         return "Channel"
     }
 
     public var placeholder: String {
         if let channel, channel.kind == .channel { return "Message #" + channel.name }
-        if case .dm(let h) = target { return "Message @" + h }
+        if case .dm(let h) = target { return h == "system" ? "System notices" : "Message @" + h }
         if let channel { return "Message " + ChannelTitle.title(channel) }
         return "Message"
     }
@@ -67,6 +67,7 @@ public final class ChatModel {
             }
             return nil
         case .dm(let h):
+            if h.lowercased() == "system" { return "Brahma engine notices can't be replied to" }
             guard let agent = agents.first(where: { $0.name.lowercased() == h.lowercased() }) else {
                 return "No agent @\(h) in this company."
             }
@@ -115,7 +116,7 @@ public final class ChatModel {
         let byId = Dictionary(agents.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         return list.map { m in
             let owner = m.senderId == "owner"
-            return ChatMessage(message: m, senderHandle: owner ? "owner" : (byId[m.senderId] ?? "unknown"), isOwner: owner, id: m.id)
+            return ChatMessage(message: m, senderHandle: owner ? "owner" : (m.senderId == "system" ? "system" : byId[m.senderId] ?? "unknown"), isOwner: owner, id: m.id)
         }
     }
 

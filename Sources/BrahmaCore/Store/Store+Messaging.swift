@@ -70,10 +70,10 @@ extension Store {
         }
     }
 
-    /// Oldest first.
+    /// Waking items only, oldest first. Quiet channel traffic is counted by `pendingChannelCounts`.
     public func pendingInbox(agentId: String) throws -> [(InboxItem, Message, Channel)] {
         try writer.read { db in
-            let items = try InboxItem.filter(Column("agentId") == agentId && Column("deliveredTurnId") == nil)
+            let items = try InboxItem.filter(Column("agentId") == agentId && Column("deliveredTurnId") == nil && Column("wakes") == true)
                 .order(Column("id")).fetchAll(db)
             return try items.compactMap { item in
                 guard let message = try Message.fetchOne(db, key: item.messageId),
@@ -81,6 +81,31 @@ extension Store {
                 return (item, message, channel)
             }
         }
+    }
+
+    /// Undelivered non-waking items as (item id, channel name).
+    func pendingQuietItems(agentId: String) throws -> [(id: Int64, channel: String)] {
+        try writer.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT inboxItem.id AS id, channel.name AS name FROM inboxItem
+                JOIN message ON message.id = inboxItem.messageId JOIN channel ON channel.id = message.channelId
+                WHERE inboxItem.agentId = ? AND inboxItem.deliveredTurnId IS NULL AND inboxItem.wakes = 0
+                ORDER BY inboxItem.id
+                """, arguments: [agentId]).map { (id: $0["id"] as Int64, channel: $0["name"] as String) }
+        }
+    }
+
+    func pendingQuietItemIds(agentId: String) throws -> [Int64] { try pendingQuietItems(agentId: agentId).map(\.id) }
+
+    /// Unread non-waking items per channel, busiest first.
+    public func pendingChannelCounts(agentId: String) throws -> [(channel: String, count: Int)] {
+        Self.channelCounts(try pendingQuietItems(agentId: agentId))
+    }
+
+    static func channelCounts(_ items: [(id: Int64, channel: String)]) -> [(channel: String, count: Int)] {
+        var counts: [String: Int] = [:]
+        for i in items { counts[i.channel, default: 0] += 1 }
+        return counts.map { (channel: $0.key, count: $0.value) }.sorted { ($1.count, $0.channel) < ($0.count, $1.channel) }
     }
 
     public func markDelivered(itemIds: [Int64], turnId: String) throws {

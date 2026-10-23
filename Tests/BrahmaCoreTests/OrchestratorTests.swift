@@ -3,63 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-private struct World {
-    let store: Store
-    let router: MessageRouter
-    let clock = TestClock()
-    let fake = FakeTurnRunner()
-    let paths: BrahmaPaths
-    let orchestrator: Orchestrator
-
-    init(store: Store? = nil, config: SchedulerConfig = World.config()) throws {
-        self.store = try store ?? Store.inMemory()
-        router = MessageRouter(store: self.store)
-        let root = try tempDir()
-        paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
-        orchestrator = Orchestrator(store: self.store, runner: fake, paths: paths, config: config,
-                                    mcpExecutable: "/usr/local/bin/brahma", clock: clock.function)
-    }
-
-    static func config(hardCap: Int = 16, turnBudget: Int = 30) -> SchedulerConfig {
-        var c = SchedulerConfig()
-        c.hardCap = hardCap
-        c.safetyCap = 64
-        c.turnBudgetPerHour = turnBudget
-        return c
-    }
-
-    func company(_ name: String, mode: UsageMode = .low) throws -> Company {
-        var c = try store.createCompany(name: name, goal: "Ship it", workspacesRoot: paths.workspaces)
-        c.usageMode = mode
-        try store.updateCompany(c)
-        return c
-    }
-
-    func hire(_ c: Company, _ name: String, role: String? = nil) throws -> Agent {
-        try store.hire(companyId: c.id, name: name, role: role ?? name, model: "sonnet")
-    }
-
-    func agent(_ a: Agent) throws -> Agent { try #require(try store.agent(id: a.id)) }
-    func pending(_ a: Agent) throws -> Int { try store.pendingInbox(agentId: a.id).count }
-
-    func turns(_ a: Agent) throws -> [Turn] {
-        try store.writer.read { db in
-            try Turn.filter(Column("agentId") == a.id).order(Column("startedAt"), Column.rowID).fetchAll(db)
-        }
-    }
-
-    func dm(_ c: Company, _ to: Agent, _ text: String = "please do it") throws {
-        _ = try router.sendDM(companyId: c.id, from: .owner, to: to.name, text: text, now: clock.now)
-    }
-
-    /// One tick, then wait for every turn it started.
-    func cycle() async throws {
-        await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(5))
-    }
-}
-
-@Suite struct OrchestratorTests {
+@Suite(.serialized) struct OrchestratorTests {
     @Test func ownerMessageRunsAgentAndSleepsAfter() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "@ceo kick off", now: w.clock.now)
@@ -84,6 +28,38 @@ private struct World {
         #expect(finished?.text.contains("succeeded") == true)
     }
 
+    @Test func turnTokenIsInTheMCPConfigOnly() async throws {
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock(); private var _token: String?; private var _validDuring = false; private var _mode: Int?
+            func set(token: String, valid: Bool, mode: Int?) { lock.withLock { _token = token; _validDuring = valid; _mode = mode } }
+            var token: String? { lock.withLock { _token } }
+            var validDuring: Bool { lock.withLock { _validDuring } }
+            var mode: Int? { lock.withLock { _mode } }
+        }
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let box = Box(); let store = w.store
+        w.fake.script("ceo", .init(sideEffect: { req in
+            let data = try Data(contentsOf: URL(fileURLWithPath: req.mcpConfigPath))
+            let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let server = try #require((json["mcpServers"] as? [String: Any])?["company"] as? [String: Any])
+            let token = try #require((server["env"] as? [String: String])?["BRAHMA_TURN_TOKEN"])
+            let mode = try FileManager.default.attributesOfItem(atPath: req.mcpConfigPath)[.posixPermissions] as? Int
+            box.set(token: token, valid: store.verifyTurnCredential(token: token, companyId: req.company.id, agentId: req.agent.id),
+                    mode: mode)
+        }))
+        try w.dm(c, ceo); try await w.cycle()
+        let token = try #require(box.token)
+        #expect(token.count == 64)
+        #expect(box.validDuring, "the engine-issued token verifies against the DB while the turn runs")
+        #expect(box.mode == 0o600)
+        let req = try #require(w.fake.requests.first)
+        #expect(!req.environment.values.contains { $0.contains(token) })
+        #expect(!ClaudeCommand.arguments(for: req).contains { $0.contains(token) })
+        let childEnv = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, extra: req.environment, purpose: .claude)
+        #expect(!childEnv.values.contains { $0.contains(token) })
+        #expect(!(w.store.verifyTurnCredential(token: token, companyId: c.id, agentId: ceo.id)), "ended turn")
+    }
+
     @Test func firstTurnSendsRolePromptThenResumes() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         try w.dm(c, ceo); try await w.cycle()
@@ -92,7 +68,8 @@ private struct World {
         #expect(reqs.count == 2)
         #expect(reqs[0].appendSystemPrompt?.contains("You are @ceo") == true)
         #expect(ClaudeCommand.arguments(for: reqs[0]).contains("--session-id"))
-        #expect(reqs[1].appendSystemPrompt == nil)
+        #expect(reqs[1].appendSystemPrompt == reqs[0].appendSystemPrompt)
+        #expect(reqs[0].environment["BRAHMA_AGENT_ID"] == reqs[0].agent.id)
         #expect(ClaudeCommand.arguments(for: reqs[1]).contains("--resume"))
         #expect(reqs[1].workingDirectory == c.workspacePath)
         #expect(FileManager.default.fileExists(atPath: reqs[1].mcpConfigPath))
@@ -220,12 +197,81 @@ private struct World {
     @Test func errorResultIsFailure() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         w.fake.script("ceo", .init(events: [.result(TurnResult(isError: true, subtype: "error_during_execution",
-                                                                 text: "tool crashed", costUSD: nil, apiErrorStatus: 500,
+                                                                 text: "tool crashed", costUSD: nil, apiErrorStatus: 400,
                                                                  sessionId: ceo.sessionId))]))
         try w.dm(c, ceo)
         try await w.cycle()
         #expect(try w.agent(ceo).blocker == .retry(until: w.clock.now.addingTimeInterval(30), failures: 1))
         #expect(try w.turns(ceo).first?.summary == "tool crashed")
+    }
+
+    /// A wall-clock kill while the rate limit is active is a usage limit (held to the reset, not counted against the agent).
+    @Test func wallClockKillWhileRateLimitedIsUsageLimited() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        let t = w.clock.now
+        let rejected = RateLimitInfo(status: "rejected", resetsAt: t.addingTimeInterval(7200), rateLimitType: "five_hour",
+                                     isUsingOverage: false, fiveHourUtilization: 1.0, sevenDayUtilization: 0.5, observedAt: t)
+        w.fake.script("ceo", .init(events: [.initialized(sessionId: a.sessionId, model: "sonnet"), .rateLimit(rejected)],
+                                   error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
+        #expect(try w.agent(a).blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        #expect(try w.agent(a).consecutiveFailures == 0)
+        #expect(try w.pending(a) == 1)
+    }
+
+    /// A timed-out turn is never a success, even with an early non-error result (background work still pending).
+    @Test func wallClockKillAfterEarlySuccessWhileRateLimitedIsUsageLimited() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        let t = w.clock.now
+        let rejected = RateLimitInfo(status: "rejected", resetsAt: t.addingTimeInterval(7200), rateLimitType: "five_hour",
+                                     isUsingOverage: false, fiveHourUtilization: 1.0, sevenDayUtilization: 0.5, observedAt: t)
+        w.fake.script("ceo", .init(events: [
+            .initialized(sessionId: a.sessionId, model: "sonnet"), .rateLimit(rejected),
+            .result(TurnResult(isError: false, subtype: "success", text: "started", costUSD: 0.01, apiErrorStatus: nil,
+                               sessionId: a.sessionId)),
+        ], error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
+        #expect(try w.agent(a).blocker == .usageLimit(until: t.addingTimeInterval(7200)))
+        #expect(try w.agent(a).consecutiveFailures == 0)
+        #expect(try w.pending(a) == 1)
+    }
+
+    /// Same with an HTTP 429 on the early result and no rate-limit event: usage-limited, and the gate closes.
+    @Test func wallClockKillAfterEarlyResultWith429IsUsageLimited() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        w.fake.script("ceo", .init(events: [
+            .initialized(sessionId: a.sessionId, model: "sonnet"),
+            .result(TurnResult(isError: false, subtype: "success", text: "started", costUSD: 0.01, apiErrorStatus: 429,
+                               sessionId: a.sessionId)),
+        ], error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
+        #expect(try w.agent(a).consecutiveFailures == 0)
+        #expect(try w.pending(a) == 1)
+    }
+
+    /// A timeout with no rate limit in play stays a plain failure with the normal backoff.
+    @Test func wallClockKillAloneIsAFailure() async throws {
+        let w = try World()
+        let c = try w.company("Acme")
+        let a = try w.hire(c, "ceo")
+        w.fake.script("ceo", .init(events: [.initialized(sessionId: a.sessionId, model: "sonnet")], error: TurnError.timedOut))
+        try w.dm(c, a)
+        try await w.cycle()
+        #expect(try w.turns(a).map(\.outcome) == [.failed])
+        #expect(try w.agent(a).consecutiveFailures == 1)
+        guard case .retry? = try w.agent(a).blocker else { Issue.record("expected a retry backoff"); return }
     }
 
     @Test func usageLimitBlocksEveryone() async throws {
@@ -399,7 +445,7 @@ private struct World {
         let a = try w.hire(low, "ceo"), b = try w.hire(bal, "ceo"), m = try w.hire(max, "ceo")
         let t = w.clock.now
         let warning = RateLimitInfo(status: "allowed_warning", resetsAt: t.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
-                                    isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.8, observedAt: t,
+                                    isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.4, observedAt: t,
                                     fiveHourResetsAt: t.addingTimeInterval(7200), sevenDayResetsAt: t.addingTimeInterval(3 * 86400))
         let router = w.router
         w.fake.script("ceo", .init(events: [
@@ -456,12 +502,13 @@ private struct World {
             .result(TurnResult(isError: true, subtype: "error_during_execution", text: "usage limit reached",
                                costUSD: nil, apiErrorStatus: 429, sessionId: a.sessionId)),
         ], delay: .milliseconds(20)))
-        w.fake.script("bob", .init(delay: .milliseconds(600)))
+        let bobGate = Gate()
+        w.fake.script("bob", .init(gate: bobGate))
         try w.dm(c1, a); try w.dm(c1, b)
         await w.orchestrator.tick()
         #expect(await w.orchestrator.runningCount() == 2)
 
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(60)
         while try w.turns(a).first?.outcome == .inProgress, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -475,7 +522,8 @@ private struct World {
         #expect(try w.turns(c).isEmpty)
         #expect(try w.agent(c).blocker == .usageLimit(until: t.addingTimeInterval(3600)))
 
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        bobGate.open()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(try w.turns(b).map(\.outcome) == [.succeeded])
         #expect(try w.pending(b) == 0, "bob's items are delivered")
         #expect(try w.agent(b).state == .sleeping)
@@ -640,15 +688,25 @@ private struct World {
         let w = try World(config: World.config(hardCap: 3)); let c = try w.company("Acme", mode: .max)
         var agents: [Agent] = []
         for i in 0..<10 { agents.append(try w.hire(c, "eng\(i)", role: "engineer")) }
-        w.fake.defaultScript = .init(delay: .milliseconds(200))
-        _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "all hands", now: w.clock.now)
-        let deadline = ContinuousClock.now + .seconds(10)
+        // The first three turns are held open until the cap has been seen to hold: no overlap depends on a timer.
+        let gate = Gate()
+        w.fake.defaultScript = .init(gate: gate)
+        _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "@here all hands", now: w.clock.now)
+        await w.orchestrator.tick()
+        let started = ContinuousClock.now + .seconds(60)
+        while w.fake.requests.count < 3, ContinuousClock.now < started { try await Task.sleep(for: .milliseconds(5)) }
+        for _ in 0..<3 {
+            await w.orchestrator.tick()
+            #expect(await w.orchestrator.runningCount() == 3, "saturated: the other seven wait")
+        }
+        gate.open()
+        let deadline = ContinuousClock.now + .seconds(60)
         while try agents.contains(where: { try w.turns($0).first?.outcome != .succeeded }), ContinuousClock.now < deadline {
             await w.orchestrator.tick()
             #expect(await w.orchestrator.runningCount() <= 3)
             try await Task.sleep(for: .milliseconds(20))
         }
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(w.fake.maxConcurrent == 3)
         #expect(w.fake.requests.count == 10)
         for a in agents { #expect(try w.turns(a).map(\.outcome) == [.succeeded]) }
@@ -656,12 +714,112 @@ private struct World {
 
     @Test func waitUntilIdleTimesOut() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
-        w.fake.script("ceo", .init(delay: .milliseconds(300)))
+        let gate = Gate()
+        w.fake.script("ceo", .init(gate: gate))
         try w.dm(c, ceo)
         await w.orchestrator.tick()
         #expect(await w.orchestrator.runningCount() == 1)
         await #expect(throws: OrchestratorError.self) { try await w.orchestrator.waitUntilIdle(timeout: .milliseconds(50)) }
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        gate.open()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(await w.orchestrator.runningCount() == 0)
+    }
+
+    // MARK: Work notices
+
+    private func ownedItem(_ w: World, _ c: Company, _ owner: Agent) throws -> WorkItem {
+        try w.store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Do it", ownerId: owner.id),
+                                   now: w.clock.now)
+    }
+
+    private func notice(_ w: World, _ item: WorkItem, _ kind: WorkEventKind, text: String = "x") throws {
+        try w.store.writer.write { db in
+            _ = try w.store.recordItemEvent(db: db, item: item, actor: "system", kind: kind, text: text, now: w.clock.now)
+        }
+    }
+
+    @Test func noticeIsDeliveredOnSuccessOnly() async throws {
+        let w = try World(); let c = try w.company("Acme"); let eng = try w.hire(c, "eng", role: "engineer")
+        let item = try ownedItem(w, c, eng)
+        try notice(w, item, .changesRequested, text: "tighten\nthe parser")
+        #expect(try w.agent(eng).state == .ready)
+        w.fake.script("eng", .init(events: [], error: FakeError(description: "boom")))
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .blocked, "the failed turn backs off")
+        #expect(try w.store.pendingNotices(agentId: eng.id).count == 2, "a failed turn delivers nothing")
+        let first = try #require(w.fake.requests.first?.prompt)
+        // The actionable notice comes first, then the FYI.
+        #expect(first.contains("\n## Work updates (2)\n- ACME-1 changesRequested by @system: tighten the parser"))
+        #expect(first.contains("\n- ACME-1 created by @owner: created task \"Do it\", assigned to @eng"))
+        #expect(!first.contains("nothing new"))
+        w.clock.advance(30)
+        try await w.cycle()
+        #expect(w.fake.requests.count == 2); #expect(w.fake.requests[1].prompt == first, "the retry carries the same notices")
+        #expect(try w.store.pendingNotices(agentId: eng.id).isEmpty)
+        #expect(try w.agent(eng).state == .sleeping)
+        let delivered = try await w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT DISTINCT deliveredTurnId FROM workNotice WHERE agentId = ?", arguments: [eng.id])
+        }
+        #expect(delivered == [try w.turns(eng).last?.id])
+    }
+
+    @Test func noticesRideAlongWithInboxItems() async throws {
+        let w = try World(); let c = try w.company("Acme"); let eng = try w.hire(c, "eng", role: "engineer")
+        let item = try ownedItem(w, c, eng)
+        try notice(w, item, .leaseClaimed)
+        #expect(try w.agent(eng).state == .sleeping, "an FYI notice does not wake")
+        try w.dm(c, eng, "status?")
+        try await w.cycle()
+        let prompt = try #require(w.fake.requests.first?.prompt)
+        #expect(prompt.contains("# Inbox\nNew since your last turn (1 items):"))
+        #expect(prompt.contains("\n## Work updates (2)\n"))
+        #expect(try w.store.pendingNotices(agentId: eng.id).isEmpty)
+    }
+
+    @Test func pendingNoticeKeepsAgentReady() async throws {
+        let w = try World(); let c = try w.company("Acme"); let eng = try w.hire(c, "eng", role: "engineer")
+        let item = try ownedItem(w, c, eng)
+        let store = w.store, now = w.clock.now
+        try w.dm(c, eng)
+        // An actionable notice arriving mid-turn: the agent stays ready for another turn.
+        w.fake.script("eng", .init(sideEffect: { _ in
+            try store.writer.write { db in
+                _ = try store.recordItemEvent(db: db, item: item, actor: "system", kind: .verificationFailed, text: "check failed", now: now)
+            }
+        }))
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .ready)
+        #expect(try w.store.pendingNotices(agentId: eng.id).map(\.event.kind) == [.verificationFailed])
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .sleeping)
+        #expect(w.fake.requests.count == 2); #expect(w.fake.requests[1].prompt.contains("verificationFailed by @system: check failed"))
+        // An FYI notice arriving mid-turn does not.
+        w.fake.script("eng", .init(sideEffect: { _ in
+            try store.writer.write { db in
+                _ = try store.recordItemEvent(db: db, item: item, actor: "system", kind: .leaseClaimed, text: "claimed", now: now)
+            }
+        }))
+        try w.dm(c, eng)
+        try await w.cycle()
+        #expect(try w.agent(eng).state == .sleeping)
+        #expect(try w.store.pendingNotices(agentId: eng.id).map(\.event.kind) == [.leaseClaimed], "left for the next turn")
+    }
+
+    @Test func debouncedLeadNoticeWakesOnTick() async throws {
+        let w = try World(); let c = try w.company("Acme"); let mgr = try w.hire(c, "mgr", role: "manager")
+        let item = try ownedItem(w, c, mgr)
+        try w.store.advanceActive(companyId: c.id, by: 1000)
+        try notice(w, item, .changesRequested)
+        try await w.cycle()
+        #expect(try w.agent(mgr).state == .sleeping); #expect(w.fake.requests.count == 1)
+        try w.store.advanceActive(companyId: c.id, by: 100)
+        try notice(w, item, .changesRequested)
+        #expect(try w.agent(mgr).state == .sleeping)
+        try await w.cycle()
+        #expect(w.fake.requests.count == 1, "not due yet")
+        try w.store.advanceActive(companyId: c.id, by: 500)
+        try await w.cycle()
+        #expect(w.fake.requests.count == 2, "the tick woke the lead when the debounce ended")
+        #expect(try w.agent(mgr).state == .sleeping); #expect(try w.store.pendingNotices(agentId: mgr.id).isEmpty)
     }
 }

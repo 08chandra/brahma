@@ -4,7 +4,7 @@ import BrahmaCore
 
 /// Sender id -> handle for a company, plus the owner.
 private func handles(_ store: Store, _ company: Company) throws -> [String: String] {
-    var map = ["owner": "owner"]
+    var map = ["owner": "owner", "system": "system"]
     for a in try store.agents(companyId: company.id) { map[a.id] = a.name }
     return map
 }
@@ -21,6 +21,7 @@ struct Say: ParsableCommand {
     @Argument(help: "Message text.") var text: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         let router = MessageRouter(store: store)

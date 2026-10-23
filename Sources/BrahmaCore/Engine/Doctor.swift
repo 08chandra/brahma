@@ -1,0 +1,289 @@
+import Foundation
+
+public struct DoctorItem: Codable, Equatable, Sendable {
+    public enum Status: String, Codable, Sendable { case pass, warn, fail }
+    public var name: String
+    public var status: Status
+    public var detail: String
+
+    public init(name: String, status: Status, detail: String) {
+        self.name = name
+        self.status = status
+        self.detail = detail
+    }
+}
+
+public struct DoctorReport: Codable, Equatable, Sendable {
+    public var cliVersion: String?
+    public var items: [DoctorItem]
+    public var checkedAt: Date
+    /// `subscription_type` as the CLI reports it (`get_usage`, read by the mode-canary with no model call); nil until read.
+    public var reportedSubscription: String? = nil
+    /// The built-in agent types this CLI version lists (`initialize`): every turn's init `agents` must equal them.
+    public var builtinAgents: [String]? = nil
+    /// The sub-agent gate record for this CLI version and profile (design §3.9): always false on the workspace profile.
+    public var subagentGate: Bool? = nil
+
+    public init(cliVersion: String?, items: [DoctorItem], checkedAt: Date, reportedSubscription: String? = nil,
+                builtinAgents: [String]? = nil, subagentGate: Bool? = nil) {
+        self.cliVersion = cliVersion
+        self.items = items
+        self.checkedAt = checkedAt
+        self.reportedSubscription = reportedSubscription
+        self.builtinAgents = builtinAgents
+        self.subagentGate = subagentGate
+    }
+
+    public var ok: Bool { !items.contains { $0.status == .fail } }
+}
+
+/// Checks that the installed `claude` still behaves the way the engine's argv and parsing assume.
+public enum Doctor {
+    public static let minimumVersion = "2.1.304"
+    public static let maxAge: TimeInterval = 86_400
+    public static let probeTimeout: Duration = .seconds(120)
+    static let probeCodeword = "BRAHMA-PROBE-7"
+    static let probePrompt = "Brahma probe: the codeword is \(probeCodeword)."
+
+    public static let requiredFlags: [String] = [
+        "-p", "--output-format", "--verbose", "--resume", "--session-id", "--mcp-config", "--strict-mcp-config",
+        "--model", "--fallback-model", "--append-system-prompt", "--permission-mode", "--allowed-tools",
+        "--disallowed-tools", "--add-dir", "--settings", "--setting-sources", "--disable-slash-commands",
+        // Work modes (W11): visible in --help. The hidden --max-turns is checked by the mode-canary (probe V-11).
+        "--effort", "--max-budget-usd",
+    ]
+
+    /// Runs an executable with arguments and returns its stdout, or nil when it cannot run. Injected by tests.
+    public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async -> String?
+
+    /// `hookExecutable`: the `brahma` the mode-canary's profiles name in their pre-tool hook, as real turns do.
+    public static func run(claudePath: String, runner: any TurnRunning, exec: @escaping Exec = defaultExec,
+                           now: Date = .now, hookExecutable: String = "brahma") async -> DoctorReport {
+        guard let version = await cliVersion(claudePath: claudePath, exec: exec) else {
+            return DoctorReport(cliVersion: nil, items: [
+                DoctorItem(name: "version", status: .fail, detail: "can't run '\(claudePath) --version'; is Claude Code installed?"),
+            ], checkedAt: now)
+        }
+        var items = [versionItem(version)]
+        items.append(await flagsItem(claudePath: claudePath, exec: exec))
+        let probe = await runProbe(runner: runner)
+        items += probe
+        var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
+        // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
+        if let canary = await ModeCanary.run(runner: runner, hookExecutable: hookExecutable) {
+            report.items.append(canary.item)
+            report.builtinAgents = canary.builtinAgents
+            report.reportedSubscription = canary.reportedSubscription
+            report.subagentGate = SubagentGate.passed(profile: .workspace)
+            report.items.append(DoctorItem(name: "subagent-gate", status: .pass, detail: SubagentGate.workspaceDetail))
+        }
+        return report
+    }
+
+    /// Reuses the stored report when it passed, is fresh, and was made by the same CLI version.
+    public static func ensure(store: Store, claudePath: String, runner: any TurnRunning,
+                              exec: @escaping Exec = defaultExec, now: Date = .now) async -> DoctorReport {
+        let version = await cliVersion(claudePath: claudePath, exec: exec)
+        if let saved = try? store.latestProbe(), saved.ok, saved.cliVersion == version, version != nil,
+           now.timeIntervalSince(saved.checkedAt) < maxAge, now >= saved.checkedAt {
+            return saved
+        }
+        let report = await run(claudePath: claudePath, runner: runner, exec: exec, now: now)
+        try? store.saveProbe(report)
+        return report
+    }
+
+    public static func cliVersion(claudePath: String, exec: @escaping Exec = defaultExec) async -> String? {
+        guard let out = await exec(claudePath, ["--version"]) else { return nil }
+        guard let token = out.split(whereSeparator: \.isWhitespace).first,
+              token.first?.isNumber == true else { return nil }
+        return String(token)
+    }
+
+    static func compare(_ a: String, _ b: String) -> Int {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
+            if l != r { return l < r ? -1 : 1 }
+        }
+        return 0
+    }
+
+    private static func versionItem(_ v: String) -> DoctorItem {
+        switch compare(v, minimumVersion) {
+        case ..<0: DoctorItem(name: "version", status: .fail, detail: "\(v) is older than the minimum \(minimumVersion)")
+        case 0: DoctorItem(name: "version", status: .pass, detail: v)
+        default: DoctorItem(name: "version", status: .warn, detail: "\(v) is newer than the tested \(minimumVersion); the probe below checks it still works")
+        }
+    }
+
+    static func help(_ text: String, mentions flag: String) -> Bool {
+        var from = text.startIndex
+        while let r = text.range(of: flag, range: from..<text.endIndex) {
+            let before = r.lowerBound == text.startIndex ? " " : text[text.index(before: r.lowerBound)]
+            let after = r.upperBound == text.endIndex ? " " : text[r.upperBound]
+            func isName(_ c: Character) -> Bool { c.isLetter || c.isNumber || c == "-" }
+            if !isName(before) && !isName(after) { return true }
+            from = r.upperBound
+        }
+        return false
+    }
+
+    private static func flagsItem(claudePath: String, exec: Exec) async -> DoctorItem {
+        guard let text = await exec(claudePath, ["--help"]) else {
+            return DoctorItem(name: "flags", status: .fail, detail: "can't run '\(claudePath) --help'")
+        }
+        let missing = requiredFlags.filter { !help(text, mentions: $0) }
+        return missing.isEmpty
+            ? DoctorItem(name: "flags", status: .pass, detail: "all \(requiredFlags.count) required flags present")
+            : DoctorItem(name: "flags", status: .fail, detail: "missing flag\(missing.count == 1 ? "" : "s"): \(missing.joined(separator: ", "))")
+    }
+
+    // MARK: probe
+
+    private struct Outcome {
+        var sawInit = false
+        var result: TurnResult?
+        var limit: RateLimitInfo?
+        var error: String?
+    }
+
+    private static func turn(_ runner: any TurnRunning, _ request: TurnRequest) async -> Outcome {
+        await withTaskGroup(of: Outcome.self) { group in
+            group.addTask {
+                var o = Outcome()
+                do {
+                    for try await event in runner.run(request) {
+                        switch event {
+                        case .initialized: o.sawInit = true
+                        case .result(let r): o.result = r
+                        case .rateLimit(let i): o.limit = i
+                        default: break
+                        }
+                    }
+                } catch {
+                    o.error = "\(error)"
+                }
+                return o
+            }
+            group.addTask {
+                try? await Task.sleep(for: probeTimeout)
+                var o = Outcome()
+                o.error = "timed out after \(probeTimeout.components.seconds) s"
+                return o
+            }
+            let first = await group.next() ?? Outcome()
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private static func runProbe(runner: any TurnRunning) async -> [DoctorItem] {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "brahma-doctor-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let config = dir.appending(path: "empty.mcp.json")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data("{\"mcpServers\":{}}".utf8).write(to: config)
+        } catch {
+            return [DoctorItem(name: "probe", status: .fail, detail: "can't prepare the probe directory: \(error)")]
+        }
+        let sessionId = UUID().uuidString.lowercased()
+        var agent = Agent(id: "doctor-probe", companyId: "doctor", name: "probe", role: "probe", model: "haiku",
+                          sessionId: sessionId, sessionStarted: false, state: .running, blocker: nil, requestedBlocker: nil,
+                          paused: false, readySince: nil, createdAt: Date())
+        let company = Company(id: "doctor", name: "Doctor", slug: "doctor", goal: "probe", workspacePath: dir.path,
+                              status: .running, usageMode: .low, priorityWeight: 1, createdAt: Date())
+        func request(_ prompt: String) -> TurnRequest {
+            TurnRequest(agent: agent, company: company, prompt: prompt, appendSystemPrompt: probePrompt,
+                        mcpConfigPath: config.path, workingDirectory: dir.path, profile: .workspace,
+                        environment: ["BRAHMA_AGENT_ID": "doctor-probe"])
+        }
+
+        let first = await turn(runner, request("Reply with the single word OK."))
+        var probe: DoctorItem
+        if let e = first.error {
+            probe = DoctorItem(name: "probe", status: .fail, detail: "probe turn failed: \(e)")
+        } else if !first.sawInit {
+            probe = DoctorItem(name: "probe", status: .fail, detail: "no init event; the stream format may have changed")
+        } else if let r = first.result {
+            if r.isError {
+                probe = DoctorItem(name: "probe", status: .fail, detail: "probe turn returned an error: \(r.text ?? r.subtype)")
+            } else if !r.hasUsage {
+                probe = DoctorItem(name: "probe", status: .fail, detail: "result line has no usage; the stream format may have changed")
+            } else if first.limit == nil {
+                probe = DoctorItem(name: "probe", status: .warn, detail: "ok, but no rate_limit_event; usage gating has no data")
+            } else {
+                probe = DoctorItem(name: "probe", status: .pass, detail: "haiku turn answered with init, result and usage")
+            }
+        } else {
+            probe = DoctorItem(name: "probe", status: .fail, detail: "no result line in the probe turn")
+        }
+
+        var resume: DoctorItem
+        if probe.status == .fail {
+            resume = DoctorItem(name: "resume-keeps-role", status: .warn, detail: "skipped; the probe failed")
+        } else {
+            agent.sessionStarted = true
+            let second = await turn(runner, request("Reply with the codeword only."))
+            if let e = second.error {
+                resume = DoctorItem(name: "resume-keeps-role", status: .fail, detail: "resumed turn failed: \(e)")
+            } else if let r = second.result, !r.isError, r.text?.contains(probeCodeword) == true {
+                resume = DoctorItem(name: "resume-keeps-role", status: .pass, detail: "the role prompt survived --resume")
+            } else {
+                resume = DoctorItem(name: "resume-keeps-role", status: .fail,
+                                    detail: "resumed turn did not echo the codeword; the appended role prompt is lost on --resume")
+            }
+        }
+
+        let overage: DoctorItem
+        if let l = first.limit {
+            if l.isUsingOverage {
+                overage = DoctorItem(name: "overage", status: .fail, detail: "the account is spending paid overage right now")
+            } else if l.overageStatus == "allowed" {
+                overage = DoctorItem(name: "overage", status: .warn, detail: "overage is allowed on this account; the engine gates on it, but check your plan")
+            } else {
+                overage = DoctorItem(name: "overage", status: .pass, detail: "not using overage")
+            }
+        } else {
+            overage = DoctorItem(name: "overage", status: .warn, detail: "no rate_limit_event to read")
+        }
+        return [probe, resume, overage]
+    }
+
+    // MARK: default exec
+
+    /// The owner's configured plan tier always wins; a CLI that reports a different subscription only earns a WARN
+    /// (the CLI's value has been stale). Nil when there is nothing to compare or they agree.
+    public static func planTierItem(configured: PlanTier, reported: String?) -> DoctorItem? {
+        guard let reported, !reported.isEmpty else { return nil }
+        guard let tier = PlanTier(reportedSubscription: reported) else {
+            return DoctorItem(name: "plan-tier", status: .warn, detail: "configured \(configured.rawValue); the CLI reports the unknown plan '\(reported)'")
+        }
+        return tier == configured ? nil
+            : DoctorItem(name: "plan-tier", status: .warn,
+                         detail: "configured \(configured.rawValue), CLI reports \(tier.rawValue); keeping \(configured.rawValue) (see `brahma settings plan`)")
+    }
+
+    public static let defaultExec: Exec = { executable, arguments in
+        await Task.detached { () -> String? in
+            let p = Process()
+            if executable.hasPrefix("/") {
+                p.executableURL = URL(fileURLWithPath: executable)
+                p.arguments = arguments
+            } else {
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                p.arguments = [executable] + arguments
+            }
+            p.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .claude)
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+            do { try p.run() } catch { return nil }
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return p.terminationStatus == 0 ? String(decoding: data, as: UTF8.self) : nil
+        }.value
+    }
+}

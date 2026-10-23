@@ -8,14 +8,18 @@ struct Hire: ParsableCommand {
     @Argument var company: String
     @Argument(help: "Agent handle (lowercase letters, digits, - and _).") var handle: String
     @Option(help: "Role, e.g. ceo, cto, engineer.") var role: String
-    @Option(help: "opus, sonnet or haiku.") var model: String
+    @Option(help: "opus, sonnet, haiku or auto (the role's default for the usage mode).") var model: String
+    @Option(help: "Manager handle.") var manager: String?
+    @Option(help: "Team name.") var team: String?
 
     func run() throws {
-        guard ["opus", "sonnet", "haiku"].contains(model) else { throw fail("model must be opus, sonnet or haiku") }
+        try requireOwnerShell()
+        guard ["opus", "sonnet", "haiku", "auto"].contains(model) else { throw fail("model must be opus, sonnet, haiku or auto") }
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
+        let managerId = try manager.map { try resolveAgent(store, company: c, handle: $0).id }
         do {
-            let a = try store.hire(companyId: c.id, name: handle, role: role, model: model)
+            let a = try store.hire(companyId: c.id, name: handle, role: role, model: model, managerId: managerId, team: team)
             print(safe("hired @\(a.name) (\(a.role), \(a.model)) into \(c.name)"))
         } catch StoreError.duplicateName {
             throw fail("@\(handle.lowercased()) already exists in \(c.name)")
@@ -33,6 +37,7 @@ struct Kill: ParsableCommand {
     @Argument var handle: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let a = try resolveAgent(store, company: try resolveCompany(store, company), handle: handle)
         do {
@@ -52,6 +57,7 @@ struct Pause: ParsableCommand {
     @Argument var handle: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let a = try resolveAgent(store, company: try resolveCompany(store, company), handle: handle)
         guard a.state != .killed else { throw fail("@\(a.name) is killed") }
@@ -67,6 +73,7 @@ struct Wake: ParsableCommand {
     @Argument var handle: String
 
     func run() throws {
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let a = try resolveAgent(store, company: try resolveCompany(store, company), handle: handle)
         guard a.state != .killed else { throw fail("@\(a.name) is killed") }

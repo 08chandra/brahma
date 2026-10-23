@@ -46,14 +46,39 @@ private struct MCPWorld {
     #expect(r["id"] as? String == "abc-1")
 }
 
-@Test func toolsListHasExactlySevenTools() throws {
+@Test func toolsListIsIdenticalForAllRolesAndIncludesInboxTools() throws {
     let w = try MCPWorld()
-    let r = try w.rpc(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
-    let tools = try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-    #expect(Set(tools.compactMap { $0["name"] as? String }) ==
-            ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"])
-    #expect(tools.count == 7)
+    func listing(_ agent: Agent) throws -> [[String: Any]] {
+        let server = MCPServer(tools: CompanyTools(store: w.store, companyId: w.company.id, agentId: agent.id))
+        let line = try #require(server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
+        let r = try #require(try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        return try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+    }
+    let engineer = try w.store.hire(companyId: w.company.id, name: "eng-1", role: "engineer", model: "m")
+    let tools = try listing(w.ceo)
+    let expected: Set<String> = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked",
+        "list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency", "comment_work_item", "claim_lease",
+        "release_lease", "submit_for_review", "confirm_spec", "plan_sprint", "close_sprint",
+        "propose_decision", "request_from_owner", "escalate_decision", "decide", "request_mode", "write_handoff"]
+    #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
+    #expect(tools.count == expected.count)
     for t in tools { #expect((t["inputSchema"] as? [String: Any])?["type"] as? String == "object") }
+    // The same list, byte for byte, whatever the caller's role: the cacheable prompt prefix never changes.
+    for agent in [w.cto, engineer] {
+        #expect(try JSONSerialization.data(withJSONObject: listing(agent), options: [.sortedKeys])
+                == JSONSerialization.data(withJSONObject: tools, options: [.sortedKeys]))
+    }
+}
+
+@Test func executiveSeesEveryTool() throws {
+    let w = try MCPWorld()
+    let line = try #require(w.server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
+    let r = try #require(try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+    let tools = try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+    #expect(Set(tools.compactMap { $0["name"] as? String }) == Set(CompanyToolNames.all).subtracting(["review", "audit"]))
+    // ...and may call each of them: none is refused for the role.
+    let template = w.store.catalog.template(role: "ceo", pack: "software")
+    #expect(Set(template.companyTools) == Set(CompanyToolNames.all).subtracting(["review", "audit"]))
 }
 
 @Test func unknownMethodIsMethodNotFoundAndNotificationsAreSilent() throws {
@@ -272,8 +297,12 @@ func endToEndBinary() throws {
     let dir = try tempDir()
     let dbPath = dir.appending(path: "t.sqlite").path
     let w = try MCPWorld(path: dbPath)
+    _ = try w.store.transition(agentId: w.ceo.id, to: .ready)
+    let (_, turn) = try #require(try w.store.beginTurn(agentId: w.ceo.id, now: Store.now()))
+    let token = try w.store.issueTurnCredential(turnId: turn.id)
     let p = Process()
     p.executableURL = bin
+    p.environment = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": token]
     p.arguments = ["mcp", "--db", dbPath, "--company", w.company.id, "--agent", w.ceo.id]
     let inPipe = Pipe(), outPipe = Pipe()
     p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = FileHandle.nullDevice
@@ -294,4 +323,49 @@ func endToEndBinary() throws {
     #expect(lines[0].contains("2025-06-18")); #expect(lines[1].contains("post_message"))
     let g = try #require(try w.store.channel(companyId: w.company.id, name: "general"))
     #expect(try w.store.messages(channelId: g.id, limit: 5).map(\.text) == ["from binary"])
+}
+
+/// Runs the built `brahma mcp` for the CEO with `token` and `extraEnv`, makes `posts` post_message calls and returns, per call,
+/// whether it succeeded.
+private func binaryPosts(_ bin: URL, dbPath: String, _ w: MCPWorld, agent: Agent? = nil, token: String, extraEnv: [String: String],
+                         posts: Int) throws -> [Bool] {
+    let p = Process()
+    p.executableURL = bin
+    p.environment = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": token].merging(extraEnv) { a, _ in a }
+    p.arguments = ["mcp", "--db", dbPath, "--company", w.company.id, "--agent", (agent ?? w.ceo).id]
+    let inPipe = Pipe(), outPipe = Pipe()
+    p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = FileHandle.nullDevice
+    try p.run()
+    let requests = (0..<posts).map { i in
+        #"{"jsonrpc":"2.0","id":\#(i + 1),"method":"tools/call","params":{"name":"post_message","arguments":{"channel":"general","text":"p\#(i)"}}}"#
+    }
+    inPipe.fileHandleForWriting.write(Data((requests.joined(separator: "\n") + "\n").utf8))
+    try inPipe.fileHandleForWriting.close()
+    let out = String(decoding: outPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    p.waitUntilExit()
+    #expect(p.terminationStatus == 0)
+    return out.split(separator: "\n").map { !$0.contains("\"isError\":true") }
+}
+
+/// Fix 1 Q1: a turn's quotas come from its credential row, never from the server's environment, and their counts live in the
+/// database, so every server process of the turn shares them. A work credential with no recorded quotas gets the strictest.
+@Test(.enabled(if: brahmaBinary() != nil, "brahma binary not built; run `swift build` first"))
+func binaryQuotasComeFromTheCredential() throws {
+    let bin = try #require(brahmaBinary())
+    let dir = try tempDir()
+    let dbPath = dir.appending(path: "t.sqlite").path
+    let w = try MCPWorld(path: dbPath)
+    _ = try w.store.transition(agentId: w.ceo.id, to: .ready)
+    let (_, turn) = try #require(try w.store.beginTurn(agentId: w.ceo.id, now: Store.now()))
+    let permissive = ["BRAHMA_MCP_QUOTA_POSTS": "1000", "BRAHMA_MCP_QUOTA_ITEMS": "1000", "BRAHMA_MCP_QUOTA_COMMENTS": "1000"]
+    // No quotas recorded on the work credential: the strictest table row (3 posts), whatever the environment says.
+    let bare = try w.store.issueTurnCredential(turnId: turn.id)
+    #expect(try binaryPosts(bin, dbPath: dbPath, w, token: bare, extraEnv: permissive, posts: 5) == [true, true, true, false, false])
+    // A second server process of the same turn shares the count.
+    #expect(try binaryPosts(bin, dbPath: dbPath, w, token: bare, extraEnv: permissive, posts: 1) == [false])
+    // Quotas recorded on the credential are what the server enforces.
+    _ = try w.store.transition(agentId: w.cto.id, to: .ready)
+    let (_, ctoTurn) = try #require(try w.store.beginTurn(agentId: w.cto.id, now: Store.now()))
+    let recorded = try w.store.issueTurnCredential(turnId: ctoTurn.id, quotas: ModeQuotas(posts: 2, itemsCreated: 0, comments: 0))
+    #expect(try binaryPosts(bin, dbPath: dbPath, w, agent: w.cto, token: recorded, extraEnv: permissive, posts: 3) == [true, true, false])
 }

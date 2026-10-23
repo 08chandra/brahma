@@ -8,9 +8,13 @@ public struct CompanySummary: Equatable, Sendable, Identifiable {
     public var unread: Int
     /// Agents blocked on the owner.
     public var waitingOnOwner: Int
+    /// Asks waiting in the owner's Inbox.
+    public var inboxCount: Int = 0
+    /// Why nothing is running (the first stall reason); nil while anything runs.
+    public var stallLine: String? = nil
 
     public var id: String { company.id }
-    public var badge: Int { unread + waitingOnOwner }
+    public var badge: Int { unread + waitingOnOwner + inboxCount }
     public var initials: String { CompanyInitials.of(company.name) }
 }
 
@@ -24,6 +28,8 @@ public struct Snapshot: Equatable, Sendable {
     public var unreadByChannel: [String: Int]
     public var lastTurns: [String: Turn]
     public var usage: RateLimitInfo?
+    /// Selected company's work, Inbox and health.
+    public var work = WorkSnapshot.empty
 
     public static let empty = Snapshot(companies: [], agents: [], channels: [], unreadByChannel: [:], lastTurns: [:], usage: nil)
 
@@ -38,7 +44,11 @@ public struct Snapshot: Equatable, Sendable {
                 if case .owner? = $0.blocker { return $0.state == .blocked }
                 return false
             }.count
-            summaries.append(CompanySummary(company: company, counts: StateCounts(agents), unread: unread, waitingOnOwner: waiting))
+            let counts2 = StateCounts(agents)
+            var summary = CompanySummary(company: company, counts: counts2, unread: unread, waitingOnOwner: waiting)
+            summary.inboxCount = try store.ownerWaitingCount(companyId: company.id)
+            if counts2.running == 0 { summary.stallLine = try store.stallReport(companyId: company.id).reasons.first }
+            summaries.append(summary)
         }
         var snap = Snapshot.empty
         snap.companies = summaries
@@ -47,6 +57,7 @@ public struct Snapshot: Equatable, Sendable {
             snap.agents = try store.agents(companyId: id)
             snap.channels = try store.channels(companyId: id)
             snap.unreadByChannel = try store.unreadCounts(companyId: id)
+            snap.work = try WorkSnapshot.load(store: store, companyId: id)
             for a in snap.agents {
                 if let t = try store.lastTurn(agentId: a.id) { snap.lastTurns[a.id] = t }
             }

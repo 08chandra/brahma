@@ -1,11 +1,20 @@
 import AppKit
 import Foundation
+import os
 import BrahmaCore
 import BrahmaAppModel
+import BrahmaKeychain
 
 struct BootError: Error {
     var path: String
     var message: String
+}
+
+/// What a successful boot produced: the model and the owner-key store resolved for this data home (the Keychain,
+/// or the dev/demo file store when `BRAHMA_OWNER_KEY_STORE=file`, never for the default data home).
+struct Booted {
+    let model: AppModel
+    let ownerKeyStore: any OwnerKeyStore
 }
 
 /// Resolves the helper binaries the embedded engine needs.
@@ -26,30 +35,51 @@ enum EngineSetup {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let boot: Result<AppModel, BootError>
+    let boot: Result<Booted, BootError>
+    /// The model, when boot succeeded.
+    var model: AppModel? { if case .success(let booted) = boot { return booted.model } else { return nil } }
     let options: LaunchOptions
     /// Set by `MainWindow.onAppear`; reopens the main window after the user closes it.
     var openMainWindow: (() -> Void)?
     /// SwiftUI wraps the adaptor, so `NSApp.delegate` is not this object; the harness reaches it here.
     static private(set) weak var current: AppDelegate?
     private var signalSources: [DispatchSourceSignal] = []
+    /// Posts the Inbox banners; created at launch once the model exists.
+    private var notifier: OwnerNotifier?
     /// Set once the bounded engine stop has begun; later quit requests wait on it instead of exiting early.
     private(set) var quitting = false
 
     override init() {
         options = LaunchOptions.parse(CommandLine.arguments)
-        boot = AppDelegate.makeModel()
+        boot = AppDelegate.makeBoot()
         super.init()
         AppDelegate.current = self
     }
 
-    /// Mirrors the CLI's `openStore()`.
-    private static func makeModel() -> Result<AppModel, BootError> {
+    private static let log = Logger(subsystem: "dev.brahma.app", category: "startup")
+
+    /// Picks the owner-key store, then opens the database like the CLI's `openStore()`. A refused store choice is a
+    /// startup error, never a silent fallback to another store.
+    private static func makeBoot() -> Result<Booted, BootError> {
         let paths = BrahmaPaths.fromEnvironment()
+        let selection: PlatformOwnerKeyStore.Selection
+        do { selection = try PlatformOwnerKeyStore.resolve(paths: paths) } catch {
+            return .failure(BootError(path: paths.home.path, message: "\(error)"))
+        }
         do {
             try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
-            let store = try Store(path: paths.database.path)
-            return .success(AppModel(store: store, paths: paths))
+            let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) {
+                FileHandle.standardError.write(Data(($0 + "\n").utf8))
+            }
+            let store = try Store(path: paths.database.path, catalog: catalog)
+            let model = AppModel(store: store, paths: paths)
+            if let warning = selection.warning {
+                // stderr is invisible to a Finder launch: also the unified log and the window's banner.
+                FileHandle.standardError.write(Data("brahma: \(warning)\n".utf8))
+                log.warning("\(warning, privacy: .public)")
+                model.startupNotice = warning
+            }
+            return .success(Booted(model: model, ownerKeyStore: selection.store))
         } catch {
             return .failure(BootError(path: paths.database.path, message: "\(error)"))
         }
@@ -69,10 +99,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(windowWillClose(_:)),
                                                name: NSWindow.willCloseNotification, object: nil)
         switch boot {
-        case .success(let model):
+        case .success(let booted):
+            let model = booted.model
             let options = self.options
-            let engine = EngineHost(paths: model.paths, store: model.store)
+            let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: booted.ownerKeyStore)
             model.engine = engine
+            let notifier = OwnerNotifier(model: model)
+            notifier.openMainWindow = { [weak self] in self?.openMainWindowFromMenu() }
+            // Smoke and snapshot runs must never raise the system permission dialog.
+            notifier.start(prompt: !options.smokeTest && options.snapshotPath == nil)
+            self.notifier = notifier
             Task { @MainActor in
                 await model.load()
                 model.startPolling()
@@ -130,7 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Re-entered (e.g. the app menu's ⌘Q) while the stop runs: the pending reply below completes the quit.
         if quitting { return .terminateLater }
-        guard case .success(let model) = boot else { return .terminateNow }
+        guard let model else { return .terminateNow }
         model.stopPolling()
         guard let engine = model.engine, engine.status == .embedded || engine.status == .starting else {
             return .terminateNow
@@ -149,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate {
     /// The menu bar summary, or nil when the store failed to open.
     var menuBarSummary: MenuBarSummary? {
-        if case .success(let model) = boot { return model.menuBar }
+        if let model { return model.menuBar }
         return nil
     }
 }

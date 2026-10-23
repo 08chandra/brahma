@@ -17,4 +17,23 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var usageMode: UsageMode
     public var priorityWeight: Int
     public var createdAt: Date
+    public var packId: String = "software"
+    public var packVersion: Int = 1
+    /// Share of the weekly allowance kept for the owner; nil means the owner-wide setting (`1 - weeklyShare`).
+    public var ownerReserve: Double? = nil
+    /// How much the owner is asked (Task 11a); changing it never touches asks already waiting.
+    public var autonomy: AutonomyPreset = .important
+    /// The head of `refs/heads/main` the engine expects: recorded at ensureRepo, after each engine merge and when the owner
+    /// accepts main. Claims and merges refuse while `main` is anything else (`Store.checkMain`).
+    public var mainCommit: String? = nil
+    /// The head the engine is about to move `main` to, written before the move. A crash between moving `main` and recording
+    /// it leaves `main` here; the guard then accepts it and records it (`Store.checkMain`).
+    public var pendingMainCommit: String? = nil
+    /// Auto-approved items that landed in `main` (9c); every one is audited.
+    public var autoMergeCount: Int = 0
+    /// Risk-tiered auto-merge (9c) for this company: off until the owner switches it on (`Store.setAutoMergeSmall`, the CLI
+    /// `brahma company set <company> auto-merge-small on`). The owner-wide switch (`Store.setAutoMerge`) must be on as well.
+    public var autoMergeSmall: Bool = false
+    /// The completion rule new sprints use unless the plan names one (the pack's `defaultCadence` at creation).
+    public var cadence: CadenceKind = .sprint
 }

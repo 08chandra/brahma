@@ -5,16 +5,47 @@ import BrahmaCore
 struct CompanyGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "company", abstract: "Create and manage companies.",
-        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self])
+        subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self, Autonomy.self, Auto.self,
+                      SetSetting.self])
 
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String
         @Option(help: "What the company is for.") var goal: String
+        @Option(help: "Agents in the full org shape (0 for an empty company, otherwise 5 to 500).") var agents: Int = 6
+        @Option(help: "Industry pack id.") var pack: String = "software"
+        @Flag(help: "Print the org that would be created and change nothing.") var dryRun = false
 
         func run() throws {
-            let (store, paths) = try openStore()
-            let c = try store.createCompany(name: name, goal: goal, workspacesRoot: paths.workspaces)
+            try requireOwnerShell()
+            guard agents == 0 || OrgGenerator.range.contains(agents) else {
+                throw fail("--agents must be 0 or between \(OrgGenerator.range.lowerBound) and \(OrgGenerator.range.upperBound)")
+            }
+            let paths = BrahmaPaths.fromEnvironment()
+            let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
+            guard let industry = catalog.pack(pack) else { throw fail("unknown pack '\(pack)'") }
+            var staffed: (seated: OrgPlan, vacancies: [PlannedAgent])?
+            var full: OrgPlan?
+            if agents > 0 {
+                if agents > 50 { print("Note: org sizes over 50 are experimental.") }
+                let plan = try OrgGenerator.generate(goal: goal, count: agents, pack: industry)
+                full = plan
+                // The seat budget follows the plan tier; a dry run on a fresh home uses the default tier.
+                let seats = FileManager.default.fileExists(atPath: paths.database.path)
+                    ? try openStore().0.seatBudget() : PlanTier.max5x.seatBudget
+                staffed = OrgGenerator.staff(plan: plan, pack: industry, readyWidth: 0, seatBudget: seats)
+            }
+            if dryRun {
+                guard let full, let staffed else { print("(empty company)"); return }
+                for line in full.treeLines(vacant: Set(staffed.vacancies.map(\.handle))) { print(safe(line)) }
+                return
+            }
+            let (store, paths2) = try openStore()
+            let c = try store.createCompany(name: name, goal: goal, workspacesRoot: paths2.workspaces, packId: pack)
             print("\(c.id)  \(c.workspacePath)")
+            if let staffed {
+                let hired = try store.applyOrg(companyId: c.id, plan: staffed.seated, pack: industry, vacancies: staffed.vacancies)
+                print("hired \(hired.count) of \(agents); \(staffed.vacancies.count) seats vacant")
+            }
         }
     }
 
@@ -33,27 +64,98 @@ struct CompanyGroup: ParsableCommand {
 
     struct Pause: ParsableCommand {
         @Argument var company: String
-        func run() throws { try set(company, .paused) }
+        func run() throws { try requireOwnerShell(); try set(company, .paused) }
     }
 
     struct Resume: ParsableCommand {
         @Argument var company: String
-        func run() throws { try set(company, .running) }
+        func run() throws { try requireOwnerShell(); try set(company, .running) }
     }
 
     struct Mode: ParsableCommand {
         @Argument var company: String
         @Argument(help: "low, balanced or max.") var mode: UsageMode
-        func run() throws { try update(company) { $0.usageMode = mode } }
+        func run() throws { try requireOwnerShell(); try update(company) { $0.usageMode = mode } }
     }
 
     struct Weight: ParsableCommand {
         @Argument var company: String
         @Argument(help: "Scheduling weight (1 or more).") var weight: Int
         func run() throws {
+            try requireOwnerShell()
             guard weight >= 1 else { throw fail("weight must be at least 1") }
             try update(company) { $0.priorityWeight = weight }
         }
+    }
+
+    struct Reserve: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Override the share of the weekly allowance kept for you, for one company (advanced; see 'brahma settings share').")
+        @Argument var company: String
+        @Argument(help: "0.0 to 0.9, or 'default' to follow the owner-wide share.") var reserve: String
+
+        func run() throws {
+            try requireOwnerShell()
+            let value: Double?
+            if reserve.lowercased() == "default" {
+                value = nil
+            } else if let v = Double(reserve), (0.0...0.9).contains(v) {
+                value = v
+            } else {
+                throw fail("reserve must be between 0.0 and 0.9, or 'default'")
+            }
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            try store.setOwnerReserve(companyId: c.id, value)
+            print(safe("\(c.name): reserve \(value.map { String(format: "%.2f", $0) } ?? "default (\(Int(((1 - store.weeklyShare()) * 100).rounded()))%)")"))
+        }
+    }
+
+    struct Autonomy: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "How much you are asked: everything, important (default) or auto. Reserved matters always come to you.")
+        @Argument var company: String
+        @Argument(help: "everything, important or auto.") var preset: AutonomyPreset
+        func run() throws { try requireOwnerShell(); try CompanyGroup.setAutonomy(company, preset) }
+    }
+
+    struct Auto: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Shorthand: 'auto on' is autonomy auto, 'auto off' is important.")
+        @Argument var company: String
+        @Argument(help: "on or off.") var state: OnOff
+        func run() throws { try requireOwnerShell(); try CompanyGroup.setAutonomy(company, state == .on ? .auto : .important) }
+    }
+
+    enum OnOff: String, ExpressibleByArgument { case on, off }
+
+    struct SetSetting: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "set",
+            abstract: "Change a company setting. auto-merge-small: small, lead-configured tier S changes whose allowlisted check "
+                + "passes land without a review turn and are audited after (off until you switch it on; 'brahma settings "
+                + "auto-merge' must be on too).")
+        enum Setting: String, ExpressibleByArgument { case autoMergeSmall = "auto-merge-small" }
+        @Argument var company: String
+        @Argument(help: "auto-merge-small.") var setting: Setting
+        @Argument(help: "on or off.") var value: OnOff
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            switch setting {
+            case .autoMergeSmall:
+                try store.setAutoMergeSmall(companyId: c.id, value == .on)
+                print(safe("\(c.name): auto-merge-small \(value.rawValue) (owner-wide auto-merge: \(store.autoMergeEnabled() ? "on" : "off"))"))
+            }
+        }
+    }
+
+    private static func setAutonomy(_ query: String, _ preset: AutonomyPreset) throws {
+        let (store, _) = try openStore()
+        let c = try resolveCompany(store, query)
+        try store.setAutonomy(companyId: c.id, preset)
+        print(safe("\(c.name) autonomy: \(preset.rawValue)"))
     }
 
     private static func set(_ query: String, _ status: CompanyStatus) throws {

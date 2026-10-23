@@ -95,12 +95,18 @@ struct AgentsView: View {
                 .lineLimit(1).frame(width: 90, alignment: .leading)
             Text(verbatim: a.model).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1)
                 .lineLimit(1).frame(width: 70, alignment: .leading)
-            StateTag(agent: a).frame(width: 110, alignment: .leading)
-            Text(verbatim: BlockerText.describe(a.blocker, handles: model.handles))
+            VStack(alignment: .leading, spacing: 2) {
+                StateTag(agent: a)
+                if a.state == .running, let chip = ModeChipText.line(turn) {
+                    Text(verbatim: chip).font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.running).lineLimit(1)
+                }
+            }
+            .frame(width: 110, alignment: .leading)
+            Text(verbatim: BlockerText.describe(a.blocker, handles: model.handles, timeZone: model.ownerTimeZone))
                 .font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1)
                 .lineLimit(1)
                 .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
-            Text(verbatim: turn.map { TimeText.hm($0.endedAt ?? $0.startedAt) } ?? "—")
+            Text(verbatim: turn.map { TimeText.hm($0.endedAt ?? $0.startedAt, timeZone: model.ownerTimeZone) } ?? "—")
                 .font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2)
                 .frame(width: 90, alignment: .leading)
         }
@@ -142,12 +148,17 @@ private struct AgentInspector: View {
                             .foregroundStyle(BrahmaTheme.text0)
                             .strikethrough(a.state == .killed)
                             .lineLimit(1)
+                        if let acting = detail.actingRole { WarningChip(label: "Acting \(acting)") }
+                        if let mode = detail.modeChip { StatusChip(label: mode, color: BrahmaTheme.running) }
                     }
                     KeyValueGrid(rows: [
                         KeyValueRow(label: "Role", value: a.role),
                         KeyValueRow(label: "Model", value: a.model, mono: true),
                         KeyValueRow(label: "State", value: detail.stateLabel, mono: true,
                                     valueColor: BrahmaTheme.statusColor(for: a.state)),
+                        KeyValueRow(label: "Reports to", value: detail.managerHandle.map { "@" + $0 } ?? "—", mono: true),
+                        KeyValueRow(label: "Team", value: detail.team ?? "—"),
+                        KeyValueRow(label: "Reports", value: "\(detail.reportCount)", mono: true),
                     ] + (detail.blockerText.isEmpty ? [] : [KeyValueRow(label: "Blocker", value: detail.blockerText)]))
                     Hairline()
                     CapsLabel("Last turn")

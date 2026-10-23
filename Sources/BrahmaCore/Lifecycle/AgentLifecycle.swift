@@ -22,7 +22,30 @@ extension Store {
     /// `paused` and `requestedBlocker` are left untouched.
     @discardableResult
     public func transition(agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date = Store.now()) throws -> Agent {
-        try writer.write { db in try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now) }
+        try writer.write { db in try transitionAndRelease(db: db, agentId: agentId, to: to, blocker: blocker, now: now) }
+    }
+
+    /// `transition`, plus what leaving the company does to the org (`offboard`): asks and reviews re-routed, leases marked
+    /// expired, items unassigned with an auto hand-off, reports reparented, an acting CEO named, observers told.
+    func transitionAndRelease(db: Database, agentId: String, to: AgentState, blocker: Blocker? = nil, now: Date) throws -> Agent {
+        // Teammates blocked on an agent that is killed are released by the transition; each is told why it is awake (an
+        // engine DM through the normal path), or it would have nothing to act on.
+        var waiters: [Agent] = []
+        if to == .killed, let target = try Agent.fetchOne(db, key: agentId) {
+            waiters = try Agent.filter(Column("companyId") == target.companyId && Column("state") == AgentState.blocked.rawValue)
+                .fetchAll(db).filter { $0.id != agentId && $0.blocker == .agent(agentId) }
+        }
+        let agent = try Store.transition(db: db, agentId: agentId, to: to, blocker: blocker, now: now)
+        if to == .killed {
+            try offboard(db: db, agent: agent, now: now)
+            for waiter in waiters {
+                try MessageRouter(store: self).sendDM(
+                    db: db, companyId: waiter.companyId, from: .system, to: waiter.name,
+                    text: "@\(agent.name) was removed from the company while you were waiting on them. "
+                        + "Re-plan: ask someone else or continue without them.", now: now)
+            }
+        }
+        return agent
     }
 
     /// Same as `transition(agentId:to:blocker:now:)`, for callers already inside a write transaction.
@@ -74,23 +97,29 @@ extension Store {
         }
     }
 
-    static func finishTurn(db: Database, id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, now: Date) throws -> Bool {
+    static func finishTurn(db: Database, id: String, outcome: TurnOutcome, summary: String?, costUSD: Double?, infra: Bool = false,
+                           reportedStatus: String? = nil, sessionResetReason: String? = nil, now: Date) throws -> Bool {
         guard var turn = try Turn.fetchOne(db, key: id) else { throw StoreError.notFound }
         guard turn.outcome == .inProgress else { return false }
-        turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.endedAt = now
+        turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.infra = infra; turn.endedAt = now
+        turn.reportedStatus = reportedStatus; turn.sessionResetReason = sessionResetReason
         try turn.update(db)
+        try db.execute(sql: "DELETE FROM turnCredential WHERE turnId = ?", arguments: [id])
+        try db.execute(sql: "DELETE FROM turnQuotaUsage WHERE turnId = ?", arguments: [id])
         return true
     }
 
     public func turnCount(agentId: String, since: Date) throws -> Int {
         try writer.read { db in
-            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since).fetchCount(db)
+            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false
+                             && Column("sessionResetReason") == nil).fetchCount(db)
         }
     }
 
     public func oldestTurnStart(agentId: String, since: Date) throws -> Date? {
         try writer.read { db in
-            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since)
+            try Turn.filter(Column("agentId") == agentId && Column("startedAt") >= since && Column("infra") == false
+                             && Column("sessionResetReason") == nil)
                 .order(Column("startedAt")).fetchOne(db)?.startedAt
         }
     }
@@ -101,6 +130,10 @@ extension Store {
         try writer.write { db in
             try db.execute(sql: "UPDATE turn SET outcome = ?, endedAt = ? WHERE outcome = ?",
                            arguments: [TurnOutcome.interrupted.rawValue, now, TurnOutcome.inProgress.rawValue])
+            try db.execute(sql: "DELETE FROM turnCredential WHERE turnId IN (SELECT id FROM turn WHERE outcome <> ?)",
+                           arguments: [TurnOutcome.inProgress.rawValue])
+            try db.execute(sql: "DELETE FROM turnQuotaUsage WHERE turnId IN (SELECT id FROM turn WHERE outcome <> ?)",
+                           arguments: [TurnOutcome.inProgress.rawValue])
             let running = try Agent.filter(Column("state") == AgentState.running.rawValue).fetchAll(db)
             for var agent in running {
                 agent.state = .ready; agent.blocker = nil; agent.readySince = now

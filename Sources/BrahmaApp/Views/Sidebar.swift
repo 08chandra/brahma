@@ -15,6 +15,10 @@ struct Sidebar: View {
                 NavRow(title: "Mission Control", icon: "square.grid.2x2", item: .missionControl, model: model)
                 NavRow(title: "Activity", icon: "list.bullet.rectangle", item: .activity, model: model)
                 NavRow(title: "Agents", icon: "person.3", item: .agents, model: model)
+                SectionHeader(title: "Work")
+                NavRow(title: "Backlog", icon: "list.bullet.indent", item: .backlog, model: model)
+                NavRow(title: "Board", icon: "rectangle.split.3x1", item: .board, model: model)
+                NavRow(title: "Inbox", icon: "tray", item: .inbox, model: model, count: model.inboxCount)
 
                 if !sections.channels.isEmpty {
                     SectionHeader(title: "Channels")
@@ -120,6 +124,8 @@ private struct NavRow: View {
     let icon: String
     let item: SidebarItem
     let model: AppModel
+    /// An accent count chip (the Inbox); hidden at 0.
+    var count = 0
 
     var body: some View {
         let selected = model.sidebarSelection == item
@@ -131,7 +137,10 @@ private struct NavRow: View {
             Text(verbatim: title)
                 .font(BrahmaTheme.body)
                 .foregroundStyle(selected ? BrahmaTheme.text0 : BrahmaTheme.text1)
+            Spacer(minLength: 4)
+            if count > 0 { MonoChip(text: count > 99 ? "99+" : "\(count)", color: .white, fill: BrahmaTheme.accent) }
         }
+        .accessibilityLabel(Text(verbatim: count > 0 ? "\(title), \(count) waiting" : title))
     }
 }
 

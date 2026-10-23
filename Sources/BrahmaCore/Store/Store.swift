@@ -6,12 +6,43 @@ public enum StoreError: Error, Equatable {
     case notFound
     /// Channel or agent name is reserved or not in the allowed alphabet.
     case invalidName
+    /// The workspace could not be made a git repository. The message is shown as `git is required: <stderr>`.
+    case gitRequired(String)
+}
+
+extension StoreError: LocalizedError, CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .duplicateName: "duplicate name"
+        case .notFound: "not found"
+        case .invalidName: "invalid name"
+        case .gitRequired(let stderr): "git is required: \(stderr)"
+        }
+    }
+    public var errorDescription: String? { description }
 }
 
 public final class Store: Sendable {
     public let writer: any DatabaseWriter
+    /// The industry packs this store knows. Every pack lookup goes through here.
+    public let catalog: PackCatalog
+    /// The directory holding the database (nil for an in-memory store): where the engine keeps its own locks.
+    let dataHome: URL?
+    /// How long engine git waits for an item's lock before skipping the item (tests shorten it).
+    let gitLockTimeout = GitLockTimeout()
+    /// How much output a plan-turn barrier git call may produce before the barrier fails closed (tests shrink it).
+    let planBarrierOutputLimit = GitOutputLimit()
+    /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
+    let lifecycleObservers: [any AgentLifecycleObserver]
+    /// Called inside the transaction that completes an item (`completeItem`). The outcome-facts observer is always first.
+    let observers: [any WorkItemObserver]
 
-    public init(path: String) throws {
+    public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
+                observers: [any WorkItemObserver] = []) throws {
+        self.catalog = catalog
+        self.lifecycleObservers = lifecycleObservers
+        self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
+        dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
         config.busyMode = .timeout(5)
         config.prepareDatabase { db in
@@ -21,13 +52,19 @@ public final class Store: Sendable {
         try Migrations.migrator().migrate(writer)
     }
 
-    private init(queue: DatabaseQueue) throws {
+    private init(queue: DatabaseQueue, catalog: PackCatalog, lifecycleObservers: [any AgentLifecycleObserver],
+                 observers: [any WorkItemObserver]) throws {
+        self.catalog = catalog
+        self.lifecycleObservers = lifecycleObservers
+        self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
+        dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)
     }
 
-    public static func inMemory() throws -> Store {
-        try Store(queue: DatabaseQueue())
+    public static func inMemory(catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
+                                observers: [any WorkItemObserver] = []) throws -> Store {
+        try Store(queue: DatabaseQueue(), catalog: catalog, lifecycleObservers: lifecycleObservers, observers: observers)
     }
 
     /// Test helper: current value of a PRAGMA as text.
@@ -42,6 +79,50 @@ public final class Store: Sendable {
             default: return ""
             }
         }
+    }
+
+    /// The git workspace of a company, with its per-item lock files (`<home>/run/locks/<companyId>`) and the engine's merge
+    /// checkout (`<home>/run/merge/<companyId>`) under the data home, never in the workspace, where an agent could hold a
+    /// lock forever or tamper with the checkout a merge runs in.
+    func gitWorkspace(root: URL, companyId: String) -> GitWorkspace {
+        func engineDir(_ name: String, fallback: String) -> URL {
+            (dataHome?.appending(path: "run/\(name)", directoryHint: .isDirectory)
+                ?? FileManager.default.temporaryDirectory.appending(path: fallback, directoryHint: .isDirectory))
+                .appending(path: companyId, directoryHint: .isDirectory)
+        }
+        // Merge-check exports go under the data home (`<home>/run/exports/<runId>`); an in-memory store uses a per-company
+        // stand-in under the temporary directory.
+        let exportHome = dataHome ?? FileManager.default.temporaryDirectory
+            .appending(path: "brahma-exports/\(companyId)", directoryHint: .isDirectory)
+        var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
+                               mergeDirectory: engineDir("merge", fallback: "brahma-merge"), exportHome: exportHome)
+        git.lockTimeout = gitLockTimeout.seconds
+        git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
+        git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }
+        git.onWorktreeTamper = { [self] key, detail in
+            let name = (try? company(id: companyId))?.name ?? companyId
+            try? EngineAlerts.raise(
+                store: self, text: "The worktree of \(key) in \(name) was repointed (\(detail)). Brahma refused to commit, merge or reset "
+                + "there and put it back from its own records. An agent probably rewrote it; look at what \(key) is doing.",
+                now: Store.now(), reason: "worktree:\(companyId):\(key)")
+        }
+        git.onUnsafeEngineFile = { [self] problem in alertEngineFile(problem, companyId: companyId) }
+        git.onUnsafeRepository = { [self] detail in
+            let name = (try? company(id: companyId))?.name ?? companyId
+            let reason = "gitconfig:\(companyId)"
+            let text = "The git repository of \(name) has settings Brahma does not run git with: \(detail). Brahma runs no git there "
+                + "(no claims, commits, checks or reviews) until that is removed, for example with `git config --unset` or "
+                + "`git config --remove-section`. An agent may have written it; look at who did."
+            // One alert while it stays open: every refused call reports again, and each raise would DM the owner.
+            try? writer.write { db in
+                let open = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
+                                          && Column("status") == AskStatus.pendingOwner.rawValue
+                                          && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
+                guard open == 0 else { return }
+                try EngineAlerts.raise(store: self, db: db, text: text, now: Store.now(), reason: reason)
+            }
+        }
+        return git
     }
 
     // MARK: Companies
@@ -67,7 +148,9 @@ public final class Store: Sendable {
         return out
     }
 
-    public func createCompany(name: String, goal: String, workspacesRoot: URL) throws -> Company {
+    public func createCompany(name: String, goal: String, workspacesRoot: URL, packId: String = "software",
+                              packVersion: Int? = nil) throws -> Company {
+        guard let pack = catalog.pack(packId) else { throw OrgError.unknownPack }
         let base = Store.slug(for: name).isEmpty ? "company" : Store.slug(for: name)
         let createdAt = Store.now()
         return try writer.write { db in
@@ -78,12 +161,29 @@ public final class Store: Sendable {
                 n += 1
             }
             let dir = workspacesRoot.appending(path: slug, directoryHint: .isDirectory)
-            let company = Company(
+            var company = Company(
                 id: UUID().uuidString, name: name, slug: slug, goal: goal, workspacePath: dir.path,
-                status: .running, usageMode: .low, priorityWeight: 1, createdAt: createdAt)
+                status: .running, usageMode: .balanced, priorityWeight: 1, createdAt: createdAt,
+                packId: packId, packVersion: packVersion ?? pack.version)
+            company.cadence = CadenceKind(rawValue: pack.defaultCadence) ?? .sprint
             try company.insert(db)
             // Directory is created only after the row is in; a failure here rolls the insert back.
+            let existed = FileManager.default.fileExists(atPath: dir.path)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            do {
+                let git = GitWorkspace(root: dir)
+                try git.ensureRepo()
+                // The head the engine expects `main` to have; every claim checks it is still an ancestor of the real one.
+                if let head = try git.head(of: GitWorkspace.mainRef) {
+                    try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [head, company.id])
+                    company.mainCommit = head
+                }
+            } catch {
+                if !existed { try? FileManager.default.removeItem(at: dir) }
+                let detail: String
+                if case GitError.failed(_, _, let stderr) = error { detail = stderr } else { detail = "\(error)" }
+                throw StoreError.gitRequired(detail)
+            }
             try Store.insertChannel(db, companyId: company.id, name: "general", kind: .channel, members: ["owner"], now: createdAt)
             return company
         }
@@ -97,29 +197,57 @@ public final class Store: Sendable {
         try writer.read { db in try Company.fetchOne(db, key: id) }
     }
 
+    /// Whole-row update of the owner-editable fields. `mainCommit`, `pendingMainCommit` and `autoMergeCount` belong to the
+    /// engine and are never overwritten from a copy; `autoMergeSmall` changes only through `setAutoMergeSmall` (which takes
+    /// back pending auto-approvals).
     public func updateCompany(_ c: Company) throws {
-        try writer.write { db in try c.update(db) }
+        try writer.write { db in
+            var kept = c
+            let row = try Row.fetchOne(db, sql: """
+                SELECT mainCommit, pendingMainCommit, autoMergeCount, autoMergeSmall FROM company WHERE id = ?
+                """, arguments: [c.id])
+            kept.mainCommit = row?["mainCommit"]
+            kept.pendingMainCommit = row?["pendingMainCommit"]
+            kept.autoMergeCount = row?["autoMergeCount"] ?? 0
+            kept.autoMergeSmall = row?["autoMergeSmall"] ?? false
+            try kept.update(db)
+        }
     }
 
     // MARK: Agents
 
-    public func hire(companyId: String, name: String, role: String, model: String) throws -> Agent {
-        let handle = name.lowercased()
-        guard handle != "owner", handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
-        else { throw StoreError.invalidName }
-        let agent = Agent(
-            id: UUID().uuidString, companyId: companyId, name: handle, role: role, model: model,
-            sessionId: UUID().uuidString, sessionStarted: false, state: .sleeping,
-            blocker: nil, requestedBlocker: nil, paused: false, readySince: nil, createdAt: Store.now())
+    public func hire(companyId: String, name: String, role: String, model: String,
+                     managerId: String? = nil, team: String? = nil) throws -> Agent {
         do {
-            try writer.write { db in
-                try agent.insert(db)
-                if let general = try Channel.filter(Column("companyId") == companyId && Column("name") == "general").fetchOne(db) {
-                    try ChannelMember(channelId: general.id, member: agent.id).insert(db, onConflict: .ignore)
-                }
+            return try writer.write { db in
+                try Store.hire(db: db, companyId: companyId, name: name, role: role, model: model,
+                               managerId: managerId, team: team, now: Store.now())
             }
         } catch let error as DatabaseError where error.extendedResultCode == .SQLITE_CONSTRAINT_UNIQUE {
             throw StoreError.duplicateName
+        }
+    }
+
+    /// `reserved` lets `applyOrg` and `fillVacancy` hire into a handle an open vacancy holds; everyone else is refused.
+    static func hire(db: Database, companyId: String, name: String, role: String, model: String, managerId: String?,
+                     team: String?, now: Date, honoringVacancy: Bool = false) throws -> Agent {
+        let handle = name.lowercased()
+        guard handle != "owner", handle != "system", handle != "here", handle != "team",
+              handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
+        else { throw StoreError.invalidName }
+        if !honoringVacancy,
+           try OrgVacancy.filter(Column("companyId") == companyId && Column("handle") == handle && Column("filledAt") == nil)
+            .fetchCount(db) > 0 {
+            throw StoreError.duplicateName
+        }
+        let agent = Agent(
+            id: UUID().uuidString, companyId: companyId, name: handle, role: role, model: model,
+            sessionId: UUID().uuidString, sessionStarted: false, state: .sleeping,
+            blocker: nil, requestedBlocker: nil, paused: false, readySince: nil, createdAt: now,
+            managerId: managerId, team: team)
+        try agent.insert(db)
+        if let general = try Channel.filter(Column("companyId") == companyId && Column("name") == "general").fetchOne(db) {
+            try ChannelMember(channelId: general.id, member: agent.id).insert(db, onConflict: .ignore)
         }
         return agent
     }
@@ -148,4 +276,17 @@ public final class Store: Sendable {
     func save(_ agent: Agent) throws {
         try writer.write { db in try agent.save(db) }
     }
+}
+
+/// A settable timeout shared by a store's git workspaces.
+final class GitOutputLimit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 32 * 1024 * 1024
+    var bytes: Int { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
+}
+
+final class GitLockTimeout: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 10
+    var seconds: TimeInterval { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }

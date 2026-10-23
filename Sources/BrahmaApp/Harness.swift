@@ -45,9 +45,21 @@ enum Harness {
         if let path = options.snapshotPath {
             await snapshot(path: path, options: options, model: model)
         } else {
-            try? await Task.sleep(for: .seconds(options.smokeHold))
+            var released: Bool?
+            if let release = options.smokeRelease {
+                // Held until the script says it has seen what it waits for, bounded by `smokeHold`.
+                let deadline = ContinuousClock.now + .seconds(options.smokeHold)
+                released = false
+                while ContinuousClock.now < deadline {
+                    if FileManager.default.fileExists(atPath: release) { released = true; break }
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+            } else {
+                try? await Task.sleep(for: .seconds(options.smokeHold))
+            }
             let agents = model.snapshot.companies.reduce(0) { $0 + $1.counts.running + $1.counts.ready + $1.counts.blocked + $1.counts.sleeping + $1.counts.killed }
             var line = "SMOKE OK companies=\(model.snapshot.companies.count) agents=\(agents) engine=\(model.engine?.status.label ?? "none") windows=\(mainWindows().count)"
+            if let released { line += " released=\(released ? "yes" : "no")" }
             if options.smokeCloseWindow {
                 if let failure = await lifecycleCheck(model: model) { finishFail("lifecycle \(failure)") }
                 line += " lifecycle=ok"
@@ -83,6 +95,10 @@ enum Harness {
     private static func snapshot(path: String, options: LaunchOptions, model: AppModel) async {
         func fail(_ reason: String) -> Never { snapshotFail(reason) }
         guard let window = mainWindows().first else { fail("no window") }
+        if let name = options.company,
+           let company = model.snapshot.companies.first(where: { $0.company.name.lowercased() == name.lowercased() }) {
+            await model.selectCompany(company.id)
+        }
         if let target = options.select { model.apply(target) }
         window.setContentSize(NSSize(width: 1280, height: 800))
         window.makeKeyAndOrderFront(nil)

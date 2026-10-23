@@ -18,13 +18,23 @@ public final class AppModel {
     public var selectedAgentId: String?
     public var presentedSheet: AppSheet?
     public var errorMessage: String?
+    /// A standing startup warning (e.g. the dev/demo owner-key store is in use), shown above the detail pane.
+    public var startupNotice: String?
     public var activityFilter: ActivityFilter = .all
+    /// The item open in the backlog's detail pane (`item:<KEY>`).
+    public var selectedItemKey: String?
+    /// Backlog: also list Done items.
+    public var showDoneItems = false
+    /// Board: only this sprint's items; nil shows them all.
+    public var boardSprintId: String?
     public let search: SearchModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
     public var highlightedMessageId: String?
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
+    /// Runs after each tick that read the database without error (the app posts the Inbox notifications here).
+    @ObservationIgnored public var afterTick: (@MainActor () async -> Void)?
 
     @ObservationIgnored private var ticksSinceTakeoverCheck = 0
     @ObservationIgnored private var cursor: Int64 = 0
@@ -57,15 +67,22 @@ public final class AppModel {
     /// Selected company's agent id → handle, plus "owner" → "owner".
     public var handles: [String: String] {
         var map = Dictionary(snapshot.agents.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
-        map["owner"] = "owner"
+        map["owner"] = "owner"; map["system"] = "system"
         return map
     }
 
-    public var usageLine: String { UsageText.line(snapshot.usage, now: clock()) }
+    /// The owner's time zone, read with the last snapshot (every calendar-facing string uses it).
+    public var ownerTimeZone: TimeZone { snapshot.work.timeZone }
+
+    public var usageLine: String {
+        var line = UsageText.line(snapshot.usage, now: clock(), timeZone: ownerTimeZone)
+        if let pace = UsageText.pace(snapshot.work.pace) { line += " · " + pace }
+        return line
+    }
 
     public var usageGateLine: String? {
         guard let mode = selectedCompany?.company.usageMode else { return nil }
-        return UsageText.gateLine(snapshot.usage, mode: mode, now: clock())
+        return UsageText.gateLine(snapshot.usage, mode: mode, now: clock(), timeZone: ownerTimeZone)
     }
 
     // MARK: Loading and polling
@@ -124,6 +141,7 @@ public final class AppModel {
                 try await refreshSnapshot()
             }
             lastDBError = nil
+            await afterTick?()
         } catch {
             report(error)
         }
@@ -151,6 +169,8 @@ public final class AppModel {
         sidebarSelection = .missionControl
         chat = nil
         selectedAgentId = nil
+        selectedItemKey = nil
+        boardSprintId = nil
         activity = []
         search.query = ""
         highlightedMessageId = nil
@@ -181,6 +201,12 @@ public final class AppModel {
         case .missionControl: select(.missionControl)
         case .activity: select(.activity)
         case .agents: select(.agents)
+        case .backlog: select(.backlog)
+        case .board: select(.board)
+        case .inbox: select(.inbox)
+        case .item(let key):
+            select(.backlog)
+            selectedItemKey = key
         case .agent(let handle):
             select(.agents)
             selectedAgentId = snapshot.agents.first { $0.name.lowercased() == handle }?.id
@@ -223,7 +249,19 @@ public final class AppModel {
         let name = form.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let goal = form.goal.trimmingCharacters(in: .whitespacesAndNewlines)
         let store = self.store, root = paths.workspaces
-        let company = try await Task.detached { try store.createCompany(name: name, goal: goal, workspacesRoot: root) }.value
+        let count = form.agentCount, packId = form.packId, mode = form.usageMode
+        let company = try await Task.detached { () -> Company in
+            // The seat budget follows the plan tier (`Store.seatBudget()`); the rest of the shape waits as vacancies.
+            let seats = store.seatBudget()
+            var company = try store.createCompany(name: name, goal: goal, workspacesRoot: root, packId: packId)
+            if count > 0, let pack = store.catalog.pack(packId) {
+                let plan = try OrgGenerator.generate(goal: goal, count: count, pack: pack)
+                let staffed = OrgGenerator.staff(plan: plan, pack: pack, readyWidth: 0, seatBudget: seats)
+                try store.applyOrg(companyId: company.id, plan: staffed.seated, pack: pack, vacancies: staffed.vacancies)
+            }
+            if mode != company.usageMode { company = try store.updateCompany(id: company.id) { $0.usageMode = mode } }
+            return company
+        }.value
         await selectCompany(company.id)
         return company
     }

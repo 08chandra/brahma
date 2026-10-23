@@ -13,7 +13,7 @@ import GRDB
     let root = try tempDir(); let s = try Store.inMemory()
     let c = try s.createCompany(name: "Acme Labs", goal: "Build a todo app", workspacesRoot: root)
     #expect(c.slug == "acme-labs"); #expect(c.status == .running)
-    #expect(c.usageMode == .low); #expect(c.priorityWeight == 1)
+    #expect(c.usageMode == .balanced); #expect(c.priorityWeight == 1)
     #expect(FileManager.default.fileExists(atPath: root.appending(path: "acme-labs").path))
     #expect(try s.company(id: c.id) == c)
     #expect(try s.companies().count == 1)

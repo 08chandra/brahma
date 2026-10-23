@@ -14,6 +14,10 @@ cleanup() {
 }
 trap cleanup EXIT
 export BRAHMA_HOME="$TMP/home"
+# Dev/demo only: keep the owner-key hash in the temp home so nothing here touches the login Keychain (a rebuilt
+# ad-hoc-signed binary makes macOS ask for the login password on every Keychain access). The CLI and app refuse
+# this for the default data home.
+export BRAHMA_OWNER_KEY_STORE=file
 export BRAHMA_WORKSPACES="$TMP/workspaces"
 export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"
 mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"
@@ -41,15 +45,28 @@ stop_cli() {
 }
 
 # (A) App embeds the engine; quitting pauses it; the bundled MCP helper path works end to end.
-set +e
-OUT="$($APP --smoke-test --smoke-hold=8)"
-STATUS=$?
-set -e
+# The app is held until @ceo's fake-turn DM is in the log (a first launch after a clean build can take well over a fixed
+# hold before the engine's first turn finishes), then released; 90 s is only the upper bound.
+$APP --smoke-test --smoke-hold=90 --smoke-release="$TMP/release-a" >"$TMP/app-a.out" 2>&1 &
+APP_PID=$!
+START=$(date +%s)
+SEEN=""
+while kill -0 "$APP_PID" 2>/dev/null && [ $(( $(date +%s) - START )) -lt 80 ]; do
+  if "$CLI" log Acme @ceo 2>/dev/null | grep -q 'Acknowledged (fake turn).'; then SEEN=1; break; fi
+  sleep 0.2
+done
+touch "$TMP/release-a"
+STATUS=0
+wait "$APP_PID" || STATUS=$?
+APP_PID=""
+OUT="$(cat "$TMP/app-a.out")"
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case A exit $STATUS"
-echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=embedded' || fail "case A: expected engine=embedded"
+[ -n "$SEEN" ] || fail "case A: no fake-turn DM from @ceo within 80 s"
+echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded.* released=yes' || fail "case A: expected engine=embedded, released"
 if "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running'; then fail "case A: agents still running after quit"; fi
 "$CLI" log Acme @ceo | grep -q 'Acknowledged (fake turn).' || fail "case A: no fake-turn DM from @ceo"
+echo "SMOKE OK case=A fake-turn-dm after $(( $(date +%s) - START ))s"
 
 # (B) A terminal engine holds the lock: the app shows it as external.
 start_cli
@@ -60,7 +77,7 @@ STATUS=$?
 set -e
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case B exit $STATUS"
-echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=external' || fail "case B: expected engine=external"
+echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=external' || fail "case B: expected engine=external"
 stop_cli
 
 # (C) The terminal engine stops while the app runs: the app takes over.
@@ -73,7 +90,7 @@ stop_cli
 wait "$APP_PID" || fail "case C: app exited non-zero"
 APP_PID=""
 cat "$TMP/app.out"
-grep -q '^SMOKE OK companies=2 agents=4 engine=embedded' "$TMP/app.out" || fail "case C: expected engine=embedded after takeover"
+grep -q '^SMOKE OK companies=3 agents=10 engine=embedded' "$TMP/app.out" || fail "case C: expected engine=embedded after takeover"
 
 # (D) Closing the main window keeps the app and engine alive in the menu bar; reopening restores the window.
 set +e
@@ -82,11 +99,13 @@ STATUS=$?
 set -e
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case D exit $STATUS"
-echo "$OUT" | grep -q '^SMOKE OK companies=2 agents=4 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
+echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
 
 # (E) A second SIGTERM while the first quit is stopping the engine must not skip the bounded stop.
 "$CLI" say Acme @ceo "Status update, please." >/dev/null
-FAKE_CLAUDE_SLEEP=60 FAKE_CLAUDE_PIDFILE="$TMP/turn-e.pid" $APP --smoke-test --smoke-hold=120 >"$TMP/app-e.out" 2>&1 &
+# Turns get an allowlisted environment, so the fake claude reads its settings from this file in the data home.
+printf 'export FAKE_CLAUDE_SLEEP=60\nexport FAKE_CLAUDE_PIDFILE=%q\n' "$TMP/turn-e.pid" >"$BRAHMA_HOME/fake-claude.env"
+$APP --smoke-test --smoke-hold=120 >"$TMP/app-e.out" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 100); do
   "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running' && break
