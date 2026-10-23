@@ -6,7 +6,7 @@ through channels and DMs, backed by one SQLite database.
 
 ## Status
 
-This is **Plan 2: Mac app shell** on top of the Plan 1 engine and `brahma` CLI.
+This is **Plan 3a: the work system** (backlog, checks, review, Inbox) on top of the Plan 2 Mac app and the Plan 1 engine and `brahma` CLI.
 
 ## Build
 
@@ -65,6 +65,127 @@ brahma run [--hard-cap 16] [--profile workspace|full]
   warning alone (e.g. on the seven-day window) does not stop turns.
 
 `brahma mcp` is internal: each agent turn launches it as that agent's company-tools MCP server.
+
+## Work system
+
+Plan 3a adds a backlog, a board, checks, review and an Inbox on top of the chat engine. The engine is the referee:
+no agent tool, CLI command or app action can mark an item `inReview` or `done`, record a verification run, or merge
+into `main`.
+
+**Items.** Statuses are exactly Backlog, Ready, In progress, In review, Done and Blocked. Create items with
+`brahma items add` (types come from the company's industry pack: epic, task, bug and so on). An item carries a tier
+(S, M or L, which sets its turn and token budget), an owner, a reviewer, an optional parent, dependencies and a check.
+
+**Checks.** A check is a shell command plus the repo paths it covers. The engine, not the agent, runs it in the item's
+git worktree with `/bin/sh` when the agent calls `submit_for_review`. A failure goes back to the agent with the output
+tail. A pass that needed a second run is marked flaky and flagged for the reviewer. A failure caused by the network,
+your account or the disk is `inconclusive`: it is re-run later (3 retries, 300 active seconds apart) and never counted
+against the agent.
+
+**Leases and worktrees.** The engine leases a Ready item to an idle owner (or an agent claims it with `claim_lease`).
+The holder works in a private git worktree under `.brahma/wt`. A lease lasts 7200 company-active seconds, is renewed by
+every successful holder turn, and never expires while the item is in review. Killing an agent reaps its leases without
+losing work.
+
+**Review and merge.** A submitted item is reviewed in a fresh, clean-context session by its reviewer: the reviewer sees
+the diff, the check result and the flags, not the author's conversation. Review flags (a check edited after start,
+deleted or modified tests, an edited check script, code changed after the pass, a flaky pass) need explicit approval.
+Three rejected attempts escalate. On approval the engine re-verifies and merges the verified SHA into `main`.
+Small tier-S changes under `autoMergePaths` (default `Sources/ src/ lib/ app/ docs/`) set up by a lead merge
+automatically and are audited 100%; switch with `brahma settings auto-merge on|off`.
+
+**Sessions and hand-offs.** Each agent keeps one session per item it works on (plus its base session for chat), so
+returning to an item resumes with its context. When work moves between agents, or an agent is killed or paused, a
+hand-off note is written and travels with the item.
+
+**Membership versus wake.** Being in a channel never wakes an agent. A message wakes only the agents it mentions
+(`@eng-7`), DMs, or `@here`/`@team` (2 per poster per hour, owner exempt); system posts wake nobody. This is what keeps
+a 300-agent company quiet.
+
+**Time.** Durations (lease TTL, sprint timebox, reminder aging, deadlock re-escalation) count company-active seconds, so
+a pause, an engine hold or a closed laptop freezes them. Calendar text (`HH:mm`, dates) uses your time zone
+(`brahma settings timezone`).
+
+**Health gate.** One global hold starts when the network drops (3 failures in 300 s), the account is logged out (2
+failures), the Claude Code CLI changes version (it is re-probed) or the disk falls under 5 GB (released at 6 GB). Failed
+turns do not count against agents, retries do not spin, active time freezes, and everything resumes when the probe
+passes. `brahma doctor` runs the probe by hand.
+
+**Sprints.** `brahma sprint` plans, starts and closes sprints. A sprint has a timebox of 5 active days or 200 team work
+turns, and the engine writes a standup every 86 400 active seconds.
+
+**Inbox.** Agents propose things (a PRD, an architecture, a sprint plan, a release, or any other ask) that go to an
+approver, who may be the CEO or another executive, before they reach you. Ask lifecycle: pending, then approved,
+rejected, answered, rescinded or expired, with reminders to you at 1 and 3 active days. `brahma inbox` lists asks;
+`brahma approve`, `answer` and `rescind` decide them (rescinding reverses what the ask started; for a sprint plan it
+cancels the sprint). If a proposed document changes after it was proposed, approval requires acknowledging the change.
+Autonomy presets (`brahma company autonomy <name> everything|important|auto`): Everything asks you for every ask,
+Important (the default) asks you for the ones that matter and shows internally approved PRDs as waiting for you,
+Auto lets ordinary asks go through once the C-suite approves and gives you an FYI. **Reserved matters** (money,
+contracts, pricing, legal, staffing, stage changes and similar) and questions
+always need you, under every setting.
+
+**Attrition.** A killed or paused agent's leases are reaped, its items unassigned with an auto-hand-off, its reviews
+and internal asks re-routed, and its reports reparented (an over-span raises an org issue). If the CEO is killed an
+acting CEO is named, pending your confirmation. Handles are never reused. `brahma org move|acting` changes the tree.
+
+**Why is nothing running?** `brahma why <company>` explains in one list: an engine hold, a paused company, usage or
+weekly pace, agents blocked on someone, asks waiting for you, deadlocks, long-blocked items, or no Ready items.
+
+**Budgets, watchdog, facts.** Each tier has a turn and counted-token budget (S 6 / 300 000, M 15 / 1 000 000, L 30 /
+3 000 000). A watchdog nudges after 3 turns without progress, escalates after 5, and stops loops (5 identical calls or
+results, 3 identical turn signatures). When an item is done the engine records outcome facts (first-pass, runs, rework,
+turns, tokens, cost); they are only recorded, never used to schedule or judge: `brahma perf facts`.
+
+**Weekly pacing.** Spend is paced against a straight line across your seven-day window, keeping a reserve for you
+(30% by default; `brahma company reserve <company> <reserve>` overrides it for one company). When ahead of the line only work that others wait on runs; past the reserve
+nothing runs.
+
+**Work modes.** The engine picks Quick, Standard or Deep per turn. Plan-first is off on this CLI version (probe V-4);
+sub-agents (Task/Agent/Workflow) are off until the sandbox (5-lite). The plan tier is a setting (`brahma settings plan`,
+default max5x).
+
+**Engine git safety.** Engine git ignores repository filters, drivers, hooks and replace objects, and allowlists
+repository config. Workspaces whose repo config has `remote.*` (clones), LFS, `core.autocrlf`, aliases or submodules
+are refused until 5-lite. Merges run in an engine-owned repo under the data home and land only the verified SHA.
+Uncommitted changes found on `main` are quarantined under `refs/brahma/quarantine/*` and need
+`brahma main accept <company> <ref>`; "main changed outside Brahma" needs `brahma main accept <company>`.
+
+**Owner key.** `brahma owner init` (in an interactive terminal) or the Mac app creates it. It is a deterrent until
+5-lite, not a boundary; `BRAHMA_OWNER_KEY_STORE=file` is only for temp or demo homes.
+
+**Commands.**
+
+```
+brahma company create <name> --goal <text> [--agents <n>]   n agents (default 6; 0 for none; over 50 is experimental)
+brahma org [show|vacancies|fill]; brahma org move <company> <handle> ...; brahma org acting <company> <handle>
+brahma items list|show|add|edit|depend|confirm ...          the backlog
+brahma inbox <company> [--all]                              asks: pending, FYI, recently decided
+brahma approve <company> <ask> [--reject] [--note <text>] [--ack-changed]
+brahma answer <company> <ask> <text>
+brahma rescind <company> <ask> --note <text>
+brahma company autonomy <company> everything|important|auto
+brahma company reserve <company> <reserve>                  weekly owner reserve for one company
+brahma settings timezone [<id>]                             (also: plan, share, auto-merge, auto-merge-paths)
+brahma sprint [show|list]
+brahma why <company>                                        why little or nothing is running
+brahma perf facts <company>                                 outcome facts of finished items
+brahma main accept <company> [<ref>]                        after main changed outside Brahma, or a quarantine
+brahma doctor                                               probe the installed Claude Code CLI
+```
+
+### Workspace profile limits
+
+**Checks and merges run as your user.** Each item's check runs in that item's git worktree with `/bin/sh`.
+Verification, merges and owner approvals are engine-owned for every agent tool, but under the workspace profile an
+agent's shell can still edit the database or the git repository directly, or run the brahma CLI. Brahma refuses owner
+commands when `BRAHMA_AGENT_ID` is set and strips `BRAHMA_DEV` from agent turns, but an agent can unset variables. Only
+the sandbox (Plan 5-lite) makes verification and approvals tamper-proof.
+
+A nested `claude` launched from an agent's Bash can load your settings (`fastMode`, `enableWorkflows`) and Keychain
+auth. Brahma sets environment defusers, but an agent can unset them, which is why sub-agents and Ultra wait for the
+sandbox. Other 5-lite residuals: the race between the git-config scan and the command that follows it, agent worktrees
+under `.brahma/wt`, and the database and MCP configs staying readable by agent shells.
 
 ## Data locations
 
