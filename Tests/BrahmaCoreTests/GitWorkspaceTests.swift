@@ -112,9 +112,16 @@ import Foundation
         try f.write("b.txt", "two")
         let lock = f.root.appending(path: ".git/index.lock")
         try Data().write(to: lock)
-        Thread.detachNewThread { Thread.sleep(forTimeInterval: 0.15); try? FileManager.default.removeItem(at: lock) }
-        let sha = try f.ws.commitAll(in: f.root, message: "after the lock")
+        // The lock goes between the first try and its retry (the retry hook), not on a timer that races git.
+        let retries = TamperLog()
+        var ws = f.ws
+        ws.gitRetryProbe = { attempt in
+            retries.add("\(attempt)")
+            try? FileManager.default.removeItem(at: lock)
+        }
+        let sha = try ws.commitAll(in: f.root, message: "after the lock")
         #expect(sha != nil)
+        #expect(retries.all == ["1"], "one retry, after the lock was cleared: \(retries.all)")
         // A lock that never goes away fails with the git error after the retries.
         try f.write("c.txt", "three")
         try Data().write(to: lock)
@@ -1865,6 +1872,121 @@ import Foundation
         #expect(!FileManager.default.fileExists(atPath: lock.path)); #expect(!FileManager.default.fileExists(atPath: branchLock.path))
     }
 
+    /// H1: the merge queue's self-heal works on descriptors only. A directory its lock walk is about to enter, or `info` right
+    /// before `info/grafts` goes, is swapped for a link to an outside directory: nothing there is removed.
+    @Test func selfHealNeverFollowsADirectorySwappedForALink() throws {
+        let fm = FileManager.default
+        let old = Date().addingTimeInterval(-3600)
+        for (trigger, swapped) in [("scratch/sub", "scratch/sub"), ("info/grafts", "info")] {
+            let outside = try tempDir()
+            for name in ["victim.lock", "grafts", "keep.txt"] {
+                let url = outside.appending(path: name)
+                try "outside\n".write(to: url, atomically: true, encoding: .utf8)
+                try fm.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+            }
+            let before = try tree(outside)
+            let swaps = TamperLog()
+            let b = try Behind(ws: { root in
+                var ws = GitWorkspace(root: root)
+                ws.healProbe = { stage in
+                    guard stage == trigger, swaps.all.isEmpty else { return }
+                    let dir = root.appending(path: ".git/\(swapped)")
+                    try? FileManager.default.moveItem(at: dir, to: URL(fileURLWithPath: dir.path + "-moved"))
+                    try? FileManager.default.createSymbolicLink(at: dir, withDestinationURL: outside)
+                    swaps.add(stage)
+                }
+                return ws
+            })
+            // A real stale lock where the walk goes, and a planted `info/grafts`, so the heal has something to remove there.
+            let inner = b.f.root.appending(path: ".git/scratch/sub/inner.lock")
+            try fm.createDirectory(at: inner.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "".write(to: inner, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.modificationDate: old], ofItemAtPath: inner.path)
+            try "\(b.k1)\n".write(to: b.f.root.appending(path: ".git/info/grafts"), atomically: true, encoding: .utf8)
+            _ = try? b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in })
+            #expect(swaps.all == [trigger], "\(trigger): the probe ran")
+            #expect(try tree(outside) == before, "\(trigger): the self-heal removed a file outside the git dir through a link")
+        }
+    }
+
+    /// N4: a workspace config refused at a landing's fetch is the company's fault at once: main's history is not bundled from
+    /// the previous engine repository (nothing there is touched) and nothing is reported as restored.
+    @Test func aRefusedConfigAtTheLandingFetchRestoresNothing() throws {
+        let home = try tempDir()
+        let planted = TamperLog()
+        let b = try Behind(ws: { root in
+            var ws = GitWorkspace(root: root, mergeDirectory: home.appending(path: "run/merge/c1"), exportHome: home)
+            ws.testHook = { stage in
+                guard stage == "fetch", planted.all.isEmpty else { return }
+                planted.add(stage)
+                _ = try? GitFixture.plainGit(["config", "uploadpack.packObjectsHook", "touch /tmp/never"], in: root)
+            }
+            return ws
+        })
+        // An export fetches main into the engine repository; the next landing keeps that one aside as the previous one.
+        _ = try b.ws.addEngineExport(runId: "run-1", commit: b.mainHead)
+        #expect(planted.all.isEmpty, "an export's fetch is not the landing's")
+        var reported: [[String]] = []
+        let error = try #require(throws: MergeInfrastructureError.self) {
+            try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in }, tamper: { reported.append($0) })
+        }
+        #expect(planted.all == ["fetch"], "the config was planted before the fetch")
+        #expect((error.underlying as? GitError)?.isRepositoryRefusal == true, "\(error)")
+        #expect(reported.isEmpty, "\(reported)")
+        let previous = b.ws.previousRepositoryPath
+        #expect(exists(previous.appending(path: "objects")), "the previous engine repository is kept")
+        #expect(try GitFixture.plainGit(["for-each-ref", "refs/brahma/"], in: previous).isEmpty, "main's history was bundled for a refused config")
+        #expect(!exists(URL(fileURLWithPath: home.appending(path: "run/merge/c1").path + "-heal.bundle")))
+    }
+
+    /// N1: two paths of a tree that differ in bytes but name one file on this volume (the NFC and NFD forms of one name) are
+    /// refused for an export, the item's fault: tar would silently keep only one of them.
+    @Test func normalizationVariantsCollideInAnExport() throws {
+        let home = try tempDir()
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let scratch = try tempDir()
+        let env = ["GIT_INDEX_FILE": scratch.appending(path: "index").path]
+        try f.git(["read-tree", "refs/heads/main"], env: env)
+        // The names go in on stdin: `Process` hands its arguments over in the file system's form, which would make them one.
+        var info = ""
+        for (name, text) in [("caf\u{E9}.txt", "composed\n"), ("cafe\u{301}.txt", "decomposed\n")] {
+            let blob = try f.git(["hash-object", "-w", try f.write("blob-\(text.count)", text, in: scratch).path])
+            info += "100644 \(blob)\t\(name)\n"
+        }
+        let infoFile = scratch.appending(path: "index-info")
+        try Data(info.utf8).write(to: infoFile)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = ["git", "-C", f.root.path, "-c", "core.precomposeunicode=false", "update-index", "--index-info"]
+        p.environment = ProcessInfo.processInfo.environment.merging(env.merging(["GIT_CONFIG_GLOBAL": "/dev/null"]) { $1 }) { $1 }
+        p.standardInput = try FileHandle(forReadingFrom: infoFile)
+        try p.run(); p.waitUntilExit()
+        #expect(p.terminationStatus == 0)
+        let tree = try f.git(["write-tree"], env: env)
+        let names = try f.git(["-c", "core.precomposeunicode=false", "ls-tree", "-z", "--name-only", tree])
+        #expect(names.split(separator: "\0").count == 3, "both forms are in the tree")
+        let commit = try f.git(["commit-tree", tree, "-p", "refs/heads/main", "-m", "two forms of one name"])
+        try f.git(["update-ref", "refs/heads/item/V-1", commit])
+        let ws = GitWorkspace(root: f.root, mergeDirectory: home.appending(path: "run/merge/c1"), exportHome: home)
+        let error = try #require(throws: UnexportableTree.self) { try ws.addEngineExport(runId: "run-1", commit: commit) }
+        #expect(error.reason.contains("collide"), "\(error)")
+        #expect(!exists(ws.exportPath(runId: "run-1")))
+    }
+
+    /// N2: a tree whose listing is too long to inspect for colliding paths is refused, never exported unchecked.
+    @Test func aTreeTooLargeToInspectIsRefused() throws {
+        let home = try tempDir()
+        let f = try GitFixture(files: ["a.txt": "one", "dir/b.txt": "two", "dir/c.txt": "three"])
+        let main = try f.git(["rev-parse", "refs/heads/main"])
+        var ws = GitWorkspace(root: f.root, mergeDirectory: home.appending(path: "run/merge/c1"), exportHome: home)
+        ws.collisionListingLimit = 40
+        let error = try #require(throws: UnexportableTree.self) { try ws.addEngineExport(runId: "run-1", commit: main) }
+        #expect(error.reason.contains("too large to inspect"), "\(error)")
+        #expect(!exists(ws.exportPath(runId: "run-1")))
+        ws.collisionListingLimit = 64 << 20
+        #expect(try String(contentsOf: try ws.addEngineExport(runId: "run-1", commit: main).appending(path: "a.txt"), encoding: .utf8) == "one")
+    }
+
     @Test func objectsWrittenStraightIntoTheEngineRepositoryNeverReachAMerge() throws {
         let engine = try tempDir().appending(path: "run/merge/c1", directoryHint: .isDirectory)
         let d = try Driven(ws: { GitWorkspace(root: $0, mergeDirectory: engine) })
@@ -1902,6 +2024,22 @@ import Foundation
             #expect("\(error)".contains("fsck") || "\(error)".contains("missingEmail"), "\(error)")
         }
         #expect(try b.ws.head(of: GitWorkspace.mainRef) == b.mainHead)
+    }
+
+    /// The author's checkout follows a rebase the engine made (`syncItemCheckout`, through `resetHard`): untracked leftovers
+    /// (a file, a directory) do not survive the sync (`clean -fd`).
+    @Test func aRebasedItemCheckoutIsSyncedAndCleaned() throws {
+        let b = try Behind()
+        let wt = b.ws.worktreePath(key: "K-1")
+        try b.f.write("leftover.txt", "stray\n", in: wt)
+        try b.f.write("stray-dir/x.txt", "stray\n", in: wt)
+        let outcome = try b.ws.landVerified(key: "K-1", verified: b.k1, expectedMain: b.mainHead, recordPending: { _ in })
+        guard case .rebased(let head) = outcome else { Issue.record("K-1 should have been rebased: \(outcome)"); return }
+        #expect(try b.ws.headCommit(in: wt) == head)
+        #expect(!exists(wt.appending(path: "leftover.txt")), "an untracked file survived the sync")
+        #expect(!exists(wt.appending(path: "stray-dir")), "an untracked directory survived the sync")
+        #expect(exists(wt.appending(path: "m.txt")), "the checkout holds the rebased tree")
+        #expect(try !b.ws.isDirty(in: wt))
     }
 
     @Test func mainsHistoryIsTheCompanysFaultAndAPlantedShallowIsHealed() throws {

@@ -1028,6 +1028,19 @@ import GRDB
         #expect(try r.ws.isAncestor(sha, of: try r.mainHead()))
     }
 
+    /// N6: a merged quarantine ask cannot be rescinded: its commit is in main, and a rescind would only misstate that.
+    @Test func aMergedQuarantineAskCannotBeRescinded() async throws {
+        let r = try R()
+        let (_, _, ref) = try await quarantined(r)
+        let ask = try #require(try quarantineAsks(r).first)
+        let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
+        _ = try r.store.ownerDecide(askId: ask.id, approve: true)
+        let message = r.failure { _ = try r.store.ownerRescind(askId: ask.id, note: "undo"); return "" }
+        #expect(message.contains("merged into main") && message.contains("cannot be rescinded"), "\(message)")
+        #expect(try r.store.ask(id: ask.id)?.status == .approved)
+        #expect(try r.mainHead() == sha)
+    }
+
     /// A2: approving a quarantine whose ref moved since Brahma asked is refused and flagged; nothing is merged, the ask stays
     /// open and the hold stays. Rejecting it then leaves main as it is and keeps the ref for inspection; the hold is released,
     /// and a later `main accept` of the ref still merges exactly the recorded commit (and says the ask was rejected).

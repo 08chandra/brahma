@@ -312,7 +312,8 @@ struct GitCommand: Sendable {
         else { throw GitError.failed(command: label, status: -1, stderr: "no temporary space for git output") }
         defer {
             try? outHandle.close(); try? errHandle.close()
-            try? FileManager.default.removeItem(at: outURL); try? FileManager.default.removeItem(at: errURL)
+            let temp = FileManager.default.temporaryDirectory
+            _ = try? EngineFiles.removeNoFollow(outURL, under: temp); _ = try? EngineFiles.removeNoFollow(errURL, under: temp)
         }
         process.standardOutput = outHandle
         process.standardError = errHandle
@@ -445,7 +446,12 @@ enum RepoConfigGuard {
            FileManager.default.contents(atPath: file.path) == Data(content.utf8) {
             return nil
         }
-        if lstat(file.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG { try? FileManager.default.removeItem(at: file) }
+        if lstat(file.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG {
+            // Through descriptors from the common dir's parent: a part swapped for a link meanwhile is never followed.
+            guard case .removed? = try? EngineFiles.removeNoFollow(file, under: commonDir.deletingLastPathComponent()) else {
+                return "cannot replace \(GitWorkspace.shown(file.path))"
+            }
+        }
         do { try Data(content.utf8).write(to: file, options: .atomic) } catch {
             return "cannot write \(GitWorkspace.shown(file.path))"
         }
@@ -501,6 +507,14 @@ public struct GitWorkspace: Sendable {
     enum RebasePhase: Sendable { case before, after }
     /// Tests only: called right before `git rebase` runs in the merge checkout and right after it returns.
     var rebaseProbe: (@Sendable (RebasePhase) -> Void)?
+    /// Tests only: called by the merge queue's self-heal with the path (relative to the workspace's git dir) of each directory
+    /// it is about to walk into, and with each planted history file's name (`shallow`, `info/grafts`) right before it is removed.
+    var healProbe: (@Sendable (String) -> Void)?
+    /// How much `ls-tree` output the export's collision check reads (`refuseCollidingPaths`); a tree with more is refused.
+    var collisionListingLimit = 64 << 20
+    /// Tests only: handed to every workspace git command as its `beforeRetry` (between a try that met an `index.lock` and
+    /// its retry), so a test can clear the lock there instead of racing a timer.
+    var gitRetryProbe: (@Sendable (_ attempt: Int) -> Void)?
 
     public init(root: URL, lockDirectory: URL? = nil, mergeDirectory: URL? = nil, exportHome: URL? = nil) {
         self.root = root
@@ -523,7 +537,11 @@ public struct GitWorkspace: Sendable {
     public func branchRef(key: String) -> String { "refs/heads/item/\(key)" }
     private var gitDir: URL { root.appending(path: ".git", directoryHint: .isDirectory) }
     private func adminDir(key: String) -> URL { gitDir.appending(path: "worktrees/\(key)", directoryHint: .isDirectory) }
-    private var main: GitCommand { GitCommand(gitDir: gitDir, workTree: root, commonDir: nil, onRefused: onUnsafeRepository) }
+    private var main: GitCommand {
+        var git = GitCommand(gitDir: gitDir, workTree: root, commonDir: nil, onRefused: onUnsafeRepository)
+        git.beforeRetry = gitRetryProbe
+        return git
+    }
 
     private static func resolved(_ url: URL) -> String { url.resolvingSymlinksInPath().standardizedFileURL.path }
 
@@ -581,7 +599,9 @@ public struct GitWorkspace: Sendable {
             throw GitError.failed(command: "-C \(key)", status: -1,
                                   stderr: "the worktree of \(key) was repointed (\(detail)); what the engine records was put back and nothing was run in it")
         }
-        return (GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir, onRefused: onUnsafeRepository), key)
+        var git = GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir, onRefused: onUnsafeRepository)
+        git.beforeRetry = gitRetryProbe
+        return (git, key)
     }
 
     private static func isRealDirectory(_ url: URL) -> Bool {
@@ -661,7 +681,7 @@ public struct GitWorkspace: Sendable {
         func ensure(_ url: URL, _ text: String) {
             guard Self.regularText(url) != text else { return }
             var st = stat()
-            if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG { try? FileManager.default.removeItem(at: url) }
+            if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG { _ = try? EngineFiles.removeNoFollow(url, under: root) }
             try? text.write(to: url, atomically: true, encoding: .utf8)
         }
         ensure(admin.appending(path: "HEAD"), "ref: \(branchRef(key: key))\n")
@@ -1028,7 +1048,7 @@ public struct GitWorkspace: Sendable {
         guard out.status == 0 else {
             let listing = try git.run(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "--diff-filter=U"], allowFailure: true)
             let files = String(decoding: listing.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
-            try MergeInfrastructureError.wrapping { try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: mainHead) }
+            try MergeInfrastructureError.wrapping { try clearMergeState(admin: mergeRepositoryPath, detachAt: mainHead) }
             _ = try? git.run(["checkout", "--quiet", "--force", "--no-recurse-submodules", "--detach", mainHead], allowFailure: true)
             let nowMain = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
             guard nowMain == mainHead else { return .mainMoved(head: nowMain) }
@@ -1041,7 +1061,7 @@ public struct GitWorkspace: Sendable {
         // HEAD is read once and from then on only that SHA is used; the checks below decide whether it is the merge.
         let rebased = try git.run(["rev-parse", "--verify", "HEAD^{commit}"]).text
         try Self.validCommit(rebased)
-        try MergeInfrastructureError.wrapping { try Self.clearMergeState(admin: mergeRepositoryPath, detachAt: rebased) }
+        try MergeInfrastructureError.wrapping { try clearMergeState(admin: mergeRepositoryPath, detachAt: rebased) }
         let nowMain = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
         guard nowMain == mainHead else { return .mainMoved(head: nowMain) }
         try checkRebase(git, rebased, of: verified, base: base, onto: mainHead, key: key)
@@ -1130,16 +1150,14 @@ public struct GitWorkspace: Sendable {
 
     /// Removes every in-progress operation's state from the merge repository's git dir (the engine's own rebase, or one
     /// planted there) without asking git to undo it, and points its `HEAD` straight at `commit` (detached).
-    private static func clearMergeState(admin: URL, detachAt commit: String) throws {
-        let fm = FileManager.default
+    private func clearMergeState(admin: URL, detachAt commit: String) throws {
         for name in ["rebase-merge", "rebase-apply", "sequencer", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_RR",
                      "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "AUTO_MERGE", "ORIG_HEAD", "BISECT_LOG", "BISECT_START",
                      "index.lock", "MERGE_AUTOSTASH"] {
-            let url = admin.appending(path: name)
-            if (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
+            try removeEngineItem(admin.appending(path: name))
         }
         let head = admin.appending(path: "HEAD")
-        if isSymlink(head) { try fm.removeItem(at: head) }
+        if Self.isSymlink(head) { try removeEngineItem(head) }
         try (commit + "\n").write(to: head, atomically: true, encoding: .utf8)
     }
 
@@ -1164,15 +1182,13 @@ public struct GitWorkspace: Sendable {
 
     /// `shallow` and `info/grafts` in the workspace repository, removed (links too, never followed); their names.
     private func removePlantedHistoryFiles() throws -> [String] {
-        let fm = FileManager.default
         guard Self.isRealDirectory(gitDir) else { return [] }
         var removed: [String] = []
         for name in ["shallow", "info/grafts"] {
-            if name.contains("/"), !Self.isRealDirectory(gitDir.appending(path: (name as NSString).deletingLastPathComponent)) { continue }
-            let url = gitDir.appending(path: name)
-            guard (try? fm.attributesOfItem(atPath: url.path)) != nil else { continue }
-            try fm.removeItem(at: url)
-            removed.append(name)
+            healProbe?(name)
+            // Through descriptors from the workspace (`.git` and `info` opened without following a link): a part of the way
+            // that is a link (`info` swapped meanwhile) is never followed, and nothing is removed through it.
+            if case .removed = try EngineFiles.removeNoFollow(gitDir.appending(path: name), under: root) { removed.append(name) }
         }
         return removed
     }
@@ -1185,32 +1201,26 @@ public struct GitWorkspace: Sendable {
     /// Removes every `*.lock` file under the workspace's common git dir (`objects` aside, no link followed, at most 16 levels
     /// deep) that nobody has touched for `staleLockAge`; the paths removed, relative to the git dir.
     private func clearStaleWorkspaceLocks() throws -> [String] {
-        let fm = FileManager.default
         guard Self.isRealDirectory(gitDir) else { return [] }
-        var removed: [String] = []
-        func walk(_ dir: URL, _ relative: String, depth: Int) throws {
-            guard depth < 16, let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
-            for name in names.sorted() {
-                let url = dir.appending(path: name)
-                let shown = relative.isEmpty ? name : "\(relative)/\(name)"
-                // `attributesOfItem` does not follow a link: a link is never walked into.
-                guard let attributes = try? fm.attributesOfItem(atPath: url.path) else { continue }
-                let type = attributes[.type] as? FileAttributeType
-                if type == .typeDirectory {
-                    if depth == 0, name == "objects" { continue }
-                    try walk(url, shown, depth: depth + 1)
-                    continue
-                }
-                guard name.hasSuffix(".lock"), type == .typeRegular || type == .typeSymbolicLink else { continue }
-                let touched = attributes[.modificationDate] as? Date ?? .distantPast
-                guard Date().timeIntervalSince(touched) >= Self.staleLockAge else { continue }
-                try fm.removeItem(at: url)
-                removed.append(shown)
-            }
-        }
-        try walk(gitDir, "", depth: 0)
-        return removed
+        let now = Date().timeIntervalSince1970
+        // Descriptor-relative (`EngineFiles.removeFilesNoFollow`): every directory is opened by name in its parent's
+        // descriptor with `O_NOFOLLOW` and every lock unlinked relative to its own directory's descriptor, so a directory
+        // swapped for a link mid-walk is never followed. Bounded in depth and in entries looked at.
+        return try EngineFiles.removeFilesNoFollow(under: root, ".git", maxDepth: 16, maxEntries: Self.lockWalkEntryLimit,
+                                                   enter: { relative in
+            guard relative != "objects" else { return false }
+            healProbe?(relative)
+            return true
+        }, shouldRemove: { relative, st in
+            let type = st.st_mode & S_IFMT
+            guard relative.hasSuffix(".lock"), type == S_IFREG || type == S_IFLNK else { return false }
+            let touched = Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
+            return now - touched >= Self.staleLockAge
+        })
     }
+
+    /// How many entries of the workspace's git dir the stale-lock walk looks at, at most (`objects` is never walked).
+    static let lockWalkEntryLimit = 20_000
 
     /// The merge queue's self-heal for missing objects (A3); the caller holds main's and the engine repository's locks.
     /// The previous engine repository (`previousRepositoryPath`, kept from the last landing or export until a fetch works
@@ -1226,8 +1236,8 @@ public struct GitWorkspace: Sendable {
         guard try source.run(["cat-file", "-e", "\(mainHead)^{commit}"], allowFailure: true).status == 0 else { return false }
         try source.run(["update-ref", "--no-deref", "refs/brahma/heal", mainHead])
         let bundle = URL(fileURLWithPath: mergeDirectory.path + "-heal.bundle")
-        if (try? fm.attributesOfItem(atPath: bundle.path)) != nil { try fm.removeItem(at: bundle) }
-        defer { try? fm.removeItem(at: bundle) }
+        try removeEngineItem(bundle)
+        defer { _ = try? removeEngineItem(bundle) }
         guard try source.run(["bundle", "create", "--quiet", bundle.path, "refs/brahma/heal"], allowFailure: true).status == 0 else { return false }
         try main.run(["bundle", "unbundle", bundle.path])
         return true
@@ -1258,10 +1268,10 @@ public struct GitWorkspace: Sendable {
             if !Self.isSymlink(repo), (try? fm.attributesOfItem(atPath: previous.path)) == nil {
                 try fm.moveItem(at: repo, to: previous)
             } else {
-                try fm.removeItem(at: repo)
+                try removeEngineItem(repo)
             }
         }
-        for url in [tree] where (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
+        try removeEngineItem(tree)
         try fm.createDirectory(at: tree, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         let git = engineCommand
         try git.run(["init", "--quiet", "--template="])
@@ -1273,10 +1283,17 @@ public struct GitWorkspace: Sendable {
     /// has worked (`dropPreviousEngineRepository`).
     var previousRepositoryPath: URL { URL(fileURLWithPath: mergeDirectory.path + "-prev.git", isDirectory: true) }
 
+    /// Removes `url` (the engine repository, its working tree, a bundle or archive beside it, or something inside them) through
+    /// descriptors from `<home>/run/merge` (`EngineFiles.removeNoFollow`): a link is removed, never followed, and nothing is
+    /// removed through a part of the way that is a link. No path is rebuilt.
+    @discardableResult
+    private func removeEngineItem(_ url: URL) throws -> EngineFiles.Removal {
+        try EngineFiles.removeNoFollow(url, under: mergeDirectory.deletingLastPathComponent())
+    }
+
     /// A fetch into the current engine repository worked: it holds `main`'s history now, so the previous one goes.
     private func dropPreviousEngineRepository() {
-        let previous = previousRepositoryPath
-        if (try? FileManager.default.attributesOfItem(atPath: previous.path)) != nil { try? FileManager.default.removeItem(at: previous) }
+        _ = try? removeEngineItem(previousRepositoryPath)
     }
 
     /// Writes the engine repository's `config` and `info/attributes` in full (no includes, no hooks, no fsmonitor, no
@@ -1292,18 +1309,20 @@ public struct GitWorkspace: Sendable {
             throw GitError.failed(command: "merge repository", status: -1, stderr: "the engine's merge repository is missing")
         }
         let config = repo.appending(path: "config")
-        if Self.isSymlink(config) { try fm.removeItem(at: config) }
+        if Self.isSymlink(config) { try removeEngineItem(config) }
         try Self.engineConfig.write(to: config, atomically: true, encoding: .utf8)
         let info = repo.appending(path: "info", directoryHint: .isDirectory)
-        if Self.isSymlink(info) { try fm.removeItem(at: info) }
+        if Self.isSymlink(info) { try removeEngineItem(info) }
         try fm.createDirectory(at: info, withIntermediateDirectories: true)
         let attributes = info.appending(path: "attributes")
-        if Self.isSymlink(attributes) { try fm.removeItem(at: attributes) }
+        if Self.isSymlink(attributes) { try removeEngineItem(attributes) }
         try Self.engineAttributes.write(to: attributes, atomically: true, encoding: .utf8)
         for name in ["config.worktree", "commondir", "shallow", "info/grafts", "objects/info/alternates", "objects/info/http-alternates",
                      "worktrees", "hooks"] {
-            let url = repo.appending(path: name)
-            if (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
+            // A part of the way that is a link (`objects/info`) is the engine repository gone wrong: refused, never followed.
+            if case .blocked(let problem) = try removeEngineItem(repo.appending(path: name)) {
+                throw GitError.failed(command: "merge repository", status: -1, stderr: "\(problem)")
+            }
         }
     }
 
@@ -1342,10 +1361,15 @@ public struct GitWorkspace: Sendable {
     /// reported through `tamper`); only when that is not possible, or does not help, is it the company's fault.
     private func fetchLandingInputs(_ engine: GitCommand, mainHead: String, verified: String, tamper: ([String]) -> Void) throws {
         try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
+        testHook?("fetch")
         do {
             try fetchIntoEngine(engine, commits: [mainHead, verified])
         } catch {
+            // A refused workspace config (its own alert) is the company's fault as it stands: nothing is fetched, bundled or
+            // restored through a repository the engine will not run git in.
+            if (error as? GitError)?.isRepositoryRefusal == true { throw MergeInfrastructureError(underlying: error) }
             if let fault = mainHistoryFault(engine, mainHead: mainHead) {
+                if (fault.underlying as? GitError)?.isRepositoryRefusal == true { throw fault }
                 guard try MergeInfrastructureError.wrapping({ try restoreMainHistory(mainHead) }) else { throw fault }
                 tamper([Self.restoredHistoryNote])
                 if mainHistoryFault(engine, mainHead: mainHead) != nil { throw fault }
@@ -1360,6 +1384,7 @@ public struct GitWorkspace: Sendable {
     private func mainHistoryFault(_ engine: GitCommand, mainHead: String) -> MergeInfrastructureError? {
         do { try fetchIntoEngine(engine, commits: [mainHead]); return nil } catch let mainError {
             if let fault = mainError as? MergeInfrastructureError { return fault }
+            if (mainError as? GitError)?.isRepositoryRefusal == true { return MergeInfrastructureError(underlying: mainError) }
             return MergeInfrastructureError(underlying: GitError.failed(
                 command: "fetch main", status: -1, stderr: "main's history (\(mainHead.prefix(7))) could not be fetched: \(mainError)"))
         }
@@ -1398,12 +1423,11 @@ public struct GitWorkspace: Sendable {
     /// `index-pack`). No transport runs in the workspace, so nothing in its config (`url.*.insteadOf`, `core.sshCommand`,
     /// remotes) takes part.
     private func handBack(_ engine: GitCommand, result: String, prerequisites: [String]) throws {
-        let fm = FileManager.default
         let ref = "refs/brahma/result"
         try engine.run(["update-ref", "--no-deref", ref, result])
         let bundle = URL(fileURLWithPath: mergeDirectory.path + "-result.bundle")
-        if (try? fm.attributesOfItem(atPath: bundle.path)) != nil { try fm.removeItem(at: bundle) }
-        defer { try? fm.removeItem(at: bundle) }
+        try removeEngineItem(bundle)
+        defer { _ = try? removeEngineItem(bundle) }
         try engine.run(["bundle", "create", "--quiet", bundle.path, ref] + prerequisites.map { "^\($0)" })
         try main.run(["bundle", "unbundle", bundle.path])
         guard try main.run(["cat-file", "-e", "\(result)^{commit}"], allowFailure: true).status == 0 else {
@@ -1416,14 +1440,9 @@ public struct GitWorkspace: Sendable {
     /// followed; never throws.
     private func retireWorkspaceMergeCheckouts() {
         retireLegacyMergeCheckout()
-        let fm = FileManager.default
-        let previous = mergeDirectory.appending(path: ".merge", directoryHint: .isDirectory)
-        if (try? fm.attributesOfItem(atPath: previous.path)) != nil { try? fm.removeItem(at: previous) }
-        let worktrees = gitDir.appending(path: "worktrees", directoryHint: .isDirectory)
-        guard !Self.isSymlink(worktrees) else { return }
+        _ = try? removeEngineItem(mergeDirectory.appending(path: ".merge", directoryHint: .isDirectory))
         for name in ["-merge", ".merge"] {
-            let admin = worktrees.appending(path: name)
-            if (try? fm.attributesOfItem(atPath: admin.path)) != nil { try? fm.removeItem(at: admin) }
+            _ = try? EngineFiles.removeNoFollow(gitDir.appending(path: "worktrees/\(name)"), under: root)
         }
     }
 
@@ -1469,7 +1488,7 @@ public struct GitWorkspace: Sendable {
             // it out, and kept out of the quarantine commit and the clean whatever that file says.
             try ensureExclude()
             let index = FileManager.default.temporaryDirectory.appending(path: "brahma-quarantine-\(UUID().uuidString).index")
-            defer { try? FileManager.default.removeItem(at: index) }
+            defer { _ = try? EngineFiles.removeNoFollow(index, under: FileManager.default.temporaryDirectory) }
             let staged = main.withIndex(index)
             try staged.run(["read-tree", expectedMain])
             try staged.run(["add", "-A"])
@@ -1670,9 +1689,8 @@ public struct GitWorkspace: Sendable {
             let repaired = try withMainLock(infrastructure: true) { try MergeInfrastructureError.wrapping { try removePlantedHistoryFiles() } }
             if !repaired.isEmpty { tamper(repaired) }
         }
-        let fm = FileManager.default
         let archive = URL(fileURLWithPath: mergeDirectory.path + "-export-\(runId).tar")
-        defer { try? fm.removeItem(at: archive) }
+        defer { _ = try? removeEngineItem(archive) }
         do {
             try withEngineLock { try archiveLocked(commit: commit, to: archive, exports: exports) }
         } catch let missing as MainHistoryMissing {
@@ -1709,7 +1727,6 @@ public struct GitWorkspace: Sendable {
     /// `main`'s head alone decides: `main` not fetchable is `MainHistoryMissing`, otherwise it is the commit's fault), refuses
     /// a tree whose paths collide on the exports' volume, and writes the archive.
     private func archiveLocked(commit: String, to archive: URL, exports: EngineFiles.OpenDirectory) throws {
-        let fm = FileManager.default
         let git = try MergeInfrastructureError.wrapping { try freshEngineRepository() }
         try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
         do { try fetchIntoEngine(git, commits: [commit]) } catch {
@@ -1718,12 +1735,15 @@ public struct GitWorkspace: Sendable {
             guard let mainHead = try MergeInfrastructureError.wrapping({ try head(of: Self.mainRef) }) else {
                 throw MergeInfrastructureError(underlying: error)
             }
-            if let fault = mainHistoryFault(git, mainHead: mainHead) { throw MainHistoryMissing(mainHead: mainHead, underlying: fault) }
+            if let fault = mainHistoryFault(git, mainHead: mainHead) {
+                if (fault.underlying as? GitError)?.isRepositoryRefusal == true { throw fault }
+                throw MainHistoryMissing(mainHead: mainHead, underlying: fault)
+            }
             throw UnexportableTree(reason: "\(commit.prefix(7)) could not be fetched from the workspace repository (\(Self.oneLine(error)))")
         }
         dropPreviousEngineRepository()
         try MergeInfrastructureError.wrapping {
-            if (try? fm.attributesOfItem(atPath: archive.path)) != nil { try fm.removeItem(at: archive) }
+            try removeEngineItem(archive)
             try assertEngineState()
         }
         try refuseCollidingPaths(git, commit: commit, on: exports)
@@ -1735,27 +1755,34 @@ public struct GitWorkspace: Sendable {
         }
     }
 
-    /// On a case-insensitive volume (the exports' own, asked of its descriptor), two paths of the tree that differ only in
-    /// case (or Unicode normalization) would be unpacked as one, silently (`tar -k` keeps the first): such a tree is refused.
+    /// Two paths of the tree that are different bytes but one name on the exports' volume would be unpacked as one, silently
+    /// (`tar -k` keeps the first): such a tree is refused. macOS volumes never tell Unicode normalization forms apart (NFC
+    /// and NFD of one name are one file); a case-insensitive volume (the exports' own, asked of its descriptor) also folds
+    /// case. Names are keyed by their case folding (`.caseInsensitive`, close to APFS's) under Swift's canonical
+    /// equivalence, and two names collide when their keys match while their bytes differ (`utf8.elementsEqual`). A listing
+    /// too long to read whole is refused rather than exported unchecked.
     private func refuseCollidingPaths(_ git: GitCommand, commit: String, on exports: EngineFiles.OpenDirectory) throws {
         #if canImport(Darwin)
-        guard fpathconf(exports.fd, _PC_CASE_SENSITIVE) != 1 else { return }
+        let foldsCase = fpathconf(exports.fd, _PC_CASE_SENSITIVE) != 1
         #else
         return
         #endif
         let out = try MergeInfrastructureError.wrapping {
-            try git.run(["ls-tree", "-r", "-t", "-z", "--full-tree", "\(commit)^{commit}"], allowFailure: true, maxOutput: 64 << 20)
+            try git.run(["ls-tree", "-r", "-t", "-z", "--full-tree", "\(commit)^{commit}"], allowFailure: true, maxOutput: collisionListingLimit)
         }
         guard out.status == 0 else { throw UnexportableTree(reason: "git could not list \(commit.prefix(7)) (\(Self.oneLine(out.stderr)))") }
-        guard !out.cut else { return }
+        guard !out.cut else {
+            throw UnexportableTree(reason: "the tree of \(commit.prefix(7)) is too large to inspect for colliding paths (over \(collisionListingLimit) bytes listed)")
+        }
         var seen: [String: (path: String, tree: Bool)] = [:]
         var collisions: [String] = []
-        for entry in String(decoding: out.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true) {
+        for raw in out.stdout.split(separator: 0, omittingEmptySubsequences: true) {
+            let entry = String(decoding: raw, as: UTF8.self)
             guard let tab = entry.firstIndex(of: "\t") else { continue }
             let path = String(entry[entry.index(after: tab)...])
             let tree = entry[..<tab].split(separator: " ").dropFirst().first == "tree"
-            let folded = path.lowercased()
-            if let other = seen[folded], other.path != path, !(other.tree && tree) {
+            let folded = foldsCase ? path.folding(options: [.caseInsensitive], locale: nil) : path
+            if let other = seen[folded], !other.path.utf8.elementsEqual(path.utf8), !(other.tree && tree) {
                 collisions.append("\(Self.flatName(other.path)) and \(Self.flatName(path))")
                 if collisions.count == 3 { break }
             } else if seen[folded] == nil {
@@ -1763,7 +1790,7 @@ public struct GitWorkspace: Sendable {
             }
         }
         guard collisions.isEmpty else {
-            throw UnexportableTree(reason: "paths that differ only in case collide on this volume: \(collisions.joined(separator: "; "))")
+            throw UnexportableTree(reason: "paths that differ only in case or Unicode form collide on this volume: \(collisions.joined(separator: "; "))")
         }
     }
 
@@ -1919,7 +1946,7 @@ public struct GitWorkspace: Sendable {
         }
         testHook?("checked")
         let index = FileManager.default.temporaryDirectory.appending(path: "brahma-index-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: index) }
+        defer { _ = try? EngineFiles.removeNoFollow(index, under: FileManager.default.temporaryDirectory) }
         let private_ = git.withIndex(index)
         try private_.run(["read-tree", tip])
         try addAll(private_)
@@ -2072,7 +2099,6 @@ public struct GitWorkspace: Sendable {
         let git: GitCommand
         do { git = try context(for: dir) } catch { throw PlanBarrierError(found: [], reason: "\(error)") }
         var found: [String] = [], failures: [String] = []
-        let fm = FileManager.default
 
         // The repository's own files. New ones go first, deepest first, so a directory or link put in place of a file goes too.
         // Files over the size cap and entries over the count cap are not read: new ones are deleted, and either fails the check.
@@ -2081,20 +2107,29 @@ public struct GitWorkspace: Sendable {
         let after = captured.files
         func known(_ rel: String) -> Bool { before.files[rel] != nil || before.files.keys.contains { $0.hasPrefix(rel + "/") } }
         func put(_ rel: String, _ file: RepoFile) {
-            do { try Self.restore(file, at: gitDir.appending(path: rel)) } catch { failures.append("restore \(Self.shown(rel)): \(error)") }
+            do { try Self.restore(file, at: gitDir.appending(path: rel), under: root) } catch { failures.append("restore \(Self.shown(rel)): \(error)") }
+        }
+        // Through descriptors from the workspace: a link is removed, never followed; a part of the way that is a link fails
+        // the check (nothing is removed through it).
+        func removeNew(_ rel: String) {
+            do {
+                if case .blocked(let problem) = try EngineFiles.removeNoFollow(gitDir.appending(path: rel), under: root) {
+                    failures.append("remove \(Self.shown(rel)): \(problem)")
+                }
+            } catch { failures.append("remove \(Self.shown(rel)): \(error)") }
         }
         for rel in captured.oversize.sorted() {
             failures.append("repository file \(Self.shown(rel)) is larger than \(Self.repoFileLimit) bytes")
             if let file = before.files[rel] { found.append("changed \(Self.shown(rel))"); put(rel, file) }
-            else { found.append("new \(Self.shown(rel))"); try? fm.removeItem(at: gitDir.appending(path: rel)) }
+            else { found.append("new \(Self.shown(rel))"); removeNew(rel) }
         }
         for rel in captured.overflow.sorted() {
             failures.append("more than \(Self.repoEntryLimit) repository files (at \(Self.shown(rel)))")
-            if !known(rel) { found.append("new \(Self.shown(rel))"); try? fm.removeItem(at: gitDir.appending(path: rel)) }
+            if !known(rel) { found.append("new \(Self.shown(rel))"); removeNew(rel) }
         }
         for rel in after.keys.filter({ before.files[$0] == nil }).sorted(by: { $0.count > $1.count }) {
             found.append("new \(Self.shown(rel))")
-            do { try fm.removeItem(at: gitDir.appending(path: rel)) } catch { failures.append("remove \(Self.shown(rel)): \(error)") }
+            removeNew(rel)
         }
         for (rel, file) in before.files.sorted(by: { $0.key < $1.key }) where rel != indexKey && after[rel] != file && !captured.oversize.contains(rel) {
             found.append(after[rel] == nil ? "removed \(rel)" : "changed \(rel)")
@@ -2273,10 +2308,12 @@ public struct GitWorkspace: Sendable {
     }
 
     /// Puts one repository file back as it was, permission bits included (an executable hook stays executable).
-    private static func restore(_ file: RepoFile, at url: URL) throws {
+    private static func restore(_ file: RepoFile, at url: URL, under root: URL) throws {
         let fm = FileManager.default
         var st = stat()
-        if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG || file.data == nil { try fm.removeItem(at: url) }
+        if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG || file.data == nil {
+            if case .blocked(let problem) = try EngineFiles.removeNoFollow(url, under: root) { throw problem }
+        }
         try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let link = file.link {
             if link != "special" { try fm.createSymbolicLink(atPath: url.path, withDestinationPath: link) }
@@ -2304,18 +2341,13 @@ public struct GitWorkspace: Sendable {
         return real == nil ? nil : String(cString: buffer)
     }
 
+    /// Every directory on the way is opened from the checkout's own descriptor without following a link
+    /// (`EngineFiles.removeNoFollow`), so a part that is a link (or swapped for one meanwhile) is never followed.
     private static func removeInside(dir: URL, base: String?, relative: Data) {
         let parts = relative.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true)
-        guard relative.first != UInt8(ascii: "/"), !parts.isEmpty, !parts.contains(where: { Data($0) == Data("..".utf8) }) else { return }
-        let path = Array(dir.path.utf8) + [UInt8(ascii: "/")] + Array(relative)
-        let parent = Array(dir.path.utf8) + parts.dropLast().flatMap { [UInt8(ascii: "/")] + Array($0) }
-        guard let base, let resolvedParent = realPath(parent),
-              resolvedParent == base || resolvedParent.hasPrefix(base + "/") else { return }
-        if let text = String(bytes: path, encoding: .utf8) {
-            try? FileManager.default.removeItem(atPath: text)
-        } else {
-            _ = (path + [0]).withUnsafeBytes { raw in unlink(raw.baseAddress!.assumingMemoryBound(to: CChar.self)) }
-        }
+        guard relative.first != UInt8(ascii: "/"), !parts.isEmpty, !parts.contains(where: { Data($0) == Data("..".utf8) }),
+              let base else { return }
+        _ = try? EngineFiles.removeNoFollow(relative: Array(relative), under: URL(fileURLWithPath: base, isDirectory: true))
     }
 
     /// A path for a message: as is when it is plain, else quoted with escapes (no newline or quote reaches a message raw).

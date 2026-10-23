@@ -133,6 +133,141 @@ public enum EngineFiles {
         try removeEntry(dfd: dfd, name: name, shown: logical(workspace, relative).appending(path: name).path)
     }
 
+    // MARK: Removal by descriptor under a root
+
+    /// What `removeNoFollow` came to.
+    public enum Removal: Equatable, Sendable {
+        /// The entry was there and is gone (a link: the link itself).
+        case removed
+        /// Nothing was there (or a directory on the way does not exist).
+        case missing
+        /// A part on the way is a link or not a directory: nothing was removed through it.
+        case blocked(UnsafeEngineFile)
+    }
+
+    /// Removes what is at `url` (a file, a link or a whole directory; never what a link points at), which must lie under
+    /// `root`. `root` is resolved (the owner may have put it behind a link) and never created; every directory between it and
+    /// `url` is opened relative to the one before with `O_NOFOLLOW`, and the entry itself is removed relative to its parent's
+    /// descriptor (`removeEntry`). No path is rebuilt, so nothing outside can be removed through a part swapped for a link.
+    /// Throws `UnsafeEngineFile` when the entry is there and cannot be removed, or `url` is not under `root`.
+    @discardableResult
+    public static func removeNoFollow(_ url: URL, under root: URL) throws -> Removal {
+        let base = root.standardizedFileURL.path, target = url.standardizedFileURL.path
+        guard target.hasPrefix(base + "/") else { throw UnsafeEngineFile(path: url.path, problem: "is not under \(base)") }
+        let parts = target.dropFirst(base.count + 1).split(separator: "/").map { Array(String($0).utf8) }
+        return try removeNoFollow(parts: parts, under: root, shown: url.path)
+    }
+
+    /// `removeNoFollow(_:under:)` for a path given as raw bytes relative to `root` (a name git reports need not be UTF-8).
+    @discardableResult
+    public static func removeNoFollow(relative: [UInt8], under root: URL) throws -> Removal {
+        let parts = relative.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true).map(Array.init)
+        let shown = root.path + "/" + String(decoding: relative, as: UTF8.self)
+        return try removeNoFollow(parts: parts, under: root, shown: shown)
+    }
+
+    private static func removeNoFollow(parts: [[UInt8]], under root: URL, shown: String) throws -> Removal {
+        guard let name = parts.last else { throw UnsafeEngineFile(path: shown, problem: "is not a valid file name") }
+        let dfd: Int32
+        switch try openWay(root: root, parts.dropLast(), shown: shown) {
+        case .missing: return .missing
+        case .blocked(let problem): return .blocked(problem)
+        case .open(let fd): dfd = fd
+        }
+        defer { close(dfd) }
+        guard isValidName(name) else { throw UnsafeEngineFile(path: shown, problem: "is not a valid file name") }
+        var st = stat()
+        let present = withCName(name) { fstatat(dfd, $0, &st, AT_SYMLINK_NOFOLLOW) } == 0
+        guard present else {
+            if errno == ENOENT { return .missing }
+            throw UnsafeEngineFile(path: shown, problem: "cannot be inspected")
+        }
+        if let text = String(bytes: name, encoding: .utf8), Array(text.utf8) == name {
+            try removeEntry(dfd: dfd, name: text, shown: shown)
+        } else {
+            // A name that is not UTF-8 is only ever a file or a link here (`unlinkat` never removes a directory).
+            guard withCName(name, { unlinkat(dfd, $0, 0) }) == 0 || errno == ENOENT else {
+                throw UnsafeEngineFile(path: shown, problem: "cannot be removed (\(String(cString: strerror(errno))))")
+            }
+        }
+        return .removed
+    }
+
+    private enum Way { case open(Int32), missing, blocked(UnsafeEngineFile) }
+
+    /// `root` resolved and opened, then each of `parts` opened relative to the one before with `O_NOFOLLOW` (never created).
+    private static func openWay(root: URL, _ parts: ArraySlice<[UInt8]>, shown: String) throws -> Way {
+        guard let real = resolved(root.path) else { return .missing }
+        var fd = open(real, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else {
+            return errno == ENOENT ? .missing : .blocked(UnsafeEngineFile(path: root.path, problem: "cannot be opened as a directory"))
+        }
+        var reached = root.path
+        for part in parts {
+            reached += "/" + String(decoding: part, as: UTF8.self)
+            guard isValidName(part) else {
+                close(fd)
+                throw UnsafeEngineFile(path: reached, problem: "is not a valid directory name")
+            }
+            let next = withCName(part) { openat(fd, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
+            if next < 0 {
+                let err = errno
+                let problem = withCName(part) { openProblem(dfd: fd, String(cString: $0), errno: err) }
+                close(fd)
+                return err == ENOENT ? .missing : .blocked(UnsafeEngineFile(path: reached, problem: problem))
+            }
+            close(fd)
+            fd = next
+        }
+        return .open(fd)
+    }
+
+    private static func isValidName(_ name: [UInt8]) -> Bool {
+        !name.isEmpty && name != [0x2e] && name != [0x2e, 0x2e] && !name.contains(UInt8(ascii: "/")) && !name.contains(0)
+    }
+
+    private static func withCName<T>(_ name: [UInt8], _ body: (UnsafePointer<CChar>) -> T) -> T {
+        (name + [0]).withUnsafeBytes { body($0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
+    }
+
+    /// Walks the real directory `relative` under `root` (resolved; every part opened with `O_NOFOLLOW`, never created) and
+    /// removes each entry that is not a directory and that `shouldRemove` (given its path relative to that directory and its
+    /// `lstat`) approves, with `unlinkat` relative to the descriptor of the directory it was found in. A directory is walked
+    /// into only through `openat(O_NOFOLLOW | O_DIRECTORY)` of its name in its parent's descriptor, so one swapped for a link
+    /// meanwhile is skipped, never followed; `enter` (given its relative path) may skip one. At most `maxDepth` levels and
+    /// `maxEntries` entries in all are looked at. Returns the relative paths removed (nothing when `relative` is missing or a
+    /// part of the way to it is a link).
+    static func removeFilesNoFollow(under root: URL, _ relative: String, maxDepth: Int, maxEntries: Int,
+                                    enter: (String) -> Bool, shouldRemove: (String, stat) -> Bool) throws -> [String] {
+        let parts = relative.split(separator: "/").map { Array(String($0).utf8) }
+        guard case .open(let top) = try openWay(root: root, parts[...], shown: root.appending(path: relative).path) else { return [] }
+        var removed: [String] = []
+        var budget = maxEntries
+        func walk(_ fd: Int32, _ prefix: String, depth: Int) {
+            guard depth < maxDepth, budget > 0, let names = try? entryNames(fd: fd, shown: prefix, limit: budget) else { return }
+            budget -= names.count
+            for name in names.sorted() {
+                let rel = prefix.isEmpty ? name : "\(prefix)/\(name)"
+                var st = stat()
+                guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+                if st.st_mode & S_IFMT == S_IFDIR {
+                    guard enter(rel) else { continue }
+                    let child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                    guard child >= 0 else { continue }
+                    walk(child, rel, depth: depth + 1)
+                    close(child)
+                    continue
+                }
+                guard shouldRemove(rel, st) else { continue }
+                // Relative to this directory's descriptor; never a directory (no `AT_REMOVEDIR`).
+                if unlinkat(fd, name, 0) == 0 { removed.append(rel) }
+            }
+        }
+        walk(top, "", depth: 0)
+        close(top)
+        return removed
+    }
+
     /// At most `limit` bytes of the regular, single-link file at `url`, which must lie under `root`. `root` is resolved (the
     /// owner may have put it behind a link); every part of `url` under it is opened without following a link. Nil otherwise.
     public static func readNoFollow(_ url: URL, under root: URL, limit: Int = defaultReadLimit) -> Data? {
@@ -381,8 +516,9 @@ public enum EngineFiles {
         }
     }
 
-    /// The names in the directory open at `fd` (without `.` and `..`), read through a fresh descriptor of it.
-    private static func entryNames(fd: Int32, shown: String) throws -> [String] {
+    /// The names in the directory open at `fd` (without `.` and `..`), at most `limit` of them, read through a fresh
+    /// descriptor of it.
+    private static func entryNames(fd: Int32, shown: String, limit: Int = .max) throws -> [String] {
         let own = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard own >= 0, let dir = fdopendir(own) else {
             if own >= 0 { close(own) }
@@ -390,7 +526,7 @@ public enum EngineFiles {
         }
         defer { closedir(dir) }
         var names: [String] = []
-        while let entry = readdir(dir) {
+        while names.count < limit, let entry = readdir(dir) {
             let name = withUnsafePointer(to: &entry.pointee.d_name) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
             }

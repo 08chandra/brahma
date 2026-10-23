@@ -197,6 +197,11 @@ extension Store {
                 throw WorkError.conflict(ask.status == .rescinded ? "\(ask.ref) is already rescinded"
                                          : "\(ask.ref) is \(ask.status.rawValue), not approved; only approved asks can be rescinded")
             }
+            // Approving the engine's quarantine ask merged its recorded commit into main: that cannot be taken back here.
+            if let ref = Store.quarantineRef(of: ask) {
+                throw WorkError.conflict("\(ask.ref) approved \(ref), and it was merged into main; a merge cannot be rescinded. "
+                                         + "To undo it, revert that commit on main in the workspace and accept main again (brahma main accept).")
+            }
             let why = Store.flat(note, max: Store.maxAskField)
             let tail = why.isEmpty ? "" : ": \(why)"
             ask.status = .rescinded
