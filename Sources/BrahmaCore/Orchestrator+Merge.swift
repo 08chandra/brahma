@@ -83,7 +83,8 @@ extension Orchestrator {
             do { try store.endMerging(itemId: item.id) } catch { log("could not end the merge of \(item.key): \(error)") }
         }
         do {
-            guard let result = try store.performMerge(item: item, company: company, now: clock()) else {
+            let (store, now) = (self.store, clock())
+            guard let result = try await Blocking.tryRun({ try store.performMerge(item: item, company: company, now: now) }) else {
                 await holdMerges(companyId: company.id, until: clock().addingTimeInterval(Self.mergeRetry))
                 return
             }

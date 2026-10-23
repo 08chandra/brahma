@@ -51,7 +51,14 @@ extension Store {
             switch a.blocker {
             case .agent(let x)?: add(a.id, x, nil)
             case .workItem(let id, _)?:
-                if let item = try WorkItem.fetchOne(db, key: id), item.status != .done { add(a.id, try owner(of: item), item.key) }
+                if let item = try WorkItem.fetchOne(db, key: id), item.status != .done {
+                    add(a.id, try owner(of: item), item.key)
+                    // An item waiting for review also waits on its reviewer.
+                    if item.reviewerId != nil, try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM workItem WHERE id = ? AND \(Store.pendingReviewWhere)",
+                                                              arguments: [item.id]) ?? 0 > 0 {
+                        add(a.id, item.reviewerId, item.key)
+                    }
+                }
             default: break
             }
         }

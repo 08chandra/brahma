@@ -45,6 +45,9 @@ public struct ClaudeProcessRunner: TurnRunning {
     public var maxTurnDuration: Duration
     /// What `ChildEnvironment` filters. Tests inject one; production uses this process's environment.
     public var baseEnvironment: [String: String]
+    /// Waits out a turn's wall clock before the engine kills it. Production sleeps; tests inject one that returns when their
+    /// condition holds, so the kill is deterministic rather than a race against a real timer.
+    public var wallClockSleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
 
     private static let live = LiveCount()
 
@@ -219,8 +222,9 @@ public struct ClaudeProcessRunner: TurnRunning {
 
         let timedOut = Flag()
         let wallClock = profile.wallClock ?? maxTurnDuration
+        let sleep = wallClockSleep
         let watchdog = Task {
-            try await Task.sleep(for: wallClock)
+            try await sleep(wallClock)
             timedOut.set()
             child.terminate(grace: Self.killGrace)
         }
@@ -243,8 +247,10 @@ public struct ClaudeProcessRunner: TurnRunning {
         let status = await exit.wait()
         process.waitUntilExit()
 
-        // The last of stderr may still be in its pipe when the process is gone; give it a moment (bounded).
-        for _ in 0..<40 where !stderrClosed.isSet { try? await Task.sleep(for: .milliseconds(5)) }
+        // The last of stderr may still be in its pipe when the process is gone; give it until the drain grace (bounded by the
+        // clock, not by a count of sleeps, which stretch on a loaded machine).
+        let stderrDeadline = ContinuousClock.now + .seconds(Self.drainGrace) + .milliseconds(500)
+        while !stderrClosed.isSet, ContinuousClock.now < stderrDeadline { try? await Task.sleep(for: .milliseconds(5)) }
         if let requested = TurnAudit.effortCap(in: tail.text) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
         let sawResult = state.sawResult

@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct LeaseTests {
+@Suite(.serialized) struct LeaseTests {
     /// A company with a real git workspace, one manager and three engineers, on the orchestrator's `World`.
     private struct L {
         let world: World
@@ -522,7 +522,7 @@ import GRDB
         l.world.clock.advance(10)
         await l.world.orchestrator.tick()
         #expect(try l.allLeases().count == 2)
-        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(60))
         // Their turns are over (the agents sleep, holding their leases); the next pass hands out two more.
         l.world.clock.advance(10)
         try await l.world.cycle()
@@ -581,19 +581,21 @@ import GRDB
         // Low mode on a max20x plan allows two concurrent turns per company; two are already running.
         _ = try l.world.hire(l.company, "spare", role: "engineer")
         for n in 0..<3 { try l.item("w\(n)") }
-        l.world.fake.defaultScript = .init(delay: .seconds(2))
+        let gate = Gate()
+        l.world.fake.defaultScript = .init(gate: gate)
         try l.world.dm(l.company, l.rev); try l.world.dm(l.company, l.mgr)
         await l.world.orchestrator.tick()
         #expect(await l.world.orchestrator.runningCount() == 2)
         l.world.clock.advance(10)
         await l.world.orchestrator.tick()
-        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(10))
+        gate.open()
+        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(try l.allLeases().isEmpty)
     }
 
     @Test func sweepSkipsOnlyTheBusyItem() async throws {
         let l = try L()
-        l.store.gitLockTimeout.seconds = 0.3
+        l.store.gitLockTimeout.seconds = 0   // one non-blocking attempt: "busy" is immediate
         _ = try l.ws.addWorktree(key: "ACME-8")
         _ = try l.ws.addWorktree(key: "ACME-9")
         let git = l.store.gitWorkspace(root: l.ws.root, companyId: l.company.id)
@@ -601,7 +603,7 @@ import GRDB
         let fd = open(git.lockDirectory.appending(path: "ACME-8.lock").path, O_CREAT | O_RDWR, 0o600)
         #expect(flock(fd, LOCK_EX) == 0)
         defer { close(fd) }
-        try await l.world.cycle()
+        await l.world.orchestrator.sweepNow(company: l.company)
         #expect(FileManager.default.fileExists(atPath: l.ws.worktreePath(key: "ACME-8").path))
         #expect(!FileManager.default.fileExists(atPath: l.ws.worktreePath(key: "ACME-9").path))
     }

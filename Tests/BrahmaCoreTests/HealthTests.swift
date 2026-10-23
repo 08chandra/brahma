@@ -37,11 +37,11 @@ private func failure(_ r: TurnRequest, _ text: String, status: Int? = nil) -> [S
      .result(TurnResult(isError: true, subtype: "error_during_execution", text: text, costUSD: nil,
                         apiErrorStatus: status, sessionId: r.agent.sessionId))]
 }
-private func failing(_ text: String, status: Int? = nil, delay: Duration? = nil) -> FakeTurnRunner.Script {
+private func failing(_ text: String, status: Int? = nil, delay: Duration? = nil, gate: Gate? = nil) -> FakeTurnRunner.Script {
     // Events depend on the request, but a script is built before it exists; the session id only has to be non-empty.
     .init(events: [.initialized(sessionId: "s", model: "m"),
                    .result(TurnResult(isError: true, subtype: "error_during_execution", text: text, costUSD: nil,
-                                      apiErrorStatus: status, sessionId: "s"))], delay: delay)
+                                      apiErrorStatus: status, sessionId: "s"))], delay: delay, gate: gate)
 }
 
 private struct HWorld {
@@ -80,7 +80,7 @@ private struct HWorld {
     }
     func cycle() async throws {
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(10))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(60))
     }
     func alerts() throws -> [Message] {
         guard let ch = try store.channel(companyId: company.id, name: "dm:owner:system") else { return [] }
@@ -92,7 +92,7 @@ private struct HWorld {
     func hold() throws -> EngineHold? { try store.engineHold() }
 }
 
-@Suite struct HealthTests {
+@Suite(.serialized) struct HealthTests {
     @Test func classifyTable() {
         let net = ["getaddrinfo ENOTFOUND x", "connect ECONNREFUSED 1.2.3.4", "read ECONNRESET", "ETIMEDOUT", "Network is unreachable",
                    "TypeError: fetch failed", "socket hang up"]
@@ -130,7 +130,7 @@ private struct HWorld {
         w.probe.online = true
         w.clock.advance(60); try await w.cycle(); try await w.cycle()
         #expect(try w.hold() == nil)
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(10))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(w.fake.requests.count == 6)
         #expect(try w.events(.usage).contains("engine resumed"))
         for a in agents { #expect(try w.turns(a).map(\.outcome) == [.failed, .succeeded]) }
@@ -381,15 +381,18 @@ private struct HWorld {
         let net = try ["n1", "n2", "n3"].map { try w.hire($0) }
         let acct = try ["x1", "x2"].map { try w.hire($0) }
         for a in net { w.fake.script(a.name, failing(networkText)); try w.dm(a) }
-        for a in acct { w.fake.script(a.name, failing(loginText, delay: .milliseconds(1500))); try w.dm(a) }
+        // The account failures stay in flight (held by the gate) until the network hold has been seen.
+        let inFlight = Gate()
+        for a in acct { w.fake.script(a.name, failing(loginText, gate: inFlight)); try w.dm(a) }
         await w.orchestrator.tick()
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(60)
         while try net.contains(where: { try w.turns($0).first?.outcome != .failed }), ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
         await w.orchestrator.tick()
         #expect(try w.hold()?.reason == .network)
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(10))
+        inFlight.open()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         await w.orchestrator.tick()
         #expect(try w.hold()?.reason == .account)
         #expect(try w.alerts().count == 1)

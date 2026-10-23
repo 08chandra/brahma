@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct OrchestratorTests {
+@Suite(.serialized) struct OrchestratorTests {
     @Test func ownerMessageRunsAgentAndSleepsAfter() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "@ceo kick off", now: w.clock.now)
@@ -502,12 +502,13 @@ import GRDB
             .result(TurnResult(isError: true, subtype: "error_during_execution", text: "usage limit reached",
                                costUSD: nil, apiErrorStatus: 429, sessionId: a.sessionId)),
         ], delay: .milliseconds(20)))
-        w.fake.script("bob", .init(delay: .milliseconds(600)))
+        let bobGate = Gate()
+        w.fake.script("bob", .init(gate: bobGate))
         try w.dm(c1, a); try w.dm(c1, b)
         await w.orchestrator.tick()
         #expect(await w.orchestrator.runningCount() == 2)
 
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(60)
         while try w.turns(a).first?.outcome == .inProgress, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -521,7 +522,8 @@ import GRDB
         #expect(try w.turns(c).isEmpty)
         #expect(try w.agent(c).blocker == .usageLimit(until: t.addingTimeInterval(3600)))
 
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        bobGate.open()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(try w.turns(b).map(\.outcome) == [.succeeded])
         #expect(try w.pending(b) == 0, "bob's items are delivered")
         #expect(try w.agent(b).state == .sleeping)
@@ -686,15 +688,25 @@ import GRDB
         let w = try World(config: World.config(hardCap: 3)); let c = try w.company("Acme", mode: .max)
         var agents: [Agent] = []
         for i in 0..<10 { agents.append(try w.hire(c, "eng\(i)", role: "engineer")) }
-        w.fake.defaultScript = .init(delay: .milliseconds(200))
+        // The first three turns are held open until the cap has been seen to hold: no overlap depends on a timer.
+        let gate = Gate()
+        w.fake.defaultScript = .init(gate: gate)
         _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "@here all hands", now: w.clock.now)
-        let deadline = ContinuousClock.now + .seconds(10)
+        await w.orchestrator.tick()
+        let started = ContinuousClock.now + .seconds(60)
+        while w.fake.requests.count < 3, ContinuousClock.now < started { try await Task.sleep(for: .milliseconds(5)) }
+        for _ in 0..<3 {
+            await w.orchestrator.tick()
+            #expect(await w.orchestrator.runningCount() == 3, "saturated: the other seven wait")
+        }
+        gate.open()
+        let deadline = ContinuousClock.now + .seconds(60)
         while try agents.contains(where: { try w.turns($0).first?.outcome != .succeeded }), ContinuousClock.now < deadline {
             await w.orchestrator.tick()
             #expect(await w.orchestrator.runningCount() <= 3)
             try await Task.sleep(for: .milliseconds(20))
         }
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(w.fake.maxConcurrent == 3)
         #expect(w.fake.requests.count == 10)
         for a in agents { #expect(try w.turns(a).map(\.outcome) == [.succeeded]) }
@@ -702,12 +714,14 @@ import GRDB
 
     @Test func waitUntilIdleTimesOut() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
-        w.fake.script("ceo", .init(delay: .milliseconds(300)))
+        let gate = Gate()
+        w.fake.script("ceo", .init(gate: gate))
         try w.dm(c, ceo)
         await w.orchestrator.tick()
         #expect(await w.orchestrator.runningCount() == 1)
         await #expect(throws: OrchestratorError.self) { try await w.orchestrator.waitUntilIdle(timeout: .milliseconds(50)) }
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        gate.open()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
         #expect(await w.orchestrator.runningCount() == 0)
     }
 

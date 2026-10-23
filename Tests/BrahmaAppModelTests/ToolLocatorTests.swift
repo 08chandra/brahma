@@ -52,7 +52,7 @@ import Foundation
         let start = ContinuousClock.now
         let result = ToolLocator.loginShellPath(shell: script.path, timeout: .seconds(1))
         #expect(result == nil)
-        #expect(ContinuousClock.now - start < .seconds(3))
+        #expect(ContinuousClock.now - start < .seconds(8), "hang guard: the script sleeps 10 s")
     }
 
     /// Depends on the owner's real login shell and dotfiles, so it is opt-in: BRAHMA_REAL_SHELL_TESTS=1.

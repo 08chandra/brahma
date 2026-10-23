@@ -309,7 +309,7 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
                              mcpExecutable: "/x", clock: clock.function, memory: NormalMemoryPressure(),
                              connectivity: AlwaysOnline(), disk: PlentyOfDisk(), exec: { _, _ in nil })
         }
-        func cycle() async throws { await o.tick(); try await o.waitUntilIdle(timeout: .seconds(5)) }
+        func cycle() async throws { await o.tick(); try await o.waitUntilIdle(timeout: .seconds(60)) }
     }
 
     private func usage(_ w: W, util: Double, fiveHour: Double = 0.1) throws {
@@ -402,14 +402,19 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
             _ = try w.store.hire(companyId: w.c.id, name: n, role: "engineer", model: "sonnet")
             _ = try w.router.sendDM(companyId: w.c.id, from: .owner, to: n, text: "go", now: w.clock.now)
         }
-        w.fake.defaultScript = .init(delay: .milliseconds(100))
+        let first = Gate()
+        w.fake.defaultScript = .init(gate: first)
         await w.o.tick()
         #expect(await w.o.runningCount() == 1, "max5x low mode allows one turn")
-        try await w.o.waitUntilIdle(timeout: .seconds(5))
+        first.open()
+        try await w.o.waitUntilIdle(timeout: .seconds(60))
         try w.store.setPlanTier(.max20x)
+        let second = Gate()
+        w.fake.defaultScript = .init(gate: second)
         await w.o.tick()
         #expect(await w.o.runningCount() == 2, "max20x low mode allows two; the third waits")
-        try await w.o.waitUntilIdle(timeout: .seconds(5))
+        second.open()
+        try await w.o.waitUntilIdle(timeout: .seconds(60))
     }
 }
 

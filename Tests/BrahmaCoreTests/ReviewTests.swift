@@ -625,6 +625,66 @@ import GRDB
         #expect(r.world.fake.requests.contains { $0.agent.name == "rev" && $0.prompt.hasPrefix("Review \(i.key)") })
     }
 
+    @Test func reviewTurnRunsWhilePaceClosed() async throws {
+        let r = try R()
+        var co = r.company; co.usageMode = .max; try r.store.updateCompany(co)
+        let i = try await r.verified()
+        let idle = try r.world.hire(co, "idle")
+        _ = try r.world.router.sendDM(companyId: co.id, from: .owner, to: "idle", text: "go", now: r.now)
+        let now = r.now
+        try r.store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                                                fiveHourUtilization: 0.1, sevenDayUtilization: 0.6, observedAt: now,
+                                                fiveHourResetsAt: now.addingTimeInterval(3600),
+                                                sevenDayResetsAt: now.addingTimeInterval(3.5 * 86_400)))
+        try await r.cycle()
+        #expect(r.world.fake.requests.contains { $0.agent.name == "rev" && $0.prompt.hasPrefix("Review \(i.key)") },
+                "the reviewer is on the critical path: the review runs while the pace is closed")
+        #expect(!r.world.fake.requests.contains { $0.agent.name == idle.name }, "other work still waits")
+    }
+
+    @Test func managerBlockedOnReportItemStillReviewsIt() async throws {
+        let r = try R()
+        let i = try r.item(reviewer: r.mgr)
+        try r.claimAndSubmit(i, r.eng)
+        _ = try r.store.transition(agentId: r.mgr.id, to: .blocked, blocker: .workItem(id: i.id, key: i.key), now: r.now)
+        try await r.cycle()
+        #expect(try r.fresh(i).verifiedCommit != nil)
+        try await r.cycle()
+        #expect(r.world.fake.requests.contains { $0.agent.name == "mgr" && $0.prompt.hasPrefix("Review \(i.key)") },
+                "a blocked reviewer is woken for a pending review")
+        // Without a decision it goes back to waiting on what it was waiting for.
+        let mgr = try r.world.agent(r.mgr)
+        #expect(mgr.state == .blocked); #expect(mgr.blocker == .workItem(id: i.id, key: i.key))
+    }
+
+    @Test func pausedReviewerReviewsRerouteAfterADay() async throws {
+        let r = try R()
+        let i = try await r.verified()
+        try r.store.setPaused(agentId: r.rev.id, true, now: r.now)
+        try r.store.advanceActive(companyId: r.company.id, by: AskLifecycle.pausedReroute - 1)
+        #expect(try r.store.sweepReviews(now: r.now) == 0)
+        #expect(try r.fresh(i).reviewerId == r.rev.id)
+        try r.store.advanceActive(companyId: r.company.id, by: 1)
+        #expect(try r.store.sweepReviews(now: r.now) == 1)
+        let moved = try r.fresh(i)
+        #expect(moved.reviewerId == r.mgr.id, "the next resolved reviewer: the assignee's manager")
+        #expect(try r.world.agent(r.mgr).state == .ready)
+    }
+
+    @Test func blockedReviewerIsAnEdgeInTheWaitGraph() async throws {
+        let r = try R()
+        let i = try r.item(reviewer: r.mgr)
+        try r.claimAndSubmit(i, r.eng)
+        try await r.cycle()
+        // eng waits on its own item; the item waits on its reviewer, who waits on eng's item: a cycle the graph can see.
+        _ = try r.store.transition(agentId: r.eng.id, to: .blocked, blocker: .workItem(id: i.id, key: i.key), now: r.now)
+        _ = try r.store.transition(agentId: r.mgr.id, to: .blocked, blocker: .agent(r.eng.id), now: r.now)
+        try r.store.advanceActive(companyId: r.company.id, by: Liveness.scanInterval)
+        try r.store.sweepLiveness(companyId: r.company.id, now: r.now)
+        let rows = try await r.store.writer.read { (db: Database) in try DeadlockRecord.fetchAll(db) }
+        #expect(rows.count == 1)
+    }
+
     // MARK: Reviewer resolution
 
     @Test func resolvesReviewerInOrder() throws {

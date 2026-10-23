@@ -88,13 +88,16 @@ extension Orchestrator {
             // A merge check runs on a `.git`-free export made by the engine's own repository, under the data home
             // (`<home>/run/exports/<runId>`); a submission's in a detached worktree there too (`<home>/run/checkouts/<runId>`).
             let (store, now) = (self.store, clock())
-            dir = run.purpose == .merge
-                ? try git.addEngineExport(runId: run.id, commit: run.commit, tamper: { store.reportMergeTamper(company: company, removed: $0, now: now) })
-                : try git.addRunWorktree(runId: run.id, commit: run.commit)
+            let (runId, commit, purpose) = (run.id, run.commit, run.purpose)
+            dir = try await Blocking.tryRun {
+                purpose == .merge
+                    ? try git.addEngineExport(runId: runId, commit: commit, tamper: { store.reportMergeTamper(company: company, removed: $0, now: now) })
+                    : try git.addRunWorktree(runId: runId, commit: commit)
+            }
             try store.setVerificationDirectory(runId: run.id, path: dir.path)
         } catch let refused as UnexportableTree where run.purpose == .merge {
             // The item's own tree cannot be written out (A1): its fault, so it goes back to its holder with the reason.
-            git.removeRunWorktree(runId: run.id)
+            await Blocking.run { git.removeRunWorktree(runId: run.id) }
             await mergeCheckDeferralsEnded(runId: run.id)
             log("the merge check of \(run.commit.prefix(7)) could not be exported: \(refused.reason)")
             do { try store.returnUnexportable(runId: run.id, reason: refused.reason, now: clock()) } catch {
@@ -104,7 +107,7 @@ extension Orchestrator {
         } catch let error where run.purpose == .merge && Orchestrator.isCompanyMergeFault(error) {
             // The engine's own machinery, not the item: held and retried, never charged to the item (`companyMergeFault`).
             // A run deferred `maxMergeCheckDeferrals` times is recorded inconclusive (retried, then returned as uncheckable).
-            git.removeRunWorktree(runId: run.id)
+            await Blocking.run { git.removeRunWorktree(runId: run.id) }
             log("could not export \(run.commit.prefix(7)) for its merge check (\(company.name)'s merge step failed): \(error)")
             let deferrals = await noteMergeCheckDeferral(runId: run.id)
             if deferrals > Self.maxMergeCheckDeferrals {
@@ -120,7 +123,7 @@ extension Orchestrator {
             }
             return
         } catch {
-            git.removeRunWorktree(runId: run.id)
+            await Blocking.run { git.removeRunWorktree(runId: run.id) }
             if run.purpose == .merge { await mergeCheckDeferralsEnded(runId: run.id) }
             couldNotRun("could not check out the submitted commit: \(error)")
             return
@@ -136,7 +139,7 @@ extension Orchestrator {
             ?? paths.companyDir(run.companyId).appending(path: "check-output/\(run.id).log")
         let outcome = await checkRunner.run(command: run.command, workingDirectory: dir,
                                             timeout: TimeInterval(run.timeoutSeconds), outputURL: output, environment: environment)
-        git.removeRunWorktree(runId: run.id)
+        await Blocking.run { git.removeRunWorktree(runId: run.id) }
         if Task.isCancelled { return }
         // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
         let passed = outcome.exitCode == 0 && !outcome.timedOut

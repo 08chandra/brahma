@@ -58,9 +58,29 @@ extension Orchestrator {
         spawnGit("wt:\(companyId):\(key)") { [self] in
             // Decided under the item's lock: a new claim may have taken the item since it was reaped, and a database
             // error is not "no lease" (nothing is removed then).
-            do {
-                try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
-            } catch { log("could not remove worktree \(key): \(error)") }
+            await Blocking.run {
+                do {
+                    try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
+                } catch { self.log("could not remove worktree \(key): \(error)") }
+            }
+        }
+    }
+
+    /// One sweep of a company's worktrees, awaitable (the tick runs it as a git task; tests drive it directly). Git runs on a
+    /// thread of its own.
+    nonisolated func sweepNow(company: Company) async {
+        let (store, ws, companyId) = (self.store, URL(fileURLWithPath: company.workspacePath, isDirectory: true), company.id)
+        guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { return }
+        await Blocking.run {
+            let git = store.gitWorkspace(root: ws, companyId: companyId)
+            let items: [(key: String, path: URL)]
+            do { items = try git.itemWorktrees() } catch { self.log("worktree sweep failed: \(error)"); return }
+            // Only registered `item/<KEY>` worktrees; engine checkouts (".preview", ".merge", ...) are never listed. One
+            // item that cannot be decided (busy lock, unreadable lease) is skipped; the others are still swept.
+            for (key, _) in items {
+                do { try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil }) }
+                catch { self.log("worktree sweep skipped \(key): \(error)") }
+            }
         }
     }
 
@@ -68,15 +88,7 @@ extension Orchestrator {
         let (store, ws, companyId) = (self.store, URL(fileURLWithPath: company.workspacePath, isDirectory: true), company.id)
         guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { return }
         spawnGit("sweep:\(companyId)") { [self] in
-            let git = store.gitWorkspace(root: ws, companyId: companyId)
-            let items: [(key: String, path: URL)]
-            do { items = try git.itemWorktrees() } catch { log("worktree sweep failed: \(error)"); return }
-            // Only registered `item/<KEY>` worktrees; engine checkouts (".preview", ".merge", ...) are never listed. One
-            // item that cannot be decided (busy lock, unreadable lease) is skipped; the others are still swept.
-            for (key, _) in items {
-                do { try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil }) }
-                catch { log("worktree sweep skipped \(key): \(error)") }
-            }
+            await self.sweepNow(company: company)
         }
     }
 
@@ -122,10 +134,12 @@ extension Orchestrator {
         spawnGit("dispatch:\(agent.id)") { [self] in
             var failed: String?
             do {
-                try store.prepareRepo(company: company)
-                try git.addWorktree(key: item.key)
-                try store.ensureProgressFile(workspace: ws, item: item)
-                try store.ensureCheckSnapshot(item: item, workspace: ws)
+                try await Blocking.tryRun {
+                    try store.prepareRepo(company: company)
+                    try git.addWorktree(key: item.key)
+                    try store.ensureProgressFile(workspace: ws, item: item)
+                    try store.ensureCheckSnapshot(item: item, workspace: ws)
+                }
             } catch {
                 if let e = error as? WorkError, e.message == Store.mainChangedMessage {
                     // Every claim in this company would fail the same way: stop offering it items for a while.

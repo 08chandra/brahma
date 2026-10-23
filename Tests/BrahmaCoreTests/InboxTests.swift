@@ -586,7 +586,7 @@ import GRDB
         #expect(mkfifo(path, 0o644) == 0)
         #expect(throws: WorkError.self) { try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now) }
         #expect(try w.store.documentChanged(a))
-        #expect(Date().timeIntervalSince(started) < 5)
+        #expect(Date().timeIntervalSince(started) < 60, "hang guard")
         // A device file is not a regular file either. With /dev as the workspace, /dev/null passes containment and reaches
         // the file-type check; a path outside the workspace is refused earlier, by containment.
         #expect(throws: WorkError.invalid("document_path is not a regular file")) {

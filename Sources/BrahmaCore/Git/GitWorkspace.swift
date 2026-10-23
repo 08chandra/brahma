@@ -91,6 +91,9 @@ struct GitCommand: Sendable {
     var attrSourceSupported = GitCommand.installedSupportsAttrSource
     /// `-c protocol.file.allow=always`, for the engine's own fetches from a local repository; every other protocol stays off.
     var allowsLocalFetch = false
+    /// Called between a failed attempt (git met an `index.lock`) and its retry, before the retry is scanned again. Tests change
+    /// the repository there instead of racing a timer.
+    var beforeRetry: (@Sendable (_ attempt: Int) -> Void)? = nil
 
     /// What the repository's `info/attributes` must hold (`RepoConfigGuard.ensureAttributes`): the shared override, or for
     /// the engine's merge repository its own stronger line (`GitWorkspace.engineAttributes`), never something weaker.
@@ -283,6 +286,7 @@ struct GitCommand: Sendable {
             if out.status == 0 || allowFailure && !out.stderr.contains("index.lock") { return out }
             if out.stderr.contains("index.lock"), attempt < Self.lockRetries {
                 attempt += 1
+                beforeRetry?(attempt)
                 Thread.sleep(forTimeInterval: Self.lockRetryDelay)
                 continue
             }

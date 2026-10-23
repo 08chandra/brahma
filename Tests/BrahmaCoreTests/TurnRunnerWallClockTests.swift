@@ -31,8 +31,28 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
 private let initLine = #"{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku-5-5","tools":["Bash"],"agents":["Explore"]}"#
 private let resultLine = #"{"type":"result","subtype":"success","is_error":false,"result":"early","session_id":"s1","total_cost_usd":0.5}"#
 
+/// A wall-clock seam that fires once `marker` exists (the script has printed everything the test needs the engine to read).
+private func fireWhenExists(_ marker: URL) -> @Sendable (Duration) async throws -> Void {
+    { _ in
+        while !FileManager.default.fileExists(atPath: marker.path) { try await Task.sleep(for: .milliseconds(10)) }
+    }
+}
+
+/// Records the wall clock the runner asked for, then fires at once (`fires`) or never (until cancelled).
+private final class AskedClocks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var asked: [Duration] = []
+    var values: [Duration] { lock.withLock { asked } }
+    func seam(fires: Bool) -> @Sendable (Duration) async throws -> Void {
+        { [self] d in
+            lock.withLock { asked.append(d) }
+            if !fires { try await Task.sleep(for: .seconds(3600)) }
+        }
+    }
+}
+
 /// Task 14a, W7: per-request wall clock, pending background work and signals, with a fake `claude` script.
-@Suite struct TurnRunnerWallClockTests {
+@Suite(.serialized) struct TurnRunnerWallClockTests {
     @Test func deepTurnNotKilledAt15Min() async throws {
         // The runner-wide limit (the Plan 1 fallback, 900 s in production) is 1 s here; the request's own wall clock wins.
         let (script, dir) = try fakeClaude("""
@@ -41,12 +61,18 @@ private let resultLine = #"{"type":"result","subtype":"success","is_error":false
             sleep 2.5
             echo '\(resultLine)'
             """)
-        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(1))
+        let quiet = AskedClocks()
+        var runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(1))
+        runner.wallClockSleep = quiet.seam(fires: false)
         let events = try await collect(runner.run(request(in: dir, wallClock: .seconds(30))))
         guard case .result(let r)? = events.last else { Issue.record("no result: \(events)"); return }
         #expect(r.text == "early")
+        #expect(quiet.values == [.seconds(30)], "the request's own wall clock, not the runner's 1 s")
         // And the fallback still applies to a request that names no wall clock.
+        let firing = AskedClocks()
+        runner.wallClockSleep = firing.seam(fires: true)
         await #expect(throws: TurnError.timedOut) { _ = try await collect(runner.run(request(in: dir))) }
+        #expect(firing.values == [.seconds(1)])
     }
 
     @Test func wallClockKillsAtTheRequestsOwnLimit() async throws {
@@ -54,10 +80,11 @@ private let resultLine = #"{"type":"result","subtype":"success","is_error":false
             cat > /dev/null
             exec sleep 30
             """)
-        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(60))
-        let start = ContinuousClock.now
+        let asked = AskedClocks()
+        var runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(60))
+        runner.wallClockSleep = asked.seam(fires: true)
         await #expect(throws: TurnError.timedOut) { _ = try await collect(runner.run(request(in: dir, wallClock: .seconds(1)))) }
-        #expect(ContinuousClock.now - start < .seconds(10))
+        #expect(asked.values == [.seconds(1)], "the request's own limit (1 s), not the runner's 60 s")
     }
 
     @Test func wallClockKillWithPendingWorkflowIsATimeoutDespiteEarlyResult() async throws {
@@ -69,9 +96,11 @@ private let resultLine = #"{"type":"result","subtype":"success","is_error":false
             cat > /dev/null
             cat '\(cut.path)'
             echo '\(resultLine)'
+            touch printed
             exec sleep 30
             """)
-        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(2))
+        var runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(900))
+        runner.wallClockSleep = fireWhenExists(dir.appending(path: "printed"))
         var seen: [StreamEvent] = []
         do {
             for try await e in runner.run(request(in: dir)) { seen.append(e) }
@@ -104,9 +133,11 @@ private let resultLine = #"{"type":"result","subtype":"success","is_error":false
             cat > /dev/null
             echo '\(initLine)'
             echo '\(resultLine)'
+            touch printed
             exec sleep 30
             """)
-        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(1))
+        var runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(900))
+        runner.wallClockSleep = fireWhenExists(dir.appending(path: "printed"))
         let events = try await collect(runner.run(request(in: dir)))
         guard case .result? = events.last else { Issue.record("no result: \(events)"); return }
     }

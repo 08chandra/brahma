@@ -154,6 +154,9 @@ public actor Orchestrator {
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }
 
+        // Pending reviews: blocked reviewers wake for them, paused reviewers' reviews are re-routed after a day.
+        attempt { _ = try store.sweepReviews(now: now) }
+
         // Open asks: expiry, owner reminders, internal aging and paused-approver rerouting (company-active time).
         attempt { _ = try store.sweepAsks(now: now) }
 
@@ -189,6 +192,8 @@ public actor Orchestrator {
         for a in all where a.state != .killed {
             if case .agent(let id)? = a.blocker { blocking[id, default: 0] += 1 }
         }
+        // A pending review or audit is the critical path for the reviewer: the item (and everything behind it) waits on it.
+        for (id, n) in (try? store.pendingReviewCounts()) ?? [:] { blocking[id, default: 0] += n }
 
         // 3. Usage gate per company. The five-hour limits close a company to everyone and are persisted as blockers
         //    (their reset is a fact). The weekly pace is NOT persisted: it is re-evaluated every tick and applied in
@@ -350,9 +355,10 @@ public actor Orchestrator {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             let template = store.catalog.template(role: agent.role, pack: company.packId)
             // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
-            let review = try Self.prepareReview(store: store, agent: agent, company: company)
+            let store = self.store
+            let review = try await Blocking.tryRun { try Self.prepareReview(store: store, agent: agent, company: company) }
             // Otherwise a batched audit of auto-merges (9c) is the same kind of clean-context turn.
-            let audit = review == nil ? try Self.prepareAudit(store: store, agent: agent, company: company) : nil
+            let audit = review == nil ? try await Blocking.tryRun { try Self.prepareAudit(store: store, agent: agent, company: company) } : nil
             isReview = review != nil || audit != nil
             var turnPrompt = ""
             var sent = agent
@@ -397,7 +403,8 @@ public actor Orchestrator {
                     let g = store.gitWorkspace(root: workspace, companyId: company.id)
                     let wt = g.worktreePath(key: leased.key)
                     if !g.hasCheckout(key: leased.key) {
-                        do { try g.addWorktree(key: leased.key) } catch {
+                        let key = leased.key
+                        do { try await Blocking.tryRun { try g.addWorktree(key: key) } } catch {
                             // Never run a leaseholder's turn outside its worktree: the turn does not start.
                             throw WorktreeUnavailable(itemId: leased.id, key: leased.key, reason: "\(error)")
                         }
@@ -426,13 +433,20 @@ public actor Orchestrator {
 
                 // Plan-first (design §2.4): only on a clean worktree, so the write barrier can tell. The selection is the mode
                 // policy's (compiled only once probe V-4 passed); tests may force it.
+                var planGit: (head: String, barrier: GitWorkspace.PlanBarrier)?
                 if kind == .work, let leased = c.item, let git, let checkout,
                    planSelector.map({ $0(agent, leased, company) })
                     ?? ModePolicy.select(modeInputs(kind: .work, agent: agent, company: company, template: template, deciding: deciding,
                                                     facts: facts, hasItem: true, itemBudget: itemBudget, sessionModel: nil,
-                                                    sessionTokens: 0)).planFirst,
-                   (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout),
-                   let barrier = try? git.planBarrier(key: leased.key, in: checkout),
+                                                    sessionTokens: 0)).planFirst {
+                    let key = leased.key
+                    planGit = await Blocking.run { () -> (head: String, barrier: GitWorkspace.PlanBarrier)? in
+                        guard (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout),
+                              let barrier = try? git.planBarrier(key: key, in: checkout) else { return nil }
+                        return (head, barrier)
+                    }
+                }
+                if let leased = c.item, let git, let checkout, let (head, barrier) = planGit,
                    let dir = Self.planDirectory(workspace: workspace, key: leased.key, store: store, companyId: company.id) {
                     kind = .plan
                     planDirectory = dir.path

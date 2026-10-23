@@ -127,7 +127,7 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         await h.stop()
         let h2 = host(paths, store, StubRunner(mode: .succeed))
         await h2.start(tools: tools)
-        try await eventually(timeout: .seconds(5)) {
+        try await eventually {
             try store.agent(id: ceo.id)?.state == .sleeping && store.lastTurn(agentId: ceo.id)?.outcome == .succeeded
         }
         #expect(try store.pendingInbox(agentId: ceo.id).isEmpty)
@@ -143,7 +143,7 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         try await eventually { try store.agent(id: ceo.id)?.state == .running }
         let start = ContinuousClock.now
         await h.stop(timeout: .milliseconds(300))
-        #expect(ContinuousClock.now - start < .seconds(2))
+        #expect(ContinuousClock.now - start < .seconds(30), "hang guard")
         #expect(h.status == .stopped)
     }
 

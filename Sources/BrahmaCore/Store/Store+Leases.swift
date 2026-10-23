@@ -315,6 +315,26 @@ extension Store {
 
     // MARK: Critical path
 
+    /// Per agent: reviews waiting on it (an item the engine has checked and nobody has decided) plus audits routed to it and
+    /// not yet done. These count as work others wait on, so the reviewer is admitted while the weekly pace is closed.
+    func pendingReviewCounts() throws -> [String: Int] {
+        try writer.read { db in
+            var counts: [String: Int] = [:]
+            for row in try Row.fetchAll(db, sql: """
+                SELECT reviewerId AS id, COUNT(*) AS n FROM workItem WHERE reviewerId IS NOT NULL AND \(Store.pendingReviewWhere)
+                GROUP BY reviewerId
+                """) {
+                if let id = String.fromDatabaseValue(row["id"]) { counts[id, default: 0] += Int.fromDatabaseValue(row["n"]) ?? 0 }
+            }
+            for row in try Row.fetchAll(db, sql: """
+                SELECT auditorId AS id, COUNT(*) AS n FROM reviewAudit WHERE auditorId IS NOT NULL AND auditedAt IS NULL GROUP BY auditorId
+                """) {
+                if let id = String.fromDatabaseValue(row["id"]) { counts[id, default: 0] += Int.fromDatabaseValue(row["n"]) ?? 0 }
+            }
+            return counts
+        }
+    }
+
     /// Per agent: undone items that depend on items it owns or leases (a dependent the agent itself wrote and linked does
     /// not count), one query. The scheduler adds the agents blocked on it.
     func blockingCounts() throws -> [String: Int] {

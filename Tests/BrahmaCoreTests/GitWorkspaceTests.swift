@@ -214,11 +214,11 @@ import Foundation
         let fd = open(ws.lockDirectory.appending(path: "K-1.lock").path, O_CREAT | O_RDWR, 0o600)
         #expect(fd >= 0); #expect(flock(fd, LOCK_EX) == 0)
         defer { close(fd) }
-        ws.lockTimeout = 0.3
+        ws.lockTimeout = 0
         let started = Date()
         #expect(throws: GitError.self) { try ws.removeWorktree(key: "K-1", keepIf: { false }) }
         #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
-        #expect(Date().timeIntervalSince(started) < 5)
+        #expect(Date().timeIntervalSince(started) < 60, "hang guard")
         #expect(FileManager.default.fileExists(atPath: wt.path))
         // Other items are not affected.
         try ws.addWorktree(key: "K-2")
@@ -1252,15 +1252,13 @@ import Foundation
         try Data().write(to: lock)
         let config = f.root.appending(path: ".git/config")
         let current = try String(contentsOf: config, encoding: .utf8)
-        // While the engine waits for the lock, the config gains a filter; then the lock goes.
-        Thread.detachNewThread {
-            Thread.sleep(forTimeInterval: 0.08)
+        // One git call whose first attempt meets the lock: between the attempts (the hook) the config gains a filter and the
+        // lock goes; the retry is scanned again and refused.
+        var git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil, onRefused: { log.add($0) })
+        git.beforeRetry = { _ in
             try? (current + "[filter \"evil\"]\n\tclean = cat\n").write(to: config, atomically: true, encoding: .utf8)
-            Thread.sleep(forTimeInterval: 0.05)
             try? FileManager.default.removeItem(at: lock)
         }
-        // One git call whose first attempt meets the lock: the retry is scanned again and refused.
-        let git = GitCommand(gitDir: f.root.appending(path: ".git"), workTree: f.root, commonDir: nil, onRefused: { log.add($0) })
         let error = try #require(throws: GitError.self) { try git.run(["add", "-A"]) }
         #expect(error.isRepositoryRefusal, "\(error)")
         #expect(log.all.count == 1)

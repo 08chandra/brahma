@@ -27,7 +27,7 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
     return out
 }
 
-@Suite struct TurnRunnerTests {
+@Suite(.serialized) struct TurnRunnerTests {
     @Test func runsExecutableFeedsPromptOnStdinAndParsesStdout() async throws {
         let fixture = try #require(Bundle.module.url(forResource: "stream-success", withExtension: "jsonl",
                                                      subdirectory: "Fixtures"))
@@ -76,11 +76,15 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             cat > /dev/null
             exec sleep 30
             """)
-        // Long enough for the script to start under a loaded parallel test run.
-        let runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(1))
-        let start = ContinuousClock.now
+        // The wall clock fires only once the script has started (its pid is written): no race against a real timer.
+        let pidFile = dir.appending(path: "pid.txt")
+        var runner = ClaudeProcessRunner(claudePath: script.path, maxTurnDuration: .seconds(900))
+        runner.wallClockSleep = { _ in
+            while !(((try? String(contentsOf: pidFile, encoding: .utf8)) ?? "").contains("\n")) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
         await #expect(throws: TurnError.timedOut) { _ = try await collect(runner.run(request(in: dir))) }
-        #expect(ContinuousClock.now - start < .seconds(5))
         let pid = try #require(Int32(try String(contentsOf: dir.appending(path: "pid.txt"), encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(kill(pid, 0) == -1)

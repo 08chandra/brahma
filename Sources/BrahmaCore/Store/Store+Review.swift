@@ -51,8 +51,64 @@ extension Store {
     /// A reviewer asleep when its review becomes due (a pass without a notice, a new reviewer) is made ready.
     static func wakeReviewer(db: Database, item: WorkItem, now: Date) throws {
         guard let reviewerId = item.reviewerId, try hasPendingReviewOf(db: db, itemId: item.id, agentId: reviewerId),
-              let agent = try Agent.fetchOne(db, key: reviewerId), agent.state == .sleeping, !agent.paused else { return }
-        try transition(db: db, agentId: reviewerId, to: .ready, now: now)
+              let agent = try Agent.fetchOne(db, key: reviewerId), !agent.paused else { return }
+        if agent.state == .sleeping {
+            try transition(db: db, agentId: reviewerId, to: .ready, now: now)
+        } else if agent.state == .blocked {
+            try wakeBlockedReviewer(db: db, agent: agent, now: now)
+        }
+    }
+
+    /// A reviewer blocked on someone (an agent, the owner, an item) is made ready for its review turn, with its old blocker
+    /// as the requested one: `endTurn` puts the blocker back after the turn unless it was answered. Timed blockers (usage,
+    /// turn budget, retry backoff) have their own clocks and are left alone.
+    private static func wakeBlockedReviewer(db: Database, agent: Agent, now: Date) throws {
+        guard agent.state == .blocked, !agent.paused, let blocker = agent.blocker else { return }
+        switch blocker {
+        case .agent, .owner, .workItem: break
+        case .usageLimit, .turnBudget, .retry: return
+        }
+        var woken = try transition(db: db, agentId: agent.id, to: .ready, now: now)
+        woken.requestedBlocker = blocker
+        try woken.update(db, columns: ["requestedBlocker"])
+    }
+
+    /// The tick's pass over reviews: a blocked reviewer with a pending review is woken (a manager blocked on its own report's
+    /// item must still review it), and the pending reviews of a reviewer paused for `AskLifecycle.pausedReroute` active seconds
+    /// go to another reviewer (like a kill). Returns how many agents or items changed.
+    @discardableResult
+    func sweepReviews(now: Date = Store.now()) throws -> Int {
+        try writer.write { db in
+            var changed = 0
+            let blocked = try Agent.fetchAll(db, sql: """
+                SELECT * FROM agent WHERE state = 'blocked' AND paused = 0 AND id IN
+                (SELECT reviewerId FROM workItem WHERE reviewerId IS NOT NULL AND \(Store.pendingReviewWhere))
+                """)
+            for agent in blocked {
+                try Store.wakeBlockedReviewer(db: db, agent: agent, now: now)
+                changed += 1
+            }
+            let paused = try Agent.fetchAll(db, sql: "SELECT * FROM agent WHERE paused = 1 AND state <> 'killed' AND pausedActive IS NOT NULL")
+            for agent in paused {
+                guard let since = agent.pausedActive,
+                      try Store.activeNow(db: db, companyId: agent.companyId) - since >= AskLifecycle.pausedReroute else { continue }
+                let items = try WorkItem.fetchAll(db, sql: """
+                    SELECT * FROM workItem WHERE companyId = ? AND reviewerId = ? AND \(Store.pendingReviewWhere) ORDER BY number
+                    """, arguments: [agent.companyId, agent.id])
+                for var item in items {
+                    guard let next = try? resolveReviewer(db: db, item: item, excluding: [agent.id]) else { continue }
+                    item.reviewerId = next.id
+                    item.reviewAttempts = 0
+                    item.updatedAt = now
+                    try item.update(db)
+                    try recordItemEvent(db: db, item: item, actor: "system", kind: .edited,
+                                        text: "reviewer is now @\(next.name): @\(agent.name) has been paused for a day", now: now)
+                    try Store.wakeReviewer(db: db, item: item, now: now)
+                    changed += 1
+                }
+            }
+            return changed
+        }
     }
 
     private static func hasPendingReviewOf(db: Database, itemId: String, agentId: String) throws -> Bool {
@@ -64,17 +120,17 @@ extension Store {
 
     /// The owner's (assignee's) non-killed manager; else a cto-covering non-killed agent other than the owner; else any
     /// non-killed executive other than the owner. Nobody: `.conflict`.
-    func resolveReviewer(db: Database, item: WorkItem) throws -> Agent {
+    func resolveReviewer(db: Database, item: WorkItem, excluding: Set<String> = []) throws -> Agent {
         let ownerId = try item.ownerId ?? Self.leaseHolderId(db: db, itemId: item.id)
         if let ownerId, let owner = try Agent.fetchOne(db, key: ownerId), let managerId = owner.managerId,
            let manager = try Agent.fetchOne(db, key: managerId), manager.companyId == item.companyId, manager.state != .killed,
-           manager.id != ownerId {
+           manager.id != ownerId, !excluding.contains(manager.id) {
             return manager
         }
         let packId = try Company.fetchOne(db, key: item.companyId)?.packId ?? "software"
         let ctoRoles = catalog.pack(packId)?.rolesCovering("cto") ?? []
         let live = try Agent.filter(Column("companyId") == item.companyId && Column("state") != AgentState.killed.rawValue)
-            .order(Column("createdAt"), Column.rowID).fetchAll(db).filter { $0.id != ownerId }
+            .order(Column("createdAt"), Column.rowID).fetchAll(db).filter { $0.id != ownerId && !excluding.contains($0.id) }
         if let cto = live.first(where: { ctoRoles.contains($0.role) }) { return cto }
         if let executive = live.first(where: { catalog.template(role: $0.role, pack: packId).kind == .executive }) { return executive }
         throw WorkError.conflict("no reviewer available; set a reviewer on \(item.key)")

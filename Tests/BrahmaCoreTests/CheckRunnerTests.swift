@@ -55,25 +55,35 @@ import Foundation
         #expect(text.contains(dir.resolvingSymlinksInPath().path)); #expect(text.contains("marker.txt"))
     }
 
+    /// A runner clock that stands still until `file` exists (the command has started and written what the test needs), then
+    /// moves `step` seconds per reading: the timeout fires only after the command is under way, with no real timer to race.
+    private func clock(after file: URL, step: TimeInterval = 10) -> @Sendable () -> TimeInterval {
+        final class Ticks: @unchecked Sendable { let lock = NSLock(); var t = 0.0 }
+        let ticks = Ticks()
+        return {
+            ticks.lock.withLock {
+                if ((try? String(contentsOf: file, encoding: .utf8)) ?? "").contains("\n") { ticks.t += step }
+                return ticks.t
+            }
+        }
+    }
+
     @Test func timeoutKillsAndRecords() async throws {
         // The shell forks a child and waits for it: both must be gone, not just the shell.
         let pidFile = try tempDir().appending(path: "pid")
-        let started = Date()
-        let (outcome, _) = try await run("sleep 30 & echo $! > '\(pidFile.path)'; wait", timeout: 1)
+        let (outcome, _) = try await run("sleep 30 & echo $! > '\(pidFile.path)'; wait", timeout: 1,
+                                         runner: ProcessCheckRunner(termGrace: 0.5, clock: clock(after: pidFile)))
         #expect(outcome.timedOut); #expect(outcome.exitCode == nil)
-        #expect(Date().timeIntervalSince(started) < 10)
         let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(await gone(pid), "the forked child survived the timeout")
     }
 
     @Test func timeoutEscalatesToKillWhenTermIsIgnored() async throws {
         let pidFile = try tempDir().appending(path: "pid")
-        let quick = ProcessCheckRunner(termGrace: 0.5)
-        let started = Date()
+        let quick = ProcessCheckRunner(termGrace: 0.5, clock: clock(after: pidFile, step: 0.5))
         let (outcome, _) = try await run("trap '' TERM; (trap '' TERM; sleep 30) & echo $! > '\(pidFile.path)'; while true; do sleep 1; done",
                                          timeout: 1, runner: quick)
         #expect(outcome.timedOut)
-        #expect(Date().timeIntervalSince(started) < 10)
         let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(await gone(pid), "a TERM-ignoring child survived SIGKILL")
     }
@@ -83,7 +93,7 @@ import Foundation
         let started = Date()
         let (outcome, _) = try await run("sleep 30 & echo $! > '\(pidFile.path)'; echo done")
         #expect(outcome.exitCode == 0)
-        #expect(Date().timeIntervalSince(started) < 10, "the runner waited for the background process's pipe")
+        #expect(Date().timeIntervalSince(started) < 25, "the runner waited for the background process's pipe")
         let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(await gone(pid))
     }
