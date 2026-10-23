@@ -92,6 +92,18 @@ import GRDB
                 == ["2 Ready items and no idle agent picked them up"])
     }
 
+    @Test func readyItemsHeldBackByOverlapGetTheirOwnReason() {
+        var input = StallInput()
+        input.readyItems = 3; input.idleAgents = 2
+        input.readyHeldBack = 2
+        input.readyHeldBackExample = "ACME-4 overlaps ACME-2 (src/a); wait until it merges"
+        #expect(StallExplainer.explain(input, timeZone: Self.utc, now: Self.now).reasons
+                == ["2 Ready items wait for others to merge (path overlap or a shared hot path): ACME-4 overlaps ACME-2 (src/a); wait until it merges"])
+        input.idleAgents = 0
+        #expect(StallExplainer.explain(input, timeZone: Self.utc, now: Self.now).reasons.last
+                == "1 Ready item and no idle agent picked them up")
+    }
+
     @Test func explainerHoldFirst() {
         var input = StallInput()
         input.hold = StallHold(reason: "account", detail: "not logged in", since: Self.now)

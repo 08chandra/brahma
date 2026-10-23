@@ -48,7 +48,9 @@ public struct ItemDetail: Equatable, Sendable {
         let hasLease = try store.lease(itemId: item.id) != nil
         if hasLease || item.linkedBranch != nil || item.status == .inProgress || item.status == .inReview {
             d.branch = item.linkedBranch ?? "item/\(item.key)"
-            if !workspace.isEmpty { d.worktree = workspace + "/.brahma/wt/" + item.key }
+            if !workspace.isEmpty {
+                d.worktree = GitWorkspace(root: URL(fileURLWithPath: workspace, isDirectory: true)).worktreePath(key: item.key).path
+            }
         }
         if let parent = item.parentId { d.parentKey = try store.workItem(id: parent)?.key }
         return d

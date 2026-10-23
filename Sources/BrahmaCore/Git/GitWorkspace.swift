@@ -1094,6 +1094,11 @@ public struct GitWorkspace: Sendable {
         return nil
     }
 
+    /// Whether `refs/heads/main` has been made a symbolic ref (to an item branch, say): the engine neither follows nor moves it.
+    public func mainIsSymbolic() throws -> Bool {
+        !(try main.run(["for-each-ref", "--format=%(symref)", Self.mainRef]).text.isEmpty)
+    }
+
     /// Fast-forwards `refs/heads/main` from `old` to `new` (the caller holds main's lock): the expected next head is recorded
     /// first, then a compare-and-swap `update-ref`, then a check that `main` is `new`. The root checkout, when it is on
     /// `main`, follows with a two-tree `read-tree` (which never overwrites local edits).
@@ -1101,8 +1106,11 @@ public struct GitWorkspace: Sendable {
         guard try isAncestor(old, of: new) else {
             throw GitError.failed(command: "update-ref \(Self.mainRef)", status: -1, stderr: "not a fast-forward of main")
         }
+        guard try !mainIsSymbolic() else {
+            throw GitError.failed(command: "update-ref \(Self.mainRef)", status: -1, stderr: "main is a symbolic ref")
+        }
         try recordPending(new)
-        try main.run(["update-ref", Self.mainRef, new, old])
+        try main.run(["update-ref", "--no-deref", Self.mainRef, new, old])
         guard try head(of: Self.mainRef) == new else {
             throw GitError.failed(command: "update-ref \(Self.mainRef)", status: -1, stderr: "main is not at \(new.prefix(7)) after the update")
         }
@@ -1116,8 +1124,8 @@ public struct GitWorkspace: Sendable {
         guard hasCheckout(key: key), let git = try? context(for: worktreePath(key: key)),
               let out = try? git.run(["symbolic-ref", "--quiet", "HEAD"], allowFailure: true),
               out.status == 0, out.text == branchRef(key: key) else { return }
-        _ = try? git.run(["reset", "--hard", "--quiet", commit], allowFailure: true)
-        _ = try? git.run(["clean", "-fd", "--quiet"], allowFailure: true)
+        // Never through `HEAD`: `resetHard` resets the index and tree by `read-tree` and moves only this item's ref (compare-and-swap).
+        try? resetHard(in: worktreePath(key: key), to: commit)
     }
 
     /// Removes every in-progress operation's state from the merge repository's git dir (the engine's own rebase, or one
@@ -1457,11 +1465,15 @@ public struct GitWorkspace: Sendable {
             guard try head(of: Self.mainRef) == expectedMain, try checkedOutRef() == Self.mainRef else {
                 throw GitError.failed(command: "quarantine", status: -1, stderr: "main is not where the engine expects it")
             }
+            // `.brahma/` is the engine's (check snapshots, plans, notes, hand-offs): put back in the exclude file if an agent took
+            // it out, and kept out of the quarantine commit and the clean whatever that file says.
+            try ensureExclude()
             let index = FileManager.default.temporaryDirectory.appending(path: "brahma-quarantine-\(UUID().uuidString).index")
             defer { try? FileManager.default.removeItem(at: index) }
             let staged = main.withIndex(index)
             try staged.run(["read-tree", expectedMain])
             try staged.run(["add", "-A"])
+            try staged.run(["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", "--", ".brahma"])
             let tree = try staged.run(["write-tree"]).text
             let mainTree = try main.run(["rev-parse", "--verify", "\(expectedMain)^{tree}"]).text
             var found: Quarantine?
@@ -1484,7 +1496,7 @@ public struct GitWorkspace: Sendable {
                 found = Quarantine(ref: ref, commit: commit, nameStatus: lines, stat: stat)
             }
             try main.run(["reset", "--hard", "--quiet", expectedMain])
-            try main.run(["clean", "-fd", "--quiet"])
+            try main.run(["clean", "-fd", "--quiet", "-e", ".brahma/"])
             return found
         }
     }
@@ -2313,7 +2325,8 @@ public struct GitWorkspace: Sendable {
     }
 
     public func isDirty(in dir: URL) throws -> Bool {
-        !(try context(for: dir).run(["status", "--porcelain", "--ignore-submodules=dirty"]).text.isEmpty)
+        // The engine's own directory is never "uncommitted work", whatever the agent-writable `info/exclude` says.
+        !(try context(for: dir).run(["status", "--porcelain", "--ignore-submodules=dirty", "--", ".", ":(exclude).brahma"]).text.isEmpty)
     }
 
     /// The commit `ref` points at, or nil when there is no such ref.

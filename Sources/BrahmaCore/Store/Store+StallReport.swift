@@ -46,8 +46,16 @@ extension Store {
                 .order(Column("id")).fetchAll(db) {
                 input.deadlocks.append(try row.memberIds.map { try Agent.fetchOne(db, key: $0)?.name ?? "?" })
             }
-            input.readyItems = try WorkItem.filter(Column("companyId") == companyId
-                                                   && Column("status") == WorkItemStatus.ready.rawValue).fetchCount(db)
+            let ready = try WorkItem.filter(Column("companyId") == companyId
+                                            && Column("status") == WorkItemStatus.ready.rawValue).order(Column("number")).fetchAll(db)
+            input.readyItems = ready.count
+            for item in ready {
+                // Only the path rules: a Ready item the dispatch pass skips because another one is still in progress or in review.
+                if let why = try pathRefusal(db, item: item) {
+                    input.readyHeldBack += 1
+                    if input.readyHeldBackExample == nil { input.readyHeldBackExample = why }
+                }
+            }
             let leased = Set(try String.fetchAll(db, sql: "SELECT agentId FROM workLease WHERE companyId = ?", arguments: [companyId]))
             input.idleAgents = live.filter { ($0.state == .ready || $0.state == .sleeping) && !$0.paused && !leased.contains($0.id) }.count
             let blocked = try WorkItem.filter(Column("companyId") == companyId

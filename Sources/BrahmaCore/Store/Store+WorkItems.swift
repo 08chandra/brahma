@@ -303,6 +303,9 @@ extension Store {
         if item.ownerId != nil, item.ownerId == item.reviewerId {
             throw WorkError.conflict("an item's assignee cannot be its reviewer")
         }
+        if let reviewer = item.reviewerId, patch.reviewerId != nil, reviewer == (try Self.leaseHolderId(db: db, itemId: item.id)) {
+            throw WorkError.conflict("the agent holding an item's lease cannot be its reviewer")
+        }
         var otherChanged: [String] = []
         if let n = patch.notes {
             let v = try n.map { try Self.limited($0, Self.maxNotes, "the notes") }

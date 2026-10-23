@@ -33,10 +33,12 @@ extension Store {
     /// it throws.
     func checkMain(company: Company, git: GitWorkspace? = nil) throws {
         let git = git ?? gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
-        let current: String?
+        var current: String?
         do { current = try git.head(of: GitWorkspace.mainRef) } catch let e as GitError where e.isRepositoryRefusal {
             throw e      // its own alert; main is not known to have moved
         } catch { current = nil }
+        // A `main` that is a symbolic ref is not the branch the engine recorded, whatever it points at: fail closed.
+        if current != nil, (try? git.mainIsSymbolic()) != false { current = nil }
         let row = try writer.read { try Row.fetchOne($0, sql: "SELECT mainCommit, pendingMainCommit FROM company WHERE id = ?", arguments: [company.id]) }
         let recorded: String? = row?["mainCommit"]
         let pending: String? = row?["pendingMainCommit"]

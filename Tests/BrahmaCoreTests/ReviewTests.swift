@@ -934,6 +934,50 @@ import GRDB
         #expect(try quarantineAsks(r).count == 1)
     }
 
+    @Test func quarantineKeepsTheEnginesDirectoryEvenWhenTheExcludeLineIsGone() async throws {
+        let r = try R()
+        try r.commitMain(["README.md": "hello\n"])
+        let i = try await r.approved(file: "src/a.txt")
+        let before = try r.mainHead()
+        // An agent removes the exclude line; the engine's own files would now look like uncommitted work.
+        try "".write(to: r.root.appending(path: ".git/info/exclude"), atomically: true, encoding: .utf8)
+        try r.write(".brahma/engine-note.txt", "engine state\n", in: r.root)
+        try r.write("scratch.txt", "the owner was here\n", in: r.root)
+        try await r.cycle()
+        let refs = try GitFixture.plainGit(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"], in: r.root)
+            .split(separator: "\n").map(String.init)
+        let ref = try #require(refs.first)
+        let files = try GitFixture.plainGit(["ls-tree", "-r", "--name-only", ref], in: r.root)
+        #expect(files.contains("scratch.txt")); #expect(!files.contains(".brahma"), "\(files)")
+        #expect(FileManager.default.fileExists(atPath: r.root.appending(path: ".brahma/engine-note.txt").path), "not cleaned away")
+        #expect(try r.mainHead() == before); _ = i
+    }
+
+    @Test func aSymbolicMainIsNeitherFollowedNorMoved() async throws {
+        let r = try R()
+        try r.commitMain(["README.md": "hello\n"])
+        let main = try r.mainHead()
+        #expect(try r.ws.mainIsSymbolic() == false)
+        try GitFixture.plainGit(["branch", "elsewhere", main], in: r.root)
+        try GitFixture.plainGit(["symbolic-ref", "refs/heads/main", "refs/heads/elsewhere"], in: r.root)
+        #expect(try r.ws.mainIsSymbolic() == true)
+        let company = try #require(try r.store.company(id: r.company.id))
+        #expect(throws: WorkError.self) { try r.store.checkMain(company: company) }
+        #expect(try r.alerts().count == 1, "the main alert is raised")
+    }
+
+    @Test func aLeaseHolderCannotBeSetAsReviewer() async throws {
+        let r = try R()
+        let i = try r.item()
+        try r.claim(i, r.eng)
+        let error = r.failure { _ = try r.store.updateWorkItem(id: i.id, by: .owner, patch: WorkItemPatch(reviewerId: .some(r.eng.id)), now: r.now); return "ok" }
+        #expect(error != "no error", "\(error)")
+        #expect(try r.fresh(i).reviewerId == r.rev.id)
+        // And a reviewer who became the holder is not "usable": a submit resolves another one.
+        try r.exec("UPDATE workItem SET reviewerId = ? WHERE id = ?", [r.eng.id, i.id])
+        #expect(try await r.store.writer.read { db in try r.store.reviewerIsUsable(db: db, item: try #require(try WorkItem.fetchOne(db, key: i.id))) } == false)
+    }
+
     @Test func ownerAcceptMergesQuarantine() async throws {
         let r = try R()
         let (i, before, ref) = try await quarantined(r)

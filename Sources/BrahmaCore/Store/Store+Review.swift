@@ -139,7 +139,9 @@ extension Store {
     /// Whether the item's current reviewer can still review it: an active teammate who is not the assignee.
     func reviewerIsUsable(db: Database, item: WorkItem) throws -> Bool {
         guard let id = item.reviewerId, let agent = try Agent.fetchOne(db, key: id) else { return false }
-        return agent.companyId == item.companyId && agent.state != .killed && id != item.ownerId
+        // Neither the assignee nor whoever holds the item's lease can review it.
+        let holder = try Self.leaseHolderId(db: db, itemId: item.id)
+        return agent.companyId == item.companyId && agent.state != .killed && id != item.ownerId && id != holder
     }
 
     /// A submit would be refused for want of a reviewer: said before anything is committed.

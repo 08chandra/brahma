@@ -90,9 +90,12 @@ losing work.
 **Review and merge.** A submitted item is reviewed in a fresh, clean-context session by its reviewer: the reviewer sees
 the diff, the check result and the flags, not the author's conversation. Review flags (a check edited after start,
 deleted or modified tests, an edited check script, code changed after the pass, a flaky pass) need explicit approval.
-Three rejected attempts escalate. On approval the engine re-verifies and merges the verified SHA into `main`.
-Small tier-S changes under `autoMergePaths` (default `Sources/ src/ lib/ app/ docs/`) set up by a lead merge
-automatically and are audited 100%; switch with `brahma settings auto-merge on|off`.
+Three review turns without a decision escalate to the reviewer's manager (else you). On approval the engine merges the
+verified SHA into `main`; it re-verifies only when `main` moved and the branch had to be rebased first. Auto-merge is **off
+by default**: a company turns it on with `brahma company set <company> auto-merge-small on` (and you can switch it off
+for every company with `brahma settings auto-merge off`, the owner-wide master switch). With it on, small tier-S changes
+under `autoMergePaths` (default `Sources/ src/ lib/ app/ docs/`) set up by a lead merge automatically and are audited
+100%; switching it off takes back every auto-approval that has not landed yet.
 
 **Sessions and hand-offs.** Each agent keeps one session per item it works on (plus its base session for chat), so
 returning to an item resumes with its context. When work moves between agents, or an agent is killed or paused, a
@@ -189,6 +192,10 @@ A nested `claude` launched from an agent's Bash can load your settings (`fastMod
 auth. Brahma sets environment defusers, but an agent can unset them, which is why sub-agents and Ultra wait for the
 sandbox. Other 5-lite residuals: the race between the git-config scan and the command that follows it, agent worktrees
 under `.brahma/wt`, and the database and MCP configs staying readable by agent shells.
+
+**Large repositories.** Each landing into `main` fetches the history it needs into a fresh engine-owned repository, so on a
+very large repository a merge costs a full-history fetch. This is acceptable for the workspaces Brahma creates; the 4a merge
+queue is where it gets reworked.
 
 ## Data locations
 

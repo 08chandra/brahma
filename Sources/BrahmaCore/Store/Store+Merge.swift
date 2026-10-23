@@ -339,6 +339,10 @@ extension Store {
         case .merged(let head):
             let landed = try writer.write { db -> Bool in
                 guard var current = try WorkItem.fetchOne(db, key: itemId), current.status != .done else { return false }
+                // The merge lockout lives in the tool layer: an owner edit or an engine step can still have changed the item while
+                // its merge ran. The commit is in main either way; say so, and tell the holder.
+                let diverged = current.status != .inReview || current.mergeState != .pending
+                let wasStatus = current.status
                 current.mergeState = .none
                 current.mergedCommit = head
                 current.updatedAt = now
@@ -346,6 +350,13 @@ extension Store {
                 // Risk-tiered review: an auto-approved item that lands is an auto-merge, and every one is queued for an audit.
                 try queueAudit(db: db, item: current, mergedCommit: head)
                 _ = try engineSetStatus(db: db, itemId: itemId, to: .done, text: "merged into main at \(head.prefix(7))", event: .merged, now: now)
+                if diverged {
+                    let holder = try Self.leaseHolderId(db: db, itemId: itemId)
+                    try recordItemEvent(db: db, item: current, actor: "system", kind: .edited,
+                                        text: "landed in main at \(head.prefix(7)) although the item had been changed while its merge ran "
+                                            + "(it was \(wasStatus.title.lowercased())); check that main holds what you intend",
+                                        alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+                }
                 try finalizeMainCommit(db, companyId: company.id, commit: head)
                 try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId), Self.mergeHoldAlertReason(company.id)], now: now)
                 return true

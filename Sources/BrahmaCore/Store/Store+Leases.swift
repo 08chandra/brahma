@@ -151,7 +151,7 @@ extension Store {
     }
 
     /// The path-overlap guard and the hot-path rule against the company's items in progress or in review.
-    private func pathRefusal(_ db: Database, item: WorkItem) throws -> String? {
+    func pathRefusal(_ db: Database, item: WorkItem) throws -> String? {
         let others = try WorkItem.filter(Column("companyId") == item.companyId && Column("id") != item.id
             && [WorkItemStatus.inProgress.rawValue, WorkItemStatus.inReview.rawValue].contains(Column("status")))
             .order(Column("number")).fetchAll(db)

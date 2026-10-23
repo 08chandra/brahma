@@ -111,6 +111,10 @@ public struct StallInput: Equatable, Sendable {
     /// Open deadlocks, each as the handles around the cycle.
     public var deadlocks: [[String]] = []
     public var readyItems: Int = 0
+    /// Ready items the dispatch pass skips because they overlap an item in progress or in review, or share a hot path with one,
+    /// and the refusal text of the first (for example "ACME-4 overlaps ACME-2 (src/a); wait until it merges").
+    public var readyHeldBack: Int = 0
+    public var readyHeldBackExample: String? = nil
     public var idleAgents: Int = 0
     public var longBlockedCount: Int = 0
     public var oldestBlockedKey: String? = nil
@@ -170,9 +174,15 @@ public enum StallExplainer {
             reasons.append("\(k) \(plural(k, "item", "items")) blocked over 3 days (oldest \(key), \(age(input.oldestBlockedAge)))")
         }
         if input.readyItems > 0 {
+            if input.readyHeldBack > 0 {
+                let k = input.readyHeldBack
+                reasons.append("\(k) Ready \(plural(k, "item waits", "items wait")) for others to merge (path overlap or a shared hot path)"
+                               + (input.readyHeldBackExample.map { ": \($0)" } ?? ""))
+            }
             // With an idle agent the next dispatch pass hands them out: that is not a stall.
-            if input.idleAgents == 0 {
-                reasons.append("\(input.readyItems) Ready \(plural(input.readyItems, "item", "items")) and no idle agent picked them up")
+            let free = input.readyItems - input.readyHeldBack
+            if input.idleAgents == 0, free > 0 {
+                reasons.append("\(free) Ready \(plural(free, "item", "items")) and no idle agent picked them up")
             }
         } else {
             reasons.append("no Ready items in the backlog")
