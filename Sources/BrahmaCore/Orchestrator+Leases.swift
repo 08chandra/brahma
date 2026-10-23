@@ -58,7 +58,7 @@ extension Orchestrator {
         spawnGit("wt:\(companyId):\(key)") { [self] in
             // Decided under the item's lock: a new claim may have taken the item since it was reaped, and a database
             // error is not "no lease" (nothing is removed then).
-            await Blocking.run {
+            await blocking.run {
                 do {
                     try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
                 } catch { self.log("could not remove worktree \(key): \(error)") }
@@ -71,7 +71,7 @@ extension Orchestrator {
     nonisolated func sweepNow(company: Company) async {
         let (store, ws, companyId) = (self.store, URL(fileURLWithPath: company.workspacePath, isDirectory: true), company.id)
         guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { return }
-        await Blocking.run {
+        await blocking.run {
             let git = store.gitWorkspace(root: ws, companyId: companyId)
             let items: [(key: String, path: URL)]
             do { items = try git.itemWorktrees() } catch { self.log("worktree sweep failed: \(error)"); return }
@@ -134,7 +134,7 @@ extension Orchestrator {
         spawnGit("dispatch:\(agent.id)") { [self] in
             var failed: String?
             do {
-                try await Blocking.tryRun {
+                try await blocking.tryRun {
                     try store.prepareRepo(company: company)
                     try git.addWorktree(key: item.key)
                     try store.ensureProgressFile(workspace: ws, item: item)

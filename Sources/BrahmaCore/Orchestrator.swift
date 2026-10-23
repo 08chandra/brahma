@@ -102,6 +102,8 @@ public actor Orchestrator {
     /// Child processes that are not turns: engine-run checks and merges. They count against the same safety cap as turns.
     var otherChildren: Int { checkTasks.count + mergeTasks.count }
 
+    /// This engine's limit on concurrently running blocking (git) bodies.
+    let blocking = Blocking()
     private var idleWaiters: [Int: CheckedContinuation<Void, any Error>] = [:]
     private var nextIdleWaiter = 0
 
@@ -388,9 +390,9 @@ public actor Orchestrator {
             let template = store.catalog.template(role: agent.role, pack: company.packId)
             // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
             let store = self.store
-            let review = try await Blocking.tryRun { try Self.prepareReview(store: store, agent: agent, company: company) }
+            let review = try await blocking.tryRun { try Self.prepareReview(store: store, agent: agent, company: company) }
             // Otherwise a batched audit of auto-merges (9c) is the same kind of clean-context turn.
-            let audit = review == nil ? try await Blocking.tryRun { try Self.prepareAudit(store: store, agent: agent, company: company) } : nil
+            let audit = review == nil ? try await blocking.tryRun { try Self.prepareAudit(store: store, agent: agent, company: company) } : nil
             isReview = review != nil || audit != nil
             var turnPrompt = ""
             var sent = agent
@@ -436,7 +438,7 @@ public actor Orchestrator {
                     let wt = g.worktreePath(key: leased.key)
                     if !g.hasCheckout(key: leased.key) {
                         let key = leased.key
-                        do { try await Blocking.tryRun { try g.addWorktree(key: key) } } catch {
+                        do { try await blocking.tryRun { try g.addWorktree(key: key) } } catch {
                             // Never run a leaseholder's turn outside its worktree: the turn does not start.
                             throw WorktreeUnavailable(itemId: leased.id, key: leased.key, reason: "\(error)")
                         }
@@ -458,7 +460,7 @@ public actor Orchestrator {
                     if c.lease != nil, let g = git {
                         // Its `nameStatus` diffs are git: off the cooperative pool.
                         let now = clock()
-                        await Blocking.run { self.escalate(itemId: itemId, agent: agent, git: g, now: now) }
+                        await blocking.run { self.escalate(itemId: itemId, agent: agent, git: g, now: now) }
                     }
                     facts = try? store.itemModeFacts(itemId: itemId, holderId: c.lease?.agentId ?? agent.id)
                     itemBudget = c.lease?.agentId == agent.id && c.lease?.itemId == itemId
@@ -474,7 +476,7 @@ public actor Orchestrator {
                                                     facts: facts, hasItem: true, itemBudget: itemBudget, sessionModel: nil,
                                                     sessionTokens: 0)).planFirst {
                     let key = leased.key
-                    planGit = await Blocking.run { () -> (head: String, barrier: GitWorkspace.PlanBarrier)? in
+                    planGit = await blocking.run { () -> (head: String, barrier: GitWorkspace.PlanBarrier)? in
                         guard (try? git.isDirty(in: checkout)) == false, let head = try? git.headCommit(in: checkout),
                               let barrier = try? git.planBarrier(key: key, in: checkout) else { return nil }
                         return (head, barrier)

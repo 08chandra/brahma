@@ -13,7 +13,7 @@ extension Orchestrator {
             let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
             guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { continue }
             let git = store.gitWorkspace(root: ws, companyId: company.id)
-            await Blocking.run { git.removeRunWorktrees() }
+            await blocking.run { git.removeRunWorktrees() }
         }
     }
 
@@ -91,7 +91,7 @@ extension Orchestrator {
             // (`<home>/run/exports/<runId>`); a submission's in a detached worktree there too (`<home>/run/checkouts/<runId>`).
             let (store, now) = (self.store, clock())
             let (runId, commit, purpose) = (run.id, run.commit, run.purpose)
-            dir = try await Blocking.tryRun {
+            dir = try await blocking.tryRun {
                 purpose == .merge
                     ? try git.addEngineExport(runId: runId, commit: commit, tamper: { store.reportMergeTamper(company: company, removed: $0, now: now) })
                     : try git.addRunWorktree(runId: runId, commit: commit)
@@ -99,7 +99,7 @@ extension Orchestrator {
             try store.setVerificationDirectory(runId: run.id, path: dir.path)
         } catch let refused as UnexportableTree where run.purpose == .merge {
             // The item's own tree cannot be written out (A1): its fault, so it goes back to its holder with the reason.
-            await Blocking.run { git.removeRunWorktree(runId: run.id) }
+            await blocking.run { git.removeRunWorktree(runId: run.id) }
             await mergeCheckDeferralsEnded(runId: run.id)
             log("the merge check of \(run.commit.prefix(7)) could not be exported: \(refused.reason)")
             do { try store.returnUnexportable(runId: run.id, reason: refused.reason, now: clock()) } catch {
@@ -109,7 +109,7 @@ extension Orchestrator {
         } catch let error where run.purpose == .merge && Orchestrator.isCompanyMergeFault(error) {
             // The engine's own machinery, not the item: held and retried, never charged to the item (`companyMergeFault`).
             // A run deferred `maxMergeCheckDeferrals` times is recorded inconclusive (retried, then returned as uncheckable).
-            await Blocking.run { git.removeRunWorktree(runId: run.id) }
+            await blocking.run { git.removeRunWorktree(runId: run.id) }
             log("could not export \(run.commit.prefix(7)) for its merge check (\(company.name)'s merge step failed): \(error)")
             let deferrals = await noteMergeCheckDeferral(runId: run.id)
             if deferrals > Self.maxMergeCheckDeferrals {
@@ -125,7 +125,7 @@ extension Orchestrator {
             }
             return
         } catch {
-            await Blocking.run { git.removeRunWorktree(runId: run.id) }
+            await blocking.run { git.removeRunWorktree(runId: run.id) }
             if run.purpose == .merge { await mergeCheckDeferralsEnded(runId: run.id) }
             couldNotRun("could not check out the submitted commit: \(error)")
             return
@@ -141,12 +141,12 @@ extension Orchestrator {
             ?? paths.companyDir(run.companyId).appending(path: "check-output/\(run.id).log")
         let outcome = await checkRunner.run(command: run.command, workingDirectory: dir,
                                             timeout: TimeInterval(run.timeoutSeconds), outputURL: output, environment: environment)
-        await Blocking.run { git.removeRunWorktree(runId: run.id) }
+        await blocking.run { git.removeRunWorktree(runId: run.id) }
         if Task.isCancelled { return }
         // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
         let passed = outcome.exitCode == 0 && !outcome.timedOut
         let assessing = self.store
-        let autoMerge = passed && run.purpose == .submit ? await Blocking.run { assessing.assessAutoMerge(run: run, git: git) } : nil
+        let autoMerge = passed && run.purpose == .submit ? await blocking.run { assessing.assessAutoMerge(run: run, git: git) } : nil
         do { try store.finishVerification(runId: run.id, outcome: outcome, autoMerge: autoMerge, now: clock()) }
         catch { log("could not record the check of run \(run.id): \(error)") }
     }
