@@ -50,6 +50,27 @@ import GRDB
         #expect(w.model.errorMessage?.contains("already approved") == true)
     }
 
+    /// A2: the app's Approve on Brahma's quarantine ask is the owner's accept: the recorded commit is merged into main.
+    @Test func approvingTheQuarantineAskMergesTheRecordedCommit() async throws {
+        let w = try await WorkWorld.make()
+        let ws = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
+        let git = w.store.gitWorkspace(root: ws, companyId: w.company.id)
+        let before = try #require(try w.store.company(id: w.company.id)?.mainCommit)
+        try "the owner was here\n".write(to: ws.appending(path: "scratch.txt"), atomically: true, encoding: .utf8)
+        try w.store.quarantineRoot(company: try #require(try w.store.company(id: w.company.id)), git: git, expectedMain: before, now: Date())
+        await w.refresh()
+        let ask = try #require(w.model.work.inbox.first { $0.title == Store.quarantineTitle })
+        let row = try #require(w.model.inboxRows.first { $0.id == ask.id })
+        #expect(row.canDecide); #expect(row.approveLabel == "Merge into main")
+        let decided = await w.model.decide(askId: ask.id, approve: true)
+        #expect(w.model.errorMessage == nil, "\(w.model.errorMessage ?? "")")
+        #expect(decided?.status == .approved)
+        let head = try #require(try git.head(of: GitWorkspace.mainRef))
+        #expect(head != before); #expect(try git.isAncestor(before, of: head))
+        #expect(try w.store.company(id: w.company.id)?.mainCommit == head)
+        #expect(try String(contentsOf: ws.appending(path: "scratch.txt"), encoding: .utf8) == "the owner was here\n")
+    }
+
     @Test func changedDocumentRequiresAck() async throws {
         let w = try await WorkWorld.make()
         try w.writeDoc("docs/prd.md", "# Plan\n\nOriginal.")

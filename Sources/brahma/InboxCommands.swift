@@ -102,7 +102,16 @@ struct Approve: ParsableCommand {
         } else {
             done = try refusing { try store.ownerDecide(askId: a.id, approve: !reject, note: note, acknowledgeChange: ackChanged) }
         }
-        print(safe("\(done.ref) \(done.status.rawValue)" + (replan != nil ? " (new plan requested)" : "")))
+        // Brahma's quarantine ask (A2): approving it merged the recorded commit; rejecting it kept main and the ref.
+        var effect = ""
+        if let ref = Store.quarantineRef(of: done) {
+            if done.status == .approved, let head = try store.company(id: c.id)?.mainCommit {
+                effect = " (\(ref) merged into main at \(head.prefix(7)))"
+            } else if done.status == .rejected {
+                effect = " (main unchanged; the changes stay on \(ref))"
+            }
+        }
+        print(safe("\(done.ref) \(done.status.rawValue)" + (replan != nil ? " (new plan requested)" : "") + effect))
     }
 }
 

@@ -484,9 +484,26 @@ extension Store {
 
     /// The owner approves or rejects a decision ask, whether or not the internal approver has decided. Approving a
     /// document that changed since it was proposed needs `acknowledgeChange`.
+    ///
+    /// The engine's own quarantine ask (`quarantineRef(of:)`, A2): approving it is the owner's accept of that quarantine,
+    /// the same pinned merge as `brahma main accept <company> <ref>` (`acceptMainCommit`: exactly the recorded commit, refused
+    /// and flagged if the ref moved, the ask then still open and the merge step still held). Rejecting it leaves `main` as it
+    /// is and keeps the ref for inspection (a later `main accept` of the ref still merges the recorded commit); either way the
+    /// settled ask releases the merge step.
     @discardableResult
     public func ownerDecide(askId: String, approve: Bool, note: String = "", acknowledgeChange: Bool = false,
                             now: Date = Store.now()) throws -> Ask {
+        if let seen = try ask(id: askId), let ref = Self.quarantineRef(of: seen) {
+            guard seen.status.isPending else { throw WorkError.conflict("\(seen.ref) is already \(seen.status.rawValue)") }
+            if approve {
+                let accepted = try acceptMainCommit(companyId: seen.companyId, ref: ref, note: note.isEmpty ? nil : note)
+                return accepted.ask ?? seen
+            }
+        }
+        return try ownerDecideRecorded(askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange, now: now)
+    }
+
+    private func ownerDecideRecorded(askId: String, approve: Bool, note: String, acknowledgeChange: Bool, now: Date) throws -> Ask {
         // Read and hash the document before the write transaction; the proposed path and hash never change.
         var currentHash: String?? = nil
         if approve, !acknowledgeChange, let seen = try ask(id: askId), seen.payload?.documentPath != nil,
@@ -506,6 +523,12 @@ extension Store {
             ask.ownerNote = Store.flat(note, max: Store.maxAskField)
             ask.ownerDecidedAt = now
             try settle(db, ask: &ask, status: approve ? .approved : .rejected, decidedBy: "owner", now: now)
+            if !approve, let ref = Self.quarantineRef(of: ask) {
+                let sha = ask.subjectId.map { String($0.drop { $0 != "@" }.dropFirst().prefix(12)) } ?? ""
+                try ActivityEvent(companyId: ask.companyId, agentId: nil, turnId: nil, kind: .work,
+                                  text: "the owner rejected \(ref): main is unchanged; the changes stay on \(ref) (\(sha)) for inspection",
+                                  createdAt: now).insert(db)
+            }
             return ask
         }
     }

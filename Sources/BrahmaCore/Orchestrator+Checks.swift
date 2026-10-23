@@ -1,6 +1,10 @@
 import Foundation
 
 extension Orchestrator {
+    /// Times one merge-check run is put back in the queue because its export failed for Brahma's own reasons before it is
+    /// recorded inconclusive (and so retried, then returned, through the usual inconclusive path).
+    static let maxMergeCheckDeferrals = 10
+
     /// Start-up: runs the previous process left running are queued again, and leftover check checkouts are removed.
     func recoverChecks(now: Date) throws {
         try store.recoverVerifications(now: now)
@@ -40,6 +44,25 @@ extension Orchestrator {
 
     func checkEnded(runId: String) { checkTasks[runId] = nil }
 
+    /// One more deferral of this merge-check run for the company's fault; how many it has had.
+    func noteMergeCheckDeferral(runId: String) -> Int {
+        let n = (mergeCheckDeferrals[runId] ?? 0) + 1
+        mergeCheckDeferrals[runId] = n
+        return n
+    }
+
+    func mergeCheckDeferralsEnded(runId: String) { mergeCheckDeferrals[runId] = nil }
+
+    /// A merge check's export worked: the company's export streak is over, and its hold alert resolves unless its landings
+    /// are still failing for the company's own reasons (A1).
+    func mergeCheckExported(company: Company) {
+        companyMergeRan(streak: "check:\(company.id)")
+        guard (mergeFaults[company.id] ?? 0) < Store.maxMergeFailures else { return }
+        do { try store.resolveMergeHoldAlert(companyId: company.id, now: clock()) } catch {
+            log("could not resolve the merge hold alert of \(company.name): \(error)")
+        }
+    }
+
     /// One run, off the actor: refuse it if its saved scripts were changed, check out the exact commit in a clean detached
     /// worktree, run the command there with a scoped environment, remove the checkout, record the outcome. A run cut short
     /// by shutdown is left `running` and queued again at the next start.
@@ -63,16 +86,34 @@ extension Orchestrator {
         let dir: URL
         do {
             // A merge check runs on a `.git`-free export made by the engine's own repository, under the data home
-            // (`<home>/run/exports/<runId>`); a submission's in a detached worktree under `<ws>/.brahma/wt-check`.
-            dir = run.purpose == .merge ? try git.addEngineExport(runId: run.id, commit: run.commit)
+            // (`<home>/run/exports/<runId>`); a submission's in a detached worktree there too (`<home>/run/checkouts/<runId>`).
+            let (store, now) = (self.store, clock())
+            dir = run.purpose == .merge
+                ? try git.addEngineExport(runId: run.id, commit: run.commit, tamper: { store.reportMergeTamper(company: company, removed: $0, now: now) })
                 : try git.addRunWorktree(runId: run.id, commit: run.commit)
             try store.setVerificationDirectory(runId: run.id, path: dir.path)
+        } catch let refused as UnexportableTree where run.purpose == .merge {
+            // The item's own tree cannot be written out (A1): its fault, so it goes back to its holder with the reason.
+            git.removeRunWorktree(runId: run.id)
+            await mergeCheckDeferralsEnded(runId: run.id)
+            log("the merge check of \(run.commit.prefix(7)) could not be exported: \(refused.reason)")
+            do { try store.returnUnexportable(runId: run.id, reason: refused.reason, now: clock()) } catch {
+                log("could not record the merge check of run \(run.id): \(error)")
+            }
+            return
         } catch let error where run.purpose == .merge && Orchestrator.isCompanyMergeFault(error) {
             // The engine's own machinery, not the item: held and retried, never charged to the item (`companyMergeFault`).
+            // A run deferred `maxMergeCheckDeferrals` times is recorded inconclusive (retried, then returned as uncheckable).
             git.removeRunWorktree(runId: run.id)
             log("could not export \(run.commit.prefix(7)) for its merge check (\(company.name)'s merge step failed): \(error)")
-            do { try store.deferVerification(runId: run.id, delay: Self.mergeRetry) } catch {
-                log("could not put the merge check of run \(run.id) back in the queue: \(error)")
+            let deferrals = await noteMergeCheckDeferral(runId: run.id)
+            if deferrals > Self.maxMergeCheckDeferrals {
+                await mergeCheckDeferralsEnded(runId: run.id)
+                couldNotRun("its export for the merge check failed \(deferrals) times for Brahma's own reasons: \(error)")
+            } else {
+                do { try store.deferVerification(runId: run.id, delay: Self.mergeRetry) } catch {
+                    log("could not put the merge check of run \(run.id) back in the queue: \(error)")
+                }
             }
             if let item = try? await store.writer.read({ try WorkItem.fetchOne($0, key: run.itemId) }) {
                 await companyMergeFault(company: company, item: item, error: Orchestrator.companyFault(error), streak: "check:\(company.id)")
@@ -80,10 +121,14 @@ extension Orchestrator {
             return
         } catch {
             git.removeRunWorktree(runId: run.id)
+            if run.purpose == .merge { await mergeCheckDeferralsEnded(runId: run.id) }
             couldNotRun("could not check out the submitted commit: \(error)")
             return
         }
-        if run.purpose == .merge { await companyMergeRan(streak: "check:\(company.id)") }
+        if run.purpose == .merge {
+            await mergeCheckDeferralsEnded(runId: run.id)
+            await mergeCheckExported(company: company)
+        }
         let holder = (try? store.lease(itemId: run.itemId))?.agentId ?? run.requestedBy
         let environment = ChildEnvironment.make(base: checkBaseEnvironment, extra: holder.map { ["BRAHMA_AGENT_ID": $0] } ?? [:],
                                                 purpose: .check)

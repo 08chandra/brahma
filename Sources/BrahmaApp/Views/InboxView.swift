@@ -185,7 +185,7 @@ private struct InboxCard: View {
                     .lineLimit(1...4).brahmaField()
             }
             HStack(spacing: BrahmaTheme.spaceS) {
-                Button("Approve") { if row.documentChanged { confirmChanged = true } else { decide(true) } }
+                Button(row.approveLabel) { if row.documentChanged { confirmChanged = true } else { decide(true) } }
                     .buttonStyle(.brahmaPrimary).disabled(busy)
                 Button("Reject") { decide(false) }.buttonStyle(.brahma).disabled(busy)
                 Spacer()

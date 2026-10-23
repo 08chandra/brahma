@@ -148,8 +148,11 @@ default max5x).
 **Engine git safety.** Engine git ignores repository filters, drivers, hooks and replace objects, and allowlists
 repository config. Workspaces whose repo config has `remote.*` (clones), LFS, `core.autocrlf`, aliases or submodules
 are refused until 5-lite. Merges run in an engine-owned repo under the data home and land only the verified SHA.
-Uncommitted changes found on `main` are quarantined under `refs/brahma/quarantine/*` and need
-`brahma main accept <company> <ref>`; "main changed outside Brahma" needs `brahma main accept <company>`.
+Uncommitted changes found on `main` are quarantined under `refs/brahma/quarantine/*` and merges wait for you:
+approving Brahma's ask (or `brahma main accept <company> <ref>`) merges exactly the recorded commit; rejecting it
+leaves `main` as it is and keeps the ref. "main changed outside Brahma" needs `brahma main accept <company>`. Git state
+planted in the workspace repo that would hold merges (stale lock files, `shallow`, `info/grafts`, deleted history
+objects) is repaired and reported to you.
 
 **Owner key.** `brahma owner init` (in an interactive terminal) or the Mac app creates it. It is a deterrent until
 5-lite, not a boundary; `BRAHMA_OWNER_KEY_STORE=file` is only for temp or demo homes.

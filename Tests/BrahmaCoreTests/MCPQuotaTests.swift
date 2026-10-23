@@ -83,6 +83,44 @@ import Testing
         #expect(rctx.quotas == nil)
     }
 
+    /// A5: a server that outlives its turn is refused on every call, quota-free tools included, and the quota counter itself
+    /// takes nothing for a turn without a live credential. A counter the database cannot update refuses, and says why in the
+    /// server's diagnostics.
+    @Test func aServerOutlivingItsTurnIsRefused() throws {
+        let q = try Q()
+        _ = try q.store.transition(agentId: q.eng.id, to: .ready)
+        let (_, turn) = try #require(try q.store.beginTurn(agentId: q.eng.id, now: Store.now()))
+        let token = try q.store.issueTurnCredential(turnId: turn.id, quotas: ModeCaps.standard.quotas)
+        let ctx = try #require(q.store.turnCredentialContext(token: token, companyId: q.company.id, agentId: q.eng.id))
+        let lines = Lines()
+        let t = CompanyTools(store: q.store, companyId: q.company.id, agentId: q.eng.id, quotas: ctx.quotas, quotaTurnId: ctx.turnId,
+                             diagnostics: { lines.add($0) })
+        let post: [String: JSONValue] = ["channel": .string("general"), "text": .string("hi")]
+        #expect(call(t, "post_message", post).ok); #expect(call(t, "list_agents", [:]).ok)
+        // No credential row for a turn: the counter refuses (throws), it never counts.
+        #expect(throws: (any Error).self) { try q.store.reserveTurnQuota(turnId: "no-such-turn", kind: "posts", limit: 10) }
+        // The turn ends; the server is still running.
+        #expect(try q.store.finishTurn(id: turn.id, outcome: .succeeded, summary: nil, costUSD: nil))
+        for (name, args) in [("list_agents", [:]), ("post_message", post), ("show_work_item", ["key": JSONValue.string("ACME-1")])] {
+            let refused = call(t, name, args)
+            #expect(!refused.ok, "\(name)"); #expect(refused.text.contains("turn has ended"), "\(name): \(refused.text)")
+        }
+        #expect(throws: (any Error).self) { try q.store.reserveTurnQuota(turnId: turn.id, kind: "posts", limit: 10) }
+        // The turn's counts went with it; a late call never starts them again from zero.
+        #expect(try q.store.turnQuotaUsed(turnId: turn.id, kind: "posts") == 0)
+
+        // A database error while counting refuses the call and is logged.
+        _ = try q.store.transition(agentId: q.eng.id, to: .ready)
+        let (_, next) = try #require(try q.store.beginTurn(agentId: q.eng.id, now: Store.now()))
+        _ = try q.store.issueTurnCredential(turnId: next.id, quotas: ModeCaps.standard.quotas)
+        let u = CompanyTools(store: q.store, companyId: q.company.id, agentId: q.eng.id, quotas: ModeCaps.standard.quotas,
+                             quotaTurnId: next.id, diagnostics: { lines.add($0) })
+        try q.store.writer.write { try $0.execute(sql: "DROP TABLE turnQuotaUsage") }
+        let failed = call(u, "post_message", post)
+        #expect(!failed.ok); #expect(failed.text.contains("could not be counted"), "\(failed.text)")
+        #expect(lines.all.contains { $0.contains("brahma mcp") && $0.contains("turnQuotaUsage") }, "\(lines.all)")
+    }
+
     @Test func subagentCallsShareParentQuota() throws {
         // Every sub-agent and workflow agent of a turn talks to the same MCP server process (p8/p9: one pid), so one counter.
         let q = try Q()

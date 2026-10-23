@@ -500,6 +500,23 @@ extension Store {
                        arguments: [active + WorkLease.ttl, itemId])
     }
 
+    /// The merge check of an item's rebased commit could not run because its own tree cannot be exported (A1:
+    /// `UnexportableTree`): the run is recorded `error` with the reason, and the item goes back to its holder with it. The
+    /// company's merge queue is not held for it.
+    func returnUnexportable(runId: String, reason: String, now: Date = Store.now()) throws {
+        try writer.write { db in
+            guard var run = try VerificationRun.fetchOne(db, key: runId), run.status == .running || run.status == .queued else { return }
+            let shown = Self.flat(reason, max: 400)
+            run.status = .error; run.outputTail = shown; run.finishedAt = now
+            try run.update(db)
+            guard let item = try WorkItem.fetchOne(db, key: run.itemId), try !Self.isStale(db, run: run, item: item) else { return }
+            let holder = try WorkLease.fetchOne(db, key: item.id)?.agentId ?? run.requestedBy
+            try returnToHolder(db, item: item, run: run, holder: holder, reason: shown, now: now,
+                               dm: "\(item.key) was returned: after its rebase onto main its commit could not be written out for the merge check (\(shown)). Fix that on your branch and submit again.",
+                               event: "the merge check could not run: \(shown)")
+        }
+    }
+
     /// The saved baseline of the item's check no longer matches: the run is refused (`error`), the item gets a review flag
     /// and returns to `inProgress`, and the holder is told. Output of nothing is recorded.
     func refuseVerification(runId: String, file: String, now: Date = Store.now()) throws {

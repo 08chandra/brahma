@@ -46,6 +46,8 @@ public actor Orchestrator {
     var mergeBackoff: [String: Date] = [:]
     /// Company id → merge attempts in a row that failed for the company's own reasons (`MergeInfrastructureError`).
     var mergeFaults: [String: Int] = [:]
+    /// Merge-check run id → times its export was put back in the queue for the company's fault (`maxMergeCheckDeferrals`).
+    var mergeCheckDeferrals: [String: Int] = [:]
     /// Agents the engine has just leased an item to, until their worktree exists (they are not scheduled meanwhile).
     var dispatching = Set<String>()
     /// Items whose dispatch failed in git: not offered again before this time.

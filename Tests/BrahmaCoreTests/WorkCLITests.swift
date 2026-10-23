@@ -195,6 +195,18 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(merged.status == 0, "\(merged.stderr)"); #expect(merged.stdout.contains("merged"))
         #expect(try store.company(id: company.id)?.mainCommit == q)
         #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == q)
+        // A2: approving Brahma's quarantine ask from the inbox does the same pinned merge; `main accept` then reports it.
+        try "r\n".write(to: ws.appending(path: "r.txt"), atomically: true, encoding: .utf8)
+        try store.quarantineRoot(company: try #require(try store.company(id: company.id)), git: store.gitWorkspace(root: ws, companyId: company.id),
+                                 expectedMain: q, now: Date(timeIntervalSince1970: 1_800_000_100))
+        let second = try #require(try store.writer.read { try store.engineQuarantineAsks($0, companyId: company.id) }.first { $0.status == .pendingOwner })
+        let ref2 = try #require(second.subjectId.map { String($0.dropFirst("quarantine:".count).prefix { $0 != "@" }) })
+        let q2 = try GitFixture.plainGit(["rev-parse", ref2], in: ws)
+        let approved = try brahma(["approve", "Acme", second.ref], home: home)
+        #expect(approved.status == 0, "\(approved.stderr)"); #expect(approved.stdout.contains("approved")); #expect(approved.stdout.contains("merged"))
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws) == q2)
+        let reported = try brahma(["main", "accept", "Acme", ref2], home: home)
+        #expect(reported.status == 0, "\(reported.stderr)"); #expect(reported.stdout.contains("already merged"), "\(reported.stdout)")
         // Without an owner key it is refused too.
         let bare = try OwnerTestHome(initOwner: false); defer { withExtendedLifetime(bare) {} }
         #expect(try brahma(["main", "accept", "Acme"], home: bare.url).status != 0)

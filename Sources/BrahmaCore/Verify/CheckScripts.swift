@@ -1,16 +1,16 @@
 import Foundation
 
 /// Where the engine keeps the files of a check in the workspace. Only the engine writes `.brahma/checks` (the saved
-/// scripts); the temporary detached checkouts a submission's check runs in live under `.brahma/wt-check`. A merge check
-/// runs on a `.git`-free export that is not in the workspace at all: `<home>/run/exports/<runId>` under the data home
-/// (`BrahmaPaths.exportDir(runId:)`, `GitWorkspace.exportPath(runId:)`). (`BrahmaPaths.checksDir` is not used for checks.)
+/// scripts). Checks themselves never run in the workspace: a submission's runs in a detached checkout under the data home,
+/// `<home>/run/checkouts/<runId>` (`BrahmaPaths.checkoutDir(runId:)`, `GitWorkspace.checkoutPath(runId:)`), and a merge
+/// check on a `.git`-free export at `<home>/run/exports/<runId>` (`BrahmaPaths.exportDir(runId:)`,
+/// `GitWorkspace.exportPath(runId:)`). (`BrahmaPaths.checksDir` is not used for checks.)
 public struct CheckPaths: Sendable, Equatable {
     public let workspace: URL
 
     public init(workspace: URL) { self.workspace = workspace }
 
     var checksRoot: URL { workspace.appending(path: ".brahma/checks", directoryHint: .isDirectory) }
-    var runWorktreesRoot: URL { workspace.appending(path: ".brahma/wt-check", directoryHint: .isDirectory) }
 
     /// `<ws>/.brahma/checks/<KEY>/rev<n>/`: the saved copies of the check's scripts.
     public func snapshotDir(key: String, revision: Int) -> URL {
@@ -24,11 +24,6 @@ public struct CheckPaths: Sendable, Equatable {
         snapshotDir(key: key, revision: revision).appending(path: "manifest.json")
     }
 
-    /// `<ws>/.brahma/wt-check/<runId>`: the clean detached checkout a submission's check run executes in. (A merge check's
-    /// export is `GitWorkspace.exportPath(runId:)`, under the data home.)
-    public func runWorktree(runId: String) -> URL {
-        runWorktreesRoot.appending(path: runId, directoryHint: .isDirectory)
-    }
 }
 
 /// What a check command could reach (`CheckScripts.checkReach`), for risk-tiered review's sensitive paths.
@@ -72,10 +67,15 @@ public enum CheckScripts {
         return out
     }
 
-    /// Options whose value is a directory the check runs in (`-C X`, `--prefix=X` …): what the check reaches is resolved
-    /// against it as well.
-    private static let directoryOptions: Set<String> = ["-C", "--directory", "--dir", "--chdir", "--cwd", "--prefix", "--package-path",
+    /// Options whose value is a directory the check runs in (`--directory X`, `--prefix=X` …): what the check reaches is
+    /// resolved against it as well. (`-C X` is not followed at all: it is one of `valueShortOptions`.)
+    private static let directoryOptions: Set<String> = ["--directory", "--dir", "--chdir", "--cwd", "--prefix", "--package-path",
                                                         "--rootdir", "--working-directory"]
+
+    /// Short options that take a value in one of the allowlisted runners (`make -C dir`, `make -f file`, `swift build -c x`,
+    /// `pytest -c file`, `-k expr`, `-o ini=`, `-W`, `python -X`, `-I dir`, `-s`, `-n`, `-u`): what their value reaches cannot
+    /// be told from the word alone, so a check using one is not followed (A6).
+    private static let valueShortOptions: Set<String> = ["-C", "-f", "-c", "-I", "-k", "-o", "-W", "-X", "-s", "-n", "-u"]
 
     /// The only check commands risk-tiered review (9c) follows: a program and subcommand from this list, then plain arguments.
     /// Anything else (a wrapper, an environment assignment, another program) is not followed, and the item keeps its review.
@@ -121,12 +121,13 @@ public enum CheckScripts {
 
     /// What a check command could reach, for risk-tiered review (9c). Deny by default: `parseable` is true only for one of
     /// `autoMergePrograms` followed by plain arguments (`lex`), none of them an environment or `make` variable assignment
-    /// (`X=y`), a plugin or module option (`-p…`, `-m…`, `--pyargs`) or a path that is not a plain relative one (`plainPath`).
+    /// (`X=y`), a plugin or module option (`-p…`, `-m…`, `--pyargs`), a single-dash word longer than two characters (`-kfoo`,
+    /// `-xvs`), a short option that takes a value (`valueShortOptions`) or a path that is not a plain relative one (`plainPath`).
     /// Every changed file is sensitive for any other command.
     ///
     /// For a followed command, over-inclusive on purpose (`ReviewPolicy.isSensitive`):
     /// - `tokens`: every argument and every `--option=value` value, cleaned, and each again relative to every directory the
-    ///   command runs in (`-C X`, `--prefix=X` …); `python -m pytest` adds `pytest.py` and `pytest` (a workspace module of
+    ///   command runs in (`--directory X`, `--prefix=X` …); `python -m pytest` adds `pytest.py` and `pytest` (a workspace module of
     ///   that name would shadow the runner).
     /// - `directories`: the directory of every argument naming a file (one with an extension): the files beside it are its
     ///   helpers.
@@ -142,7 +143,11 @@ public enum CheckScripts {
             var value: String?, key = word
             if word.hasPrefix("-") {
                 if word == "--pyargs" { return refused }
-                if !word.hasPrefix("--"), word.hasPrefix("-p") || word.hasPrefix("-m") { return refused }
+                if !word.hasPrefix("--") {
+                    // One flag of one letter only: `-kfoo` (an attached value) and `-xvs` (a cluster that may hide one) are
+                    // not followed, nor is a short option that takes a value, nor a plugin or module option.
+                    if word.count > 2 || valueShortOptions.contains(word) || word.hasPrefix("-p") || word.hasPrefix("-m") { return refused }
+                }
                 guard let eq = word.firstIndex(of: "=") else { continue }
                 key = String(word[..<eq])
                 guard let v = plainPath(String(word[word.index(after: eq)...]), go: go, operand: false) else { return refused }

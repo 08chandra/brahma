@@ -17,12 +17,19 @@ struct MainGroup: ParsableCommand {
             try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
-            do { try store.acceptMainCommit(companyId: c.id, ref: ref) } catch let e as WorkError { throw fail(e.message) }
-            let head = try store.company(id: c.id)?.mainCommit ?? "?"
+            let accepted: MainAcceptance
+            do { accepted = try store.acceptMainCommit(companyId: c.id, ref: ref) } catch let e as WorkError { throw fail(e.message) }
+            let head = accepted.head.prefix(7)
             if let ref {
-                print(safe("\(c.name): \(ref) merged; main is at \(head.prefix(7))"))
+                // How Brahma's quarantine ask stands (A2): merged before, decided earlier, or settled by this accept.
+                let state = accepted.ask.map { " (\($0.ref) \($0.status.rawValue))" } ?? ""
+                if accepted.alreadyMerged {
+                    print(safe("\(c.name): \(ref) is already merged\(state); main is at \(head)"))
+                } else {
+                    print(safe("\(c.name): \(ref) merged\(state); main is at \(head)"))
+                }
             } else {
-                print(safe("\(c.name): main accepted at \(head.prefix(7))"))
+                print(safe("\(c.name): main accepted at \(head)"))
             }
         }
     }

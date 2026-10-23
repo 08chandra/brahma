@@ -41,6 +41,9 @@ public struct InboxRow: Equatable, Identifiable, Sendable {
     public var canAcknowledge: Bool
     /// "Approved by owner", "Approved by policy: Auto", ... for FYIs and recent decisions.
     public var decidedLine: String
+    /// The approve button's title: "Merge into main" on Brahma's quarantine ask, whose approval is the owner's accept of
+    /// exactly the recorded commit (`Store.ownerDecide`, A2).
+    public var approveLabel: String = "Approve"
 }
 
 public enum InboxRows {
@@ -68,6 +71,7 @@ public enum InboxRows {
                 decided = a.fyi ? "Approved by \(by) (FYI)" : "Approved by \(by)"
             }
             let pending = section == .pending
+            let quarantine = Store.quarantineRef(of: a) != nil
             return InboxRow(
                 id: a.id, ref: a.ref, kind: a.kind, section: section,
                 kindTitle: work.displayTitles[a.id] ?? a.kind.title,
@@ -79,11 +83,13 @@ public enum InboxRows {
                 stakes: a.payload?.stakes,
                 reversibleLabel: a.payload?.reversible.map { $0 == .oneWay ? "One way: can't be undone" : "Can be undone" },
                 proposal: a.payload?.proposal, isFYI: section == .fyi,
-                canRescind: a.status == .approved,
+                // A merged quarantine is not taken back by rescinding its ask: main has moved.
+                canRescind: a.status == .approved && !quarantine,
                 canDecide: pending && a.kind.isDecision,
                 canAnswer: pending && a.kind == .info,
                 canAcknowledge: (pending && a.kind == .engineAlert) || section == .fyi,
-                decidedLine: decided)
+                decidedLine: decided,
+                approveLabel: quarantine ? "Merge into main" : "Approve")
         }
         return work.inbox.map { row($0, .pending) } + work.fyi.map { row($0, .fyi) } + work.recentDecided.map { row($0, .recent) }
     }

@@ -12,6 +12,12 @@ public struct TurnCredentialContext: Equatable, Sendable {
     public var quotas: ModeQuotas?
 }
 
+/// The turn a server or a quota unit is for is no longer in progress, or holds no credential row.
+public struct TurnNotLive: Error, CustomStringConvertible, Sendable {
+    public var turnId: String
+    public var description: String { "turn \(turnId) has ended or holds no credential" }
+}
+
 extension Store {
     /// A random 32-byte token for one turn, hex. Only its SHA-256 is stored. The token reaches `brahma mcp` through
     /// the 0600 per-turn MCP config, never through the agent's process environment.
@@ -58,13 +64,30 @@ extension Store {
         return TurnCredentialContext(turnId: turnId, kind: kind, itemId: row["itemId"], quotas: quotas)
     }
 
+    /// The turn is in progress and still holds its credential row: what every call of its MCP server needs (A5). A server
+    /// that outlives its turn (or a turn whose credential is gone) is refused, whatever the tool.
+    public func turnCredentialIsLive(turnId: String, companyId: String, agentId: String) throws -> Bool {
+        try writer.read { db in try Self.turnCredentialIsLive(db, turnId: turnId, companyId: companyId, agentId: agentId) }
+    }
+
+    static func turnCredentialIsLive(_ db: Database, turnId: String, companyId: String? = nil, agentId: String? = nil) throws -> Bool {
+        try Bool.fetchOne(db, sql: """
+            SELECT EXISTS(SELECT 1 FROM turnCredential c JOIN turn t ON t.id = c.turnId
+                          WHERE c.turnId = ? AND t.companyId = c.companyId AND t.agentId = c.agentId
+                            AND (? IS NULL OR c.companyId = ?) AND (? IS NULL OR c.agentId = ?)
+                            AND t.outcome = 'inProgress' AND t.endedAt IS NULL)
+            """, arguments: [turnId, companyId, companyId, agentId, agentId]) ?? false
+    }
+
     // MARK: Per-turn quota counts
 
     /// Takes one unit of the turn's `kind` quota when fewer than `limit` are used, in one write transaction, so concurrent
-    /// server processes of the same turn can never overshoot. False when the quota is used up.
+    /// server processes of the same turn can never overshoot. False when the quota is used up. A turn without a live
+    /// credential row (it ended, or it never had one) takes nothing and throws `TurnNotLive`.
     public func reserveTurnQuota(turnId: String, kind: String, limit: Int) throws -> Bool {
         // Write first (no read-then-upgrade), and the increment is conditional in the same statement.
         try writer.write { db in
+            guard try Self.turnCredentialIsLive(db, turnId: turnId) else { throw TurnNotLive(turnId: turnId) }
             try db.execute(sql: "INSERT INTO turnQuotaUsage(turnId, kind, used) VALUES (?, ?, 0) ON CONFLICT(turnId, kind) DO NOTHING",
                            arguments: [turnId, kind])
             try db.execute(sql: "UPDATE turnQuotaUsage SET used = used + 1 WHERE turnId = ? AND kind = ? AND used < ?",

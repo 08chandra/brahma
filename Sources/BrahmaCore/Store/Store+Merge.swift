@@ -204,8 +204,9 @@ extension Store {
             Merges into main wait until you decide.
 
             Review exactly what would be merged with: git --no-replace-objects diff \(expectedMain) \(q.commit)
-            Merge them into main with: brahma main accept \(Self.flat(company.name, max: 100)) \(q.ref)
+            Merge them into main by approving this ask, or with: brahma main accept \(Self.flat(company.name, max: 100)) \(q.ref)
             Only commit \(q.commit) is merged; if \(q.ref) points anywhere else by then, the accept is refused.
+            Rejecting this ask leaves main as it is; the changes stay on \(q.ref).
 
             Changed files:
             \(files.joined(separator: "\n"))
@@ -288,14 +289,20 @@ extension Store {
         }
     }
 
-    /// Agent-writable state that blocked the merge (stale git lock files in the workspace repository) was removed: the owner
-    /// hears about it (one open alert at a time), since Brahma did not leave it there.
-    private func reportMergeTamper(company: Company, removed: [String], now: Date) {
-        let names = removed.map { Self.flat($0, max: 100) }.joined(separator: ", ")
+    /// Agent-writable state that held the merge queue was repaired (A3: stale git lock files, a planted `shallow` or
+    /// `info/grafts`, objects of `main`'s history restored): the owner hears about it (one open alert at a time), since Brahma
+    /// did not leave it there.
+    func reportMergeTamper(company: Company, removed: [String], now: Date) {
+        let names = removed.map { Self.flat($0, max: 120) }.joined(separator: ", ")
         try? EngineAlerts.raise(
-            store: self, text: "\(company.name): Brahma removed git lock files nobody was using from the workspace repository (\(names)). "
-                + "They blocked merges into main and Brahma did not leave them; something with access to the workspace did.",
+            store: self, text: "\(company.name): Brahma repaired the workspace repository so merges into main could go on (\(names)). "
+                + "These held merges into main and Brahma did not leave them; something with access to the workspace did.",
             now: now, reason: Self.mergeTamperAlertReason(company.id))
+    }
+
+    /// A merge check's export worked (A1): the company's merge hold alert, if one is open, is resolved.
+    func resolveMergeHoldAlert(companyId: String, now: Date) throws {
+        try writer.write { db in try resolveEngineAlerts(db, reasons: [Self.mergeHoldAlertReason(companyId)], now: now) }
     }
 
     /// One alert per company however often the merge is retried; it resolves itself when the checkout is back on `main`.

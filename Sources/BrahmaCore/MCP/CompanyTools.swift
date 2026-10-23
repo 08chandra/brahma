@@ -59,7 +59,8 @@ public struct CompanyTools: Sendable {
 
     /// The turn's mode quotas, from its credential row; nil: none (review turns, tools built without a turn).
     let quotas: ModeQuotas?
-    /// The turn whose database counters the quotas use; nil: the in-memory counter.
+    /// The turn this server belongs to: its database counters hold the quotas, and every call needs its credential row live
+    /// (`Store.turnCredentialIsLive`). nil: tools built without a turn (the in-memory counter, no credential check).
     let quotaTurnId: String?
     /// A plan turn's server: the mutating work and decision tools are not offered.
     let planTurn: Bool
@@ -81,6 +82,8 @@ public struct CompanyTools: Sendable {
         self.auditTurnId = reviewItemId == nil ? auditTurnId : nil
         self.quotas = quotas; self.quotaTurnId = quotaTurnId; self.planTurn = planTurn
     }
+
+    static let turnEndedMessage = "this turn has ended; its tools no longer work"
 
     /// Tools that only read; they carry `readOnlyHint` and are never counted.
     static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item"]
@@ -119,7 +122,13 @@ public struct CompanyTools: Sendable {
         guard let limit else { return false }
         let taken: Bool
         if let turnId = quotaTurnId {
-            taken = (try? store.reserveTurnQuota(turnId: turnId, kind: kind.rawValue, limit: limit)) ?? false
+            // Fail closed, and say why: a turn that ended takes nothing; a counter the database cannot update refuses too.
+            do { taken = try store.reserveTurnQuota(turnId: turnId, kind: kind.rawValue, limit: limit) } catch is TurnNotLive {
+                throw ToolError(message: Self.turnEndedMessage)
+            } catch {
+                diagnostics("brahma mcp: could not count a \(kind.rawValue) quota unit for turn \(turnId): \(error)")
+                throw ToolError(message: "this turn's quota could not be counted, so nothing was done; say what you need in your final reply")
+            }
         } else {
             taken = counter.reserve(kind, limit: limit)
         }
@@ -194,6 +203,15 @@ public struct CompanyTools: Sendable {
         // Validate the caller on every call: it may have been killed or removed since the server started.
         guard let me = try? store.agent(id: agentId), me.companyId == companyId, me.state != .killed else {
             throw ToolError(message: "this agent is not active in the company")
+        }
+        // A turn's server works only while its turn does: the turn must still be in progress and hold its credential row.
+        if let turnId = quotaTurnId {
+            let live: Bool
+            do { live = try store.turnCredentialIsLive(turnId: turnId, companyId: companyId, agentId: agentId) } catch {
+                diagnostics("brahma mcp: could not check the credential of turn \(turnId): \(error)")
+                live = false
+            }
+            guard live else { throw ToolError(message: Self.turnEndedMessage) }
         }
         if auditTurnId != nil { return try callInAuditTurn(name: name, arguments: arguments) }
         if reviewItemId != nil { return try callInReviewTurn(name: name, arguments: arguments) }

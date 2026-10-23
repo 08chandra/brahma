@@ -172,12 +172,13 @@ import GRDB
         // Uncommitted work after the submit must not be in the checkout.
         try v.write("dirty.txt", "not committed", in: wt)
         final class Seen: @unchecked Sendable {
-            var head = "", detached = false, dirty = true, committed = false, existed = false
+            var head = "", detached = false, dirty = true, committed = false, existed = false, mode = 0
         }
         let seen = Seen()
         v.checks.onRun { call in
             let dir = call.workingDirectory
             seen.existed = FileManager.default.fileExists(atPath: dir.path)
+            seen.mode = ((try? FileManager.default.attributesOfItem(atPath: dir.path))?[.posixPermissions] as? Int) ?? 0
             seen.head = (try? GitFixture.plainGit(["rev-parse", "HEAD"], in: dir)) ?? ""
             seen.detached = ((try? GitFixture.plainGit(["symbolic-ref", "-q", "HEAD"], in: dir, allowFailure: true)) ?? "x").isEmpty
             seen.dirty = FileManager.default.fileExists(atPath: dir.appending(path: "dirty.txt").path)
@@ -187,9 +188,13 @@ import GRDB
         try await v.cycle()
         let run = try v.latest(i)
         let call = try #require(v.checks.calls.first)
-        let expected = v.paths.runWorktree(runId: run.id)
+        // A7: the checkout is under the engine's data home (`<home>/run/checkouts/<runId>`, 0700), never in the workspace.
+        let engine = v.store.gitWorkspace(root: v.root, companyId: v.company.id)
+        let expected = engine.checkoutPath(runId: run.id)
         #expect(call.workingDirectory.path == expected.path)
-        #expect(expected.path == v.root.appending(path: ".brahma/wt-check/\(run.id)").path)
+        #expect(expected.path == engine.exportHome.appending(path: "run/checkouts/\(run.id)").path)
+        #expect(!expected.path.hasPrefix(v.root.path + "/"), "the checkout is not in the workspace")
+        #expect(seen.mode == 0o700, "the checkout is engine-private")
         #expect(run.workingDirectory == expected.path, "the run records the directory it ran in")
         #expect(seen.existed); #expect(seen.head == sha); #expect(seen.detached); #expect(seen.committed); #expect(!seen.dirty)
         #expect(call.command == "true"); #expect(call.timeout == 600)
@@ -197,7 +202,8 @@ import GRDB
         #expect(call.outputURL.path.hasPrefix(v.world.paths.companyDir(v.company.id).path), "output is kept in the engine's home")
         // The temporary checkout is gone, and git no longer lists it.
         #expect(!FileManager.default.fileExists(atPath: expected.path))
-        #expect(!(try GitFixture.plainGit(["worktree", "list"], in: v.root)).contains("wt-check"))
+        #expect(!(try GitFixture.plainGit(["worktree", "list"], in: v.root)).contains(run.id))
+        #expect(!FileManager.default.fileExists(atPath: v.root.appending(path: ".brahma/wt-check").path), "nothing under the workspace")
         #expect(try v.fresh(i).verifiedCommit == sha)
     }
 
@@ -216,7 +222,7 @@ import GRDB
         let run = try v.latest(i)
         #expect(run.status == .passed, "\(run.outputTail ?? "")")
         #expect(try v.fresh(i).verifiedRevision == 0)
-        #expect(!FileManager.default.fileExists(atPath: v.paths.runWorktree(runId: run.id).path))
+        #expect(!FileManager.default.fileExists(atPath: v.store.gitWorkspace(root: v.root, companyId: v.company.id).checkoutPath(runId: run.id).path))
     }
 
     // MARK: Failures, flakes, infrastructure
@@ -887,13 +893,18 @@ import GRDB
         try v.submit(i, v.eng)
         // A crash left a registered detached checkout behind.
         let sha = try #require(try v.ws.head(of: v.ws.branch(key: i.key)))
-        let stray = v.paths.runWorktree(runId: "crashed-run")
+        let stray = v.store.gitWorkspace(root: v.root, companyId: v.company.id).checkoutPath(runId: "crashed-run")
         try FileManager.default.createDirectory(at: stray.deletingLastPathComponent(), withIntermediateDirectories: true)
         try GitFixture.plainGit(["worktree", "add", "--detach", stray.path, sha], in: v.root)
+        // And one an older engine left in the workspace.
+        let legacy = v.root.appending(path: ".brahma/wt-check/older-run")
+        try FileManager.default.createDirectory(at: legacy.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try GitFixture.plainGit(["worktree", "add", "--detach", legacy.path, sha], in: v.root)
         #expect(FileManager.default.fileExists(atPath: stray.path))
         try await v.world.orchestrator.start()
-        #expect(!FileManager.default.fileExists(atPath: stray.path))
-        #expect(!(try GitFixture.plainGit(["worktree", "list"], in: v.root)).contains("wt-check"))
+        #expect(!FileManager.default.fileExists(atPath: stray.path)); #expect(!FileManager.default.fileExists(atPath: legacy.path))
+        let listed = try GitFixture.plainGit(["worktree", "list"], in: v.root)
+        #expect(!listed.contains("crashed-run") && !listed.contains("older-run"), "\(listed)")
     }
 
     @Test func checkConcurrencyIsBounded() async throws {

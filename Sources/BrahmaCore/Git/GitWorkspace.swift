@@ -32,6 +32,22 @@ struct MergeInfrastructureError: Error, CustomStringConvertible, LocalizedError 
     }
 }
 
+/// The commit a merge check runs on cannot be written out faithfully for its export, because of its own tree: `git archive`
+/// refuses it, tar refuses a path in it (an over-long name, say), or two of its paths collide on the data home's volume
+/// (names that differ only in case on a case-insensitive volume). The item's fault, never the company's (A1).
+struct UnexportableTree: Error, CustomStringConvertible, LocalizedError {
+    let reason: String
+    var description: String { reason }
+    var errorDescription: String? { reason }
+}
+
+/// `main`'s history could not be fetched from the workspace repository for an export; the caller may restore it
+/// (`restoreMainHistory`, under main's lock) and try once more. Otherwise it is the company's fault.
+private struct MainHistoryMissing: Error {
+    let mainHead: String
+    let underlying: MergeInfrastructureError
+}
+
 /// One line of `git diff --name-status`: `A`, `M`, `D`, `R100`, ...; for a rename or copy, the new path.
 public struct GitChange: Equatable, Sendable {
     public var status: String
@@ -51,7 +67,10 @@ public struct GitChange: Equatable, Sendable {
 ///
 /// Programs a repository can name for git to run (filters, textconv, diff and merge drivers, gpg, credential helpers,
 /// askpass, ssh, proxies, submodule recursion) are kept out in two layers. The guarantee is the command line: every call
-/// forces each such setting off (`configFlags`, `environment()`), and reads attributes from the empty tree
+/// forces each such setting off (`configFlags`, `environment()`) for the git it runs and the git processes that one spawns
+/// in the same repository (a local fetch's `git-upload-pack` in the other repository does not get them: git drops
+/// `GIT_CONFIG_PARAMETERS` for it, so the engine scans that repository right before such a fetch, `fetchIntoEngine`), and
+/// reads attributes from the empty tree
 /// (`--attr-source`, git 2.43+), never from a checkout's `.gitattributes`, with `core.attributesFile=/dev/null` and the
 /// engine's override (`attributesOverride`) as `info/attributes`. On top of that, before every attempt (retries included)
 /// the repository's own config files are read (`RepoConfigGuard`): a key outside a short allowlist of what git and the
@@ -465,7 +484,7 @@ public struct GitWorkspace: Sendable {
     /// textconv, diff or merge driver, hooks path, ssh command, fsmonitor) or includes another file; `detail` says which
     /// file and keys. Nothing ran. The store files one owner alert while it stays that way.
     public var onUnsafeRepository: (@Sendable (_ detail: String) -> Void)?
-    /// Called each time a link or an odd file is found on the way to `.brahma/wt`, `.brahma/wt-check` or the data home's
+    /// Called each time a link or an odd file is found on the way to `.brahma/wt` or the data home's `run/checkouts` and
     /// `run/exports` (or a checkout or export there moved while git or tar wrote into it). Nothing was created or removed
     /// through it. The store files the engine alert.
     public var onUnsafeEngineFile: (@Sendable (UnsafeEngineFile) -> Void)?
@@ -796,8 +815,9 @@ public struct GitWorkspace: Sendable {
 
     // MARK: Engine checkout places under .brahma
 
-    /// `<ws>/<relative>` (`.brahma/wt`, `.brahma/wt-check`) as a real directory, walked from the workspace without following
-    /// a link and created when missing. A link or odd file on the way is reported (`onUnsafeEngineFile`) and refused.
+    /// `<ws>/<relative>` (`.brahma/wt`; an older engine's `.brahma/wt-check`) as a real directory, walked from the workspace
+    /// without following a link and created when missing. A link or odd file on the way is reported (`onUnsafeEngineFile`)
+    /// and refused.
     private func engineDirectory(_ relative: String, command: String) throws -> EngineFiles.OpenDirectory {
         do { return try EngineFiles.openWalked(workspace: root, relative) } catch let problem as UnsafeEngineFile {
             onUnsafeEngineFile?(problem)
@@ -819,22 +839,27 @@ public struct GitWorkspace: Sendable {
     /// reported and refused. A git worktree (`registered`) must also have its `.git` file in this very directory afterwards:
     /// a way swapped for a link while git ran and swapped back would have sent the checkout elsewhere. Whenever `body` fails
     /// or the place moved, the place is removed through `parent`'s descriptor, and for a git worktree git's record of it too.
+    /// `placeFault` turns a failure of the place itself (made or moved) into the caller's kind of error (a merge-check export
+    /// reports it as the company's fault).
     private func intoPlace(_ name: String, in parent: EngineFiles.OpenDirectory, mode: mode_t = 0o755, registered: Bool,
-                           command: String, _ body: (EngineFiles.OpenDirectory) throws -> Void) throws {
+                           command: String, placeFault: (any Error) -> any Error = { $0 },
+                           _ body: (EngineFiles.OpenDirectory) throws -> Void) throws {
         let place: EngineFiles.OpenDirectory
         do { place = try parent.makeDirectory(name, mode: mode) } catch let problem as UnsafeEngineFile {
             onUnsafeEngineFile?(problem)
-            throw GitError.failed(command: command, status: -1, stderr: "\(problem)")
+            throw placeFault(GitError.failed(command: command, status: -1, stderr: "\(problem)"))
+        } catch {
+            throw placeFault(error)
         }
         func discard() {
             try? parent.remove(name)
             if registered { try? EngineFiles.remove(workspace: root, dir: ".git/worktrees", name: name) }
         }
-        func moved() -> GitError {
+        func moved() -> any Error {
             discard()
             let problem = UnsafeEngineFile(path: place.shown.path, problem: "moved while \(command) used it; it was refused and removed")
             onUnsafeEngineFile?(problem)
-            return GitError.failed(command: command, status: -1, stderr: "\(problem)")
+            return placeFault(GitError.failed(command: command, status: -1, stderr: "\(problem)"))
         }
         checkoutProbe?(place.shown)
         guard place.isInPlace, parent.isInPlace else { throw moved() }
@@ -955,27 +980,29 @@ public struct GitWorkspace: Sendable {
         try Self.validKey(key); try Self.validCommit(verified); try Self.validCommit(expectedMain)
         return try withKeyLock(key, infrastructure: true) {
             try withMainLock(infrastructure: true) {
-                let removed = try MergeInfrastructureError.wrapping { try clearStaleWorkspaceLocks(key: key) }
-                if !removed.isEmpty { tamper(removed) }
+                let repaired = try MergeInfrastructureError.wrapping { try healWorkspaceRepositoryLocked() }
+                if !repaired.isEmpty { tamper(repaired) }
                 let branchHead = try MergeInfrastructureError.wrapping { try head(of: branchRef(key: key)) }
                 guard branchHead == verified else { return .branchMoved(head: branchHead) }
                 let mainHead = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
                 guard let mainHead, mainHead == expectedMain else { return .mainMoved(head: mainHead) }
                 return try withEngineLock {
-                    try landLocked(key: key, verified: verified, mainHead: mainHead, recordPending: recordPending)
+                    try landLocked(key: key, verified: verified, mainHead: mainHead, recordPending: recordPending, tamper: tamper)
                 }
             }
         }
     }
 
     /// `landVerified` from step 3 on; the caller holds the item's, main's and the engine repository's locks.
-    private func landLocked(key: String, verified: String, mainHead: String, recordPending: (String) throws -> Void) throws -> LandOutcome {
+    private func landLocked(key: String, verified: String, mainHead: String, recordPending: (String) throws -> Void,
+                            tamper: ([String]) -> Void) throws -> LandOutcome {
         let git = try MergeInfrastructureError.wrapping { () throws -> GitCommand in
             let git = try freshEngineRepository()
             retireWorkspaceMergeCheckouts()
             return git
         }
-        try fetchLandingInputs(git, mainHead: mainHead, verified: verified)
+        try fetchLandingInputs(git, mainHead: mainHead, verified: verified, tamper: tamper)
+        dropPreviousEngineRepository()
         if try Self.isAncestor(git, verified, of: mainHead) { return .alreadyLanded(mainHead: mainHead) }
         guard let base = try Self.mergeBase(git, mainHead, verified) else {
             throw GitError.failed(command: "merge-base", status: -1, stderr: "item/\(key) shares no history with main")
@@ -1107,32 +1134,91 @@ public struct GitWorkspace: Sendable {
     // MARK: Agent-writable state that blocks a merge
 
     /// A git lock file nobody has touched for this long is left behind, not held: git holds its locks for milliseconds.
-    static let staleLockAge: TimeInterval = 30
+    static let staleLockAge: TimeInterval = 60
 
-    /// Removes the lock files of the workspace repository that a landing of `key` needs (`main`'s and the item branch's ref
-    /// locks, `packed-refs.lock`, `HEAD.lock`, the root checkout's `index.lock`) when nobody has touched them for
-    /// `staleLockAge`. The workspace repository is agent-writable, so such a file is tampering, not the company's fault: the
-    /// names removed are returned for the owner's alert. A lock younger than that is left alone (git may be using it); the
-    /// step that needs it then fails as the company's fault and is retried. Links are removed, never followed.
-    private func clearStaleWorkspaceLocks(key: String) throws -> [String] {
+    /// What the merge-queue self-heal reports when it fetched objects of `main`'s history back into the workspace.
+    static let restoredHistoryNote = "objects of main's history that were missing (restored from Brahma's merge repository)"
+
+    /// The merge queue's self-heal (A3); the caller holds main's lock. The workspace repository is agent-writable, so state in
+    /// it that would hold every merge is tampering, not the company's fault: it is repaired and the names are returned for
+    /// the owner's alert.
+    /// - every `*.lock` file in the common git dir (`objects` aside) nobody has touched for `staleLockAge` (a younger one is
+    ///   left alone: git may be using it; the step that needs it then fails as the company's fault and is retried);
+    /// - a planted `shallow` (the engine never makes a shallow repository; merges need full history) and `info/grafts`.
+    /// Nothing is followed through a link; a link in the way is removed as the file it stands for.
+    private func healWorkspaceRepositoryLocked() throws -> [String] {
+        try clearStaleWorkspaceLocks() + removePlantedHistoryFiles()
+    }
+
+    /// `shallow` and `info/grafts` in the workspace repository, removed (links too, never followed); their names.
+    private func removePlantedHistoryFiles() throws -> [String] {
         let fm = FileManager.default
+        guard Self.isRealDirectory(gitDir) else { return [] }
         var removed: [String] = []
-        for name in ["refs/heads/main.lock", "refs/heads/item/\(key).lock", "packed-refs.lock", "HEAD.lock", "index.lock"] {
-            // Never through a directory that was swapped for a link.
-            var parent = (name as NSString).deletingLastPathComponent
-            var linked = false
-            while !parent.isEmpty {
-                if Self.isSymlink(gitDir.appending(path: parent)) { linked = true }
-                parent = (parent as NSString).deletingLastPathComponent
-            }
+        for name in ["shallow", "info/grafts"] {
+            if name.contains("/"), !Self.isRealDirectory(gitDir.appending(path: (name as NSString).deletingLastPathComponent)) { continue }
             let url = gitDir.appending(path: name)
-            guard !linked, let attributes = try? fm.attributesOfItem(atPath: url.path) else { continue }
-            let touched = attributes[.modificationDate] as? Date ?? .distantPast
-            guard Date().timeIntervalSince(touched) >= Self.staleLockAge else { continue }
+            guard (try? fm.attributesOfItem(atPath: url.path)) != nil else { continue }
             try fm.removeItem(at: url)
             removed.append(name)
         }
         return removed
+    }
+
+    /// Whether a `shallow` or `info/grafts` is there (`removePlantedHistoryFiles` would remove something).
+    private var hasPlantedHistoryFiles: Bool {
+        ["shallow", "info/grafts"].contains { (try? FileManager.default.attributesOfItem(atPath: gitDir.appending(path: $0).path)) != nil }
+    }
+
+    /// Removes every `*.lock` file under the workspace's common git dir (`objects` aside, no link followed, at most 16 levels
+    /// deep) that nobody has touched for `staleLockAge`; the paths removed, relative to the git dir.
+    private func clearStaleWorkspaceLocks() throws -> [String] {
+        let fm = FileManager.default
+        guard Self.isRealDirectory(gitDir) else { return [] }
+        var removed: [String] = []
+        func walk(_ dir: URL, _ relative: String, depth: Int) throws {
+            guard depth < 16, let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+            for name in names.sorted() {
+                let url = dir.appending(path: name)
+                let shown = relative.isEmpty ? name : "\(relative)/\(name)"
+                // `attributesOfItem` does not follow a link: a link is never walked into.
+                guard let attributes = try? fm.attributesOfItem(atPath: url.path) else { continue }
+                let type = attributes[.type] as? FileAttributeType
+                if type == .typeDirectory {
+                    if depth == 0, name == "objects" { continue }
+                    try walk(url, shown, depth: depth + 1)
+                    continue
+                }
+                guard name.hasSuffix(".lock"), type == .typeRegular || type == .typeSymbolicLink else { continue }
+                let touched = attributes[.modificationDate] as? Date ?? .distantPast
+                guard Date().timeIntervalSince(touched) >= Self.staleLockAge else { continue }
+                try fm.removeItem(at: url)
+                removed.append(shown)
+            }
+        }
+        try walk(gitDir, "", depth: 0)
+        return removed
+    }
+
+    /// The merge queue's self-heal for missing objects (A3); the caller holds main's and the engine repository's locks.
+    /// The previous engine repository (`previousRepositoryPath`, kept from the last landing or export until a fetch works
+    /// again) holds `main`'s history as it was fetched then. When it has `mainHead`, it bundles that history and the
+    /// workspace repository unbundles it (`index-pack`: every object is checked against its id; no transport runs there).
+    /// True when the objects were handed over; false when there is nothing to restore them from.
+    private func restoreMainHistory(_ mainHead: String) throws -> Bool {
+        let fm = FileManager.default
+        let previous = previousRepositoryPath
+        guard !Self.isSymlink(previous), fm.fileExists(atPath: previous.appending(path: "objects").path) else { return false }
+        var source = GitCommand(gitDir: previous, workTree: mergeDirectory.deletingLastPathComponent(), commonDir: nil)
+        source.attributes = Self.engineAttributes
+        guard try source.run(["cat-file", "-e", "\(mainHead)^{commit}"], allowFailure: true).status == 0 else { return false }
+        try source.run(["update-ref", "--no-deref", "refs/brahma/heal", mainHead])
+        let bundle = URL(fileURLWithPath: mergeDirectory.path + "-heal.bundle")
+        if (try? fm.attributesOfItem(atPath: bundle.path)) != nil { try fm.removeItem(at: bundle) }
+        defer { try? fm.removeItem(at: bundle) }
+        guard try source.run(["bundle", "create", "--quiet", bundle.path, "refs/brahma/heal"], allowFailure: true).status == 0 else { return false }
+        try main.run(["bundle", "unbundle", bundle.path])
+        return true
     }
 
     // MARK: The engine's merge repository
@@ -1151,15 +1237,34 @@ public struct GitWorkspace: Sendable {
     private func freshEngineRepository() throws -> GitCommand {
         try GitCommand.requireAttributeSource()
         let fm = FileManager.default
-        let repo = mergeRepositoryPath, tree = mergeWorktreePath
+        let repo = mergeRepositoryPath, tree = mergeWorktreePath, previous = previousRepositoryPath
         try fm.createDirectory(at: mergeDirectory.deletingLastPathComponent(), withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
-        for url in [repo, tree] where (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
+        // The last repository is kept aside (`previousRepositoryPath`) while no fetch has worked since: it is what main's
+        // history can be restored from (`restoreMainHistory`). One that is already kept stays; this one then goes.
+        if (try? fm.attributesOfItem(atPath: repo.path)) != nil {
+            if !Self.isSymlink(repo), (try? fm.attributesOfItem(atPath: previous.path)) == nil {
+                try fm.moveItem(at: repo, to: previous)
+            } else {
+                try fm.removeItem(at: repo)
+            }
+        }
+        for url in [tree] where (try? fm.attributesOfItem(atPath: url.path)) != nil { try fm.removeItem(at: url) }
         try fm.createDirectory(at: tree, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         let git = engineCommand
         try git.run(["init", "--quiet", "--template="])
         try assertEngineState()
         return git
+    }
+
+    /// The engine repository before the current one, at `<mergeDirectory>-prev.git`, kept until a fetch into the current one
+    /// has worked (`dropPreviousEngineRepository`).
+    var previousRepositoryPath: URL { URL(fileURLWithPath: mergeDirectory.path + "-prev.git", isDirectory: true) }
+
+    /// A fetch into the current engine repository worked: it holds `main`'s history now, so the previous one goes.
+    private func dropPreviousEngineRepository() {
+        let previous = previousRepositoryPath
+        if (try? FileManager.default.attributesOfItem(atPath: previous.path)) != nil { try? FileManager.default.removeItem(at: previous) }
     }
 
     /// Writes the engine repository's `config` and `info/attributes` in full (no includes, no hooks, no fsmonitor, no
@@ -1220,16 +1325,31 @@ public struct GitWorkspace: Sendable {
     /// Fetches `mainHead` and `verified` into the engine repository. When that fails, `mainHead` alone decides whose fault it
     /// is: `main`'s history that cannot be fetched (and a shallow workspace) is the company's (`MergeInfrastructureError`),
     /// anything else is the verified commit's (`GitError`).
-    private func fetchLandingInputs(_ engine: GitCommand, mainHead: String, verified: String) throws {
+    ///
+    /// `main`'s history that cannot be fetched is first restored from the previous engine repository (`restoreMainHistory`,
+    /// reported through `tamper`); only when that is not possible, or does not help, is it the company's fault.
+    private func fetchLandingInputs(_ engine: GitCommand, mainHead: String, verified: String, tamper: ([String]) -> Void) throws {
         try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
         do {
             try fetchIntoEngine(engine, commits: [mainHead, verified])
         } catch {
-            do { try fetchIntoEngine(engine, commits: [mainHead]) } catch let mainError {
-                throw MergeInfrastructureError(underlying: GitError.failed(
-                    command: "fetch main", status: -1, stderr: "main's history (\(mainHead.prefix(7))) could not be fetched: \(mainError)"))
+            if let fault = mainHistoryFault(engine, mainHead: mainHead) {
+                guard try MergeInfrastructureError.wrapping({ try restoreMainHistory(mainHead) }) else { throw fault }
+                tamper([Self.restoredHistoryNote])
+                if mainHistoryFault(engine, mainHead: mainHead) != nil { throw fault }
+                try fetchIntoEngine(engine, commits: [mainHead, verified])
+                return
             }
             throw error
+        }
+    }
+
+    /// Nil when `mainHead` alone can be fetched into the engine repository; otherwise the company's fault to report.
+    private func mainHistoryFault(_ engine: GitCommand, mainHead: String) -> MergeInfrastructureError? {
+        do { try fetchIntoEngine(engine, commits: [mainHead]); return nil } catch let mainError {
+            if let fault = mainError as? MergeInfrastructureError { return fault }
+            return MergeInfrastructureError(underlying: GitError.failed(
+                command: "fetch main", status: -1, stderr: "main's history (\(mainHead.prefix(7))) could not be fetched: \(mainError)"))
         }
     }
 
@@ -1238,16 +1358,24 @@ public struct GitWorkspace: Sendable {
     /// never skips a commit because it seems to be there), every object checked by fsck, over the local file transport only
     /// (`protocol.allow=never`, `protocol.file.allow=always`, the stock `git-upload-pack`). A commit git cannot hand over (a
     /// missing or corrupt object) fails as a `GitError`.
+    ///
+    /// The fetch runs in the engine repository's context, but the `git-upload-pack` it spawns runs in the workspace
+    /// repository, with that repository's config and without the forced `-c` overrides (git drops `GIT_CONFIG_PARAMETERS`
+    /// for a local transport's child). So right before it, the workspace repository is asked for each commit through
+    /// `main` (`cat-file -e`): its config passes the allowlist scan first (a refusal is `GitError.isRepositoryRefusal`,
+    /// nothing is fetched), and a commit it does not hold fails here, as a `GitError`.
     private func fetchIntoEngine(_ engine: GitCommand, commits: [String]) throws {
+        for commit in commits { try main.run(["cat-file", "-e", "\(commit)^{commit}"]) }
         var fetcher = engine
         fetcher.allowsLocalFetch = true
         try fetcher.run(Self.fetchFlags + [gitDir.path] + commits)
     }
 
-    /// With `GitCommand.configFlags` (`protocol.allow=never`) and `allowsLocalFetch` (`protocol.file.allow=always`).
+    /// With `GitCommand.configFlags` (`protocol.allow=never`) and `allowsLocalFetch` (`protocol.file.allow=always`). Protocol
+    /// v2 is what lets the engine want a commit by its id (`uploadpack.*` set on this command line would never reach the
+    /// workspace's `git-upload-pack`).
     private static let fetchFlags = [
         "-c", "protocol.version=2",
-        "-c", "uploadpack.allowAnySHA1InWant=true",
         "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true", "-c", "fetch.unpackLimit=1", "-c", "transfer.unpackLimit=1",
         "fetch", "--quiet", "--refetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-gc",
         "--upload-pack=git-upload-pack",
@@ -1466,6 +1594,16 @@ public struct GitWorkspace: Sendable {
 
     static let exportsRelative = "run/exports"
 
+    /// Where the check of a submission runs (run `runId`): `<exportHome>/run/checkouts/<runId>`
+    /// (`BrahmaPaths.checkoutDir(runId:)`), a detached worktree under the data home, never in the workspace.
+    public func checkoutPath(runId: String) -> URL {
+        exportHome.appending(path: "\(Self.checkoutsRelative)/\(runId)", directoryHint: .isDirectory)
+    }
+
+    static let checkoutsRelative = "run/checkouts"
+    /// Where older engines put submission checkouts, inside the agent-writable workspace; only swept at start-up now.
+    static let legacyRunChecksRelative = ".brahma/wt-check"
+
     private static func validRunId(_ id: String) throws {
         guard id.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil else {
             throw GitError.failed(command: "worktree \(id.prefix(40))", status: -1, stderr: "invalid run id")
@@ -1478,13 +1616,15 @@ public struct GitWorkspace: Sendable {
         }
     }
 
-    /// A clean detached checkout of exactly `commit` at `<ws>/.brahma/wt-check/<runId>`, for an engine-run check of a
-    /// submission. Anything left at that place by a crashed run is removed first.
+    /// A clean detached checkout of exactly `commit` at `<exportHome>/run/checkouts/<runId>` (`checkoutPath`), for an
+    /// engine-run check of a submission: under the engine's data home, never in the workspace. The place is made 0700 through
+    /// the walk from the data home (no link followed) and checked around git (`intoPlace`). Anything left at that place by a
+    /// crashed run is removed first.
     public func addRunWorktree(runId: String, commit: String) throws -> URL {
         let command = "worktree add \(runId)"
         let checks = try freshRunPlace(runId: runId, commit: commit, command: command)
-        let path = CheckPaths(workspace: root).runWorktree(runId: runId)
-        try intoPlace(runId, in: checks, registered: true, command: command) { _ in
+        let path = checkoutPath(runId: runId)
+        try intoPlace(runId, in: checks, mode: 0o700, registered: true, command: command) { _ in
             try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
         }
         return path
@@ -1498,25 +1638,36 @@ public struct GitWorkspace: Sendable {
     /// directory's descriptor, relative names only and `-k`: it is never handed a path a swapped link could send elsewhere.
     /// No worktree is linked to the engine repository, so the check has no path back to its config or objects. Anything
     /// left at that place by a crashed run is removed first.
-    public func addEngineExport(runId: String, commit: String) throws -> URL {
+    ///
+    /// Whose fault a failure is (A1): the engine's own steps (the engine repository and its lock, the shallow check,
+    /// `assertEngineState`, the export directory and its place, `main`'s history that cannot be fetched even after the
+    /// self-heal) throw `MergeInfrastructureError`, the company's fault. What only the item's own tree causes (the commit
+    /// cannot be fetched or archived, tar refuses a path, two paths collide on this volume, a `.git` in it) throws
+    /// `UnexportableTree`, the item's fault. Agent-planted state found on the way (`shallow`, `info/grafts`, objects of
+    /// `main`'s history gone) is repaired under main's lock and reported through `tamper` (A3).
+    public func addEngineExport(runId: String, commit: String, tamper: ([String]) -> Void = { _ in }) throws -> URL {
         let command = "archive \(runId)"
         try Self.validRunId(runId); try Self.validCommit(commit)
-        let exports = try exportsDirectory(command: command)
-        try removeEngineEntry(runId, in: exports, command: command)
+        let exports = try MergeInfrastructureError.wrapping { try exportsDirectory(command: command) }
+        try MergeInfrastructureError.wrapping { try removeEngineEntry(runId, in: exports, command: command) }
+        if hasPlantedHistoryFiles {
+            let repaired = try withMainLock(infrastructure: true) { try MergeInfrastructureError.wrapping { try removePlantedHistoryFiles() } }
+            if !repaired.isEmpty { tamper(repaired) }
+        }
         let fm = FileManager.default
         let archive = URL(fileURLWithPath: mergeDirectory.path + "-export-\(runId).tar")
         defer { try? fm.removeItem(at: archive) }
-        try withEngineLock {
-            let git = try MergeInfrastructureError.wrapping { try freshEngineRepository() }
-            try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
-            try fetchIntoEngine(git, commits: [commit])
-            try MergeInfrastructureError.wrapping {
-                if (try? fm.attributesOfItem(atPath: archive.path)) != nil { try fm.removeItem(at: archive) }
-                try assertEngineState()
+        do {
+            try withEngineLock { try archiveLocked(commit: commit, to: archive, exports: exports) }
+        } catch let missing as MainHistoryMissing {
+            // Restored under main's lock, then main's and the engine repository's (the landing's order), and tried once more.
+            let restored = try withMainLock(infrastructure: true) {
+                try withEngineLock { try MergeInfrastructureError.wrapping { try restoreMainHistory(missing.mainHead) } }
             }
-            // The commit is in the engine repository by now (fetched and fsck'd): writing it out is the engine's own step.
-            try MergeInfrastructureError.wrapping {
-                _ = try git.run(["archive", "--format=tar", "--output=\(archive.path)", "\(commit)^{commit}"])
+            guard restored else { throw missing.underlying }
+            tamper([Self.restoredHistoryNote])
+            do { try withEngineLock { try archiveLocked(commit: commit, to: archive, exports: exports) } } catch let again as MainHistoryMissing {
+                throw again.underlying
             }
         }
         let tarball = open(archive.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
@@ -1525,14 +1676,87 @@ public struct GitWorkspace: Sendable {
                                                                        stderr: "could not open the export of \(commit.prefix(7))"))
         }
         defer { close(tarball) }
-        try intoPlace(runId, in: exports, mode: 0o700, registered: false, command: command) { place in
-            try MergeInfrastructureError.wrapping { try Self.untar(tarball, into: place) }
+        try intoPlace(runId, in: exports, mode: 0o700, registered: false, command: command,
+                      placeFault: { MergeInfrastructureError(underlying: $0) }) { place in
+            do { try Self.untar(tarball, into: place) } catch let refused as UnexportableTree { throw refused } catch {
+                throw MergeInfrastructureError(underlying: error)
+            }
             // A tree cannot hold `.git` (fsck refuses it on the fetch); an export never has one either way.
             if place.kind(of: ".git") != .missing {
-                throw GitError.failed(command: "archive", status: -1, stderr: "the export of \(commit.prefix(7)) holds a .git")
+                throw UnexportableTree(reason: "the export of \(commit.prefix(7)) holds a .git")
             }
         }
         return exportPath(runId: runId)
+    }
+
+    /// `addEngineExport`'s work in the engine repository; the caller holds its lock. Fetches `commit` (when that fails,
+    /// `main`'s head alone decides: `main` not fetchable is `MainHistoryMissing`, otherwise it is the commit's fault), refuses
+    /// a tree whose paths collide on the exports' volume, and writes the archive.
+    private func archiveLocked(commit: String, to archive: URL, exports: EngineFiles.OpenDirectory) throws {
+        let fm = FileManager.default
+        let git = try MergeInfrastructureError.wrapping { try freshEngineRepository() }
+        try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
+        do { try fetchIntoEngine(git, commits: [commit]) } catch {
+            // A refused repository config (its own alert) or the engine's own fault stays what it is.
+            if error is MergeInfrastructureError || (error as? GitError)?.isRepositoryRefusal == true { throw error }
+            guard let mainHead = try MergeInfrastructureError.wrapping({ try head(of: Self.mainRef) }) else {
+                throw MergeInfrastructureError(underlying: error)
+            }
+            if let fault = mainHistoryFault(git, mainHead: mainHead) { throw MainHistoryMissing(mainHead: mainHead, underlying: fault) }
+            throw UnexportableTree(reason: "\(commit.prefix(7)) could not be fetched from the workspace repository (\(Self.oneLine(error)))")
+        }
+        dropPreviousEngineRepository()
+        try MergeInfrastructureError.wrapping {
+            if (try? fm.attributesOfItem(atPath: archive.path)) != nil { try fm.removeItem(at: archive) }
+            try assertEngineState()
+        }
+        try refuseCollidingPaths(git, commit: commit, on: exports)
+        let out = try MergeInfrastructureError.wrapping {
+            try git.run(["archive", "--format=tar", "--output=\(archive.path)", "\(commit)^{commit}"], allowFailure: true)
+        }
+        guard out.status == 0 else {
+            throw UnexportableTree(reason: "git could not archive \(commit.prefix(7)) (\(Self.oneLine(out.stderr)))")
+        }
+    }
+
+    /// On a case-insensitive volume (the exports' own, asked of its descriptor), two paths of the tree that differ only in
+    /// case (or Unicode normalization) would be unpacked as one, silently (`tar -k` keeps the first): such a tree is refused.
+    private func refuseCollidingPaths(_ git: GitCommand, commit: String, on exports: EngineFiles.OpenDirectory) throws {
+        #if canImport(Darwin)
+        guard fpathconf(exports.fd, _PC_CASE_SENSITIVE) != 1 else { return }
+        #else
+        return
+        #endif
+        let out = try MergeInfrastructureError.wrapping {
+            try git.run(["ls-tree", "-r", "-t", "-z", "--full-tree", "\(commit)^{commit}"], allowFailure: true, maxOutput: 64 << 20)
+        }
+        guard out.status == 0 else { throw UnexportableTree(reason: "git could not list \(commit.prefix(7)) (\(Self.oneLine(out.stderr)))") }
+        guard !out.cut else { return }
+        var seen: [String: (path: String, tree: Bool)] = [:]
+        var collisions: [String] = []
+        for entry in String(decoding: out.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true) {
+            guard let tab = entry.firstIndex(of: "\t") else { continue }
+            let path = String(entry[entry.index(after: tab)...])
+            let tree = entry[..<tab].split(separator: " ").dropFirst().first == "tree"
+            let folded = path.lowercased()
+            if let other = seen[folded], other.path != path, !(other.tree && tree) {
+                collisions.append("\(Self.flatName(other.path)) and \(Self.flatName(path))")
+                if collisions.count == 3 { break }
+            } else if seen[folded] == nil {
+                seen[folded] = (path, tree)
+            }
+        }
+        guard collisions.isEmpty else {
+            throw UnexportableTree(reason: "paths that differ only in case collide on this volume: \(collisions.joined(separator: "; "))")
+        }
+    }
+
+    private static func oneLine(_ error: any Error) -> String { oneLine("\(error)") }
+    private static func oneLine(_ text: String) -> String {
+        String(text.split(whereSeparator: \.isNewline).joined(separator: " ").prefix(300))
+    }
+    private static func flatName(_ path: String) -> String {
+        String(path.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7f }.map(Character.init).prefix(120))
     }
 
     /// `<exportHome>/run/exports`, walked from the data home without following a link (created when missing); a link or
@@ -1552,13 +1776,30 @@ public struct GitWorkspace: Sendable {
         return try? exportsDirectory(command: command)
     }
 
-    /// `<ws>/.brahma/wt-check` (walked without links), with whatever a crashed run left at `<runId>` in it removed.
+    /// `<exportHome>/run/checkouts` (walked from the data home without links, created when missing), with whatever a
+    /// crashed run left at `<runId>` in it removed.
     private func freshRunPlace(runId: String, commit: String, command: String) throws -> EngineFiles.OpenDirectory {
         try Self.validRunId(runId); try Self.validCommit(commit)
-        let checks = try engineDirectory(".brahma/wt-check", command: command)
+        let checks = try checkoutsDirectory(command: command)
         try removeEngineEntry(runId, in: checks, command: command)
         _ = try? main.run(["worktree", "prune"], allowFailure: true)
         return checks
+    }
+
+    /// `<exportHome>/run/checkouts`, walked from the data home without following a link (created when missing); a link or
+    /// odd file on the way is reported and refused.
+    private func checkoutsDirectory(command: String) throws -> EngineFiles.OpenDirectory {
+        do { return try EngineFiles.openWalked(workspace: exportHome, Self.checkoutsRelative) } catch let problem as UnsafeEngineFile {
+            onUnsafeEngineFile?(problem)
+            throw GitError.failed(command: command, status: -1, stderr: "\(problem)")
+        }
+    }
+
+    /// The walked `<exportHome>/run/checkouts`, or nil when nothing is there yet or it is refused (reported).
+    private func existingCheckouts(command: String) -> EngineFiles.OpenDirectory? {
+        let dir = exportHome.appending(path: Self.checkoutsRelative, directoryHint: .isDirectory)
+        guard (try? FileManager.default.attributesOfItem(atPath: dir.path)) != nil || Self.isSymlink(dir) else { return nil }
+        return try? checkoutsDirectory(command: command)
     }
 
     /// Unpacks a tar file made by `git archive` (read from `archive`, a descriptor) with `/usr/bin/tar` into `place`. tar is
@@ -1595,38 +1836,44 @@ public struct GitWorkspace: Sendable {
                 throw GitError.failed(command: "archive", status: -1, stderr: "could not wait for tar: \(String(cString: strerror(errno)))")
             }
         }
+        // tar ran and refused: what it was given is the commit's tree (a path it or the volume refuses, an over-long name).
         guard status == 0 else {
-            throw GitError.failed(command: "archive", status: status, stderr: "could not unpack the export")
+            throw UnexportableTree(reason: "its files could not be unpacked for the merge check (tar exit \(status >> 8); a path tar or the volume refuses, such as an over-long name)")
         }
     }
 
-    /// Removes one run's checkout (through the walked `.brahma/wt-check`) and its export (through the walked
+    /// Removes one run's checkout (through the walked `<exportHome>/run/checkouts`) and its export (through the walked
     /// `<exportHome>/run/exports`), never by a path; git then forgets a checkout (`prune`). Never throws.
     public func removeRunWorktree(runId: String) {
         guard (try? Self.validRunId(runId)) != nil else { return }
         let command = "worktree remove \(runId)"
         if let exports = existingExports(command: command) { try? removeEngineEntry(runId, in: exports, command: command) }
-        guard let checks = existingRunChecks(command: command) else { return }
+        guard let checks = existingCheckouts(command: command) else { return }
         try? removeEngineEntry(runId, in: checks, command: command)
         _ = try? main.run(["worktree", "prune"], allowFailure: true)
     }
 
-    /// Start-up: no check is running, so every leftover run checkout and export goes.
+    /// Start-up: no check is running, so every leftover run checkout and export goes, and so do the checkouts older engines
+    /// left in the workspace's `.brahma/wt-check`.
     public func removeRunWorktrees() {
         if let exports = existingExports(command: "export prune") {
             for name in (try? exports.names()) ?? [] { try? removeEngineEntry(name, in: exports, command: "export prune") }
         }
-        guard let checks = existingRunChecks(command: "worktree prune") else { return }
-        for name in (try? checks.names()) ?? [] { try? removeEngineEntry(name, in: checks, command: "worktree prune") }
+        if let checks = existingCheckouts(command: "worktree prune") {
+            for name in (try? checks.names()) ?? [] { try? removeEngineEntry(name, in: checks, command: "worktree prune") }
+        }
+        if let legacy = existingLegacyRunChecks(command: "worktree prune") {
+            for name in (try? legacy.names()) ?? [] { try? removeEngineEntry(name, in: legacy, command: "worktree prune") }
+        }
         _ = try? main.run(["worktree", "prune"], allowFailure: true)
     }
 
-    /// The walked `.brahma/wt-check`, or nil when nothing is there yet (it is not created just to be emptied) or it is
-    /// refused (reported).
-    private func existingRunChecks(command: String) -> EngineFiles.OpenDirectory? {
-        let dir = CheckPaths(workspace: root).runWorktreesRoot
+    /// The walked `.brahma/wt-check` of an older engine, or nil when nothing is there (it is not created just to be emptied)
+    /// or it is refused (reported).
+    private func existingLegacyRunChecks(command: String) -> EngineFiles.OpenDirectory? {
+        let dir = root.appending(path: Self.legacyRunChecksRelative, directoryHint: .isDirectory)
         guard (try? FileManager.default.attributesOfItem(atPath: dir.path)) != nil || Self.isSymlink(dir) else { return nil }
-        return try? engineDirectory(".brahma/wt-check", command: command)
+        return try? engineDirectory(Self.legacyRunChecksRelative, command: command)
     }
 
     // MARK: Commits and refs

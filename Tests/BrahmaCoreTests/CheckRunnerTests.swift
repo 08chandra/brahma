@@ -181,11 +181,13 @@ import Foundation
         let p = CheckPaths(workspace: URL(fileURLWithPath: "/w/acme"))
         #expect(p.snapshotDir(key: "ACME-3", revision: 2).path == "/w/acme/.brahma/checks/ACME-3/rev2")
         #expect(p.manifest(key: "ACME-3", revision: 2).path == "/w/acme/.brahma/checks/ACME-3/rev2/manifest.json")
-        #expect(p.runWorktree(runId: "r-1").path == "/w/acme/.brahma/wt-check/r-1")
-        // A merge check's export is not in the workspace: it lives under the data home.
+        // Neither a submission's checkout nor a merge check's export is in the workspace: both live under the data home.
         let home = BrahmaPaths(home: URL(fileURLWithPath: "/h"), workspaces: URL(fileURLWithPath: "/w"))
         #expect(home.exportDir(runId: "r-1").path == "/h/run/exports/r-1")
-        #expect(GitWorkspace(root: URL(fileURLWithPath: "/w/acme"), exportHome: home.home).exportPath(runId: "r-1") == home.exportDir(runId: "r-1"))
+        #expect(home.checkoutDir(runId: "r-1").path == "/h/run/checkouts/r-1")
+        let ws = GitWorkspace(root: URL(fileURLWithPath: "/w/acme"), exportHome: home.home)
+        #expect(ws.exportPath(runId: "r-1") == home.exportDir(runId: "r-1"))
+        #expect(ws.checkoutPath(runId: "r-1") == home.checkoutDir(runId: "r-1"))
     }
 
     /// True when the process is gone (the check polls briefly: a killed process may take a moment to be reaped).

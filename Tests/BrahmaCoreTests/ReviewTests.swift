@@ -901,6 +901,59 @@ import GRDB
         #expect(try r.store.company(id: r.company.id)?.mainCommit == (try r.mainHead()))
     }
 
+    /// A2: approving Brahma's quarantine ask (the Inbox's Approve) is the owner's accept: exactly the recorded commit is
+    /// merged into main, the ask settles, the hold is released, and a later `main accept` reports it as merged.
+    @Test func approvingTheQuarantineAskMergesTheRecordedCommit() async throws {
+        let r = try R()
+        let (i, before, ref) = try await quarantined(r)
+        let ask = try #require(try quarantineAsks(r).first)
+        let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
+        let decided = try r.store.ownerDecide(askId: ask.id, approve: true, note: "keep them")
+        #expect(decided.status == .approved); #expect(decided.decidedBy == "owner"); #expect(decided.ownerNote == "keep them")
+        #expect(try r.mainHead() == sha, "a fast-forward to exactly the recorded commit")
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == sha)
+        #expect(try String(contentsOf: r.root.appending(path: "scratch.txt"), encoding: .utf8) == "the owner was here\n")
+        #expect(try !r.store.quarantineHeld(companyId: r.company.id))
+        #expect(try r.store.events(afterId: 0).map(\.text).contains { $0.contains("accepted") && $0.contains(ref) })
+        let again = try r.store.acceptMainCommit(companyId: r.company.id, ref: ref)
+        #expect(again.alreadyMerged); #expect(again.ask?.id == ask.id); #expect(again.ask?.status == .approved)
+        #expect(try r.mainHead() == sha)
+        _ = before
+        r.world.clock.advance(120)
+        #expect(try await r.drive(i).status == .done)
+        #expect(try r.ws.isAncestor(sha, of: try r.mainHead()))
+    }
+
+    /// A2: approving a quarantine whose ref moved since Brahma asked is refused and flagged; nothing is merged, the ask stays
+    /// open and the hold stays. Rejecting it then leaves main as it is and keeps the ref for inspection; the hold is released,
+    /// and a later `main accept` of the ref still merges exactly the recorded commit (and says the ask was rejected).
+    @Test func aMovedQuarantineIsRefusedAndARejectedOneKeepsItsRef() async throws {
+        let r = try R()
+        let (i, before, ref) = try await quarantined(r)
+        let ask = try #require(try quarantineAsks(r).first)
+        let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
+        let moved = try GitFixture.plainGit(["commit-tree", "\(before)^{tree}", "-p", sha, "-m", "moved"], in: r.root)
+        try GitFixture.plainGit(["update-ref", ref, moved], in: r.root)
+        #expect(r.failure { _ = try r.store.ownerDecide(askId: ask.id, approve: true); return "" }.contains("moved"))
+        #expect(try r.mainHead() == before)
+        #expect(try r.store.ask(id: ask.id)?.status == .pendingOwner); #expect(try r.store.quarantineHeld(companyId: r.company.id))
+        #expect(try r.alerts().contains { $0.status == .pendingOwner && $0.summary.contains(ref) && $0.summary.contains("moved") })
+        // The owner puts the ref back and rejects instead.
+        try GitFixture.plainGit(["update-ref", ref, sha], in: r.root)
+        let rejected = try r.store.ownerDecide(askId: ask.id, approve: false, note: "not these")
+        #expect(rejected.status == .rejected)
+        #expect(try r.mainHead() == before); #expect(try GitFixture.plainGit(["rev-parse", ref], in: r.root) == sha, "the ref is kept")
+        #expect(try !r.store.quarantineHeld(companyId: r.company.id))
+        #expect(try r.store.events(afterId: 0).map(\.text).contains { $0.contains("rejected") && $0.contains(ref) && $0.contains("unchanged") })
+        r.world.clock.advance(120)
+        #expect(try await r.drive(i).status == .done, "merges go on")
+        #expect(try !r.ws.isAncestor(sha, of: try r.mainHead()))
+        // The owner changes their mind: `main accept` merges exactly the recorded commit and reports the ask's state.
+        let accepted = try r.store.acceptMainCommit(companyId: r.company.id, ref: ref)
+        #expect(!accepted.alreadyMerged); #expect(accepted.ask?.status == .rejected)
+        #expect(try r.ws.isAncestor(sha, of: try r.mainHead())); #expect(try r.store.company(id: r.company.id)?.mainCommit == (try r.mainHead()))
+    }
+
     @Test func quarantineRefMovedAfterTheAskIsRefused() async throws {
         let r = try R()
         let (i, before, ref) = try await quarantined(r)
@@ -1169,13 +1222,159 @@ import GRDB
         #expect(runs.first?.status == .queued)
         let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
         #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.count == 1, "one owner alert")
-        // Once the fault clears the check runs, passes and b lands; the alert resolves.
+        // Once the fault clears the export works and the check runs: the export's success resolves the alert at once (A1),
+        // before b lands.
         try FileManager.default.removeItem(at: parent)
         r.world.clock.advance(61)
+        try await r.cycle()
+        #expect(r.world.checks.calls.count == calls + 1)
+        #expect(try r.fresh(b).status == .inReview, "not landed yet")
+        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty, "the export resolved the hold alert")
         let done = try await r.drive(b)
         #expect(done.status == .done); #expect(try r.mainHead() == rebased)
         #expect(r.world.checks.calls.count == calls + 1)
         #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
+    }
+
+    /// A1: a merge check whose export keeps failing for Brahma's own reasons is deferred at most `maxMergeCheckDeferrals`
+    /// times; then the run is recorded inconclusive (the usual retry and return path, never charged as a failure).
+    @Test func mergeCheckExportDeferralsAreCappedPerRun() async throws {
+        let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let r = try R(store: try Store(path: home.appending(path: "brahma.db").path))
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
+        _ = try await r.drive(a)
+        try await r.cycle()
+        #expect(try r.fresh(b).mergeState == .verifying)
+        let parent = r.store.gitWorkspace(root: r.root, companyId: r.company.id).mergeDirectory.deletingLastPathComponent()
+        if FileManager.default.fileExists(atPath: parent.path) { try FileManager.default.removeItem(at: parent) }
+        try "blocked".write(to: parent, atomically: true, encoding: .utf8)
+        for _ in 0..<(Orchestrator.maxMergeCheckDeferrals + 1) {
+            r.world.clock.advance(61)
+            try await r.cycle()
+        }
+        let runs = try await r.store.writer.read { db in
+            try VerificationRun.filter(Column("itemId") == b.id && Column("purpose") == "merge").order(Column("rowid")).fetchAll(db)
+        }
+        #expect(runs.map(\.status) == [.inconclusive, .queued], "\(runs.map(\.status))")
+        #expect(runs.last?.attempt == 2)
+        let held = try r.fresh(b)
+        #expect(held.status == .inReview); #expect(held.mergeState == .verifying)
+        #expect(try r.events(b, .verificationFailed).isEmpty, "inconclusive is not a failure")
+    }
+
+    /// A1: an export that fails because of the item's own tree (a path tar refuses, names that collide on a case-insensitive
+    /// volume) is the item's fault: the item goes back to its holder with the reason, no hold is raised, and the queue moves.
+    @Test func anUnexportableTreeReturnsTheItemAndTheQueueMoves() async throws {
+        let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let r = try R(store: try Store(path: home.appending(path: "brahma.db").path))
+        let probe = try tempDir()
+        try "x".write(to: probe.appending(path: "Case"), atomically: true, encoding: .utf8)
+        let caseInsensitive = FileManager.default.fileExists(atPath: probe.appending(path: "cASE").path)
+        let long = String(repeating: "x", count: 300) + ".txt"
+        var trees: [(name: String, files: [String: String], why: String)] = [("long", ["src/\(long)": "one"], "could not be unpacked")]
+        if caseInsensitive { trees.append(("case", ["src/A.txt": "one", "src/a.txt": "two"], "differ only in case")) }
+        for (n, tree) in trees.enumerated() {
+            let a = try await r.approved("a\(n)", by: r.eng, file: "src/a\(n).txt")
+            let b = try await r.approved("b\(n)", by: r.eng2, file: "src/b\(n).txt")
+            #expect(try await r.drive(a).status == .done)
+            try await r.cycle()
+            let rebased = try #require(try r.head(b))
+            let run = try #require(try r.store.latestVerification(itemId: b.id))
+            #expect(run.purpose == .merge); #expect(run.status == .queued)
+            // The rebased commit as the item's tree would make it: one that git holds but no export can write out faithfully.
+            let index = try tempDir().appending(path: "index")
+            let env = ["GIT_INDEX_FILE": index.path]
+            try GitFixture.plainGit(["read-tree", rebased], in: r.root, env: env)
+            for (path, text) in tree.files {
+                let file = index.deletingLastPathComponent().appending(path: "blob-\(path.count)-\(text)")
+                try text.write(to: file, atomically: true, encoding: .utf8)
+                let blob = try GitFixture.plainGit(["hash-object", "-w", file.path], in: r.root)
+                try GitFixture.plainGit(["update-index", "--add", "--cacheinfo", "100644,\(blob),\(path)"], in: r.root, env: env)
+            }
+            let treeId = try GitFixture.plainGit(["write-tree"], in: r.root, env: env)
+            let bad = try GitFixture.plainGit(["commit-tree", treeId, "-p", rebased, "-m", "bad tree"], in: r.root)
+            try r.exec(#"UPDATE verificationRun SET "commit" = ? WHERE id = ?"#, [bad, run.id])
+            let calls = r.world.checks.calls.count
+            r.world.clock.advance(61)
+            try await r.cycle()
+            #expect(r.world.checks.calls.count == calls, "\(tree.name): no check ran without its export")
+            let back = try r.fresh(b)
+            #expect(back.status == .inProgress, "\(tree.name): the item is returned"); #expect(back.mergeState == .none)
+            let event = try #require(try r.events(b, .verificationFailed).last, "\(tree.name)")
+            #expect(event.text.contains(tree.why), "\(tree.name): \(event.text)")
+            #expect(try r.dms(r.eng2).contains { $0.contains(b.key) && $0.contains(tree.why) }, "\(tree.name): the holder is told why")
+            let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
+            #expect(try r.alerts().filter { $0.subjectId == hold }.isEmpty, "\(tree.name): not the company's fault")
+            #expect(!FileManager.default.fileExists(atPath: r.store.gitWorkspace(root: r.root, companyId: r.company.id).exportPath(runId: run.id).path))
+            // The queue moves: the next approved item lands.
+            let c = try await r.approved("c\(n)", by: r.eng3, file: "src/c\(n).txt")
+            #expect(try await r.drive(c).status == .done, "\(tree.name)")
+            // Free the authors for the next round.
+            try r.exec("DELETE FROM workLease WHERE itemId = ?", [b.id])
+        }
+    }
+
+    /// A3: agent-writable state that holds the merge queue is repaired under main's lock, each repair reported to the owner:
+    /// a git lock file nobody has touched for over a minute, a planted `shallow` and `info/grafts`.
+    @Test func aPlantedShallowAndAStaleLockAreHealedAndTheMergeProceeds() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let before = try r.mainHead()
+        let git = r.root.appending(path: ".git")
+        let lock = git.appending(path: "refs/heads/main.lock"), packed = git.appending(path: "packed-refs.lock")
+        let shallow = git.appending(path: "shallow"), grafts = git.appending(path: "info/grafts")
+        for url in [lock, packed] {
+            try "".write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-120)], ofItemAtPath: url.path)
+        }
+        try (before + "\n").write(to: shallow, atomically: true, encoding: .utf8)
+        try (before + "\n").write(to: grafts, atomically: true, encoding: .utf8)
+        let done = try await r.drive(a)
+        #expect(done.status == .done)
+        #expect(try r.ws.isAncestor(before, of: try r.mainHead()))
+        for url in [lock, packed, shallow, grafts] { #expect(!FileManager.default.fileExists(atPath: url.path), "\(url.lastPathComponent)") }
+        let tamper = try r.alerts().filter { $0.subjectId == Store.engineAlertKey(Store.mergeTamperAlertReason(r.company.id)) }
+        #expect(tamper.count == 1, "\(tamper.map(\.summary))")
+        for name in ["refs/heads/main.lock", "packed-refs.lock", "shallow", "info/grafts"] {
+            #expect(tamper.first?.summary.contains(name) == true, "\(name): \(tamper.first?.summary ?? "")")
+        }
+        let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
+        #expect(try r.alerts().filter { $0.subjectId == hold }.isEmpty)
+        // A lock touched within the last minute is left alone (git may be using it).
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
+        try "".write(to: lock, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-40)], ofItemAtPath: lock.path)
+        try await r.cycle()
+        #expect(FileManager.default.fileExists(atPath: lock.path)); #expect(try r.fresh(b).status != .done)
+        try FileManager.default.removeItem(at: lock)
+        r.world.clock.advance(61)
+        #expect(try await r.drive(b).status == .done)
+    }
+
+    /// A3: objects of `main`'s history deleted from the workspace repository are fetched back from the engine's previous merge
+    /// repository (which holds that history from the last landing), reported to the owner, and the merge proceeds.
+    @Test func missingMainHistoryIsRestoredFromTheEngineRepository() async throws {
+        let r = try R()
+        try r.commitMain(["old.txt": "old content\n"])
+        let oldBlob = try GitFixture.plainGit(["rev-parse", "HEAD:old.txt"], in: r.root)
+        try r.commitMain(["old.txt": "new content\n"])
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        #expect(try await r.drive(a).status == .done)
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
+        // Something deletes an object only main's history holds.
+        let loose = r.root.appending(path: ".git/objects/\(oldBlob.prefix(2))/\(oldBlob.dropFirst(2))")
+        try #require(FileManager.default.fileExists(atPath: loose.path))
+        try FileManager.default.removeItem(at: loose)
+        let done = try await r.drive(b)
+        #expect(done.status == .done)
+        #expect((try? GitFixture.plainGit(["cat-file", "-p", oldBlob], in: r.root)) == "old content", "the object is back")
+        let tamper = try r.alerts().filter { $0.subjectId == Store.engineAlertKey(Store.mergeTamperAlertReason(r.company.id)) }
+        #expect(tamper.count == 1); #expect(tamper.first?.summary.contains("main's history") == true, "\(tamper.first?.summary ?? "")")
+        let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
+        #expect(try r.alerts().filter { $0.subjectId == hold }.isEmpty)
     }
 
     @Test func theGitVersionIsRecordedAtStartUp() async throws {
@@ -1895,9 +2094,9 @@ extension ReviewTests {
                           "a new pytest.ini")
         try keptForReview(r, try await submitted(r, command: "python3 -m pytest src/pkg", files: ["src/pkg/util.py": "X = 2\n"]),
                           "under the directory python -m pytest collects")
-        // `make test -C src`: everything under the directory the check runs in.
-        try keptForReview(r, try await submitted(r, command: "make test -C src", files: ["src/main.c": "int main(){return 0;}\n"]),
-                          "under a -C directory")
+        // `make test --directory=src`: everything under the directory the check runs in.
+        try keptForReview(r, try await submitted(r, command: "make test --directory=src", files: ["src/main.c": "int main(){return 0;}\n"]),
+                          "under a --directory directory")
         // A workspace module that would shadow pytest.
         try keptForReview(r, try await submitted(r, command: "python -m pytest", files: ["src/pytest.py": "raise SystemExit(0)\n"]),
                           "a pytest.py shadowing the runner")
@@ -1913,7 +2112,8 @@ extension ReviewTests {
         // Beside a referenced script.
         #expect(sensitive("src/tools/lib.py", "pytest src/tools/check.py")); #expect(!sensitive("src/other/lib.py", "pytest src/tools/check.py"))
         // A directory option, as a separate word or with `=`.
-        #expect(sensitive("lib/x/y.rb", "make test -C lib/x")); #expect(!sensitive("lib/y.rb", "make test -C lib/x"))
+        #expect(sensitive("lib/x/y.rb", "make test --directory lib/x")); #expect(!sensitive("lib/y.rb", "make test --directory lib/x"))
+        #expect(sensitive("lib/y.rb", "make test -C lib/x"), "-C takes a value: not eligible, so everything is sensitive")
         #expect(sensitive("app/web/a.js", "npm test --prefix=app/web")); #expect(!sensitive("app/a.js", "npm test --prefix=app/web"))
         #expect(sensitive("src/pkg/a.go", "go test ./src/...")); #expect(!sensitive("lib/a.go", "go test ./src/..."))
         // A check outside the allowlist makes every path sensitive.
@@ -1953,16 +2153,38 @@ extension ReviewTests {
         "npm test --prefix=example.com/x",
         // Paths outside the workspace.
         "go test ../x", "pytest /etc", "make test -C ..", "swift test --package-path=/tmp/x", "pytest --rootdir=../x", "pytest src/../..",
+        // Short options with an attached value or clustered flags, and short options that take a value (A6).
+        "pytest -kfoo", "pytest -xvs", "make test -Csrc", "make test -fMakefile.x", "swift build -crelease", "go test -run=X -vet=off -cover",
+        "make test -C lib/x", "make test -f other.mk", "swift build -c release", "pytest -c alt.ini", "pytest src/checks -k smoke -x",
+        "pytest -I x", "make test -k", "pytest -o addopts=", "pytest -W error", "python -m pytest -X dev", "cargo test -s",
+        "go test -n ./...", "npm test -u",
     ]
 
     /// The allowlisted check forms, with plain arguments.
     static let eligibleChecks = [
         "swift test", "swift build", "npm test", "npm run test", "pnpm test", "yarn test", "pytest", "python -m pytest",
         "python3 -m pytest", "go test ./...", "cargo test", "make test",
-        "swift test --filter=ReviewTests --parallel", "pytest src/checks -k smoke -x", "npm test -- --runInBand",
-        "go test ./src/... -run=TestX", "pytest tests/test_a.py::test_b", "cargo test --release my_mod::case", "go test .",
-        "pytest .", "make test -C lib/x", "yarn test --ci", "swift build -c release",
+        "swift test --filter=ReviewTests --parallel", "pytest src/checks -x -v", "npm test -- --runInBand",
+        "go test ./src/... --run=TestX", "pytest tests/test_a.py::test_b", "cargo test --release my_mod::case", "go test .",
+        "pytest .", "make test --directory=lib/x", "yarn test --ci", "swift build --configuration=release", "pytest -q -x",
     ]
+
+    /// A6: a single-dash word longer than two characters (an attached value such as `-kfoo`, or clustered flags such as
+    /// `-xvs` that may hide one) and the short options that take a value (`-C -f -c -I -k -o -W -X -s -n -u`) are outside
+    /// the grammar: the check is not eligible and every changed path is sensitive.
+    @Test func shortOptionsWithValuesOrClustersAreNotEligible() {
+        for word in ["-kfoo", "-xvs", "-Csrc", "-vv", "-run=X"] {
+            #expect(!CheckScripts.checkReach(command: "pytest \(word)").parseable, "\(word)")
+        }
+        for flag in ["-C", "-f", "-c", "-I", "-k", "-o", "-W", "-X", "-s", "-n", "-u"] {
+            #expect(!CheckScripts.checkReach(command: "make test \(flag) x").parseable, "\(flag) x")
+            #expect(!CheckScripts.checkReach(command: "make test \(flag)").parseable, "\(flag)")
+            #expect(ReviewPolicy.isSensitive("lib/a.txt", reach: CheckScripts.checkReach(command: "pytest \(flag) x")), "\(flag)")
+        }
+        for plain in ["pytest -x", "pytest -v -q", "go test -v ./...", "pytest -", "cargo test --release"] {
+            #expect(CheckScripts.checkReach(command: plain).parseable, "\(plain)")
+        }
+    }
 
     @Test func aCheckOutsideTheAllowlistedGrammarIsNeverAutoMerged() async throws {
         let r = try R()
