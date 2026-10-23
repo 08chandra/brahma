@@ -90,10 +90,10 @@ public actor Orchestrator {
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
-    public func start() throws {
+    public func start() async throws {
         let now = clock()
         _ = try store.recoverInterruptedTurns(now: now)
-        try recoverChecks(now: now)
+        try await recoverChecks(now: now)
         try recoverMerges()
     }
 
@@ -424,7 +424,9 @@ public actor Orchestrator {
                     // A leaseholder's failed checks and review rejections may raise the item's floor before this turn picks
                     // its rung (design §3.3), so the fix turn already runs at it.
                     if c.lease != nil, let g = git {
-                        escalate(itemId: itemId, agent: agent, git: g, now: clock())
+                        // Its `nameStatus` diffs are git: off the cooperative pool.
+                        let now = clock()
+                        await Blocking.run { self.escalate(itemId: itemId, agent: agent, git: g, now: now) }
                     }
                     facts = try? store.itemModeFacts(itemId: itemId, holderId: c.lease?.agentId ?? agent.id)
                     itemBudget = c.lease?.agentId == agent.id && c.lease?.itemId == itemId

@@ -63,6 +63,21 @@ public struct ClaudeProcessRunner: TurnRunning {
         self.baseEnvironment = baseEnvironment
     }
 
+    /// What is in the pipe at `fd` right now (up to `stderrLimit` × 16 bytes), read without blocking.
+    static func readWithoutWaiting(_ fd: Int32) -> Data {
+        let flags = fcntl(fd, F_GETFL)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        var out = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while out.count < stderrLimit * 16 {
+            let n = read(fd, &buffer, buffer.count)
+            if n < 0, errno == EINTR { continue }
+            guard n > 0 else { break }
+            out.append(contentsOf: buffer[0..<n])
+        }
+        return out
+    }
+
     /// Exit code of a process that died of SIGTERM: 143 through a shell wrapper, the signal number itself from Foundation.
     static func isSigterm(_ status: Int32) -> Bool { status == 143 || status == SIGTERM }
 
@@ -192,9 +207,9 @@ public struct ClaudeProcessRunner: TurnRunning {
         let child = ChildProcess(process)
         process.terminationHandler = { p in
             exit.signal(p.terminationStatus)
+            // Stderr is not cut here: the turn drains what is left of it itself once the process is gone (below).
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.drainGrace) {
                 stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
                 splitter.finish()
             }
         }
@@ -251,6 +266,12 @@ public struct ClaudeProcessRunner: TurnRunning {
         // clock, not by a count of sleeps, which stretch on a loaded machine).
         let stderrDeadline = ContinuousClock.now + .seconds(Self.drainGrace) + .milliseconds(500)
         while !stderrClosed.isSet, ContinuousClock.now < stderrDeadline { try? await Task.sleep(for: .milliseconds(5)) }
+        if !stderrClosed.isSet {
+            // Not closed in time (a grandchild may hold the pipe, or the handler is slow on a loaded machine): whatever the
+            // process wrote before it exited is still in the pipe, so it is read now, without waiting, and nothing is lost.
+            stderr.fileHandleForReading.readabilityHandler = nil
+            tail.append(Self.readWithoutWaiting(stderr.fileHandleForReading.fileDescriptor))
+        }
         if let requested = TurnAudit.effortCap(in: tail.text) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
         let sawResult = state.sawResult

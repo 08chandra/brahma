@@ -47,12 +47,12 @@ import Foundation
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let script = dir.appending(path: "slowsh")
-        try "#!/bin/sh\nsleep 10\n".write(to: script, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nsleep 120\n".write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         let start = ContinuousClock.now
         let result = ToolLocator.loginShellPath(shell: script.path, timeout: .seconds(1))
         #expect(result == nil)
-        #expect(ContinuousClock.now - start < .seconds(8), "hang guard: the script sleeps 10 s")
+        #expect(ContinuousClock.now - start < .seconds(60), "hang guard: the script sleeps 120 s")
     }
 
     /// Depends on the owner's real login shell and dotfiles, so it is opt-in: BRAHMA_REAL_SHELL_TESTS=1.

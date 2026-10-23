@@ -5,13 +5,15 @@ extension Orchestrator {
     /// recorded inconclusive (and so retried, then returned, through the usual inconclusive path).
     static let maxMergeCheckDeferrals = 10
 
-    /// Start-up: runs the previous process left running are queued again, and leftover check checkouts are removed.
-    func recoverChecks(now: Date) throws {
+    /// Start-up: runs the previous process left running are queued again, and leftover check checkouts are removed (git,
+    /// off the cooperative pool: `Blocking`).
+    func recoverChecks(now: Date) async throws {
         try store.recoverVerifications(now: now)
         for company in try store.companies() {
             let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
             guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { continue }
-            store.gitWorkspace(root: ws, companyId: company.id).removeRunWorktrees()
+            let git = store.gitWorkspace(root: ws, companyId: company.id)
+            await Blocking.run { git.removeRunWorktrees() }
         }
     }
 
@@ -143,7 +145,8 @@ extension Orchestrator {
         if Task.isCancelled { return }
         // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
         let passed = outcome.exitCode == 0 && !outcome.timedOut
-        let autoMerge = passed && run.purpose == .submit ? store.assessAutoMerge(run: run, git: git) : nil
+        let assessing = self.store
+        let autoMerge = passed && run.purpose == .submit ? await Blocking.run { assessing.assessAutoMerge(run: run, git: git) } : nil
         do { try store.finishVerification(runId: run.id, outcome: outcome, autoMerge: autoMerge, now: clock()) }
         catch { log("could not record the check of run \(run.id): \(error)") }
     }

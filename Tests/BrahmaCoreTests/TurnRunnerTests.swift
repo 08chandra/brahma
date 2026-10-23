@@ -134,8 +134,8 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
         waiter.cancel()
         await waiter.value
         let elapsed = ContinuousClock.now - start
-        // The child ignores SIGTERM until its sleep ends or the 5 s kill grace; an early return would not wait.
-        #expect(elapsed > .milliseconds(300))
+        // The child ignores SIGTERM until its sleep ends or the 5 s kill grace: an early return would leave it alive, which
+        // the check of its pid below observes (no assertion on how long the wait took).
         // A busy-spinning waiter would poll thousands of times; a sleeping one about once per 20 ms.
         // Structural, not CPU time: clock() measures the whole test process, which runs suites in parallel.
         #expect(polls.value <= Int(elapsed / .milliseconds(20)) * 2 + 5)

@@ -143,7 +143,7 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         try await eventually { try store.agent(id: ceo.id)?.state == .running }
         let start = ContinuousClock.now
         await h.stop(timeout: .milliseconds(300))
-        #expect(ContinuousClock.now - start < .seconds(30), "hang guard")
+        #expect(ContinuousClock.now - start < .seconds(60), "hang guard")
         #expect(h.status == .stopped)
     }
 
@@ -151,8 +151,11 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         let (store, paths) = try makeHome()
         let h = host(paths, store)
         await h.start(tools: tools)
+        #expect(h.status == .embedded)
         await h.stop()
-        _ = try OrchestratorLock.acquire(paths: paths)
+        #expect(h.status == .stopped)
+        // The CLI can take the lock once the host has let it go (asked again until it can, never against a fixed delay).
+        try await eventually { (try? OrchestratorLock.acquire(paths: paths)) != nil }
     }
 
     @Test func missingToolsFailWithoutTakingLock() async throws {

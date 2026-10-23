@@ -89,7 +89,9 @@ extension Orchestrator {
                 return
             }
             await companyMergeRan(companyId: company.id)
-            try store.finishMerge(itemId: item.id, result: result, now: clock())
+            // Recording a landing also removes the item's worktree and branch and looks at the other branches (git).
+            let finished = clock()
+            try await Blocking.tryRun { try store.finishMerge(itemId: item.id, result: result, now: finished) }
         } catch let error where Self.isCompanyMergeFault(error) {
             log("could not merge \(item.key) (\(company.name)'s merge step failed): \(error)")
             await companyMergeFault(company: company, item: item, error: Self.companyFault(error))
