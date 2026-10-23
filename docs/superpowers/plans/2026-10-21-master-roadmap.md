@@ -23,7 +23,7 @@ Everything else in v2 stands.
 | 5 | **L "Live"** | written, 14 tasks; being amended (existing-repo import added by owner). Notes: `tmp/planL-4a-notes.md` L1–L6 | `tmp/2026-10-21-planL-live.md` | 3a, 5L |
 | 6 | **ML Memory-lite (lean)** | **to write** (scope in §2.6) | — | 3a, 5L (taint, transcripts, redaction) |
 | 7 | **4a Merge queue and non-web previews** | written, 10 tasks, re-cut on L; being re-planned. Notes: A1–A7 | `tmp/2026-10-21-plan4a-workspace-previews.md` | 3a, 5L, L |
-| 8 | **4b Org-chart map** | written, 11 tasks; this review re-based it on 3a's `orgVacancy` | `tmp/2026-10-21-plan4b-maps.md` | 3a (+ layout left by L/4a) |
+| 8 | **4b Org-chart map** | written, 15 tasks (pre-build checks applied 2026-10-23); builds after C | `docs/superpowers/plans/2026-10-21-plan4b-maps.md` | 3a (+ layout left by L/4a) |
 | 9 | **Dogfood week** | after 4b | — | all of the above |
 | 10 | **Ops** | to write; after the dogfood week **[owner 18:16]** | — | L, 5L |
 | 11 | **M Marketing** (v1 text/image, M2 video) | to write | — | L (human tasks), ML (memory ingest), 5L |
