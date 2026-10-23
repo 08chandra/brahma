@@ -58,6 +58,11 @@ public enum UsageText {
         return s
     }
 
+    /// The 7-day pace line: "7D on pace" or "7D ahead by 12%". Nil until a usage reading exists.
+    public static func pace(_ pace: Pace?) -> String? {
+        pace.map { "7D \($0.text)" }
+    }
+
     public static func gateLine(_ info: RateLimitInfo?, mode: UsageMode, now: Date, timeZone: TimeZone = .current) -> String? {
         guard case .closed(let until) = UsageGate.evaluate(info, mode: mode, now: now) else { return nil }
         return "Usage limit — new turns resume at \(TimeText.hm(until, timeZone: timeZone))"

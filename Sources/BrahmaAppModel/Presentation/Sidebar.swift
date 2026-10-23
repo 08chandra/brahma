@@ -3,6 +3,7 @@ import BrahmaCore
 
 public enum SidebarItem: Hashable, Sendable {
     case missionControl, activity, agents
+    case backlog, board, inbox
     case channel(id: String)
     case dm(handle: String)
 }

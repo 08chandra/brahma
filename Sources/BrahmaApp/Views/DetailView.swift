@@ -30,6 +30,10 @@ struct DetailView: View {
                         ActivityFeedView(model: model, compact: true)
                             .frame(minHeight: 60, idealHeight: 140, maxHeight: 260)
                     }
+                case .backlog, .board, .inbox:
+                    // Task 16a builds these views; the model layer behind them is in place.
+                    MonoEmptyState("Coming soon", detail: "This screen arrives in the next update.")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .channel, .dm:
                     if let chat = model.chat {
                         VSplitView {

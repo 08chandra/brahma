@@ -53,6 +53,8 @@ public final class EngineHost {
     @ObservationIgnored private let config: SchedulerConfig
     @ObservationIgnored private let ownerKeyStore: any OwnerKeyStore
     @ObservationIgnored private let probe: @Sendable (String) async -> DoctorReport
+    /// Retry's probe: always a real run, never the saved report.
+    @ObservationIgnored private let freshProbe: @Sendable (String) async -> DoctorReport
     @ObservationIgnored private let tickInterval: Duration
     @ObservationIgnored private var lock: OrchestratorLock?
     @ObservationIgnored private var engineTask: Task<Void, Never>?
@@ -62,10 +64,17 @@ public final class EngineHost {
                 makeRunner: @escaping @Sendable (String) -> any TurnRunning = { ClaudeProcessRunner(claudePath: $0) },
                 config: SchedulerConfig = .init(), tickInterval: Duration = .seconds(1),
                 probe: (@Sendable (String) async -> DoctorReport)? = nil,
+                freshProbe: (@Sendable (String) async -> DoctorReport)? = nil,
                 ownerKeyStore: any OwnerKeyStore) {
         self.ownerKeyStore = ownerKeyStore
         self.probe = probe ?? { [store] path in
             await Doctor.ensure(store: store, claudePath: path, runner: ClaudeProcessRunner(claudePath: path))
+        }
+        // An injected probe stands for the doctor in tests; otherwise Retry runs the real one and saves its report.
+        self.freshProbe = freshProbe ?? probe ?? { [store] path in
+            let report = await Doctor.run(claudePath: path, runner: ClaudeProcessRunner(claudePath: path))
+            try? store.saveProbe(report)
+            return report
         }
         self.paths = paths
         self.store = store
@@ -120,6 +129,12 @@ public final class EngineHost {
         let interval = tickInterval
         engineTask = Task.detached { await orchestrator.runForever(interval: interval) }
         status = .embedded
+    }
+
+    /// The Retry button: runs the doctor again (not the saved report). Nil when Claude Code was never located.
+    public func recheck() async -> DoctorReport? {
+        guard case .success(let tools)? = rememberedTools else { return nil }
+        return await freshProbe(tools.claudePath)
     }
 
     /// Re-attempts the lock while a terminal `brahma run` holds it.

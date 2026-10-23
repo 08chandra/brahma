@@ -51,6 +51,8 @@ private struct Shell: View {
                 switch sheet {
                 case .newCompany: NewCompanySheet(model: model)
                 case .hire: HireSheet(model: model)
+                case .newItem: MonoEmptyState("Coming soon", detail: "The new-item form arrives in the next update.")
+                    .frame(width: 360, height: 160)
                 }
             }
             .background(BrahmaTheme.bg1)
