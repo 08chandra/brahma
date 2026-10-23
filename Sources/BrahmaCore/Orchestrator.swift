@@ -32,16 +32,16 @@ public actor Orchestrator {
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
     /// Agent id → its turn task.
-    private var tasks: [String: Task<Void, Never>] = [:]
+    private var tasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Health work that must never block a tick (doctor re-probe, `claude --version`, HTTPS probe, disk checks).
-    var healthTasks: [String: Task<Void, Never>] = [:]
+    var healthTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     var health = HealthState()
     /// Git work that must never block a tick: removing worktrees, the orphan sweep, creating a dispatched item's worktree.
-    var gitTasks: [String: Task<Void, Never>] = [:]
+    var gitTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Run id → its check task. Checks are child processes: they count in the safety cap next to turns.
-    var checkTasks: [String: Task<Void, Never>] = [:]
+    var checkTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Company id → its merge task (one approved item lands at a time per company). Merges are child processes too.
-    var mergeTasks: [String: Task<Void, Never>] = [:]
+    var mergeTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Companies whose last merge attempt did not land (HEAD not on main, git failed): not tried again before this time.
     var mergeBackoff: [String: Date] = [:]
     /// Company id → merge attempts in a row that failed for the company's own reasons (`MergeInfrastructureError`).
@@ -102,11 +102,43 @@ public actor Orchestrator {
     /// Child processes that are not turns: engine-run checks and merges. They count against the same safety cap as turns.
     var otherChildren: Int { checkTasks.count + mergeTasks.count }
 
+    private var idleWaiters: [Int: CheckedContinuation<Void, any Error>] = [:]
+    private var nextIdleWaiter = 0
+
+    /// Everything the engine owns that is in flight: turns, health, git, check and merge tasks. (Whatever a tick would start
+    /// next is started synchronously inside that tick, so nothing is "queued" outside these sets.)
+    private var isIdle: Bool {
+        tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty
+    }
+
+    private func resumeIdleWaitersIfIdle() {
+        guard isIdle, !idleWaiters.isEmpty else { return }
+        let waiters = idleWaiters; idleWaiters = [:]
+        for (_, c) in waiters { c.resume() }
+    }
+
+    private func busyDescription() -> String {
+        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted())"
+    }
+
+    private func idleWaiterTimedOut(_ id: Int) {
+        guard let c = idleWaiters.removeValue(forKey: id) else { return }
+        log("waitUntilIdle timed out; still running: \(busyDescription())")
+        c.resume(throwing: OrchestratorError.idleTimeout(running: runningCount()))
+    }
+
+    /// Returns once no engine-owned work is in flight, woken by the work finishing (no polling). `timeout` is only a hang
+    /// backstop: when it passes, the throw names (in the log) what is still running.
     public func waitUntilIdle(timeout: Duration) async throws {
-        let deadline = ContinuousClock.now + timeout
-        while !tasks.isEmpty || !healthTasks.isEmpty || !gitTasks.isEmpty || !checkTasks.isEmpty || !mergeTasks.isEmpty {
-            guard ContinuousClock.now < deadline else { throw OrchestratorError.idleTimeout(running: runningCount()) }
-            try await Task.sleep(for: .milliseconds(5))
+        if isIdle { return }
+        let id = nextIdleWaiter; nextIdleWaiter += 1
+        let backstop = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            await self?.idleWaiterTimedOut(id)
+        }
+        defer { backstop.cancel() }
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, any Error>) in
+            idleWaiters[id] = c
         }
     }
 

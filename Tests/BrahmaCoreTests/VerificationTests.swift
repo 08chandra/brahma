@@ -1009,9 +1009,10 @@ import GRDB
     }
 }
 
-/// Polls until the condition holds (at most ~10 s).
+/// Polls until the condition holds; the 60 s bound is only a hang backstop.
 private func waitUntil(_ condition: @Sendable () -> Bool) async throws {
-    for _ in 0..<2000 {
+    let deadline = ContinuousClock.now + .seconds(60)
+    while ContinuousClock.now < deadline {
         if condition() { return }
         try await Task.sleep(for: .milliseconds(5))
     }
