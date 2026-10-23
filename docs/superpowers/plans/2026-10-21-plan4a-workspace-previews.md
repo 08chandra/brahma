@@ -11,7 +11,7 @@
 - **A main guard.** Only the queue (including its journaled engine commits) moves `main`. Any other move or rewrite is saved under a unique ref, and `main` is restored. The owner is told.
 - **Previews beyond the web, from the same engine as L.**
   - Kinds: CLI demo output, backend smoke requests, the iOS Simulator (behind an owner approval, because it runs outside the sandbox) and macOS apps under a GUI sandbox policy.
-  - Published artifacts for any industry pack (R-285): HTML, Markdown, PDF, images, tables, office documents, 3D models, CAD file cards, and MP4/MOV video in a 9:16 phone frame for marketing clips.
+  - Published artifacts for any industry pack (R-285): HTML, Markdown, PDF, images, tables, office documents, 3D models, CAD file cards, text and source-code files, and MP4/MOV video in a 9:16 phone frame for marketing clips.
   - Artifacts show before any preview runs (R-192).
   - Sprint-review demos reuse these previews.
   - App views for all of it, a merge-queue panel, and merge status in item detail.
@@ -99,9 +99,16 @@ The names come from the plan texts: † = 3a, ‡ = 5-lite, § = L. Task 1a's im
   - `RestoreHooks.afterRestore`‡.
 
 **ML (Memory-lite, `/Users/chandra/.claude/jobs/6d89b87c/tmp/2026-10-21-planML-memory-lite.md`):**
-- `Model/FileKinds.swift`: `ArtifactKind`, `ArtifactSniffer`, `ArtifactPolicy`, `ArchiveRatio` and `ArchiveStats` (shipped early from 4a's definitions).
-- `ResourcePolicy` (`maxArchiveRatio`), `MemoryIndex` and `MemorySource`.
-- The `F-<n>` resource numbering. Artifacts stay `AR-<n>`, and asks keep `A-<n>`.
+- **File kinds (ruling a).** `Model/FileKinds.swift` (ML Task 6a) owns the whole table, and 4a defines none of it:
+  - `ArtifactKind` (`html, markdown, pdf, image, video, table, spreadsheet, document, model3d, cad, text, code`, plus `from(fileName:)`, `isText` and `playlistExtensions = [m3u8, m3u, mpd, pls]`);
+  - `ArtifactSniffer.matches(kind:ext:head:)` with one rule per extension, including the `video` rule;
+  - `ArtifactPolicy` with 4a's caps unchanged (`maxFileBytes`, `maxVideoBytes`, `maxFolderBytes`, `maxFiles`, `titleMax`, `companyQuotaBytes`, `publishesPerHour`);
+  - `ArchiveRatio.check(url:)` / `stats(url:)` and `ArchiveStats`.
+- **Provenance.** `Model/Provenance.swift` (ML Task 1): `enum Provenance { owner, agent(String), engine, external(String) }` with `raw` and `init?(raw:)`.
+- **Memory.** `MemoryIndex` (`search(companyId:scope:query:sources:limit:now:)`), `MemorySource`, `MemoryIngestDoc`, `Store.ingest(_:now:)` / `ingest(db:_:now:)`, `Store.removeMemoryDoc(companyId:source:sourceId:now:)`, `AccessClass` (`.company`), `Sensitivity`, `Reader`, and `ResourcePolicy.maxArchiveRatio`.
+- **Ref forms.** Artifacts are `AR-<n>` (4a), asks `A-<n>` (alias `ask:<n>`) and resources `F-<n>`. `A`, `AR` and `F` are reserved prefixes, and `MemoryRefs.implied` resolves by them.
+- **Migrations.** ML's are `"vML-memory"`, `"vML-kb"` and `"vML-resources"`, in that order. 4a's follow `"vML-resources"`.
+Step 1 of Task 1a records the shipped names of these in the commit body.
 
 **L:**
 - **Layout and export.**
@@ -191,7 +198,7 @@ Copied from Plans 3a, 5-lite and L and still binding:
 4a additions:
 - **Sandbox.** Every agent-written command 4a runs goes through 5-lite inside a fresh `.git`-free export: `SandboxedRunner` for preview build, demo and run commands and built macOS apps; the sandboxed `CheckRunning` for merge checks. Only `git` (through `GitCommand`), `xcrun simctl`, `lsof` and `ps` use plain `Process`.
 - **Git.** Every engine git call goes through 3a's `GitWorkspace`/`GitCommand`. 4a adds methods to `GitWorkspace` and never builds its own git argv.
-- **Migrations** append after the last migration in the merged code (ML's, which follow `"vML-resources"`; otherwise L's `"vL-import"`), in this order: `"v4a-merge"`, `"v4a-merge-journal"`, `"v4a-preview-kinds"`, `"v4a-artifacts"`, `"v4a-demos"`. Never edit an earlier migration. Collab-MVP's `"vC-refs"`, `"vC-threads"` and `"vC-show"` come after `"v4a-demos"` (and before 4b's `"v4b-vacancy-note"`).
+- **Migrations** append after ML's last, `"vML-resources"` (ML follows L's `"vL-import"`), in this order: `"v4a-merge"`, `"v4a-merge-journal"`, `"v4a-preview-kinds"`, `"v4a-artifacts"`, `"v4a-demos"`. Never edit an earlier migration. Collab-MVP's `"vC-refs"`, `"vC-threads"`, `"vC-show"` and `"vC-changes"` come after `"v4a-demos"` (and before 4b's `"v4b-vacancy-note"`).
 - **Agent-controlled text in 4a** includes commit subjects, file names (conflict lists, artifact names), preview logs, demo output, HTTP bodies, page titles, artifact titles and contents, and secret-scan labels.
   - In prompts it is quoted or flattened.
   - `@system` DMs and channel posts carry only engine-written reasons, counts, refs and paths.
@@ -279,8 +286,7 @@ Sources/BrahmaCore/
   Store/Store+Merge.swift        enqueueApproved, queue queries and writes, journal, settings, holds, main check, mainCommit, adoptMain
   Preview/PreviewKinds.swift     PreviewKind cases, validate rules, policies, demo default, SimulatorControlling, MacAppLaunching, Unavailable*
   Preview/CLIAdapter.swift Preview/BackendAdapter.swift Preview/ArtifactAdapter.swift Preview/AppleAdapters.swift Preview/DemoRunner.swift
-  Model/Artifact.swift           Artifact (ArtifactKind, ArtifactSniffer, ArtifactPolicy, ArchiveRatio come from ML's Model/FileKinds.swift; extended in place only if missing)
-  Model/Provenance.swift         Provenance (the shape Collab-MVP's WorkRef reuses)
+  Model/Artifact.swift           Artifact (ArtifactKind, ArtifactSniffer, ArtifactPolicy, ArchiveRatio and ArchiveStats are ML's Model/FileKinds.swift; Provenance is ML's Model/Provenance.swift; 4a adds none of them)
   Store/Store+Artifacts.swift
   MCP/QueueTools.swift           set_main_check, publish_artifact
   (modified) Model/Company.swift Model/Turn.swift Model/WorkItem.swift Messaging/WakePolicy.swift Org/IndustryPack.swift Org/SoftwarePack.swift
@@ -705,29 +711,26 @@ func resumesFromEveryStep(step: MergeStep) async throws {
 ### Task 6: Published artifacts — confined, sniffed, rate-limited, video and CAD included
 
 **Files:**
-- Create: `Sources/BrahmaCore/Model/Artifact.swift`, `Model/Provenance.swift`, `Store/Store+Artifacts.swift`, `Preview/ArtifactAdapter.swift`, `Sources/brahma/ArtifactCommands.swift`, `Tests/BrahmaCoreTests/ArtifactTests.swift`, `Fixtures/artifacts/`
+- Create: `Sources/BrahmaCore/Model/Artifact.swift`, `Store/Store+Artifacts.swift`, `Preview/ArtifactAdapter.swift`, `Sources/brahma/ArtifactCommands.swift`, `Tests/BrahmaCoreTests/ArtifactTests.swift`, `Fixtures/artifacts/`
 - Modify: `Store/Migrations.swift` (`"v4a-artifacts"`), `MCP/QueueTools.swift` (`publish_artifact`), `Turns/TurnDigest.swift`, `Brahma.swift`
 
 **Interfaces:**
 - Consumes:
-  - ML `ArtifactKind`, `ArtifactSniffer`, `ArtifactPolicy`, `ArchiveRatio`/`ArchiveStats`, `ResourcePolicy.maxArchiveRatio`;
-  - ML `MemoryIndex`/`MemorySource` ingestion;
+  - ML `ArtifactKind`, `ArtifactSniffer`, `ArtifactPolicy`, `ArchiveRatio`/`ArchiveStats`, `ResourcePolicy.maxArchiveRatio` (`Model/FileKinds.swift`);
+  - ML `Provenance` (`Model/Provenance.swift`);
+  - ML `MemorySource`, `MemoryIngestDoc`, `Store.ingest(db:_:now:)`, `Store.removeMemoryDoc(companyId:source:sourceId:now:)`, `AccessClass.company`, `MemoryIndex.search`;
   - Task 1b `EngineLayout.artifacts`; Task 4 `DemoCapture`;
   - 3a `Store.lease(agentId:)`, `GitWorkspace.worktreePath(key:)`, `WorkError`, `Store.slug(for:)`.
 - Produces:
   - Migration `"v4a-artifacts"`: `artifact(id TEXT PK, companyId FK cascade, number INT NOT NULL, title TEXT NOT NULL, kind TEXT NOT NULL, storedPath TEXT NOT NULL, entryFile TEXT NOT NULL, sourcePath TEXT NOT NULL, publishedById TEXT NOT NULL, itemId TEXT REFERENCES workItem ON DELETE SET NULL, bytes INT NOT NULL, createdAt)`.
-  - **File kinds come from Plan ML** (`Model/FileKinds.swift`, ML Task 6). 4a defines none of these types:
-    - `ArtifactKind` (cases `html, markdown, pdf, image, video, table, spreadsheet, document, model3d, cad, text`, plus `from(fileName:)` and the playlist refusal `"streaming playlists can't be published; publish the video file"`);
+  - **File kinds come from Plan ML** (`Model/FileKinds.swift`, ML Task 6a). 4a defines none of these types and adds no rows, caps or sniff rules to ML's file:
+    - `ArtifactKind` (cases `html, markdown, pdf, image, video, table, spreadsheet, document, model3d, cad, text, code`, plus `from(fileName:)`, `isText` and `playlistExtensions`);
     - `ArtifactSniffer.matches(kind:ext:head:)` (fix 11; mismatch → `"the file's content doesn't match .<ext>"`);
     - `ArtifactPolicy` (`maxFileBytes` 50 MB, `maxVideoBytes` 500 MB, `maxFolderBytes` 200 MB, `maxFiles` 500, `titleMax` 120, `companyQuotaBytes` 2 GB, `publishesPerHour` 20);
     - `ArchiveRatio.check(url:)` / `stats(url:)` with `ArchiveStats`.
 
-    ML ships them "exactly as 4a printed them". Step 1 diffs the shipped file against this list. **4a extends only where ML's shipped file lacks something it needs**, adding it in place in `Model/FileKinds.swift` with a `FileKindsTests` case:
-    - the `cad` kind (`step, stp, iges, igs`, A6: file card only, never rendered);
-    - the `video` kind (`mp4, mov, m4v`) with its sniffer rule (`ftyp` at offset 4, or a `moov`/`wide`/`mdat` atom for `mov`);
-    - `maxVideoBytes`, `companyQuotaBytes` and `publishesPerHour`.
-
-    Any value that differs from the table above is reported in the commit, and ML's value wins.
+    Step 1 only checks that the shipped names match this list and records any rename in the commit. A value that differs is reported, and ML's value wins.
+  - **The `code` kind.** `.code` (swift, ts, py, sh, sql, toml, … per ML's table; text rule) is **publishable**, at the 50 MB file cap. Every `switch` over `ArtifactKind` in 4a handles it: `FileBody.make` maps it to `.text`, so it renders as capped mono text, never executed or parsed. The playlist refusal text stays `"streaming playlists can't be published; publish the video file"`.
   - `Store.publishArtifact(companyId:by:sourcePath:title:itemKey:baseDirectory:now:) throws -> Artifact`, with exact messages:
     - **Resolution.** `realpath` must be inside the workspace (`"artifacts must be inside your company workspace"`) and outside `.brahma/` except the caller's own leased worktree. That covers `.brahma/preview/runs`, `.brahma/wt/.merge`, `.brahma/artifacts` and other worktrees: `"that folder can't be published"`.
     - **Each file.** Opened with `open(O_RDONLY | O_NOFOLLOW)` after `realpath`. `fstat` must show `S_ISREG` (`"only regular files can be published"`). Bytes are counted while copying, and the copy aborts as soon as the cap is passed. This applies per file inside folders too.
@@ -737,8 +740,8 @@ func resumesFromEveryStep(step: MergeStep) async throws {
     - **Folders and glTF.** A folder needs `index.html`, and any symlink inside is refused. glTF copies only bare-name siblings (`"unsupported glTF resource <uri>"`).
     - **Storage.** Copies go to `.brahma/artifacts/<number>-<slug(title)>/`. `itemKey` must be in the same company. Activity: `"AR-<n> published by @<h>: <title>"`.
   - `Store.artifacts(companyId:limit: Int = 20)`, `latestArtifact(companyId:)`, `artifactBytes(companyId:)`, `deleteArtifact(id:by: .owner)`.
-  - **Memory (ML delta).** 4a registers `MemorySource("artifact")`. On publish, in the same transaction, it ingests the artifact title (company class, ref `AR-<n>`), so the Show bar finds artifacts through `MemoryIndex`. Delete removes the entry. Test `publishedArtifactIsSearchable`.
-  - `enum Provenance: Codable, Hashable, Sendable { case owner, agent(String), engine, external(String) }` (Collab-MVP §1.1's exact cases, so `WorkRef` reuses it). `Artifact` + `var provenance: Provenance`, a computed property: `publishedById == "owner"` → `.owner`, otherwise `.agent(handle)`.
+  - **Memory (ML delta).** 4a adds the source `MemorySource("artifact")` (a static `artifact` in a 4a extension; ML's list is open to later plans). On publish, in the same transaction, it calls `Store.ingest(db:_:now:)` with `MemoryIngestDoc(companyId:, source: .artifact, sourceId: <artifact id>, ref: "AR-<n>", title: <title>, body: "<kind> artifact: <title>", access: .company, readerSet: nil, futureHolders: false, sensitivity: .normal, provenance: artifact.provenance, authorId: publishedById, itemId:, createdAt:)`, so Collab's Show bar finds artifacts through `MemoryIndex`. `deleteArtifact` calls `removeMemoryDoc(companyId:source:sourceId:now:)`. Test `publishedArtifactIsSearchable`.
+  - `Provenance` is ML's (`Model/Provenance.swift`, with `raw` and `init?(raw:)`); 4a does not define it. `Artifact` + `var provenance: Provenance`, a computed property over ML's type: `publishedById == "owner"` → `.owner`, otherwise `.agent(handle)`.
   - Tool `publish_artifact {path, title, item?: KEY}` (the `design` list; taint-safe; no URL argument) returns `"Published AR-<n> “<title>” (<kind>); it shows in the preview pane."`.
   - `ArtifactAdapter.demo`: `ok = true`, line `"artifacts: latest AR-<n>"` (the title appears only in the app).
   - `TurnDigest`: `Latest artifact: AR-<n> <title…1> (<abs entry path>)`.
@@ -746,10 +749,10 @@ func resumesFromEveryStep(step: MergeStep) async throws {
   - CLI: `brahma artifacts <company>` (`list`: `AR-<n>  <kind>  <title>  @<by>  <yyyy-MM-dd HH:mm>`, sanitized); `artifacts publish <company> <path> --title t [--item KEY]` (prints the tool's `Published AR-<n> …` line); `artifacts rm <company> <AR-n>` (owner-write).
   - **Rendering boundary (A6).** The engine never parses or renders spreadsheets, documents, PDFs, 3D or CAD files; only the app does, and those go through out-of-process Quick Look or the bounded loaders in Task 8a.
 
-- [ ] **Step 1: Write failing tests** in `ArtifactTests`. Before writing them, diff ML's `Model/FileKinds.swift` against the consume list above and add only what is missing, in place, with a `FileKindsTests` case each. The kind-table test below then exercises ML's table, including `cad` and `video`:
+- [ ] **Step 1: Write failing tests** in `ArtifactTests`. Before writing them, check that ML's shipped `Model/FileKinds.swift` matches the consume list above (it is not edited here). The kind-table test below exercises ML's table, including `cad`, `video` and `code`:
 ```swift
 @Test(arguments: [("mock.html", "html"), ("PRD.md", "markdown"), ("deck.PPTX", "document"), ("bom.xlsx", "spreadsheet"), ("parts.csv", "table"),
-                  ("chair.glb", "model3d"), ("part.STL", "model3d"), ("part.STEP", "cad"), ("logo.svg", "image"), ("notes.txt", "text"), ("reel.MP4", "video")])
+                  ("chair.glb", "model3d"), ("part.STL", "model3d"), ("part.STEP", "cad"), ("logo.svg", "image"), ("notes.txt", "text"), ("reel.MP4", "video"), ("main.swift", "code")])
 func kindsByExtension(file: String, kind: String) { }
 @Test func publishFromWorktreeCopies() throws { }
 @Test func magicBytesMismatchRefused() throws { /* m3u8 text renamed reel.mp4 → mismatch; HTML renamed x.pdf → mismatch; fixture samples pass */ }
@@ -759,13 +762,14 @@ func kindsByExtension(file: String, kind: String) { }
 @Test func sizeCountedWhileCopying() throws { /* file grows past 50 MB during copy (test hook) → aborted, no partial artifact */ }
 @Test func quotaAndRateLimit() throws { }
 @Test func archiveRatioRefused() throws { /* a 10 KB docx-named zip whose central directory claims 50 MB → "this archive expands too much to preview safely"; a normal docx fixture passes */ }
-@Test func playlistRefused() throws { }
+@Test func playlistRefused() throws { /* reel.m3u8 → "streaming playlists can't be published; publish the video file" */ }
+@Test func codeFilePublishes() throws { /* main.swift → kind code, entry copied, Published AR-n line says (code) */ }
 @Test func gltfCopiesOnlyBareSiblings() throws { }
 @Test func crossCompanyRefused() throws { }
 @Test func roleFiltered() throws { }
 @Test func digestLatestArtifactLine() throws { /* render contains "Latest artifact: AR-1 Landing mock (" */ }
 @Test func artifactsCLI() throws { /* publish → stdout starts "Published AR-1"; list line starts "AR-1  markdown  Spec  @owner"; `artifacts rm Acme AR-1` ok; `artifacts rm Acme A-1` → exit 1 "artifact keys look like AR-<n>" */ }
-@Test func publishedArtifactIsSearchable() throws { /* publish "Landing mock" → MemoryIndex.search(scope: .owner, "landing") contains AR-1; after delete → absent */ }
+@Test func publishedArtifactIsSearchable() throws { /* publish "Landing mock" → MemoryIndex(store:).search(companyId:scope: .owner, query: "landing", sources: nil, limit:, now:) contains ref AR-1 (company access, so an unrelated agent finds it too); after delete → absent */ }
 @Test func artifactRefParsing() { /* "AR-3", "ar-3", "3" → 3; "A-3", "AR-", "AR-0", "AR-x" → nil */ }
 ```
 - [ ] **Step 2:** Run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter ArtifactTests`. Expected: FAIL.
@@ -895,7 +899,8 @@ func kindsByExtension(file: String, kind: String) { }
     - `make` stats the file but parses nothing. Modes:
       - pdf, spreadsheet, document, and model3d except gltf/glb → `.quickLook`;
       - gltf/glb → `.gltf` when ≤ 20 MB, else `.fileCard`;
-      - cad → `.fileCard`; video → `.video`; image → `.image`; svg → `.web`.
+      - cad → `.fileCard`; video → `.video`; image → `.image`; svg → `.web`;
+      - text and code → `.text` (`code` is ML's new kind: capped mono text, never parsed).
     - `func effectiveMode(for p: Provenance) -> Mode`: for `.agent`/`.external`, `.image` becomes `.quickLook` (Quick Look thumbnail, out of process). In-process images are for `.owner` and `.engine` only.
     - `.artifact(Artifact, all:)` now renders through `FileBody.make(url: a.entryURL, kind: a.kind, root: a.storedPath)`. The video layout comes from the view (Task 9b).
   - `AppModel` + `phoneFrameOverride: [String: Bool]`, `selectArtifact(_:)`, `deleteArtifact(_:)`.
@@ -910,7 +915,7 @@ func kindsByExtension(file: String, kind: String) { }
     - `tabOrderSurfaceArtifactsLive`;
     - `defaultShowsArtifactsBeforeAnyPreview` (one failed surface + one artifact → ARTIFACTS; a running web → web; no surfaces with live → ARTIFACTS when artifacts exist);
     - `bodiesForNewKinds`;
-    - `fileBodyModes` (each kind; cad → `fileCard`; stl → `quickLook`; glb 1 MB → `gltf`, glb 25 MB → `fileCard`; png → `image`, effective `quickLook` for `.agent("design-1")` and `image` for `.owner`);
+    - `fileBodyModes` (each kind; code → `text`; cad → `fileCard`; stl → `quickLook`; glb 1 MB → `gltf`, glb 25 MB → `fileCard`; png → `image`, effective `quickLook` for `.agent("design-1")` and `image` for `.owner`);
     - `navigationPolicy`.
   - `MergePresentationTests`: `rowsOrderAndText`, `settingsFormValidation`, `holdShown`.
   - `QueueModelLayerTests` (`@MainActor`): `snapshotCarriesMergeAndArtifacts`, `saveMergeSettingsPersists`, `retryAndResume`, `itemMergeLoads`, `selectTargets`, `phoneFrameOverrideToggles`.
