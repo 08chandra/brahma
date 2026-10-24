@@ -39,6 +39,7 @@ private struct SandboxWorld {
     }
 
     var ws: URL { URL(fileURLWithPath: company.workspacePath, isDirectory: false) }
+    static func exists(_ path: String) -> Bool { var st = stat(); return lstat(path, &st) == 0 }
     var key: String { item.key }
     func p(_ relative: String) -> String { ws.appending(path: relative).path }
 
@@ -76,10 +77,11 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         let s = try w.scope(.work)
         let k = w.key
         #expect(s.cwd.path == w.p(".brahma/wt/\(k)"))
+        #expect(s.cwd.resolvedForSandbox.path == GitWorkspace(root: w.ws).worktreePath(key: k).resolvedForSandbox.path)
         #expect(s.writable.paths == [
             w.p(".brahma/home/eng-1"), w.p(".brahma/labs/eng-1"), w.p(".brahma/home/eng-1/cache"), w.p(".git/objects"),
             w.p(".git/worktrees/\(k)"), w.p(".git/refs/heads/item/\(k)"), w.p(".git/refs/heads/item/\(k).lock"),
-            w.p(".git/logs/refs/heads/item/\(k)"), w.p(".brahma/progress/\(k).md"), w.p(".brahma/notes/eng-1.md"),
+            w.p(".git/logs/refs/heads/item/\(k)"), w.p(".brahma/progress/\(k).md"), w.p(".brahma/notes/agents/eng-1.md"),
         ])
         #expect(!s.writable.paths.contains(w.p(".git/refs/heads/item")))
         #expect(!s.writable.paths.contains(w.p(".git/logs/refs/heads/item")))
@@ -100,7 +102,7 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
             let s = try w.scope(kind, item: .some(nil))
             #expect(s.cwd.path == w.p(".brahma/labs/eng-1"))
             #expect(s.writable.paths == [w.p(".brahma/home/eng-1"), w.p(".brahma/labs/eng-1"), w.p(".brahma/home/eng-1/cache"),
-                                         w.p(".brahma/notes/eng-1.md")])
+                                         w.p(".brahma/notes/agents/eng-1.md")])
             #expect(!s.writable.paths.contains { $0.contains("/.git/") || $0.hasSuffix("/.git") })
         }
     }
@@ -286,13 +288,187 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         try ok.validate()
     }
 
-    @Test func handleMustBeSafeAndNotATeamNotesName() throws {
+    @Test func handleMustBeASafePathComponent() throws {
         let w = try SandboxWorld()
-        for handle in ["../x", "a/b", "company", "team-1", "core", ""] {
+        for handle in ["../x", "a/b", "", "Eng", "it's", "a\\b"] {
             let layout = SandboxLayout(paths: w.paths, company: w.company, agentHandle: handle)
             expectSandboxError(.invalidHandle(handle)) { _ = try w.scope(.work, layout: layout) }
             expectSandboxError(.invalidHandle(handle)) { try layout.ensure() }
         }
+        // Agent notes live in `notes/agents/`, so handles that name a team's notes file are fine now.
+        for handle in ["company", "team-1", "core"] {
+            let layout = SandboxLayout(paths: w.paths, company: w.company, agentHandle: handle)
+            try layout.ensure()
+            let s = try w.scope(.work, layout: layout)
+            #expect(s.writable.paths.contains(w.p(".brahma/notes/agents/\(handle).md")))
+            #expect(!s.writable.paths.contains(w.p(".brahma/notes/\(handle).md")))
+        }
+    }
+
+    @Test func teamNotesNeverWritable() throws {
+        let w = try SandboxWorld()
+        _ = try NotesFile.append(workspace: w.ws, team: "team-1", heading: "retro", lines: ["x"])
+        _ = try NotesFile.append(workspace: w.ws, team: "eng-1", heading: "retro", lines: ["x"])
+        for kind in TurnKind.allCases {
+            let s = try w.scope(kind)
+            for team in [".brahma/notes/team-1.md", ".brahma/notes/eng-1.md"] {
+                #expect(s.denyWrite.paths.contains(w.p(team)), "\(kind) \(team)")
+                #expect(!s.writable.paths.contains(w.p(team)))
+            }
+            #expect(!s.writable.paths.contains(w.p(".brahma/notes")) && !s.writable.paths.contains(w.p(".brahma/notes/agents")))
+        }
+    }
+
+    // MARK: Agent-planted links (fix round 1, C1)
+
+    private func expectLinked(_ body: () throws -> Void) {
+        expectAnySandboxError(body) { if case .linkedPath = $0 { true } else { false } }
+    }
+
+    private func link(_ w: SandboxWorld, _ relative: String, to target: String) throws {
+        let path = w.p(relative)
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        if SandboxWorld.exists(path) { try FileManager.default.removeItem(atPath: path) }
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: target)
+    }
+
+    @Test func progressFileLinkedToAFutureItemRefRefused() throws {
+        let w = try SandboxWorld()
+        try link(w, ".brahma/progress/\(w.key).md", to: "../../.git/refs/heads/item/FUTURE-9")
+        expectLinked { _ = try w.scope(.work) }
+    }
+
+    @Test func progressFileLinkedToTeamNotesRefused() throws {
+        let w = try SandboxWorld()
+        try link(w, ".brahma/progress/\(w.key).md", to: w.p(".brahma/notes/team-1.md"))
+        expectLinked { _ = try w.scope(.work) }
+    }
+
+    @Test func ownItemRefAsLinkRefused() throws {
+        let w = try SandboxWorld()
+        try link(w, ".git/refs/heads/item/\(w.key)", to: "../main")
+        expectLinked { _ = try w.scope(.work) }
+        let v = try SandboxWorld()
+        try link(v, ".git/refs/heads/item/\(v.key).lock", to: v.p(".git/refs/heads/main"))
+        expectLinked { _ = try v.scope(.work) }
+        let u = try SandboxWorld()
+        try link(u, ".git/logs/refs/heads/item/\(u.key)", to: u.p(".git/logs/HEAD"))
+        expectLinked { _ = try u.scope(.work) }
+    }
+
+    @Test func adminDirAsLinkRefused() throws {
+        let w = try SandboxWorld()
+        try FileManager.default.createDirectory(atPath: w.p(".git/worktrees/FUTURE-9"), withIntermediateDirectories: true)
+        try link(w, ".git/worktrees/\(w.key)", to: w.p(".git/worktrees/FUTURE-9"))
+        expectLinked { _ = try w.scope(.work) }
+    }
+
+    @Test func worktreeCwdAsLinkRefused() throws {
+        let w = try SandboxWorld()
+        try SandboxLayout(paths: w.paths, company: w.company, agentHandle: "eng-2").ensure()
+        try link(w, ".brahma/wt/\(w.key)", to: w.p(".brahma/labs/eng-2"))
+        expectLinked { _ = try w.scope(.work) }
+        // A review mounts the same worktree read-only: refused too.
+        expectLinked { _ = try w.scope(.review) }
+    }
+
+    @Test func plansCwdAsLinkRefused() throws {
+        let w = try SandboxWorld()
+        try link(w, ".brahma/plans/\(w.key)", to: w.p(".brahma/plans/FUTURE-9"))
+        expectLinked { _ = try w.scope(.plan) }
+    }
+
+    @Test func labHomeCacheAndNotesAsLinksRefused() throws {
+        for (relative, kinds) in [(".brahma/labs/eng-1", TurnKind.allCases), (".brahma/home/eng-1", TurnKind.allCases),
+                                  (".brahma/home/eng-1/cache", [TurnKind.work, .notice]),
+                                  (".brahma/notes/agents/eng-1.md", [TurnKind.work, .notice])] {
+            let w = try SandboxWorld(ensure: false)
+            try SandboxLayout(paths: w.paths, company: w.company, agentHandle: "eng-2").ensure()
+            if relative.hasSuffix("/cache") {
+                try FileManager.default.createDirectory(atPath: w.p(".brahma/home/eng-1"), withIntermediateDirectories: true)
+            }
+            try link(w, relative, to: w.p(".brahma/labs/eng-2"))
+            for kind in kinds {
+                expectLinked { _ = try w.scope(kind, item: .some(nil)) }
+                expectLinked { _ = try w.scope(kind) }
+            }
+        }
+    }
+
+    @Test func shellPrefixLinkRefused() throws {
+        let w = try SandboxWorld()
+        try link(w, ".brahma/bin/shell-eng-1.sh", to: w.p(".brahma/labs/eng-2"))
+        expectLinked { _ = try w.scope(.work) }
+    }
+
+    @Test func linkedAllowlistedChildIsNotReadable() throws {
+        let w = try SandboxWorld()
+        try SandboxLayout(paths: w.paths, company: w.company, agentHandle: "eng-2").ensure()
+        try link(w, ".brahma/kb", to: w.p(".brahma/labs/eng-2"))
+        try FileManager.default.createDirectory(atPath: w.p(".brahma/resources"), withIntermediateDirectories: true)
+        try link(w, ".brahma/resources/company", to: w.p(".brahma/home/eng-2"))
+        let s = try w.scope(.work)
+        let shown = s.readable.paths + s.readOnlyDirs.paths
+        #expect(!shown.contains { $0.hasPrefix(w.p(".brahma/labs/eng-2")) || $0.hasPrefix(w.p(".brahma/home/eng-2")) })
+        #expect(!shown.contains(w.p(".brahma/kb")) && !shown.contains(w.p(".brahma/resources/company")))
+    }
+
+    // MARK: Unsafe names and deny forms (fix round 1, M1–M3)
+
+    @Test func unsafeTopLevelNameIsSkippedNotFatal() throws {
+        let w = try SandboxWorld()
+        for name in ["it's", "tab\tname", "back\\slash"] {
+            FileManager.default.createFile(atPath: w.p(name), contents: Data())
+        }
+        try FileManager.default.createDirectory(atPath: w.p("docs"), withIntermediateDirectories: true)
+        for kind in TurnKind.allCases {
+            let s = try w.scope(kind)
+            #expect(s.readable.paths.contains(w.p("docs")))
+            #expect(!s.readable.paths.contains { $0.contains("it's") || $0.contains("\t") || $0.contains("\\") })
+            #expect(Set(s.skippedUnsafe) == Set(["it's", "tab\tname", "back\\slash"].map(w.p)), "\(kind)")
+        }
+    }
+
+    @Test func unsafeSiblingNameDeniesTheParent() throws {
+        let w = try SandboxWorld()
+        try FileManager.default.createDirectory(atPath: w.p(".brahma/plans/x'y"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: w.p(".brahma/wt/a\"b"), withIntermediateDirectories: true)
+        // No carve-out in `plans` or `wt` on a review turn: the parent is denied whole, the turn runs.
+        let review = try w.scope(.review)
+        #expect(review.denyWrite.paths.contains(w.p(".brahma/plans")))
+        #expect(review.denyWrite.paths.contains(w.p(".brahma/wt")))
+        #expect(!review.denyWrite.paths.contains { $0.contains("x'y") || $0.contains("a\"b") })
+        // A turn whose own carve-out shares that parent fails alone.
+        expectAnySandboxError({ _ = try w.scope(.plan) }) { if case .unsafePathCharacter = $0 { true } else { false } }
+        expectAnySandboxError({ _ = try w.scope(.work) }) { if case .unsafePathCharacter = $0 { true } else { false } }
+        _ = try w.scope(.work, item: .some(nil))
+    }
+
+    @Test func backslashAndControlCharactersRefused() throws {
+        let w = try SandboxWorld()
+        for bad in ["back\\slash", "tab\there", "esc\u{1B}x", "del\u{7F}x", "cr\rx"] {
+            var c = w.company
+            c.workspacePath = w.paths.workspaces.appending(path: bad).path
+            let layout = SandboxLayout(paths: w.paths, company: c, agentHandle: "eng-1")
+            expectAnySandboxError({ _ = try w.scope(.work, company: c, layout: layout) }) {
+                if case .unsafePathCharacter = $0 { true } else { false }
+            }
+            c = w.company
+            c.toolchainReadPaths = ["/opt/\(bad)"]
+            expectAnySandboxError({ _ = try w.scope(.work, company: c) }) { if case .unsafePathCharacter = $0 { true } else { false } }
+        }
+    }
+
+    @Test func linkedDenyEntryIsDeniedInBothForms() throws {
+        let w = try SandboxWorld()
+        let wt = w.p(".brahma/wt/\(w.key)")
+        try FileManager.default.createDirectory(atPath: wt, withIntermediateDirectories: true)
+        let target = w.root.appending(path: "elsewhere-claude").path
+        try FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: wt + "/.claude", withDestinationPath: target)
+        let s = try w.scope(.work)
+        #expect(s.denyWrite.paths.contains(wt + "/.claude"))
+        #expect(s.denyWrite.paths.contains(target))
     }
 
     // MARK: Company settings
@@ -393,21 +569,23 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         #expect(s.network == n)
     }
 
-    @Test(arguments: ["api.anthropic.com", "*.anthropic.com", "claude.ai", "claude.com"])
+    @Test(arguments: ["api.anthropic.com", "*.anthropic.com", "claude.ai", "claude.com", "claude.ai.", "x.claude.ai", "x.claude.com",
+                      "*.claude.com", "*.ai"])
     func anthropicDomainsRefused(_ d: String) throws {
         var w = try SandboxWorld()
+        let shown = SandboxDomains.normalize(d)
         w.company.allowedDomains = [d]
-        expectSandboxError(.forbiddenDomain(d)) { _ = try w.scope(.work) }
+        expectSandboxError(.forbiddenDomain(shown)) { _ = try w.scope(.work) }
         w.company.allowedDomains = []
         w.company.webDomains = [d.uppercased()]
-        expectSandboxError(.forbiddenDomain(d)) { _ = try w.scope(.work) }
+        expectSandboxError(.forbiddenDomain(shown)) { _ = try w.scope(.work) }
         w.company.webDomains = []
-        expectSandboxError(.forbiddenDomain(d)) { _ = try w.scope(.work, grants: GrantInputs(domains: [d])) }
-        expectSandboxError(.forbiddenDomain(d)) { _ = try w.scope(.work, grants: GrantInputs(webDomains: [d])) }
-        expectSandboxError(.forbiddenDomain(d)) {
+        expectSandboxError(.forbiddenDomain(shown)) { _ = try w.scope(.work, grants: GrantInputs(domains: [d])) }
+        expectSandboxError(.forbiddenDomain(shown)) { _ = try w.scope(.work, grants: GrantInputs(webDomains: [d])) }
+        expectSandboxError(.forbiddenDomain(shown)) {
             try w.store.updateSandbox(companyId: w.company.id, SandboxPatch(allowedDomains: [d]))
         }
-        expectSandboxError(.forbiddenDomain(d)) {
+        expectSandboxError(.forbiddenDomain(shown)) {
             try w.store.updateSandbox(companyId: w.company.id, SandboxPatch(webDomains: [d]))
         }
     }
@@ -420,11 +598,11 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         for kind in TurnKind.allCases {
             let s = try w.scope(kind)
             let shown = s.readable.paths + s.readOnlyDirs.paths + s.writable.paths + [s.cwd.path]
-            for other in [w.p(".brahma/labs/eng-2"), w.p(".brahma/home/eng-2"), w.p(".brahma/notes/eng-2.md")] {
+            for other in [w.p(".brahma/labs/eng-2"), w.p(".brahma/home/eng-2"), w.p(".brahma/notes/agents/eng-2.md")] {
                 #expect(!shown.contains { $0 == other || $0.hasPrefix(other + "/") }, "\(kind) shows \(other)")
             }
             // Nothing shown contains another agent's place either.
-            #expect(!shown.contains { $0 == w.p(".brahma/labs") || $0 == w.p(".brahma/home") || $0 == w.p(".brahma/notes") })
+            #expect(!shown.contains { $0 == w.p(".brahma/labs") || $0 == w.p(".brahma/home") || $0 == w.p(".brahma/notes") || $0 == w.p(".brahma/notes/agents") })
             #expect(s.denyRead.paths.contains(w.p(".brahma")))
         }
     }
@@ -432,7 +610,7 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
     @Test func ownLabReadable() throws {
         let w = try SandboxWorld()
         let s = try w.scope(.work)
-        for own in [".brahma/labs/eng-1", ".brahma/home/eng-1", ".brahma/notes/eng-1.md", ".brahma/bin/shell-eng-1.sh"] {
+        for own in [".brahma/labs/eng-1", ".brahma/home/eng-1", ".brahma/notes/agents/eng-1.md", ".brahma/bin/shell-eng-1.sh"] {
             #expect(s.readable.paths.contains(w.p(own)), "\(own)")
         }
     }
@@ -543,7 +721,7 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         let engineOnly = [".brahma/checks", ".brahma/wt-check", ".brahma/releases", ".brahma/artifacts", ".brahma/handoffs",
                           ".brahma/resources", ".brahma/cache", ".brahma/ext", ".brahma/ext-review", ".brahma/hooks", ".brahma/bin",
                           ".brahma/wt/.preview", ".brahma/wt/.release", ".brahma/wt/.merge", ".brahma/home/eng-2",
-                          ".brahma/labs/eng-2", ".brahma/notes/eng-2.md", ".brahma/notes/company.md",
+                          ".brahma/labs/eng-2", ".brahma/notes/agents/eng-2.md", ".brahma/notes/company.md",
                           ".brahma/progress/OTHER-2.md"]
         for kind in TurnKind.allCases {
             let s = try w.scope(kind)
@@ -625,7 +803,8 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         #expect(l.extLib.path == ws + "/.brahma/ext")
         #expect(l.hooksDir.path == ws + "/.brahma/hooks")
         #expect(l.shellPrefix.path == ws + "/.brahma/bin/shell-eng-1.sh")
-        #expect(l.notes.path == ws + "/.brahma/notes/eng-1.md")
+        #expect(l.notes.path == ws + "/.brahma/notes/agents/eng-1.md")
+        #expect(!FileManager.default.fileExists(atPath: ws + "/.brahma/notes/eng-1.md"))
         #expect(l.plansDir("ACME-3").path == ws + "/.brahma/plans/ACME-3")
         #expect(l.gitDir.path == ws + "/.git")
         func mode(_ url: URL) throws -> Int {
@@ -649,10 +828,10 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
 
     @Test func ensureRefusesALinkedNotesFileAndAMissingRepo() throws {
         let w = try SandboxWorld(ensure: false)
-        try FileManager.default.createDirectory(atPath: w.p(".brahma/notes"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: w.p(".brahma/notes/agents"), withIntermediateDirectories: true)
         let target = w.root.appending(path: "outside.md")
         try "owner".write(to: target, atomically: true, encoding: .utf8)
-        try FileManager.default.createSymbolicLink(atPath: w.p(".brahma/notes/eng-1.md"), withDestinationPath: target.path)
+        try FileManager.default.createSymbolicLink(atPath: w.p(".brahma/notes/agents/eng-1.md"), withDestinationPath: target.path)
         #expect(throws: (any Error).self) { try w.layout.ensure() }
         #expect(try String(contentsOf: target, encoding: .utf8) == "owner")
 

@@ -28,6 +28,10 @@ public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedEr
     case invalidHandle(String)
     /// A path that is not absolute (or `~`, `~/…`), or an item key that is not a valid key.
     case invalidPath(String)
+    /// A place the turn would run in, write or read (its own lab, home, notes, worktree, admin dir, ref, progress file, plan
+    /// directory) has a symbolic link at or above it inside the workspace: an agent can plant one, and following it would
+    /// grant the turn whatever it names.
+    case linkedPath(String)
 
     public var description: String {
         switch self {
@@ -40,6 +44,7 @@ public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedEr
         case .invalidDomain(let domain): "\(domain.debugDescription) is not a valid domain pattern"
         case .invalidHandle(let handle): "\(handle.debugDescription) cannot be an agent's sandbox handle"
         case .invalidPath(let path): "\(path.debugDescription) is not an absolute path"
+        case .linkedPath(let path): "\(path) is a symbolic link where the sandbox expects a real file or directory"
         }
     }
     public var errorDescription: String? { description }
@@ -51,11 +56,10 @@ public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedEr
 /// becomes `/private/tmp`), `.` and `..` removed. A path that does not exist (yet) keeps its missing tail, appended to its
 /// longest existing resolved parent; a dangling link on the way is followed by its text.
 enum SandboxPath {
-    static let unsafeCharacters: Set<Character> = ["'", "\"", "\n", "\r", "\r\n", "\0"]
-
-    /// Also `%00`: `URL.path` keeps a NUL percent-encoded, so a URL built from a path with a NUL shows it that way.
+    /// `'`, `"`, `\`, every C0 control (NUL, tab, line breaks, ESC …) and DEL: no sandbox profile (SBPL string escapes) or
+    /// settings file may carry them. Also `%00`: `URL.path` keeps a NUL percent-encoded.
     static func isUnsafe(_ path: String) -> Bool {
-        path.contains { unsafeCharacters.contains($0) } || path.unicodeScalars.contains { $0 == "\n" || $0 == "\r" || $0 == "\0" }
+        path.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F || $0 == "'" || $0 == "\"" || $0 == "\\" }
             || path.contains("%00")
     }
 
@@ -105,6 +109,24 @@ enum SandboxPath {
         let n = readlink(path, &buffer, buffer.count - 1)
         guard n > 0 else { return nil }
         return String(decoding: buffer[0..<n].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    /// The first component of `path` below `root` that is a symbolic link (or a `.`/`..` part, or `path` itself when it is
+    /// not under `root`); nil when there is none. A missing component ends the walk: what does not exist cannot be a link.
+    static func linkedComponent(_ path: String, under root: String) -> String? {
+        guard path != root else { return nil }
+        guard path.hasPrefix(root + "/") else { return path }
+        var current = root
+        for part in path.dropFirst(root.count + 1).split(separator: "/") {
+            current += "/" + part
+            if part == "." || part == ".." { return current }
+            switch kind(current) {
+            case .link: return current
+            case .missing: return nil
+            default: continue
+            }
+        }
+        return nil
     }
 
     /// Paths compare case-insensitively on Darwin (APFS and HFS+ default): an overlap that differs only in case is still one.
@@ -157,6 +179,7 @@ enum SandboxPath {
 extension URL {
     /// This path resolved for a sandbox scope (`SandboxPath.resolve`), as a file URL without a directory hint.
     public var resolvedForSandbox: URL { URL(fileURLWithPath: SandboxPath.resolve(path), isDirectory: false) }
+
 }
 
 // MARK: Layout
@@ -183,7 +206,7 @@ public struct SandboxLayout: Equatable, Sendable {
     public let hooksDir: URL
     /// `.brahma/bin/shell-<h>.sh`: the agent's Bash prefix (Task 1b).
     public let shellPrefix: URL
-    /// `.brahma/notes/<h>.md`: the agent's own notes file.
+    /// `.brahma/notes/agents/<h>.md`: the agent's own notes file (team notes stay `.brahma/notes/<team>.md`, engine-written).
     public let notes: URL
     /// `<ws>/.git`: the common git dir.
     public let gitDir: URL
@@ -200,30 +223,25 @@ public struct SandboxLayout: Equatable, Sendable {
         extLib = dotBrahma.appending(path: "ext")
         hooksDir = dotBrahma.appending(path: "hooks")
         shellPrefix = dotBrahma.appending(path: "bin/shell-\(agentHandle).sh")
-        notes = dotBrahma.appending(path: "notes/\(agentHandle).md")
+        notes = dotBrahma.appending(path: "notes/agents/\(agentHandle).md")
         gitDir = workspace.appending(path: ".git")
     }
 
     /// `.brahma/plans/<KEY>`: 3a's plan-turn directory (`Orchestrator.planDirectory`), the plan turn's cwd and `plansDirectory`.
     public func plansDir(_ key: String) -> URL { dotBrahma.appending(path: "plans/\(key)") }
 
-    /// A handle is one safe path component (3a's handle alphabet) and never the name of a team's or the company's notes file
-    /// (`NotesFile.fileName`), which the agent's own notes file would otherwise be.
+    /// A handle is one safe path component: 3a's handle alphabet (`Store.hire`).
     static func validate(handle: String) throws {
-        guard handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil,
-              !reservedNoteNames.contains(handle), handle.range(of: "^team-[0-9]+$", options: .regularExpression) == nil
+        guard handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
         else { throw SandboxError.invalidHandle(handle) }
     }
-
-    /// The company's notes file and the merged-team names of the built-in packs (generated teams are `team-<n>`).
-    static let reservedNoteNames: Set<String> = Set(["company"] + PackCatalog.builtin.packs.map { $0.org.smallTeamName.lowercased() })
 
     /// Creates the agent's places (blocking: run it in a `Blocking` body). Every part under the workspace is walked without
     /// following a link (`EngineFiles`); a link or odd file in the way throws and nothing is written through it.
     /// - `home/<h>`, `home/<h>/cache` and `labs/<h>` at 0700;
     /// - `home/<h>/.gitconfig` (rewritten every time): `user.name <h>`, `user.email <h>@<slug>.brahma.local`;
     /// - `.git/refs/heads/item/` and `.git/logs/refs/heads/item/`, so the item turn's own ref, lock and reflog can be created;
-    /// - an empty `notes/<h>.md` (0600) when missing (an existing one is kept);
+    /// - an empty `notes/agents/<h>.md` (0600) when missing (an existing one is kept);
     /// - the lab as its own repository (`GitWorkspace.initStandaloneRepository`: `git init --template= -b main`) when it has none.
     public func ensure() throws {
         try Self.validate(handle: handle)
@@ -240,9 +258,9 @@ public struct SandboxLayout: Equatable, Sendable {
         try EngineFiles.replace(Data(gitconfig.utf8), workspace: ws, dir: ".brahma/home/\(handle)", name: ".gitconfig", mode: 0o600)
         try EngineFiles.directory(workspace: ws, ".git/refs/heads/item")
         try EngineFiles.directory(workspace: ws, ".git/logs/refs/heads/item")
-        switch try EngineFiles.entry(workspace: ws, dir: ".brahma/notes", name: "\(handle).md") {
+        switch try EngineFiles.entry(workspace: ws, dir: ".brahma/notes/agents", name: "\(handle).md") {
         case .regular: break
-        case .missing: _ = try EngineFiles.create(Data(), workspace: ws, dir: ".brahma/notes", name: "\(handle).md", mode: 0o600)
+        case .missing: _ = try EngineFiles.create(Data(), workspace: ws, dir: ".brahma/notes/agents", name: "\(handle).md", mode: 0o600)
         case .unsafe(let problem): throw problem
         }
         try ensureLabRepository()
@@ -405,6 +423,9 @@ public struct SandboxScope: Equatable, Sendable {
     /// The per-user Darwin temp dir xcrun writes (`confstr(_CS_DARWIN_USER_TEMP_DIR)`): the one writable place outside the
     /// workspace, a documented residual.
     public var toolchainTempWrite: URL?
+    /// Top-level workspace entries left out of `readable` because their names hold characters no sandbox profile may carry;
+    /// the caller logs them (one activity line), the turn still runs.
+    public var skippedUnsafe: [String] = []
 
     public init(workspace: URL, cwd: URL, writable: [URL], readable: [URL], readOnlyDirs: [URL], denyRead: [URL],
                 denyWrite: [URL], protected: [URL], network: NetworkScope, toolchainTempWrite: URL?) {
@@ -497,16 +518,31 @@ public struct SandboxScope: Equatable, Sendable {
         let toolchain = try company.toolchainReadPaths.map { try SandboxPath.expand($0, userHome: userHome) }
 
         func r(_ url: URL) -> URL { url.resolvedForSandbox }
+        // Paths are resolved for deny lists and owner-chosen places; the workspace itself may sit behind a link the owner chose.
         let ws = r(layout.workspace)
         let dataHome = r(paths.home)
         if SandboxPath.isInside(dataHome.path, ws.path) { throw SandboxError.dataHomeInsideWorkspace(dataHome.path) }
-        let dot = r(layout.dotBrahma)
-        func b(_ relative: String) -> URL { r(dot.appending(path: relative)) }
-        let home = r(layout.agentHome), lab = r(layout.lab), cache = r(layout.agentCache), notes = r(layout.notes)
-        let git = r(layout.gitDir)
-        func g(_ relative: String) -> URL { r(git.appending(path: relative)) }
-        let worktrees = GitWorkspace(root: layout.workspace)
-        func worktree(_ key: String) -> URL { r(worktrees.worktreePath(key: key)) }
+        /// Both the path as built and its resolved form: a deny on a link must hold for the link and for what it names.
+        func both(_ url: URL) -> [URL] { [url, r(url)] }
+
+        // What the turn runs in, writes, or reads of its own is built logically under the resolved workspace, never resolved:
+        // an agent can replace any of its writable places with a link, and following one would grant whatever it names. A
+        // link at or above such a place (below the workspace) refuses the turn.
+        func l(_ relative: String) -> URL { ws.appending(path: relative) }
+        func checked(_ url: URL) throws -> URL {
+            if let hit = SandboxPath.linkedComponent(url.path, under: ws.path) { throw SandboxError.linkedPath(hit) }
+            return url
+        }
+        func own(_ relative: String) throws -> URL { try checked(l(relative)) }
+        let h = layout.handle
+        let dot = l(".brahma")
+        let git = l(".git")
+        let home = try own(".brahma/home/\(h)")
+        let lab = try own(".brahma/labs/\(h)")
+        let notes = try own(".brahma/notes/agents/\(h).md")
+        let shellPrefix = try own(".brahma/bin/shell-\(h).sh")
+        // 3a's item worktree (`GitWorkspace.worktreePath`: `<ws>/.brahma/wt/<KEY>`).
+        func worktree(_ key: String) throws -> URL { try own(".brahma/wt/\(key)") }
 
         let shape: Shape
         switch kind {
@@ -521,63 +557,69 @@ public struct SandboxScope: Equatable, Sendable {
         var readOnly: [URL] = []
         switch shape {
         case .item(let key):
-            cwd = worktree(key)
-            writable = [home, lab, cache, g("objects"), g("worktrees/\(key)"), g("refs/heads/item/\(key)"),
-                        g("refs/heads/item/\(key).lock"), g("logs/refs/heads/item/\(key)"),
-                        r(ProgressFile.path(workspace: layout.workspace, key: key)), notes]
+            cwd = try worktree(key)
+            writable = [home, lab, try own(".brahma/home/\(h)/cache"), try own(".git/objects"), try own(".git/worktrees/\(key)"),
+                        try own(".git/refs/heads/item/\(key)"), try own(".git/refs/heads/item/\(key).lock"),
+                        try own(".git/logs/refs/heads/item/\(key)"), try checked(ProgressFile.path(workspace: ws, key: key)), notes]
         case .itemless:
             cwd = lab
-            writable = [home, lab, cache, notes]
+            writable = [home, lab, try own(".brahma/home/\(h)/cache"), notes]
         case .review(let key):
             cwd = lab
             writable = [home, lab]
-            if let key { readOnly.append(worktree(key)) }
+            if let key { readOnly.append(try worktree(key)) }
         case .audit:
             // Audit digests quote merged diffs; no worktree is mounted.
             cwd = lab
             writable = [home, lab]
         case .plan(let key):
-            cwd = r(layout.plansDir(key))
+            // 3a's plan directory (`Orchestrator.planDirectory`, `layout.plansDir`), built under the resolved workspace.
+            cwd = try own(".brahma/plans/\(key)")
             writable = [home, cwd]
-            readOnly.append(worktree(key))
+            readOnly.append(try worktree(key))
         }
 
-        // Protected and denied.
-        var protected = ProtectedPaths.defaults(userHome: userHome).map(r) + [dataHome]
-        protected += otherWorkspaces.map(r) + backupTargets.map(r)
+        // Protected and denied (each in both forms).
+        var protected = ProtectedPaths.defaults(userHome: userHome).flatMap(both) + both(paths.home)
+        protected += otherWorkspaces.flatMap(both) + backupTargets.flatMap(both)
         protected = dedupe(protected)
-        let deniedRoots = dedupe([r(userHome), dataHome, r(URL(fileURLWithPath: "/Volumes", isDirectory: false)), dot])
-        let denyRead = dedupe(deniedRoots + otherWorkspaces.map(r) + backupTargets.map(r) + protected)
+        let deniedRoots = dedupe(both(userHome) + both(paths.home) + both(URL(fileURLWithPath: "/Volumes", isDirectory: false))
+                                 + both(dot))
+        let denyRead = dedupe(deniedRoots + protected)
 
         // Read paths the owner or a grant added are checked whether or not they exist yet; only existing ones are mounted.
         // None may reach into `.brahma` (other agents' labs, homes and notes, the engine's files).
         let extraReads = toolchain.map(r) + grants.readPaths.map(r)
         for path in extraReads {
-            try checkAllowed(path, protected: protected + [dot], deniedRoots: deniedRoots)
+            try checkAllowed(path, protected: protected + both(dot), deniedRoots: deniedRoots)
         }
         let existingExtra = extraReads.filter { SandboxPath.kind($0.path) != .missing }
 
-        // Readable, by enumeration (5L-1), recomputed every turn.
+        // Readable, by enumeration (5L-1), recomputed every turn. A top-level link is not followed into a re-allowed read (its
+        // target keeps its own rules); a name no profile may carry is left out and reported, never fatal.
         var readable: [URL] = []
+        var skipped: [String] = []
         for name in SandboxPath.entries(ws.path) where name != ".brahma" {
-            let entry = ws.appending(path: name).path
-            // A top-level link is not followed into a re-allowed read (its target keeps its own rules).
-            guard SandboxPath.kind(entry) != .link else { continue }
-            readable.append(r(ws.appending(path: name)))
+            let entry = l(name)
+            if SandboxPath.isUnsafe(name) { skipped.append(entry.path); continue }
+            guard SandboxPath.kind(entry.path) != .link else { continue }
+            readable.append(entry)
         }
-        for child in readableDotBrahma {
-            let url = dot.appending(path: child)
+        // Engine places, mounted only when they are real (no link at or above them).
+        func engineChild(_ child: String) -> URL? {
+            let url = l(".brahma/\(child)")
             let kind = SandboxPath.kind(url.path)
-            if kind == .directory || kind == .file { readable.append(r(url)) }
+            guard kind == .directory || kind == .file, SandboxPath.linkedComponent(url.path, under: ws.path) == nil else { return nil }
+            return url
         }
-        readable += [home, lab, notes, r(layout.shellPrefix)]
+        readable += readableDotBrahma.compactMap(engineChild)
+        readable += [home, lab, notes, shellPrefix]
         readable += existingExtra
         // Whatever the turn runs in or writes it can read.
         readable += [cwd] + writable
-        readable = dedupe(readable)
 
-        for child in ["resources/company", "kb"] where SandboxPath.kind(dot.appending(path: child).path) == .directory {
-            readOnly.append(b(child))
+        for child in ["resources/company", "kb"] {
+            if let url = engineChild(child), SandboxPath.kind(url.path) == .directory { readOnly.append(url) }
         }
         readOnly += grants.readPaths.map(r).filter { SandboxPath.kind($0.path) != .missing }
         readOnly = dedupe(readOnly)
@@ -586,51 +628,56 @@ public struct SandboxScope: Equatable, Sendable {
         // Write denials.
         var denyWrite = protected
         denyWrite += [cwd.appending(path: ".claude"), cwd.appending(path: ".mcp.json"), lab.appending(path: ".claude"),
-                      lab.appending(path: ".mcp.json")].map(r)
-        denyWrite += engineOnlyDotBrahma.map(b)
+                      lab.appending(path: ".mcp.json")].flatMap(both)
+        denyWrite += engineOnlyDotBrahma.map { l(".brahma/\($0)") }.flatMap(both)
         var ownKey: String?
         if case .item(let key) = shape { ownKey = key }
-        // Per-agent and per-item places: every existing entry but the turn's own, plus the whole directory when the turn has
-        // no carve-out there.
-        func denySiblings(_ relative: String, keeping own: String?) {
-            let dir = dot.appending(path: relative)
-            if own == nil { denyWrite.append(r(dir)) }
-            for name in SandboxPath.entries(dir.path) where name != own { denyWrite.append(r(dir.appending(path: name))) }
+        // Every existing entry of `dir` but the turn's own, plus the whole directory when the turn has no carve-out there. A
+        // name no profile may carry denies the whole directory instead; where the turn's own carve-out shares it, only this
+        // turn is refused.
+        func denyEntries(of dir: URL, keeping keep: Set<String>, carveOut: Bool) throws {
+            let names = SandboxPath.entries(dir.path).filter { !keep.contains($0) }
+            if !carveOut { denyWrite += both(dir) }
+            if let bad = names.first(where: SandboxPath.isUnsafe) {
+                if carveOut { throw SandboxError.unsafePathCharacter(dir.appending(path: bad).path) }
+                return
+            }
+            for name in names { denyWrite += both(dir.appending(path: name)) }
+        }
+        func denySiblings(_ relative: String, keeping own: String?) throws {
+            try denyEntries(of: l(".brahma/\(relative)"), keeping: own.map { [$0] } ?? [], carveOut: own != nil)
         }
         let writesNotes = writable.contains(notes)
-        denySiblings("notes", keeping: writesNotes ? notes.lastPathComponent : nil)
-        denySiblings("home", keeping: layout.handle)
-        denySiblings("labs", keeping: layout.handle)
-        denySiblings("progress", keeping: ownKey.map { "\($0).md" })
-        denySiblings("wt", keeping: ownKey)
-        if case .plan(let key) = shape { denySiblings("plans", keeping: key) } else { denyWrite.append(b("plans")) }
+        try denySiblings("notes", keeping: writesNotes ? "agents" : nil)
+        try denySiblings("notes/agents", keeping: writesNotes ? "\(h).md" : nil)
+        try denySiblings("home", keeping: h)
+        try denySiblings("labs", keeping: h)
+        try denySiblings("progress", keeping: ownKey.map { "\($0).md" })
+        try denySiblings("wt", keeping: ownKey)
+        if case .plan(let key) = shape { try denySiblings("plans", keeping: key) } else { try denySiblings("plans", keeping: nil) }
         // The common git dir.
-        denyWrite += gitInternals.map(g)
+        denyWrite += gitInternals.map { l(".git/\($0)") }.flatMap(both)
         if let key = item?.key {
-            denyWrite += ["config.worktree", "commondir", "gitdir"].map { g("worktrees/\(key)/\($0)") }
+            denyWrite += ["config.worktree", "commondir", "gitdir"].map { l(".git/worktrees/\(key)/\($0)") }.flatMap(both)
         }
-        for name in SandboxPath.entries(git.appending(path: "worktrees").path) where name != ownKey {
-            denyWrite.append(g("worktrees/\(name)"))
+        try denyEntries(of: l(".git/worktrees"), keeping: ownKey.map { [$0] } ?? [], carveOut: ownKey != nil)
+        for dir in [".git/refs/heads/item", ".git/logs/refs/heads/item"] {
+            try denyEntries(of: l(dir), keeping: ownKey.map { [$0, "\($0).lock"] } ?? [], carveOut: ownKey != nil)
         }
-        for dir in ["refs/heads/item", "logs/refs/heads/item"] {
-            for name in SandboxPath.entries(git.appending(path: dir).path)
-            where ownKey.map({ name != $0 && name != "\($0).lock" }) ?? true {
-                denyWrite.append(g("\(dir)/\(name)"))
-            }
-        }
-        if case .item(let key) = shape {
+        if case .item = shape {
             // The worktree's link to its admin dir.
-            denyWrite.append(worktree(key).appending(path: ".git").resolvedForSandbox)
+            denyWrite += both(cwd.appending(path: ".git"))
         } else {
             // A turn without an item writes nothing in the common git dir.
-            denyWrite.append(git)
+            denyWrite += both(git)
         }
         denyWrite = dedupe(denyWrite)
 
         let network = CompanyNetwork.scope(company: company, grantDomains: grants.domains, grantWebDomains: grants.webDomains)
-        let scope = SandboxScope(workspace: ws, cwd: cwd, writable: writable, readable: readable, readOnlyDirs: readOnly,
+        var scope = SandboxScope(workspace: ws, cwd: cwd, writable: writable, readable: readable, readOnlyDirs: readOnly,
                                  denyRead: denyRead, denyWrite: denyWrite, protected: protected, network: network,
                                  toolchainTempWrite: darwinUserTemp.map(r))
+        scope.skippedUnsafe = skipped
         try scope.validate()
         return scope
     }

@@ -31,24 +31,31 @@ extension Store {
         }
         let allowed = try patch.allowedDomains.map(domains)
         let web = try patch.webDomains.map(domains)
-        let home = dataHome
-        try writer.write { db in
-            guard var company = try Company.fetchOne(db, key: companyId) else { throw StoreError.notFound }
+        func apply(_ company: inout Company) {
             if let profile = patch.profile { company.permissionProfile = profile }
             if let roles = patch.roleProfiles { company.roleProfiles = roles }
             if let allowed { company.allowedDomains = allowed }
             if let web { company.webDomains = web }
             if let binding = patch.allowLocalBinding { company.allowLocalBinding = binding }
             if let reads = patch.toolchainReadPaths { company.toolchainReadPaths = reads }
-            // The scope a turn would get; its validation covers the read paths and every domain.
-            let others = try Company.filter(Column("id") != companyId).fetchAll(db)
-                .map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) }
-            let workspaces = URL(fileURLWithPath: company.workspacePath, isDirectory: false).deletingLastPathComponent()
-            let paths = BrahmaPaths(home: home ?? FileManager.default.temporaryDirectory.appending(path: "brahma-home-\(companyId)"),
-                                    workspaces: workspaces)
-            let layout = SandboxLayout(paths: paths, company: company, agentHandle: "sandbox-check")
-            _ = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: [], kind: .audit,
-                                         item: nil, company: company, grants: GrantInputs(), darwinUserTemp: nil, userHome: userHome)
+        }
+        // Validated from a fetched copy, outside the write transaction (it reads the file system).
+        let (fetched, others) = try writer.read { db in
+            (try Company.fetchOne(db, key: companyId),
+             try Company.filter(Column("id") != companyId).fetchAll(db).map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) })
+        }
+        guard var candidate = fetched else { throw StoreError.notFound }
+        apply(&candidate)
+        // The scope a turn would get; its validation covers the read paths and every domain.
+        let workspaces = URL(fileURLWithPath: candidate.workspacePath, isDirectory: false).deletingLastPathComponent()
+        let paths = BrahmaPaths(home: dataHome ?? FileManager.default.temporaryDirectory.appending(path: "brahma-home-\(companyId)"),
+                                workspaces: workspaces)
+        let layout = SandboxLayout(paths: paths, company: candidate, agentHandle: "sandbox-check")
+        _ = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: [], kind: .audit,
+                                     item: nil, company: candidate, grants: GrantInputs(), darwinUserTemp: nil, userHome: userHome)
+        try writer.write { db in
+            guard var company = try Company.fetchOne(db, key: companyId) else { throw StoreError.notFound }
+            apply(&company)
             try company.update(db)
         }
     }
