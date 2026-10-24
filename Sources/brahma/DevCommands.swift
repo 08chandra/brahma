@@ -18,7 +18,7 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
 struct DevGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self])
+        subcommands: [Propose.self, Decide.self, Request.self, DigestNow.self])
 
     struct Propose: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "File an ask as an agent.")
@@ -61,6 +61,20 @@ struct DevGroup: ParsableCommand {
                                   itemId: itemId, supersedes: old, requestId: requestId, decisionClass: cls)
             }
             print(safe(describe(ask, store: store)))
+        }
+    }
+
+    struct DigestNow: ParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "digest", abstract: "Build and store a digest now.")
+        @Argument var company: String
+
+        func run() throws {
+            try requireDev()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let digest = try buildDigest(store: store, company: c)
+            try store.saveDigest(companyId: c.id, digest: digest)
+            print(safe(digest.markdown), terminator: "")
         }
     }
 
