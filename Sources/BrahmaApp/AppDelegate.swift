@@ -8,6 +8,8 @@ import BrahmaKeychain
 struct BootError: Error {
     var path: String
     var message: String
+    /// The first row of a failed `PRAGMA integrity_check`: the database was not opened (the view offers a restore).
+    var integrityProblem: String? = nil
 }
 
 /// What a successful boot produced: the model and the owner-key store resolved for this data home (the Keychain,
@@ -79,10 +81,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         do {
             try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+            // Before anything opens (and migrates) the database: a damaged one is restored from a snapshot, not run on.
+            if FileManager.default.fileExists(atPath: paths.database.path) {
+                let rows = BackupService.integrity(of: paths.database)
+                if rows != ["ok"] {
+                    let first = rows.first ?? "unknown"
+                    return .failure(BootError(path: paths.database.path, message: "database check failed (\(first))", integrityProblem: first))
+                }
+            }
             let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) {
                 FileHandle.standardError.write(Data(($0 + "\n").utf8))
             }
-            let store = try Store(path: paths.database.path, catalog: catalog)
+            let store = try Store(path: paths.database.path, catalog: catalog, backupsDir: paths.backupsDir)
             // Owner writes from the app fail closed until the secrets are loaded: a non-interactive load now (it cannot prompt
             // or block on a dialog); the engine retries in the background, and the banner's Load secrets asks the owner.
             // `logFailures: false`: the engine logs failures and writes the hold notice; the banner reflects the store's state.
@@ -122,6 +132,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: booted.ownerKeyStore,
                                     secretVault: booted.secretVault)
             model.engine = engine
+            // After a restore the model has a new store: the engine is rebuilt on it.
+            model.restartEngine = { [weak model, ownerKeyStore = booted.ownerKeyStore] store in
+                guard let model else { return nil }
+                let engine = EngineHost(paths: model.paths, store: store, ownerKeyStore: ownerKeyStore)
+                await engine.start(tools: EngineSetup.resolveTools())
+                return engine
+            }
             let notifier = OwnerNotifier(model: model)
             notifier.openMainWindow = { [weak self] in self?.openMainWindowFromMenu() }
             // Smoke and snapshot runs must never raise the system permission dialog.

@@ -26,6 +26,12 @@ struct Run: AsyncParsableCommand {
         try requireOwnerShell()
         // A child or MCP pipe closing under us must surface as EPIPE, not kill the orchestrator.
         signal(SIGPIPE, SIG_IGN)
+        // Before anything opens (and migrates) the database: a damaged one is restored from a snapshot, not run on.
+        let database = BrahmaPaths.fromEnvironment().database
+        if FileManager.default.fileExists(atPath: database.path) {
+            let rows = BackupService.integrity(of: database)
+            if rows != ["ok"] { throw fail("database check failed (\(rows.first ?? "unknown")). See: brahma restore --list") }
+        }
         let (store, paths) = try openStore(lazySecrets: false)
         if !skipDoctor {
             let report = await BrahmaCore.Doctor.ensure(store: store, claudePath: "claude", runner: ClaudeProcessRunner())

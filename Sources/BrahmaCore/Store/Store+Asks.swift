@@ -130,9 +130,9 @@ extension Store {
         let fd = open(resolved.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw WorkError.invalid("document_path cannot be read") }
         var info = stat()
-        guard fstat(fd, &info) == 0 else { close(fd); throw WorkError.invalid("document_path cannot be read") }
-        guard (info.st_mode & S_IFMT) == S_IFREG else { close(fd); throw WorkError.invalid("document_path is not a regular file") }
-        guard info.st_size >= 0, info.st_size <= maxAskDocumentBytes else { close(fd); throw WorkError.invalid("the document is larger than 10 MB") }
+        guard fstat(fd, &info) == 0 else { closeDescriptor(fd); throw WorkError.invalid("document_path cannot be read") }
+        guard (info.st_mode & S_IFMT) == S_IFREG else { closeDescriptor(fd); throw WorkError.invalid("document_path is not a regular file") }
+        guard info.st_size >= 0, info.st_size <= maxAskDocumentBytes else { closeDescriptor(fd); throw WorkError.invalid("the document is larger than 10 MB") }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         guard let data = try? handle.read(upToCount: maxAskDocumentBytes + 1), data.count <= maxAskDocumentBytes else {
             throw WorkError.invalid("document_path cannot be read or is larger than 10 MB")

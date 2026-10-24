@@ -4,7 +4,7 @@ import BrahmaCore
 
 @MainActor @Observable
 public final class AppModel {
-    public let store: Store
+    public private(set) var store: Store
     public let paths: BrahmaPaths
     @ObservationIgnored private let clock: @Sendable () -> Date
 
@@ -31,7 +31,7 @@ public final class AppModel {
     public var showDoneItems = false
     /// Board: only this sprint's items; nil shows them all.
     public var boardSprintId: String?
-    public let search: SearchModel
+    public private(set) var search: SearchModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
     public var highlightedMessageId: String?
 
@@ -87,6 +87,59 @@ public final class AppModel {
     public var usageGateLine: String? {
         guard let mode = selectedCompany?.company.usageMode else { return nil }
         return UsageText.gateLine(snapshot.usage, mode: mode, now: clock(), timeZone: ownerTimeZone)
+    }
+
+    // MARK: Restore
+
+    /// Starts the engine again on a reopened store (the app delegate sets it: it owns the owner-key store and the tools).
+    @ObservationIgnored public var restartEngine: (@MainActor (Store) async -> EngineHost?)?
+
+    /// Stops polling and closes this model's database connections, so a restore can replace the file. Any use of the old
+    /// `store` fails until `reopenStore()`.
+    public func closeStore() async {
+        stopPolling()
+        chat = nil
+        let store = self.store
+        try? await Task.detached { try store.close() }.value
+    }
+
+    /// Opens the database again (after a restore), starts from a clean snapshot and re-seeds the activity cursor from the
+    /// current maximum, so no event of the restored database is replayed or skipped.
+    public func reopenStore() async {
+        let (path, backups, catalog) = (paths.database.path, paths.backupsDir, store.catalog)
+        do {
+            let reopened = try await Task.detached { try Store(path: path, catalog: catalog, backupsDir: backups) }.value
+            store = reopened
+            search = SearchModel(store: reopened)
+            snapshot = .empty
+            activity = []
+            loaded = false
+            await load()
+            startPolling()
+        } catch {
+            report(error)
+        }
+    }
+
+    /// Restores the database from `snapshot`: stops the engine, closes the store, restores, reopens the store and restarts
+    /// the engine. The store is reopened even when the restore fails.
+    @discardableResult
+    public func restore(from snapshot: URL) async throws -> RestoreOutcome {
+        await engine?.stop(timeout: .seconds(15))
+        await closeStore()
+        let paths = self.paths
+        var failure: (any Error)?
+        var outcome: RestoreOutcome?
+        do {
+            outcome = try await Task.detached {
+                let service = BackupService(paths: paths)
+                return try service.restore(try service.planRestore(snapshot: snapshot))
+            }.value
+        } catch { failure = error }
+        await reopenStore()
+        if let restartEngine, let started = await restartEngine(store) { engine = started }
+        if let failure { throw failure }
+        return outcome!
     }
 
     // MARK: Loading and polling

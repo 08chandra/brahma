@@ -33,10 +33,10 @@ extension Orchestrator {
             return
         }
         guard try store.claimFire(timerId: timer.id, expectedNext: timer.nextFireAt, now: now, next: next) else { return }
-        let context = TimerContext(store: store, paths: paths, timer: timer, now: now)
+        let context = TimerContext(store: store, paths: paths, timer: timer, now: now, blocking: blocking)
         timerTasks[timer.id] = Task.detached { [self] in
             do {
-                try await job(context)
+                try await asEngine { try await job(context) }
             } catch {
                 if !Task.isCancelled {
                     attempt { try store.logTimerError(timer, text: "timer \(timer.name) failed: \(error)", now: clock()) }

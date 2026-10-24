@@ -2455,6 +2455,35 @@ public struct GitWorkspace: Sendable {
         return out.status == 0 && !out.text.isEmpty ? out.text : nil
     }
 
+    // MARK: Backups
+
+    /// Every ref and the object it names (`for-each-ref`), one `<id> <ref>` per line: what a backup bundle holds, so an equal
+    /// listing means an equal bundle.
+    public func refListing() throws -> String {
+        try main.run(["for-each-ref", "--format=%(objectname) %(refname)"]).text
+    }
+
+    /// `git bundle create <file> --all`. False when the repository has nothing to bundle (no refs yet).
+    @discardableResult
+    public func createBundle(at file: URL) throws -> Bool {
+        let out = try main.run(["bundle", "create", file.path, "--all"], allowFailure: true)
+        if out.status == 0 { return true }
+        if out.stderr.contains("empty bundle") { return false }
+        throw GitError.failed(command: "bundle create", status: out.status, stderr: String(out.stderr.prefix(2000)))
+    }
+
+    /// `git bundle verify <file>` against this repository (throws when the bundle is damaged or needs missing history).
+    public func verifyBundle(at file: URL) throws {
+        try main.run(["bundle", "verify", file.path])
+    }
+
+    /// How many commits `to` has that `from` does not; nil when either is unknown here.
+    public func commitCount(from: String, to: String) throws -> Int? {
+        try Self.validRef(from); try Self.validRef(to)
+        let out = try main.run(["rev-list", "--count", "\(from)..\(to)"], allowFailure: true)
+        return out.status == 0 ? Int(out.text) : nil
+    }
+
     public func mergeBase(_ a: String, _ b: String) throws -> String? {
         try Self.validRef(a); try Self.validRef(b)
         let out = try main.run(["merge-base", a, b], allowFailure: true)

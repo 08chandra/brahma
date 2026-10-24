@@ -119,6 +119,8 @@ public struct TimerContext: Sendable {
     public let paths: BrahmaPaths
     public let timer: EngineTimer
     public let now: Date
+    /// The engine's blocking-work gate: jobs run database and git work inside it, never on the cooperative pool.
+    let blocking: Blocking
 }
 
 public struct TimerJobRegistry: Sendable {
@@ -127,10 +129,13 @@ public struct TimerJobRegistry: Sendable {
 
     public init() {}
 
-    /// The engine's own jobs, as no-ops until the tasks that own them (backups, digest) replace them.
+    /// The engine's own jobs: `backup.hourly` and `backup.repos` are real; the rest are no-ops until the tasks that own them
+    /// (home and target backups, digest) replace them.
     public static var system: TimerJobRegistry {
         var registry = TimerJobRegistry()
         for name in SystemTimers.jobNames { registry.register(name) { _ in } }
+        registry.register("backup.hourly", BackupJobs.hourly)
+        registry.register("backup.repos", BackupJobs.repos)
         return registry
     }
 

@@ -29,6 +29,29 @@ public struct BrahmaPaths: Sendable, Equatable {
     }
     public var extensionsDir: ExtensionDirs { ExtensionDirs(root: home.appending(path: "extensions", directoryHint: .isDirectory)) }
 
+    /// `<home>/tmp`: where the engine stages temporary files (snapshot, export and restore staging). 0700 directory, 0600 files;
+    /// never the system temp directory. Created on demand by `ensureTmpDir()`.
+    public var tmpDir: URL { home.appending(path: "tmp", directoryHint: .isDirectory) }
+    /// `<home>/backups`: every backup the engine makes (DB snapshots, repo bundles; later the data-home snapshots).
+    public var backupsDir: URL { home.appending(path: "backups", directoryHint: .isDirectory) }
+    /// Verified DB snapshots (`BackupService.snapshot`).
+    public var dbBackups: URL { backupsDir.appending(path: "db", directoryHint: .isDirectory) }
+    /// Per-company git bundles (`repoBackups/<companyId>/<yyyyMMdd>.bundle`).
+    public var repoBackups: URL { backupsDir.appending(path: "repos", directoryHint: .isDirectory) }
+
+    /// Creates `url` (and parents) as a 0700 directory, and tightens an existing one.
+    public static func ensurePrivateDirectory(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        chmod(url.path, 0o700)
+    }
+
+    @discardableResult
+    public func ensureTmpDir() throws -> URL {
+        try Self.ensurePrivateDirectory(tmpDir)
+        return tmpDir
+    }
+
     public var packsDir: URL { home.appending(path: "packs", directoryHint: .isDirectory) }
     /// Not used for checks: their saved scripts live in the workspace under `.brahma/checks` (`CheckPaths`), submission
     /// checkouts under `run/checkouts` (`checkoutDir(runId:)`) and merge-check exports under `run/exports` (`exportDir(runId:)`).

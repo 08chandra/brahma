@@ -36,6 +36,8 @@ public actor Orchestrator {
     /// What each turn asserts about the session the CLI reports (the work modes set it; nil asserts nothing).
     let turnExpectations: @Sendable (Agent, Company) -> TurnExpectations?
     let timerJobs: TimerJobRegistry
+    /// Handlers run, per company, after a restore re-adopts that company's `main` (`restoreMarkerTick`).
+    let restoreHooks: RestoreHooks
     /// Where secret values live; read only to reload the store's redactor. Production passes the store `PlatformSecretVault`
     /// selected (the Keychain, or a dev/demo home's file store); the library default is `UnavailableVault`, never the Keychain.
     nonisolated let vault: any SecretVault
@@ -98,8 +100,9 @@ public actor Orchestrator {
                 planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)? = nil,
                 turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil },
                 timerJobs: TimerJobRegistry = .system,
-                vault: any SecretVault = UnavailableVault()) {
-        self.timerJobs = timerJobs; self.vault = vault
+                vault: any SecretVault = UnavailableVault(),
+                restoreHooks: RestoreHooks = RestoreHooks()) {
+        self.timerJobs = timerJobs; self.vault = vault; self.restoreHooks = restoreHooks
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
@@ -254,6 +257,9 @@ public actor Orchestrator {
         // ready items to idle individual contributors. Nothing here waits on git.
         let reaped = try store.reapLeases(now: now)
         leaseMaintenance(now: now, companies: companies, reaped: reaped, held: held)
+
+        // A restore left its marker: re-adopt every repository's main (never waits on git).
+        restoreMarkerTick(companies: companies)
 
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }

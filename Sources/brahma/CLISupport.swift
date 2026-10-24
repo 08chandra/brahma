@@ -22,7 +22,7 @@ func openStore(lazySecrets: Bool = true) throws -> (Store, BrahmaPaths) {
     do { try PlatformSecretVault.refuseMemory(try PlatformSecretVault.resolve(paths: paths)) } catch { throw fail("\(error)") }
     try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
     let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
-    let store = try Store(path: paths.database.path, catalog: catalog)
+    let store = try Store(path: paths.database.path, catalog: catalog, backupsDir: paths.backupsDir)
     cliTimeZone = store.ownerTimeZone()
     // Every write of redactable text fails closed until the redactor has loaded the secrets (`Store.secretsHeld`). The load
     // is lazy: it runs once, non-interactively, on the first redacting write, so read-only commands never touch the vault.

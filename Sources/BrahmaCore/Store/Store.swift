@@ -8,6 +8,10 @@ public enum StoreError: Error, Equatable {
     case invalidName
     /// The workspace could not be made a git repository. The message is shown as `git is required: <stderr>`.
     case gitRequired(String)
+    /// A migration failed. The database was backed up first (`backup` names the snapshot) and is left as it was.
+    case migrationFailed(backup: String, detail: String)
+    /// Migrations were pending and the pre-migration snapshot could not be made, so nothing was migrated.
+    case preMigrationBackupFailed(String)
 }
 
 extension StoreError: LocalizedError, CustomStringConvertible {
@@ -17,6 +21,8 @@ extension StoreError: LocalizedError, CustomStringConvertible {
         case .notFound: "not found"
         case .invalidName: "invalid name"
         case .gitRequired(let stderr): "git is required: \(stderr)"
+        case .migrationFailed(let backup, let detail): "the database migration failed (\(detail)); your data was backed up first: \(backup)"
+        case .preMigrationBackupFailed(let detail): "the database needs a migration and Brahma could not back it up first (\(detail)); nothing was changed"
         }
     }
     public var errorDescription: String? { description }
@@ -42,7 +48,7 @@ public final class Store: Sendable {
     public let redactor = Redactor()
 
     public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
-                observers: [any WorkItemObserver] = []) throws {
+                observers: [any WorkItemObserver] = [], backupsDir: URL? = nil) throws {
         self.catalog = catalog
         self.lifecycleObservers = lifecycleObservers
         self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
@@ -52,9 +58,34 @@ public final class Store: Sendable {
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA busy_timeout = 5000")
         }
-        writer = try DatabasePool(path: path, configuration: config)
-        try Migrations.migrator().migrate(writer)
+        let pool = try DatabasePool(path: path, configuration: config)
+        writer = pool
+        let migrator = Migrations.migrator()
+        // Pending migrations on a database that already holds data: snapshot it first (verified), so a failed or regretted
+        // migration can be undone with `brahma restore`. A brand-new database has nothing to protect.
+        var backup: URL?
+        if let backupsDir {
+            let completed = try pool.read { db in try migrator.completedMigrations(db) }
+            if !completed.isEmpty, migrator.migrations.contains(where: { !completed.contains($0) }) {
+                let service = BackupService(database: URL(fileURLWithPath: path), backupsDir: backupsDir, writer: pool)
+                do { backup = try service.snapshot(reason: .preMigration) } catch {
+                    throw StoreError.preMigrationBackupFailed("\(error)")
+                }
+            }
+        }
+        do {
+            try migrator.migrate(pool)
+        } catch {
+            if let backup { throw StoreError.migrationFailed(backup: backup.path, detail: "\(error)") }
+            throw error
+        }
         try initializeRedactor()
+    }
+
+    /// Closes the database connections. Every later use of this store fails; open a new `Store` instead (the app does this
+    /// around a restore).
+    public func close() throws {
+        if let pool = writer as? DatabasePool { try pool.close() } else if let queue = writer as? DatabaseQueue { try queue.close() }
     }
 
     private init(queue: DatabaseQueue, catalog: PackCatalog, lifecycleObservers: [any AgentLifecycleObserver],
@@ -305,3 +336,6 @@ final class GitLockTimeout: @unchecked Sendable {
     private var value: TimeInterval = 10
     var seconds: TimeInterval { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }
+
+/// The C `close(2)`, for code inside `Store` where `Store.close()` (the database) shadows it.
+func closeDescriptor(_ fd: Int32) { _ = close(fd) }
