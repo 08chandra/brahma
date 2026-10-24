@@ -3,6 +3,9 @@ import GRDB
 
 public enum OrchestratorError: Error, Equatable {
     case idleTimeout(running: Int)
+    /// The engine started git on its actor or the cooperative pool instead of in a `Blocking` body (`EngineGitGuard`): the
+    /// commands, as reported by `waitUntilIdle`.
+    case gitOffBlocking([String])
 }
 
 /// Global scheduler: one per machine, across all companies. Each tick unblocks, applies the usage gate and
@@ -91,10 +94,12 @@ public actor Orchestrator {
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
     public func start() async throws {
-        let now = clock()
-        _ = try store.recoverInterruptedTurns(now: now)
-        try await recoverChecks(now: now)
-        try recoverMerges()
+        try await EngineGitGuard.$engine.withValue(engineId) {
+            let now = clock()
+            _ = try store.recoverInterruptedTurns(now: now)
+            try await recoverChecks(now: now)
+            try await recoverMerges()
+        }
     }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
@@ -104,6 +109,13 @@ public actor Orchestrator {
 
     /// This engine's limit on concurrently running blocking (git) bodies.
     let blocking = Blocking()
+    /// Marks this engine's tasks for `EngineGitGuard`.
+    nonisolated let engineId = UUID().uuidString
+
+    /// Runs `body` as one of this engine's tasks (`EngineGitGuard.engine`); for the detached ones, which inherit no task-local.
+    nonisolated func asEngine<T: Sendable>(_ body: @Sendable () async throws -> T) async rethrows -> T {
+        try await EngineGitGuard.$engine.withValue(engineId, operation: body)
+    }
     private var idleWaiters: [Int: CheckedContinuation<Void, any Error>] = [:]
     private var nextIdleWaiter = 0
 
@@ -142,6 +154,12 @@ public actor Orchestrator {
 
     /// `waitUntilIdle` with its backstop on `clock`.
     public func waitUntilIdle<C: Clock<Duration>>(timeout: Duration, clock: C) async throws {
+        try await waitUntilIdleOnly(timeout: timeout, clock: clock)
+        let offBlocking = EngineGitGuard.takeViolations(engine: engineId)
+        if !offBlocking.isEmpty { throw OrchestratorError.gitOffBlocking(offBlocking) }
+    }
+
+    private func waitUntilIdleOnly<C: Clock<Duration>>(timeout: Duration, clock: C) async throws {
         if isIdle { return }
         let id = nextIdleWaiter; nextIdleWaiter += 1
         let backstop = Task { [weak self] in
@@ -168,10 +186,12 @@ public actor Orchestrator {
 
     /// Synchronous on the actor (no suspension points), so ticks never interleave with each other.
     public func tick() async {
-        do {
-            try schedule(now: clock())
-        } catch {
-            log("tick failed: \(error)")
+        EngineGitGuard.$engine.withValue(engineId) {
+            do {
+                try schedule(now: clock())
+            } catch {
+                log("tick failed: \(error)")
+            }
         }
     }
 
@@ -438,7 +458,9 @@ public actor Orchestrator {
                 turnPrompt = audit.digest
                 toolsKey = "audit"
             } else {
-                var c = try TurnContext.load(store: store, paths: paths, agent: agent, company: company)
+                // Reads the item's recent commits (git): off the cooperative pool.
+                let paths = self.paths
+                var c = try await blocking.tryRun { try TurnContext.load(store: store, paths: paths, agent: agent, company: company) }
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 var checkout: URL?
                 var git: GitWorkspace?
@@ -733,8 +755,9 @@ public actor Orchestrator {
             end = .failed("claude exited without a result")
         }
 
-        // A plan turn must not have changed the worktree: the engine checks and resets before anything else looks at it.
-        if let plan { finishPlanTurn(plan, agent: agent, end: end, now: now) }
+        // A plan turn must not have changed the worktree: the engine checks and resets before anything else looks at it (git,
+        // off the cooperative pool).
+        if let plan { await blocking.run { self.finishPlanTurn(plan, agent: agent, end: end, now: now) } }
 
         // A resumed session that no longer exists: it is reset and the agent is ready again at once (no penalty). The next
         // turn starts a fresh session. A fresh session that is "not found" again is an ordinary failure.

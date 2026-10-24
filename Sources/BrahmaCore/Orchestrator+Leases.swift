@@ -31,7 +31,7 @@ extension Orchestrator {
     func spawnGit(_ key: String, _ body: @escaping @Sendable () async -> Void) {
         guard gitTasks[key] == nil else { return }
         gitTasks[key] = Task.detached { [self] in
-            await body()
+            await asEngine { await body() }
             await gitTaskDone(key)
         }
     }

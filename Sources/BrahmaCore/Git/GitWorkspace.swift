@@ -140,6 +140,7 @@ struct GitCommand: Sendable {
 
     /// Asked once per process.
     static let installedSupportsAttrSource: Bool = {
+        EngineGitGuard.willRunGit("git --version (attr-source probe)")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["git", "--version"]
@@ -154,6 +155,7 @@ struct GitCommand: Sendable {
 
     /// The installed git's version as `git --version` prints it (`2.52.0`), read once; nil when it cannot be read.
     static let gitVersionText: String? = {
+        EngineGitGuard.willRunGit("git --version")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["git", "--version"]
@@ -297,6 +299,7 @@ struct GitCommand: Sendable {
     }
 
     private func runOnce(_ argv: [String], environment: [String: String], label: String, maxOutput: Int) throws -> Output {
+        EngineGitGuard.willRunGit("git \(label)")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = argv
@@ -526,6 +529,12 @@ public struct GitWorkspace: Sendable {
         self.mergeDirectory = mergeDirectory ?? FileManager.default.temporaryDirectory
             .appending(path: "brahma-merge/\(hash)", directoryHint: .isDirectory)
     }
+
+    /// The installed git's version (`2.52.0`), nil when it cannot be read. The first use runs `git --version` (once per
+    /// process), so the engine asks for it only in a blocking body.
+    static var installedGitVersion: String? { GitCommand.gitVersionText }
+    /// Whether the installed git is one the engine merges with (2.43 or newer, `--attr-source`); asked the same way.
+    static var installedGitMerges: Bool { GitCommand.installedSupportsAttrSource }
 
     // MARK: Layout
 

@@ -3,7 +3,7 @@ import GRDB
 
 /// Everything the turn-start orientation is built from, read from the store and the workspace. Plain data: `TurnDigest.render`
 /// turns it into text without touching either.
-public struct TurnContext {
+public struct TurnContext: Sendable {
     public struct RosterEntry: Equatable, Sendable { public var handle: String; public var role: String; public var state: AgentState }
 
     public var roleCard: String

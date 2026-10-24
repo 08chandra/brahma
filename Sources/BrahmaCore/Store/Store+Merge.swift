@@ -78,9 +78,9 @@ extension Store {
     /// Start-up: no merge is running. A pending head that `main` never reached (a crash before the move) is forgotten. Each
     /// company's activity records the git the engine found (merges need 2.43 or newer).
     func recoverMerges() throws {
-        let gitLine: (ActivityKind, String) = GitCommand.installedSupportsAttrSource
-            ? (.work, "git \(GitCommand.gitVersionText ?? "?") found; merges into main need git 2.43 or newer")
-            : (.error, "git \(GitCommand.gitVersionText ?? "was not found"): merges into main need git 2.43 or newer and are refused")
+        let gitLine: (ActivityKind, String) = GitWorkspace.installedGitMerges
+            ? (.work, "git \(GitWorkspace.installedGitVersion ?? "?") found; merges into main need git 2.43 or newer")
+            : (.error, "git \(GitWorkspace.installedGitVersion ?? "was not found"): merges into main need git 2.43 or newer and are refused")
         try writer.write { db in
             try db.execute(sql: "UPDATE itemMerge SET running = 0")
             for company in try Company.fetchAll(db) {

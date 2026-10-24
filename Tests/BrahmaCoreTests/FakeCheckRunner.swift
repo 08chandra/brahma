@@ -47,7 +47,8 @@ final class FakeCheckRunner: CheckRunning, @unchecked Sendable {
         }
         defer { lock.withLock { current -= 1 } }
         while lock.withLock({ gated }) { try? await Task.sleep(for: .milliseconds(5)) }
-        var outcome = await h?(call)
+        // A check is a child process, not engine work: a test's hook runs outside the engine's tasks (`EngineGitGuard`).
+        var outcome = await EngineGitGuard.$engine.withValue(nil) { await h?(call) }
         if outcome == nil { outcome = lock.withLock { queue.isEmpty ? nil : queue.removeFirst() } }
         let result = outcome ?? Self.pass
         try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
