@@ -32,6 +32,8 @@ public final class AppModel {
     /// Board: only this sprint's items; nil shows them all.
     public var boardSprintId: String?
     public private(set) var search: SearchModel
+    /// Settings › Backups.
+    public private(set) var backups: BackupsModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
     public var highlightedMessageId: String?
     /// The ask a notification banner pointed at (set by `ask:<id>`); the Inbox calls it out.
@@ -62,6 +64,7 @@ public final class AppModel {
         self.paths = paths
         self.clock = clock
         self.search = SearchModel(store: store)
+        self.backups = BackupsModel(store: store, paths: paths)
     }
 
     public var selectedCompany: CompanySummary? {
@@ -114,11 +117,12 @@ public final class AppModel {
     /// Opens the database again (after a restore), starts from a clean snapshot and re-seeds the activity cursor from the
     /// current maximum, so no event of the restored database is replayed or skipped.
     public func reopenStore() async {
-        let (path, backups, catalog) = (paths.database.path, paths.backupsDir, store.catalog)
+        let (path, backupsDir, catalog) = (paths.database.path, paths.backupsDir, store.catalog)
         do {
-            let reopened = try await Task.detached { try Store(path: path, catalog: catalog, backupsDir: backups) }.value
+            let reopened = try await Task.detached { try Store(path: path, catalog: catalog, backupsDir: backupsDir) }.value
             store = reopened
             search = SearchModel(store: reopened)
+            backups = BackupsModel(store: reopened, paths: paths)
             snapshot = .empty
             activity = []
             loaded = false
@@ -275,6 +279,7 @@ public final class AppModel {
         case .backlog: select(.backlog)
         case .board: select(.board)
         case .inbox: select(.inbox)
+        case .backups: select(.settingsBackups)
         case .ask(let id):
             select(.inbox)
             highlightedAskId = id

@@ -3,6 +3,8 @@ import Foundation
 public enum SelectTarget: Equatable, Sendable {
     case missionControl, activity, agents
     case backlog, board, inbox
+    /// Settings › Backups.
+    case backups
     case item(key: String)
     /// `ask:<id>`: the Inbox, with that ask called out.
     case ask(id: String)
@@ -20,6 +22,7 @@ public enum SelectTarget: Equatable, Sendable {
         case "backlog": self = .backlog
         case "board": self = .board
         case "inbox": self = .inbox
+        case "backups": self = .backups
         case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)

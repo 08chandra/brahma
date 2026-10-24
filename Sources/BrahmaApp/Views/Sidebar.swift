@@ -20,6 +20,9 @@ struct Sidebar: View {
                 NavRow(title: "Board", icon: "rectangle.split.3x1", item: .board, model: model)
                 NavRow(title: "Inbox", icon: "tray", item: .inbox, model: model, count: model.inboxCount)
 
+                SectionHeader(title: "Settings")
+                NavRow(title: "Backups", icon: "externaldrive", item: .settingsBackups, model: model)
+
                 if !sections.channels.isEmpty {
                     SectionHeader(title: "Channels")
                     ForEach(sections.channels) { row in
