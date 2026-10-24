@@ -5,7 +5,9 @@ public enum AgentState: String, Codable, Sendable { case ready, running, blocked
 
 public enum Blocker: Codable, Equatable, Sendable {
     case agent(String)
-    case owner(reason: String)
+    /// Waiting on the owner. `askId` links the wait to an open ask of the same company; only the engine sets it (`set_blocked`
+    /// with an `ask` it validated), never parsed from the reason. Owner-notice urgency counts these links.
+    case owner(reason: String, askId: String? = nil)
     case usageLimit(until: Date)
     case turnBudget(until: Date)
     case retry(until: Date, failures: Int)

@@ -45,6 +45,7 @@ extension CompanyTools {
         update["key"] = key
         update["status"] = s.prop("string", "backlog, ready or blocked (the engine sets inReview and done)")
         update["blockedReason"] = s.prop("string", "Why it is blocked (with status blocked)")
+        update["blockedOnAsk"] = s.prop("string", "The open ask it waits for, e.g. A-3 (with status blocked)")
         update["notes"] = s.prop("string", "Your working notes on the item")
         update["linkedBranch"] = s.prop("string", "Branch that holds the work")
         return [
@@ -340,6 +341,10 @@ extension CompanyTools {
             patch.status = st
         }
         patch.blockedReason = try optString(args, "blockedReason")
+        if let ref = try optString(args, "blockedOnAsk"), !ref.trimmingCharacters(in: .whitespaces).isEmpty {
+            guard let ask = try store.ask(companyId: companyId, ref: ref) else { throw ToolError(message: "no ask \(Store.flat(ref, max: 20))") }
+            patch.blockedOnAsk = ask.id
+        }
         if let n = try optString(args, "notes") { patch.notes = .some(n.isEmpty ? nil : n) }
         if let b = try optString(args, "linkedBranch") { patch.linkedBranch = .some(b.isEmpty ? nil : b) }
         let before = try store.lease(itemId: target.id)

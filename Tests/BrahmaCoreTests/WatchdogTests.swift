@@ -194,7 +194,7 @@ import GRDB
         #expect(back.status == .ready); #expect(back.stopReason == "no-progress")
         let ceoNow = try t.agent(ceo)
         #expect(ceoNow.state == .blocked)
-        guard case .owner(let reason)? = ceoNow.blocker else { Issue.record("blocked on the owner, not \(String(describing: ceoNow.blocker))"); return }
+        guard case .owner(let reason, _)? = ceoNow.blocker else { Issue.record("blocked on the owner, not \(String(describing: ceoNow.blocker))"); return }
         #expect(reason == "watchdog: no work-item progress in 5 turns")
         let toOwner = try await t.store.writer.read { db in
             try String.fetchAll(db, sql: "SELECT m.text FROM message m JOIN channel ch ON ch.id = m.channelId WHERE ch.name = 'dm:owner:system'")

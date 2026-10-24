@@ -150,11 +150,10 @@ extension CompanyTools {
                                  recommendation: try optionalText(args, "recommendation"), stakes: try optionalText(args, "stakes"),
                                  reversible: reversible, proposal: try optionalText(args, "proposal"))
         let deduped = try isRepeat(requestId: try optionalText(args, "request_id"))
-        if !deduped { try AskQuota.check(store: store, agentId: agentId) }
         let ask = try store.propose(companyId: companyId, by: .agent(agentId), kind: kind, risk: risk,
                                     category: try optionalText(args, "category"), title: title, summary: summary, payload: payload,
                                     itemId: itemId, supersedes: supersedes, requestId: try optionalText(args, "request_id"),
-                                    decisionClass: cls)
+                                    decisionClass: cls, quota: true)
         return try describe(ask, expecting: kind, deduped: deduped)
     }
 
@@ -165,10 +164,9 @@ extension CompanyTools {
             hours = n
         }
         let deduped = try isRepeat(requestId: try optionalText(args, "request_id"))
-        if !deduped { try AskQuota.check(store: store, agentId: agentId) }
         let ask = try store.requestFromOwner(companyId: companyId, by: .agent(agentId), title: try text(args, "title"),
                                              question: try text(args, "question"), details: try optionalText(args, "details"),
-                                             expiresInHours: hours, requestId: try optionalText(args, "request_id"))
+                                             expiresInHours: hours, requestId: try optionalText(args, "request_id"), quota: true)
         if deduped || ask.kind != .info || ask.status != .pendingOwner { return try describe(ask, expecting: .info, deduped: deduped) }
         return "Asked the owner (\(ask.ref)). You will get the answer as a DM from the owner."
     }

@@ -3,13 +3,18 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-/// Records banners; `accept` false plays a poster the system refuses (not authorized).
+/// Records banners; `accept` false plays a poster the system refuses, `refuse` refuses those banner ids only, and
+/// `canPost` false plays a poster that is not authorized.
 @MainActor
 final class FakePoster: NotificationPosting {
     var posted: [PostedNotice] = []
+    var attempts = 0
     var accept = true
+    var refuse: Set<String> = []
+    var canPost = true
     func post(_ notice: PostedNotice) async -> Bool {
-        guard accept else { return false }
+        attempts += 1
+        guard accept, !refuse.contains(notice.id) else { return false }
         posted.append(notice)
         return true
     }
@@ -42,7 +47,7 @@ final class FakePoster: NotificationPosting {
         // A refused post marks nothing; the banner is planned again once the poster accepts.
         let c = try w.ask(title: "Third")
         poster.accept = false
-        try await w.model.deliverNotices()
+        await w.model.deliverNotices()
         #expect(try w.store.dueAskNotices().map(\.ask.id) == [c.id])
         poster.accept = true
         await w.model.deliverNotices()
@@ -54,6 +59,41 @@ final class FakePoster: NotificationPosting {
         w.model.poster = nil
         await w.model.deliverNotices()
         #expect(try w.store.dueAskNotices().map(\.ask.id) == [d.id])
+    }
+
+    @Test func failedPostMarksOnlyThatOne() async throws {
+        let w = try await WorkWorld.make()
+        var prefs = OwnerPrefs.defaults; prefs.quietEnabled = false
+        try w.store.updateOwnerPrefs(prefs)
+        let a = try w.ask(title: "First"), b = try w.ask(title: "Second")
+        let poster = FakePoster()
+        poster.refuse = ["ask-\(a.id)-0"]
+        w.model.poster = poster
+        await w.model.deliverNotices()
+        #expect(poster.posted.map(\.id) == ["ask-\(b.id)-0"])
+        // Only the refused banner stays due; the next round posts just that one.
+        #expect(try w.store.dueAskNotices().map(\.ask.id) == [a.id])
+        poster.refuse = []
+        await w.model.deliverNotices()
+        #expect(poster.posted.map(\.id) == ["ask-\(b.id)-0", "ask-\(a.id)-0"])
+        #expect(try w.store.dueAskNotices().isEmpty)
+    }
+
+    @Test func unauthorizedPosterSkipsPlanning() async throws {
+        let w = try await WorkWorld.make()
+        var prefs = OwnerPrefs.defaults; prefs.quietEnabled = false
+        try w.store.updateOwnerPrefs(prefs)
+        let a = try w.ask(title: "Waiting")
+        let poster = FakePoster()
+        poster.canPost = false
+        w.model.poster = poster
+        for _ in 0..<(AppModel.deliveryEvery * 2) { await w.model.tick() }
+        await w.model.deliverNotices()
+        #expect(poster.attempts == 0)
+        #expect(try w.store.dueAskNotices().map(\.ask.id) == [a.id])
+        poster.canPost = true
+        await w.model.deliverNotices()
+        #expect(poster.posted.map(\.id) == ["ask-\(a.id)-0"])
     }
 
     @Test func quietHoursHoldBannersAtTheModel() async throws {

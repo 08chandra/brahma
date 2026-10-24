@@ -149,6 +149,7 @@ extension Store {
         let from = item.status
         item.status = .blocked
         item.blockedReason = String("over budget: \(parts)".prefix(500))
+        item.blockedAskId = nil; item.blockedAskBy = nil
         item.blockedSinceActive = try Store.activeNow(db: db, companyId: item.companyId)
         item.stopReason = "budget"
         item.updatedAt = now
@@ -186,7 +187,7 @@ extension Store {
     func releaseDoctorHeldAgents(now: Date) throws {
         try writer.write { db in
             for a in try Agent.filter(Column("state") == AgentState.blocked.rawValue).fetchAll(db) {
-                guard case .owner(let reason)? = a.blocker, reason.hasPrefix(Store.doctorHoldPrefix) else { continue }
+                guard case .owner(let reason, _)? = a.blocker, reason.hasPrefix(Store.doctorHoldPrefix) else { continue }
                 try Store.transition(db: db, agentId: a.id, to: a.paused ? .sleeping : .ready, now: now)
             }
         }

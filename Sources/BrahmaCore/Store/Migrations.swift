@@ -666,7 +666,7 @@ enum Migrations {
     }
 
     /// Plan 5-lite migrations, in the plan's order (v5-sandbox, v5-owner-guard, v5-secrets, v5-extensions, v5-timers,
-    /// v5-notices, ...). Called once at the end of `migrator()`, after every 3a migration.
+    /// v5-notices, v5-notices-2, ...). Called once at the end of `migrator()`, after every 3a migration.
     static func registerPlan5(_ m: inout DatabaseMigrator) {
         m.registerMigration("v5-sandbox") { db in
             try db.alter(table: "company") { t in
@@ -746,6 +746,14 @@ enum Migrations {
                     preventSleep BOOLEAN NOT NULL DEFAULT 1)
                 """)
             try db.execute(sql: "INSERT INTO ownerPrefs(id) VALUES (1)")
+        }
+        m.registerMigration("v5-notices-2") { db in
+            // The engine-set link from a blocked item to the ask it waits for (and who linked it), so notice urgency never
+            // comes from reason text. Agents carry theirs on `Blocker.owner(askId:)` inside the JSON blocker column.
+            try db.alter(table: "workItem") { t in
+                t.add(column: "blockedAskId", .text)
+                t.add(column: "blockedAskBy", .text)
+            }
         }
         m.registerMigration("v5-digests") { db in
             try db.create(table: "ownerDigest") { t in

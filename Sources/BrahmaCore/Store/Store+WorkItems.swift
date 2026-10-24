@@ -324,6 +324,17 @@ extension Store {
         var statusChange: (from: WorkItemStatus, to: WorkItemStatus)?
         let reason = patch.blockedReason?.components(separatedBy: .newlines).joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // The ask link is checked here, never taken from text: an open ask of the item's company, on a blocked item.
+        var askLink: String?
+        if let askId = patch.blockedOnAsk {
+            guard let ask = try Ask.fetchOne(db, key: askId) else { throw WorkError.notFound("no such ask") }
+            guard ask.companyId == item.companyId else { throw WorkError.forbidden("not in your company") }
+            guard ask.status.isPending else { throw WorkError.invalid("\(ask.ref) is no longer open") }
+            guard patch.status == .blocked || (patch.status == nil && item.status == .blocked) else {
+                throw WorkError.invalid("blockedOnAsk goes with status blocked")
+            }
+            askLink = ask.id
+        }
         if let to = patch.status, to != item.status {
             let isHolderOrAssignee = actor.id == item.ownerId || (holder != nil && actor.id == holder)
             if let denial = WorkPolicy.statusDenial(from: item.status, to: to, actor: actor.id, actorKind: actor.kind,
@@ -335,10 +346,13 @@ extension Store {
             if to == .blocked {
                 item.blockedReason = String((reason ?? "").prefix(500))
                 item.blockedSinceActive = try Self.activeNow(db: db, companyId: item.companyId)
+                item.blockedAskId = askLink
+                item.blockedAskBy = askLink == nil ? nil : actor.id
             } else if item.status == .blocked {
                 item.blockedReason = nil
                 item.blockedSinceActive = nil
                 item.stopReason = nil
+                item.blockedAskId = nil; item.blockedAskBy = nil
             }
             if item.status == .done { item.doneAt = nil }
             item.status = to
@@ -347,6 +361,10 @@ extension Store {
                   reason != item.blockedReason {
             item.blockedReason = String(reason.prefix(500))
             otherChanged.append("blocked reason")
+        }
+        if statusChange == nil, let askLink, item.status == .blocked, askLink != item.blockedAskId || actor.id != item.blockedAskBy {
+            item.blockedAskId = askLink; item.blockedAskBy = actor.id
+            otherChanged.append("blocked on ask")
         }
 
         guard !specChanged.isEmpty || checkChanged || assignment != nil || !otherChanged.isEmpty || statusChange != nil else {
@@ -549,7 +567,7 @@ extension Store {
         let from = item.status
         guard from != to else { return item }
         item.status = to
-        if from == .blocked { item.blockedReason = nil; item.blockedSinceActive = nil }
+        if from == .blocked { item.blockedReason = nil; item.blockedSinceActive = nil; item.blockedAskId = nil; item.blockedAskBy = nil }
         if from == .done { item.doneAt = nil }
         if to == .inProgress { item.everStarted = true }
         if to == .done { item.doneAt = now }

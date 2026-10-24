@@ -116,6 +116,10 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var blockedReason: String? = nil
     /// Company-active seconds when the item entered `blocked`.
     public var blockedSinceActive: Double? = nil
+    /// The open ask this blocked item waits for, and the agent that linked it (`update_work_item` with `blockedOnAsk`, checked
+    /// by the store). Set only with `blocked` and cleared whenever the item leaves it; owner-notice urgency counts it.
+    public var blockedAskId: String? = nil
+    public var blockedAskBy: String? = nil
     /// 0 is most urgent; the default is 2.
     public var priority: Int = 2
     public var points: Int? = nil
@@ -230,6 +234,8 @@ public struct WorkItemPatch: Sendable {
     public var parentId: String??
     public var status: WorkItemStatus?
     public var blockedReason: String?
+    /// An ask id the item is blocked on (with status `blocked`, or on an item that already is). The store checks it.
+    public var blockedOnAsk: String?
     public var notes: String??
     public var linkedBranch: String??
     public var intensity: WorkIntensity?
@@ -238,8 +244,9 @@ public struct WorkItemPatch: Sendable {
     public init(type: WorkItemType? = nil, title: String? = nil, description: String? = nil, acceptanceCriteria: String? = nil,
                 checkSpec: CheckSpec?? = nil, priority: Int? = nil, points: Int?? = nil, tier: EffortTier? = nil,
                 ownerId: String?? = nil, reviewerId: String?? = nil, team: String?? = nil, parentId: String?? = nil,
-                status: WorkItemStatus? = nil, blockedReason: String? = nil, notes: String?? = nil,
+                status: WorkItemStatus? = nil, blockedReason: String? = nil, blockedOnAsk: String? = nil, notes: String?? = nil,
                 linkedBranch: String?? = nil, intensity: WorkIntensity? = nil, touchPaths: [String]? = nil) {
+        self.blockedOnAsk = blockedOnAsk
         self.touchPaths = touchPaths
         self.type = type; self.title = title; self.description = description; self.acceptanceCriteria = acceptanceCriteria
         self.checkSpec = checkSpec; self.priority = priority; self.points = points; self.tier = tier; self.ownerId = ownerId
@@ -255,7 +262,7 @@ public struct WorkItemPatch: Sendable {
     var touchesOwner: Bool { ownerId != nil }
     var touchesNotes: Bool { notes != nil }
     var touchesBranch: Bool { linkedBranch != nil }
-    var touchesStatus: Bool { status != nil || blockedReason != nil }
+    var touchesStatus: Bool { status != nil || blockedReason != nil || blockedOnAsk != nil }
 }
 
 public struct WorkItemFilter: Sendable {

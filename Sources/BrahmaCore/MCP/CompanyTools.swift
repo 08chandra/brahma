@@ -96,7 +96,7 @@ public struct CompanyTools: Sendable {
                                                     "create_work_item", "link_dependency", "write_handoff", "create_channel",
                                                     "set_blocked"])
         .union(highRiskTools)
-    static let updateLowRiskFields: Set<String> = ["key", "status", "blockedReason", "notes", "linkedBranch"]
+    static let updateLowRiskFields: Set<String> = ["key", "status", "blockedReason", "blockedOnAsk", "notes", "linkedBranch"]
 
     func quotaKind(_ name: String, _ args: [String: JSONValue]) -> TurnQuotaCounter.Kind? {
         switch name {
@@ -192,7 +192,9 @@ public struct CompanyTools: Sendable {
                                            required: ["name", "members"])),
             ToolSpec(name: "set_blocked", description: "Declare you cannot continue until someone answers or a work item is done. Takes effect when your turn ends.",
                      inputSchema: s.schema(["on": s.prop("string", "Who or what you are waiting on: @handle, owner, or a work item key such as ACME-12"),
-                                            "reason": s.prop("string", "What you need")], required: ["on", "reason"])),
+                                            "reason": s.prop("string", "What you need"),
+                                            "ask": s.prop("string", "With on owner: the open ask you wait for, e.g. A-3")],
+                     required: ["on", "reason"])),
         ]
         return base
     }
@@ -293,7 +295,7 @@ public struct CompanyTools: Sendable {
             case "create_channel":
                 return try createChannel(name: try string(args, "name"), members: try stringArray(args, "members"))
             case "set_blocked":
-                return try setBlocked(on: try string(args, "on"), reason: try string(args, "reason"))
+                return try setBlocked(on: try string(args, "on"), reason: try string(args, "reason"), ask: try optionalString(args, "ask"))
             case "review":
                 return try reviewTool(args)
             case "audit":
@@ -355,19 +357,31 @@ public struct CompanyTools: Sendable {
         return "Created #\(channel.name) with \(ids.count) members."
     }
 
-    private func setBlocked(on: String, reason: String) throws -> String {
+    private func setBlocked(on: String, reason: String, ask askRef: String?) throws -> String {
         let target = Self.handle(on)
         let reason = try store.redact(reason)
         let raw = on.trimmingCharacters(in: .whitespaces)
-        if !raw.hasPrefix("@"), raw.range(of: "^[A-Z0-9]{1,8}-[0-9]+$", options: .regularExpression) != nil {
+        if askRef != nil, target != "owner" { throw ToolError(message: "ask applies only when you are blocked on the owner") }
+        if askRef == nil, !raw.hasPrefix("@"), raw.range(of: "^[A-Z0-9]{1,8}-[0-9]+$", options: .regularExpression) != nil {
             if let result = try setBlockedOnItem(key: raw) { return result }
         }
         // Target check and write share one transaction, so a teammate killed in between cannot be waited on.
         // Touch only this column so a concurrent orchestrator save is not clobbered.
-        try store.writer.write { [companyId, agentId] db in
+        let linked: String? = try store.writer.write { [companyId, agentId] db in
+            var linkedRef: String?
             let blocker: Blocker
             if target == "owner" {
-                blocker = .owner(reason: reason)
+                // The ask link is the engine's: resolved by ref inside this company and checked open, never read from the reason.
+                var askId: String?
+                if let askRef {
+                    guard let ask = try Store.ask(db: db, companyId: companyId, ref: askRef) else {
+                        throw ToolError(message: "no ask \(Store.flat(askRef, max: 20))")
+                    }
+                    guard ask.status.isPending else { throw ToolError(message: "\(ask.ref) is no longer open") }
+                    askId = ask.id
+                    linkedRef = ask.ref
+                }
+                blocker = .owner(reason: reason, askId: askId)
             } else {
                 guard let other = try Agent.filter(Column("companyId") == companyId && Column("name") == target).fetchOne(db) else {
                     throw ToolError(message: Self.describe(.unknownAgent(target)))
@@ -379,8 +393,9 @@ public struct CompanyTools: Sendable {
             guard var me = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
             me.requestedBlocker = blocker
             try me.update(db, columns: ["requestedBlocker"])
+            return linkedRef
         }
-        return "Marked blocked on @\(target); this takes effect when your turn ends."
+        return "Marked blocked on @\(target)" + (linked.map { " waiting for \($0)" } ?? "") + "; this takes effect when your turn ends."
     }
 
     // MARK: Argument helpers
@@ -392,6 +407,13 @@ public struct CompanyTools: Sendable {
             throw ToolError(message: "argument \(key) must not be empty")
         }
         return s
+    }
+
+    /// An optional string argument; absent, null or blank is nil.
+    func optionalString(_ args: [String: JSONValue], _ key: String) throws -> String? {
+        guard let v = args[key], v != .null else { return nil }
+        guard let s = v.stringValue else { throw ToolError(message: "argument \(key) must be a string") }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : s
     }
 
     func stringArray(_ args: [String: JSONValue], _ key: String) throws -> [String] {

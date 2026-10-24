@@ -239,12 +239,13 @@ extension Store {
     /// Files an ask. It routes to the first available approver for the kind (see `internalApprover`) and otherwise goes
     /// straight to the owner. `viaOwner` skips the internal step (engine-filed asks that must reach the owner).
     /// A repeat call with the same company, requester and `requestId` returns the existing ask. A `mechanical` decision is
-    /// not an ask: use `recordMechanicalDecision`.
+    /// not an ask: use `recordMechanicalDecision`. `quota` applies `AskQuota` inside the write that inserts the ask (every
+    /// agent tool path passes true; engine-filed asks and the dev hook do not).
     @discardableResult
     public func propose(companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk? = nil, category: String? = nil,
                         title: String, summary: String, payload: AskPayload? = nil, itemId: String? = nil, subjectId: String? = nil,
                         supersedes: String? = nil, requestId: String? = nil, decisionClass: DecisionClass = .taste,
-                        viaOwner: Bool = false, now: Date = Store.now()) throws -> Ask {
+                        viaOwner: Bool = false, quota: Bool = false, now: Date = Store.now()) throws -> Ask {
         // The document is read and hashed before the write transaction opens, so a slow file never holds the database.
         var document: PreparedDocument?
         if let raw = payload?.documentPath {
@@ -254,13 +255,15 @@ extension Store {
         return try writer.write { db in
             try propose(db: db, companyId: companyId, by: sender, kind: kind, risk: risk, category: category, title: title,
                         summary: summary, payload: payload, document: document, itemId: itemId, subjectId: subjectId,
-                        supersedes: supersedes, requestId: requestId, decisionClass: decisionClass, viaOwner: viaOwner, now: now)
+                        supersedes: supersedes, requestId: requestId, decisionClass: decisionClass, viaOwner: viaOwner,
+                        quota: quota, now: now)
         }
     }
 
     func propose(db: Database, companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk?, category: String?, title: String,
                  summary: String, payload: AskPayload?, document: PreparedDocument?, itemId: String?, subjectId: String?,
-                 supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool, now: Date) throws -> Ask {
+                 supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool, quota: Bool = false,
+                 now: Date) throws -> Ask {
         let company = try requireCompany(db, companyId)
         let requester = try askRequester(db, sender, companyId: companyId)
         let rid = Store.cleanRequestId(requestId)
@@ -270,6 +273,8 @@ extension Store {
         }
         guard decisionClass != .mechanical else { throw WorkError.invalid("a mechanical decision is recorded, not filed as an ask") }
         guard kind.isDecision else { throw WorkError.invalid("\(kind.rawValue) asks are not proposed; use request_from_owner") }
+        // Counted in the write that inserts, so two concurrent filings cannot both pass.
+        if quota, requester.id != "system" { try AskQuota.check(db: db, agentId: requester.id) }
 
         let extra = pack(for: company)?.reservedCategories ?? []
         var cat = ReservedMatters.normalize(category)
@@ -378,16 +383,19 @@ extension Store {
         }
     }
 
-    /// A question for the owner (`info` ask). `expiresInHours` counts company-active time.
+    /// A question for the owner (`info` ask). `expiresInHours` counts company-active time. `quota` applies `AskQuota` in
+    /// the same write (agent tool paths pass true; engine and dev paths do not).
     @discardableResult
     public func requestFromOwner(companyId: String, by sender: Sender, title: String, question: String, details: String? = nil,
-                                 expiresInHours: Double? = nil, requestId: String? = nil, now: Date = Store.now()) throws -> Ask {
+                                 expiresInHours: Double? = nil, requestId: String? = nil, quota: Bool = false,
+                                 now: Date = Store.now()) throws -> Ask {
         try writer.write { db in
             let company = try requireCompany(db, companyId)
             let requester = try askRequester(db, sender, companyId: companyId)
             let rid = Store.cleanRequestId(requestId)
             if let rid, let existing = try Ask.filter(Column("companyId") == companyId && Column("requesterId") == requester.id
                                                       && Column("requestId") == rid).fetchOne(db) { return existing }
+            if quota, requester.id != "system" { try AskQuota.check(db: db, agentId: requester.id) }
             let cleanTitle = try Store.cleanAskTitle(title)
             guard let q = try Store.limitedText(question, Store.maxAskField, "the question") else { throw WorkError.invalid("the question is empty") }
             let body = AskPayload(question: q, details: try Store.limitedText(details, Store.maxAskText, "the details"))
@@ -604,12 +612,15 @@ extension Store {
 
     /// "A-12", "a-12" or "12", within one company.
     public func ask(companyId: String, ref: String) throws -> Ask? {
+        try writer.read { db in try Store.ask(db: db, companyId: companyId, ref: ref) }
+    }
+
+    /// The ask `ref` ("A-3" or "3") names in this company; nil for anything else (another company's ask is out of reach).
+    static func ask(db: Database, companyId: String, ref: String) throws -> Ask? {
         var text = ref.trimmingCharacters(in: .whitespaces).lowercased()
         if text.hasPrefix("a-") { text.removeFirst(2) }
         guard let number = Int(text) else { return nil }
-        return try writer.read { db in
-            try Ask.filter(Column("companyId") == companyId && Column("number") == number).fetchOne(db)
-        }
+        return try Ask.filter(Column("companyId") == companyId && Column("number") == number).fetchOne(db)
     }
 
     /// Asks waiting for this agent's decision, optionally of one kind.
@@ -645,6 +656,17 @@ extension Store {
     public func markAskNotified(ids: [String], now: Date = Store.now()) throws {
         try writer.write { db in
             for id in ids { try db.execute(sql: "UPDATE ask SET notifiedAt = ? WHERE id = ?", arguments: [now, id]) }
+        }
+    }
+
+    /// Marks the banner of each ask as shown, but only while its `remindCount` is still the planned one: a reminder that
+    /// fired between planning and marking keeps its new banner due.
+    public func markAskNotified(planned: [String: Int], now: Date = Store.now()) throws {
+        guard !planned.isEmpty else { return }
+        try writer.write { db in
+            for (id, remind) in planned {
+                try db.execute(sql: "UPDATE ask SET notifiedAt = ? WHERE id = ? AND remindCount = ?", arguments: [now, id, remind])
+            }
         }
     }
 

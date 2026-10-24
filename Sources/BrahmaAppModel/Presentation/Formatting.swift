@@ -74,7 +74,7 @@ public enum BlockerText {
         switch b {
         case nil: return ""
         case .agent(let id): return "Waiting on @\(handles[id] ?? id)"
-        case .owner(let reason): return "Waiting on you: \(reason)"
+        case .owner(let reason, _): return "Waiting on you: \(reason)"
         case .workItem(_, let key): return "Waiting on \(key)"
         case .usageLimit(let until): return "Usage limit until \(TimeText.hm(until, timeZone: timeZone))"
         case .turnBudget(let until): return "Turn budget until \(TimeText.hm(until, timeZone: timeZone))"

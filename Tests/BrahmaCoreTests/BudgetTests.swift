@@ -393,7 +393,7 @@ import GRDB
         #expect(alerts.count == 1); #expect(alerts[0].contains("unexpected model (claude-fable-5-0)"))
         let agent = try b.w.agent(b.eng)
         #expect(agent.state == .blocked)
-        guard case .owner(let reason)? = agent.blocker else { Issue.record("expected an owner blocker"); return }
+        guard case .owner(let reason, _)? = agent.blocker else { Issue.record("expected an owner blocker"); return }
         #expect(reason.hasPrefix("doctor re-run needed: unexpected model"))
         // A passing doctor lets it run again.
         try b.store.clearHoldAfterDoctor(now: b.w.clock.now)

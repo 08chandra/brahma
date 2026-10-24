@@ -5,13 +5,16 @@ import BrahmaAppModel
 
 /// Banners through the system notification center. Banners are grouped per company (`threadIdentifier`); a click opens
 /// the main window and applies the banner's target (`ask:<id>` selects the Inbox and that ask, `inbox` the Inbox).
-/// If notifications are not authorized, `post` returns false, so nothing is marked and a later grant still announces
-/// what is waiting.
+/// While notifications are not authorized `canPost` is false, so the model plans and marks nothing; the setting is
+/// re-read at most every `recheckEvery` of awake time, so a later grant in System Settings still announces what is waiting.
 @MainActor
 final class UNNotificationPoster: NSObject, NotificationPosting, UNUserNotificationCenterDelegate {
     private let model: AppModel
     private var center: UNUserNotificationCenter?
     private var authorized = false
+    private var lastCheck: SuspendingClock.Instant?
+    private var checking = false
+    static let recheckEvery: Duration = .seconds(60)
     var openMainWindow: () -> Void = {}
 
     init(model: AppModel) {
@@ -31,6 +34,25 @@ final class UNNotificationPoster: NSObject, NotificationPosting, UNUserNotificat
             Task { @MainActor [weak self] in self?.authorized = granted }
         }
         model.poster = self
+    }
+
+    var canPost: Bool {
+        if !authorized { recheckAuthorization() }
+        return authorized && center != nil
+    }
+
+    /// Re-reads the authorization (no prompt), at most once per `recheckEvery`.
+    private func recheckAuthorization() {
+        guard let center, !checking else { return }
+        let now = AwakeTime.now
+        if let last = lastCheck, last.advanced(by: Self.recheckEvery) > now { return }
+        lastCheck = now
+        checking = true
+        Task { @MainActor [weak self] in
+            let status = await center.notificationSettings().authorizationStatus
+            self?.authorized = status == .authorized || status == .provisional
+            self?.checking = false
+        }
     }
 
     func post(_ notice: PostedNotice) async -> Bool {
