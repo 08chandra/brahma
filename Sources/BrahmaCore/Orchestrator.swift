@@ -92,6 +92,9 @@ public actor Orchestrator {
     var secretsTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
     var ensuredTimerCompanies: Set<String>?
+    /// Phone alerts (Task 7b): one dispatcher for the engine's life, and its pass in flight (a pass never overlaps itself).
+    nonisolated let pushDispatcher: PushDispatcher
+    var pushTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -108,11 +111,13 @@ public actor Orchestrator {
                 turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil },
                 timerJobs: TimerJobRegistry = .system,
                 vault: any SecretVault = UnavailableVault(),
+                pushChannel: (any PushChannel)? = nil,
                 restoreHooks: RestoreHooks = RestoreHooks(),
                 transcripts: TranscriptCapture? = nil,
                 backupTools: BackupTools = .system,
                 walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) }) {
         self.backupTools = backupTools; self.walSleeper = walSleeper
+        self.pushDispatcher = PushDispatcher(store: store, vault: vault, channel: pushChannel)
         self.timerJobs = timerJobs; self.vault = vault; self.restoreHooks = restoreHooks; self.transcripts = transcripts
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
@@ -208,7 +213,7 @@ public actor Orchestrator {
     /// next is started synchronously inside that tick, so nothing is "queued" outside these sets.)
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
-            && secretsTask == nil
+            && secretsTask == nil && pushTask == nil
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -267,7 +272,7 @@ public actor Orchestrator {
         // The engine is stopping: litestream stops with it (SIGTERM, then SIGKILL after the grace).
         stopWALShipping()
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
-            + (secretsTask.map { [$0] } ?? [])
+            + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -349,6 +354,9 @@ public actor Orchestrator {
 
         // 1b. Timers that are due (jobs run detached; a `.turn` timer sends its agent a system DM).
         attempt { try timersTick(now: now, companies: companies) }
+
+        // 1c. Phone alerts: a detached pass that sends what the delivery plan asks for (see `PushDispatcher`).
+        pushTick(now: now)
 
         // 2. How many live agents each agent is holding up.
         let all = try store.agents()

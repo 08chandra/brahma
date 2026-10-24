@@ -64,6 +64,20 @@ brahma run [--hard-cap 16] [--profile workspace|full]
   (balanced) or 97% (max), when a request is rejected for usage, or once paid overage is in use. A usage
   warning alone (e.g. on the seven-day window) does not stop turns.
 
+Phone alerts go through the service you pick. With ntfy.sh, anyone who knows the topic name can read it: pick a long
+random topic or run your own server. Brahma sends counts, not content, unless you choose titles.
+
+```
+brahma prefs set push ntfy <topic> [--server <https url>] [--token-stdin]
+brahma prefs set push pushover                  app token, then user key, one per line on standard input
+brahma prefs set push off
+brahma prefs set push-detail counts|titles
+brahma push test                                send one test alert
+```
+
+The service credentials are kept in the secrets vault (Keychain), never in the database, and agents never receive them.
+Urgent alerts go at once; the rest wait out quiet hours and arrive as at most one alert every 5 minutes, 30 per day.
+
 `brahma mcp` is internal: each agent turn launches it as that agent's company-tools MCP server.
 
 ## Work system

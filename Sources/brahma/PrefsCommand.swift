@@ -19,7 +19,7 @@ struct PrefsGroup: ParsableCommand {
     struct Set: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Change a preference (owner only).",
-            subcommands: [Quiet.self, Digest.self, PreventSleep.self, Notifications.self])
+            subcommands: [Quiet.self, Digest.self, PreventSleep.self, Notifications.self, Push.self, PushDetailCommand.self])
 
         struct Quiet: ParsableCommand {
             static let configuration = CommandConfiguration(
@@ -71,7 +71,84 @@ struct PrefsGroup: ParsableCommand {
 
             func run() throws { try update { $0.notificationsEnabled = value == .on } }
         }
+
+        enum PushChoice: String, ExpressibleByArgument { case ntfy, pushover, off }
+
+        struct Push: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "push",
+                abstract: "Phone alerts: 'push ntfy <topic> [--server <https url>]', 'push pushover' (app token, then user key, one per line on standard input) or 'push off'.")
+            @Argument(help: "ntfy, pushover or off.") var provider: PushChoice
+            @Argument(help: "The ntfy topic: a long random name, because anyone who knows it can read it.") var topic: String?
+            @Option(help: "The ntfy server (https only). Default https://ntfy.sh.") var server: String?
+            @Flag(help: "ntfy: read an access token from standard input (stored in the vault as owner:NTFY_TOKEN).") var tokenStdin = false
+
+            func run() throws {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                do {
+                    switch provider {
+                    case .off:
+                        try store.setPush(provider: nil)
+                        for name in [OwnerCredential.ntfyToken, OwnerCredential.pushoverAppToken, OwnerCredential.pushoverUserKey] {
+                            try cliSecretVault().delete(companyId: OwnerCredential.scope, name: name)
+                        }
+                    case .ntfy:
+                        guard let topic else { throw fail("ntfy needs a topic: brahma prefs set push ntfy <topic>") }
+                        // Validated before anything is stored.
+                        _ = try NtfyChannel(server: server ?? OwnerPrefs.defaultPushServer, topic: topic, token: nil)
+                        if tokenStdin {
+                            try cliSecretVault().set(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken,
+                                                     value: try SecretInput.read(from: .standardInput))
+                        }
+                        try store.setPush(provider: .ntfy, topic: topic, server: server)
+                    case .pushover:
+                        let lines = try readPushoverCredentials()
+                        let vault = try cliSecretVault()
+                        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverAppToken, value: lines.app)
+                        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverUserKey, value: lines.user)
+                        try store.setPush(provider: .pushover)
+                    }
+                } catch let e as PushError {
+                    throw fail(e.description)
+                } catch let e as SecretError {
+                    throw fail(e.message)
+                } catch let e as SettingsError {
+                    if case .invalid(let m) = e { throw fail(m) }
+                    throw e
+                }
+                printPrefs(try store.ownerPrefs(), zone: store.ownerTimeZone())
+            }
+        }
+
+        struct PushDetailCommand: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "push-detail", abstract: "What a phone alert says: counts (default, no text from agents) or titles (ask titles, 80 characters).")
+            @Argument(help: "counts or titles.") var detail: PushDetail
+
+            func run() throws {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                try store.setPushDetail(detail)
+                printPrefs(try store.ownerPrefs(), zone: store.ownerTimeZone())
+            }
+        }
     }
+}
+
+extension PushDetail: ExpressibleByArgument {}
+
+/// The Pushover app token and user key: two lines on standard input, or two prompts in a terminal.
+private func readPushoverCredentials() throws -> (app: String, user: String) {
+    func prompt(_ label: String) throws -> String {
+        guard let line = getpass("\(label): "), let text = String(validatingCString: line), !text.isEmpty else { throw fail("\(label) is empty") }
+        return text
+    }
+    if isatty(STDIN_FILENO) != 0 { return (try prompt("Pushover app token"), try prompt("Pushover user key")) }
+    let data = try FileHandle.standardInput.readToEnd() ?? Data()
+    let lines = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    guard lines.count == 2 else { throw fail("expected two lines on standard input: the Pushover app token, then the user key") }
+    return (lines[0], lines[1])
 }
 
 enum OnOff: String, ExpressibleByArgument { case on, off }
@@ -90,4 +167,9 @@ private func printPrefs(_ prefs: OwnerPrefs, zone: TimeZone) {
     print("quiet hours: \(prefs.quietEnabled ? "\(prefs.quietStart)-\(prefs.quietEnd)" : "off") (\(safe(zone.identifier)))")
     print("digest: \(prefs.digestTime)")
     print("prevent sleep: \(prefs.preventSleep ? "on" : "off")")
+    switch prefs.pushProvider {
+    case nil: print("phone alerts: off")
+    case .ntfy?: print("phone alerts: ntfy \(safe(prefs.pushServer))/\(safe(prefs.pushTopic ?? "?")) (\(prefs.pushDetail.rawValue))")
+    case .pushover?: print("phone alerts: pushover (\(prefs.pushDetail.rawValue))")
+    }
 }

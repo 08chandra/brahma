@@ -24,7 +24,7 @@ import GRDB
                      decisionClass: DecisionClass = .taste) throws -> Ask {
             try store.propose(companyId: company.id, by: .agent((by ?? eng).id), kind: kind, risk: risk, category: category,
                               title: title, summary: "why", payload: payload, itemId: itemId, subjectId: nil, supersedes: supersedes,
-                              requestId: requestId, decisionClass: decisionClass, now: now)
+                              requestId: requestId, decisionClass: decisionClass, quotaExempt: .devHook, now: now)
         }
 
         @discardableResult

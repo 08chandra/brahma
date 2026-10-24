@@ -136,7 +136,7 @@ extension Store {
             let ask = try propose(db: db, companyId: companyId, by: sender, kind: .sprintPlan, risk: nil, category: nil,
                                   title: "\(sprint.name): \(Store.flat(cleanGoal, max: 180))", summary: summary.joined(separator: "\n"),
                                   payload: nil, document: nil, itemId: nil, subjectId: sprint.id, supersedes: nil, requestId: nil,
-                                  decisionClass: missing.isEmpty ? .taste : .goalChanging, viaOwner: false, quota: true, now: now)
+                                  decisionClass: missing.isEmpty ? .taste : .goalChanging, viaOwner: false, now: now)
             sprint.askId = ask.id
             try sprint.update(db)
             try ActivityEvent(companyId: companyId, agentId: actor.id, turnId: nil, kind: .work,

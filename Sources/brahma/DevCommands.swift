@@ -58,7 +58,7 @@ struct DevGroup: ParsableCommand {
                 try store.propose(companyId: c.id, by: .agent(agent.id), kind: AskKind(kind), risk: riskValue, category: category,
                                   title: title, summary: summary, payload: (document != nil || !optionLabels.isEmpty)
                                     ? AskPayload(documentPath: document, options: optionLabels.map { AskOption(label: $0) }) : nil,
-                                  itemId: itemId, supersedes: old, requestId: requestId, decisionClass: cls)
+                                  itemId: itemId, supersedes: old, requestId: requestId, decisionClass: cls, quotaExempt: .devHook)
             }
             print(safe(describe(ask, store: store)))
         }
@@ -126,7 +126,7 @@ struct DevGroup: ParsableCommand {
             let agent = try resolveAgent(store, company: c, handle: by)
             let ask = try refusing {
                 try store.requestFromOwner(companyId: c.id, by: .agent(agent.id), title: title, question: question, details: details,
-                                           expiresInHours: expiresHours)
+                                           expiresInHours: expiresHours, quotaExempt: .devHook)
             }
             print(safe(describe(ask, store: store)))
         }

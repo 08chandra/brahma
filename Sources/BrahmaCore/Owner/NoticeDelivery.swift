@@ -28,9 +28,12 @@ public struct DeliveryPlan: Equatable, Sendable {
     public var markNotices: [Int64] = []
     /// The `remindCount` each ask in `markAsks` was planned at: marking skips an ask whose reminder moved on since.
     public var remindCounts: [String: Int] = [:]
+    /// Phone pushes to send now (empty when phone alerts are off). Independent of `post`: marked by `pushedAt` after a 2xx.
+    public var push: [PushedNotice] = []
 
-    public init(post: [PostedNotice] = [], markAsks: [String] = [], markNotices: [Int64] = [], remindCounts: [String: Int] = [:]) {
-        self.post = post; self.markAsks = markAsks; self.markNotices = markNotices; self.remindCounts = remindCounts
+    public init(post: [PostedNotice] = [], markAsks: [String] = [], markNotices: [Int64] = [], remindCounts: [String: Int] = [:],
+                push: [PushedNotice] = []) {
+        self.post = post; self.markAsks = markAsks; self.markNotices = markNotices; self.remindCounts = remindCounts; self.push = push
     }
 
     /// What to mark once the posts are done: everything planned except the asks and notices behind a banner that failed
@@ -55,6 +58,78 @@ public enum NoticeDelivery {
     public static let maxNoticeBody = 140
 
     public static func plan(dueAsks: [DueAsk], notices: [OwnerNotice], prefs: OwnerPrefs, now: Date, tz: TimeZone) -> DeliveryPlan {
+        var plan = desktopPlan(dueAsks: dueAsks, notices: notices, prefs: prefs, now: now, tz: tz)
+        plan.push = pushPlan(dueAsks: dueAsks, notices: notices, prefs: prefs, now: now, tz: tz)
+        return plan
+    }
+
+    // MARK: Phone pushes
+
+    public static let maxPushTitle = 80
+
+    /// What to push now. Urgent asks (blocked work at the threshold, and every `engineAlert`) and urgent notices go one each,
+    /// at once, quiet hours or not. Everything else waits out quiet hours (it stays due), then coalesces into ONE push.
+    /// Rate limits (`PushDispatcher.minInterval`, `dailyCap`) are the dispatcher's. Nothing is pushed while phone alerts are
+    /// off, and `notificationsEnabled` (desktop banners) does not gate the phone.
+    ///
+    /// Privacy: the text is the engine's own. With `counts` no ask title, notice text or message text appears. With `titles`
+    /// the only agent-controlled text is each ask's flattened title cut to 80 characters (the caller redacts it first).
+    public static func pushPlan(dueAsks: [DueAsk], notices: [OwnerNotice], prefs: OwnerPrefs, now: Date, tz: TimeZone) -> [PushedNotice] {
+        guard prefs.pushProvider != nil else { return [] }
+        let titles = prefs.pushDetail == .titles
+        func companyName(_ n: String) -> String { flatten(n, max: 40) }
+
+        var urgent: [PushedNotice] = []
+        var normalAsks: [DueAsk] = []
+        var normalNotices: [OwnerNotice] = []
+        for due in dueAsks {
+            let isUrgent = due.ask.kind == .engineAlert || NoticeUrgency.of(blockedCount: due.blockedCount) == .urgent
+            guard isUrgent else { normalAsks.append(due); continue }
+            let line = "\(companyName(due.companyName)): \(askLabel(due.ask.kind)) waiting"
+            urgent.append(PushedNotice(title: "Brahma", body: titles ? flatten(due.ask.title, max: maxPushTitle) : line, urgent: true,
+                                       askIds: [due.ask.id], companyId: due.ask.companyId))
+        }
+        for n in notices {
+            guard let id = n.id else { continue }
+            if n.urgency == .urgent {
+                urgent.append(PushedNotice(title: "Brahma", body: "Brahma: 1 thing needs you", urgent: true, noticeIds: [id], companyId: n.companyId))
+            } else {
+                normalNotices.append(n)
+            }
+        }
+        var out = urgent
+        let quiet = prefs.quietHours?.contains(now, tz: tz) ?? false
+        let count = normalAsks.count + normalNotices.count
+        guard !quiet, count > 0 else { return out }
+        let askIds = normalAsks.map(\.ask.id), noticeIds = normalNotices.compactMap(\.id)
+        let line: String
+        if count == 1, let due = normalAsks.first {
+            line = "\(companyName(due.companyName)): \(askLabel(due.ask.kind)) waiting"
+        } else {
+            line = "Brahma: \(count) \(count == 1 ? "thing needs" : "things need") you"
+        }
+        var body = line
+        if titles, !normalAsks.isEmpty {
+            body = normalAsks.prefix(3).map { flatten($0.ask.title, max: maxPushTitle) }.joined(separator: " | ")
+            if count > 3 || !normalNotices.isEmpty { body += " | +\(count - min(3, normalAsks.count)) more" }
+        }
+        out.append(PushedNotice(title: titles ? line : "Brahma", body: titles ? body : line, urgent: false, askIds: askIds,
+                                noticeIds: noticeIds, companyId: normalAsks.first?.ask.companyId ?? normalNotices.first?.companyId))
+        return out
+    }
+
+    /// The engine's own word for what an ask is (an enum, never agent text).
+    static func askLabel(_ kind: AskKind) -> String {
+        switch kind {
+        case .info: "question"
+        case .engineAlert: "engine alert"
+        default: "\(kind.title.lowercased()) approval"
+        }
+    }
+
+    // MARK: Desktop banners
+
+    static func desktopPlan(dueAsks: [DueAsk], notices: [OwnerNotice], prefs: OwnerPrefs, now: Date, tz: TimeZone) -> DeliveryPlan {
         let remindCounts = Dictionary(dueAsks.map { ($0.ask.id, $0.ask.remindCount) }, uniquingKeysWith: { a, _ in a })
         guard prefs.notificationsEnabled else {
             return DeliveryPlan(post: [], markAsks: dueAsks.map(\.ask.id), markNotices: notices.compactMap(\.id), remindCounts: remindCounts)
@@ -112,10 +187,13 @@ public enum NoticeDelivery {
     }
 }
 
-/// The most open owner requests one agent may hold at a time. Every agent-filed ask counts and is checked in the write
-/// that inserts it (`request_from_owner`, `propose_decision`, `plan_sprint`; later `request_secret` and `request_access`,
-/// which must pass `quota: true` too). Engine-filed asks and the dev hook are not checked.
+/// The most open owner requests one agent may hold at a time. Every ask whose requester is an agent counts and is checked
+/// in the write that inserts it, inside `Store.propose` / `requestFromOwner`, so a new agent path is limited by default.
+/// Engine (`system`) asks are exempt, and the owner files none. The only opt-out is `Exemption.devHook`.
 public enum AskQuota {
+    /// A named, deliberate opt-out. Only the dev hook (`brahma dev ...`, refused outside a dev build) uses it.
+    public enum Exemption: Sendable { case devHook }
+
     public static let perAgent = 3
     public static let refusal = "You already have 3 open requests for the owner; wait for an answer before asking again."
 
@@ -135,9 +213,10 @@ public enum AskQuota {
 extension Store {
     /// Asks waiting for the owner without a banner (including reminders), oldest first, in every company, with their
     /// `blockedCount` (see `linkedBlockers`).
-    public func dueAskNotices() throws -> [DueAsk] {
+    /// `forPush` asks for the ones without a phone push (`pushedAt`) instead of without a banner (`notifiedAt`).
+    public func dueAskNotices(forPush: Bool = false) throws -> [DueAsk] {
         try writer.read { db in
-            let asks = try Ask.filter(Column("status") == AskStatus.pendingOwner.rawValue && Column("notifiedAt") == nil)
+            let asks = try Ask.filter(Column("status") == AskStatus.pendingOwner.rawValue && Column(forPush ? "pushedAt" : "notifiedAt") == nil)
                 .order(Column("createdAt"), Column.rowID).fetchAll(db)
             var names: [String: String] = [:]
             var links: [String: LinkedBlockers] = [:]

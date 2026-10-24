@@ -666,7 +666,7 @@ enum Migrations {
     }
 
     /// Plan 5-lite migrations, in the plan's order (v5-sandbox, v5-owner-guard, v5-secrets, v5-extensions, v5-timers,
-    /// v5-notices, v5-notices-2, ...). Called once at the end of `migrator()`, after every 3a migration.
+    /// v5-notices, v5-notices-2, v5-push, ...). Called once at the end of `migrator()`, after every 3a migration.
     static func registerPlan5(_ m: inout DatabaseMigrator) {
         m.registerMigration("v5-sandbox") { db in
             try db.alter(table: "company") { t in
@@ -754,6 +754,27 @@ enum Migrations {
                 t.add(column: "blockedAskId", .text)
                 t.add(column: "blockedAskBy", .text)
             }
+        }
+        m.registerMigration("v5-push") { db in
+            // Phone alerts (Task 7b). The provider's credentials are NOT here: they live in the SecretVault under owner-level
+            // accounts ("owner:NTFY_TOKEN", "owner:PUSHOVER_APP_TOKEN", "owner:PUSHOVER_USER_KEY").
+            try db.alter(table: "ownerPrefs") { t in
+                t.add(column: "pushProvider", .text)
+                t.add(column: "pushServer", .text).notNull().defaults(to: "https://ntfy.sh")
+                t.add(column: "pushTopic", .text)
+                t.add(column: "pushDetail", .text).notNull().defaults(to: "counts")
+            }
+            try db.alter(table: "ask") { t in t.add(column: "pushedAt", .datetime) }
+            try db.alter(table: "ownerNotice") { t in t.add(column: "pushedAt", .datetime) }
+            try db.create(table: "pushLog") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("sentAt", .datetime).notNull()
+                t.column("ok", .boolean).notNull()
+                t.column("status", .integer)
+                // Engine text only (urgent, normal, cap, test, or an error class), never a payload.
+                t.column("detail", .text)
+            }
+            try db.create(index: "pushLog_sentAt", on: "pushLog", columns: ["sentAt"])
         }
         m.registerMigration("v5-digests") { db in
             try db.create(table: "ownerDigest") { t in

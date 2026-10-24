@@ -36,7 +36,7 @@ struct WorkWorld {
     func ask(_ kind: AskKind = .other, title: String = "Pick a name", category: String? = "general", risk: AskRisk? = .high,
              payload: AskPayload? = nil, by: Agent? = nil) throws -> Ask {
         try store.propose(companyId: company.id, by: .agent((by ?? eng).id), kind: kind, risk: risk, category: category, title: title,
-                          summary: "why", payload: payload, viaOwner: true)
+                          summary: "why", payload: payload, viaOwner: true, quotaExempt: .devHook)
     }
 
     func setStatus(_ item: WorkItem, _ status: WorkItemStatus) throws {

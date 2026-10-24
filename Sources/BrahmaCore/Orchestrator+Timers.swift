@@ -66,3 +66,21 @@ extension Orchestrator {
         }
     }
 }
+
+extension Orchestrator {
+    /// Whether only the stop notice may be pushed. Task 7c: true while `engineStopped` holds. Until it exists nothing is held.
+    var pushOnlyStopNotice: Bool { false }
+
+    func pushTaskDone() { pushTask = nil }
+
+    /// The "push" tick step: starts one detached dispatcher pass when phone alerts are on and none is running. Network
+    /// waits never block a tick.
+    func pushTick(now: Date) {
+        guard pushTask == nil, (try? store.ownerPrefs().pushProvider) != nil else { return }
+        let onlyStop = pushOnlyStopNotice
+        pushTask = Task.detached { [self] in
+            await asEngine { await pushDispatcher.tick(now: now, onlyStopNotice: onlyStop) }
+            await pushTaskDone()
+        }
+    }
+}

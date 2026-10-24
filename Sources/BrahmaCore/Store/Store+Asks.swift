@@ -239,13 +239,14 @@ extension Store {
     /// Files an ask. It routes to the first available approver for the kind (see `internalApprover`) and otherwise goes
     /// straight to the owner. `viaOwner` skips the internal step (engine-filed asks that must reach the owner).
     /// A repeat call with the same company, requester and `requestId` returns the existing ask. A `mechanical` decision is
-    /// not an ask: use `recordMechanicalDecision`. `quota` applies `AskQuota` inside the write that inserts the ask (every
-    /// agent tool path passes true; engine-filed asks and the dev hook do not).
+    /// not an ask: use `recordMechanicalDecision`. `AskQuota` is applied inside the write that inserts the ask to every ask an
+    /// agent files (fail-safe: a new agent path is limited without doing anything). Engine (`system`) asks are exempt;
+    /// only the dev hook passes `quotaExempt: .devHook`.
     @discardableResult
     public func propose(companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk? = nil, category: String? = nil,
                         title: String, summary: String, payload: AskPayload? = nil, itemId: String? = nil, subjectId: String? = nil,
                         supersedes: String? = nil, requestId: String? = nil, decisionClass: DecisionClass = .taste,
-                        viaOwner: Bool = false, quota: Bool = false, now: Date = Store.now()) throws -> Ask {
+                        viaOwner: Bool = false, quotaExempt: AskQuota.Exemption? = nil, now: Date = Store.now()) throws -> Ask {
         // The document is read and hashed before the write transaction opens, so a slow file never holds the database.
         var document: PreparedDocument?
         if let raw = payload?.documentPath {
@@ -256,14 +257,14 @@ extension Store {
             try propose(db: db, companyId: companyId, by: sender, kind: kind, risk: risk, category: category, title: title,
                         summary: summary, payload: payload, document: document, itemId: itemId, subjectId: subjectId,
                         supersedes: supersedes, requestId: requestId, decisionClass: decisionClass, viaOwner: viaOwner,
-                        quota: quota, now: now)
+                        quotaExempt: quotaExempt, now: now)
         }
     }
 
     func propose(db: Database, companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk?, category: String?, title: String,
                  summary: String, payload: AskPayload?, document: PreparedDocument?, itemId: String?, subjectId: String?,
-                 supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool, quota: Bool = false,
-                 now: Date) throws -> Ask {
+                 supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool,
+                 quotaExempt: AskQuota.Exemption? = nil, now: Date) throws -> Ask {
         let company = try requireCompany(db, companyId)
         let requester = try askRequester(db, sender, companyId: companyId)
         let rid = Store.cleanRequestId(requestId)
@@ -274,7 +275,7 @@ extension Store {
         guard decisionClass != .mechanical else { throw WorkError.invalid("a mechanical decision is recorded, not filed as an ask") }
         guard kind.isDecision else { throw WorkError.invalid("\(kind.rawValue) asks are not proposed; use request_from_owner") }
         // Counted in the write that inserts, so two concurrent filings cannot both pass.
-        if quota, requester.id != "system" { try AskQuota.check(db: db, agentId: requester.id) }
+        if quotaExempt == nil, requester.id != "system" { try AskQuota.check(db: db, agentId: requester.id) }
 
         let extra = pack(for: company)?.reservedCategories ?? []
         var cat = ReservedMatters.normalize(category)
@@ -383,19 +384,19 @@ extension Store {
         }
     }
 
-    /// A question for the owner (`info` ask). `expiresInHours` counts company-active time. `quota` applies `AskQuota` in
-    /// the same write (agent tool paths pass true; engine and dev paths do not).
+    /// A question for the owner (`info` ask). `expiresInHours` counts company-active time. `AskQuota` applies in the same
+    /// write to every agent requester; only the dev hook passes `quotaExempt: .devHook`.
     @discardableResult
     public func requestFromOwner(companyId: String, by sender: Sender, title: String, question: String, details: String? = nil,
-                                 expiresInHours: Double? = nil, requestId: String? = nil, quota: Bool = false,
-                                 now: Date = Store.now()) throws -> Ask {
+                                 expiresInHours: Double? = nil, requestId: String? = nil,
+                                 quotaExempt: AskQuota.Exemption? = nil, now: Date = Store.now()) throws -> Ask {
         try writer.write { db in
             let company = try requireCompany(db, companyId)
             let requester = try askRequester(db, sender, companyId: companyId)
             let rid = Store.cleanRequestId(requestId)
             if let rid, let existing = try Ask.filter(Column("companyId") == companyId && Column("requesterId") == requester.id
                                                       && Column("requestId") == rid).fetchOne(db) { return existing }
-            if quota, requester.id != "system" { try AskQuota.check(db: db, agentId: requester.id) }
+            if quotaExempt == nil, requester.id != "system" { try AskQuota.check(db: db, agentId: requester.id) }
             let cleanTitle = try Store.cleanAskTitle(title)
             guard let q = try Store.limitedText(question, Store.maxAskField, "the question") else { throw WorkError.invalid("the question is empty") }
             let body = AskPayload(question: q, details: try Store.limitedText(details, Store.maxAskText, "the details"))

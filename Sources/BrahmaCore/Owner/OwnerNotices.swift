@@ -52,12 +52,23 @@ public struct OwnerPrefs: Codable, Equatable, Sendable, FetchableRecord, Persist
     public var quietEnd: String
     public var digestTime: String
     public var preventSleep: Bool
+    /// Phone alerts (Task 7b): nil is off. The credentials are in the vault, never here.
+    public var pushProvider: PushProvider?
+    /// The ntfy base URL (`https` only).
+    public var pushServer: String
+    public var pushTopic: String?
+    public var pushDetail: PushDetail
+
+    public static let defaultPushServer = "https://ntfy.sh"
 
     public init(notificationsEnabled: Bool = true, quietEnabled: Bool = true, quietStart: String = "22:00",
-                quietEnd: String = "08:00", digestTime: String = "08:00", preventSleep: Bool = true) {
+                quietEnd: String = "08:00", digestTime: String = "08:00", preventSleep: Bool = true,
+                pushProvider: PushProvider? = nil, pushServer: String = OwnerPrefs.defaultPushServer, pushTopic: String? = nil,
+                pushDetail: PushDetail = .counts) {
         self.notificationsEnabled = notificationsEnabled; self.quietEnabled = quietEnabled
         self.quietStart = quietStart; self.quietEnd = quietEnd
         self.digestTime = digestTime; self.preventSleep = preventSleep
+        self.pushProvider = pushProvider; self.pushServer = pushServer; self.pushTopic = pushTopic; self.pushDetail = pushDetail
     }
 
     /// Quiet hours 22:00-08:00 and a digest at 08:00 (owner time zone), notifications and sleep prevention on.
@@ -88,6 +99,9 @@ public struct OwnerPrefs: Codable, Equatable, Sendable, FetchableRecord, Persist
         where Self.parseTime(text) == nil {
             throw SettingsError.invalid("\(label) '\(text)' is not HH:MM")
         }
+        do { _ = try PushURL.validate(server: pushServer) } catch { throw SettingsError.invalid("\(error)") }
+        if let pushTopic, !PushURL.validTopic(pushTopic) { throw SettingsError.invalid("\(PushError.badTopic)") }
+        if pushProvider == .ntfy, pushTopic == nil { throw SettingsError.invalid("ntfy needs a topic") }
     }
 }
 

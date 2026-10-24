@@ -73,7 +73,7 @@ import GRDB
         let eng = try store.hire(companyId: company.id, name: "eng-\(UUID().uuidString.prefix(4))", role: "engineer", model: "sonnet")
         for i in 0..<count {
             _ = try store.propose(companyId: company.id, by: .agent(eng.id), kind: .other, risk: .high, category: "general",
-                                  title: "Pick name \(i)", summary: "why", payload: nil, viaOwner: true)
+                                  title: "Pick name \(i)", summary: "why", payload: nil, viaOwner: true, quotaExempt: .devHook)
         }
         return try store.dueAskNotices().map { ($0.ask, $0.companyName, blocked, $0.handle) }
     }
@@ -358,14 +358,31 @@ import GRDB
         // The store counts and inserts in one write when asked to (every agent tool path does).
         #expect(throws: WorkError.invalid(AskQuota.refusal)) {
             try store.propose(companyId: company.id, by: .agent(mgr.id), kind: .other, risk: .low, category: "general", title: "T",
-                              summary: "S", quota: true)
+                              summary: "S")
         }
         #expect(throws: WorkError.invalid(AskQuota.refusal)) {
-            try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "T", question: "Q", quota: true)
+            try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "T", question: "Q")
         }
         // A repeated request_id is not a new ask, so it is not refused.
-        let first = try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "R", question: "Q", requestId: "r-1")
-        #expect(try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "R", question: "Q", requestId: "r-1", quota: true).id == first.id)
+        let first = try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "R", question: "Q", requestId: "r-1", quotaExempt: .devHook)
+        #expect(try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "R", question: "Q", requestId: "r-1").id == first.id)
+    }
+
+    /// Fail-safe: the store applies the quota to any agent-attributed ask with no flag; only engine asks and the named dev
+    /// opt-out are exempt.
+    @Test func agentAskIsQuotadByDefault() throws {
+        let (store, company) = try makeStore()
+        let mgr = try store.hire(companyId: company.id, name: "mgr", role: "manager", model: "sonnet")
+        for i in 0..<3 { _ = try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "Q\(i)", question: "q") }
+        #expect(throws: WorkError.invalid(AskQuota.refusal)) {
+            try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "X", question: "q")
+        }
+        #expect(throws: WorkError.invalid(AskQuota.refusal)) {
+            try store.propose(companyId: company.id, by: .agent(mgr.id), kind: .other, risk: .low, category: "general", title: "T", summary: "S")
+        }
+        // Exempt: the engine, and the dev hook by its explicit name.
+        _ = try store.requestFromOwner(companyId: company.id, by: .system, title: "E", question: "q")
+        _ = try store.requestFromOwner(companyId: company.id, by: .agent(mgr.id), title: "D", question: "q", quotaExempt: .devHook)
     }
 
     @Test func postsCarryTheirIdsAndMarkOnlyWhatPosted() throws {
