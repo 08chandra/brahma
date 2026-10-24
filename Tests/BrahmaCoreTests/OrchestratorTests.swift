@@ -508,8 +508,11 @@ import GRDB
         await w.orchestrator.tick()
         #expect(await w.orchestrator.runningCount() == 2)
 
+        // Until alice's turn task has ended, not just until its outcome is recorded: the record comes first, then the actor hears
+        // the outcome, then the task ends and stops counting as running.
         let deadline = ContinuousClock.now + .seconds(60)
-        while try w.turns(a).first?.outcome == .inProgress, ContinuousClock.now < deadline {
+        while ContinuousClock.now < deadline {
+            if try w.turns(a).first?.outcome != .inProgress, await w.orchestrator.runningCount() == 1 { break }
             try await Task.sleep(for: .milliseconds(5))
         }
         #expect(try w.turns(a).map(\.outcome) == [.usageLimited])
