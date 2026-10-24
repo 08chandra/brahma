@@ -19,6 +19,12 @@ private func request(started: Bool, profile: PermissionProfile = .workspace) -> 
 }
 
 private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
+/// The settings every Workspace turn carries since 5-lite Task 1b (3a's was `{"enabledPlugins":{}}`): bundled skills and the two
+/// builtin plugins off, skill shell execution off, nested `claude` denied, the workflow and fast-mode kill switches.
+let plan1Settings = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disableBundledSkills\":true,"
+    + "\"disableSkillShellExecution\":true,\"disableWorkflows\":true,\"enabledPlugins\":{\"cc-plugin-agents-md@builtin\":false,"
+    + "\"cc-plugin-plugin-authoring@builtin\":false},\"fastMode\":false,\"permissions\":{\"deny\":[\"Bash(claude *)\","
+    + "\"Bash(*/claude *)\"]},\"workflowKeywordTriggerEnabled\":false}"
 
 @Suite struct TurnProfileTests {
     @Test func plan1ArgvUnchanged() throws {
@@ -26,7 +32,7 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
         #expect(first == [
             "-p", "--output-format", "stream-json", "--verbose",
             "--model", "opus", "--fallback-model", "sonnet",
-            "--setting-sources", "", "--settings", "{\"enabledPlugins\":{}}", "--disable-slash-commands",
+            "--setting-sources", "", "--settings", plan1Settings, "--disable-slash-commands",
             "--strict-mcp-config", "--mcp-config", "/tmp/run/a1.mcp.json",
             "--disallowed-tools", disallowed,
             "--session-id", "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0", "--append-system-prompt", "ROLE PROMPT",
@@ -35,6 +41,11 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
             "--add-dir", "/tmp/ws/acme",
         ])
         #expect(ClaudeCommand.arguments(for: request(started: false)) == first)
+        // With a settings file (as every engine turn has), `--settings` names the file instead.
+        var filed = request(started: false)
+        filed.settingsFilePath = "/tmp/run/a1.settings.json"
+        let fileArgs = TurnProfileCompiler.arguments(TurnProfileCompiler.profile(for: filed))
+        #expect(fileArgs == first.map { $0 == plan1Settings ? "/tmp/run/a1.settings.json" : $0 })
         let resumed = TurnProfileCompiler.arguments(TurnProfileCompiler.profile(for: request(started: true)))
         let i = try #require(resumed.firstIndex(of: "--resume"))
         #expect(resumed[i + 1] == "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0")
@@ -58,7 +69,10 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
             "-p", "--output-format", "stream-json", "--verbose",
             "--model", "opus", "--fallback-model", "sonnet",
             "--setting-sources", "", "--settings",
-            "{\"enabledPlugins\":{},\"plansDirectory\":\"/tmp/ws/acme/.brahma/plans/ACME-1\"}", "--disable-slash-commands",
+            // 3a's plansDirectory, now among the 5-lite keys.
+            plan1Settings.replacingOccurrences(of: "},\"workflowKeywordTriggerEnabled\"",
+                                               with: "},\"plansDirectory\":\"/tmp/ws/acme/.brahma/plans/ACME-1\",\"workflowKeywordTriggerEnabled\""),
+            "--disable-slash-commands",
             "--strict-mcp-config", "--mcp-config", "/tmp/run/a1.mcp.json",
             "--disallowed-tools", disallowed + ",Edit,MultiEdit,NotebookEdit,Write,Bash",
             "--session-id", "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0", "--append-system-prompt", "ROLE PROMPT",
@@ -76,12 +90,15 @@ private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
         #expect(pairs == ["/a", "/b"])
     }
 
-    @Test func extraSettingsMerged() {
+    /// 5-lite: the settings are the typed mirror (`ClaudeSettings`, 3a's `extraSettings` dictionary renamed); `settingsJSON` is
+    /// exactly its encoding.
+    @Test func settingsAreTheTypedMirror() {
         var p = TurnProfileCompiler.profile(for: request(started: false))
-        p.extraSettings = ["sandbox": .object(["enabled": .bool(true)])]
-        #expect(TurnProfileCompiler.settingsJSON(p) == "{\"enabledPlugins\":{},\"sandbox\":{\"enabled\":true}}")
-        p.extraSettings = [:]
-        #expect(TurnProfileCompiler.settingsJSON(p) == "{\"enabledPlugins\":{}}")
+        #expect(TurnProfileCompiler.settingsJSON(p) == plan1Settings)
+        p.settings.sandbox = ClaudeSettings.Sandbox(enabled: true)
+        #expect(TurnProfileCompiler.settingsJSON(p).contains("\"sandbox\":{\"enabled\":true}"))
+        p.settings = ClaudeSettings()
+        #expect(TurnProfileCompiler.settingsJSON(p) == "{}")
     }
 
     @Test func slashCommandsFlagKeptByDefault() {

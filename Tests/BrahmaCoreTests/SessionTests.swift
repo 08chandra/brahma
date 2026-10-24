@@ -443,7 +443,9 @@ import GRDB
         let a = s.args(r)
         #expect(a.firstIndex(of: "--permission-mode").map { a[$0 + 1] } == "plan")
         #expect(a.firstIndex(of: "--allowed-tools").map { !a[$0 + 1].split(separator: ",").contains("Edit") } == true)
-        let settings = try #require(a.firstIndex(of: "--settings").map { a[$0 + 1] })
+        // 5-lite: `--settings` names the turn's settings file, which holds the plansDirectory.
+        let settingsFile = try #require(a.firstIndex(of: "--settings").map { a[$0 + 1] })
+        let settings = try String(contentsOfFile: settingsFile, encoding: .utf8)
         #expect(settings.contains("plansDirectory"))
         #expect(settings.contains(".brahma/plans/\(i.key)"))
         #expect(try s.turns(s.eng).first?.kind == .plan)

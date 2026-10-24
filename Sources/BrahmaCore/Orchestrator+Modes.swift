@@ -32,7 +32,7 @@ extension Orchestrator {
         }
         i.opusScarce = (try? store.opusScarce(now: now)) ?? false
         i.calibration = (try? store.modeCalibration()) ?? ModeCalibration()
-        i.subagentGate = SubagentGate.passed(profile: profile)
+        i.subagentGate = SubagentGate.passed(profile: turnProfile(agent: agent, company: company))
         i.trust = agent.trustLevel
         if let f = facts {
             i.tier = f.tier

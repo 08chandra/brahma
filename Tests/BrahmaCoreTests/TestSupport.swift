@@ -97,3 +97,11 @@ enum Toolchain {
             && FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec")
     }
 }
+
+/// 3a's orchestration tests run their companies on the Workspace profile; the Sandboxed profile (5-lite's default for new
+/// companies) has its own tests (`SandboxTurnTests`).
+@discardableResult
+func onWorkspaceProfile(_ store: Store, _ company: Company) throws -> Company {
+    try store.updateSandbox(companyId: company.id, SandboxPatch(profile: .workspace), userHome: try tempDir())
+    return try store.company(id: company.id) ?? company
+}

@@ -344,6 +344,27 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         expectLinked { _ = try w.scope(.work) }
     }
 
+    /// A link at an intermediate component, not the leaf (1a re-review): `.brahma/progress` itself pointing into the item refs,
+    /// `.brahma/labs` pointing elsewhere. The walk names the linked component.
+    @Test func linkAtAnIntermediateComponentRefused() throws {
+        let w = try SandboxWorld()
+        let progress = w.p(".brahma/progress")
+        try? FileManager.default.removeItem(atPath: progress)
+        try FileManager.default.createSymbolicLink(atPath: progress, withDestinationPath: w.p(".git/refs/heads/item"))
+        expectSandboxError(.linkedPath(progress)) { _ = try w.scope(.work) }
+        // The itemless scope has no progress file: it is not refused for it.
+        _ = try w.scope(.work, item: .some(nil))
+
+        let v = try SandboxWorld()
+        let labs = v.p(".brahma/labs")
+        let elsewhere = try tempDir()
+        try FileManager.default.moveItem(atPath: labs, toPath: elsewhere.appending(path: "labs").path)
+        try FileManager.default.createSymbolicLink(atPath: labs, withDestinationPath: elsewhere.appending(path: "labs").path)
+        for kind in TurnKind.allCases {
+            expectSandboxError(.linkedPath(labs)) { _ = try v.scope(kind) }
+        }
+    }
+
     @Test func ownItemRefAsLinkRefused() throws {
         let w = try SandboxWorld()
         try link(w, ".git/refs/heads/item/\(w.key)", to: "../main")

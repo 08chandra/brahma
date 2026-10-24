@@ -79,6 +79,10 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
     }
 
     var requests: [TurnRequest] { lock.withLock { _requests } }
+    /// What `waitForTurnProcesses` reports (processes of an earlier turn that could not be killed).
+    var survivors: [Int32] { get { lock.withLock { _survivors } } set { lock.withLock { _survivors = newValue } } }
+    private var _survivors: [Int32] = []
+    func waitForTurnProcesses(agentId: String) async -> [Int32] { survivors }
     var maxConcurrent: Int { lock.withLock { _maxConcurrent } }
 
     func script(_ handle: String, _ s: Script...) {

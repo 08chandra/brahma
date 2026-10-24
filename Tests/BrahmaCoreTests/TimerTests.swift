@@ -38,7 +38,7 @@ private struct TimerWorld {
     }
 
     func company(_ name: String = "Acme") throws -> Company {
-        try store.createCompany(name: name, goal: "Ship it", workspacesRoot: paths.workspaces)
+        try onWorkspaceProfile(store, try store.createCompany(name: name, goal: "Ship it", workspacesRoot: paths.workspaces))
     }
 
     func cycle() async throws {

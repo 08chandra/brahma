@@ -60,3 +60,83 @@ extension Store {
         }
     }
 }
+
+/// One owner edit of a list in a company's sandbox settings (`brahma network`).
+public enum SandboxListEdit: Equatable, Sendable {
+    case add(String)
+    case remove(String)
+}
+
+public enum SandboxEditError: Error, Equatable, CustomStringConvertible {
+    /// The domain is one of the built-in defaults, which are not stored and cannot be removed.
+    case isDefault(String)
+    case notInList(String)
+    case unknownRole(String)
+
+    public var description: String {
+        switch self {
+        case .isDefault(let d): "\(d) is a default and cannot be removed"
+        case .notInList(let v): "\(v) is not in the list"
+        case .unknownRole(let r): "no role '\(r)' in this company"
+        }
+    }
+}
+
+extension SandboxPatch {
+    /// The company's profile, or (with `role`) that role's override.
+    public static func profile(_ profile: PermissionProfile, role: String?, company: Company) -> SandboxPatch {
+        guard let role else { return SandboxPatch(profile: profile) }
+        var roles = company.roleProfiles
+        roles[role] = profile
+        return SandboxPatch(roleProfiles: roles)
+    }
+
+    /// A Bash egress domain (or, `web`, a WebFetch domain) added or removed. Defaults cannot be removed.
+    public static func domains(_ edit: SandboxListEdit, web: Bool, company: Company) throws -> SandboxPatch {
+        let current = web ? company.webDomains : company.allowedDomains
+        let defaults = Set(web ? CompanyNetwork.defaultRegistries + CompanyNetwork.defaultDocs : CompanyNetwork.defaultRegistries)
+        var list = current
+        switch edit {
+        case .add(let d):
+            list.append(d)
+        case .remove(let d):
+            let n = SandboxDomains.normalize(d)
+            if defaults.contains(n) { throw SandboxEditError.isDefault(n) }
+            guard list.contains(n) else { throw SandboxEditError.notInList(n) }
+            list.removeAll { $0 == n }
+        }
+        return web ? SandboxPatch(webDomains: list) : SandboxPatch(allowedDomains: list)
+    }
+
+    /// A toolchain read path added or removed (validated by `Store.updateSandbox`).
+    public static func toolchain(_ edit: SandboxListEdit, company: Company) throws -> SandboxPatch {
+        var list = company.toolchainReadPaths
+        switch edit {
+        case .add(let p):
+            if !list.contains(p) { list.append(p) }
+        case .remove(let p):
+            guard list.contains(p) else { throw SandboxEditError.notInList(p) }
+            list.removeAll { $0 == p }
+        }
+        return SandboxPatch(toolchainReadPaths: list)
+    }
+}
+
+extension CompanyNetwork {
+    /// The effective lists a company's sandboxed turns get, defaults marked `(default)` (`brahma network <co>`).
+    public static func listing(company: Company) -> [String] {
+        let scope = scope(company: company, grantDomains: [], grantWebDomains: [])
+        let bashDefaults = Set(defaultRegistries), webDefaults = Set(defaultRegistries + defaultDocs)
+        var lines = ["Bash egress (sandboxed turns and checks):"]
+        lines += scope.allowedDomains.map { "  \($0)" + (bashDefaults.contains($0) ? " (default)" : "") }
+        lines.append("WebFetch:")
+        lines += scope.webDomains.map { "  \($0)" + (webDefaults.contains($0) ? " (default)" : "") }
+        lines.append("Local binding: \(company.allowLocalBinding ? "on" : "off")" + (company.allowLocalBinding ? " (default)" : ""))
+        lines.append("Toolchain read paths:")
+        lines += company.toolchainReadPaths.isEmpty ? ["  (none)"] : company.toolchainReadPaths.map { "  \($0)" }
+        var profile = "Profile: \(company.permissionProfile.rawValue)" + (company.permissionProfile == .sandboxed ? " (default)" : "")
+        for (role, p) in company.roleProfiles.sorted(by: { $0.key < $1.key }) { profile += "; \(role): \(p.rawValue)" }
+        lines.append(profile)
+        return lines
+    }
+}

@@ -63,9 +63,14 @@ private let allModes = [quick, standard, deep, deepOpus]
 
     @Test func quickHasNoTaskAndWorkflowKillSwitches() throws {
         let a = args(request(quick))
-        let settingsJSON = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disableWorkflows\":true,\"enabledPlugins\":{},"
+        // 3a's keys plus 5-lite's (Task 1b): disableBundledSkills, disableSkillShellExecution, the two builtin plugins off, and
+        // the nested-claude denies.
+        let settingsJSON = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disableBundledSkills\":true,"
+            + "\"disableSkillShellExecution\":true,\"disableWorkflows\":true,\"enabledPlugins\":{\"cc-plugin-agents-md@builtin\":false,"
+            + "\"cc-plugin-plugin-authoring@builtin\":false},"
             + "\"fastMode\":false,\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"command\":\"\(hook) --mode quick\","
-            + "\"type\":\"command\"}],\"matcher\":\"Agent|Task|Workflow\"}]},\"maxEffortLevel\":\"low\",\"workflowKeywordTriggerEnabled\":false}"
+            + "\"type\":\"command\"}],\"matcher\":\"Agent|Task|Workflow\"}]},\"maxEffortLevel\":\"low\","
+            + "\"permissions\":{\"deny\":[\"Bash(claude *)\",\"Bash(*/claude *)\"]},\"workflowKeywordTriggerEnabled\":false}"
         #expect(a == [
             "-p", "--output-format", "stream-json", "--verbose",
             "--model", "haiku", "--fallback-model", "sonnet",
@@ -302,10 +307,11 @@ private let allModes = [quick, standard, deep, deepOpus]
     }
 
     @Test func plan1InputsCompileUnchanged() {
-        // No mode on the request (the doctor's probe, Plan 1 callers): byte-identical to before.
+        // No mode on the request (the doctor's probe, Plan 1 callers): no mode flags; the settings are 5-lite's common keys
+        // (Task 1b: no maxEffortLevel without a mode).
         let a = args(request(nil))
         #expect(!a.contains("--effort")); #expect(!a.contains("--max-turns")); #expect(!a.contains("--max-budget-usd"))
-        #expect(value(a, "--settings") == "{\"enabledPlugins\":{}}")
+        #expect(value(a, "--settings") == plan1Settings)
         #expect(TurnProfileCompiler.profile(for: request(nil)).environment == ["BRAHMA_AGENT_ID": "a1"])
     }
 }

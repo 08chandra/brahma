@@ -27,7 +27,7 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
         #expect(args == [
             "-p", "--output-format", "stream-json", "--verbose",
             "--model", "opus", "--fallback-model", "sonnet",
-            "--setting-sources", "", "--settings", "{\"enabledPlugins\":{}}", "--disable-slash-commands",
+            "--setting-sources", "", "--settings", plan1Settings, "--disable-slash-commands",
             "--strict-mcp-config", "--mcp-config", "/tmp/run/a1.mcp.json",
             "--disallowed-tools", disallowed,
             "--session-id", "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0", "--append-system-prompt", "ROLE PROMPT",

@@ -9,17 +9,17 @@ extension PermissionProfile: ExpressibleByArgument {}
 struct Run: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Run the orchestrator in the foreground until Ctrl-C.",
-        discussion: "WARNING: --profile full gives agents access to your whole Mac, not just their workspace.")
+        discussion: "Each turn runs under its company's profile for the agent's role ('brahma company profile'; sandboxed "
+            + "unless you changed it). --profile is a ceiling: it can narrow those profiles, never widen them.")
 
     @Option(help: "Maximum concurrent turns across all companies.") var hardCap: Int = 16
-    @Option(help: "workspace (default) or full.") var profile: PermissionProfile = .workspace
+    @Option(help: "A ceiling on every turn's profile: sandboxed, workspace or full (default: each company's own profile).")
+    var profile: PermissionProfile?
 
     @Flag(name: .customLong("skip-doctor"), help: .hidden) var skipDoctor = false
 
     func validate() throws {
         guard hardCap >= 1 else { throw ValidationError("--hard-cap must be at least 1") }
-        // Until the sandbox is wired into turns (Task 1b), `sandboxed` would silently run as `workspace`.
-        guard profile != .sandboxed else { throw ValidationError("--profile sandboxed is not available yet; use workspace or full") }
     }
 
     func run() async throws {
@@ -65,7 +65,8 @@ struct Run: AsyncParsableCommand {
         }
 
         let tier = store.planTier()
-        print("brahma running (plan \(tier.rawValue), up to \(min(hardCap, tier.hardCap)) concurrent turns, profile \(profile.rawValue)); Ctrl-C to stop")
+        print("brahma running (plan \(tier.rawValue), up to \(min(hardCap, tier.hardCap)) concurrent turns, "
+              + "profile \(profile.map { "at most \($0.rawValue)" } ?? "per company")); Ctrl-C to stop")
         let printing = Task {
             while !Task.isCancelled {
                 printer.drain()

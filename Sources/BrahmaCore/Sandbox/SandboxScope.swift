@@ -18,13 +18,15 @@ public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedEr
     case dataHomeInsideWorkspace(String)
     /// The platform sandbox is missing (Tasks 1b/2).
     case unavailable
-    /// A path holds `'`, `"`, a line break or NUL, which no sandbox profile or settings file may carry.
+    /// A path holds `'`, `"`, `\`, a control character (NUL, tab, line breaks, ESC …), DEL or `%00`, which no sandbox
+    /// profile, settings file or shell prefix may carry (`SandboxPath.isUnsafe`).
     case unsafePathCharacter(String)
     /// A domain that would route to Anthropic's API (`anthropic.com`, `claude.ai`, `claude.com` or a subdomain).
     case forbiddenDomain(String)
     /// Not a domain pattern the sandbox routes (the `DomainMatcher.isValidPattern` rules, Task 2).
     case invalidDomain(String)
-    /// An agent handle that is not a safe single path component, or that names a team's or the company's notes file.
+    /// An agent handle that is not a safe single path component (3a's handle alphabet). Agent notes live under
+    /// `notes/agents/`, so a handle can no longer name a team's or the company's notes file.
     case invalidHandle(String)
     /// A path that is not absolute (or `~`, `~/…`), or an item key that is not a valid key.
     case invalidPath(String)
@@ -39,7 +41,7 @@ public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedEr
         case .writableOutsideCompany(let path): "\(path) is outside the company workspace and cannot be writable"
         case .dataHomeInsideWorkspace(let path): "the Brahma data home \(path) is inside a company workspace"
         case .unavailable: "the sandbox is not available on this Mac"
-        case .unsafePathCharacter(let path): "the path \(path.debugDescription) holds a quote, a line break or NUL"
+        case .unsafePathCharacter(let path): "the path \(path.debugDescription) holds a quote, a backslash or a control character"
         case .forbiddenDomain(let domain): "\(domain) routes to Anthropic's API and is never allowed"
         case .invalidDomain(let domain): "\(domain.debugDescription) is not a valid domain pattern"
         case .invalidHandle(let handle): "\(handle.debugDescription) cannot be an agent's sandbox handle"
@@ -185,7 +187,8 @@ extension URL {
 // MARK: Layout
 
 /// Where one agent's sandboxed turns live inside its company's workspace. Paths are as the workspace path names them;
-/// `SandboxScope.forTurn` resolves them.
+/// `SandboxScope.forTurn` resolves only the workspace itself and builds every own place logically under it (never resolved:
+/// a link at or above one refuses the turn).
 public struct SandboxLayout: Equatable, Sendable {
     public let handle: String
     public let companySlug: String
@@ -378,8 +381,11 @@ public struct GrantInputs: Equatable, Sendable {
 
 // MARK: Scope
 
-/// What one turn may touch. Every URL is resolved (`resolvedForSandbox`). Writes are allowed only to `cwd` and `writable`,
-/// minus `denyWrite` (a deny inside an allowed directory wins); reads are denied in `denyRead`, except `readable`.
+/// What one turn may touch. `workspace` is resolved; `cwd`, `writable` and the turn's own `readable` places are built
+/// logically under it and are link-free when computed (a link at or above one refuses the turn, `.linkedPath`; re-checked
+/// right before spawn, `recheckBeforeSpawn`). Owner-chosen read paths are resolved. Deny entries come in both forms, as
+/// built and resolved (a deny on a link holds for the link and for what it names). Writes are allowed only to `cwd` and
+/// `writable`, minus `denyWrite` (a deny inside an allowed directory wins); reads are denied in `denyRead`, except `readable`.
 public struct SandboxScope: Equatable, Sendable {
     /// The company workspace every writable entry must lie in.
     public var workspace: URL
@@ -410,7 +416,8 @@ public struct SandboxScope: Equatable, Sendable {
     private var deniedRoots: [URL] { denyRead.filter { d in !protected.contains(d) } }
 
     /// Throws when:
-    /// - any path holds `'`, `"`, a line break or NUL (`.unsafePathCharacter`), or is not absolute (`.invalidPath`);
+    /// - any path holds `'`, `"`, `\`, a control character, DEL or `%00` (`.unsafePathCharacter`), or is not absolute
+    ///   (`.invalidPath`);
     /// - a `cwd`, `writable`, `readable`, `readOnlyDirs` (or `toolchainTempWrite`) entry equals, contains or lies inside a
     ///   `protected` entry, or equals or contains one of the denied roots (`.overlapsProtected`);
     /// - a writable entry (or `cwd`) is outside the workspace (`.writableOutsideCompany`; `toolchainTempWrite` is exempt);
@@ -430,6 +437,19 @@ public struct SandboxScope: Equatable, Sendable {
             throw SandboxError.writableOutsideCompany(path: entry.path)
         }
         for domain in network.allowedDomains + network.webDomains { try SandboxDomains.check(domain) }
+    }
+
+    /// Right before the turn's process starts (the scope may be some time old by then): the link walk again over `cwd` and
+    /// every writable entry, `cwd` a real directory whose resolved path is `cwd` itself (the process is started in it, and a
+    /// directory opened through a link would be the link's target), then `validate()`. A process of the agent's that outlived
+    /// an earlier turn is gone by now (the runner sweeps every turn), so what this sees is what the turn starts with.
+    public func recheckBeforeSpawn() throws {
+        for url in [cwd] + writable {
+            if let hit = SandboxPath.linkedComponent(url.path, under: workspace.path) { throw SandboxError.linkedPath(hit) }
+        }
+        guard SandboxPath.kind(cwd.path) == .directory else { throw SandboxError.invalidPath(cwd.path) }
+        guard SandboxPath.key(SandboxPath.resolve(cwd.path)) == SandboxPath.key(cwd.path) else { throw SandboxError.linkedPath(cwd.path) }
+        try validate()
     }
 
     static func checkAllowed(_ entry: URL, protected: [URL], deniedRoots: [URL]) throws {

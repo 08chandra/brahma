@@ -16,13 +16,16 @@ public enum RolePrompt {
     /// The tools a role gets when none are given: the base and work tools.
     static let defaultTools = CompanyToolNames.base + CompanyToolNames.work
 
+    /// The line a role on the Sandboxed profile gets (5-lite Task 1b), verbatim.
+    public static let sandboxLine = "Your shell is sandboxed: you can write only in your working directory, your lab and your cache. For xcodebuild pass -derivedDataPath .build/DerivedData; for SwiftPM pass --cache-path .build/cache."
+
     /// Byte-stable for a given agent, company and role: it rides every turn as the cacheable prefix, so it carries no roster,
     /// counts or times (the roster rides in the orientation digest). `roster` is accepted for older callers and ignored.
-    /// `tools` are the company tools the role may call (default: the base and work tools).
+    /// `tools` are the company tools the role may call (default: the base and work tools). `sandboxed` appends `sandboxLine`.
     public static func render(agent: Agent, company: Company, roster: [Agent] = [], template: RoleTemplate? = nil,
-                              tools: [String]? = nil) -> String {
+                              tools: [String]? = nil, sandboxed: Bool = false) -> String {
         let names = tools ?? template?.companyTools ?? defaultTools
-        return """
+        let text = """
         You are @\(agent.name), the \(agent.role) of \(company.name), a company of AI agents run on behalf of a human owner.
 
         Company goal: \(company.goal)
@@ -49,6 +52,7 @@ public enum RolePrompt {
         Operating rules:
         \(OperatingRules.text)
         """
+        return sandboxed ? text + "\n\n" + sandboxLine : text
     }
 }
 

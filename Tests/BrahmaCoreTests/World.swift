@@ -13,17 +13,24 @@ struct World {
     let paths: BrahmaPaths
     let orchestrator: Orchestrator
 
+    /// The owner's home the sandboxed turns' scopes protect: a temp dir, never the real one.
+    let userHome: URL
+
     init(store: Store? = nil, config: SchedulerConfig = World.config(), memory: (any MemoryPressureSource)? = nil,
          checkEnvironment: [String: String]? = nil, checkRunner: (any CheckRunning)? = nil,
          planSelector: @escaping @Sendable (Agent, WorkItem, Company) -> Bool = { _, _, _ in false },
-         vault: any SecretVault = MemoryVault()) throws {
+         vault: any SecretVault = MemoryVault(), profile: PermissionProfile? = nil) throws {
         self.store = try store ?? Store.inMemory()
         try self.store.setPlanTier(.max20x)   // Plan 1 tests assume the 2/6/16 mode caps
         router = MessageRouter(store: self.store)
         let root = try tempDir()
         paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        userHome = root.appending(path: "user")
+        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
         orchestrator = Orchestrator(store: self.store, runner: fake, paths: paths, config: config,
-                                    mcpExecutable: "/usr/local/bin/brahma", clock: clock.function,
+                                    mcpExecutable: "/usr/local/bin/brahma", profile: profile,
+                                    sandboxEnvironment: SandboxEnvironment(userHome: userHome, darwinUserTemp: nil, shell: "/bin/zsh"),
+                                    clock: clock.function,
                                     memory: memory ?? DispatchMemoryPressureSource(), checkRunner: checkRunner ?? checks,
                                     checkBaseEnvironment: checkEnvironment ?? ProcessInfo.processInfo.environment,
                                     planSelector: planSelector, vault: vault)
@@ -37,11 +44,16 @@ struct World {
         return c
     }
 
-    func company(_ name: String, mode: UsageMode = .low) throws -> Company {
+    /// 3a's orchestration tests run their companies on the Workspace profile; the Sandboxed profile (the default for new
+    /// companies) has its own tests (`SandboxTurnTests`).
+    func company(_ name: String, mode: UsageMode = .low, profile: PermissionProfile = .workspace) throws -> Company {
         var c = try store.createCompany(name: name, goal: "Ship it", workspacesRoot: paths.workspaces)
         c.usageMode = mode
         try store.updateCompany(c)
-        return c
+        if profile != c.permissionProfile {
+            try store.updateSandbox(companyId: c.id, SandboxPatch(profile: profile), userHome: userHome)
+        }
+        return try store.company(id: c.id) ?? c
     }
 
     func hire(_ c: Company, _ name: String, role: String? = nil) throws -> Agent {

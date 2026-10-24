@@ -18,7 +18,8 @@ public struct TurnProfile: Equatable, Sendable {
     public var addDirs: [String]
     public var allowedTools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__company"]
     public var disallowedTools = ClaudeCommand.disallowedTools
-    public var extraSettings: [String: JSONValue] = [:]
+    /// The turn's settings (the typed mirror `ClaudeSettingsCompiler` compiles; 3a's `extraSettings` dictionary before 5-lite).
+    public var settings = ClaudeSettings()
     public var disableSlashCommands = true
     /// `BRAHMA_*` variables plus the engine's `CLAUDE_CODE_*` controls (`ChildEnvironment.engineClaudeVars`).
     public var environment: [String: String] = [:]
@@ -46,6 +47,20 @@ public struct TurnProfile: Equatable, Sendable {
     public var quotas: ModeQuotas? = nil
     /// `<quoted brahma> hook pre-tool`: the engine's PreToolUse hook on `Agent|Task|Workflow`, on every mode turn.
     public var hookCommand: String? = nil
+    /// That hook as the settings carry it (`hooks.PreToolUse`), built by `apply`.
+    public var preToolHook: HookMatcher? = nil
+
+    // Sandboxed profile (5-lite Task 1b).
+    /// When set, `--settings <path>` names this file (which holds `settingsJSON(_:)`) instead of carrying the JSON inline.
+    public var settingsFilePath: String? = nil
+    /// `--restricted`: only the built-in tools `tools` names, file tools confined to the cwd and `--add-dir`.
+    public var restricted = false
+    /// `--tools`.
+    public var tools: [String]? = nil
+    /// `--permission-prompts` (`none`: anything that would prompt is denied).
+    public var permissionPrompts: String? = nil
+    /// `--plugin-dir`, one per mounted extension part (Task 5a).
+    public var pluginDirs: [String] = []
 
     public init(model: String, session: Session, mcpConfigPath: String, permission: PermissionProfile,
                 workingDirectory: String, addDirs: [String] = []) {
@@ -66,10 +81,13 @@ public struct WorkflowPolicy: Equatable, Sendable {
 
 public enum TurnProfileError: Error, Equatable, CustomStringConvertible {
     case modelNotAllowed(String)
+    /// A Sandboxed turn missing part of its sandbox: it never starts.
+    case sandboxIncomplete(String)
 
     public var description: String {
         switch self {
         case .modelNotAllowed(let m): ModelAllowlist.refusal(m)
+        case .sandboxIncomplete(let why): "sandbox scope: the sandboxed turn is incomplete (\(why)); it was not started"
         }
     }
 }
@@ -99,13 +117,43 @@ public enum TurnProfileCompiler {
             for name in ["Edit", "MultiEdit", "NotebookEdit", "Write", "Bash"] where !p.disallowedTools.contains(name) {
                 p.disallowedTools.append(name)
             }
-            if let dir = r.planDirectory {
-                p.extraSettings["plansDirectory"] = .string(dir)
-                p.addDirs = [dir]
-            }
+            if let dir = r.planDirectory { p.addDirs = [dir] }
         }
         if let d = r.mode { apply(d, to: &p, hookCommand: r.hookCommand, kind: r.kind) }
-        return restricted(p, for: r.kind)
+        p = restricted(p, for: r.kind)
+        // F10: `--disable-slash-commands` stays unless extension parts mount (then the Skill denies replace it).
+        p.disableSlashCommands = r.mounts.isEmpty
+        p.pluginDirs = r.mounts.map(\.path)
+        p.settingsFilePath = r.settingsFilePath
+        if r.profile == .sandboxed { sandboxed(r, &p) }
+        p.settings = ClaudeSettingsCompiler.compile(
+            scope: r.profile == .sandboxed ? r.sandbox : nil, profile: r.profile, mode: r.mode, mounts: r.mounts,
+            hookCommand: r.postToolHookCommand, preToolHook: p.preToolHook, kind: r.kind, plansDirectory: r.planDirectory,
+            deniedPaths: r.profile == .workspace ? r.deniedPaths : [], workflow: r.workflow)
+        return p
+    }
+
+    /// The Sandboxed profile's part of a profile: `--restricted`, the mode's built-in tools, no prompts, the scope's cwd and
+    /// read-only directories, and the shell prefix. Without a scope the cwd and directories are left as they are and
+    /// `validate` refuses the profile.
+    static func sandboxed(_ r: TurnRequest, _ p: inout TurnProfile) {
+        p.restricted = true
+        p.permissionPrompts = "none"
+        if r.kind.isReview {
+            p.tools = BuiltinTools.review
+        } else if r.kind == .plan {
+            p.tools = BuiltinTools.plan
+        } else if p.subagents != .off {
+            // Only once the sub-agent gate passed (14u); no web tools until F7.
+            p.tools = BuiltinTools.taskTurn
+        } else {
+            p.tools = BuiltinTools.sandboxed
+        }
+        if let scope = r.sandbox {
+            p.workingDirectory = scope.cwd.path
+            p.addDirs = scope.readOnlyDirs.map(\.path)
+        }
+        if let prefix = r.shellPrefix { p.environment["CLAUDE_CODE_SHELL_PREFIX"] = prefix }
     }
 
     /// The work-mode part of a profile (design §2.3): `--effort`, `--max-turns`, `--max-budget-usd`, the common settings keys
@@ -125,18 +173,12 @@ public enum TurnProfileCompiler {
         p.quotas = d.quotas
         p.hookCommand = hookCommand
         p.subagents = kind.isReview || kind == .plan ? .off : d.subagents
-        p.extraSettings["availableModels"] = .array(availableModels.map { .string($0) })
-        p.extraSettings["fastMode"] = .bool(false)
-        p.extraSettings["workflowKeywordTriggerEnabled"] = .bool(false)
-        p.extraSettings["disableWorkflows"] = .bool(true)
-        p.extraSettings["maxEffortLevel"] = .string(d.maxEffortLevel.rawValue)
+        // The settings keys (`availableModels`, `fastMode`, the workflow kill switches, `maxEffortLevel`) are compiled from the
+        // decision by `ClaudeSettingsCompiler`; the pre-tool hook block is built here and merged in unchanged.
         if let hookCommand {
             var command = "\(hookCommand) --mode \(d.mode.rawValue)"
             if p.subagents != .off { command += " --subagents" }
-            p.extraSettings["hooks"] = .object(["PreToolUse": .array([.object([
-                "matcher": .string(hookMatcher),
-                "hooks": .array([.object(["type": .string("command"), "command": .string(command)])]),
-            ])])])
+            p.preToolHook = HookMatcher(matcher: hookMatcher, hooks: [HookCommand(command: command)])
         }
         p.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] = "1"
         p.environment["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
@@ -167,10 +209,23 @@ public enum TurnProfileCompiler {
         "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "' hook pre-tool"
     }
 
-    /// Refuses a profile whose model or fallback is not on the allowlist (owner pins included). The runner calls it before
-    /// it starts a process.
+    /// Refuses a profile whose model or fallback is not on the allowlist (owner pins included), and a Sandboxed profile that
+    /// lacks any part of its sandbox (the sandbox block, the settings file, `--restricted` and `--tools`, the shell prefix):
+    /// such a turn never starts. The runner calls it before it starts a process.
     public static func validate(_ p: TurnProfile) throws {
         for m in [p.model, p.fallbackModel] where !ModelAllowlist.allows(m) { throw TurnProfileError.modelNotAllowed(m) }
+        guard p.permission == .sandboxed else { return }
+        guard let sandbox = p.settings.sandbox, sandbox.enabled == true, sandbox.failIfUnavailable == true,
+              sandbox.allowUnsandboxedCommands == false, sandbox.filesystem != nil else {
+            throw TurnProfileError.sandboxIncomplete("no sandbox scope was compiled")
+        }
+        guard p.settingsFilePath != nil else { throw TurnProfileError.sandboxIncomplete("no settings file") }
+        guard p.restricted, p.tools != nil, p.permissionPrompts == "none" else {
+            throw TurnProfileError.sandboxIncomplete("not restricted to its tools")
+        }
+        guard let prefix = p.environment["CLAUDE_CODE_SHELL_PREFIX"], !prefix.isEmpty else {
+            throw TurnProfileError.sandboxIncomplete("no shell prefix")
+        }
     }
 
     /// Review and audit turns never get sub-agent or workflow tools, whatever the profile was widened to.
@@ -184,15 +239,8 @@ public enum TurnProfileCompiler {
         return p
     }
 
-    /// `{"enabledPlugins":{}}` merged with `extraSettings`, compact, keys sorted.
-    public static func settingsJSON(_ p: TurnProfile) -> String {
-        var settings = p.extraSettings
-        if settings["enabledPlugins"] == nil { settings["enabledPlugins"] = .object([:]) }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let data = (try? encoder.encode(settings)) ?? Data("{\"enabledPlugins\":{}}".utf8)
-        return String(decoding: data, as: UTF8.self)
-    }
+    /// The compiled settings (`p.settings`), compact, keys sorted: the settings file's bytes (or the inline `--settings`).
+    public static func settingsJSON(_ p: TurnProfile) -> String { p.settings.json() }
 
     /// `2.00`, `0.30`, `0.0425`: two decimals, more when a small cap needs them.
     static func money(_ v: Double) -> String {
@@ -208,9 +256,13 @@ public enum TurnProfileCompiler {
         var a = [
             "-p", "--output-format", "stream-json", "--verbose",
             "--model", p.model, "--fallback-model", p.fallbackModel,
-            "--setting-sources", "", "--settings", settingsJSON(p),
         ]
+        if p.restricted { a.append("--restricted") }
+        if let tools = p.tools { a += ["--tools", tools.joined(separator: ",")] }
+        if let prompts = p.permissionPrompts { a += ["--permission-prompts", prompts] }
+        a += ["--setting-sources", "", "--settings", p.settingsFilePath ?? settingsJSON(p)]
         if p.disableSlashCommands { a.append("--disable-slash-commands") }
+        for dir in p.pluginDirs { a += ["--plugin-dir", dir] }
         a += ["--strict-mcp-config", "--mcp-config", p.mcpConfigPath,
               "--disallowed-tools", p.disallowedTools.joined(separator: ",")]
         switch p.session {
@@ -223,7 +275,6 @@ public enum TurnProfileCompiler {
         }
         switch p.permission {
         case .workspace, .sandboxed:
-            // `sandboxed` keeps the workspace argv until Task 1b compiles the sandbox settings; never looser than workspace.
             a += ["--permission-mode", p.permissionModeOverride ?? "acceptEdits", "--allowed-tools", p.allowedTools.joined(separator: ",")]
             for dir in p.addDirs { a += ["--add-dir", dir] }
         case .full:

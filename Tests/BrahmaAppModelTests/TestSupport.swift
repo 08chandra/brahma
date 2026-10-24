@@ -19,7 +19,8 @@ func tempDir() throws -> URL {
 
 func makeHome() throws -> (Store, BrahmaPaths) {
     let home = try tempDir()
-    let paths = BrahmaPaths(home: home, workspaces: home.appending(path: "workspaces", directoryHint: .isDirectory))
+    // Beside the data home, not inside it: a workspace inside the data home can never be sandboxed (5-lite).
+    let paths = BrahmaPaths(home: home, workspaces: try tempDir().appending(path: "workspaces", directoryHint: .isDirectory))
     try FileManager.default.createDirectory(at: paths.workspaces, withIntermediateDirectories: true)
     return (try Store(path: paths.database.path), paths)
 }
@@ -27,7 +28,12 @@ func makeHome() throws -> (Store, BrahmaPaths) {
 /// Acme: ceo ready, cto sleeping, eng blocked on the owner. Plus an empty company "Globex".
 @discardableResult
 func seedAcme(_ s: Store, _ p: BrahmaPaths) throws -> (Company, ceo: Agent, cto: Agent, eng: Agent) {
-    let acme = try s.createCompany(name: "Acme", goal: "Build", workspacesRoot: p.workspaces)
+    var acme = try s.createCompany(name: "Acme", goal: "Build", workspacesRoot: p.workspaces)
+    // 3a's app tests run on the Workspace profile (5-lite's sandboxed default has its own tests in BrahmaCoreTests).
+    let scratchHome = FileManager.default.temporaryDirectory.appending(path: "brahma-test-home-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: scratchHome, withIntermediateDirectories: true)
+    try s.updateSandbox(companyId: acme.id, SandboxPatch(profile: .workspace), userHome: scratchHome)
+    acme = try s.company(id: acme.id) ?? acme
     let ceo = try s.hire(companyId: acme.id, name: "ceo", role: "ceo", model: "sonnet")
     let cto = try s.hire(companyId: acme.id, name: "cto", role: "cto", model: "sonnet")
     let eng = try s.hire(companyId: acme.id, name: "eng", role: "engineer", model: "sonnet")

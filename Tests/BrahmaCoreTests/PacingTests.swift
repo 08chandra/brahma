@@ -303,7 +303,7 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
             let root = try tempDir()
             try store.setPlanTier(tier)
             var co = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: root.appending(path: "ws"))
-            co.usageMode = .max; try store.updateCompany(co); c = co
+            co.usageMode = .max; try store.updateCompany(co); c = try onWorkspaceProfile(store, co)
             o = Orchestrator(store: store, runner: fake,
                              paths: BrahmaPaths(home: root.appending(path: "h"), workspaces: root.appending(path: "ws")),
                              mcpExecutable: "/x", clock: clock.function, memory: NormalMemoryPressure(),

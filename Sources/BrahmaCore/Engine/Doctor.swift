@@ -51,14 +51,21 @@ public enum Doctor {
         "--disallowed-tools", "--add-dir", "--settings", "--setting-sources", "--disable-slash-commands",
         // Work modes (W11): visible in --help. The hidden --max-turns is checked by the mode-canary (probe V-11).
         "--effort", "--max-budget-usd",
+        // The Sandboxed profile (5-lite Task 1b).
+        "--restricted", "--tools", "--plugin-dir", "--permission-prompts",
     ]
+
+    /// Where an administrator's managed settings live; `disableSideloadFlags` there makes the CLI ignore `--plugin-dir` (and
+    /// `--mcp-config`).
+    public static let managedSettingsPath = "/Library/Application Support/ClaudeCode/managed-settings.json"
 
     /// Runs an executable with arguments and returns its stdout, or nil when it cannot run. Injected by tests.
     public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async -> String?
 
     /// `hookExecutable`: the `brahma` the mode-canary's profiles name in their pre-tool hook, as real turns do.
     public static func run(claudePath: String, runner: any TurnRunning, exec: @escaping Exec = defaultExec,
-                           now: Date = .now, hookExecutable: String = "brahma") async -> DoctorReport {
+                           now: Date = .now, hookExecutable: String = "brahma",
+                           managedSettingsPath: String = Doctor.managedSettingsPath) async -> DoctorReport {
         guard let version = await cliVersion(claudePath: claudePath, exec: exec) else {
             return DoctorReport(cliVersion: nil, items: [
                 DoctorItem(name: "version", status: .fail, detail: "can't run '\(claudePath) --version'; is Claude Code installed?"),
@@ -67,7 +74,9 @@ public enum Doctor {
         var items = [versionItem(version)]
         items.append(await flagsItem(claudePath: claudePath, exec: exec))
         let probe = await runProbe(runner: runner)
-        items += probe
+        items += probe.items
+        items.append(toolsItem(probe.tools))
+        items.append(sideloadItem(path: managedSettingsPath))
         var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
         // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
         if let canary = await ModeCanary.run(runner: runner, hookExecutable: hookExecutable) {
@@ -143,6 +152,8 @@ public enum Doctor {
 
     private struct Outcome {
         var sawInit = false
+        /// The init event's `tools`, when it carried them.
+        var tools: [String]?
         var result: TurnResult?
         var limit: RateLimitInfo?
         var error: String?
@@ -156,6 +167,7 @@ public enum Doctor {
                     for try await event in runner.run(request) {
                         switch event {
                         case .initialized: o.sawInit = true
+                        case .initInfo(let info): o.tools = info.tools
                         case .result(let r): o.result = r
                         case .rateLimit(let i): o.limit = i
                         default: break
@@ -178,7 +190,40 @@ public enum Doctor {
         }
     }
 
-    private static func runProbe(runner: any TurnRunning) async -> [DoctorItem] {
+    /// `tools-present`: the probe's init `tools` hold every name the Sandboxed profile's `--tools` uses (`BuiltinTools.sandboxed`).
+    static func toolsItem(_ tools: [String]?) -> DoctorItem {
+        guard let tools, !tools.isEmpty else {
+            return DoctorItem(name: "tools-present", status: .warn, detail: "the probe's init event listed no tools; nothing to compare")
+        }
+        let missing = BuiltinTools.sandboxed.filter { !tools.contains($0) }
+        return missing.isEmpty
+            ? DoctorItem(name: "tools-present", status: .pass, detail: "every tool the sandboxed profile names is present")
+            : DoctorItem(name: "tools-present", status: .fail,
+                         detail: "the CLI lacks \(missing.joined(separator: ", ")), which the sandboxed profile's --tools names")
+    }
+
+    /// `sideload-allowed`: the managed setting `disableSideloadFlags` is not set (it makes the CLI ignore `--plugin-dir`, so a
+    /// turn's extension parts would silently not load). Managed settings that cannot be read fail: the doctor cannot tell.
+    static func sideloadItem(path: String) -> DoctorItem {
+        let name = "sideload-allowed"
+        guard FileManager.default.fileExists(atPath: path) else {
+            return DoctorItem(name: name, status: .pass, detail: "no managed settings")
+        }
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return DoctorItem(name: name, status: .fail, detail: "can't read the managed settings at \(path)")
+        }
+        switch object["disableSideloadFlags"] {
+        case nil, is NSNull: break
+        case let flag as Bool where flag == false: break
+        default:
+            return DoctorItem(name: name, status: .fail,
+                              detail: "managed setting disableSideloadFlags is set in \(path): --plugin-dir would be ignored")
+        }
+        return DoctorItem(name: name, status: .pass, detail: "sideload flags allowed")
+    }
+
+    private static func runProbe(runner: any TurnRunning) async -> (items: [DoctorItem], tools: [String]?) {
         let dir = FileManager.default.temporaryDirectory.appending(path: "brahma-doctor-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: dir) }
         let config = dir.appending(path: "empty.mcp.json")
@@ -186,7 +231,7 @@ public enum Doctor {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try Data("{\"mcpServers\":{}}".utf8).write(to: config)
         } catch {
-            return [DoctorItem(name: "probe", status: .fail, detail: "can't prepare the probe directory: \(error)")]
+            return ([DoctorItem(name: "probe", status: .fail, detail: "can't prepare the probe directory: \(error)")], nil)
         }
         let sessionId = UUID().uuidString.lowercased()
         var agent = Agent(id: "doctor-probe", companyId: "doctor", name: "probe", role: "probe", model: "haiku",
@@ -248,7 +293,7 @@ public enum Doctor {
         } else {
             overage = DoctorItem(name: "overage", status: .warn, detail: "no rate_limit_event to read")
         }
-        return [probe, resume, overage]
+        return ([probe, resume, overage], first.tools)
     }
 
     // MARK: default exec

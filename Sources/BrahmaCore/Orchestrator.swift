@@ -16,7 +16,11 @@ public actor Orchestrator {
     let paths: BrahmaPaths
     let config: SchedulerConfig
     let mcpExecutable: String
-    let profile: PermissionProfile
+    /// The engine's ceiling on every turn's profile (`brahma run --profile`): nil runs each turn under its company's profile
+    /// for the agent's role (`turnProfile`); a value narrows it, never widens it.
+    let profileCeiling: PermissionProfile?
+    /// The owner's home, the xcrun temp dir and the shell the sandboxed turns' scopes and prefixes use.
+    let sandboxEnvironment: SandboxEnvironment
     let clock: @Sendable () -> Date
     let memory: any MemoryPressureSource
     let connectivity: any ConnectivityProbe
@@ -84,7 +88,7 @@ public actor Orchestrator {
     static let hour: TimeInterval = 3600
 
     public init(store: Store, runner: any TurnRunning, paths: BrahmaPaths, config: SchedulerConfig = .init(),
-                mcpExecutable: String, profile: PermissionProfile = .workspace,
+                mcpExecutable: String, profile: PermissionProfile? = nil, sandboxEnvironment: SandboxEnvironment = .current,
                 clock: @escaping @Sendable () -> Date = { .now },
                 memory: any MemoryPressureSource = DispatchMemoryPressureSource(),
                 connectivity: any ConnectivityProbe = HTTPSProbe(), disk: any DiskSpace = SystemDiskSpace(),
@@ -99,7 +103,8 @@ public actor Orchestrator {
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
-        self.mcpExecutable = mcpExecutable; self.profile = profile; self.clock = clock
+        self.mcpExecutable = mcpExecutable; self.profileCeiling = profile; self.clock = clock
+        self.sandboxEnvironment = sandboxEnvironment
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
         self.claudePath = claudePath
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
@@ -116,6 +121,11 @@ public actor Orchestrator {
                 do { try store.reloadRedactorIfNeeded(vault: vault); return nil } catch { return "\(error)" }
             }
             if let failure { log("could not load secrets: \(failure)") }
+            // The shell prefix's backstop: only an unsandboxed process can read it (the sandbox denies the data home).
+            let paths = self.paths
+            if let sentinel = await blocking.run({ () -> String? in
+                do { try Sentinel.write(paths: paths); return nil } catch { return "\(error)" }
+            }) { log("could not write the sandbox sentinel: \(sentinel)") }
             let now = clock()
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
@@ -479,8 +489,11 @@ public actor Orchestrator {
             isReview = review != nil || audit != nil
             var turnPrompt = ""
             var sent = agent
+            // The company's profile for this role, under the engine's ceiling.
+            let profile = turnProfile(agent: agent, company: company)
+            var sandboxed: SandboxedTurn?
             // The system prompt is byte-stable per agent and role: the roster, items and times ride in the orientation.
-            var systemPrompt = RolePrompt.render(agent: agent, company: company, template: template)
+            var systemPrompt = RolePrompt.render(agent: agent, company: company, template: template, sandboxed: profile == .sandboxed)
             // `ModePolicy.select` decides each turn's mode, model and effort from the role, the item's effective spec, the company's
             // usage mode and the pressure on the plan (design §3.2).
             let deciding = (try? store.askModelContext(agentId: agent.id)) ?? ModelContext()
@@ -504,12 +517,25 @@ public actor Orchestrator {
                 workingDirectory = review.worktree.path
                 addDirs = [review.worktree.path]
                 facts = try? store.itemModeFacts(itemId: review.item.id, holderId: nil)
+                if profile == .sandboxed {
+                    // The review runs in the reviewer's lab and reads the worktree (read-only).
+                    let prepared = try await prepareSandbox(agent: agent, company: company, kind: .review, item: review.item, turnId: turn.id)
+                    sandboxed = prepared
+                    workingDirectory = prepared.scope.cwd.path
+                    addDirs = prepared.scope.readOnlyDirs.map(\.path)
+                }
             } else if let audit {
                 sent.sessionId = UUID().uuidString
                 sent.sessionStarted = false
                 systemPrompt += "\n\n" + AuditDigest.instructions
                 turnPrompt = audit.digest
                 toolsKey = "audit"
+                if profile == .sandboxed {
+                    let prepared = try await prepareSandbox(agent: agent, company: company, kind: .audit, item: nil, turnId: turn.id)
+                    sandboxed = prepared
+                    workingDirectory = prepared.scope.cwd.path
+                    addDirs = prepared.scope.readOnlyDirs.map(\.path)
+                }
             } else {
                 // Reads the item's recent commits (git): off the cooperative pool.
                 let paths = self.paths
@@ -576,6 +602,17 @@ public actor Orchestrator {
                     toolsKey = "plan:" + template.companyTools.joined(separator: ",")
                     plan = PlanWatch(git: git, worktree: checkout, preHead: head, itemId: leased.id, key: leased.key, directory: dir,
                                      barrier: barrier)
+                }
+
+                // A sandboxed turn runs where its scope says (the item worktree for a leaseholder, the plans directory for a plan
+                // turn, else the lab), computed before the session is chosen so its stored cwd is the one the turn uses.
+                if profile == .sandboxed {
+                    let prepared = try await prepareSandbox(agent: agent, company: company, kind: kind,
+                                                            item: checkout != nil ? c.item : nil, turnId: turn.id)
+                    sandboxed = prepared
+                    workingDirectory = prepared.scope.cwd.path
+                    addDirs = prepared.scope.readOnlyDirs.map(\.path)
+                    toolsKey += "|sandboxed"
                 }
 
                 // Warm-only resume: a cold or large session starts over with the role card, the orientation and Continuity.
@@ -665,6 +702,16 @@ public actor Orchestrator {
             request.hookCommand = TurnProfileCompiler.hookCommand(executable: mcpExecutable)
             request.expectations = turnExpectations(agent, company)
                 ?? TurnProfileCompiler.expectations(for: mode, agents: store.recordedBuiltinAgents())
+            // The settings travel in a file only the engine can read or write (`<runDir>/<agentId>.settings.json`, 0600).
+            let settingsFile = SettingsFile.path(paths: paths, agentId: agent.id)
+            request.settingsFilePath = settingsFile.path
+            if let sandboxed {
+                request.sandbox = sandboxed.scope
+                request.shellPrefix = sandboxed.shellPrefix.path
+            } else if profile == .workspace {
+                request.deniedPaths = workspaceDeniedPaths(company: company)
+            }
+            try SettingsFile.write(TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: request)), to: settingsFile)
             // A review session is never recorded as the agent's own.
             var sessionMarked = wasResume || review != nil || audit != nil
             sentRequest = request

@@ -93,8 +93,14 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
         #expect(AwakeTime.now - start < .seconds(20), "bounded by the drain grace, not the grandchild")
         let grandchild = try #require(Int32(try String(contentsOf: dir.appending(path: "grandchild.txt"), encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)))
-        #expect(kill(grandchild, 0) == 0, "the grandchild was still holding stderr when the turn ended")
-        kill(grandchild, SIGKILL)
+        // 5-lite Task 1b: nothing of a turn outlives it; the grandchild was swept with the turn's session.
+        var alive = kill(grandchild, 0) == 0 && ProcessTable.entry(grandchild)?.isZombie != true
+        for _ in 0..<100 where alive {
+            try await Task.sleep(for: .milliseconds(20))
+            alive = kill(grandchild, 0) == 0 && ProcessTable.entry(grandchild)?.isZombie != true
+        }
+        #expect(!alive, "the grandchild outlived its turn")
+        if alive { kill(grandchild, SIGKILL) }
     }
 
     @Test func timeoutKillsProcess() async throws {

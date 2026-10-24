@@ -65,7 +65,7 @@ private struct HWorld {
         var c = try store.createCompany(name: "Acme", goal: "Ship it", workspacesRoot: paths.workspaces)
         c.usageMode = .max
         try store.updateCompany(c)
-        company = c
+        company = try onWorkspaceProfile(store, c)
         try store.saveProbe(DoctorReport(cliVersion: "2.1.304", items: [DoctorItem(name: "version", status: .pass, detail: "2.1.304")],
                                          checkedAt: clock.now))
         orchestrator = Orchestrator(store: store, runner: fake, paths: paths, mcpExecutable: "/usr/local/bin/brahma",

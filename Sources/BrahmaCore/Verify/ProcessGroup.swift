@@ -45,9 +45,12 @@ final class ProcessGroupChild: @unchecked Sendable {
     /// Spawns `executable` with `arguments` (argv, `arguments[0]` included) as the leader of a new process group: stdin
     /// `/dev/null`, stdout and stderr to `output` (`-1`: `/dev/null`), working directory `workingDirectory`, exactly
     /// `environment`, default signal dispositions, an empty signal mask, and (Darwin) no descriptor inherited but those.
+    /// `stdin` (`-1`: `/dev/null`) and `stderr` (nil: `output`) override those two; `newSession` makes it the leader of a new
+    /// session as well (`setsid`: a turn's `claude`), which is also its own process group.
     /// Throws a message when it cannot be started.
     static func spawn(executable: String, arguments: [String], environment: [String: String], workingDirectory: URL,
-                      output: Int32, observer: Observer? = nil) throws -> ProcessGroupChild {
+                      output: Int32, stdin: Int32 = -1, stderr: Int32? = nil, newSession: Bool = false,
+                      observer: Observer? = nil) throws -> ProcessGroupChild {
         #if canImport(Darwin)
         var actions: posix_spawn_file_actions_t? = nil
         var attr: posix_spawnattr_t? = nil
@@ -57,12 +60,21 @@ final class ProcessGroupChild: @unchecked Sendable {
         #endif
         posix_spawn_file_actions_init(&actions); posix_spawnattr_init(&attr)
         defer { posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr) }
-        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        if stdin >= 0 {
+            posix_spawn_file_actions_adddup2(&actions, stdin, 0)
+        } else {
+            posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        }
         if output >= 0 {
             posix_spawn_file_actions_adddup2(&actions, output, 1)
-            posix_spawn_file_actions_adddup2(&actions, output, 2)
         } else {
             posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
+        }
+        if let stderr, stderr >= 0 {
+            posix_spawn_file_actions_adddup2(&actions, stderr, 2)
+        } else if stderr == nil, output >= 0 {
+            posix_spawn_file_actions_adddup2(&actions, output, 2)
+        } else {
             posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
         }
         posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.path)
@@ -70,12 +82,13 @@ final class ProcessGroupChild: @unchecked Sendable {
         sigfillset(&defaults); sigemptyset(&mask)
         posix_spawnattr_setsigdefault(&attr, &defaults)
         posix_spawnattr_setsigmask(&attr, &mask)
-        var flags = Int32(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK)
+        // A new session makes the child its own group's leader too (setpgid would fail on a session leader).
+        var flags = Int32(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK) | (newSession ? Int32(POSIX_SPAWN_SETSID) : Int32(POSIX_SPAWN_SETPGROUP))
         #if canImport(Darwin)
         flags |= Int32(POSIX_SPAWN_CLOEXEC_DEFAULT)
         #endif
         posix_spawnattr_setflags(&attr, Int16(flags))
-        posix_spawnattr_setpgroup(&attr, 0)
+        if !newSession { posix_spawnattr_setpgroup(&attr, 0) }
 
         var argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
         var envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
@@ -107,6 +120,22 @@ final class ProcessGroupChild: @unchecked Sendable {
             if info.si_pid == pid { exited = true }
             return exited
         }
+    }
+
+    /// Blocks until the leader exits and leaves it unreaped (a zombie: its pid and group id stay this child's). Returns its
+    /// exit code, or the number of the signal that ended it (as Foundation's `terminationStatus` does).
+    func waitForExit() -> Int32 {
+        var info = siginfo_t()
+        while true {
+            let r = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT)
+            if r == 0 { break }
+            if errno == EINTR { continue }
+            // ECHILD: reaped elsewhere; never signalled again.
+            lock.withLock { if status == nil { status = 0 }; exited = true }
+            return 0
+        }
+        lock.withLock { exited = true }
+        return info.si_status
     }
 
     /// Sends `sig` to the whole group, unless the leader has been reaped (its group id may belong to someone else by now).

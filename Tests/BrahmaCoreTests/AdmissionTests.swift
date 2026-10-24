@@ -75,7 +75,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     @Test func pressureChangeLogged() async throws {
         let store = try Store.inMemory()
         let root = try tempDir()
-        let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: root.appending(path: "ws"))
+        let c = try onWorkspaceProfile(store, try store.createCompany(name: "Acme", goal: "g", workspacesRoot: root.appending(path: "ws")))
         let memory = StubMemory()
         let clock = TestClock()
         let o = Orchestrator(store: store, runner: FakeTurnRunner(),
@@ -99,7 +99,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     @Test func criticalPressureStopsOrchestratorLaunches() async throws {
         let store = try Store.inMemory()
         let root = try tempDir()
-        let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: root.appending(path: "ws"))
+        let c = try onWorkspaceProfile(store, try store.createCompany(name: "Acme", goal: "g", workspacesRoot: root.appending(path: "ws")))
         let ceo = try store.hire(companyId: c.id, name: "ceo", role: "ceo", model: "sonnet")
         let fake = FakeTurnRunner(); let memory = StubMemory(.critical); let clock = TestClock()
         let o = Orchestrator(store: store, runner: fake, paths: BrahmaPaths(home: root.appending(path: "h"), workspaces: root.appending(path: "ws")),

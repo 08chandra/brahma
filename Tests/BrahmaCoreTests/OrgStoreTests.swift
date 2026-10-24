@@ -9,7 +9,7 @@ import GRDB
     private func make() throws -> (Store, Company) {
         let s = try Store.inMemory()
         let root = try tempDir()
-        return (s, try s.createCompany(name: "Acme", goal: "g", workspacesRoot: root))
+        return (s, try onWorkspaceProfile(s, try s.createCompany(name: "Acme", goal: "g", workspacesRoot: root)))
     }
 
     @Test func newCompaniesDefaultToBalancedSoftware() throws {

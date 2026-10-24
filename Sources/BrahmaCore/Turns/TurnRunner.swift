@@ -10,11 +10,15 @@ public protocol TurnRunning: Sendable {
     /// returns what it printed until each request was answered, the process exited or `timeout` passed. No prompt is sent, so
     /// no model is called. Nil when the runner cannot (test fakes): the doctor's mode-canary is then skipped.
     func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript?
+    /// Returns once no turn of `agentId` is in flight and its earlier turns' processes are gone: the pids of any that could
+    /// not be killed (empty: nothing of an earlier turn still runs). The engine waits here before it computes a turn's scope.
+    func waitForTurnProcesses(agentId: String) async -> [Int32]
 }
 
 extension TurnRunning {
     public func waitForChildren() async {}
     public func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? { nil }
+    public func waitForTurnProcesses(agentId: String) async -> [Int32] { [] }
 }
 
 /// What a control session printed: its stdout lines, and its exit status when it exited by itself.
@@ -35,6 +39,20 @@ public enum TurnError: Error, Equatable {
     /// after a SIGTERM, or it was killed with background work (`pendingTasks`) still running, even if an early `result`
     /// had been printed. Never counted against the agent. The engine's own wall-clock kill is `timedOut`.
     case interrupted(pendingTasks: Int)
+    /// Processes of an earlier turn of the agent could not be killed: no new turn of it starts.
+    case earlierTurnStillRunning(pids: [Int32])
+}
+
+extension TurnError: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .exitedWithoutResult(let code, let tail): "exitedWithoutResult(code: \(code), stderrTail: \(tail.debugDescription))"
+        case .timedOut: "timedOut"
+        case .interrupted(let n): "interrupted(pendingTasks: \(n))"
+        case .earlierTurnStillRunning(let pids):
+            "sandbox scope: processes of an earlier turn are still running (pid \(pids.map(String.init).joined(separator: ", ")))"
+        }
+    }
 }
 
 /// Runs `claude -p` as a child process: prompt on stdin, stream-json on stdout.
@@ -51,6 +69,10 @@ public struct ClaudeProcessRunner: TurnRunning {
     public var wallClockSleep: @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) }
 
     private static let live = LiveCount()
+    /// Every agent's turns in flight and what their sweeps could not kill.
+    static let registry = TurnRegistry()
+    /// Arguments placed before the compiled argv (tests run `/bin/sh -c <script>` as the CLI). Empty in production.
+    var leadingArguments: [String] = []
 
     static let stderrLimit = 4096
     static let killGrace: TimeInterval = 5
@@ -69,6 +91,10 @@ public struct ClaudeProcessRunner: TurnRunning {
 
     public func waitForChildren() async {
         await waitForChildren(pollInterval: .milliseconds(20))
+    }
+
+    public func waitForTurnProcesses(agentId: String) async -> [Int32] {
+        await Self.registry.waitUntilGone(agentId)
     }
 
     /// `onPoll` runs once per check of the live count; tests use it to prove the wait sleeps between checks.
@@ -157,55 +183,81 @@ public struct ClaudeProcessRunner: TurnRunning {
     }
 
     private func execute(_ request: TurnRequest, yield: (StreamEvent) -> Void) async throws {
-        let process = Process()
         // One compiled profile: its argv and its engine-set environment (the only source of `CLAUDE_CODE_*` controls).
         let profile = TurnProfileCompiler.profile(for: request)
         try TurnProfileCompiler.validate(profile)
         let args = TurnProfileCompiler.arguments(profile)
+        let agentId = request.agent.id
+        // Nothing of an earlier turn of this agent may still run when this one starts (1a re-review, binding).
+        let earlier = await Self.registry.waitUntilGone(agentId)
+        if !earlier.isEmpty { throw TurnError.earlierTurnStillRunning(pids: earlier) }
+        // The scope may be some time old: its link walk again, and the cwd it starts in must be the scope's own.
+        if profile.permission == .sandboxed, let scope = request.sandbox { try scope.recheckBeforeSpawn() }
+        let executable: String, argv: [String]
         if claudePath.hasPrefix("/") {
-            process.executableURL = URL(fileURLWithPath: claudePath)
-            process.arguments = args
+            executable = claudePath
+            argv = [claudePath] + leadingArguments + args
         } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = [claudePath] + args
+            executable = "/usr/bin/env"
+            argv = ["env", claudePath] + leadingArguments + args
         }
-        process.environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
-                                                       engineClaudeVars: profile.environment, purpose: .claude)
-        process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
-        let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
+        let environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
+                                                engineClaudeVars: profile.environment, purpose: .claude)
+
+        // The parent's ends are close-on-exec, so no other child ever holds them; the child's ends are dup'ed onto 0, 1, 2.
+        func makePipe() throws -> (read: Int32, write: Int32) {
+            var fds: [Int32] = [0, 0]
+            guard pipe(&fds) == 0 else { throw CocoaError(.fileWriteUnknown) }
+            _ = fcntl(fds[0], F_SETFD, FD_CLOEXEC); _ = fcntl(fds[1], F_SETFD, FD_CLOEXEC)
+            return (fds[0], fds[1])
+        }
+        let inPipe = try makePipe()
+        let outPipe: (read: Int32, write: Int32)
+        let errPipe: (read: Int32, write: Int32)
+        do { outPipe = try makePipe() } catch { close(inPipe.read); close(inPipe.write); throw error }
+        do { errPipe = try makePipe() } catch {
+            for fd in [inPipe.read, inPipe.write, outPipe.read, outPipe.write] { close(fd) }
+            throw error
+        }
+        // A sandboxed turn's processes are also known by their sandbox (it cannot be dropped).
+        let probe = profile.permission == .sandboxed ? request.sandbox.map { SandboxProbe(workspace: $0.workspace, handle: request.agent.name) } : nil
+        Self.registry.begin(agentId, probe: probe)
+        let child: TurnChild
+        do {
+            child = try TurnChild.spawn(executable: executable, arguments: argv, environment: environment,
+                                        workingDirectory: profile.workingDirectory,
+                                        stdin: inPipe.read, stdout: outPipe.write, stderr: errPipe.write, probe: probe)
+        } catch {
+            for fd in [inPipe.read, inPipe.write, outPipe.read, outPipe.write, errPipe.read, errPipe.write] { close(fd) }
+            Self.registry.end(agentId, survivors: [])
+            throw error
+        }
+        close(inPipe.read); close(outPipe.write); close(errPipe.write)
+        let input = FileHandle(fileDescriptor: inPipe.write, closeOnDealloc: true)
+        let stdout = FileHandle(fileDescriptor: outPipe.read, closeOnDealloc: true)
+        let stderr = FileHandle(fileDescriptor: errPipe.read, closeOnDealloc: true)
 
         let (lines, lineSink) = AsyncStream.makeStream(of: String.self)
         let splitter = LineSplitter(sink: lineSink)
-        stdout.fileHandleForReading.readabilityHandler = { h in
+        stdout.readabilityHandler = { h in
             let data = h.availableData
             if data.isEmpty { h.readabilityHandler = nil; splitter.finish() } else { splitter.append(data) }
         }
-        let stderrReader = StderrReader(stderr.fileHandleForReading, limit: Self.stderrLimit)
+        let stderrReader = StderrReader(stderr, limit: Self.stderrLimit)
         stderrReader.start()
         let exit = ExitWaiter()
-        let child = ChildProcess(process)
-        process.terminationHandler = { p in
-            exit.signal(p.terminationStatus)
+        // The leader's exit is noticed without reaping it: it stays a zombie until every process of the turn is swept.
+        Thread.detachNewThread {
+            let status = child.waitForExit()
+            exit.signal(status)
             // Stderr is not cut here: the turn drains what is left of it itself once the process is gone (below).
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.drainGrace) {
-                stdout.fileHandleForReading.readabilityHandler = nil
+                stdout.readabilityHandler = nil
                 splitter.finish()
             }
         }
 
-        do {
-            try process.run()
-        } catch {
-            stdout.fileHandleForReading.readabilityHandler = nil
-            stderrReader.drain()
-            throw error
-        }
-
         // Write the prompt off-thread: a large prompt can fill the pipe before the child starts reading.
-        let input = stdin.fileHandleForWriting
         #if canImport(Darwin)
         // If the child exits without reading stdin, the write must fail with EPIPE, not kill us with SIGPIPE.
         // Linux has no per-fd equivalent; a Linux host must ignore SIGPIPE process-wide.
@@ -242,7 +294,6 @@ public struct ClaudeProcessRunner: TurnRunning {
         // Stdout can end (or the consumer be cancelled) before the process exits; always reap it.
         if Task.isCancelled { child.terminate(grace: Self.killGrace) }
         let status = await exit.wait()
-        process.waitUntilExit()
 
         // The last of stderr may still be in its pipe when the process is gone; give it until the drain grace (bounded by the
         // clock, not by a count of sleeps, which stretch on a loaded machine).
@@ -252,7 +303,17 @@ public struct ClaudeProcessRunner: TurnRunning {
         // process wrote before it exited is still in the pipe, so it is read now, without waiting, and nothing is lost.
         // The drain stops the handler first, so no handler read can race it (a no-op once the pipe has closed).
         stderrReader.drain()
+        stdout.readabilityHandler = nil
         let stderrTail = stderrReader.text
+        // Every process of the turn goes (its group, its session, its watched descendants, whatever carries its marker), then
+        // the leader is reaped; off the cooperative pool (it waits between kill rounds). On every path, cancelled or not.
+        let left = await withCheckedContinuation { (c: CheckedContinuation<[ProcessEntry], Never>) in
+            DispatchQueue.global().async { c.resume(returning: child.finish()) }
+        }
+        Self.registry.end(agentId, survivors: left)
+        if !left.isEmpty {
+            FileHandle.standardError.write(Data("brahma: \(left.count) process(es) of @\(request.agent.name)'s turn could not be killed: \(left.map { String($0.pid) }.joined(separator: ", "))\n".utf8))
+        }
         if let requested = TurnAudit.effortCap(in: stderrTail) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
         let sawResult = state.sawResult
@@ -434,28 +495,6 @@ private final class ExitWaiter: @unchecked Sendable {
                 return nil
             }
             if let done { c.resume(returning: done) }
-        }
-    }
-}
-
-/// SIGTERM, then SIGKILL if the child is still alive after the grace period.
-private final class ChildProcess: @unchecked Sendable {
-    private let process: Process
-    private let lock = NSLock()
-    private var terminating = false
-
-    init(_ p: Process) { process = p }
-
-    func terminate(grace: TimeInterval) {
-        let first = lock.withLock { () -> Bool in
-            defer { terminating = true }
-            return !terminating
-        }
-        guard first, process.isRunning else { return }
-        process.terminate()
-        let pid = process.processIdentifier
-        DispatchQueue.global().asyncAfter(deadline: .now() + grace) { [process] in
-            if process.isRunning { kill(pid, SIGKILL) }
         }
     }
 }

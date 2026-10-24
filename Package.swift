@@ -13,9 +13,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
     ],
     targets: [
+        // The one caller of the variadic `sandbox_check` (what another process's sandbox allows); a stub off macOS.
+        .target(name: "CSandboxCheck"),
         .target(
             name: "BrahmaCore",
-            dependencies: [.product(name: "GRDB", package: "GRDB.swift")]
+            dependencies: [.product(name: "GRDB", package: "GRDB.swift"), "CSandboxCheck"]
         ),
         // Platform owner-key hash store (macOS Keychain); kept out of BrahmaCore so the core stays portable.
         .target(name: "BrahmaKeychain", dependencies: ["BrahmaCore"]),
