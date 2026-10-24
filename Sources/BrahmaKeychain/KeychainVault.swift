@@ -200,9 +200,7 @@ public struct KeychainVault: SecretVault {
             return sec("SecItemCopyMatching") { SecItemCopyMatching(q as CFDictionary, &out) }
         }
         if status == errSecItemNotFound { return nil }
-        if status == errSecInteractionNotAllowed || status == errSecAuthFailed {
-            throw SecretError.vaultFailed("reading it needs your permission (OSStatus \(status)); run `brahma secret load` or press Load secrets in the app")
-        }
+        if status == errSecInteractionNotAllowed || status == errSecAuthFailed { throw SecretError.needsPermission }
         guard status == errSecSuccess, let data = out as? Data else { throw SecretError.vaultFailed("read failed (OSStatus \(status))") }
         return try SecretValue.decode(data)
     }

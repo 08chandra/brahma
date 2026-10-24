@@ -154,7 +154,7 @@ public actor Orchestrator {
     }
 
     private func busyDescription() -> String {
-        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted())"
+        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted()) secrets=\(secretsTask == nil ? "idle" : "reloading")"
     }
 
     private func idleWaiterTimedOut(_ id: Int) {

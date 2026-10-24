@@ -26,7 +26,7 @@ struct Run: AsyncParsableCommand {
         try requireOwnerShell()
         // A child or MCP pipe closing under us must surface as EPIPE, not kill the orchestrator.
         signal(SIGPIPE, SIG_IGN)
-        let (store, paths) = try openStore()
+        let (store, paths) = try openStore(lazySecrets: false)
         if !skipDoctor {
             let report = await BrahmaCore.Doctor.ensure(store: store, claudePath: "claude", runner: ClaudeProcessRunner())
             if !report.ok {

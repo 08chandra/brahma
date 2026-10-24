@@ -17,6 +17,8 @@ public enum SecretError: Error, Equatable, Sendable, CustomStringConvertible {
     case vaultFailed(String)
     /// The redactor has not loaded the secrets yet in this process: nothing redactable may be stored (fail closed).
     case secretsNotLoaded
+    /// A non-interactive (background) read would have needed the owner's permission (a Keychain prompt).
+    case needsPermission
 
     /// Plain text for the CLI and the app.
     public var message: String {
@@ -31,6 +33,7 @@ public enum SecretError: Error, Equatable, Sendable, CustomStringConvertible {
         case .vaultUnavailable: "no secrets vault is available on this platform"
         case .vaultFailed(let detail): "the secrets vault failed: \(detail)"
         case .secretsNotLoaded: "secrets are not loaded yet; try again shortly"
+        case .needsPermission: "reading it needs your permission; run `brahma secret load` or press Load secrets in the app"
         }
     }
 
@@ -255,7 +258,11 @@ public final class Redactor: @unchecked Sendable {
     private var cache: [String: Loaded] = [:]
     private var logged: Set<String> = []
     private var noticeOpen = false
-    private var reasons: [String: String] = [:]
+    private var failures: [Failure] = []
+    private var tickets = 0
+    private var installedTicket = 0
+    /// Serializes whole reloads (metadata read, vault reads, install) of one store; recursive for `ownerLoadSecrets`.
+    private let reloadLock = NSRecursiveLock()
     private var loader: (@Sendable () -> Void)?
     private var loaderTried = false
     // Background-read backoff (awake time): after a load with failures, the next background read waits `firstRetry`,
@@ -268,10 +275,11 @@ public final class Redactor: @unchecked Sendable {
     public static let maxRetry: TimeInterval = 300
 
     /// One loaded value: the secret's name and the `updatedAt` it was loaded for (a retry reads only what failed or changed).
-    struct Loaded: Equatable {
-        var name: String
-        var updatedAt: Date
-        var value: String
+    public struct Loaded: Equatable, Sendable {
+        public var name: String
+        public var updatedAt: Date
+        public var value: String
+        public init(name: String, updatedAt: Date, value: String) { self.name = name; self.updatedAt = updatedAt; self.value = value }
     }
 
     public init() {}
@@ -299,18 +307,52 @@ public final class Redactor: @unchecked Sendable {
     public func update(_ values: [(name: String, value: String)], version: String) {
         let built = Self.build(values)
         lock.lock(); defer { lock.unlock() }
+        tickets += 1
+        installedTicket = tickets
         entries = built
         currentVersion = version
         loadedOnce = true
         failed = []
+        failures = []
         cache = [:]
     }
 
     /// Installs a load: `loaded` are the values to redact (keyed `<companyId>:<name>`), `failed` the names that did not
     /// load. `version` is set (and the load counts as complete) only when nothing failed.
-    func install(loaded: [String: Loaded], failed failedNames: [String], version: String?) {
+    /// Why one secret did not load: a read that needed the owner's permission (`brahma secret load` fixes it) or anything
+    /// else (a missing item, a value that is not UTF-8, a vault error).
+    public struct Failure: Equatable, Sendable {
+        public var name: String
+        public var reason: String
+        public var needsPermission: Bool
+    }
+
+    /// Runs a whole reload under the store's reload lock.
+    func withReloadLock<T>(_ body: () throws -> T) rethrows -> T {
+        reloadLock.lock(); defer { reloadLock.unlock() }
+        return try body()
+    }
+
+    /// A ticket for a load about to read the metadata: `install` rejects a load whose ticket is older than the installed one.
+    public func beginLoad() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        tickets += 1
+        return tickets
+    }
+
+    /// Installs a load: `loaded` are the values to redact (keyed `<companyId>:<name>`), `failed` the names that did not
+    /// load. `version` is set (and the load counts as complete) only when nothing failed. Returns false, changing nothing,
+    /// when `ticket` is older than the installed load's: a slow, stale result never replaces a newer one.
+    @discardableResult
+    public func install(loaded: [String: Loaded], failed failedNames: [String], version: String?, ticket: Int? = nil,
+                        failures details: [Failure] = []) -> Bool {
         let built = Self.build(loaded.values.sorted { $0.name < $1.name }.map { ($0.name, $0.value) })
         lock.lock(); defer { lock.unlock() }
+        if let ticket {
+            guard ticket >= installedTicket else { return false }
+            installedTicket = ticket
+        }
+        failures = details
         entries = built
         cache = loaded
         failed = failedNames
@@ -318,6 +360,7 @@ public final class Redactor: @unchecked Sendable {
             currentVersion = version
             loadedOnce = true
         }
+        return true
     }
 
     /// A one-shot loader (`Store.redactorLoader`): the CLI's lazy load of the secrets.
@@ -373,14 +416,10 @@ public final class Redactor: @unchecked Sendable {
     }
 
     /// Why each secret in `failedNames` did not load (by name).
-    func lastFailureReasons() -> [String: String] {
+    /// The failures of the last installed load (names and reasons, never values).
+    public var lastFailures: [Failure] {
         lock.lock(); defer { lock.unlock() }
-        return reasons
-    }
-
-    func setFailureReasons(_ r: [String: String]) {
-        lock.lock(); defer { lock.unlock() }
-        reasons = r
+        return failures
     }
 
     func cachedValues() -> [String: Loaded] {

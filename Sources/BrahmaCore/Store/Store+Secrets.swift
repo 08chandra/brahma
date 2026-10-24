@@ -93,39 +93,48 @@ extension Store {
     /// never with a value, and each hold episode writes one owner notice. Throws only when the database cannot be read.
     @discardableResult
     public func reloadRedactorIfNeeded(vault: any SecretVault, logFailures: Bool = true, force: Bool = false) throws -> Bool {
-        let version = try secretsVersion()
-        guard version != redactor.version || !redactor.hasLoaded else { return false }
-        guard force || redactor.retryDue(version: version) else { return false }
-        let metas = try writer.unsafeReentrantRead { db in try SecretMeta.order(Column("createdAt"), Column("name")).fetchAll(db) }
-        let previous = redactor.cachedValues()
-        var loaded: [String: Redactor.Loaded] = [:]
-        var failures: [(meta: SecretMeta, key: String, reason: String)] = []
-        for meta in metas {
-            let key = "\(meta.companyId):\(meta.name)"
-            if let cached = previous[key], cached.updatedAt == meta.updatedAt { loaded[key] = cached; continue }
-            let reason: String
-            do {
-                if let value = try vault.value(companyId: meta.companyId, name: meta.name) {
-                    loaded[key] = Redactor.Loaded(name: meta.name, updatedAt: meta.updatedAt, value: value)
-                    continue
+        // One reload at a time per store, held across reading the metadata, reading the vault and installing: the engine's
+        // background reload and the owner's load (in the app) can never interleave. The writes (log lines, the notice) happen
+        // after the lock is released: the CLI's lazy loader may hold the database's write lock while it waits for this one.
+        let writes: (lines: [ActivityEvent], notice: OwnerNotice?)? = try redactor.withReloadLock {
+            let version = try secretsVersion()
+            guard version != redactor.version || !redactor.hasLoaded else { return nil }
+            guard force || redactor.retryDue(version: version) else { return nil }
+            let ticket = redactor.beginLoad()
+            let metas = try writer.unsafeReentrantRead { db in try SecretMeta.order(Column("createdAt"), Column("name")).fetchAll(db) }
+            let previous = redactor.cachedValues()
+            var loaded: [String: Redactor.Loaded] = [:]
+            var failures: [(meta: SecretMeta, key: String, reason: String, permission: Bool)] = []
+            for meta in metas {
+                let key = "\(meta.companyId):\(meta.name)"
+                if let cached = previous[key], cached.updatedAt == meta.updatedAt { loaded[key] = cached; continue }
+                let reason: String
+                var permission = false
+                do {
+                    if let value = try vault.value(companyId: meta.companyId, name: meta.name) {
+                        loaded[key] = Redactor.Loaded(name: meta.name, updatedAt: meta.updatedAt, value: value)
+                        continue
+                    }
+                    reason = "the vault has no value for it"
+                } catch {
+                    reason = "\(error)"
+                    permission = (error as? SecretError) == .needsPermission
                 }
-                reason = "the vault has no value for it"
-            } catch {
-                reason = "\(error)"
+                failures.append((meta, key, reason, permission))
+                // An older value stays redacted until the new one loads (its stale `updatedAt` makes the next read retry).
+                if let old = previous[key] { loaded[key] = old }
             }
-            failures.append((meta, key, reason))
-            // An older value stays redacted until the new one loads (its stale `updatedAt` makes the next read retry).
-            if let old = previous[key] { loaded[key] = old }
-        }
-        redactor.install(loaded: loaded, failed: failures.map(\.meta.name).sorted(),
-                         version: failures.isEmpty ? version : nil)
-        redactor.recordAttempt(version: version, failed: !failures.isEmpty)
-        redactor.setFailureReasons(Dictionary(failures.map { ($0.meta.name, Store.flat($0.reason, max: 200)) }, uniquingKeysWith: { a, _ in a }))
-        if failures.isEmpty { _ = redactor.holdEpisode(held: false) }
-        let fresh = redactor.unlogged(Set(failures.map { "\($0.key)@\($0.meta.updatedAt.timeIntervalSince1970)" }))
-        if logFailures {
+            let details = failures.map { Redactor.Failure(name: $0.meta.name, reason: Store.flat($0.reason, max: 200),
+                                                          needsPermission: $0.permission) }.sorted { $0.name < $1.name }
+            // A result read before the installed one never replaces it (defence in depth behind the lock).
+            guard redactor.install(loaded: loaded, failed: failures.map(\.meta.name).sorted(),
+                                   version: failures.isEmpty ? version : nil, ticket: ticket, failures: details) else { return nil }
+            redactor.recordAttempt(version: version, failed: !failures.isEmpty)
+            if failures.isEmpty { _ = redactor.holdEpisode(held: false) }
+            let fresh = redactor.unlogged(Set(failures.map { "\($0.key)@\($0.meta.updatedAt.timeIntervalSince1970)" }))
+            guard logFailures else { return ([], nil) }
             let now = Store.now()
-            var lines = failures.filter { fresh.contains("\($0.key)@\($0.meta.updatedAt.timeIntervalSince1970)") }.map { f in
+            let lines = failures.filter { fresh.contains("\($0.key)@\($0.meta.updatedAt.timeIntervalSince1970)") }.map { f in
                 ActivityEvent(companyId: f.meta.companyId, agentId: nil, turnId: nil, kind: .error, text: redactor.apply(
                     "secret \(f.meta.name) could not be loaded (\(Store.flat(f.reason, max: 200))); new turns and agent tool calls are held until it loads. Run `brahma secret load` (or press Load secrets in the app), set it again with `brahma secret set`, or remove it with `brahma secret rm`."),
                     createdAt: now)
@@ -133,17 +142,19 @@ extension Store {
             // One owner notice per hold episode, so the app shows why agents stopped.
             var notice: OwnerNotice?
             if redactor.holdEpisode(held: !failures.isEmpty) {
-                notice = OwnerNotice(companyId: nil, kind: .system, urgency: .normal, title: "Secrets need your permission",
-                                     body: "Brahma can't read \(failures.count) secret(s) without your permission; agents are paused. Run `brahma secret load` or press Load secrets in the app.",
-                                     createdAt: now)
+                notice = OwnerNotice(companyId: nil, kind: .system, urgency: .normal,
+                                     title: details.allSatisfy(\.needsPermission) ? "Secrets need your permission" : "Secrets could not be loaded",
+                                     body: Store.holdText(details), createdAt: now)
             }
-            // Engine-authored text naming secrets, never their values: written directly, not through `redact`, which throws
-            // while the secrets are not loaded.
-            if !lines.isEmpty || notice != nil {
-                try writer.write { db in
-                    for i in lines.indices { try lines[i].insert(db) }
-                    if var n = notice { try n.insert(db) }
-                }
+            return (lines, notice)
+        }
+        guard let writes else { return false }
+        // Engine-authored text naming secrets, never their values: written directly, not through `redact`, which throws while
+        // the secrets are not loaded.
+        if !writes.lines.isEmpty || writes.notice != nil {
+            try writer.write { db in
+                for var line in writes.lines { try line.insert(db) }
+                if var n = writes.notice { try n.insert(db) }
             }
         }
         return true
@@ -162,9 +173,40 @@ extension Store {
         }
         try reloadRedactorIfNeeded(vault: vault, logFailures: false, force: true)
         let metas = try secretsMetas()
-        let failed = redactor.failedNames
-        let reasons = redactor.lastFailureReasons()
-        return (metas.count - failed.count, failed.map { ($0, reasons[$0] ?? "not loaded") })
+        let failed = redactor.lastFailures
+        return (metas.count - failed.count, failed.map { ($0.name, $0.reason) })
+    }
+
+    /// Why the store is held, for the owner (the hold notice and the app's banner), or nil when it is not. Names and reasons
+    /// only, never values. A read that needed permission points to `brahma secret load`; any other failure (a missing item, a
+    /// value that is not UTF-8) points to setting the secret again or removing it.
+    public func secretsHoldText() -> String? {
+        guard secretsHeld else { return nil }
+        let failures = redactor.lastFailures
+        if failures.isEmpty {
+            let n = (try? secretCount()) ?? 0
+            return "Brahma can't read \(n) secret(s) yet; agents are paused. Run `brahma secret load` or press Load secrets in the app."
+        }
+        return Store.holdText(failures)
+    }
+
+    static func holdText(_ failures: [Redactor.Failure]) -> String {
+        var parts: [String] = []
+        let permission = failures.filter(\.needsPermission)
+        let other = failures.filter { !$0.needsPermission }
+        if !permission.isEmpty {
+            parts.append("Brahma can't read \(permission.count) secret(s) without your permission (\(permission.map(\.name).joined(separator: ", "))); agents are paused. Run `brahma secret load` or press Load secrets in the app.")
+        }
+        if !other.isEmpty {
+            // Grouped by reason, in name order.
+            var groups: [(reason: String, names: [String])] = []
+            for f in other {
+                if let i = groups.firstIndex(where: { $0.reason == f.reason }) { groups[i].names.append(f.name) } else { groups.append((f.reason, [f.name])) }
+            }
+            let list = groups.map { "\($0.names.joined(separator: ", ")) (\($0.reason))" }.joined(separator: "; ")
+            parts.append("Brahma can't read \(other.count) secret(s): \(list). Agents are paused until they load; set them again with `brahma secret set` or remove them with `brahma secret rm`.")
+        }
+        return parts.joined(separator: " ")
     }
 
     /// How many secrets the database holds (all companies).

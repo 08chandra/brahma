@@ -14,7 +14,9 @@ func fail(_ message: String) -> ExitCode {
 /// The owner's time zone for `clock()`, set by `openStore()`. A CLI process is single-threaded for output.
 nonisolated(unsafe) var cliTimeZone: TimeZone = .current
 
-func openStore() throws -> (Store, BrahmaPaths) {
+/// `lazySecrets: false` for the engine (`brahma run`): it reloads the secrets in its own Blocking bodies, never through the
+/// CLI's loader (which would read the vault on the Orchestrator actor).
+func openStore(lazySecrets: Bool = true) throws -> (Store, BrahmaPaths) {
     let paths = BrahmaPaths.fromEnvironment()
     // The secret store is chosen before anything else: a refused choice fails the command, never falls back.
     do { try PlatformSecretVault.refuseMemory(try PlatformSecretVault.resolve(paths: paths)) } catch { throw fail("\(error)") }
@@ -25,7 +27,7 @@ func openStore() throws -> (Store, BrahmaPaths) {
     // Every write of redactable text fails closed until the redactor has loaded the secrets (`Store.secretsHeld`). The load
     // is lazy: it runs once, non-interactively, on the first redacting write, so read-only commands never touch the vault.
     // An agent's shell (BRAHMA_AGENT_ID) never reads secret values: its writes keep failing closed.
-    if ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] == nil {
+    if lazySecrets, ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] == nil {
         store.redactorLoader = { [store] in
             guard let vault = try? cliSecretVault(interactive: false) else { return }
             _ = try? store.reloadRedactorIfNeeded(vault: vault, logFailures: false)

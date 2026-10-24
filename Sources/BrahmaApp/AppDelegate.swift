@@ -85,7 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let store = try Store(path: paths.database.path, catalog: catalog)
             // Owner writes from the app fail closed until the secrets are loaded: a non-interactive load now (it cannot prompt
             // or block on a dialog); the engine retries in the background, and the banner's Load secrets asks the owner.
-            if store.secretsHeld { _ = try? store.reloadRedactorIfNeeded(vault: secrets.vault) }
+            // `logFailures: false`: the engine logs failures and writes the hold notice; the banner reflects the store's state.
+            if store.secretsHeld { _ = try? store.reloadRedactorIfNeeded(vault: secrets.vault, logFailures: false) }
             let model = AppModel(store: store, paths: paths)
             model.ownerSecretVault = ownerSecrets.vault
             let warnings = [selection.warning, secrets.warning].compactMap { $0 }

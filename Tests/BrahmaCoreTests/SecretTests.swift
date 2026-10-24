@@ -20,6 +20,7 @@ final class ScriptedVault: SecretVault, @unchecked Sendable {
     private let inner: any SecretVault
     private var _failing: Set<String> = []
     private var _unavailable = false
+    private var _needPermission = false
     private var _reads: [String] = []
     private var _threads: [String] = []
     private var _failDelete = false
@@ -29,11 +30,14 @@ final class ScriptedVault: SecretVault, @unchecked Sendable {
     var threads: [String] { lock.withLock { _threads } }
     var failing: Set<String> { get { lock.withLock { _failing } } set { lock.withLock { _failing = newValue } } }
     var unavailable: Bool { get { lock.withLock { _unavailable } } set { lock.withLock { _unavailable = newValue } } }
+    /// Reads fail as a Keychain read that would have needed the owner's permission (non-interactive).
+    var needPermission: Bool { get { lock.withLock { _needPermission } } set { lock.withLock { _needPermission = newValue } } }
     var reads: [String] { lock.withLock { _reads } }
     func set(companyId: String, name: String, value: String) throws { try inner.set(companyId: companyId, name: name, value: value) }
     func value(companyId: String, name: String) throws -> String? {
         let thread = Thread.current.name ?? ""
         lock.withLock { _reads.append(name); _threads.append(thread) }
+        if needPermission { throw SecretError.needsPermission }
         if unavailable || failing.contains(name) { throw SecretError.vaultFailed("scripted failure") }
         return try inner.value(companyId: companyId, name: name)
     }
@@ -423,27 +427,129 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         let vault = ScriptedVault(inner: w.vault)
         try w.store.setSecret(companyId: w.company.id, name: "A_KEY", value: "a-value-1234567", isTest: false, vault: vault)
         try w.store.setSecret(companyId: w.company.id, name: "B_KEY", value: "b-value-1234567", isTest: false, vault: vault)
-        vault.unavailable = true
+        vault.needPermission = true
         let notices = { try w.store.undeliveredNotices().filter { $0.kind == .system } }
         _ = try w.store.reloadRedactorIfNeeded(vault: vault)
         for _ in 0..<3 { clock.advance(400); _ = try w.store.reloadRedactorIfNeeded(vault: vault) }
         #expect(try notices().count == 1)
         let n = try #require(try notices().first)
         #expect(n.companyId == nil)
-        #expect("\(n.title) \(n.body)".contains("Brahma can't read 2 secret(s) without your permission; agents are paused. Run `brahma secret load` or press Load secrets in the app."),
+        #expect("\(n.title) \(n.body)".contains("Brahma can't read 2 secret(s) without your permission (A_KEY, B_KEY); agents are paused. Run `brahma secret load` or press Load secrets in the app."),
                 "\(n.title) | \(n.body)")
         // MCP and the CLI never write notices.
         try? w.store.prepareForToolCall(vault: vault)
         #expect(try notices().count == 1)
         // The episode ends when everything loads; a new failure starts a new one.
-        vault.unavailable = false
+        vault.needPermission = false
         clock.advance(400); _ = try w.store.reloadRedactorIfNeeded(vault: vault)
         #expect(!w.store.secretsHeld)
         try w.store.setSecret(companyId: w.company.id, name: "C_KEY", value: "c-value-1234567", isTest: false, vault: w.vault)
         vault.failing = ["C_KEY"]
         _ = try w.store.reloadRedactorIfNeeded(vault: vault)
         #expect(try notices().count == 2)
-        #expect(try notices().last.map { "\($0.title) \($0.body)".contains("1 secret(s)") } == true)
+        // A failure `brahma secret load` cannot fix says what it is, by name and reason (never a value).
+        let second = try #require(try notices().last)
+        #expect("\(second.title) \(second.body)".contains("Brahma can't read 1 secret(s): C_KEY (the secrets vault failed: scripted failure)"),
+                "\(second.body)")
+        #expect(!second.body.contains("c-value-1234567"))
+    }
+
+    @Test func holdTextSaysWhyByReason() throws {
+        let w = try W()
+        let clock = ManualUptime(); clock.install(on: w.store)
+        let vault = ScriptedVault(inner: w.vault)
+        #expect(w.store.secretsHoldText() == nil)
+        for (n, v) in [("A_KEY", "a-value-1234567"), ("B_KEY", "b-value-1234567"), ("C_KEY", "c-value-1234567")] {
+            try w.store.setSecret(companyId: w.company.id, name: n, value: v, isTest: false, vault: vault)
+        }
+        // Before any load attempt in this process.
+        let fresh = try Store(path: try { () throws -> String in
+            let d = try tempDir(); let p = d.appending(path: "b.sqlite").path
+            let o = try Store(path: p); let c = try o.createCompany(name: "X", goal: "g", workspacesRoot: d)
+            try o.setSecret(companyId: c.id, name: "X_KEY", value: "x-value-1234567", isTest: false, vault: MemoryVault())
+            return p }())
+        #expect(fresh.secretsHoldText()?.contains("can't read 1 secret(s)") == true, "\(fresh.secretsHoldText() ?? "nil")")
+        // Missing value and a value that is not UTF-8: names and reasons, and the fix is not `secret load`.
+        try w.vault.delete(companyId: w.company.id, name: "B_KEY")
+        vault.failing = ["C_KEY"]
+        _ = try w.store.reloadRedactorIfNeeded(vault: vault)
+        let text = try #require(w.store.secretsHoldText())
+        #expect(text.contains("Brahma can't read 2 secret(s): B_KEY (the vault has no value for it); C_KEY (the secrets vault failed: scripted failure)."), "\(text)")
+        #expect(!text.contains("without your permission")); #expect(text.contains("brahma secret set"))
+        #expect(!text.contains("value-1234567"))
+        // Permission failures say so and point to `brahma secret load`.
+        try w.vault.set(companyId: w.company.id, name: "B_KEY", value: "b-value-1234567")
+        vault.failing = []; vault.needPermission = true
+        clock.advance(400); _ = try w.store.reloadRedactorIfNeeded(vault: vault)
+        let perm = try #require(w.store.secretsHoldText())
+        #expect(perm.contains("Brahma can't read 2 secret(s) without your permission (B_KEY, C_KEY)"), "\(perm)")
+        #expect(perm.contains("brahma secret load"))
+    }
+
+    // MARK: round 3: one reload at a time; a stale load never wins
+
+    /// A vault whose read of `gated` signals `reached`, waits for `release`, then fails (a background read that would have
+    /// needed permission).
+    final class GatedVault: SecretVault, @unchecked Sendable {
+        let inner: any SecretVault, gated: String
+        let reached = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        init(inner: any SecretVault, gated: String) { self.inner = inner; self.gated = gated }
+        func set(companyId: String, name: String, value: String) throws { try inner.set(companyId: companyId, name: name, value: value) }
+        func value(companyId: String, name: String) throws -> String? {
+            if name == gated { reached.signal(); release.wait(); throw SecretError.needsPermission }
+            return try inner.value(companyId: companyId, name: name)
+        }
+        func delete(companyId: String, name: String) throws { try inner.delete(companyId: companyId, name: name) }
+    }
+
+    @Test func concurrentReloadsNeverLeaveAStaleFailedLoad() throws {
+        let dir = try tempDir(); let path = dir.appending(path: "brahma.sqlite").path
+        let owner = try Store(path: path)
+        let company = try owner.createCompany(name: "Acme", goal: "g", workspacesRoot: dir)
+        let vault = MemoryVault()
+        for (n, v) in [("A_KEY", "a-value-1234567"), ("B_KEY", "b-value-1234567"), ("C_KEY", "c-value-1234567")] {
+            try owner.setSecret(companyId: company.id, name: n, value: v, isTest: false, vault: vault)
+        }
+        // One process (the app): its engine's background reload and the owner's Load secrets share this store.
+        let store = try Store(path: path)
+        let background = GatedVault(inner: vault, gated: "B_KEY")
+        let bgDone = DispatchSemaphore(value: 0), ownerDone = DispatchSemaphore(value: 0)
+        Thread { _ = try? store.reloadRedactorIfNeeded(vault: background, logFailures: false); bgDone.signal() }.start()
+        #expect(background.reached.wait(timeout: .now() + 10) == .success)   // the background read of B is in flight
+        Thread { _ = try? store.ownerLoadSecrets(vault: vault); ownerDone.signal() }.start()
+        // Give the owner's load every chance to finish first (it must not be able to: one reload at a time).
+        let ownerFinishedFirst = ownerDone.wait(timeout: .now() + 0.5) == .success
+        background.release.signal()                                          // B fails in the background
+        #expect(bgDone.wait(timeout: .now() + 10) == .success)
+        if !ownerFinishedFirst { #expect(ownerDone.wait(timeout: .now() + 10) == .success) }
+        #expect(!ownerFinishedFirst, "the owner's load ran while the background reload was in flight")
+        // The owner's complete load is the one that stands: nothing held, everything redacted.
+        #expect(!store.secretsHeld, "failed: \(store.redactor.failedNames)")
+        #expect(store.redactor.version == (try store.secretsVersion()))
+        #expect(store.redactor.apply("a-value-1234567 b-value-1234567 c-value-1234567")
+                == "[redacted A_KEY] [redacted B_KEY] [redacted C_KEY]")
+    }
+
+    @Test func installRejectsALoadStartedBeforeTheInstalledOne() {
+        let r = Redactor()
+        let older = r.beginLoad(), newer = r.beginLoad()
+        r.install(loaded: ["c:A_KEY": .init(name: "A_KEY", updatedAt: .now, value: "a-value-1234567")], failed: [], version: "1:2",
+                  ticket: newer)
+        #expect(r.hasLoaded); #expect(r.version == "1:2")
+        // The older, failed result arrives late: ignored.
+        #expect(r.install(loaded: [:], failed: ["A_KEY"], version: nil, ticket: older) == false)
+        #expect(r.failedNames.isEmpty); #expect(r.version == "1:2")
+        #expect(r.apply("a-value-1234567") == "[redacted A_KEY]")
+    }
+
+    @Test func engineRunDoesNotInstallTheCLILazyLoader() throws {
+        // `brahma run` is the engine: it reloads in its own Blocking bodies, never through the CLI's on-the-actor loader.
+        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let run = try String(contentsOf: sources.appending(path: "Sources/brahma/RunCommand.swift"), encoding: .utf8)
+        #expect(run.contains("openStore(lazySecrets: false)"))
+        #expect(!run.contains("try openStore()"))
+        let support = try String(contentsOf: sources.appending(path: "Sources/brahma/CLISupport.swift"), encoding: .utf8)
+        #expect(support.contains("func openStore(lazySecrets: Bool = true)"))
     }
 
     @Test func lazyLoaderRunsOnceOnTheFirstRedactingWrite() throws {

@@ -4,10 +4,7 @@ import BrahmaCore
 extension AppModel {
     /// Updates `secretsBanner` from the store's redactor (in-memory; counts the secrets only while held).
     public func refreshSecrets() {
-        guard store.secretsHeld else { secretsBanner = nil; return }
-        let failed = store.redactor.failedNames.count
-        let count = failed > 0 ? failed : ((try? store.secretCount()) ?? 0)
-        secretsBanner = "Brahma can't read \(count) secret(s) without your permission; agents are paused."
+        secretsBanner = store.secretsHoldText()
     }
 
     /// The owner's explicit "Load secrets": reads every secret with the interactive store (macOS may ask to allow access),
