@@ -19,10 +19,20 @@ import GRDB
             try env.post(acme, "acme plans the zebra launch")
             try env.post(beta, "beta keeps the giraffe secret")
             try SystemTimers.ensure(store: env.store, now: Date(timeIntervalSince1970: 1_781_107_200))
+            // Task 13a: captured work records travel with the company (already redacted when they were captured).
+            try Self.put(env.paths.transcriptsDir.appending(path: "\(acme.id)/a-1/s-1/t-1.jsonl.gz"), "acme transcript")
+            try Self.put(env.paths.transcriptsDir.appending(path: "\(beta.id)/b-1/s-2/t-2.jsonl.gz"), "beta transcript")
+            try Self.put(env.paths.archiveDir.appending(path: "\(acme.slug)/memo.md"), "acme archive")
+            try Self.put(env.paths.archiveDir.appending(path: "\(beta.slug)/memo.md"), "beta archive")
             try env.store.writer.write { db in
                 try db.execute(sql: "INSERT INTO engineProbe(id, report, checkedAt) VALUES (1, '{}', '2026-06-10 12:00:00.000')")
                 try db.execute(sql: "INSERT INTO usageState(id, status, isUsingOverage, observedAt) VALUES (1, 'allowed', 0, '2026-06-10 12:00:00.000')")
             }
+        }
+
+        static func put(_ url: URL, _ text: String) throws {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: url)
         }
 
         func export(_ company: Company, includeWorkspace: Bool = true) throws -> ExportResult {
@@ -115,9 +125,24 @@ import GRDB
         for unwanted in [".cache", "node_modules", "wt", ".brahma", "link", "dirlink", "secret-in-worktree"] {
             #expect(!names.contains { $0.contains(unwanted) }, "\(unwanted) must not be exported: \(names)")
         }
-        #expect(result.copied.sorted() == ["files", "roles"])
+        #expect(result.copied.sorted() == ["archive", "files", "roles", "transcripts"])
         var st = stat()
         #expect(stat(result.directory.appending(path: "files/keep.txt").path, &st) == 0 && st.st_mode & 0o777 == 0o600)
+    }
+
+    @Test func exportCopiesTranscriptsAndArchive() throws {
+        let f = try Fixture()
+        let result = try f.export(f.acme)
+        let dir = result.directory
+        func text(_ rel: String) -> String? { try? String(contentsOf: dir.appending(path: rel), encoding: .utf8) }
+        #expect(text("transcripts/\(f.acme.id)/a-1/s-1/t-1.jsonl.gz") == "acme transcript")
+        #expect(text("archive/\(f.acme.slug)/memo.md") == "acme archive")
+        // Nothing of the other company.
+        #expect(!FileManager.default.fileExists(atPath: dir.appending(path: "transcripts/\(f.beta.id)").path))
+        #expect(!FileManager.default.fileExists(atPath: dir.appending(path: "archive/\(f.beta.slug)").path))
+        #expect(result.copied.contains("transcripts") && result.copied.contains("archive"))
+        var st = stat()
+        #expect(stat(dir.appending(path: "transcripts/\(f.acme.id)/a-1/s-1/t-1.jsonl.gz").path, &st) == 0 && st.st_mode & 0o777 == 0o600)
     }
 
     @Test func exportHasNoSecretValues() throws {

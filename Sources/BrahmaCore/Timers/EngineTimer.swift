@@ -129,13 +129,14 @@ public struct TimerJobRegistry: Sendable {
 
     public init() {}
 
-    /// The engine's own jobs: `backup.hourly` and `backup.repos` are real; the rest are no-ops until the tasks that own them
-    /// (home and target backups, digest) replace them.
+    /// The engine's own jobs: `backup.hourly`, `backup.repos` and `backup.home` are real; the rest are no-ops until the tasks that own them
+    /// (target backups, digest) replace them.
     public static var system: TimerJobRegistry {
         var registry = TimerJobRegistry()
         for name in SystemTimers.jobNames { registry.register(name) { _ in } }
         registry.register("backup.hourly", BackupJobs.hourly)
         registry.register("backup.repos", BackupJobs.repos)
+        registry.register("backup.home", BackupJobs.home)
         return registry
     }
 

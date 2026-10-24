@@ -34,9 +34,17 @@ public enum DBOpeners {
     public static let lsofTimeout: TimeInterval = 20
     /// Seconds between SIGTERM and SIGKILL of a timed-out `lsof`.
     static let killGrace: TimeInterval = 1
+    /// Awake seconds to wait for `lsof` to be gone after SIGKILL. A process that survives it (stuck in the kernel) is abandoned
+    /// and the check reported impossible, so a restore never waits on it.
+    static let killWait: TimeInterval = 2
 
-    /// `lsof` and `timeout` are test seams (macOS only).
-    public static func pids(of db: URL, lsof: String = "/usr/sbin/lsof", timeout: TimeInterval = lsofTimeout) throws -> [Int32] {
+    /// The processes other than this one that have the database (or its `-wal`/`-shm`) open.
+    public static func pids(of db: URL) throws -> [Int32] {
+        try pids(of: db, lsof: "/usr/sbin/lsof", timeout: lsofTimeout)
+    }
+
+    /// `lsof`, `timeout` and `killWait` are test seams (macOS only).
+    static func pids(of db: URL, lsof: String, timeout: TimeInterval, killWait: TimeInterval = DBOpeners.killWait) throws -> [Int32] {
         let files = [db.path, db.path + "-wal", db.path + "-shm"].filter { FileManager.default.fileExists(atPath: $0) }
         guard !files.isEmpty else { return [] }
         let me = getpid()
@@ -77,11 +85,13 @@ public enum DBOpeners {
         // Bounded in awake time (AwakeTime): a hung lsof is SIGTERMed, then SIGKILLed, and its output is never waited on.
         let deadline = AwakeTime.uptime() + timeout
         var termAt: TimeInterval?
-        var killed = false
+        var killedAt: TimeInterval?
         while process.isRunning {
             let now = AwakeTime.uptime()
             if termAt == nil, now >= deadline { termAt = now; process.terminate() }
-            if let t = termAt, !killed, now - t >= killGrace { killed = true; kill(process.processIdentifier, SIGKILL) }
+            if let t = termAt, killedAt == nil, now - t >= killGrace { killedAt = now; kill(process.processIdentifier, SIGKILL) }
+            // Still there after SIGKILL: abandoned, not waited on.
+            if let k = killedAt, now - k >= killWait { break }
             usleep(10_000)
         }
         if termAt != nil {
@@ -233,7 +243,13 @@ public struct RestorePlan: Equatable, Sendable {
     public let snapshot: URL
     public let snapshotDate: Date?
     public let reposAhead: [RepoAhead]
+    /// The newest data-home snapshot at or before the database snapshot: what `restore(_:withFiles:)` puts the files back to.
+    public let homeSnapshot: HomeSnapshotInfo?
     public var warnings: [String] { reposAhead.map(\.warning) }
+
+    public init(snapshot: URL, snapshotDate: Date?, reposAhead: [RepoAhead], homeSnapshot: HomeSnapshotInfo? = nil) {
+        self.snapshot = snapshot; self.snapshotDate = snapshotDate; self.reposAhead = reposAhead; self.homeSnapshot = homeSnapshot
+    }
 }
 
 public struct RestoreOutcome: Equatable, Sendable {
@@ -242,6 +258,9 @@ public struct RestoreOutcome: Equatable, Sendable {
     /// The verified pre-restore snapshot, when the old database could still be snapshotted.
     public let preRestoreSnapshot: URL?
     public let warnings: [String]
+    /// With `withFiles`: the files put back from the data-home snapshot, and where the ones they replaced were kept.
+    public var filesRestored: Int = 0
+    public var filesPreRestore: URL?
 }
 
 extension BackupService {
@@ -287,8 +306,14 @@ extension BackupService {
         let openers = try DBOpeners.pids(of: database)
         if !openers.isEmpty { throw RestoreError.dbOpenElsewhere(openers) }
         try validate(snapshot: snapshot)
-        return RestorePlan(snapshot: snapshot, snapshotDate: Self.parse(name: snapshot.lastPathComponent)?.date,
-                           reposAhead: reposAhead(of: snapshot))
+        let date = Self.parse(name: snapshot.lastPathComponent)?.date
+        return RestorePlan(snapshot: snapshot, snapshotDate: date, reposAhead: reposAhead(of: snapshot),
+                           homeSnapshot: date.flatMap { HomeSnapshot.newest(atOrBefore: $0, paths: lockPaths) })
+    }
+
+    /// The newest snapshot taken at or before `date` that passes `validate` (`brahma restore --at`).
+    public func snapshot(atOrBefore date: Date) -> BackupInfo? {
+        list().first { $0.date <= date && (try? validate(snapshot: $0.url)) != nil }
     }
 
     /// Companies whose `main` has commits the snapshot's record of it does not: they survive a restore (git is not touched).
@@ -323,8 +348,11 @@ extension BackupService {
     ///    `mainCommit` in `restoreMain`) and write the nonce to the restore marker, before anything else can fail;
     /// 7. rebuild every FTS index (`VACUUM` may have renumbered the implicit rowids the external-content indexes point at) and
     ///    run their integrity check.
+    ///
+    /// With `withFiles` the data home's files are then put back from `plan.homeSnapshot` (`HomeSnapshot.restore`): that snapshot is
+    /// verified against its manifest before anything changes, and what the restore overwrites is kept in `.pre-restore-<stamp>/`.
     @discardableResult
-    public func restore(_ plan: RestorePlan) throws -> RestoreOutcome {
+    public func restore(_ plan: RestorePlan, withFiles: Bool = false) throws -> RestoreOutcome {
         let lock: OrchestratorLock
         do { lock = try OrchestratorLock.acquire(paths: lockPaths) } catch OrchestratorLockError.alreadyRunning {
             throw RestoreError.engineRunning
@@ -337,6 +365,13 @@ extension BackupService {
         }
         try openersCheck()
         try validate(snapshot: plan.snapshot)
+        if withFiles {
+            guard let home = plan.homeSnapshot else {
+                throw RestoreError.failed("there is no data-home snapshot at or before that snapshot; nothing was changed "
+                    + "(see: brahma restore without --with-files)")
+            }
+            do { try HomeSnapshot.verify(home) } catch { throw RestoreError.failed("\(error); nothing was changed") }
+        }
         var warnings: [String] = []
         var preSnapshot: URL?
         let stamp = Self.stamp(now())
@@ -411,10 +446,21 @@ extension BackupService {
 
         // 6. The nonce lives in the database the engine reads; the marker only points at it.
         do {
+            let recordedAt = now()
             let nonce = try queue.write { db in
-                try Self.recordRestoreEvent(db, snapshot: plan.snapshot.lastPathComponent, now: now(), notes: warnings)
+                try Self.recordRestoreEvent(db, snapshot: plan.snapshot.lastPathComponent, now: recordedAt, notes: warnings)
             }
-            try RestoreMarker.write(nonce: nonce, to: Self.restoreMarker(home: home))
+            do {
+                try RestoreMarker.write(nonce: nonce, to: Self.restoreMarker(home: home))
+            } catch {
+                // No marker will ever name this nonce: a live one would let anyone who reads it from the database roll `main` back
+                // without an alert. Use it up.
+                try? queue.write { db in
+                    try db.execute(sql: "UPDATE restoreEvent SET consumedAt = ? WHERE nonce = ? AND consumedAt IS NULL",
+                                   arguments: [recordedAt, nonce])
+                }
+                throw error
+            }
         } catch {
             throw RestoreError.failed("restored, but the restore could not be recorded (\(error)); repositories are not re-adopted: "
                 + "review each company's main and accept it (brahma main accept)")
@@ -426,7 +472,20 @@ extension BackupService {
         } catch {
             throw RestoreError.failed("restored, but the search index could not be rebuilt: \(error)")
         }
-        return RestoreOutcome(previousCopy: hadDatabase ? previous : nil, preRestoreSnapshot: preSnapshot, warnings: warnings)
+        var outcome = RestoreOutcome(previousCopy: hadDatabase ? previous : nil, preRestoreSnapshot: preSnapshot, warnings: warnings)
+
+        // 8. The files, last: the database is already where it should be.
+        if withFiles, let homeSnapshot = plan.homeSnapshot {
+            do {
+                let result = try HomeSnapshot.restore(homeSnapshot, paths: lockPaths, now: now())
+                outcome.filesRestored = result.restored
+                outcome.filesPreRestore = result.movedAway > 0 || result.restored > 0 ? result.preRestore : nil
+            } catch {
+                throw RestoreError.failed("the database was restored, but the files could not be put back (\(error)); "
+                    + "run 'brahma restore' again with --with-files, or copy them from \(homeSnapshot.url.path)")
+            }
+        }
+        return outcome
     }
 
     /// Records a restore in the (restored) database: one `restoreEvent` row with a fresh nonce, the `notes` (warnings, logged as

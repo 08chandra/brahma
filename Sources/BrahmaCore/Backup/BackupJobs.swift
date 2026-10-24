@@ -28,7 +28,7 @@ public final class RestoreHooks: @unchecked Sendable {
     var afterRestore: [Handler] { lock.withLock { handlers } }
 }
 
-/// The engine's backup timer jobs (`backup.hourly`, `backup.repos`).
+/// The engine's backup timer jobs (`backup.hourly`, `backup.repos`, `backup.home`).
 enum BackupJobs {
     static func hourly(_ context: TimerContext) async throws {
         let store = context.store
@@ -58,6 +58,21 @@ enum BackupJobs {
             if !failures.isEmpty { fail(context, "repository backup failed for " + failures.joined(separator: "; ")) }
         } catch {
             fail(context, "repository backup failed: \(error)")
+        }
+    }
+
+    /// The data-home snapshot (Task 13a): archives, transcripts, role cards and the rest of the home, hard-linked against the
+    /// previous snapshot. Files that could not be copied are named in the owner notice; the snapshot is still kept.
+    static func home(_ context: TimerContext) async throws {
+        let paths = context.paths, now = context.now
+        do {
+            let result = try await context.blocking.tryRun { try HomeSnapshot.take(paths: paths, now: now) }
+            if !result.problems.isEmpty {
+                fail(context, "the data-home snapshot left out \(result.problems.count) file(s): "
+                    + result.problems.prefix(3).joined(separator: "; "))
+            }
+        } catch {
+            fail(context, "data-home backup failed: \(error)")
         }
     }
 

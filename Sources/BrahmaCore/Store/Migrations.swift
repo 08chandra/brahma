@@ -747,5 +747,23 @@ enum Migrations {
                 """)
             try db.execute(sql: "INSERT INTO ownerPrefs(id) VALUES (1)")
         }
+        m.registerMigration("v5-transcripts") { db in
+            // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
+            // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).
+            try db.create(table: "turnTranscript") { t in
+                t.primaryKey("turnId", .text).references("turn", onDelete: .cascade)
+                t.column("companyId", .text).notNull()
+                t.column("agentId", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("path", .text).notNull()
+                t.column("byteStart", .integer).notNull()
+                t.column("byteEnd", .integer).notNull()
+                t.column("codec", .text).notNull()
+                t.column("sha", .text).notNull()
+                t.column("capturedAt", .datetime).notNull()
+            }
+            try db.create(index: "turnTranscript_session", on: "turnTranscript", columns: ["sessionId", "capturedAt"])
+            try db.create(index: "turnTranscript_agent", on: "turnTranscript", columns: ["companyId", "agentId", "capturedAt"])
+        }
     }
 }

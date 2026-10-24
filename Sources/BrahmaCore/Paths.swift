@@ -39,6 +39,14 @@ public struct BrahmaPaths: Sendable, Equatable {
     /// Per-company git bundles (`repoBackups/<companyId>/<yyyyMMdd>.bundle`).
     public var repoBackups: URL { backupsDir.appending(path: "repos", directoryHint: .isDirectory) }
 
+    /// `<home>/transcripts/<companyId>/<agentId>/<sessionId>/<turnId>.jsonl.<zst|gz>`: the redacted, compressed record of every
+    /// turn (`TranscriptCapture`). Part of the data-home backup set.
+    public var transcriptsDir: URL { home.appending(path: "transcripts", directoryHint: .isDirectory) }
+    /// `<home>/archive/<companySlug>/`: the company archive Memory-lite writes (notes and SQLite files). Part of the backup set.
+    public var archiveDir: URL { home.appending(path: "archive", directoryHint: .isDirectory) }
+    /// Data-home snapshots (`HomeSnapshot`): `<backups>/home/home-<stamp>/{tree,MANIFEST.json}`.
+    public var homeSnapshots: URL { backupsDir.appending(path: "home", directoryHint: .isDirectory) }
+
     /// Creates `url` (and parents) as a 0700 directory, and tightens an existing one.
     public static func ensurePrivateDirectory(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,

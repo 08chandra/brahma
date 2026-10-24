@@ -301,4 +301,83 @@ import GRDB
         try await tick(orchestrator)
         #expect(try activity(store, acme).contains { $0.contains("could not be checkpointed") })
     }
+
+    // MARK: Task 13a (Task 12 re-review minors)
+
+    /// (a) A restore whose marker cannot be written does not leave a live nonce behind: the event is consumed.
+    @Test func markerWriteFailureConsumesEvent() throws {
+        let env = try BackupEnv()
+        _ = try env.company("Acme")
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.close()
+        let marker = BackupService.restoreMarker(paths: env.paths)
+        // A directory where the marker goes: the rename onto it fails after the event was committed.
+        try FileManager.default.createDirectory(at: marker.appending(path: "blocker"), withIntermediateDirectories: true)
+        let plan = try service.planRestore(snapshot: snapshot)
+        #expect(throws: RestoreError.self) { try service.restore(plan) }
+        let store = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        let rows = try store.writer.read { db in try Row.fetchAll(db, sql: "SELECT nonce, consumedAt FROM restoreEvent") }
+        #expect(rows.count == 1)
+        #expect(rows.allSatisfy { ($0["consumedAt"] as Date?) != nil }, "a nonce nobody can use must not stay valid")
+    }
+
+    private func insertEvent(_ store: Store, nonce: String, at seconds: TimeInterval) async throws {
+        try await store.writer.write { db in
+            try Migrations.createRestoreTables(db)
+            try db.execute(sql: "INSERT INTO restoreEvent (nonce, snapshot, restoredAt, notes) VALUES (?, 'x.sqlite', ?, '')",
+                           arguments: [nonce, Date(timeIntervalSince1970: seconds)])
+        }
+    }
+
+    /// (a) Unconsumed events older than the newest expire: on the first tick with no marker, and when a restore is taken up.
+    @Test func staleEventExpires() async throws {
+        let old = String(repeating: "a1", count: 32), newest = String(repeating: "b2", count: 32)
+        // No marker: the first tick consumes everything older than the newest, and leaves the newest.
+        let r = try await movedMainRig(moveMain: false)
+        try await insertEvent(r.store, nonce: old, at: 1_000)
+        try await insertEvent(r.store, nonce: newest, at: 2_000)
+        try await tick(r.orchestrator)
+        #expect(try restoreRow(r.store, old)?["consumedAt"] as Date? != nil)
+        #expect(try restoreRow(r.store, newest)?["consumedAt"] as Date? == nil)
+        // The stale nonce cannot be replayed into a marker: main is not rolled back, and the attempt is logged.
+        let marker = BackupService.restoreMarker(paths: r.paths)
+        try BrahmaPaths.ensurePrivateDirectory(marker.deletingLastPathComponent())
+        try RestoreMarker.write(nonce: old, to: marker)
+        try await tick(r.orchestrator)
+        #expect(r.events.all.isEmpty)
+        #expect(try activity(r.store, r.acme).contains { $0.hasPrefix("restore marker ignored: ") })
+
+        // Take-up: the marker names the newest; an older unconsumed event goes with it.
+        let t = try await movedMainRig(moveMain: false)
+        try await insertEvent(t.store, nonce: old, at: 1_000)
+        try await insertEvent(t.store, nonce: newest, at: 2_000)
+        let tMarker = BackupService.restoreMarker(paths: t.paths)
+        try BrahmaPaths.ensurePrivateDirectory(tMarker.deletingLastPathComponent())
+        try RestoreMarker.write(nonce: newest, to: tMarker)
+        try await tick(t.orchestrator)
+        #expect(try restoreRow(t.store, newest)?["consumedAt"] as Date? != nil)
+        #expect(try restoreRow(t.store, old)?["consumedAt"] as Date? != nil)
+    }
+
+    /// (c) A `main` that is a symbolic ref is never re-adopted, even when it resolves to the recorded commit.
+    @Test func restoreWithSymbolicMainRefused() async throws {
+        let r = try await restoredRig()
+        let marker = BackupService.restoreMarker(paths: r.env.paths)
+        let nonce = try markerNonce(marker)
+        let fixture = GitFixture(existing: URL(fileURLWithPath: r.acme.workspacePath, isDirectory: true))
+        try fixture.git(["branch", "elsewhere", r.recorded])
+        try fixture.git(["symbolic-ref", "refs/heads/main", "refs/heads/elsewhere"])
+        #expect(try fixture.git(["rev-parse", "refs/heads/main"]) == r.recorded)          // it resolves to the recorded commit
+
+        try await tick(r.orchestrator)
+
+        #expect(r.events.all.isEmpty)                                                       // nothing re-adopted, no handler ran
+        let texts = try activity(r.store, r.acme)
+        #expect(texts.contains { $0.hasPrefix("restored from \(r.snapshot.lastPathComponent); main is not the commit") }, "\(texts)")
+        #expect(!texts.contains { $0.contains("repos re-adopted") })
+        #expect(try restoreRow(r.store, nonce)?["consumedAt"] as Date? != nil)
+        #expect(try r.store.company(id: r.acme.id)?.mainCommit == r.recorded)
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
 }

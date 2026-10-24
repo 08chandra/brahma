@@ -122,7 +122,8 @@ public final class EngineHost {
         lock = acquired
         let orchestrator = Orchestrator(store: store, runner: makeRunner(resolved.claudePath), paths: paths, config: config,
                                         mcpExecutable: resolved.mcpExecutable, profile: .workspace,
-                                        claudePath: resolved.claudePath, vault: secretVault)
+                                        claudePath: resolved.claudePath, vault: secretVault,
+                                        transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()))
         do {
             try await orchestrator.start()
         } catch {

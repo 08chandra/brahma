@@ -31,8 +31,8 @@ public enum CompanyExporter {
         "sandboxCanary", "engineStop", "pushLog", "restoreEvent",
     ]
 
-    /// Trees copied from the company's data directory (`<home>/companies/<companyId>/`). Task 13a appends the transcript and
-    /// archive trees.
+    /// Trees copied from the company's data directory (`<home>/companies/<companyId>/`). The company's transcripts
+    /// (`<home>/transcripts/<companyId>/`) and archive (`<home>/archive/<slug>/`) are copied beside them, under the same names.
     nonisolated(unsafe) public static var copiedTrees = ["files", "roles"]
 
     /// Directory names never copied: worktrees, build output and caches.
@@ -78,6 +78,18 @@ public enum CompanyExporter {
                   !isLink(source) else { continue }
             try copyTree(from: source, to: staging.appending(path: tree, directoryHint: .isDirectory))
             copied.append(tree)
+        }
+        // Task 13a: the captured work record (already redacted when captured) and the company archive.
+        let homeTrees: [(name: String, source: URL, to: String)] = [
+            ("transcripts", paths.transcriptsDir.appending(path: company.id, directoryHint: .isDirectory), "transcripts/\(company.id)"),
+            ("archive", paths.archiveDir.appending(path: company.slug, directoryHint: .isDirectory), "archive/\(company.slug)"),
+        ]
+        for tree in homeTrees {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: tree.source.path, isDirectory: &isDir), isDir.boolValue, !isLink(tree.source),
+                  !tree.source.lastPathComponent.isEmpty else { continue }
+            try copyTree(from: tree.source, to: staging.appending(path: tree.to, directoryHint: .isDirectory))
+            copied.append(tree.name)
         }
         let manifest = staging.appending(path: "MANIFEST.json")
         let sourceManifest = companyDir.appending(path: "MANIFEST.json")

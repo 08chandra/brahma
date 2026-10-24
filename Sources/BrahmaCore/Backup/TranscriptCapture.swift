@@ -1,0 +1,228 @@
+import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
+/// Where the Claude CLI keeps its session transcripts: `<configDir>/projects/<encoded cwd>/<sessionId>.jsonl`.
+///
+/// The engine's turns inherit `HOME` and `CLAUDE_CONFIG_DIR` from the engine's own environment (`ChildEnvironment` admits both;
+/// nothing per agent or per company overrides them), so the CLI writes under `$CLAUDE_CONFIG_DIR` when that is set and
+/// `$HOME/.claude` otherwise. Tests pass a temp directory: the owner's real `~/.claude` is never read by a test.
+public struct TranscriptSource: Sendable, Equatable {
+    public let configDir: URL
+    public init(configDir: URL) { self.configDir = configDir }
+
+    public var projectsDir: URL { configDir.appending(path: "projects", directoryHint: .isDirectory) }
+
+    public static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> TranscriptSource {
+        if let dir = environment["CLAUDE_CONFIG_DIR"], !dir.isEmpty {
+            return TranscriptSource(configDir: URL(fileURLWithPath: dir, isDirectory: true))
+        }
+        let home = environment["HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? NSHomeDirectory()
+        return TranscriptSource(configDir: URL(fileURLWithPath: home, isDirectory: true).appending(path: ".claude", directoryHint: .isDirectory))
+    }
+}
+
+/// Per-turn capture of the Claude session transcript into the data home: redacted, compressed, one file per turn.
+///
+/// A session's file grows across turns (`--resume`), so each turn stores only the bytes appended since the previous capture of
+/// that session (`turnTranscript.byteEnd`), and only whole lines. Capture never fails a turn: every problem is an `Outcome`
+/// and an activity line.
+public struct TranscriptCapture: Sendable {
+    public enum Outcome: Equatable, Sendable {
+        case captured(TurnTranscript)
+        /// Nothing complete was appended since the last capture.
+        case nothingNew
+        /// No transcript file for the session (or the session id is not one).
+        case missing
+        /// The redactor has not loaded every secret yet: nothing is written; the next capture continues from the stored position.
+        case held
+        case alreadyCaptured
+        case failed(String)
+    }
+
+    public let paths: BrahmaPaths
+    public let source: TranscriptSource
+    public let compressor: Compressor
+    /// Upper bound on the bytes of one capture; the rest is taken by the next one.
+    static let maxChunk = 256 * 1024 * 1024
+
+    private let heldLogged = LoggedOnce()
+
+    public init(paths: BrahmaPaths, source: TranscriptSource, compressor: Compressor = .platformDefault) {
+        self.paths = paths; self.source = source; self.compressor = compressor
+    }
+
+    /// Blocking (file reads and a compression process): the caller runs it inside a `Blocking` body.
+    @discardableResult
+    public func capture(turn: Turn, sessionId: String, store: Store, now: Date = Date()) -> Outcome {
+        func note(_ text: String) {
+            try? store.appendEvent(ActivityEvent(companyId: turn.companyId, agentId: turn.agentId, turnId: turn.id, kind: .error,
+                                                 text: String(text.prefix(300)), createdAt: now))
+        }
+        // Fail closed: until every secret is loaded into the redactor nothing is written. The next capture of this session
+        // continues from the stored `byteEnd`, so no bytes are lost.
+        guard !store.secretsHeld else {
+            if heldLogged.first() {
+                note("transcript capture paused: secrets are not loaded yet; it continues from where it stopped once they are")
+            }
+            return .held
+        }
+        heldLogged.reset()
+        do {
+            guard Self.isSessionId(sessionId), let file = newestFile(sessionId: sessionId) else {
+                note("no transcript found for session \(sessionId.prefix(80)); nothing captured for this turn")
+                return .missing
+            }
+            if try store.transcript(turnId: turn.id) != nil { return .alreadyCaptured }
+            var start = try store.lastTranscriptEnd(sessionId: sessionId) ?? 0
+            let size = Int64(file.size)
+            if size < start {
+                note("transcript for session \(sessionId) was truncated or rotated; captured from the start")
+                start = 0
+            }
+            guard size > start else { return .nothingNew }
+            var slice = try Self.read(file.url, from: start, upTo: min(size, start + Int64(Self.maxChunk)))
+            // Only whole lines: the writer may be mid-line.
+            guard let lastNewline = slice.lastIndex(of: 0x0A) else { return .nothingNew }
+            slice = slice.prefix(through: lastNewline)
+            let redacted = redact(slice, with: store.redactor)
+            let packed = try compressor.compress(redacted, workDir: paths.tmpDir)
+            let relative = "transcripts/\(turn.companyId)/\(turn.agentId)/\(sessionId)/\(turn.id).jsonl.\(compressor.fileExtension)"
+            try Self.writePrivate(packed, to: paths.home.appending(path: relative))
+            let row = TurnTranscript(turnId: turn.id, companyId: turn.companyId, agentId: turn.agentId, sessionId: sessionId,
+                                     path: relative, byteStart: start, byteEnd: start + Int64(slice.count), codec: compressor.codec,
+                                     sha: StableHash.fnv1a64(redacted), capturedAt: now)
+            try store.recordTranscript(row)
+            return .captured(row)
+        } catch {
+            note("transcript capture failed: \(error)")
+            return .failed("\(error)")
+        }
+    }
+
+    /// The decompressed, verified content of a captured turn.
+    public func read(_ row: TurnTranscript) throws -> Data {
+        let url = paths.home.appending(path: row.path)
+        guard Self.isInside(url, root: paths.transcriptsDir) else { throw CompressorError.failed("\(row.path) is outside the transcripts directory") }
+        let packed = try Data(contentsOf: url)
+        let data = try Compressor.forCodec(row.codec).decompress(packed, workDir: paths.tmpDir)
+        guard StableHash.fnv1a64(data) == row.sha else { throw CompressorError.failed("\(row.path) does not match its recorded hash") }
+        return data
+    }
+
+    // MARK: Redaction
+
+    /// Every line is parsed, its string leaves redacted (`applyJSON`: a secret that is JSON-escaped on disk or inside a
+    /// `tool_result` string is found after decoding) and re-encoded. A line that changes nothing is kept byte for byte; one that
+    /// does not parse is redacted as raw text.
+    func redact(_ slice: Data, with redactor: Redactor) -> Data {
+        var out = Data()
+        out.reserveCapacity(slice.count)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let decoder = JSONDecoder()
+        var lineStart = slice.startIndex
+        while lineStart < slice.endIndex {
+            let lineEnd = slice[lineStart...].firstIndex(of: 0x0A) ?? slice.endIndex
+            let line = slice[lineStart..<lineEnd]
+            if line.isEmpty || line.allSatisfy({ $0 == 0x20 || $0 == 0x0D }) {
+                out.append(line)
+            } else if let value = try? decoder.decode(JSONValue.self, from: line) {
+                let cleaned = redactor.applyJSON(value)
+                if cleaned == value { out.append(line) } else if let encoded = try? encoder.encode(cleaned) { out.append(encoded) }
+                else { out.append(Data(redactor.apply(String(decoding: line, as: UTF8.self)).utf8)) }
+            } else {
+                out.append(Data(redactor.apply(String(decoding: line, as: UTF8.self)).utf8))
+            }
+            if lineEnd < slice.endIndex { out.append(0x0A) }
+            lineStart = lineEnd < slice.endIndex ? slice.index(after: lineEnd) : lineEnd
+        }
+        return out
+    }
+
+    // MARK: Files
+
+    /// A session id is what the CLI names a file: letters, digits, dashes and underscores.
+    static func isSessionId(_ text: String) -> Bool {
+        !text.isEmpty && text.utf8.count <= 100 && text.utf8.allSatisfy {
+            ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x41 && $0 <= 0x5A) || ($0 >= 0x61 && $0 <= 0x7A) || $0 == 0x2D || $0 == 0x5F
+        }
+    }
+
+    /// `projects/*/<sessionId>.jsonl`, the newest by modification time. Links are not followed.
+    func newestFile(sessionId: String) -> (url: URL, size: Int)? {
+        let fm = FileManager.default
+        guard let projects = try? fm.contentsOfDirectory(atPath: source.projectsDir.path) else { return nil }
+        var best: (url: URL, size: Int, mtime: Double)?
+        for name in projects.sorted() {
+            let url = source.projectsDir.appending(path: name).appending(path: "\(sessionId).jsonl")
+            var st = stat()
+            guard lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
+            let mtime = Self.modificationTime(st)
+            if best == nil || mtime > best!.mtime { best = (url, Int(st.st_size), mtime) }
+        }
+        return best.map { ($0.url, $0.size) }
+    }
+
+    static func modificationTime(_ st: stat) -> Double {
+        #if canImport(Darwin)
+        Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
+        #else
+        Double(st.st_mtim.tv_sec) + Double(st.st_mtim.tv_nsec) / 1e9
+        #endif
+    }
+
+    static func read(_ url: URL, from start: Int64, upTo end: Int64) throws -> Data {
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw CompressorError.failed("cannot open \(url.lastPathComponent) (errno \(errno))") }
+        defer { close(fd) }
+        var remaining = Int(end - start)
+        var data = Data(count: remaining)
+        var done = 0
+        while remaining > 0 {
+            let n = data.withUnsafeMutableBytes { raw in pread(fd, raw.baseAddress! + done, remaining, off_t(start) + off_t(done)) }
+            if n < 0 { if errno == EINTR { continue }; throw CompressorError.failed("cannot read \(url.lastPathComponent) (errno \(errno))") }
+            if n == 0 { break }
+            done += n; remaining -= n
+        }
+        return data.prefix(done)
+    }
+
+    /// A fresh 0600 file in the target's own directory (0700 directories), fsynced, then renamed into place.
+    static func writePrivate(_ data: Data, to url: URL) throws {
+        let dir = url.deletingLastPathComponent()
+        try BrahmaPaths.ensurePrivateDirectory(dir)
+        let staging = dir.appending(path: ".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        let fd = open(staging.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw CompressorError.failed("cannot create \(url.lastPathComponent) (errno \(errno))") }
+        var ok = fchmod(fd, 0o600) == 0
+        var done = 0
+        while ok && done < data.count {
+            let n = data.withUnsafeBytes { raw in write(fd, raw.baseAddress! + done, data.count - done) }
+            if n < 0 { if errno == EINTR { continue }; ok = false } else { done += n }
+        }
+        ok = ok && fsync(fd) == 0
+        let closed = close(fd) == 0
+        guard ok, closed, rename(staging.path, url.path) == 0 else {
+            let code = errno
+            unlink(staging.path)
+            throw CompressorError.failed("cannot write \(url.lastPathComponent) (errno \(code))")
+        }
+    }
+
+    static func isInside(_ url: URL, root: URL) -> Bool {
+        let path = url.standardizedFileURL.path, base = root.standardizedFileURL.path
+        return path.hasPrefix(base + "/") && !path.contains("/../")
+    }
+}
+
+/// Logs a condition once until it clears.
+private final class LoggedOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var logged = false
+    func first() -> Bool { lock.withLock { defer { logged = true }; return !logged } }
+    func reset() { lock.withLock { logged = false } }
+}

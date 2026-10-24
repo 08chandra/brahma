@@ -41,6 +41,9 @@ public actor Orchestrator {
     /// Where secret values live; read only to reload the store's redactor. Production passes the store `PlatformSecretVault`
     /// selected (the Keychain, or a dev/demo home's file store); the library default is `UnavailableVault`, never the Keychain.
     nonisolated let vault: any SecretVault
+    /// Per-turn transcript capture (`TranscriptCapture`); nil: off (the library default, as for `vault`). The app and
+    /// `brahma run` pass one reading the Claude CLI's real transcript directory.
+    nonisolated let transcripts: TranscriptCapture?
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -65,6 +68,8 @@ public actor Orchestrator {
     var dispatching = Set<String>()
     /// The restore marker last ignored and left in place (it could not be removed safely): it is logged once, not every tick.
     var ignoredRestoreMarker: String?
+    /// Whether this process has already expired the stale restore events (`expireStaleRestoreEvents`).
+    var staleRestoreEventsExpired = false
     /// Items whose dispatch failed in git: not offered again before this time.
     var dispatchBackoff: [String: Date] = [:]
     /// Companies whose `main` changed outside Brahma: no dispatch before this time.
@@ -103,8 +108,9 @@ public actor Orchestrator {
                 turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil },
                 timerJobs: TimerJobRegistry = .system,
                 vault: any SecretVault = UnavailableVault(),
-                restoreHooks: RestoreHooks = RestoreHooks()) {
-        self.timerJobs = timerJobs; self.vault = vault; self.restoreHooks = restoreHooks
+                restoreHooks: RestoreHooks = RestoreHooks(),
+                transcripts: TranscriptCapture? = nil) {
+        self.timerJobs = timerJobs; self.vault = vault; self.restoreHooks = restoreHooks; self.transcripts = transcripts
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
@@ -896,6 +902,11 @@ public actor Orchestrator {
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
                                       deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use,
                                       telemetry: telemetry, now: now)
+        }
+        // Task 13a: the turn's slice of the Claude session transcript, redacted and stored. Never fails the turn.
+        if let transcripts, let sessionId = state.result?.sessionId ?? state.inits.last?.sessionId ?? (sawInit ? sentRequest?.agent.sessionId : nil) {
+            let (store, turn, ended) = (self.store, turn, now)
+            _ = await blocking.run { transcripts.capture(turn: turn, sessionId: sessionId, store: store, now: ended) }
         }
         if let why = abortReason {
             attempt {

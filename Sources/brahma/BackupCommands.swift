@@ -51,12 +51,16 @@ struct RestoreCommand: ParsableCommand {
 
     @Flag(help: "List the snapshots instead.") var list = false
     @Flag(help: "Restore the newest snapshot that passes its integrity check.") var latest = false
+    @Option(help: "Restore the newest snapshot taken at or before this time (ISO-8601, e.g. 2026-06-10T14:30:00Z).") var at: String?
+    @Flag(name: .customLong("with-files"), help: "Also put the data home's files (archives, transcripts, role cards) back, from the newest data-home snapshot at or before the database snapshot.") var withFiles = false
     @Flag(name: .customLong("dry-run"), help: "Check the snapshot and show what would happen; change nothing.") var dryRun = false
     @Argument(help: "The snapshot file to restore.") var path: String?
 
     func validate() throws {
         if list { return }
-        guard latest != (path != nil) else { throw ValidationError("give a snapshot path or --latest (see: brahma restore --list)") }
+        let chosen = [latest, path != nil, at != nil].filter { $0 }.count
+        guard chosen == 1 else { throw ValidationError("give one of a snapshot path, --latest or --at <time> (see: brahma restore --list)") }
+        if let at, parseISO8601(at) == nil { throw ValidationError("--at wants an ISO-8601 time such as 2026-06-10T14:30:00Z, not '\(at)'") }
     }
 
     func run() throws {
@@ -68,24 +72,47 @@ struct RestoreCommand: ParsableCommand {
         if latest {
             guard let info = service.latestGood() else { throw fail("no snapshot passes its integrity check (see: brahma restore --list)") }
             snapshot = info.url
+        } else if let at, let when = parseISO8601(at) {
+            guard let info = service.snapshot(atOrBefore: when) else {
+                throw fail("no snapshot at or before \(stamp(when)) passes its integrity check (see: brahma restore --list)")
+            }
+            snapshot = info.url
         } else {
             snapshot = URL(fileURLWithPath: path ?? "")
         }
         let plan: RestorePlan
         do { plan = try service.planRestore(snapshot: snapshot) } catch { throw fail("\(error)") }
         for warning in plan.warnings { print(safe("warning: \(warning)")) }
+        if withFiles && plan.homeSnapshot == nil {
+            throw fail("there is no data-home snapshot at or before \(plan.snapshotDate.map(stamp) ?? "that snapshot"); nothing was changed "
+                + "(restore without --with-files to bring back the database only)")
+        }
         if dryRun {
             let when = plan.snapshotDate.map { " taken \(stamp($0))" } ?? ""
             print(safe("dry run: would restore \(snapshot.lastPathComponent)\(when); nothing was changed"))
+            if withFiles, let home = plan.homeSnapshot {
+                print(safe("dry run: would also put the files back from \(home.url.lastPathComponent) (\(stamp(home.date)))"))
+            }
             return
         }
         do {
-            let outcome = try service.restore(plan)
+            let outcome = try service.restore(plan, withFiles: withFiles)
             for warning in outcome.warnings { print(safe("warning: \(warning)")) }
             if let previous = outcome.previousCopy { print(safe("previous database kept: \(previous.path)")) }
+            if let kept = outcome.filesPreRestore {
+                print(safe("\(outcome.filesRestored) files restored; what they replaced is kept in \(kept.path)"))
+            }
             print(safe("restored \(snapshot.lastPathComponent); Brahma re-adopts the repositories when it next starts"))
         } catch { throw fail("\(error)") }
     }
+}
+
+/// ISO-8601 with or without fractional seconds.
+private func parseISO8601(_ text: String) -> Date? {
+    let plain = ISO8601DateFormatter()
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return plain.date(from: text) ?? fractional.date(from: text)
 }
 
 struct ExportCommand: ParsableCommand {

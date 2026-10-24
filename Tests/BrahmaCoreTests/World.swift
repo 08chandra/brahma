@@ -19,12 +19,14 @@ struct World {
     init(store: Store? = nil, config: SchedulerConfig = World.config(), memory: (any MemoryPressureSource)? = nil,
          checkEnvironment: [String: String]? = nil, checkRunner: (any CheckRunning)? = nil,
          planSelector: @escaping @Sendable (Agent, WorkItem, Company) -> Bool = { _, _, _ in false },
-         vault: any SecretVault = MemoryVault(), profile: PermissionProfile? = nil) throws {
+         vault: any SecretVault = MemoryVault(), profile: PermissionProfile? = nil,
+         transcriptSource: TranscriptSource? = nil) throws {
         self.store = try store ?? Store.inMemory()
         try self.store.setPlanTier(.max20x)   // Plan 1 tests assume the 2/6/16 mode caps
         router = MessageRouter(store: self.store)
         let root = try tempDir()
-        paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        let worldPaths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        paths = worldPaths
         userHome = root.appending(path: "user")
         try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
         orchestrator = Orchestrator(store: self.store, runner: fake, paths: paths, config: config,
@@ -33,7 +35,8 @@ struct World {
                                     clock: clock.function,
                                     memory: memory ?? DispatchMemoryPressureSource(), checkRunner: checkRunner ?? checks,
                                     checkBaseEnvironment: checkEnvironment ?? ProcessInfo.processInfo.environment,
-                                    planSelector: planSelector, vault: vault)
+                                    planSelector: planSelector, vault: vault,
+                                    transcripts: transcriptSource.map { TranscriptCapture(paths: worldPaths, source: $0, compressor: .gzip) })
     }
 
     static func config(hardCap: Int = 16, turnBudget: Int = 30) -> SchedulerConfig {

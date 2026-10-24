@@ -19,7 +19,10 @@ extension Orchestrator {
         let marker = BackupService.restoreMarker(paths: paths)
         guard gitTasks[Self.restoreTaskKey] == nil else { return }
         var st = stat()
-        guard lstat(marker.path, &st) == 0 || errno != ENOENT else { return }
+        guard lstat(marker.path, &st) == 0 || errno != ENOENT else {
+            expireStaleRestoreEvents()
+            return
+        }
         let (store, blocking, hooks) = (self.store, self.blocking, restoreHooks.afterRestore)
         spawnGit(Self.restoreTaskKey) { [self] in
             let reading = await blocking.run { RestoreMarker.read(marker) }
@@ -30,6 +33,24 @@ extension Orchestrator {
                 await ignoreRestoreMarker(marker, reason: reason, removable: removable, identity: identity, companies: companies)
             case .nonce(let nonce):
                 await takeUpRestore(nonce: nonce, marker: marker, companies: companies, store: store, blocking: blocking, hooks: hooks)
+            }
+        }
+    }
+
+    /// The first tick that finds no marker: every unconsumed restore event older than the newest one is used up. A nonce no marker
+    /// can still name must not stay valid (before the sandbox, anyone who reads it from the database could plant a marker and
+    /// roll `main` back without an alert). Once per process.
+    private func expireStaleRestoreEvents() {
+        guard !staleRestoreEventsExpired else { return }
+        staleRestoreEventsExpired = true
+        let now = clock()
+        attempt {
+            try store.writer.write { db in
+                guard try db.tableExists("restoreEvent") else { return }
+                try db.execute(sql: """
+                    UPDATE restoreEvent SET consumedAt = ?
+                    WHERE consumedAt IS NULL AND (restoredAt, rowid) < (SELECT restoredAt, rowid FROM restoreEvent ORDER BY restoredAt DESC, rowid DESC LIMIT 1)
+                    """, arguments: [now])
             }
         }
     }
@@ -112,6 +133,11 @@ extension Orchestrator {
             consumed = try await store.writer.write { db -> Bool in
                 try db.execute(sql: "UPDATE restoreEvent SET consumedAt = ? WHERE nonce = ? AND consumedAt IS NULL", arguments: [now, nonce])
                 guard db.changesCount == 1 else { return false }
+                // A restore this one supersedes that was never taken up goes with it.
+                try db.execute(sql: """
+                    UPDATE restoreEvent SET consumedAt = ?
+                    WHERE consumedAt IS NULL AND restoredAt < (SELECT restoredAt FROM restoreEvent WHERE nonce = ?)
+                    """, arguments: [now, nonce])
                 for reading in readings {
                     if reading.adopt, let recorded = reading.recorded {
                         try store.finalizeMainCommit(db, companyId: reading.company.id, commit: recorded)
