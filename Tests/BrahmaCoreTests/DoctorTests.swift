@@ -177,3 +177,52 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         #expect(try store.latestProbe()?.cliVersion == "2.1.310")
     }
 }
+
+@Suite(.serialized) struct DoctorExecTests {
+    @Test func aHangingProcessIsKilledAtTheTimeoutAndThrows() async throws {
+        let started = AwakeTime.uptime()
+        do {
+            _ = try await Doctor.execProcess(executable: "/bin/sleep", arguments: ["120"], timeout: 0.3, blocking: Blocking())
+            Issue.record("expected a timeout")
+        } catch let e as Doctor.ExecTimedOut {
+            #expect(e.description.contains("did not finish within"), "\(e)")
+        }
+        #expect(AwakeTime.uptime() - started < 60, "killed long before the 120 s sleep ends")
+    }
+
+    @Test func aFastProcessReturnsItsOutputAndAFailingOneNil() async throws {
+        let ok = try await Doctor.execProcess(executable: "/bin/echo", arguments: ["2.1.304 (Claude Code)"], timeout: 10)
+        #expect(ok == "2.1.304 (Claude Code)\n")
+        let bad = try await Doctor.execProcess(executable: "/usr/bin/false", arguments: [], timeout: 10)
+        #expect(bad == nil)
+    }
+
+    @Test func aTimedOutExecIsAFailingItemWithAClearDetail() async {
+        let hang: Doctor.Exec = { _, _ in throw Doctor.ExecTimedOut(command: "claude --version", seconds: 30) }
+        let r = await Doctor.run(claudePath: "claude", runner: ProbeRunner([]), exec: hang, now: t0)
+        #expect(!r.ok)
+        #expect(item(r, "version")?.status == .fail)
+        #expect(item(r, "version")?.detail.contains("did not finish within 30 s") == true, "\(r.items)")
+        let help: Doctor.Exec = { _, a in if a == ["--help"] { throw Doctor.ExecTimedOut(command: "claude --help", seconds: 30) }; return "2.1.304 (Claude Code)" }
+        let r2 = await Doctor.run(claudePath: "claude", runner: ProbeRunner(good()), exec: help, now: t0)
+        #expect(item(r2, "flags")?.status == .fail)
+        #expect(item(r2, "flags")?.detail.contains("did not finish") == true, "\(r2.items)")
+    }
+
+    /// Many doctor execs at once must not take the cooperative workers: an unrelated async task still runs promptly.
+    @Test func manyConcurrentExecsDoNotStarveTheCooperativePool() async throws {
+        let n = max(ProcessInfo.processInfo.activeProcessorCount * 3, 24)
+        let pool = Blocking()
+        let probe = Task { () -> TimeInterval in
+            let t = AwakeTime.uptime()
+            try? await AwakeTime.sleep(for: .milliseconds(50))
+            return AwakeTime.uptime() - t
+        }
+        await withTaskGroup(of: Void.self) { g in
+            for _ in 0..<n { g.addTask { _ = try? await Doctor.execProcess(executable: "/bin/sleep", arguments: ["0.2"], timeout: 10, blocking: pool) } }
+            let elapsed = await probe.value
+            #expect(elapsed < 0.6, "the unrelated task took \(elapsed) s")
+            await g.waitForAll()
+        }
+    }
+}

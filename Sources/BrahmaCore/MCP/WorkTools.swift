@@ -372,6 +372,7 @@ extension CompanyTools {
             try store.ensureProgressFile(workspace: ws, item: target)
             // The baseline of the check's scripts, once per check revision; a reclaim keeps the first one.
             try store.ensureCheckSnapshot(item: target, workspace: ws)
+            store.noteWorktreeSetupSuccess(companyId: companyId)
         } catch {
             // The claim is undone; nothing this call did not create is removed. The engine's own fault: the owner hears of it.
             _ = try? store.releaseLease(itemId: target.id, agentId: agentId, note: "the worktree could not be created",

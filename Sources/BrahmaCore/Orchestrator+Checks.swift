@@ -97,6 +97,7 @@ extension Orchestrator {
                     : try git.addRunWorktree(runId: runId, commit: commit)
             }
             try store.setVerificationDirectory(runId: run.id, path: dir.path)
+            store.noteWorktreeSetupSuccess(companyId: company.id, now: clock())
         } catch let refused as UnexportableTree where run.purpose == .merge {
             // The item's own tree cannot be written out (A1): its fault, so it goes back to its holder with the reason.
             await blocking.run { git.removeRunWorktree(runId: run.id) }

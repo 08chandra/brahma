@@ -59,17 +59,17 @@ public enum Doctor {
     /// `--mcp-config`).
     public static let managedSettingsPath = "/Library/Application Support/ClaudeCode/managed-settings.json"
 
-    /// Runs an executable with arguments and returns its stdout, or nil when it cannot run. Injected by tests.
-    public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async -> String?
+    /// Runs an executable with arguments and returns its stdout, or nil when it cannot run; throws `ExecTimedOut` when it hangs. Injected by tests.
+    public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async throws -> String?
 
     /// `hookExecutable`: the `brahma` the mode-canary's profiles name in their pre-tool hook, as real turns do.
     public static func run(claudePath: String, runner: any TurnRunning, exec: @escaping Exec = defaultExec,
                            now: Date = .now, hookExecutable: String = "brahma",
                            managedSettingsPath: String = Doctor.managedSettingsPath) async -> DoctorReport {
-        guard let version = await cliVersion(claudePath: claudePath, exec: exec) else {
-            return DoctorReport(cliVersion: nil, items: [
-                DoctorItem(name: "version", status: .fail, detail: "can't run '\(claudePath) --version'; is Claude Code installed?"),
-            ], checkedAt: now)
+        let found = await versionOutcome(claudePath: claudePath, exec: exec)
+        guard let version = found.version else {
+            let detail = found.timedOut?.description ?? "can't run '\(claudePath) --version'; is Claude Code installed?"
+            return DoctorReport(cliVersion: nil, items: [DoctorItem(name: "version", status: .fail, detail: detail)], checkedAt: now)
         }
         var items = [versionItem(version)]
         items.append(await flagsItem(claudePath: claudePath, exec: exec))
@@ -103,10 +103,14 @@ public enum Doctor {
     }
 
     public static func cliVersion(claudePath: String, exec: @escaping Exec = defaultExec) async -> String? {
-        guard let out = await exec(claudePath, ["--version"]) else { return nil }
-        guard let token = out.split(whereSeparator: \.isWhitespace).first,
-              token.first?.isNumber == true else { return nil }
-        return String(token)
+        await versionOutcome(claudePath: claudePath, exec: exec).version
+    }
+
+    private static func versionOutcome(claudePath: String, exec: Exec) async -> (version: String?, timedOut: ExecTimedOut?) {
+        let out: String?
+        do { out = try await exec(claudePath, ["--version"]) } catch { return (nil, error as? ExecTimedOut) }
+        guard let out, let token = out.split(whereSeparator: \.isWhitespace).first, token.first?.isNumber == true else { return (nil, nil) }
+        return (String(token), nil)
     }
 
     static func compare(_ a: String, _ b: String) -> Int {
@@ -139,9 +143,11 @@ public enum Doctor {
     }
 
     private static func flagsItem(claudePath: String, exec: Exec) async -> DoctorItem {
-        guard let text = await exec(claudePath, ["--help"]) else {
-            return DoctorItem(name: "flags", status: .fail, detail: "can't run '\(claudePath) --help'")
+        let text: String?
+        do { text = try await exec(claudePath, ["--help"]) } catch {
+            return DoctorItem(name: "flags", status: .fail, detail: (error as? ExecTimedOut)?.description ?? "can't run '\(claudePath) --help': \(error)")
         }
+        guard let text else { return DoctorItem(name: "flags", status: .fail, detail: "can't run '\(claudePath) --help'") }
         let missing = requiredFlags.filter { !help(text, mentions: $0) }
         return missing.isEmpty
             ? DoctorItem(name: "flags", status: .pass, detail: "all \(requiredFlags.count) required flags present")
@@ -310,8 +316,38 @@ public enum Doctor {
                          detail: "configured \(configured.rawValue), CLI reports \(tier.rawValue); keeping \(configured.rawValue) (see `brahma settings plan`)")
     }
 
+    /// A doctor command that did not finish within `execTimeout` of awake time; it was killed.
+    public struct ExecTimedOut: Error, Sendable, CustomStringConvertible {
+        public var command: String
+        public var seconds: Int
+        public var description: String { "'\(command)' did not finish within \(seconds) s and was killed" }
+    }
+
+    /// Awake seconds a `--version` or `--help` run may take. Far above a healthy CLI; a hung one must not hold the doctor.
+    public static let execTimeout: TimeInterval = 30
+    /// Seconds between SIGTERM and SIGKILL of a timed-out child.
+    static let execKillGrace: TimeInterval = 1
+
+    /// The doctor's own blocking threads, apart from any engine's: a default exec has no engine to borrow a `Blocking` from.
+    static let execBlocking = Blocking(maxConcurrent: 4)
+
     public static let defaultExec: Exec = { executable, arguments in
-        await Task.detached { () -> String? in
+        try await execProcess(executable: executable, arguments: arguments, timeout: execTimeout)
+    }
+
+    private final class Capture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        func append(_ d: Data) { lock.withLock { data.append(d) } }
+        var snapshot: Data { lock.withLock { data } }
+    }
+
+    /// Runs the process on a `Blocking` thread (never a cooperative worker). Past `timeout` awake seconds the child is
+    /// SIGTERMed, then SIGKILLed, and `ExecTimedOut` is thrown. Foundation's `Process` cannot start a process group, so only
+    /// the child itself is signalled; the output is never waited on after a kill, so a grandchild holding the pipe cannot hang us.
+    static func execProcess(executable: String, arguments: [String], timeout: TimeInterval,
+                            blocking: Blocking = Doctor.execBlocking) async throws -> String? {
+        let outcome: Result<String?, ExecTimedOut> = await blocking.run {
             let p = Process()
             if executable.hasPrefix("/") {
                 p.executableURL = URL(fileURLWithPath: executable)
@@ -322,13 +358,34 @@ public enum Doctor {
             }
             p.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .claude)
             let out = Pipe()
+            let capture = Capture()
+            let drained = DispatchSemaphore(value: 0)
+            out.fileHandleForReading.readabilityHandler = { h in
+                let d = h.availableData
+                if d.isEmpty { h.readabilityHandler = nil; drained.signal() } else { capture.append(d) }
+            }
             p.standardOutput = out
             p.standardError = FileHandle.nullDevice
             p.standardInput = FileHandle.nullDevice
-            do { try p.run() } catch { return nil }
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            return p.terminationStatus == 0 ? String(decoding: data, as: UTF8.self) : nil
-        }.value
+            do { try p.run() } catch { out.fileHandleForReading.readabilityHandler = nil; return .success(nil) }
+            let deadline = AwakeTime.uptime() + timeout
+            var termAt: TimeInterval?
+            var killed = false
+            while p.isRunning {
+                let now = AwakeTime.uptime()
+                if termAt == nil, now >= deadline { termAt = now; p.terminate() }
+                if let t = termAt, !killed, now - t >= execKillGrace { killed = true; kill(p.processIdentifier, SIGKILL) }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            if termAt != nil {
+                out.fileHandleForReading.readabilityHandler = nil
+                let shown = ([executable] + arguments).joined(separator: " ")
+                return .failure(ExecTimedOut(command: shown, seconds: Int(timeout.rounded(.up))))
+            }
+            _ = drained.wait(timeout: .now() + 2)
+            out.fileHandleForReading.readabilityHandler = nil
+            return .success(p.terminationStatus == 0 ? String(decoding: capture.snapshot, as: UTF8.self) : nil)
+        }
+        return try outcome.get()
     }
 }

@@ -140,6 +140,7 @@ extension Orchestrator {
                     try store.ensureProgressFile(workspace: ws, item: item)
                     try store.ensureCheckSnapshot(item: item, workspace: ws)
                 }
+                store.noteWorktreeSetupSuccess(companyId: company.id, now: clock())
             } catch {
                 if let e = error as? WorkError, e.message == Store.mainChangedMessage {
                     // Every claim in this company would fail the same way: stop offering it items for a while.

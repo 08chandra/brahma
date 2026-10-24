@@ -357,6 +357,7 @@ import GRDB
         #expect(v.checks.calls.count == 1)
         item = try v.fresh(i)
         #expect(item.verifiedCommit == runs[2].commit); #expect(item.reviewFlags.isEmpty)
+        #expect(try worktreeSetupAlerts(v.store, v.company).filter { $0.status == .pendingOwner }.isEmpty, "the success cleared the alert")
     }
 
     /// A claim whose worktree git cannot make: the agent is told, the lease goes back, and the owner gets the alert.

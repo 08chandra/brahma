@@ -18,7 +18,10 @@ extension Orchestrator {
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let git = store.gitWorkspace(root: workspace, companyId: company.id)
         if !git.hasCheckout(key: item.key) {
-            do { try git.addWorktree(key: item.key) } catch {
+            do {
+                try git.addWorktree(key: item.key)
+                store.noteWorktreeSetupSuccess(companyId: company.id)
+            } catch {
                 throw WorktreeUnavailable(itemId: item.id, key: item.key, reason: "\(error)", review: true)
             }
         }

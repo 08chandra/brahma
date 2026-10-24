@@ -555,7 +555,10 @@ public actor Orchestrator {
                     let wt = g.worktreePath(key: leased.key)
                     if !g.hasCheckout(key: leased.key) {
                         let key = leased.key
-                        do { try await blocking.tryRun { try g.addWorktree(key: key) } } catch {
+                        do {
+                            try await blocking.tryRun { try g.addWorktree(key: key) }
+                            store.noteWorktreeSetupSuccess(companyId: company.id, now: clock())
+                        } catch {
                             // Never run a leaseholder's turn outside its worktree: the turn does not start.
                             throw WorktreeUnavailable(itemId: leased.id, key: leased.key, reason: "\(error)")
                         }

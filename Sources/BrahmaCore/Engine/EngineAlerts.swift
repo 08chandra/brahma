@@ -78,4 +78,12 @@ extension Store {
         }
         return raised ?? false
     }
+
+    /// A git checkout was just made: the company's open worktree-setup alert (if any) answers itself with "resolved". A later
+    /// failure raises it again. Never throws.
+    func noteWorktreeSetupSuccess(companyId: String, now: Date = Store.now()) {
+        try? writer.write { db in
+            try resolveEngineAlerts(db, reasons: [Store.worktreeSetupAlertReason(companyId)], now: now)
+        }
+    }
 }
