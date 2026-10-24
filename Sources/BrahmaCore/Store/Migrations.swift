@@ -765,5 +765,11 @@ enum Migrations {
             try db.create(index: "turnTranscript_session", on: "turnTranscript", columns: ["sessionId", "capturedAt"])
             try db.create(index: "turnTranscript_agent", on: "turnTranscript", columns: ["companyId", "agentId", "capturedAt"])
         }
+        m.registerMigration("v5-targets") { db in
+            // Off-machine backup targets (a JSON array of `BackupTarget`) and the optional Litestream replica (a JSON
+            // `WALShippingConfig`, NULL = off). Kept on the owner's one preferences row.
+            try db.execute(sql: "ALTER TABLE ownerPrefs ADD COLUMN backupTargets TEXT NOT NULL DEFAULT '[]'")
+            try db.execute(sql: "ALTER TABLE ownerPrefs ADD COLUMN walShipping TEXT")
+        }
     }
 }

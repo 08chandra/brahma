@@ -293,7 +293,10 @@ extension BackupService {
         list().first { (try? validate(snapshot: $0.url)) != nil }
     }
 
-    public func planRestore(snapshot: URL) throws -> RestorePlan {
+    /// `date`: when the snapshot's content is from, for a file whose name does not say (a Litestream point-in-time rebuild).
+    public func planRestore(snapshot: URL) throws -> RestorePlan { try planRestore(snapshot: snapshot, date: nil) }
+
+    public func planRestore(snapshot: URL, date explicitDate: Date?) throws -> RestorePlan {
         guard FileManager.default.fileExists(atPath: snapshot.path) else { throw RestoreError.notFound }
         do {
             // Nothing is held after this: the real check is `restore`, which holds the lock throughout.
@@ -306,7 +309,7 @@ extension BackupService {
         let openers = try DBOpeners.pids(of: database)
         if !openers.isEmpty { throw RestoreError.dbOpenElsewhere(openers) }
         try validate(snapshot: snapshot)
-        let date = Self.parse(name: snapshot.lastPathComponent)?.date
+        let date = explicitDate ?? Self.parse(name: snapshot.lastPathComponent)?.date
         return RestorePlan(snapshot: snapshot, snapshotDate: date, reposAhead: reposAhead(of: snapshot),
                            homeSnapshot: date.flatMap { HomeSnapshot.newest(atOrBefore: $0, paths: lockPaths) })
     }
@@ -419,9 +422,11 @@ extension BackupService {
 
         // 3.
         let staging = sibling.appending(path: database.lastPathComponent + ".restoring")
-        try? fm.removeItem(at: staging)
+        // A Litestream rebuild (`WALShipping.restoreFile`) already sits at `staging`: it is swapped in as it is.
+        let alreadyStaged = plan.snapshot.resolvingSymlinksInPath().path == staging.resolvingSymlinksInPath().path
+        if !alreadyStaged { try? fm.removeItem(at: staging) }
         do {
-            try fm.copyItem(at: plan.snapshot, to: staging)
+            if !alreadyStaged { try fm.copyItem(at: plan.snapshot, to: staging) }
             chmod(staging.path, 0o600)
             try Self.syncFile(staging)
         } catch { throw RestoreError.failed("could not stage the snapshot: \(error)") }

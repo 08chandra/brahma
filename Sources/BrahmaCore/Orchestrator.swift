@@ -109,7 +109,10 @@ public actor Orchestrator {
                 timerJobs: TimerJobRegistry = .system,
                 vault: any SecretVault = UnavailableVault(),
                 restoreHooks: RestoreHooks = RestoreHooks(),
-                transcripts: TranscriptCapture? = nil) {
+                transcripts: TranscriptCapture? = nil,
+                backupTools: BackupTools = .system,
+                walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) }) {
+        self.backupTools = backupTools; self.walSleeper = walSleeper
         self.timerJobs = timerJobs; self.vault = vault; self.restoreHooks = restoreHooks; self.transcripts = transcripts
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
@@ -143,13 +146,44 @@ public actor Orchestrator {
             try await recoverMerges()
             try SystemTimers.ensure(store: store, now: now, digestTime: store.ownerPrefs().digestHourMinute)
             ensuredTimerCompanies = Set(try store.companies().map(\.id))
+            startWALShipping()
         }
     }
+
+    /// Optional Litestream WAL shipping (Task 13b): while it is switched on and this engine runs (it holds the engine lock), litestream
+    /// is supervised and restarted with backoff. Without litestream installed nothing starts; the doctor says so.
+    func startWALShipping() {
+        guard walShipper == nil, let config = try? store.walShipping() else { return }
+        guard let litestream = backupTools.litestream else {
+            log("WAL shipping is on but litestream is not installed")
+            return
+        }
+        do { try WALShipping.config(paths: paths, replica: config.replica) } catch {
+            log("WAL shipping config could not be written: \(error)")
+            return
+        }
+        let shipper = WALShipper(executable: litestream, paths: paths, tools: backupTools, sleeper: walSleeper) { [self] in log($0) }
+        walShipper = shipper
+        shipper.start()
+    }
+
+    /// Stops the litestream supervisor (the engine is shutting down).
+    public func stopWALShipping() {
+        walShipper?.stop()
+        walShipper = nil
+    }
+
+    deinit { walShipper?.stop() }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
     /// Child processes that are not turns: engine-run checks and merges. They count against the same safety cap as turns.
     var otherChildren: Int { checkTasks.count + mergeTasks.count }
+
+    nonisolated let backupTools: BackupTools
+    nonisolated let walSleeper: WALShipper.Sleeper
+    /// The litestream supervisor, while WAL shipping is on. Not part of `isIdle`: it runs for the engine's whole life.
+    var walShipper: WALShipper?
 
     /// This engine's limit on concurrently running blocking (git) bodies.
     let blocking = Blocking()

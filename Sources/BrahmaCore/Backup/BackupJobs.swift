@@ -76,6 +76,26 @@ enum BackupJobs {
         }
     }
 
+    /// `backup.targets` (Task 13b): syncs the backup set to every configured target. An unmounted folder is skipped with one notice a
+    /// day; a failed or unavailable target is a failed job. Nothing configured: nothing to do.
+    static func targets(_ context: TimerContext, tools: BackupTools = .system, hostname: String = BackupTargets.hostName()) async throws {
+        let store = context.store, paths = context.paths, now = context.now
+        do {
+            let results = try await context.blocking.tryRun {
+                try BackupTargets.syncAll(store: store, paths: paths, hostname: hostname, tools: tools, now: now)
+            }
+            let problems = results.compactMap { r -> String? in
+                switch r.outcome {
+                case .failed(let why), .unavailable(let why): return "\(r.target.summary): \(why)"
+                case .synced, .skipped: return nil
+                }
+            }
+            if !problems.isEmpty { fail(context, "off-machine backup failed for " + problems.joined(separator: "; ")) }
+        } catch {
+            fail(context, "off-machine backup failed: \(error)")
+        }
+    }
+
     /// A failed job writes activity (every company) and tells the owner.
     private static func fail(_ context: TimerContext, _ text: String) {
         let store = context.store

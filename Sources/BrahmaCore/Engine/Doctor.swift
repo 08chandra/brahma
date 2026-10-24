@@ -389,3 +389,43 @@ public enum Doctor {
         return try outcome.get()
     }
 }
+
+// MARK: Backup items (Task 13b)
+
+extension Doctor {
+    /// `backup-targets`: every configured target is reachable (a folder is mounted and writable; an rclone remote exists, is of type
+    /// `crypt` and rclone is installed).
+    public static func backupTargetsItem(targets: [BackupTarget], tools: BackupTools = .system) -> DoctorItem {
+        guard !targets.isEmpty else {
+            return DoctorItem(name: "backup-targets", status: .pass, detail: "none configured (see: brahma backup target add)")
+        }
+        var problems: [String] = []
+        for target in targets {
+            switch target {
+            case .folder(let path):
+                var isDir: ObjCBool = false
+                if !FileManager.default.fileExists(atPath: path, isDirectory: &isDir) || !isDir.boolValue {
+                    problems.append("\(path) is not connected")
+                } else if !FileManager.default.isWritableFile(atPath: path) {
+                    problems.append("\(path) is not writable")
+                }
+            case .rclone(let remote):
+                guard let rclone = tools.rclone else { problems.append("rclone is not installed (\(remote):)"); continue }
+                if !BackupTargets.isCrypt(remote: remote, rclone: rclone, tools: tools) {
+                    problems.append("\(remote) is not an rclone crypt remote")
+                }
+            }
+        }
+        if problems.isEmpty { return DoctorItem(name: "backup-targets", status: .pass, detail: "\(targets.count) reachable") }
+        return DoctorItem(name: "backup-targets", status: .warn, detail: problems.joined(separator: "; "))
+    }
+
+    /// The two backup items, off the cooperative pool (they run child processes).
+    public static func backupItems(store: Store, tools: BackupTools = .system, now: Date = .now) async -> [DoctorItem] {
+        let targets = (try? store.backupTargets()) ?? []
+        let replica = (try? store.walShipping())?.replica
+        return await execBlocking.run {
+            [WALShipping.doctorItem(replica: replica, tools: tools, now: now), backupTargetsItem(targets: targets, tools: tools)]
+        }
+    }
+}

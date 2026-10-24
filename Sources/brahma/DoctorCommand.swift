@@ -20,6 +20,9 @@ struct Doctor: AsyncParsableCommand {
         if let item = BrahmaCore.Doctor.planTierItem(configured: store.planTier(), reported: report.reportedSubscription) {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
         }
+        for item in await BrahmaCore.Doctor.backupItems(store: store) {
+            print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
+        }
         if !report.ok { throw ExitCode.failure }
         // A passing doctor is what ends an account or CLI hold (the running engine sees it on its next tick).
         try? store.clearHoldAfterDoctor(now: Date())

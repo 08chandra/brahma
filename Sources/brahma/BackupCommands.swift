@@ -12,10 +12,12 @@ private func stamp(_ date: Date) -> String {
 
 struct BackupGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "backup", abstract: "Database snapshots (owner only).", subcommands: [Now.self, List.self])
+        commandName: "backup", abstract: "Database snapshots and off-machine backup targets (owner only).",
+        subcommands: [Now.self, List.self, Target.self, Targets.self, WAL.self])
 
     struct Now: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Take a verified snapshot of the database now.")
+        @Flag(help: "Then copy the backups to every off-machine target.") var targets = false
         func run() throws {
             try requireOwnerShell()
             let (store, paths) = try openStore()
@@ -23,6 +25,92 @@ struct BackupGroup: ParsableCommand {
                 let url = try BackupService(paths: paths, writer: store.writer).snapshot(reason: .manual)
                 print(safe("snapshot: \(url.path)"))
             } catch { throw fail("backup failed: \(error)") }
+            if targets { try syncTargets(store: store, paths: paths) }
+        }
+    }
+
+    struct Target: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Add or remove an off-machine backup target.", subcommands: [Add.self, Remove.self])
+
+        struct Add: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Add a target: an external folder, or an rclone crypt remote.", subcommands: [Folder.self, Rclone.self])
+
+            struct Folder: ParsableCommand {
+                static let configuration = CommandConfiguration(
+                    commandName: "folder", abstract: "Mirror the backups to a folder (an external drive) under <path>/<hostname>/.")
+                @Argument(help: "An existing, writable folder outside Brahma's data and workspaces.") var path: String
+                func run() throws { try add(.folder(path: path)) }
+            }
+
+            struct Rclone: ParsableCommand {
+                static let configuration = CommandConfiguration(
+                    commandName: "rclone", abstract: "Upload the backups through an rclone remote of type crypt.")
+                @Argument(help: "The remote's name, as in 'rclone config'.") var remote: String
+                func run() throws { try add(.rclone(remote: remote)) }
+            }
+        }
+
+        struct Remove: ParsableCommand {
+            static let configuration = CommandConfiguration(commandName: "rm", abstract: "Remove target <n> (see: brahma backup targets).")
+            @Argument var n: Int
+            func run() throws {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                do { print(safe("removed: \(try store.removeBackupTarget(number: n).summary)")) } catch { throw fail("\(error)") }
+            }
+        }
+
+        private static func add(_ target: BackupTarget) throws {
+            try requireOwnerShell()
+            let (store, paths) = try openStore()
+            do {
+                let workspaces = try store.companies().map { URL(fileURLWithPath: $0.workspacePath, isDirectory: true) }
+                let valid = try BackupTargets.validate(target, paths: paths, workspaces: workspaces)
+                try store.addBackupTarget(valid)
+                print(safe("added: \(valid.summary)"))
+            } catch { throw fail("\(error)") }
+        }
+    }
+
+    struct Targets: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "List the off-machine backup targets.")
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let list = try store.backupTargets()
+            if list.isEmpty { print("no targets (see: brahma backup target add)"); return }
+            for (i, target) in list.enumerated() { print(safe("\(i + 1)  \(target.summary)")) }
+        }
+    }
+
+    struct WAL: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "wal", abstract: "Optional Litestream WAL shipping (litestream must be installed). Takes effect when the engine next starts.",
+            subcommands: [Enable.self, Disable.self])
+
+        struct Enable: ParsableCommand {
+            static let configuration = CommandConfiguration(commandName: "enable", abstract: "Ship the write-ahead log to a replica.")
+            @Argument(help: "A folder, or a URL litestream understands (s3://bucket/path).") var replica: String
+            func run() throws {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                guard BackupTools.system.litestream != nil else { throw fail("\(WALShippingError.unavailable)") }
+                let target = replica.contains("://") ? replica : ((replica as NSString).expandingTildeInPath)
+                try store.setWALShipping(WALShippingConfig(replica: target))
+                print(safe("WAL shipping on: \(target) (restart Brahma to begin)"))
+            }
+        }
+
+        struct Disable: ParsableCommand {
+            static let configuration = CommandConfiguration(commandName: "disable", abstract: "Stop shipping the write-ahead log.")
+            func run() throws {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                try store.setWALShipping(nil)
+                print("WAL shipping off (restart Brahma to stop it)")
+            }
         }
     }
 
@@ -34,6 +122,22 @@ struct BackupGroup: ParsableCommand {
             printSnapshots(BackupService(paths: paths).list())
         }
     }
+}
+
+private func syncTargets(store: Store, paths: BrahmaPaths) throws {
+    let results: [TargetResult]
+    do { results = try BackupTargets.syncAll(store: store, paths: paths) } catch { throw fail("target backup failed: \(error)") }
+    if results.isEmpty { print("no targets (see: brahma backup target add)"); return }
+    var failed = false
+    for result in results {
+        switch result.outcome {
+        case .synced(let files): print(safe("\(result.target.summary): copied (\(files) files)"))
+        case .skipped(let why): print(safe("\(result.target.summary): skipped, \(why)"))
+        case .unavailable(let why): failed = true; print(safe("\(result.target.summary): unavailable, \(why)"))
+        case .failed(let why): failed = true; print(safe("\(result.target.summary): FAILED, \(why)"))
+        }
+    }
+    if failed { throw ExitCode.failure }
 }
 
 private func printSnapshots(_ list: [BackupInfo]) {
@@ -69,25 +173,35 @@ struct RestoreCommand: ParsableCommand {
         let service = BackupService(paths: paths)
         if list { printSnapshots(service.list()); return }
         let snapshot: URL
+        var walDate: Date?
         if latest {
             guard let info = service.latestGood() else { throw fail("no snapshot passes its integrity check (see: brahma restore --list)") }
             snapshot = info.url
         } else if let at, let when = parseISO8601(at) {
-            guard let info = service.snapshot(atOrBefore: when) else {
-                throw fail("no snapshot at or before \(stamp(when)) passes its integrity check (see: brahma restore --list)")
+            if let walFile = walRestore(paths: paths, at: when, dryRun: dryRun) {
+                snapshot = walFile
+                walDate = when
+            } else {
+                guard let info = service.snapshot(atOrBefore: when) else {
+                    throw fail("no snapshot at or before \(stamp(when)) passes its integrity check (see: brahma restore --list)")
+                }
+                snapshot = info.url
             }
-            snapshot = info.url
         } else {
             snapshot = URL(fileURLWithPath: path ?? "")
         }
         let plan: RestorePlan
-        do { plan = try service.planRestore(snapshot: snapshot) } catch { throw fail("\(error)") }
+        do { plan = try service.planRestore(snapshot: snapshot, date: walDate) } catch {
+            if walDate != nil { try? FileManager.default.removeItem(at: snapshot) }
+            throw fail("\(error)")
+        }
         for warning in plan.warnings { print(safe("warning: \(warning)")) }
         if withFiles && plan.homeSnapshot == nil {
             throw fail("there is no data-home snapshot at or before \(plan.snapshotDate.map(stamp) ?? "that snapshot"); nothing was changed "
                 + "(restore without --with-files to bring back the database only)")
         }
         if dryRun {
+            if walDate != nil { try? FileManager.default.removeItem(at: snapshot) }
             let when = plan.snapshotDate.map { " taken \(stamp($0))" } ?? ""
             print(safe("dry run: would restore \(snapshot.lastPathComponent)\(when); nothing was changed"))
             if withFiles, let home = plan.homeSnapshot {
@@ -104,6 +218,19 @@ struct RestoreCommand: ParsableCommand {
             }
             print(safe("restored \(snapshot.lastPathComponent); Brahma re-adopts the repositories when it next starts"))
         } catch { throw fail("\(error)") }
+    }
+}
+
+/// With WAL shipping on, a point-in-time restore is rebuilt by litestream into `<home>/brahma.sqlite.restoring` and then swapped in
+/// by the ordinary restore. Nil when WAL shipping is off or litestream cannot produce the file (the snapshots are used instead,
+/// with a warning when it was on).
+private func walRestore(paths: BrahmaPaths, at when: Date, dryRun: Bool) -> URL? {
+    guard let replica = WALShipping.configuredReplica(paths: paths) else { return nil }
+    do {
+        return try WALShipping.restoreFile(paths: paths, replica: replica, timestamp: when)
+    } catch {
+        print(safe("warning: \(error); using the newest snapshot instead"))
+        return nil
     }
 }
 
