@@ -51,7 +51,7 @@ extension Store {
             guard item.ownerId == agentId else { throw WorkError.forbidden("only the item's assignee can request a mode") }
             let m = mode.trimmingCharacters(in: .whitespaces).lowercased()
             guard m == "deep" || m == "ultra" else { throw WorkError.invalid("mode must be deep or ultra") }
-            let why = reason.components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            let why = try redact(reason).components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !why.isEmpty else { throw WorkError.invalid("a reason is required") }
             guard why.count <= 1000 else { throw WorkError.invalid("the reason is longer than 1000 characters") }
             let rid = requestId?.trimmingCharacters(in: .whitespacesAndNewlines).prefix(100).description

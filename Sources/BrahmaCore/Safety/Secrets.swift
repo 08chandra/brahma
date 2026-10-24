@@ -254,6 +254,18 @@ public final class Redactor: @unchecked Sendable {
     private var failed: [String] = []
     private var cache: [String: Loaded] = [:]
     private var logged: Set<String> = []
+    private var noticeOpen = false
+    private var reasons: [String: String] = [:]
+    private var loader: (@Sendable () -> Void)?
+    private var loaderTried = false
+    // Background-read backoff (awake time): after a load with failures, the next background read waits `firstRetry`,
+    // doubling to `maxRetry`; a different secrets version retries at once and restarts it.
+    private var retryClock: @Sendable () -> TimeInterval = { AwakeTime.uptime() }
+    private var attemptedVersion: String?
+    private var retryDelay: TimeInterval = 0
+    private var nextRetryAt: TimeInterval?
+    public static let firstRetry: TimeInterval = 5
+    public static let maxRetry: TimeInterval = 300
 
     /// One loaded value: the secret's name and the `updatedAt` it was loaded for (a retry reads only what failed or changed).
     struct Loaded: Equatable {
@@ -306,6 +318,69 @@ public final class Redactor: @unchecked Sendable {
             currentVersion = version
             loadedOnce = true
         }
+    }
+
+    /// A one-shot loader (`Store.redactorLoader`): the CLI's lazy load of the secrets.
+    var lazyLoader: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return loader }
+        set { lock.lock(); defer { lock.unlock() }; loader = newValue; loaderTried = false }
+    }
+
+    /// The loader, the first time it is asked for; nil afterwards (it runs at most once).
+    func takeLoader() -> (@Sendable () -> Void)? {
+        lock.lock(); defer { lock.unlock() }
+        guard !loaderTried, let loader else { return nil }
+        loaderTried = true
+        return loader
+    }
+
+    /// Replaces the awake-time clock the retry backoff runs on (tests).
+    public func setRetryClock(_ clock: @escaping @Sendable () -> TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        retryClock = clock
+    }
+
+    /// Whether a background read for `version` may run now: always for a version not attempted yet, else once the backoff
+    /// has passed.
+    func retryDue(version: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard version == attemptedVersion, let next = nextRetryAt else { return true }
+        return retryClock() >= next
+    }
+
+    /// Records a load attempt of `version`: a failed one schedules the next background read (5 s, doubling to 5 min; a new
+    /// version starts over), a complete one clears the backoff.
+    func recordAttempt(version: String, failed: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if version != attemptedVersion { retryDelay = 0 }
+        attemptedVersion = version
+        if failed {
+            retryDelay = retryDelay == 0 ? Self.firstRetry : min(retryDelay * 2, Self.maxRetry)
+            nextRetryAt = retryClock() + retryDelay
+        } else {
+            retryDelay = 0
+            nextRetryAt = nil
+        }
+    }
+
+    /// Opens a hold episode (returns true the first time, so its owner notice is written once) or closes it when `held` is false.
+    func holdEpisode(held: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard held else { noticeOpen = false; return false }
+        if noticeOpen { return false }
+        noticeOpen = true
+        return true
+    }
+
+    /// Why each secret in `failedNames` did not load (by name).
+    func lastFailureReasons() -> [String: String] {
+        lock.lock(); defer { lock.unlock() }
+        return reasons
+    }
+
+    func setFailureReasons(_ r: [String: String]) {
+        lock.lock(); defer { lock.unlock() }
+        reasons = r
     }
 
     func cachedValues() -> [String: Loaded] {

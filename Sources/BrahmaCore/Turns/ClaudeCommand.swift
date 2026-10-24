@@ -68,7 +68,8 @@ public enum MCPConfig {
     /// An audit turn passes `audit`: its server runs `--audit` and writes `<agentId>.audit.mcp.json`.
     /// The turn's mode quotas are not here: they ride on the credential row the token names.
     public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String,
-                             reviewItem: String? = nil, audit: Bool = false) throws -> String {
+                             reviewItem: String? = nil, audit: Bool = false,
+                             environment: [String: String] = ProcessInfo.processInfo.environment) throws -> String {
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
@@ -76,7 +77,7 @@ public enum MCPConfig {
         var env = [tokenVariable: turnToken]
         // A dev/demo home's file secret store reaches the turn's `brahma mcp` (which resolves it again against its database's
         // own home, refusing the default home), so its redactor loads the same values as the engine's. Never the agent's env.
-        if ProcessInfo.processInfo.environment[SecretStore.environmentVariable] == "file" { env[SecretStore.environmentVariable] = "file" }
+        if environment[SecretStore.environmentVariable] == "file" { env[SecretStore.environmentVariable] = "file" }
         let config: [String: Any] = ["mcpServers": ["company": [
             "command": executable,
             "args": args,

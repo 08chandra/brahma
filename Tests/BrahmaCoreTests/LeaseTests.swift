@@ -325,6 +325,20 @@ import GRDB
         #expect(throws: WorkError.self) { try l.store.releaseLease(itemId: i.id, agentId: l.eng.id, note: nil, now: l.now) }
     }
 
+    @Test func releaseNoteIsRedactedRawFirst() throws {
+        let l = try L()
+        let s = "lease-secret\nsecond-line-7"
+        let vault = MemoryVault().with(l.company.id, "LEASE_KEY", s)
+        try l.store.setSecret(companyId: l.company.id, name: "LEASE_KEY", value: s, isTest: false, vault: vault)
+        _ = try l.store.reloadRedactorIfNeeded(vault: vault)
+        let i = try l.item()
+        _ = try l.claim(i, l.eng)
+        try l.store.releaseLease(itemId: i.id, agentId: l.eng.id, note: "pasted \(s) by mistake", now: l.now)
+        let released = try #require(try l.store.itemEvents(itemId: i.id).last { $0.kind == .leaseReleased })
+        #expect(released.text.contains("[redacted LEASE_KEY]"), "\(released.text)")
+        #expect(!(try dumpDatabase(l.store)).contains("second-line-7"))
+    }
+
     // MARK: Merge safety
 
     @Test func overlappingItemsCannotBothBeInProgress() throws {

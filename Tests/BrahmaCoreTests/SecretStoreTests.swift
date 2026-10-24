@@ -50,6 +50,29 @@ import Testing
         }
     }
 
+    @Test func selectionCarriesTheInteractiveFlag() throws {
+        let p = try paths()
+        let elsewhere = try tempDir()
+        #expect(try PlatformSecretVault.resolve(environment: [:], paths: p, defaultHome: elsewhere).interactive == false)
+        #expect(try PlatformSecretVault.resolve(environment: [:], paths: p, defaultHome: elsewhere, interactive: true).interactive)
+    }
+
+    @Test func mcpConfigForwardsOnlyTheFileStore() throws {
+        let p = try paths()
+        let store = try Store.inMemory()
+        let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+        let agent = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        func env(_ e: [String: String]) throws -> [String: String] {
+            let path = try MCPConfig.write(paths: p, executable: "/x/brahma", agent: agent, turnToken: "tok", environment: e)
+            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as? [String: Any]
+            let server = ((json?["mcpServers"] as? [String: Any])?["company"] as? [String: Any])
+            return server?["env"] as? [String: String] ?? [:]
+        }
+        #expect(try env(["BRAHMA_SECRET_STORE": "file"]) == ["BRAHMA_TURN_TOKEN": "tok", "BRAHMA_SECRET_STORE": "file"])
+        #expect(try env(["BRAHMA_SECRET_STORE": "memory"]) == ["BRAHMA_TURN_TOKEN": "tok"])
+        #expect(try env([:]) == ["BRAHMA_TURN_TOKEN": "tok"])
+    }
+
     // MARK: FileVault
 
     @Test func fileVaultRoundTripsWithPrivatePermissions() throws {

@@ -9,7 +9,6 @@ public final class MCPServer {
         return e
     }()
 
-    /// Runs before every tool call (the redactor reload in `brahma mcp`).
     /// Runs before every tool call (`brahma mcp` reloads secrets here: `Store.prepareForToolCall`); a throw refuses the call
     /// with the error's text as the tool error.
     private let beforeCall: @Sendable () throws -> Void

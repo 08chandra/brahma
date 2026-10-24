@@ -211,7 +211,8 @@ extension Store {
             item.updatedAt = now
             try item.update(db)
             var text = "released by @\(actor.handle)"
-            if let note {
+            if let rawNote = note {
+                let note = try redact(rawNote)   // raw, before flattening, so a multi-line secret still matches
                 let flat = note.components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !flat.isEmpty { text += ": " + String(flat.prefix(500)) }
             }

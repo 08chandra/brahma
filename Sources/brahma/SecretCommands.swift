@@ -8,7 +8,7 @@ import BrahmaKeychain
 struct SecretGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "secret", abstract: "Store, list and remove a company's secrets (owner only).",
-        subcommands: [Set.self, List.self, Remove.self])
+        subcommands: [Set.self, List.self, Remove.self, Load.self])
 
     struct Set: ParsableCommand {
         static let configuration = CommandConfiguration(
@@ -34,7 +34,7 @@ struct SecretGroup: ParsableCommand {
                 } else {
                     value = try SecretInput.read(from: .standardInput)
                 }
-                try store.setSecret(companyId: selected.id, name: name, value: value, isTest: test, vault: try cliSecretVault())
+                try store.setSecret(companyId: selected.id, name: name, value: value, isTest: test, vault: try cliSecretVault(interactive: true))
             } catch let e as SecretError {
                 throw fail(e.message)
             }
@@ -71,6 +71,29 @@ struct SecretGroup: ParsableCommand {
         }
     }
 
+    /// Loads every secret now, interactively: macOS may ask to allow access (choose Always Allow). This is how the owner
+    /// unpauses agents held because a background read needed permission; the engine and `brahma mcp` retry at once.
+    struct Load: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Load every secret now (macOS may ask you to allow access) so paused agents resume.")
+        @Argument(help: "Company name or slug (optional; every company's secrets are loaded).") var company: String?
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            if let company { _ = try resolveCompany(store, company) }
+            let report: (loaded: Int, failed: [(name: String, reason: String)])
+            do { report = try store.ownerLoadSecrets(vault: try cliSecretVault(interactive: true)) } catch let e as SecretError {
+                throw fail(e.message)
+            }
+            guard report.failed.isEmpty else {
+                for f in report.failed { FileHandle.standardError.write(Data("brahma: \(safe(f.name)): \(safe(f.reason))\n".utf8)) }
+                throw fail("could not load \(report.failed.count) secret(s); agents stay paused")
+            }
+            print("loaded \(report.loaded) secret\(report.loaded == 1 ? "" : "s")")
+        }
+    }
+
     struct Remove: ParsableCommand {
         static let configuration = CommandConfiguration(commandName: "rm", abstract: "Remove a secret.")
         @Argument(help: "Company name or slug.") var company: String
@@ -82,7 +105,7 @@ struct SecretGroup: ParsableCommand {
             let (store, _) = try openStore()
             let selected = try resolveCompany(store, company)
             do {
-                try store.deleteSecret(companyId: selected.id, name: name, vault: try cliSecretVault())
+                try store.deleteSecret(companyId: selected.id, name: name, vault: try cliSecretVault(interactive: true))
             } catch let e as SecretError {
                 throw fail(e.message)
             }

@@ -20,6 +20,10 @@ public final class AppModel {
     public var errorMessage: String?
     /// A standing startup warning (e.g. the dev/demo owner-key store is in use), shown above the detail pane.
     public var startupNotice: String?
+    /// Shown while this process cannot read every secret (agents are paused): "Load secrets" asks the owner (`loadSecrets`).
+    public internal(set) var secretsBanner: String?
+    /// The interactive secret store for the owner's Load secrets action (set by the app; nil in tests unless given).
+    @ObservationIgnored public var ownerSecretVault: (any SecretVault)?
     public var activityFilter: ActivityFilter = .all
     /// The item open in the backlog's detail pane (`item:<KEY>`).
     public var selectedItemKey: String?
@@ -110,6 +114,7 @@ public final class AppModel {
             ticksSinceTakeoverCheck = 0
             if let engine, engine.status == .external { await engine.retryTakeover() }
         }
+        refreshSecrets()
         let store = self.store
         let start = cursor
         do {

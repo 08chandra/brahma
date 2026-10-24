@@ -68,8 +68,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do { selection = try PlatformOwnerKeyStore.resolve(paths: paths) } catch {
             return .failure(BootError(path: paths.home.path, message: "\(error)"))
         }
-        let secrets: PlatformSecretVault.Selection
-        do { secrets = try PlatformSecretVault.resolve(paths: paths) } catch {
+        // Background reads (boot, the engine) never prompt; only the owner's Load secrets uses the interactive store.
+        let secrets: PlatformSecretVault.Selection, ownerSecrets: PlatformSecretVault.Selection
+        do {
+            secrets = try PlatformSecretVault.resolve(paths: paths)
+            try PlatformSecretVault.refuseMemory(secrets)
+            ownerSecrets = try PlatformSecretVault.resolve(paths: paths, interactive: true)
+        } catch {
             return .failure(BootError(path: paths.home.path, message: "\(error)"))
         }
         do {
@@ -78,9 +83,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 FileHandle.standardError.write(Data(($0 + "\n").utf8))
             }
             let store = try Store(path: paths.database.path, catalog: catalog)
-            // Owner writes from the app fail closed until the secrets are loaded; load them now (the engine retries each tick).
+            // Owner writes from the app fail closed until the secrets are loaded: a non-interactive load now (it cannot prompt
+            // or block on a dialog); the engine retries in the background, and the banner's Load secrets asks the owner.
             if store.secretsHeld { _ = try? store.reloadRedactorIfNeeded(vault: secrets.vault) }
             let model = AppModel(store: store, paths: paths)
+            model.ownerSecretVault = ownerSecrets.vault
             let warnings = [selection.warning, secrets.warning].compactMap { $0 }
             for warning in warnings {
                 // stderr is invisible to a Finder launch: also the unified log and the window's banner.

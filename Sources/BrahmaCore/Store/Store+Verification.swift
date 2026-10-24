@@ -195,7 +195,7 @@ extension Store {
             guard item.status == .inProgress else {
                 throw WorkError.conflict("\(item.key) is \(item.status.title.lowercased()), not in progress")
             }
-            let text = try Self.validSummary(summary)
+            let text = try Self.validSummary(try redact(summary))   // redacted raw, before validation and storage
             if commit == item.baseCommit { throw WorkError.conflict("\(item.key) has no changes to submit") }
             // Someone must be able to review it: the named reviewer, else the owner's manager, a CTO or an executive.
             var chosenReviewer: Agent?

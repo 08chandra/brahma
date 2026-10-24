@@ -330,6 +330,25 @@ import GRDB
         #expect(try w.posts("team-core").last?.text.contains("@eng-1 — done: none · in progress: \(b.key) (check failed)") == true)
     }
 
+    @Test func sprintTextIsRedactedRawFirst() throws {
+        let w = try W()
+        try w.approveGates()
+        let s = "sprint-secret\nline-two-42"
+        try w.store.setSecret(companyId: w.company.id, name: "SPRINT_KEY", value: s, isTest: false, vault: MemoryVault().with(w.company.id, "SPRINT_KEY", s))
+        _ = try w.store.reloadRedactorIfNeeded(vault: MemoryVault().with(w.company.id, "SPRINT_KEY", s))
+        let a = try w.item("A")
+        let (planned, ask) = try w.plan([a.key], goal: "Ship \(s) today")
+        #expect(try w.fresh(planned).goal == "Ship [redacted SPRINT_KEY] today")
+        _ = try w.decide(ask)
+        let closed = try w.store.closeSprint(sprintId: planned.id, by: .agent(w.mgr.id), summary: "Used \(s) once",
+                                             lessons: "Never paste \(s)\n- Rotate keys", now: w.now)
+        #expect(closed.sprint.summary?.contains("[redacted SPRINT_KEY]") == true)
+        let notes = try String(contentsOf: NotesFile.path(workspace: URL(fileURLWithPath: w.company.workspacePath), team: "core"), encoding: .utf8)
+        #expect(notes.contains("[redacted SPRINT_KEY]")); #expect(!notes.contains("sprint-secret")); #expect(!notes.contains("line-two-42"))
+        let everything = try dumpDatabase(w.store)
+        #expect(!everything.contains("sprint-secret")); #expect(!everything.contains("line-two-42"))
+    }
+
     // MARK: Close and notes
 
     @Test func closeWritesSummaryAndRetroNotes() throws {

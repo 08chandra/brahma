@@ -75,6 +75,8 @@ public actor Orchestrator {
     var loggedPaceClosed = Set<String>()
     /// Timer jobs in flight, by timer id (a job never overlaps itself).
     var timerTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
+    /// The background reload of the store's redactor (vault reads never run on the actor: `reloadSecretsIfDue`).
+    var secretsTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
     var ensuredTimerCompanies: Set<String>?
 
@@ -106,7 +108,12 @@ public actor Orchestrator {
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
     public func start() async throws {
         try await EngineGitGuard.$engine.withValue(engineId) {
-            attempt { try store.reloadRedactorIfNeeded(vault: vault) }
+            // The first load of the secrets, in a Blocking body (vault reads may block; never on the actor).
+            let (store, vault) = (self.store, self.vault)
+            let failure: String? = await blocking.run {
+                do { try store.reloadRedactorIfNeeded(vault: vault); return nil } catch { return "\(error)" }
+            }
+            if let failure { log("could not load secrets: \(failure)") }
             let now = clock()
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
@@ -137,6 +144,7 @@ public actor Orchestrator {
     /// next is started synchronously inside that tick, so nothing is "queued" outside these sets.)
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
+            && secretsTask == nil
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -193,6 +201,7 @@ public actor Orchestrator {
             try? await Task.sleep(for: interval)
         }
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
+            + (secretsTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -210,14 +219,15 @@ public actor Orchestrator {
     }
 
     private func schedule(now: Date) throws {
-        // Secrets another process added or removed apply to everything this tick writes.
-        attempt { try store.reloadRedactorIfNeeded(vault: vault) }
+        // Secrets another process added or removed: reloaded in the background (a Blocking body, non-interactive reads, with
+        // backoff after failures); until then admission is held.
+        let secretsPending = reloadSecretsIfDue()
         // Active time first, so everything below sees the same clock; then health, which may start or end a hold.
         try store.accrueActiveTime(now: now)
         try healthTick(now: now)
         // Fail closed on secrets: until every secret's value is loaded into the redactor (`Store.secretsHeld`), nothing that
         // would let an agent write text starts: no turn, check, merge or dispatch. The reload logged which secret failed.
-        let held = try store.engineHold() != nil || store.secretsHeld
+        let held = try store.engineHold() != nil || store.secretsHeld || secretsPending
         let pressure = memory.current
         logPressure(pressure, now: now)
         // The owner's plan tier and weekly share apply from the next tick after they are changed.
@@ -369,6 +379,26 @@ public actor Orchestrator {
             dispatchTick(now: now, companies: companies, skipping: Set(reaped.map(\.itemId)), freeSlots: free, companyFree: companyFree)
         }
     }
+
+    /// Starts the background redactor reload when one is due (never more than one at a time). Returns whether the redactor
+    /// is behind the database, in which case admission is held this tick.
+    private func reloadSecretsIfDue() -> Bool {
+        let needed = (try? store.secretsReloadNeeded()) ?? true
+        guard needed else { return false }
+        if secretsTask == nil, (try? store.redactorReloadDue()) ?? false {
+            let (store, vault, blocking) = (self.store, self.vault, self.blocking)
+            secretsTask = Task.detached { [self] in
+                let failure: String? = await blocking.run {
+                    do { try store.reloadRedactorIfNeeded(vault: vault); return nil } catch { return "\(error)" }
+                }
+                if let failure { log("could not reload secrets: \(failure)") }
+                await secretsReloadDone()
+            }
+        }
+        return true
+    }
+
+    private func secretsReloadDone() { secretsTask = nil }
 
     private func logPressure(_ level: MemoryPressure, now: Date) {
         guard level != lastPressure else { return }

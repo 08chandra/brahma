@@ -134,12 +134,14 @@ extension Store {
         guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
         let actor = try resolveActor(db, sender, companyId: companyId)
         _ = try itemType(db, draft.type, company: company)
-        let title = try redact(try Self.cleanTitle(draft.title))
-        let description = try redact(try Self.limited(draft.description, Self.maxDescription, "the description"))
-        let criteria = try redact(try Self.limited(draft.acceptanceCriteria, Self.maxCriteria, "the acceptance criteria"))
-        try draft.checkSpec?.validate()
-        try CheckSpec.validatePaths(draft.touchPaths, what: "touch")
+        // Redacted raw, before any normalization or validation (a multi-line secret matches; what is validated is what is stored).
+        let title = try Self.cleanTitle(try redact(draft.title))
+        let description = try Self.limited(try redact(draft.description), Self.maxDescription, "the description")
+        let criteria = try Self.limited(try redact(draft.acceptanceCriteria), Self.maxCriteria, "the acceptance criteria")
         let checkSpec = try redact(draft.checkSpec)
+        let touchPaths = try draft.touchPaths.map { try redact($0) }
+        try checkSpec?.validate()
+        try CheckSpec.validatePaths(touchPaths, what: "touch")
         let priority = try Self.validPriority(draft.priority)
         let points = try Self.validPoints(draft.points)
         let team = try Self.validTeam(draft.team)
@@ -161,7 +163,7 @@ extension Store {
             status: draft.status, priority: priority, points: points, tier: draft.tier, authorId: actor.id,
             ownerId: draft.ownerId, reviewerId: draft.reviewerId, team: team, parentId: draft.parentId,
             createdAt: now, updatedAt: now, intensity: draft.intensity,
-            specConfirmedBy: actor.privileged || actor.isLead ? actor.label : nil, touchPaths: draft.touchPaths,
+            specConfirmedBy: actor.privileged || actor.isLead ? actor.label : nil, touchPaths: touchPaths,
             tierSetBy: actor.label, checkSpecSetBy: draft.checkSpec == nil ? nil : actor.label)
         // The same rules as an edit, applied to the draft's assignee and reviewer.
         if item.ownerId != nil,
@@ -413,6 +415,7 @@ extension Store {
         p.blockedReason = try redact(p.blockedReason)
         if let notes = p.notes { p.notes = .some(try redact(notes)) }
         if let branch = p.linkedBranch { p.linkedBranch = .some(try redact(branch)) }
+        if let paths = p.touchPaths { p.touchPaths = try paths.map { try redact($0) } }
         return p
     }
 

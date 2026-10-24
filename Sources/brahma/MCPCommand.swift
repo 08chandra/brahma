@@ -87,7 +87,11 @@ struct MCP: ParsableCommand {
         let secretPaths = BrahmaPaths(home: URL(fileURLWithPath: db).deletingLastPathComponent(),
                                       workspaces: BrahmaPaths.fromEnvironment().workspaces)
         let vault: any SecretVault
-        do { vault = try PlatformSecretVault.resolve(paths: secretPaths).vault } catch {
+        do {
+            let selection = try PlatformSecretVault.resolve(paths: secretPaths)   // non-interactive: never prompts
+            try PlatformSecretVault.refuseMemory(selection)
+            vault = selection.vault
+        } catch {
             FileHandle.standardError.write(Data("brahma mcp: \(error)\n".utf8))
             throw ExitCode.failure
         }

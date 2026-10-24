@@ -21,17 +21,34 @@ final class ScriptedVault: SecretVault, @unchecked Sendable {
     private var _failing: Set<String> = []
     private var _unavailable = false
     private var _reads: [String] = []
+    private var _threads: [String] = []
+    private var _failDelete = false
     init(inner: any SecretVault = MemoryVault()) { self.inner = inner }
+    var failDelete: Bool { get { lock.withLock { _failDelete } } set { lock.withLock { _failDelete = newValue } } }
+    /// The name of the thread each read ran on.
+    var threads: [String] { lock.withLock { _threads } }
     var failing: Set<String> { get { lock.withLock { _failing } } set { lock.withLock { _failing = newValue } } }
     var unavailable: Bool { get { lock.withLock { _unavailable } } set { lock.withLock { _unavailable = newValue } } }
     var reads: [String] { lock.withLock { _reads } }
     func set(companyId: String, name: String, value: String) throws { try inner.set(companyId: companyId, name: name, value: value) }
     func value(companyId: String, name: String) throws -> String? {
-        lock.withLock { _reads.append(name) }
+        let thread = Thread.current.name ?? ""
+        lock.withLock { _reads.append(name); _threads.append(thread) }
         if unavailable || failing.contains(name) { throw SecretError.vaultFailed("scripted failure") }
         return try inner.value(companyId: companyId, name: name)
     }
-    func delete(companyId: String, name: String) throws { try inner.delete(companyId: companyId, name: name) }
+    func delete(companyId: String, name: String) throws {
+        if failDelete { throw SecretError.vaultFailed("scripted delete failure") }
+        try inner.delete(companyId: companyId, name: name)
+    }
+}
+
+/// An awake-time clock the tests move by hand (the redactor's retry backoff runs on it).
+final class ManualUptime: @unchecked Sendable {
+    private let lock = NSLock(); private var t: TimeInterval = 1000
+    var now: TimeInterval { lock.withLock { t } }
+    func advance(_ s: TimeInterval) { lock.withLock { t += s } }
+    func install(on store: Store) { store.redactor.setRetryClock { [self] in now } }
 }
 
 struct PatternSample: Sendable, CustomTestStringConvertible {
@@ -187,6 +204,7 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
 
     @Test func reloadWithUnavailableVaultKeepsTheOldSet() throws {
         let w = try W()
+        let clock = ManualUptime(); clock.install(on: w.store)
         try w.set()
         _ = try w.store.reloadRedactorIfNeeded(vault: w.vault)
         try w.set("NEW_KEY", "brand-new-value-xx")
@@ -195,6 +213,9 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(w.store.redactor.apply("sk_test_abcdef123456") == "[redacted STRIPE_KEY]")
         #expect(w.store.secretsHeld)
         #expect(w.store.redactor.version != (try w.store.secretsVersion()))
+        // Retried after the backoff (5 s of awake time), not before.
+        #expect(try w.store.reloadRedactorIfNeeded(vault: w.vault) == false)
+        clock.advance(5)
         #expect(try w.store.reloadRedactorIfNeeded(vault: w.vault))
         #expect(!w.store.secretsHeld)
         #expect(w.store.redactor.version == (try w.store.secretsVersion()))
@@ -205,6 +226,7 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
 
     @Test func oneFailingSecretStillRedactsOthers() throws {
         let w = try W()
+        let clock = ManualUptime(); clock.install(on: w.store)
         let vault = ScriptedVault(inner: w.vault)
         try w.store.setSecret(companyId: w.company.id, name: "GOOD_KEY", value: "good-value-12345", isTest: false, vault: vault)
         try w.store.setSecret(companyId: w.company.id, name: "BAD_KEY", value: "bad-value-123456", isTest: false, vault: vault)
@@ -217,13 +239,15 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(try errors().count == 1)
         #expect(try errors()[0].text.contains("BAD_KEY")); #expect(!(try errors()[0].text.contains("bad-value-123456")))
         #expect(try w.store.events(afterId: 0, companyId: w.other.id).filter { $0.kind == .error }.isEmpty)
-        // Retried on the next call (only the failed one is read again), and the same failure is not logged twice.
+        // Retried once the backoff has passed (only the failed one is read again), and the same failure is not logged twice.
         let readsBefore = vault.reads.count
+        clock.advance(5)
         #expect(try w.store.reloadRedactorIfNeeded(vault: vault))
         #expect(vault.reads.dropFirst(readsBefore) == ["BAD_KEY"])
         #expect(try errors().count == 1)
         // The vault recovers: fully loaded, no longer held, both redact.
         vault.failing = []
+        clock.advance(10)
         #expect(try w.store.reloadRedactorIfNeeded(vault: vault))
         #expect(!w.store.secretsHeld); #expect(w.store.redactor.failedNames.isEmpty)
         #expect(w.store.redactor.version == (try w.store.secretsVersion()))
@@ -279,6 +303,7 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         let vault = ScriptedVault(inner: f.inner)
         vault.unavailable = true
         let store = try Store(path: f.path)
+        let clock = ManualUptime(); clock.install(on: store)
         // Before any load in this process: held, and every redacting write throws instead of storing unredacted text.
         #expect(store.secretsHeld); #expect(!store.redactor.hasLoaded)
         #expect(throws: SecretError.secretsNotLoaded) {
@@ -306,11 +331,22 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         let general = try #require(try store.channel(companyId: f.company.id, name: "general"))
         #expect(try store.messages(channelId: general.id, limit: 5).isEmpty)
 
-        // The vault comes back: the next tick loads, the hold lifts and the turn runs; MCP writes work and are redacted.
+        // Every engine read ran in the engine's Blocking threads, never on the actor.
+        #expect(!vault.threads.isEmpty); #expect(vault.threads.allSatisfy { $0 == "brahma-blocking" }, "\(vault.threads)")
+        // One owner notice for the hold episode, written although redaction is not loaded.
+        let notices = try store.undeliveredNotices().filter { $0.kind == .system && $0.title.lowercased().contains("secret") }
+        #expect(notices.count == 1, "\(notices.map(\.title))")
+        // The vault comes back: once the backoff passes a tick loads in the background, the next tick admits the turn; MCP writes
+        // work and are redacted.
         vault.unavailable = false
         try await w.cycle()
+        #expect(store.secretsHeld, "not retried before the backoff")
+        clock.advance(5)
+        try await w.cycle()
         #expect(!store.secretsHeld); #expect(store.redactor.hasLoaded)
+        try await w.cycle()
         #expect(w.fake.requests.count == 1)
+        #expect(vault.threads.allSatisfy { $0 == "brahma-blocking" }, "\(vault.threads)")
         let ok = server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"post_message","arguments":{"channel":"general","text":"key api-key-value-123"}}}"#) ?? ""
         #expect(ok.contains(#""isError":false"#), "\(ok)")
         #expect(try store.messages(channelId: general.id, limit: 5).map(\.text) == ["key [redacted API_KEY]"])
@@ -321,8 +357,12 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         let vault = ScriptedVault(inner: w.vault)
         try w.store.setSecret(companyId: w.company.id, name: "BAD_KEY", value: "bad-value-123456", isTest: false, vault: vault)
         vault.failing = ["BAD_KEY"]
+        let clock = ManualUptime(); clock.install(on: w.store)
         #expect(throws: (any Error).self) { try w.store.prepareForToolCall(vault: vault) }
         vault.failing = []
+        // MCP reads back off like the engine: still refused until the retry is due.
+        #expect(throws: (any Error).self) { try w.store.prepareForToolCall(vault: vault) }
+        clock.advance(5)
         try w.store.prepareForToolCall(vault: vault)
         #expect(w.store.redactor.apply("bad-value-123456") == "[redacted BAD_KEY]")
     }
@@ -346,6 +386,162 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         let server = MCPServer(tools: tools, beforeCall: { try w.store.prepareForToolCall(vault: UnavailableVault()) })
         let ok = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_channels","arguments":{}}}"#) ?? ""
         #expect(ok.contains(#""isError":false"#), "\(ok)")
+    }
+
+    // MARK: round 2: backoff, notices, lazy loading, owner load
+
+    @Test func backgroundReadsBackOffAndResetOnVersionChange() throws {
+        let w = try W()
+        let clock = ManualUptime(); clock.install(on: w.store)
+        let vault = ScriptedVault(inner: w.vault)
+        try w.store.setSecret(companyId: w.company.id, name: "BAD_KEY", value: "bad-value-123456", isTest: false, vault: vault)
+        vault.failing = ["BAD_KEY"]
+        func attempt() throws -> Bool { let n = vault.reads.count; _ = try w.store.reloadRedactorIfNeeded(vault: vault); return vault.reads.count > n }
+        #expect(try attempt())                       // first attempt at once
+        var delays: [Int] = []
+        for _ in 0..<9 {
+            var waited = 0
+            while !(try attempt()) { clock.advance(1); waited += 1; if waited > 400 { break } }
+            delays.append(waited)
+        }
+        #expect(delays == [5, 10, 20, 40, 80, 160, 300, 300, 300], "\(delays)")
+        #expect(try w.store.redactorReloadDue() == false)
+        // A secrets change (another process set one) retries at once and restarts the backoff.
+        try w.store.setSecret(companyId: w.company.id, name: "OTHER_KEY", value: "other-value-1234", isTest: false, vault: vault)
+        #expect(try w.store.redactorReloadDue())
+        #expect(try attempt())
+        #expect(try attempt() == false); clock.advance(5); #expect(try attempt())
+        // An explicit owner load ignores the backoff.
+        vault.failing = []
+        let report = try w.store.ownerLoadSecrets(vault: vault)
+        #expect(report.failed.isEmpty); #expect(!w.store.secretsHeld)
+    }
+
+    @Test func holdEpisodeWritesOneOwnerNotice() throws {
+        let w = try W()
+        let clock = ManualUptime(); clock.install(on: w.store)
+        let vault = ScriptedVault(inner: w.vault)
+        try w.store.setSecret(companyId: w.company.id, name: "A_KEY", value: "a-value-1234567", isTest: false, vault: vault)
+        try w.store.setSecret(companyId: w.company.id, name: "B_KEY", value: "b-value-1234567", isTest: false, vault: vault)
+        vault.unavailable = true
+        let notices = { try w.store.undeliveredNotices().filter { $0.kind == .system } }
+        _ = try w.store.reloadRedactorIfNeeded(vault: vault)
+        for _ in 0..<3 { clock.advance(400); _ = try w.store.reloadRedactorIfNeeded(vault: vault) }
+        #expect(try notices().count == 1)
+        let n = try #require(try notices().first)
+        #expect(n.companyId == nil)
+        #expect("\(n.title) \(n.body)".contains("Brahma can't read 2 secret(s) without your permission; agents are paused. Run `brahma secret load` or press Load secrets in the app."),
+                "\(n.title) | \(n.body)")
+        // MCP and the CLI never write notices.
+        try? w.store.prepareForToolCall(vault: vault)
+        #expect(try notices().count == 1)
+        // The episode ends when everything loads; a new failure starts a new one.
+        vault.unavailable = false
+        clock.advance(400); _ = try w.store.reloadRedactorIfNeeded(vault: vault)
+        #expect(!w.store.secretsHeld)
+        try w.store.setSecret(companyId: w.company.id, name: "C_KEY", value: "c-value-1234567", isTest: false, vault: w.vault)
+        vault.failing = ["C_KEY"]
+        _ = try w.store.reloadRedactorIfNeeded(vault: vault)
+        #expect(try notices().count == 2)
+        #expect(try notices().last.map { "\($0.title) \($0.body)".contains("1 secret(s)") } == true)
+    }
+
+    @Test func lazyLoaderRunsOnceOnTheFirstRedactingWrite() throws {
+        let f = try FreshProcess()
+        let store = try Store(path: f.path)
+        let loads = HitCounter()
+        let vault = ScriptedVault(inner: f.inner)
+        store.redactorLoader = { loads.bump(); _ = try? store.reloadRedactorIfNeeded(vault: vault, logFailures: false) }
+        // Read-only work never touches the vault.
+        _ = try store.secrets(companyId: f.company.id); _ = try store.companies(); _ = try store.events(afterId: 0)
+        #expect(loads.value == 0); #expect(vault.reads.isEmpty)
+        // The first redacting write loads (from inside its write transaction) and is redacted.
+        _ = try MessageRouter(store: store).post(companyId: f.company.id, channel: "general", from: .owner, text: "key api-key-value-123")
+        #expect(loads.value == 1); #expect(vault.reads == ["API_KEY"])
+        let general = try #require(try store.channel(companyId: f.company.id, name: "general"))
+        #expect(try store.messages(channelId: general.id, limit: 5).map(\.text) == ["key [redacted API_KEY]"])
+        _ = try MessageRouter(store: store).post(companyId: f.company.id, channel: "general", from: .owner, text: "again")
+        #expect(loads.value == 1)
+        // A loader that cannot load: the write still fails closed, and the loader is tried only once.
+        let other = try Store(path: f.path)
+        let failing = ScriptedVault(inner: f.inner); failing.unavailable = true
+        let tries = HitCounter()
+        other.redactorLoader = { tries.bump(); _ = try? other.reloadRedactorIfNeeded(vault: failing, logFailures: false) }
+        for _ in 0..<2 {
+            #expect(throws: SecretError.secretsNotLoaded) {
+                _ = try MessageRouter(store: other).post(companyId: f.company.id, channel: "general", from: .owner, text: "x")
+            }
+        }
+        #expect(tries.value == 1)
+    }
+
+    @Test func ownerLoadSignalsOtherProcessesToRetryAtOnce() throws {
+        let f = try FreshProcess()
+        let engine = try Store(path: f.path)
+        let clock = ManualUptime(); clock.install(on: engine)
+        let denied = ScriptedVault(inner: f.inner); denied.unavailable = true
+        _ = try engine.reloadRedactorIfNeeded(vault: denied)
+        #expect(engine.secretsHeld); #expect(try engine.redactorReloadDue() == false)
+        // The owner loads interactively in another process (the CLI's `brahma secret load`, or the app's button).
+        let owner = try Store(path: f.path)
+        let report = try owner.ownerLoadSecrets(vault: f.inner)
+        #expect(report.loaded == 1); #expect(report.failed.isEmpty); #expect(!owner.secretsHeld)
+        // The engine's backoff is reset by the secrets version change and its next background read succeeds.
+        #expect(try engine.redactorReloadDue())
+        denied.unavailable = false
+        _ = try engine.reloadRedactorIfNeeded(vault: denied)
+        #expect(!engine.secretsHeld)
+        // A failed owner load reports the names and reasons.
+        let broken = try Store(path: f.path)
+        let failing = ScriptedVault(inner: f.inner); failing.unavailable = true
+        let bad = try broken.ownerLoadSecrets(vault: failing)
+        #expect(bad.failed.map(\.name) == ["API_KEY"]); #expect(bad.failed[0].reason.contains("scripted failure"))
+    }
+
+    @Test func deleteSecretRemovesTheVaultValueFirst() throws {
+        let w = try W()
+        let vault = ScriptedVault(inner: w.vault)
+        try w.store.setSecret(companyId: w.company.id, name: "A_KEY", value: "a-value-1234567", isTest: false, vault: vault)
+        vault.failDelete = true
+        #expect(throws: (any Error).self) { try w.store.deleteSecret(companyId: w.company.id, name: "A_KEY", vault: vault) }
+        // The row stays, so the owner can retry; the value was not orphaned.
+        #expect(try w.store.secrets(companyId: w.company.id).map(\.name) == ["A_KEY"])
+        vault.failDelete = false
+        try w.store.deleteSecret(companyId: w.company.id, name: "A_KEY", vault: vault)
+        #expect(try w.store.secrets(companyId: w.company.id).isEmpty)
+        #expect(try vault.value(companyId: w.company.id, name: "A_KEY") == nil)
+        #expect(throws: SecretError.notFound) { try w.store.deleteSecret(companyId: w.company.id, name: "A_KEY", vault: vault) }
+    }
+
+    @Test func requestModeReasonIsRedactedRawFirst() throws {
+        let w = try W()
+        let s = "multi-line\nsecret-9876"
+        try w.set("ML_KEY", s)
+        _ = try w.store.reloadRedactorIfNeeded(vault: w.vault)
+        let item = try w.store.createWorkItem(companyId: w.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Hard \(s)", ownerId: w.eng.id, status: .ready), now: w.now)
+        #expect(try w.store.workItem(id: item.id)?.title == "Hard [redacted ML_KEY]", "title redacted before it is flattened")
+        _ = try w.store.requestMode(companyId: w.company.id, by: w.eng.id, itemKey: item.key, mode: "deep", reason: "need \(s) now", now: w.now)
+        let everything = try dump(w.store)
+        #expect(!everything.contains("multi-line secret-9876")); #expect(!everything.contains("secret-9876"))
+    }
+
+    @Test func checkSpecAndTouchPathsAreRedactedBeforeValidation() throws {
+        let w = try W()
+        let s = "sk_test_pathsecret1"
+        try w.set("PATH_KEY", s)
+        _ = try w.store.reloadRedactorIfNeeded(vault: w.vault)
+        let draft = WorkItemDraft(type: .task, title: "T", checkSpec: CheckSpec(command: "make", paths: ["src/\(s)/x.swift"]),
+                                  ownerId: w.eng.id, status: .ready, touchPaths: ["docs/\(s).md"])
+        // Either refused (a redacted path is not a valid path) or stored redacted: never stored raw.
+        let created = try? w.store.createWorkItem(companyId: w.company.id, by: .owner, draft: draft, now: w.now)
+        let plain = try w.store.createWorkItem(companyId: w.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "U", ownerId: w.eng.id, status: .ready), now: w.now)
+        _ = try? w.store.updateWorkItem(id: plain.id, by: .owner, patch: WorkItemPatch(touchPaths: ["lib/\(s).swift"]), now: w.now)
+        _ = try? w.store.updateWorkItem(id: plain.id, by: .owner, patch: WorkItemPatch(
+            checkSpec: .some(CheckSpec(command: "make", paths: ["a/\(s)"]))), now: w.now)
+        #expect(!(try dump(w.store)).contains(s))
+        _ = created
     }
 
     // MARK: redaction at every store write path
@@ -607,7 +803,25 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         // A refused store choice fails the command instead of falling back.
         let unknown = try brahma(["secret", "list", "Acme"], home: home, env: ["BRAHMA_SECRET_STORE": "plaintext"])
         #expect(unknown.status == 1); #expect(unknown.stderr.contains("BRAHMA_SECRET_STORE=plaintext is not supported"))
-        #expect(try brahma(["secret", "rm", "Acme", "API_KEY"], home: home).status == 0)
+        // `brahma secret load` reads every secret (interactively in production) and reports.
+        let load = try brahma(["secret", "load", "Acme"], home: home)
+        #expect(load.status == 0, "\(load.stderr)"); #expect(load.stdout.contains("loaded 1 secret"))
+        // The memory store is refused by the CLI (its values would vanish with the process).
+        let memory = try brahma(["secret", "list", "Acme"], home: home, env: ["BRAHMA_SECRET_STORE": "memory"])
+        #expect(memory.status == 1); #expect(memory.stderr.contains("BRAHMA_SECRET_STORE=memory"), "\(memory.stderr)")
+        // Lazy loading: with an unreadable vault, read-only commands still work and never mention secrets; a write fails closed.
+        try Data("not json".utf8).write(to: file)
+        let readOnly = try brahma(["log", "Acme", "#general"], home: home)
+        #expect(readOnly.status == 0, "\(readOnly.stderr)"); #expect(!readOnly.stderr.contains("secret"), "\(readOnly.stderr)")
+        #expect(try brahma(["secret", "list", "Acme"], home: home).status == 0)
+        let write = try brahma(["say", "Acme", "#general", "hello"], home: home)
+        #expect(write.status != 0); #expect(write.stderr.contains("secrets are not loaded yet"), "\(write.stderr)")
+        #expect(write.stderr.contains("brahma secret load"), "\(write.stderr)")
+        let failedLoad = try brahma(["secret", "load", "Acme"], home: home)
+        #expect(failedLoad.status == 1); #expect(failedLoad.stderr.contains("API_KEY"), "\(failedLoad.stderr)")
+        try FileManager.default.removeItem(at: file)
+        let rm = try brahma(["secret", "rm", "Acme", "API_KEY"], home: home)
+        #expect(rm.status == 0, "\(rm.stderr)")
         #expect(try brahma(["secret", "list", "Acme"], home: home).stdout.contains("no secrets"))
     }
 

@@ -10,11 +10,21 @@ struct EngineBanner: View {
     /// An account or CLI hold has something to retry.
     var canRetryHold = false
     var retryHold: () -> Void = {}
+    /// Agents are paused until the secrets load; the button asks the owner (a Keychain prompt may follow).
+    var secrets: String?
+    var loadSecrets: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 0) {
             if let notice {
                 bar(color: BrahmaTheme.warning, icon: "exclamationmark.triangle.fill") { Text(verbatim: notice) }
+            }
+            if let secrets {
+                bar(color: BrahmaTheme.danger, icon: "key.fill") {
+                    Text(verbatim: secrets)
+                    Spacer(minLength: 12)
+                    Button("Load secrets", action: loadSecrets).buttonStyle(.brahma)
+                }
             }
             if let hold {
                 bar(color: BrahmaTheme.danger, icon: "exclamationmark.octagon.fill") {

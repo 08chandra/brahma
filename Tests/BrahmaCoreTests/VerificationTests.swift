@@ -113,6 +113,20 @@ import GRDB
 
     // MARK: Submit and pass
 
+    @Test func submitSummaryIsRedactedRawFirst() async throws {
+        let v = try V()
+        let secret = "submit-secret\nline-2-55"
+        let vault = MemoryVault().with(v.company.id, "SUBMIT_KEY", secret)
+        try v.store.setSecret(companyId: v.company.id, name: "SUBMIT_KEY", value: secret, isTest: false, vault: vault)
+        _ = try v.store.reloadRedactorIfNeeded(vault: vault)
+        let i = try v.item(reviewer: v.rev)
+        let wt = try v.claim(i, v.eng)
+        try v.write("src/new.txt", "hello", in: wt)
+        _ = try v.submit(i, v.eng, "used \(secret) here")
+        #expect(try v.fresh(i).submitSummary?.contains("[redacted SUBMIT_KEY]") == true)
+        #expect(!(try dumpDatabase(v.store)).contains("line-2-55"))
+    }
+
     @Test func submitCommitsAndEngineRecordsPass() async throws {
         let v = try V()
         let i = try v.item(reviewer: v.rev)

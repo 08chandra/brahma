@@ -38,7 +38,8 @@ private struct Shell: View {
                 SplitDivider(width: $sidebarWidth, range: 180...320)
                 VStack(spacing: 0) {
                     EngineBanner(engine: model.engine, notice: model.startupNotice, hold: model.holdBanner,
-                                 canRetryHold: model.canRetryEngine, retryHold: { Task { await model.retryEngine() } })
+                                 canRetryHold: model.canRetryEngine, retryHold: { Task { await model.retryEngine() } },
+                                 secrets: model.secretsBanner, loadSecrets: { Task { await model.loadSecrets() } })
                     DetailView(model: model)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }

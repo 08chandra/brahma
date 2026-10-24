@@ -1,6 +1,7 @@
 import Testing
 import Foundation
-import BrahmaCore
+import GRDB
+@testable import BrahmaCore
 import BrahmaKeychain
 
 /// Armed on first use (every temp dir touches it): any later Keychain call in this process crashes instead of
@@ -59,5 +60,28 @@ final class OwnerTestHome: @unchecked Sendable {
     init(initOwner: Bool = true) throws {
         url = try tempDir()
         if initOwner { try #require(try initOwnerKey(home: url) == 0, "brahma owner init failed under script") }
+    }
+}
+
+// MARK: secrets helpers
+
+extension MemoryVault {
+    /// The vault with one value stored (for tests that set a secret and load it).
+    func with(_ companyId: String, _ name: String, _ value: String) -> MemoryVault {
+        try? set(companyId: companyId, name: name, value: value)
+        return self
+    }
+}
+
+/// Every column of every table, as text: where a leaked value would have to be to leak.
+func dumpDatabase(_ store: Store) throws -> String {
+    try store.writer.read { db in
+        var out = ""
+        for table in try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'") {
+            for row in try Row.fetchAll(db, sql: "SELECT * FROM \"\(table)\"") {
+                out += "\(table): " + row.databaseValues.map { "\($0)" }.joined(separator: " | ") + "\n"
+            }
+        }
+        return out
     }
 }

@@ -23,11 +23,15 @@ public enum PlatformSecretVault {
         public let kind: Kind
         /// One line for stderr (and the app's banner) when a non-production store is in use.
         public let warning: String?
+        /// Whether the vault may ask the owner (a Keychain prompt). Only explicit owner actions resolve an interactive one:
+        /// `brahma secret set|rm|load` and the app's Load secrets. Background reads (the engine, `brahma mcp`, other CLI
+        /// commands' lazy load, app boot) never prompt: a read that would is a per-secret failure.
+        public var interactive: Bool = false
     }
 
     public static func resolve(environment: [String: String], paths: BrahmaPaths,
-                               defaultHome: URL = BrahmaPaths.from(environment: [:]).home) throws -> Selection {
-        guard let value = environment[environmentVariable] else { return platform() }
+                               defaultHome: URL = BrahmaPaths.from(environment: [:]).home, interactive: Bool = false) throws -> Selection {
+        guard let value = environment[environmentVariable] else { return platform(interactive: interactive) }
         guard value == "file" || value == "memory" else {
             throw Refusal(description: "\(environmentVariable)=\(value) is not supported (only 'file' or 'memory', for temp/demo data homes; unset it to use the Keychain)")
         }
@@ -36,22 +40,30 @@ public enum PlatformSecretVault {
         }
         if value == "file" {
             return Selection(vault: FileVault(home: paths.home), kind: .file,
-                             warning: "using a file-backed secret store (dev/demo home only)")
+                             warning: "using a file-backed secret store (dev/demo home only)", interactive: interactive)
         }
         return Selection(vault: MemoryVault(), kind: .memory,
-                         warning: "using an in-memory secret store (dev/demo home only; values last only as long as this process)")
+                         warning: "using an in-memory secret store (dev/demo home only; values last only as long as this process)",
+                         interactive: interactive)
     }
 
     /// `resolve` against the process environment.
-    public static func resolve(paths: BrahmaPaths) throws -> Selection {
-        try resolve(environment: ProcessInfo.processInfo.environment, paths: paths)
+    public static func resolve(paths: BrahmaPaths, interactive: Bool = false) throws -> Selection {
+        try resolve(environment: ProcessInfo.processInfo.environment, paths: paths, interactive: interactive)
     }
 
-    private static func platform() -> Selection {
+    /// The refusal the production entry points (the CLI, `brahma mcp`, the app) give for `memory`: its values would vanish
+    /// with the process (later processes would be held), and a child `brahma mcp` cannot share it.
+    public static func refuseMemory(_ selection: Selection) throws {
+        guard selection.kind == .memory else { return }
+        throw Refusal(description: "\(environmentVariable)=memory is for in-process tests only; use 'file' for a temp/demo data home")
+    }
+
+    private static func platform(interactive: Bool) -> Selection {
         #if canImport(Security)
-        return Selection(vault: KeychainVault(), kind: .keychain, warning: nil)
+        return Selection(vault: KeychainVault(interactive: interactive), kind: .keychain, warning: nil, interactive: interactive)
         #else
-        return Selection(vault: UnavailableVault(), kind: .unavailable, warning: nil)
+        return Selection(vault: UnavailableVault(), kind: .unavailable, warning: nil, interactive: interactive)
         #endif
     }
 }
@@ -136,7 +148,13 @@ public enum KeychainTrust {
 /// app, the CLI and the per-turn `brahma mcp` read it without a prompt, and every other program (`/usr/bin/security`, an
 /// agent's own tools) gets the system prompt instead of the value. Residual risk (README: "Keychain asks once per app
 /// build to allow access"): a trusted entry pins the binary's code identity; an unsigned or ad-hoc-signed binary that is
-/// rebuilt or re-signed is a different application, so macOS asks once per build until "Always Allow" adds it.
+/// rebuilt or re-signed is a different application, so macOS asks once per item per binary build (and only the binaries
+/// on the list of the build that last wrote the item are trusted) until "Always Allow" adds it.
+///
+/// Reads are NON-interactive unless the vault was made `interactive` (explicit owner actions only): the query carries
+/// `kSecUseAuthenticationUIFail` and user interaction is switched off around the read (`SecKeychainSetUserInteractionAllowed`,
+/// restored after, under a process-wide lock), so a read that would prompt fails with errSecInteractionNotAllowed, a
+/// per-secret failure the redactor retries with backoff. No background read can raise a dialog or block on one.
 ///
 /// Replacing a value deletes the old item and adds a new one with the current trusted list, never an in-place update: that
 /// also replaces an item written by older code whose access list trusted any application, and changing an existing
@@ -146,8 +164,15 @@ public struct KeychainVault: SecretVault {
     public static let service = "dev.brahma.secrets"
 
     private let trustedPaths: @Sendable () -> [String]
+    public let interactive: Bool
 
-    public init() { trustedPaths = { KeychainTrust.trustedApplicationPaths() } }
+    /// Serializes reads, because the user-interaction switch is process-wide.
+    private static let readLock = NSLock()
+
+    public init(interactive: Bool = false) {
+        self.interactive = interactive
+        trustedPaths = { KeychainTrust.trustedApplicationPaths() }
+    }
 
     /// Every Security framework call goes through here so `KeychainAccessLog` sees it.
     private func sec<T>(_ call: String, _ body: () -> T) -> T {
@@ -164,9 +189,20 @@ public struct KeychainVault: SecretVault {
         var q = query(companyId, name)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
+        if !interactive { q[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail }
         var out: CFTypeRef?
-        let status = sec("SecItemCopyMatching") { SecItemCopyMatching(q as CFDictionary, &out) }
+        let status: OSStatus = Self.readLock.withLock {
+            guard !interactive else { return sec("SecItemCopyMatching") { SecItemCopyMatching(q as CFDictionary, &out) } }
+            var allowed: DarwinBoolean = true
+            _ = sec("SecKeychainGetUserInteractionAllowed") { SecKeychainGetUserInteractionAllowed(&allowed) }
+            _ = sec("SecKeychainSetUserInteractionAllowed") { SecKeychainSetUserInteractionAllowed(false) }
+            defer { _ = sec("SecKeychainSetUserInteractionAllowed") { SecKeychainSetUserInteractionAllowed(allowed.boolValue) } }
+            return sec("SecItemCopyMatching") { SecItemCopyMatching(q as CFDictionary, &out) }
+        }
         if status == errSecItemNotFound { return nil }
+        if status == errSecInteractionNotAllowed || status == errSecAuthFailed {
+            throw SecretError.vaultFailed("reading it needs your permission (OSStatus \(status)); run `brahma secret load` or press Load secrets in the app")
+        }
         guard status == errSecSuccess, let data = out as? Data else { throw SecretError.vaultFailed("read failed (OSStatus \(status))") }
         return try SecretValue.decode(data)
     }

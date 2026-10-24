@@ -98,12 +98,15 @@ import GRDB
         // Added through a different Store handle (the owner's CLI or app).
         try other.setSecret(companyId: company.id, name: "API_TOKEN", value: "tok-0123456789", isTest: false, vault: vault)
         #expect(engine.redactor.apply("x tok-0123456789 y") == "x tok-0123456789 y")
+        // The tick reloads in the background (a Blocking body), never on the actor.
         await orchestrator.tick()
+        try await orchestrator.waitUntilIdle(timeout: .seconds(10))
         #expect(engine.redactor.apply("x tok-0123456789 y") == "x [redacted API_TOKEN] y")
         #expect(engine.redactor.version == (try engine.secretsVersion()))
         // Removing it is picked up on the next tick too.
         try other.deleteSecret(companyId: company.id, name: "API_TOKEN", vault: vault)
         await orchestrator.tick()
+        try await orchestrator.waitUntilIdle(timeout: .seconds(10))
         #expect(engine.redactor.apply("x tok-0123456789 y") == "x tok-0123456789 y")
     }
 

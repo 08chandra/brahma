@@ -75,7 +75,8 @@ extension Store {
             guard case .agent = sender else { throw WorkError.invalid("sprints are planned by an agent with plan_sprint") }
             let actor = try resolveActor(db, sender, companyId: companyId)
             guard actor.isLead else { throw WorkError.forbidden("plan_sprint is for managers and executives") }
-            let cleanGoal = Store.flat(goal, max: Store.maxSprintGoal)
+            // Redacted raw, before newlines are flattened, so a multi-line secret still matches.
+            let cleanGoal = Store.flat(try redact(goal), max: Store.maxSprintGoal)
             guard !cleanGoal.isEmpty else { throw WorkError.invalid("the goal is empty") }
             let team = try Store.validTeam(team)
             let open = SprintStatus.open.map(\.rawValue)
@@ -370,8 +371,9 @@ extension Store {
     /// carries unfinished items over (their `sprintId` cleared) and appends the lessons to the team's notes file.
     @discardableResult
     public func closeSprint(sprintId: String, by sender: Sender, summary: String, lessons: String, now: Date = Store.now()) throws -> SprintClose {
-        let agentSummary = try Store.limitedText(summary, Store.maxSprintSummary, "the summary")
-        let lessonText = try Store.limitedText(lessons, Store.maxSprintLessons, "the lessons")
+        // The agent's text is redacted raw (before trimming or splitting into lines); the lessons go to the DB and the notes file.
+        let agentSummary = try Store.limitedText(try redact(summary), Store.maxSprintSummary, "the summary")
+        let lessonText = try Store.limitedText(try redact(lessons), Store.maxSprintLessons, "the lessons")
         let (sprint, workspace) = try writer.write { db -> (Sprint, String) in
             guard var sprint = try Sprint.fetchOne(db, key: sprintId) else { throw WorkError.notFound("no such sprint") }
             let actor = try resolveActor(db, sender, companyId: sprint.companyId)
