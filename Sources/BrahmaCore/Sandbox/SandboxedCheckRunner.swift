@@ -131,19 +131,24 @@ extension Orchestrator {
 
     /// The default check runner: `SandboxedCheckRunner` over the platform sandbox (Seatbelt on macOS, else fail closed) with
     /// `checkRoute`. The baseline is the owner's (`SandboxBaseline.current`) with the data home (and the store's, if
-    /// different) as engine homes and every company's workspace listed; backup targets are not known here yet (Task 13b).
+    /// different) as engine homes, every company's workspace listed, and the owner's backup folders and WAL replica
+    /// protected (`checkBaseline`).
     static func defaultCheckRunner(store: Store, paths: BrahmaPaths) -> any CheckRunning {
-        let baseline: @Sendable () -> SandboxBaseline = {
-            var b = SandboxBaseline.current(paths: paths, otherWorkspaces: [], backupTargets: [])
-            if let home = store.dataHome?.resolvedForSandbox, !b.engineHomes.contains(home) { b.engineHomes.append(home) }
-            do {
-                b.companyWorkspaces = try store.companies().map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false).resolvedForSandbox }
-            } catch {
-                b.problem = "could not list the company workspaces (\(error))"
-            }
-            return b
-        }
+        let baseline: @Sendable () -> SandboxBaseline = { checkBaseline(store: store, paths: paths) }
         return SandboxedCheckRunner(sandbox: SandboxRunners.platformDefault(baseline: baseline, proxies: EgressProxyPool()),
                                     route: checkRoute(store: store))
+    }
+
+    /// The Seatbelt baseline of one check run, taken when it starts (so a backup folder added since is protected).
+    static func checkBaseline(store: Store, paths: BrahmaPaths) -> SandboxBaseline {
+        var b = SandboxBaseline.current(paths: paths, otherWorkspaces: [],
+                                        backupTargets: BackupTargets.protectedFolders(store: store))
+        if let home = store.dataHome?.resolvedForSandbox, !b.engineHomes.contains(home) { b.engineHomes.append(home) }
+        do {
+            b.companyWorkspaces = try store.companies().map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false).resolvedForSandbox }
+        } catch {
+            b.problem = "could not list the company workspaces (\(error))"
+        }
+        return b
     }
 }

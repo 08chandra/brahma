@@ -117,6 +117,8 @@ public actor Orchestrator {
                 backupTools: BackupTools = .system,
                 walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) }) {
         self.backupTools = backupTools; self.walSleeper = walSleeper
+        // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
+        let vault = vault.nonInteractive()
         self.pushDispatcher = PushDispatcher(store: store, vault: vault, channel: pushChannel)
         self.timerJobs = timerJobs; self.vault = vault; self.restoreHooks = restoreHooks; self.transcripts = transcripts
         self.planSelector = planSelector

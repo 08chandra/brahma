@@ -90,50 +90,14 @@ struct ToolResult: Sendable {
 }
 
 enum ExternalTool {
-    /// Runs `executable` and waits, counting awake time: past `timeout` the child is SIGTERMed, then SIGKILLed a second later.
-    /// Blocking: call it inside a `Blocking` body (or a CLI's main thread). Only the last 64 KB of output are kept.
+    /// Runs `executable` and waits, counting awake time: past `timeout` its process group is SIGTERMed, then SIGKILLed a second
+    /// later (`GroupExec`). Blocking: call it inside a `Blocking` body (or a CLI's main thread). Only the last 64 KB of output
+    /// (stdout and stderr) are kept.
     static func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) -> ToolResult {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: executable)
-        p.arguments = arguments
-        p.environment = environment
-        let out = Pipe()
-        let capture = Capture()
-        let drained = DispatchSemaphore(value: 0)
-        out.fileHandleForReading.readabilityHandler = { h in
-            let d = h.availableData
-            if d.isEmpty { h.readabilityHandler = nil; drained.signal() } else { capture.append(d) }
-        }
-        p.standardOutput = out
-        p.standardError = out
-        p.standardInput = FileHandle.nullDevice
-        do { try p.run() } catch {
-            out.fileHandleForReading.readabilityHandler = nil
-            return ToolResult(status: -1, output: "\(error)", timedOut: false, launched: false)
-        }
-        let deadline = AwakeTime.uptime() + timeout
-        var termAt: TimeInterval?
-        var killed = false
-        while p.isRunning {
-            let now = AwakeTime.uptime()
-            if termAt == nil, now >= deadline { termAt = now; p.terminate() }
-            if let t = termAt, !killed, now - t >= 1 { killed = true; kill(p.processIdentifier, SIGKILL) }
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-        if termAt == nil { _ = drained.wait(timeout: .now() + 2) }
-        out.fileHandleForReading.readabilityHandler = nil
-        return ToolResult(status: p.terminationStatus, output: String(decoding: capture.snapshot, as: UTF8.self),
-                          timedOut: termAt != nil, launched: true)
-    }
-
-    private final class Capture: @unchecked Sendable {
-        private let lock = NSLock()
-        private var data = Data()
-        static let cap = 64 * 1024
-        func append(_ d: Data) {
-            lock.withLock { data.append(d); if data.count > Self.cap { data = data.suffix(Self.cap) } }
-        }
-        var snapshot: Data { lock.withLock { data } }
+        let r = GroupExec.run(executable: executable, arguments: arguments, environment: environment,
+                              output: .capture(cap: 64 * 1024, stderr: true), timeout: timeout, killGrace: 1)
+        guard r.launched else { return ToolResult(status: -1, output: r.error ?? "could not start", timedOut: false, launched: false) }
+        return ToolResult(status: r.status, output: String(decoding: r.output, as: UTF8.self), timedOut: r.timedOut, launched: true)
     }
 }
 

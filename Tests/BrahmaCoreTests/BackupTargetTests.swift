@@ -84,6 +84,29 @@ import GRDB
         let reopened = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
         #expect(BackupTargets.protectedFolders(store: reopened) == protected)
         #expect(try reopened.backupTargets() == [valid, .rclone(remote: "secret")])
+        // Seatbelt-sandboxed checks: the baseline of every run protects the folder target and a folder WAL replica.
+        let replica = try folder("replica")
+        try env.store.setWALShipping(WALShippingConfig(replica: replica.path))
+        let baseline = Orchestrator.checkBaseline(store: env.store, paths: env.paths).protected.map(\.path)
+        #expect(baseline.contains(drive.resolvedForSandbox.path), "\(baseline)")
+        #expect(baseline.contains(replica.resolvedForSandbox.path), "\(baseline)")
+    }
+
+    @Test func folderTargetIsDeniedToSandboxedTurns() async throws {
+        let world = try World()
+        let company = try world.company("Acme", profile: .sandboxed)
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        let drive = try folder()
+        try world.store.addBackupTarget(try BackupTargets.validate(.folder(path: drive.path), paths: world.paths))
+        try world.dm(company, eng)
+        try await world.cycle()
+        // The compiled turn (Task 1a/1b): the backup folder is protected and unreadable.
+        let request = try #require(world.fake.requests.last { $0.agent.id == eng.id })
+        let scope = try #require(request.sandbox)
+        #expect(scope.denyRead.map(\.path).contains(drive.resolvedForSandbox.path), "\(scope.denyRead.map(\.path))")
+        #expect(scope.protected.map(\.path).contains(drive.resolvedForSandbox.path), "\(scope.protected.map(\.path))")
+        let settings = TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: request))
+        #expect(settings.contains(drive.resolvedForSandbox.path))
     }
 
     @Test func unmountedFolderSkippedWithNotice() async throws {

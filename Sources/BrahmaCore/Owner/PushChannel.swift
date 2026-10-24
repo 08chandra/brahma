@@ -64,7 +64,9 @@ public enum OwnerCredential {
     /// The ONE place an owner credential is read from the vault (the engine's dispatcher and `brahma push test` both come
     /// here). Nil when it is not stored; `credentialUnavailable` when the vault cannot answer (the push fails and is retried
     /// later, never "no token"). The engine reads only when a push is due and the channel is not cached (`PushDispatcher`).
-    /// Lane-merge item: route this read through the vault's non-interactive flag, so a background read can never prompt.
+    /// The engine's `PushDispatcher` holds `vault.nonInteractive()`, so its reads can never prompt (a read that would needs
+    /// permission and fails as `credentialUnavailable`, retried later); only the explicit owner commands (`brahma prefs set
+    /// push`, `brahma push test`) pass an interactive vault.
     public static func readOwnerCredential(_ vault: any SecretVault, _ name: String) throws -> String? {
         let value: String?
         do { value = try vault.value(companyId: scope, name: name) } catch { throw PushError.credentialUnavailable(name) }

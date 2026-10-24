@@ -483,7 +483,7 @@ public struct SandboxScope: Equatable, Sendable {
     }
 
     /// The scope of one turn of the agent `layout` describes. `otherWorkspaces` is every other company's workspace;
-    /// `backupTargets` the owner's backup destinations (none until Task 13b); `darwinUserTemp` the xcrun temp dir.
+    /// `backupTargets` the owner's backup folders and WAL replica (`BackupTargets.protectedFolders`); `darwinUserTemp` the xcrun temp dir.
     /// `userHome` is the owner's home (the process's by default; tests pass a temp dir).
     ///
     /// - Item turn (`work`/`notice` with an item): cwd = the item worktree; writes to the agent's home, lab and cache, the

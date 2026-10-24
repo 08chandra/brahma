@@ -174,6 +174,9 @@ public struct KeychainVault: SecretVault {
         trustedPaths = { KeychainTrust.trustedApplicationPaths() }
     }
 
+    /// Background readers (the push dispatcher) hold this: the same items, read without ever prompting.
+    public func nonInteractive() -> any SecretVault { interactive ? KeychainVault(interactive: false) : self }
+
     /// Every Security framework call goes through here so `KeychainAccessLog` sees it.
     private func sec<T>(_ call: String, _ body: () -> T) -> T {
         KeychainAccessLog.record(call)

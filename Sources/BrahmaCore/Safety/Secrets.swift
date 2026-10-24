@@ -89,6 +89,13 @@ public protocol SecretVault: Sendable {
     func value(companyId: String, name: String) throws -> String?
     /// Deleting a secret that is not there is not an error.
     func delete(companyId: String, name: String) throws
+    /// The same store with reads that can never ask the owner (no Keychain prompt): what every background reader holds
+    /// (the push dispatcher, the engine's redactor reloads). Stores that never prompt return themselves.
+    func nonInteractive() -> any SecretVault
+}
+
+extension SecretVault {
+    public func nonInteractive() -> any SecretVault { self }
 }
 
 /// In-process storage for tests.

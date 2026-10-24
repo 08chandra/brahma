@@ -15,7 +15,7 @@ struct PushGroup: AsyncParsableCommand {
             let (store, _) = try openStore()
             let result: PushResult
             do {
-                result = try await PushDispatcher.sendTest(store: store, vault: try cliSecretVault())
+                result = try await PushDispatcher.sendTest(store: store, vault: try cliSecretVault(interactive: true))
             } catch let e as PushError {
                 throw fail(e.description)
             }

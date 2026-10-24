@@ -361,3 +361,81 @@ enum GroupRun {
         return CheckOutcome(exitCode: ProcessGroupChild.exitCode(status), timedOut: false, tail: tail)
     }
 }
+
+/// One bounded run of an engine tool (`claude --version`, rclone, zstd/gzip, lsof): spawned as the leader of its own process
+/// group (`ProcessGroupChild`), waited on in awake time (`AwakeTime`), and past `timeout` SIGTERMed as a group, then
+/// SIGKILLed as a group `killGrace` later, so a hung tool's children go with it. When the leader exits its group is swept
+/// before it is reaped (`finish`). Blocking: call it inside a `Blocking` body (or a CLI's main thread).
+enum GroupExec {
+    /// Where the child's standard output goes.
+    enum Output {
+        /// Captured through a pipe: at most the last `cap` bytes are kept; `stderr` joins it (else `/dev/null`).
+        case capture(cap: Int, stderr: Bool)
+        /// This descriptor (the caller keeps it); standard error goes to `/dev/null`.
+        case descriptor(Int32)
+    }
+
+    struct Result: Sendable {
+        /// False when it could not be started (`error` says why).
+        var launched: Bool
+        /// The exit code, or 128 + the signal that ended it.
+        var status: Int32
+        var output: Data
+        var timedOut: Bool
+        var error: String?
+    }
+
+    /// `arguments` excludes argv[0]. `stdin` `-1`: `/dev/null`. `abandonAfter`: once SIGKILL has been sent, how long to wait for
+    /// the leader before giving up on it (nil: wait). Captured output is drained for up to 2 s after a normal exit and not
+    /// waited on after a timeout, so a process outside the group that holds the pipe cannot hang the caller.
+    static func run(executable: String, arguments: [String], environment: [String: String],
+                    workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+                    stdin: Int32 = -1, output: Output, timeout: TimeInterval, killGrace: TimeInterval = 1,
+                    abandonAfter: TimeInterval? = nil,
+                    clock: () -> TimeInterval = { AwakeTime.uptime() }) -> Result {
+        var readEnd: Int32 = -1, writeEnd: Int32 = -1
+        let outFD: Int32, errFD: Int32?
+        switch output {
+        case .descriptor(let fd):
+            outFD = fd; errFD = -1
+        case .capture(_, let withStderr):
+            var fds: [Int32] = [0, 0]
+            guard pipe(&fds) == 0 else {
+                return Result(launched: false, status: -1, output: Data(), timedOut: false,
+                              error: "no pipe (\(String(cString: strerror(errno))))")
+            }
+            (readEnd, writeEnd) = (fds[0], fds[1])
+            _ = fcntl(readEnd, F_SETFD, FD_CLOEXEC); _ = fcntl(writeEnd, F_SETFD, FD_CLOEXEC)
+            outFD = writeEnd; errFD = withStderr ? nil : -1
+        }
+        let child: ProcessGroupChild
+        do {
+            child = try ProcessGroupChild.spawn(executable: executable, arguments: [executable] + arguments, environment: environment,
+                                                workingDirectory: workingDirectory, output: outFD, stdin: stdin, stderr: errFD)
+        } catch {
+            if readEnd >= 0 { close(readEnd); close(writeEnd) }
+            return Result(launched: false, status: -1, output: Data(), timedOut: false, error: "could not start \(executable): \(error)")
+        }
+        var capture: OutputCapture?
+        if case .capture(let cap, _) = output {
+            close(writeEnd)
+            // The reader owns `readEnd` and the sink from here on; it keeps only the tail (`cap` bytes).
+            let sink = open("/dev/null", O_WRONLY | O_CLOEXEC)
+            capture = OutputCapture(readEnd: readEnd, file: sink, cap: 0, tailBytes: cap, marker: "")
+        }
+        let deadline = clock() + timeout
+        var termAt: TimeInterval?, killAt: TimeInterval?
+        var abandoned = false
+        while !child.hasExited() {
+            let now = clock()
+            if termAt == nil, now >= deadline { termAt = now; child.signalGroup(SIGTERM) }
+            if let t = termAt, killAt == nil, now - t >= killGrace { killAt = now; child.signalGroup(SIGKILL) }
+            if let k = killAt, let abandonAfter, now - k >= abandonAfter { abandoned = true; break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        // A leader still there after SIGKILL is left unreaped (never signalled again by us); otherwise sweep, then reap.
+        let status = abandoned ? 0 : child.finish()
+        let data = capture?.finish(drain: termAt == nil ? 2 : 0) ?? Data()
+        return Result(launched: true, status: ProcessGroupChild.exitCode(status), output: data, timedOut: termAt != nil, error: nil)
+    }
+}

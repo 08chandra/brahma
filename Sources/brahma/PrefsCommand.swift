@@ -91,14 +91,14 @@ struct PrefsGroup: ParsableCommand {
                     // server and deleted when the server or provider changes without a new one.
                     switch provider {
                     case .off:
-                        try PushSettings.turnOff(store: store, vault: try cliSecretVault())
+                        try PushSettings.turnOff(store: store, vault: try cliSecretVault(interactive: true))
                     case .ntfy:
                         guard let topic else { throw fail("ntfy needs a topic: brahma prefs set push ntfy <topic>") }
                         let token = tokenStdin ? try SecretInput.read(from: .standardInput) : nil
-                        try PushSettings.setNtfy(store: store, vault: try cliSecretVault(), topic: topic, server: server, token: token)
+                        try PushSettings.setNtfy(store: store, vault: try cliSecretVault(interactive: true), topic: topic, server: server, token: token)
                     case .pushover:
                         let lines = try readPushoverCredentials()
-                        try PushSettings.setPushover(store: store, vault: try cliSecretVault(), appToken: lines.app, userKey: lines.user)
+                        try PushSettings.setPushover(store: store, vault: try cliSecretVault(interactive: true), appToken: lines.app, userKey: lines.user)
                     }
                 } catch let e as PushError {
                     throw fail(e.description)

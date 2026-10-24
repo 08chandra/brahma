@@ -12,7 +12,7 @@ public enum CompressorError: Error, Equatable, CustomStringConvertible {
     }
 }
 
-/// zstd (when installed) or gzip, reached through `Process`. Input and output go through files in a work directory, never
+/// zstd (when installed) or gzip, run as its own process group (`GroupExec`). Input and output go through files in a work directory, never
 /// pipes, so a tool that stops reading can not deadlock the caller; the wait is bounded in awake time.
 public enum Compressor: Sendable, Equatable {
     case zstd(path: String)
@@ -78,26 +78,15 @@ public enum Compressor: Sendable, Equatable {
               FileManager.default.createFile(atPath: outURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CompressorError.failed("could not stage \(tool)'s files in \(workDir.path)")
         }
-        let reader = try FileHandle(forReadingFrom: inURL), writer = try FileHandle(forWritingTo: outURL)
-        defer { try? reader.close(); try? writer.close() }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: tool)
-        process.arguments = arguments
-        process.standardInput = reader
-        process.standardOutput = writer
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { throw CompressorError.failed("could not start \(tool): \(error)") }
-        // Bounded in awake time (AwakeTime): a tool that hangs is terminated, then killed.
-        let deadline = AwakeTime.uptime() + timeout
-        var killAt: TimeInterval?
-        while process.isRunning {
-            let now = AwakeTime.uptime()
-            if killAt == nil, now >= deadline { process.terminate(); killAt = now + 1 }
-            if let k = killAt, now >= k { kill(process.processIdentifier, SIGKILL); break }
-            usleep(2_000)
-        }
-        if killAt != nil { throw CompressorError.failed("\(tool) timed out") }
-        guard process.terminationStatus == 0 else { throw CompressorError.failed("\(tool) exited with status \(process.terminationStatus)") }
+        let reader = open(inURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC), writer = open(outURL.path, O_WRONLY | O_NOFOLLOW | O_CLOEXEC)
+        defer { if reader >= 0 { close(reader) }; if writer >= 0 { close(writer) } }
+        guard reader >= 0, writer >= 0 else { throw CompressorError.failed("could not open \(tool)'s staged files in \(workDir.path)") }
+        // Bounded in awake time (`GroupExec`): a tool that hangs is terminated, then killed, with its process group.
+        let r = GroupExec.run(executable: tool, arguments: arguments, environment: ProcessInfo.processInfo.environment,
+                              stdin: reader, output: .descriptor(writer), timeout: timeout, killGrace: 1)
+        guard r.launched else { throw CompressorError.failed(r.error ?? "could not start \(tool)") }
+        if r.timedOut { throw CompressorError.failed("\(tool) timed out") }
+        guard r.status == 0 else { throw CompressorError.failed("\(tool) exited with status \(r.status)") }
         return try Data(contentsOf: outURL)
     }
 }

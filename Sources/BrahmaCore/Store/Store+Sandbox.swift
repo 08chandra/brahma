@@ -51,7 +51,8 @@ extension Store {
         let paths = BrahmaPaths(home: dataHome ?? FileManager.default.temporaryDirectory.appending(path: "brahma-home-\(companyId)"),
                                 workspaces: workspaces)
         let layout = SandboxLayout(paths: paths, company: candidate, agentHandle: "sandbox-check")
-        _ = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: [], kind: .audit,
+        _ = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others,
+                                     backupTargets: BackupTargets.protectedFolders(store: self), kind: .audit,
                                      item: nil, company: candidate, grants: GrantInputs(), darwinUserTemp: nil, userHome: userHome)
         try writer.write { db in
             guard var company = try Company.fetchOne(db, key: companyId) else { throw StoreError.notFound }

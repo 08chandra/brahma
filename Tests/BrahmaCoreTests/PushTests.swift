@@ -572,6 +572,48 @@ extension PushTests {
         #expect(vault.reads.count == 2)
     }
 
+    /// A vault that, like the Keychain one, may be interactive; it records whether each read could have prompted.
+    final class ModalVault: SecretVault, @unchecked Sendable {
+        final class Log: @unchecked Sendable {
+            let lock = NSLock()
+            var reads: [(name: String, interactive: Bool)] = []
+        }
+        let inner: MemoryVault, log: Log, interactive: Bool
+        init(inner: MemoryVault = MemoryVault(), log: Log = Log(), interactive: Bool) {
+            self.inner = inner; self.log = log; self.interactive = interactive
+        }
+        var reads: [(name: String, interactive: Bool)] { log.lock.withLock { log.reads } }
+        func set(companyId: String, name: String, value: String) throws { try inner.set(companyId: companyId, name: name, value: value) }
+        func delete(companyId: String, name: String) throws { try inner.delete(companyId: companyId, name: name) }
+        func value(companyId: String, name: String) throws -> String? {
+            log.lock.withLock { log.reads.append((name, interactive)) }
+            return try inner.value(companyId: companyId, name: name)
+        }
+        func nonInteractive() -> any SecretVault { ModalVault(inner: inner, log: log, interactive: false) }
+    }
+
+    @Test func dispatcherReadsTheVaultNonInteractively() async throws {
+        // Handed an interactive vault, the dispatcher still reads without any possible prompt.
+        let vault = ModalVault(interactive: true), transport = RecordingTransport()
+        let r = try liveRig(vault: vault, transport: transport)
+        try file(r.store, r.company, r.eng, "one")
+        await r.dispatcher.tick(now: noon)
+        #expect(transport.requests.count == 1)
+        #expect(vault.reads.map(\.name) == [OwnerCredential.ntfyToken])
+        #expect(vault.reads.allSatisfy { !$0.interactive })
+        // The engine's own dispatcher (and its redactor reloads) hold the non-interactive vault too.
+        let orchestrator = Orchestrator(store: r.store, runner: FakeTurnRunner(), paths: BrahmaPaths(home: try tempDir(), workspaces: try tempDir()),
+                                        mcpExecutable: "/usr/local/bin/brahma", vault: ModalVault(inner: vault.inner, log: vault.log, interactive: true))
+        #expect((orchestrator.vault as? ModalVault)?.interactive == false)
+        try file(r.store, r.company, r.eng, "two")
+        await orchestrator.pushDispatcher.tick(now: noon)
+        #expect(vault.reads.count == 2)
+        #expect(vault.reads.allSatisfy { !$0.interactive })
+        // Only an explicit owner command (`brahma push test`) reads with the interactive vault it was given.
+        _ = try await PushDispatcher.sendTest(store: r.store, vault: vault, transport: transport)
+        #expect(vault.reads.last?.interactive == true)
+    }
+
     @Test func missingCredentialIsOneFailurePerEpisode() async throws {
         let vault = ScriptedVault(), transport = RecordingTransport()
         let r = try liveRig(vault: vault, transport: transport)

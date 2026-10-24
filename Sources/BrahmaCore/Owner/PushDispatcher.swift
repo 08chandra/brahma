@@ -70,7 +70,9 @@ public actor PushDispatcher {
          awake: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() },
          clock: @escaping @Sendable () -> Date = { Store.now() },
          redact: (@Sendable (String) throws -> String)?) {
-        self.store = store; self.vault = vault; self.injected = channel; self.transport = transport
+        // A background reader: its credential reads never prompt, whatever vault it was given. (`brahma push test`, an explicit
+        // owner command, goes through `sendTest` with the caller's interactive vault instead.)
+        self.store = store; self.vault = vault.nonInteractive(); self.injected = channel; self.transport = transport
         self.awake = awake; self.clock = clock; self.redactOverride = redact
     }
 

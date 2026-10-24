@@ -65,53 +65,17 @@ public enum DBOpeners {
         return found.sorted()
         #else
         guard FileManager.default.isExecutableFile(atPath: lsof) else { throw RestoreError.cannotCheckOpeners }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: lsof)
-        process.arguments = ["-t"] + files
-        let out = Pipe()
-        let capture = OutputCapture()
-        let drained = DispatchSemaphore(value: 0)
-        out.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { handle.readabilityHandler = nil; drained.signal() } else { capture.append(chunk) }
-        }
-        process.standardOutput = out
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
-        do { try process.run() } catch {
-            out.fileHandleForReading.readabilityHandler = nil
-            throw RestoreError.cannotCheckOpeners
-        }
-        // Bounded in awake time (AwakeTime): a hung lsof is SIGTERMed, then SIGKILLed, and its output is never waited on.
-        let deadline = AwakeTime.uptime() + timeout
-        var termAt: TimeInterval?
-        var killedAt: TimeInterval?
-        while process.isRunning {
-            let now = AwakeTime.uptime()
-            if termAt == nil, now >= deadline { termAt = now; process.terminate() }
-            if let t = termAt, killedAt == nil, now - t >= killGrace { killedAt = now; kill(process.processIdentifier, SIGKILL) }
-            // Still there after SIGKILL: abandoned, not waited on.
-            if let k = killedAt, now - k >= killWait { break }
-            usleep(10_000)
-        }
-        if termAt != nil {
-            out.fileHandleForReading.readabilityHandler = nil
-            throw RestoreError.cannotCheckOpeners
-        }
-        _ = drained.wait(timeout: .now() + 2)
-        out.fileHandleForReading.readabilityHandler = nil
+        // Bounded in awake time (`GroupExec`): a hung lsof is SIGTERMed, then SIGKILLed with its group, and abandoned if it
+        // is still there `killWait` later; its output is never waited on after a timeout.
+        let r = GroupExec.run(executable: lsof, arguments: ["-t"] + files, environment: ProcessInfo.processInfo.environment,
+                              output: .capture(cap: 1 << 20, stderr: false), timeout: timeout, killGrace: killGrace,
+                              abandonAfter: killWait)
+        guard r.launched, !r.timedOut else { throw RestoreError.cannotCheckOpeners }
         // 0: something found; 1: nothing open. Anything else means lsof itself failed.
-        guard process.terminationStatus == 0 || process.terminationStatus == 1 else { throw RestoreError.cannotCheckOpeners }
-        let pids = String(decoding: capture.data, as: UTF8.self).split(whereSeparator: \.isNewline).compactMap { Int32($0) }
+        guard r.status == 0 || r.status == 1 else { throw RestoreError.cannotCheckOpeners }
+        let pids = String(decoding: r.output, as: UTF8.self).split(whereSeparator: \.isNewline).compactMap { Int32($0) }
         return Array(Set(pids.filter { $0 != me })).sorted()
         #endif
-    }
-
-    private final class OutputCapture: @unchecked Sendable {
-        private let lock = NSLock()
-        private var bytes = Data()
-        func append(_ d: Data) { lock.withLock { bytes.append(d) } }
-        var data: Data { lock.withLock { bytes } }
     }
 }
 

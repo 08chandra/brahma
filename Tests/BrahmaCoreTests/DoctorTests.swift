@@ -190,6 +190,23 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         #expect(AwakeTime.uptime() - started < 60, "killed long before the 120 s sleep ends")
     }
 
+    /// The engine's bounded tool runs (doctor, rclone, zstd/gzip, lsof) all go through `GroupExec`: a hung tool's children
+    /// die with it, since its whole process group is signalled.
+    @Test func aHungToolsChildrenAreKilledWithItsGroup() async throws {
+        let pidFile = try tempDir().appending(path: "child.pid")
+        let script = "/bin/sleep 300 & echo $! > '\(pidFile.path)'; wait"
+        _ = try? await Doctor.execProcess(executable: "/bin/sh", arguments: ["-c", script], timeout: 0.5, blocking: Blocking())
+        let r = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", script + "; echo never"], environment: [:], timeout: 0.5)
+        #expect(r.timedOut && r.launched)
+        let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        let until = AwakeTime.uptime() + 5
+        while kill(pid, 0) == 0, AwakeTime.uptime() < until { try await Task.sleep(nanoseconds: 20_000_000) }
+        #expect(kill(pid, 0) != 0, "the tool's background child outlived the timeout")
+        // A normal run still captures stdout and stderr and returns the exit code.
+        let ok = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", "echo out; echo err >&2; exit 3"], environment: [:], timeout: 10)
+        #expect(ok.status == 3 && ok.output == "out\nerr\n" && !ok.timedOut, "\(ok)")
+    }
+
     @Test func aFastProcessReturnsItsOutputAndAFailingOneNil() async throws {
         let ok = try await Doctor.execProcess(executable: "/bin/echo", arguments: ["2.1.304 (Claude Code)"], timeout: 10)
         #expect(ok == "2.1.304 (Claude Code)\n")

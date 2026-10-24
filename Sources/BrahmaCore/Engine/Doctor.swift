@@ -335,56 +335,22 @@ public enum Doctor {
         try await execProcess(executable: executable, arguments: arguments, timeout: execTimeout)
     }
 
-    private final class Capture: @unchecked Sendable {
-        private let lock = NSLock()
-        private var data = Data()
-        func append(_ d: Data) { lock.withLock { data.append(d) } }
-        var snapshot: Data { lock.withLock { data } }
-    }
-
-    /// Runs the process on a `Blocking` thread (never a cooperative worker). Past `timeout` awake seconds the child is
-    /// SIGTERMed, then SIGKILLed, and `ExecTimedOut` is thrown. Foundation's `Process` cannot start a process group, so only
-    /// the child itself is signalled; the output is never waited on after a kill, so a grandchild holding the pipe cannot hang us.
+    /// Runs the process on a `Blocking` thread (never a cooperative worker), as its own process group (`GroupExec`). Past
+    /// `timeout` awake seconds the group is SIGTERMed, then SIGKILLed, and `ExecTimedOut` is thrown; the output is never
+    /// waited on after a kill, so a process holding the pipe cannot hang us.
     static func execProcess(executable: String, arguments: [String], timeout: TimeInterval,
                             blocking: Blocking = Doctor.execBlocking) async throws -> String? {
         let outcome: Result<String?, ExecTimedOut> = await blocking.run {
-            let p = Process()
-            if executable.hasPrefix("/") {
-                p.executableURL = URL(fileURLWithPath: executable)
-                p.arguments = arguments
-            } else {
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                p.arguments = [executable] + arguments
-            }
-            p.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .claude)
-            let out = Pipe()
-            let capture = Capture()
-            let drained = DispatchSemaphore(value: 0)
-            out.fileHandleForReading.readabilityHandler = { h in
-                let d = h.availableData
-                if d.isEmpty { h.readabilityHandler = nil; drained.signal() } else { capture.append(d) }
-            }
-            p.standardOutput = out
-            p.standardError = FileHandle.nullDevice
-            p.standardInput = FileHandle.nullDevice
-            do { try p.run() } catch { out.fileHandleForReading.readabilityHandler = nil; return .success(nil) }
-            let deadline = AwakeTime.uptime() + timeout
-            var termAt: TimeInterval?
-            var killed = false
-            while p.isRunning {
-                let now = AwakeTime.uptime()
-                if termAt == nil, now >= deadline { termAt = now; p.terminate() }
-                if let t = termAt, !killed, now - t >= execKillGrace { killed = true; kill(p.processIdentifier, SIGKILL) }
-                Thread.sleep(forTimeInterval: 0.01)
-            }
-            if termAt != nil {
-                out.fileHandleForReading.readabilityHandler = nil
+            let (path, args) = executable.hasPrefix("/") ? (executable, arguments) : ("/usr/bin/env", [executable] + arguments)
+            let r = GroupExec.run(executable: path, arguments: args,
+                                  environment: ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .claude),
+                                  output: .capture(cap: 4 << 20, stderr: false), timeout: timeout, killGrace: execKillGrace)
+            guard r.launched else { return .success(nil) }
+            if r.timedOut {
                 let shown = ([executable] + arguments).joined(separator: " ")
                 return .failure(ExecTimedOut(command: shown, seconds: Int(timeout.rounded(.up))))
             }
-            _ = drained.wait(timeout: .now() + 2)
-            out.fileHandleForReading.readabilityHandler = nil
-            return .success(p.terminationStatus == 0 ? String(decoding: capture.snapshot, as: UTF8.self) : nil)
+            return .success(r.status == 0 ? String(decoding: r.output, as: UTF8.self) : nil)
         }
         return try outcome.get()
     }
