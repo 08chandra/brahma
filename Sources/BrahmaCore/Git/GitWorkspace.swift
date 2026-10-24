@@ -102,7 +102,16 @@ struct GitCommand: Sendable {
     /// the engine's merge repository its own stronger line (`GitWorkspace.engineAttributes`), never something weaker.
     var attributes = GitCommand.attributesOverride
 
+    /// Where git's captured stdout/stderr files go (`brahma-git-*`). The engine points this at a 0700 directory under its own
+    /// data home (A-I1b), so a sandboxed check can never read another company's in-flight git output in the shared per-user
+    /// temp dir; the default (`NSTemporaryDirectory`) is for tests and standalone callers.
+    var tempRoot: URL = FileManager.default.temporaryDirectory
+
     func withIndex(_ url: URL) -> GitCommand { var copy = self; copy.indexFile = url; return copy }
+
+    /// Tests only: handed the `tempRoot` of every git run, to prove the engine's captured output never lands in the shared
+    /// per-user temp dir (A-I1b). `nonisolated(unsafe)`: set once before a test, read on the git thread.
+    nonisolated(unsafe) static var tempRootObserver: (@Sendable (URL) -> Void)?
 
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
@@ -310,7 +319,10 @@ struct GitCommand: Sendable {
         process.standardInput = FileHandle.nullDevice
         // Output goes to files, not pipes: concurrent children cannot hold each other's pipe ends open, and a grandchild
         // that outlives git cannot keep us waiting for end of file.
-        let base = FileManager.default.temporaryDirectory.appending(path: "brahma-git-\(UUID().uuidString)")
+        GitCommand.tempRootObserver?(tempRoot)
+        try? FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        let base = tempRoot.appending(path: "brahma-git-\(UUID().uuidString)")
         let outURL = base.appendingPathExtension("out"), errURL = base.appendingPathExtension("err")
         guard FileManager.default.createFile(atPath: outURL.path, contents: nil, attributes: [.posixPermissions: 0o600]),
               FileManager.default.createFile(atPath: errURL.path, contents: nil, attributes: [.posixPermissions: 0o600]),
@@ -318,8 +330,7 @@ struct GitCommand: Sendable {
         else { throw GitError.failed(command: label, status: -1, stderr: "no temporary space for git output") }
         defer {
             try? outHandle.close(); try? errHandle.close()
-            let temp = FileManager.default.temporaryDirectory
-            _ = try? EngineFiles.removeNoFollow(outURL, under: temp); _ = try? EngineFiles.removeNoFollow(errURL, under: temp)
+            _ = try? EngineFiles.removeNoFollow(outURL, under: tempRoot); _ = try? EngineFiles.removeNoFollow(errURL, under: tempRoot)
         }
         process.standardOutput = outHandle
         process.standardError = errHandle
@@ -522,15 +533,21 @@ public struct GitWorkspace: Sendable {
     /// its retry), so a test can clear the lock there instead of racing a timer.
     var gitRetryProbe: (@Sendable (_ attempt: Int) -> Void)?
 
+    /// Where the engine's git commands keep their captured output and private index files (A-I1b): a 0700 directory under the
+    /// engine's data home (`<exportHome>/tmp`), never the shared per-user temp dir a sandboxed check could read.
+    let gitTemp: URL
+
     public init(root: URL, lockDirectory: URL? = nil, mergeDirectory: URL? = nil, exportHome: URL? = nil) {
         self.root = root
         let hash = StableHash.fnv1a64(root.path)
-        self.exportHome = exportHome ?? FileManager.default.temporaryDirectory
+        let export = exportHome ?? FileManager.default.temporaryDirectory
             .appending(path: "brahma-exports/\(hash)", directoryHint: .isDirectory)
+        self.exportHome = export
         self.lockDirectory = lockDirectory ?? FileManager.default.temporaryDirectory
             .appending(path: "brahma-locks/\(hash)", directoryHint: .isDirectory)
         self.mergeDirectory = mergeDirectory ?? FileManager.default.temporaryDirectory
             .appending(path: "brahma-merge/\(hash)", directoryHint: .isDirectory)
+        self.gitTemp = export.appending(path: "tmp", directoryHint: .isDirectory)
     }
 
     /// The installed git's version (`2.52.0`), nil when it cannot be read. The first use runs `git --version` (once per
@@ -552,6 +569,7 @@ public struct GitWorkspace: Sendable {
     private var main: GitCommand {
         var git = GitCommand(gitDir: gitDir, workTree: root, commonDir: nil, onRefused: onUnsafeRepository)
         git.beforeRetry = gitRetryProbe
+        git.tempRoot = gitTemp
         return git
     }
 
@@ -613,6 +631,7 @@ public struct GitWorkspace: Sendable {
         }
         var git = GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir, onRefused: onUnsafeRepository)
         git.beforeRetry = gitRetryProbe
+        git.tempRoot = gitTemp
         return (git, key)
     }
 
@@ -738,9 +757,21 @@ public struct GitWorkspace: Sendable {
         let info = gitDir.appending(path: "info", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: info, withIntermediateDirectories: true)
         let file = info.appending(path: "exclude")
-        let current = EngineFiles.readNoFollow(file, under: gitDir).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        let existing = EngineFiles.readNoFollow(file, under: gitDir)
+        let current = existing.map { String(decoding: $0, as: UTF8.self) } ?? ""
         let lines = current.split(separator: "\n").map(String.init)
         let missing = Self.excludedEntries.filter { !lines.contains($0) }
+        // A real file that could not be read whole (a second hard link, or over the read cap) must never be replaced: the
+        // atomic write would drop whatever the owner put there. The entries are appended without following a link (B-M3).
+        if existing == nil, SandboxPath.kind(file.path) == .file {
+            guard !missing.isEmpty else { return }
+            let fd = open(file.path, O_WRONLY | O_APPEND | O_NOFOLLOW)
+            guard fd >= 0 else { throw GitError.failed(command: "exclude", status: -1, stderr: "cannot append to \(file.path)") }
+            defer { close(fd) }
+            let text = "\n" + missing.map { $0 + "\n" }.joined()
+            _ = text.withCString { write(fd, $0, strlen($0)) }
+            return
+        }
         guard !missing.isEmpty || Self.isSymlink(file) else { return }
         let prefix = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
         try (current + prefix + missing.map { $0 + "\n" }.joined()).write(to: file, atomically: true, encoding: .utf8)
@@ -998,6 +1029,7 @@ public struct GitWorkspace: Sendable {
     private var engineCommand: GitCommand {
         var git = GitCommand(gitDir: mergeRepositoryPath, workTree: mergeWorktreePath, commonDir: nil)
         git.attributes = Self.engineAttributes
+        git.tempRoot = gitTemp
         return git
     }
     /// Where older engines kept the merge checkout, inside the agent-writable `<ws>/.brahma`.
@@ -1275,6 +1307,7 @@ public struct GitWorkspace: Sendable {
         guard !Self.isSymlink(previous), fm.fileExists(atPath: previous.appending(path: "objects").path) else { return false }
         var source = GitCommand(gitDir: previous, workTree: mergeDirectory.deletingLastPathComponent(), commonDir: nil)
         source.attributes = Self.engineAttributes
+        source.tempRoot = gitTemp
         guard try source.run(["cat-file", "-e", "\(mainHead)^{commit}"], allowFailure: true).status == 0 else { return false }
         try source.run(["update-ref", "--no-deref", "refs/brahma/heal", mainHead])
         let bundle = URL(fileURLWithPath: mergeDirectory.path + "-heal.bundle")
@@ -1533,8 +1566,9 @@ public struct GitWorkspace: Sendable {
             // `.brahma/` is the engine's (check snapshots, plans, notes, hand-offs): put back in the exclude file if an agent took
             // it out, and kept out of the quarantine commit and the clean whatever that file says.
             try ensureExclude()
-            let index = FileManager.default.temporaryDirectory.appending(path: "brahma-quarantine-\(UUID().uuidString).index")
-            defer { _ = try? EngineFiles.removeNoFollow(index, under: FileManager.default.temporaryDirectory) }
+            try? FileManager.default.createDirectory(at: gitTemp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let index = gitTemp.appending(path: "brahma-quarantine-\(UUID().uuidString).index")
+            defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
             let staged = main.withIndex(index)
             try staged.run(["read-tree", expectedMain])
             try staged.run(["add", "-A"])
@@ -1997,8 +2031,9 @@ public struct GitWorkspace: Sendable {
             throw GitError.failed(command: "commit \(key)", status: -1, stderr: "\(ref) does not exist")
         }
         testHook?("checked")
-        let index = FileManager.default.temporaryDirectory.appending(path: "brahma-index-\(UUID().uuidString)")
-        defer { _ = try? EngineFiles.removeNoFollow(index, under: FileManager.default.temporaryDirectory) }
+        try? FileManager.default.createDirectory(at: gitTemp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let index = gitTemp.appending(path: "brahma-index-\(UUID().uuidString)")
+        defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
         let private_ = git.withIndex(index)
         try private_.run(["read-tree", tip])
         try addAll(private_)
@@ -2577,7 +2612,9 @@ extension GitWorkspace {
     /// (`SandboxLayout.ensure`). No template, so no sample hooks. The caller has walked `dir` as a real directory and checked
     /// that `dir/.git` does not exist yet. Blocking.
     static func initStandaloneRepository(at dir: URL) throws {
-        let git = GitCommand(gitDir: dir.appending(path: ".git", directoryHint: .isDirectory), workTree: dir, commonDir: nil)
+        var git = GitCommand(gitDir: dir.appending(path: ".git", directoryHint: .isDirectory), workTree: dir, commonDir: nil)
+        // Its captured output goes inside the new repo's own `.git`, never the shared per-user temp dir (A-I1b).
+        git.tempRoot = dir.appending(path: ".git/brahma-tmp", directoryHint: .isDirectory)
         try git.run(["init", "--quiet", "--template=", "-b", "main"])
     }
 }

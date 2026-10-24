@@ -202,6 +202,55 @@ struct SeatbeltRunnerTests {
         #expect(outcome.exitCode != 0); #expect(text.contains("not permitted"), "\(text)")
     }
 
+    /// B-I3: each run gets its own HOME, CARGO_HOME and XDG_CACHE_HOME under its TMPDIR (thrown away with it), so config a
+    /// check plants there cannot run in a later check; only the npm cache is shared, and only when the policy gives a shared
+    /// cache. A merge check (one writable entry) gets no shared cache: its npm cache is per-run too.
+    @Test func toolchainCachesArePerRunExceptSharedNpm() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let cache = try Self.mkdir(h.appending(path: "cache"))
+        let show = "echo \"HOME=$HOME\"; echo \"CARGO=$CARGO_HOME\"; echo \"XDG=$XDG_CACHE_HOME\"; echo \"NPM=$npm_config_cache\""
+        let (submit, s) = try await Self.run(show, Self.policy(writable: [w, cache], readable: [h], toolchain: true))
+        #expect(submit.exitCode == 0)
+        let tmp = w.appending(path: ".brahma-tmp")
+        #expect(s.contains("HOME=\(tmp.path)/home")); #expect(s.contains("CARGO=\(tmp.path)/cargo"))
+        #expect(s.contains("XDG=\(tmp.path)/xdg")); #expect(s.contains("NPM=\(cache.path)/npm"), "npm stays in the shared cache: \(s)")
+        // One writable entry (a merge check): the npm cache is per-run too, nothing shared.
+        let (merge, m) = try await Self.run(show, Self.policy(writable: [w], readable: [h], toolchain: true))
+        #expect(merge.exitCode == 0)
+        #expect(m.contains("NPM=\(tmp.path)/npm"), "a merge check must not share the npm cache: \(m)")
+        #expect(m.contains("HOME=\(tmp.path)/home"))
+    }
+
+    /// B-I2: the engine never follows a link a check planted at its own writable root. `removeTemp`, anchored at the root's
+    /// parent and opened O_NOFOLLOW, removes the link itself and never touches the link's target.
+    @Test func removeTempNeverFollowsALinkAtTheRoot() throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let parent = try Self.mkdir(h.appending(path: "checkouts"))
+        let root = parent.appending(path: "r1")
+        let outside = try Self.mkdir(h.appending(path: "outside"))
+        try Self.file(outside.appending(path: ".brahma-tmp/keep"), "do-not-delete")
+        try FileManager.default.createSymbolicLink(at: root, withDestinationURL: outside)   // root is a link to `outside`
+        SeatbeltRunner.removeTemp(Self.policy(writable: [root]))
+        #expect(FileManager.default.fileExists(atPath: outside.appending(path: ".brahma-tmp/keep").path), "followed the link")
+        #expect(SandboxPath.kind(root.path) == .link, "the link itself should be untouched by removeTemp")
+    }
+
+    /// B-I4: a check that puts a process in a new session (`setsid`) or forks one into the background cannot outlive the run;
+    /// the sandbox-based sweep kills everything that ran under the run's sandbox.
+    @Test func setsidEscapeeIsSweptAfterTheRun() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        // `setsid` leaves the process group; a plain `&` child also outlives the shell. Both write their pid for the test.
+        let command = "/usr/bin/env setsid sh -c 'echo $$ > escapee.pid; exec sleep 300' & sleep 0.3; echo started"
+        let (outcome, _) = try await Self.run(command, Self.policy(writable: [w], readable: [h]), timeout: .seconds(20))
+        #expect(outcome.exitCode == 0)
+        let pidText = (try? String(contentsOf: w.appending(path: "escapee.pid"), encoding: .utf8)) ?? ""
+        if let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            #expect(await Self.gone(pid), "an escaped sandboxed process survived the run")
+        }
+    }
+
     @Test func securityCLIDenied() async throws {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
@@ -326,13 +375,19 @@ struct SeatbeltRunnerTests {
         env["DEVELOPER_DIR"] = Toolchain.developerDir
         let p = Self.policy(writable: [pkg, cache], readable: [h], toolchain: true)
         // SwiftPM sandboxes its manifest with sandbox-exec, which cannot nest inside Seatbelt: inside Brahma's sandbox SwiftPM
-        // runs with its own turned off (`--disable-sandbox`; xcodebuild: `-IDEPackageSupportDisableManifestSandbox YES`).
+        // runs with its own turned off (`--disable-sandbox`). Its atomic writes stage in the per-user temp dir
+        // (`TemporaryItems/NSIRD_swift-build_…`), which the toolchain policy allows; nothing under the owner's ~/Library.
         let (build, buildText) = try await Self.run("swift build --disable-sandbox --cache-path .build/cache > build.log 2>&1; s=$?; tail -40 build.log; exit $s",
                                                      p, timeout: .seconds(150), env: env)
         #expect(build.exitCode == 0, "swift build failed under the toolchain policy:\n\(buildText.suffix(3000))")
+        // xcodebuild builds an Xcode PROJECT (resolving a SwiftPM package needs to write the owner's ~/Library SwiftPM cache,
+        // which stays denied — the check-author guidance says to build projects with `-project`, not Swift packages). Its
+        // build service stages atomic writes in `TemporaryItems/NSIRD_(xcodebuild|SWBBuildService)_…`, which the policy allows.
+        let proj = try Self.xcodeProject(in: try Self.mkdir(h.appending(path: "proj")))
+        let xp = Self.policy(writable: [proj, cache], readable: [h], toolchain: true)
         let (xcode, xcodeText) = try await Self.run(
-            "xcodebuild -scheme Hello -destination 'platform=macOS' -derivedDataPath .build/dd -IDEPackageSupportDisableManifestSandbox YES build > xc.log 2>&1; s=$?; tail -40 xc.log; exit $s",
-            p, timeout: .seconds(150), env: env)
+            "xcodebuild -project Hello.xcodeproj -scheme Hello -destination 'platform=macOS' -derivedDataPath .build/dd build > xc.log 2>&1; s=$?; tail -40 xc.log; exit $s",
+            xp, cwd: proj, timeout: .seconds(150), env: env)
         #expect(xcode.exitCode == 0 && xcodeText.contains("BUILD SUCCEEDED"), "xcodebuild failed under the toolchain policy:\n\(xcodeText.suffix(3000))")
         let after = try? FileManager.default.attributesOfItem(atPath: swiftpmCache.path)[.modificationDate] as? Date
         #expect(before == after, "the owner's SwiftPM cache was written")
@@ -341,6 +396,33 @@ struct SeatbeltRunnerTests {
         let (bare, _) = try await Self.run("swift build --disable-sandbox --cache-path .build/cache", Self.policy(writable: [pkg, cache], readable: [h]),
                                            timeout: .seconds(120), env: env)
         #expect(bare.exitCode != 0)
+    }
+
+    /// A minimal Xcode project (one command-line tool target, manual signing) under `dir`, whose cwd is `dir`.
+    static func xcodeProject(in dir: URL) throws -> URL {
+        try file(dir.appending(path: "main.swift"), "print(\"hello from xcodebuild\")\n")
+        try file(dir.appending(path: "Hello.xcodeproj/project.pbxproj"), """
+        // !$*UTF8*$!
+        {
+        \tarchiveVersion = 1; classes = {}; objectVersion = 56;
+        \tobjects = {
+        \t\tA1 = {isa = PBXBuildFile; fileRef = A2; };
+        \t\tA2 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+        \t\tA3 = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = Hello; sourceTree = BUILT_PRODUCTS_DIR; };
+        \t\tA4 = {isa = PBXGroup; children = (A2, A5); sourceTree = "<group>"; };
+        \t\tA5 = {isa = PBXGroup; children = (A3); name = Products; sourceTree = "<group>"; };
+        \t\tA6 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1); runOnlyForDeploymentPostprocessing = 0; };
+        \t\tA7 = {isa = PBXNativeTarget; buildConfigurationList = A8; buildPhases = (A6); buildRules = (); dependencies = (); name = Hello; productName = Hello; productReference = A3; productType = "com.apple.product-type.tool"; };
+        \t\tA8 = {isa = XCConfigurationList; buildConfigurations = (A9); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+        \t\tA9 = {isa = XCBuildConfiguration; buildSettings = {PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; }; name = Debug; };
+        \t\tAA = {isa = XCConfigurationList; buildConfigurations = (AB); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+        \t\tAB = {isa = XCBuildConfiguration; buildSettings = {SDKROOT = macosx; }; name = Debug; };
+        \t\tAC = {isa = PBXProject; buildConfigurationList = AA; compatibilityVersion = "Xcode 14.0"; mainGroup = A4; productRefGroup = A5; projectDirPath = ""; projectRoot = ""; targets = (A7); };
+        \t};
+        \trootObject = AC;
+        }
+        """)
+        return dir
     }
 
     /// A tiny AppKit app (built here, outside the sandbox) runs under the toolchain policy: it reaches the window server,

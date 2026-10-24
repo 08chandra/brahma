@@ -33,6 +33,7 @@ final class ProcessGroupChild: @unchecked Sendable {
     private var exited = false
     private var status: Int32?
     private var signals = 0
+    private var lost = false
     private let observer: Observer?
 
     private init(pid: pid_t, observer: Observer?) {
@@ -113,14 +114,36 @@ final class ProcessGroupChild: @unchecked Sendable {
                 let r = waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
                 if r == 0 { break }
                 if errno == EINTR { continue }
-                // ECHILD: reaped elsewhere. It is gone, and its pid may already be someone else's: never signal it again.
-                status = 0; exited = true
+                // ECHILD: reaped by someone else, which the engine never does. Its pid may already be another process's, so
+                // it is never signalled again, and the outcome is inconclusive (not a pass): the check's exit was lost (B-M1).
+                status = 0; exited = true; lost = true
                 return true
             }
-            if info.si_pid == pid { exited = true }
+            if Self.sigPid(info) == pid { exited = true }
             return exited
         }
     }
+
+    /// `siginfo_t.si_pid`/`si_status` behind platform conditionals: on Glibc they are macros over `_sifields` that Swift does
+    /// not import as members (B-M5).
+    private static func sigPid(_ info: siginfo_t) -> pid_t {
+        #if canImport(Darwin)
+        return info.si_pid
+        #else
+        return info._sifields._sigchld.si_pid
+        #endif
+    }
+    private static func sigStatus(_ info: siginfo_t) -> Int32 {
+        #if canImport(Darwin)
+        return info.si_status
+        #else
+        return info._sifields._sigchld.si_status
+        #endif
+    }
+
+    /// True when the check's own exit status was lost (it was reaped out from under the engine): the outcome is inconclusive,
+    /// never a pass (B-M1).
+    var lostTrack: Bool { lock.withLock { lost } }
 
     /// Blocks until the leader exits and leaves it unreaped (a zombie: its pid and group id stay this child's). Returns its
     /// exit code, or the number of the signal that ended it (as Foundation's `terminationStatus` does).
@@ -130,21 +153,24 @@ final class ProcessGroupChild: @unchecked Sendable {
             let r = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT)
             if r == 0 { break }
             if errno == EINTR { continue }
-            // ECHILD: reaped elsewhere; never signalled again.
-            lock.withLock { if status == nil { status = 0 }; exited = true }
+            // ECHILD: reaped elsewhere; never signalled again, and the status was lost (B-M1).
+            lock.withLock { if status == nil { status = 0 }; exited = true; lost = true }
             return 0
         }
         lock.withLock { exited = true }
-        return info.si_status
+        return Self.sigStatus(info)
     }
 
-    /// Sends `sig` to the whole group, unless the leader has been reaped (its group id may belong to someone else by now).
+    /// Sends `sig` to the whole group and, directly, to the leader, unless the leader has been reaped (its pid/group id may
+    /// belong to someone else by now). The leader's own pid cannot be recycled while it is unreaped, so `kill(pid, sig)`
+    /// reaches it even after it moved itself out of its process group (`setpgid`/`setsid`) to dodge the `killpg` (B-I1).
     /// Returns whether it was sent.
     @discardableResult
     func signalGroup(_ sig: Int32) -> Bool {
         lock.withLock {
             guard status == nil else { return false }
             killpg(pid, sig)
+            kill(pid, sig)
             signals += 1
             observer?(.signal(pid, sig))
             return true
@@ -327,6 +353,11 @@ enum GroupRun {
 
         if cancelled { return CheckOutcome(exitCode: nil, timedOut: false, tail: tail) }
         if timedOut { return CheckOutcome(exitCode: nil, timedOut: true, tail: tail) }
+        // Its exit was lost (reaped from under us): inconclusive, never a pass (B-M1).
+        if child.lostTrack {
+            let note = tail.isEmpty ? "lost track of the check process" : tail + "\nlost track of the check process"
+            return CheckOutcome(exitCode: nil, timedOut: false, tail: note)
+        }
         return CheckOutcome(exitCode: ProcessGroupChild.exitCode(status), timedOut: false, tail: tail)
     }
 }

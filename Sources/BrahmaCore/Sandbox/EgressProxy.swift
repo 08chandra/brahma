@@ -32,6 +32,10 @@ public enum DomainMatcher {
     /// neither start nor end with `-`; the whole name is at most 253.
     public static func isValidPattern(_ s: String) -> Bool {
         let p = normalize(s)
+        // Only the characters the pattern may hold, checked before the regex: ICU's `$` also matches just before a final
+        // line terminator, so without this `"*.co.uk\n"` would slip a public-suffix wildcard past the rule below (A-I3).
+        guard p.unicodeScalars.allSatisfy({ ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" || $0 == "." || $0 == "*" })
+        else { return false }
         guard p.range(of: "^(\\*\\.)?[a-z0-9-]+(\\.[a-z0-9-]+)+$", options: .regularExpression) != nil else { return false }
         let wildcard = p.hasPrefix("*.")
         let base = wildcard ? String(p.dropFirst(2)) : p
@@ -50,6 +54,8 @@ public enum DomainMatcher {
         let h = normalize(host)
         guard isHostName(h), !SandboxDomains.isForbidden(h) else { return false }
         for raw in allow {
+            // A pattern that is not valid, or is Anthropic's, is skipped whatever the list says (A-M3, defence in depth).
+            guard isValidPattern(raw), !SandboxDomains.isForbidden(raw) else { continue }
             let pattern = normalize(raw)
             if pattern.hasPrefix("*.") {
                 let parent = String(pattern.dropFirst(2))
@@ -173,6 +179,25 @@ public final class EgressProxy: @unchecked Sendable {
     public static let idleTimeout: Duration = .seconds(300)
     static let maxRequestBytes = 8192
     static let maxDeniedHosts = 1000
+    /// The default per-proxy cap on connections being served at once (A-I2).
+    public static let perProxyLimit = 64
+
+    /// A shared ceiling on how many connections may be in flight across a set of proxies (the pool gives all of its proxies
+    /// one). A connection is admitted only if both its proxy's own cap and this ceiling have room.
+    public final class Budget: @unchecked Sendable {
+        private let lock = NSLock()
+        private let limit: Int
+        private var count = 0
+        public init(limit: Int) { self.limit = limit }
+        func acquire() -> Bool { lock.withLock { count < limit ? { count += 1; return true }() : false } }
+        func release() { lock.withLock { if count > 0 { count -= 1 } } }
+    }
+
+    /// The back-off after `failures` accept failures in a row (EMFILE/ENFILE): 50 ms doubling to 1 s, awake time, never a spin.
+    static func acceptBackoff(failures: Int) -> Duration {
+        let ms = min(1000, 50 << min(failures - 1, 20))
+        return .milliseconds(ms)
+    }
 
     public let port: UInt16
     public let allow: [String]
@@ -182,20 +207,25 @@ public final class EgressProxy: @unchecked Sendable {
     private let vet: @Sendable (sockaddr_storage) -> Bool
     /// The port dialled on the vetted address (always 443 outside tests).
     private let dialPort: UInt16
+    private let maxConnections: Int
+    private let budget: Budget?
     private let listener: Int32
     private let lock = NSLock()
     private var stopped = false
     private var denied: [String] = []
+    private var active = 0
     private let acceptDone = DispatchSemaphore(value: 0)
 
     public convenience init(allow: [String]) throws {
         try self.init(allow: allow, resolver: EgressProxy.systemResolve)
     }
 
-    /// `resolver`, `vet` and `dialPort` are for tests (a fake answer, a loopback echo server).
+    /// `resolver`, `vet` and `dialPort` are for tests. `maxConnections` caps this proxy; `budget`, when given, is a ceiling
+    /// shared with other proxies (the pool's).
     init(allow: [String], resolver: @escaping Resolver, vet: @escaping @Sendable (sockaddr_storage) -> Bool = AddressPolicy.isPublic,
-         dialPort: UInt16 = EgressProxy.allowedPort) throws {
+         dialPort: UInt16 = EgressProxy.allowedPort, maxConnections: Int = EgressProxy.perProxyLimit, budget: Budget? = nil) throws {
         self.allow = allow; self.resolver = resolver; self.vet = vet; self.dialPort = dialPort
+        self.maxConnections = maxConnections; self.budget = budget
         let fd = socket(AF_INET, Self.streamType, 0)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
@@ -225,6 +255,9 @@ public final class EgressProxy: @unchecked Sendable {
     /// Hosts refused so far (oldest first, at most `maxDeniedHosts`).
     public var deniedHosts: [String] { lock.withLock { denied } }
 
+    /// How many connections this proxy is serving now (tests).
+    public var activeConnections: Int { lock.withLock { active } }
+
     /// Stops accepting (the listening socket is closed by its own thread, which this waits for) and ends every open
     /// connection within a second. Idempotent.
     public func stop() {
@@ -247,25 +280,66 @@ public final class EgressProxy: @unchecked Sendable {
 
     // MARK: Connections
 
+    private static let serviceBusy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
     private func acceptLoop() {
+        var failures = 0
         while !isStopped {
             var pfd = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
             let ready = poll(&pfd, 1, 200)
             if ready <= 0 { continue }
             let client = accept(listener, nil, nil)
-            guard client >= 0 else { continue }
+            guard client >= 0 else {
+                // Out of descriptors: back off instead of spinning (A-I2); other errors just retry.
+                if errno == EMFILE || errno == ENFILE {
+                    failures += 1
+                    let ns = Self.acceptBackoff(failures: failures).components
+                    Thread.sleep(forTimeInterval: Double(ns.seconds) + Double(ns.attoseconds) / 1e18)
+                }
+                continue
+            }
+            failures = 0
             _ = fcntl(client, F_SETFD, FD_CLOEXEC)
             Self.noSigPipe(client)
             Self.setNonBlocking(client)
+            // Past this proxy's cap or the shared ceiling: 503 and close, never a new worker (A-I2).
+            let admitted = lock.withLock { () -> Bool in
+                guard !stopped, active < maxConnections else { return false }
+                if let budget, !budget.acquire() { return false }
+                active += 1
+                return true
+            }
+            guard admitted else {
+                _ = Self.blockingWrite(client, Array(Self.serviceBusy.utf8))
+                close(client)
+                continue
+            }
             let thread = Thread { [self] in
                 handle(client)
                 close(client)
+                lock.withLock { active -= 1 }
+                budget?.release()
             }
             thread.name = "brahma-egress-conn"
+            // If a thread cannot be started, release the slot and drop the connection; never crash (A-I2).
+            thread.stackSize = 512 << 10
             thread.start()
         }
         close(listener)
         acceptDone.signal()
+    }
+
+    /// A best-effort blocking write of a short reply to a socket that may be non-blocking (the 503 path, outside a worker).
+    private static func blockingWrite(_ fd: Int32, _ bytes: [UInt8]) {
+        var offset = 0, tries = 0
+        while offset < bytes.count, tries < 100 {
+            let n = bytes[offset...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+            if n > 0 { offset += n; continue }
+            if n < 0 && errno != EAGAIN && errno != EINTR { return }
+            tries += 1
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            _ = poll(&pfd, 1, 50)
+        }
     }
 
     private static let forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -273,11 +347,12 @@ public final class EgressProxy: @unchecked Sendable {
     private static let established = "HTTP/1.1 200 Connection established\r\n\r\n"
 
     private func handle(_ client: Int32) {
-        let deadline = AwakeTime.deadline(after: Self.connectTimeout)
-        guard let (head, rest) = readRequest(client, deadline: deadline) else {
+        // Separate budgets: up to 10 s to read the request, then a fresh 10 s to resolve and connect (A-M2).
+        guard let (head, rest) = readRequest(client, deadline: AwakeTime.deadline(after: Self.connectTimeout)) else {
             _ = writeAll(client, Array(Self.forbidden.utf8), idle: Self.connectTimeout)
             return
         }
+        let deadline = AwakeTime.deadline(after: Self.connectTimeout)
         let line = head.split(separator: "\r\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
         let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard parts.count == 3, parts[2].hasPrefix("HTTP/1.") else {
@@ -297,7 +372,7 @@ public final class EgressProxy: @unchecked Sendable {
         }
         let host = DomainMatcher.normalize(String(target[..<colon]))
         guard DomainMatcher.matches(host: host, allow: allow),
-              let addresses = resolver(host), !addresses.isEmpty, addresses.allSatisfy(vet),
+              let addresses = resolve(host, deadline: deadline), !addresses.isEmpty, addresses.allSatisfy(vet),
               let upstream = dial(addresses, deadline: deadline) else {
             deny(host)
             _ = writeAll(client, Array(Self.forbidden.utf8), idle: Self.connectTimeout)
@@ -309,7 +384,8 @@ public final class EgressProxy: @unchecked Sendable {
         pipeBoth(client, upstream)
     }
 
-    /// The request head (up to the blank line) and whatever bytes followed it, or nil (too long, closed, timed out).
+    /// The request head (up to the blank line) and whatever bytes followed it, or nil (too long, closed, timed out). A read
+    /// that is merely not ready yet waits in poll slices until `deadline`, so a slow client is not refused after 1 s (A-M1).
     private func readRequest(_ fd: Int32, deadline: SuspendingClock.Instant) -> (String, [UInt8])? {
         var got: [UInt8] = []
         var buffer = [UInt8](repeating: 0, count: 2048)
@@ -318,13 +394,38 @@ public final class EgressProxy: @unchecked Sendable {
             if let r = Self.find(end, in: got) {
                 return (String(decoding: got[..<r], as: UTF8.self), Array(got[(r + end.count)...]))
             }
-            guard !isStopped, AwakeTime.now < deadline, Self.waitFor(fd, POLLIN) else { return nil }
+            guard !isStopped, AwakeTime.now < deadline else { return nil }
+            if !Self.waitFor(fd, POLLIN) { continue }
             let n = read(fd, &buffer, buffer.count)
             if n < 0 { if errno == EINTR || errno == EAGAIN { continue }; return nil }
             if n == 0 { return nil }
             got += buffer[0..<n]
         }
         return nil
+    }
+
+    /// `resolver` run on a thread of its own with an awake-time deadline, so a slow DNS answer cannot hold the connection's
+    /// thread past the connect budget (A-M2). Nil on timeout.
+    private func resolve(_ host: String, deadline: SuspendingClock.Instant) -> [sockaddr_storage]? {
+        let box = ResolveBox()
+        let resolver = self.resolver
+        let thread = Thread { box.finish(resolver(host)) }
+        thread.name = "brahma-egress-resolve"
+        thread.start()
+        return box.wait(until: deadline)
+    }
+
+    private final class ResolveBox: @unchecked Sendable {
+        private let sem = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var result: [sockaddr_storage]??
+        func finish(_ value: [sockaddr_storage]?) { lock.withLock { result = .some(value) }; sem.signal() }
+        func wait(until deadline: SuspendingClock.Instant) -> [sockaddr_storage]? {
+            while AwakeTime.now < deadline {
+                if sem.wait(timeout: .now() + 0.1) == .success { return lock.withLock { result ?? nil } }
+            }
+            return nil
+        }
     }
 
     private static func find(_ needle: [UInt8], in hay: [UInt8]) -> Int? {
@@ -466,11 +567,15 @@ public final class EgressProxy: @unchecked Sendable {
     }
 }
 
-/// One proxy per distinct allow-list (normalized, deduped, sorted), started on first use and kept until `stopAll`.
+/// One proxy per distinct allow-list (normalized, deduped, sorted), started on first use and kept until `stopAll`. Every
+/// proxy it hands out shares one connection budget, so all of them together can never hold more than `globalLimit`
+/// connections open at once (A-I2).
 public actor EgressProxyPool {
-    private nonisolated let proxies = Proxies()
+    /// The shared ceiling on connections across every proxy of one pool.
+    public static let globalLimit = 256
+    private nonisolated let proxies: Proxies
 
-    public init() {}
+    public init() { proxies = Proxies(budget: EgressProxy.Budget(limit: EgressProxyPool.globalLimit)) }
 
     public func proxy(for allow: [String]) throws -> EgressProxy { try proxies.proxy(for: allow) }
 
@@ -482,13 +587,15 @@ public actor EgressProxyPool {
     private final class Proxies: @unchecked Sendable {
         private let lock = NSLock()
         private var proxies: [String: EgressProxy] = [:]
+        private let budget: EgressProxy.Budget
+        init(budget: EgressProxy.Budget) { self.budget = budget }
 
         func proxy(for allow: [String]) throws -> EgressProxy {
             let list = Array(Set(allow.map(DomainMatcher.normalize))).sorted()
             let key = list.joined(separator: "\n")
             return try lock.withLock {
                 if let existing = proxies[key] { return existing }
-                let made = try EgressProxy(allow: list)
+                let made = try EgressProxy(allow: list, resolver: EgressProxy.systemResolve, budget: budget)
                 proxies[key] = made
                 return made
             }

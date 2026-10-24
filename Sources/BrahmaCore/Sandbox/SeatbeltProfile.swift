@@ -50,6 +50,13 @@ public enum SeatbeltProfile {
     /// Read-only places of the toolchain under the owner's home (the home itself is otherwise unreadable).
     static let toolchainHomeReads = ["Library/Developer", "Library/Caches/org.swift.swiftpm", "Library/org.swift.swiftpm", ".npm"]
 
+    /// Entries of the per-user temp dir the toolchain reads and writes (regexes after `^<T>/`, already escaped): xcrun's cache
+    /// (the brief), and the item-replacement directories Foundation stages atomic writes in for the SwiftPM front ends,
+    /// xcodebuild and its build service (`TemporaryItems/NSIRD_<process>_<random>`, whatever TMPDIR says). Found from the
+    /// sandbox's violation log: without them `swift build` fails reading back `output-file-map.json` and xcodebuild cannot
+    /// save its PIF cache. Residual: the owner's own builds by the same tools stage there too.
+    static let toolchainTempEntries = ["xcrun_db", "TemporaryItems/NSIRD_(swift-(build|package|test|run)|xcodebuild|SWBBuildService)_"]
+
     /// `proxyPort` is the egress proxy's port (`.outbound` and `.loopbackListen`; ignored for `.none`).
     public static func render(policy: SandboxPolicy, baseline: SandboxBaseline, proxyPort: UInt16?) -> String {
         func r(_ url: URL) -> String { SandboxPath.resolve(url.path) }
@@ -63,7 +70,10 @@ public enum SeatbeltProfile {
         let home = r(baseline.userHome)
 
         var lines = ["(version 1)", "(allow default)"]
-        lines.append("(deny file-read-data " + (unique([home, "/Volumes"] + baseline.engineHomes.map(r))).map(subpath).joined(separator: " ") + ")")
+        // The per-user Darwin folder (`/private/var/folders/<a>/<b>`: T, C and 0) holds the engine's and every app's
+        // temporary files; it is unreadable like the home (A-I1), except the toolchain's own entries below.
+        let darwinUser = baseline.darwinUserDir.map(r).map { [$0] } ?? []
+        lines.append("(deny file-read-data " + (unique([home, "/Volumes"] + baseline.engineHomes.map(r) + darwinUser)).map(subpath).joined(separator: " ") + ")")
 
         var reads = (readable + writable).map(subpath)
         var writes: [String] = []
@@ -76,7 +86,11 @@ public enum SeatbeltProfile {
                            "(regex #\"^\(regexEscape(cache))/org\\.llvm\\.clang\")", subpath(cache + "/org.swift.swiftpm")]
             }
             if let temp = baseline.darwinUserTemp.map(r) {
-                writes.insert("(regex #\"^\(regexEscape(temp))/xcrun_db\")", at: 0)
+                // xcrun's cache, read and written; SwiftPM's atomic writes, which Foundation stages in the per-user temp
+                // dir whatever TMPDIR says (`<T>/TemporaryItems/NSIRD_<process>_<random>`): only SwiftPM's own.
+                let temps = toolchainTempEntries.map { "(regex #\"^\(regexEscape(temp))/\($0)\")" }
+                writes.insert(contentsOf: temps, at: 0)
+                reads += temps
             }
         }
         if !reads.isEmpty { lines.append("(allow file-read-data " + unique(reads).joined(separator: " ") + ")") }

@@ -31,6 +31,12 @@ import Glibc
         #expect(!DomainMatcher.matches(host: "api.anthropic.com", allow: ["api.anthropic.com"]))
         #expect(!DomainMatcher.matches(host: "x.claude.ai", allow: ["*.claude.ai"]))
         #expect(!DomainMatcher.matches(host: "example.com", allow: []))
+        // A-M3: patterns that are not valid, or are Anthropic's, are skipped whatever the list says.
+        #expect(!DomainMatcher.matches(host: "anything.com", allow: ["*.com"]))
+        #expect(!DomainMatcher.matches(host: "x.github.io", allow: ["*.github.io"]))
+        #expect(!DomainMatcher.matches(host: "example.com", allow: ["example.com\n"]))
+        #expect(DomainMatcher.matches(host: "example.com", allow: ["*.com", "example.com"]))
+        #expect(!DomainMatcher.matches(host: "api.anthropic.com", allow: ["*.anthropic.com"]))
     }
 
     @Test func validPatterns() {
@@ -44,8 +50,17 @@ import Glibc
             #expect(DomainMatcher.isValidPattern(good), "\(good) should be accepted")
         }
         // The pinned list (the brief's exact set).
-        #expect(DomainMatcher.publicSuffixes.count == 36)
-        #expect(DomainMatcher.publicSuffixes.contains("ngrok-free.app") && DomainMatcher.publicSuffixes.contains("blob.core.windows.net"))
+        #expect(DomainMatcher.publicSuffixes == [
+            "com", "net", "org", "io", "dev", "app", "co", "ai", "me", "xyz", "info", "biz", "us", "uk", "co.uk", "org.uk", "com.au",
+            "github.io", "githubusercontent.com", "vercel.app", "netlify.app", "pages.dev", "workers.dev", "herokuapp.com", "web.app",
+            "firebaseapp.com", "s3.amazonaws.com", "amazonaws.com", "cloudfront.net", "azurewebsites.net", "blob.core.windows.net",
+            "appspot.com", "glitch.me", "repl.co", "ngrok.io", "ngrok-free.app"])
+        // A-I3: a line terminator (or any character outside [a-z0-9.*-]) is refused before the regex, so ICU's `$` before a
+        // final newline cannot smuggle a public-suffix wildcard through.
+        for bad in ["*.co.uk\n", "*.github.io\n", "*.co.uk\u{0085}", "*.co.uk\u{2029}", "example.com\n", "example.com\r",
+                    "ex\u{00e4}mple.com", "example.com ", " example.com"] {
+            #expect(!DomainMatcher.isValidPattern(bad), "\(bad.debugDescription) should be refused")
+        }
     }
 
     @Test func storeUpdateSandboxUsesDomainMatcher() throws {
@@ -121,6 +136,29 @@ import Glibc
             connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
         guard ok == 0 else { throw POSIXError(.ECONNREFUSED) }
         _ = request.withCString { write(fd, $0, strlen($0)) }
+        var got = [UInt8]()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while !String(decoding: got, as: UTF8.self).contains("\r\n\r\n") {
+            let n = read(fd, &buffer, buffer.count)
+            if n <= 0 { break }
+            got += buffer[0..<n]
+        }
+        return String(decoding: got, as: UTF8.self)
+    }
+
+    private static func open(_ port: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, Int32(SOCK_STREAM), 0)
+        var tv = timeval(tv_sec: 15, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET); addr.sin_port = port.bigEndian; addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let ok = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard ok == 0 else { close(fd); throw POSIXError(.ECONNREFUSED) }
+        return fd
+    }
+
+    private static func reply(_ fd: Int32) -> String {
         var got = [UInt8]()
         var buffer = [UInt8](repeating: 0, count: 4096)
         while !String(decoding: got, as: UTF8.self).contains("\r\n\r\n") {
@@ -247,6 +285,77 @@ import Glibc
         #expect(text.hasPrefix("HTTP/1.1 200 Connection established\r\n\r\n"), "\(text)")
         #expect(text.hasSuffix("PING-42"))
         #expect(proxy.deniedHosts.isEmpty)
+    }
+
+    /// A-M8: an IP literal never matches even when it is on the list (validation bypassed), and the host is resolved exactly
+    /// once per CONNECT (a rebinding resolver that would answer differently the second time is never asked again).
+    @Test func ipLiteralNeverMatchesAndResolvesOnce() throws {
+        let literal = try EgressProxy(allow: ["93.184.215.14"], resolver: { _ in [Self.v4("93.184.215.14")] })
+        defer { literal.stop() }
+        #expect(try Self.ask(literal.port, "CONNECT 93.184.215.14:443 HTTP/1.1\r\n\r\n").hasPrefix("HTTP/1.1 403"))
+
+        final class Count: @unchecked Sendable { let lock = NSLock(); var n = 0 }
+        let count = Count()
+        // Every answer is loopback (vetting swapped for this test) on a port nobody listens on: the dial fails at once, and
+        // the proxy must not resolve again to look for another address.
+        let rebinding = try EgressProxy(allow: ["rebind.example.com"], resolver: { _ in
+            count.lock.withLock { count.n += 1 }
+            return [Self.v4("127.0.0.1")]
+        }, vet: { _ in true }, dialPort: 9)
+        defer { rebinding.stop() }
+        _ = try Self.ask(rebinding.port, "CONNECT rebind.example.com:443 HTTP/1.1\r\n\r\n")
+        #expect(count.lock.withLock { count.n } == 1)
+    }
+
+    /// A-M1/A-M8: the request may take its time (up to the 10 s budget), and an oversized head is refused.
+    @Test func requestReadWaitsAndOversizedHeadRefused() throws {
+        let proxy = try EgressProxy(allow: ["example.com"])
+        defer { proxy.stop() }
+        let fd = try Self.open(proxy.port)
+        defer { close(fd) }
+        Thread.sleep(forTimeInterval: 2.5)   // longer than one poll slice
+        _ = "GET / HTTP/1.1\r\n\r\n".withCString { write(fd, $0, strlen($0)) }
+        #expect(Self.reply(fd).hasPrefix("HTTP/1.1 405"), "a pause before the request was taken for a failure")
+
+        let big = "CONNECT example.com:443 HTTP/1.1\r\n" + String(repeating: "X-Pad: \(String(repeating: "a", count: 100))\r\n", count: 120)
+        #expect(try Self.ask(proxy.port, big + "\r\n").hasPrefix("HTTP/1.1 403"))
+    }
+
+    /// A-I2: past the per-proxy cap, new connections get 503 and are closed; the proxy keeps serving once one ends.
+    @Test func connectionCapRefusesWith503() throws {
+        let budget = EgressProxy.Budget(limit: 8)
+        let proxy = try EgressProxy(allow: ["example.com"], resolver: EgressProxy.systemResolve, maxConnections: 2, budget: budget)
+        defer { proxy.stop() }
+        let a = try Self.open(proxy.port), b = try Self.open(proxy.port)
+        defer { close(a); close(b) }
+        Thread.sleep(forTimeInterval: 0.3)
+        let c = try Self.open(proxy.port)
+        defer { close(c) }
+        #expect(Self.reply(c).hasPrefix("HTTP/1.1 503"))
+        #expect(proxy.activeConnections == 2)
+        close(a)
+        // `a` ended: once its thread notices, a new connection is served again.
+        var served = false
+        for _ in 0..<60 where !served {
+            Thread.sleep(forTimeInterval: 0.1)
+            served = (try? Self.ask(proxy.port, "GET / HTTP/1.1\r\n\r\n").hasPrefix("HTTP/1.1 405")) ?? false
+        }
+        #expect(served)
+        // The pool's global budget caps every proxy it holds together.
+        #expect(EgressProxyPool.globalLimit == 256); #expect(EgressProxy.perProxyLimit == 64)
+        let tight = EgressProxy.Budget(limit: 1)
+        let p1 = try EgressProxy(allow: ["a.example.com"], resolver: { _ in nil }, budget: tight)
+        let p2 = try EgressProxy(allow: ["b.example.com"], resolver: { _ in nil }, budget: tight)
+        defer { p1.stop(); p2.stop() }
+        let held = try Self.open(p1.port)
+        defer { close(held) }
+        Thread.sleep(forTimeInterval: 0.3)
+        let other = try Self.open(p2.port)
+        defer { close(other) }
+        #expect(Self.reply(other).hasPrefix("HTTP/1.1 503"))
+        // Back-off when accept fails is bounded (AwakeTime), never a spin.
+        #expect(EgressProxy.acceptBackoff(failures: 1) == .milliseconds(50))
+        #expect(EgressProxy.acceptBackoff(failures: 30) == .seconds(1))
     }
 
     @Test func poolSharesOneProxyPerAllowList() async throws {

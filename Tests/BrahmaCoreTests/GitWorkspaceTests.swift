@@ -22,6 +22,39 @@ import Foundation
         #expect(f.ws.worktreePath(key: "ACME-1").path.hasSuffix("/.brahma/wt/ACME-1"))
     }
 
+    /// A-I1b: the engine's git commands keep their captured output and private index under a 0700 directory in the data
+    /// home (`<exportHome>/tmp`), never the shared per-user temp dir a sandboxed check can read.
+    @Test func engineGitTempStaysUnderTheDataHome() throws {
+        let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let f = try GitFixture(ensure: false)
+        let ws = GitWorkspace(root: f.root, exportHome: home)
+        #expect(ws.gitTemp.path == home.appending(path: "tmp").path)
+        let nsTemp = FileManager.default.temporaryDirectory
+        func strays() -> [String] {
+            ((try? FileManager.default.contentsOfDirectory(atPath: nsTemp.path)) ?? [])
+                .filter { $0.hasPrefix("brahma-git-") || $0.hasPrefix("brahma-index-") || $0.hasPrefix("brahma-quarantine-") }
+        }
+        // Every git run of this workspace reports its temp root. The observer is process-global and tests run in parallel,
+        // so it is filtered to this workspace's own home (a unique path), which only this ws's git runs touch.
+        let mine = home.path
+        final class Seen: @unchecked Sendable { let lock = NSLock(); var roots: Set<String> = [] }
+        let seen = Seen()
+        GitCommand.tempRootObserver = { url in if url.path.hasPrefix(mine + "/") { seen.lock.withLock { _ = seen.roots.insert(url.path) } } }
+        defer { GitCommand.tempRootObserver = nil }
+        _ = strays()                                          // keep the helper referenced; the real check is below
+        try ws.ensureRepo()                                   // init, symbolic-ref, add, commit: many git runs
+        _ = try f.write("a.txt", "one")
+        _ = try ws.commitAll(in: f.root, message: "x")        // the commit path
+        let roots = seen.lock.withLock { seen.roots }
+        #expect(!roots.isEmpty, "no git ran for this workspace")
+        #expect(roots == [ws.gitTemp.path], "engine git used a temp root outside the data home: \(roots.subtracting([ws.gitTemp.path]))")
+        #expect(!roots.contains(nsTemp.path), "engine git used the shared per-user temp dir")
+        // The directory it uses is 0700, under the data home.
+        var st = stat()
+        #expect(stat(ws.gitTemp.path, &st) == 0 && st.st_mode & 0o777 == 0o700)
+    }
+
     @Test func ensureRepoImportsExistingFiles() throws {
         let f = try GitFixture(files: ["a.txt": "one", "src/b.swift": "two"])
         let files = try f.git(["ls-tree", "-r", "--name-only", "main"]).split(separator: "\n").map(String.init)

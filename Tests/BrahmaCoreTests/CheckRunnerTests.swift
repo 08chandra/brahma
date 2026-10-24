@@ -78,6 +78,17 @@ import Foundation
         #expect(await gone(pid), "the forked child survived the timeout")
     }
 
+    /// B-I1: a check that moves its leader out of its own process group (into the engine's) cannot dodge the timeout. The
+    /// `killpg` misses the now-empty group, but the leader is killed by `kill(pid)` directly, so the run still ends.
+    @Test func timeoutKillsALeaderThatLeftItsGroup() async throws {
+        // `setpgrp(0, getppid())` puts this process into its parent's (the runner's) group; it then ignores TERM and sleeps.
+        final class Ticks: @unchecked Sendable { let lock = NSLock(); var t = 0.0; func next() -> TimeInterval { lock.withLock { t += 0.5; return t } } }
+        let ticks = Ticks()
+        let (outcome, _) = try await run("exec perl -e 'setpgrp(0, getppid()); $SIG{TERM}=\"IGNORE\"; sleep 600'",
+                                         timeout: 1, runner: ProcessCheckRunner(termGrace: 0.5, clock: { ticks.next() }))
+        #expect(outcome.timedOut); #expect(outcome.exitCode == nil)
+    }
+
     @Test func timeoutEscalatesToKillWhenTermIsIgnored() async throws {
         let pidFile = try tempDir().appending(path: "pid")
         let quick = ProcessCheckRunner(termGrace: 0.5, clock: clock(after: pidFile, step: 0.5))
@@ -201,6 +212,20 @@ import Foundation
     }
 
     /// True when the process is gone (the check polls briefly: a killed process may take a moment to be reaped).
+    /// B-M1: if the leader is reaped out from under the engine (waitid gives ECHILD), its exit is lost, so the outcome is
+    /// inconclusive (exitCode nil), never exit 0. Signalling a lost child never happens.
+    @Test func lostChildIsInconclusiveNotPass() async throws {
+        let child = try ProcessGroupChild.spawn(executable: "/bin/sh", arguments: ["/bin/sh", "-c", "exit 0"],
+                                                environment: ["PATH": "/usr/bin:/bin"], workingDirectory: URL(fileURLWithPath: "/"),
+                                                output: -1)
+        // Reap it ourselves before the engine notices (what a stray wait(-1) elsewhere would do).
+        var status: Int32 = 0
+        while waitpid(child.pid, &status, 0) < 0 && errno == EINTR {}
+        #expect(child.hasExited())
+        #expect(child.lostTrack)
+        #expect(child.signalGroup(SIGKILL) == false, "a lost child must never be signalled")
+    }
+
     private func gone(_ pid: Int32) async -> Bool {
         for _ in 0..<100 {
             if kill(pid, 0) != 0 { return true }

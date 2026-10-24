@@ -21,10 +21,11 @@ public protocol CheckRunning: Sendable {
 
 /// `/bin/sh -c <command>` in its own process group, stdin `/dev/null`, exactly the environment it is given. The first
 /// 1 MB of output goes to `outputURL` (`[output truncated]` appended once); the outcome carries the real last 4000
-/// characters. On timeout the whole group gets SIGTERM, and SIGKILL `termGrace` seconds later. When the shell exits, any
-/// process it left behind is killed too, so a check cannot leave a server running. The process handling (`GroupRun`,
-/// `ProcessGroupChild`) is shared with `SeatbeltRunner`; it never signals a group it has reaped and never touches a
-/// descriptor after it was closed.
+/// characters. On timeout the whole group gets SIGTERM, and SIGKILL `termGrace` seconds later. When the shell exits, every
+/// process still in its group is killed. A process that left the group (its own `setsid`, or a double fork) is NOT caught
+/// here — only a sandboxed check's stragglers are swept, by their sandbox (`SeatbeltRunner.sweepStragglers`, B-I4); an
+/// unsandboxed Full check can still leave one running. The process handling (`GroupRun`, `ProcessGroupChild`) is shared
+/// with `SeatbeltRunner`; it never signals a group it has reaped and never touches a descriptor after it was closed.
 public struct ProcessCheckRunner: CheckRunning {
     public static let outputCap = 1_048_576
     public static let tailChars = 4000

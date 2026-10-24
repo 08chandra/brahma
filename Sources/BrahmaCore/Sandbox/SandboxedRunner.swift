@@ -78,6 +78,9 @@ public struct SandboxBaseline: Equatable, Sendable {
     public var darwinUserTemp: URL?
     /// `confstr(_CS_DARWIN_USER_CACHE_DIR)`, resolved (`/private/var/folders/…/C`): clang's and SwiftPM's caches.
     public var darwinUserCache: URL?
+    /// The per-user Darwin folder (the parent of `confstr(_CS_DARWIN_USER_DIR)`, resolved: `/private/var/folders/<a>/<b>`,
+    /// holding T, C and 0): unreadable like the home, except the toolchain's own entries.
+    public var darwinUserDir: URL?
     /// The engine's data homes: unreadable and unwritable except a policy entry inside one (a check's own checkout). Added
     /// to the first read rule next to the home and `/Volumes`, so a data home outside `~` (a custom `BRAHMA_HOME`) is
     /// covered too.
@@ -88,11 +91,11 @@ public struct SandboxBaseline: Equatable, Sendable {
     /// Why the baseline could not be built completely; while it is set nothing runs (fail closed).
     public var problem: String?
 
-    public init(userHome: URL, protected: [URL], darwinUserTemp: URL?, darwinUserCache: URL?, engineHomes: [URL] = [],
-                companyWorkspaces: [URL] = [], problem: String? = nil) {
+    public init(userHome: URL, protected: [URL], darwinUserTemp: URL?, darwinUserCache: URL?, darwinUserDir: URL? = nil,
+                engineHomes: [URL] = [], companyWorkspaces: [URL] = [], problem: String? = nil) {
         self.userHome = userHome; self.protected = protected; self.darwinUserTemp = darwinUserTemp
-        self.darwinUserCache = darwinUserCache; self.engineHomes = engineHomes; self.companyWorkspaces = companyWorkspaces
-        self.problem = problem
+        self.darwinUserCache = darwinUserCache; self.darwinUserDir = darwinUserDir; self.engineHomes = engineHomes
+        self.companyWorkspaces = companyWorkspaces; self.problem = problem
     }
 
     /// The owner's baseline now: the resolved home, `ProtectedPaths.defaults` plus `otherWorkspaces` and `backupTargets`
@@ -103,11 +106,12 @@ public struct SandboxBaseline: Equatable, Sendable {
         let protected = dedupe((ProtectedPaths.defaults(userHome: home) + otherWorkspaces + backupTargets).flatMap(both))
         #if canImport(Darwin)
         let temp = darwinDirectory(_CS_DARWIN_USER_TEMP_DIR), cache = darwinDirectory(_CS_DARWIN_USER_CACHE_DIR)
+        let user = darwinDirectory(_CS_DARWIN_USER_DIR)?.deletingLastPathComponent()
         #else
-        let temp: URL? = nil, cache: URL? = nil
+        let temp: URL? = nil, cache: URL? = nil, user: URL? = nil
         #endif
         return SandboxBaseline(userHome: home.resolvedForSandbox, protected: protected, darwinUserTemp: temp, darwinUserCache: cache,
-                               engineHomes: [paths.home.resolvedForSandbox])
+                               darwinUserDir: user, engineHomes: [paths.home.resolvedForSandbox])
     }
 
     #if canImport(Darwin)
@@ -171,7 +175,7 @@ enum SandboxPolicyCheck {
         if let problem = baseline.problem { throw SandboxError.invalidPath("sandbox baseline unavailable: \(problem)") }
         guard !policy.writable.isEmpty else { throw SandboxError.invalidPath("a sandbox policy needs a writable directory") }
         let baselinePaths = [baseline.userHome] + baseline.protected + baseline.engineHomes + baseline.companyWorkspaces
-            + [baseline.darwinUserTemp, baseline.darwinUserCache].compactMap { $0 }
+            + [baseline.darwinUserTemp, baseline.darwinUserCache, baseline.darwinUserDir].compactMap { $0 }
         for url in policy.writable + policy.readable + baselinePaths {
             if SandboxPath.isUnsafe(url.path) { throw SandboxError.unsafePathCharacter(url.path) }
             if !url.path.hasPrefix("/") { throw SandboxError.invalidPath(url.path) }

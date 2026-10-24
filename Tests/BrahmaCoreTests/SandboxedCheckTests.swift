@@ -167,10 +167,47 @@ import GRDB
         let out = try tempDir().appending(path: "out.log")
         let runner = SandboxedCheckRunner(sandbox: s.sandbox, route: route, fallback: s.fallback)
         let outcome = await runner.run(command: "true", workingDirectory: elsewhere, timeout: 5, outputURL: out, environment: [:])
-        #expect(outcome == CheckOutcome(exitCode: nil, timedOut: false, tail: "check directory is outside every company workspace"))
+        // The outcome carries the route's precise reason (B-I2c), written to the output file; the generic tail is the fallback.
+        #expect(outcome.exitCode == nil && !outcome.timedOut)
+        #expect(outcome.tail.contains("no engine record of a check running in"), "\(outcome.tail)")
         #expect(SandboxedCheckRunner.refusedTail == "check directory is outside every company workspace")
-        #expect((try? String(contentsOf: out, encoding: .utf8)) == SandboxedCheckRunner.refusedTail)
+        #expect((try? String(contentsOf: out, encoding: .utf8)) == outcome.tail)
+        // An empty reason falls back to the generic tail.
+        let empty = SandboxedCheckRunner(sandbox: s.sandbox, route: { _ in .refused("") }, fallback: s.fallback)
+        let o2 = await empty.run(command: "true", workingDirectory: elsewhere, timeout: 5, outputURL: out, environment: [:])
+        #expect(o2.tail == SandboxedCheckRunner.refusedTail)
         #expect(s.sandbox.calls.isEmpty); #expect(s.fallback.calls.isEmpty)
+    }
+
+    /// B-I2: if a check turned `.brahma/cache/shared` into a link (or a file), the engine removes it without following the
+    /// link and recreates it as a real 0700 directory, so one check cannot permanently break its company's later checks.
+    @Test func linkedSharedCacheIsRepairedByTheRoute() async throws {
+        let s = try S()
+        let item = try s.submitted()
+        let run = try s.latest(item)
+        // The route only runs for a `running` row whose recorded directory is the engine's checkout; make that real.
+        let checkout = s.git.checkoutPath(runId: run.id)
+        try FileManager.default.createDirectory(at: checkout, withIntermediateDirectories: true)
+        try await s.store.writer.write { db in
+            try db.execute(sql: "UPDATE verificationRun SET status = 'running', workingDirectory = ? WHERE id = ?",
+                           arguments: [checkout.path, run.id])
+        }
+        let cacheParent = s.root.appending(path: ".brahma/cache")
+        try FileManager.default.createDirectory(at: cacheParent, withIntermediateDirectories: true)
+        let outside = try tempDir().appending(path: "elsewhere")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let cache = cacheParent.appending(path: "shared")
+        try? FileManager.default.removeItem(at: cache)
+        try FileManager.default.createSymbolicLink(at: cache, withDestinationURL: outside)   // a check planted this link
+        guard case .sandboxed(let policy) = Orchestrator.checkRoute(store: s.store)(checkout.path) else {
+            Issue.record("the route refused instead of repairing the cache"); return
+        }
+        let wsReal = s.root.resolvedForSandbox
+        let realCache = wsReal.appending(path: ".brahma/cache/shared")
+        #expect(SandboxPath.kind(realCache.path) == .directory, "the link was not replaced by a real directory")
+        #expect(SandboxPath.linkedComponent(realCache.path, under: wsReal.path) == nil)
+        #expect(policy.writable.last == realCache)
+        #expect(FileManager.default.fileExists(atPath: outside.path), "the link target must be left alone")
     }
 
     @Test func unavailableRunnerFailsClosed() async throws {
@@ -250,8 +287,9 @@ import GRDB
         guard case .sandboxed(let policy) = Orchestrator.checkRoute(store: store)(export.path) else {
             Issue.record("the merge check was not routed to the sandbox"); return
         }
-        let cache = Self.resolved(s.root).appending(path: ".brahma/cache/shared")
-        #expect(policy.writable == [Self.resolved(export), cache])
+        // A merge check writes only its export: no shared cache (B-I3), so a submission check cannot have left config there
+        // that runs during the merge gate.
+        #expect(policy.writable == [Self.resolved(export)])
         #expect(policy.readable == [Self.resolved(s.root)])
         for entry in policy.writable + policy.readable {
             #expect(!SandboxPath.overlaps(entry.path, mergeRepo.resolvedForSandbox.path), "\(entry.path) reaches the merge repo")

@@ -154,6 +154,13 @@ struct SandboxProbe: Equatable, Sendable {
         denied = workspace.path
     }
 
+    /// For a sandboxed check (B-I4): the sandbox lets the process write the run's own checkout/export, which is unique to the
+    /// run, but not the company workspace (a check may only read it). Both must exist for the kernel to answer.
+    init(allowedWrite: URL, deniedWrite: URL) {
+        allowed = allowedWrite.path
+        denied = deniedWrite.path
+    }
+
     /// Whether `pid` runs under a sandbox shaped like one of this agent's turns.
     func matches(_ pid: pid_t) -> Bool {
         guard SandboxCheck.isSandboxed(pid) == true else { return false }
@@ -164,6 +171,25 @@ struct SandboxProbe: Equatable, Sendable {
     func scan(_ table: [ProcessEntry]) -> [ProcessEntry] {
         let uid = getuid(), me = getpid()
         return table.filter { $0.uid == uid && $0.pid != me && !$0.isZombie && matches($0.pid) }
+    }
+}
+
+/// Kills whatever a finished sandboxed run left behind: processes a `probe` matches that started no earlier than the run
+/// (`since`), so a check that did `setsid sleep 300 &` or double-forked out of its process group cannot outlive the run
+/// (B-I4). Shared with Task 1b's turn cleanup, which recognizes a turn's own processes the same way (`SandboxProbe`).
+/// Each kill re-reads the process and checks its start time first, so a pid reused meanwhile is never signalled. Returns
+/// the pids still alive after `rounds`.
+enum SandboxSweep {
+    @discardableResult
+    static func run(probe: SandboxProbe, since: Double, rounds: Int = 50) -> [pid_t] {
+        var left: [ProcessEntry] = []
+        for _ in 0..<rounds {
+            left = probe.scan(ProcessTable.snapshot()).filter { $0.start >= since }
+            if left.isEmpty { return [] }
+            for p in left where ProcessTable.entry(p.pid)?.start == p.start { kill(p.pid, SIGKILL) }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return probe.scan(ProcessTable.snapshot()).filter { $0.start >= since }.map(\.pid)
     }
 }
 
