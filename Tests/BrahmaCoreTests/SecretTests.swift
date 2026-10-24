@@ -14,6 +14,26 @@ let patternSamples: [PatternSample] = [
     PatternSample(label: "google-api", sample: "AIza" + String(repeating: "x", count: 35)),
 ]
 
+/// A vault whose reads can be made to fail per name (or entirely), and that counts its reads.
+final class ScriptedVault: SecretVault, @unchecked Sendable {
+    private let lock = NSLock()
+    private let inner: any SecretVault
+    private var _failing: Set<String> = []
+    private var _unavailable = false
+    private var _reads: [String] = []
+    init(inner: any SecretVault = MemoryVault()) { self.inner = inner }
+    var failing: Set<String> { get { lock.withLock { _failing } } set { lock.withLock { _failing = newValue } } }
+    var unavailable: Bool { get { lock.withLock { _unavailable } } set { lock.withLock { _unavailable = newValue } } }
+    var reads: [String] { lock.withLock { _reads } }
+    func set(companyId: String, name: String, value: String) throws { try inner.set(companyId: companyId, name: name, value: value) }
+    func value(companyId: String, name: String) throws -> String? {
+        lock.withLock { _reads.append(name) }
+        if unavailable || failing.contains(name) { throw SecretError.vaultFailed("scripted failure") }
+        return try inner.value(companyId: companyId, name: name)
+    }
+    func delete(companyId: String, name: String) throws { try inner.delete(companyId: companyId, name: name) }
+}
+
 struct PatternSample: Sendable, CustomTestStringConvertible {
     let label: String, sample: String
     var testDescription: String { label }
@@ -76,7 +96,6 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(throws: (any Error).self) { try v.set(companyId: "c", name: "A_KEY", value: "x") }
         #expect(throws: (any Error).self) { _ = try v.value(companyId: "c", name: "A_KEY") }
         #expect(throws: (any Error).self) { try v.delete(companyId: "c", name: "A_KEY") }
-        _ = SecretVaults.platformDefault()   // constructs without touching anything
     }
 
     @Test func setStoresMetadataNotValue() throws {
@@ -149,11 +168,21 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         try w.store.setSecret(companyId: w.other.id, name: "OTHER_KEY", value: "other-company-value", isTest: false, vault: w.vault)
         #expect(try w.store.reloadRedactorIfNeeded(vault: w.vault))
         #expect(w.store.redactor.apply("a sk_test_abcdef123456 b other-company-value") == "a [redacted STRIPE_KEY] b [redacted OTHER_KEY]")
-        // A vault that lost a value does not abort the reload; the rest still redact.
+        #expect(!w.store.secretsHeld)
+        // A value already loaded is not read again while its secret is unchanged: it stays redacted even if the vault
+        // loses it. A secret whose value is missing when it is loaded is a per-secret failure (fail closed): the rest still
+        // redact and the store is held until it loads.
         try w.vault.delete(companyId: w.other.id, name: "OTHER_KEY")
         try w.set("NEW_KEY", "brand-new-value-xx")
+        try w.set("LOST_KEY", "lost-value-123456")
+        try w.vault.delete(companyId: w.company.id, name: "LOST_KEY")
         #expect(try w.store.reloadRedactorIfNeeded(vault: w.vault))
-        #expect(w.store.redactor.apply("brand-new-value-xx sk_test_abcdef123456") == "[redacted NEW_KEY] [redacted STRIPE_KEY]")
+        #expect(w.store.redactor.apply("brand-new-value-xx sk_test_abcdef123456 other-company-value lost-value-123456")
+                == "[redacted NEW_KEY] [redacted STRIPE_KEY] [redacted OTHER_KEY] lost-value-123456")
+        #expect(w.store.secretsHeld)
+        #expect(w.store.redactor.failedNames == ["LOST_KEY"])
+        let line = try #require(try w.store.events(afterId: 0, companyId: w.company.id).last { $0.kind == .error })
+        #expect(line.text.contains("LOST_KEY")); #expect(line.text.contains("the vault has no value for it"))
     }
 
     @Test func reloadWithUnavailableVaultKeepsTheOldSet() throws {
@@ -161,8 +190,162 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         try w.set()
         _ = try w.store.reloadRedactorIfNeeded(vault: w.vault)
         try w.set("NEW_KEY", "brand-new-value-xx")
-        #expect(throws: (any Error).self) { _ = try w.store.reloadRedactorIfNeeded(vault: UnavailableVault()) }
+        // Nothing can be read: no throw, the values already loaded still redact, the store is held and the next call retries.
+        #expect(try w.store.reloadRedactorIfNeeded(vault: UnavailableVault()))
         #expect(w.store.redactor.apply("sk_test_abcdef123456") == "[redacted STRIPE_KEY]")
+        #expect(w.store.secretsHeld)
+        #expect(w.store.redactor.version != (try w.store.secretsVersion()))
+        #expect(try w.store.reloadRedactorIfNeeded(vault: w.vault))
+        #expect(!w.store.secretsHeld)
+        #expect(w.store.redactor.version == (try w.store.secretsVersion()))
+        #expect(w.store.redactor.apply("brand-new-value-xx") == "[redacted NEW_KEY]")
+    }
+
+    // MARK: F2: per-secret load, fail closed
+
+    @Test func oneFailingSecretStillRedactsOthers() throws {
+        let w = try W()
+        let vault = ScriptedVault(inner: w.vault)
+        try w.store.setSecret(companyId: w.company.id, name: "GOOD_KEY", value: "good-value-12345", isTest: false, vault: vault)
+        try w.store.setSecret(companyId: w.company.id, name: "BAD_KEY", value: "bad-value-123456", isTest: false, vault: vault)
+        vault.failing = ["BAD_KEY"]
+        #expect(try w.store.reloadRedactorIfNeeded(vault: vault))   // a vault failure never aborts the load
+        #expect(w.store.redactor.apply("good-value-12345 bad-value-123456") == "[redacted GOOD_KEY] bad-value-123456")
+        #expect(w.store.secretsHeld); #expect(w.store.redactor.failedNames == ["BAD_KEY"])
+        // Logged by name for the secret's company, never with the value.
+        let errors = { try w.store.events(afterId: 0, companyId: w.company.id).filter { $0.kind == .error } }
+        #expect(try errors().count == 1)
+        #expect(try errors()[0].text.contains("BAD_KEY")); #expect(!(try errors()[0].text.contains("bad-value-123456")))
+        #expect(try w.store.events(afterId: 0, companyId: w.other.id).filter { $0.kind == .error }.isEmpty)
+        // Retried on the next call (only the failed one is read again), and the same failure is not logged twice.
+        let readsBefore = vault.reads.count
+        #expect(try w.store.reloadRedactorIfNeeded(vault: vault))
+        #expect(vault.reads.dropFirst(readsBefore) == ["BAD_KEY"])
+        #expect(try errors().count == 1)
+        // The vault recovers: fully loaded, no longer held, both redact.
+        vault.failing = []
+        #expect(try w.store.reloadRedactorIfNeeded(vault: vault))
+        #expect(!w.store.secretsHeld); #expect(w.store.redactor.failedNames.isEmpty)
+        #expect(w.store.redactor.version == (try w.store.secretsVersion()))
+        #expect(w.store.redactor.apply("good-value-12345 bad-value-123456") == "[redacted GOOD_KEY] [redacted BAD_KEY]")
+        #expect(try w.store.reloadRedactorIfNeeded(vault: vault) == false)
+    }
+
+    @Test func nonUTF8Refused() throws {
+        // At input: `brahma secret set` refuses bytes that are not UTF-8 (they would be stored mangled and never redacted).
+        func read(_ bytes: [UInt8]) throws -> String {
+            let pipe = Pipe()
+            pipe.fileHandleForWriting.write(Data(bytes))
+            try pipe.fileHandleForWriting.close()
+            return try SecretInput.read(from: pipe.fileHandleForReading)
+        }
+        #expect(throws: SecretError.notUTF8) { _ = try read([0x61, 0xFF, 0xFE, 0x62, 0x0A]) }
+        #expect(try read(Array("ok-ünï-value\n".utf8)) == "ok-ünï-value")
+        #expect(throws: SecretError.notUTF8) { _ = try SecretValue.decode(Data([0x61, 0xC3, 0x28, 0x62])) }
+        #expect(try SecretValue.decode(Data("plain-value".utf8)) == "plain-value")
+        // At load: a stored value that is not UTF-8 is a per-secret failure (logged, held, retried), never skipped.
+        let w = try W()
+        let home = try tempDir()
+        let vault = FileVault(home: home)
+        try w.store.setSecret(companyId: w.company.id, name: "GOOD_KEY", value: "good-value-12345", isTest: false, vault: vault)
+        try w.store.setSecret(companyId: w.company.id, name: "RAW_KEY", value: "placeholder-1234", isTest: false, vault: vault)
+        try vault.setRaw(companyId: w.company.id, name: "RAW_KEY", bytes: Data([0x72, 0x61, 0x77, 0xFF, 0xFE, 0x31, 0x32, 0x33, 0x34]))
+        #expect(throws: SecretError.notUTF8) { _ = try vault.value(companyId: w.company.id, name: "RAW_KEY") }
+        _ = try w.store.reloadRedactorIfNeeded(vault: vault)
+        #expect(w.store.secretsHeld); #expect(w.store.redactor.failedNames == ["RAW_KEY"])
+        #expect(w.store.redactor.apply("good-value-12345") == "[redacted GOOD_KEY]")
+        let errors = try w.store.events(afterId: 0, companyId: w.company.id).filter { $0.kind == .error }
+        #expect(errors.count == 1); #expect(errors[0].text.contains("RAW_KEY")); #expect(errors[0].text.contains("UTF-8"))
+    }
+
+    /// A data home whose database already holds a secret, opened by a fresh Store (a new engine or MCP process).
+    private struct FreshProcess {
+        let dir: URL, path: String
+        let company: Company, ceo: Agent
+        let inner = MemoryVault()
+        init() throws {
+            dir = try tempDir()
+            path = dir.appending(path: "brahma.sqlite").path
+            let owner = try Store(path: path)
+            company = try owner.createCompany(name: "Acme", goal: "g", workspacesRoot: dir.appending(path: "ws"))
+            ceo = try owner.hire(companyId: company.id, name: "ceo", role: "ceo", model: "sonnet")
+            _ = try MessageRouter(store: owner).sendDM(companyId: company.id, from: .owner, to: "ceo", text: "please start")
+            try owner.setSecret(companyId: company.id, name: "API_KEY", value: "api-key-value-123", isTest: false, vault: inner)
+        }
+    }
+
+    @Test func failClosedUntilFirstLoad() async throws {
+        let f = try FreshProcess()
+        let vault = ScriptedVault(inner: f.inner)
+        vault.unavailable = true
+        let store = try Store(path: f.path)
+        // Before any load in this process: held, and every redacting write throws instead of storing unredacted text.
+        #expect(store.secretsHeld); #expect(!store.redactor.hasLoaded)
+        #expect(throws: SecretError.secretsNotLoaded) {
+            _ = try MessageRouter(store: store).post(companyId: f.company.id, channel: "general", from: .owner, text: "api-key-value-123")
+        }
+        #expect(throws: SecretError.secretsNotLoaded) {
+            try store.appendEvent(ActivityEvent(companyId: f.company.id, agentId: nil, turnId: nil, kind: .usage, text: "x", createdAt: .now))
+        }
+
+        // (a) The engine admits no turn while the vault throws.
+        let w = try World(store: store, vault: vault)
+        try await w.orchestrator.start()
+        try await w.cycle(); try await w.cycle()
+        #expect(w.fake.requests.isEmpty, "no turn may start before the secrets are loaded")
+        #expect(try w.agent(f.ceo).state == .ready)
+        let errors = try store.events(afterId: 0, companyId: f.company.id).filter { $0.kind == .error }
+        #expect(errors.filter { $0.text.contains("API_KEY") }.count == 1, "one activity line, not one per tick: \(errors.map(\.text))")
+        #expect(!errors.contains { $0.text.contains("api-key-value-123") })
+
+        // (b) `brahma mcp` refuses tool calls with a clear error, and nothing is written.
+        let server = MCPServer(tools: CompanyTools(store: store, companyId: f.company.id, agentId: f.ceo.id),
+                               beforeCall: { try store.prepareForToolCall(vault: vault) })
+        let refused = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"post_message","arguments":{"channel":"general","text":"api-key-value-123"}}}"#) ?? ""
+        #expect(refused.contains("secrets are not loaded yet; try again shortly")); #expect(refused.contains(#""isError":true"#))
+        let general = try #require(try store.channel(companyId: f.company.id, name: "general"))
+        #expect(try store.messages(channelId: general.id, limit: 5).isEmpty)
+
+        // The vault comes back: the next tick loads, the hold lifts and the turn runs; MCP writes work and are redacted.
+        vault.unavailable = false
+        try await w.cycle()
+        #expect(!store.secretsHeld); #expect(store.redactor.hasLoaded)
+        #expect(w.fake.requests.count == 1)
+        let ok = server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"post_message","arguments":{"channel":"general","text":"key api-key-value-123"}}}"#) ?? ""
+        #expect(ok.contains(#""isError":false"#), "\(ok)")
+        #expect(try store.messages(channelId: general.id, limit: 5).map(\.text) == ["key [redacted API_KEY]"])
+    }
+
+    @Test func mcpRefusesWhileAnySecretFailsAfterTheFirstLoad() throws {
+        let w = try W()
+        let vault = ScriptedVault(inner: w.vault)
+        try w.store.setSecret(companyId: w.company.id, name: "BAD_KEY", value: "bad-value-123456", isTest: false, vault: vault)
+        vault.failing = ["BAD_KEY"]
+        #expect(throws: (any Error).self) { try w.store.prepareForToolCall(vault: vault) }
+        vault.failing = []
+        try w.store.prepareForToolCall(vault: vault)
+        #expect(w.store.redactor.apply("bad-value-123456") == "[redacted BAD_KEY]")
+    }
+
+    @Test func noSecretsNoHold() async throws {
+        let w = try World(vault: UnavailableVault())
+        let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        #expect(!w.store.secretsHeld); #expect(w.store.redactor.hasLoaded)
+        // A fresh process on a database with no secrets is not held either.
+        let dir = try tempDir(); let path = dir.appending(path: "brahma.sqlite").path
+        let first = try Store(path: path)
+        _ = try first.createCompany(name: "Acme", goal: "g", workspacesRoot: dir)
+        let fresh = try Store(path: path)
+        #expect(!fresh.secretsHeld)
+        try fresh.prepareForToolCall(vault: UnavailableVault())
+        try w.dm(c, ceo)
+        try await w.orchestrator.start()
+        try await w.cycle()
+        #expect(w.fake.requests.count == 1)
+        let tools = CompanyTools(store: w.store, companyId: c.id, agentId: ceo.id)
+        let server = MCPServer(tools: tools, beforeCall: { try w.store.prepareForToolCall(vault: UnavailableVault()) })
+        let ok = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_channels","arguments":{}}}"#) ?? ""
+        #expect(ok.contains(#""isError":false"#), "\(ok)")
     }
 
     // MARK: redaction at every store write path
@@ -309,6 +492,58 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(hostile["PATH"] == "/bin"); #expect(hostile["HOME"] == "/h")
     }
 
+    static let refusedInjectable = [
+        "GIT_SSH_COMMAND", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "PYTHONPATH", "PATH", "BASH_FUNC_X",
+        "CLAUDE_CODE_SHELL_PREFIX", "MY_LIB_PATH", "TEST_NAME",
+        // Allowlisted by KEY/TOKEN/SECRET, then caught by a denied family.
+        "GIT_TOKEN", "SSH_KEY", "DYLD_KEY", "LD_KEY", "BASH_FUNC_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "BRAHMA_SECRET",
+        "ANTHROPIC_API_KEY", "NODE_AUTH_TOKEN", "NPM_TOKEN", "PYTHON_KEY", "PERL5_KEY", "RUBY_TOKEN", "JAVA_KEY", "XDG_SECRET",
+        "MY_KEY_OPTIONS", "SECRET_LIB", "TOKEN_PATH", "SSL_KEYLOG_FILE", "SSLKEYLOGFILE", "LC_KEY",
+        // Exact names and the base allowlist (none contains KEY/TOKEN/SECRET, so the allowlist already refuses them).
+        "HOME", "SHELL", "ENV", "BASH_ENV", "ZDOTDIR", "PROMPT_COMMAND", "IFS", "TMPDIR", "LANG", "TERM", "USER", "LOGNAME",
+    ]
+
+    @Test(arguments: SecretTests.refusedInjectable)
+    func refusedInjectableNames(_ name: String) throws {
+        #expect(!SecretName.isInjectable(name), "\(name)")
+        let w = try W()
+        if SecretName.isValid(name) {
+            #expect(throws: SecretError.notInjectable) {
+                try w.store.setSecret(companyId: w.company.id, name: name, value: "some-value-123", isTest: true, vault: w.vault)
+            }
+        }
+        #expect(try w.store.secrets(companyId: w.company.id).isEmpty)
+        #expect(try w.vault.value(companyId: w.company.id, name: name) == nil, "refused before the vault is touched")
+        // A row written by other means cannot bypass it: the child environment drops the name and reports it.
+        let env = ChildEnvironment.make(base: ["PATH": "/bin", "HOME": "/h"], extra: [:], purpose: .claude, secrets: [name: "evil"])
+        #expect(env[name] != "evil")
+        #expect(ChildEnvironment.droppedSecretNames([name: "evil", "STRIPE_TEST_KEY": "v"]) == [name])
+    }
+
+    @Test(arguments: ["STRIPE_TEST_KEY", "GITHUB_TOKEN_TEST", "AWS_SECRET_ACCESS_KEY", "API_KEY", "MY_TOKEN", "TEST_SECRET",
+                      "OPENAI_API_KEY", "AWS_SESSION_TOKEN"])
+    func acceptedInjectableNames(_ name: String) throws {
+        #expect(SecretName.isInjectable(name), "\(name)")
+        let w = try W()
+        try w.store.setSecret(companyId: w.company.id, name: name, value: "some-value-123", isTest: true, vault: w.vault)
+        #expect(ChildEnvironment.make(base: [:], extra: [:], purpose: .general, secrets: [name: "v"])[name] == "v")
+        #expect(ChildEnvironment.droppedSecretNames([name: "v"]).isEmpty)
+    }
+
+    @Test func engineHeldSecretsKeepThePlainNameRules() throws {
+        // An engine-held secret is never injected, so only the name pattern and the reserved names apply to it.
+        let w = try W()
+        try w.store.setSecret(companyId: w.company.id, name: "PLAIN_NAME", value: "some-value-123", isTest: false, vault: w.vault)
+        #expect(throws: SecretError.reservedName) {
+            try w.store.setSecret(companyId: w.company.id, name: "PATH", value: "some-value-123", isTest: false, vault: w.vault)
+        }
+        // Turning it into a test key later goes through the injectable check.
+        #expect(throws: SecretError.notInjectable) {
+            try w.store.setSecret(companyId: w.company.id, name: "PLAIN_NAME", value: "some-value-123", isTest: true, vault: w.vault)
+        }
+        #expect(try w.store.secrets(companyId: w.company.id).map(\.isTest) == [false])
+    }
+
     // MARK: CLI input
 
     @Test func cliSecretSetReadsStdin() throws {
@@ -346,6 +581,34 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         let o = out.fileHandleForReading.readDataToEndOfFile(), r = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))
+    }
+
+    /// The CLI's secret store is the file store in test homes (`cliEnvironment`): set, list, a redacted owner message, rm.
+    @Test func secretCommandsUseTheFileStoreAndRedactCLIWrites() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let set = try brahma(["secret", "set", "Acme", "API_KEY"], home: home, stdin: "cli-secret-value-42\n")
+        #expect(set.status == 0, "\(set.stderr)")
+        #expect(set.stderr.contains("using a file-backed secret store (dev/demo home only)"))
+        let dataHome = ownerPaths(home).home
+        let file = dataHome.appending(path: "secrets/vault.json")
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        #expect((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let dirAttrs = try FileManager.default.attributesOfItem(atPath: dataHome.appending(path: "secrets").path)
+        #expect((dirAttrs[.posixPermissions] as? NSNumber)?.intValue == 0o700)
+        #expect(try brahma(["secret", "list", "Acme"], home: home).stdout.contains("API_KEY"))
+        // Another CLI process loads the secrets before it writes: the owner's message is stored redacted.
+        let say = try brahma(["say", "Acme", "#general", "the key is cli-secret-value-42"], home: home)
+        #expect(say.status == 0, "\(say.stderr)")
+        let log = try brahma(["log", "Acme", "#general"], home: home)
+        #expect(log.stdout.contains("the key is [redacted API_KEY]")); #expect(!log.stdout.contains("cli-secret-value-42"))
+        let db = try Data(contentsOf: dataHome.appending(path: "brahma.sqlite"))
+        #expect(db.range(of: Data("cli-secret-value-42".utf8)) == nil)
+        // A refused store choice fails the command instead of falling back.
+        let unknown = try brahma(["secret", "list", "Acme"], home: home, env: ["BRAHMA_SECRET_STORE": "plaintext"])
+        #expect(unknown.status == 1); #expect(unknown.stderr.contains("BRAHMA_SECRET_STORE=plaintext is not supported"))
+        #expect(try brahma(["secret", "rm", "Acme", "API_KEY"], home: home).status == 0)
+        #expect(try brahma(["secret", "list", "Acme"], home: home).stdout.contains("no secrets"))
     }
 
     // None of these reach the Keychain: they fail before the vault is touched, or only read metadata.

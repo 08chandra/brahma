@@ -2,6 +2,7 @@ import ArgumentParser
 import Dispatch
 import Foundation
 import BrahmaCore
+import BrahmaKeychain
 
 extension PermissionProfile: ExpressibleByArgument {}
 
@@ -45,7 +46,7 @@ struct Run: AsyncParsableCommand {
         let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
         let orchestrator = Orchestrator(
             store: store, runner: ClaudeProcessRunner(), paths: paths, config: config,
-            mcpExecutable: executable, profile: profile)
+            mcpExecutable: executable, profile: profile, vault: try cliSecretVault())
         try await orchestrator.start()
         // Read before the engine starts, so the first tick's events are printed too.
         let printer = EventPrinter(store: store, startAfter: try store.maxEventId())

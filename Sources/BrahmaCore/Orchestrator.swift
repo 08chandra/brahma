@@ -32,8 +32,9 @@ public actor Orchestrator {
     /// What each turn asserts about the session the CLI reports (the work modes set it; nil asserts nothing).
     let turnExpectations: @Sendable (Agent, Company) -> TurnExpectations?
     let timerJobs: TimerJobRegistry
-    /// Where secret values live; read only to reload the store's redactor.
-    let vault: any SecretVault
+    /// Where secret values live; read only to reload the store's redactor. Production passes the store `PlatformSecretVault`
+    /// selected (the Keychain, or a dev/demo home's file store); the library default is `UnavailableVault`, never the Keychain.
+    nonisolated let vault: any SecretVault
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -91,7 +92,7 @@ public actor Orchestrator {
                 planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)? = nil,
                 turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil },
                 timerJobs: TimerJobRegistry = .system,
-                vault: any SecretVault = SecretVaults.platformDefault()) {
+                vault: any SecretVault = UnavailableVault()) {
         self.timerJobs = timerJobs; self.vault = vault
         self.planSelector = planSelector
         self.turnExpectations = turnExpectations
@@ -214,7 +215,9 @@ public actor Orchestrator {
         // Active time first, so everything below sees the same clock; then health, which may start or end a hold.
         try store.accrueActiveTime(now: now)
         try healthTick(now: now)
-        let held = try store.engineHold() != nil
+        // Fail closed on secrets: until every secret's value is loaded into the redactor (`Store.secretsHeld`), nothing that
+        // would let an agent write text starts: no turn, check, merge or dispatch. The reload logged which secret failed.
+        let held = try store.engineHold() != nil || store.secretsHeld
         let pressure = memory.current
         logPressure(pressure, now: now)
         // The owner's plan tier and weekly share apply from the next tick after they are changed.
@@ -1028,12 +1031,12 @@ extension Store {
             var cost: Double?
             var infraClass = InfraClass.none
             switch end {
-            case .succeeded(let r, _): summary = redact(r.text)
-            case .capped(let r, _): summary = redact(r.text ?? r.subtype as String?)
+            case .succeeded(let r, _): summary = try redact(r.text)
+            case .capped(let r, _): summary = try redact(r.text ?? r.subtype as String?)
             case .failed(let text, let input, _):
-                summary = redact(text)
+                summary = try redact(text)
                 if let input { infraClass = EngineHealth.classify(input) }
-            case .usageLimited(_, let text): summary = redact(text)
+            case .usageLimited(_, let text): summary = try redact(text)
             case .interrupted: summary = "interrupted"
             }
             // The result's total is cumulative over `--resume`: the turn's own cost is the difference (Task 14a, L-4).

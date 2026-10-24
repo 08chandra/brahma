@@ -272,7 +272,9 @@ public enum ChildEnvironment {
     }
 
     /// `secrets` (name → value) are test keys the engine hands to this child, and are applied after the drop step, which
-    /// would otherwise remove them (their names contain KEY, TOKEN or SECRET). A reserved or invalid name is ignored.
+    /// would otherwise remove them (their names contain KEY, TOKEN or SECRET). A name `SecretName.isInjectable` refuses is
+    /// silently dropped, so a row written by other means can never set `GIT_SSH_COMMAND`, `LD_PRELOAD`, `PATH` and the
+    /// like; the caller logs `droppedSecretNames(_:)`.
     public static func make(base: [String: String], extra: [String: String] = [:],
                             engineClaudeVars: [String: String] = [:], purpose: Purpose = .general,
                             secrets: [String: String] = [:]) -> [String: String] {
@@ -287,7 +289,12 @@ public enum ChildEnvironment {
         if purpose == .claude {
             for (name, value) in engineClaudeVars where Self.engineClaudeVars.contains(name) { env[name] = value }
         }
-        for (name, value) in secrets where SecretName.isValid(name) && !isReserved(name) { env[name] = value }
+        for (name, value) in secrets where SecretName.isInjectable(name) { env[name] = value }
         return env
+    }
+
+    /// The names `make` would drop from `secrets` (sorted), for the caller to log.
+    public static func droppedSecretNames(_ secrets: [String: String]) -> [String] {
+        secrets.keys.filter { !SecretName.isInjectable($0) }.sorted()
     }
 }

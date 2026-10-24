@@ -34,7 +34,7 @@ func ownerPaths(_ home: URL) -> BrahmaPaths {
 func cliEnvironment(home: URL) -> [String: String] {
     let paths = ownerPaths(home)
     return ["BRAHMA_HOME": paths.home.path, "BRAHMA_WORKSPACES": paths.workspaces.path, "PATH": "/usr/bin:/bin",
-            "BRAHMA_OWNER_KEY_STORE": "file"]
+            "BRAHMA_OWNER_KEY_STORE": "file", "BRAHMA_SECRET_STORE": "file"]
 }
 
 /// Runs `brahma owner init` under a pseudo-terminal (`script`), the only way to satisfy its TTY check.

@@ -13,7 +13,7 @@ public enum EngineAlerts {
     public static func raise(store: Store, db: Database, text: String, now: Date, reason: String? = nil,
                              companyId: String? = nil) throws {
         let router = MessageRouter(store: store)
-        let text = store.redact(text)
+        let text = try store.redact(text)
         let key = try reason ?? EngineHold.fetchOne(db, key: 1)?.reason.rawValue ?? generalReason
         for company in try Company.fetchAll(db) where companyId == nil || company.id == companyId {
             try router.sendDM(db: db, companyId: company.id, from: .system, to: "owner", text: text, now: now)

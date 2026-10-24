@@ -1,32 +1,40 @@
 import Foundation
-#if canImport(Security)
-import Security
-#endif
 
 // MARK: Names and errors
 
-public enum SecretError: Error, Equatable, Sendable {
+public enum SecretError: Error, Equatable, Sendable, CustomStringConvertible {
     case invalidName
     /// The name is one the engine itself sets in a child's environment (PATH, BRAHMA_*, DYLD_*, ...).
     case reservedName
+    /// A test key's name must be one `SecretName.isInjectable` accepts: it is put in agents' environments.
+    case notInjectable
     case emptyValue
+    /// The value's bytes are not UTF-8 (refused at input; a stored one fails to load).
+    case notUTF8
     case unknownCompany
     case notFound
     case vaultUnavailable
     case vaultFailed(String)
+    /// The redactor has not loaded the secrets yet in this process: nothing redactable may be stored (fail closed).
+    case secretsNotLoaded
 
     /// Plain text for the CLI and the app.
     public var message: String {
         switch self {
         case .invalidName: "invalid secret name: use A-Z, 0-9 and _, starting with a letter (2 to 64 characters)"
         case .reservedName: "that name is reserved: the engine sets it in every child's environment"
+        case .notInjectable: "a test key's name must contain KEY, TOKEN or SECRET and must not be a variable that changes how programs run (GIT_*, SSH_*, DYLD_*, LD_*, NODE_*, PYTHON*, ...*PATH, ...*_OPTIONS, ...)"
         case .emptyValue: "the secret value is empty"
+        case .notUTF8: "the secret value is not valid UTF-8 text"
         case .unknownCompany: "no such company"
         case .notFound: "no such secret"
         case .vaultUnavailable: "no secrets vault is available on this platform"
         case .vaultFailed(let detail): "the secrets vault failed: \(detail)"
+        case .secretsNotLoaded: "secrets are not loaded yet; try again shortly"
         }
     }
+
+    public var description: String { message }
 }
 
 public enum SecretName {
@@ -35,6 +43,38 @@ public enum SecretName {
         let bytes = Array(name.utf8)
         guard (2...64).contains(bytes.count), (0x41...0x5A).contains(bytes[0]) else { return false }
         return bytes.allSatisfy { (0x41...0x5A).contains($0) || (0x30...0x39).contains($0) || $0 == 0x5F }
+    }
+
+    /// Whether a TEST key of this name may be put in an agent's (or a check's) environment. Two layers, both required:
+    /// - allowlist: the name contains `KEY`, `TOKEN` or `SECRET` (names are upper-case already);
+    /// - denylist, checked after it: variable families that change how a program runs or where it loads code from
+    ///   (`GIT_SSH_COMMAND`, `LD_PRELOAD`, `DYLD_*`, `BASH_FUNC_*`, `NODE_OPTIONS`, `PYTHONPATH`, `PATH`, ...), the engine's and
+    ///   Claude's own variables, and every name `ChildEnvironment` itself sets or passes through.
+    /// The one check for test keys: `Store.setSecret(isTest: true)` refuses, and `ChildEnvironment.make` drops, any other name.
+    public static func isInjectable(_ name: String) -> Bool {
+        guard isValid(name) else { return false }
+        guard name.contains("KEY") || name.contains("TOKEN") || name.contains("SECRET") else { return false }
+        if deniedPrefixes.contains(where: name.hasPrefix) { return false }
+        if deniedSuffixes.contains(where: name.hasSuffix) { return false }
+        if deniedNames.contains(name) || ChildEnvironment.isReserved(name) { return false }
+        return true
+    }
+
+    /// From the security review, plus `SSL`/`OPENSSL` (TLS key logging and engine loading) and `LC_` (locale, passed through).
+    static let deniedPrefixes = ["GIT_", "SSH_", "DYLD_", "LD_", "BASH_FUNC_", "CLAUDE_", "BRAHMA_", "ANTHROPIC_", "NODE_", "NPM_",
+                                 "PYTHON", "PERL", "RUBY", "JAVA_", "XDG_", "SSL", "OPENSSL", "LC_"]
+    /// From the security review, plus `FILE` (`SSLKEYLOGFILE`, `SSL_KEYLOG_FILE`: a path a program writes TLS keys to).
+    static let deniedSuffixes = ["_OPTIONS", "LIB", "PATH", "FILE"]
+    static let deniedNames: Set<String> = ["PATH", "HOME", "SHELL", "ENV", "BASH_ENV", "ZDOTDIR", "PROMPT_COMMAND", "IFS", "TMPDIR",
+                                           "LANG", "TERM", "USER", "LOGNAME"]
+}
+
+/// Secret values are text: the redactor matches them in stored text, so bytes that are not UTF-8 are refused rather than
+/// repaired (a repaired value would never match the real one).
+public enum SecretValue {
+    public static func decode(_ data: Data) throws -> String {
+        guard let text = String(data: data, encoding: .utf8), Data(text.utf8) == data else { throw SecretError.notUTF8 }
+        return text
     }
 }
 
@@ -81,104 +121,121 @@ public struct UnavailableVault: SecretVault {
     public func delete(companyId: String, name: String) throws { throw SecretError.vaultUnavailable }
 }
 
-public enum SecretVaults {
-    public static func platformDefault() -> any SecretVault {
-        #if canImport(Security)
-        return KeychainVault()
-        #else
-        return UnavailableVault()
-        #endif
-    }
+/// The environment variable that picks a non-Keychain secret store for a dev/demo data home (`PlatformSecretVault`, in
+/// BrahmaKeychain, is the one place that reads it; `MCPConfig` passes a `file` choice on to the turn's `brahma mcp`).
+public enum SecretStore {
+    public static let environmentVariable = "BRAHMA_SECRET_STORE"
 }
 
-#if canImport(Security)
-/// A generic-password Keychain item per secret: service `dev.brahma.secrets`, account `<companyId>:<name>`.
+/// Dev/demo/test store: one JSON file `<dataHome>/secrets/vault.json` (0600) in a 0700 directory, values base64-encoded
+/// bytes. Selected only by `BRAHMA_SECRET_STORE=file`, which is refused for the default data home, so production always
+/// uses the Keychain. Weaker than the Keychain: any process of the same user can read it.
 ///
-/// Same lessons as the owner-key store (`KeychainOwnerKeyStore`): the item is created with an access list that trusts
-/// any application, so the app, the `brahma` CLI and the per-turn `brahma mcp` processes all read it without a
-/// prompt, and the modern `SecItemUpdate` and `SecItemDelete` refuse an item another binary created
-/// (errSecInvalidOwnerEdit), so replacing and deleting use the legacy per-item calls, which do not check the owner.
-/// Every write is in place: a failed update leaves the old value. New items also carry
-/// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (the login keychain accepts it next to the access list).
-public struct KeychainVault: SecretVault {
-    public static let service = "dev.brahma.secrets"
+/// Neither the directory nor the file may be a symbolic link (`O_NOFOLLOW`, `lstat`). Writes take an exclusive `flock` on
+/// `vault.lock`, write a fresh 0600 temporary file (`O_EXCL`) and rename it over the old one, so a reader always sees a
+/// whole file and two writers never lose each other's change.
+public struct FileVault: SecretVault {
+    public let home: URL
 
-    public init() {}
+    public init(home: URL) { self.home = home }
 
-    private func query(_ companyId: String, _ name: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: Self.service,
-         kSecAttrAccount as String: "\(companyId):\(name)"]
-    }
+    var directory: URL { home.appending(path: "secrets", directoryHint: .isDirectory) }
+    var file: URL { directory.appending(path: "vault.json") }
+
+    private struct Contents: Codable { var version = 1; var items: [String: String] = [:] }
+
+    private static func key(_ companyId: String, _ name: String) -> String { "\(companyId):\(name)" }
 
     public func value(companyId: String, name: String) throws -> String? {
-        var q = query(companyId, name)
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var out: CFTypeRef?
-        let status = SecItemCopyMatching(q as CFDictionary, &out)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = out as? Data else { throw SecretError.vaultFailed("read failed (OSStatus \(status))") }
-        return String(data: data, encoding: .utf8)
+        guard let encoded = try read().items[Self.key(companyId, name)] else { return nil }
+        guard let bytes = Data(base64Encoded: encoded) else { throw SecretError.vaultFailed("the stored value is corrupt") }
+        return try SecretValue.decode(bytes)
     }
 
     public func set(companyId: String, name: String, value: String) throws {
-        let data = Data(value.utf8)
-        let q = query(companyId, name)
-        let found = SecItemCopyMatching(q as CFDictionary, nil)
-        if found == errSecSuccess {
-            if SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecSuccess { return }
-            var r = q
-            r[kSecReturnRef as String] = true
-            r[kSecMatchLimit as String] = kSecMatchLimitOne
-            var ref: CFTypeRef?
-            guard SecItemCopyMatching(r as CFDictionary, &ref) == errSecSuccess, let ref else {
-                throw SecretError.vaultFailed("the existing item could not be read for update")
-            }
-            let status = data.withUnsafeBytes { raw in
-                SecKeychainItemModifyAttributesAndData(ref as! SecKeychainItem, nil, UInt32(data.count), raw.baseAddress)
-            }
-            guard status == errSecSuccess else { throw SecretError.vaultFailed("update failed (OSStatus \(status))") }
-            return
-        }
-        guard found == errSecItemNotFound else { throw SecretError.vaultFailed("lookup failed (OSStatus \(found))") }
-        var access: SecAccess?
-        guard SecAccessCreate("Brahma secret \(name)" as CFString, nil, &access) == errSecSuccess, let access else {
-            throw SecretError.vaultFailed("the access list could not be created")
-        }
-        var add = q
-        add[kSecValueData as String] = data
-        add[kSecAttrAccess as String] = access
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let status = SecItemAdd(add as CFDictionary, nil)
-        guard status == errSecSuccess else { throw SecretError.vaultFailed("add failed (OSStatus \(status))") }
+        try setRaw(companyId: companyId, name: name, bytes: Data(value.utf8))
+    }
+
+    /// Stores raw bytes (tests use it to plant a value that is not UTF-8).
+    func setRaw(companyId: String, name: String, bytes: Data) throws {
+        try modify { $0.items[Self.key(companyId, name)] = bytes.base64EncodedString() }
     }
 
     public func delete(companyId: String, name: String) throws {
-        var q = query(companyId, name)
-        q[kSecReturnRef as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitAll
-        var out: CFTypeRef?
-        let status = SecItemCopyMatching(q as CFDictionary, &out)
-        if status == errSecItemNotFound { return }
-        guard status == errSecSuccess, let items = out as? [AnyObject] else { throw SecretError.vaultFailed("lookup failed (OSStatus \(status))") }
-        for item in items {
-            let s = SecKeychainItemDelete(item as! SecKeychainItem)
-            guard s == errSecSuccess else { throw SecretError.vaultFailed("delete failed (OSStatus \(s))") }
+        try modify { $0.items[Self.key(companyId, name)] = nil }
+    }
+
+    private func modify(_ change: (inout Contents) -> Void) throws {
+        try ensureDirectory()
+        let lockFD = open(directory.appending(path: "vault.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard lockFD >= 0 else { throw SecretError.vaultFailed("cannot open the vault lock (errno \(errno))") }
+        defer { close(lockFD) }
+        guard flock(lockFD, LOCK_EX) == 0 else { throw SecretError.vaultFailed("cannot lock the vault (errno \(errno))") }
+        var contents = try read()
+        change(&contents)
+        let data = try JSONEncoder().encode(contents)
+        let temp = directory.appending(path: ".vault.\(UUID().uuidString).json")
+        let fd = open(temp.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw SecretError.vaultFailed("cannot write the vault (errno \(errno))") }
+        let bytes = [UInt8](data)
+        let written = bytes.withUnsafeBufferPointer { Foundation.write(fd, $0.baseAddress, $0.count) }
+        let synced = fsync(fd) == 0
+        close(fd)
+        guard written == bytes.count, synced, rename(temp.path, file.path) == 0 else {
+            unlink(temp.path)
+            throw SecretError.vaultFailed("cannot write the vault")
         }
     }
+
+    private func read() throws -> Contents {
+        try checkDirectory()
+        let fd = open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if fd < 0 {
+            if errno == ENOENT { return Contents() }
+            throw SecretError.vaultFailed("cannot open the vault (errno \(errno))")
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_uid == getuid() else {
+            throw SecretError.vaultFailed("the vault is not a regular file owned by this user")
+        }
+        let data = try handle.readToEnd() ?? Data()
+        guard let contents = try? JSONDecoder().decode(Contents.self, from: data) else {
+            throw SecretError.vaultFailed("the vault file is corrupt")
+        }
+        return contents
+    }
+
+    /// The secrets directory, if it exists, must be a real directory (not a link).
+    private func checkDirectory() throws {
+        var st = stat()
+        if lstat(directory.path, &st) != 0 {
+            if errno == ENOENT { return }
+            throw SecretError.vaultFailed("cannot inspect the vault directory (errno \(errno))")
+        }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else { throw SecretError.vaultFailed("the vault directory is not a directory") }
+    }
+
+    private func ensureDirectory() throws {
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        if mkdir(directory.path, 0o700) != 0, errno != EEXIST {
+            throw SecretError.vaultFailed("cannot create the vault directory (errno \(errno))")
+        }
+        try checkDirectory()
+        guard chmod(directory.path, 0o700) == 0 else { throw SecretError.vaultFailed("cannot protect the vault directory") }
+    }
 }
-#endif
 
 /// Reads a secret value for `brahma secret set`.
 public enum SecretInput {
-    /// Everything on `handle`, minus one trailing newline (`\n` or `\r\n`). Other whitespace is part of the value.
+    /// Everything on `handle`, minus one trailing newline (`\n` or `\r\n`). Other whitespace is part of the value. Bytes
+    /// that are not UTF-8 are refused (`SecretError.notUTF8`).
     public static func read(from handle: FileHandle) throws -> String {
         var bytes = Array(try handle.readToEnd() ?? Data())
         // "\r\n" is a single Character in Swift, so trim bytes.
         if bytes.suffix(2) == [0x0D, 0x0A] { bytes.removeLast(2) } else if bytes.last == 0x0A { bytes.removeLast() }
-        let text = String(decoding: bytes, as: UTF8.self)
-        guard !text.isEmpty else { throw SecretError.emptyValue }
-        return text
+        guard !bytes.isEmpty else { throw SecretError.emptyValue }
+        return try SecretValue.decode(Data(bytes))
     }
 }
 
@@ -193,16 +250,78 @@ public final class Redactor: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [(needle: String, replacement: String)] = []
     private var currentVersion = ""
+    private var loadedOnce = false
+    private var failed: [String] = []
+    private var cache: [String: Loaded] = [:]
+    private var logged: Set<String> = []
+
+    /// One loaded value: the secret's name and the `updatedAt` it was loaded for (a retry reads only what failed or changed).
+    struct Loaded: Equatable {
+        var name: String
+        var updatedAt: Date
+        var value: String
+    }
 
     public init() {}
 
+    /// The secrets version of the last COMPLETE load (every secret's value loaded); "" before one.
     public var version: String {
         lock.lock(); defer { lock.unlock() }
         return currentVersion
     }
 
-    /// Replaces the whole set of values.
+    /// Whether a complete load has happened in this process (a database with no secrets at open counts as one). Until
+    /// then `Store.redact` throws: nothing redactable is stored unredacted (fail closed).
+    public var hasLoaded: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return loadedOnce
+    }
+
+    /// The secrets whose values did not load at the last load (sorted names); they are retried on the next reload.
+    public var failedNames: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return failed
+    }
+
+    /// Replaces the whole set of values: a complete load of `version`.
     public func update(_ values: [(name: String, value: String)], version: String) {
+        let built = Self.build(values)
+        lock.lock(); defer { lock.unlock() }
+        entries = built
+        currentVersion = version
+        loadedOnce = true
+        failed = []
+        cache = [:]
+    }
+
+    /// Installs a load: `loaded` are the values to redact (keyed `<companyId>:<name>`), `failed` the names that did not
+    /// load. `version` is set (and the load counts as complete) only when nothing failed.
+    func install(loaded: [String: Loaded], failed failedNames: [String], version: String?) {
+        let built = Self.build(loaded.values.sorted { $0.name < $1.name }.map { ($0.name, $0.value) })
+        lock.lock(); defer { lock.unlock() }
+        entries = built
+        cache = loaded
+        failed = failedNames
+        if let version {
+            currentVersion = version
+            loadedOnce = true
+        }
+    }
+
+    func cachedValues() -> [String: Loaded] {
+        lock.lock(); defer { lock.unlock() }
+        return cache
+    }
+
+    /// Which of `failures` (keys) have not been logged yet; remembers them, and forgets keys that are no longer failing.
+    func unlogged(_ failures: Set<String>) -> Set<String> {
+        lock.lock(); defer { lock.unlock() }
+        let fresh = failures.subtracting(logged)
+        logged = failures
+        return fresh
+    }
+
+    private static func build(_ values: [(name: String, value: String)]) -> [(needle: String, replacement: String)] {
         var built: [(needle: String, replacement: String)] = []
         var seen = Set<String>()
         for (name, value) in values where value.count >= Self.minLength {
@@ -211,9 +330,7 @@ public final class Redactor: @unchecked Sendable {
             }
         }
         built.sort { $0.needle.utf8.count > $1.needle.utf8.count }
-        lock.lock(); defer { lock.unlock() }
-        entries = built
-        currentVersion = version
+        return built
     }
 
     private func snapshot() -> [(needle: String, replacement: String)] {

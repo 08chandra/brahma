@@ -28,8 +28,8 @@ extension Store {
 
     /// The one place notice text is cleaned before it is stored: secrets are redacted (while any newlines are still in,
     /// so a multi-line secret matches), then newlines and control characters become spaces.
-    func noticeText(_ text: String) -> String {
-        let redacted = redact(text)
+    func noticeText(_ text: String) throws -> String {
+        let redacted = try redact(text)
         return String(String.UnicodeScalarView(redacted.unicodeScalars.map { Store.noticeBlocked.contains($0) ? " " : $0 }))
     }
 
@@ -45,8 +45,8 @@ extension Store {
     @discardableResult
     func notifyOwner(db: Database, companyId: String?, kind: NoticeKind, urgency: NoticeUrgency,
                             title: String, body: String, now: Date) throws -> OwnerNotice {
-        var notice = OwnerNotice(companyId: companyId, kind: kind, urgency: urgency, title: noticeText(title),
-                                 body: noticeText(body), createdAt: now)
+        var notice = OwnerNotice(companyId: companyId, kind: kind, urgency: urgency, title: try noticeText(title),
+                                 body: try noticeText(body), createdAt: now)
         try notice.insert(db)
         return notice
     }

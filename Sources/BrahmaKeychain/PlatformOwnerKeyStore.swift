@@ -81,7 +81,8 @@ public enum PlatformOwnerKeyStore {
     }
 }
 
-/// Process-wide count of every `SecItem*` / `SecKeychain*` / `SecAccess*` call this module makes (always 0 where there is no Keychain, so
+/// Process-wide count of every `SecItem*` / `SecKeychain*` / `SecAccess*` / `SecTrustedApplication*` call this module makes
+/// (the owner-key store and the secrets vault) (always 0 where there is no Keychain, so
 /// tests compile and pass on every platform). Tests use it to
 /// prove they never touch the login Keychain (a rebuilt, ad-hoc-signed binary makes macOS ask for the password on
 /// every access). `forbid()` arms a trap: any later call crashes loudly instead of prompting.
@@ -93,9 +94,9 @@ public enum KeychainAccessLog {
     public static var callCount: Int { lock.withLock { count } }
     public static func forbid() { lock.withLock { forbidden = true } }
 
-    fileprivate static func record(_ call: String) {
+    static func record(_ call: String) {
         let trap = lock.withLock { count += 1; return forbidden }
-        if trap { fatalError("Keychain access (\(call)) is forbidden in this process; use InMemoryOwnerKeyStore or BRAHMA_OWNER_KEY_STORE=file") }
+        if trap { fatalError("Keychain access (\(call)) is forbidden in this process; use InMemoryOwnerKeyStore/MemoryVault or BRAHMA_OWNER_KEY_STORE=file/BRAHMA_SECRET_STORE=file") }
     }
 }
 

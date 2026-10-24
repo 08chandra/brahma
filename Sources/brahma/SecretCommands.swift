@@ -1,9 +1,10 @@
 import ArgumentParser
 import Foundation
 import BrahmaCore
+import BrahmaKeychain
 
-/// Owner-side secrets. Values go to the vault (the macOS Keychain), never to the database, and never into an agent's
-/// hands unless they are test keys.
+/// Owner-side secrets. Values go to the vault (the macOS Keychain; a dev/demo home's file store with
+/// `BRAHMA_SECRET_STORE=file`), never to the database, and never into an agent's hands unless they are test keys.
 struct SecretGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "secret", abstract: "Store, list and remove a company's secrets (owner only).",
@@ -26,12 +27,14 @@ struct SecretGroup: ParsableCommand {
             do {
                 if isatty(STDIN_FILENO) != 0 {
                     guard let line = getpass("Value for \(name): ") else { throw SecretError.emptyValue }
-                    value = String(cString: line)
+                    // Not `String(cString:)`, which would repair bytes that are not UTF-8 into a different value.
+                    guard let typed = String(validatingCString: line) else { throw SecretError.notUTF8 }
+                    value = typed
                     guard !value.isEmpty else { throw SecretError.emptyValue }
                 } else {
                     value = try SecretInput.read(from: .standardInput)
                 }
-                try store.setSecret(companyId: selected.id, name: name, value: value, isTest: test, vault: SecretVaults.platformDefault())
+                try store.setSecret(companyId: selected.id, name: name, value: value, isTest: test, vault: try cliSecretVault())
             } catch let e as SecretError {
                 throw fail(e.message)
             }
@@ -79,7 +82,7 @@ struct SecretGroup: ParsableCommand {
             let (store, _) = try openStore()
             let selected = try resolveCompany(store, company)
             do {
-                try store.deleteSecret(companyId: selected.id, name: name, vault: SecretVaults.platformDefault())
+                try store.deleteSecret(companyId: selected.id, name: name, vault: try cliSecretVault())
             } catch let e as SecretError {
                 throw fail(e.message)
             }

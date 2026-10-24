@@ -37,7 +37,8 @@ public final class Store: Sendable {
     /// Called inside the transaction that completes an item (`completeItem`). The outcome-facts observer is always first.
     let observers: [any WorkItemObserver]
     /// Secret values the engine knows, redacted from any agent- or tool-produced text before it is stored. Reloaded by
-    /// `reloadRedactorIfNeeded(vault:)`.
+    /// `reloadRedactorIfNeeded(vault:)`; until its first complete load (when the database had secrets at open) every
+    /// redacting write throws (`secretsHeld`, `SecretError.secretsNotLoaded`).
     public let redactor = Redactor()
 
     public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
@@ -53,6 +54,7 @@ public final class Store: Sendable {
         }
         writer = try DatabasePool(path: path, configuration: config)
         try Migrations.migrator().migrate(writer)
+        try initializeRedactor()
     }
 
     private init(queue: DatabaseQueue, catalog: PackCatalog, lifecycleObservers: [any AgentLifecycleObserver],
@@ -63,6 +65,7 @@ public final class Store: Sendable {
         dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)
+        try initializeRedactor()
     }
 
     public static func inMemory(catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],

@@ -15,6 +15,8 @@ struct BootError: Error {
 struct Booted {
     let model: AppModel
     let ownerKeyStore: any OwnerKeyStore
+    /// The secrets vault (the Keychain, or a dev/demo home's file store with `BRAHMA_SECRET_STORE`, never for the default home).
+    let secretVault: any SecretVault
 }
 
 /// Resolves the helper binaries the embedded engine needs.
@@ -66,20 +68,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do { selection = try PlatformOwnerKeyStore.resolve(paths: paths) } catch {
             return .failure(BootError(path: paths.home.path, message: "\(error)"))
         }
+        let secrets: PlatformSecretVault.Selection
+        do { secrets = try PlatformSecretVault.resolve(paths: paths) } catch {
+            return .failure(BootError(path: paths.home.path, message: "\(error)"))
+        }
         do {
             try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
             let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) {
                 FileHandle.standardError.write(Data(($0 + "\n").utf8))
             }
             let store = try Store(path: paths.database.path, catalog: catalog)
+            // Owner writes from the app fail closed until the secrets are loaded; load them now (the engine retries each tick).
+            if store.secretsHeld { _ = try? store.reloadRedactorIfNeeded(vault: secrets.vault) }
             let model = AppModel(store: store, paths: paths)
-            if let warning = selection.warning {
+            let warnings = [selection.warning, secrets.warning].compactMap { $0 }
+            for warning in warnings {
                 // stderr is invisible to a Finder launch: also the unified log and the window's banner.
                 FileHandle.standardError.write(Data("brahma: \(warning)\n".utf8))
                 log.warning("\(warning, privacy: .public)")
-                model.startupNotice = warning
             }
-            return .success(Booted(model: model, ownerKeyStore: selection.store))
+            if !warnings.isEmpty { model.startupNotice = warnings.joined(separator: "; ") }
+            return .success(Booted(model: model, ownerKeyStore: selection.store, secretVault: secrets.vault))
         } catch {
             return .failure(BootError(path: paths.database.path, message: "\(error)"))
         }
@@ -102,7 +111,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .success(let booted):
             let model = booted.model
             let options = self.options
-            let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: booted.ownerKeyStore)
+            let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: booted.ownerKeyStore,
+                                    secretVault: booted.secretVault)
             model.engine = engine
             let notifier = OwnerNotifier(model: model)
             notifier.openMainWindow = { [weak self] in self?.openMainWindowFromMenu() }

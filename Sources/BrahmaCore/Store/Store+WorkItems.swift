@@ -134,12 +134,12 @@ extension Store {
         guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
         let actor = try resolveActor(db, sender, companyId: companyId)
         _ = try itemType(db, draft.type, company: company)
-        let title = redact(try Self.cleanTitle(draft.title))
-        let description = redact(try Self.limited(draft.description, Self.maxDescription, "the description"))
-        let criteria = redact(try Self.limited(draft.acceptanceCriteria, Self.maxCriteria, "the acceptance criteria"))
+        let title = try redact(try Self.cleanTitle(draft.title))
+        let description = try redact(try Self.limited(draft.description, Self.maxDescription, "the description"))
+        let criteria = try redact(try Self.limited(draft.acceptanceCriteria, Self.maxCriteria, "the acceptance criteria"))
         try draft.checkSpec?.validate()
         try CheckSpec.validatePaths(draft.touchPaths, what: "touch")
-        let checkSpec = redact(draft.checkSpec)
+        let checkSpec = try redact(draft.checkSpec)
         let priority = try Self.validPriority(draft.priority)
         let points = try Self.validPoints(draft.points)
         let team = try Self.validTeam(draft.team)
@@ -220,7 +220,7 @@ extension Store {
     }
 
     func updateWorkItem(db: Database, id: String, by sender: Sender, patch: WorkItemPatch, now: Date) throws -> WorkItem {
-        let patch = redacted(patch)
+        let patch = try redacted(patch)
         guard var item = try WorkItem.fetchOne(db, key: id) else { throw WorkError.notFound("no such work item") }
         guard let company = try Company.fetchOne(db, key: item.companyId) else { throw WorkError.notFound("no such company") }
         let actor = try resolveActor(db, sender, companyId: item.companyId)
@@ -404,15 +404,15 @@ extension Store {
     }
 
     /// The patch with secrets redacted from every free-text field, before anything is compared or stored.
-    private func redacted(_ patch: WorkItemPatch) -> WorkItemPatch {
+    private func redacted(_ patch: WorkItemPatch) throws -> WorkItemPatch {
         var p = patch
-        p.title = redact(p.title)
-        p.description = redact(p.description)
-        p.acceptanceCriteria = redact(p.acceptanceCriteria)
-        if let spec = p.checkSpec { p.checkSpec = .some(redact(spec)) }
-        p.blockedReason = redact(p.blockedReason)
-        if let notes = p.notes { p.notes = .some(redact(notes)) }
-        if let branch = p.linkedBranch { p.linkedBranch = .some(redact(branch)) }
+        p.title = try redact(p.title)
+        p.description = try redact(p.description)
+        p.acceptanceCriteria = try redact(p.acceptanceCriteria)
+        if let spec = p.checkSpec { p.checkSpec = .some(try redact(spec)) }
+        p.blockedReason = try redact(p.blockedReason)
+        if let notes = p.notes { p.notes = .some(try redact(notes)) }
+        if let branch = p.linkedBranch { p.linkedBranch = .some(try redact(branch)) }
         return p
     }
 
@@ -607,7 +607,7 @@ extension Store {
     func recordItemEvent(db: Database, item: WorkItem, actor: String, kind: WorkEventKind, text: String,
                          alsoNotify: [String] = [], alsoNotifyRole: NoticeRecipientRole = .other,
                          assigneeRole: NoticeRecipientRole = .owner, onlyAlsoNotify: Bool = false, now: Date) throws -> WorkItemEvent {
-        let text = redact(text)
+        let text = try redact(text)
         let active = try Self.activeNow(db: db, companyId: item.companyId)
         var event = WorkItemEvent(id: nil, companyId: item.companyId, itemId: item.id, actorId: actor, kind: kind, text: text,
                                   createdAt: now, createdActive: active)

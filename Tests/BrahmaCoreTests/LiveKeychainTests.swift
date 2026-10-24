@@ -36,22 +36,53 @@ struct LiveKeychainTests {
     }
 }
 
-/// Touches the real login Keychain, so it is off unless `BRAHMA_LIVE_KEYCHAIN=1`. Uses a unique company id and removes its item.
+/// The secrets vault's one live test (off unless `BRAHMA_LIVE_KEYCHAIN=1`): round trip, then the F1 access-control probe —
+/// `/usr/bin/security` is not on the item's trusted-application list, so it must never print the value (a prompt, a denial or
+/// the 5 s timeout all count as "not read"). Uses a unique company id and always deletes its item.
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1", "set BRAHMA_LIVE_KEYCHAIN=1"))
 struct LiveKeychainVaultTests {
-    @Test
-    func roundTripsUpdatesAndDeletes() throws {
+    /// Runs `/usr/bin/security find-generic-password -w` as a child with a hard 5 s timeout (then SIGKILL) and returns its
+    /// stdout. Output goes to a file, not a pipe, so a stuck child can never block the read.
+    private func securityReads(account: String) throws -> String {
+        let out = FileManager.default.temporaryDirectory.appending(path: "brahma-kc-\(UUID().uuidString).txt")
+        guard FileManager.default.createFile(atPath: out.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { try? FileManager.default.removeItem(at: out) }
+        let sink = try FileHandle(forWritingTo: out)
+        defer { try? sink.close() }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", KeychainVault.service, "-a", account, "-w"]
+        p.standardOutput = sink; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
+        try p.run()
+        if done.wait(timeout: .now() + 5) == .timedOut {
+            kill(p.processIdentifier, SIGKILL)
+            _ = done.wait(timeout: .now() + 2)
+        }
+        return String(decoding: try Data(contentsOf: out), as: UTF8.self)
+    }
+
+    @Test func roundTripsAndOnlyTrustedBinariesRead() throws {
         let vault = KeychainVault()
         let company = "test-\(UUID().uuidString)"
-        defer { try? vault.delete(companyId: company, name: "KC_TEST_KEY") }
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == nil)
-        try vault.set(companyId: company, name: "KC_TEST_KEY", value: "first-value")
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == "first-value")
-        try vault.set(companyId: company, name: "KC_TEST_KEY", value: "päss \"wörd\"/2")
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == "päss \"wörd\"/2")
-        try vault.delete(companyId: company, name: "KC_TEST_KEY")
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == nil)
-        try vault.delete(companyId: company, name: "KC_TEST_KEY")
+        let name = "KC_TEST_KEY", account = "\(company):KC_TEST_KEY"
+        defer { try? vault.delete(companyId: company, name: name) }
+        #expect(try vault.value(companyId: company, name: name) == nil)
+        let first = "first-\(UUID().uuidString)"
+        try vault.set(companyId: company, name: name, value: first)
+        #expect(try vault.value(companyId: company, name: name) == first, "the trusted binary itself reads it")
+        #expect(!(try securityReads(account: account)).contains(first), "/usr/bin/security read the secret without being trusted")
+        // Replacing the value rebuilds the item with the same restricted list.
+        let second = "päss \"wörd\"/\(UUID().uuidString)"
+        try vault.set(companyId: company, name: name, value: second)
+        #expect(try vault.value(companyId: company, name: name) == second)
+        #expect(!(try securityReads(account: account)).contains(second))
+        try vault.delete(companyId: company, name: name)
+        #expect(try vault.value(companyId: company, name: name) == nil)
+        try vault.delete(companyId: company, name: name)
     }
 }
 #endif

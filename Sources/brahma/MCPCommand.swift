@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import BrahmaCore
+import BrahmaKeychain
 
 struct MCP: ParsableCommand {
     static let configuration = CommandConfiguration(
@@ -80,16 +81,23 @@ struct MCP: ParsableCommand {
         // The turn's mode quotas come from its credential row (the strictest when none were recorded), never from this process's
         // environment, and are counted in the database per turn; review and audit turns have none.
         let quotas = reviewItemId == nil && auditTurnId == nil ? context.quotas ?? .strictest : nil
-        // Secrets added or removed by the owner apply to the next tool call, not the next turn.
-        let vault = SecretVaults.platformDefault()
-        let reload: @Sendable () -> Void = {
-            do { try store.reloadRedactorIfNeeded(vault: vault) }
-            catch { FileHandle.standardError.write(Data("brahma mcp: could not reload secrets: \(error)\n".utf8)) }
+        // The secret store is resolved against the database's own home (a dev/demo home's `BRAHMA_SECRET_STORE=file` arrives
+        // through the MCP config; it is refused for the default home). Secrets added or removed by the owner apply to the next
+        // tool call, not the next turn, and every call is refused while any secret is not loaded (fail closed).
+        let secretPaths = BrahmaPaths(home: URL(fileURLWithPath: db).deletingLastPathComponent(),
+                                      workspaces: BrahmaPaths.fromEnvironment().workspaces)
+        let vault: any SecretVault
+        do { vault = try PlatformSecretVault.resolve(paths: secretPaths).vault } catch {
+            FileHandle.standardError.write(Data("brahma mcp: \(error)\n".utf8))
+            throw ExitCode.failure
         }
-        reload()
+        let check: @Sendable () throws -> Void = {
+            try store.prepareForToolCall(vault: vault) { FileHandle.standardError.write(Data("brahma mcp: \($0)\n".utf8)) }
+        }
+        try? check()
         let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId,
                                                    auditTurnId: auditTurnId, quotas: quotas, quotaTurnId: context.turnId,
-                                                   planTurn: planTurn), beforeCall: reload)
+                                                   planTurn: planTurn), beforeCall: check)
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

@@ -10,9 +10,11 @@ public final class MCPServer {
     }()
 
     /// Runs before every tool call (the redactor reload in `brahma mcp`).
-    private let beforeCall: @Sendable () -> Void
+    /// Runs before every tool call (`brahma mcp` reloads secrets here: `Store.prepareForToolCall`); a throw refuses the call
+    /// with the error's text as the tool error.
+    private let beforeCall: @Sendable () throws -> Void
 
-    public init(tools: CompanyTools, beforeCall: @escaping @Sendable () -> Void = {}) {
+    public init(tools: CompanyTools, beforeCall: @escaping @Sendable () throws -> Void = {}) {
         self.tools = tools; self.beforeCall = beforeCall
     }
 
@@ -52,8 +54,7 @@ public final class MCPServer {
             }
             let args = params["arguments"]?.objectValue ?? [:]
             let text: String, isError: Bool
-            beforeCall()
-            do { text = try tools.call(name: name, arguments: args); isError = false }
+            do { try beforeCall(); text = try tools.call(name: name, arguments: args); isError = false }
             catch let e as ToolError { text = e.message; isError = true }
             catch { text = "\(error)"; isError = true }
             return respond(id: id, result: .object([

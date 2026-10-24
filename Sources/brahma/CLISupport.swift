@@ -16,11 +16,46 @@ nonisolated(unsafe) var cliTimeZone: TimeZone = .current
 
 func openStore() throws -> (Store, BrahmaPaths) {
     let paths = BrahmaPaths.fromEnvironment()
+    // The secret store is chosen before anything else: a refused choice fails the command, never falls back.
+    let selection: PlatformSecretVault.Selection
+    do { selection = try PlatformSecretVault.resolve(paths: paths) } catch { throw fail("\(error)") }
+    cliSecretSelection = selection
     try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
     let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
     let store = try Store(path: paths.database.path, catalog: catalog)
     cliTimeZone = store.ownerTimeZone()
+    // Every write of redactable text fails closed until the redactor has loaded the secrets (`Store.secretsHeld`), so an
+    // owner command loads them here when the database has any. An agent's shell (BRAHMA_AGENT_ID) never reads secret
+    // values: its writes keep failing closed.
+    if store.secretsHeld, ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] == nil {
+        do { try store.reloadRedactorIfNeeded(vault: cliSecretVault(), logFailures: false) } catch {
+            FileHandle.standardError.write(Data("brahma: could not load secrets: \(safe("\(error)"))\n".utf8))
+        }
+        let failed = store.redactor.failedNames
+        if !failed.isEmpty {
+            FileHandle.standardError.write(Data("brahma: secrets not loaded (\(safe(failed.joined(separator: ", ")))); commands that store text will refuse\n".utf8))
+        }
+    }
     return (store, paths)
+}
+
+/// The secret store `openStore()` chose for this process (`PlatformSecretVault`: the Keychain, or a dev/demo home's file
+/// store chosen by `BRAHMA_SECRET_STORE`, refused for the default data home and for unknown values).
+nonisolated(unsafe) var cliSecretSelection: PlatformSecretVault.Selection?
+nonisolated(unsafe) private var cliSecretWarned = false
+
+/// The chosen vault; prints the dev/demo warning once, the first time a non-production store is used.
+func cliSecretVault() throws -> any SecretVault {
+    let selection: PlatformSecretVault.Selection
+    if let chosen = cliSecretSelection { selection = chosen } else {
+        do { selection = try PlatformSecretVault.resolve(paths: BrahmaPaths.fromEnvironment()) } catch { throw fail("\(error)") }
+        cliSecretSelection = selection
+    }
+    if let warning = selection.warning, !cliSecretWarned {
+        cliSecretWarned = true
+        FileHandle.standardError.write(Data("brahma: \(safe(warning))\n".utf8))
+    }
+    return selection.vault
 }
 
 /// Resolves a company by name or slug, case-insensitively. Ambiguity lists the matches.

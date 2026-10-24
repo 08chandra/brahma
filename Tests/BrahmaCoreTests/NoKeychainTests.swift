@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@testable import BrahmaCore
 import BrahmaKeychain
 
 /// The login Keychain prompts for a password on every access from a freshly built, ad-hoc-signed binary, so a test
@@ -7,7 +8,10 @@ import BrahmaKeychain
 ///  1. `tempDir()` arms `KeychainAccessLog.forbid()`: any Keychain call later in the process crashes the run.
 ///  2. A process-wide counter of every Security call, asserted to be 0 here (catches calls made before arming).
 ///  3. A source scan: only `LiveKeychainTests.swift` (disabled unless `BRAHMA_LIVE_KEYCHAIN=1`) may use the Keychain
-///     store; every CLI subprocess helper (checked helper by helper, not file by file) must use the file store.
+///     stores (the owner-key store and the secrets vault) or the live secret-store selection; every CLI subprocess helper
+///     (checked helper by helper, not file by file) must use the file stores for both.
+///  4. BrahmaCore holds no Keychain code at all: every Security call lives in BrahmaKeychain, behind `KeychainAccessLog`.
+///     The secrets vault the engine, `brahma mcp` and tests get is injected; library defaults are `UnavailableVault`.
 @Suite struct NoKeychainTests {
     /// True for the deliberate `BRAHMA_LIVE_KEYCHAIN=1` run, which is allowed to touch the Keychain.
     private static let live = ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1"
@@ -21,7 +25,8 @@ import BrahmaKeychain
 
     @Test func onlyTheLiveSuiteUsesTheKeychainStore() throws {
         let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-        let needles = ["KeychainOwnerKeyStore", "PlatformOwnerKeyStore.make", "import Security", "SecItem"]
+        let needles = ["KeychainOwnerKeyStore", "PlatformOwnerKeyStore.make", "import Security", "SecItem",
+                       "KeychainVault", "PlatformSecretVault.resolve(paths", "SecAccess", "SecTrustedApplication", "SecKeychain"]
         let allowed: Set<String> = ["LiveKeychainTests.swift", "NoKeychainTests.swift", "OwnerKeyTests.swift"]
         var offenders: [String] = []
         for case let file as URL in try #require(FileManager.default.enumerator(at: tests, includingPropertiesForKeys: nil)) {
@@ -29,7 +34,7 @@ import BrahmaKeychain
             let text = try String(contentsOf: file, encoding: .utf8)
             if needles.contains(where: text.contains) { offenders.append(file.lastPathComponent) }
         }
-        #expect(offenders.isEmpty, "tests must use InMemoryOwnerKeyStore or HomeFileOwnerKeyStore: \(offenders)")
+        #expect(offenders.isEmpty, "tests must use InMemoryOwnerKeyStore/HomeFileOwnerKeyStore and MemoryVault/FileVault: \(offenders)")
         // OwnerKeyTests may only name the type to assert the default selection, never construct it or call Security.
         let ownerTests = try String(contentsOf: tests.appending(path: "BrahmaCoreTests/OwnerKeyTests.swift"), encoding: .utf8)
         #expect(!ownerTests.contains("KeychainOwnerKeyStore()"))
@@ -54,6 +59,37 @@ import BrahmaKeychain
         #expect(checked >= 4)
         let support = try String(contentsOf: tests.appending(path: "TestSupport.swift"), encoding: .utf8)
         #expect(support.contains("\"BRAHMA_OWNER_KEY_STORE\": \"file\""))
+        #expect(support.contains("\"BRAHMA_SECRET_STORE\": \"file\""))
+        // The environment the helpers use can never select the Keychain vault.
+        let home = try tempDir()
+        let env = cliEnvironment(home: home)
+        let selection = try PlatformSecretVault.resolve(environment: env, paths: BrahmaPaths.from(environment: env))
+        #expect(selection.kind == .file); #expect(selection.vault is FileVault)
+    }
+
+    @Test func brahmaCoreHasNoKeychainCode() throws {
+        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appending(path: "Sources/BrahmaCore")
+        var offenders: [String] = []
+        var scanned = 0
+        for case let file as URL in try #require(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil)) {
+            guard file.pathExtension == "swift" else { continue }
+            scanned += 1
+            let text = try String(contentsOf: file, encoding: .utf8)
+            for needle in ["import Security", "SecItem", "SecKeychain", "SecAccessCreate", "SecTrustedApplication", "KeychainVault"]
+            where text.contains(needle) { offenders.append("\(file.lastPathComponent): \(needle)") }
+        }
+        #expect(scanned > 50)
+        #expect(offenders.isEmpty, "Keychain code belongs in BrahmaKeychain, behind KeychainAccessLog: \(offenders)")
+    }
+
+    @Test func libraryDefaultsNeverSelectTheKeychainVault() throws {
+        // The Orchestrator's default vault (no argument) and World's are in-memory, never the Keychain.
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        let plain = Orchestrator(store: try Store.inMemory(), runner: FakeTurnRunner(), paths: paths, mcpExecutable: "/x/brahma")
+        #expect(plain.vault is UnavailableVault)
+        #expect(try World().orchestrator.vault is MemoryVault)
     }
 
     @Test func theScanSeesAHelperThatForgetsTheFileStore() {

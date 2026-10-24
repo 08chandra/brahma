@@ -134,7 +134,7 @@ extension Store {
     /// changes nothing. Returns whether the hold changed (callers raise alerts only then).
     @discardableResult
     public func setHold(reason: HoldReason, detail: String, now: Date) throws -> Bool {
-        let detail = redact(detail)
+        let detail = try redact(detail)
         return try writer.write { db in
             let current = try EngineHold.fetchOne(db, key: 1)
             if let current, current.reason.rank >= reason.rank { return false }

@@ -71,7 +71,10 @@ public enum MCPConfig {
                                                 attributes: [.posixPermissions: 0o700])
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
         if let reviewItem { args += ["--review-item", reviewItem] } else if audit { args.append("--audit") }
-        let env = [tokenVariable: turnToken]
+        var env = [tokenVariable: turnToken]
+        // A dev/demo home's file secret store reaches the turn's `brahma mcp` (which resolves it again against its database's
+        // own home, refusing the default home), so its redactor loads the same values as the engine's. Never the agent's env.
+        if ProcessInfo.processInfo.environment[SecretStore.environmentVariable] == "file" { env[SecretStore.environmentVariable] = "file" }
         let config: [String: Any] = ["mcpServers": ["company": [
             "command": executable,
             "args": args,

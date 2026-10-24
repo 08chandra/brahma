@@ -52,6 +52,9 @@ public final class EngineHost {
     @ObservationIgnored private let makeRunner: @Sendable (String) -> any TurnRunning
     @ObservationIgnored private let config: SchedulerConfig
     @ObservationIgnored private let ownerKeyStore: any OwnerKeyStore
+    /// Where secret values live, for the engine's redactor: the app passes the vault `PlatformSecretVault` chose (the
+    /// Keychain, or a dev/demo home's file store). The default is `UnavailableVault`, never the Keychain.
+    @ObservationIgnored private let secretVault: any SecretVault
     @ObservationIgnored private let probe: @Sendable (String) async -> DoctorReport
     /// Retry's probe: always a real run, never the saved report.
     @ObservationIgnored private let freshProbe: @Sendable (String) async -> DoctorReport
@@ -65,8 +68,9 @@ public final class EngineHost {
                 config: SchedulerConfig = .init(), tickInterval: Duration = .seconds(1),
                 probe: (@Sendable (String) async -> DoctorReport)? = nil,
                 freshProbe: (@Sendable (String) async -> DoctorReport)? = nil,
-                ownerKeyStore: any OwnerKeyStore) {
+                ownerKeyStore: any OwnerKeyStore, secretVault: any SecretVault = UnavailableVault()) {
         self.ownerKeyStore = ownerKeyStore
+        self.secretVault = secretVault
         self.probe = probe ?? { [store] path in
             await Doctor.ensure(store: store, claudePath: path, runner: ClaudeProcessRunner(claudePath: path))
         }
@@ -118,7 +122,7 @@ public final class EngineHost {
         lock = acquired
         let orchestrator = Orchestrator(store: store, runner: makeRunner(resolved.claudePath), paths: paths, config: config,
                                         mcpExecutable: resolved.mcpExecutable, profile: .workspace,
-                                        claudePath: resolved.claudePath)
+                                        claudePath: resolved.claudePath, vault: secretVault)
         do {
             try await orchestrator.start()
         } catch {
