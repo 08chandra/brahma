@@ -65,7 +65,10 @@ public struct HomeRestoreResult: Equatable, Sendable {
 public enum HomeSnapshot {
     public static let keepDaily = 30
 
-    static let excludedDirectories: Set<String> = ["run", "backups", "tmp", "cache"]
+    /// Top-level directories left out. `owner/` (the owner-key file store's hash) and `secrets/` (the file secret vault's
+    /// state, plaintext in a dev home) are left out so a restore never rolls the owner key back and no secret is copied into a
+    /// backup.
+    static let excludedDirectories: Set<String> = ["run", "backups", "tmp", "cache", "owner", "secrets"]
     static let excludedSuffixes = [".sqlite-wal", ".sqlite-shm", ".sqlite-journal", ".lock"]
     static let preRestorePrefix = ".pre-restore-"
 
@@ -88,6 +91,8 @@ public enum HomeSnapshot {
         if first.hasPrefix(preRestorePrefix) { return true }
         // The live database and its byte copies (`brahma.sqlite.pre-restore-*`, `.restoring`): the database has its own snapshots.
         if parts.count == 1, first.hasPrefix("brahma.sqlite") { return true }
+        // The owner-key file store (`owner.key`, and its `.owner.key.<uuid>` temporaries while it is written).
+        if parts.count == 1, first == "owner.key" || first.hasPrefix(".owner.key.") { return true }
         guard let name = parts.last else { return true }
         return excludedSuffixes.contains { name.hasSuffix($0) }
     }
@@ -117,21 +122,26 @@ public enum HomeSnapshot {
         list(paths: paths).first { $0.date <= date }
     }
 
-    /// The manifest's `files` keys exactly as written (read through `NSDictionary`, which compares keys literally).
-    static func manifestKeys(of info: HomeSnapshotInfo) throws -> [String] {
-        guard let data = try? Data(contentsOf: info.manifestURL),
-              let top = try? JSONSerialization.jsonObject(with: data) as? NSDictionary,
+    /// The manifest's `files` keys exactly as written in `data` (read through `NSDictionary`, which compares keys literally;
+    /// a Swift dictionary would merge NFC and NFD spellings).
+    static func manifestKeys(_ data: Data, name: String) throws -> [String] {
+        guard let top = try? JSONSerialization.jsonObject(with: data) as? NSDictionary,
               let files = top["files"] as? NSDictionary else {
-            throw HomeSnapshotError.damaged("\(info.name) has no readable manifest")
+            throw HomeSnapshotError.damaged("\(name) has no readable manifest")
         }
         return files.allKeys.compactMap { ($0 as? NSString).map { String($0) } }
     }
 
     public static func manifest(of info: HomeSnapshotInfo) throws -> HomeSnapshotManifest {
+        guard let data = try? Data(contentsOf: info.manifestURL) else { throw HomeSnapshotError.damaged("\(info.name) has no readable manifest") }
+        return try manifest(data, name: info.name)
+    }
+
+    static func manifest(_ data: Data, name: String) throws -> HomeSnapshotManifest {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        do { return try decoder.decode(HomeSnapshotManifest.self, from: Data(contentsOf: info.manifestURL)) } catch {
-            throw HomeSnapshotError.damaged("\(info.name) has no readable manifest (\(error))")
+        do { return try decoder.decode(HomeSnapshotManifest.self, from: data) } catch {
+            throw HomeSnapshotError.damaged("\(name) has no readable manifest (\(error))")
         }
     }
 
@@ -350,6 +360,17 @@ public enum HomeSnapshot {
     static func sqliteCopy(in dir: HomeFiles.Directory, _ name: String, relative: String, expected: stat, tmpDir: URL,
                            to destination: URL) throws {
         sqliteCopyProbe?(relative)
+        // A rollback-journal database with a hot journal (the journal magic at its start: a writer crashed or is mid-
+        // transaction) would be copied torn without it; it is refused instead. An empty or zeroed (cold) journal is no reason.
+        if HomeFiles.status(dir, name + "-journal") != nil {
+            let journal = try HomeFiles.openRead(dir, name + "-journal")
+            defer { close(journal) }
+            var head = [UInt8](repeating: 0, count: 8)
+            let n = head.withUnsafeMutableBytes { read(journal, $0.baseAddress!, 8) }
+            if n == 8, head == [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7] {
+                throw HomeSnapshotError.io("has a hot rollback journal (\(name)-journal); not copied until SQLite has recovered it")
+            }
+        }
         func same(_ a: stat, _ b: stat) -> Bool { a.st_dev == b.st_dev && a.st_ino == b.st_ino }
         func unchanged(_ a: stat, _ b: stat) -> Bool { a.st_size == b.st_size && modificationNs(a) == modificationNs(b) }
         let staging = tmpDir.appending(path: "sqlite-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -442,7 +463,11 @@ public enum HomeSnapshot {
         // The keys exactly as written (a Swift dictionary would merge NFC and NFD spellings): each must be a valid path, and no
         // two may name one file once case and normalization are ignored.
         var seen: [String: String] = [:]
-        for relative in try manifestKeys(of: snapshot) {
+        // One read of MANIFEST.json: the key checks and the entries come from the same bytes.
+        guard let data = try? Data(contentsOf: snapshot.manifestURL) else {
+            throw HomeSnapshotError.damaged("\(snapshot.name) has no readable manifest")
+        }
+        for relative in try manifestKeys(data, name: snapshot.name) {
             if let problem = pathProblem(relative) {
                 throw HomeSnapshotError.damaged("\(String(reflecting: relative)) is not a path a snapshot may hold (\(problem))")
             }
@@ -453,7 +478,7 @@ public enum HomeSnapshot {
             }
             seen[folded] = relative
         }
-        let recorded = try manifest(of: snapshot)
+        let recorded = try manifest(data, name: snapshot.name)
         let entries = recorded.files.sorted(by: { $0.key < $1.key })
         let tree: HomeFiles.Directory
         do { tree = try HomeFiles.root(snapshot.treeURL, create: false) } catch {
@@ -520,7 +545,7 @@ public enum HomeSnapshot {
             let (dirs, name) = parts(relative)
             do {
                 let dir = try homeParents.directory(dirs)
-                if fold(name).hasSuffix(".sqlite") { for suffix in ["-wal", "-shm"] { try moveAside(dir, name + suffix, relative + suffix) } }
+                if fold(name).hasSuffix(".sqlite") { for suffix in ["-wal", "-shm", "-journal"] { try moveAside(dir, name + suffix, relative + suffix) } }
                 try moveAside(dir, name, relative)
             } catch let error as UnsafeEngineFile { refuse(relative, error) }
         }
@@ -529,7 +554,7 @@ public enum HomeSnapshot {
             let dir: HomeFiles.Directory
             do {
                 dir = try homeParents.directory(dirs)
-                if entry.kind == "sqlite" { for suffix in ["-wal", "-shm"] { try moveAside(dir, name + suffix, relative + suffix) } }
+                if entry.kind == "sqlite" { for suffix in ["-wal", "-shm", "-journal"] { try moveAside(dir, name + suffix, relative + suffix) } }
                 try moveAside(dir, name, relative)
             } catch let error as UnsafeEngineFile { refuse(relative, error); continue }
             let staging = ".brahma-restoring-\(UUID().uuidString)"

@@ -420,6 +420,55 @@ import GRDB
         try reader.close()
     }
 
+    // MARK: Fix round 3
+
+    /// X1: the owner-key file store and the file secret vault are never in a snapshot, and a restore never rolls them back.
+    @Test func ownerKeyAndFileVaultExcluded() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo")
+        try rig.put("owner.key", "key v1")
+        try rig.put(".owner.key.0D4C", "key temp")
+        try rig.put("owner/keyhash", "hash v1")
+        try rig.put("secrets/vault.json", #"{"STRIPE_KEY":"sk-plain-secret-0123456789"}"#)
+        let s1 = try rig.take()
+        #expect(try HomeSnapshot.relativeFiles(under: s1.treeURL).sorted() == ["companies/c1/roles/ceo.md"])
+        for relative in ["owner.key", "Owner.Key", ".owner.key.x", "owner/keyhash", "OWNER/keyhash", "secrets/vault.json", "Secrets/x"] {
+            #expect(HomeSnapshot.excluded(relative), "\(relative)")
+        }
+        #expect(!HomeSnapshot.excluded("companies/c1/files/owner.key"))         // only the data home's own key store
+        // A restore leaves the current key and vault alone.
+        try rig.put("owner.key", "key v2")
+        try rig.put("owner/keyhash", "hash v2")
+        try rig.put("secrets/vault.json", "vault v2")
+        _ = try HomeSnapshot.restore(s1, paths: rig.paths, now: rig.clock.next())
+        #expect(rig.read("owner.key") == "key v2" && rig.read("owner/keyhash") == "hash v2" && rig.read("secrets/vault.json") == "vault v2")
+    }
+
+    /// X3: a rollback-journal database with a hot `-journal` is refused (listed), never copied without its journal.
+    @Test func hotJournalRefused() throws {
+        let rig = try Rig()
+        try rig.makeSQLite("archive/acme/rollback.sqlite", rows: ["one"])
+        try rig.makeSQLite("archive/acme/cold.sqlite", rows: ["two"])
+        // A hot journal: the rollback-journal magic, then a torn transaction.
+        var hot = Data([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7])
+        hot.append(Data(repeating: 0x42, count: 600))
+        try hot.write(to: rig.url("archive/acme/rollback.sqlite-journal"))
+        try Data().write(to: rig.url("archive/acme/cold.sqlite-journal"))     // an empty (cold) journal is no reason to refuse
+        let result = try HomeSnapshot.take(paths: rig.paths, now: rig.clock.next())
+        #expect(result.problems.contains { $0.hasPrefix("archive/acme/rollback.sqlite") && $0.contains("journal") }, "\(result.problems)")
+        let manifest = try HomeSnapshot.manifest(of: result.info)
+        #expect(manifest.files["archive/acme/rollback.sqlite"] == nil)
+        #expect(manifest.files["archive/acme/cold.sqlite"] != nil)
+        // On restore, a journal left next to a database the snapshot puts back is moved aside with it (SQLite would otherwise
+        // "roll back" the restored file with it).
+        let outcome = try HomeSnapshot.restore(result.info, paths: rig.paths, now: rig.clock.next())
+        #expect(!FileManager.default.fileExists(atPath: rig.url("archive/acme/cold.sqlite-journal").path))
+        #expect(FileManager.default.fileExists(atPath: outcome.preRestore.appending(path: "archive/acme/cold.sqlite-journal").path))
+        let queue = try BackupService.openForReading(rig.url("archive/acme/cold.sqlite"))
+        #expect(try queue.read { db in try String.fetchAll(db, sql: "SELECT text FROM note") } == ["two"])
+        try queue.close()
+    }
+
     @Test func pruneKeeps30() throws {
         let rig = try Rig()
         try rig.put("companies/c1/roles/ceo.md", "x")

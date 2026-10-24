@@ -236,6 +236,29 @@ import GRDB
         #expect(names.sorted() == ["memo.md"])
     }
 
+    /// X1 + X3: an export never carries the owner-key file store or the file vault, and skips a hot-journal archive database.
+    @Test func exportNeverCopiesOwnerKeyOrVault() throws {
+        let f = try Fixture()
+        let plain = "sk-plain-secret-0123456789"
+        try Fixture.put(f.env.paths.home.appending(path: "owner.key"), "owner key bytes")
+        try Fixture.put(f.env.paths.home.appending(path: "owner/keyhash"), "owner hash")
+        try Fixture.put(f.env.paths.home.appending(path: "secrets/vault.json"), #"{"STRIPE_KEY":"\#(plain)"}"#)
+        let archive = f.env.paths.archiveDir.appending(path: f.acme.slug, directoryHint: .isDirectory)
+        let rollback = try DatabaseQueue(path: archive.appending(path: "rollback.sqlite").path)
+        try rollback.write { db in try db.execute(sql: "CREATE TABLE note (text TEXT); INSERT INTO note VALUES ('x')") }
+        try rollback.close()
+        var hot = Data([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7])
+        hot.append(Data(repeating: 0x42, count: 600))
+        try hot.write(to: archive.appending(path: "rollback.sqlite-journal"))
+        let result = try f.export(f.acme)
+        #expect(result.skipped.contains { $0.contains("rollback.sqlite") && $0.contains("journal") }, "\(result.skipped)")
+        let walker = try #require(FileManager.default.enumerator(at: result.directory, includingPropertiesForKeys: nil))
+        for case let url as URL in walker {
+            #expect(!["owner.key", "keyhash", "vault.json"].contains(url.lastPathComponent), "\(url.path)")
+            if let data = try? Data(contentsOf: url) { #expect(data.range(of: Data(plain.utf8)) == nil, "\(url.path)") }
+        }
+    }
+
     @Test func exportHasNoSecretValues() throws {
         let f = try Fixture()
         let value = "sk-live-SUPERSECRET-9f8e7d6c5b4a"

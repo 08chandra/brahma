@@ -142,7 +142,9 @@ import GRDB
         let run = try runBrahma(["restore", "--at", iso(start.addingTimeInterval(1)), "--with-files"], home: home.url)
         #expect(run.status == 0, "\(run.stdout) \(run.stderr)")
         #expect(run.stdout.contains("files from \(info.name)"), "\(run.stdout)")
-        #expect(run.stdout.components(separatedBy: ": 1 restored").count == 2 && !run.stdout.contains("files restored"), "\(run.stdout)")
+        // The count is printed once, in this format (the snapshot holds the company's files too, so not a fixed number).
+        let countLines = run.stdout.split(separator: "\n").filter { $0.range(of: #"^files from home-.*: \d+ restored$"#, options: .regularExpression) != nil }
+        #expect(countLines.count == 1 && !run.stdout.contains("files restored;"), "\(run.stdout)")
         #expect(run.stdout.contains("5h 7m before the database snapshot"), "\(run.stdout)")
         #expect(run.stdout.contains("warning: not restored: linked/file.md"), "\(run.stdout)")
         #expect(try String(contentsOf: notes, encoding: .utf8) == "v1")
