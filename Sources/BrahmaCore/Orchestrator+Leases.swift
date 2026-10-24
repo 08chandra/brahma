@@ -146,6 +146,8 @@ extension Orchestrator {
                     await noteMainBlocked(companyId: company.id, until: clock().addingTimeInterval(Self.mainBlockedRetry))
                 }
                 log("could not create the worktree of \(item.key): \(error)")
+                store.noteWorktreeSetupFailure(companyId: company.id, what: "the worktree of \(item.key) for @\(agent.name)", error: error,
+                                               now: clock())
                 _ = try? store.releaseLease(itemId: item.id, agentId: agent.id, note: "the worktree could not be created",
                                             undoOwner: wasUnowned, now: clock())
                 failed = item.id

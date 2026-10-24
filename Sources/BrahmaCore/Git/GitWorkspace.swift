@@ -757,6 +757,20 @@ public struct GitWorkspace: Sendable {
         try withLockFile(name: "+main", what: "main", infrastructure: infrastructure, body)
     }
 
+    /// Exclusion for a repository's worktree records (`.git/worktrees/*`), shared by everything that writes them or reads all
+    /// of them: `git worktree add` (it creates `<id>/commondir` empty and fills it in after, and checks every other worktree's
+    /// branch through theirs), `worktree prune` (it deletes a record whose `gitdir` is not written yet), `worktree list` and
+    /// `branch -D`, and the engine's own removals of checkouts and records. Without it two of them in one repository fail
+    /// with "failed to read .git/worktrees/<id>/commondir" or "could not open .../locked". Held inside the caller's
+    /// blocking body: in this process by a per-repository gate (`RepositoryGate`, so the engine and the MCP tools, each with
+    /// their own `GitWorkspace`, take turns), across processes by `<lockDirectory>/+worktrees.lock` (under the data home).
+    /// Re-entrant on its thread. Taken after an item's lock, never before one.
+    private func withWorktreeRecords<T>(_ body: () throws -> T) throws -> T {
+        try RepositoryGate.gate(for: Self.resolved(gitDir)).run { outermost in
+            outermost ? try withLockFile(name: "+worktrees", what: "the worktree records", body) : try body()
+        }
+    }
+
     /// `infrastructure`: a lock that cannot be taken is reported as a `MergeInfrastructureError` (what `body` throws is not).
     private func withLockFile<T>(name: String, what: String, infrastructure: Bool = false, _ body: () throws -> T) throws -> T {
         func failure(_ stderr: String) -> any Error {
@@ -765,7 +779,9 @@ public struct GitWorkspace: Sendable {
         }
         let dir = lockDirectory
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) } catch { throw failure("\(error)") }
-        let fd = open(dir.appending(path: "\(name).lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        // Close-on-exec: a git or check spawned meanwhile must not carry the lock file (the lock itself is released by
+        // `LOCK_UN` below, whoever else still holds a copy of the descriptor).
+        let fd = open(dir.appending(path: "\(name).lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw failure("cannot open the lock file") }
         defer { close(fd) }
         let deadline = Date().addingTimeInterval(lockTimeout)
@@ -779,6 +795,10 @@ public struct GitWorkspace: Sendable {
     }
 
     private func addWorktreeLocked(key: String) throws -> URL {
+        try withWorktreeRecords { try addWorktreeRecorded(key: key) }
+    }
+
+    private func addWorktreeRecorded(key: String) throws -> URL {
         let fm = FileManager.default
         let path = worktreePath(key: key)
         let command = "worktree add \(key)"
@@ -830,11 +850,11 @@ public struct GitWorkspace: Sendable {
             try commitAll(in: worktreePath(key: key), message: "\(key): auto-commit before release")
             // The work is committed. The checkout goes through the walked directory's descriptor, never by a path a link on
             // the way could send elsewhere (so not `git worktree remove`); git then forgets it (`prune`).
-            try removeEngineEntry(key, in: wt, command: command)
+            try withWorktreeRecords { try removeEngineEntry(key, in: wt, command: command) }
         default:
             break
         }
-        try? main.run(["worktree", "prune"])
+        try withWorktreeRecords { _ = try? main.run(["worktree", "prune"]) }
     }
 
     // MARK: Engine checkout places under .brahma
@@ -899,7 +919,7 @@ public struct GitWorkspace: Sendable {
     /// Registered `item/<KEY>` worktrees under `<ws>/.brahma/wt`. Names starting with "." (engine checkouts such as
     /// `.preview`, `.release`, `.merge`) and worktrees on other branches are never listed.
     public func itemWorktrees() throws -> [(key: String, path: URL)] {
-        let listing = try main.run(["worktree", "list", "--porcelain"]).text
+        let listing = try withWorktreeRecords { try main.run(["worktree", "list", "--porcelain"]).text }
         let wt = Self.resolved(worktreesDir)
         var found: [(String, URL)] = []
         var path: String?
@@ -923,7 +943,8 @@ public struct GitWorkspace: Sendable {
 
     public func deleteBranch(key: String) throws {
         try Self.validKey(key)
-        try main.run(["branch", "-D", branch(key: key)])
+        // `branch -D` reads every worktree's record (it refuses a branch checked out anywhere).
+        try withWorktreeRecords { _ = try main.run(["branch", "-D", branch(key: key)]) }
     }
 
     // MARK: Merging into main
@@ -1441,8 +1462,10 @@ public struct GitWorkspace: Sendable {
     private func retireWorkspaceMergeCheckouts() {
         retireLegacyMergeCheckout()
         _ = try? removeEngineItem(mergeDirectory.appending(path: ".merge", directoryHint: .isDirectory))
-        for name in ["-merge", ".merge"] {
-            _ = try? EngineFiles.removeNoFollow(gitDir.appending(path: "worktrees/\(name)"), under: root)
+        _ = try? withWorktreeRecords {
+            for name in ["-merge", ".merge"] {
+                _ = try? EngineFiles.removeNoFollow(gitDir.appending(path: "worktrees/\(name)"), under: root)
+            }
         }
     }
 
@@ -1454,8 +1477,10 @@ public struct GitWorkspace: Sendable {
               let wt = try? engineDirectory(".brahma/wt", command: "worktree remove .merge") else { return }
         // Through the walked directory's descriptor (a link is unlinked, never followed); its admin directory goes with the
         // others in `retireWorkspaceMergeCheckouts`.
-        try? removeEngineEntry(".merge", in: wt, command: "worktree remove .merge")
-        _ = try? main.run(["worktree", "prune"], allowFailure: true)
+        _ = try? withWorktreeRecords {
+            try? removeEngineEntry(".merge", in: wt, command: "worktree remove .merge")
+            _ = try? main.run(["worktree", "prune"], allowFailure: true)
+        }
     }
 
     // MARK: Quarantine of the root checkout
@@ -1657,12 +1682,14 @@ public struct GitWorkspace: Sendable {
     /// crashed run is removed first.
     public func addRunWorktree(runId: String, commit: String) throws -> URL {
         let command = "worktree add \(runId)"
-        let checks = try freshRunPlace(runId: runId, commit: commit, command: command)
-        let path = checkoutPath(runId: runId)
-        try intoPlace(runId, in: checks, mode: 0o700, registered: true, command: command) { _ in
-            try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
+        return try withWorktreeRecords {
+            let checks = try freshRunPlace(runId: runId, commit: commit, command: command)
+            let path = checkoutPath(runId: runId)
+            try intoPlace(runId, in: checks, mode: 0o700, registered: true, command: command) { _ in
+                try main.run(["worktree", "add", "--quiet", "--detach", path.path, commit])
+            }
+            return path
         }
-        return path
     }
 
     /// The merge check of a rebased commit: a `.git`-free export of exactly `commit` at `<exportHome>/run/exports/<runId>`
@@ -1892,8 +1919,10 @@ public struct GitWorkspace: Sendable {
         let command = "worktree remove \(runId)"
         if let exports = existingExports(command: command) { try? removeEngineEntry(runId, in: exports, command: command) }
         guard let checks = existingCheckouts(command: command) else { return }
-        try? removeEngineEntry(runId, in: checks, command: command)
-        _ = try? main.run(["worktree", "prune"], allowFailure: true)
+        _ = try? withWorktreeRecords {
+            try? removeEngineEntry(runId, in: checks, command: command)
+            _ = try? main.run(["worktree", "prune"], allowFailure: true)
+        }
     }
 
     /// Start-up: no check is running, so every leftover run checkout and export goes, and so do the checkouts older engines
@@ -1902,13 +1931,15 @@ public struct GitWorkspace: Sendable {
         if let exports = existingExports(command: "export prune") {
             for name in (try? exports.names()) ?? [] { try? removeEngineEntry(name, in: exports, command: "export prune") }
         }
-        if let checks = existingCheckouts(command: "worktree prune") {
-            for name in (try? checks.names()) ?? [] { try? removeEngineEntry(name, in: checks, command: "worktree prune") }
+        _ = try? withWorktreeRecords {
+            if let checks = existingCheckouts(command: "worktree prune") {
+                for name in (try? checks.names()) ?? [] { try? removeEngineEntry(name, in: checks, command: "worktree prune") }
+            }
+            if let legacy = existingLegacyRunChecks(command: "worktree prune") {
+                for name in (try? legacy.names()) ?? [] { try? removeEngineEntry(name, in: legacy, command: "worktree prune") }
+            }
+            _ = try? main.run(["worktree", "prune"], allowFailure: true)
         }
-        if let legacy = existingLegacyRunChecks(command: "worktree prune") {
-            for name in (try? legacy.names()) ?? [] { try? removeEngineEntry(name, in: legacy, command: "worktree prune") }
-        }
-        _ = try? main.run(["worktree", "prune"], allowFailure: true)
     }
 
     /// The walked `.brahma/wt-check` of an older engine, or nil when nothing is there (it is not created just to be emptied)

@@ -309,6 +309,54 @@ import GRDB
         #expect(try v.dms(to: v.eng).isEmpty)
     }
 
+    /// A submission's checkout git cannot make is the engine's fault, never the item's: the run is inconclusive (queued again,
+    /// nothing counted against the item, no check run on a checkout that does not exist), the owner gets one alert however
+    /// often it repeats, and the check passes once the checkout can be made. The fault injected is the worktree-records race
+    /// itself: another worktree's record caught half-written by `git worktree add` (locked against prune, `commondir` empty).
+    @Test func checkoutSetupFailureIsAnInconclusiveInfraFaultWithOneAlert() async throws {
+        let v = try V()
+        let i = try v.item(reviewer: v.rev)
+        _ = try v.claimAndSubmit(i, v.eng)
+        let record = try halfWrittenWorktreeRecord(in: v.root)
+        try await v.cycle()
+        var runs = try v.runs(i)
+        #expect(runs.map(\.status) == [.inconclusive, .queued])
+        #expect(runs[0].outputTail?.contains("commondir") == true, "\(runs[0].outputTail ?? "")")
+        #expect(v.checks.calls.isEmpty, "nothing ran: there was no checkout")
+        var item = try v.fresh(i)
+        #expect(item.status == .inReview); #expect(item.verifiedCommit == nil)
+        #expect(!(try v.kinds(i).contains(.verificationFailed)))
+        #expect(try worktreeSetupAlerts(v.store, v.company).count == 1)
+        #expect(try v.allTexts().contains { $0.contains("could not set up a git checkout in Acme") })
+        // It happens again: still inconclusive, still one alert.
+        try v.store.advanceActive(companyId: v.company.id, by: 300)
+        try await v.cycle()
+        runs = try v.runs(i)
+        #expect(runs.map(\.status) == [.inconclusive, .inconclusive, .queued])
+        #expect(try worktreeSetupAlerts(v.store, v.company).count == 1)
+        // The records are whole again: the next attempt checks out and passes.
+        try FileManager.default.removeItem(at: record)
+        try v.store.advanceActive(companyId: v.company.id, by: 300)
+        try await v.cycle()
+        runs = try v.runs(i)
+        #expect(runs.map(\.status) == [.inconclusive, .inconclusive, .passed])
+        #expect(v.checks.calls.count == 1)
+        item = try v.fresh(i)
+        #expect(item.verifiedCommit == runs[2].commit); #expect(item.reviewFlags.isEmpty)
+    }
+
+    /// A claim whose worktree git cannot make: the agent is told, the lease goes back, and the owner gets the alert.
+    @Test func claimWorktreeSetupFailureReleasesTheLeaseAndAlerts() throws {
+        let v = try V()
+        let i = try v.item()
+        try v.commitMain(["README.md": "hi"])
+        _ = try halfWrittenWorktreeRecord(in: v.root)
+        let reply = v.failure { try v.tools(v.eng).call(name: "claim_lease", arguments: ["key": .string(i.key)]) }
+        #expect(reply.contains("could not create your worktree"), "\(reply)")
+        #expect(try v.store.lease(itemId: i.id) == nil)
+        #expect(try worktreeSetupAlerts(v.store, v.company).count == 1)
+    }
+
     @Test func infraCheckFailureIsInconclusive() async throws {
         let v = try V()
         let i = try v.item()
@@ -1017,4 +1065,23 @@ private func waitUntil(_ condition: @Sendable () -> Bool) async throws {
         try await Task.sleep(for: .milliseconds(5))
     }
     Issue.record("condition not reached in time")
+}
+
+/// What `git worktree add` leaves for a moment while it registers a worktree: the record's directory, `locked` (so prune
+/// keeps it) and an empty `commondir`. Every other worktree add, `worktree list` and `branch -D` dies on it.
+func halfWrittenWorktreeRecord(in workspace: URL) throws -> URL {
+    let record = workspace.appending(path: ".git/worktrees/zz-half", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: record, withIntermediateDirectories: true)
+    try "initializing\n".write(to: record.appending(path: "locked"), atomically: true, encoding: .utf8)
+    try "/nowhere/zz-half/.git\n".write(to: record.appending(path: "gitdir"), atomically: true, encoding: .utf8)
+    try Data().write(to: record.appending(path: "commondir"))
+    return record
+}
+
+/// The company's open alerts about checkouts the engine could not set up.
+func worktreeSetupAlerts(_ store: Store, _ company: Company) throws -> [Ask] {
+    try store.writer.read { db in
+        try Ask.filter(Column("companyId") == company.id && Column("kind") == AskKind.engineAlert
+                       && Column("subjectId") == Store.engineAlertKey(Store.worktreeSetupAlertReason(company.id))).fetchAll(db)
+    }
 }

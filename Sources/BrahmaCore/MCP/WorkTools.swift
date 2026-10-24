@@ -371,9 +371,10 @@ extension CompanyTools {
             // The baseline of the check's scripts, once per check revision; a reclaim keeps the first one.
             try store.ensureCheckSnapshot(item: target, workspace: ws)
         } catch {
-            // The claim is undone; nothing this call did not create is removed.
+            // The claim is undone; nothing this call did not create is removed. The engine's own fault: the owner hears of it.
             _ = try? store.releaseLease(itemId: target.id, agentId: agentId, note: "the worktree could not be created",
                                         undoOwner: wasUnowned)
+            store.noteWorktreeSetupFailure(companyId: companyId, what: "the worktree of \(target.key) for a claim", error: error)
             throw ToolError(message: "could not create your worktree, so the lease was released: \(error)")
         }
         let until = store.formatTime(lease.expiresAt(activeNow: store.activeNow(companyId: companyId), now: Store.now()))

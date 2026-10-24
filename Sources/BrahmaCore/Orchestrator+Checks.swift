@@ -125,8 +125,12 @@ extension Orchestrator {
             }
             return
         } catch {
+            // The engine could not set up the checkout: its own fault, loud (log and owner alert), and the run is recorded
+            // inconclusive (retried, never counted against the item), never passed or failed.
             await blocking.run { git.removeRunWorktree(runId: run.id) }
             if run.purpose == .merge { await mergeCheckDeferralsEnded(runId: run.id) }
+            store.noteWorktreeSetupFailure(companyId: company.id, what: "the checkout for the check of \(run.commit.prefix(7))",
+                                           error: error, now: clock())
             couldNotRun("could not check out the submitted commit: \(error)")
             return
         }

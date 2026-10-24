@@ -669,13 +669,18 @@ public actor Orchestrator {
             }
         } else if let unavailable = worktreeUnavailable, unavailable.review {
             // A reviewer holds no lease: the missing worktree is an undecided review attempt (three of them escalate), and the
-            // agent waits out the short fixed infrastructure delay.
+            // agent waits out the short fixed infrastructure delay. The engine's own fault: the owner hears of it.
+            store.noteWorktreeSetupFailure(companyId: agent.companyId, what: "the worktree of \(unavailable.key) for its review",
+                                           error: WorktreeSetupError(reason: unavailable.reason), now: now)
             attempt { try store.noteReviewWorktreeFailure(itemId: unavailable.itemId, agentId: agent.id, reason: unavailable.reason, now: now) }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
             end = .interrupted()
         } else if let unavailable = worktreeUnavailable {
             // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
-            // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime.
+            // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime. The engine's
+            // own fault: the owner hears of it.
+            store.noteWorktreeSetupFailure(companyId: agent.companyId, what: "the worktree of \(unavailable.key) for @\(agent.name)'s turn",
+                                           error: WorktreeSetupError(reason: unavailable.reason), now: now)
             if await noteWorktreeFailure(itemId: unavailable.itemId) >= Self.maxWorktreeFailures {
                 await clearWorktreeFailures(itemId: unavailable.itemId)
                 attempt {
@@ -894,6 +899,9 @@ struct SessionUse: Sendable {
 
 /// A leaseholder's worktree is missing and could not be recreated.
 struct WorktreeUnavailable: Error { var itemId: String; var key: String; var reason: String; var review = false }
+
+/// What a worktree that could not be made came to, as text (`WorktreeUnavailable.reason`), for the owner's alert.
+struct WorktreeSetupError: Error, CustomStringConvertible { var reason: String; var description: String { reason } }
 
 enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.
