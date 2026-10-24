@@ -46,3 +46,35 @@ extension Store {
         try? writer.write { db in try alertEngineFile(db: db, problem, companyId: companyId, now: now) }
     }
 }
+
+extension Store {
+    /// The reason that keys a company's alert about git checkouts the engine could not set up.
+    static func worktreeSetupAlertReason(_ companyId: String) -> String { "worktree-setup:\(companyId)" }
+
+    /// A git checkout the engine needed could not be made (an item's worktree for a claim, a dispatch, a lease turn or a review;
+    /// a submission's check checkout). That is the engine's fault, never the work's: the caller defers or retries the work
+    /// (a check is recorded inconclusive), and here it is made loud: a log line and one owner alert per company while that alert
+    /// stays open. Failures that file their own alert add none: git refused to run in the repository (its config), or `main`
+    /// changed outside Brahma. Returns whether an alert was raised; never throws.
+    @discardableResult
+    func noteWorktreeSetupFailure(companyId: String, what: String, error: any Error, now: Date = Store.now()) -> Bool {
+        FileHandle.standardError.write(Data("brahma: could not set up \(what): \(error)\n".utf8))
+        if let git = error as? GitError, git.isRepositoryRefusal { return false }
+        if GitError.isRepositoryRefusal(text: "\(error)") { return false }
+        if let work = error as? WorkError, work.message == Store.mainChangedMessage { return false }
+        let reason = Store.worktreeSetupAlertReason(companyId)
+        let raised = try? writer.write { db -> Bool in
+            guard let company = try Company.fetchOne(db, key: companyId) else { return false }
+            let open = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
+                                      && Column("status") == AskStatus.pendingOwner.rawValue
+                                      && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
+            guard open == 0 else { return false }
+            let text = "Brahma could not set up a git checkout in \(company.name) (\(what)): \(Store.flat("\(error)", max: 400)). "
+                + "This is Brahma's own fault, not the work's: nothing was counted against it and Brahma tries again. If it keeps "
+                + "happening, run `git worktree list` in \(Store.flat(company.workspacePath, max: 200)) and look at .git/worktrees."
+            try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: reason, companyId: companyId)
+            return true
+        }
+        return raised ?? false
+    }
+}

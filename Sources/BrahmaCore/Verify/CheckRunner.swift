@@ -39,7 +39,7 @@ public struct ProcessCheckRunner: CheckRunning {
     }
 
     /// Monotonic uptime (mach absolute time / `CLOCK_MONOTONIC`): excludes time the system spent asleep.
-    public static let uptime: @Sendable () -> TimeInterval = { TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
+    public static let uptime: @Sendable () -> TimeInterval = { AwakeTime.uptime() }
 
     public func run(command: String, workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
                     environment: [String: String]) async -> CheckOutcome {

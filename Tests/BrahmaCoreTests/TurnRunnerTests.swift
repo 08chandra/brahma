@@ -82,7 +82,7 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             exit 4
             """)
         let runner = ClaudeProcessRunner(claudePath: script.path)
-        let start = ContinuousClock.now
+        let start = AwakeTime.now
         do {
             _ = try await collect(runner.run(request(in: dir)))
             Issue.record("expected an error")
@@ -90,7 +90,7 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             #expect(code == 4)
             #expect(stderrTail.contains("fatal: grandchild kept stderr"))
         }
-        #expect(ContinuousClock.now - start < .seconds(20), "bounded by the drain grace, not the grandchild")
+        #expect(AwakeTime.now - start < .seconds(20), "bounded by the drain grace, not the grandchild")
         let grandchild = try #require(Int32(try String(contentsOf: dir.appending(path: "grandchild.txt"), encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(kill(grandchild, 0) == 0, "the grandchild was still holding stderr when the turn ended")
@@ -155,12 +155,12 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
         }
         turn.cancel()
         await turn.value
-        let start = ContinuousClock.now
+        let start = AwakeTime.now
         let polls = PollCounter()
         let waiter = Task { await runner.waitForChildren(pollInterval: .milliseconds(20)) { polls.increment() } }
         waiter.cancel()
         await waiter.value
-        let elapsed = ContinuousClock.now - start
+        let elapsed = AwakeTime.now - start
         // The child ignores SIGTERM until its sleep ends or the 5 s kill grace: an early return would leave it alive, which
         // the check of its pid below observes (no assertion on how long the wait took).
         // A busy-spinning waiter would poll thousands of times; a sleeping one about once per 20 ms.

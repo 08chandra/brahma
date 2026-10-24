@@ -49,14 +49,14 @@ struct LiveSmokeTests {
             mcpExecutable: try brahmaExecutable())
         try await orchestrator.start()
 
-        let deadline = ContinuousClock.now + .seconds(240)
+        let deadline = AwakeTime.now + .seconds(240)
         while true {
             await orchestrator.tick()
-            let remaining = deadline - ContinuousClock.now
+            let remaining = deadline - AwakeTime.now
             try await orchestrator.waitUntilIdle(timeout: max(remaining, .seconds(1)))
             let active = try store.agents(companyId: company.id, states: [.ready, .running, .blocked])
             if active.isEmpty { break }
-            guard ContinuousClock.now < deadline else { Issue.record("timed out; still active: \(active.map(\.name))"); break }
+            guard AwakeTime.now < deadline else { Issue.record("timed out; still active: \(active.map(\.name))"); break }
             try await Task.sleep(for: .seconds(1))
         }
 
@@ -161,9 +161,9 @@ struct LiveSmokeTests {
         let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp)
         try await orchestrator.start()
         let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
-        let deadline = ContinuousClock.now + .seconds(330)
+        let deadline = AwakeTime.now + .seconds(330)
         var finished = false
-        while ContinuousClock.now < deadline {
+        while AwakeTime.now < deadline {
             if try store.workItem(id: item.id)?.status == .done { finished = true; break }
             try await Task.sleep(for: .seconds(2))
         }

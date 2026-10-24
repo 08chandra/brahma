@@ -27,5 +27,11 @@ public final class OrchestratorLock: @unchecked Sendable {
         return OrchestratorLock(fd: fd)
     }
 
-    deinit { close(fd) }
+    /// Unlocked before it is closed. `close` alone frees the lock only once every copy of the descriptor is gone, and a
+    /// child that another thread is spawning holds a copy of each one (`O_CLOEXEC` included) until its exec closes them:
+    /// the lock would outlive this object by that long, and an orchestrator started right after would be refused.
+    deinit {
+        flock(fd, LOCK_UN)
+        close(fd)
+    }
 }

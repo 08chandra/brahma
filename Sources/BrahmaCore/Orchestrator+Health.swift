@@ -46,7 +46,7 @@ extension Orchestrator {
     private func spawn(_ key: String, _ body: @escaping @Sendable () async -> Void) {
         guard healthTasks[key] == nil else { return }
         healthTasks[key] = Task.detached { [self] in
-            await body()
+            await asEngine { await body() }
             await healthTaskDone(key)
         }
     }

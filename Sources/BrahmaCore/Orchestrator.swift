@@ -3,6 +3,9 @@ import GRDB
 
 public enum OrchestratorError: Error, Equatable {
     case idleTimeout(running: Int)
+    /// The engine started git on its actor or the cooperative pool instead of in a `Blocking` body (`EngineGitGuard`): the
+    /// commands, as reported by `waitUntilIdle`.
+    case gitOffBlocking([String])
 }
 
 /// Global scheduler: one per machine, across all companies. Each tick unblocks, applies the usage gate and
@@ -91,10 +94,12 @@ public actor Orchestrator {
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
     public func start() async throws {
-        let now = clock()
-        _ = try store.recoverInterruptedTurns(now: now)
-        try await recoverChecks(now: now)
-        try recoverMerges()
+        try await EngineGitGuard.$engine.withValue(engineId) {
+            let now = clock()
+            _ = try store.recoverInterruptedTurns(now: now)
+            try await recoverChecks(now: now)
+            try await recoverMerges()
+        }
     }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
@@ -104,6 +109,13 @@ public actor Orchestrator {
 
     /// This engine's limit on concurrently running blocking (git) bodies.
     let blocking = Blocking()
+    /// Marks this engine's tasks for `EngineGitGuard`.
+    nonisolated let engineId = UUID().uuidString
+
+    /// Runs `body` as one of this engine's tasks (`EngineGitGuard.engine`); for the detached ones, which inherit no task-local.
+    nonisolated func asEngine<T: Sendable>(_ body: @Sendable () async throws -> T) async rethrows -> T {
+        try await EngineGitGuard.$engine.withValue(engineId, operation: body)
+    }
     private var idleWaiters: [Int: CheckedContinuation<Void, any Error>] = [:]
     private var nextIdleWaiter = 0
 
@@ -129,13 +141,29 @@ public actor Orchestrator {
         c.resume(throwing: OrchestratorError.idleTimeout(running: runningCount()))
     }
 
+    /// The clock `waitUntilIdle`'s backstop runs on: awake time (`AwakeTime`, the suspending clock), which stands still while
+    /// the Mac sleeps (as a check's timeout does). `Task.sleep(for:)` runs on the continuous clock, which counts the sleep: a
+    /// wait that spans a system sleep then times out on wake with the engine's work merely frozen, not stuck.
+    public static let idleBackstopClock: any Clock<Duration> = AwakeTime.clock
+
     /// Returns once no engine-owned work is in flight, woken by the work finishing (no polling). `timeout` is only a hang
-    /// backstop: when it passes, the throw names (in the log) what is still running.
+    /// backstop, counted in awake time (`idleBackstopClock`): when it passes, the throw names (in the log) what is still running.
     public func waitUntilIdle(timeout: Duration) async throws {
+        try await waitUntilIdle(timeout: timeout, clock: Self.idleBackstopClock)
+    }
+
+    /// `waitUntilIdle` with its backstop on `clock`.
+    public func waitUntilIdle<C: Clock<Duration>>(timeout: Duration, clock: C) async throws {
+        try await waitUntilIdleOnly(timeout: timeout, clock: clock)
+        let offBlocking = EngineGitGuard.takeViolations(engine: engineId)
+        if !offBlocking.isEmpty { throw OrchestratorError.gitOffBlocking(offBlocking) }
+    }
+
+    private func waitUntilIdleOnly<C: Clock<Duration>>(timeout: Duration, clock: C) async throws {
         if isIdle { return }
         let id = nextIdleWaiter; nextIdleWaiter += 1
         let backstop = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
+            try? await clock.sleep(for: timeout)
             await self?.idleWaiterTimedOut(id)
         }
         defer { backstop.cancel() }
@@ -158,10 +186,12 @@ public actor Orchestrator {
 
     /// Synchronous on the actor (no suspension points), so ticks never interleave with each other.
     public func tick() async {
-        do {
-            try schedule(now: clock())
-        } catch {
-            log("tick failed: \(error)")
+        EngineGitGuard.$engine.withValue(engineId) {
+            do {
+                try schedule(now: clock())
+            } catch {
+                log("tick failed: \(error)")
+            }
         }
     }
 
@@ -428,7 +458,9 @@ public actor Orchestrator {
                 turnPrompt = audit.digest
                 toolsKey = "audit"
             } else {
-                var c = try TurnContext.load(store: store, paths: paths, agent: agent, company: company)
+                // Reads the item's recent commits (git): off the cooperative pool.
+                let paths = self.paths
+                var c = try await blocking.tryRun { try TurnContext.load(store: store, paths: paths, agent: agent, company: company) }
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 var checkout: URL?
                 var git: GitWorkspace?
@@ -659,13 +691,18 @@ public actor Orchestrator {
             }
         } else if let unavailable = worktreeUnavailable, unavailable.review {
             // A reviewer holds no lease: the missing worktree is an undecided review attempt (three of them escalate), and the
-            // agent waits out the short fixed infrastructure delay.
+            // agent waits out the short fixed infrastructure delay. The engine's own fault: the owner hears of it.
+            store.noteWorktreeSetupFailure(companyId: agent.companyId, what: "the worktree of \(unavailable.key) for its review",
+                                           error: WorktreeSetupError(reason: unavailable.reason), now: now)
             attempt { try store.noteReviewWorktreeFailure(itemId: unavailable.itemId, agentId: agent.id, reason: unavailable.reason, now: now) }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
             end = .interrupted()
         } else if let unavailable = worktreeUnavailable {
             // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
-            // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime.
+            // `maxWorktreeFailures` in a row the lease is given back instead of retrying for its whole lifetime. The engine's
+            // own fault: the owner hears of it.
+            store.noteWorktreeSetupFailure(companyId: agent.companyId, what: "the worktree of \(unavailable.key) for @\(agent.name)'s turn",
+                                           error: WorktreeSetupError(reason: unavailable.reason), now: now)
             if await noteWorktreeFailure(itemId: unavailable.itemId) >= Self.maxWorktreeFailures {
                 await clearWorktreeFailures(itemId: unavailable.itemId)
                 attempt {
@@ -718,8 +755,9 @@ public actor Orchestrator {
             end = .failed("claude exited without a result")
         }
 
-        // A plan turn must not have changed the worktree: the engine checks and resets before anything else looks at it.
-        if let plan { finishPlanTurn(plan, agent: agent, end: end, now: now) }
+        // A plan turn must not have changed the worktree: the engine checks and resets before anything else looks at it (git,
+        // off the cooperative pool).
+        if let plan { await blocking.run { self.finishPlanTurn(plan, agent: agent, end: end, now: now) } }
 
         // A resumed session that no longer exists: it is reset and the agent is ready again at once (no penalty). The next
         // turn starts a fresh session. A fresh session that is "not found" again is an ordinary failure.
@@ -884,6 +922,9 @@ struct SessionUse: Sendable {
 
 /// A leaseholder's worktree is missing and could not be recreated.
 struct WorktreeUnavailable: Error { var itemId: String; var key: String; var reason: String; var review = false }
+
+/// What a worktree that could not be made came to, as text (`WorktreeUnavailable.reason`), for the owner's alert.
+struct WorktreeSetupError: Error, CustomStringConvertible { var reason: String; var description: String { reason } }
 
 enum TurnEnd {
     /// `usageHold`: the turn completed but also hit the usage limit; if work is pending, the agent waits until then.

@@ -38,7 +38,7 @@ extension Orchestrator {
         let output = paths.companyDir(run.companyId).appending(path: "check-output/\(run.id).log")
         guard let begun = try? store.beginVerification(runId: run.id, outputPath: output.path, now: now) else { return false }
         checkTasks[run.id] = Task.detached { [self] in
-            await performCheck(run: begun)
+            await asEngine { await performCheck(run: begun) }
             await checkEnded(runId: begun.id)
         }
         return true
@@ -121,12 +121,18 @@ extension Orchestrator {
                 }
             }
             if let item = try? await store.writer.read({ try WorkItem.fetchOne($0, key: run.itemId) }) {
-                await companyMergeFault(company: company, item: item, error: Orchestrator.companyFault(error), streak: "check:\(company.id)")
+                let version = await blocking.run { GitWorkspace.installedGitVersion }
+                await companyMergeFault(company: company, item: item, error: Orchestrator.companyFault(error), streak: "check:\(company.id)",
+                                        gitVersion: version)
             }
             return
         } catch {
+            // The engine could not set up the checkout: its own fault, loud (log and owner alert), and the run is recorded
+            // inconclusive (retried, never counted against the item), never passed or failed.
             await blocking.run { git.removeRunWorktree(runId: run.id) }
             if run.purpose == .merge { await mergeCheckDeferralsEnded(runId: run.id) }
+            store.noteWorktreeSetupFailure(companyId: company.id, what: "the checkout for the check of \(run.commit.prefix(7))",
+                                           error: error, now: clock())
             couldNotRun("could not check out the submitted commit: \(error)")
             return
         }

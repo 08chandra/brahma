@@ -174,7 +174,8 @@ public final class EngineHost {
                 once.fire()
             }
             let timer = Task.detached {
-                try? await Task.sleep(for: timeout)
+                // Awake time (`AwakeTime`): a Mac that sleeps while the engine winds down does not cut the wait short.
+                try? await AwakeTime.sleep(for: timeout)
                 once.fire()
             }
             once.onFire { timer.cancel() }

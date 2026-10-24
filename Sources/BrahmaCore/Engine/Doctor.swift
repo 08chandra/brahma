@@ -167,7 +167,7 @@ public enum Doctor {
                 return o
             }
             group.addTask {
-                try? await Task.sleep(for: probeTimeout)
+                try? await AwakeTime.sleep(for: probeTimeout)
                 var o = Outcome()
                 o.error = "timed out after \(probeTimeout.components.seconds) s"
                 return o

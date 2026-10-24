@@ -20,7 +20,7 @@ extension Orchestrator {
                 continue
             }
             mergeTasks[company.id] = Task.detached { [self] in
-                await performMerge(company: company, item: item)
+                await asEngine { await performMerge(company: company, item: item) }
                 await mergeEnded(companyId: company.id)
             }
         }
@@ -30,8 +30,11 @@ extension Orchestrator {
 
     func holdMerges(companyId: String, until: Date) { mergeBackoff[companyId] = until }
 
-    /// Crash recovery: no merge runs at start-up.
-    func recoverMerges() throws { try store.recoverMerges() }
+    /// Crash recovery: no merge runs at start-up. Reads `main` and the installed git's version (git: off the cooperative pool).
+    func recoverMerges() async throws {
+        let store = self.store
+        try await blocking.tryRun { try store.recoverMerges() }
+    }
 
     /// A merge of the company failed for the company's own reasons (the engine's own steps: locks, moving main, the engine's
     /// merge repository, main's history): held for `mergeRetry`. Such a fault is never charged to an item: the item at the head
@@ -39,7 +42,8 @@ extension Orchestrator {
     /// `Store.maxMergeFailures` of them in a row the owner gets one engine alert (resolved when a merge lands).
     /// `streak` names the run of faults counted (the company's landings; a merge check's export counts on its own, so landings
     /// of other items in between never hide its faults).
-    func companyMergeFault(company: Company, item: WorkItem, error: MergeInfrastructureError, streak: String? = nil) {
+    func companyMergeFault(company: Company, item: WorkItem, error: MergeInfrastructureError, streak: String? = nil,
+                           gitVersion: String?) {
         let now = clock()
         holdMerges(companyId: company.id, until: now.addingTimeInterval(Self.mergeRetry))
         let key = streak ?? company.id
@@ -49,7 +53,7 @@ extension Orchestrator {
         do {
             try EngineAlerts.raise(
                 store: store, text: "\(company.name): merges into main are held (\(Store.flat("\(error)", max: 300))); "
-                    + "\(count) attempts in a row failed for Brahma's own reasons (git \(GitCommand.gitVersionText ?? "version unknown")). "
+                    + "\(count) attempts in a row failed for Brahma's own reasons (git \(gitVersion ?? "version unknown")). "
                     + "\(item.key) keeps its approval and its place in the queue; Brahma tries again every minute and the queue moves "
                     + "as soon as the fault clears.",
                 now: now, reason: Store.mergeHoldAlertReason(company.id))
@@ -94,7 +98,8 @@ extension Orchestrator {
             try await blocking.tryRun { try store.finishMerge(itemId: item.id, result: result, now: finished) }
         } catch let error where Self.isCompanyMergeFault(error) {
             log("could not merge \(item.key) (\(company.name)'s merge step failed): \(error)")
-            await companyMergeFault(company: company, item: item, error: Self.companyFault(error))
+            let version = await blocking.run { GitWorkspace.installedGitVersion }
+            await companyMergeFault(company: company, item: item, error: Self.companyFault(error), gitVersion: version)
         } catch {
             log("could not merge \(item.key): \(error)")
             let returned = (try? store.noteMergeFailure(itemId: item.id, error: "\(error)", now: clock())) ?? false

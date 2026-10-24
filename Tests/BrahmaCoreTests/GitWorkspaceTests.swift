@@ -222,14 +222,81 @@ import Foundation
         #expect(fd >= 0); #expect(flock(fd, LOCK_EX) == 0)
         defer { close(fd) }
         ws.lockTimeout = 0
-        let started = Date()
+        let started = AwakeTime.now
         #expect(throws: GitError.self) { try ws.removeWorktree(key: "K-1", keepIf: { false }) }
         #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
-        #expect(Date().timeIntervalSince(started) < 60, "hang guard")
+        #expect(AwakeTime.now - started < .seconds(60), "hang guard")
         #expect(FileManager.default.fileExists(atPath: wt.path))
         // Other items are not affected.
         try ws.addWorktree(key: "K-2")
         try ws.removeWorktree(key: "K-2", keepIf: { false })
+    }
+
+    /// `git worktree add` writes the new worktree's `commondir` after creating it, and every command that reads all of a
+    /// repository's worktrees (another `worktree add`, `worktree list`, `branch -D`) dies on the empty file ("failed to read
+    /// .git/worktrees/<id>/commondir: Undefined error: 0"). Item checkouts, run checkouts, sweeps and prunes of one repository,
+    /// from the engine and the MCP tools at once, must all succeed.
+    @Test func concurrentWorktreeAdministrationOfOneRepositoryAllSucceeds() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let main = try #require(try f.ws.head(of: GitWorkspace.mainRef))
+        // Two separately made values for the same repository, as the engine and the MCP tool path each make their own.
+        let engine = f.ws, tools = f.ws
+        let failures = ErrorBox()
+        let threads = (0..<24).map { t in
+            Thread {
+                let ws = t.isMultiple(of: 2) ? engine : tools
+                for round in 0..<4 {
+                    let n = t * 10 + round
+                    do {
+                        switch (t + round) % 3 {
+                        case 0:
+                            try ws.addWorktree(key: "K-\(n)")
+                            try ws.removeWorktree(key: "K-\(n)", keepIf: { false })
+                            try ws.deleteBranch(key: "K-\(n)")
+                        case 1:
+                            _ = try ws.addRunWorktree(runId: "run-\(n)", commit: main)
+                            ws.removeRunWorktree(runId: "run-\(n)")
+                        default:
+                            _ = try ws.itemWorktrees()
+                            try ws.addWorktree(key: "K-\(n)")
+                            _ = try ws.itemWorktrees()
+                            try ws.removeWorktree(key: "K-\(n)", keepIf: { false })
+                        }
+                    } catch { failures.add("\(error)") }
+                }
+            }
+        }
+        let done = DispatchGroup()
+        for thread in threads {
+            done.enter()
+            let run = thread
+            Thread.detachNewThread { run.start(); while !run.isFinished { usleep(1000) }; done.leave() }
+        }
+        #expect(done.wait(timeout: .now() + 300) == .success, "hang guard")
+        #expect(failures.all.isEmpty, "\(failures.all.count) failed: \(failures.all.prefix(3))")
+        #expect(try f.ws.itemWorktrees().isEmpty)
+        #expect(try f.git(["worktree", "list", "--porcelain"]).components(separatedBy: "\nworktree ").count == 1)
+    }
+
+    /// Another process (the engine, or `brahma mcp`) holds the repository's worktree records: worktree administration here
+    /// waits for it (bounded), and goes ahead once it lets go.
+    @Test func worktreeAdministrationWaitsForAnotherProcessHoldingTheRecords() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var ws = f.ws
+        let main = try #require(try ws.head(of: GitWorkspace.mainRef))
+        try FileManager.default.createDirectory(at: ws.lockDirectory, withIntermediateDirectories: true)
+        let fd = open(ws.lockDirectory.appending(path: "+worktrees.lock").path, O_CREAT | O_RDWR, 0o600)
+        #expect(fd >= 0); #expect(flock(fd, LOCK_EX) == 0)
+        ws.lockTimeout = 0.2
+        #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
+        #expect(throws: GitError.self) { try ws.addRunWorktree(runId: "run-1", commit: main) }
+        #expect(throws: GitError.self) { try ws.itemWorktrees() }
+        #expect(!FileManager.default.fileExists(atPath: ws.worktreePath(key: "K-1").path), "nothing was made while it was held")
+        flock(fd, LOCK_UN); close(fd)
+        let wt = try ws.addWorktree(key: "K-1")
+        #expect(try ws.itemWorktrees().map(\.key) == ["K-1"])
+        try ws.removeWorktree(key: "K-1", keepIf: { false })
+        #expect(!FileManager.default.fileExists(atPath: wt.path))
     }
 
     // MARK: Plan-turn write barrier
@@ -2127,4 +2194,10 @@ import Foundation
         #expect(try String(contentsOf: b.f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == GitCommand.attributesOverride)
         b.ws.removeRunWorktree(runId: "run-1")
     }
+}
+
+final class ErrorBox: @unchecked Sendable {
+    private let lock = NSLock(); private var items: [String] = []
+    func add(_ s: String) { lock.lock(); items.append(s); lock.unlock() }
+    var all: [String] { lock.lock(); defer { lock.unlock() }; return items }
 }

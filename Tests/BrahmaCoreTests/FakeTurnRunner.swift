@@ -104,7 +104,9 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
             return _default
         }
         return AsyncThrowingStream { continuation in
-            let task = Task {
+            // A turn is a child process, not engine work: what its script does (an agent's MCP tool calls, say) runs outside the
+            // engine's tasks, as it would in production (`EngineGitGuard`).
+            let task = Task { await EngineGitGuard.$engine.withValue(nil) {
                 // Leave the concurrency count before the stream ends, so the orchestrator never sees a stale slot.
                 let leave = { self.lock.withLock { self.current -= 1 } }
                 do {
@@ -123,7 +125,7 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
                     leave()
                     continuation.finish(throwing: error)
                 }
-            }
+            } }
             continuation.onTermination = { _ in task.cancel() }
         }
     }
