@@ -95,6 +95,7 @@ final class EventPrinter: @unchecked Sendable {
     private var lastId: Int64
     /// Notices already printed by this process. Printing never marks anything: delivery belongs to the app.
     private var lastNoticeId: Int64 = 0
+    private var printedAsks = Set<String>()
     private var slugs: [String: String] = [:]
     private let lock = NSLock()
 
@@ -124,6 +125,12 @@ final class EventPrinter: @unchecked Sendable {
             let slug = n.companyId.flatMap { slugs[$0] } ?? "all"
             print(safe("notice: [\(slug)] \(n.title): \(n.body)"))
             lastNoticeId = n.id ?? lastNoticeId
+        }
+        // Owner-pending asks, once each per process (read-only: the app's delivery plan owns `notifiedAt`).
+        for company in (try? store.companies()) ?? [] {
+            for ask in (try? store.asks(companyId: company.id, statuses: [.pendingOwner])) ?? [] where printedAsks.insert(ask.id).inserted {
+                print(safe("notice: [\(company.slug)] \(ask.ref) \(ask.kind.title) waits for you: \(ask.title)"))
+            }
         }
         fflush(stdout)
     }

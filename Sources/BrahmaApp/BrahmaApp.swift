@@ -15,7 +15,12 @@ struct BrahmaApp: App {
         MenuBarExtra {
             MenuBarContent(delegate: delegate)
         } label: {
-            Image(systemName: delegate.menuBarSummary?.anyRunningAgents == true ? "circle.hexagongrid.fill" : "circle.hexagongrid")
+            HStack(spacing: BrahmaTheme.spaceXS) {
+                Image(systemName: delegate.menuBarSummary?.anyRunningAgents == true ? "circle.hexagongrid.fill" : "circle.hexagongrid")
+                if let badge = delegate.menuBarSummary?.badge, badge > 0 {
+                    Text(verbatim: "\(badge)").font(BrahmaTheme.mono)
+                }
+            }
         }
         .menuBarExtraStyle(.menu)
     }

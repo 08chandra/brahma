@@ -49,7 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static private(set) weak var current: AppDelegate?
     private var signalSources: [DispatchSourceSignal] = []
     /// Posts the Inbox banners; created at launch once the model exists.
-    private var notifier: OwnerNotifier?
+    private var notifier: UNNotificationPoster?
     /// Set once the bounded engine stop has begun; later quit requests wait on it instead of exiting early.
     private(set) var quitting = false
 
@@ -139,7 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await engine.start(tools: EngineSetup.resolveTools())
                 return engine
             }
-            let notifier = OwnerNotifier(model: model)
+            let notifier = UNNotificationPoster(model: model)
             notifier.openMainWindow = { [weak self] in self?.openMainWindowFromMenu() }
             // Smoke and snapshot runs must never raise the system permission dialog.
             notifier.start(prompt: !options.smokeTest && options.snapshotPath == nil)

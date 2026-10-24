@@ -34,11 +34,17 @@ public final class AppModel {
     public private(set) var search: SearchModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
     public var highlightedMessageId: String?
+    /// The ask a notification banner pointed at (set by `ask:<id>`); the Inbox calls it out.
+    public var highlightedAskId: String?
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
-    /// Runs after each tick that read the database without error (the app posts the Inbox notifications here).
+    /// Runs after each tick that read the database without error.
     @ObservationIgnored public var afterTick: (@MainActor () async -> Void)?
+    /// Posts owner banners. Nil in headless runs and before the app has set one up: nothing is delivered or marked then.
+    @ObservationIgnored public var poster: (any NotificationPosting)?
+    @ObservationIgnored var ticksSinceDelivery = 0
+    @ObservationIgnored var delivering = false
 
     @ObservationIgnored private var ticksSinceTakeoverCheck = 0
     @ObservationIgnored private var cursor: Int64 = 0
@@ -48,6 +54,8 @@ public final class AppModel {
     @ObservationIgnored private var lastDBError: String?
 
     private static let activityCap = 500
+    /// Owner notices are planned on every 4th tick (about every 2 s at the default poll).
+    static let deliveryEvery = 4
 
     public init(store: Store, paths: BrahmaPaths, clock: @escaping @Sendable () -> Date = { .now }) {
         self.store = store
@@ -199,6 +207,11 @@ public final class AppModel {
                 try await refreshSnapshot()
             }
             lastDBError = nil
+            ticksSinceDelivery += 1
+            if ticksSinceDelivery >= Self.deliveryEvery {
+                ticksSinceDelivery = 0
+                await deliverNotices()
+            }
             await afterTick?()
         } catch {
             report(error)
@@ -262,6 +275,9 @@ public final class AppModel {
         case .backlog: select(.backlog)
         case .board: select(.board)
         case .inbox: select(.inbox)
+        case .ask(let id):
+            select(.inbox)
+            highlightedAskId = id
         case .item(let key):
             select(.backlog)
             selectedItemKey = key

@@ -17,6 +17,8 @@ public struct MenuBarSummary: Equatable, Sendable {
     public var engine: String
     public var rows: [MenuCompanyRow]
     public var anyRunningAgents: Bool
+    /// Asks waiting for the owner across all companies (shown next to the menu bar icon when above zero).
+    public var badge: Int = 0
     /// Why nothing is running, for the first running company with nothing running; nil when all is well.
     public var stall: String? = nil
 
@@ -41,7 +43,8 @@ public struct MenuBarSummary: Equatable, Sendable {
             row.stallLine.map { companies.count > 1 ? "\(row.name): \($0)" : $0 }
         }
         return MenuBarSummary(totals: totals, pending: "\(waiting) waiting on you · \(unread) unread",
-                              engine: engineLine(engine), rows: rows, anyRunningAgents: running > 0, stall: stall)
+                              engine: engineLine(engine), rows: rows, anyRunningAgents: running > 0,
+                              badge: companies.reduce(0) { $0 + $1.inboxCount }, stall: stall)
     }
 
     private static func engineLine(_ status: EngineStatus?) -> String {

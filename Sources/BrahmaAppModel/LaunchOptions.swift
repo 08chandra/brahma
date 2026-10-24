@@ -4,6 +4,8 @@ public enum SelectTarget: Equatable, Sendable {
     case missionControl, activity, agents
     case backlog, board, inbox
     case item(key: String)
+    /// `ask:<id>`: the Inbox, with that ask called out.
+    case ask(id: String)
     case agent(handle: String)
     case channel(name: String)
     case dm(handle: String)
@@ -29,6 +31,7 @@ public enum SelectTarget: Equatable, Sendable {
             switch key {
             case "agent": self = .agent(handle: value.lowercased())
             case "item": self = .item(key: value.uppercased())
+            case "ask": self = .ask(id: value)
             case "channel": self = .channel(name: value.lowercased())
             case "dm": self = .dm(handle: value.lowercased())
             case "search": self = .search(value)

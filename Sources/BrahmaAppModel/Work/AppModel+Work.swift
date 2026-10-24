@@ -222,27 +222,6 @@ extension AppModel {
         }
     }
 
-    // MARK: Notifications
-
-    /// Asks waiting for the owner that no banner was shown for yet, in every company.
-    public func dueNotifications() async -> [InboxNotification] {
-        let store = self.store
-        let names = Dictionary(snapshot.companies.map { ($0.id, $0.company.name) }, uniquingKeysWith: { a, _ in a })
-        do {
-            let asks = try await Task.detached { try store.unnotifiedOwnerAsks() }.value
-            return InboxNotifications.due(asks).map { InboxNotifications.content(for: $0, companyName: names[$0.companyId] ?? "Brahma") }
-        } catch {
-            report(error)
-            return []
-        }
-    }
-
-    public func markNotified(_ askIds: [String]) async {
-        guard !askIds.isEmpty else { return }
-        let store = self.store
-        do { try await Task.detached { try store.markAskNotified(ids: askIds) }.value } catch { report(error) }
-    }
-
     // MARK: Internals
 
     /// Runs one owner write off the main actor, then refreshes. A refused write puts its reason in `errorMessage`.
