@@ -222,7 +222,8 @@ public enum TurnProfileCompiler {
             if let system { a += ["--append-system-prompt", system] }
         }
         switch p.permission {
-        case .workspace:
+        case .workspace, .sandboxed:
+            // `sandboxed` keeps the workspace argv until Task 1b compiles the sandbox settings; never looser than workspace.
             a += ["--permission-mode", p.permissionModeOverride ?? "acceptEdits", "--allowed-tools", p.allowedTools.joined(separator: ",")]
             for dir in p.addDirs { a += ["--add-dir", dir] }
         case .full:

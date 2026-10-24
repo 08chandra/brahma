@@ -1,6 +1,8 @@
 import Foundation
 
-public enum PermissionProfile: String, Codable, Sendable { case workspace, full }
+/// How much of the Mac an agent's turn may touch. `sandboxed` (5-lite, the default for new companies) confines every turn to
+/// the `SandboxScope` the engine computes for it; `workspace` is 3a's permission-prompt profile; `full` is the whole Mac.
+public enum PermissionProfile: String, Codable, Sendable, CaseIterable { case workspace, full, sandboxed }
 
 public struct TurnRequest: Sendable {
     public var agent: Agent

@@ -2561,3 +2561,15 @@ public struct ChangeStats: Sendable, Equatable {
 
     public init() {}
 }
+
+// MARK: Standalone repositories
+
+extension GitWorkspace {
+    /// Makes `dir` its own repository on `main` (`git init --quiet --template= -b main` through `GitCommand`): an agent's lab
+    /// (`SandboxLayout.ensure`). No template, so no sample hooks. The caller has walked `dir` as a real directory and checked
+    /// that `dir/.git` does not exist yet. Blocking.
+    static func initStandaloneRepository(at dir: URL) throws {
+        let git = GitCommand(gitDir: dir.appending(path: ".git", directoryHint: .isDirectory), workTree: dir, commonDir: nil)
+        try git.run(["init", "--quiet", "--template=", "-b", "main"])
+    }
+}

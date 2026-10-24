@@ -17,6 +17,18 @@ public struct BrahmaPaths: Sendable, Equatable {
     /// (`GitWorkspace.checkoutPath`).
     public func checkoutDir(runId: String) -> URL { runDir.appending(path: "checkouts/\(runId)", directoryHint: .isDirectory) }
 
+    /// `<home>/run/.sentinel`: the file whose readability tells the agent shell prefix the sandbox is not active (Task 1b).
+    public var sentinel: URL { runDir.appending(path: ".sentinel") }
+
+    /// `<home>/extensions`: the extension store (`store/<id>/<hash12>`), its import staging area and its state.
+    public struct ExtensionDirs: Sendable, Equatable {
+        public let root: URL
+        public var store: URL { root.appending(path: "store", directoryHint: .isDirectory) }
+        public var staging: URL { root.appending(path: "staging", directoryHint: .isDirectory) }
+        public var state: URL { root.appending(path: "state", directoryHint: .isDirectory) }
+    }
+    public var extensionsDir: ExtensionDirs { ExtensionDirs(root: home.appending(path: "extensions", directoryHint: .isDirectory)) }
+
     public var packsDir: URL { home.appending(path: "packs", directoryHint: .isDirectory) }
     /// Not used for checks: their saved scripts live in the workspace under `.brahma/checks` (`CheckPaths`), submission
     /// checkouts under `run/checkouts` (`checkoutDir(runId:)`) and merge-check exports under `run/exports` (`exportDir(runId:)`).

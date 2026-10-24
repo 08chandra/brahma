@@ -647,6 +647,18 @@ enum Migrations {
     /// Plan 5-lite migrations, in the plan's order (v5-sandbox, v5-owner-guard, v5-secrets, v5-extensions, v5-timers,
     /// v5-notices, ...). Called once at the end of `migrator()`, after every 3a migration.
     static func registerPlan5(_ m: inout DatabaseMigrator) {
+        m.registerMigration("v5-sandbox") { db in
+            try db.alter(table: "company") { t in
+                t.add(column: "permissionProfile", .text).notNull().defaults(to: "sandboxed")
+                // JSON: role id → profile.
+                t.add(column: "roleProfiles", .text).notNull().defaults(to: "{}")
+                // JSON arrays of domain patterns / paths.
+                t.add(column: "allowedDomains", .text).notNull().defaults(to: "[]")
+                t.add(column: "webDomains", .text).notNull().defaults(to: "[]")
+                t.add(column: "allowLocalBinding", .boolean).notNull().defaults(to: true)
+                t.add(column: "toolchainReadPaths", .text).notNull().defaults(to: "[]")
+            }
+        }
         m.registerMigration("v5-secrets") { db in
             // Names and flags only; values live in the Keychain (or another SecretVault), never here.
             try db.create(table: "secret") { t in

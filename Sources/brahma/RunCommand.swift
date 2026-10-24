@@ -18,6 +18,8 @@ struct Run: AsyncParsableCommand {
 
     func validate() throws {
         guard hardCap >= 1 else { throw ValidationError("--hard-cap must be at least 1") }
+        // Until the sandbox is wired into turns (Task 1b), `sandboxed` would silently run as `workspace`.
+        guard profile != .sandboxed else { throw ValidationError("--profile sandboxed is not available yet; use workspace or full") }
     }
 
     func run() async throws {

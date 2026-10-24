@@ -216,6 +216,15 @@ public final class Store: Sendable {
             kept.pendingMainCommit = row?["pendingMainCommit"]
             kept.autoMergeCount = row?["autoMergeCount"] ?? 0
             kept.autoMergeSmall = row?["autoMergeSmall"] ?? false
+            // The sandbox settings change only through `updateSandbox` (validated); a copy never overwrites them.
+            if let stored = try Company.fetchOne(db, key: c.id) {
+                kept.permissionProfile = stored.permissionProfile
+                kept.roleProfiles = stored.roleProfiles
+                kept.allowedDomains = stored.allowedDomains
+                kept.webDomains = stored.webDomains
+                kept.allowLocalBinding = stored.allowLocalBinding
+                kept.toolchainReadPaths = stored.toolchainReadPaths
+            }
             try kept.update(db)
         }
     }

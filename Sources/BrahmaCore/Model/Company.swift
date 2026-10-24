@@ -36,4 +36,22 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var autoMergeSmall: Bool = false
     /// The completion rule new sprints use unless the plan names one (the pack's `defaultCadence` at creation).
     public var cadence: CadenceKind = .sprint
+
+    // Sandbox (5-lite, `"v5-sandbox"`). Changed only through `Store.updateSandbox`, which validates them; `updateCompany` keeps
+    // the stored values.
+    /// The company's default profile for every agent turn.
+    public var permissionProfile: PermissionProfile = .sandboxed
+    /// Role id → profile, overriding `permissionProfile` for that role.
+    public var roleProfiles: [String: PermissionProfile] = [:]
+    /// Owner-added Bash egress domains (on top of `CompanyNetwork.defaultRegistries`).
+    public var allowedDomains: [String] = []
+    /// Owner-added WebFetch domains (on top of the registries and `CompanyNetwork.defaultDocs`).
+    public var webDomains: [String] = []
+    /// Whether agent processes may listen on loopback (dev servers, test fixtures).
+    public var allowLocalBinding: Bool = true
+    /// Extra read-only toolchain paths (absolute or `~/…`), readable on every turn when they exist.
+    public var toolchainReadPaths: [String] = []
+
+    /// The profile a turn of an agent with this role runs under: the role's override, else the company's.
+    public func profile(forRole role: String) -> PermissionProfile { roleProfiles[role] ?? permissionProfile }
 }

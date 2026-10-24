@@ -44,6 +44,18 @@ public enum EngineFiles {
         return logical(workspace, relative)
     }
 
+    /// As `directory(workspace:_:)`, then sets the directory's own mode (through its descriptor, never a path) to `mode`.
+    /// Parts created on the way keep the default mode.
+    @discardableResult
+    public static func directory(workspace: URL, _ relative: String, mode: mode_t) throws -> URL {
+        let fd = try openDirectory(workspace: workspace, relative)
+        defer { close(fd) }
+        guard fchmod(fd, mode) == 0 else {
+            throw UnsafeEngineFile(path: logical(workspace, relative).path, problem: "cannot be given mode \(String(mode, radix: 8)) (\(String(cString: strerror(errno))))")
+        }
+        return logical(workspace, relative)
+    }
+
     // MARK: Files
 
     /// What is at `name` in the directory (which is created when missing).
@@ -76,11 +88,11 @@ public enum EngineFiles {
     }
 
     /// Creates `name` with `data`; false when the name is taken (by anything, a link included, which is never followed).
-    public static func create(_ data: Data, workspace: URL, dir relative: String, name: String) throws -> Bool {
+    public static func create(_ data: Data, workspace: URL, dir relative: String, name: String, mode: mode_t = 0o644) throws -> Bool {
         let dfd = try openDirectory(workspace: workspace, relative)
         defer { close(dfd) }
         let shown = logical(workspace, relative).appending(path: name).path
-        return try create(data, dfd: dfd, name: name, shown: shown)
+        return try create(data, dfd: dfd, name: name, shown: shown, mode: mode)
     }
 
     /// Creates `<base>.<ext>`, else `<base>-2.<ext>`, `<base>-3.<ext>` …, and returns its path and every link or odd file found
@@ -103,13 +115,14 @@ public enum EngineFiles {
     /// Writes `data` to `name` atomically (a temporary file renamed over it). Returns the problem when what it replaced was a
     /// link or not a regular file: that thing is gone and was never followed. Throws when the target is a directory.
     @discardableResult
-    public static func replace(_ data: Data, workspace: URL, dir relative: String, name: String) throws -> UnsafeEngineFile? {
+    public static func replace(_ data: Data, workspace: URL, dir relative: String, name: String,
+                               mode: mode_t = 0o644) throws -> UnsafeEngineFile? {
         let dfd = try openDirectory(workspace: workspace, relative)
         defer { close(dfd) }
         let shown = logical(workspace, relative).appending(path: name).path
         let before = try entry(fd: dfd, name: name, shown: shown)
         let temp = ".\(name).tmp-\(UUID().uuidString)"
-        guard try create(data, dfd: dfd, name: temp, shown: shown) else {
+        guard try create(data, dfd: dfd, name: temp, shown: shown, mode: mode) else {
             throw UnsafeEngineFile(path: shown, problem: "cannot be written (its temporary file exists)")
         }
         guard renameat(dfd, temp, dfd, name) == 0 else {
@@ -567,9 +580,9 @@ public enum EngineFiles {
         }
     }
 
-    private static func create(_ data: Data, dfd: Int32, name: String, shown: String) throws -> Bool {
+    private static func create(_ data: Data, dfd: Int32, name: String, shown: String, mode: mode_t = 0o644) throws -> Bool {
         try checkName(name, shown)
-        let fd = openat(dfd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
+        let fd = openat(dfd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode)
         if fd < 0 {
             let err = errno
             if err == EEXIST || err == ELOOP { return false }
