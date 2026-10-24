@@ -55,7 +55,8 @@ struct Run: AsyncParsableCommand {
         let orchestrator = Orchestrator(
             store: store, runner: ClaudeProcessRunner(), paths: paths, config: config,
             mcpExecutable: executable, profile: profile, vault: try cliSecretVault(interactive: false),
-            transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()))
+            transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()),
+            sleepGuard: SleepGuard(launcher: CaffeinateProcess.launcher()))
         try await orchestrator.start()
         // Read before the engine starts, so the first tick's events are printed too.
         let printer = EventPrinter(store: store, startAfter: try store.maxEventId())

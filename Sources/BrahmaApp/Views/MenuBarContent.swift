@@ -24,6 +24,12 @@ struct MenuBarContent: View {
             }
             if !summary.rows.isEmpty { Divider() }
         }
+        if let model = delegate.model {
+            // A native menu item: the theme does not reach an NSMenu, so there is nothing of BrahmaTheme to apply here.
+            Toggle("Prevent sleep while agents run", isOn: Binding(
+                get: { model.preventSleep },
+                set: { value in Task { await model.setPreventSleep(value) } }))
+        }
         Button("Open Brahma") { delegate.openMainWindowFromMenu() }
             .keyboardShortcut("o")
         // Same safe path as the signal handlers: terminate from a run-loop source, never a main-queue block.

@@ -683,6 +683,26 @@ import GRDB
         #expect(!FileManager.default.fileExists(atPath: WALShipper.pidFile(paths: env.paths).path))
     }
 
+    /// The litestream fake starts a grandchild of its own (like litestream's sftp/ssh helpers); stopping the shipper takes the whole
+    /// process group down, with TERM first and KILL after the grace for a leader that ignores TERM.
+    @Test(arguments: [false, true]) func stopKillsTheProcessGroup(ignoreTerm: Bool) async throws {
+        let env = try BackupEnv()
+        let childFile = try tempDir().appending(path: "grandchild.pid")
+        let body = (ignoreTerm ? "trap '' TERM\n" : "") + "sleep 30 &\necho $! > '\(childFile.path)'\nwait"
+        let (_, tools) = try fakeBin(["litestream": body])
+        let shipper = WALShipper(executable: try #require(tools.litestream), paths: env.paths, tools: tools, grace: 0.3)
+        shipper.start()
+        try await waitUntil { recordedPID(env.paths) != nil && FileManager.default.fileExists(atPath: childFile.path) }
+        try await AwakeTime.sleep(for: .milliseconds(200))
+        let leader = try #require(recordedPID(env.paths))
+        let grandchild = try #require(Int32((try String(contentsOf: childFile, encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines)))
+        #expect(pidAlive(leader) && pidAlive(grandchild))
+        shipper.stop()
+        #expect(!pidAlive(leader))
+        try await waitUntil(5) { !pidAlive(grandchild) }
+        #expect(!pidAlive(grandchild), "the litestream child outlived the shipper")
+    }
+
     @Test func stopEscalatesToKill() async throws {
         let env = try BackupEnv()
         let (_, tools) = try fakeBin(["litestream": "trap '' TERM\n" + Self.boundedLoop])

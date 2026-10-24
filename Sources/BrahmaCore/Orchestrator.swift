@@ -115,8 +115,9 @@ public actor Orchestrator {
                 restoreHooks: RestoreHooks = RestoreHooks(),
                 transcripts: TranscriptCapture? = nil,
                 backupTools: BackupTools = .system,
-                walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) }) {
-        self.backupTools = backupTools; self.walSleeper = walSleeper
+                walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) },
+                sleepGuard: SleepGuard = .disabled) {
+        self.backupTools = backupTools; self.walSleeper = walSleeper; self.sleepGuard = sleepGuard
         // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
         let vault = vault.nonInteractive()
         self.pushDispatcher = PushDispatcher(store: store, vault: vault, channel: pushChannel)
@@ -190,6 +191,12 @@ public actor Orchestrator {
     }
 
     deinit { walShipper?.stop() }
+
+    /// Keeps the Mac awake while agents run (the owner's `preventSleep`); ended with the engine (`stopSleepPrevention`).
+    nonisolated let sleepGuard: SleepGuard
+
+    /// Ends caffeinate (the engine is shutting down: `runForever` ends here, and the app's `EngineHost.stop` calls it too).
+    public func stopSleepPrevention() async { await sleepGuard.shutdown() }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
@@ -275,6 +282,7 @@ public actor Orchestrator {
         }
         // The engine is stopping: litestream stops with it (SIGTERM, then SIGKILL after the grace).
         stopWALShipping()
+        await stopSleepPrevention()
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
             + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }
@@ -310,6 +318,8 @@ public actor Orchestrator {
         cfg.planTier = store.planTier()
         cfg.ownerReserve = 1 - store.weeklyShare()
         let companies = try store.companies()
+        // Turns, checks and merges in flight keep the Mac awake (and for a minute after the last one), if the owner allows it.
+        sleepGuard.update(running: runningCount() + otherChildren, enabled: (try? store.ownerPrefs().preventSleep) ?? false, now: now)
         let calibration = try store.usageCalibration()
         let reservedLE = store.openReservationLE()
 

@@ -274,7 +274,7 @@ public final class WALShipper: @unchecked Sendable {
     private let launchProbe: (@Sendable () -> Void)?
     private let lock = NSLock()
     private var task: Task<Void, Never>?
-    private var process: Process?
+    private var process: ProcessGroupChild?
     private var starts = 0
 
     public static func pidFile(paths: BrahmaPaths) -> URL { paths.runDir.appending(path: "litestream.pid") }
@@ -307,7 +307,7 @@ public final class WALShipper: @unchecked Sendable {
 
     /// Stops supervising and ends the child (SIGTERM, `grace`, SIGKILL); returns when it is gone. Blocking.
     public func stop() {
-        let (running, child) = lock.withLock { () -> (Task<Void, Never>?, Process?) in
+        let (running, child) = lock.withLock { () -> (Task<Void, Never>?, ProcessGroupChild?) in
             let pair = (task, process); task = nil; return pair
         }
         guard running != nil || child != nil else { return }                 // never started (or already stopped)
@@ -334,57 +334,65 @@ public final class WALShipper: @unchecked Sendable {
     private func runOnce() async -> Int32 {
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: executable)
-                p.arguments = arguments
-                p.environment = environment
-                p.standardInput = FileHandle.nullDevice
-                p.standardOutput = FileHandle.nullDevice
-                p.standardError = FileHandle.nullDevice
-                p.terminationHandler = { [weak self] finished in
-                    self?.lock.withLock { if self?.process === finished { self?.process = nil } }
-                    continuation.resume(returning: finished.terminationStatus)
-                }
                 launchProbe?()
                 // Launch and publish in one step under the lock: `stop` (which takes the lock) either runs first, and nothing
-                // is launched, or after, and finds a launched process. An unlaunched Process is never terminated.
+                // is launched, or after, and finds a launched process. An unlaunched child is never signalled.
                 lock.lock()
                 guard task != nil, !Task.isCancelled else {
                     lock.unlock()
-                    p.terminationHandler = nil
                     continuation.resume(returning: -2)                      // stopped before it started
                     return
                 }
-                do { try p.run() } catch {
+                // The child leads its own process group, so litestream's own helpers (ssh, sftp) go down with it.
+                let child: ProcessGroupChild
+                do {
+                    child = try ProcessGroupChild.spawn(executable: executable, arguments: [executable] + arguments,
+                                                        environment: environment,
+                                                        workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+                                                        output: -1)
+                } catch {
                     lock.unlock()
-                    p.terminationHandler = nil
                     continuation.resume(returning: -1)
                     return
                 }
                 starts += 1
-                process = p
-                let record = "\(p.processIdentifier)\n\(WALShipping.configURL(paths: paths).path)\n"
+                process = child
+                let record = "\(child.pid)\n\(WALShipping.configURL(paths: paths).path)\n"
                 if (try? TranscriptCapture.writePrivate(Data(record.utf8), to: Self.pidFile(paths: paths))) == nil {
                     note("could not write \(Self.pidFile(paths: paths).path)")
                 }
                 lock.unlock()
+                // Waits for the leader, sweeps what is left of its group, reaps it (nothing is signalled after that).
+                let thread = Thread { [weak self] in
+                    let status = ProcessGroupChild.exitCode(child.finish())
+                    self?.lock.withLock { if self?.process === child { self?.process = nil } }
+                    continuation.resume(returning: status)
+                }
+                thread.name = "brahma-litestream-reaper"
+                thread.start()
             }
         } onCancel: { [weak self] in
-            // Only a launched process is ever published, so this never signals an unlaunched one.
-            self?.lock.withLock { self?.process }?.terminate()
+            // Only a launched child is ever published, so this never signals an unlaunched one.
+            self?.lock.withLock { self?.process }?.signalGroup(SIGTERM)
         }
     }
 
-    /// SIGTERM, up to `grace` awake seconds, SIGKILL, then up to 2 s more for it to be reaped.
-    static func end(_ p: Process, grace: TimeInterval) {
-        guard p.isRunning else { return }
-        p.terminate()
-        let soft = AwakeTime.uptime() + grace
-        while p.isRunning, AwakeTime.uptime() < soft { Thread.sleep(forTimeInterval: 0.01) }
-        guard p.isRunning else { return }
-        kill(p.processIdentifier, SIGKILL)
-        let hard = AwakeTime.uptime() + 2
-        while p.isRunning, AwakeTime.uptime() < hard { Thread.sleep(forTimeInterval: 0.01) }
+    /// SIGTERM to the child's whole process group, up to `grace` awake seconds, SIGKILL to the group, then up to 2 s more for the
+    /// leader to go; what is left in the group is swept before the leader is reaped.
+    static func end(_ child: ProcessGroupChild, grace: TimeInterval) {
+        if !child.hasExited() {
+            child.signalGroup(SIGTERM)
+            let soft = AwakeTime.uptime() + grace
+            while !child.hasExited(), AwakeTime.uptime() < soft { Thread.sleep(forTimeInterval: 0.01) }
+            if !child.hasExited() {
+                child.signalGroup(SIGKILL)
+                let hard = AwakeTime.uptime() + 2
+                while !child.hasExited(), AwakeTime.uptime() < hard { Thread.sleep(forTimeInterval: 0.01) }
+            }
+        }
+        // A leader that ended (TERM was enough) may have left helpers in the group: the sweep kills them. A leader that
+        // survived SIGKILL is not waited for.
+        if child.hasExited() { child.finish() }
     }
 
     /// A litestream an earlier engine left running for this config (named by the pid file): stopped (SIGTERM, `grace`, SIGKILL)

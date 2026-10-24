@@ -24,6 +24,8 @@ public final class AppModel {
     public internal(set) var secretsBanner: String?
     /// The interactive secret store for the owner's Load secrets action (set by the app; nil in tests unless given).
     @ObservationIgnored public var ownerSecretVault: (any SecretVault)?
+    /// The owner's `preventSleep` pref (the menu's "Prevent sleep while agents run"); refreshed every tick.
+    public internal(set) var preventSleep = OwnerPrefs.defaults.preventSleep
     public var activityFilter: ActivityFilter = .all
     /// The item open in the backlog's detail pane (`item:<KEY>`).
     public var selectedItemKey: String?
@@ -180,6 +182,7 @@ public final class AppModel {
             if let engine, engine.status == .external { await engine.retryTakeover() }
         }
         refreshSecrets()
+        await refreshPreventSleep()
         let store = self.store
         let start = cursor
         do {

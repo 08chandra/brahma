@@ -134,7 +134,8 @@ public final class EngineHost {
         let orchestrator = Orchestrator(store: store, runner: makeRunner(resolved.claudePath), paths: paths, config: config,
                                         mcpExecutable: resolved.mcpExecutable, profile: .workspace,
                                         claudePath: resolved.claudePath, vault: secretVault,
-                                        transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()))
+                                        transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()),
+                                        sleepGuard: SleepGuard(launcher: CaffeinateProcess.launcher()))
         do {
             try await orchestrator.start()
         } catch {
@@ -170,6 +171,7 @@ public final class EngineHost {
                 task.cancel()
                 // litestream stops even when a stuck child keeps `runForever` from returning within the timeout.
                 await engine?.stopWALShipping()
+                await engine?.stopSleepPrevention()
                 await Self.waitBounded(task, timeout: timeout)
             }
             engineTask = nil
