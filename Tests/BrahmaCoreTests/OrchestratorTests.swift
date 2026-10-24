@@ -725,6 +725,41 @@ import GRDB
         #expect(await w.orchestrator.runningCount() == 0)
     }
 
+    /// A Mac that sleeps during an idle wait must not expire its hang backstop with the engine's work merely frozen (the
+    /// full-suite `idleTimeout(running: 0)` of a run that spanned two system sleeps): the backstop runs on a clock that stands
+    /// still in sleep, as check timeouts do, so only awake time counts.
+    @Test func idleBackstopCountsOnlyTimeOnAClockThatStandsStillInSleep() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let gate = Gate()
+        w.fake.script("ceo", .init(gate: gate))
+        try w.dm(c, ceo)
+        await w.orchestrator.tick()
+        #expect(await w.orchestrator.runningCount() == 1)
+        // The backstop's clock stands still (the Mac asleep) while far more than the timeout passes on the continuous clock.
+        let asleep = ManualClock()
+        let waiting = Task { try await w.orchestrator.waitUntilIdle(timeout: .milliseconds(50), clock: asleep) }
+        try await Task.sleep(for: .milliseconds(400))
+        gate.open()
+        try await waiting.value
+        #expect(await w.orchestrator.runningCount() == 0)
+
+        // The timeout's worth of time on that clock (awake time) still times a stuck wait out.
+        let stuck = Gate()
+        w.fake.script("ceo", .init(gate: stuck))
+        try w.dm(c, ceo)
+        await w.orchestrator.tick()
+        let awake = ManualClock()
+        let timingOut = Task { try await w.orchestrator.waitUntilIdle(timeout: .seconds(60), clock: awake) }
+        while awake.sleeping == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        awake.advance(by: .seconds(60))
+        await #expect(throws: OrchestratorError.self) { try await timingOut.value }
+        stuck.open()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+
+        // The default clock is the suspending one (it stands still while the Mac sleeps), not the continuous one.
+        #expect(Orchestrator.idleBackstopClock is SuspendingClock)
+    }
+
     // MARK: Work notices
 
     private func ownedItem(_ w: World, _ c: Company, _ owner: Agent) throws -> WorkItem {
