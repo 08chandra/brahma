@@ -11,7 +11,7 @@ private actor Counter {
 }
 
 /// A job that parks until `open()` is called.
-private actor Gate {
+private actor TimerGate {
     private var continuation: CheckedContinuation<Void, Never>?
     private var isOpen = false
     func wait() async {
@@ -219,7 +219,7 @@ private struct TimerWorld {
 
     @Test func jobsDoNotOverlap() async throws {
         let counter = Counter()
-        let gate = Gate()
+        let gate = TimerGate()
         var jobs = TimerJobRegistry.system
         jobs.register("test.slow") { _ in await counter.start(); await gate.wait() }
         let w = try TimerWorld(jobs: jobs)
@@ -319,7 +319,7 @@ private struct TimerWorld {
             let p = Process()
             p.executableURL = url
             p.arguments = args
-            p.environment = ["BRAHMA_HOME": paths.home.path, "BRAHMA_WORKSPACES": paths.workspaces.path, "PATH": "/usr/bin:/bin"]
+            p.environment = cliEnvironment(home: root)
             let out = Pipe()
             p.standardOutput = out
             p.standardError = FileHandle.nullDevice

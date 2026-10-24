@@ -73,7 +73,7 @@ public actor Orchestrator {
     /// Companies whose weekly-pace closure has been logged (cleared when it reopens).
     var loggedPaceClosed = Set<String>()
     /// Timer jobs in flight, by timer id (a job never overlaps itself).
-    var timerTasks: [String: Task<Void, Never>] = [:]
+    var timerTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
     var ensuredTimerCompanies: Set<String>?
 
@@ -1029,7 +1029,7 @@ extension Store {
             var infraClass = InfraClass.none
             switch end {
             case .succeeded(let r, _): summary = redact(r.text)
-            case .capped(let r, _): summary = redact(r.text ?? r.subtype)
+            case .capped(let r, _): summary = redact(r.text ?? r.subtype as String?)
             case .failed(let text, let input, _):
                 summary = redact(text)
                 if let input { infraClass = EngineHealth.classify(input) }

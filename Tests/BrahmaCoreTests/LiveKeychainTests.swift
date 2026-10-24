@@ -35,4 +35,23 @@ struct LiveKeychainTests {
         #expect(store.hash(for: p) == nil)
     }
 }
+
+/// Touches the real login Keychain, so it is off unless `BRAHMA_LIVE_KEYCHAIN=1`. Uses a unique company id and removes its item.
+@Suite(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1", "set BRAHMA_LIVE_KEYCHAIN=1"))
+struct LiveKeychainVaultTests {
+    @Test
+    func roundTripsUpdatesAndDeletes() throws {
+        let vault = KeychainVault()
+        let company = "test-\(UUID().uuidString)"
+        defer { try? vault.delete(companyId: company, name: "KC_TEST_KEY") }
+        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == nil)
+        try vault.set(companyId: company, name: "KC_TEST_KEY", value: "first-value")
+        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == "first-value")
+        try vault.set(companyId: company, name: "KC_TEST_KEY", value: "päss \"wörd\"/2")
+        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == "päss \"wörd\"/2")
+        try vault.delete(companyId: company, name: "KC_TEST_KEY")
+        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == nil)
+        try vault.delete(companyId: company, name: "KC_TEST_KEY")
+    }
+}
 #endif

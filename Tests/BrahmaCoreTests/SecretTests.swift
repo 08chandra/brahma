@@ -329,33 +329,13 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
     }
 }
 
-#if canImport(Security)
-/// Touches the real login Keychain, so it is off unless `BRAHMA_KEYCHAIN_TESTS=1`. Uses a unique company id and removes its item.
-@Suite struct KeychainVaultTests {
-    @Test(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_KEYCHAIN_TESTS"] == "1"))
-    func roundTripsUpdatesAndDeletes() throws {
-        let vault = KeychainVault()
-        let company = "test-\(UUID().uuidString)"
-        defer { try? vault.delete(companyId: company, name: "KC_TEST_KEY") }
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == nil)
-        try vault.set(companyId: company, name: "KC_TEST_KEY", value: "first-value")
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == "first-value")
-        try vault.set(companyId: company, name: "KC_TEST_KEY", value: "päss \"wörd\"/2")
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == "päss \"wörd\"/2")
-        try vault.delete(companyId: company, name: "KC_TEST_KEY")
-        #expect(try vault.value(companyId: company, name: "KC_TEST_KEY") == nil)
-        try vault.delete(companyId: company, name: "KC_TEST_KEY")
-    }
-}
-#endif
-
 @Suite struct SecretCLITests {
     private func brahma(_ args: [String], home: URL, env: [String: String] = [:], stdin: String? = nil) throws
         -> (status: Int32, stdout: String, stderr: String) {
         let p = Process()
         p.executableURL = brahmaExecutableURL()
         p.arguments = args
-        var e = ["BRAHMA_HOME": home.appending(path: "home").path, "BRAHMA_WORKSPACES": home.appending(path: "ws").path, "PATH": "/usr/bin:/bin"]
+        var e = cliEnvironment(home: home)
         e.merge(env) { _, new in new }
         p.environment = e
         let out = Pipe(), err = Pipe(), inp = Pipe()
