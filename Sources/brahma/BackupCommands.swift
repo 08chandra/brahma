@@ -223,7 +223,7 @@ struct RestoreCommand: ParsableCommand {
             }
             for entry in outcome.filesRefused { print(safe("warning: not restored: \(entry)")) }
             if let kept = outcome.filesPreRestore {
-                print(safe("\(outcome.filesRestored) files restored; what they replaced is kept in \(kept.path)"))
+                print(safe("what the files replaced is kept in \(kept.path)"))
             }
             print(safe("restored \(snapshot.lastPathComponent); Brahma re-adopts the repositories when it next starts"))
         } catch { throw fail("\(error)") }
@@ -290,6 +290,7 @@ struct ExportCommand: ParsableCommand {
         do {
             let result = try CompanyExporter.export(store: store, paths: paths, company: c, to: URL(fileURLWithPath: to),
                                                     includeWorkspace: !noWorkspace)
+            for entry in result.skipped { print(safe("warning: not exported: \(entry)")) }
             print(safe("\(c.name): exported to \(result.directory.path)"))
         } catch { throw fail("export failed: \(error)") }
     }

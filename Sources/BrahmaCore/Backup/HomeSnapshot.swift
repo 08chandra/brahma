@@ -66,12 +66,23 @@ public enum HomeSnapshot {
     public static let keepDaily = 30
 
     static let excludedDirectories: Set<String> = ["run", "backups", "tmp", "cache"]
-    static let excludedSuffixes = [".sqlite-wal", ".sqlite-shm", ".lock"]
+    static let excludedSuffixes = [".sqlite-wal", ".sqlite-shm", ".sqlite-journal", ".lock"]
     static let preRestorePrefix = ".pre-restore-"
 
-    /// Whether the path (relative to the data home) is left out of the backup set.
+    /// A name as the file system compares it (APFS is case- and normalization-insensitive by default): NFC, case-folded, NFC.
+    static func fold(_ name: String) -> String {
+        name.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive], locale: nil).precomposedStringWithCanonicalMapping
+    }
+
+    /// `fold` applied to every part of a relative path.
+    static func foldPath(_ relative: String) -> String {
+        relative.split(separator: "/", omittingEmptySubsequences: false).map { fold(String($0)) }.joined(separator: "/")
+    }
+
+    /// Whether the path (relative to the data home) is left out of the backup set. Compared as the file system compares names
+    /// (`fold`): `Brahma.SQLITE`, `RUN/x` or `a.SQLITE-WAL` are left out like their lower-case spellings.
     public static func excluded(_ relative: String) -> Bool {
-        let parts = relative.split(separator: "/").map(String.init)
+        let parts = relative.split(separator: "/").map { fold(String($0)) }
         guard let first = parts.first else { return true }
         if excludedDirectories.contains(first) { return true }
         if first.hasPrefix(preRestorePrefix) { return true }
@@ -104,6 +115,16 @@ public enum HomeSnapshot {
     /// The newest snapshot taken at or before `date`.
     public static func newest(atOrBefore date: Date, paths: BrahmaPaths) -> HomeSnapshotInfo? {
         list(paths: paths).first { $0.date <= date }
+    }
+
+    /// The manifest's `files` keys exactly as written (read through `NSDictionary`, which compares keys literally).
+    static func manifestKeys(of info: HomeSnapshotInfo) throws -> [String] {
+        guard let data = try? Data(contentsOf: info.manifestURL),
+              let top = try? JSONSerialization.jsonObject(with: data) as? NSDictionary,
+              let files = top["files"] as? NSDictionary else {
+            throw HomeSnapshotError.damaged("\(info.name) has no readable manifest")
+        }
+        return files.allKeys.compactMap { ($0 as? NSString).map { String($0) } }
     }
 
     public static func manifest(of info: HomeSnapshotInfo) throws -> HomeSnapshotManifest {
@@ -167,9 +188,16 @@ public enum HomeSnapshot {
 
         let home = try HomeFiles.root(paths.home)
         var walkProblems: [String] = []
+        var seen = Set<String>()
         try walkHome(home, prefix: "", depth: 0, problems: &walkProblems) { dir, leaf, relative, st in
+            // Two names one file system would take for the same file (case or normalization only): the second is left out, so
+            // the manifest never holds keys a restore must refuse.
+            guard seen.insert(foldPath(relative)).inserted else {
+                problems.append("\(String(reflecting: relative)): another file differs from it only in case or Unicode normalization; left out")
+                return
+            }
             let target = tree.appending(path: relative)
-            let isSQLite = relative.hasSuffix(".sqlite")
+            let isSQLite = fold(leaf).hasSuffix(".sqlite")
             let kind = isSQLite ? "sqlite" : "file"
             let size = Int64(st.st_size), mtime = modificationNs(st)
             let old = before?.files[relative]
@@ -187,7 +215,7 @@ public enum HomeSnapshot {
                 if isSQLite {
                     let temp = paths.tmpDir.appending(path: "home-sqlite-\(UUID().uuidString).sqlite")
                     defer { unlink(temp.path) }
-                    try vacuumCopy(in: dir, leaf, expected: st, to: temp)
+                    try sqliteCopy(in: dir, leaf, relative: relative, expected: st, tmpDir: paths.tmpDir, to: temp)
                     let hash = try fileHash(temp)
                     if let old, old.sha == hash, let oldCopy, link(oldCopy.path, target.path) == 0 {
                         linked += 1
@@ -271,7 +299,7 @@ public enum HomeSnapshot {
         }
     }
 
-    private static func modificationNs(_ st: stat) -> Int64 {
+    static func modificationNs(_ st: stat) -> Int64 {
         #if canImport(Darwin)
         Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
         #else
@@ -280,7 +308,7 @@ public enum HomeSnapshot {
     }
 
     /// A new private copy of an open file at `target` (inside the engine's own staging; `O_EXCL`, never through a link).
-    private static func copyFile(from input: Int32, to target: URL) throws {
+    static func copyFile(from input: Int32, to target: URL) throws {
         let output = open(target.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard output >= 0 else { throw HomeSnapshotError.io("cannot create the copy (errno \(errno))") }
         let ok = HomeFiles.copy(from: input, to: output) && fsync(output) == 0
@@ -306,26 +334,66 @@ public enum HomeSnapshot {
         return try HomeFiles.hash(fd: fd, shown: url.lastPathComponent)
     }
 
-    /// `VACUUM INTO` the SQLite file `name` of a home directory held open by the walk. SQLite needs a path, so it is given the
-    /// kernel's path for that directory (every part a real directory when the walk opened it) and the walk checks, before and
-    /// after, that the directory is still in place and `name` is still the same regular file (device and inode): a part or
-    /// the file swapped for a link while it was copied makes the copy fail, and it is thrown away.
-    private static func vacuumCopy(in dir: HomeFiles.Directory, _ name: String, expected: stat, to destination: URL) throws {
-        func same() -> Bool {
-            guard dir.isInPlace, let now = HomeFiles.status(dir, name) else { return false }
-            return now.st_mode & S_IFMT == S_IFREG && now.st_dev == expected.st_dev && now.st_ino == expected.st_ino
+    /// Tests only: called with the file's relative path just before `sqliteCopy` opens it (a seam to swap a part for a link).
+    @TaskLocal static var sqliteCopyProbe: (@Sendable (String) -> Void)?
+
+    /// A consistent, checked copy at `destination` of the SQLite file `name` in a directory held open by a descriptor walk
+    /// (the data home's, or the exporter's). SQLite is never pointed at the original path:
+    /// 1. The file (and its `-wal`, when there is one) is opened relative to the held directory with `O_NOFOLLOW` (a link at
+    ///    the leaf is refused) and must be the regular file the walk saw (`expected`: device and inode).
+    /// 2. Both are copied by descriptor into a private directory under `tmpDir` (0700; the `-shm` is not copied, SQLite
+    ///    rebuilds it from the `-wal`).
+    /// 3. Afterwards the directory must still be in place and both names still the same files; a size or modification-time
+    ///    change during the copy (a live writer) starts the copy over, at most three times.
+    /// 4. Only then is the private copy opened by SQLite: `VACUUM INTO destination` and `integrity_check` (`vacuumCopy`). A
+    ///    file that is not a database is copied as it is.
+    static func sqliteCopy(in dir: HomeFiles.Directory, _ name: String, relative: String, expected: stat, tmpDir: URL,
+                           to destination: URL) throws {
+        sqliteCopyProbe?(relative)
+        func same(_ a: stat, _ b: stat) -> Bool { a.st_dev == b.st_dev && a.st_ino == b.st_ino }
+        func unchanged(_ a: stat, _ b: stat) -> Bool { a.st_size == b.st_size && modificationNs(a) == modificationNs(b) }
+        let staging = tmpDir.appending(path: "sqlite-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try BrahmaPaths.ensurePrivateDirectory(staging)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        let stage = try HomeFiles.root(staging, create: false)
+        let copy = "db.sqlite"
+        var attempt = 0
+        while true {
+            attempt += 1
+            guard dir.isInPlace else { throw HomeSnapshotError.io("moved while it was copied") }
+            let main = try HomeFiles.openRead(dir, name)
+            defer { close(main) }
+            var opened = stat()
+            guard fstat(main, &opened) == 0, same(opened, expected) else { throw HomeSnapshotError.io("replaced while it was copied") }
+            var wal: Int32?
+            if let st = HomeFiles.status(dir, name + "-wal"), st.st_mode & S_IFMT == S_IFREG { wal = try HomeFiles.openRead(dir, name + "-wal") }
+            defer { if let wal { close(wal) } }
+            var walOpened = stat()
+            if let wal { fstat(wal, &walOpened) }
+            unlinkat(stage.fd, copy, 0)
+            unlinkat(stage.fd, copy + "-wal", 0)
+            try HomeFiles.copy(from: main, toNew: stage, copy)
+            if let wal { try HomeFiles.copy(from: wal, toNew: stage, copy + "-wal") }
+            var mainAfter = stat(), walAfter = stat()
+            fstat(main, &mainAfter)
+            if let wal { fstat(wal, &walAfter) }
+            guard dir.isInPlace, let named = HomeFiles.status(dir, name), same(named, opened) else {
+                throw HomeSnapshotError.io("moved or replaced while it was copied")
+            }
+            var quiet = unchanged(mainAfter, opened)
+            if wal != nil {
+                let namedWal = HomeFiles.status(dir, name + "-wal")
+                quiet = quiet && namedWal.map { same($0, walOpened) } == true && unchanged(walAfter, walOpened)
+            }
+            if quiet { break }
+            guard attempt < 3 else { throw HomeSnapshotError.io("kept changing while it was copied") }
         }
-        guard same() else { throw HomeSnapshotError.io("moved or replaced while it was copied") }
-        try vacuumCopy(URL(fileURLWithPath: dir.real).appending(path: name), to: destination)
-        guard same() else {
-            unlink(destination.path)
-            throw HomeSnapshotError.io("moved or replaced while it was copied")
-        }
+        try vacuumCopy(staging.appending(path: copy), to: destination)
     }
 
-    /// `VACUUM INTO` a SQLite file that is not ours alone (a company archive), then `integrity_check` on the copy. A file that is
-    /// not a database at all is copied as it is.
-    static func vacuumCopy(_ source: URL, to destination: URL) throws {
+    /// `VACUUM INTO` a private copy of a SQLite file (`sqliteCopy` made it; nothing else opens it), then `integrity_check` on
+    /// the result. A file that is not a database at all is copied as it is.
+    private static func vacuumCopy(_ source: URL, to destination: URL) throws {
         var config = Configuration()
         config.busyMode = .timeout(5)
         do {
@@ -371,15 +439,24 @@ public enum HomeSnapshot {
     /// by descriptor (`HomeFiles`); throws on the first problem. Changes nothing.
     @discardableResult
     public static func verify(_ snapshot: HomeSnapshotInfo) throws -> HomeSnapshotManifest {
-        let recorded = try manifest(of: snapshot)
-        let entries = recorded.files.sorted(by: { $0.key < $1.key })
-        for (relative, _) in entries {
+        // The keys exactly as written (a Swift dictionary would merge NFC and NFD spellings): each must be a valid path, and no
+        // two may name one file once case and normalization are ignored.
+        var seen: [String: String] = [:]
+        for relative in try manifestKeys(of: snapshot) {
             if let problem = pathProblem(relative) {
                 throw HomeSnapshotError.damaged("\(String(reflecting: relative)) is not a path a snapshot may hold (\(problem))")
             }
+            let folded = foldPath(relative)
+            if let other = seen[folded] {
+                throw HomeSnapshotError.damaged("\(String(reflecting: relative)) is not a path a snapshot may hold (it names the same "
+                    + "file as \(String(reflecting: other)) once case and Unicode normalization are ignored)")
+            }
+            seen[folded] = relative
         }
+        let recorded = try manifest(of: snapshot)
+        let entries = recorded.files.sorted(by: { $0.key < $1.key })
         let tree: HomeFiles.Directory
-        do { tree = try HomeFiles.root(snapshot.treeURL) } catch {
+        do { tree = try HomeFiles.root(snapshot.treeURL, create: false) } catch {
             throw HomeSnapshotError.damaged("\(snapshot.name) has no readable tree (\(error))")
         }
         var parents = HomeFiles.Parents(tree, create: false)
@@ -411,7 +488,7 @@ public enum HomeSnapshot {
         let keepName = preRestorePrefix + BackupService.stamp(now)
         let keepURL = paths.home.appending(path: keepName, directoryHint: .isDirectory)
         let home = try HomeFiles.root(paths.home)
-        let tree = try HomeFiles.root(snapshot.treeURL)
+        let tree = try HomeFiles.root(snapshot.treeURL, create: false)
         var homeParents = HomeFiles.Parents(home, create: true)
         var treeParents = HomeFiles.Parents(tree, create: false)
         var keepRoot: HomeFiles.Directory?
@@ -438,11 +515,12 @@ public enum HomeSnapshot {
         var present: [String] = []
         var ignored: [String] = []
         try walkHome(home, prefix: "", depth: 0, problems: &ignored) { _, _, relative, _ in present.append(relative) }
-        for relative in present where recorded.files[relative] == nil {
+        let recordedFolded = Set(recorded.files.keys.map(foldPath))
+        for relative in present where !recordedFolded.contains(foldPath(relative)) {
             let (dirs, name) = parts(relative)
             do {
                 let dir = try homeParents.directory(dirs)
-                if relative.hasSuffix(".sqlite") { for suffix in ["-wal", "-shm"] { try moveAside(dir, name + suffix, relative + suffix) } }
+                if fold(name).hasSuffix(".sqlite") { for suffix in ["-wal", "-shm"] { try moveAside(dir, name + suffix, relative + suffix) } }
                 try moveAside(dir, name, relative)
             } catch let error as UnsafeEngineFile { refuse(relative, error) }
         }

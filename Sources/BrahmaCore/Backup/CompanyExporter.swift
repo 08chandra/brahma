@@ -18,6 +18,9 @@ public struct ExportResult: Equatable, Sendable {
     public let database: URL
     public let bundle: URL?
     public let copied: [String]
+    /// Archive databases left out because they could not be copied consistently or failed their integrity check, each
+    /// `<path in the export>: <why>`. The rest of the export is complete.
+    public var skipped: [String] = []
 }
 
 /// A self-contained copy of one company: its rows only, its repository as a bundle, and its files and roles.
@@ -68,35 +71,38 @@ public enum CompanyExporter {
             }
         }
 
-        // Files, roles, manifest.
-        let companyDir = paths.companyDir(company.id)
+        // Files, roles, manifest. Every source is read by descriptor from the resolved data home (`HomeFiles`): a link anywhere
+        // on the way, or inside a tree, is never followed.
         var copied: [String] = []
+        var skipped: [String] = []
+        let home = try HomeFiles.root(paths.home, create: false)
+        func source(_ parts: [String]) -> HomeFiles.Directory? { try? HomeFiles.walk(home, parts, create: false) }
         for tree in copiedTrees {
-            let source = companyDir.appending(path: tree, directoryHint: .isDirectory)
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: source.path, isDirectory: &isDir), isDir.boolValue,
-                  !isLink(source) else { continue }
-            try copyTree(from: source, to: staging.appending(path: tree, directoryHint: .isDirectory))
+            guard let dir = source(["companies", company.id, tree]) else { continue }
+            try copyTree(from: dir, to: staging.appending(path: tree, directoryHint: .isDirectory), relative: tree,
+                         sqlite: false, tmpDir: paths.tmpDir, skipped: &skipped)
             copied.append(tree)
         }
-        // Task 13a: the captured work record (already redacted when captured) and the company archive.
-        let homeTrees: [(name: String, source: URL, to: String)] = [
-            ("transcripts", paths.transcriptsDir.appending(path: company.id, directoryHint: .isDirectory), "transcripts/\(company.id)"),
-            ("archive", paths.archiveDir.appending(path: company.slug, directoryHint: .isDirectory), "archive/\(company.slug)"),
+        // Task 13a: the captured work record (already redacted when captured) and the company archive. The archive holds live
+        // SQLite files (Memory-lite writes them, in WAL mode): each is exported from a private, descriptor-made copy as one
+        // consistent `VACUUM INTO` that passes `integrity_check` (`HomeSnapshot.sqliteCopy`); one that cannot be is skipped and
+        // named in `skipped`, and the export goes on.
+        let homeTrees: [(name: String, parts: [String])] = [
+            ("transcripts", ["transcripts", company.id]),
+            ("archive", ["archive", company.slug]),
         ]
         for tree in homeTrees {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: tree.source.path, isDirectory: &isDir), isDir.boolValue, !isLink(tree.source) else { continue }
-            // The archive holds live SQLite files (Memory-lite writes them, in WAL mode): each is exported as one consistent
-            // `VACUUM INTO` copy that passes `integrity_check`, never as raw bytes plus sidecars.
-            try copyTree(from: tree.source, to: staging.appending(path: tree.to, directoryHint: .isDirectory),
-                         sqlite: tree.name == "archive")
+            guard let dir = source(tree.parts) else { continue }
+            let to = tree.parts.joined(separator: "/")
+            try copyTree(from: dir, to: staging.appending(path: to, directoryHint: .isDirectory), relative: to,
+                         sqlite: tree.name == "archive", tmpDir: paths.tmpDir, skipped: &skipped)
             copied.append(tree.name)
         }
         let manifest = staging.appending(path: "MANIFEST.json")
-        let sourceManifest = companyDir.appending(path: "MANIFEST.json")
-        if fm.fileExists(atPath: sourceManifest.path), !isLink(sourceManifest) {
-            try fm.copyItem(at: sourceManifest, to: manifest)
+        if let companyDir = source(["companies", company.id]), HomeFiles.status(companyDir, "MANIFEST.json").map({ $0.st_mode & S_IFMT == S_IFREG }) == true {
+            let input = try HomeFiles.openRead(companyDir, "MANIFEST.json")
+            defer { close(input) }
+            try HomeSnapshot.copyFile(from: input, to: manifest)
         } else {
             var body: [String: Any] = [
                 "format": 1,
@@ -114,10 +120,10 @@ public enum CompanyExporter {
             // Another volume: copy, then the staging directory is removed by the deferred cleanup.
             try fm.copyItem(at: staging, to: destination)
             return ExportResult(directory: destination, database: destination.appending(path: "brahma.sqlite"),
-                                bundle: bundleName.map { destination.appending(path: $0) }, copied: copied)
+                                bundle: bundleName.map { destination.appending(path: $0) }, copied: copied, skipped: skipped)
         }
         return ExportResult(directory: destination, database: destination.appending(path: "brahma.sqlite"),
-                            bundle: bundleName.map { destination.appending(path: $0) }, copied: copied)
+                            bundle: bundleName.map { destination.appending(path: $0) }, copied: copied, skipped: skipped)
     }
 
     /// Reduces a copy of the database to one company.
@@ -149,36 +155,38 @@ public enum CompanyExporter {
 
     private static func quote(_ name: String) -> String { "\"" + name.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
 
-    private static func isLink(_ url: URL) -> Bool {
-        var st = stat()
-        return lstat(url.path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK
-    }
-
-    /// SQLite sidecars: their content is inside the `VACUUM INTO` copy of the database they belong to.
+    /// SQLite sidecars: their content is inside the copy of the database they belong to.
     static let sqliteSidecarSuffixes = [".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
 
-    /// Copies regular files and directories; links, worktrees and caches are left out. With `sqlite`, a `*.sqlite` file is a
-    /// `VACUUM INTO` copy checked with `integrity_check` (`HomeSnapshot.vacuumCopy`; a file that is not a database is copied
-    /// as it is) and its sidecars are left out.
-    static func copyTree(from source: URL, to destination: URL, sqlite: Bool = false) throws {
-        let fm = FileManager.default
+    /// Copies the regular files and directories of a tree held open by a descriptor walk: subdirectories are opened with
+    /// `O_NOFOLLOW` (`child`), files read with `HomeFiles.openRead`; links, worktrees and caches are left out. With `sqlite`, a
+    /// `*.sqlite` file goes through `HomeSnapshot.sqliteCopy` (a private copy, then `VACUUM INTO` and `integrity_check`; one
+    /// that fails is listed in `skipped` and left out) and its sidecars are not copied.
+    static func copyTree(from source: HomeFiles.Directory, to destination: URL, relative: String, sqlite: Bool, tmpDir: URL,
+                         skipped: inout [String], depth: Int = 0) throws {
         try BrahmaPaths.ensurePrivateDirectory(destination)
-        for name in try fm.contentsOfDirectory(atPath: source.path).sorted() where !skippedNames.contains(name) {
-            let from = source.appending(path: name), to = destination.appending(path: name)
-            var st = stat()
-            guard lstat(from.path, &st) == 0 else { continue }
+        guard depth < HomeSnapshot.maxDepth else { return }
+        for name in try source.names().sorted() where !skippedNames.contains(name) {
+            guard let st = HomeFiles.status(source, name) else { continue }
+            let to = destination.appending(path: name), path = relative + "/" + name
+            let folded = HomeSnapshot.fold(name)
             switch st.st_mode & S_IFMT {
-            case S_IFDIR: try copyTree(from: from, to: to, sqlite: sqlite)
-            case S_IFREG where sqlite && sqliteSidecarSuffixes.contains(where: { name.hasSuffix($0) }):
+            case S_IFDIR:
+                guard let child = try? source.child(name) else { continue }
+                try copyTree(from: child, to: to, relative: path, sqlite: sqlite, tmpDir: tmpDir, skipped: &skipped, depth: depth + 1)
+            case S_IFREG where sqlite && sqliteSidecarSuffixes.contains(where: { folded.hasSuffix($0) }):
                 continue
-            case S_IFREG where sqlite && name.hasSuffix(".sqlite"):
-                do { try HomeSnapshot.vacuumCopy(from, to: to) } catch {
-                    throw ExportError.failed("could not export \(name) consistently: \(error)")
+            case S_IFREG where sqlite && folded.hasSuffix(".sqlite"):
+                do { try HomeSnapshot.sqliteCopy(in: source, name, relative: path, expected: st, tmpDir: tmpDir, to: to) } catch {
+                    unlink(to.path)
+                    skipped.append("\(path): \(error)")
                 }
             case S_IFREG:
-                try fm.copyItem(at: from, to: to)
-                chmod(to.path, 0o600)
-            default: continue
+                let input = try HomeFiles.openRead(source, name)
+                defer { close(input) }
+                try HomeSnapshot.copyFile(from: input, to: to)
+            default:
+                continue
             }
         }
     }

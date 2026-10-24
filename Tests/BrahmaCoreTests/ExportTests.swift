@@ -176,6 +176,66 @@ import GRDB
         #expect(stat(exported.path, &st) == 0 && st.st_mode & 0o777 == 0o600)
     }
 
+    /// S4 #2: the exporter copies an archive database from a private, descriptor-made copy: a directory swapped for a link
+    /// between the walk and the copy is refused (listed as skipped), and the outside database never reaches the export.
+    @Test func exportSwapSeamRefused() throws {
+        let f = try Fixture()
+        let archive = f.env.paths.archiveDir.appending(path: f.acme.slug, directoryHint: .isDirectory)
+        let inside = try DatabaseQueue(path: archive.appending(path: "notes.sqlite").path)
+        try inside.write { db in try db.execute(sql: "CREATE TABLE note (text TEXT); INSERT INTO note VALUES ('inside')") }
+        try inside.close()
+        let outside = f.env.root.appending(path: "outside", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let other = try DatabaseQueue(path: outside.appending(path: "notes.sqlite").path)
+        try other.write { db in try db.execute(sql: "CREATE TABLE note (text TEXT); INSERT INTO note VALUES ('OUTSIDE')") }
+        try other.close()
+        let before = try FileManager.default.contentsOfDirectory(atPath: outside.path).sorted()
+        let result = try HomeSnapshot.$sqliteCopyProbe.withValue({ relative in
+            guard relative.hasSuffix("notes.sqlite") else { return }
+            try? FileManager.default.moveItem(at: archive, to: archive.deletingLastPathComponent().appending(path: "moved"))
+            try? FileManager.default.createSymbolicLink(at: archive, withDestinationURL: outside)
+        }) { try f.export(f.acme) }
+        #expect(result.skipped.contains { $0.contains("notes.sqlite") }, "\(result.skipped)")
+        let exported = result.directory.appending(path: "archive/\(f.acme.slug)/notes.sqlite")
+        if let data = try? Data(contentsOf: exported) { #expect(data.range(of: Data("OUTSIDE".utf8)) == nil) }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).sorted() == before)
+    }
+
+    /// Re-review: an unhealthy archive database is skipped and listed; the rest of the export goes on.
+    @Test func exportSkipsUnhealthyArchiveDB() throws {
+        let f = try Fixture()
+        let bad = f.env.paths.archiveDir.appending(path: "\(f.acme.slug)/broken.sqlite")
+        let queue = try DatabaseQueue(path: bad.path)
+        try queue.write { db in
+            try db.execute(sql: "CREATE TABLE note (text TEXT)")
+            for n in 0..<400 { try db.execute(sql: "INSERT INTO note VALUES (?)", arguments: [String(repeating: "x", count: 200) + "\(n)"]) }
+        }
+        try queue.close()
+        // Damage the pages after the first one (the header stays valid, so it is still "a database").
+        let handle = try FileHandle(forWritingTo: bad)
+        try handle.seek(toOffset: 4096 + 100)
+        try handle.write(contentsOf: Data(repeating: 0xA5, count: 8192))
+        try handle.close()
+        let result = try f.export(f.acme)
+        #expect(result.skipped.contains { $0.contains("broken.sqlite") }, "\(result.skipped)")
+        #expect(!FileManager.default.fileExists(atPath: result.directory.appending(path: "archive/\(f.acme.slug)/broken.sqlite").path))
+        #expect(try String(contentsOf: result.directory.appending(path: "archive/\(f.acme.slug)/memo.md"), encoding: .utf8) == "acme archive")
+    }
+
+    /// S4 #2: the exporter's tree walk never follows a link (a linked directory or file inside a copied tree is left out).
+    @Test func exportTreeWalkDoesNotFollowLinks() throws {
+        let f = try Fixture()
+        let outside = f.env.root.appending(path: "outside-tree", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("outside secret".utf8).write(to: outside.appending(path: "secret.txt"))
+        let archive = f.env.paths.archiveDir.appending(path: f.acme.slug, directoryHint: .isDirectory)
+        try FileManager.default.createSymbolicLink(at: archive.appending(path: "linked-dir"), withDestinationURL: outside)
+        try FileManager.default.createSymbolicLink(at: archive.appending(path: "linked.txt"), withDestinationURL: outside.appending(path: "secret.txt"))
+        let result = try f.export(f.acme)
+        let names = try FileManager.default.contentsOfDirectory(atPath: result.directory.appending(path: "archive/\(f.acme.slug)").path)
+        #expect(names.sorted() == ["memo.md"])
+    }
+
     @Test func exportHasNoSecretValues() throws {
         let f = try Fixture()
         let value = "sk-live-SUPERSECRET-9f8e7d6c5b4a"

@@ -283,6 +283,143 @@ import GRDB
         #expect(rig.read("companies/c1/files/..hidden") == "hidden v1")
     }
 
+    // MARK: Fix round 2 (S4 + re-review)
+
+    /// Writes `MANIFEST.json` by hand, so keys a Swift dictionary would merge (NFC vs NFD) can both be present.
+    private func writeManifest(_ info: HomeSnapshotInfo, keys: [String], sha: String) throws {
+        func quoted(_ text: String) throws -> String { String(decoding: try JSONEncoder().encode(text), as: UTF8.self) }
+        let entries = try keys.map { "\(try quoted($0)): {\"size\": 1, \"mtimeNs\": 0, \"sha\": \(try quoted(sha)), \"kind\": \"file\"}" }
+        let text = "{\"format\": 1, \"takenAt\": \"2026-06-10T16:00:00Z\", \"files\": {\(entries.joined(separator: ", "))}}"
+        try Data(text.utf8).write(to: info.manifestURL)
+    }
+
+    /// S4 #1: exclusions and collisions compare case- and normalization-insensitively (APFS is both by default).
+    @Test func manifestCaseAndNormalizationCollisionsRefused() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo v1")
+        let s1 = try rig.take()
+        try rig.put("companies/c1/roles/ceo.md", "ceo v2")
+        let sha = try #require(try HomeSnapshot.manifest(of: s1).files["companies/c1/roles/ceo.md"]).sha
+        let cases: [[String]] = [
+            ["Brahma.SQLITE"], ["BRAHMA.sqlite-wal"], ["RUN/orchestrator.pid"], ["Backups/x"], ["companies/c1/notes.SQLITE-SHM"],
+            ["companies/c1/x.Lock"], ["companies/c1/x.sqlite-journal"], [".Pre-Restore-x/y"],
+            ["companies/c1/Roles/CEO.md"],                                          // differs from the real key only in case
+            ["companies/c1/caf\u{e9}.md", "companies/c1/cafe\u{301}.md"],           // NFC and NFD spellings of one name
+        ]
+        for extra in cases {
+            try writeManifest(s1, keys: ["companies/c1/roles/ceo.md"] + extra, sha: sha)
+            do {
+                _ = try HomeSnapshot.restore(s1, paths: rig.paths, now: rig.clock.next())
+                Issue.record("\(extra) restored")
+            } catch let error as HomeSnapshotError {
+                #expect("\(error)".contains("is not a path a snapshot may hold"), "\(extra): \(error)")
+            }
+            #expect(rig.read("companies/c1/roles/ceo.md") == "ceo v2", "\(extra)")
+        }
+        #expect(HomeSnapshot.excluded("Brahma.SQLITE") && HomeSnapshot.excluded("Cache/x") && HomeSnapshot.excluded("a/b.SQLITE-WAL"))
+        #expect(HomeSnapshot.excluded("a/b.sqlite-journal"))
+    }
+
+    /// S4 #1 on the take side: the same normalized comparison decides what is left out.
+    @Test func takeSideExclusionsAreCaseInsensitive() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo")
+        try rig.put("Brahma.SQLITE-copy", "db copy")
+        try rig.put("companies/c1/x.SQLITE-WAL", "wal")
+        try rig.put("companies/c1/y.Lock", "lock")
+        try rig.put("companies/c1/z.sqlite-journal", "journal")
+        try rig.put("Cache/blob", "cached")
+        let info = try rig.take()
+        #expect(try HomeSnapshot.relativeFiles(under: info.treeURL).sorted() == ["companies/c1/roles/ceo.md"])
+    }
+
+    /// Re-review: verify changes nothing, not even a missing snapshot tree.
+    @Test func verifyCreatesNothing() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo")
+        let s1 = try rig.take()
+        try FileManager.default.removeItem(at: s1.treeURL)
+        #expect(throws: HomeSnapshotError.self) { try HomeSnapshot.verify(s1) }
+        #expect(!FileManager.default.fileExists(atPath: s1.treeURL.path))
+    }
+
+    /// Re-review: a leaf file replaced by a link is moved aside as a link; nothing is written through it.
+    @Test func leafFileSymlinkMovedAsideOnRestore() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo v1")
+        let s1 = try rig.take()
+        let outside = rig.root.appending(path: "outside.md")
+        try Data("outside".utf8).write(to: outside)
+        try FileManager.default.removeItem(at: rig.url("companies/c1/roles/ceo.md"))
+        try FileManager.default.createSymbolicLink(at: rig.url("companies/c1/roles/ceo.md"), withDestinationURL: outside)
+        let outcome = try HomeSnapshot.restore(s1, paths: rig.paths, now: rig.clock.next())
+        var st = stat()
+        #expect(lstat(rig.url("companies/c1/roles/ceo.md").path, &st) == 0 && st.st_mode & S_IFMT == S_IFREG)
+        #expect(rig.read("companies/c1/roles/ceo.md") == "ceo v1")
+        #expect(try String(contentsOf: outside, encoding: .utf8) == "outside")
+        #expect(lstat(outcome.preRestore.appending(path: "companies/c1/roles/ceo.md").path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK)
+    }
+
+    /// S4 #2: a directory swapped for a link between the walk and the copy of a SQLite file: refused, the outside database
+    /// never read into the snapshot and never opened (no sidecar appears next to it).
+    @Test func sqliteSwapSeamRefusedOnTake() throws {
+        let rig = try Rig()
+        try rig.makeSQLite("archive/acme/notes.sqlite", rows: ["inside"])
+        try rig.makeSQLite("archive/leaf/notes.sqlite", rows: ["inside leaf"])
+        let outside = rig.root.appending(path: "outside", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let queue = try DatabaseQueue(path: outside.appending(path: "notes.sqlite").path)
+        try queue.write { db in try db.execute(sql: "CREATE TABLE note (text TEXT); INSERT INTO note VALUES ('OUTSIDE')") }
+        try queue.close()
+        let before = try FileManager.default.contentsOfDirectory(atPath: outside.path).sorted()
+        let paths = rig.paths
+        let result = try HomeSnapshot.$sqliteCopyProbe.withValue({ relative in
+            let fm = FileManager.default
+            if relative == "archive/acme/notes.sqlite" {                        // a directory on the way becomes a link
+                try? fm.moveItem(at: paths.home.appending(path: "archive/acme"), to: paths.home.appending(path: "archive/acme-moved"))
+                try? fm.createSymbolicLink(at: paths.home.appending(path: "archive/acme"), withDestinationURL: outside)
+            } else if relative == "archive/leaf/notes.sqlite" {                 // the file itself becomes a link
+                try? fm.removeItem(at: paths.home.appending(path: "archive/leaf/notes.sqlite"))
+                try? fm.createSymbolicLink(at: paths.home.appending(path: "archive/leaf/notes.sqlite"),
+                                           withDestinationURL: outside.appending(path: "notes.sqlite"))
+            }
+        }) { try HomeSnapshot.take(paths: rig.paths, now: rig.clock.next()) }
+        #expect(result.problems.contains { $0.hasPrefix("archive/acme/notes.sqlite") }, "\(result.problems)")
+        #expect(result.problems.contains { $0.hasPrefix("archive/leaf/notes.sqlite") }, "\(result.problems)")
+        let manifest = try HomeSnapshot.manifest(of: result.info)
+        #expect(manifest.files["archive/acme/notes.sqlite"] == nil && manifest.files["archive/leaf/notes.sqlite"] == nil)
+        for relative in try HomeSnapshot.relativeFiles(under: result.info.treeURL) {
+            let data = try Data(contentsOf: result.info.treeURL.appending(path: relative))
+            #expect(data.range(of: Data("OUTSIDE".utf8)) == nil, "\(relative)")
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).sorted() == before)
+        // Staging is gone from tmp/.
+        #expect(try FileManager.default.contentsOfDirectory(atPath: rig.paths.tmpDir.path).isEmpty)
+    }
+
+    /// S4 #2: a live WAL-mode archive (writer open, nothing checkpointed) is snapshotted from a private copy of the file and
+    /// its -wal: every committed row is there and the copy passes its integrity check.
+    @Test func liveWALArchiveSnapshotFromPrivateCopy() throws {
+        let rig = try Rig()
+        let live = rig.url("archive/acme/live.sqlite")
+        try FileManager.default.createDirectory(at: live.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let writer = try DatabaseQueue(path: live.path)
+        defer { try? writer.close() }
+        try writer.writeWithoutTransaction { db in
+            _ = try String.fetchOne(db, sql: "PRAGMA journal_mode = WAL")
+            try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
+            try db.execute(sql: "CREATE TABLE note (text TEXT)")
+            for n in 0..<40 { try db.execute(sql: "INSERT INTO note VALUES (?)", arguments: ["row \(n)"]) }
+        }
+        #expect(FileManager.default.fileExists(atPath: live.path + "-wal"))
+        let info = try rig.take()
+        let copy = info.treeURL.appending(path: "archive/acme/live.sqlite")
+        #expect(BackupService.integrity(of: copy) == ["ok"])
+        let reader = try BackupService.openForReading(copy)
+        #expect(try reader.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM note") } == 40)
+        try reader.close()
+    }
+
     @Test func pruneKeeps30() throws {
         let rig = try Rig()
         try rig.put("companies/c1/roles/ceo.md", "x")

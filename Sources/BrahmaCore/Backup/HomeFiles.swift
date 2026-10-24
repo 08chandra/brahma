@@ -15,8 +15,17 @@ import Glibc
 enum HomeFiles {
     typealias Directory = EngineFiles.OpenDirectory
 
-    /// `url` resolved and opened as a real directory.
-    static func root(_ url: URL) throws -> Directory { try EngineFiles.openWalked(workspace: url, "") }
+    /// `url` resolved and opened as a real directory. Without `create`, a missing `url` throws and nothing is made (a check
+    /// such as `HomeSnapshot.verify` changes nothing).
+    static func root(_ url: URL, create: Bool = true) throws -> Directory {
+        if !create {
+            var st = stat()
+            guard stat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR else {
+                throw UnsafeEngineFile(path: url.path, problem: "does not exist")
+            }
+        }
+        return try EngineFiles.openWalked(workspace: url, "")
+    }
 
     /// The real directory `parts` under `dir`, one part at a time, never through a link; with `create`, missing parts are made.
     static func walk(_ dir: Directory, _ parts: some Sequence<String>, create: Bool) throws -> Directory {
