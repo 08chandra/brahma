@@ -19,17 +19,29 @@ extension Store {
     // MARK: Settings
 
     /// Turns phone alerts off (`nil`) or on for a provider. Switching them on marks every existing notice as pushed, so
-    /// a backlog from before is not sent as a flood; asks still waiting are pushed (once).
-    public func setPush(provider: PushProvider?, topic: String? = nil, server: String? = nil, now: Date = Store.now()) throws {
+    /// a backlog from before is not sent as a flood; asks still waiting are pushed (once). The vault credentials go with
+    /// `PushSettings`, which calls this with `credentialsChanged` (the engine then rebuilds its cached channel).
+    public func setPush(provider: PushProvider?, topic: String? = nil, server: String? = nil, credentialsChanged: Bool = false,
+                        now: Date = Store.now()) throws {
         var prefs = try ownerPrefs()
         let wasOff = prefs.pushProvider == nil
         prefs.pushProvider = provider
         if provider == .ntfy { prefs.pushTopic = topic }
         if let server { prefs.pushServer = server }
         try updateOwnerPrefs(prefs, now: now)
+        if credentialsChanged {
+            try writer.write { db in try db.execute(sql: "UPDATE ownerPrefs SET pushCredentialsVersion = pushCredentialsVersion + 1 WHERE id = 1") }
+        }
         if wasOff, provider != nil {
             try writer.write { db in try db.execute(sql: "UPDATE ownerNotice SET pushedAt = ? WHERE pushedAt IS NULL", arguments: [now]) }
         }
+    }
+
+    /// Bumped whenever a push credential is stored or removed (`PushSettings`): the engine rebuilds its cached channel, and
+    /// reads the vault, only when this or the provider, server or topic changes. Kept out of `OwnerPrefs` on purpose: it is
+    /// bookkeeping, never a setting.
+    public func pushCredentialsVersion() throws -> Int {
+        try writer.read { db in try Int.fetchOne(db, sql: "SELECT pushCredentialsVersion FROM ownerPrefs WHERE id = 1") } ?? 0
     }
 
     public func setPushDetail(_ detail: PushDetail, now: Date = Store.now()) throws {
@@ -61,7 +73,7 @@ extension Store {
     /// Records an attempt. Rows older than 30 days go with it.
     public func logPush(ok: Bool, status: Int?, detail: String, now: Date) throws {
         try writer.write { db in
-            var row = PushLogEntry(id: nil, sentAt: now, ok: ok, status: status, detail: detail)
+            let row = PushLogEntry(id: nil, sentAt: now, ok: ok, status: status, detail: detail)
             try row.insert(db)
             try db.execute(sql: "DELETE FROM pushLog WHERE sentAt < ?", arguments: [now.addingTimeInterval(-30 * 86400)])
         }

@@ -29,6 +29,13 @@ public enum PushError: Error, Equatable, Sendable, CustomStringConvertible {
     case badServer
     case badTopic
     case missingCredential(String)
+    /// A credential with a space, a control character (CR, LF, NUL...) or a non-ASCII character: refused when stored and
+    /// when used, so it can never split a header. Names the credential, never its value.
+    case badCredential(String)
+    /// The vault could not answer (a locked Keychain, an unreadable store): this push fails and is retried later.
+    case credentialUnavailable(String)
+    /// The ntfy token in the vault was stored for another server (or for none): it is never sent to this one.
+    case tokenForOtherServer
     case notConfigured
 
     public var description: String {
@@ -37,6 +44,9 @@ public enum PushError: Error, Equatable, Sendable, CustomStringConvertible {
         case .badServer: "the push server URL is not usable (no user info, query or fragment allowed)"
         case .badTopic: "the topic may use only letters, digits, - and _ (1 to 64 characters)"
         case .missingCredential(let name): "the \(name) is not set for phone alerts"
+        case .badCredential(let name): "the \(name) must be printable ASCII with no spaces or control characters"
+        case .credentialUnavailable(let name): "the vault could not read \(name) for phone alerts"
+        case .tokenForOtherServer: "the ntfy token was stored for another server; set it again with --token-stdin"
         case .notConfigured: "phone alerts are off"
         }
     }
@@ -51,11 +61,38 @@ public enum OwnerCredential {
     public static let pushoverAppToken = "PUSHOVER_APP_TOKEN"
     public static let pushoverUserKey = "PUSHOVER_USER_KEY"
 
-    /// Read like the engine's secret reload: through the vault in the background, never prompting. A vault that cannot
-    /// answer is a missing credential for this push (it fails and retries later), not a reason to ask the owner.
-    public static func read(_ vault: any SecretVault, _ name: String) -> String? {
-        guard let value = try? vault.value(companyId: scope, name: name), !value.isEmpty else { return nil }
+    /// The ONE place an owner credential is read from the vault (the engine's dispatcher and `brahma push test` both come
+    /// here). Nil when it is not stored; `credentialUnavailable` when the vault cannot answer (the push fails and is retried
+    /// later, never "no token"). The engine reads only when a push is due and the channel is not cached (`PushDispatcher`).
+    /// Lane-merge item: route this read through the vault's non-interactive flag, so a background read can never prompt.
+    public static func readOwnerCredential(_ vault: any SecretVault, _ name: String) throws -> String? {
+        let value: String?
+        do { value = try vault.value(companyId: scope, name: name) } catch { throw PushError.credentialUnavailable(name) }
+        guard let value, !value.isEmpty else { return nil }
         return value
+    }
+
+    /// A credential is 1 to 512 printable ASCII characters with no space (`!` to `~`): no CR, LF, NUL or other control.
+    public static func valid(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        return (1...512).contains(bytes.count) && bytes.allSatisfy { (0x21...0x7E).contains($0) }
+    }
+
+    /// The vault value of an ntfy token: the server it was stored for, a newline, the token. The newline cannot occur in
+    /// either part (servers are validated URLs, tokens are `valid`), and a token is only sent to the server it names.
+    static func boundNtfyToken(_ token: String, server: String) throws -> String {
+        guard valid(token) else { throw PushError.badCredential("ntfy token") }
+        return try PushURL.normalized(server: server) + "\n" + token
+    }
+
+    /// The token stored for `server`; `tokenForOtherServer` when it names another server or none (a raw value).
+    static func ntfyToken(from stored: String, server: String) throws -> String {
+        // By bytes: "\r\n" is one Character, so a Character search could miss the newline.
+        let bytes = Array(stored.utf8)
+        guard let cut = bytes.firstIndex(of: 0x0A) else { throw PushError.tokenForOtherServer }
+        let bound = String(decoding: bytes[..<cut], as: UTF8.self), token = String(decoding: bytes[(cut + 1)...], as: UTF8.self)
+        guard bound == (try PushURL.normalized(server: server)) else { throw PushError.tokenForOtherServer }
+        return token
     }
 }
 
@@ -86,9 +123,20 @@ enum PushURL {
         return "=?UTF-8?B?\(Data(clean.utf8).base64EncodedString())?="
     }
 
+    /// The server as one comparable string: lower-case scheme and host, the port, the path without a trailing slash.
+    static func normalized(server: String) throws -> String {
+        let parts = try validate(server: server)
+        var path = parts.percentEncodedPath
+        while path.hasSuffix("/") { path.removeLast() }
+        return "https://" + (parts.host ?? "").lowercased() + (parts.port.map { ":\($0)" } ?? "") + path
+    }
+
+    /// `application/x-www-form-urlencoded` over the ASCII unreserved set only (`A-Z a-z 0-9 - . _ ~`); everything else,
+    /// non-ASCII letters included, is percent-encoded as UTF-8.
+    static let formAllowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
     static func formEncode(_ pairs: [(String, String)]) -> Data {
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-._~")
+        let allowed = formAllowed
         func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: allowed) ?? "" }
         return Data(pairs.map { "\(enc($0.0))=\(enc($0.1))" }.joined(separator: "&").utf8)
     }
@@ -146,6 +194,7 @@ public struct URLSessionPushTransport: PushTransport {
             }
             let first = await group.next() ?? nil
             group.cancelAll()
+            if first == nil, Task.isCancelled { return (nil, "cancelled") }
             return first ?? (nil, "timed out")
         }
     }
@@ -162,6 +211,7 @@ public struct NtfyChannel: PushChannel {
     public init(server: String, topic: String, token: String?, transport: any PushTransport = URLSessionPushTransport()) throws {
         self.server = try PushURL.validate(server: server)
         guard PushURL.validTopic(topic) else { throw PushError.badTopic }
+        if let token, !token.isEmpty, !OwnerCredential.valid(token) { throw PushError.badCredential("ntfy token") }
         self.topic = topic; self.token = token.flatMap { $0.isEmpty ? nil : $0 }; self.transport = transport
     }
 
@@ -199,6 +249,8 @@ public struct PushoverChannel: PushChannel {
     public init(appToken: String, userKey: String, transport: any PushTransport = URLSessionPushTransport()) throws {
         guard !appToken.isEmpty else { throw PushError.missingCredential("Pushover app token") }
         guard !userKey.isEmpty else { throw PushError.missingCredential("Pushover user key") }
+        guard OwnerCredential.valid(appToken) else { throw PushError.badCredential("Pushover app token") }
+        guard OwnerCredential.valid(userKey) else { throw PushError.badCredential("Pushover user key") }
         self.appToken = appToken; self.userKey = userKey; self.transport = transport
     }
 
@@ -227,20 +279,23 @@ public enum PushChannels {
         return (false, status, error ?? (status.map { "HTTP \($0)" } ?? "failed"))
     }
 
-    /// The channel for the owner's settings, with credentials read from the vault without prompting. Nil when phone alerts
-    /// are off; throws when they are on but cannot be sent (no topic, an http:// server, a missing credential).
+    /// The channel for the owner's settings, with credentials read through `OwnerCredential.readOwnerCredential`. Nil when
+    /// phone alerts are off; throws when they are on but cannot be sent (no topic, an http:// server, a missing or unreadable
+    /// credential, an ntfy token stored for another server). Each call reads the vault: the engine caches the result.
     public static func make(prefs: OwnerPrefs, vault: any SecretVault, transport: any PushTransport = URLSessionPushTransport()) throws -> (any PushChannel)? {
         switch prefs.pushProvider {
         case nil: return nil
         case .ntfy?:
             guard let topic = prefs.pushTopic else { throw PushError.badTopic }
-            return try NtfyChannel(server: prefs.pushServer, topic: topic, token: OwnerCredential.read(vault, OwnerCredential.ntfyToken),
-                                   transport: transport)
+            let token = try OwnerCredential.readOwnerCredential(vault, OwnerCredential.ntfyToken).map {
+                try OwnerCredential.ntfyToken(from: $0, server: prefs.pushServer)
+            }
+            return try NtfyChannel(server: prefs.pushServer, topic: topic, token: token, transport: transport)
         case .pushover?:
-            guard let app = OwnerCredential.read(vault, OwnerCredential.pushoverAppToken) else {
+            guard let app = try OwnerCredential.readOwnerCredential(vault, OwnerCredential.pushoverAppToken) else {
                 throw PushError.missingCredential("Pushover app token")
             }
-            guard let user = OwnerCredential.read(vault, OwnerCredential.pushoverUserKey) else {
+            guard let user = try OwnerCredential.readOwnerCredential(vault, OwnerCredential.pushoverUserKey) else {
                 throw PushError.missingCredential("Pushover user key")
             }
             return try PushoverChannel(appToken: app, userKey: user, transport: transport)

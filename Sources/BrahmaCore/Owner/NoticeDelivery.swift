@@ -28,12 +28,9 @@ public struct DeliveryPlan: Equatable, Sendable {
     public var markNotices: [Int64] = []
     /// The `remindCount` each ask in `markAsks` was planned at: marking skips an ask whose reminder moved on since.
     public var remindCounts: [String: Int] = [:]
-    /// Phone pushes to send now (empty when phone alerts are off). Independent of `post`: marked by `pushedAt` after a 2xx.
-    public var push: [PushedNotice] = []
 
-    public init(post: [PostedNotice] = [], markAsks: [String] = [], markNotices: [Int64] = [], remindCounts: [String: Int] = [:],
-                push: [PushedNotice] = []) {
-        self.post = post; self.markAsks = markAsks; self.markNotices = markNotices; self.remindCounts = remindCounts; self.push = push
+    public init(post: [PostedNotice] = [], markAsks: [String] = [], markNotices: [Int64] = [], remindCounts: [String: Int] = [:]) {
+        self.post = post; self.markAsks = markAsks; self.markNotices = markNotices; self.remindCounts = remindCounts
     }
 
     /// What to mark once the posts are done: everything planned except the asks and notices behind a banner that failed
@@ -57,10 +54,10 @@ public enum NoticeDelivery {
     public static let maxAskBody = 120
     public static let maxNoticeBody = 140
 
+    /// The desktop banners. Phone pushes are planned apart, only by `PushDispatcher` (`pushPlan`), from the `pushedAt` due
+    /// set and with titles that went through the redactor: never from this plan's inputs.
     public static func plan(dueAsks: [DueAsk], notices: [OwnerNotice], prefs: OwnerPrefs, now: Date, tz: TimeZone) -> DeliveryPlan {
-        var plan = desktopPlan(dueAsks: dueAsks, notices: notices, prefs: prefs, now: now, tz: tz)
-        plan.push = pushPlan(dueAsks: dueAsks, notices: notices, prefs: prefs, now: now, tz: tz)
-        return plan
+        desktopPlan(dueAsks: dueAsks, notices: notices, prefs: prefs, now: now, tz: tz)
     }
 
     // MARK: Phone pushes
@@ -73,7 +70,8 @@ public enum NoticeDelivery {
     /// off, and `notificationsEnabled` (desktop banners) does not gate the phone.
     ///
     /// Privacy: the text is the engine's own. With `counts` no ask title, notice text or message text appears. With `titles`
-    /// the only agent-controlled text is each ask's flattened title cut to 80 characters (the caller redacts it first).
+    /// the only agent-controlled text is ask titles, flattened, and at most 80 characters of them in one push (several
+    /// coalesced titles share the 80). The caller redacts them first and plans `counts` when it cannot.
     public static func pushPlan(dueAsks: [DueAsk], notices: [OwnerNotice], prefs: OwnerPrefs, now: Date, tz: TimeZone) -> [PushedNotice] {
         guard prefs.pushProvider != nil else { return [] }
         let titles = prefs.pushDetail == .titles
@@ -110,7 +108,8 @@ public enum NoticeDelivery {
         }
         var body = line
         if titles, !normalAsks.isEmpty {
-            body = normalAsks.prefix(3).map { flatten($0.ask.title, max: maxPushTitle) }.joined(separator: " | ")
+            // One push carries at most `maxPushTitle` characters of agent text in all, separators included.
+            body = flatten(normalAsks.prefix(3).map { flatten($0.ask.title, max: maxPushTitle) }.joined(separator: " | "), max: maxPushTitle)
             if count > 3 || !normalNotices.isEmpty { body += " | +\(count - min(3, normalAsks.count)) more" }
         }
         out.append(PushedNotice(title: titles ? line : "Brahma", body: titles ? body : line, urgent: false, askIds: askIds,

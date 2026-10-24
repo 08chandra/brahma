@@ -314,7 +314,9 @@ final class RecordingTransport: PushTransport, @unchecked Sendable {
 
     @Test func ntfyTokenAndTopicComeFromPrefsAndVault() throws {
         let vault = MemoryVault()
-        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken, value: "tk_from_vault")
+        // Stored bound to the server it is for (`PushSettings` does this; a raw value is refused).
+        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken,
+                      value: try OwnerCredential.boundNtfyToken("tk_from_vault", server: OwnerPrefs.defaultPushServer))
         var prefs = OwnerPrefs.defaults
         prefs.pushProvider = .ntfy; prefs.pushTopic = "mytopic"
         let channel = try #require(try PushChannels.make(prefs: prefs, vault: vault) as? NtfyChannel)
@@ -327,7 +329,7 @@ final class RecordingTransport: PushTransport, @unchecked Sendable {
     @Test func pushoverRequestShape() throws {
         let vault = MemoryVault()
         try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverAppToken, value: "app-token-1")
-        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverUserKey, value: "user key&1")
+        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverUserKey, value: "user-key&1")
         var prefs = OwnerPrefs.defaults
         prefs.pushProvider = .pushover
         let channel = try #require(try PushChannels.make(prefs: prefs, vault: vault) as? PushoverChannel)
@@ -336,7 +338,7 @@ final class RecordingTransport: PushTransport, @unchecked Sendable {
         #expect(req.url?.absoluteString == "https://api.pushover.net/1/messages.json")
         #expect(req.value(forHTTPHeaderField: "Content-Type") == "application/x-www-form-urlencoded")
         let body = String(decoding: req.httpBody ?? Data(), as: UTF8.self)
-        #expect(body == "token=app-token-1&user=user%20key%261&title=Brahma&message=Brahma%3A%203%20things%20need%20you&priority=1")
+        #expect(body == "token=app-token-1&user=user-key%261&title=Brahma&message=Brahma%3A%203%20things%20need%20you&priority=1")
         #expect(req.value(forHTTPHeaderField: "Authorization") == nil)
         // A missing credential means no channel (the push fails and retries; it never prompts).
         #expect(throws: PushError.missingCredential("Pushover user key")) {
@@ -441,5 +443,287 @@ final class RecordingTransport: PushTransport, @unchecked Sendable {
         try await o.waitUntilIdle(timeout: .seconds(20))
         #expect(channel.sent.map(\.body) == ["Brahma: 1 thing needs you"])
         #expect(try store.duePushNotices().isEmpty)
+    }
+}
+
+/// A channel whose send waits until its task is cancelled (an engine shutdown mid-send).
+final class HangingPushChannel: PushChannel, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _started = 0
+    var started: Int { lock.withLock { _started } }
+    func send(title: String, body: String, priority: PushPriority, deepLink: String?) async -> (ok: Bool, status: Int?, error: String?) {
+        lock.withLock { _started += 1 }
+        while !Task.isCancelled { try? await Task.sleep(nanoseconds: 2_000_000) }
+        return (false, nil, "timed out")
+    }
+}
+
+/// Fix round 1: fail closed to counts while secrets are held, no per-tick vault reads, the token bound to its server.
+extension PushTests {
+    /// A store with phone alerts on and NO injected channel: the dispatcher builds its own from the prefs and `vault`.
+    func liveRig(vault: any SecretVault, transport: RecordingTransport) throws -> (store: Store, company: Company, eng: Agent, awake: AwakeBox, dispatcher: PushDispatcher) {
+        let store = try Store.inMemory()
+        try store.setOwnerTimeZone("America/New_York")
+        let company = try store.createCompany(name: "Acme", goal: "Ship it", workspacesRoot: try tempDir())
+        let eng = try store.hire(companyId: company.id, name: "eng", role: "engineer", model: "sonnet")
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "long-random-topic-9f3a", server: nil, token: nil)
+        var prefs = try store.ownerPrefs(); prefs.quietEnabled = false
+        try store.updateOwnerPrefs(prefs)
+        let awake = AwakeBox()
+        let d = PushDispatcher(store: store, vault: vault, transport: transport, awake: { awake.value }, clock: { Date(timeIntervalSince1970: 1_781_107_200) })
+        return (store, company, eng, awake, d)
+    }
+
+    func file(_ store: Store, _ company: Company, _ eng: Agent, _ title: String) throws {
+        try store.propose(companyId: company.id, by: .agent(eng.id), kind: .other, risk: .high, category: "general",
+                          title: title, summary: "why", payload: nil, viaOwner: true, quotaExempt: .devHook)
+    }
+
+    // MARK: S6
+
+    @Test func titlesFallBackToCountsWhileSecretsAreHeld() async throws {
+        let r = try rig(detail: .titles)
+        try r.store.setSecret(companyId: r.company.id, name: "STRIPE_KEY", value: "sk_live_abcdef123456", isTest: false, vault: r.vault)
+        _ = try r.store.reloadRedactorIfNeeded(vault: r.vault)
+        // A second secret whose value does not load: the store is held (the redactor is loaded but incomplete).
+        try r.store.setSecret(companyId: r.company.id, name: "OTHER_KEY", value: "other-value-123456", isTest: false, vault: r.vault)
+        _ = try r.store.reloadRedactorIfNeeded(vault: MemoryVault(), logFailures: false)
+        #expect(r.store.secretsHeld && r.store.redactor.hasLoaded)
+        try ask(r, "plain readable agent title")
+        await r.dispatcher.tick(now: noon)
+        let sent = try #require(r.channel.sent.first)
+        #expect(!(sent.title + sent.body).contains("readable"))
+        #expect(sent.body == "Acme: decision approval waiting")
+        // Urgent pushes too: an engine alert in titles mode is worded by the engine while held.
+        let a = try ask(r, "urgent agent words")
+        try await r.store.writer.write { try $0.execute(sql: "UPDATE ask SET kind = ? WHERE id = ?", arguments: [AskKind.engineAlert.rawValue, a.id]) }
+        await r.dispatcher.tick(now: noon)
+        #expect(r.channel.sent.count == 2)
+        #expect(!r.channel.sent[1].body.contains("urgent agent") && r.channel.sent[1].body == "Acme: engine alert waiting")
+    }
+
+    @Test func titlesFallBackToCountsWhenRedactionThrows() async throws {
+        let r = try rig(detail: .titles)
+        try ask(r, "plain readable agent title")
+        let throwing = PushDispatcher(store: r.store, vault: r.vault, channel: r.channel, awake: { r.awake.value },
+                                      clock: { Date(timeIntervalSince1970: 1_781_107_200) },
+                                      redact: { _ in throw SecretError.secretsNotLoaded })
+        await throwing.tick(now: noon)
+        let sent = try #require(r.channel.sent.first)
+        #expect(!(sent.title + sent.body).contains("readable"))
+        #expect(sent.body == "Acme: decision approval waiting" && sent.title == "Brahma")
+        // A redactor that has never loaded in this process (a database with secrets, reopened) also sends counts only.
+        let dir = try tempDir()
+        let path = dir.appending(path: "b.sqlite").path
+        do {
+            let s = try Store(path: path)
+            try s.setOwnerTimeZone("America/New_York")
+            let c = try s.createCompany(name: "Acme", goal: "g", workspacesRoot: dir.appending(path: "ws"))
+            let e = try s.hire(companyId: c.id, name: "eng", role: "engineer", model: "sonnet")
+            try s.setSecret(companyId: c.id, name: "STRIPE_KEY", value: "sk_live_abcdef123456", isTest: false, vault: MemoryVault())
+            try s.setPush(provider: .ntfy, topic: "abc")
+            var p = try s.ownerPrefs(); p.quietEnabled = false; p.pushDetail = .titles
+            try s.updateOwnerPrefs(p)
+            try file(s, c, e, "pay sk_live_abcdef123456 now")
+        }
+        let reopened = try Store(path: path)
+        #expect(!reopened.redactor.hasLoaded)
+        let ch = FakePushChannel()
+        await PushDispatcher(store: reopened, vault: MemoryVault(), channel: ch, awake: { 1000 }).tick(now: noon)
+        let only = try #require(ch.sent.first)
+        #expect(!(only.title + only.body).contains("sk_live") && only.body == "Acme: decision approval waiting")
+    }
+
+    @Test func titlesCapTheJoinedAgentTextAt80() async throws {
+        let r = try rig(detail: .titles)
+        for i in 0..<4 { try ask(r, "\(i)" + String(repeating: "y", count: 59)) }
+        await r.dispatcher.tick(now: noon)
+        let body = try #require(r.channel.sent.first).body
+        let agentPart = body.components(separatedBy: " | +").first ?? body
+        #expect(agentPart.count <= NoticeDelivery.maxPushTitle, "one push carries at most 80 characters of agent text: \(agentPart.count)")
+        #expect(body.hasSuffix(" | +3 more") || body.hasSuffix(" | +2 more") || body.hasSuffix(" | +1 more"))
+    }
+
+    // MARK: I1, m3
+
+    @Test func noVaultReadWhileNothingIsDueAndOnePerChange() async throws {
+        let vault = ScriptedVault(), transport = RecordingTransport()
+        let r = try liveRig(vault: vault, transport: transport)
+        for _ in 0..<50 { await r.dispatcher.tick(now: noon); r.awake.advance(1) }
+        #expect(vault.reads.isEmpty, "nothing due: no vault read")
+        #expect(try r.store.pushLog().isEmpty, "nothing due: no failure row")
+        try file(r.store, r.company, r.eng, "one")
+        await r.dispatcher.tick(now: noon)
+        #expect(transport.requests.count == 1)
+        #expect(vault.reads == [OwnerCredential.ntfyToken])
+        // Later pushes reuse the channel: no second read.
+        try file(r.store, r.company, r.eng, "two")
+        r.awake.advance(301)
+        for _ in 0..<5 { await r.dispatcher.tick(now: noon) }
+        #expect(transport.requests.count == 2)
+        #expect(vault.reads.count == 1)
+        // A changed setting (or a stored credential) builds it again, once.
+        try PushSettings.setNtfy(store: r.store, vault: vault, topic: "another-random-topic", server: nil, token: nil)
+        try file(r.store, r.company, r.eng, "three")
+        r.awake.advance(301)
+        for _ in 0..<5 { await r.dispatcher.tick(now: noon) }
+        #expect(transport.requests.count == 3)
+        #expect(transport.requests.last?.url?.lastPathComponent == "another-random-topic")
+        #expect(vault.reads.count == 2)
+    }
+
+    @Test func missingCredentialIsOneFailurePerEpisode() async throws {
+        let vault = ScriptedVault(), transport = RecordingTransport()
+        let r = try liveRig(vault: vault, transport: transport)
+        // Pushover on, but its credentials are not in the vault.
+        try r.store.setPush(provider: .pushover)
+        for _ in 0..<5 { await r.dispatcher.tick(now: noon); r.awake.advance(301) }
+        #expect(try r.store.pushLog().isEmpty, "nothing due: no failure")
+        #expect(try r.store.events(afterId: 0, companyId: r.company.id).filter { $0.kind == .error }.isEmpty)
+        try file(r.store, r.company, r.eng, "due")
+        for _ in 0..<6 { await r.dispatcher.tick(now: noon); r.awake.advance(301) }
+        #expect(try r.store.pushLog().map(\.ok) == [false], "one row per episode, not one per window")
+        let errors = try r.store.events(afterId: 0, companyId: r.company.id).filter { $0.kind == .error }.map(\.text)
+        #expect(errors.count == 1 && errors[0].hasPrefix("phone alerts failing"))
+        #expect(transport.requests.isEmpty)
+        // Storing the credentials ends the episode: the next window sends.
+        try PushSettings.setPushover(store: r.store, vault: vault, appToken: "app-token-12345", userKey: "user-key-12345")
+        await r.dispatcher.tick(now: noon)
+        #expect(transport.requests.count == 1)
+        #expect(try r.store.pushLog().map(\.ok) == [false, true])
+    }
+
+    // MARK: I2
+
+    @Test func changingTheNtfyServerOrProviderDropsTheToken() throws {
+        let store = try Store.inMemory(), vault = MemoryVault()
+        func token() throws -> String? { try vault.value(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken) }
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abc", server: "https://a.example", token: "tk_for_server_a")
+        #expect(try token() != nil)
+        // Same server, new topic: the token stays.
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abcd", server: nil, token: nil)
+        #expect(try token() != nil)
+        let kept = try #require(try PushChannels.make(prefs: store.ownerPrefs(), vault: vault) as? NtfyChannel)
+        #expect(kept.request(title: "t", body: "b", priority: .normal, deepLink: nil).value(forHTTPHeaderField: "Authorization") == "Bearer tk_for_server_a")
+        // Another server: the token is deleted, and the new server gets no Authorization header.
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abcd", server: "https://b.example", token: nil)
+        #expect(try token() == nil)
+        let plain = try #require(try PushChannels.make(prefs: store.ownerPrefs(), vault: vault) as? NtfyChannel)
+        #expect(plain.request(title: "t", body: "b", priority: .normal, deepLink: nil).value(forHTTPHeaderField: "Authorization") == nil)
+        // Another provider: the token is deleted too.
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abcd", server: nil, token: "tk_for_server_b")
+        try PushSettings.setPushover(store: store, vault: vault, appToken: "app-token-12345", userKey: "user-key-12345")
+        #expect(try token() == nil)
+        // Switching back to ntfy drops the Pushover credentials.
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abcd", server: nil, token: nil)
+        #expect(try vault.value(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverAppToken) == nil)
+        // Off deletes everything.
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abcd", server: nil, token: "tk_again_123")
+        try PushSettings.turnOff(store: store, vault: vault)
+        #expect(try token() == nil && store.ownerPrefs().pushProvider == nil)
+    }
+
+    @Test func aTokenIsOnlySentToTheServerItWasStoredFor() throws {
+        let store = try Store.inMemory(), vault = MemoryVault()
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abc", server: "https://a.example", token: "tk_for_server_a")
+        // A server changed without PushSettings (the token survives in the vault): the token is refused, nothing is sent.
+        try store.setPush(provider: .ntfy, topic: "abc", server: "https://b.example")
+        #expect(throws: PushError.tokenForOtherServer) { _ = try PushChannels.make(prefs: store.ownerPrefs(), vault: vault) }
+        // A raw token with no server bound to it is refused as well.
+        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken, value: "tk_unbound_token")
+        #expect(throws: PushError.tokenForOtherServer) { _ = try PushChannels.make(prefs: store.ownerPrefs(), vault: vault) }
+        // The same server spelled with a trailing slash or upper-case host still matches.
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abc", server: "https://B.example/", token: "tk_for_server_b")
+        try store.setPush(provider: .ntfy, topic: "abc", server: "https://b.example")
+        #expect(try PushChannels.make(prefs: store.ownerPrefs(), vault: vault) != nil)
+        // A vault that cannot answer fails the build; it is never "no token".
+        let broken = ScriptedVault(); broken.unavailable = true
+        #expect(throws: PushError.credentialUnavailable(OwnerCredential.ntfyToken)) { _ = try PushChannels.make(prefs: store.ownerPrefs(), vault: broken) }
+    }
+
+    // MARK: m2
+
+    @Test func credentialsWithControlCharactersAreRefused() throws {
+        let store = try Store.inMemory(), vault = MemoryVault()
+        for bad in ["tk_abc\r\nX-Evil: 1", "tk_abc\n", "tk\u{0}abc", "tk abc", "tk_é_abc", ""] {
+            #expect(throws: PushError.badCredential("ntfy token")) {
+                try PushSettings.setNtfy(store: store, vault: vault, topic: "abc", server: nil, token: bad)
+            }
+            #expect(throws: PushError.badCredential("ntfy token")) { _ = try NtfyChannel(server: "https://ntfy.sh", topic: "abc", token: bad.isEmpty ? "\r" : bad) }
+            #expect(throws: PushError.badCredential("Pushover user key")) {
+                try PushSettings.setPushover(store: store, vault: vault, appToken: "app-token-12345", userKey: bad)
+            }
+        }
+        #expect(try vault.value(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken) == nil)
+        #expect(try store.ownerPrefs().pushProvider == nil, "nothing stored on a refusal")
+        #expect(throws: PushError.badCredential("Pushover app token")) { _ = try PushoverChannel(appToken: "a\nb", userKey: "user-key-1") }
+        // A bad value already in the vault is refused when used, too.
+        try PushSettings.setNtfy(store: store, vault: vault, topic: "abc", server: nil, token: nil)
+        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken, value: OwnerPrefs.defaultPushServer + "\ntk\rabc")
+        #expect(throws: PushError.badCredential("ntfy token")) { _ = try PushChannels.make(prefs: store.ownerPrefs(), vault: vault) }
+    }
+
+    // MARK: m5, m6, m7
+
+    @Test func formEncodingUsesTheASCIIUnreservedSetOnly() {
+        let body = String(decoding: PushURL.formEncode([("t", "Café ß-._~"), ("k", "aZ09")]), as: UTF8.self)
+        #expect(body == "t=Caf%C3%A9%20%C3%9F-._~&k=aZ09")
+    }
+
+    @Test func theSessionInstallsTheRedirectRefusingDelegate() {
+        let session = URLSessionPushTransport.makeSession()
+        #expect(session.delegate is URLSessionPushTransport.RefuseRedirects)
+        session.invalidateAndCancel()
+    }
+
+    @Test func cancellationAtShutdownIsNotAFailure() async throws {
+        let store = try Store.inMemory()
+        let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+        try store.setPush(provider: .ntfy, topic: "abc")
+        var prefs = try store.ownerPrefs(); prefs.quietEnabled = false
+        try store.updateOwnerPrefs(prefs)
+        try store.notifyOwner(companyId: company.id, title: "t", body: "b")
+        let channel = HangingPushChannel()
+        let dispatcher = PushDispatcher(store: store, vault: MemoryVault(), channel: channel, awake: { 1000 })
+        let pass = Task { await dispatcher.tick(now: Store.now()) }
+        while channel.started == 0 { try await Task.sleep(nanoseconds: 2_000_000) }
+        pass.cancel()
+        await pass.value
+        #expect(try store.pushLog().isEmpty, "a cancelled send is not logged as a failure")
+        #expect(try store.events(afterId: 0, companyId: company.id).filter { $0.kind == .error }.isEmpty)
+        #expect(try store.duePushNotices().count == 1, "and nothing is marked")
+    }
+
+    // MARK: CLI
+
+    private func cli(_ args: [String], home: URL, stdin: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
+        let p = Process()
+        p.executableURL = brahmaExecutableURL()
+        p.arguments = args
+        p.environment = cliEnvironment(home: home)
+        let out = Pipe(), err = Pipe(), inp = Pipe()
+        p.standardOutput = out; p.standardError = err; p.standardInput = inp
+        try p.run()
+        if let stdin { inp.fileHandleForWriting.write(Data(stdin.utf8)) }
+        try inp.fileHandleForWriting.close()
+        let o = out.fileHandleForReading.readDataToEndOfFile(), e = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: e, as: UTF8.self))
+    }
+
+    @Test func cliDropsTheTokenOnAServerChangeAndRefusesControlCharacters() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        let vault = FileVault(home: ownerPaths(home).home)
+        func token() throws -> String? { try vault.value(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken) }
+        let bad = try cli(["prefs", "set", "push", "ntfy", "long-topic-1", "--token-stdin"], home: home, stdin: "tk_abc\rX-Evil: 1\n")
+        #expect(bad.status == 1, "\(bad.stdout)")
+        #expect(bad.stderr.contains("control characters") || bad.stderr.contains("printable"))
+        #expect(try token() == nil)
+        let set = try cli(["prefs", "set", "push", "ntfy", "long-topic-1", "--server", "https://a.example", "--token-stdin"], home: home, stdin: "tk_server_a_123\n")
+        #expect(set.status == 0, "\(set.stderr)")
+        #expect(try token() != nil)
+        let moved = try cli(["prefs", "set", "push", "ntfy", "long-topic-1", "--server", "https://b.example"], home: home)
+        #expect(moved.status == 0, "\(moved.stderr)")
+        #expect(try token() == nil, "a token is never carried to another server")
     }
 }

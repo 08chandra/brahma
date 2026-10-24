@@ -87,27 +87,18 @@ struct PrefsGroup: ParsableCommand {
                 try requireOwnerShell()
                 let (store, _) = try openStore()
                 do {
+                    // Settings and vault credentials change together (`PushSettings`): an ntfy token is bound to its
+                    // server and deleted when the server or provider changes without a new one.
                     switch provider {
                     case .off:
-                        try store.setPush(provider: nil)
-                        for name in [OwnerCredential.ntfyToken, OwnerCredential.pushoverAppToken, OwnerCredential.pushoverUserKey] {
-                            try cliSecretVault().delete(companyId: OwnerCredential.scope, name: name)
-                        }
+                        try PushSettings.turnOff(store: store, vault: try cliSecretVault())
                     case .ntfy:
                         guard let topic else { throw fail("ntfy needs a topic: brahma prefs set push ntfy <topic>") }
-                        // Validated before anything is stored.
-                        _ = try NtfyChannel(server: server ?? OwnerPrefs.defaultPushServer, topic: topic, token: nil)
-                        if tokenStdin {
-                            try cliSecretVault().set(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken,
-                                                     value: try SecretInput.read(from: .standardInput))
-                        }
-                        try store.setPush(provider: .ntfy, topic: topic, server: server)
+                        let token = tokenStdin ? try SecretInput.read(from: .standardInput) : nil
+                        try PushSettings.setNtfy(store: store, vault: try cliSecretVault(), topic: topic, server: server, token: token)
                     case .pushover:
                         let lines = try readPushoverCredentials()
-                        let vault = try cliSecretVault()
-                        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverAppToken, value: lines.app)
-                        try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverUserKey, value: lines.user)
-                        try store.setPush(provider: .pushover)
+                        try PushSettings.setPushover(store: store, vault: try cliSecretVault(), appToken: lines.app, userKey: lines.user)
                     }
                 } catch let e as PushError {
                     throw fail(e.description)

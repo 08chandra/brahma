@@ -76,6 +76,7 @@ brahma push test                                send one test alert
 ```
 
 The service credentials are kept in the secrets vault (Keychain), never in the database, and agents never receive them.
+An ntfy token is only sent to the server it was set for: changing the server or the service deletes it.
 Urgent alerts go at once; the rest wait out quiet hours and arrive as at most one alert every 5 minutes, 30 per day.
 
 `brahma mcp` is internal: each agent turn launches it as that agent's company-tools MCP server.

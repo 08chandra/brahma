@@ -776,6 +776,10 @@ enum Migrations {
             }
             try db.create(index: "pushLog_sentAt", on: "pushLog", columns: ["sentAt"])
         }
+        m.registerMigration("v5-push-2") { db in
+            // Bumped when a push credential changes, so the engine's cached channel (and its one vault read) is redone then.
+            try db.alter(table: "ownerPrefs") { t in t.add(column: "pushCredentialsVersion", .integer).notNull().defaults(to: 0) }
+        }
         m.registerMigration("v5-digests") { db in
             try db.create(table: "ownerDigest") { t in
                 t.primaryKey("id", .text)
