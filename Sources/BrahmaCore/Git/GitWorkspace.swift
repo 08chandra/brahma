@@ -17,6 +17,9 @@ public enum GitError: Error, Equatable, CustomStringConvertible, LocalizedError 
         if case .failed(_, -1, let stderr) = self { return stderr.hasPrefix(GitCommand.refusalPrefix) }
         return false
     }
+
+    /// Whether an error's text (one already turned into a string, as `WorktreeUnavailable.reason`) is such a refusal.
+    static func isRepositoryRefusal(text: String) -> Bool { text.contains(GitCommand.refusalPrefix) }
 }
 
 /// A failure of a company's merge machinery (main's lock, moving `main`, the engine's merge checkout, a quarantine of the
@@ -864,7 +867,7 @@ public struct GitWorkspace: Sendable {
         default:
             break
         }
-        try withWorktreeRecords { _ = try? main.run(["worktree", "prune"]) }
+        _ = try? withWorktreeRecords { _ = try? main.run(["worktree", "prune"]) }
     }
 
     // MARK: Engine checkout places under .brahma

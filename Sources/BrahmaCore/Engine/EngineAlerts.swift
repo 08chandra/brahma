@@ -60,6 +60,7 @@ extension Store {
     func noteWorktreeSetupFailure(companyId: String, what: String, error: any Error, now: Date = Store.now()) -> Bool {
         FileHandle.standardError.write(Data("brahma: could not set up \(what): \(error)\n".utf8))
         if let git = error as? GitError, git.isRepositoryRefusal { return false }
+        if GitError.isRepositoryRefusal(text: "\(error)") { return false }
         if let work = error as? WorkError, work.message == Store.mainChangedMessage { return false }
         let reason = Store.worktreeSetupAlertReason(companyId)
         let raised = try? writer.write { db -> Bool in

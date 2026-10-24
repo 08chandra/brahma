@@ -19,7 +19,8 @@ enum EngineGitGuard {
         guard let engine else { return }
         let site = String(what().prefix(200))
         FileHandle.standardError.write(Data("brahma: engine git ran off its blocking threads: \(site)\n".utf8))
-        lock.withLock { found[engine, default: []].append(site) }
+        // Bounded: a production engine never calls `waitUntilIdle` to collect them (the log line is what it leaves).
+        lock.withLock { if found[engine, default: []].count < 100 { found[engine, default: []].append(site) } }
     }
 
     /// What `engine` ran off its blocking threads since the last call, cleared.
