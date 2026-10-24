@@ -644,6 +644,27 @@ enum Migrations {
         return m
     }
 
+    /// Task 12 fix 1 (`v5-restore`): one row per restore (`nonce`, also in the restore marker; `consumedAt` once the engine has
+    /// taken it up) and, per company, the `mainCommit` the restored database recorded: the only head a restore may re-adopt.
+    /// `IF NOT EXISTS`: a restore writes these into a snapshot of any older schema before the migrator next runs on it.
+    static func createRestoreTables(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS restoreEvent (
+                nonce TEXT PRIMARY KEY NOT NULL,
+                snapshot TEXT NOT NULL,
+                restoredAt DATETIME NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                consumedAt DATETIME
+            );
+            CREATE TABLE IF NOT EXISTS restoreMain (
+                nonce TEXT NOT NULL REFERENCES restoreEvent(nonce) ON DELETE CASCADE,
+                companyId TEXT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
+                mainCommit TEXT,
+                PRIMARY KEY (nonce, companyId)
+            );
+            """)
+    }
+
     /// Plan 5-lite migrations, in the plan's order (v5-sandbox, v5-owner-guard, v5-secrets, v5-extensions, v5-timers,
     /// v5-notices, ...). Called once at the end of `migrator()`, after every 3a migration.
     static func registerPlan5(_ m: inout DatabaseMigrator) {
@@ -680,6 +701,9 @@ enum Migrations {
                 t.column("grantedAt", .datetime).notNull()
                 t.column("endedAt", .datetime)
             }
+        }
+        m.registerMigration("v5-restore") { db in
+            try createRestoreTables(db)
         }
         m.registerMigration("v5-timers") { db in
             try db.create(table: "timer") { t in

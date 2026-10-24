@@ -30,7 +30,13 @@ public enum RestoreError: Error, Equatable, CustomStringConvertible, LocalizedEr
 
 /// Who has the database open, other than this process.
 public enum DBOpeners {
-    public static func pids(of db: URL) throws -> [Int32] {
+    /// Awake seconds `lsof` may take before it is killed and the check reported impossible (`cannotCheckOpeners`).
+    public static let lsofTimeout: TimeInterval = 20
+    /// Seconds between SIGTERM and SIGKILL of a timed-out `lsof`.
+    static let killGrace: TimeInterval = 1
+
+    /// `lsof` and `timeout` are test seams (macOS only).
+    public static func pids(of db: URL, lsof: String = "/usr/sbin/lsof", timeout: TimeInterval = lsofTimeout) throws -> [Int32] {
         let files = [db.path, db.path + "-wal", db.path + "-shm"].filter { FileManager.default.fileExists(atPath: $0) }
         guard !files.isEmpty else { return [] }
         let me = getpid()
@@ -50,30 +56,177 @@ public enum DBOpeners {
         }
         return found.sorted()
         #else
-        let lsof = "/usr/sbin/lsof"
         guard FileManager.default.isExecutableFile(atPath: lsof) else { throw RestoreError.cannotCheckOpeners }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: lsof)
         process.arguments = ["-t"] + files
         let out = Pipe()
+        let capture = OutputCapture()
+        let drained = DispatchSemaphore(value: 0)
+        out.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty { handle.readabilityHandler = nil; drained.signal() } else { capture.append(chunk) }
+        }
         process.standardOutput = out
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
-        do { try process.run() } catch { throw RestoreError.cannotCheckOpeners }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        do { try process.run() } catch {
+            out.fileHandleForReading.readabilityHandler = nil
+            throw RestoreError.cannotCheckOpeners
+        }
+        // Bounded in awake time (AwakeTime): a hung lsof is SIGTERMed, then SIGKILLed, and its output is never waited on.
+        let deadline = AwakeTime.uptime() + timeout
+        var termAt: TimeInterval?
+        var killed = false
+        while process.isRunning {
+            let now = AwakeTime.uptime()
+            if termAt == nil, now >= deadline { termAt = now; process.terminate() }
+            if let t = termAt, !killed, now - t >= killGrace { killed = true; kill(process.processIdentifier, SIGKILL) }
+            usleep(10_000)
+        }
+        if termAt != nil {
+            out.fileHandleForReading.readabilityHandler = nil
+            throw RestoreError.cannotCheckOpeners
+        }
+        _ = drained.wait(timeout: .now() + 2)
+        out.fileHandleForReading.readabilityHandler = nil
         // 0: something found; 1: nothing open. Anything else means lsof itself failed.
         guard process.terminationStatus == 0 || process.terminationStatus == 1 else { throw RestoreError.cannotCheckOpeners }
-        let pids = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).compactMap { Int32($0) }
+        let pids = String(decoding: capture.data, as: UTF8.self).split(whereSeparator: \.isNewline).compactMap { Int32($0) }
         return Array(Set(pids.filter { $0 != me })).sorted()
         #endif
     }
+
+    private final class OutputCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bytes = Data()
+        func append(_ d: Data) { lock.withLock { bytes.append(d) } }
+        var data: Data { lock.withLock { bytes } }
+    }
 }
+
+/// The restore marker `<home>/run/restored-at`. It holds only the nonce of a `restoreEvent` row; the marker by itself grants
+/// nothing. It is honoured only when it is a regular file (never a link) in this user's private `run/` directory, owned by this
+/// user, mode 0600, at most `maxBytes`, and its nonce names a restore event the database has not taken up yet.
+public enum RestoreMarker {
+    public static let maxBytes = 512
+
+    public enum Reading: Equatable, Sendable {
+        case absent
+        /// A well-formed marker; its nonce still has to match an unconsumed `restoreEvent` row.
+        case nonce(String)
+        /// Not honoured. `removable`: unlinking it is safe (its directory is this user's own, and it is not a directory).
+        /// `identity` tells one bad marker from the next, so each is logged once.
+        case ignored(reason: String, removable: Bool, identity: String)
+    }
+
+    /// 256 bits from `SystemRandomNumberGenerator`, as 64 lowercase hex digits.
+    static func makeNonce() -> String {
+        var rng = SystemRandomNumberGenerator()
+        return (0..<4).map { _ -> String in
+            let hex = String(rng.next() as UInt64, radix: 16)
+            return String(repeating: "0", count: 16 - hex.count) + hex
+        }.joined()
+    }
+
+    static func isNonce(_ text: String) -> Bool {
+        text.utf8.count == 64 && text.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
+    }
+
+    /// Reads the marker without following a link (lstat, then `O_NOFOLLOW` and an fstat that must name the same file).
+    public static func read(_ url: URL) -> Reading {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else {
+            let code = errno
+            return code == ENOENT ? .absent : .ignored(reason: "it cannot be examined (errno \(code))", removable: false, identity: "lstat:\(code)")
+        }
+        let identity = "\(st.st_dev):\(st.st_ino):\(st.st_size):\(st.st_mode)"
+        let dir = url.deletingLastPathComponent().path
+        var ds = stat()
+        let dirStat: Bool = lstat(dir, &ds) == 0
+        let dirIsDirectory: Bool = (ds.st_mode & S_IFMT) == S_IFDIR
+        let dirIsMine: Bool = ds.st_uid == getuid()
+        let dirIsPrivate: Bool = (ds.st_mode & mode_t(0o022)) == 0
+        let dirSafe = dirStat && dirIsDirectory && dirIsMine && dirIsPrivate
+        let type = st.st_mode & S_IFMT
+        func ignored(_ reason: String) -> Reading {
+            .ignored(reason: reason, removable: dirSafe && type != S_IFDIR, identity: identity + " " + reason)
+        }
+        guard dirSafe else { return ignored("its directory is not this user's private run directory") }
+        if type == S_IFLNK { return ignored("it is a symbolic link") }
+        guard type == S_IFREG else { return ignored("it is not a regular file") }
+        guard st.st_uid == getuid() else { return ignored("it is owned by uid \(st.st_uid), not this user") }
+        let permissions: mode_t = st.st_mode & mode_t(0o7777)
+        guard permissions == mode_t(0o600) else { return ignored("its mode is \(String(permissions, radix: 8)), not 600") }
+        guard st.st_size <= maxBytes else { return ignored("it is too large (\(st.st_size) bytes)") }
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return ignored("it cannot be opened without following a link (errno \(errno))") }
+        defer { _ = closeMarkerFD(fd) }
+        var fs = stat()
+        guard fstat(fd, &fs) == 0 else { return ignored("it cannot be examined once open") }
+        let same: Bool = fs.st_dev == st.st_dev && fs.st_ino == st.st_ino
+        let stillRegular: Bool = (fs.st_mode & S_IFMT) == S_IFREG && fs.st_uid == getuid()
+        let stillPrivate: Bool = (fs.st_mode & mode_t(0o7777)) == mode_t(0o600)
+        guard same, stillRegular, stillPrivate else { return ignored("it changed while it was read") }
+        guard let bytes = readMarkerFD(fd, limit: maxBytes + 1) else { return ignored("it cannot be read") }
+        guard bytes.count <= maxBytes else { return ignored("it is too large") }
+        let first = String(decoding: bytes, as: UTF8.self).split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? ""
+        guard isNonce(first) else { return ignored("it holds no restore nonce") }
+        return .nonce(first)
+    }
+
+    /// Writes `<nonce>\n` as a fresh 0600 file (`O_CREAT|O_EXCL|O_NOFOLLOW`), fsynced, then renamed over the marker.
+    public static func write(nonce: String, to url: URL) throws {
+        let dir = url.deletingLastPathComponent()
+        try BrahmaPaths.ensurePrivateDirectory(dir)
+        let staging = dir.appending(path: ".\(url.lastPathComponent).\(makeNonce().prefix(16)).tmp")
+        let fd = open(staging.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw RestoreError.failed("could not write the restore marker (errno \(errno))") }
+        let ok = fchmod(fd, 0o600) == 0 && writeMarkerFD(fd, Array((nonce + "\n").utf8)) && fsync(fd) == 0
+        let closed = closeMarkerFD(fd)
+        guard ok, closed, rename(staging.path, url.path) == 0 else {
+            let code = errno
+            unlink(staging.path)
+            throw RestoreError.failed("could not write the restore marker (errno \(code))")
+        }
+        BackupService.syncDirectory(dir)
+    }
+}
+
+private func readMarkerFD(_ fd: Int32, limit: Int) -> [UInt8]? {
+    var buffer = [UInt8](repeating: 0, count: limit)
+    var total = 0
+    while total < limit {
+        let n = buffer.withUnsafeMutableBytes { raw in read(fd, raw.baseAddress! + total, limit - total) }
+        if n < 0 { if errno == EINTR { continue }; return nil }
+        if n == 0 { break }
+        total += n
+    }
+    return Array(buffer[..<total])
+}
+
+private func writeMarkerFD(_ fd: Int32, _ bytes: [UInt8]) -> Bool {
+    var done = 0
+    while done < bytes.count {
+        let n = bytes.withUnsafeBytes { raw in write(fd, raw.baseAddress! + done, bytes.count - done) }
+        if n < 0 { if errno == EINTR { continue }; return false }
+        done += n
+    }
+    return true
+}
+
+private func closeMarkerFD(_ fd: Int32) -> Bool { close(fd) == 0 }
 
 public struct RepoAhead: Equatable, Sendable {
     public let company: String
     public let commitsAfterSnapshot: Int
-    public var warning: String { "\(company): repo has \(commitsAfterSnapshot) commits after the snapshot; they are kept and re-adopted" }
+    /// The commits stay in git, but a restore re-adopts only the snapshot's own record of `main` (Task 12 fix 1): the owner reviews
+    /// and accepts the newer head (`brahma main accept`), as for any move of `main` outside Brahma.
+    public var warning: String {
+        "\(company): repo has \(commitsAfterSnapshot) commits after the snapshot; they are kept, but Brahma will not adopt them "
+            + "until you review main and accept it (brahma main accept)"
+    }
 }
 
 public struct RestorePlan: Equatable, Sendable {
@@ -92,7 +245,8 @@ public struct RestoreOutcome: Equatable, Sendable {
 }
 
 extension BackupService {
-    /// `<home>/run/restored-at`: written by a restore; the next Orchestrator tick that sees it re-adopts every repo.
+    /// `<home>/run/restored-at`: written by a restore with the nonce of its `restoreEvent` row (`RestoreMarker`); the next
+    /// Orchestrator tick that sees it, and finds that row unconsumed, re-adopts each company's recorded `main`.
     public static func restoreMarker(paths: BrahmaPaths) -> URL { paths.runDir.appending(path: "restored-at") }
     static func restoreMarker(home: URL) -> URL { home.appending(path: "run/restored-at") }
 
@@ -161,13 +315,14 @@ extension BackupService {
     /// Replaces the live database with the snapshot, holding the `OrchestratorLock` throughout.
     ///
     /// 1. checkpoint (`TRUNCATE`) the live database and snapshot it (`.preRestore`), then close it;
-    /// 2. keep a byte copy as `brahma.sqlite.pre-restore-<stamp>`;
+    /// 2. keep a byte copy as `brahma.sqlite.pre-restore-<stamp>` (with the `-wal`/`-shm` beside it when the checkpoint failed);
     /// 3. copy the snapshot to `brahma.sqlite.restoring` and fsync it;
     /// 4. `rename(2)` it over `brahma.sqlite`: there is never a moment without a database;
     /// 5. remove the stale `-wal` and `-shm`;
-    /// 6. rebuild every FTS index (`VACUUM` may have renumbered the implicit rowids the external-content indexes point at) and
-    ///    run their integrity check;
-    /// 7. write the restore marker.
+    /// 6. record the restore in the restored database (`restoreEvent` with a random nonce, and each company's recorded
+    ///    `mainCommit` in `restoreMain`) and write the nonce to the restore marker, before anything else can fail;
+    /// 7. rebuild every FTS index (`VACUUM` may have renumbered the implicit rowids the external-content indexes point at) and
+    ///    run their integrity check.
     @discardableResult
     public func restore(_ plan: RestorePlan) throws -> RestoreOutcome {
         let lock: OrchestratorLock
@@ -191,9 +346,15 @@ extension BackupService {
 
         // 1.
         if hadDatabase {
+            var checkpointProblem: String? = "the database could not be opened"
             do {
                 let live = try DatabaseQueue(path: database.path)
-                try? live.writeWithoutTransaction { db in try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)") }
+                do {
+                    // busy = 1: a reader kept the log from being emptied (the call itself does not throw then).
+                    let row = try live.writeWithoutTransaction { db in try Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)") }
+                    let busy: Int = row?[0] ?? 1
+                    checkpointProblem = busy == 0 ? nil : "it was busy"
+                } catch { checkpointProblem = "\(error)" }
                 var service = self
                 service.writer = live
                 do { preSnapshot = try service.snapshot(reason: .preRestore) } catch {
@@ -203,10 +364,20 @@ extension BackupService {
             } catch {
                 warnings.append("the current database could not be opened (\(error)); the byte copy below is kept")
             }
-            // 2.
+            // 2. Without a checkpoint the newest commits may live only in the -wal: it travels with the byte copy.
             do {
                 try fm.copyItem(at: database, to: previous)
                 chmod(previous.path, 0o600)
+                if let checkpointProblem {
+                    var kept: [String] = []
+                    for suffix in ["-wal", "-shm"] where fm.fileExists(atPath: database.path + suffix) {
+                        try fm.copyItem(atPath: database.path + suffix, toPath: previous.path + suffix)
+                        chmod(previous.path + suffix, 0o600)
+                        kept.append(previous.lastPathComponent + suffix)
+                    }
+                    warnings.append("the current database could not be checkpointed (\(Self.flatText(checkpointProblem))); "
+                        + (kept.isEmpty ? "it had no -wal/-shm to keep" : "its log was kept beside the byte copy: \(kept.joined(separator: ", "))"))
+                }
             } catch { throw RestoreError.failed("could not keep a copy of the current database: \(error)") }
             pruneByteCopies()
         }
@@ -220,7 +391,8 @@ extension BackupService {
             try Self.syncFile(staging)
         } catch { throw RestoreError.failed("could not stage the snapshot: \(error)") }
 
-        // 4. and 5. The old log is empty after the checkpoint; removing it first means the renamed file never meets a stale one.
+        // 4. and 5. The old log is empty after the checkpoint (or kept beside the byte copy); removing it first means the
+        // renamed file never meets a stale one.
         try openersCheck()
         for suffix in ["-wal", "-shm"] { try? fm.removeItem(atPath: database.path + suffix) }
         guard rename(staging.path, database.path) == 0 else {
@@ -231,29 +403,59 @@ extension BackupService {
         for suffix in ["-wal", "-shm"] { try? fm.removeItem(atPath: database.path + suffix) }
         Self.syncDirectory(sibling)
 
-        // 6.
+        let queue: DatabaseQueue
+        do { queue = try DatabaseQueue(path: database.path) } catch {
+            throw RestoreError.failed("restored, but the database could not be opened: \(error)")
+        }
+        defer { try? queue.close() }
+
+        // 6. The nonce lives in the database the engine reads; the marker only points at it.
         do {
-            let queue = try DatabaseQueue(path: database.path)
-            defer { try? queue.close() }
-            try queue.writeWithoutTransaction { db in try Self.rebuildSearchIndexes(db, check: true) }
+            let nonce = try queue.write { db in
+                try Self.recordRestoreEvent(db, snapshot: plan.snapshot.lastPathComponent, now: now(), notes: warnings)
+            }
+            try RestoreMarker.write(nonce: nonce, to: Self.restoreMarker(home: home))
         } catch {
-            throw RestoreError.failed("restored, but the search index could not be rebuilt: \(error)")
+            throw RestoreError.failed("restored, but the restore could not be recorded (\(error)); repositories are not re-adopted: "
+                + "review each company's main and accept it (brahma main accept)")
         }
 
         // 7.
-        let marker = Self.restoreMarker(home: home)
-        try BrahmaPaths.ensurePrivateDirectory(marker.deletingLastPathComponent())
-        let when = plan.snapshotDate.map { ISO8601DateFormatter().string(from: $0) } ?? ""
-        try Data("\(plan.snapshot.lastPathComponent)\n\(when)\n".utf8).write(to: marker, options: .atomic)
-        chmod(marker.path, 0o600)
+        do {
+            try queue.writeWithoutTransaction { db in try searchRebuild(db) }
+        } catch {
+            throw RestoreError.failed("restored, but the search index could not be rebuilt: \(error)")
+        }
         return RestoreOutcome(previousCopy: hadDatabase ? previous : nil, preRestoreSnapshot: preSnapshot, warnings: warnings)
+    }
+
+    /// Records a restore in the (restored) database: one `restoreEvent` row with a fresh nonce, the `notes` (warnings, logged as
+    /// activity when the engine takes the restore up) and, per company, the `mainCommit` this database recorded. Any earlier
+    /// restore that was never taken up is marked consumed: only the newest restore can re-adopt. Returns the nonce.
+    static func recordRestoreEvent(_ db: Database, snapshot: String, now: Date, notes: [String] = []) throws -> String {
+        try Migrations.createRestoreTables(db)
+        try db.execute(sql: "UPDATE restoreEvent SET consumedAt = ? WHERE consumedAt IS NULL", arguments: [now])
+        let nonce = RestoreMarker.makeNonce()
+        try db.execute(sql: "INSERT INTO restoreEvent (nonce, snapshot, restoredAt, notes) VALUES (?, ?, ?, ?)",
+                       arguments: [nonce, snapshot, now, notes.joined(separator: "\n")])
+        let recorded = try db.columns(in: "company").contains { $0.name == "mainCommit" } ? "mainCommit" : "NULL"
+        try db.execute(sql: "INSERT INTO restoreMain (nonce, companyId, mainCommit) SELECT ?, id, \(recorded) FROM company",
+                       arguments: [nonce])
+        return nonce
+    }
+
+    private static func flatText(_ text: String) -> String {
+        String(text.split(whereSeparator: \.isNewline).joined(separator: " ").prefix(200))
     }
 
     private func pruneByteCopies() {
         let prefix = database.lastPathComponent + ".pre-restore-"
         let dir = database.deletingLastPathComponent()
-        let copies = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasPrefix(prefix) }.sorted()
-        for old in copies.dropLast(Self.keep[.preRestore] ?? 5) { try? FileManager.default.removeItem(at: dir.appending(path: old)) }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        let copies = names.filter { $0.hasPrefix(prefix) && !$0.hasSuffix("-wal") && !$0.hasSuffix("-shm") }.sorted()
+        for old in copies.dropLast(Self.keep[.preRestore] ?? 5) {
+            for name in [old, old + "-wal", old + "-shm"] { try? FileManager.default.removeItem(at: dir.appending(path: name)) }
+        }
     }
 
     static func syncDirectory(_ url: URL) {

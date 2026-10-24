@@ -36,7 +36,7 @@ public actor Orchestrator {
     /// What each turn asserts about the session the CLI reports (the work modes set it; nil asserts nothing).
     let turnExpectations: @Sendable (Agent, Company) -> TurnExpectations?
     let timerJobs: TimerJobRegistry
-    /// Handlers run, per company, after a restore re-adopts that company's `main` (`restoreMarkerTick`).
+    /// Handlers run, per company, after a restore re-adopts that company's recorded `main` (`restoreMarkerTick`).
     let restoreHooks: RestoreHooks
     /// Where secret values live; read only to reload the store's redactor. Production passes the store `PlatformSecretVault`
     /// selected (the Keychain, or a dev/demo home's file store); the library default is `UnavailableVault`, never the Keychain.
@@ -63,6 +63,8 @@ public actor Orchestrator {
     var mergeCheckDeferrals: [String: Int] = [:]
     /// Agents the engine has just leased an item to, until their worktree exists (they are not scheduled meanwhile).
     var dispatching = Set<String>()
+    /// The restore marker last ignored and left in place (it could not be removed safely): it is logged once, not every tick.
+    var ignoredRestoreMarker: String?
     /// Items whose dispatch failed in git: not offered again before this time.
     var dispatchBackoff: [String: Date] = [:]
     /// Companies whose `main` changed outside Brahma: no dispatch before this time.

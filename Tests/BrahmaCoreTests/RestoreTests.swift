@@ -100,10 +100,11 @@ import GRDB
         let service = BackupService(paths: paths)
         let plan = try service.planRestore(snapshot: snapshot)
         #expect(plan.reposAhead == [RepoAhead(company: "Acme", commitsAfterSnapshot: 2)])
-        #expect(plan.warnings == ["Acme: repo has 2 commits after the snapshot; they are kept and re-adopted"])
+        #expect(plan.warnings == [RepoAhead(company: "Acme", commitsAfterSnapshot: 2).warning])
+        #expect(plan.warnings.first?.contains("Brahma will not adopt them until you review main and accept it") == true)
         let result = try runBrahma(["restore", "--dry-run", snapshot.path], home: home.url)
         #expect(result.status == 0)
-        #expect(result.stdout.contains("Acme: repo has 2 commits after the snapshot; they are kept and re-adopted"))
+        #expect(result.stdout.contains("Acme: repo has 2 commits after the snapshot; they are kept, but Brahma will not adopt them"))
         #expect(result.stdout.contains("nothing was changed"))
         let after = try snapshotOfTree(paths.home)
         #expect(after == before, "changed: \(Set(after).symmetricDifference(Set(before)).sorted())")   // not a byte, not a file, not a marker
@@ -169,47 +170,8 @@ import GRDB
         try reopened.writer.write { db in try db.execute(sql: "INSERT INTO messageFts(messageFts) VALUES('integrity-check')") }
     }
 
-    @Test func markerReadoptsRepos() async throws {
-        let store = try Store.inMemory()
-        let root = try tempDir()
-        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
-        let hooks = RestoreHooks()
-        let events = RestoreEvents()
-        hooks.register { event in events.add(event) }
-        let clock = TestClock()
-        let orchestrator = Orchestrator(store: store, runner: FakeTurnRunner(), paths: paths, mcpExecutable: "/usr/local/bin/brahma",
-                                        clock: clock.function, vault: MemoryVault(), restoreHooks: hooks)
-        let acme = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
-        // A restored database holds the head from the snapshot; the repository has moved on since.
-        try await store.writer.write { db in
-            try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [String(repeating: "a", count: 40), acme.id])
-        }
-        let fixture = GitFixture(existing: URL(fileURLWithPath: acme.workspacePath, isDirectory: true))
-        try fixture.write("later.txt", "x")
-        try fixture.git(["add", "-A"])
-        try fixture.git(["commit", "-m", "after the snapshot"])
-        let head = try fixture.git(["rev-parse", "refs/heads/main"])
-        let marker = BackupService.restoreMarker(paths: paths)
-        try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("brahma-20260610T120000.000Z-manual.sqlite\n2026-06-10T12:00:00Z\n".utf8).write(to: marker)
-
-        await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(30))
-
-        #expect(try store.company(id: acme.id)?.mainCommit == head)            // re-adopted from git
-        #expect(!FileManager.default.fileExists(atPath: marker.path))          // marker removed
-        let seen = events.all
-        #expect(seen.count == 1 && seen.first?.companyId == acme.id && seen.first?.mainHead == head)
-        #expect(seen.first?.snapshotName == "brahma-20260610T120000.000Z-manual.sqlite")
-        let texts = try store.events(afterId: 0, limit: 100).filter { $0.companyId == acme.id }.map(\.text)
-        #expect(texts.contains("restored from brahma-20260610T120000.000Z-manual.sqlite; repos re-adopted"))
-        // The main guard accepts it: nothing reads as "main changed outside Brahma".
-        try store.checkMain(company: try #require(try store.company(id: acme.id)))
-        // A second tick does nothing more.
-        await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(30))
-        #expect(events.all.count == 1)
-    }
+    // `markerReadoptsRepos` planted a bare marker and expected main's current head adopted: that was the review bypass fixed in
+    // Task 12 fix round 1. Its coverage lives in RestoreMarkerTests (happyPathAdoptsRecordedMain and the refusals).
 
     @Test func cliRestoreOwnerOnly() throws {
         let home = try OwnerTestHome(initOwner: false)

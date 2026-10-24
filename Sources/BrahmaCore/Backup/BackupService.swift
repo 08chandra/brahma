@@ -50,6 +50,8 @@ public struct BackupService: Sendable {
     /// Test seams.
     var now: @Sendable () -> Date = { Date() }
     var integrityCheck: @Sendable (URL) -> [String] = { BackupService.integrity(of: $0) }
+    /// The restore's search-index rebuild and check (step 7 of `restore`).
+    var searchRebuild: @Sendable (Database) throws -> Void = { db in try BackupService.rebuildSearchIndexes(db, check: true) }
 
     public init(paths: BrahmaPaths, writer: (any DatabaseWriter)? = nil) {
         database = paths.database; home = paths.home

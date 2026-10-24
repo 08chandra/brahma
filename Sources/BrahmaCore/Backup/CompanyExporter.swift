@@ -25,10 +25,10 @@ public enum CompanyExporter {
     /// Tables that do not belong to one company and are emptied in an export. Later tasks append their tables here (the export
     /// skips a name that does not exist yet): `sandboxCanary` (Task 1b), `engineStop` (7c), `pushLog` (7b).
     /// `rateLimit` is `usageState` in 3a's schema. `turnCredential` holds the hashed MCP tokens of turns, which are meaningless
-    /// outside this machine and must not travel.
+    /// outside this machine and must not travel. `restoreEvent` (and, by cascade, `restoreMain`) is this machine's restore record.
     nonisolated(unsafe) public static var globalTables = [
         "rateLimit", "usageState", "engineProbe", "engineHold", "turnCredential",
-        "sandboxCanary", "engineStop", "pushLog",
+        "sandboxCanary", "engineStop", "pushLog", "restoreEvent",
     ]
 
     /// Trees copied from the company's data directory (`<home>/companies/<companyId>/`). Task 13a appends the transcript and

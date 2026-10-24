@@ -46,7 +46,8 @@ struct RestoreCommand: ParsableCommand {
         commandName: "restore",
         abstract: "Restore the database from a snapshot (owner only). Quit the app and 'brahma run' first.",
         discussion: "The current database is kept next to it as brahma.sqlite.pre-restore-<time>. Git repositories are never touched; "
-            + "commits made after the snapshot are kept and re-adopted when Brahma starts.")
+            + "when Brahma starts it re-adopts each main the snapshot recorded. Commits made after the snapshot are kept, but Brahma "
+            + "alerts you and holds that company until you review main and accept it (brahma main accept).")
 
     @Flag(help: "List the snapshots instead.") var list = false
     @Flag(help: "Restore the newest snapshot that passes its integrity check.") var latest = false
