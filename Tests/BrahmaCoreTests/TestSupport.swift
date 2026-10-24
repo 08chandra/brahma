@@ -85,3 +85,15 @@ func dumpDatabase(_ store: Store) throws -> String {
         return out
     }
 }
+
+// MARK: toolchain
+
+/// Xcode for the sandboxed toolchain tests (`SeatbeltRunnerTests`): its developer directory, and whether it and Seatbelt exist.
+enum Toolchain {
+    static let developerDir = "/Applications/Xcode.app/Contents/Developer"
+    static var seatbeltAvailable: Bool { FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec") }
+    static var xcodeAvailable: Bool {
+        FileManager.default.isExecutableFile(atPath: developerDir + "/usr/bin/xcodebuild")
+            && FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec")
+    }
+}

@@ -728,14 +728,22 @@ public struct GitWorkspace: Sendable {
         }
     }
 
+    /// What `.git/info/exclude` must list: the engine's directory, and the `TMPDIR` a sandboxed check gets inside its
+    /// checkout (`SeatbeltRunner`), so neither shows up as untracked work.
+    static let excludedEntries = [".brahma/", ".brahma-tmp/"]
+
+    /// Adds `excludedEntries` to `.git/info/exclude`. The current file is read without following a link (a link there is
+    /// read as empty and replaced by the atomic write, never followed), so nothing it names is copied into the repository.
     private func ensureExclude() throws {
         let info = gitDir.appending(path: "info", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: info, withIntermediateDirectories: true)
         let file = info.appending(path: "exclude")
-        let current = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
-        guard !current.split(separator: "\n").contains(".brahma/") else { return }
+        let current = EngineFiles.readNoFollow(file, under: gitDir).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        let lines = current.split(separator: "\n").map(String.init)
+        let missing = Self.excludedEntries.filter { !lines.contains($0) }
+        guard !missing.isEmpty || Self.isSymlink(file) else { return }
         let prefix = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
-        try (current + prefix + ".brahma/\n").write(to: file, atomically: true, encoding: .utf8)
+        try (current + prefix + missing.map { $0 + "\n" }.joined()).write(to: file, atomically: true, encoding: .utf8)
     }
 
     // MARK: Worktrees

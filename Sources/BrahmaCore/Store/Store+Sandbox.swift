@@ -19,8 +19,8 @@ public struct SandboxPatch: Equatable, Sendable {
 
 extension Store {
     /// The owner's change to a company's sandbox settings (the only way they change; `updateCompany` keeps them). Domains are
-    /// lowercased, deduped and sorted; each must be a valid pattern (`SandboxDomains.isValidPattern`, Task 2's
-    /// `DomainMatcher` rules) and never Anthropic's (`.forbiddenDomain`). Read paths must be absolute or `~/…` and are
+    /// lowercased, deduped and sorted; each must be a valid pattern (`DomainMatcher.isValidPattern`) and never Anthropic's
+    /// (`.forbiddenDomain`). Read paths must be absolute or `~/…` and are
     /// validated as a turn's scope would be (`SandboxScope.forTurn`/`validate`) against the owner's protected paths, the data
     /// home and every other company's workspace, whether or not they exist yet. A refused patch changes nothing.
     public func updateSandbox(companyId: String, _ patch: SandboxPatch,

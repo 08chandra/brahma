@@ -339,24 +339,12 @@ public enum CompanyNetwork {
     }
 }
 
-/// Domain-pattern rules until Task 2's `DomainMatcher` exists; Task 2 replaces `isValidPattern` with
-/// `DomainMatcher.isValidPattern` (same rules).
+/// The forbidden-domain rule and the one check every owner-set domain passes; the pattern rules are `DomainMatcher`'s.
 enum SandboxDomains {
     /// Anthropic's API and apps: nested `claude` must have no route to them (the V-9 barrier is network plus exec, Task 3).
     static let forbiddenRoots = ["anthropic.com", "claude.ai", "claude.com"]
 
-    static let publicSuffixes: Set<String> = [
-        "com", "net", "org", "io", "dev", "app", "co", "ai", "me", "xyz", "info", "biz", "us", "uk", "co.uk", "org.uk", "com.au",
-        "github.io", "githubusercontent.com", "vercel.app", "netlify.app", "pages.dev", "workers.dev", "herokuapp.com", "web.app",
-        "firebaseapp.com", "s3.amazonaws.com", "amazonaws.com", "cloudfront.net", "azurewebsites.net", "blob.core.windows.net",
-        "appspot.com", "glitch.me", "repl.co", "ngrok.io", "ngrok-free.app",
-    ]
-
-    static func normalize(_ s: String) -> String {
-        var d = s.lowercased()
-        if d.hasSuffix("."), d.count > 1 { d.removeLast() }
-        return d
-    }
+    static func normalize(_ s: String) -> String { DomainMatcher.normalize(s) }
 
     /// The pattern covers one of Anthropic's domains: it is one of them, a subdomain of one, or a parent of one.
     static func isForbidden(_ pattern: String) -> Bool {
@@ -366,27 +354,10 @@ enum SandboxDomains {
         return forbiddenRoots.contains { root in base == root || base.hasSuffix("." + root) || root.hasSuffix("." + base) }
     }
 
-    /// `^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)+$` (case-insensitive, trailing dot dropped); not `localhost`, not an IP literal, not
-    /// `*` alone; a wildcard's parent is neither a public suffix nor a single label. Labels are 1–63 characters and neither
-    /// start nor end with `-`; the whole name is at most 253.
-    static func isValidPattern(_ s: String) -> Bool {
-        let p = normalize(s)
-        guard p.range(of: "^(\\*\\.)?[a-z0-9-]+(\\.[a-z0-9-]+)+$", options: .regularExpression) != nil else { return false }
-        let wildcard = p.hasPrefix("*.")
-        let base = wildcard ? String(p.dropFirst(2)) : p
-        guard base.count <= 253, base != "localhost", !base.hasSuffix(".localhost") else { return false }
-        let labels = base.split(separator: ".", omittingEmptySubsequences: false)
-        guard labels.allSatisfy({ !$0.isEmpty && $0.count <= 63 && !$0.hasPrefix("-") && !$0.hasSuffix("-") }) else { return false }
-        // An IPv4 literal (every label numeric); IPv6 never matches the pattern above.
-        if labels.allSatisfy({ $0.allSatisfy(\.isNumber) }) { return false }
-        if wildcard, labels.count < 2 || publicSuffixes.contains(base) { return false }
-        return true
-    }
-
     /// Refuses a forbidden domain first (so any Anthropic name reports as such), then an invalid one.
     static func check(_ domain: String) throws {
         if isForbidden(domain) { throw SandboxError.forbiddenDomain(normalize(domain)) }
-        if !isValidPattern(domain) { throw SandboxError.invalidDomain(domain) }
+        if !DomainMatcher.isValidPattern(domain) { throw SandboxError.invalidDomain(domain) }
     }
 }
 

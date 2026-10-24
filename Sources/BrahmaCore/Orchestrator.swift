@@ -89,7 +89,7 @@ public actor Orchestrator {
                 memory: any MemoryPressureSource = DispatchMemoryPressureSource(),
                 connectivity: any ConnectivityProbe = HTTPSProbe(), disk: any DiskSpace = SystemDiskSpace(),
                 exec: @escaping Doctor.Exec = Doctor.defaultExec, claudePath: String = "claude",
-                checkRunner: any CheckRunning = ProcessCheckRunner(),
+                checkRunner: (any CheckRunning)? = nil,
                 checkBaseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
                 planSelector: (@Sendable (Agent, WorkItem, Company) -> Bool)? = nil,
                 turnExpectations: @escaping @Sendable (Agent, Company) -> TurnExpectations? = { _, _ in nil },
@@ -102,7 +102,9 @@ public actor Orchestrator {
         self.mcpExecutable = mcpExecutable; self.profile = profile; self.clock = clock
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
         self.claudePath = claudePath
-        self.checkRunner = checkRunner; self.checkBaseEnvironment = checkBaseEnvironment
+        // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
+        self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths)
+        self.checkBaseEnvironment = checkBaseEnvironment
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
