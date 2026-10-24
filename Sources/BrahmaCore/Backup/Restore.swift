@@ -261,6 +261,9 @@ public struct RestoreOutcome: Equatable, Sendable {
     /// With `withFiles`: the files put back from the data-home snapshot, and where the ones they replaced were kept.
     public var filesRestored: Int = 0
     public var filesPreRestore: URL?
+    /// With `withFiles`: the data-home snapshot the files came from, and the entries it refused (`HomeRestoreResult.refused`).
+    public var filesSnapshot: HomeSnapshotInfo?
+    public var filesRefused: [String] = []
 }
 
 extension BackupService {
@@ -485,6 +488,8 @@ extension BackupService {
                 let result = try HomeSnapshot.restore(homeSnapshot, paths: lockPaths, now: now())
                 outcome.filesRestored = result.restored
                 outcome.filesPreRestore = result.movedAway > 0 || result.restored > 0 ? result.preRestore : nil
+                outcome.filesSnapshot = homeSnapshot
+                outcome.filesRefused = result.refused
             } catch {
                 throw RestoreError.failed("the database was restored, but the files could not be put back (\(error)); "
                     + "run 'brahma restore' again with --with-files, or copy them from \(homeSnapshot.url.path)")

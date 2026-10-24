@@ -86,9 +86,11 @@ public enum CompanyExporter {
         ]
         for tree in homeTrees {
             var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: tree.source.path, isDirectory: &isDir), isDir.boolValue, !isLink(tree.source),
-                  !tree.source.lastPathComponent.isEmpty else { continue }
-            try copyTree(from: tree.source, to: staging.appending(path: tree.to, directoryHint: .isDirectory))
+            guard fm.fileExists(atPath: tree.source.path, isDirectory: &isDir), isDir.boolValue, !isLink(tree.source) else { continue }
+            // The archive holds live SQLite files (Memory-lite writes them, in WAL mode): each is exported as one consistent
+            // `VACUUM INTO` copy that passes `integrity_check`, never as raw bytes plus sidecars.
+            try copyTree(from: tree.source, to: staging.appending(path: tree.to, directoryHint: .isDirectory),
+                         sqlite: tree.name == "archive")
             copied.append(tree.name)
         }
         let manifest = staging.appending(path: "MANIFEST.json")
@@ -152,8 +154,13 @@ public enum CompanyExporter {
         return lstat(url.path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK
     }
 
-    /// Copies regular files and directories; links, worktrees and caches are left out.
-    static func copyTree(from source: URL, to destination: URL) throws {
+    /// SQLite sidecars: their content is inside the `VACUUM INTO` copy of the database they belong to.
+    static let sqliteSidecarSuffixes = [".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
+
+    /// Copies regular files and directories; links, worktrees and caches are left out. With `sqlite`, a `*.sqlite` file is a
+    /// `VACUUM INTO` copy checked with `integrity_check` (`HomeSnapshot.vacuumCopy`; a file that is not a database is copied
+    /// as it is) and its sidecars are left out.
+    static func copyTree(from source: URL, to destination: URL, sqlite: Bool = false) throws {
         let fm = FileManager.default
         try BrahmaPaths.ensurePrivateDirectory(destination)
         for name in try fm.contentsOfDirectory(atPath: source.path).sorted() where !skippedNames.contains(name) {
@@ -161,7 +168,13 @@ public enum CompanyExporter {
             var st = stat()
             guard lstat(from.path, &st) == 0 else { continue }
             switch st.st_mode & S_IFMT {
-            case S_IFDIR: try copyTree(from: from, to: to)
+            case S_IFDIR: try copyTree(from: from, to: to, sqlite: sqlite)
+            case S_IFREG where sqlite && sqliteSidecarSuffixes.contains(where: { name.hasSuffix($0) }):
+                continue
+            case S_IFREG where sqlite && name.hasSuffix(".sqlite"):
+                do { try HomeSnapshot.vacuumCopy(from, to: to) } catch {
+                    throw ExportError.failed("could not export \(name) consistently: \(error)")
+                }
             case S_IFREG:
                 try fm.copyItem(at: from, to: to)
                 chmod(to.path, 0o600)

@@ -54,6 +54,9 @@ public struct HomeRestoreResult: Equatable, Sendable {
     public let preRestore: URL
     public let restored: Int
     public let movedAway: Int
+    /// Entries not restored because their way in the home is not a real directory (a link planted there, or a file where a
+    /// directory should be), each `<relative path>: <what is in the way>`. Nothing was written or moved through them.
+    public var refused: [String] = []
 }
 
 /// An incremental hard-link mirror of the data home: everything under `paths.home` except `run/`, `backups/`, `tmp/`, `cache/`,
@@ -139,6 +142,9 @@ public enum HomeSnapshot {
     ///    `integrity_check`), hashed, and linked instead when the hash equals the previous snapshot's.
     /// 2. `MANIFEST.json`, then the staging directory is renamed into `backups/home/`.
     /// 3. Snapshots beyond `keepDaily` are pruned (their links keep the surviving snapshots whole).
+    ///
+    /// The home is read through `HomeFiles` (a descriptor walk that never follows a link): a linked directory or file under the
+    /// home is not in the snapshot, and nothing outside the home is read.
     @discardableResult
     public static func take(paths: BrahmaPaths, now: Date = Date()) throws -> HomeSnapshotResult {
         let fm = FileManager.default
@@ -159,32 +165,29 @@ public enum HomeSnapshot {
         var problems: [String] = []
         var linked = 0, copied = 0
 
-        var candidates: [String] = []
-        try walkHome(paths.home, prefix: "") { candidates.append($0) }
-        for relative in candidates.sorted() {
-            let source = paths.home.appending(path: relative)
-            var st = stat()
-            guard lstat(source.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
+        let home = try HomeFiles.root(paths.home)
+        var walkProblems: [String] = []
+        try walkHome(home, prefix: "", depth: 0, problems: &walkProblems) { dir, leaf, relative, st in
             let target = tree.appending(path: relative)
-            try BrahmaPaths.ensurePrivateDirectory(target.deletingLastPathComponent())
             let isSQLite = relative.hasSuffix(".sqlite")
             let kind = isSQLite ? "sqlite" : "file"
             let size = Int64(st.st_size), mtime = modificationNs(st)
             let old = before?.files[relative]
             let oldCopy = previous?.treeURL.appending(path: relative)
             do {
+                try BrahmaPaths.ensurePrivateDirectory(target.deletingLastPathComponent())
                 // Unchanged file: link the previous copy (a SQLite file is re-copied: its bytes do not change with its mtime
                 // alone being trustworthy, and a VACUUM INTO of an unchanged database is the same bytes).
                 if !isSQLite, let old, let oldCopy, old.size == size, old.mtimeNs == mtime,
                    link(oldCopy.path, target.path) == 0 {
                     files[relative] = old
                     linked += 1
-                    continue
+                    return
                 }
                 if isSQLite {
                     let temp = paths.tmpDir.appending(path: "home-sqlite-\(UUID().uuidString).sqlite")
                     defer { unlink(temp.path) }
-                    try vacuumCopy(source, to: temp)
+                    try vacuumCopy(in: dir, leaf, expected: st, to: temp)
                     let hash = try fileHash(temp)
                     if let old, old.sha == hash, let oldCopy, link(oldCopy.path, target.path) == 0 {
                         linked += 1
@@ -196,15 +199,17 @@ public enum HomeSnapshot {
                     var after = stat()
                     let copySize = (lstat(target.path, &after) == 0) ? Int64(after.st_size) : size
                     files[relative] = .init(size: copySize, mtimeNs: mtime, sha: hash, kind: kind)
-                    continue
+                    return
                 }
-                try copyFile(source, to: target)
+                let input = try HomeFiles.openRead(dir, leaf)
+                defer { close(input) }
+                try copyFile(from: input, to: target)
                 let hash = try fileHash(target)
                 if let old, old.sha == hash, let oldCopy {
-                    // Same bytes, new mtime: link instead of keeping a second copy.
-                    unlink(target.path)
-                    if link(oldCopy.path, target.path) == 0 { linked += 1 } else {
-                        try copyFile(source, to: target)
+                    // Same bytes, new mtime: link instead of keeping a second copy (the link replaces the copy atomically).
+                    let swap = target.deletingLastPathComponent().appending(path: ".link-\(UUID().uuidString)")
+                    if link(oldCopy.path, swap.path) == 0, rename(swap.path, target.path) == 0 { linked += 1 } else {
+                        unlink(swap.path)
                         copied += 1
                     }
                 } else {
@@ -219,6 +224,7 @@ public enum HomeSnapshot {
             }
         }
 
+        problems = walkProblems + problems
         let record = HomeSnapshotManifest(takenAt: now, files: files)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -237,17 +243,29 @@ public enum HomeSnapshot {
         for old in list(paths: paths).dropFirst(keepDaily) { try? FileManager.default.removeItem(at: old.url) }
     }
 
-    /// The backup set: regular files under the home, never through a link, honouring `excluded`.
-    private static func walkHome(_ dir: URL, prefix: String, _ visit: (String) -> Void) throws {
-        for name in try FileManager.default.contentsOfDirectory(atPath: dir.path) {
+    /// Deeper than this, a directory under the home is left out (named in `problems`).
+    static let maxDepth = 64
+
+    /// The backup set: regular files under the home, honouring `excluded`, walked by descriptor (`HomeFiles`): a link is
+    /// never followed, a directory that moved while it was walked is left out (named in `problems`), and a name no manifest
+    /// may hold (`pathProblem`) is left out and named. `visit` gets the file's open directory, its name there, its path
+    /// relative to the home and its `fstatat` status.
+    private static func walkHome(_ dir: HomeFiles.Directory, prefix: String, depth: Int, problems: inout [String],
+                                 _ visit: (HomeFiles.Directory, String, String, stat) throws -> Void) throws {
+        guard depth < maxDepth else { problems.append("\(prefix): deeper than \(maxDepth) directories; left out"); return }
+        for name in try dir.names().sorted() {
             let relative = prefix + name
             if excluded(relative) { continue }
-            let url = dir.appending(path: name)
-            var st = stat()
-            guard lstat(url.path, &st) == 0 else { continue }
+            guard let st = HomeFiles.status(dir, name) else { continue }
             switch st.st_mode & S_IFMT {
-            case S_IFDIR: try walkHome(url, prefix: relative + "/", visit)
-            case S_IFREG: visit(relative)
+            case S_IFDIR:
+                if let problem = pathProblem(relative) { problems.append("\(String(reflecting: relative)): \(problem); left out"); continue }
+                let child: HomeFiles.Directory
+                do { child = try dir.child(name) } catch { problems.append("\(relative)/: \(error); left out"); continue }
+                try walkHome(child, prefix: relative + "/", depth: depth + 1, problems: &problems, visit)
+            case S_IFREG:
+                if let problem = pathProblem(relative) { problems.append("\(String(reflecting: relative)): \(problem); left out"); continue }
+                try visit(dir, name, relative, st)
             default: continue
             }
         }
@@ -261,28 +279,23 @@ public enum HomeSnapshot {
         #endif
     }
 
-    private static func copyFile(_ source: URL, to target: URL) throws {
-        let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        guard input >= 0 else { throw HomeSnapshotError.io("cannot read (errno \(errno))") }
-        defer { close(input) }
+    /// A new private copy of an open file at `target` (inside the engine's own staging; `O_EXCL`, never through a link).
+    private static func copyFile(from input: Int32, to target: URL) throws {
         let output = open(target.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard output >= 0 else { throw HomeSnapshotError.io("cannot create the copy (errno \(errno))") }
-        var ok = true
-        var buffer = [UInt8](repeating: 0, count: 1 << 20)
-        copying: while true {
-            let n = buffer.withUnsafeMutableBytes { read(input, $0.baseAddress!, $0.count) }
-            if n < 0 { if errno == EINTR { continue }; ok = false; break }
-            if n == 0 { break }
-            var done = 0
-            while done < n {
-                let w = buffer.withUnsafeBytes { write(output, $0.baseAddress! + done, n - done) }
-                if w < 0 { if errno == EINTR { continue }; ok = false; break copying }
-                done += w
-            }
-        }
-        ok = ok && fsync(output) == 0
+        let ok = HomeFiles.copy(from: input, to: output) && fsync(output) == 0
         let closed = close(output) == 0
         guard ok, closed else { unlink(target.path); throw HomeSnapshotError.io("copy failed (errno \(errno))") }
+    }
+
+    /// `copyFile(from:to:)` from a path whose last part is never followed (the exporter's archive copies).
+    private static func copyFile(_ source: URL, to target: URL) throws {
+        let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard input >= 0 else { throw HomeSnapshotError.io("cannot read (errno \(errno))") }
+        defer { close(input) }
+        var st = stat()
+        guard fstat(input, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { throw HomeSnapshotError.io("not a regular file") }
+        try copyFile(from: input, to: target)
     }
 
     /// FNV-1a 64 of a file, streamed.
@@ -290,21 +303,29 @@ public enum HomeSnapshot {
         let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw HomeSnapshotError.io("cannot read \(url.lastPathComponent) (errno \(errno))") }
         defer { close(fd) }
-        var hash: UInt64 = 0xcbf29ce484222325
-        var buffer = [UInt8](repeating: 0, count: 1 << 20)
-        while true {
-            let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress!, $0.count) }
-            if n < 0 { if errno == EINTR { continue }; throw HomeSnapshotError.io("cannot read \(url.lastPathComponent) (errno \(errno))") }
-            if n == 0 { break }
-            for i in 0..<n { hash ^= UInt64(buffer[i]); hash = hash &* 0x100000001b3 }
+        return try HomeFiles.hash(fd: fd, shown: url.lastPathComponent)
+    }
+
+    /// `VACUUM INTO` the SQLite file `name` of a home directory held open by the walk. SQLite needs a path, so it is given the
+    /// kernel's path for that directory (every part a real directory when the walk opened it) and the walk checks, before and
+    /// after, that the directory is still in place and `name` is still the same regular file (device and inode): a part or
+    /// the file swapped for a link while it was copied makes the copy fail, and it is thrown away.
+    private static func vacuumCopy(in dir: HomeFiles.Directory, _ name: String, expected: stat, to destination: URL) throws {
+        func same() -> Bool {
+            guard dir.isInPlace, let now = HomeFiles.status(dir, name) else { return false }
+            return now.st_mode & S_IFMT == S_IFREG && now.st_dev == expected.st_dev && now.st_ino == expected.st_ino
         }
-        let hex = String(hash, radix: 16)
-        return String(repeating: "0", count: 16 - hex.count) + hex
+        guard same() else { throw HomeSnapshotError.io("moved or replaced while it was copied") }
+        try vacuumCopy(URL(fileURLWithPath: dir.real).appending(path: name), to: destination)
+        guard same() else {
+            unlink(destination.path)
+            throw HomeSnapshotError.io("moved or replaced while it was copied")
+        }
     }
 
     /// `VACUUM INTO` a SQLite file that is not ours alone (a company archive), then `integrity_check` on the copy. A file that is
     /// not a database at all is copied as it is.
-    private static func vacuumCopy(_ source: URL, to destination: URL) throws {
+    static func vacuumCopy(_ source: URL, to destination: URL) throws {
         var config = Configuration()
         config.busyMode = .timeout(5)
         do {
@@ -325,14 +346,46 @@ public enum HomeSnapshot {
 
     // MARK: Restore
 
-    /// Hashes every file of the snapshot against its manifest; throws on the first mismatch. Changes nothing.
+    /// Why `relative` (a manifest key) is not a path a snapshot may hold, or nil when it is one: it must be relative, made of
+    /// non-empty parts none of which is `.` or `..` (a `..` inside a name, like `a..b.md`, is fine), at most 255 bytes a part,
+    /// with no NUL or other control character, and in the backup set (`excluded`).
+    public static func pathProblem(_ relative: String) -> String? {
+        if relative.isEmpty { return "is empty" }
+        if relative.hasPrefix("/") { return "is absolute" }
+        if relative.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) { return "holds a control character" }
+        for part in relative.split(separator: "/", omittingEmptySubsequences: false) {
+            if part.isEmpty { return "has an empty part" }
+            if part == "." || part == ".." { return "has a '\(part)' part" }
+            if part.utf8.count > 255 { return "has a part longer than 255 bytes" }
+        }
+        if excluded(relative) { return "is left out of every snapshot" }
+        return nil
+    }
+
+    private static func parts(_ relative: String) -> (parents: [String], name: String) {
+        let parts = relative.split(separator: "/").map(String.init)
+        return (Array(parts.dropLast()), parts.last ?? relative)
+    }
+
+    /// Checks every manifest path (`pathProblem`) and hashes every file of the snapshot against its manifest, reading the tree
+    /// by descriptor (`HomeFiles`); throws on the first problem. Changes nothing.
     @discardableResult
     public static func verify(_ snapshot: HomeSnapshotInfo) throws -> HomeSnapshotManifest {
         let recorded = try manifest(of: snapshot)
-        for (relative, entry) in recorded.files.sorted(by: { $0.key < $1.key }) {
-            guard !excluded(relative), !relative.contains("..") else { throw HomeSnapshotError.damaged("\(relative) is not a path a snapshot may hold") }
-            let copy = snapshot.treeURL.appending(path: relative)
-            guard let hash = try? fileHash(copy), hash == entry.sha else {
+        let entries = recorded.files.sorted(by: { $0.key < $1.key })
+        for (relative, _) in entries {
+            if let problem = pathProblem(relative) {
+                throw HomeSnapshotError.damaged("\(String(reflecting: relative)) is not a path a snapshot may hold (\(problem))")
+            }
+        }
+        let tree: HomeFiles.Directory
+        do { tree = try HomeFiles.root(snapshot.treeURL) } catch {
+            throw HomeSnapshotError.damaged("\(snapshot.name) has no readable tree (\(error))")
+        }
+        var parents = HomeFiles.Parents(tree, create: false)
+        for (relative, entry) in entries {
+            let (dirs, name) = parts(relative)
+            guard let dir = try? parents.directory(dirs), let hash = try? HomeFiles.hash(dir, name), hash == entry.sha else {
                 throw HomeSnapshotError.damaged("\(relative) does not match its recorded hash in \(snapshot.name)")
             }
         }
@@ -342,45 +395,80 @@ public enum HomeSnapshot {
     /// Puts the home's files back as they were in `snapshot`, holding no lock of its own (`BackupService.restore` calls it with
     /// the engine lock held).
     ///
-    /// 1. Every file of the snapshot is hashed against its manifest first; a mismatch throws and nothing has changed.
+    /// 1. Every manifest path is checked and every file of the snapshot hashed against its manifest first (`verify`); a problem
+    ///    throws and nothing has changed.
     /// 2. Each file in the backup set that is in the home but not in the snapshot, and each one the snapshot replaces, is moved
     ///    to `<home>/.pre-restore-<stamp>/` (never deleted).
-    /// 3. The snapshot's files are copied in (a copy, never a link, so the snapshot stays intact) and each is hashed again.
+    /// 3. The snapshot's files are copied in (a copy, never a link, so the snapshot stays intact) to a staging name and each is
+    ///    hashed again before it is renamed into place.
+    ///
+    /// Every read, write and move goes through `HomeFiles` (descriptors from the resolved home, `O_NOFOLLOW` at every part,
+    /// `renameat` between held directories). An entry whose way in the home is not a real directory (a link planted there, or a
+    /// file where a directory should be) is refused and named in `refused`; nothing is written or moved through it, and the
+    /// other entries are restored.
     public static func restore(_ snapshot: HomeSnapshotInfo, paths: BrahmaPaths, now: Date = Date()) throws -> HomeRestoreResult {
-        let fm = FileManager.default
         let recorded = try verify(snapshot)
-        let keep = paths.home.appending(path: preRestorePrefix + BackupService.stamp(now), directoryHint: .isDirectory)
+        let keepName = preRestorePrefix + BackupService.stamp(now)
+        let keepURL = paths.home.appending(path: keepName, directoryHint: .isDirectory)
+        let home = try HomeFiles.root(paths.home)
+        let tree = try HomeFiles.root(snapshot.treeURL)
+        var homeParents = HomeFiles.Parents(home, create: true)
+        var treeParents = HomeFiles.Parents(tree, create: false)
+        var keepRoot: HomeFiles.Directory?
+        var keepParents: HomeFiles.Parents?
         var moved = 0, restored = 0
-        func moveAside(_ relative: String) throws {
-            let from = paths.home.appending(path: relative)
-            var st = stat()
-            guard lstat(from.path, &st) == 0 else { return }
-            let to = keep.appending(path: relative)
-            try BrahmaPaths.ensurePrivateDirectory(to.deletingLastPathComponent())
-            guard rename(from.path, to.path) == 0 else { throw HomeSnapshotError.io("could not move \(relative) aside (errno \(errno))") }
+        var refused: [String] = []
+
+        func keepDirectory(_ dirs: [String]) throws -> HomeFiles.Directory {
+            if keepParents == nil {
+                let root = try HomeFiles.walk(home, [keepName], create: true)
+                keepRoot = root
+                keepParents = HomeFiles.Parents(root, create: true)
+            }
+            return try keepParents!.directory(dirs)
+        }
+        /// Moves `name` (in `dir`, at `relative` in the home) to the same place under the pre-restore directory; no-op when absent.
+        func moveAside(_ dir: HomeFiles.Directory, _ name: String, _ relative: String) throws {
+            guard HomeFiles.status(dir, name) != nil else { return }
+            try HomeFiles.rename(dir, name, to: try keepDirectory(parts(relative).parents), name)
             moved += 1
         }
+        func refuse(_ relative: String, _ error: UnsafeEngineFile) { refused.append("\(relative): \(error)") }
+
         var present: [String] = []
-        try walkHome(paths.home, prefix: "") { present.append($0) }
+        var ignored: [String] = []
+        try walkHome(home, prefix: "", depth: 0, problems: &ignored) { _, _, relative, _ in present.append(relative) }
         for relative in present where recorded.files[relative] == nil {
-            if relative.hasSuffix(".sqlite") { for suffix in ["-wal", "-shm"] { try moveAside(relative + suffix) } }
-            try moveAside(relative)
+            let (dirs, name) = parts(relative)
+            do {
+                let dir = try homeParents.directory(dirs)
+                if relative.hasSuffix(".sqlite") { for suffix in ["-wal", "-shm"] { try moveAside(dir, name + suffix, relative + suffix) } }
+                try moveAside(dir, name, relative)
+            } catch let error as UnsafeEngineFile { refuse(relative, error) }
         }
         for (relative, entry) in recorded.files.sorted(by: { $0.key < $1.key }) {
-            let destination = paths.home.appending(path: relative)
-            if entry.kind == "sqlite" { for suffix in ["-wal", "-shm"] { try moveAside(relative + suffix) } }
-            try moveAside(relative)
-            try BrahmaPaths.ensurePrivateDirectory(destination.deletingLastPathComponent())
-            let staging = destination.deletingLastPathComponent().appending(path: ".\(destination.lastPathComponent).\(UUID().uuidString).restoring")
-            try copyFile(snapshot.treeURL.appending(path: relative), to: staging)
-            guard try fileHash(staging) == entry.sha, rename(staging.path, destination.path) == 0 else {
-                unlink(staging.path)
-                throw HomeSnapshotError.damaged("\(relative) did not verify after the copy")
+            let (dirs, name) = parts(relative)
+            let dir: HomeFiles.Directory
+            do {
+                dir = try homeParents.directory(dirs)
+                if entry.kind == "sqlite" { for suffix in ["-wal", "-shm"] { try moveAside(dir, name + suffix, relative + suffix) } }
+                try moveAside(dir, name, relative)
+            } catch let error as UnsafeEngineFile { refuse(relative, error); continue }
+            let staging = ".brahma-restoring-\(UUID().uuidString)"
+            do {
+                let source = try HomeFiles.openRead(try treeParents.directory(dirs), name)
+                defer { close(source) }
+                try HomeFiles.copy(from: source, toNew: dir, staging)
+                guard try HomeFiles.hash(dir, staging) == entry.sha else { throw HomeSnapshotError.damaged("hash mismatch") }
+                try HomeFiles.rename(dir, staging, to: dir, name)
+            } catch {
+                unlinkat(dir.fd, staging, 0)
+                throw HomeSnapshotError.damaged("\(relative) did not verify after the copy (\(error))")
             }
             restored += 1
         }
-        if moved > 0 { BackupService.syncDirectory(paths.home) }
-        if !fm.fileExists(atPath: keep.path) { try? BrahmaPaths.ensurePrivateDirectory(keep) }
-        return HomeRestoreResult(preRestore: keep, restored: restored, movedAway: moved)
+        if moved > 0 || restored > 0 { fsync(home.fd) }
+        if keepRoot == nil { _ = try? keepDirectory([]) }
+        return HomeRestoreResult(preRestore: keepURL, restored: restored, movedAway: moved, refused: refused)
     }
 }

@@ -170,6 +170,119 @@ import GRDB
         #expect(rig.read("companies/c1/roles/ceo.md") == "ceo v2")
     }
 
+    // MARK: Fix round 1 (S2): no link is followed out of the home; manifest paths are validated
+
+    /// A symlinked directory under the home (planted after the snapshot) must not redirect the restore: that entry is refused
+    /// and reported, the link's target is untouched, and every other entry is restored.
+    @Test func symlinkedSubdirectoryInHomeRefused() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo v1")
+        try rig.put("companies/c2/deep/a/b.md", "b v1")
+        try rig.put("transcripts/c1/a/s/t1.jsonl.gz", "t1 v1")
+        let s1 = try rig.take()
+        try rig.put("transcripts/c1/a/s/t1.jsonl.gz", "t1 v2")
+        // Outside the home: what the links point at.
+        let outside = rig.root.appending(path: "outside", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("outside".utf8).write(to: outside.appending(path: "ceo.md"))
+        let outsideDeep = rig.root.appending(path: "outside-deep", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outsideDeep.appending(path: "a"), withIntermediateDirectories: true)
+        try Data("outside b".utf8).write(to: outsideDeep.appending(path: "a/b.md"))
+        // The leaf directory and a middle directory are each replaced by a link.
+        try FileManager.default.removeItem(at: rig.url("companies/c1/roles"))
+        try FileManager.default.createSymbolicLink(at: rig.url("companies/c1/roles"), withDestinationURL: outside)
+        try FileManager.default.removeItem(at: rig.url("companies/c2/deep"))
+        try FileManager.default.createSymbolicLink(at: rig.url("companies/c2/deep"), withDestinationURL: outsideDeep)
+
+        let outcome = try HomeSnapshot.restore(s1, paths: rig.paths, now: rig.clock.next())
+        // Refused and reported, by name.
+        #expect(outcome.refused.contains { $0.hasPrefix("companies/c1/roles/ceo.md") }, "\(outcome.refused)")
+        #expect(outcome.refused.contains { $0.hasPrefix("companies/c2/deep/a/b.md") }, "\(outcome.refused)")
+        #expect(outcome.refused.allSatisfy { $0.contains("symbolic link") }, "\(outcome.refused)")
+        // Nothing outside the home changed: no file written, none moved away.
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).sorted() == ["ceo.md"])
+        #expect(try String(contentsOf: outside.appending(path: "ceo.md"), encoding: .utf8) == "outside")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outsideDeep.appending(path: "a").path).sorted() == ["b.md"])
+        #expect(try String(contentsOf: outsideDeep.appending(path: "a/b.md"), encoding: .utf8) == "outside b")
+        // The links stay links (the restore never writes through or replaces them).
+        var st = stat()
+        #expect(lstat(rig.url("companies/c1/roles").path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK)
+        // The other entry is restored.
+        #expect(rig.read("transcripts/c1/a/s/t1.jsonl.gz") == "t1 v1")
+        #expect(outcome.restored == 1)
+        // The pre-restore directory holds only what the restore really replaced, from inside the home.
+        #expect(try String(contentsOf: outcome.preRestore.appending(path: "transcripts/c1/a/s/t1.jsonl.gz"), encoding: .utf8) == "t1 v2")
+        #expect(!FileManager.default.fileExists(atPath: outcome.preRestore.appending(path: "companies").path))
+    }
+
+    /// The take side never reads through a link either: a linked directory or file under the home is not in the snapshot.
+    @Test func takeDoesNotFollowLinkedDirectories() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo")
+        let outside = rig.root.appending(path: "outside", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("secret outside".utf8).write(to: outside.appending(path: "private.md"))
+        try FileManager.default.createSymbolicLink(at: rig.url("companies/c1/files"), withDestinationURL: outside)
+        try FileManager.default.createSymbolicLink(at: rig.url("companies/c1/linked.md"),
+                                                   withDestinationURL: outside.appending(path: "private.md"))
+        let info = try rig.take()
+        #expect(try HomeSnapshot.relativeFiles(under: info.treeURL).sorted() == ["companies/c1/roles/ceo.md"])
+        #expect(Set(try HomeSnapshot.manifest(of: info).files.keys) == ["companies/c1/roles/ceo.md"])
+    }
+
+    /// A manifest naming a path outside the tree (or one no snapshot writes) makes the whole restore refuse before anything
+    /// changes, even when a file with the recorded hash sits where that path leads.
+    @Test func manifestPathTraversalRefused() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo v1")
+        let s1 = try rig.take()
+        try rig.put("companies/c1/roles/ceo.md", "ceo v2")
+        let bait = Data("bait".utf8)
+        let baitURL = s1.url.appending(path: "bait")
+        try bait.write(to: baitURL)
+        let baitHash = try HomeSnapshot.fileHash(baitURL)
+        // Files where the bad paths would lead, so only the path check can stop them.
+        try bait.write(to: s1.url.appending(path: "x"))
+        try FileManager.default.createDirectory(at: s1.treeURL.appending(path: "etc"), withIntermediateDirectories: true)
+        try bait.write(to: s1.treeURL.appending(path: "etc/x"))
+        let original = try HomeSnapshot.manifest(of: s1)
+        for bad in ["../x", "/etc/x", "companies/../../x", "a\u{0}b", "companies//c1", "./companies/x", "companies/c1/",
+                    "", "line\nbreak", "tab\there", "del\u{7f}x", ".."] {
+            var tampered = original
+            tampered.files[bad] = .init(size: 4, mtimeNs: 0, sha: baitHash, kind: "file")
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(tampered).write(to: s1.manifestURL)
+            #expect(HomeSnapshot.pathProblem(bad) != nil, "\(bad.debugDescription) should be refused")
+            do {
+                _ = try HomeSnapshot.restore(s1, paths: rig.paths, now: rig.clock.next())
+                Issue.record("\(bad.debugDescription) restored")
+            } catch let error as HomeSnapshotError {
+                #expect("\(error)".contains("is not a path a snapshot may hold"), "\(bad.debugDescription): \(error)")
+            }
+            #expect(rig.read("companies/c1/roles/ceo.md") == "ceo v2")
+            #expect(!FileManager.default.fileExists(atPath: rig.root.appending(path: "x").path))
+            #expect(!FileManager.default.fileExists(atPath: rig.url("etc").path))
+        }
+    }
+
+    /// m3: `..` inside a name is an ordinary name; only a whole `..` component is refused.
+    @Test func dotsInsideANameAreAllowed() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/files/a..b.md", "dots v1")
+        try rig.put("companies/c1/files/..hidden", "hidden v1")
+        let s1 = try rig.take()
+        try rig.put("companies/c1/files/a..b.md", "dots v2")
+        #expect(HomeSnapshot.pathProblem("companies/c1/files/a..b.md") == nil)
+        #expect(HomeSnapshot.pathProblem("companies/c1/files/..hidden") == nil)
+        #expect(HomeSnapshot.pathProblem("companies/../x") != nil)
+        _ = try HomeSnapshot.verify(s1)
+        let outcome = try HomeSnapshot.restore(s1, paths: rig.paths, now: rig.clock.next())
+        #expect(outcome.refused.isEmpty)
+        #expect(rig.read("companies/c1/files/a..b.md") == "dots v1")
+        #expect(rig.read("companies/c1/files/..hidden") == "hidden v1")
+    }
+
     @Test func pruneKeeps30() throws {
         let rig = try Rig()
         try rig.put("companies/c1/roles/ceo.md", "x")

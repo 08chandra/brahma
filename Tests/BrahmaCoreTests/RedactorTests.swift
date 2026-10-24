@@ -35,6 +35,26 @@ import GRDB
                                 "b": .object(["c": .string("[redacted DB_PASS]"), "d": .bool(true)]), "n": .null]))
     }
 
+    /// m1 (13a fix round 1): a secret used as an object key is redacted too, at any depth.
+    @Test func applyJSONRedactsObjectKeys() {
+        let r = redactor([("STRIPE_KEY", "sk_test_abcdef123456")])
+        let tree: JSONValue = .object([
+            "sk_test_abcdef123456": .string("v"),
+            "outer": .array([.object(["id=sk_test_abcdef123456": .number(1), "plain": .bool(false)])]),
+        ])
+        let out = r.applyJSON(tree)
+        #expect(out == .object([
+            "[redacted STRIPE_KEY]": .string("v"),
+            "outer": .array([.object(["id=[redacted STRIPE_KEY]": .number(1), "plain": .bool(false)])]),
+        ]))
+        // Two keys that redact to the same text both survive (nothing is silently dropped), and neither holds the value.
+        let both = r.applyJSON(.object(["sk_test_abcdef123456": .string("a"), "[redacted STRIPE_KEY]": .string("b")]))
+        guard case .object(let keys) = both else { Issue.record("not an object"); return }
+        #expect(keys.count == 2)
+        #expect(keys.keys.allSatisfy { !$0.contains("sk_test_abcdef123456") })
+        #expect(keys.values.contains(.string("a")) && keys.values.contains(.string("b")))
+    }
+
     private func jsonInner(_ s: String, escapeSlashes: Bool) throws -> String {
         let e = JSONEncoder()
         if !escapeSlashes { e.outputFormatting = [.withoutEscapingSlashes] }

@@ -165,6 +165,22 @@ import GRDB
         #expect(stored.range(of: Data(value.utf8)) == nil)
     }
 
+    /// m1 (13a fix round 1): a secret that is a JSON object key is redacted in the capture.
+    @Test func secretAsJSONKeyRedacted() throws {
+        let rig = try Rig()
+        let value = "key-secret-0123456789"
+        rig.store.redactor.update([("API_KEY", value)], version: "1:x")
+        let sid = UUID().uuidString
+        try rig.write(sid, #"{"type":"user","message":{"headers":{"\#(value)":"x"}}}"# + "\n")
+        guard case .captured(let row) = rig.capture.capture(turn: try rig.turn(), sessionId: sid, store: rig.store) else {
+            Issue.record("not captured"); return
+        }
+        let text = try rig.content(row)
+        #expect(!text.contains(value))
+        #expect(text.contains("[redacted API_KEY]"))
+        _ = try JSONSerialization.jsonObject(with: Data(text.utf8))
+    }
+
     @Test func linesThatDoNotParseAreRedactedAsRawText() throws {
         let rig = try Rig()
         rig.store.redactor.update([("TOKEN_X", "tok-abcdefgh12345")], version: "1:x")

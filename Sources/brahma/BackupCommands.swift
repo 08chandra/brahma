@@ -205,7 +205,7 @@ struct RestoreCommand: ParsableCommand {
             let when = plan.snapshotDate.map { " taken \(stamp($0))" } ?? ""
             print(safe("dry run: would restore \(snapshot.lastPathComponent)\(when); nothing was changed"))
             if withFiles, let home = plan.homeSnapshot {
-                print(safe("dry run: would also put the files back from \(home.url.lastPathComponent) (\(stamp(home.date)))"))
+                print(safe("dry run: would also put the files back from \(homeSnapshotText(home, databaseDate: plan.snapshotDate))"))
             }
             return
         }
@@ -213,12 +213,34 @@ struct RestoreCommand: ParsableCommand {
             let outcome = try service.restore(plan, withFiles: withFiles)
             for warning in outcome.warnings { print(safe("warning: \(warning)")) }
             if let previous = outcome.previousCopy { print(safe("previous database kept: \(previous.path)")) }
+            if let home = outcome.filesSnapshot {
+                print(safe("files from \(homeSnapshotText(home, databaseDate: plan.snapshotDate)): \(outcome.filesRestored) restored"))
+            }
+            for entry in outcome.filesRefused { print(safe("warning: not restored: \(entry)")) }
             if let kept = outcome.filesPreRestore {
                 print(safe("\(outcome.filesRestored) files restored; what they replaced is kept in \(kept.path)"))
             }
             print(safe("restored \(snapshot.lastPathComponent); Brahma re-adopts the repositories when it next starts"))
         } catch { throw fail("\(error)") }
     }
+}
+
+/// `home-<stamp> (taken <time>, 5h 7m before the database snapshot)`: which data-home snapshot a `--with-files` restore uses
+/// and how much older than the database snapshot it is (it is the newest one at or before it, so it may be up to a day older).
+private func homeSnapshotText(_ home: HomeSnapshotInfo, databaseDate: Date?) -> String {
+    var text = "\(home.name) (taken \(stamp(home.date))"
+    if let databaseDate {
+        let gap = max(0, Int(databaseDate.timeIntervalSince(home.date)))
+        let age: String
+        switch gap {
+        case ..<60: age = "\(gap)s"
+        case ..<3600: age = "\(gap / 60)m"
+        case ..<86_400: age = "\(gap / 3600)h \(gap % 3600 / 60)m"
+        default: age = "\(gap / 86_400)d \(gap % 86_400 / 3600)h"
+        }
+        text += ", \(age) before the database snapshot"
+    }
+    return text + ")"
 }
 
 /// With WAL shipping on, a point-in-time restore is rebuilt by litestream into `<home>/brahma.sqlite.restoring` and then swapped in

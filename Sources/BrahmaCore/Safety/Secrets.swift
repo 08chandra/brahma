@@ -458,13 +458,24 @@ public final class Redactor: @unchecked Sendable {
         return out
     }
 
-    /// Redacts every string leaf. Keys, numbers, booleans and nulls are left alone.
+    /// Redacts every string leaf and every object key. Numbers, booleans and nulls are left alone. When a redacted key
+    /// collides with another key of the same object, it gets a ` #2`, ` #3`, … suffix, so no member is dropped.
     public func applyJSON(_ v: JSONValue) -> JSONValue {
         switch v {
-        case .string(let s): .string(apply(s))
-        case .array(let a): .array(a.map(applyJSON))
-        case .object(let o): .object(o.mapValues(applyJSON))
-        case .number, .bool, .null: v
+        case .string(let s): return .string(apply(s))
+        case .array(let a): return .array(a.map(applyJSON))
+        case .object(let o):
+            var out: [String: JSONValue] = [:]
+            // Unchanged keys first, so a key that needed no redaction always keeps its exact name.
+            let keyed = o.map { (original: $0.key, redacted: apply($0.key), value: $0.value) }
+            for member in keyed where member.redacted == member.original { out[member.original] = applyJSON(member.value) }
+            for member in keyed.filter({ $0.redacted != $0.original }).sorted(by: { $0.original < $1.original }) {
+                var key = member.redacted, n = 2
+                while out[key] != nil { key = "\(member.redacted) #\(n)"; n += 1 }
+                out[key] = applyJSON(member.value)
+            }
+            return .object(out)
+        case .number, .bool, .null: return v
         }
     }
 

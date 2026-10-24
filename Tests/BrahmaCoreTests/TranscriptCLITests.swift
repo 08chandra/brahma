@@ -114,4 +114,37 @@ import GRDB
         let with = try runBrahma(["restore", "--at", iso(start.addingTimeInterval(1.5)), "--with-files", "--dry-run"], home: home.url)
         #expect(with.status == 0 && with.stdout.contains(info.url.lastPathComponent), "\(with.stdout) \(with.stderr)")
     }
+
+    /// m6 (13a fix round 1): a real `restore --with-files` (not only `--dry-run`) names the data-home snapshot it put back and
+    /// how much older than the database snapshot it is, and reports an entry it refused.
+    @Test func restoreWithFilesNamesTheHomeSnapshotAndItsAge() throws {
+        let home = try OwnerTestHome()
+        let paths = ownerPaths(home.url)
+        let start = Date(timeIntervalSince1970: 1_781_107_200)
+        let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+        _ = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+        var service = BackupService(paths: paths, writer: store.writer)
+        service.now = { start }
+        _ = try service.snapshot(reason: .manual)
+        try store.close()
+        let notes = paths.home.appending(path: "notes/today.md")
+        try FileManager.default.createDirectory(at: notes.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("v1".utf8).write(to: notes)
+        try FileManager.default.createDirectory(at: paths.home.appending(path: "linked"), withIntermediateDirectories: true)
+        try Data("l1".utf8).write(to: paths.home.appending(path: "linked/file.md"))
+        let info = try HomeSnapshot.take(paths: paths, now: start.addingTimeInterval(-(5 * 3600 + 7 * 60))).info
+        try Data("v2".utf8).write(to: notes)
+        let outside = home.url.appending(path: "outside-target", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.removeItem(at: paths.home.appending(path: "linked"))
+        try FileManager.default.createSymbolicLink(at: paths.home.appending(path: "linked"), withDestinationURL: outside)
+
+        let run = try runBrahma(["restore", "--at", iso(start.addingTimeInterval(1)), "--with-files"], home: home.url)
+        #expect(run.status == 0, "\(run.stdout) \(run.stderr)")
+        #expect(run.stdout.contains("files from \(info.name)"), "\(run.stdout)")
+        #expect(run.stdout.contains("5h 7m before the database snapshot"), "\(run.stdout)")
+        #expect(run.stdout.contains("warning: not restored: linked/file.md"), "\(run.stdout)")
+        #expect(try String(contentsOf: notes, encoding: .utf8) == "v1")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+    }
 }

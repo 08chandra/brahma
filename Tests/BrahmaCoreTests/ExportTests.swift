@@ -145,6 +145,37 @@ import GRDB
         #expect(stat(dir.appending(path: "transcripts/\(f.acme.id)/a-1/s-1/t-1.jsonl.gz").path, &st) == 0 && st.st_mode & 0o777 == 0o600)
     }
 
+    /// m4 (13a fix round 1): a live SQLite archive (WAL mode, a writer still open, nothing checkpointed) is exported as one
+    /// consistent `VACUUM INTO` copy that passes its integrity check, never as raw bytes plus sidecars. A `.sqlite` name that
+    /// is not a database is copied as it is.
+    @Test func exportCopiesArchiveSQLiteConsistently() throws {
+        let f = try Fixture()
+        let live = f.env.paths.archiveDir.appending(path: "\(f.acme.slug)/notes.sqlite")
+        let queue = try DatabaseQueue(path: live.path)
+        defer { try? queue.close() }
+        try queue.writeWithoutTransaction { db in
+            _ = try String.fetchOne(db, sql: "PRAGMA journal_mode = WAL")
+            try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
+            try db.execute(sql: "CREATE TABLE note (text TEXT)")
+            for n in 0..<50 { try db.execute(sql: "INSERT INTO note VALUES (?)", arguments: ["row \(n)"]) }
+        }
+        #expect(FileManager.default.fileExists(atPath: live.path + "-wal"))
+        try Fixture.put(f.env.paths.archiveDir.appending(path: "\(f.acme.slug)/fake.sqlite"), "not a database")
+
+        let result = try f.export(f.acme)
+        let exported = result.directory.appending(path: "archive/\(f.acme.slug)/notes.sqlite")
+        let names = try FileManager.default.contentsOfDirectory(atPath: exported.deletingLastPathComponent().path).sorted()
+        #expect(names == ["fake.sqlite", "memo.md", "notes.sqlite"], "\(names)")
+        #expect(BackupService.integrity(of: exported) == ["ok"])
+        let copy = try BackupService.openForReading(exported)
+        #expect(try copy.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM note") } == 50)
+        try copy.close()
+        #expect(try String(contentsOf: exported.deletingLastPathComponent().appending(path: "fake.sqlite"), encoding: .utf8)
+                == "not a database")
+        var st = stat()
+        #expect(stat(exported.path, &st) == 0 && st.st_mode & 0o777 == 0o600)
+    }
+
     @Test func exportHasNoSecretValues() throws {
         let f = try Fixture()
         let value = "sk-live-SUPERSECRET-9f8e7d6c5b4a"
