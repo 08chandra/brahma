@@ -85,8 +85,8 @@ private func isNonBlocking(_ fd: Int32) -> Bool { fcntl(fd, F_GETFL) & O_NONBLOC
         reader.start()
         try pipe.fileHandleForWriting.write(contentsOf: Data("0123456789abcdef".utf8))
         try pipe.fileHandleForWriting.close()
-        let deadline = Date().addingTimeInterval(5)
-        while !reader.isClosed, Date() < deadline { usleep(5_000) }
+        let deadline = AwakeTime.uptime() + 5
+        while !reader.isClosed, AwakeTime.uptime() < deadline { usleep(5_000) }
         #expect(reader.isClosed)
         reader.drain()
         reader.drain()

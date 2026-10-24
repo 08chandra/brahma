@@ -39,8 +39,8 @@ func seedAcme(_ s: Store, _ p: BrahmaPaths) throws -> (Company, ceo: Agent, cto:
 
 @MainActor
 func eventually(timeout: Duration = .seconds(60), _ cond: () throws -> Bool) async throws {
-    let deadline = ContinuousClock.now + timeout
-    while ContinuousClock.now < deadline {
+    let deadline = AwakeTime.now + timeout
+    while AwakeTime.now < deadline {
         if try cond() { return }
         try await Task.sleep(for: .milliseconds(20))
     }

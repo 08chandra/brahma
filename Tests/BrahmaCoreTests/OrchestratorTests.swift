@@ -510,8 +510,8 @@ import GRDB
 
         // Until alice's turn task has ended, not just until its outcome is recorded: the record comes first, then the actor hears
         // the outcome, then the task ends and stops counting as running.
-        let deadline = ContinuousClock.now + .seconds(60)
-        while ContinuousClock.now < deadline {
+        let deadline = AwakeTime.now + .seconds(60)
+        while AwakeTime.now < deadline {
             if try w.turns(a).first?.outcome != .inProgress, await w.orchestrator.runningCount() == 1 { break }
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -696,15 +696,15 @@ import GRDB
         w.fake.defaultScript = .init(gate: gate)
         _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "@here all hands", now: w.clock.now)
         await w.orchestrator.tick()
-        let started = ContinuousClock.now + .seconds(60)
-        while w.fake.requests.count < 3, ContinuousClock.now < started { try await Task.sleep(for: .milliseconds(5)) }
+        let started = AwakeTime.now + .seconds(60)
+        while w.fake.requests.count < 3, AwakeTime.now < started { try await Task.sleep(for: .milliseconds(5)) }
         for _ in 0..<3 {
             await w.orchestrator.tick()
             #expect(await w.orchestrator.runningCount() == 3, "saturated: the other seven wait")
         }
         gate.open()
-        let deadline = ContinuousClock.now + .seconds(60)
-        while try agents.contains(where: { try w.turns($0).first?.outcome != .succeeded }), ContinuousClock.now < deadline {
+        let deadline = AwakeTime.now + .seconds(60)
+        while try agents.contains(where: { try w.turns($0).first?.outcome != .succeeded }), AwakeTime.now < deadline {
             await w.orchestrator.tick()
             #expect(await w.orchestrator.runningCount() <= 3)
             try await Task.sleep(for: .milliseconds(20))

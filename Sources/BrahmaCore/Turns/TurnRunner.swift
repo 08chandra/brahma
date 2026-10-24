@@ -47,7 +47,8 @@ public struct ClaudeProcessRunner: TurnRunning {
     public var baseEnvironment: [String: String]
     /// Waits out a turn's wall clock before the engine kills it. Production sleeps; tests inject one that returns when their
     /// condition holds, so the kill is deterministic rather than a race against a real timer.
-    public var wallClockSleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    /// Production counts awake time (`AwakeTime`): a turn frozen by a system sleep is not killed on wake for the time it slept.
+    public var wallClockSleep: @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) }
 
     private static let live = LiveCount()
 
@@ -138,14 +139,14 @@ public struct ClaudeProcessRunner: TurnRunning {
             _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
             #endif
             try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8))
-            let deadline = Date().addingTimeInterval(seconds)
-            while Date() < deadline, process.isRunning, !collected.done { usleep(20_000) }
+            let deadline = AwakeTime.uptime() + seconds
+            while AwakeTime.uptime() < deadline, process.isRunning, !collected.done { usleep(20_000) }
             let exitedByItself = !process.isRunning
             try? stdin.fileHandleForWriting.close()
             if process.isRunning {
                 process.terminate()
-                let killAt = Date().addingTimeInterval(Self.killGrace)
-                while process.isRunning, Date() < killAt { usleep(20_000) }
+                let killAt = AwakeTime.uptime() + Self.killGrace
+                while process.isRunning, AwakeTime.uptime() < killAt { usleep(20_000) }
                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
             }
             process.waitUntilExit()
@@ -245,8 +246,8 @@ public struct ClaudeProcessRunner: TurnRunning {
 
         // The last of stderr may still be in its pipe when the process is gone; give it until the drain grace (bounded by the
         // clock, not by a count of sleeps, which stretch on a loaded machine).
-        let stderrDeadline = ContinuousClock.now + .seconds(Self.drainGrace) + .milliseconds(500)
-        while !stderrReader.isClosed, ContinuousClock.now < stderrDeadline { try? await Task.sleep(for: .milliseconds(5)) }
+        let stderrDeadline = AwakeTime.deadline(after: .seconds(Self.drainGrace) + .milliseconds(500))
+        while !stderrReader.isClosed, AwakeTime.now < stderrDeadline { try? await Task.sleep(for: .milliseconds(5)) }
         // Not closed in time (a grandchild may hold the pipe, or the handler is slow on a loaded machine): whatever the
         // process wrote before it exited is still in the pipe, so it is read now, without waiting, and nothing is lost.
         // The drain stops the handler first, so no handler read can race it (a no-op once the pipe has closed).

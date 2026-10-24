@@ -90,10 +90,10 @@ import Foundation
 
     @Test func leftoverBackgroundProcessesAreKilledWhenTheCheckEnds() async throws {
         let pidFile = try tempDir().appending(path: "pid")
-        let started = Date()
+        let started = AwakeTime.now
         let (outcome, _) = try await run("sleep 300 & echo $! > '\(pidFile.path)'; echo done")
         #expect(outcome.exitCode == 0)
-        #expect(Date().timeIntervalSince(started) < 60, "hang guard: the runner waited for the background process's pipe (it sleeps 300 s)")
+        #expect(AwakeTime.now - started < .seconds(60), "hang guard: the runner waited for the background process's pipe (it sleeps 300 s)")
         let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         #expect(await gone(pid))
     }

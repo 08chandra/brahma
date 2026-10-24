@@ -388,8 +388,8 @@ private struct HWorld {
         // Until the engine has counted the network failures, not just until the database shows them failed: a turn is recorded
         // (`endTurn`) before the actor hears its outcome (`noteOutcome`), and only then does its task end. Only the gated
         // account turns may still be running.
-        let deadline = ContinuousClock.now + .seconds(60)
-        while ContinuousClock.now < deadline {
+        let deadline = AwakeTime.now + .seconds(60)
+        while AwakeTime.now < deadline {
             let recorded = try net.allSatisfy { try w.turns($0).first?.outcome == .failed }
             if recorded, await w.orchestrator.runningCount() == acct.count { break }
             try await Task.sleep(for: .milliseconds(10))

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import BrahmaAppModel
+import BrahmaCore
 
 /// Launch-time automation used by the smoke and UI-snapshot scripts.
 @MainActor
@@ -28,8 +29,8 @@ enum Harness {
     }
 
     private static func waitReady(model: AppModel) async -> Bool {
-        let deadline = ContinuousClock.now + .seconds(20)
-        while ContinuousClock.now < deadline {
+        let deadline = AwakeTime.deadline(after: .seconds(20))
+        while AwakeTime.now < deadline {
             if model.loaded && !mainWindows().isEmpty { return true }
             try? await Task.sleep(for: .milliseconds(50))
         }
@@ -48,14 +49,14 @@ enum Harness {
             var released: Bool?
             if let release = options.smokeRelease {
                 // Held until the script says it has seen what it waits for, bounded by `smokeHold`.
-                let deadline = ContinuousClock.now + .seconds(options.smokeHold)
+                let deadline = AwakeTime.deadline(after: .seconds(options.smokeHold))
                 released = false
-                while ContinuousClock.now < deadline {
+                while AwakeTime.now < deadline {
                     if FileManager.default.fileExists(atPath: release) { released = true; break }
                     try? await Task.sleep(for: .milliseconds(100))
                 }
             } else {
-                try? await Task.sleep(for: .seconds(options.smokeHold))
+                try? await AwakeTime.sleep(for: .seconds(options.smokeHold))
             }
             let agents = model.snapshot.companies.reduce(0) { $0 + $1.counts.running + $1.counts.ready + $1.counts.blocked + $1.counts.sleeping + $1.counts.killed }
             var line = "SMOKE OK companies=\(model.snapshot.companies.count) agents=\(agents) engine=\(model.engine?.status.label ?? "none") windows=\(mainWindows().count)"
@@ -88,7 +89,7 @@ enum Harness {
     /// Quit stops the engine first (up to 15 s); only exit once the delegate has had its chance to finish.
     private static func terminateAndExit() async -> Never {
         AppDelegate.requestQuit()
-        try? await Task.sleep(for: .seconds(20))
+        try? await AwakeTime.sleep(for: .seconds(20))
         exit(0)
     }
 

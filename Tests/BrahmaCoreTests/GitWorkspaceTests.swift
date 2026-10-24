@@ -222,10 +222,10 @@ import Foundation
         #expect(fd >= 0); #expect(flock(fd, LOCK_EX) == 0)
         defer { close(fd) }
         ws.lockTimeout = 0
-        let started = Date()
+        let started = AwakeTime.now
         #expect(throws: GitError.self) { try ws.removeWorktree(key: "K-1", keepIf: { false }) }
         #expect(throws: GitError.self) { try ws.addWorktree(key: "K-1") }
-        #expect(Date().timeIntervalSince(started) < 60, "hang guard")
+        #expect(AwakeTime.now - started < .seconds(60), "hang guard")
         #expect(FileManager.default.fileExists(atPath: wt.path))
         // Other items are not affected.
         try ws.addWorktree(key: "K-2")

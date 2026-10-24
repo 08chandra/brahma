@@ -141,9 +141,9 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         let h = host(paths, store, StubRunner(mode: .hangUntilCancelled, childrenNeverExit: true))
         await h.start(tools: tools)
         try await eventually { try store.agent(id: ceo.id)?.state == .running }
-        let start = ContinuousClock.now
+        let start = AwakeTime.now
         await h.stop(timeout: .milliseconds(300))
-        #expect(ContinuousClock.now - start < .seconds(60), "hang guard")
+        #expect(AwakeTime.now - start < .seconds(60), "hang guard")
         #expect(h.status == .stopped)
     }
 

@@ -793,10 +793,11 @@ public struct GitWorkspace: Sendable {
         let fd = open(dir.appending(path: "\(name).lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw failure("cannot open the lock file") }
         defer { close(fd) }
-        let deadline = Date().addingTimeInterval(lockTimeout)
+        // Bounded in awake time (`AwakeTime`): a system sleep while waiting is not a busy lock.
+        let deadline = AwakeTime.uptime() + lockTimeout
         while flock(fd, LOCK_EX | LOCK_NB) != 0 {
             if errno != EWOULDBLOCK && errno != EINTR { throw failure("cannot take the lock") }
-            guard Date() < deadline else { throw failure("\(what) is busy; try again later") }
+            guard AwakeTime.uptime() < deadline else { throw failure("\(what) is busy; try again later") }
             Thread.sleep(forTimeInterval: 0.02)
         }
         defer { flock(fd, LOCK_UN) }

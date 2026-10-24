@@ -141,10 +141,10 @@ public actor Orchestrator {
         c.resume(throwing: OrchestratorError.idleTimeout(running: runningCount()))
     }
 
-    /// The clock `waitUntilIdle`'s backstop runs on: the suspending clock, which stands still while the Mac sleeps (as a
-    /// check's timeout does). `Task.sleep(for:)` runs on the continuous clock, which counts the sleep: a wait that spans a
-    /// system sleep then times out on wake with the engine's work merely frozen, not stuck.
-    public static let idleBackstopClock: any Clock<Duration> = SuspendingClock()
+    /// The clock `waitUntilIdle`'s backstop runs on: awake time (`AwakeTime`, the suspending clock), which stands still while
+    /// the Mac sleeps (as a check's timeout does). `Task.sleep(for:)` runs on the continuous clock, which counts the sleep: a
+    /// wait that spans a system sleep then times out on wake with the engine's work merely frozen, not stuck.
+    public static let idleBackstopClock: any Clock<Duration> = AwakeTime.clock
 
     /// Returns once no engine-owned work is in flight, woken by the work finishing (no polling). `timeout` is only a hang
     /// backstop, counted in awake time (`idleBackstopClock`): when it passes, the throw names (in the log) what is still running.
