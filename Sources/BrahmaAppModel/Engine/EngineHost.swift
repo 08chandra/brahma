@@ -61,6 +61,8 @@ public final class EngineHost {
     @ObservationIgnored private let tickInterval: Duration
     @ObservationIgnored private var lock: OrchestratorLock?
     @ObservationIgnored private var engineTask: Task<Void, Never>?
+    /// The running orchestrator, so `stop` can end its litestream directly.
+    @ObservationIgnored private var engine: Orchestrator?
     @ObservationIgnored private var rememberedTools: Result<EngineTools, EngineSetupError>?
 
     public init(paths: BrahmaPaths, store: Store,
@@ -132,6 +134,7 @@ public final class EngineHost {
             return
         }
         let interval = tickInterval
+        engine = orchestrator
         engineTask = Task.detached { await orchestrator.runForever(interval: interval) }
         status = .embedded
     }
@@ -156,9 +159,12 @@ public final class EngineHost {
             status = .stopping
             if let task = engineTask {
                 task.cancel()
+                // litestream stops even when a stuck child keeps `runForever` from returning within the timeout.
+                await engine?.stopWALShipping()
                 await Self.waitBounded(task, timeout: timeout)
             }
             engineTask = nil
+            engine = nil
             lock = nil
             status = .stopped
         case .external:

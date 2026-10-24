@@ -1,5 +1,10 @@
 import Foundation
 import GRDB
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// An off-machine place the engine's backups are copied to (Task 13b).
 public enum BackupTarget: Codable, Equatable, Sendable {
@@ -27,12 +32,24 @@ public struct BackupTools: Sendable {
     public var searchPath: String
     /// Other variables the tools may need (`HOME` for rclone's config, `RCLONE_CONFIG`...). Everything else is left out.
     public var passthrough: [String: String]
+    /// Replica credentials, for litestream only (`litestreamEnvironment`): `AWS_*`, `LITESTREAM_*` and `SSH_AUTH_SOCK`. Brahma
+    /// never stores replica credentials; the owner provides them in the environment the engine runs with. Litestream is
+    /// engine-run, never by an agent; rclone does not get them.
+    public var litestreamCredentials: [String: String]
 
     public init(searchPath: String? = nil, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.searchPath = searchPath ?? environment["PATH"] ?? "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
-        var kept: [String: String] = [:]
-        for (key, value) in environment where Self.passedThrough(key) { kept[key] = value }
+        var kept: [String: String] = [:], credentials: [String: String] = [:]
+        for (key, value) in environment {
+            if Self.passedThrough(key) { kept[key] = value }
+            if Self.litestreamCredential(key) { credentials[key] = value }
+        }
         self.passthrough = kept
+        self.litestreamCredentials = credentials
+    }
+
+    static func litestreamCredential(_ key: String) -> Bool {
+        key.hasPrefix("AWS_") || key.hasPrefix("LITESTREAM_") || key == "SSH_AUTH_SOCK"
     }
 
     public static let system = BackupTools()
@@ -40,6 +57,9 @@ public struct BackupTools: Sendable {
     private static func passedThrough(_ key: String) -> Bool {
         ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME"].contains(key) || key.hasPrefix("RCLONE_")
     }
+
+    /// What litestream runs with: `environment` plus `litestreamCredentials`.
+    public var litestreamEnvironment: [String: String] { environment.merging(litestreamCredentials) { $1 } }
 
     public var environment: [String: String] {
         var env = passthrough
@@ -182,10 +202,24 @@ public enum BackupTargets {
     static func isCrypt(remote: String, rclone: String, tools: BackupTools) -> Bool {
         let result = ExternalTool.run(executable: rclone, arguments: ["config", "show", remote], environment: tools.environment, timeout: 60)
         guard result.launched, result.status == 0 else { return false }
-        return result.output.split(whereSeparator: \.isNewline).contains { line in
+        return cryptSection(result.output, remote: remote)
+    }
+
+    /// True when the `[<remote>]` section of `rclone config show` output (and only that section: another remote's section,
+    /// or lines before any section header, never count) has `type = crypt`.
+    static func cryptSection(_ output: String, remote: String) -> Bool {
+        var inRemote = false
+        for raw in output.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                inRemote = line.dropFirst().dropLast() == Substring(remote)
+                continue
+            }
+            guard inRemote else { continue }
             let parts = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-            return parts.count == 2 && parts[0] == "type" && parts[1] == "crypt"
+            if parts.count == 2 && parts[0] == "type" { return parts[1] == "crypt" }
         }
+        return false
     }
 
     /// Symlinks resolved and the path standardized, as the sandbox compares paths.
@@ -200,15 +234,26 @@ public enum BackupTargets {
 
     /// Every configured folder target as a resolved URL. These are added to `protected` and `denyRead` for every turn (Task 1a's
     /// `backupTargets`) and every sandboxed run (Task 2's `SandboxBaseline`): an agent can neither read nor delete the backups.
+    /// The WAL replica, when it is a folder, is protected the same way (it holds the database's whole history).
     public static func protectedFolders(store: Store) -> [URL] {
-        protectedFolders(targets: (try? store.backupTargets()) ?? [])
+        protectedFolders(targets: (try? store.backupTargets()) ?? [], walReplica: (try? store.walShipping())?.replica)
     }
 
-    public static func protectedFolders(targets: [BackupTarget]) -> [URL] {
-        targets.compactMap { target in
+    public static func protectedFolders(targets: [BackupTarget], walReplica: String? = nil) -> [URL] {
+        var folders = targets.compactMap { target -> URL? in
             if case .folder(let path) = target { return resolve(URL(fileURLWithPath: path, isDirectory: true)) }
             return nil
         }
+        if let walReplica {
+            var path: String?
+            if walReplica.lowercased().hasPrefix("file://") { path = String(walReplica.dropFirst("file://".count)) }
+            else if !walReplica.contains("://") { path = walReplica }
+            if let path, path.hasPrefix("/") {
+                let url = resolve(URL(fileURLWithPath: path, isDirectory: true))
+                if !folders.contains(url) { folders.append(url) }
+            }
+        }
+        return folders
     }
 
     // MARK: Sync
@@ -221,18 +266,19 @@ public enum BackupTargets {
     }
 
     /// Syncs `paths.backupsDir` to one target. Blocking.
-    public static func sync(_ target: BackupTarget, paths: BrahmaPaths, hostname: String = hostName(), tools: BackupTools = .system)
-        -> TargetOutcome {
+    ///
+    /// A folder is checked again first, every time (`recheck`): still where it was added (no part of it became a link), still
+    /// outside the data home and every workspace, and mounted (an emptied mount point under `volumesRoot` on the data home's
+    /// volume reads as not connected). `workspaces`: the companies' workspaces (`syncAll` passes them).
+    public static func sync(_ target: BackupTarget, paths: BrahmaPaths, hostname: String = hostName(), tools: BackupTools = .system,
+                            workspaces: [URL] = [], volumesRoot: URL = URL(fileURLWithPath: "/Volumes")) -> TargetOutcome {
         guard FileManager.default.fileExists(atPath: paths.backupsDir.path) else { return .synced(files: 0) }
         switch target {
         case .folder(let path):
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
-                return .skipped(notConnectedNotice(path))
-            }
+            if let refused = recheck(folder: path, paths: paths, workspaces: workspaces, volumesRoot: volumesRoot) { return refused }
             do {
-                let destination = URL(fileURLWithPath: path, isDirectory: true).appending(path: hostname, directoryHint: .isDirectory)
-                return .synced(files: try mirror(from: paths.backupsDir, to: destination))
+                return .synced(files: try mirror(from: paths.backupsDir, into: URL(fileURLWithPath: path, isDirectory: true),
+                                                 hostname: hostname))
             } catch { return .failed("\(error)") }
         case .rclone(let remote):
             guard let rclone = tools.rclone else { return .unavailable("rclone is not installed") }
@@ -255,8 +301,9 @@ public enum BackupTargets {
     public static func syncAll(store: Store, paths: BrahmaPaths, hostname: String = hostName(), tools: BackupTools = .system,
                                now: Date = Store.now()) throws -> [TargetResult] {
         var results: [TargetResult] = []
+        let workspaces = try store.companies().map { URL(fileURLWithPath: $0.workspacePath, isDirectory: true) }
         for target in try store.backupTargets() {
-            let outcome = sync(target, paths: paths, hostname: hostname, tools: tools)
+            let outcome = sync(target, paths: paths, hostname: hostname, tools: tools, workspaces: workspaces)
             if case .skipped(let text) = outcome { try noticeOncePerDay(store: store, title: "Backup target skipped", body: text, now: now) }
             results.append(TargetResult(target: target, outcome: outcome))
         }
@@ -277,67 +324,160 @@ public enum BackupTargets {
         }
     }
 
-    // MARK: Hard-link mirror
+    // MARK: Folder check at each sync
 
-    /// Makes `destination` match `source`: new and changed files are hard-linked (copied when the target is another volume),
-    /// files no longer in `source` are removed. Symbolic links are never followed or copied. An empty source removes nothing: a
-    /// lost backup set must not empty the drive. Returns the number of files in the mirror.
-    static func mirror(from source: URL, to destination: URL) throws -> Int {
-        let fm = FileManager.default
-        try fm.createDirectory(at: destination, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        var wanted: Set<String> = []
-        var count = 0
-        guard let walker = fm.enumerator(atPath: source.path) else { return 0 }
-        for case let relative as String in walker {
-            let from = source.appending(path: relative)
-            let type = (try? fm.attributesOfItem(atPath: from.path))?[.type] as? FileAttributeType
-            let target = destination.appending(path: relative)
-            switch type {
-            case .typeDirectory:
-                try fm.createDirectory(at: target, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                wanted.insert(relative)
-            case .typeRegular:
-                wanted.insert(relative)
-                count += 1
-                try place(from, at: target)
-            default:
-                continue                                    // symbolic links, sockets...: never followed or copied
+    /// Nil when the stored folder may receive the mirror now; else the outcome to report instead.
+    static func recheck(folder path: String, paths: BrahmaPaths, workspaces: [URL], volumesRoot: URL) -> TargetOutcome? {
+        guard path.hasPrefix("/") else { return .failed("\(path) is not an absolute path; re-add the target") }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+            return .skipped(notConnectedNotice(path))
+        }
+        let stored = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        let now = resolve(stored)
+        guard now.path == stored.path else {
+            return .failed("\(path) now resolves to \(now.path) (a part of it was replaced by a link); nothing was copied. "
+                + "Check the drive and re-add the target (brahma backup target add folder)")
+        }
+        for other in ([paths.home, paths.workspaces] + workspaces).map(resolve) where contains(now, other) || contains(other, now) {
+            return .failed("\(path) is inside (or holds) Brahma's own data (\(other.path)); nothing was copied. Re-add a folder outside it")
+        }
+        // An emptied mount point left on the boot volume (the drive is unplugged) must not receive the mirror.
+        let volumes = resolve(volumesRoot)
+        if contains(volumes, now), now.path != volumes.path {
+            var target = stat(), home = stat()
+            if stat(now.path, &target) == 0, stat(paths.home.path, &home) == 0, target.st_dev == home.st_dev {
+                return .skipped(notConnectedNotice(path))
             }
         }
-        guard count > 0 else { return 0 }
-        var stale: [String] = []
-        if let existing = fm.enumerator(atPath: destination.path) {
-            for case let relative as String in existing where !wanted.contains(relative) { stale.append(relative) }
-        }
-        // Deepest first, so a directory is emptied before it is removed.
-        for relative in stale.sorted(by: { $0.count > $1.count }) { try? fm.removeItem(at: destination.appending(path: relative)) }
-        return count
+        guard FileManager.default.isWritableFile(atPath: path) else { return .failed("\(path) is not writable") }
+        return nil
     }
 
-    private static func place(_ file: URL, at target: URL) throws {
-        let fm = FileManager.default
-        guard let source = try? fm.attributesOfItem(atPath: file.path) else { return }
-        if let existing = try? fm.attributesOfItem(atPath: target.path) {
-            if existing[.systemFileNumber] as? UInt64 == source[.systemFileNumber] as? UInt64,
-               existing[.systemNumber] as? Int == source[.systemNumber] as? Int { return }     // already the same file
-            if existing[.type] as? FileAttributeType == .typeRegular, existing[.size] as? UInt64 == source[.size] as? UInt64,
-               let a = existing[.modificationDate] as? Date, let b = source[.modificationDate] as? Date,
-               abs(a.timeIntervalSince(b)) < 1 { return }
-            try fm.removeItem(at: target)
+    // MARK: Folder mirror
+
+    /// Deeper than this, a directory of the backup set is not mirrored.
+    static let maxMirrorDepth = 64
+
+    /// Makes `<target>/<hostname>/` match `source` (the backups directory). Every read, write and removal goes through
+    /// descriptors (`HomeFiles` / `EngineFiles.OpenDirectory`): the target is resolved once, then each directory is opened with
+    /// `O_NOFOLLOW | O_DIRECTORY` relative to the one before (a link at `<target>/<hostname>` or anywhere in the mirror is
+    /// refused and the sync fails, nothing written through it); files are copied to an `O_EXCL` temporary in the held
+    /// directory and `renameat`-ed into place; stale entries are removed with `EngineFiles.removeEntry` relative to their
+    /// held parent (a link is unlinked, never followed), so removal never leaves `<target>/<hostname>/`.
+    ///
+    /// Files are always copied, never hard-linked to the source, even on the same volume: a target never shares an inode with
+    /// a file under the data home. Within one run, files that are one inode in the source (the data-home snapshots' links)
+    /// become one inode in the mirror too. A file already there with the same size and modification time is left as it is.
+    /// An empty source removes nothing: a lost backup set must not empty the drive. Returns the number of files mirrored.
+    static func mirror(from source: URL, into target: URL, hostname: String) throws -> Int {
+        let from = try HomeFiles.root(source)
+        let root = try HomeFiles.root(target)
+        let host = try HomeFiles.walk(root, [hostname], create: true)
+        var run = MirrorRun(host: host)
+        try run.copy(from, into: host, prefix: "", depth: 0)
+        guard run.count > 0 else { return 0 }
+        try run.prune(host, prefix: "", depth: 0)
+        return run.count
+    }
+
+    private struct InodeKey: Hashable { let dev: Int64; let ino: UInt64 }
+
+    private struct MirrorRun {
+        let host: HomeFiles.Directory
+        var wanted: Set<String> = []
+        var count = 0
+        /// Source inode -> the mirror path of its first copy this run.
+        var placed: [InodeKey: String] = [:]
+
+        init(host: HomeFiles.Directory) { self.host = host }
+
+        mutating func copy(_ from: HomeFiles.Directory, into to: HomeFiles.Directory, prefix: String, depth: Int) throws {
+            guard depth < BackupTargets.maxMirrorDepth else { return }
+            for name in try from.names().sorted() {
+                guard let st = HomeFiles.status(from, name) else { continue }
+                let relative = prefix + name
+                switch st.st_mode & S_IFMT {
+                case S_IFDIR:
+                    wanted.insert(relative)
+                    let child = try from.child(name)
+                    try copy(child, into: try HomeFiles.walk(to, [name], create: true), prefix: relative + "/", depth: depth + 1)
+                case S_IFREG:
+                    wanted.insert(relative)
+                    count += 1
+                    try place(from, name, st, into: to, relative: relative)
+                default:
+                    continue                                                // links, sockets...: never followed or copied
+                }
+            }
         }
-        if link(file.path, target.path) == 0 { return }
-        // Another volume: copy beside the target, then rename, so a reader never sees half a file.
-        let temp = target.deletingLastPathComponent().appending(path: ".\(target.lastPathComponent).partial")
-        try? fm.removeItem(at: temp)
-        try fm.copyItem(at: file, to: temp)
-        var attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o600]
-        if let modified = source[.modificationDate] { attributes[.modificationDate] = modified }
-        try? fm.setAttributes(attributes, ofItemAtPath: temp.path)
-        guard rename(temp.path, target.path) == 0 else {
-            let code = errno
-            try? fm.removeItem(at: temp)
-            throw BackupTargetError.invalid("could not place \(target.path) (errno \(code))")
+
+        private mutating func place(_ from: HomeFiles.Directory, _ name: String, _ st: stat, into to: HomeFiles.Directory,
+                                    relative: String) throws {
+            let key = InodeKey(dev: Int64(st.st_dev), ino: UInt64(st.st_ino))
+            if let existing = HomeFiles.status(to, name), existing.st_mode & S_IFMT == S_IFREG,
+               !(existing.st_dev == st.st_dev && existing.st_ino == st.st_ino),       // a hard link to the source is replaced
+               existing.st_size == st.st_size, abs(BackupTargets.mtime(existing) - BackupTargets.mtime(st)) < 2 {
+                if placed[key] == nil { placed[key] = relative }
+                return
+            }
+            let temp = ".brahma-partial-\(UUID().uuidString)"
+            if let first = placed[key], linkWithin(first, to: to, temp) {
+                // Same source inode as a file already mirrored this run: the same mirror inode.
+            } else {
+                let input = try HomeFiles.openRead(from, name)
+                defer { close(input) }
+                try HomeFiles.copy(from: input, toNew: to, temp)
+                BackupTargets.setMtime(of: temp, in: to, like: st)
+            }
+            if let existing = HomeFiles.status(to, name), existing.st_mode & S_IFMT == S_IFDIR {
+                try EngineFiles.removeEntry(dfd: to.fd, name: name, shown: to.shown.appending(path: name).path)
+            }
+            do { try HomeFiles.rename(to, temp, to: to, name) } catch {
+                unlinkat(to.fd, temp, 0)
+                throw error
+            }
+            if placed[key] == nil { placed[key] = relative }
         }
+
+        /// A hard link, inside the mirror, from the earlier copy at `first` to `name` in `to`.
+        private func linkWithin(_ first: String, to: HomeFiles.Directory, _ name: String) -> Bool {
+            let parts = first.split(separator: "/").map(String.init)
+            guard let leaf = parts.last, let dir = try? HomeFiles.walk(host, parts.dropLast(), create: false) else { return false }
+            return linkat(dir.fd, leaf, to.fd, name, 0) == 0
+        }
+
+        /// Removes what is in the mirror but no longer in the source, relative to each held directory.
+        func prune(_ dir: HomeFiles.Directory, prefix: String, depth: Int) throws {
+            guard depth < BackupTargets.maxMirrorDepth else { return }
+            for name in try dir.names() {
+                let relative = prefix + name
+                guard let st = HomeFiles.status(dir, name) else { continue }
+                if !wanted.contains(relative) {
+                    try? EngineFiles.removeEntry(dfd: dir.fd, name: name, shown: dir.shown.appending(path: name).path)
+                } else if st.st_mode & S_IFMT == S_IFDIR, let child = try? dir.child(name) {
+                    try prune(child, prefix: relative + "/", depth: depth + 1)
+                }
+            }
+        }
+    }
+
+    static func mtime(_ st: stat) -> TimeInterval {
+        #if canImport(Darwin)
+        TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9
+        #else
+        TimeInterval(st.st_mtim.tv_sec) + TimeInterval(st.st_mtim.tv_nsec) / 1e9
+        #endif
+    }
+
+    /// Gives `name` in `dir` the source's modification time (never following a link), so the next run sees it unchanged.
+    static func setMtime(of name: String, in dir: HomeFiles.Directory, like st: stat) {
+        #if canImport(Darwin)
+        var times = [timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT)), st.st_mtimespec]
+        #else
+        var times = [timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT)), st.st_mtim]
+        #endif
+        _ = utimensat(dir.fd, name, &times, AT_SYMLINK_NOFOLLOW)
     }
 }
 

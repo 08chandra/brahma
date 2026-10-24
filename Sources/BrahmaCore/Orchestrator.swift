@@ -158,6 +158,12 @@ public actor Orchestrator {
             log("WAL shipping is on but litestream is not installed")
             return
         }
+        // The stored replica is checked again (a folder may since have become a link into the data home, or lost its drive).
+        let workspaces = ((try? store.companies()) ?? []).map { URL(fileURLWithPath: $0.workspacePath, isDirectory: true) }
+        do { _ = try WALShipping.validateReplica(config.replica, paths: paths, workspaces: workspaces) } catch {
+            log("WAL shipping is on but not started: \(error)")
+            return
+        }
         do { try WALShipping.config(paths: paths, replica: config.replica) } catch {
             log("WAL shipping config could not be written: \(error)")
             return
@@ -167,7 +173,8 @@ public actor Orchestrator {
         shipper.start()
     }
 
-    /// Stops the litestream supervisor (the engine is shutting down).
+    /// Stops the litestream supervisor and its child (the engine is shutting down: `runForever` ends here, and the app's
+    /// `EngineHost.stop` calls it too). Blocking for at most `WALShipper.stopGrace` + 2 s.
     public func stopWALShipping() {
         walShipper?.stop()
         walShipper = nil
@@ -257,6 +264,8 @@ public actor Orchestrator {
             await tick()
             try? await Task.sleep(for: interval)
         }
+        // The engine is stopping: litestream stops with it (SIGTERM, then SIGKILL after the grace).
+        stopWALShipping()
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
             + (secretsTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }

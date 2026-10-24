@@ -92,12 +92,17 @@ struct BackupGroup: ParsableCommand {
 
         struct Enable: ParsableCommand {
             static let configuration = CommandConfiguration(commandName: "enable", abstract: "Ship the write-ahead log to a replica.")
-            @Argument(help: "A folder, or a URL litestream understands (s3://bucket/path).") var replica: String
+            @Argument(help: "A folder outside Brahma's data and workspaces, or a URL litestream understands (s3://bucket/path). Credentials go in the environment (AWS_*, LITESTREAM_*, SSH_AUTH_SOCK), never in the URL.") var replica: String
             func run() throws {
                 try requireOwnerShell()
-                let (store, _) = try openStore()
+                let (store, paths) = try openStore()
                 guard BackupTools.system.litestream != nil else { throw fail("\(WALShippingError.unavailable)") }
-                let target = replica.contains("://") ? replica : ((replica as NSString).expandingTildeInPath)
+                // A folder replica gets a folder target's checks; a URL may not carry credentials (they stay in the environment).
+                let target: String
+                do {
+                    let workspaces = try store.companies().map { URL(fileURLWithPath: $0.workspacePath, isDirectory: true) }
+                    target = try WALShipping.validateReplica(replica, paths: paths, workspaces: workspaces)
+                } catch { throw fail("\(error)") }
                 try store.setWALShipping(WALShippingConfig(replica: target))
                 print(safe("WAL shipping on: \(target) (restart Brahma to begin)"))
             }
@@ -246,8 +251,15 @@ private func homeSnapshotText(_ home: HomeSnapshotInfo, databaseDate: Date?) -> 
 /// With WAL shipping on, a point-in-time restore is rebuilt by litestream into `<home>/brahma.sqlite.restoring` and then swapped in
 /// by the ordinary restore. Nil when WAL shipping is off or litestream cannot produce the file (the snapshots are used instead,
 /// with a warning when it was on).
+///
+/// A dry run runs nothing and writes nothing (no litestream, no `litestream.yml`): it says what a real restore would try first.
 private func walRestore(paths: BrahmaPaths, at when: Date, dryRun: Bool) -> URL? {
     guard let replica = WALShipping.configuredReplica(paths: paths) else { return nil }
+    if dryRun {
+        print(safe("dry run: WAL shipping is on, so a real restore first has litestream rebuild \(stamp(when)) from \(replica) "
+            + "(checked before it is used) and falls back to the snapshot below if that fails; litestream was not run"))
+        return nil
+    }
     do {
         return try WALShipping.restoreFile(paths: paths, replica: replica, timestamp: when)
     } catch {
