@@ -821,6 +821,18 @@ enum Migrations {
                 t.column("enabled", .boolean).notNull()
                 t.primaryKey(["companyId", "presetId"])
             }
+            // Refused `request_access` calls: the owner's view of why, and the agent's refusal budget.
+            try db.create(table: "accessRefusal") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("value", .text).notNull()
+                t.column("detail", .text).notNull()
+                t.column("createdActive", .double).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "accessRefusal_agent", on: "accessRefusal", columns: ["agentId", "createdActive"])
         }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which

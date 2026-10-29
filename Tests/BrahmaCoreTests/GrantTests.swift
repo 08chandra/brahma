@@ -17,6 +17,8 @@ struct GrantWorld {
     }
 
     var store: Store { world.store }
+    /// The owner's machine as the World's orchestrator sees it (a temp home, no Darwin temp dir).
+    var env: SandboxEnvironment { SandboxEnvironment(userHome: world.userHome, darwinUserTemp: nil, shell: "/bin/zsh") }
     func tools(_ agent: Agent? = nil) -> CompanyTools { CompanyTools(store: store, companyId: company.id, agentId: (agent ?? eng).id) }
 
     /// `request_access` as the agent calls it.
@@ -38,7 +40,7 @@ struct GrantWorld {
                duration: GrantDuration) throws -> Grant {
         _ = try request(kind, value, by: agent, item: item)
         let ask = try #require(try store.asks(companyId: company.id).last { $0.kind == .grant })
-        return try store.approveAccess(askId: ask.id, scope: scope, duration: duration, note: "ok", userHome: world.userHome)
+        return try store.approveAccess(askId: ask.id, scope: scope, duration: duration, note: "ok", environment: env)
     }
 
     /// The scope of the agent's next sandboxed turn.
@@ -86,28 +88,40 @@ func refusal(_ body: () throws -> Any) -> String? {
 
     @Test func invalidValuesRefused() throws {
         let g = try GrantWorld()
-        for (kind, value) in [("network_domain", "localhost"), ("network_domain", "*"), ("network_domain", "10.0.0.1"),
-                              ("web_domain", "api.anthropic.com"), ("read_path", "~/.ssh"), ("read_path", "/Volumes/X"),
-                              ("read_path", "/Volumes"), ("read_path", "relative/dir"), ("read_path", "/no/such/dir-\(UUID())"),
-                              ("plugin", "x"), ("network_domain", "a.example.com\n")] {
-            #expect(refusal { try g.request(kind, value) } != nil, "\(kind) \(value.debugDescription) should be refused")
-        }
         // An extension is refused until extensions are installable (Task 5a).
         #expect(refusal { try g.request("extension", "acme/linter") }
                 == "No extension 'acme/linter'. Build one in your lab and use propose_extension.")
+        for (kind, value) in [("network_domain", "localhost"), ("network_domain", "*"), ("network_domain", "10.0.0.1"),
+                              ("web_domain", "api.anthropic.com"), ("plugin", "x"), ("network_domain", "a.example.com\n")] {
+            #expect(refusal { try g.request(kind, value) } != nil, "\(kind) \(value.debugDescription) should be refused")
+        }
         #expect(try g.store.asks(companyId: g.company.id).isEmpty, "nothing was filed")
+        // Every read-path refusal reads the same to the agent (no probe of the owner's tree); the owner sees why.
+        let other = try g.store.hire(companyId: g.company.id, name: "eng-2", role: "engineer", model: "sonnet")
+        for value in ["~/.ssh", "/Volumes/X", "/Volumes", "relative/dir", "/no/such/dir-\(UUID())"] {
+            #expect(refusal { try g.request("read_path", value, by: other) } == Grants.pathRefusal, "\(value)")
+        }
+        let refused = try g.store.accessRefusals(companyId: g.company.id)
+        #expect(refused.count >= 5); #expect(refused.contains { $0.value == "/Volumes" && !$0.detail.isEmpty })
 
         // Read paths: protected places of the owner's home, the data home, other workspaces, /Volumes.
         let home = try tempDir()
         let ssh = home.appending(path: ".ssh")
         try FileManager.default.createDirectory(at: ssh, withIntermediateDirectories: true)
-        let data = try tempDir(), other = try tempDir(), ok = try tempDir()
+        let data = try tempDir(), otherWs = try tempDir(), ok = try tempDir(), temp = try tempDir()
+        let ownWs = URL(fileURLWithPath: g.company.workspacePath).appending(path: "docs")
+        try FileManager.default.createDirectory(at: ownWs, withIntermediateDirectories: true)
+        let inTemp = temp.appending(path: "data")
+        try FileManager.default.createDirectory(at: inTemp, withIntermediateDirectories: true)
         let paths = BrahmaPaths(home: data, workspaces: data.deletingLastPathComponent())
+        let env = SandboxEnvironment(userHome: home, darwinUserTemp: temp, shell: "/bin/zsh")
         func validate(_ v: String) throws -> String {
-            try Grants.validate(kind: .readPath, value: v, company: g.company, paths: paths, userHome: home, otherWorkspaces: [other],
+            try Grants.validate(kind: .readPath, value: v, company: g.company, paths: paths, environment: env, otherWorkspaces: [otherWs],
                                 backupTargets: [])
         }
-        for bad in [ssh.path, data.path, other.path, home.path, "/Volumes", "/"] {
+        // Protected places, and every place a turn can write: the workspace (its .git and .brahma too) and the Darwin temp dir.
+        for bad in [ssh.path, data.path, otherWs.path, home.path, "/Volumes", "/", ownWs.path, g.company.workspacePath,
+                    g.company.workspacePath + "/.git", temp.path, inTemp.path] {
             #expect(throws: (any Error).self, "\(bad)") { try validate(bad) }
         }
         #expect(try validate(ok.path) == ok.resolvedForSandbox.path)
@@ -115,11 +129,17 @@ func refusal(_ body: () throws -> Any) -> String? {
 
     @Test func publicSuffixWildcardRefused() throws {
         let g = try GrantWorld()
-        for value in ["*.github.io", "*.vercel.app", "*.co.uk", "*.com"] {
-            #expect(refusal { try g.request("web_domain", value) } != nil, "\(value)")
-            #expect(refusal { try g.request("network_domain", value) } != nil, "\(value)")
+        let bad = ["*.github.io", "*.vercel.app", "*.co.uk", "*.com", "*.foo.github.io", "*.s3.us-east-1.amazonaws.com",
+                   "*.trycloudflare.com", "*.fly.dev", "*.onrender.com", "*.r2.dev", "*.ngrok.app", "*.web.core.windows.net"]
+        for value in bad {
+            #expect(throws: (any Error).self, "\(value)") {
+                try Grants.validate(kind: .webDomain, value: value, company: g.company, paths: g.world.paths, environment: g.env)
+            }
         }
-        #expect(try g.request("network_domain", "*.example.com").hasPrefix("Requested A-1"))
+        // Bash egress grants are exact hosts only; a web grant may be a wildcard under a registrable name.
+        #expect(refusal { try g.request("network_domain", "*.example.com") } != nil)
+        #expect(try g.request("web_domain", "*.example.com").hasPrefix("Requested A-1"))
+        #expect(try g.request("network_domain", "api.fly.dev").hasPrefix("Requested A-2"), "an exact host under one is fine")
     }
 
     @Test func dedupeAndQuota() throws {
@@ -161,7 +181,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         // Another company's ask cannot be approved as a grant in this one, nor its grant revoked from here.
         _ = try g.request("web_domain", "x.example.com")
         let ask = try g.ask("A-1")
-        let granted = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", userHome: g.world.userHome)
+        let granted = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", environment: g.env)
         #expect(throws: WorkError.self) { try g.store.revokeGrant(companyId: bolt.id, number: granted.number, by: "owner") }
         #expect(try g.store.asks(companyId: bolt.id).isEmpty)
     }
@@ -173,9 +193,9 @@ func refusal(_ body: () throws -> Any) -> String? {
         _ = try g.request("web_domain", "docs.example.com")
         #expect(!(try await g.nextScope()).network.allowedDomains.contains("api.example.com"), "not before the owner decides")
         let net = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .sprint, note: "fine",
-                                            userHome: g.world.userHome)
+                                            environment: g.env)
         let web = try g.store.approveAccess(askId: try g.ask("A-2").id, scope: .agent, duration: .sprint, note: "",
-                                            userHome: g.world.userHome)
+                                            environment: g.env)
         #expect(net.ref == "G-1"); #expect(web.ref == "G-2")
         #expect(net.kind == .networkDomain); #expect(net.value == "api.example.com"); #expect(net.scope == .agent)
         #expect(net.scopeRef == g.eng.id); #expect(net.requesterId == g.eng.id); #expect(net.duration == .sprint)
@@ -194,25 +214,81 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(used.useCount >= 1); #expect(used.lastUsedAt != nil)
         // Approving again is refused; a non-grant ask is not approved as one.
         #expect(throws: WorkError.self) {
-            try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .sprint, note: "", userHome: g.world.userHome)
+            try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .sprint, note: "", environment: g.env)
         }
     }
 
-    @Test func plainOwnerApproveCreatesTheRequestedGrant() throws {
+    @Test func plainApproveRefusesGrantAsks() throws {
         let g = try GrantWorld()
-        _ = try g.request("web_domain", "docs.example.com", scope: "role", duration: "always")
-        _ = try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: true, note: "yes")
-        let grant = try #require(try g.store.grants(companyId: g.company.id).first)
-        #expect(grant.scope == .role); #expect(grant.scopeRef == "engineer"); #expect(grant.duration == .always)
-        #expect(grant.approvedBy == "owner")
-        // A rejected ask grants nothing.
-        _ = try g.request("web_domain", "other.example.com")
-        _ = try g.store.ownerDecide(askId: try g.ask("A-2").id, approve: false)
-        #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).count == 1)
-        // Rescinding the approval takes the grant with it.
-        _ = try g.store.ownerRescind(askId: try g.ask("A-1").id)
+        _ = try g.request("web_domain", "docs.example.com", scope: "company", duration: "always")
+        // The agent's proposal is never applied silently: the owner names the scope and duration.
+        let message = refusal { try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: true, note: "yes") }
+        #expect(message == "approve access with: brahma access approve \(g.company.slug) A-1 --scope … --duration …")
+        #expect(try g.ask("A-1").status == .pendingOwner)
+        #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).isEmpty)
+        // Rejecting stays a plain decision.
+        _ = try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: false)
+        #expect(try g.ask("A-1").status == .rejected)
+        // Rescinding an approval takes the grant with it, and the ledger says so.
+        let grant = try g.grant("web_domain", "other.example.com", scope: .agent, duration: .always)
+        _ = try g.store.ownerRescind(askId: try #require(grant.askId))
         #expect(try g.store.grants(companyId: g.company.id).isEmpty)
-        #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).first?.revokedBy == "owner")
+        #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).first { $0.id == grant.id }?.revokedBy == "owner")
+        #expect(try g.store.events(afterId: 0, companyId: g.company.id).contains { $0.text.contains("\(grant.ref) revoked") })
+    }
+
+    @Test func refusalsAreRateLimited() throws {
+        let g = try GrantWorld()
+        for n in 0..<AccessRefusals.perActiveDay {
+            #expect(refusal { try g.request("read_path", "/no/such/\(n)") } == Grants.pathRefusal)
+        }
+        // Even a good request is refused now, and nothing is filed: probing is bounded.
+        #expect(refusal { try g.request("web_domain", "fine.example.com") } == AccessRefusals.message)
+        #expect(try g.store.asks(companyId: g.company.id).isEmpty)
+        // A new active day opens the window again.
+        try g.store.advanceActive(companyId: g.company.id, by: AccessRefusals.window + 1)
+        #expect(try g.request("web_domain", "fine.example.com").hasPrefix("Requested A-1"))
+    }
+
+    @Test func readPathLinkedBeforeApprovalRefused() throws {
+        let g = try GrantWorld()
+        let root = try tempDir()
+        let data = root.appending(path: "data"), secret = root.appending(path: "secret")
+        for d in [data, secret] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: data.path, reason: "r",
+                                      environment: g.env)
+        // The agent swaps the directory for a link before the owner looks.
+        try FileManager.default.removeItem(at: data)
+        try FileManager.default.createSymbolicLink(at: data, withDestinationURL: secret)
+        #expect(throws: (any Error).self) {
+            try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+        }
+        #expect(try g.ask("A-1").status == .pendingOwner)
+        #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).isEmpty)
+        // A link anywhere on the way is refused at request time too.
+        let via = root.appending(path: "via")
+        try FileManager.default.createSymbolicLink(at: via, withDestinationURL: root)
+        #expect(!Grants.isPinned(via.appending(path: "secret").path))
+        #expect(Grants.isPinned(secret.resolvedForSandbox.path))
+    }
+
+    @Test func readPathSwappedAfterApprovalIsDropped() async throws {
+        let g = try GrantWorld()
+        let root = try tempDir()
+        let data = root.appending(path: "data"), secret = root.appending(path: "secret")
+        for d in [data, secret] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: data.path, reason: "r",
+                                      environment: g.env)
+        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+        #expect((try await g.nextScope()).readOnlyDirs.map(\.path).contains(grant.value))
+        try FileManager.default.removeItem(at: data)
+        try FileManager.default.createSymbolicLink(at: data, withDestinationURL: secret)
+        let scope = try await g.nextScope()
+        let paths = scope.readOnlyDirs.map(\.path) + scope.readable.map(\.path)
+        #expect(!paths.contains(grant.value)); #expect(!paths.contains(secret.resolvedForSandbox.path))
+        let after = try #require(try g.store.grants(companyId: g.company.id, includeInactive: true).first)
+        #expect(after.revokedAt != nil); #expect(after.revokedBy == "engine")
+        #expect(try g.store.allNotices().contains { $0.companyId == g.company.id && $0.body.contains(grant.ref) })
     }
 
     @Test func onceGrantUsedByOneTurn() async throws {
@@ -230,8 +306,49 @@ func refusal(_ body: () throws -> Any) -> String? {
         let after = try g.store.grants(companyId: g.company.id, includeInactive: true)
         #expect(after.allSatisfy { $0.usesLeft == 0 && $0.useCount == 1 })
         #expect(try g.store.grants(companyId: g.company.id).isEmpty, "used up: no longer active")
-        // Consuming a used-up grant takes nothing.
-        #expect(try g.store.consumeGrants(ids: [grant.id], turnId: "t", now: Date()).isEmpty)
+        // Consuming is all-or-nothing: a used-up grant is reported lost and nothing else is taken.
+        let fresh = try g.grant("network_domain", "fresh.example.com", scope: .once, duration: .always)
+        #expect(try g.store.consumeGrants(ids: [grant.id, fresh.id], turnId: "t", now: Date()) == [grant.id])
+        #expect(try g.store.grants(companyId: g.company.id).first { $0.id == fresh.id }?.usesLeft == 1)
+        #expect(try g.store.consumeGrants(ids: [fresh.id], turnId: "t", now: Date()).isEmpty)
+    }
+
+    @Test func notLaunchedTurnKeepsItsOneUseGrant() async throws {
+        let g = try GrantWorld()
+        // A model outside the allowlist: the turn is prepared, then not launched.
+        let odd = try g.store.hire(companyId: g.company.id, name: "odd-1", role: "engineer", model: "not-a-model")
+        let grant = try g.grant("network_domain", "once.example.com", by: odd, scope: .once, duration: .always)
+        try g.world.dm(g.company, odd)
+        try await g.world.cycle()
+        #expect(!g.world.fake.requests.contains { $0.agent.id == odd.id })
+        #expect(try g.store.grants(companyId: g.company.id).first { $0.id == grant.id }?.usesLeft == 1)
+    }
+
+    @Test func reviewAndAuditTurnsSkipOneUseAndItemGrants() throws {
+        let g = try GrantWorld()
+        let item = try g.item()
+        _ = try g.tools().call(name: "claim_lease", arguments: ["key": .string(item.key)])
+        let once = try g.grant("network_domain", "once.example.com", scope: .once, duration: .always)
+        let turn = try g.grant("network_domain", "turn.example.com", scope: .agent, duration: .turn)
+        let onItem = try g.grant("network_domain", "item.example.com", item: item.key, scope: .item, duration: .always)
+        let always = try g.grant("network_domain", "always.example.com", scope: .agent, duration: .always)
+        #expect(Set(try g.store.activeGrants(agent: g.eng, itemId: item.id, kind: .work).map(\.id)) == [once.id, turn.id, onItem.id, always.id])
+        for kind in [TurnKind.review, .audit] {
+            #expect(try g.store.activeGrants(agent: g.eng, itemId: item.id, kind: kind).map(\.id) == [always.id], "\(kind)")
+        }
+    }
+
+    @Test func teamSprintBeforeCompanySprint() throws {
+        let g = try GrantWorld()
+        try g.store.writer.write { db in try db.execute(sql: "UPDATE agent SET team = 'core' WHERE id = ?", arguments: [g.eng.id]) }
+        let company = Sprint(id: UUID().uuidString, companyId: g.company.id, number: 1, team: nil, goal: "g", cadence: .sprint,
+                             status: .active, createdAt: Date())
+        let team = Sprint(id: UUID().uuidString, companyId: g.company.id, number: 2, team: "core", goal: "g", cadence: .sprint,
+                          status: .active, createdAt: Date())
+        try g.store.writer.write { db in try company.insert(db); try team.insert(db) }
+        #expect(try g.grant("network_domain", "t.example.com", scope: .agent, duration: .sprint).sprintId == team.id)
+        let other = try g.store.hire(companyId: g.company.id, name: "eng-2", role: "engineer", model: "sonnet")
+        #expect(try g.grant("network_domain", "c.example.com", by: other, scope: .agent, duration: .sprint).sprintId == company.id)
     }
 
     @Test func itemScopeFollowsItem() async throws {
@@ -250,7 +367,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         // An item scope needs an item on the ask.
         _ = try g.request("network_domain", "noitem.example.com")
         #expect(throws: WorkError.self) {
-            try g.store.approveAccess(askId: try g.ask("A-2").id, scope: .item, duration: .always, note: "", userHome: g.world.userHome)
+            try g.store.approveAccess(askId: try g.ask("A-2").id, scope: .item, duration: .always, note: "", environment: g.env)
         }
     }
 
@@ -321,16 +438,17 @@ func refusal(_ body: () throws -> Any) -> String? {
             #expect(gr.revokedAt != nil); #expect(gr.revokedBy == "kill")
         }
         #expect(all.first { $0.id == roleGrant.id }?.revokedAt == nil, "a role grant outlives the agent")
+        #expect(try g.store.events(afterId: 0, companyId: g.company.id).contains { $0.text.contains("revoked") && $0.text.contains("kill") })
     }
 
     @Test func readPathGrantIsReadOnly() async throws {
         let g = try GrantWorld()
         let dir = try tempDir()
         _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: dir.path, reason: "data",
-                                      userHome: g.world.userHome)
+                                      environment: g.env)
         let ask = try g.ask("A-1")
         #expect(ask.risk == .medium)
-        let grant = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", userHome: g.world.userHome)
+        let grant = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", environment: g.env)
         #expect(grant.value == dir.resolvedForSandbox.path)
         let scope = try await g.nextScope()
         let resolved = dir.resolvedForSandbox.path
@@ -340,6 +458,16 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(scope.cwd.path != resolved)
         let r = try #require(g.world.fake.requests.last)
         #expect(TurnProfileCompiler.profile(for: r).addDirs.contains(resolved))
+        // The settings write-deny it, for the sandbox and for Edit/Write.
+        let profile = TurnProfileCompiler.profile(for: r)
+        let settings = try JSONDecoder().decode(ClaudeSettings.self, from: Data(TurnProfileCompiler.settingsJSON(profile).utf8))
+        #expect(settings.sandbox?.filesystem?.denyWrite?.contains(resolved) == true)
+        #expect(settings.sandbox?.filesystem?.allowWrite?.contains(resolved) != true)
+        let deny = try #require(settings.permissions?.deny)
+        #expect(deny.contains("Edit(/\(resolved)/**)")); #expect(deny.contains("Write(/\(resolved)/**)"))
+        // An unlimited grant's use is counted, not logged every turn.
+        #expect(try g.store.grants(companyId: g.company.id).first?.useCount == 1)
+        #expect(!(try g.store.events(afterId: 0, companyId: g.company.id)).contains { $0.text.contains("uses \(grant.ref)") })
     }
 
     @Test func ownerOnlyCLI() throws {
@@ -350,6 +478,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         let eng = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
         _ = try store.requestAccess(companyId: company.id, agentId: eng.id, kind: .webDomain, value: "docs.example.com",
                                     reason: "read \u{1b}[31mdocs")
+        _ = try store.requestAccess(companyId: company.id, agentId: eng.id, kind: .webDomain, value: "*.docs.example.org", reason: "all docs")
         try store.close()
         let asAgent = ["BRAHMA_AGENT_ID": eng.id]
         for args in [["access", "acme"], ["access", "approve", "acme", "A-1", "--scope", "agent", "--duration", "always"],
@@ -365,7 +494,11 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(list.status == 0, "\(list.stderr)")
         #expect(list.stdout.contains("A-1") && list.stdout.contains("web_domain docs.example.com") && list.stdout.contains("@eng-1"))
         #expect(!list.stdout.contains("\u{1b}"))
-        #expect(try runBrahma(["access", "approve", "acme", "A-1", "--scope", "galaxy"], home: home.url).status != 0)
+        #expect(list.stdout.contains("*.docs.example.org") && list.stdout.contains("WILDCARD"), "\(list.stdout)")
+        #expect(try runBrahma(["access", "approve", "acme", "A-1", "--scope", "galaxy", "--duration", "always"], home: home.url).status != 0)
+        #expect(try runBrahma(["access", "approve", "acme", "A-1", "--scope", "agent"], home: home.url).status != 0, "--duration is required")
+        #expect(try runBrahma(["access", "approve", "acme", "A-1", "--duration", "always"], home: home.url).status != 0, "--scope is required")
+        #expect(try runBrahma(["approve", "acme", "A-1"], home: home.url).stderr.contains("brahma access approve"))
         let approve = try runBrahma(["access", "approve", "acme", "A-1", "--scope", "agent", "--duration", "always"], home: home.url)
         #expect(approve.status == 0, "\(approve.stderr)")
         #expect(approve.stdout.contains("G-1"))

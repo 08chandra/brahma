@@ -90,46 +90,97 @@ public struct RequestedGrant: Codable, Equatable, Sendable {
 }
 
 public enum Grants {
+    /// What the agent hears for every refused read path, whatever the reason: a specific answer would let it probe which
+    /// directories exist or are protected. The owner sees the reason (`Store.accessRefusals`, `brahma access`).
+    public static let pathRefusal = "That path can't be granted; the owner can see why in the ledger."
+
+    /// Multi-tenant parents (anyone can get a name under them): a wildcard grant whose parent is one of these, or lies under
+    /// one, is refused. The single-label and country suffixes of `DomainMatcher.publicSuffixes` are matched exactly there; these
+    /// also match as a suffix. (Folded into `DomainMatcher.publicSuffixes` in the final wave.)
+    public static let multiTenantSuffixes: Set<String> = Set(DomainMatcher.publicSuffixes.filter {
+        $0.contains(".") && !["co.uk", "org.uk", "com.au"].contains($0)
+    }).union(["trycloudflare.com", "fly.dev", "onrender.com", "r2.dev", "ngrok.app", "web.core.windows.net"])
+
     /// Until Task 5a builds the installed-extension table, every extension grant is refused with this.
     static func noExtension(_ id: String) -> String {
         "No extension '\(Store.flat(id, max: 200))'. Build one in your lab and use propose_extension."
     }
 
     /// The normalized value, or throws why it cannot be granted:
-    /// - domains: `DomainMatcher.isValidPattern` (no public-suffix wildcard, `localhost`, IP literal or `*`) and never Anthropic's;
-    /// - read paths: absolute, an existing directory, no character a sandbox profile cannot carry, not inside `/Volumes`, and
-    ///   accepted as a read path by the scope a turn would get (`SandboxScope.forTurn`: no overlap with the owner's protected
-    ///   paths, the data home, another company's workspace, a backup target or `<ws>/.brahma`; never the owner's home itself).
-    ///   Returned resolved (`resolvedForSandbox`);
+    /// - domains: `DomainMatcher.isValidPattern` (no public-suffix wildcard, `localhost`, IP literal or `*`) and never Anthropic's.
+    ///   A `network_domain` (Bash egress) is an exact host only; a `web_domain` wildcard's parent may not be or lie under a
+    ///   multi-tenant suffix (`multiTenantSuffixes`);
+    /// - read paths: absolute, an existing directory reached without a symbolic link (`isPinned` once resolved), no character a
+    ///   sandbox profile cannot carry, not overlapping `/Volumes` or any place a turn can write (the company's workspace with its
+    ///   `.git` and `.brahma`, the Darwin user temp dir), and accepted as a read path by the scope a turn would get
+    ///   (`SandboxScope.forTurn`: no overlap with the owner's protected paths, the data home, another company's workspace, a
+    ///   backup target; never the owner's home itself). Returned resolved;
     /// - extensions: refused until extensions can be installed (Task 5a).
     public static func validate(kind: GrantKind, value raw: String, company: Company, paths: BrahmaPaths,
-                                userHome: URL = FileManager.default.homeDirectoryForCurrentUser, otherWorkspaces: [URL] = [],
+                                environment: SandboxEnvironment = .owner, otherWorkspaces: [URL] = [],
                                 backupTargets: [URL] = []) throws -> String {
         let value = raw.trimmingCharacters(in: .whitespaces)
         switch kind {
         case .networkDomain, .webDomain:
             try SandboxDomains.check(value)
-            return SandboxDomains.normalize(value)
+            let domain = SandboxDomains.normalize(value)
+            if domain.hasPrefix("*.") {
+                guard kind == .webDomain else {
+                    throw WorkError.invalid("a network_domain grant is one exact host name; ask for each host you need")
+                }
+                let base = String(domain.dropFirst(2))
+                if multiTenantSuffixes.contains(where: { base == $0 || base.hasSuffix("." + $0) }) {
+                    throw WorkError.invalid("\(domain) would cover names anyone can register; ask for exact host names")
+                }
+            }
+            return domain
         case .extension:
             throw WorkError.invalid(noExtension(value))
         case .readPath:
             if SandboxPath.isUnsafe(value) { throw SandboxError.unsafePathCharacter(value) }
             guard value.hasPrefix("/") else { throw WorkError.invalid("a read path must be absolute: \(Store.flat(value, max: 200))") }
             let resolved = URL(fileURLWithPath: value, isDirectory: false).resolvedForSandbox
-            guard SandboxPath.kind(resolved.path) == .directory else {
-                throw WorkError.invalid("a read path must be an existing directory: \(Store.flat(value, max: 200))")
+            guard isPinned(resolved.path) else {
+                throw WorkError.invalid("a read path must be an existing directory reached without a link: \(Store.flat(value, max: 200))")
             }
-            for volumes in [URL(fileURLWithPath: "/Volumes", isDirectory: false), URL(fileURLWithPath: "/Volumes").resolvedForSandbox]
-            where SandboxPath.overlaps(resolved.path, volumes.path) {
-                throw SandboxError.overlapsProtected(path: resolved.path, protected: volumes.path)
+            // Never a place a turn can write: the agent could replace what was granted with a link to anything.
+            let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: false)
+            let writable = [URL(fileURLWithPath: "/Volumes", isDirectory: false), workspace]
+                + (environment.darwinUserTemp.map { [$0] } ?? [])
+            for place in writable.flatMap({ [$0, $0.resolvedForSandbox] }) where SandboxPath.overlaps(resolved.path, place.path) {
+                throw SandboxError.overlapsProtected(path: resolved.path, protected: place.path)
             }
             // The scope a turn of this company would get with only this grant: its checks are the turn's own.
             let layout = SandboxLayout(paths: paths, company: company, agentHandle: "grant-check")
             _ = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: otherWorkspaces, backupTargets: backupTargets,
                                          kind: .audit, item: nil, company: company, grants: GrantInputs(readPaths: [resolved]),
-                                         darwinUserTemp: nil, userHome: userHome)
+                                         darwinUserTemp: environment.darwinUserTemp, userHome: environment.userHome)
             return resolved.path
         }
+    }
+
+    /// A granted path stays what the owner approved: it is absolute and safe, it resolves to itself, and no component of it is
+    /// a symbolic link (an `lstat` walk from `/`); it is a directory.
+    public static func isPinned(_ path: String) -> Bool {
+        guard path.hasPrefix("/"), !SandboxPath.isUnsafe(path),
+              SandboxPath.key(SandboxPath.resolve(path)) == SandboxPath.key(path) else { return false }
+        var current = ""
+        for part in path.split(separator: "/") {
+            if part == "." || part == ".." { return false }
+            current += "/" + part
+            guard SandboxPath.kind(current) == .directory else { return false }
+        }
+        return true
+    }
+
+    /// A stored read-path grant still is what was approved: pinned, and accepted again by `validate` unchanged.
+    static func stillValid(_ grant: Grant, company: Company, paths: BrahmaPaths, environment: SandboxEnvironment,
+                           otherWorkspaces: [URL], backupTargets: [URL]) -> Bool {
+        guard grant.kind == .readPath else { return true }
+        guard isPinned(grant.value),
+              let again = try? validate(kind: .readPath, value: grant.value, company: company, paths: paths, environment: environment,
+                                        otherWorkspaces: otherWorkspaces, backupTargets: backupTargets) else { return false }
+        return SandboxPath.key(again) == SandboxPath.key(grant.value)
     }
 
     /// The agent's request as stored on a `grant` ask; nil for any other ask.
@@ -161,10 +212,15 @@ public enum GrantResolver {
 
     /// The live grants that apply to a turn of `agent` (working `itemId`, if any). `roles` is the agent's role plus the roles it
     /// covers (`RoleTemplate.covers`): a `role` grant applies when its role is one of them.
-    public static func active(_ grants: [Grant], agent: Agent, roles: Set<String>, itemId: String?, activeNow: Double,
-                              sprintActive: (String) -> Bool) -> [Grant] {
-        grants.filter { g in
+    /// A review or audit turn gets neither one-use grants (`once` scope, `turn` duration: they are meant for the requester's
+    /// own work) nor item grants (a reviewer does not work the item).
+    public static func active(_ grants: [Grant], agent: Agent, roles: Set<String>, itemId: String?, kind: TurnKind = .work,
+                              activeNow: Double, sprintActive: (String) -> Bool) -> [Grant] {
+        let reviewing = kind == .review || kind == .audit
+        let itemId = reviewing ? nil : itemId
+        return grants.filter { g in
             guard g.companyId == agent.companyId, isLive(g, activeNow: activeNow, sprintActive: sprintActive) else { return false }
+            if reviewing, g.scope == .once || g.duration == .turn { return false }
             switch g.scope {
             case .once: return g.requesterId == agent.id
             case .item: return itemId != nil && g.scopeRef == itemId
@@ -191,6 +247,29 @@ public enum AccessPreset: String, Codable, CaseIterable, Sendable, DatabaseValue
     case readOnlyWebForEngineers = "readonly-web-engineers"
     /// Under the `auto` autonomy preset, low-risk web reads are approved for the requester for the sprint.
     case autoModeLowRisk = "auto-low-risk"
+}
+
+/// Refused `request_access` calls are counted per agent: past `perActiveDay` in `window` company-active seconds, every
+/// request is refused, so an agent cannot probe the owner's file system or the domain rules without bound.
+public enum AccessRefusals {
+    public static let perActiveDay = 5
+    public static let window: TimeInterval = 86_400
+    public static let message = "Too many of your access requests were refused today; ask the owner with request_from_owner instead."
+}
+
+/// One refused `request_access` call, with the reason only the owner sees.
+public struct AccessRefusal: Codable, Equatable, Sendable, FetchableRecord, MutablePersistableRecord {
+    public static let databaseTableName = "accessRefusal"
+    public var id: Int64?
+    public var companyId: String
+    public var agentId: String
+    public var kind: String
+    public var value: String
+    public var detail: String
+    public var createdActive: Double
+    public var createdAt: Date
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }
 
 public enum AccessPresets {

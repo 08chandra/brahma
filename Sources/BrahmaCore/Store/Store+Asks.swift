@@ -264,7 +264,7 @@ extension Store {
     func propose(db: Database, companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk?, category: String?, title: String,
                  summary: String, payload: AskPayload?, document: PreparedDocument?, itemId: String?, subjectId: String?,
                  supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool,
-                 quotaExempt: AskQuota.Exemption? = nil, now: Date) throws -> Ask {
+                 quotaExempt: AskQuota.Exemption? = nil, announce: Bool = true, now: Date) throws -> Ask {
         let company = try requireCompany(db, companyId)
         let requester = try askRequester(db, sender, companyId: companyId)
         let rid = Store.cleanRequestId(requestId)
@@ -319,8 +319,12 @@ extension Store {
             try ask.insert(db)
             let text = "\(ask.ref) needs your decision: \(try Store.displayTitle(db, ask)): \(ask.title) (decide with the decide tool)"
             try MessageRouter(store: self).sendDM(db: db, companyId: companyId, from: .system, to: approver.name, text: text, now: now)
-        } else {
+        } else if announce {
             try enterPendingOwner(db, ask: &ask, company: company, now: now)
+            try ask.insert(db)
+        } else {
+            // Decided in the same transaction (an access preset): no "approval needed" line or DM for the owner.
+            ask.status = .pendingOwner
             try ask.insert(db)
         }
         return ask
@@ -519,23 +523,19 @@ extension Store {
            let company = try company(id: seen.companyId) {
             currentHash = .some(currentDocumentHash(seen, company: company))
         }
-        // Approving an access ask grants what the agent asked for; its value is checked again first (it reads the file system).
-        var grant: GrantApproval?
-        if approve, let seen = try ask(id: askId), seen.kind == .grant, seen.status.isPending {
-            grant = try grantApproval(askId: askId, scope: nil, duration: nil, approvedBy: "owner")
-        }
         return try writer.write { db in
             try ownerDecide(db: db, askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange,
-                            currentHash: currentHash, grant: grant, now: now)
+                            currentHash: currentHash, grant: nil, now: now)
         }
     }
 
     /// `ownerDecide` inside the caller's write transaction. `currentHash` is the document's hash read before the transaction
-    /// (`.some(nil)`: unreadable; nil: not read). Approving a `grant` ask needs `grant` (`Store.grantApproval`) and writes the
-    /// grant in the same transaction. Besides the owner paths, its one caller is an access preset the owner turned on
-    /// (`requestAccess`, owner-delegated, note `auto: <title>`).
+    /// (`.some(nil)`: unreadable; nil: not read). Approving a `grant` ask needs `grant` (`Store.approveAccess`, with the scope
+    /// and duration the owner chose) and writes the grant in the same transaction; a plain approve of one is refused. Besides
+    /// the owner paths, its one caller is an access preset the owner turned on (`requestAccess`, owner-delegated, note
+    /// `auto: <title>`, `decidedBy` `preset:<id>`).
     func ownerDecide(db: Database, askId: String, approve: Bool, note: String, acknowledgeChange: Bool, currentHash: String??,
-                     grant: GrantApproval?, now: Date) throws -> Ask {
+                     grant: GrantApproval?, decidedBy: String = "owner", now: Date) throws -> Ask {
         var ask = try requireAsk(db, askId)
         guard ask.kind.isDecision else {
             throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
@@ -545,10 +545,13 @@ extension Store {
            let current = currentHash, current != proposed {
             throw WorkError.conflict("\(ask.ref)'s document changed since it was proposed; read it again and approve with --ack-changed")
         }
-        if approve, ask.kind == .grant, grant == nil { throw WorkError.invalid("\(ask.ref) is an access request; approve it with brahma access approve") }
+        if approve, ask.kind == .grant, grant == nil {
+            let slug = try Company.fetchOne(db, key: ask.companyId)?.slug ?? "<co>"
+            throw WorkError.invalid("approve access with: brahma access approve \(slug) \(ask.ref) --scope … --duration …")
+        }
         ask.ownerNote = Store.flat(note, max: Store.maxAskField)
         ask.ownerDecidedAt = now
-        try settle(db, ask: &ask, status: approve ? .approved : .rejected, decidedBy: "owner", now: now)
+        try settle(db, ask: &ask, status: approve ? .approved : .rejected, decidedBy: decidedBy, now: now)
         if approve, ask.kind == .grant, let grant { try createGrant(db, ask: ask, approval: grant, now: now) }
         if !approve, let ref = Self.quarantineRef(of: ask) {
             let sha = ask.subjectId.map { String($0.drop { $0 != "@" }.dropFirst().prefix(12)) } ?? ""

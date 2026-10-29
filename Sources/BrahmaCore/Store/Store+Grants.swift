@@ -10,13 +10,13 @@ public struct AccessRequest: Equatable, Sendable {
     public var grant: Grant?
 }
 
-/// How an approved `grant` ask becomes a grant: the validated value, and the owner's (or a preset's) scope and duration (nil:
-/// what the agent asked for).
+/// How an approved `grant` ask becomes a grant: the validated value, and the scope and duration the owner (or a preset the
+/// owner turned on) chose. Never the agent's proposal.
 struct GrantApproval: Sendable {
     var kind: GrantKind
     var value: String
-    var scope: GrantScope?
-    var duration: GrantDuration?
+    var scope: GrantScope
+    var duration: GrantDuration
     var approvedBy: String
 }
 
@@ -26,16 +26,17 @@ extension Store {
     /// An agent's access request (`request_access`). In order:
     /// 1. the requester must be an active agent of the company, and the item (if any) the company's (`.forbidden("not in
     ///    your company")`);
-    /// 2. `AskQuota` (checked again in the write that files the ask);
-    /// 3. the value must be grantable (`Grants.validate`; read paths against the owner's `userHome`);
+    /// 2. `AskQuota` (checked again in the write that files the ask), then the refusal budget (`AccessRefusals`);
+    /// 3. the value must be grantable (`Grants.validate`). A refusal is recorded with its reason for the owner and counts
+    ///    against the agent's refusal budget; a read path is refused with the one generic `Grants.pathRefusal`;
     /// 4. an open request for the same kind and value anywhere in the company is returned instead (`deduped`);
-    /// 5. a `grant` ask (category `tooling`, risk `kind.risk`) goes straight to the owner;
-    /// 6. an enabled access preset may approve it at once, through `ownerDecide` (owner-delegated), with an FYI notice.
+    /// 5. an enabled access preset may decide it at once: the ask is filed without the "approval needed" line and DM, approved
+    ///    through `ownerDecide` (owner-delegated, `decidedBy` `preset:<id>`) and the owner gets an FYI notice;
+    /// 6. otherwise the `grant` ask (category `tooling`, risk `kind.risk`) goes straight to the owner.
     @discardableResult
     public func requestAccess(companyId: String, agentId: String, kind: GrantKind, value: String, reason: String,
                               itemId: String? = nil, scope: GrantScope? = nil, duration: GrantDuration? = nil,
-                              userHome: URL = FileManager.default.homeDirectoryForCurrentUser,
-                              now: Date = Store.now()) throws -> AccessRequest {
+                              environment: SandboxEnvironment = .owner, now: Date = Store.now()) throws -> AccessRequest {
         // 1. Cross-company ids first.
         try writer.read { db in
             guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId else {
@@ -48,13 +49,34 @@ extension Store {
                 }
             }
         }
-        // 2. The quota, before anything else is looked at.
+        // 2. The quota, then the refusal budget, before anything else is looked at.
         try AskQuota.check(store: self, agentId: agentId)
+        try writer.read { db in
+            let since = try Store.activeNow(db: db, companyId: companyId) - AccessRefusals.window
+            let refused = try AccessRefusal.filter(Column("agentId") == agentId && Column("createdActive") > since).fetchCount(db)
+            if refused >= AccessRefusals.perActiveDay { throw WorkError.invalid(AccessRefusals.message) }
+        }
         // 3. The value (reads the file system for a path: outside any transaction).
-        let context = try grantCheckContext(companyId: companyId, userHome: userHome)
-        let normalized = try Grants.validate(kind: kind, value: value, company: context.company, paths: context.paths,
-                                             userHome: userHome, otherWorkspaces: context.others, backupTargets: context.backups)
-        if scope == .item, itemId == nil { throw WorkError.invalid("scope item needs an item") }
+        let normalized: String
+        do {
+            if scope == .item, itemId == nil { throw WorkError.invalid("scope item needs an item") }
+            let context = try grantCheckContext(companyId: companyId)
+            normalized = try Grants.validate(kind: kind, value: value, company: context.company, paths: context.paths,
+                                             environment: environment, otherWorkspaces: context.others, backupTargets: context.backups)
+        } catch {
+            let detail = (error as? WorkError)?.message ?? "\(error)"
+            try writer.write { db in
+                var row = AccessRefusal(companyId: companyId, agentId: agentId, kind: kind.rawValue, value: Store.flat(value, max: 500),
+                                        detail: Store.flat(detail, max: 1000),
+                                        createdActive: try Store.activeNow(db: db, companyId: companyId), createdAt: now)
+                try row.insert(db)
+            }
+            switch kind {
+            case .readPath: throw WorkError.invalid(Grants.pathRefusal)
+            case .extension: throw WorkError.invalid(Grants.noExtension(value))
+            case .networkDomain, .webDomain: throw WorkError.invalid(detail)
+            }
+        }
         let requested = RequestedGrant(kind: kind, value: normalized, duration: duration ?? .sprint)
 
         return try writer.write { db in
@@ -66,25 +88,26 @@ extension Store {
             if let same = open.first(where: { Grants.requested($0).map { $0.kind == kind && $0.value == normalized } ?? false }) {
                 return AccessRequest(ask: same, deduped: true, grant: nil)
             }
-            // 5. The ask: no approver decides a grant; it goes to the owner.
+            // 5. The presets decide before the ask is routed, so an ask they resolve never reaches the owner as "approval needed".
+            let company = try requireCompany(db, companyId)
+            guard let requester = try Agent.fetchOne(db, key: agentId) else { throw WorkError.forbidden("not in your company") }
+            let decision = AccessPresets.autoDecision(kind: kind, value: normalized, risk: kind.risk, requesterRole: requester.role,
+                                                      company: company, enabled: try Store.enabledPresets(db, companyId: companyId),
+                                                      pack: catalog.pack(company.packId))
+            // 6. The ask: no approver decides a grant; it goes to the owner.
             var ask = try propose(db: db, companyId: companyId, by: .agent(agentId), kind: .grant, risk: kind.risk,
                                   category: AccessPresets.category, title: "\(kind.rawValue) \(normalized)", summary: reason,
                                   payload: AskPayload(details: Grants.details(requested)), document: nil, itemId: itemId,
-                                  subjectId: nil, supersedes: nil, requestId: nil, decisionClass: .taste, viaOwner: true, now: now)
+                                  subjectId: nil, supersedes: nil, requestId: nil, decisionClass: .taste, viaOwner: true,
+                                  announce: decision == nil, now: now)
             ask.proposedGrant = ProposedGrant(scope: (scope ?? .agent).rawValue, durationSeconds: nil)
             try ask.update(db, columns: ["proposedGrant"])
-            // 6. The presets.
-            let company = try requireCompany(db, companyId)
-            guard let requester = try Agent.fetchOne(db, key: agentId),
-                  let decision = AccessPresets.autoDecision(kind: kind, value: normalized, risk: ask.risk, requesterRole: requester.role,
-                                                            company: company, enabled: try Store.enabledPresets(db, companyId: companyId),
-                                                            pack: catalog.pack(company.packId))
-            else { return AccessRequest(ask: ask, deduped: false, grant: nil) }
+            guard let decision else { return AccessRequest(ask: ask, deduped: false, grant: nil) }
             let approval = GrantApproval(kind: kind, value: normalized, scope: decision.scope, duration: decision.duration,
                                          approvedBy: decision.approvedBy)
             // The one engine-internal caller of `ownerDecide`: the owner turned this preset on, so the decision is theirs.
             let decided = try ownerDecide(db: db, askId: ask.id, approve: true, note: "auto: \(ask.title)", acknowledgeChange: false,
-                                          currentHash: nil, grant: approval, now: now)
+                                          currentHash: nil, grant: approval, decidedBy: decision.approvedBy, now: now)
             let grant = try Grant.filter(Column("askId") == ask.id).fetchOne(db)
             try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal,
                             title: "Access approved by preset \(decision.preset.rawValue)",
@@ -95,9 +118,16 @@ extension Store {
         }
     }
 
+    /// The refused access requests of a company, newest first (the owner's view of why).
+    public func accessRefusals(companyId: String, limit: Int = 50) throws -> [AccessRefusal] {
+        try writer.read { db in
+            try AccessRefusal.filter(Column("companyId") == companyId).order(Column("id").desc).limit(limit).fetchAll(db)
+        }
+    }
+
     /// The company and what a grant value is checked against: the data home (a stand-in for an in-memory store), every other
     /// company's workspace and the owner's backup folders.
-    func grantCheckContext(companyId: String, userHome: URL) throws -> (company: Company, paths: BrahmaPaths, others: [URL], backups: [URL]) {
+    func grantCheckContext(companyId: String) throws -> (company: Company, paths: BrahmaPaths, others: [URL], backups: [URL]) {
         let (fetched, others) = try writer.read { db in
             (try Company.fetchOne(db, key: companyId),
              try Company.filter(Column("id") != companyId).fetchAll(db).map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) })
@@ -111,12 +141,13 @@ extension Store {
 
     // MARK: Owner
 
-    /// The owner approves an access ask with a scope and duration (nil: what the agent asked for). The value is validated again
-    /// (a path may have changed), then the ask is approved through `ownerDecide` and the grant written in the same transaction.
+    /// The owner approves an access ask with the scope and duration they chose (the agent's proposal is only shown). The value is
+    /// validated again (a read path must still be the very directory that was asked for), then the ask is approved through
+    /// `ownerDecide` and the grant written in the same transaction.
     @discardableResult
-    public func approveAccess(askId: String, scope: GrantScope? = nil, duration: GrantDuration? = nil, note: String = "",
-                              userHome: URL = FileManager.default.homeDirectoryForCurrentUser, now: Date = Store.now()) throws -> Grant {
-        let approval = try grantApproval(askId: askId, scope: scope, duration: duration, approvedBy: "owner", userHome: userHome)
+    public func approveAccess(askId: String, scope: GrantScope, duration: GrantDuration, note: String = "",
+                              environment: SandboxEnvironment = .owner, now: Date = Store.now()) throws -> Grant {
+        let approval = try grantApproval(askId: askId, scope: scope, duration: duration, approvedBy: "owner", environment: environment)
         return try writer.write { db in
             let ask = try ownerDecide(db: db, askId: askId, approve: true, note: note, acknowledgeChange: false, currentHash: nil,
                                       grant: approval, now: now)
@@ -126,14 +157,19 @@ extension Store {
     }
 
     /// What approving a `grant` ask grants; reads the file system for a path (call it outside a write transaction).
-    func grantApproval(askId: String, scope: GrantScope?, duration: GrantDuration?, approvedBy: String,
-                       userHome: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> GrantApproval {
+    func grantApproval(askId: String, scope: GrantScope, duration: GrantDuration, approvedBy: String,
+                       environment: SandboxEnvironment) throws -> GrantApproval {
         guard let ask = try ask(id: askId) else { throw WorkError.notFound("no such ask") }
         guard ask.kind == .grant, let requested = Grants.requested(ask) else { throw WorkError.invalid("\(ask.ref) is not an access request") }
         guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
-        let context = try grantCheckContext(companyId: ask.companyId, userHome: userHome)
+        let context = try grantCheckContext(companyId: ask.companyId)
         let value = try Grants.validate(kind: requested.kind, value: requested.value, company: context.company, paths: context.paths,
-                                        userHome: userHome, otherWorkspaces: context.others, backupTargets: context.backups)
+                                        environment: environment, otherWorkspaces: context.others, backupTargets: context.backups)
+        // A read path is pinned at request: if it now resolves elsewhere (a link was put in its place), it is not what was asked.
+        if requested.kind == .readPath, !Grants.isPinned(requested.value) || SandboxPath.key(value) != SandboxPath.key(requested.value) {
+            throw WorkError.invalid("\(requested.value) is no longer the directory that was requested (a symbolic link replaced it "
+                                    + "or a part of it); reject \(ask.ref)")
+        }
         return GrantApproval(kind: requested.kind, value: value, scope: scope, duration: duration, approvedBy: approvedBy)
     }
 
@@ -146,8 +182,7 @@ extension Store {
         guard let requester = try Agent.fetchOne(db, key: ask.requesterId), requester.companyId == ask.companyId else {
             throw WorkError.forbidden("not in your company")
         }
-        let scope = approval.scope ?? ask.proposedGrant.flatMap { GrantScope(rawValue: $0.scope) } ?? .agent
-        let duration = approval.duration ?? requested.duration
+        let scope = approval.scope, duration = approval.duration
         let scopeRef: String?
         switch scope {
         case .once, .agent:
@@ -212,17 +247,42 @@ extension Store {
 
     /// A killed agent's own grants (`agent` scope naming it, and its `once` grants) are revoked in the kill's transaction.
     static func revokeGrantsOfKilled(db: Database, agent: Agent, now: Date) throws {
-        try db.execute(sql: #"""
-            UPDATE "grant" SET revokedAt = ?, revokedBy = 'kill'
-            WHERE companyId = ? AND revokedAt IS NULL
-              AND ((scope = 'agent' AND scopeRef = ?) OR (scope = 'once' AND requesterId = ?))
-            """#, arguments: [now, agent.companyId, agent.id, agent.id])
+        let own = try Grant.filter(Column("companyId") == agent.companyId && Column("revokedAt") == nil
+                                   && ((Column("scope") == GrantScope.agent.rawValue && Column("scopeRef") == agent.id)
+                                       || (Column("scope") == GrantScope.once.rawValue && Column("requesterId") == agent.id)))
+            .fetchAll(db)
+        try revoke(db, own, by: "kill", why: "@\(agent.name) was removed", now: now)
     }
 
     /// A rescinded access ask takes its grant with it.
     func revokeGrants(_ db: Database, askId: String, now: Date) throws {
-        try db.execute(sql: #"UPDATE "grant" SET revokedAt = ?, revokedBy = 'owner' WHERE askId = ? AND revokedAt IS NULL"#,
-                       arguments: [now, askId])
+        let grants = try Grant.filter(Column("askId") == askId && Column("revokedAt") == nil).fetchAll(db)
+        try Store.revoke(db, grants, by: "owner", why: "its ask was rescinded", now: now)
+    }
+
+    /// Revokes each grant with a ledger line.
+    static func revoke(_ db: Database, _ grants: [Grant], by: String, why: String, now: Date) throws {
+        for var g in grants {
+            g.revokedAt = now
+            g.revokedBy = by
+            try g.update(db)
+            try ActivityEvent(companyId: g.companyId, agentId: nil, turnId: nil, kind: .approval,
+                              text: "\(g.ref) revoked by \(by) (\(why)): \(g.kind.rawValue) \(g.value)", createdAt: now).insert(db)
+        }
+    }
+
+    /// A read-path grant that no longer is what was approved (a link replaced it or a part of it, or it moved under a protected
+    /// place) is revoked by the engine and the owner is told; it never reaches a turn.
+    func revokeChangedPathGrant(_ grant: Grant, now: Date) throws {
+        try writer.write { db in
+            guard let current = try Grant.fetchOne(db, key: grant.id), current.revokedAt == nil else { return }
+            try Store.revoke(db, [current], by: "engine", why: "the path changed", now: now)
+            try notifyOwner(db: db, companyId: grant.companyId, kind: .system, urgency: .normal,
+                            title: "Read grant \(grant.ref) revoked",
+                            body: "\(grant.ref) read_path \(grant.value) no longer is the directory you approved (a symbolic link "
+                                + "replaced it or a part of it, or it now overlaps a protected place). Brahma revoked it; check "
+                                + "what changed it before granting it again.", now: now)
+        }
     }
 
     // MARK: Ledger
@@ -243,8 +303,8 @@ extension Store {
                                 arguments: [companyId, SprintStatus.active.rawValue]))
     }
 
-    /// The grants a turn of `agent` gets now (working `itemId`, if any).
-    public func activeGrants(agent: Agent, itemId: String?) throws -> [Grant] {
+    /// The grants a turn of `agent` of `kind` gets now (working `itemId`, if any; see `GrantResolver.active`).
+    public func activeGrants(agent: Agent, itemId: String?, kind: TurnKind = .work) throws -> [Grant] {
         try writer.read { db in
             guard let current = try Agent.fetchOne(db, key: agent.id), current.state != .killed,
                   let company = try Company.fetchOne(db, key: current.companyId) else { return [] }
@@ -252,37 +312,38 @@ extension Store {
             if let template = catalog.pack(company.packId)?.role(current.role) { roles.formUnion(template.covers) }
             let all = try Grant.filter(Column("companyId") == company.id && Column("revokedAt") == nil).order(Column("number")).fetchAll(db)
             let sprints = try Store.activeSprintIds(db, companyId: company.id)
-            return GrantResolver.active(all, agent: current, roles: roles, itemId: itemId,
+            return GrantResolver.active(all, agent: current, roles: roles, itemId: itemId, kind: kind,
                                         activeNow: try Store.activeNow(db: db, companyId: company.id), sprintActive: sprints.contains)
         }
     }
 
-    /// Counts one use of each grant a turn starts with; a grant with uses left loses one. Returns the ids actually consumed: a
-    /// grant revoked or used up meanwhile is not.
+    /// Counts one use of each grant a launching turn starts with, all or nothing: when any of them was revoked, used up or removed
+    /// meanwhile, nothing is written and those ids are returned (the caller rebuilds the scope without them and tries again).
+    /// A grant with uses left loses one; only those uses are logged (unlimited ones keep `useCount`/`lastUsedAt`).
     @discardableResult
     public func consumeGrants(ids: [String], turnId: String, now: Date) throws -> Set<String> {
         guard !ids.isEmpty else { return [] }
         return try writer.write { db in
-            var used: Set<String> = []
-            var refs: [String] = []
-            var companyId: String?
+            var grants: [Grant] = []
+            var lost: Set<String> = []
             for id in ids {
-                try db.execute(sql: #"""
-                    UPDATE "grant" SET useCount = useCount + 1, lastUsedAt = ?,
-                        usesLeft = CASE WHEN usesLeft IS NULL THEN NULL ELSE usesLeft - 1 END
-                    WHERE id = ? AND revokedAt IS NULL AND (usesLeft IS NULL OR usesLeft > 0)
-                    """#, arguments: [now, id])
-                guard db.changesCount > 0, let g = try Grant.fetchOne(db, key: id) else { continue }
-                used.insert(id)
-                refs.append(g.ref)
-                companyId = g.companyId
+                guard let g = try Grant.fetchOne(db, key: id), g.revokedAt == nil, (g.usesLeft ?? 1) > 0 else { lost.insert(id); continue }
+                grants.append(g)
             }
-            if let companyId, !refs.isEmpty {
+            guard lost.isEmpty else { return lost }
+            var oneUse: [String] = []
+            for var g in grants {
+                g.useCount += 1
+                g.lastUsedAt = now
+                if let uses = g.usesLeft { g.usesLeft = uses - 1; oneUse.append(g.ref) }
+                try g.update(db)
+            }
+            if let companyId = grants.first?.companyId, !oneUse.isEmpty {
                 let agentId = try String.fetchOne(db, sql: "SELECT agentId FROM turn WHERE id = ?", arguments: [turnId])
                 try ActivityEvent(companyId: companyId, agentId: agentId, turnId: turnId, kind: .work,
-                                  text: "turn uses \(refs.joined(separator: ", "))", createdAt: now).insert(db)
+                                  text: "turn uses \(oneUse.joined(separator: ", ")) (one use)", createdAt: now).insert(db)
             }
-            return used
+            return []
         }
     }
 

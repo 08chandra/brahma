@@ -11,7 +11,10 @@ import GRDB
         let reply = try g.request("web_domain", "docs.stripe.com")
         #expect(reply.contains("A-1") && reply.contains("G-1"), "\(reply)")
         let ask = try g.ask("A-1")
-        #expect(ask.status == .approved); #expect(ask.decidedBy == "owner")
+        #expect(ask.status == .approved); #expect(ask.decidedBy == "preset:readonly-web-engineers")
+        // Decided before it was routed: no "approval needed" line or DM, only the FYI.
+        #expect(!(try g.store.events(afterId: 0, companyId: g.company.id)).contains { $0.text.contains("Owner approval needed") })
+        #expect(try g.store.allNotices().filter { $0.companyId == g.company.id }.count == 1)
         #expect(ask.ownerNote == "auto: web_domain docs.stripe.com")
         let grant = try #require(try g.store.grants(companyId: g.company.id).first)
         #expect(grant.approvedBy == "preset:readonly-web-engineers")

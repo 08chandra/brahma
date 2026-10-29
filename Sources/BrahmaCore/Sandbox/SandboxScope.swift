@@ -580,7 +580,13 @@ public struct SandboxScope: Equatable, Sendable {
 
         // Read paths the owner or a grant added are checked whether or not they exist yet; only existing ones are mounted.
         // None may reach into `.brahma` (other agents' labs, homes and notes, the engine's files).
-        let extraReads = toolchain.map(r) + grants.readPaths.map(r)
+        // A grant's path is used as stored (`Grants.isPinned`: it resolves to itself); one that no longer does refuses the turn
+        // rather than mounting whatever a link now names.
+        let grantReads = try grants.readPaths.map { p -> URL in
+            guard SandboxPath.key(r(p).path) == SandboxPath.key(p.path) else { throw SandboxError.linkedPath(p.path) }
+            return p
+        }
+        let extraReads = toolchain.map(r) + grantReads
         for path in extraReads {
             try checkAllowed(path, protected: protected + both(dot), deniedRoots: deniedRoots)
         }
@@ -612,7 +618,7 @@ public struct SandboxScope: Equatable, Sendable {
         for child in ["resources/company", "kb"] {
             if let url = engineChild(child), SandboxPath.kind(url.path) == .directory { readOnly.append(url) }
         }
-        readOnly += grants.readPaths.map(r).filter { SandboxPath.kind($0.path) != .missing }
+        readOnly += grantReads.filter { SandboxPath.kind($0.path) != .missing }
         readOnly = dedupe(readOnly)
         readable = dedupe(readable + readOnly)
 

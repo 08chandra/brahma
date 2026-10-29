@@ -1,5 +1,10 @@
 import Foundation
 import GRDB
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// What the engine needs from the owner's machine to compute sandbox scopes: the owner's home (protected paths), the Darwin
 /// per-user temp dir xcrun writes, and the shell the agent's Bash prefix execs. Tests pass their own.
@@ -10,6 +15,16 @@ public struct SandboxEnvironment: Sendable {
 
     public init(userHome: URL, darwinUserTemp: URL?, shell: String) {
         self.userHome = userHome; self.darwinUserTemp = darwinUserTemp; self.shell = shell
+    }
+
+    /// `current` with the owner's home from the account database (`getpwuid`), never `$HOME`: inside `brahma mcp` (an agent's
+    /// child) `HOME` is the agent's. What grant checks use by default.
+    public static var owner: SandboxEnvironment {
+        var env = current
+        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
+            env.userHome = URL(fileURLWithPath: String(cString: dir), isDirectory: false)
+        }
+        return env
     }
 
     public static var current: SandboxEnvironment {
@@ -27,6 +42,10 @@ public struct SandboxEnvironment: Sendable {
 struct SandboxedTurn: Sendable {
     var scope: SandboxScope
     var shellPrefix: URL
+    /// The owner's grants compiled into `scope`; consumed only when the turn launches (`consumeSandboxGrants`).
+    var grants: [Grant] = []
+    /// The same scope with other grants (blocking): used when a grant was revoked or used up between preparing and launching.
+    var rebuild: (@Sendable (GrantInputs) throws -> SandboxScope)? = nil
 }
 
 /// A sandboxed turn that does not start (its scope was refused, or its places could not be made): `sandbox scope: <why>`.
@@ -80,29 +99,25 @@ extension Orchestrator {
                 let backups = try BackupTargets.requiredProtectedFolders(store: store)
                 try layout.ensure()
                 let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: mcp)
-                // The owner's grants that apply to this turn (Task 9). A read path that no longer passes the checks (it moved
-                // under a protected place, or is gone) is left out and logged rather than refusing the whole turn.
-                var grants = try store.activeGrants(agent: agent, itemId: item?.id)
+                // The owner's grants that apply to this turn (Task 9). A read path that no longer is what was approved (a link
+                // replaced it or a part of it, or it now overlaps a protected place) is revoked and the owner told; the turn
+                // runs without it.
+                var grants = try store.activeGrants(agent: agent, itemId: item?.id, kind: kind)
                 var dropped: [String] = []
-                grants.removeAll { g in
-                    guard g.kind == .readPath else { return false }
-                    let ok = (try? Grants.validate(kind: .readPath, value: g.value, company: company, paths: paths, userHome: env.userHome,
-                                                   otherWorkspaces: others, backupTargets: backups)) != nil
-                    if !ok { dropped.append(g.ref) }
-                    return !ok
+                for g in grants where !Grants.stillValid(g, company: company, paths: paths, environment: env, otherWorkspaces: others,
+                                                         backupTargets: backups) {
+                    dropped.append(g.ref)
+                    try store.revokeChangedPathGrant(g, now: now)
                 }
-                let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
-                                                     kind: kind, item: item, company: company, grants: GrantResolver.inputs(grants),
-                                                     darwinUserTemp: env.darwinUserTemp, userHome: env.userHome)
-                // Each use is counted; a one-use grant another turn took meanwhile refuses this turn (the next one recomputes).
-                let used = try store.consumeGrants(ids: grants.map(\.id), turnId: turnId, now: now)
-                if let lost = grants.first(where: { $0.usesLeft != nil && !used.contains($0.id) }) {
-                    throw SandboxRefusal(reason: "\(lost.ref) was used up by another turn meanwhile")
+                grants.removeAll { dropped.contains($0.ref) }
+                let rebuild: @Sendable (GrantInputs) throws -> SandboxScope = { inputs in
+                    try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
+                                             kind: kind, item: item, company: company, grants: inputs,
+                                             darwinUserTemp: env.darwinUserTemp, userHome: env.userHome)
                 }
-                return (SandboxedTurn(scope: scope, shellPrefix: prefix), dropped)
+                let scope = try rebuild(GrantResolver.inputs(grants))
+                return (SandboxedTurn(scope: scope, shellPrefix: prefix, grants: grants, rebuild: rebuild), dropped)
             }
-        } catch let refusal as SandboxRefusal {
-            throw refusal
         } catch {
             let linked: String?
             switch error {
@@ -119,7 +134,7 @@ extension Orchestrator {
         }
         if !droppedGrants.isEmpty {
             event("@\(agent.name): read-path \(droppedGrants.count == 1 ? "grant" : "grants") \(droppedGrants.joined(separator: ", ")) "
-                  + "left out of the turn (the path no longer passes the sandbox checks)")
+                  + "revoked and left out of the turn (the path is no longer what was approved)")
         }
         if !turn.scope.skippedUnsafe.isEmpty {
             let names = turn.scope.skippedUnsafe.map { Store.flat(URL(fileURLWithPath: $0).lastPathComponent, max: 80) }
@@ -127,6 +142,22 @@ extension Orchestrator {
                   + "(names no sandbox profile may carry): \(names.prefix(10).joined(separator: ", "))")
         }
         return turn
+    }
+
+    /// When the turn launches (after the mode's no-launch checks): counts one use of each grant it got, all or nothing. A grant
+    /// revoked or used up since `prepareSandbox` (another turn took a one-use grant) is left out and the scope rebuilt without
+    /// it, so the turn neither refuses nor spends the others for nothing.
+    nonisolated func consumeSandboxGrants(_ turn: inout SandboxedTurn, turnId: String) async throws {
+        var grants = turn.grants
+        while true {
+            let lost = try store.consumeGrants(ids: grants.map(\.id), turnId: turnId, now: clock())
+            if lost.isEmpty { break }
+            grants.removeAll { lost.contains($0.id) }
+            guard let rebuild = turn.rebuild else { throw SandboxRefusal(reason: "a grant changed while the turn was prepared") }
+            let inputs = GrantResolver.inputs(grants)
+            turn.scope = try await blocking.tryRun { try rebuild(inputs) }
+            turn.grants = grants
+        }
     }
 
     /// When `path` is one of the agent's own places (its home, cache, lab or notes, or the turn's progress file), removes the

@@ -28,16 +28,26 @@ struct AccessList: ParsableCommand {
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         let open = try store.asks(companyId: c.id, statuses: [.pendingInternal, .pendingOwner]).filter { $0.kind == .grant }
-        guard !open.isEmpty else { print(safe("\(c.name): no open access requests")); return }
         let handles = Dictionary(try store.agents(companyId: c.id).map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        if open.isEmpty { print(safe("\(c.name): no open access requests")) }
         for ask in open {
             let wanted = Grants.requested(ask)
             let who = handles[ask.requesterId].map { "@\($0)" } ?? ask.requesterId
-            print(safe("\(ask.ref)  \(ask.title)  \(who)  risk \(ask.risk.rawValue)  scope \(ask.proposedGrant?.scope ?? "agent")  "
-                       + "duration \(wanted?.duration.rawValue ?? "?")"))
+            let wildcard = wanted?.value.hasPrefix("*.") == true ? "  [WILDCARD: every subdomain]" : ""
+            print(safe("\(ask.ref)  \(ask.title)\(wildcard)  \(who)  risk \(ask.risk.rawValue)  "
+                       + "asks for scope \(ask.proposedGrant?.scope ?? "agent"), duration \(wanted?.duration.rawValue ?? "?")"))
             if !ask.summary.isEmpty { print(safe("    | " + ask.summary.replacingOccurrences(of: "\n", with: "\n    | "))) }
         }
-        print("Approve: brahma access approve \(c.slug) A-<n> --scope once|item|agent|role|company --duration turn|sprint|always")
+        if !open.isEmpty {
+            print("Approve: brahma access approve \(c.slug) A-<n> --scope once|item|agent|role|company --duration turn|sprint|always")
+        }
+        let refused = try store.accessRefusals(companyId: c.id, limit: 10)
+        if !refused.isEmpty {
+            print("Refused requests (newest first):")
+            for r in refused {
+                print(safe("  @\(handles[r.agentId] ?? "?")  \(r.kind) \(r.value)  \(r.detail)"))
+            }
+        }
     }
 }
 
@@ -46,8 +56,9 @@ struct AccessApprove: ParsableCommand {
 
     @Argument(help: "Company name or slug.") var company: String
     @Argument(help: "Ask reference, e.g. A-3.") var ask: String
-    @Option(help: "once, item, agent, role or company (default: what the agent asked for).") var scope: GrantScope?
-    @Option(help: "turn, sprint or always (default: what the agent asked for).") var duration: GrantDuration?
+    @Option(help: "once, item, agent, role or company (required: the agent's proposal is only shown in 'brahma access').")
+    var scope: GrantScope
+    @Option(help: "turn, sprint or always (required).") var duration: GrantDuration
     @Option(help: "Why.") var note: String = ""
 
     func run() throws {
