@@ -18,8 +18,8 @@ import CryptoKit
 enum Scratch {
     static let pid = getpid()
     static let rootName = "brahma-test-\(pid)"
-    static let temporaryBase = FileManager.default.temporaryDirectory
-    static let homeBase = FileManager.default.homeDirectoryForCurrentUser
+    fileprivate static let temporaryBase = FileManager.default.temporaryDirectory
+    fileprivate static let homeBase = FileManager.default.homeDirectoryForCurrentUser
     /// The test target this copy is compiled into (`BrahmaCoreTests`, `BrahmaAppModelTests`).
     static let moduleTag = String(#fileID.prefix { $0 != "/" })
 
@@ -27,8 +27,11 @@ enum Scratch {
     static let root: URL = makeRoot(in: temporaryBase, prefix: "brahma-test-")
 
     /// `~/.brahma-test-<pid>/<TestTarget>/`, for the Seatbelt tests (a home denial has to be the real one); same sweep and
-    /// exit removal.
-    static let homeRoot: URL = makeRoot(in: homeBase, prefix: ".brahma-test-")
+    /// exit removal. Reached only through `homeDir()`, so every directory under it is scoped.
+    fileprivate static let homeRoot: URL = makeRoot(in: homeBase, prefix: ".brahma-test-")
+
+    /// A fresh directory for the current test case under the owner's real home (Seatbelt tests), removed when the case ends.
+    static func homeDir() throws -> URL { try dir(under: homeRoot) }
 
     /// A fresh directory for the current test case, under `root` (or `parent`), removed when the test case ends.
     static func dir(under parent: URL? = nil) throws -> URL {
@@ -71,7 +74,7 @@ enum Scratch {
         defer { if lock >= 0 { close(lock) } }
         if !fm.fileExists(atPath: marker.path) {
             // Not ours: a root of a dead process that had our pid (I5), or nothing yet.
-            if fm.fileExists(atPath: rootURL.path) { remove(rootURL, recordLeak: false) }
+            if fm.fileExists(atPath: rootURL.path) { removeOnce(rootURL) }
             sweep(in: base, prefix: prefix)
             try? fm.createDirectory(at: rootURL, withIntermediateDirectories: true)
             fm.createFile(atPath: marker.path, contents: nil)
@@ -87,7 +90,7 @@ enum Scratch {
         atexit {
             for url in [Scratch.temporaryBase.appending(path: Scratch.rootName), Scratch.homeBase.appending(path: "." + Scratch.rootName)]
             where FileManager.default.fileExists(atPath: url.path) {
-                Scratch.remove(url, recordLeak: false)
+                Scratch.removeOnce(url)
             }
             let s = Scratch.state
             let (leaks, orphans, executables) = s.lock.withLock { (s.leaks, s.orphans, s.executables) }
@@ -129,7 +132,7 @@ enum Scratch {
             let suffix = name.dropFirst(prefix.count)
             if let other = pidNumber(suffix) {
                 if other != pid, isDead(other) {
-                    remove(base.appending(path: name, directoryHint: .isDirectory), recordLeak: false)
+                    removeOnce(base.appending(path: name, directoryHint: .isDirectory))
                     roots += 1
                 }
             } else if examined < oldFormatExamined, removed < oldFormatRemoved, isOldFormat(suffix) {
@@ -137,7 +140,7 @@ enum Scratch {
                 let url = base.appending(path: name)
                 guard let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                       modified < dayAgo else { continue }
-                remove(url, recordLeak: false)
+                removeOnce(url)
                 removed += 1
             }
         }
@@ -146,8 +149,15 @@ enum Scratch {
 
     // MARK: removal
 
-    /// Removes `url`: a tree a test left unwritable is made writable, and a removal a still-running child races is retried
-    /// (3 × 50 ms, I4). What still remains is a leak: recorded, and `ScratchScope.finish` fails the owning test.
+    /// One attempt, no chmod pass, no sleep: the sweep (under the base lock), the stale own-pid root and the exit hook. What
+    /// it cannot remove is left for the next process's sweep.
+    static func removeOnce(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// Removes a test's directory (`ScratchScope.finish` only): a tree the test left unwritable is made writable, and a
+    /// removal a still-running child races is retried (3 × 50 ms, I4). What still remains is a leak: recorded, and
+    /// `finish` fails the owning test.
     @discardableResult
     static func remove(_ url: URL, recordLeak: Bool = true) -> Bool {
         let fm = FileManager.default

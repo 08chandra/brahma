@@ -18,7 +18,7 @@ struct SeatbeltRunnerTests {
 
     /// `~/.brahma-test-<pid>/<n>` (resolved, so policies hold resolved paths), removed with the test case.
     static func homeDir() throws -> URL {
-        try Scratch.dir(under: Scratch.homeRoot).resolvedForSandbox
+        try Scratch.homeDir().resolvedForSandbox
     }
 
     static func remove(_ url: URL) { try? FileManager.default.removeItem(at: url) }

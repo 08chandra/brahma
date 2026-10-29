@@ -69,7 +69,8 @@ import Foundation
     /// No test reaches for the raw temp or home APIs: every scratch path comes from `tempDir()` / `Scratch`, so it is scoped,
     /// swept and guarded. A read-only use says why on its line: `raw-temp-api: ...`.
     @Test func noRawTempOrHomeAPIOutsideScratch() throws {
-        let raw = ["temporaryDirectory", "NSTemporaryDirectory", "mkdtemp", "homeDirectoryForCurrentUser", "NSHomeDirectory"]
+        let raw = ["temporaryDirectory", "NSTemporaryDirectory", "mkdtemp", "homeDirectoryForCurrentUser", "NSHomeDirectory",
+                   "Scratch.temporaryBase", "Scratch.homeBase", "Scratch.homeRoot"]      // the bases are fileprivate to TestScratch anyway
         var offenders: [String] = []
         for (file, text) in try Self.sources() where file != "TestScratch.swift" && file != "TempHygieneTests.swift" {
             for (i, line) in text.components(separatedBy: "\n").enumerated()
