@@ -92,7 +92,7 @@ public struct RequestedGrant: Codable, Equatable, Sendable {
 public enum Grants {
     /// What the agent hears for every refused read path, whatever the reason: a specific answer would let it probe which
     /// directories exist or are protected. The owner sees the reason (`Store.accessRefusals`, `brahma access`).
-    public static let pathRefusal = "That path can't be granted; the owner can see why in the ledger."
+    public static let pathRefusal = "That path can't be granted; the owner can see why with brahma access."
 
     /// Multi-tenant parents (anyone can get a name under them): a wildcard grant whose parent is one of these, or lies under
     /// one, is refused. The single-label and country suffixes of `DomainMatcher.publicSuffixes` are matched exactly there; these
@@ -143,12 +143,17 @@ public enum Grants {
             guard isPinned(resolved.path) else {
                 throw WorkError.invalid("a read path must be an existing directory reached without a link: \(Store.flat(value, max: 200))")
             }
-            // Never a place a turn can write: the agent could replace what was granted with a link to anything.
-            let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: false)
-            let writable = [URL(fileURLWithPath: "/Volumes", isDirectory: false), workspace]
-                + (environment.darwinUserTemp.map { [$0] } ?? [])
+            // Never a place a turn can write: the agent could replace what was granted with a link to anything. Compared by
+            // spelling and by identity (device and inode), so a firmlink or alias spelling is the same place.
+            let writable = turnWritablePlaces(company: company, environment: environment)
             for place in writable.flatMap({ [$0, $0.resolvedForSandbox] }) where SandboxPath.overlaps(resolved.path, place.path) {
                 throw SandboxError.overlapsProtected(path: resolved.path, protected: place.path)
+            }
+            if let hit = SandboxPath.IdentityRoots(writable).overlapping(resolved.path) {
+                throw SandboxError.overlapsProtected(path: resolved.path, protected: hit)
+            }
+            if inClaudeTemp(resolved.path) {
+                throw SandboxError.overlapsProtected(path: resolved.path, protected: "/private/tmp/claude*")
             }
             // The scope a turn of this company would get with only this grant: its checks are the turn's own.
             let layout = SandboxLayout(paths: paths, company: company, agentHandle: "grant-check")
@@ -161,26 +166,62 @@ public enum Grants {
 
     /// A granted path stays what the owner approved: it is absolute and safe, it resolves to itself, and no component of it is
     /// a symbolic link (an `lstat` walk from `/`); it is a directory.
-    public static func isPinned(_ path: String) -> Bool {
-        guard path.hasPrefix("/"), !SandboxPath.isUnsafe(path),
-              SandboxPath.key(SandboxPath.resolve(path)) == SandboxPath.key(path) else { return false }
-        var current = ""
-        for part in path.split(separator: "/") {
-            if part == "." || part == ".." { return false }
-            current += "/" + part
-            guard SandboxPath.kind(current) == .directory else { return false }
-        }
-        return true
+    public static func isPinned(_ path: String) -> Bool { SandboxPath.isPinnedDirectory(path) }
+
+    /// Where a sandboxed turn can write outside its own places, besides the company workspace: `/Volumes` (never grantable),
+    /// the Darwin user temp dir, and Claude Code's own sandbox write defaults under the owner's home (`~/.npm`; `~/.claude` is
+    /// protected). `/private/tmp/claude*` is matched by `inClaudeTemp`.
+    static func turnWritablePlaces(company: Company, environment: SandboxEnvironment) -> [URL] {
+        [URL(fileURLWithPath: "/Volumes", isDirectory: false), URL(fileURLWithPath: company.workspacePath, isDirectory: false),
+         environment.userHome.appending(path: ".npm"), environment.userHome.appending(path: ".claude")]
+            + (environment.darwinUserTemp.map { [$0] } ?? [])
     }
 
-    /// A stored read-path grant still is what was approved: pinned, and accepted again by `validate` unchanged.
-    static func stillValid(_ grant: Grant, company: Company, paths: BrahmaPaths, environment: SandboxEnvironment,
-                           otherWorkspaces: [URL], backupTargets: [URL]) -> Bool {
-        guard grant.kind == .readPath else { return true }
-        guard isPinned(grant.value),
-              let again = try? validate(kind: .readPath, value: grant.value, company: company, paths: paths, environment: environment,
-                                        otherWorkspaces: otherWorkspaces, backupTargets: backupTargets) else { return false }
-        return SandboxPath.key(again) == SandboxPath.key(grant.value)
+    /// The path is `/private/tmp` (or contains it), or lies in a `claude…` directory directly under it (Claude Code writes
+    /// `/tmp/claude`, `/tmp/claude-<uid>`, `/tmp/claude-tool-results`): compared by identity, so `/tmp` and alias spellings match.
+    static func inClaudeTemp(_ path: String) -> Bool {
+        guard let tmp = SandboxPath.identity("/private/tmp") else { return false }
+        if let id = SandboxPath.identity(path), SandboxPath.lineage("/private/tmp").contains(id) { return true }
+        var current = ""
+        var parentIsTmp = SandboxPath.identity("/") == tmp
+        for part in path.split(separator: "/") {
+            if parentIsTmp, part.lowercased().hasPrefix("claude") { return true }
+            current += "/" + part
+            parentIsTmp = SandboxPath.identity(current) == tmp
+        }
+        return false
+    }
+
+    /// How a stored read-path grant compares with what was approved, right before a turn.
+    enum PathState: Equatable {
+        case ok
+        /// Gone for now (a part of it is missing): left out of this turn only.
+        case missing
+        /// A link, an alias or something other than a directory is where the approved directory was: revoked.
+        case changed
+        /// It is still the same directory, but now overlaps something new (another workspace, a backup target): left out of
+        /// this turn only.
+        case refused
+    }
+
+    static func pathState(_ grant: Grant, company: Company, paths: BrahmaPaths, environment: SandboxEnvironment,
+                          otherWorkspaces: [URL], backupTargets: [URL]) -> PathState {
+        guard grant.kind == .readPath else { return .ok }
+        let value = grant.value
+        var current = ""
+        for part in value.split(separator: "/") {
+            current += "/" + part
+            switch SandboxPath.kind(current) {
+            case .directory: continue
+            case .missing: return .missing
+            default: return .changed
+            }
+        }
+        guard isPinned(value) else { return .changed }
+        guard let again = try? validate(kind: .readPath, value: value, company: company, paths: paths, environment: environment,
+                                        otherWorkspaces: otherWorkspaces, backupTargets: backupTargets),
+              SandboxPath.key(again) == SandboxPath.key(value) else { return .refused }
+        return .ok
     }
 
     /// The agent's request as stored on a `grant` ask; nil for any other ask.

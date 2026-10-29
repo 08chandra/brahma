@@ -272,6 +272,110 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(Grants.isPinned(secret.resolvedForSandbox.path))
     }
 
+    @Test func aliasSpellingsRefused() throws {
+        let g = try GrantWorld()
+        let home = try tempDir().resolvedForSandbox
+        try FileManager.default.createDirectory(at: home.appending(path: ".ssh"), withIntermediateDirectories: true)
+        let x = URL(fileURLWithPath: g.company.workspacePath).appending(path: "x")
+        try FileManager.default.createDirectory(at: x, withIntermediateDirectories: true)
+        let env = SandboxEnvironment(userHome: home, darwinUserTemp: nil, shell: "/bin/zsh")
+        func validate(_ v: String) throws -> String {
+            try Grants.validate(kind: .readPath, value: v, company: g.company, paths: g.world.paths, environment: env)
+        }
+        let ws = URL(fileURLWithPath: g.company.workspacePath).resolvedForSandbox.path
+        for bad in ["/System/Volumes/Data" + home.path, "/System/Volumes/Data" + home.path + "/.ssh", "/.nofollow" + home.path,
+                    "/.resolve/1" + home.path, "/System/Volumes/Data" + ws + "/x"] {
+            #expect(throws: (any Error).self, "\(bad)") { try validate(bad) }
+        }
+        // By identity (device and inode), the firmlink spelling is the place itself.
+        let firm = "/System/Volumes/Data" + home.path
+        if SandboxPath.kind(firm) == .directory {
+            #expect(SandboxPath.IdentityRoots([home]).overlapping(firm) == home.path)
+            #expect(SandboxPath.IdentityRoots([home.appending(path: ".ssh")]).overlapping(firm) != nil, "it contains .ssh")
+        }
+        // The same helper guards the owner's toolchain paths.
+        #expect(throws: (any Error).self) {
+            try g.store.updateSandbox(companyId: g.company.id, SandboxPatch(toolchainReadPaths: [firm]), userHome: home)
+        }
+    }
+
+    @Test func claudeDefaultWritablePlacesRefused() throws {
+        let g = try GrantWorld()
+        let home = try tempDir().resolvedForSandbox
+        let npm = home.appending(path: ".npm/_logs")
+        try FileManager.default.createDirectory(at: npm, withIntermediateDirectories: true)
+        let claudeTmp = URL(fileURLWithPath: "/private/tmp/claude-brahma-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: claudeTmp.appending(path: "x"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: claudeTmp) }
+        let env = SandboxEnvironment(userHome: home, darwinUserTemp: nil, shell: "/bin/zsh")
+        for bad in [npm.path, home.appending(path: ".npm").path, claudeTmp.path, claudeTmp.path + "/x",
+                    "/tmp/" + claudeTmp.lastPathComponent, "/private/tmp", "/tmp"] {
+            #expect(throws: (any Error).self, "\(bad)") {
+                try Grants.validate(kind: .readPath, value: bad, company: g.company, paths: g.world.paths, environment: env)
+            }
+        }
+    }
+
+    @Test func lostOneUseGrantRebuildsTheScope() async throws {
+        let g = try GrantWorld()
+        let once = try g.grant("network_domain", "once.example.com", scope: .once, duration: .always)
+        let always = try g.grant("network_domain", "always.example.com", scope: .agent, duration: .always)
+        let agent = try #require(try g.store.agent(id: g.eng.id))
+        var prepared = try await g.world.orchestrator.prepareSandbox(agent: agent, company: g.company, kind: .work, item: nil,
+                                                                     turnId: "t-1")
+        #expect(prepared.scope.network.allowedDomains.contains("once.example.com"))
+        // Another launch takes the one-use grant between preparing and launching.
+        #expect(try g.store.consumeGrants(ids: [once.id], turnId: "t-0", now: Date()).isEmpty)
+        try await g.world.orchestrator.consumeSandboxGrants(&prepared, agent: agent, company: g.company, item: nil, turnId: "t-1")
+        #expect(prepared.grants.map(\.id) == [always.id])
+        #expect(!prepared.scope.network.allowedDomains.contains("once.example.com"))
+        #expect(prepared.scope.network.allowedDomains.contains("always.example.com"))
+        #expect(try g.store.grants(companyId: g.company.id).first { $0.id == always.id }?.useCount == 1)
+    }
+
+    @Test func swapRightBeforeSpawnDropsTheGrant() async throws {
+        let g = try GrantWorld()
+        let root = try tempDir()
+        let data = root.appending(path: "data"), secret = root.appending(path: "secret")
+        for d in [data, secret] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: data.path, reason: "r",
+                                      environment: g.env)
+        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+        let agent = try #require(try g.store.agent(id: g.eng.id))
+        let prepared = try await g.world.orchestrator.prepareSandbox(agent: agent, company: g.company, kind: .work, item: nil,
+                                                                     turnId: "t-1")
+        #expect(prepared.scope.grantReadDirs.map(\.path) == [grant.value])
+        try FileManager.default.removeItem(at: data)
+        try FileManager.default.createSymbolicLink(at: data, withDestinationURL: secret)
+        var scope = prepared.scope
+        #expect(try scope.recheckBeforeSpawnDroppingGrants().map(\.path) == [grant.value], "dropped, the turn not refused")
+        #expect(!scope.readOnlyDirs.map(\.path).contains(grant.value)); #expect(!scope.readable.map(\.path).contains(grant.value))
+    }
+
+    @Test func missingReadPathIsLeftOutNotRevoked() async throws {
+        let g = try GrantWorld()
+        let dir = try tempDir().appending(path: "data")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: dir.path, reason: "r",
+                                      environment: g.env)
+        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+        try FileManager.default.removeItem(at: dir)
+        #expect(!(try await g.nextScope()).readOnlyDirs.map(\.path).contains(grant.value))
+        #expect(try g.store.grants(companyId: g.company.id).first?.revokedAt == nil, "a missing directory is not a swap")
+        #expect(try g.store.allNotices().filter { $0.companyId == g.company.id }.isEmpty)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        #expect((try await g.nextScope()).readOnlyDirs.map(\.path).contains(grant.value))
+    }
+
+    @Test func extensionRefusalsDoNotUseTheBudget() throws {
+        let g = try GrantWorld()
+        for n in 0...AccessRefusals.perActiveDay {
+            #expect(refusal { try g.request("extension", "acme/x\(n)") }?.hasPrefix("No extension") == true)
+        }
+        #expect(try g.request("web_domain", "fine.example.com").hasPrefix("Requested A-1"))
+        #expect(Grants.pathRefusal.contains("brahma access"))
+    }
+
     @Test func readPathSwappedAfterApprovalIsDropped() async throws {
         let g = try GrantWorld()
         let root = try tempDir()

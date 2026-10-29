@@ -743,7 +743,7 @@ public actor Orchestrator {
             }
             // The turn launches: its one-use grants are spent now, never by a turn that does not run.
             if var prepared = sandboxed, !prepared.grants.isEmpty {
-                try await consumeSandboxGrants(&prepared, turnId: turn.id)
+                try await consumeSandboxGrants(&prepared, agent: agent, company: company, item: prepared.item, turnId: turn.id)
                 sandboxed = prepared
                 addDirs = prepared.scope.readOnlyDirs.map(\.path)
             }

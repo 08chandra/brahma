@@ -53,7 +53,9 @@ extension Store {
         try AskQuota.check(store: self, agentId: agentId)
         try writer.read { db in
             let since = try Store.activeNow(db: db, companyId: companyId) - AccessRefusals.window
-            let refused = try AccessRefusal.filter(Column("agentId") == agentId && Column("createdActive") > since).fetchCount(db)
+            // Extension requests are refused by design until Task 5a: they do not use up the budget.
+            let refused = try AccessRefusal.filter(Column("agentId") == agentId && Column("createdActive") > since
+                                                   && Column("kind") != GrantKind.extension.rawValue).fetchCount(db)
             if refused >= AccessRefusals.perActiveDay { throw WorkError.invalid(AccessRefusals.message) }
         }
         // 3. The value (reads the file system for a path: outside any transaction).
@@ -271,17 +273,17 @@ extension Store {
         }
     }
 
-    /// A read-path grant that no longer is what was approved (a link replaced it or a part of it, or it moved under a protected
-    /// place) is revoked by the engine and the owner is told; it never reaches a turn.
+    /// A read-path grant whose directory was replaced (a link, an alias or a file where it or a part of it was) is revoked by
+    /// the engine and the owner is told; it never reaches a turn. A missing or newly overlapping path is only left out of a turn.
     func revokeChangedPathGrant(_ grant: Grant, now: Date) throws {
         try writer.write { db in
             guard let current = try Grant.fetchOne(db, key: grant.id), current.revokedAt == nil else { return }
             try Store.revoke(db, [current], by: "engine", why: "the path changed", now: now)
             try notifyOwner(db: db, companyId: grant.companyId, kind: .system, urgency: .normal,
                             title: "Read grant \(grant.ref) revoked",
-                            body: "\(grant.ref) read_path \(grant.value) no longer is the directory you approved (a symbolic link "
-                                + "replaced it or a part of it, or it now overlaps a protected place). Brahma revoked it; check "
-                                + "what changed it before granting it again.", now: now)
+                            body: "\(grant.ref) read_path \(grant.value) no longer is the directory you approved: a symbolic link, "
+                                + "an alias or a file is where it (or a part of it) was. Brahma revoked it; check what changed it "
+                                + "before granting it again.", now: now)
         }
     }
 

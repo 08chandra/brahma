@@ -171,6 +171,79 @@ enum SandboxPath {
         }
     }
 
+    // MARK: Aliases and identity
+
+    /// Spellings `realpath` leaves alone that name another place: the Data volume's firmlinked view
+    /// (`/System/Volumes/Data/Users/…` is `/Users/…`) and the kernel's alias namespaces. No allowed entry may use one.
+    static let aliasPrefixes = ["/System/Volumes", "/.nofollow", "/.resolve", "/.vol"]
+
+    /// The alias prefix `path` is spelled under, if any.
+    static func alias(_ path: String) -> String? { aliasPrefixes.first { isInside(path, $0) } }
+
+    /// A file system object: compared by device and inode, two spellings of one directory (a firmlink, an alias namespace)
+    /// are the same place.
+    struct Identity: Hashable { let dev: UInt64; let ino: UInt64 }
+
+    /// The identity of what `path` names (links followed); nil when it does not exist.
+    static func identity(_ path: String) -> Identity? {
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        return Identity(dev: UInt64(truncatingIfNeeded: st.st_dev), ino: UInt64(truncatingIfNeeded: st.st_ino))
+    }
+
+    /// The identities of `/` and of every existing prefix of `path`, `path` itself last (the walk stops at a missing part).
+    static func lineage(_ path: String) -> [Identity] {
+        var out: [Identity] = identity("/").map { [$0] } ?? []
+        var current = ""
+        for part in path.split(separator: "/") {
+            current += "/" + part
+            guard let id = identity(current) else { break }
+            out.append(id)
+        }
+        return out
+    }
+
+    /// Roots compared by identity: whatever spelling a path uses, it overlaps a root when it is the root, lies inside it, or
+    /// contains it.
+    struct IdentityRoots {
+        private let roots: [(path: String, id: Identity, lineage: Set<Identity>)]
+
+        init(_ urls: [URL]) {
+            var seen: Set<Identity> = []
+            roots = urls.compactMap { url in
+                guard let id = SandboxPath.identity(url.path), seen.insert(id).inserted else { return nil }
+                return (url.path, id, Set(SandboxPath.lineage(url.path)))
+            }
+        }
+
+        /// The first root `path` equals, lies inside or contains.
+        func overlapping(_ path: String) -> String? {
+            let mine = SandboxPath.lineage(path)
+            let inside = Set(mine)
+            let id = SandboxPath.identity(path)
+            return roots.first { inside.contains($0.id) || (id.map($0.lineage.contains) ?? false) }?.path
+        }
+
+        /// The first root `path` equals or contains.
+        func containedIn(_ path: String) -> String? {
+            guard let id = SandboxPath.identity(path) else { return nil }
+            return roots.first { $0.lineage.contains(id) }?.path
+        }
+    }
+
+    /// An existing directory reached without a symbolic link or an alias spelling: absolute and safe, it resolves to itself,
+    /// and an `lstat` walk from `/` finds a real directory at every part. A read-path grant must stay this.
+    static func isPinnedDirectory(_ path: String) -> Bool {
+        guard path.hasPrefix("/"), !isUnsafe(path), alias(path) == nil, key(resolve(path)) == key(path) else { return false }
+        var current = ""
+        for part in path.split(separator: "/") {
+            if part == "." || part == ".." { return false }
+            current += "/" + part
+            guard kind(current) == .directory else { return false }
+        }
+        return true
+    }
+
     /// The names in a directory (not following a link at `path`), sorted; empty when it is missing or not a real directory.
     static func entries(_ path: String) -> [String] {
         guard kind(path) == .directory, let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return [] }
@@ -403,6 +476,8 @@ public struct SandboxScope: Equatable, Sendable {
     /// Top-level workspace entries left out of `readable` because their names hold characters no sandbox profile may carry;
     /// the caller logs them (one activity line), the turn still runs.
     public var skippedUnsafe: [String] = []
+    /// The read-only places that come from the owner's grants (`readOnlyDirs` holds them too): re-pinned right before spawn.
+    public var grantReadDirs: [URL] = []
 
     public init(workspace: URL, cwd: URL, writable: [URL], readable: [URL], readOnlyDirs: [URL], denyRead: [URL],
                 denyWrite: [URL], protected: [URL], network: NetworkScope, toolchainTempWrite: URL?) {
@@ -430,8 +505,9 @@ public struct SandboxScope: Equatable, Sendable {
             if !url.path.hasPrefix("/") { throw SandboxError.invalidPath(url.path) }
         }
         let allowed = [cwd] + writable + readable + readOnlyDirs + (toolchainTempWrite.map { [$0] } ?? [])
+        let identities = (SandboxPath.IdentityRoots(protected), SandboxPath.IdentityRoots(deniedRoots))
         for entry in allowed {
-            try Self.checkAllowed(entry, protected: protected, deniedRoots: deniedRoots)
+            try Self.checkAllowed(entry, protected: protected, deniedRoots: deniedRoots, byIdentity: identities)
         }
         for entry in [cwd] + writable where !SandboxPath.isInside(entry.path, workspace.path) {
             throw SandboxError.writableOutsideCompany(path: entry.path)
@@ -443,6 +519,21 @@ public struct SandboxScope: Equatable, Sendable {
     /// every writable entry, `cwd` a real directory whose resolved path is `cwd` itself (the process is started in it, and a
     /// directory opened through a link would be the link's target), then `validate()`. A process of the agent's that outlived
     /// an earlier turn is gone by now (the runner sweeps every turn), so what this sees is what the turn starts with.
+    /// `recheckBeforeSpawn`, first dropping every grant read path that is no longer pinned (`SandboxPath.isPinnedDirectory`:
+    /// a link or alias was put in its place since the scope was computed). A dropped grant is not mounted this turn (the
+    /// next turn's check revokes it); the turn is not refused for it. Returns the dropped paths.
+    public mutating func recheckBeforeSpawnDroppingGrants() throws -> [URL] {
+        let dropped = grantReadDirs.filter { !SandboxPath.isPinnedDirectory($0.path) }
+        if !dropped.isEmpty {
+            let gone = Set(dropped.map { SandboxPath.key($0.path) })
+            readOnlyDirs.removeAll { gone.contains(SandboxPath.key($0.path)) }
+            readable.removeAll { gone.contains(SandboxPath.key($0.path)) }
+            grantReadDirs.removeAll { gone.contains(SandboxPath.key($0.path)) }
+        }
+        try recheckBeforeSpawn()
+        return dropped
+    }
+
     public func recheckBeforeSpawn() throws {
         for url in [cwd] + writable {
             if let hit = SandboxPath.linkedComponent(url.path, under: workspace.path) { throw SandboxError.linkedPath(hit) }
@@ -453,11 +544,27 @@ public struct SandboxScope: Equatable, Sendable {
     }
 
     static func checkAllowed(_ entry: URL, protected: [URL], deniedRoots: [URL]) throws {
+        try checkAllowed(entry, protected: protected, deniedRoots: deniedRoots,
+                         byIdentity: (SandboxPath.IdentityRoots(protected), SandboxPath.IdentityRoots(deniedRoots)))
+    }
+
+    /// The overlap checks by spelling and by identity (device and inode: a firmlink or alias spelling of a protected place is
+    /// that place), and no alias spelling at all (`SandboxPath.aliasPrefixes`). Every allowed entry goes through here: cwd,
+    /// writable, readable, read-only, toolchain and grant read paths.
+    static func checkAllowed(_ entry: URL, protected: [URL], deniedRoots: [URL],
+                             byIdentity: (protected: SandboxPath.IdentityRoots, denied: SandboxPath.IdentityRoots)) throws {
+        if let prefix = SandboxPath.alias(entry.path) { throw SandboxError.overlapsProtected(path: entry.path, protected: prefix) }
         if let hit = protected.first(where: { SandboxPath.overlaps(entry.path, $0.path) }) {
             throw SandboxError.overlapsProtected(path: entry.path, protected: hit.path)
         }
         if let hit = deniedRoots.first(where: { SandboxPath.isInside($0.path, entry.path) }) {
             throw SandboxError.overlapsProtected(path: entry.path, protected: hit.path)
+        }
+        if let hit = byIdentity.protected.overlapping(entry.path) {
+            throw SandboxError.overlapsProtected(path: entry.path, protected: hit)
+        }
+        if let hit = byIdentity.denied.containedIn(entry.path) {
+            throw SandboxError.overlapsProtected(path: entry.path, protected: hit)
         }
     }
 
@@ -580,12 +687,10 @@ public struct SandboxScope: Equatable, Sendable {
 
         // Read paths the owner or a grant added are checked whether or not they exist yet; only existing ones are mounted.
         // None may reach into `.brahma` (other agents' labs, homes and notes, the engine's files).
-        // A grant's path is used as stored (`Grants.isPinned`: it resolves to itself); one that no longer does refuses the turn
-        // rather than mounting whatever a link now names.
-        let grantReads = try grants.readPaths.map { p -> URL in
-            guard SandboxPath.key(r(p).path) == SandboxPath.key(p.path) else { throw SandboxError.linkedPath(p.path) }
-            return p
-        }
+        // A grant's path is used as stored, and only while it is pinned (`SandboxPath.isPinnedDirectory`: it resolves to itself
+        // through real directories only); one that no longer is (a link or alias was put in its place) is left out of the turn,
+        // never followed and never a reason to refuse the turn.
+        let grantReads = grants.readPaths.filter { SandboxPath.isPinnedDirectory($0.path) }
         let extraReads = toolchain.map(r) + grantReads
         for path in extraReads {
             try checkAllowed(path, protected: protected + both(dot), deniedRoots: deniedRoots)
@@ -675,6 +780,7 @@ public struct SandboxScope: Equatable, Sendable {
                                  denyRead: denyRead, denyWrite: denyWrite, protected: protected, network: network,
                                  toolchainTempWrite: darwinUserTemp.map(r))
         scope.skippedUnsafe = skipped
+        scope.grantReadDirs = grantReads
         try scope.validate()
         return scope
     }

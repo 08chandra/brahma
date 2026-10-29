@@ -46,6 +46,8 @@ struct SandboxedTurn: Sendable {
     var grants: [Grant] = []
     /// The same scope with other grants (blocking): used when a grant was revoked or used up between preparing and launching.
     var rebuild: (@Sendable (GrantInputs) throws -> SandboxScope)? = nil
+    /// The item the scope was built for.
+    var item: WorkItem? = nil
 }
 
 /// A sandboxed turn that does not start (its scope was refused, or its places could not be made): `sandbox scope: <why>`.
@@ -91,7 +93,7 @@ extension Orchestrator {
             }
         }
         let turn: SandboxedTurn
-        let droppedGrants: [String]
+        let droppedGrants: [(ref: String, state: Grants.PathState)]
         do {
             (turn, droppedGrants) = try await blocking.tryRun {
                 // The owner's backup folders and WAL replica (Task 13b): protected and unreadable for every turn. Read in the
@@ -99,42 +101,39 @@ extension Orchestrator {
                 let backups = try BackupTargets.requiredProtectedFolders(store: store)
                 try layout.ensure()
                 let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: mcp)
-                // The owner's grants that apply to this turn (Task 9). A read path that no longer is what was approved (a link
-                // replaced it or a part of it, or it now overlaps a protected place) is revoked and the owner told; the turn
-                // runs without it.
+                // The owner's grants that apply to this turn (Task 9). A read path that no longer is what was approved (a link,
+                // an alias or a file is where the directory was) is revoked and the owner told; one that is missing for now or
+                // newly overlaps a protected place is only left out of this turn. The turn runs either way.
                 var grants = try store.activeGrants(agent: agent, itemId: item?.id, kind: kind)
-                var dropped: [String] = []
-                for g in grants where !Grants.stillValid(g, company: company, paths: paths, environment: env, otherWorkspaces: others,
-                                                         backupTargets: backups) {
-                    dropped.append(g.ref)
-                    try store.revokeChangedPathGrant(g, now: now)
+                var dropped: [(ref: String, state: Grants.PathState)] = []
+                for g in grants {
+                    let state = Grants.pathState(g, company: company, paths: paths, environment: env, otherWorkspaces: others,
+                                                 backupTargets: backups)
+                    guard state != .ok else { continue }
+                    dropped.append((g.ref, state))
+                    if state == .changed { try store.revokeChangedPathGrant(g, now: now) }
                 }
-                grants.removeAll { dropped.contains($0.ref) }
+                grants.removeAll { g in dropped.contains { $0.ref == g.ref } }
                 let rebuild: @Sendable (GrantInputs) throws -> SandboxScope = { inputs in
                     try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
                                              kind: kind, item: item, company: company, grants: inputs,
                                              darwinUserTemp: env.darwinUserTemp, userHome: env.userHome)
                 }
                 let scope = try rebuild(GrantResolver.inputs(grants))
-                return (SandboxedTurn(scope: scope, shellPrefix: prefix, grants: grants, rebuild: rebuild), dropped)
+                return (SandboxedTurn(scope: scope, shellPrefix: prefix, grants: grants, rebuild: rebuild, item: item), dropped)
             }
         } catch {
-            let linked: String?
-            switch error {
-            case SandboxError.linkedPath(let path): linked = path
-            case let refused as UnsafeEngineFile: linked = refused.path
-            default: linked = nil
-            }
-            if let linked {
-                let repaired = await blocking.run { Self.repairOwnPlace(linked, layout: layout, item: item) }
-                noteLinkedPlace(linked, agent: agent, company: company, repaired: repaired, now: now)
-            }
-            if let refusal = error as? SandboxError { throw SandboxRefusal(reason: refusal.description) }
-            throw SandboxRefusal(reason: "the agent's places could not be prepared: \(error)")
+            throw await sandboxRefusal(error, agent: agent, company: company, layout: layout, item: item, now: now)
         }
-        if !droppedGrants.isEmpty {
-            event("@\(agent.name): read-path \(droppedGrants.count == 1 ? "grant" : "grants") \(droppedGrants.joined(separator: ", ")) "
-                  + "revoked and left out of the turn (the path is no longer what was approved)")
+        for (ref, state) in droppedGrants {
+            let why: String
+            switch state {
+            case .changed: why = "revoked: a link or alias is where the approved directory was"
+            case .missing: why = "left out of this turn: the directory is missing"
+            case .refused: why = "left out of this turn: the path now overlaps a protected place"
+            case .ok: continue
+            }
+            event("@\(agent.name): read-path grant \(ref) \(why)")
         }
         if !turn.scope.skippedUnsafe.isEmpty {
             let names = turn.scope.skippedUnsafe.map { Store.flat(URL(fileURLWithPath: $0).lastPathComponent, max: 80) }
@@ -147,7 +146,9 @@ extension Orchestrator {
     /// When the turn launches (after the mode's no-launch checks): counts one use of each grant it got, all or nothing. A grant
     /// revoked or used up since `prepareSandbox` (another turn took a one-use grant) is left out and the scope rebuilt without
     /// it, so the turn neither refuses nor spends the others for nothing.
-    nonisolated func consumeSandboxGrants(_ turn: inout SandboxedTurn, turnId: String) async throws {
+    /// A rebuild error is handled like `prepareSandbox`'s (`sandboxRefusal`).
+    nonisolated func consumeSandboxGrants(_ turn: inout SandboxedTurn, agent: Agent, company: Company, item: WorkItem?,
+                                          turnId: String) async throws {
         var grants = turn.grants
         while true {
             let lost = try store.consumeGrants(ids: grants.map(\.id), turnId: turnId, now: clock())
@@ -155,9 +156,34 @@ extension Orchestrator {
             grants.removeAll { lost.contains($0.id) }
             guard let rebuild = turn.rebuild else { throw SandboxRefusal(reason: "a grant changed while the turn was prepared") }
             let inputs = GrantResolver.inputs(grants)
-            turn.scope = try await blocking.tryRun { try rebuild(inputs) }
+            do {
+                turn.scope = try await blocking.tryRun { try rebuild(inputs) }
+            } catch {
+                throw await sandboxRefusal(error, agent: agent, company: company,
+                                           layout: SandboxLayout(paths: paths, company: company, agentHandle: agent.name),
+                                           item: item, now: clock())
+            }
             turn.grants = grants
         }
+    }
+
+    /// What a scope that could not be built becomes: a link in one of the agent's own places is removed (never followed) and
+    /// the owner told; the turn does not start (`SandboxRefusal`).
+    nonisolated func sandboxRefusal(_ error: any Error, agent: Agent, company: Company, layout: SandboxLayout, item: WorkItem?,
+                                    now: Date) async -> SandboxRefusal {
+        if let refusal = error as? SandboxRefusal { return refusal }
+        let linked: String?
+        switch error {
+        case SandboxError.linkedPath(let path): linked = path
+        case let refused as UnsafeEngineFile: linked = refused.path
+        default: linked = nil
+        }
+        if let linked {
+            let repaired = await blocking.run { Self.repairOwnPlace(linked, layout: layout, item: item) }
+            noteLinkedPlace(linked, agent: agent, company: company, repaired: repaired, now: now)
+        }
+        if let refusal = error as? SandboxError { return SandboxRefusal(reason: refusal.description) }
+        return SandboxRefusal(reason: "the agent's places could not be prepared: \(error)")
     }
 
     /// When `path` is one of the agent's own places (its home, cache, lab or notes, or the turn's progress file), removes the

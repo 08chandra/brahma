@@ -183,16 +183,30 @@ public struct ClaudeProcessRunner: TurnRunning {
     }
 
     private func execute(_ request: TurnRequest, yield: (StreamEvent) -> Void) async throws {
+        var request = request
         // One compiled profile: its argv and its engine-set environment (the only source of `CLAUDE_CODE_*` controls).
-        let profile = TurnProfileCompiler.profile(for: request)
+        var profile = TurnProfileCompiler.profile(for: request)
         try TurnProfileCompiler.validate(profile)
-        let args = TurnProfileCompiler.arguments(profile)
         let agentId = request.agent.id
         // Nothing of an earlier turn of this agent may still run when this one starts (1a re-review, binding).
         let earlier = await Self.registry.waitUntilGone(agentId)
         if !earlier.isEmpty { throw TurnError.earlierTurnStillRunning(pids: earlier) }
-        // The scope may be some time old: its link walk again, and the cwd it starts in must be the scope's own.
-        if profile.permission == .sandboxed, let scope = request.sandbox { try scope.recheckBeforeSpawn() }
+        // The scope may be some time old: its link walk again, and the cwd it starts in must be the scope's own. A grant read
+        // path that is no longer pinned (a link put in its place) is dropped for this turn, and the settings written again.
+        if profile.permission == .sandboxed, var scope = request.sandbox {
+            let dropped = try scope.recheckBeforeSpawnDroppingGrants()
+            if !dropped.isEmpty {
+                let gone = Set(dropped.map(\.path))
+                request.sandbox = scope
+                request.addDirs.removeAll { gone.contains($0) }
+                profile = TurnProfileCompiler.profile(for: request)
+                try TurnProfileCompiler.validate(profile)
+                if let path = request.settingsFilePath {
+                    try SettingsFile.write(TurnProfileCompiler.settingsJSON(profile), to: URL(fileURLWithPath: path))
+                }
+            }
+        }
+        let args = TurnProfileCompiler.arguments(profile)
         let executable: String, argv: [String]
         if claudePath.hasPrefix("/") {
             executable = claudePath
