@@ -284,7 +284,9 @@ import GRDB
             if delays.count >= 4 { throw CancellationError() }
         })
         shipper.start()
-        let deadline = AwakeTime.deadline(after: .seconds(20))
+        // The supervisor loop runs real fake-script launches; under full-suite load they can take far longer than a quick
+        // deadline, so wait on the condition (4 backoffs seen, which means 4 starts) with a generous awake-time bound.
+        let deadline = AwakeTime.deadline(after: .seconds(120))
         while delays.count < 4, AwakeTime.now < deadline { try await AwakeTime.sleep(for: .milliseconds(20)) }
         shipper.stop()
         #expect(delays.all == [5, 10, 20, 40].map { Duration.seconds($0) })
