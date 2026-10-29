@@ -2404,10 +2404,10 @@ extension ReviewTests {
         let fm = FileManager.default
         try keptForReview(r, try await submitted(r, edit: { try fm.removeItem(at: $0.appending(path: "src/gone.txt")) }), "a deleted file")
         try keptForReview(r, try await submitted(r, edit: {
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: $0.appending(path: "src/tool.txt").path)  // exec-bit fixture: a mode change under review
+            try FakeTools.fixtureMode(0o755, at: $0.appending(path: "src/tool.txt"))     // a mode change under review
         }), "an executable bit")
         try keptForReview(r, try await submitted(r, files: ["src/new-tool.txt": "z\n"], edit: {
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: $0.appending(path: "src/new-tool.txt").path)  // exec-bit fixture: a mode change under review
+            try FakeTools.fixtureMode(0o755, at: $0.appending(path: "src/new-tool.txt")) // a mode change under review
         }), "a new executable")
         try keptForReview(r, try await submitted(r, edit: {
             try fm.createSymbolicLink(atPath: $0.appending(path: "src/link").path, withDestinationPath: "tool.txt")

@@ -85,6 +85,6 @@ final class StubRunner: TurnRunning, @unchecked Sendable {
 
     func waitForChildren() async {
         guard childrenNeverExit else { return }
-        await Task.detached { try? await Task.sleep(for: .seconds(60)) }.value
+        await Task.detached { try? await Task.sleep(for: .seconds(60)) }.value  // scope-escape: a sleep, no scratch dirs
     }
 }

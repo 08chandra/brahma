@@ -249,7 +249,7 @@ import Glibc
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
         _ = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(server, $0, &len) } }
         let echoPort = UInt16(bigEndian: addr.sin_port)
-        Thread.detachNewThread {
+        Thread.detachNewThread {                                                // scope-escape: an echo server, no scratch dirs
             defer { close(server); echoDone.signal() }
             let c = accept(server, nil, nil)
             guard c >= 0 else { return }

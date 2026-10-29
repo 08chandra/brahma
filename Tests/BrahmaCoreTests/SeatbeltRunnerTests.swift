@@ -14,7 +14,7 @@ struct SeatbeltRunnerTests {
     static let env = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
 
     /// The owner's real home, resolved.
-    static var realHome: URL { FileManager.default.homeDirectoryForCurrentUser.resolvedForSandbox }
+    static var realHome: URL { FileManager.default.homeDirectoryForCurrentUser.resolvedForSandbox }  // raw-temp-api: read-only, the home the policy denies
 
     /// `~/.brahma-test-<pid>/<n>` (resolved, so policies hold resolved paths), removed with the test case.
     static func homeDir() throws -> URL {
@@ -72,7 +72,7 @@ struct SeatbeltRunnerTests {
         #expect(ok.exitCode == 0, "\(ok.tail)")
         #expect(FileManager.default.fileExists(atPath: w.appending(path: "sub/deeper/f").path))
         for target in [h.appending(path: escape).path, "/private/tmp/\(escape)", Self.realHome.appending(path: escape).path,
-                       FileManager.default.temporaryDirectory.resolvedForSandbox.appending(path: escape).path] {
+                       FileManager.default.temporaryDirectory.resolvedForSandbox.appending(path: escape).path] {  // raw-temp-api: an escape the sandbox must refuse
             let (bad, _) = try await Self.run("touch '\(target)'", p)
             #expect(bad.exitCode != 0, "\(target) was writable")
             #expect(!FileManager.default.fileExists(atPath: target)); try? FileManager.default.removeItem(atPath: target)

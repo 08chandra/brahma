@@ -17,7 +17,7 @@ private func request(in dir: URL, agentId: String = "a1") -> TurnRequest {
 }
 
 private func shRunner(_ script: String) -> ClaudeProcessRunner {
-    var runner = ClaudeProcessRunner(claudePath: "/bin/sh", baseEnvironment: ["PATH": "/usr/bin:/bin", "HOME": NSTemporaryDirectory()])
+    var runner = ClaudeProcessRunner(claudePath: "/bin/sh", baseEnvironment: ["PATH": "/usr/bin:/bin", "HOME": NSTemporaryDirectory()])  // raw-temp-api: a HOME value for /bin/sh, nothing written there
     runner.leadingArguments = ["-c", script, "fake-claude"]
     return runner
 }

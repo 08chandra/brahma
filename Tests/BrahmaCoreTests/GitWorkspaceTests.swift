@@ -30,7 +30,7 @@ import Foundation
         let f = try GitFixture(ensure: false)
         var ws = GitWorkspace(root: f.root, exportHome: home)
         #expect(ws.gitTemp.path == home.appending(path: "tmp").path)
-        let nsTemp = FileManager.default.temporaryDirectory
+        let nsTemp = FileManager.default.temporaryDirectory                    // raw-temp-api: read-only, counts the engine's strays
         func strays() -> [String] {
             ((try? FileManager.default.contentsOfDirectory(atPath: nsTemp.path)) ?? [])
                 .filter { $0.hasPrefix("brahma-git-") || $0.hasPrefix("brahma-index-") || $0.hasPrefix("brahma-quarantine-") }
@@ -324,7 +324,7 @@ import Foundation
         let decided = ResultBox()
         let ws = f.ws
         // A removal that has decided "nobody holds it" and is about to delete the checkout...
-        Thread.detachNewThread {
+        Thread.detachNewThread {                                                // scope-escape: no scratch dirs made on this thread
             try? ws.removeWorktree(key: "K-1", keepIf: {
                 inside.signal(); Thread.sleep(forTimeInterval: 0.3); decided.add(true); return false
             })
@@ -411,7 +411,7 @@ import Foundation
         for thread in threads {
             done.enter()
             let run = thread
-            Thread.detachNewThread { run.start(); while !run.isFinished { usleep(1000) }; done.leave() }
+            Thread.detachNewThread { run.start(); while !run.isFinished { usleep(1000) }; done.leave() }  // scope-escape: runs a git op, no scratch dirs
         }
         #expect(done.wait(timeout: .now() + 300) == .success, "hang guard")
         #expect(failures.all.isEmpty, "\(failures.all.count) failed: \(failures.all.prefix(3))")
@@ -551,7 +551,7 @@ import Foundation
         let admin = f.root.appending(path: ".git/worktrees/ACME-1")
         let script = "#!/bin/sh\nexit 0\n"
         let hook = try f.write(".git/hooks/post-checkout", script)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)      // exec-bit fixture: a mode under test, never run
+        try FakeTools.fixtureMode(0o755, at: hook)                                     // a mode under test, never run
         let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
         // Rewritten (and so no longer executable), attributes and an alternate added and a tracked file hidden from status
         // with the skip-worktree bit. (A repointed worktree HEAD is the engine's own check, not the barrier's.)
@@ -570,7 +570,7 @@ import Foundation
         #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/objects/info/alternates").path))
         #expect(try f.git(["ls-files", "-v", "a.txt"], in: wt) == "H a.txt")
         // A mode change alone is a change too.
-        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hook.path)      // exec-bit fixture: a mode under test, never run
+        try FakeTools.fixtureMode(0o700, at: hook)                                     // a mode under test, never run
         #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) == ["changed hooks/post-checkout"])
         #expect((try fm.attributesOfItem(atPath: hook.path)[.posixPermissions] as? Int) == 0o755)
     }

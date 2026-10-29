@@ -66,6 +66,34 @@ import Foundation
         #expect(offenders == [], "use FakeTools.script/bin/install, or mark a mode under test `// exec-bit fixture: ...`: \(offenders)")
     }
 
+    /// No test reaches for the raw temp or home APIs: every scratch path comes from `tempDir()` / `Scratch`, so it is scoped,
+    /// swept and guarded. A read-only use says why on its line: `raw-temp-api: ...`.
+    @Test func noRawTempOrHomeAPIOutsideScratch() throws {
+        let raw = ["temporaryDirectory", "NSTemporaryDirectory", "mkdtemp", "homeDirectoryForCurrentUser", "NSHomeDirectory"]
+        var offenders: [String] = []
+        for (file, text) in try Self.sources() where file != "TestScratch.swift" && file != "TempHygieneTests.swift" {
+            for (i, line) in text.components(separatedBy: "\n").enumerated()
+            where raw.contains(where: { line.contains($0) }) && !line.contains("raw-temp-api:") {
+                offenders.append("\(file):\(i + 1)")
+            }
+        }
+        #expect(offenders == [], "use tempDir(), or mark a read-only use `// raw-temp-api: ...`: \(offenders)")
+    }
+
+    /// Work that escapes the test's task (a detached task or thread) does not see the scratch scope: `tempDir()` there would
+    /// be an orphan. Each such site says what it does on its line: `scope-escape: ...`.
+    @Test func scopeEscapesAreDeclared() throws {
+        let escapes = ["Task.detached", "Thread.detachNewThread", "DispatchQueue.global"]
+        var offenders: [String] = []
+        for (file, text) in try Self.sources() where file != "TestScratch.swift" && file != "TempHygieneTests.swift" {
+            for (i, line) in text.components(separatedBy: "\n").enumerated()
+            where escapes.contains(where: { line.contains($0) }) && !line.contains("scope-escape:") {
+                offenders.append("\(file):\(i + 1)")
+            }
+        }
+        #expect(offenders == [], "mark `// scope-escape: ...` (and make no scratch dirs there): \(offenders)")
+    }
+
     /// The two targets' copies of the scratch support are the same file.
     @Test func scratchSupportTwinsAreIdentical() throws {
         let core = try Data(contentsOf: Self.tests.appending(path: "BrahmaCoreTests/TestScratch.swift"))

@@ -280,7 +280,7 @@ private final class DeleteThenFailStore: OwnerKeyStore, @unchecked Sendable {
 
     @Test func fileStoreRefusedForTheDefaultHomeViaTheDataVolumeFirmlinkAlias() throws {
         // realpath does not resolve the APFS firmlink, so a string compare of canonical paths misses this alias.
-        let user = NSHomeDirectory()
+        let user = NSHomeDirectory()                                            // raw-temp-api: read-only, the alias of the real home
         let alias = "/System/Volumes/Data" + user
         try #require(FileManager.default.fileExists(atPath: alias), "no firmlink alias on this machine")
         let d = try tempDir()
