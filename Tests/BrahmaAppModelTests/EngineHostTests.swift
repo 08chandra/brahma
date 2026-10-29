@@ -6,7 +6,7 @@ import BrahmaCore
 private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorItem(name: "probe", status: .pass, detail: "ok")],
                                          checkedAt: Date())
 
-@MainActor @Suite struct EngineHostTests {
+@MainActor @Suite(.scratch) struct EngineHostTests {
     let tools = Result<EngineTools, EngineSetupError>.success(EngineTools(claudePath: "claude", mcpExecutable: "/tmp/brahma"))
 
     func host(_ paths: BrahmaPaths, _ store: Store, _ runner: StubRunner = StubRunner(mode: .succeed)) -> EngineHost {

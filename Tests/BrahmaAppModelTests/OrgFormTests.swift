@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct OrgFormTests {
+@MainActor @Suite(.scratch) struct OrgFormTests {
     @Test func agentCountValidation() {
         var form = CompanyForm(name: "Acme", goal: "Ship")
         #expect(form.agentCount == 6 && form.usageMode == .balanced && form.packId == "software")

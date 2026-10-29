@@ -35,7 +35,7 @@ private final class DeleteThenFailStore: OwnerKeyStore, @unchecked Sendable {
     func removeHash(for paths: BrahmaPaths) { inner.removeHash(for: paths) }
 }
 
-@Suite struct OwnerKeyTests {
+@Suite(.scratch) struct OwnerKeyTests {
     @Test func rotationRestoresAHashThatTheFailedWriteDeleted() throws {
         let p = try paths(); let store = DeleteThenFailStore(failures: 0)
         try OwnerKey.create(paths: p, store: store)

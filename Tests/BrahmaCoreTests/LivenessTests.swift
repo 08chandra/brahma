@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// The stall explainer, deadlock detection and item aging (Task 12).
-@Suite struct LivenessTests {
+@Suite(.scratch) struct LivenessTests {
     static let now = Date(timeIntervalSince1970: 1_800_000_000)   // Fri 2027-01-15 08:00 UTC
     static let utc = TimeZone(identifier: "UTC")!
 

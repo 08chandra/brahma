@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct ActivityTextTests {
+@MainActor @Suite(.scratch) struct ActivityTextTests {
     func event(_ kind: ActivityKind, _ text: String, agent: String? = nil) -> ActivityEvent {
         ActivityEvent(companyId: "c", agentId: agent, turnId: nil, kind: kind, text: text, createdAt: .now)
     }

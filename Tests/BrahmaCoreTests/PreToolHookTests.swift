@@ -3,7 +3,7 @@ import Testing
 @testable import BrahmaCore
 
 /// `brahma hook pre-tool` (design §4.2): the engine's PreToolUse hook on `Agent|Task|Workflow`.
-@Suite struct PreToolHookTests {
+@Suite(.scratch) struct PreToolHookTests {
     private func input(_ tool: String, _ fields: [String: JSONValue]) -> [String: JSONValue] {
         ["hook_event_name": .string("PreToolUse"), "tool_name": .string(tool), "tool_input": .object(fields),
          "session_id": .string("s")]

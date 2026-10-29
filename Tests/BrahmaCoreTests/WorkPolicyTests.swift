@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Suite struct WorkPolicyTests {
+@Suite(.scratch) struct WorkPolicyTests {
     // Actors: the assignee, the author, the reviewer, a manager and a stranger. "owner" and "system" are privileged.
     private func item(status: WorkItemStatus = .ready, check: CheckSpec? = nil) -> WorkItem {
         WorkItem(id: "i1", companyId: "c1", number: 1, key: "ACME-1", type: .task, title: "t", checkSpec: check, status: status,

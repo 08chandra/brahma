@@ -48,7 +48,7 @@ private let deep = decision { $0.tier = .m; $0.riskTags = ["hotPath"] }
 private let deepOpus = decision { $0.tier = .l }
 private let allModes = [quick, standard, deep, deepOpus]
 
-@Suite struct ModeProfileTests {
+@Suite(.scratch) struct ModeProfileTests {
     /// Fix 1 minor: the L-4 gate really gates the per-mode caps.
     @Test func perModeCapsGateEmitsTheCaps() {
         #expect(ModeGates.perModeCaps)
@@ -251,15 +251,12 @@ private let allModes = [quick, standard, deep, deepOpus]
 
     @Test func spawnedEnvContainsEmittedVars() async throws {
         let dir = try tempDir()
-        let dump = dir.appending(path: "env.txt")
-        let script = dir.appending(path: "claude")
-        try """
-        #!/bin/sh
-        env > '\(dump.path)'
+        let dump = dir.appending(path: "env.txt")                            // the turn's working directory is `dir`
+        let script = try FakeTools.script("claude", """
+        env > env.txt
         echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-haiku-5-5","tools":[],"agents":[]}'
         echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","total_cost_usd":0.001,"usage":{"input_tokens":1,"output_tokens":1}}'
-        """.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        """)
         var r = request(quick)
         r.workingDirectory = dir.path
         let runner = ClaudeProcessRunner(claudePath: script.path, baseEnvironment: ["PATH": "/usr/bin:/bin", "CLAUDE_CODE_EFFORT_LEVEL": "max"])
@@ -275,9 +272,7 @@ private let allModes = [quick, standard, deep, deepOpus]
         // printed `error_max_budget_usd` and exited 1 by itself. That is the cap, not an interruption.
         let fixture = try #require(Bundle.module.url(forResource: "stream-subagent-budget-cap", withExtension: "jsonl", subdirectory: "Fixtures"))
         let dir = try tempDir()
-        let script = dir.appending(path: "claude")
-        try "#!/bin/sh\ncat > /dev/null\ncat '\(fixture.path)'\nexit 1\n".write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let script = try FakeTools.script("claude", "cat > /dev/null\ncat '\(fixture.path)'\nexit 1")
         var r = request(quick)
         r.workingDirectory = dir.path
         var result: TurnResult?

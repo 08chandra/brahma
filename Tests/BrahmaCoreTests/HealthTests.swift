@@ -92,7 +92,7 @@ private struct HWorld {
     func hold() throws -> EngineHold? { try store.engineHold() }
 }
 
-@Suite(.serialized) struct HealthTests {
+@Suite(.scratch, .serialized) struct HealthTests {
     @Test func classifyTable() {
         let net = ["getaddrinfo ENOTFOUND x", "connect ECONNREFUSED 1.2.3.4", "read ECONNRESET", "ETIMEDOUT", "Network is unreachable",
                    "TypeError: fetch failed", "socket hang up"]

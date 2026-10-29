@@ -24,7 +24,7 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
     return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))
 }
 
-@Suite struct WorkCLITests {
+@Suite(.scratch) struct WorkCLITests {
     @Test func companyCreateDryRunPrintsTree() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url

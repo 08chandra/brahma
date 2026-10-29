@@ -26,7 +26,7 @@ let plan1Settings = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disa
     + "\"cc-plugin-plugin-authoring@builtin\":false},\"fastMode\":false,\"permissions\":{\"deny\":[\"Bash(claude *)\","
     + "\"Bash(*/claude *)\"]},\"workflowKeywordTriggerEnabled\":false}"
 
-@Suite struct TurnProfileTests {
+@Suite(.scratch) struct TurnProfileTests {
     @Test func plan1ArgvUnchanged() throws {
         let first = TurnProfileCompiler.arguments(TurnProfileCompiler.profile(for: request(started: false)))
         #expect(first == [

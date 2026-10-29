@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Suite struct QuietHoursTests {
+@Suite(.scratch) struct QuietHoursTests {
     let ny = TimeZone(identifier: "America/New_York")!
 
     func date(_ iso: String) -> Date {

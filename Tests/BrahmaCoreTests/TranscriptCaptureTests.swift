@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Task 13a: per-turn transcript capture. The source directory is always a temp dir: the owner's real `~/.claude` is never read.
-@Suite struct TranscriptCaptureTests {
+@Suite(.scratch) struct TranscriptCaptureTests {
     static let zstdPath: String? = Compressor.findZstd()
 
     struct Rig {

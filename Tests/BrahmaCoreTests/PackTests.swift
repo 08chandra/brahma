@@ -2,13 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Suite struct PackTests {
-    private func tempDir() -> URL {
-        let u = FileManager.default.temporaryDirectory.appending(path: "brahma-pack-\(UUID().uuidString)", directoryHint: .isDirectory)
-        try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
-        return u
-    }
-
+@Suite(.scratch) struct PackTests {
     private func encoded(_ p: IndustryPack) throws -> Data { try JSONEncoder().encode(p) }
 
     private var software: IndustryPack { PackCatalog.builtin.pack("software")! }
@@ -36,7 +30,7 @@ import Foundation
     }
 
     @Test func filePackWithHigherVersionOverrides() throws {
-        let dir = tempDir(); var p = software; p.version = 2; p.title = "Software v2"
+        let dir = try tempDir(); var p = software; p.version = 2; p.title = "Software v2"
         try encoded(p).write(to: dir.appending(path: "software.json"))
         var lower = software; lower.version = 0; lower.id = "other"; lower.title = "Other"
         try encoded(lower).write(to: dir.appending(path: "other.json"))
@@ -47,12 +41,12 @@ import Foundation
         #expect(c.pack("other")?.title == "Other")
         // A lower or equal version never replaces the built-in.
         var old = software; old.version = 1; old.title = "Same version"
-        let dir2 = tempDir(); try encoded(old).write(to: dir2.appending(path: "s.json"))
+        let dir2 = try tempDir(); try encoded(old).write(to: dir2.appending(path: "s.json"))
         #expect(try PackCatalog.load(directory: dir2).pack("software")?.title == software.title)
     }
 
     @Test func filePackAddsNewIndustry() throws {
-        let dir = tempDir(); var p = software; p.id = "marketing"; p.title = "Marketing"
+        let dir = try tempDir(); var p = software; p.id = "marketing"; p.title = "Marketing"
         try encoded(p).write(to: dir.appending(path: "marketing.json"))
         let c = try PackCatalog.load(directory: dir)
         #expect(c.packs.count == 2); #expect(c.pack("marketing")?.title == "Marketing")
@@ -71,7 +65,7 @@ import Foundation
                 "membersPerTeamMax":6,"ratios":[],"director":"boss","smallTeamName":"core"},
          "defaultCadence":"milestone","askApprovers":{"prd":["boss"]},"reservedCategories":["legal"]}
         """
-        let dir = tempDir(); try json.write(to: dir.appending(path: "mini.json"), atomically: true, encoding: .utf8)
+        let dir = try tempDir(); try json.write(to: dir.appending(path: "mini.json"), atomically: true, encoding: .utf8)
         let p = try #require(try PackCatalog.load(directory: dir).pack("mini"))
         #expect(p.connectors.isEmpty); #expect(p.role("boss")?.skills.isEmpty == true)
         #expect(p.role("boss")?.playbooks.isEmpty == true); #expect(p.itemType("task")?.checkTemplate == nil)
@@ -90,7 +84,7 @@ import Foundation
         default: p.roles[0].playbooks["nonexistent"] = "x"
         }
         #expect(throws: PackError.self) { try p.validate() }
-        let dir = tempDir(); p.id = "broken"
+        let dir = try tempDir(); p.id = "broken"
         try encoded(p).write(to: dir.appending(path: "broken.json"))
         do { _ = try PackCatalog.load(directory: dir); Issue.record("expected throw") }
         catch let PackError.invalid(name, _) { #expect(name == "broken.json") }
@@ -114,7 +108,7 @@ import Foundation
     }
 
     @Test func roleCardMaterializedOnceThenReadFromFile() throws {
-        let home = tempDir()
+        let home = try tempDir()
         let paths = BrahmaPaths(home: home, workspaces: home.appending(path: "ws"))
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let company = Company(id: "c1", name: "Acme", slug: "acme", goal: "g", workspacePath: "/tmp/acme", status: .running,

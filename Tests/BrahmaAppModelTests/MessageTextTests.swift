@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaAppModel
 
-@Suite struct MessageTextTests {
+@Suite(.scratch) struct MessageTextTests {
     private func emphasized(_ a: AttributedString) -> [String] {
         a.runs.filter { $0.inlinePresentationIntent == .stronglyEmphasized }.map { String(a[$0.range].characters) }
     }

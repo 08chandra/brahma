@@ -63,7 +63,7 @@ private struct TimerWorld {
     }
 }
 
-@Suite struct TimerTests {
+@Suite(.scratch) struct TimerTests {
     @Test func jobFiresAndReschedules() async throws {
         let counter = Counter()
         var jobs = TimerJobRegistry.system

@@ -10,7 +10,7 @@ import GRDB
 /// - (c) with `.claude/skills/x/SKILL.md` and `.claude/agents/x.md` in the cwd, init `skills` and `agents` lack `x`;
 /// - (d) a commit on `item/<KEY>` succeeds with only the per-ref `allowWrite` entries.
 /// Run with: BRAHMA_LIVE=1 swift test --filter LiveSandboxProbeTests (the findings are printed as `PROBE …` lines).
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1"))
+@Suite(.scratch, .enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1"))
 struct LiveSandboxProbeTests {
     @Test(.timeLimit(.minutes(4)))
     func sandboxedTurnProbes() async throws {

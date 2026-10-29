@@ -2,13 +2,9 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-/// Writes an executable `#!/bin/sh` script standing in for `claude`.
+/// The shared `#!/bin/sh` script standing in for `claude` (one per body per process), and a working directory for the turn.
 private func fakeClaude(_ body: String) throws -> (script: URL, dir: URL) {
-    let dir = try tempDir()
-    let url = dir.appending(path: "fake-claude")
-    try ("#!/bin/sh\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-    return (url, dir)
+    (try FakeTools.script("fake-claude", body), try tempDir())
 }
 
 private func request(in dir: URL) -> TurnRequest {
@@ -27,7 +23,7 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
     return out
 }
 
-@Suite(.serialized) struct TurnRunnerTests {
+@Suite(.scratch, .serialized) struct TurnRunnerTests {
     @Test func runsExecutableFeedsPromptOnStdinAndParsesStdout() async throws {
         let fixture = try #require(Bundle.module.url(forResource: "stream-success", withExtension: "jsonl",
                                                      subdirectory: "Fixtures"))
@@ -183,7 +179,9 @@ private final class PollCounter: @unchecked Sendable {
     private var count = 0
     func increment() { lock.lock(); count += 1; lock.unlock() }
     var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
 
+extension TurnRunnerTests {
     @Test func spawnedEnvironmentCarriesOnlyEngineClaudeVars() async throws {
         let (script, dir) = try fakeClaude("""
             cat > /dev/null

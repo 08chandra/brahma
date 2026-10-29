@@ -13,12 +13,10 @@ let keychainTrapArmed: Bool = {
     return true
 }()
 
+/// A directory for this test case under the process root (`TestScratch.swift`), removed when the case ends.
 func tempDir() throws -> URL {
     _ = keychainTrapArmed
-    let url = FileManager.default.temporaryDirectory
-        .appending(path: "brahma-test-\(UUID().uuidString)", directoryHint: .isDirectory)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    return url
+    return try Scratch.dir()
 }
 
 // MARK: owner key helpers for CLI subprocess tests

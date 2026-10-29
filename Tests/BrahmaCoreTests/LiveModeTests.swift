@@ -4,7 +4,7 @@ import Testing
 
 /// Live work-mode probes (design §7; haiku, tiny prompts, `--max-budget-usd` ≤ 0.05). They use subscription quota.
 /// Run with: BRAHMA_LIVE=1 swift test --filter LiveModeTests
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1"))
+@Suite(.scratch, .enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1"))
 struct LiveModeTests {
     private func request(_ d: ModeDecision, dir: URL, session: String = UUID().uuidString.lowercased(), resume: Bool = false,
                          prompt: String = "Reply with OK.") throws -> TurnRequest {

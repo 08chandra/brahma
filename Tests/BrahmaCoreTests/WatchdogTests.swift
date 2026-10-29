@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// The watchdog, its loop guards and the failed-check guard (Task 14b).
-@Suite(.serialized) struct WatchdogTests {
+@Suite(.scratch, .serialized) struct WatchdogTests {
     /// A company with a manager and an engineer who reports to her.
     private struct W {
         let w: World

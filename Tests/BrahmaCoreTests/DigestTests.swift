@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct DigestTests {
+@Suite(.scratch) struct DigestTests {
     private static func date(_ iso: String) -> Date { ISO8601DateFormatter().date(from: iso)! }
     private static let la = TimeZone(identifier: "America/Los_Angeles")!
     private static let utc = TimeZone(identifier: "UTC")!

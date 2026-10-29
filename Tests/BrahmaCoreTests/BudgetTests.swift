@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Token and cost accounting, per-item budgets, the tier model and the turn-level assertions (Task 14a).
-@Suite struct BudgetTests {
+@Suite(.scratch) struct BudgetTests {
     /// A company with a real git workspace, a manager and an engineer who reports to her.
     private struct B {
         let w: World

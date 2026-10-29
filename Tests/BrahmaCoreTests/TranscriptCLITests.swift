@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Task 13a: `brahma transcript` and `brahma restore --at/--with-files`, run as subprocesses on a throwaway home.
-@Suite struct TranscriptCLITests {
+@Suite(.scratch) struct TranscriptCLITests {
     private func iso(_ date: Date) -> String {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

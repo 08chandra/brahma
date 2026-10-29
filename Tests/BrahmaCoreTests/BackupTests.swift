@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct BackupTests {
+@Suite(.scratch) struct BackupTests {
     @Test func snapshotIsConsistentAndPruned() throws {
         let env = try BackupEnv()
         let acme = try env.company()

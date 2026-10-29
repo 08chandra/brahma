@@ -62,7 +62,7 @@ struct PatternSample: Sendable, CustomTestStringConvertible {
 
 private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not itself trip a scanner
 
-@Suite struct SecretTests {
+@Suite(.scratch) struct SecretTests {
     private struct W {
         let store: Store, company: Company, other: Company, vault = MemoryVault()
         let ceo: Agent, eng: Agent
@@ -866,7 +866,7 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
     }
 }
 
-@Suite struct SecretCLITests {
+@Suite(.scratch) struct SecretCLITests {
     private func brahma(_ args: [String], home: URL, env: [String: String] = [:], stdin: String? = nil) throws
         -> (status: Int32, stdout: String, stderr: String) {
         let p = Process()

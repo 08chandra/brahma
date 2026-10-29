@@ -8,7 +8,7 @@ import Glibc
 @testable import BrahmaCore
 
 /// The egress proxy (CONNECT only, port 443, allow-list, public addresses only, one resolution) and its matchers.
-@Suite struct EgressProxyTests {
+@Suite(.scratch) struct EgressProxyTests {
     // MARK: DomainMatcher
 
     @Test func domainMatcherTable() {

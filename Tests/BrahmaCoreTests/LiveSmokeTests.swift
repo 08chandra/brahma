@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Real `claude` turns (uses subscription quota). Run with: BRAHMA_LIVE=1 swift test --filter LiveSmokeTests
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1"))
+@Suite(.scratch, .enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1"))
 struct LiveSmokeTests {
     /// The built `brahma` binary sits next to the test resource bundle; agents' MCP servers run from it.
     private func brahmaExecutable() throws -> String {

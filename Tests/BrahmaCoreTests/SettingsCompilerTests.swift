@@ -103,7 +103,7 @@ private func pretty(_ settings: ClaudeSettings) throws -> String {
     return String(decoding: try encoder.encode(settings), as: UTF8.self)
 }
 
-@Suite struct SettingsCompilerTests {
+@Suite(.scratch) struct SettingsCompilerTests {
     // MARK: Snapshots
 
     @Test func sandboxedSettingsSnapshot() throws {

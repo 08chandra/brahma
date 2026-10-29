@@ -26,7 +26,7 @@ private func isNonBlocking(_ fd: Int32) -> Bool { fcntl(fd, F_GETFL) & O_NONBLOC
 /// The race behind the stderr drain (Plan 3a): clearing `readabilityHandler` does not stop a handler that is already
 /// running. The old drain then made the fd non-blocking and emptied it, so the handler's `availableData` hit EAGAIN and
 /// Darwin's FileHandle raised an uncatchable NSFileHandleOperationException.
-@Suite(.serialized) struct StderrReaderTests {
+@Suite(.scratch, .serialized) struct StderrReaderTests {
     /// The seam reproduces the old condition: with the old drain, a handler paused in flight and resumed afterwards reads an
     /// emptied non-blocking fd and fails with EAGAIN, which `availableData` turns into a process crash.
     @Test func seamReproducesTheOldRace() throws {

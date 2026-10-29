@@ -50,7 +50,7 @@ final class RecordingTransport: PushTransport, @unchecked Sendable {
     }
 }
 
-@Suite struct PushTests {
+@Suite(.scratch) struct PushTests {
     let ny = TimeZone(identifier: "America/New_York")!
     func date(_ iso: String) -> Date {
         let f = ISO8601DateFormatter()

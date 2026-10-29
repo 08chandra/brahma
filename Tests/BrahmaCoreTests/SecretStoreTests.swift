@@ -5,7 +5,7 @@ import Testing
 
 /// The secret store choice (`PlatformSecretVault`), the dev/demo `FileVault`, and the trusted-application list the
 /// Keychain vault's access control is built from. Nothing here touches the Keychain (`NoKeychainTests` checks).
-@Suite struct SecretStoreTests {
+@Suite(.scratch) struct SecretStoreTests {
     private func paths() throws -> BrahmaPaths {
         let d = try tempDir()
         return BrahmaPaths(home: d.appending(path: "home"), workspaces: d.appending(path: "ws"))
@@ -164,8 +164,7 @@ import Testing
         try FileManager.default.createDirectory(at: bundle.appending(path: "MacOS"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: bundle.appending(path: "Helpers"), withIntermediateDirectories: true)
         for exe in [bundle.appending(path: "MacOS/Brahma"), bundle.appending(path: "Helpers/brahma")] {
-            try Data("#!/bin/sh\n".utf8).write(to: exe)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
+            try FakeTools.install(at: exe, "exit 0")
         }
         let link = root.appending(path: "brahma")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: bundle.appending(path: "Helpers/brahma"))

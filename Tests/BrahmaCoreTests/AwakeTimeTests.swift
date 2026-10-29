@@ -4,7 +4,7 @@ import Foundation
 
 /// Every timeout and hang backstop counts awake time (`AwakeTime`), the clock of the idle backstop: a Mac that sleeps through
 /// a wait never makes it expire with the work it guards merely frozen.
-@Suite struct AwakeTimeTests {
+@Suite(.scratch) struct AwakeTimeTests {
     @Test func theSharedClockIsTheIdleBackstopsAndTheChecks() {
         #expect(Orchestrator.idleBackstopClock is SuspendingClock)
         #expect(type(of: AwakeTime.clock) == SuspendingClock.self)

@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Test func secondOrchestratorLockFailsUntilFirstIsReleased() throws {
+@Test(.scratch) func secondOrchestratorLockFailsUntilFirstIsReleased() throws {
     let root = try tempDir()
     let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
     var first: OrchestratorLock? = try OrchestratorLock.acquire(paths: paths)
@@ -16,7 +16,7 @@ import Foundation
 /// spawning a child, the child briefly holds a copy of every descriptor (`O_CLOEXEC` ones too, until its exec closes them),
 /// so a lock that was only `close`d stayed held by that copy and the very next acquire saw `.alreadyRunning`. Releasing
 /// unlocks explicitly before closing, so no copy can keep it.
-@Test func orchestratorLockIsFreeTheMomentItIsReleasedWhileChildrenSpawn() throws {
+@Test(.scratch) func orchestratorLockIsFreeTheMomentItIsReleasedWhileChildrenSpawn() throws {
     let root = try tempDir()
     let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
     let stop = LockFlag()
@@ -46,7 +46,7 @@ private final class LockFlag: @unchecked Sendable {
     var isSet: Bool { lock.withLock { value } }
 }
 
-@Test func sanitizerNeutralisesControlCharacters() {
+@Test(.scratch) func sanitizerNeutralisesControlCharacters() {
     #expect(TerminalText.sanitize("a\u{1B}[2Jb") == "a [2Jb")
     #expect(TerminalText.sanitize("x\u{9B}31my") == "x 31my")
     #expect(TerminalText.sanitize("p\u{7F}q") == "p q")

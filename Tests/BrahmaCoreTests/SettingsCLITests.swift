@@ -20,7 +20,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
     return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))
 }
 
-@Suite struct SettingsCLITests {
+@Suite(.scratch) struct SettingsCLITests {
     @Test func timezoneShowsSetsAndValidates() throws {
         let owner = try OwnerTestHome(); let home = owner.url
         #expect(try brahma(["settings", "timezone"], home: home).stdout.contains("time zone: "))

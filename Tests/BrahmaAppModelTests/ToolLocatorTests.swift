@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@Suite struct ToolLocatorTests {
+@Suite(.scratch) struct ToolLocatorTests {
     @Test func mcpHelperPrefersBundleHelpers() {
         let existing: Set<String> = ["/A/Brahma.app/Contents/Helpers/brahma", "/A/Brahma.app/Contents/MacOS/brahma"]
         let found = ToolLocator.mcpHelper(appBundle: URL(fileURLWithPath: "/A/Brahma.app"),
@@ -44,12 +44,7 @@ import BrahmaCore
     }
 
     @Test func loginShellPathTimesOut() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "brahma-shell-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let script = dir.appending(path: "slowsh")
-        try "#!/bin/sh\nsleep 120\n".write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let script = try FakeTools.script("slowsh", "sleep 120")
         let start = AwakeTime.now
         let result = ToolLocator.loginShellPath(shell: script.path, timeout: .seconds(1))
         #expect(result == nil)

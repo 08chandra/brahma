@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct RestoreTests {
+@Suite(.scratch) struct RestoreTests {
     /// A data home with one company and a message, a snapshot of it, and then a later company the snapshot does not have.
     private func scenario() throws -> (env: BackupEnv, snapshot: URL, service: BackupService) {
         let env = try BackupEnv()

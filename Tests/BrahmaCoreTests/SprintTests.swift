@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct SprintTests {
+@Suite(.scratch) struct SprintTests {
     private struct W {
         let store: Store, company: Company
         let ceo: Agent, cto: Agent, cpo: Agent, mgr: Agent, eng1: Agent, eng2: Agent

@@ -34,7 +34,7 @@ private struct SandboxTurnWorld {
 
 private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: flag).map { a[$0 + 1] } }
 
-@Suite struct SandboxTurnTests {
+@Suite(.scratch) struct SandboxTurnTests {
     @Test func itemlessSandboxedTurnRunsInTheLabWithItsSettingsFile() async throws {
         let w = try SandboxTurnWorld()
         try w.world.dm(w.company, w.eng)

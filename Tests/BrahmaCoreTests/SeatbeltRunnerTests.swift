@@ -7,20 +7,18 @@ import Glibc
 #endif
 @testable import BrahmaCore
 
-/// The Seatbelt backend, run for real: only where `/usr/bin/sandbox-exec` exists. Every test works in `~/.brahma-test-<uuid>`
-/// (removed afterwards), under the owner's real home, so the home denial is the real one.
-@Suite(.serialized, .enabled(if: Toolchain.seatbeltAvailable, "no /usr/bin/sandbox-exec"))
+/// The Seatbelt backend, run for real: only where `/usr/bin/sandbox-exec` exists. Every test works in `~/.brahma-test-<pid>/<n>`
+/// (removed when the test ends), under the owner's real home, so the home denial is the real one.
+@Suite(.scratch, .serialized, .enabled(if: Toolchain.seatbeltAvailable, "no /usr/bin/sandbox-exec"))
 struct SeatbeltRunnerTests {
     static let env = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
 
     /// The owner's real home, resolved.
     static var realHome: URL { FileManager.default.homeDirectoryForCurrentUser.resolvedForSandbox }
 
-    /// `~/.brahma-test-<uuid>` (resolved, so policies hold resolved paths).
+    /// `~/.brahma-test-<pid>/<n>` (resolved, so policies hold resolved paths), removed with the test case.
     static func homeDir() throws -> URL {
-        let url = realHome.appending(path: ".brahma-test-\(UUID().uuidString)", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url.resolvedForSandbox
+        try Scratch.dir(under: Scratch.homeRoot).resolvedForSandbox
     }
 
     static func remove(_ url: URL) { try? FileManager.default.removeItem(at: url) }

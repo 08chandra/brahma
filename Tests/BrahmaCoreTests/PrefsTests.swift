@@ -19,7 +19,7 @@ private func brahma(_ args: [String], home: URL) throws -> (status: Int32, stdou
     return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))
 }
 
-@Suite struct PrefsTests {
+@Suite(.scratch) struct PrefsTests {
     // 2026-06-10 12:00 EDT
     let now = Date(timeIntervalSince1970: 1_781_107_200)
 

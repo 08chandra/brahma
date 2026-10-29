@@ -8,7 +8,7 @@ private let passing = DoctorReport(cliVersion: "2.1.306", items: [DoctorItem(nam
 private let failing = DoctorReport(cliVersion: "2.1.306", items: [DoctorItem(name: "probe", status: .fail, detail: "not logged in")],
                                    checkedAt: Date())
 
-@MainActor @Suite struct WorkModelTests {
+@MainActor @Suite(.scratch) struct WorkModelTests {
     @Test func ownerCreatesAndEditsItem() async throws {
         let w = try await WorkWorld.make()
         let epic = try w.item("Epic", type: .epic)

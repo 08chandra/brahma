@@ -5,7 +5,7 @@ import GRDB
 
 /// One session per (agent, item), warm-only resume, the session-not-found fallback, no empty turns, byte-stable system
 /// prompt, plan turns and the session-model rule (Task 10).
-@Suite(.serialized) struct SessionTests {
+@Suite(.scratch, .serialized) struct SessionTests {
     private final class Flag: @unchecked Sendable {
         private let lock = NSLock(); private var _on = false
         var on: Bool { get { lock.withLock { _on } } set { lock.withLock { _on = newValue } } }

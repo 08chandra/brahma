@@ -5,7 +5,7 @@ import BrahmaCore
 @testable import BrahmaAppModel
 
 /// Task 16a: what the owner can do from the backlog, the board and the inspector.
-@MainActor @Suite struct OwnerActionsTests {
+@MainActor @Suite(.scratch) struct OwnerActionsTests {
     private let all: [WorkItemStatus] = [.backlog, .ready, .inProgress, .inReview, .blocked, .done]
 
     @Test func everyOfferedMoveIsAcceptedByTheStore() async throws {

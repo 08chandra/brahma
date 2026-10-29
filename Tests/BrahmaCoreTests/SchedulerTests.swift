@@ -30,12 +30,12 @@ private func config(hard: Int = 16, safety: Int = 100) -> SchedulerConfig {
 
 private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
 
-@Test func thresholdsPerMode() {
+@Test(.scratch) func thresholdsPerMode() {
     #expect(UsageGate.threshold(.low) == 0.80); #expect(UsageGate.threshold(.balanced) == 0.90)
     #expect(UsageGate.threshold(.max) == 0.97)
 }
 
-@Test func gateClosesOnRejectedOverageOrHighUtilization() {
+@Test(.scratch) func gateClosesOnRejectedOverageOrHighUtilization() {
     let reset = now.addingTimeInterval(3600)
     let fallback = now.addingTimeInterval(900)
     #expect(UsageGate.evaluate(info(status: "rejected"), mode: .max, now: now) == .closed(until: reset))
@@ -58,7 +58,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
                                now: now.addingTimeInterval(300)) == .open)
 }
 
-@Test func allowedWarningIsNotALimit() {
+@Test(.scratch) func allowedWarningIsNotALimit() {
     // Claude Code emits allowed_warning past soft thresholds, e.g. on the seven-day window, days before its reset.
     let warning = RateLimitInfo(status: "allowed_warning", resetsAt: now.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
                                 isUsingOverage: false, fiveHourUtilization: 0.3, sevenDayUtilization: 0.40, observedAt: now,
@@ -67,7 +67,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     #expect(!UsageGate.isHardLimit(warning))
 }
 
-@Test func thresholdClosesUntilFiveHourResetNotTopLevelReset() {
+@Test(.scratch) func thresholdClosesUntilFiveHourResetNotTopLevelReset() {
     let i = RateLimitInfo(status: "allowed_warning", resetsAt: now.addingTimeInterval(3 * 86400), rateLimitType: "seven_day",
                           isUsingOverage: false, fiveHourUtilization: 0.85, sevenDayUtilization: 0.40, observedAt: now,
                           fiveHourResetsAt: now.addingTimeInterval(7200), sevenDayResetsAt: now.addingTimeInterval(3 * 86400))
@@ -78,7 +78,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     #expect(UsageGate.evaluate(noWindow, mode: .low, now: now) == .closed(until: now.addingTimeInterval(900)))
 }
 
-@Test func rejectedClosesUntilTopLevelReset() {
+@Test(.scratch) func rejectedClosesUntilTopLevelReset() {
     let i = RateLimitInfo(status: "rejected", resetsAt: now.addingTimeInterval(5 * 3600), rateLimitType: "seven_day",
                           isUsingOverage: false, fiveHourUtilization: 0.2, sevenDayUtilization: 1.0, observedAt: now,
                           fiveHourResetsAt: now.addingTimeInterval(600), sevenDayResetsAt: now.addingTimeInterval(5 * 3600))
@@ -87,7 +87,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     }
 }
 
-@Test func staleUsageInfoWithoutResetOpensTheGate() {
+@Test(.scratch) func staleUsageInfoWithoutResetOpensTheGate() {
     // High utilization but no reset time: closed for 15 min after observation, then stale, so a probe turn may run.
     let i = RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
                           fiveHourUtilization: 0.99, sevenDayUtilization: nil, observedAt: now)
@@ -99,7 +99,7 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     #expect(UsageGate.evaluate(withReset, mode: .low, now: now.addingTimeInterval(3600)) == .closed(until: now.addingTimeInterval(4 * 3600)))
 }
 
-@Test func rateLimitPersistsAsSingleRow() throws {
+@Test(.scratch) func rateLimitPersistsAsSingleRow() throws {
     let s = try Store.inMemory()
     #expect(try s.latestRateLimit() == nil)
     let t = Store.now()
@@ -114,56 +114,56 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     #expect(try s.writer.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM usageState") } == 1)
 }
 
-@Test func safetyCapFor24GiB() {
+@Test(.scratch) func safetyCapFor24GiB() {
     #expect(SafetyCap.compute(physicalMemoryBytes: 25_769_803_776) == 42)
     #expect(SafetyCap.compute(physicalMemoryBytes: 1) == 1)
     #expect(SafetyCap.current >= 1)
 }
 
-@Test func roleWeights() {
+@Test(.scratch) func roleWeights() {
     #expect(["ceo", "cto", "cpo"].allSatisfy { roleWeight($0) == 3 })
     #expect(roleWeight("architect") == 2); #expect(roleWeight("manager") == 1); #expect(roleWeight("engineer") == 0)
 }
 
-@Test func modeCaps() {
+@Test(.scratch) func modeCaps() {
     // `config()` is max20x: the Plan 1 caps 2 / 6 / hard cap.
     let c = config(hard: 9)
     #expect(c.modeCap(.low) == 2); #expect(c.modeCap(.balanced) == 6); #expect(c.modeCap(.max) == 9)
 }
 
-@Test func respectsModeCaps() {
+@Test(.scratch) func respectsModeCaps() {
     let a = company("a", mode: .low)
     #expect(Scheduler.select(candidates: many(a, 5), runningByCompany: [:], config: config(), usage: open).count == 2)
 }
 
-@Test func respectsGlobalCapAcrossCompanies() {
+@Test(.scratch) func respectsGlobalCapAcrossCompanies() {
     let a = company("a"), b = company("b")
     let r = Scheduler.select(candidates: many(a, 10) + many(b, 10), runningByCompany: [:], config: config(hard: 4), usage: open)
     #expect(r.count == 4)
     #expect(r.filter { $0.companyId == "a" }.count == 2)
 }
 
-@Test func safetyCapAlsoLimits() {
+@Test(.scratch) func safetyCapAlsoLimits() {
     let a = company("a")
     #expect(Scheduler.select(candidates: many(a, 10), runningByCompany: [:], config: config(hard: 8, safety: 3), usage: open).count == 3)
     #expect(Scheduler.select(candidates: many(a, 10), runningByCompany: ["a": 3], config: config(hard: 8, safety: 3), usage: open).isEmpty)
 }
 
-@Test func weightedRoundRobin() {
+@Test(.scratch) func weightedRoundRobin() {
     let a = company("a", weight: 2), b = company("b", weight: 1)
     let r = Scheduler.select(candidates: many(a, 20) + many(b, 20), runningByCompany: [:], config: config(hard: 6), usage: open)
     #expect(r.filter { $0.companyId == "a" }.count == 4)
     #expect(r.filter { $0.companyId == "b" }.count == 2)
 }
 
-@Test func pausedCompanyAndClosedGateGetNothing() {
+@Test(.scratch) func pausedCompanyAndClosedGateGetNothing() {
     let p = company("p", status: .paused), c = company("c")
     #expect(Scheduler.select(candidates: many(p, 3), runningByCompany: [:], config: config(), usage: open).isEmpty)
     let closed: (Company) -> UsageDecision = { _ in .closed(until: now) }
     #expect(Scheduler.select(candidates: many(c, 3), runningByCompany: [:], config: config(), usage: closed).isEmpty)
 }
 
-@Test func priorityOrderWithinCompany() {
+@Test(.scratch) func priorityOrderWithinCompany() {
     let a = company("a")
     let r = Scheduler.select(candidates: [
         cand(a, "ceo", role: "ceo"), cand(a, "eng", blocking: 2), cand(a, "old", ready: -50), cand(a, "new", ready: 50),
@@ -172,13 +172,13 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
     #expect(r.map(\.name) == ["eng", "ceo", "arch", "old", "new"])
 }
 
-@Test func alreadyRunningCountsAgainstCaps() {
+@Test(.scratch) func alreadyRunningCountsAgainstCaps() {
     let a = company("a", mode: .low)
     #expect(Scheduler.select(candidates: many(a, 5), runningByCompany: ["a": 2], config: config(), usage: open).isEmpty)
     #expect(Scheduler.select(candidates: many(a, 5), runningByCompany: ["a": 1], config: config(), usage: open).count == 1)
 }
 
-@Test func equalRatioTieBreaksByCompanyName() {
+@Test(.scratch) func equalRatioTieBreaksByCompanyName() {
     let a = company("a"), b = company("b")
     let r = Scheduler.select(candidates: many(b, 3) + many(a, 3), runningByCompany: [:], config: config(hard: 1), usage: open)
     #expect(r.map(\.companyId) == ["a"])

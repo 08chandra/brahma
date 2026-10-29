@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct SearchModelTests {
+@MainActor @Suite(.scratch) struct SearchModelTests {
     func world() throws -> (model: AppModel, store: Store, acme: Company, ceo: Agent, general: Channel) {
         let (store, paths) = try makeHome()
         let (acme, ceo, _, _) = try seedAcme(store, paths)

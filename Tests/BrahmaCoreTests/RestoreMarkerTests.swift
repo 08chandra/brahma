@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Task 12 fix round 1 (S1, M1): the restore marker only re-adopts `main` through a DB-recorded restore event.
-@Suite struct RestoreMarkerTests {
+@Suite(.scratch) struct RestoreMarkerTests {
     /// An in-memory store with one company whose repository has a commit nobody reviewed on `main`.
     private func movedMainRig(moveMain: Bool = true) async throws -> (store: Store, paths: BrahmaPaths, orchestrator: Orchestrator,
                                                                      acme: Company, recorded: String, moved: String, events: RestoreEvents) {
@@ -271,16 +271,12 @@ import GRDB
         let dir = try tempDir()
         let db = dir.appending(path: "x.sqlite")
         try Data("x".utf8).write(to: db)
-        let hung = dir.appending(path: "lsof-hung")
-        try Data("#!/bin/sh\nexec sleep 30\n".utf8).write(to: hung)
-        chmod(hung.path, 0o755)
+        let hung = try FakeTools.script("lsof-hung", "exec sleep 30")
         let start = AwakeTime.uptime()
         #expect(throws: RestoreError.cannotCheckOpeners) { try DBOpeners.pids(of: db, lsof: hung.path, timeout: 0.5) }
         #expect(AwakeTime.uptime() - start < 10)
         // A prompt one is read as before (the caller is never listed).
-        let quick = dir.appending(path: "lsof-quick")
-        try Data("#!/bin/sh\necho 4242\necho \(getpid())\nexit 0\n".utf8).write(to: quick)
-        chmod(quick.path, 0o755)
+        let quick = try FakeTools.script("lsof-quick", "echo 4242\necho \(getpid())\nexit 0")
         #expect(try DBOpeners.pids(of: db, lsof: quick.path, timeout: 5) == [4242])
     }
     #endif

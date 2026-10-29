@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct MenuBarSummaryTests {
+@MainActor @Suite(.scratch) struct MenuBarSummaryTests {
     private func counts(running: Int, ready: Int) -> StateCounts {
         var c = StateCounts([])
         c.running = running

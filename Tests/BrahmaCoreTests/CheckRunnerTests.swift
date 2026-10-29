@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Suite(.serialized) struct CheckRunnerTests {
+@Suite(.scratch, .serialized) struct CheckRunnerTests {
     private let runner = ProcessCheckRunner()
 
     private func run(_ command: String, in dir: URL? = nil, timeout: TimeInterval = 20, env: [String: String]? = nil,

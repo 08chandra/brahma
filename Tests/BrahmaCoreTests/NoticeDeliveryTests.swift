@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// The notice store contract, the delivery plan (quiet hours, urgency, batching) and the per-agent ask quota.
-@Suite struct NoticeDeliveryTests {
+@Suite(.scratch) struct NoticeDeliveryTests {
     func makeStore() throws -> (Store, Company) {
         let store = try Store.inMemory()
         let company = try store.createCompany(name: "Acme", goal: "Ship it", workspacesRoot: try tempDir())

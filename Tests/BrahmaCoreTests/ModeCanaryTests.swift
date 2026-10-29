@@ -50,7 +50,7 @@ private final class CanaryRunner: TurnRunning, @unchecked Sendable {
     }
 }
 
-@Suite struct ModeCanaryTests {
+@Suite(.scratch) struct ModeCanaryTests {
     @Test func modeCanaryAppliedEffortMatchesEachCap() async throws {
         let runner = CanaryRunner()
         let result = try #require(await ModeCanary.run(runner: runner))

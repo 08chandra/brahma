@@ -5,7 +5,7 @@ import GRDB
 
 /// Work modes end to end through the orchestrator (Task 14c): the decision on the request and the turn, the no-launch rule,
 /// escalation, the review spend cap and the floor reset.
-@Suite struct WorkModeTests {
+@Suite(.scratch) struct WorkModeTests {
     private struct M {
         let w: World
         let c: Company

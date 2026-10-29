@@ -5,7 +5,7 @@ import GRDB
 
 /// Clean-context review turns (Task 9a): the digest, the review turn, `Store.review`, the engine-owned approval and the
 /// refs / main-commit hardening carried from Task 8, and (9b) the engine merge into `main`, merge safety and the completion hook.
-@Suite(.serialized) struct ReviewTests {
+@Suite(.scratch, .serialized) struct ReviewTests {
     private struct R {
         let world: World
         let company: Company
@@ -2404,10 +2404,10 @@ extension ReviewTests {
         let fm = FileManager.default
         try keptForReview(r, try await submitted(r, edit: { try fm.removeItem(at: $0.appending(path: "src/gone.txt")) }), "a deleted file")
         try keptForReview(r, try await submitted(r, edit: {
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: $0.appending(path: "src/tool.txt").path)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: $0.appending(path: "src/tool.txt").path)  // exec-bit fixture: a mode change under review
         }), "an executable bit")
         try keptForReview(r, try await submitted(r, files: ["src/new-tool.txt": "z\n"], edit: {
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: $0.appending(path: "src/new-tool.txt").path)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: $0.appending(path: "src/new-tool.txt").path)  // exec-bit fixture: a mode change under review
         }), "a new executable")
         try keptForReview(r, try await submitted(r, edit: {
             try fm.createSymbolicLink(atPath: $0.appending(path: "src/link").path, withDestinationPath: "tool.txt")

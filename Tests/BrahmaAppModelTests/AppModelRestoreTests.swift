@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct AppModelRestoreTests {
+@MainActor @Suite(.scratch) struct AppModelRestoreTests {
     @Test func restoreClosesAndReopensTheStore() async throws {
         let (store, paths) = try makeHome()
         try seedAcme(store, paths)

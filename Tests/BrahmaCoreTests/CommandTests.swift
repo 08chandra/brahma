@@ -21,7 +21,7 @@ private func request(started: Bool, profile: PermissionProfile) -> TurnRequest {
 
 private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,RemoteTrigger,PushNotification,SendMessage,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ReportFindings,Task,Agent,TaskStop,Workflow"
 
-@Suite struct CommandTests {
+@Suite(.scratch) struct CommandTests {
     @Test func firstTurnWorkspaceArgs() {
         let args = ClaudeCommand.arguments(for: request(started: false, profile: .workspace))
         #expect(args == [

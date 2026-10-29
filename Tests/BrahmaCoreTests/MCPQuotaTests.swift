@@ -4,7 +4,7 @@ import Testing
 
 /// Per-turn MCP quotas, counted inside the turn's one `brahma mcp` process (design §4.1), and the plan turn's read-mostly
 /// surface.
-@Suite struct MCPQuotaTests {
+@Suite(.scratch) struct MCPQuotaTests {
     private struct Q {
         let store: Store
         let company: Company

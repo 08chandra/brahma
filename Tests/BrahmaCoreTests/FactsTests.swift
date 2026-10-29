@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Per-item outcome facts and `brahma perf facts` (Task 14b).
-@Suite(.serialized) struct FactsTests {
+@Suite(.scratch, .serialized) struct FactsTests {
     private struct F {
         let world: World
         let company: Company

@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct ExportTests {
+@Suite(.scratch) struct ExportTests {
     private struct Fixture {
         let env: BackupEnv
         let acme: Company

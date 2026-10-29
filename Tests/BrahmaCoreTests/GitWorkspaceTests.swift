@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Suite struct GitWorkspaceTests {
+@Suite(.scratch) struct GitWorkspaceTests {
     @Test func ensureRepoInitializesMainAndExcludesBrahma() throws {
         let f = try GitFixture(ensure: false)
         try f.ws.ensureRepo()
@@ -185,18 +185,17 @@ import Foundation
         let evil = try tempDir().appending(path: "evil", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: evil, withIntermediateDirectories: true)
         try GitFixture.plainGit(["init", "-q"], in: evil)
-        let fsmarker = evil.deletingLastPathComponent().appending(path: "fsmonitor-ran")
-        let hookmarker = evil.deletingLastPathComponent().appending(path: "hook-ran")
+        // Each sentinel (a shared script hard-linked at its own path) touches `<its path>-ran` when it runs.
         let script = evil.deletingLastPathComponent().appending(path: "fsm.sh")
-        try "#!/bin/sh\ntouch '\(fsmarker.path)'\nexit 1\n".write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let fsmarker = URL(fileURLWithPath: script.path + "-ran")
+        try FakeTools.install(at: script, "touch \"$0-ran\"\nexit 1")
         try GitFixture.plainGit(["config", "core.fsmonitor", script.path], in: evil)
         try GitFixture.plainGit(["config", "diff.external", script.path], in: evil)
+        var hookmarkers: [URL] = []
         for hook in ["pre-commit", "post-commit", "commit-msg"] {
             let h = evil.appending(path: ".git/hooks/\(hook)")
-            try FileManager.default.createDirectory(at: h.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try "#!/bin/sh\ntouch '\(hookmarker.path)'\nexit 0\n".write(to: h, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: h.path)
+            try FakeTools.install(at: h, "touch \"$0-ran\"\nexit 0")
+            hookmarkers.append(URL(fileURLWithPath: h.path + "-ran"))
         }
         // The agent rewrites the worktree's `.git` file and the commondir pointer toward the crafted repo.
         try "gitdir: \(evil.path)/.git\n".write(to: wt.appending(path: ".git"), atomically: true, encoding: .utf8)
@@ -217,7 +216,9 @@ import Foundation
         #expect(try f.ws.log(base: base, head: sha) .count == 1)
         try f.ws.removeWorktree(key: "K-1", keepIf: { false })
         #expect(!FileManager.default.fileExists(atPath: fsmarker.path), "fsmonitor from the crafted config ran")
-        #expect(!FileManager.default.fileExists(atPath: hookmarker.path), "a hook from the crafted repo ran")
+        for hookmarker in hookmarkers {
+            #expect(!FileManager.default.fileExists(atPath: hookmarker.path), "a hook from the crafted repo ran")
+        }
     }
 
     @Test func addAndRemoveOfOneItemDoNotInterleave() throws {
@@ -454,7 +455,7 @@ import Foundation
         let admin = f.root.appending(path: ".git/worktrees/ACME-1")
         let script = "#!/bin/sh\nexit 0\n"
         let hook = try f.write(".git/hooks/post-checkout", script)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)      // exec-bit fixture: a mode under test, never run
         let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
         // Rewritten (and so no longer executable), attributes and an alternate added and a tracked file hidden from status
         // with the skip-worktree bit. (A repointed worktree HEAD is the engine's own check, not the barrier's.)
@@ -473,7 +474,7 @@ import Foundation
         #expect(!fm.fileExists(atPath: f.root.appending(path: ".git/objects/info/alternates").path))
         #expect(try f.git(["ls-files", "-v", "a.txt"], in: wt) == "H a.txt")
         // A mode change alone is a change too.
-        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hook.path)
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hook.path)      // exec-bit fixture: a mode under test, never run
         #expect(try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) == ["changed hooks/post-checkout"])
         #expect((try fm.attributesOfItem(atPath: hook.path)[.posixPermissions] as? Int) == 0o755)
     }
@@ -775,8 +776,8 @@ import Foundation
         try f.write(".git/hooks/post-commit", "#!/bin/sh\n")
         let before = try f.ws.planBarrier(key: "ACME-1", in: wt)
         try "#!/bin/sh\ntouch /tmp/pwned\n".write(to: hooks.appending(path: "post-commit"), atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: hooks.path)      // the put-back cannot write here
-        defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hooks.path) }
+        try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: hooks.path)      // the put-back cannot write here (exec-bit fixture: a directory)
+        defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hooks.path) }  // exec-bit fixture: a directory
         let error = try #require(throws: GitWorkspace.PlanBarrierError.self) { try f.ws.enforcePlanBarrier(before, key: "ACME-1", in: wt) }
         #expect(error.found == ["changed hooks/post-commit"])
         #expect(error.reason.contains("restore hooks/post-commit"))
@@ -1245,11 +1246,11 @@ import Foundation
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// A shared sentinel script hard-linked at `<dir>/<name>.sh`; it touches `<dir>/<name>.sh-ran` when it runs.
     private func sentinelScript(_ dir: URL, _ name: String) throws -> (script: URL, marker: URL) {
-        let marker = dir.appending(path: "\(name)-ran"), script = dir.appending(path: "\(name).sh")
-        try "#!/bin/sh\ntouch '\(marker.path)'\nexit 1\n".write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
-        return (script, marker)
+        let script = dir.appending(path: "\(name).sh")
+        try FakeTools.install(at: script, "touch \"$0-ran\"\nexit 1")
+        return (script, URL(fileURLWithPath: script.path + "-ran"))
     }
 
     @Test func execOverridesHoldWithoutTheScan() throws {

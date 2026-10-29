@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite(.serialized) struct LeaseTests {
+@Suite(.scratch, .serialized) struct LeaseTests {
     /// A company with a real git workspace, one manager and three engineers, on the orchestrator's `World`.
     private struct L {
         let world: World

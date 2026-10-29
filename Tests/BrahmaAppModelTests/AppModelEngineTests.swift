@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct AppModelEngineTests {
+@MainActor @Suite(.scratch) struct AppModelEngineTests {
     @Test func tickRetriesTakeover() async throws {
         let (store, paths) = try makeHome()
         let tools = Result<EngineTools, EngineSetupError>.success(EngineTools(claudePath: "claude", mcpExecutable: "/tmp/brahma"))

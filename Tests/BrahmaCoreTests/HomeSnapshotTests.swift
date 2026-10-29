@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Task 13a: data-home snapshots and restore of the files to any point.
-@Suite struct HomeSnapshotTests {
+@Suite(.scratch) struct HomeSnapshotTests {
     struct Rig {
         let root: URL
         let paths: BrahmaPaths

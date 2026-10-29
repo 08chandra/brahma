@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Structured hand-offs (Task 10): the file, who may write one, the recipient's notice, the progress file.
-@Suite(.serialized) struct HandoffTests {
+@Suite(.scratch, .serialized) struct HandoffTests {
     private struct H {
         let world: World
         var store: Store { world.store }

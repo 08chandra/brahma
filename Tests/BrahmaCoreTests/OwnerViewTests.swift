@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Suite struct OwnerViewTests {
+@Suite(.scratch) struct OwnerViewTests {
     private struct World {
         let store: Store, router: MessageRouter, company: Company, general: Channel
         let ceo: Agent, cto: Agent

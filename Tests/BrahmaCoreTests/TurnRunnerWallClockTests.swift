@@ -2,12 +2,9 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
+/// The shared `#!/bin/sh` script standing in for `claude` (one per body per process), and a working directory for the turn.
 private func fakeClaude(_ body: String) throws -> (script: URL, dir: URL) {
-    let dir = try tempDir()
-    let url = dir.appending(path: "fake-claude")
-    try ("#!/bin/sh\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-    return (url, dir)
+    (try FakeTools.script("fake-claude", body), try tempDir())
 }
 
 private func request(in dir: URL, wallClock: Duration? = nil) -> TurnRequest {
@@ -52,7 +49,7 @@ private final class AskedClocks: @unchecked Sendable {
 }
 
 /// Task 14a, W7: per-request wall clock, pending background work and signals, with a fake `claude` script.
-@Suite(.serialized) struct TurnRunnerWallClockTests {
+@Suite(.scratch, .serialized) struct TurnRunnerWallClockTests {
     @Test func deepTurnNotKilledAt15Min() async throws {
         // The runner-wide limit (the Plan 1 fallback, 900 s in production) is 1 s here; the request's own wall clock wins.
         let (script, dir) = try fakeClaude("""

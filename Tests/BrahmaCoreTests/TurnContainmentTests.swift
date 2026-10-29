@@ -91,7 +91,7 @@ private struct SandboxedRequestWorld {
 /// `perl -e 'use POSIX; ...'` (a system binary) stands in for `setsid`, which macOS does not ship.
 private let perl = "/usr/bin/perl"
 
-@Suite(.serialized) struct TurnContainmentTests {
+@Suite(.scratch, .serialized) struct TurnContainmentTests {
     /// `setsid sleep 300 &`: a new session and process group, reparented to launchd once the shell exits.
     @Test func backgroundedSessionLeaderDoesNotSurviveTheTurn() async throws {
         let dir = try tempDir()

@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite(.serialized) struct OrchestratorTests {
+@Suite(.scratch, .serialized) struct OrchestratorTests {
     @Test func ownerMessageRunsAgentAndSleepsAfter() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "@ceo kick off", now: w.clock.now)

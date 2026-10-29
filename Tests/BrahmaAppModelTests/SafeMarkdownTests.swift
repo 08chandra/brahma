@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@Suite struct SafeMarkdownTests {
+@Suite(.scratch) struct SafeMarkdownTests {
     func text(_ a: AttributedString) -> String { String(a.characters) }
 
     func workspace() throws -> URL {

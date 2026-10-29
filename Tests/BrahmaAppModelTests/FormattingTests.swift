@@ -3,7 +3,7 @@ import Foundation
 @testable import BrahmaCore
 @testable import BrahmaAppModel
 
-@Suite struct FormattingTests {
+@Suite(.scratch) struct FormattingTests {
     let day = Date(timeIntervalSince1970: TimeInterval(1_799_971_200)) // 00:00 GMT
     func at(_ h: Int, _ m: Int = 0) -> Date { day.addingTimeInterval(Double(h * 3600 + m * 60)) }
 

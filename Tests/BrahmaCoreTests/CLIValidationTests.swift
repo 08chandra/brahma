@@ -20,7 +20,7 @@ private func brahma(_ args: [String], home: URL? = nil) throws -> (status: Int32
     return (p.terminationStatus, String(decoding: data, as: UTF8.self))
 }
 
-@Suite struct CLIValidationTests {
+@Suite(.scratch) struct CLIValidationTests {
     @Test(arguments: ["0", "-1"])
     func hardCapMustBePositive(value: String) throws {
         let r = try brahma(["run", "--hard-cap=\(value)"])

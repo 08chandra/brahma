@@ -5,7 +5,7 @@ import Testing
 /// Who may ask for more (design §3.5). `nextTurnOnly` and `assigneeRequestCappedAtR2` live in InboxTests
 /// (`requestModeNextTurnOnly`, `assigneeRequestCappedAtR2`, Task 11a) and `schemasCannotSetIntensityOrFloor` in WorkItemTests
 /// (Task 6); this suite adds the rest of the 3a list.
-@Suite struct RequestModeTests {
+@Suite(.scratch) struct RequestModeTests {
     private struct R {
         let store: Store, company: Company
         let mgr: Agent, eng: Agent, other: Agent

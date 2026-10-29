@@ -4,7 +4,7 @@ import BrahmaCore
 @testable import BrahmaAppModel
 
 /// The app's "Load secrets" action: the owner-visible side of the secrets hold.
-@MainActor @Suite struct SecretsModelTests {
+@MainActor @Suite(.scratch) struct SecretsModelTests {
     @Test func loadSecretsClearsTheBanner() async throws {
         let (owner, paths) = try makeHome()
         let (acme, _, _, _) = try seedAcme(owner, paths)

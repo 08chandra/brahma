@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct InboxModelTests {
+@MainActor @Suite(.scratch) struct InboxModelTests {
     /// An FYI: the preset is Auto, an agent proposes, the internal approver approves, and the policy only tells the owner.
     func makeFYI(_ w: WorkWorld, title: String = "Rename the module") async throws -> Ask {
         await w.model.setAutonomy(.auto)

@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Org integrity when an agent leaves (Task 12): asks and reviews re-routed, hand-offs, reparenting, the acting CEO.
-@Suite struct AttritionTests {
+@Suite(.scratch) struct AttritionTests {
     private struct W {
         let store: Store
         let company: Company

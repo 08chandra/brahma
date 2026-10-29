@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Test(arguments: [(AgentState.sleeping, AgentState.ready, true), (.ready, .running, true), (.running, .blocked, true),
+@Test(.scratch, arguments: [(AgentState.sleeping, AgentState.ready, true), (.ready, .running, true), (.running, .blocked, true),
                   (.blocked, .ready, true), (.sleeping, .running, false), (.killed, .ready, false), (.ready, .ready, false),
                   (.running, .killed, true), (.killed, .killed, false)])
 func transitionTable(from: AgentState, to: AgentState, ok: Bool) {
@@ -14,7 +14,7 @@ private func makeAgent(_ s: Store) throws -> Agent {
     return try s.hire(companyId: c.id, name: "bob", role: "dev", model: "sonnet")
 }
 
-@Test func illegalTransitionThrowsAndPersistsNothing() throws {
+@Test(.scratch) func illegalTransitionThrowsAndPersistsNothing() throws {
     let s = try Store.inMemory(); let a = try makeAgent(s)
     #expect(throws: LifecycleError.illegal(from: .sleeping, to: .running)) {
         try s.transition(agentId: a.id, to: .running)
@@ -23,7 +23,7 @@ private func makeAgent(_ s: Store) throws -> Agent {
     #expect(try s.events(afterId: 0).isEmpty)
 }
 
-@Test func enteringReadyStampsReadySinceAndClearsBlocker() throws {
+@Test(.scratch) func enteringReadyStampsReadySinceAndClearsBlocker() throws {
     let s = try Store.inMemory(); var a = try makeAgent(s)
     let t0 = Store.now()
     a.state = .blocked; a.blocker = .retry(until: t0, failures: 1); try s.save(a)
@@ -37,14 +37,14 @@ private func makeAgent(_ s: Store) throws -> Agent {
     #expect(evs.count == 2); #expect(evs.allSatisfy { $0.kind == .stateChanged && $0.agentId == a.id })
 }
 
-@Test func transitionKeepsPausedAndRequestedBlocker() throws {
+@Test(.scratch) func transitionKeepsPausedAndRequestedBlocker() throws {
     let s = try Store.inMemory(); var a = try makeAgent(s)
     a.paused = true; a.requestedBlocker = .agent("x"); try s.save(a)
     let r = try s.transition(agentId: a.id, to: .ready)
     #expect(r.paused); #expect(r.requestedBlocker == .agent("x"))
 }
 
-@Test func recoverInterruptedTurns() throws {
+@Test(.scratch) func recoverInterruptedTurns() throws {
     let dir = try tempDir(); let path = dir.appending(path: "t.sqlite").path
     let s = try Store(path: path); let a = try makeAgent(s)
     _ = try s.transition(agentId: a.id, to: .ready)
@@ -59,7 +59,7 @@ private func makeAgent(_ s: Store) throws -> Agent {
     #expect(try s2.recoverInterruptedTurns() == 0)
 }
 
-@Test func turnCountSince() throws {
+@Test(.scratch) func turnCountSince() throws {
     let s = try Store.inMemory(); let a = try makeAgent(s)
     let t = Store.now()
     for m in [90.0, 30, 5] { _ = try s.startTurn(agentId: a.id, now: t.addingTimeInterval(-m * 60)) }
@@ -68,7 +68,7 @@ private func makeAgent(_ s: Store) throws -> Agent {
     #expect(try s.oldestTurnStart(agentId: a.id, since: t) == nil)
 }
 
-@Test func finishTurnRecordsOutcome() throws {
+@Test(.scratch) func finishTurnRecordsOutcome() throws {
     let s = try Store.inMemory(); let a = try makeAgent(s)
     let turn = try s.startTurn(agentId: a.id)
     #expect(turn.outcome == .inProgress)
@@ -78,7 +78,7 @@ private func makeAgent(_ s: Store) throws -> Agent {
     #expect(t?.outcome == .succeeded); #expect(t?.summary == "done"); #expect(t?.costUSD == 0.12); #expect(t?.endedAt == end)
 }
 
-@Test func finishTurnOnlyUpdatesInProgressTurns() throws {
+@Test(.scratch) func finishTurnOnlyUpdatesInProgressTurns() throws {
     let s = try Store.inMemory(); let a = try makeAgent(s)
     let turn = try s.startTurn(agentId: a.id)
     _ = try s.recoverInterruptedTurns()
@@ -90,7 +90,7 @@ private func makeAgent(_ s: Store) throws -> Agent {
     #expect(try s.writer.read { db in try Turn.fetchOne(db, key: live.id) }?.outcome == .succeeded)
 }
 
-@Test func eventsFilterAndPaginate() throws {
+@Test(.scratch) func eventsFilterAndPaginate() throws {
     let s = try Store.inMemory()
     let c1 = try s.createCompany(name: "A", goal: "g", workspacesRoot: try tempDir())
     let c2 = try s.createCompany(name: "B", goal: "g", workspacesRoot: try tempDir())

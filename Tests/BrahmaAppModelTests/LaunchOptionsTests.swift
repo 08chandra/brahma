@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct LaunchOptionsTests {
+@MainActor @Suite(.scratch) struct LaunchOptionsTests {
     @Test func parsesSmokeAndSnapshot() {
         let a = LaunchOptions.parse(["/x/Brahma", "--smoke-test", "--smoke-hold", "8", "--smoke-close-window"])
         #expect(a.smokeTest)

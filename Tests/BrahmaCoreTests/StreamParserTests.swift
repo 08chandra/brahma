@@ -11,7 +11,7 @@ private func fixtureLines(_ name: String) throws -> [String] {
         .map(String.init)
 }
 
-@Suite struct StreamParserTests {
+@Suite(.scratch) struct StreamParserTests {
     @Test func parsesInitLine() throws {
         let lines = try fixtureLines("stream-success")
         #expect(StreamParser.parse(line: lines[0]) == .initialized(sessionId: sessionId, model: "claude-haiku-5-5"))

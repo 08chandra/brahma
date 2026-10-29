@@ -9,12 +9,10 @@ let keychainTrapArmed: Bool = {
     return true
 }()
 
+/// A directory for this test case under the process root (`TestScratch.swift`), removed when the case ends.
 func tempDir() throws -> URL {
     _ = keychainTrapArmed
-    let url = FileManager.default.temporaryDirectory
-        .appending(path: "brahma-appmodel-\(UUID().uuidString)", directoryHint: .isDirectory)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    return url
+    return try Scratch.dir()
 }
 
 func makeHome() throws -> (Store, BrahmaPaths) {
@@ -30,9 +28,7 @@ func makeHome() throws -> (Store, BrahmaPaths) {
 func seedAcme(_ s: Store, _ p: BrahmaPaths) throws -> (Company, ceo: Agent, cto: Agent, eng: Agent) {
     var acme = try s.createCompany(name: "Acme", goal: "Build", workspacesRoot: p.workspaces)
     // 3a's app tests run on the Workspace profile (5-lite's sandboxed default has its own tests in BrahmaCoreTests).
-    let scratchHome = FileManager.default.temporaryDirectory.appending(path: "brahma-test-home-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: scratchHome, withIntermediateDirectories: true)
-    try s.updateSandbox(companyId: acme.id, SandboxPatch(profile: .workspace), userHome: scratchHome)
+    try s.updateSandbox(companyId: acme.id, SandboxPatch(profile: .workspace), userHome: try tempDir())
     acme = try s.company(id: acme.id) ?? acme
     let ceo = try s.hire(companyId: acme.id, name: "ceo", role: "ceo", model: "sonnet")
     let cto = try s.hire(companyId: acme.id, name: "cto", role: "cto", model: "sonnet")

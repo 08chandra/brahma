@@ -4,7 +4,7 @@ import Foundation
 
 /// Engine git runs only in `Blocking` bodies, never on the orchestrator's actor or the cooperative pool. Two guards:
 /// the static one here (sources), and the run-time one (`EngineGitGuard`), which makes `waitUntilIdle` throw in every test.
-@Suite struct EngineGitGuardTests {
+@Suite(.scratch) struct EngineGitGuardTests {
     static let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent()
 

@@ -45,7 +45,7 @@ private let t0 = Date(timeIntervalSince1970: 1_000_000)
 
 private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.first { $0.name == name } }
 
-@Suite struct DoctorTests {
+@Suite(.scratch) struct DoctorTests {
     @Test func allPass() async {
         let runner = ProbeRunner(good())
         let r = await Doctor.run(claudePath: "claude", runner: runner, exec: exec(), now: t0)
@@ -178,7 +178,7 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
     }
 }
 
-@Suite(.serialized) struct DoctorExecTests {
+@Suite(.scratch, .serialized) struct DoctorExecTests {
     @Test func aHangingProcessIsKilledAtTheTimeoutAndThrows() async throws {
         let started = AwakeTime.uptime()
         do {

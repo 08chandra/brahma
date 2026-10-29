@@ -3,7 +3,7 @@ import Testing
 @testable import BrahmaCore
 
 /// The work-mode selection policy as a pure table (design §3.2–§3.4; Task 14c).
-@Suite struct ModePolicyTests {
+@Suite(.scratch) struct ModePolicyTests {
     /// A work turn on a confirmed item of `tier`, balanced usage mode, max5x, on pace, plenty of budget.
     private func work(_ tier: EffortTier = .s, _ edit: (inout ModeInputs) -> Void = { _ in }) -> ModeInputs {
         var i = ModeInputs()

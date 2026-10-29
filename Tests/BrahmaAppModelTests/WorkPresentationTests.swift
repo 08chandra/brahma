@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct WorkPresentationTests {
+@MainActor @Suite(.scratch) struct WorkPresentationTests {
     @Test func backlogTreeOrder() async throws {
         let w = try await WorkWorld.make()
         let epic = try w.item("Epic", type: .epic)

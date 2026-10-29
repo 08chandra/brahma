@@ -20,7 +20,7 @@ final class FakePoster: NotificationPosting {
     }
 }
 
-@MainActor @Suite struct NoticeModelTests {
+@MainActor @Suite(.scratch) struct NoticeModelTests {
     @Test func tickPostsAndMarks() async throws {
         let w = try await WorkWorld.make()
         var prefs = OwnerPrefs.defaults; prefs.quietEnabled = false

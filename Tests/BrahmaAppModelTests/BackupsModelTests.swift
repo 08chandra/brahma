@@ -6,16 +6,11 @@ import BrahmaCore
 /// Tool lookups are injected: an empty directory plays "nothing installed", a directory with an executable `litestream` plays an
 /// install. No real litestream or rclone is ever run.
 private func toolbox(litestream: Bool) throws -> BackupTools {
-    let dir = try tempDir()
-    if litestream {
-        let path = dir.appending(path: "litestream")
-        try "#!/bin/sh\nexit 0\n".write(to: path, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
-    }
+    let dir = litestream ? try FakeTools.bin(["litestream": "exit 0"]) : try tempDir()
     return BackupTools(searchPath: dir.path, environment: [:])
 }
 
-@MainActor @Suite struct BackupsModelTests {
+@MainActor @Suite(.scratch) struct BackupsModelTests {
     private func make(litestream: Bool = false) throws -> (BackupsModel, Store, BrahmaPaths) {
         let (store, paths) = try makeHome()
         return (BackupsModel(store: store, paths: paths, tools: try toolbox(litestream: litestream)), store, paths)

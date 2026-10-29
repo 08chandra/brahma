@@ -48,7 +48,7 @@ private struct PrefixWorld {
     }
 }
 
-@Suite struct ShellPrefixTests {
+@Suite(.scratch) struct ShellPrefixTests {
     @Test func exportsHomeAndExecsShell() throws {
         let w = try PrefixWorld()
         try w.unreadableSentinel()

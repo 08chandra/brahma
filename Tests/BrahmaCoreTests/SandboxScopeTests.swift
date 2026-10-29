@@ -69,7 +69,7 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
     } catch { Issue.record("expected a SandboxError, got \(error)") }
 }
 
-@Suite struct SandboxScopeTests {
+@Suite(.scratch) struct SandboxScopeTests {
     // MARK: Turn scopes
 
     @Test func itemTurnScopes() throws {

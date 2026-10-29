@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct StallTextTests {
+@MainActor @Suite(.scratch) struct StallTextTests {
     @Test func stallLineOnlyWhenNothingRunning() async throws {
         let w = try await WorkWorld.make()
         // Nothing runs: the first reason is shown, in the company summary and for the selected company.

@@ -3,17 +3,12 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct BackupTargetTests {
-    /// A directory of fake executables (shell scripts) used as the tools' search path.
-    private func fakeBin(_ scripts: [String: String]) throws -> (dir: URL, tools: BackupTools) {
-        let dir = try tempDir().appending(path: "bin", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        for (name, body) in scripts {
-            let url = dir.appending(path: name)
-            try Data("#!/bin/sh\n\(body)\n".utf8).write(to: url)
-            chmod(url.path, 0o755)
-        }
-        return (dir, BackupTools(searchPath: dir.path + ":/usr/bin:/bin", environment: [:]))
+@Suite(.scratch) struct BackupTargetTests {
+    /// The shared directory of fake executables (shell scripts) for these bodies, used as the tools' search path. A script that
+    /// has to write somewhere test-specific gets the place through `env` (`TMPDIR` passes through to both tools).
+    private func fakeBin(_ scripts: [String: String], env: [String: String] = [:]) throws -> (dir: URL, tools: BackupTools) {
+        let dir = try FakeTools.bin(scripts)
+        return (dir, BackupTools(searchPath: dir.path + ":/usr/bin:/bin", environment: env))
     }
 
     private func folder(_ name: String = "drive") throws -> URL {
@@ -202,18 +197,19 @@ import GRDB
     @Test func rcloneSyncRunsWithTheExactArguments() throws {
         let env = try BackupEnv()
         _ = try env.service().snapshot(reason: .manual)
-        let log = try tempDir().appending(path: "rclone.log")
+        let dir = try tempDir(), log = dir.appending(path: "rclone.log")
         let (_, tools) = try fakeBin(["rclone": """
             if [ "$1" = config ]; then printf '[secret]\\ntype = crypt\\n'; exit 0; fi
-            echo "$@" >> "\(log.path)"
+            echo "$@" >> "$TMPDIR/rclone.log"
             exit 0
-            """])
+            """], env: ["TMPDIR": dir.path])
         #expect(BackupTargets.sync(.rclone(remote: "secret"), paths: env.paths, hostname: "studio", tools: tools) == .synced(files: 0))
         let line = try String(contentsOf: log, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(line == "sync \(env.paths.backupsDir.path) secret:studio --fast-list")
         #expect(BackupTargets.rcloneTimeout == 6 * 3600)
         // A remote reconfigured to plain storage is not uploaded to.
-        let (_, plain) = try fakeBin(["rclone": "if [ \"$1\" = config ]; then printf 'type = s3\\n'; exit 0; fi\necho uploaded >> \"\(log.path)\"\nexit 0"])
+        let (_, plain) = try fakeBin(["rclone": "if [ \"$1\" = config ]; then printf 'type = s3\\n'; exit 0; fi\necho uploaded >> \"$TMPDIR/rclone.log\"\nexit 0"],
+                                     env: ["TMPDIR": dir.path])
         let outcome = BackupTargets.sync(.rclone(remote: "secret"), paths: env.paths, hostname: "studio", tools: plain)
         guard case .failed(let why) = outcome else { Issue.record("expected failure"); return }
         #expect(why.contains("not an rclone crypt remote"))
@@ -246,15 +242,15 @@ import GRDB
 
         // The restore: litestream rebuilds into brahma.sqlite.restoring, then Task 12's swap puts it in place.
         _ = try env.company("Before")
-        let rebuilt = try tempDir().appending(path: "rebuilt.sqlite")
+        let scratch = try tempDir(), rebuilt = scratch.appending(path: "rebuilt.sqlite")
         _ = try env.service().snapshot(reason: .manual)
         let snapshot = try #require(BackupService(paths: env.paths).list().first).url
         try FileManager.default.copyItem(at: snapshot, to: rebuilt)
-        let args = try tempDir().appending(path: "args.log")
+        let args = scratch.appending(path: "args.log")
         let (_, tools) = try fakeBin(["litestream": """
-            echo "$@" > "\(args.path)"
-            while [ $# -gt 0 ]; do if [ "$1" = -o ]; then cp "\(rebuilt.path)" "$2"; fi; shift; done
-            """])
+            echo "$@" > "$TMPDIR/args.log"
+            while [ $# -gt 0 ]; do if [ "$1" = -o ]; then cp "$TMPDIR/rebuilt.sqlite" "$2"; fi; shift; done
+            """], env: ["TMPDIR": scratch.path])
         let staged = try WALShipping.restoreFile(paths: env.paths, replica: "/Volumes/Drive/wal", timestamp: when, tools: tools)
         #expect(staged == env.paths.home.appending(path: "brahma.sqlite.restoring"))
         #expect(try String(contentsOf: args, encoding: .utf8).contains("-timestamp 2026-06-10T16:00:00Z"))
@@ -280,8 +276,8 @@ import GRDB
         #expect(backoff.take() == .seconds(5))
 
         let env = try BackupEnv()
-        let runs = try tempDir().appending(path: "runs.log")
-        let (_, tools) = try fakeBin(["litestream": "echo \"$@\" >> \"\(runs.path)\"\nexit 1"])
+        let dir = try tempDir(), runs = dir.appending(path: "runs.log")
+        let (_, tools) = try fakeBin(["litestream": "echo \"$@\" >> \"$TMPDIR/runs.log\"\nexit 1"], env: ["TMPDIR": dir.path])
         let delays = Delays()
         let shipper = WALShipper(executable: try #require(tools.litestream), paths: env.paths, tools: tools, sleeper: { d in
             delays.add(d)
@@ -299,8 +295,8 @@ import GRDB
 
     @Test func orchestratorSupervisesLitestreamOnlyWhileEnabled() async throws {
         let env = try BackupEnv()
-        let marker = try tempDir().appending(path: "started")
-        let (_, tools) = try fakeBin(["litestream": "echo started >> \"\(marker.path)\"\nexec sleep 30"])
+        let dir = try tempDir(), marker = dir.appending(path: "started")
+        let (_, tools) = try fakeBin(["litestream": "echo started >> \"$TMPDIR/started\"\nexec sleep 30"], env: ["TMPDIR": dir.path])
         let off = Orchestrator(store: env.store, runner: FakeTurnRunner(), paths: env.paths, mcpExecutable: "/usr/local/bin/brahma",
                                vault: MemoryVault(), backupTools: tools)
         try await off.start()
@@ -496,10 +492,11 @@ import GRDB
         service.now = { start }
         _ = try service.snapshot(reason: .manual)
         try store.close()
-        let marker = try tempDir().appending(path: "ran")
-        let (bin, _) = try fakeBin(["litestream": "echo ran > \"\(marker.path)\""])
+        let dir = try tempDir(), marker = dir.appending(path: "ran")
+        let (bin, _) = try fakeBin(["litestream": "echo ran > \"$TMPDIR/ran\""])
         let iso = ISO8601DateFormatter().string(from: start.addingTimeInterval(5))
-        let run = try runBrahma(["restore", "--at", iso, "--dry-run"], home: home.url, extra: ["PATH": bin.path + ":/usr/bin:/bin"])
+        let run = try runBrahma(["restore", "--at", iso, "--dry-run"], home: home.url,
+                                extra: ["PATH": bin.path + ":/usr/bin:/bin", "TMPDIR": dir.path])
         #expect(run.status == 0, "\(run.stdout) \(run.stderr)")
         #expect(!FileManager.default.fileExists(atPath: marker.path))
         #expect(!FileManager.default.fileExists(atPath: WALShipping.configURL(paths: paths).path))
@@ -651,11 +648,12 @@ import GRDB
 
     @Test func litestreamEnvironmentPassesCredentialsOnlyToLitestream() throws {
         let env = try BackupEnv()
-        let dump = try tempDir().appending(path: "env.txt")
-        let (dir, _) = try fakeBin(["litestream": "env > \"\(dump.path)\"\nexit 1"])
+        let scratch = try tempDir(), dump = scratch.appending(path: "env.txt")
+        let (dir, _) = try fakeBin(["litestream": "env > \"$TMPDIR/env.txt\"\nexit 1"])
         let tools = BackupTools(searchPath: dir.path + ":/usr/bin:/bin", environment: [
             "AWS_ACCESS_KEY_ID": "AKIAEXAMPLE", "AWS_SECRET_ACCESS_KEY": "s3cr3t", "LITESTREAM_ACCESS_KEY_ID": "lsk",
             "SSH_AUTH_SOCK": "/tmp/agent.sock", "RCLONE_CONFIG": "/r.conf", "HOME": "/Users/x", "GITHUB_TOKEN": "ghp_nope",
+            "TMPDIR": scratch.path,
         ])
         #expect(tools.environment["AWS_ACCESS_KEY_ID"] == nil && tools.environment["SSH_AUTH_SOCK"] == nil
                 && tools.environment["LITESTREAM_ACCESS_KEY_ID"] == nil)

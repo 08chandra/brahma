@@ -21,7 +21,7 @@ private func config(hard: Int = 16, safety: Int = 100) -> SchedulerConfig {
 }
 private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
 
-@Suite struct AdmissionTests {
+@Suite(.scratch) struct AdmissionTests {
     @Test func tierCaps() {
         var c = SchedulerConfig()
         #expect(c.planTier == .max5x)

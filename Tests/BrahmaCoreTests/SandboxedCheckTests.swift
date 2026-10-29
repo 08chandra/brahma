@@ -5,7 +5,7 @@ import GRDB
 
 /// Engine-run checks through the sandbox: the route the Orchestrator builds (company, purpose and place from the engine's
 /// own record of the run), the policy it gets, and the fallbacks. A fake `SandboxedRunner` records what it is asked.
-@Suite(.serialized) struct SandboxedCheckTests {
+@Suite(.scratch, .serialized) struct SandboxedCheckTests {
     final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
         struct Call: Sendable {
             var command: String

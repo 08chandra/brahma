@@ -3,7 +3,7 @@ import Foundation
 @testable import BrahmaCore
 
 /// The removal probe is process-wide, so these run one at a time; each probe only acts on its own temporary directory.
-@Suite(.serialized) struct EngineFilesTests {
+@Suite(.scratch, .serialized) struct EngineFilesTests {
     private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
 
     /// A probe that runs `body` once, the first time an entry called `name` under `inside` is about to be removed.

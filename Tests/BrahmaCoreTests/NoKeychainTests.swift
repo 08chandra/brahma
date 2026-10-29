@@ -12,7 +12,7 @@ import BrahmaKeychain
 ///     (checked helper by helper, not file by file) must use the file stores for both.
 ///  4. BrahmaCore holds no Keychain code at all: every Security call lives in BrahmaKeychain, behind `KeychainAccessLog`.
 ///     The secrets vault the engine, `brahma mcp` and tests get is injected; library defaults are `UnavailableVault`.
-@Suite struct NoKeychainTests {
+@Suite(.scratch) struct NoKeychainTests {
     /// True for the deliberate `BRAHMA_LIVE_KEYCHAIN=1` run, which is allowed to touch the Keychain.
     private static let live = ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1"
 

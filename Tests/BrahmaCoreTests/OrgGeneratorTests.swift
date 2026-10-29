@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-@Suite struct OrgGeneratorTests {
+@Suite(.scratch) struct OrgGeneratorTests {
     private let software = PackCatalog.builtin.pack("software")!
 
     @Test(arguments: [

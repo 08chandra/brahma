@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct OrgStoreTests {
+@Suite(.scratch) struct OrgStoreTests {
     private let software = PackCatalog.builtin.pack("software")!
 
     private func make() throws -> (Store, Company) {

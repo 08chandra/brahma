@@ -17,14 +17,14 @@ private struct RouterWorld {
     func state(_ a: Agent) throws -> AgentState { try store.agent(id: a.id)!.state }
 }
 
-@Test func generalExistsWithOwnerAndHiredAgents() throws {
+@Test(.scratch) func generalExistsWithOwnerAndHiredAgents() throws {
     let w = try RouterWorld()
     let g = try #require(try w.store.channel(companyId: w.company.id, name: "#General"))
     #expect(Set(try w.store.members(channelId: g.id)) == ["owner", w.ceo.id, w.cto.id, w.eng.id])
     #expect(throws: StoreError.duplicateName) { try w.store.createChannel(companyId: w.company.id, name: "#GENERAL", members: []) }
 }
 
-@Test func channelPostFansOutToMembersExceptSender() throws {
+@Test(.scratch) func channelPostFansOutToMembersExceptSender() throws {
     let w = try RouterWorld()
     _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "hello")
     // Membership no longer wakes: every member gets an inbox item, but a quiet one (counted, not delivered).
@@ -37,7 +37,7 @@ private struct RouterWorld {
     #expect(ev?.text == "#general @ceo: hello")
 }
 
-@Test func postWakesSleepingButNotPaused() throws {
+@Test(.scratch) func postWakesSleepingButNotPaused() throws {
     let w = try RouterWorld()
     var eng = w.eng; eng.paused = true; try w.store.save(eng)
     _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "@cto @eng1 hi")
@@ -45,7 +45,7 @@ private struct RouterWorld {
     #expect(try w.state(w.eng) == .sleeping); #expect(try w.pending(w.eng) == 1)
 }
 
-@Test func mentionReachesNonMember() throws {
+@Test(.scratch) func mentionReachesNonMember() throws {
     let w = try RouterWorld()
     let ch = try w.store.createChannel(companyId: w.company.id, name: "exec", members: [w.ceo.id, w.cto.id])
     _ = try w.router.post(companyId: w.company.id, channel: "exec", from: .agent(w.ceo.id), text: "@Eng1, ping")
@@ -53,7 +53,7 @@ private struct RouterWorld {
     #expect(!(try w.store.members(channelId: ch.id)).contains(w.eng.id))
 }
 
-@Test func systemSenderWorksInsideATransactionWithoutMembership() throws {
+@Test(.scratch) func systemSenderWorksInsideATransactionWithoutMembership() throws {
     let w = try RouterWorld()
     let now = Date()
     try w.store.writer.write { db in
@@ -86,11 +86,11 @@ private struct RouterWorld {
     }
 }
 
-@Test func mentionParsing() {
+@Test(.scratch) func mentionParsing() {
     #expect(MessageRouter.mentions(in: "hi @a, @B-2. mail x@y.com @owner!") == ["a", "b-2", "owner"])
 }
 
-@Test func postErrors() throws {
+@Test(.scratch) func postErrors() throws {
     let w = try RouterWorld()
     #expect(throws: RouterError.unknownChannel("nope")) { try w.router.post(companyId: w.company.id, channel: "nope", from: .owner, text: "x") }
     _ = try w.store.createChannel(companyId: w.company.id, name: "exec", members: [w.ceo.id])
@@ -98,7 +98,7 @@ private struct RouterWorld {
     #expect(throws: RouterError.unknownAgent("zed")) { try w.router.sendDM(companyId: w.company.id, from: .owner, to: "zed", text: "x") }
 }
 
-@Test func dmCreatesSortedChannelOnce() throws {
+@Test(.scratch) func dmCreatesSortedChannelOnce() throws {
     let w = try RouterWorld()
     _ = try w.router.sendDM(companyId: w.company.id, from: .agent(w.cto.id), to: "ceo", text: "a")
     _ = try w.router.sendDM(companyId: w.company.id, from: .agent(w.ceo.id), to: "cto", text: "b")
@@ -108,7 +108,7 @@ private struct RouterWorld {
     #expect(try w.pending(w.ceo) == 1); #expect(try w.pending(w.cto) == 1); #expect(try w.pending(w.eng) == 0)
 }
 
-@Test func replyUnblocksAgentWaitingOnSender() throws {
+@Test(.scratch) func replyUnblocksAgentWaitingOnSender() throws {
     let w = try RouterWorld()
     try w.store.transition(agentId: w.eng.id, to: .blocked, blocker: .agent(w.cto.id))
     try w.store.transition(agentId: w.ceo.id, to: .blocked, blocker: .agent(w.cto.id))
@@ -117,14 +117,14 @@ private struct RouterWorld {
     #expect(try w.state(w.ceo) == .blocked)
 }
 
-@Test func blockedOnOtherAgentIsNotWokenByStranger() throws {
+@Test(.scratch) func blockedOnOtherAgentIsNotWokenByStranger() throws {
     let w = try RouterWorld()
     try w.store.transition(agentId: w.eng.id, to: .blocked, blocker: .agent(w.cto.id))
     _ = try w.router.sendDM(companyId: w.company.id, from: .agent(w.ceo.id), to: "eng1", text: "yo")
     #expect(try w.state(w.eng) == .blocked); #expect(try w.pending(w.eng) == 1)
 }
 
-@Test func ownerMessageUnblocksOwnerBlocker() throws {
+@Test(.scratch) func ownerMessageUnblocksOwnerBlocker() throws {
     let w = try RouterWorld()
     try w.store.transition(agentId: w.eng.id, to: .blocked, blocker: .owner(reason: "key"))
     _ = try w.router.sendDM(companyId: w.company.id, from: .agent(w.cto.id), to: "eng1", text: "x")
@@ -133,7 +133,7 @@ private struct RouterWorld {
     #expect(try w.state(w.eng) == .ready)
 }
 
-@Test func markDeliveredOnlyAffectsGivenItems() throws {
+@Test(.scratch) func markDeliveredOnlyAffectsGivenItems() throws {
     let w = try RouterWorld()
     _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "@cto one")
     _ = try w.router.post(companyId: w.company.id, channel: "general", from: .agent(w.ceo.id), text: "@cto two")
@@ -145,7 +145,7 @@ private struct RouterWorld {
     #expect(try w.store.pendingChannelCounts(agentId: w.eng.id).map(\.count) == [2])
 }
 
-@Test func searchFindsByWord() throws {
+@Test(.scratch) func searchFindsByWord() throws {
     let w = try RouterWorld()
     _ = try w.router.post(companyId: w.company.id, channel: "general", from: .owner, text: "stripe webhooks please")
     _ = try w.router.post(companyId: w.company.id, channel: "general", from: .owner, text: "unrelated")
@@ -153,7 +153,7 @@ private struct RouterWorld {
     #expect(try w.store.searchMessages(companyId: w.company.id, query: "\"( AND").isEmpty)
 }
 
-@Test func invalidSendersAreRejectedAndCreateNothing() throws {
+@Test(.scratch) func invalidSendersAreRejectedAndCreateNothing() throws {
     let w = try RouterWorld()
     let other = try w.store.createCompany(name: "Other", goal: "g", workspacesRoot: try tempDir())
     let stranger = try w.store.hire(companyId: other.id, name: "evil", role: "r", model: "m")
@@ -181,14 +181,14 @@ private struct RouterWorld {
     #expect(try w.store.events(afterId: 0).count == before)
 }
 
-@Test func selfDMIsRejected() throws {
+@Test(.scratch) func selfDMIsRejected() throws {
     let w = try RouterWorld()
     #expect(throws: RouterError.invalidSender) { try w.router.sendDM(companyId: w.company.id, from: .agent(w.cto.id), to: "cto", text: "x") }
     #expect(throws: RouterError.invalidSender) { try w.router.sendDM(companyId: w.company.id, from: .owner, to: "@owner", text: "x") }
     #expect(try w.store.channels(companyId: w.company.id).filter { $0.kind == .dm }.isEmpty)
 }
 
-@Test func concurrentWritersDoNotLock() async throws {
+@Test(.scratch) func concurrentWritersDoNotLock() async throws {
     let path = try tempDir().appending(path: "c.sqlite").path
     let w = try RouterWorld(path: path)
     let stores = try (0..<8).map { _ in try Store(path: path) }
@@ -206,7 +206,7 @@ private struct RouterWorld {
     #expect(try w.store.messages(channelId: g.id, limit: 1000).count == 400)
 }
 
-@Test func sendDMCannotReuseNonDMOrWrongMemberChannel() throws {
+@Test(.scratch) func sendDMCannotReuseNonDMOrWrongMemberChannel() throws {
     let w = try RouterWorld()
     // A squatted non-DM channel occupying the DM name must not be reused.
     try w.store.writer.write { db in

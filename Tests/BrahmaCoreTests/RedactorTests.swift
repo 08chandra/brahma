@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct RedactorTests {
+@Suite(.scratch) struct RedactorTests {
     private func redactor(_ values: [(name: String, value: String)], version: String = "v1") -> Redactor {
         let r = Redactor()
         r.update(values, version: version)

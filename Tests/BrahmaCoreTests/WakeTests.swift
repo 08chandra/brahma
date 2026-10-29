@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct WakeTests {
+@Suite(.scratch) struct WakeTests {
     private let software = PackCatalog.builtin.pack("software")!
 
     private struct World {

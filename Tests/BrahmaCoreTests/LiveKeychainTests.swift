@@ -7,7 +7,7 @@ import BrahmaKeychain
 
 /// The only test that touches the real login Keychain. A rebuilt binary has a new ad-hoc signature, so macOS asks for
 /// the login password on each access (once per call, so there is exactly ONE test here); run it deliberately: `BRAHMA_LIVE_KEYCHAIN=1 swift test --filter LiveKeychain`.
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1",
+@Suite(.scratch, .enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1",
                 "set BRAHMA_LIVE_KEYCHAIN=1 to run tests that use the real login Keychain"))
 struct LiveKeychainTests {
     private func paths() throws -> BrahmaPaths {
@@ -39,16 +39,15 @@ struct LiveKeychainTests {
 /// The secrets vault's one live test (off unless `BRAHMA_LIVE_KEYCHAIN=1`): round trip, then the F1 access-control probe —
 /// `/usr/bin/security` is not on the item's trusted-application list, so it must never print the value (a prompt, a denial or
 /// the 5 s timeout all count as "not read"). Uses a unique company id and always deletes its item.
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1", "set BRAHMA_LIVE_KEYCHAIN=1"))
+@Suite(.scratch, .enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE_KEYCHAIN"] == "1", "set BRAHMA_LIVE_KEYCHAIN=1"))
 struct LiveKeychainVaultTests {
     /// Runs `/usr/bin/security find-generic-password -w` as a child with a hard 5 s timeout (then SIGKILL) and returns its
     /// stdout. Output goes to a file, not a pipe, so a stuck child can never block the read.
     private func securityReads(account: String) throws -> String {
-        let out = FileManager.default.temporaryDirectory.appending(path: "brahma-kc-\(UUID().uuidString).txt")
+        let out = try tempDir().appending(path: "security-out.txt")
         guard FileManager.default.createFile(atPath: out.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CocoaError(.fileWriteUnknown)
         }
-        defer { try? FileManager.default.removeItem(at: out) }
         let sink = try FileHandle(forWritingTo: out)
         defer { try? sink.close() }
         let p = Process()

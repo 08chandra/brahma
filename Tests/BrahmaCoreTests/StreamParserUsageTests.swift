@@ -29,7 +29,7 @@ private func fold(_ fixture: String) throws -> TurnStreamState {
 /// Usage, tool blocks and fan-out events (Task 14a). `stream-tools`, `stream-max-turns`, `stream-max-budget` and
 /// `stream-resume` are real recordings of the installed CLI (2.1.308, haiku); `stream-workflow` is a real recording of a
 /// two-agent workflow (p9, 2.1.306) and `stream-workflow-cut17` is its first 17 lines.
-@Suite struct StreamParserUsageTests {
+@Suite(.scratch) struct StreamParserUsageTests {
     @Test func resultCarriesUsage() throws {
         let r = try lastResult("stream-tools")
         // Usage is summed over the process's API calls; cache reads are not counted.

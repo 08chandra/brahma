@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// The turn-start orientation (Task 10): layout, re-read role card, quoting of agent text, bounds, time zone.
-@Suite(.serialized) struct TurnDigestTests {
+@Suite(.scratch, .serialized) struct TurnDigestTests {
     private struct D {
         let world: World
         var store: Store { world.store }

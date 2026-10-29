@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
-@Suite struct WorktreeSetupAlertTests {
+@Suite(.scratch) struct WorktreeSetupAlertTests {
     private struct Boom: Error {}
 
     private func open(_ store: Store, _ company: Company) throws -> Int {

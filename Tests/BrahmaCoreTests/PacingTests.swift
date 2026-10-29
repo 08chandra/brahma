@@ -15,7 +15,7 @@ private func info(elapsed: Double = 0.5, util: Double? = 0.2, hasReset: Bool = t
 }
 private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
 
-@Suite struct PacingTests {
+@Suite(.scratch) struct PacingTests {
     @Test func burstConstant() { #expect(UsageGate.burst == 0.15) }
 
     @Test func paceClosesWhenAhead() {
@@ -294,7 +294,7 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
 }
 
 /// Orchestrator-level behavior of the weekly pace.
-@Suite struct PacingOrchestratorTests {
+@Suite(.scratch) struct PacingOrchestratorTests {
     private struct W {
         let store: Store; let clock = TestClock(); let fake = FakeTurnRunner(); let router: MessageRouter
         let o: Orchestrator; let c: Company

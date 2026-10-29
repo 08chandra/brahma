@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import BrahmaCore
 
-@Suite struct ClockTests {
+@Suite(.scratch) struct ClockTests {
     private func make() throws -> (Store, Company, Date) {
         let store = try Store.inMemory()
         let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
