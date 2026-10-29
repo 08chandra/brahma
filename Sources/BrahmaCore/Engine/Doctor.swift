@@ -39,7 +39,9 @@ public struct DoctorReport: Codable, Equatable, Sendable {
 
 /// Checks that the installed `claude` still behaves the way the engine's argv and parsing assume.
 public enum Doctor {
-    public static let minimumVersion = "2.1.304"
+    /// 2.1.312: exec-form hooks (`command` + `args`) and `onFailure: "block"` are verified live there (1b fix round 1, C1); an
+    /// older CLI may run a hook without its arguments, which would let the engine's PreToolUse hook fail open.
+    public static let minimumVersion = "2.1.312"
     public static let maxAge: TimeInterval = 86_400
     public static let probeTimeout: Duration = .seconds(120)
     static let probeCodeword = "BRAHMA-PROBE-7"
@@ -58,6 +60,8 @@ public enum Doctor {
     /// Where an administrator's managed settings live; `disableSideloadFlags` there makes the CLI ignore `--plugin-dir` (and
     /// `--mcp-config`).
     public static let managedSettingsPath = "/Library/Application Support/ClaudeCode/managed-settings.json"
+    /// The MDM profile Claude Code also reads (`com.anthropic.claudecode`).
+    public static let managedPreferencesPath = "/Library/Managed Preferences/com.anthropic.claudecode.plist"
 
     /// Runs an executable with arguments and returns its stdout, or nil when it cannot run; throws `ExecTimedOut` when it hangs. Injected by tests.
     public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async throws -> String?
@@ -66,7 +70,9 @@ public enum Doctor {
     /// `sandbox`: the sandboxed runner the `plugin-details-inert` fixture (Task 5a) runs the CLI under; without one that item is skipped.
     public static func run(claudePath: String, runner: any TurnRunning, exec: @escaping Exec = defaultExec,
                            now: Date = .now, hookExecutable: String = "brahma",
-                           managedSettingsPath: String = Doctor.managedSettingsPath, sandbox: (any SandboxedRunner)? = nil) async -> DoctorReport {
+                           managedSettingsPath: String = Doctor.managedSettingsPath,
+                           managedPreferencesPath: String = Doctor.managedPreferencesPath,
+                           sandbox: (any SandboxedRunner)? = nil) async -> DoctorReport {
         let found = await versionOutcome(claudePath: claudePath, exec: exec)
         guard let version = found.version else {
             let detail = found.timedOut?.description ?? "can't run '\(claudePath) --version'; is Claude Code installed?"
@@ -77,7 +83,7 @@ public enum Doctor {
         let probe = await runProbe(runner: runner)
         items += probe.items
         items.append(toolsItem(probe.tools))
-        items.append(sideloadItem(path: managedSettingsPath))
+        items.append(sideloadItem(path: managedSettingsPath, preferences: managedPreferencesPath))
         if let sandbox { items.append(await pluginDetailsItem(claudePath: claudePath, sandbox: sandbox)) }
         var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
         // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
@@ -201,7 +207,8 @@ public enum Doctor {
     /// `tools-present`: the probe's init `tools` hold every name the Sandboxed profile's `--tools` uses (`BuiltinTools.sandboxed`).
     static func toolsItem(_ tools: [String]?) -> DoctorItem {
         guard let tools, !tools.isEmpty else {
-            return DoctorItem(name: "tools-present", status: .warn, detail: "the probe's init event listed no tools; nothing to compare")
+            // Nothing proves the tools are there (fix round 1, M2).
+            return DoctorItem(name: "tools-present", status: .fail, detail: "the probe's init event listed no tools; the sandboxed --tools cannot be checked")
         }
         let missing = BuiltinTools.sandboxed.filter { !tools.contains($0) }
         return missing.isEmpty
@@ -210,25 +217,40 @@ public enum Doctor {
                          detail: "the CLI lacks \(missing.joined(separator: ", ")), which the sandboxed profile's --tools names")
     }
 
-    /// `sideload-allowed`: the managed setting `disableSideloadFlags` is not set (it makes the CLI ignore `--plugin-dir`, so a
-    /// turn's extension parts would silently not load). Managed settings that cannot be read fail: the doctor cannot tell.
-    static func sideloadItem(path: String) -> DoctorItem {
+    /// `sideload-allowed`: the managed setting `disableSideloadFlags` is set nowhere Claude Code reads managed settings: the file,
+    /// its `managed-settings.d/*.json` drop-ins, the MDM profile (M3). Set, the CLI ignores `--plugin-dir` (extension parts would
+    /// silently not load) and `--mcp-config` (every turn would lose its company server). Managed settings that cannot be read
+    /// fail: the doctor cannot tell.
+    static func sideloadItem(path: String, preferences: String = managedPreferencesPath) -> DoctorItem {
         let name = "sideload-allowed"
-        guard FileManager.default.fileExists(atPath: path) else {
-            return DoctorItem(name: name, status: .pass, detail: "no managed settings")
+        let fm = FileManager.default
+        var documents: [(String, [String: Any]?)] = []
+        if fm.fileExists(atPath: path) {
+            documents.append((path, fm.contents(atPath: path).flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }))
         }
-        guard let data = FileManager.default.contents(atPath: path),
-              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            return DoctorItem(name: name, status: .fail, detail: "can't read the managed settings at \(path)")
+        let dropIns = URL(fileURLWithPath: path).deletingLastPathComponent().appending(path: "managed-settings.d")
+        if let names = try? fm.contentsOfDirectory(atPath: dropIns.path) {
+            for file in names.sorted() where file.hasSuffix(".json") {
+                let p = dropIns.appending(path: file).path
+                documents.append((p, fm.contents(atPath: p).flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }))
+            }
         }
-        switch object["disableSideloadFlags"] {
-        case nil, is NSNull: break
-        case let flag as Bool where flag == false: break
-        default:
-            return DoctorItem(name: name, status: .fail,
-                              detail: "managed setting disableSideloadFlags is set in \(path): --plugin-dir would be ignored")
+        if fm.fileExists(atPath: preferences) {
+            documents.append((preferences, fm.contents(atPath: preferences).flatMap {
+                (try? PropertyListSerialization.propertyList(from: $0, format: nil)) as? [String: Any]
+            }))
         }
-        return DoctorItem(name: name, status: .pass, detail: "sideload flags allowed")
+        for (where_, object) in documents {
+            guard let object else { return DoctorItem(name: name, status: .fail, detail: "can't read the managed settings at \(where_)") }
+            switch object["disableSideloadFlags"] {
+            case nil, is NSNull: continue
+            case let flag as Bool where flag == false: continue
+            default:
+                return DoctorItem(name: name, status: .fail,
+                                  detail: "managed setting disableSideloadFlags is set in \(where_): --plugin-dir and --mcp-config would be ignored")
+            }
+        }
+        return DoctorItem(name: name, status: .pass, detail: documents.isEmpty ? "no managed settings" : "sideload flags allowed")
     }
 
     private static func runProbe(runner: any TurnRunning) async -> (items: [DoctorItem], tools: [String]?) {

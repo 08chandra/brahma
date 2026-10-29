@@ -25,6 +25,11 @@ extension Store {
     /// home and every other company's workspace, whether or not they exist yet. A refused patch changes nothing.
     public func updateSandbox(companyId: String, _ patch: SandboxPatch,
                               userHome: URL = FileManager.default.homeDirectoryForCurrentUser) throws {
+        try updateSandbox(companyId: companyId, patch, userHome: userHome, unless: { _ in false })
+    }
+
+    /// `unless`: checked on the stored row inside the write transaction; true leaves the row as it is (`editSandbox`).
+    func updateSandbox(companyId: String, _ patch: SandboxPatch, userHome: URL, unless: (Company) -> Bool) throws {
         func domains(_ list: [String]) throws -> [String] {
             for d in list { try SandboxDomains.check(d) }
             return Array(Set(list.map(SandboxDomains.normalize))).sorted()
@@ -56,9 +61,33 @@ extension Store {
                                      item: nil, company: candidate, grants: GrantInputs(), darwinUserTemp: nil, userHome: userHome)
         try writer.write { db in
             guard var company = try Company.fetchOne(db, key: companyId) else { throw StoreError.notFound }
+            if unless(company) { return }
             apply(&company)
             try company.update(db)
         }
+    }
+
+    /// An owner edit computed from the STORED company (M8): `edit` gets the current row, its patch is validated as
+    /// `updateSandbox` does, and the write happens only if the row has not changed meanwhile (else the edit is recomputed from
+    /// the new row, a few times). Two edits made at once both land.
+    public func editSandbox(companyId: String, userHome: URL = FileManager.default.homeDirectoryForCurrentUser,
+                            _ edit: (Company) throws -> SandboxPatch) throws {
+        for _ in 0..<5 {
+            guard let current = try company(id: companyId) else { throw StoreError.notFound }
+            let patch = try edit(current)
+            var changed = false
+            try updateSandbox(companyId: companyId, patch, userHome: userHome, unless: { stored in
+                changed = !Store.sameSandbox(stored, current)
+                return changed
+            })
+            if !changed { return }
+        }
+        throw WorkError.invalid("the company's sandbox settings kept changing; try again")
+    }
+
+    static func sameSandbox(_ a: Company, _ b: Company) -> Bool {
+        a.permissionProfile == b.permissionProfile && a.roleProfiles == b.roleProfiles && a.allowedDomains == b.allowedDomains
+            && a.webDomains == b.webDomains && a.allowLocalBinding == b.allowLocalBinding && a.toolchainReadPaths == b.toolchainReadPaths
     }
 }
 

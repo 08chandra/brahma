@@ -61,11 +61,13 @@ struct Run: AsyncParsableCommand {
         // Read before the engine starts, so the first tick's events are printed too.
         let printer = EventPrinter(store: store, startAfter: try store.maxEventId())
 
-        // Handle SIGINT/SIGTERM ourselves so in-flight turns are killed and recorded before we exit.
+        // Handle SIGINT/SIGTERM/SIGHUP ourselves so in-flight turns are killed and recorded before we exit (a closed Terminal
+        // window sends SIGHUP; each turn runs in its own session, so it would not get it: 1b fix round 1, B-I1).
         signal(SIGINT, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
+        signal(SIGHUP, SIG_IGN)
         let engine = Task { await orchestrator.runForever() }
-        let sources = [SIGINT, SIGTERM].map { sig in
+        let sources = [SIGINT, SIGTERM, SIGHUP].map { sig in
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
             source.setEventHandler { engine.cancel() }
             source.resume()

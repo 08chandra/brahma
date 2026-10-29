@@ -11,12 +11,20 @@ import Glibc
 // built-in file tools. In `-p` mode an invalid settings file is silently ignored, so Task 3's canary gates scheduling by this
 // file's `shape()`, and the shell prefix's sentinel is the per-command backstop.
 
-/// One hook command (`{"type": "command", "command": …}`).
+/// One hook command, always in exec form (`{"type": "command", "command": <executable>, "args": [...]}`). Claude Code wraps a
+/// shell-form hook in `CLAUDE_CODE_SHELL_PREFIX` and runs it outside the sandbox, so the prefix would refuse it and a
+/// PreToolUse hook would fail open (1b fix round 1, C1); an exec-form hook is run directly. `onFailure: "block"` keeps a hook
+/// that cannot run from letting the call through. Both verified live on 2.1.312 (`Doctor.minimumVersion`).
 public struct HookCommand: Codable, Equatable, Sendable {
     public var type: String
+    /// The executable (one path, no shell words).
     public var command: String
+    public var args: [String]
+    public var onFailure: String?
 
-    public init(type: String = "command", command: String) { self.type = type; self.command = command }
+    public init(command: String, args: [String], onFailure: String? = "block") {
+        type = "command"; self.command = command; self.args = args; self.onFailure = onFailure
+    }
 }
 
 /// One `hooks.<Event>` entry: a tool-name matcher and the commands it runs.
@@ -49,8 +57,13 @@ public struct ClaudeSettings: Codable, Equatable, Sendable {
         public var allowedDomains: [String]?
         public var allowLocalBinding: Bool?
         public var allowAllUnixSockets: Bool?
-        public init(allowedDomains: [String]? = nil, allowLocalBinding: Bool? = nil, allowAllUnixSockets: Bool? = nil) {
+        /// The turn's own mach global name (Task 2's unremovable marker, adopted for turns): allowed by the turn's sandbox and
+        /// answered by no service, so the engine recognizes the turn's processes by their sandbox alone (`SandboxProbe`).
+        public var allowMachLookup: [String]?
+        public init(allowedDomains: [String]? = nil, allowLocalBinding: Bool? = nil, allowAllUnixSockets: Bool? = nil,
+                    allowMachLookup: [String]? = nil) {
             self.allowedDomains = allowedDomains; self.allowLocalBinding = allowLocalBinding; self.allowAllUnixSockets = allowAllUnixSockets
+            self.allowMachLookup = allowMachLookup
         }
     }
 
@@ -88,12 +101,12 @@ public struct ClaudeSettings: Codable, Equatable, Sendable {
 
     public init() {}
 
-    /// Compact JSON, keys sorted, slashes unescaped: the bytes of the settings file.
-    public func json() -> String {
+    /// Compact JSON, keys sorted, slashes unescaped: the bytes of the settings file. Throws rather than ever producing a
+    /// smaller file (an empty one would be an unsandboxed turn).
+    public func json() throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        // Encoding plain strings, bools and arrays cannot fail.
-        return String(decoding: (try? encoder.encode(self)) ?? Data("{}".utf8), as: UTF8.self)
+        return String(decoding: try encoder.encode(self), as: UTF8.self)
     }
 
     /// The `StableHash` of the JSON with every string replaced by `"s"` and every array cut to its first element: equal for
@@ -154,14 +167,16 @@ public enum ClaudeSettingsCompiler {
     ///   block and `TurnProfileCompiler.validate` refuses it).
     /// - `mode`: the work mode (nil for Plan 1 inputs: no `maxEffortLevel`; the workflow and fast-mode kill switches still apply).
     /// - `mounts`: the turn's extension parts (Task 5a; empty until then).
-    /// - `hookCommand`: the PostToolUse hook (Task 10; nil until then). `preToolHook`: 3a's PreToolUse block, merged unchanged.
+    /// - `postToolHook`: the PostToolUse hook (Task 10; nil until then), exec form. `preToolHook`: 3a's PreToolUse block (exec
+    ///   form since fix round 1), merged unchanged.
+    /// - `machMarker`: the sandboxed turn's mach marker (`sandbox.network.allowMachLookup`).
     /// - `kind`, `plansDirectory`: a plan turn's `plansDirectory` (the scope's cwd when the sandboxed caller names none).
     /// - `deniedPaths`: the Workspace profile's read and edit denies (the data home, the protected list, other workspaces).
     /// - `workflow`: Ultra's policy (Task 14u); Ultra compiles only on the Sandboxed profile with one.
     public static func compile(scope: SandboxScope?, profile: PermissionProfile, mode: ModeDecision?, mounts: [URL],
-                               hookCommand: String?, preToolHook: HookMatcher?, kind: TurnKind = .work,
+                               postToolHook: HookCommand?, preToolHook: HookMatcher?, kind: TurnKind = .work,
                                plansDirectory: String? = nil, deniedPaths: [URL] = [],
-                               workflow: WorkflowPolicy? = nil) -> ClaudeSettings {
+                               workflow: WorkflowPolicy? = nil, machMarker: String? = nil) -> ClaudeSettings {
         var s = ClaudeSettings()
         var allow: [String] = []
         var deny: [String] = []
@@ -173,16 +188,18 @@ public enum ClaudeSettingsCompiler {
             if let scope {
                 let fs = ClaudeSettings.Filesystem(
                     // The cwd is granted literally: never rely on the CLI's own write grant for its physical cwd.
-                    allowWrite: dedupe([scope.cwd] + scope.writable + (scope.toolchainTempWrite.map { [$0] } ?? [])),
+                    allowWrite: dedupe([scope.cwd] + scope.writable + (scope.toolchainTempWrite.map { [$0] } ?? [])
+                                       + (scope.claudeTmp.map { [$0] } ?? [])),
                     // A read-only place may also be an `--add-dir`, which can carry a write grant of the CLI's own.
                     denyWrite: dedupe(scope.denyWrite + scope.readOnlyDirs),
                     denyRead: dedupe(scope.denyRead),
-                    allowRead: dedupe(scope.readable + scope.readOnlyDirs + [scope.cwd]))
+                    allowRead: dedupe(scope.readable + scope.readOnlyDirs + [scope.cwd] + (scope.claudeTmp.map { [$0] } ?? [])))
                 s.sandbox = ClaudeSettings.Sandbox(
                     enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false,
                     filesystem: fs,
                     network: ClaudeSettings.Network(allowedDomains: scope.network.allowedDomains,
-                                                    allowLocalBinding: scope.network.allowLocalBinding, allowAllUnixSockets: false))
+                                                    allowLocalBinding: scope.network.allowLocalBinding, allowAllUnixSockets: false,
+                                                    allowMachLookup: machMarker.map { [$0] }))
                 allow = ["Bash", "mcp__company"] + scope.network.webDomains.map { "WebFetch(domain:\($0))" }
                 for p in unique(scope.protected.map(\.path)) { deny += rules("Read", p) + rules("Edit", p) }
                 for d in unique((scope.readOnlyDirs + scope.denyWrite).map(\.path)) { deny += rules("Edit", d) + rules("Write", d) }
@@ -215,7 +232,7 @@ public enum ClaudeSettingsCompiler {
 
         var hooks: [String: [HookMatcher]] = [:]
         if let preToolHook { hooks["PreToolUse"] = [preToolHook] }
-        if let hookCommand { hooks["PostToolUse"] = [HookMatcher(matcher: postToolMatcher, hooks: [HookCommand(command: hookCommand)])] }
+        if let postToolHook { hooks["PostToolUse"] = [HookMatcher(matcher: postToolMatcher, hooks: [postToolHook])] }
         if !hooks.isEmpty { s.hooks = hooks }
 
         if !allow.isEmpty || !deny.isEmpty {
@@ -295,17 +312,28 @@ public enum ShellPrefix {
         #endif
     }
 
-    /// The script: the brief's body plus two lines the live probes showed are needed (Task 1b Step 1):
-    /// - Claude Code starts stdio MCP servers through the prefix too, outside the sandbox (so the sentinel is readable). The
-    ///   engine's own server (`mcpExecutable mcp …`, started with its per-turn `BRAHMA_TURN_TOKEN`, which lives only in that
-    ///   server's environment, never in the agent's) is exec'd as it is, before any check or scrub. Without `mcpExecutable`
-    ///   no command passes this way, nor does one holding anything but letters, digits, space, `'` and `-_./:` (no second
-    ///   command can ride along: no `;`, `&`, `|`, `$`, a backquote, a redirection or a line break).
-    /// - Claude Code injects git settings as `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`; scrubbing the
-    ///   `KEY` names alone breaks every git command, so `GIT_CONFIG_KEY_<n>` are kept (they name config keys, not secrets).
+    /// The tools the script runs, by absolute path: never found through the PATH it inherits (fix round 1, I1), where a
+    /// relative entry could hold a `cat` an agent planted.
+    public static let tools: (cat: String, env: String, sed: String) = {
+        #if os(macOS)
+        return ("/bin/cat", "/usr/bin/env", "/usr/bin/sed")
+        #else
+        return ("/bin/cat", "/usr/bin/env", "/bin/sed")
+        #endif
+    }()
+
+    /// The script: the brief's body, with these changes (live probes, Step 1; fix round 1):
+    /// - Claude Code starts stdio MCP servers through the prefix too, outside the sandbox. A process carrying the per-turn
+    ///   `BRAHMA_TURN_TOKEN` (only the company server's env block has it; never claude's own environment) is either the engine's
+    ///   own server, started by the FIXED argv `<mcpExecutable> mcp` (it reads its parameters from its env block; the auth
+    ///   variables are unset first), or refused (126). The line Claude hands over is only compared, never evaluated.
+    ///   Without `mcpExecutable` every token-carrying line is refused.
+    /// - `cat`, `env` and `sed` by absolute path (`tools`).
+    /// - `GIT_CONFIG_KEY_<digits>` (the git settings Claude Code injects next to `GIT_CONFIG_COUNT`) survive the scrub; nothing
+    ///   else that holds `KEY` does.
     /// Every substituted value is single- or double-quoted, so one holding `'`, `"`, `\`, `$`, a backquote, a control character
     /// or `%00` is refused (`SandboxError.unsafePathCharacter`); a keep name that is not a variable name is dropped (it is then
-    /// scrubbed like any other).
+    /// scrubbed like any other). No bracket range is used in a `case` (locale-independent); `sed`'s runs with `LC_ALL=C`.
     public static func script(layout: SandboxLayout, paths: BrahmaPaths, shell: String, keepNames: [String],
                               mcpExecutable: String? = nil) throws -> String {
         // The agent's places as the turn's scope names them: built under the resolved workspace.
@@ -318,16 +346,23 @@ public enum ShellPrefix {
             throw SandboxError.unsafePathCharacter(value)
         }
         let keep = keepNames.filter { $0.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil }
-        let mcpLine = mcpExecutable.map { exe in
-            "case \"${BRAHMA_TURN_TOKEN:+t}:$1\" in *[!-A-Za-z0-9_./:\\ \\']*) ;; \"t:\(exe) mcp \"*|\"t:'\(exe)' mcp \"*|\"t:'\(exe)' 'mcp' \"*) exec '\(shell)' -c \"$1\";; esac\n"
+        let serverForms = mcpExecutable.map { exe in
+            ["\"\(exe) mcp\"", "\"\(exe) mcp \"*", "\"'\(exe)' mcp\"", "\"'\(exe)' mcp \"*", "\"'\(exe)' 'mcp'\"", "\"'\(exe)' 'mcp' \"*"]
+                .joined(separator: "|")
+        }
+        let serverCase = mcpExecutable.map { exe in
+            "  case \"$1\" in \(serverForms!)) unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; exec '\(exe)' mcp;; esac\n"
         } ?? ""
         return """
             #!/bin/sh
-            \(mcpLine)if cat '\(sentinel)' >/dev/null 2>&1; then echo "brahma: sandbox is not active; command refused" >&2; exit 126; fi
+            if [ -n "${BRAHMA_TURN_TOKEN:-}" ]; then
+            \(serverCase)  echo "brahma: refused" >&2; exit 126
+            fi
+            if \(tools.cat) '\(sentinel)' >/dev/null 2>&1; then echo "brahma: sandbox is not active; command refused" >&2; exit 126; fi
             keep=' \(keep.joined(separator: " ")) '
-            for n in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do
+            for n in $(\(tools.env) | LC_ALL=C \(tools.sed) -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do
               case "$keep" in *" $n "*) continue;; esac
-              case "$n" in GIT_CONFIG_KEY_[0-9]*) continue;; esac
+              case "${n#GIT_CONFIG_KEY_}" in "$n"|'') ;; *[!0123456789]*) ;; *) continue;; esac
               case "$n" in CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|SSH_AUTH_SOCK|AWS_*|*TOKEN*|*SECRET*|*KEY*|*token*|*secret*|*key*) unset "$n";; esac
             done
             export HOME='\(home)' XDG_CONFIG_HOME='\(home)/.config' XDG_CACHE_HOME='\(cache)/xdg'
@@ -344,6 +379,11 @@ public enum ShellPrefix {
     public static func write(layout: SandboxLayout, paths: BrahmaPaths, shell: String, keepNames: [String],
                              mcpExecutable: String? = nil) throws -> URL {
         try SandboxLayout.validate(handle: layout.handle)
+        // Claude Code splits `CLAUDE_CODE_SHELL_PREFIX` at whitespace (M7): the prefix's own path holds none.
+        let prefixPath = layout.workspace.resolvedForSandbox.appending(path: ".brahma/bin/\(layout.shellPrefix.lastPathComponent)").path
+        for path in [prefixPath, layout.shellPrefix.path] where path.contains(where: \.isWhitespace) {
+            throw SandboxError.unsafePathCharacter(path)
+        }
         let text = try script(layout: layout, paths: paths, shell: shell, keepNames: keepNames, mcpExecutable: mcpExecutable)
         let data = Data(text.utf8)
         let name = layout.shellPrefix.lastPathComponent

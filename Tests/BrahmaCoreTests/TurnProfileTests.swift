@@ -92,13 +92,13 @@ let plan1Settings = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disa
 
     /// 5-lite: the settings are the typed mirror (`ClaudeSettings`, 3a's `extraSettings` dictionary renamed); `settingsJSON` is
     /// exactly its encoding.
-    @Test func settingsAreTheTypedMirror() {
+    @Test func settingsAreTheTypedMirror() throws {
         var p = TurnProfileCompiler.profile(for: request(started: false))
-        #expect(TurnProfileCompiler.settingsJSON(p) == plan1Settings)
+        #expect(try TurnProfileCompiler.settingsJSON(p) == plan1Settings)
         p.settings.sandbox = ClaudeSettings.Sandbox(enabled: true)
-        #expect(TurnProfileCompiler.settingsJSON(p).contains("\"sandbox\":{\"enabled\":true}"))
+        #expect(try TurnProfileCompiler.settingsJSON(p).contains("\"sandbox\":{\"enabled\":true}"))
         p.settings = ClaudeSettings()
-        #expect(TurnProfileCompiler.settingsJSON(p) == "{}")
+        #expect(try TurnProfileCompiler.settingsJSON(p) == "{}")
     }
 
     @Test func slashCommandsFlagKeptByDefault() {
@@ -107,6 +107,19 @@ let plan1Settings = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disa
         #expect(TurnProfileCompiler.arguments(p).contains("--disable-slash-commands"))
         p.disableSlashCommands = false
         #expect(!TurnProfileCompiler.arguments(p).contains("--disable-slash-commands"))
+    }
+
+    /// I2(d): the MCP server's per-turn token lives only in that server's env block (the 0600 MCP config); it never reaches
+    /// claude's own environment, whatever puts it on the request.
+    @Test func turnTokenNeverReachesClaudesEnvironment() {
+        let env = ChildEnvironment.make(base: ["PATH": "/bin", MCPConfig.tokenVariable: "t1"],
+                                        extra: [MCPConfig.tokenVariable: "t2", "BRAHMA_AGENT_ID": "a1"],
+                                        engineClaudeVars: [MCPConfig.tokenVariable: "t3"], purpose: .claude)
+        #expect(env[MCPConfig.tokenVariable] == nil); #expect(env["BRAHMA_AGENT_ID"] == "a1")
+        var r = request(started: false, profile: .workspace)
+        r.environment[MCPConfig.tokenVariable] = "leak"
+        let p = TurnProfileCompiler.profile(for: r)
+        #expect(ChildEnvironment.make(base: [:], extra: p.environment, engineClaudeVars: p.environment, purpose: .claude)[MCPConfig.tokenVariable] == nil)
     }
 
     @Test func childEnvironmentStripsDev() {

@@ -12,9 +12,17 @@ public struct SandboxEnvironment: Sendable {
     public var userHome: URL
     public var darwinUserTemp: URL?
     public var shell: String
+    /// Whether the engine can see what a sandbox allows (`ContainmentSelfTest`, once per engine); without it sandboxed turns
+    /// do not start. Tests pass their own.
+    public var canSeeSandboxes: @Sendable () -> Bool
+    /// `/private/tmp/b-<uid>`: each sandboxed agent's claude keeps its temp files in a private directory under it (short
+    /// enough for Claude Code to use: `SandboxScope.claudeTmpMaxLength`). Nil: Claude's own default.
+    public var claudeTmpRoot: URL?
 
-    public init(userHome: URL, darwinUserTemp: URL?, shell: String) {
+    public init(userHome: URL, darwinUserTemp: URL?, shell: String,
+                canSeeSandboxes: @escaping @Sendable () -> Bool = { ContainmentSelfTest.passed }, claudeTmpRoot: URL? = nil) {
         self.userHome = userHome; self.darwinUserTemp = darwinUserTemp; self.shell = shell
+        self.canSeeSandboxes = canSeeSandboxes; self.claudeTmpRoot = claudeTmpRoot
     }
 
     /// `current` with the owner's home from the account database (`getpwuid`), never `$HOME`: inside `brahma mcp` (an agent's
@@ -34,7 +42,8 @@ public struct SandboxEnvironment: Sendable {
         let temp: URL? = nil
         #endif
         return SandboxEnvironment(userHome: FileManager.default.homeDirectoryForCurrentUser, darwinUserTemp: temp,
-                                  shell: ShellPrefix.shell())
+                                  shell: ShellPrefix.shell(),
+                                  claudeTmpRoot: URL(fileURLWithPath: "/private/tmp/b-\(getuid())", isDirectory: false))
     }
 }
 
@@ -48,6 +57,8 @@ struct SandboxedTurn: Sendable {
     var rebuild: (@Sendable (GrantInputs) throws -> SandboxScope)? = nil
     /// The item the scope was built for.
     var item: WorkItem? = nil
+    /// The turn's mach marker (`dev.brahma.turn.<id>`), compiled into its sandbox.
+    var marker: String = ""
 }
 
 /// A sandboxed turn that does not start (its scope was refused, or its places could not be made): `sandbox scope: <why>`.
@@ -65,11 +76,61 @@ extension Orchestrator {
     }
 
     /// What a Workspace turn's settings deny reading and editing: the data home, the owner's protected paths and every other
-    /// company's workspace.
-    nonisolated func workspaceDeniedPaths(company: Company) -> [URL] {
-        let others = ((try? store.companies()) ?? []).filter { $0.id != company.id }
+    /// company's workspace, each as given and resolved. A company list that cannot be read fails the turn (M6).
+    nonisolated func workspaceDeniedPaths(company: Company) throws -> [URL] {
+        let others = try store.companies().filter { $0.id != company.id }
             .map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) }
-        return [paths.home] + ProtectedPaths.defaults(userHome: sandboxEnvironment.userHome) + others
+        var seen = Set<String>()
+        return ([paths.home] + ProtectedPaths.defaults(userHome: sandboxEnvironment.userHome) + others)
+            .flatMap { [$0, $0.resolvedForSandbox] }
+            .filter { seen.insert(SandboxPath.key($0.path)).inserted }
+    }
+
+    /// `<runDir>/turns`: where every turn's leader is recorded (`TurnRecords`).
+    nonisolated var turnRecordDirectory: URL { paths.runDir.appending(path: "turns", directoryHint: .isDirectory) }
+
+    /// Every turn, every profile, first (M1): waits until the agent's earlier turns are swept and kills what they, or an earlier
+    /// engine's turns, left. What it killed is logged (M4); anything that would not die refuses the turn and tells the owner.
+    nonisolated func settleEarlierTurns(agent: Agent, company: Company, turnId: String) async throws {
+        let left: TurnLeftovers
+        do {
+            left = try await runner.waitForTurnProcesses(agentId: agent.id, records: turnRecordDirectory)
+        } catch {
+            throw SandboxRefusal(reason: "processes of an earlier turn could not be accounted for (\(error))")
+        }
+        let now = clock()
+        if !left.killed.isEmpty {
+            attempt {
+                try store.appendEvent(ActivityEvent(
+                    companyId: company.id, agentId: agent.id, turnId: turnId, kind: .error,
+                    text: "@\(agent.name): \(left.killed.count) process(es) left over from an earlier turn were killed "
+                        + "(pid \(left.killed.map(String.init).joined(separator: ", ")))", createdAt: now))
+            }
+        }
+        guard left.survivors.isEmpty else {
+            let pids = left.survivors.map(String.init).joined(separator: ", ")
+            alertOnce(reason: "turn-leftovers:\(agent.id)", company: company, agent: agent, now: now,
+                      text: "@\(agent.name)'s turns do not start in \(company.name): processes of an earlier turn are still running "
+                        + "and could not be killed (pid \(pids)). Check them (`ps -p \(pids)`) and stop them.")
+            throw SandboxRefusal(reason: "processes of an earlier turn are still running (pid \(pids))")
+        }
+    }
+
+    /// Raises an owner alert once while one with the same reason is open; afterwards only an activity line.
+    nonisolated func alertOnce(reason: String, company: Company, agent: Agent, now: Date, text: String) {
+        attempt {
+            try store.writer.write { db in
+                let open = try Ask.filter(Column("companyId") == company.id && Column("kind") == AskKind.engineAlert
+                                          && Column("status") == AskStatus.pendingOwner.rawValue
+                                          && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
+                if open == 0 {
+                    try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: reason, companyId: company.id)
+                } else {
+                    try ActivityEvent(companyId: company.id, agentId: agent.id, turnId: nil, kind: .error, text: try store.redact(text),
+                                      createdAt: now).insert(db)
+                }
+            }
+        }
     }
 
     /// Before a sandboxed turn: no process of an earlier turn of the agent may still run; then (blocking) the agent's places
@@ -80,11 +141,13 @@ extension Orchestrator {
     /// `extraDomains`: the egress the turn's mounted extensions declare (`ExtensionLibrary.agentNetwork`, Task 5a), joined to the grants'.
     nonisolated func prepareSandbox(agent: Agent, company: Company, kind: TurnKind, item: WorkItem?, turnId: String,
                                     extraDomains: [String] = []) async throws -> SandboxedTurn {
-        let left = await runner.waitForTurnProcesses(agentId: agent.id)
-        if !left.isEmpty {
-            throw SandboxRefusal(reason: "processes of an earlier turn are still running (pid \(left.map(String.init).joined(separator: ", ")))")
+        // The containment of a sandboxed turn finds its processes by their sandbox; blind, it could not (B-I2).
+        let env = sandboxEnvironment
+        guard await blocking.run({ env.canSeeSandboxes() }) else {
+            throw SandboxRefusal(reason: "cannot see sandboxed processes on this Mac (the containment self-test failed), so no "
+                                 + "sandboxed turn starts")
         }
-        let store = self.store, paths = self.paths, env = sandboxEnvironment, mcp = mcpExecutable
+        let store = self.store, paths = self.paths, mcp = mcpExecutable
         let others = try store.companies().filter { $0.id != company.id }.map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) }
         let layout = SandboxLayout(paths: paths, company: company, agentHandle: agent.name)
         let now = clock()
@@ -101,6 +164,8 @@ extension Orchestrator {
                 // The owner's backup folders and WAL replica (Task 13b): protected and unreadable for every turn. Read in the
                 // blocking body (INT-M1); a database error refuses the turn rather than leave the backups unprotected (INT-I1).
                 let backups = try BackupTargets.requiredProtectedFolders(store: store)
+                // The prefix's backstop, re-asserted before every sandboxed turn (M4).
+                try Sentinel.write(paths: paths)
                 try layout.ensure()
                 let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: mcp)
                 // The owner's grants that apply to this turn (Task 9). A read path that no longer is what was approved (a link,
@@ -121,13 +186,16 @@ extension Orchestrator {
                     inputs.domains = Array(Set(inputs.domains + extraDomains)).sorted()
                     return try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
                                                     kind: kind, item: item, company: company, grants: inputs,
-                                                    darwinUserTemp: env.darwinUserTemp, userHome: env.userHome)
+                                                    darwinUserTemp: env.darwinUserTemp, userHome: env.userHome,
+                                                    claudeTmpRoot: env.claudeTmpRoot)
                 }
                 let scope = try rebuild(GrantResolver.inputs(grants))
-                return (SandboxedTurn(scope: scope, shellPrefix: prefix, grants: grants, rebuild: rebuild, item: item), dropped)
+                if let tmp = scope.claudeTmp { try ClaudeTmp.ensure(tmp) }
+                return (SandboxedTurn(scope: scope, shellPrefix: prefix, grants: grants, rebuild: rebuild, item: item,
+                                      marker: TurnProfileCompiler.containmentMarkerPrefix + UUID().uuidString.lowercased()), dropped)
             }
         } catch {
-            throw await sandboxRefusal(error, agent: agent, company: company, layout: layout, item: item, now: now)
+            throw await sandboxRefusal(error, agent: agent, company: company, layout: layout, item: item, kind: kind, now: now)
         }
         for (ref, state) in droppedGrants {
             let why: String
@@ -165,67 +233,91 @@ extension Orchestrator {
             } catch {
                 throw await sandboxRefusal(error, agent: agent, company: company,
                                            layout: SandboxLayout(paths: paths, company: company, agentHandle: agent.name),
-                                           item: item, now: clock())
+                                           item: item, kind: .work, now: clock())
             }
             turn.grants = grants
         }
     }
 
-    /// What a scope that could not be built becomes: a link in one of the agent's own places is removed (never followed) and
-    /// the owner told; the turn does not start (`SandboxRefusal`).
+    /// What a scope that could not be built becomes: a link or an odd entry in one of the agent's own places is repaired (B-I4,
+    /// `repairOwnPlace`) and the owner told what was there; the turn does not start (`SandboxRefusal`).
     nonisolated func sandboxRefusal(_ error: any Error, agent: Agent, company: Company, layout: SandboxLayout, item: WorkItem?,
-                                    now: Date) async -> SandboxRefusal {
+                                    kind: TurnKind, now: Date) async -> SandboxRefusal {
         if let refusal = error as? SandboxRefusal { return refusal }
-        let linked: String?
+        let problem: (path: String, what: String)?
         switch error {
-        case SandboxError.linkedPath(let path): linked = path
-        case let refused as UnsafeEngineFile: linked = refused.path
-        default: linked = nil
+        case SandboxError.linkedPath(let path): problem = (path, "is a symbolic link")
+        case let refused as UnsafeEngineFile: problem = (refused.path, refused.problem)
+        default: problem = nil
         }
-        if let linked {
-            let repaired = await blocking.run { Self.repairOwnPlace(linked, layout: layout, item: item) }
-            noteLinkedPlace(linked, agent: agent, company: company, repaired: repaired, now: now)
+        if let problem {
+            // Only a work or plan turn's own item places count as the agent's (M10).
+            let own = kind == .work || kind == .notice || kind == .plan ? item : nil
+            let repaired = await blocking.run { Self.repairOwnPlace(problem.path, layout: layout, item: own, plan: kind == .plan) }
+            notePlaceProblem(problem.path, what: problem.what, agent: agent, company: company, repaired: repaired, now: now)
         }
         if let refusal = error as? SandboxError { return SandboxRefusal(reason: refusal.description) }
         return SandboxRefusal(reason: "the agent's places could not be prepared: \(error)")
     }
 
-    /// When `path` is one of the agent's own places (its home, cache, lab or notes, or the turn's progress file), removes the
-    /// link there (never what it names) and recreates the places. Returns whether it did. Blocking.
-    nonisolated static func repairOwnPlace(_ path: String, layout: SandboxLayout, item: WorkItem?) -> Bool {
+    /// The agent's own places (B-I4): its home and lab subtrees, its notes file, and on its own item turns the progress file
+    /// (and on a plan turn the plan directory). When `path` lies at or below one of them, what is at `path` is removed if it is
+    /// a link (never followed) or else moved into the engine-only `.brahma/trash/<h>/` (nothing is lost), and the places are
+    /// recreated. Returns whether it did. Blocking.
+    nonisolated static func repairOwnPlace(_ path: String, layout: SandboxLayout, item: WorkItem?, plan: Bool = false) -> Bool {
         let h = layout.handle
-        var own = [".brahma/home/\(h)", ".brahma/home/\(h)/cache", ".brahma/labs/\(h)", ".brahma/notes/agents/\(h).md"]
-        if let key = item?.key { own.append(".brahma/progress/\(key).md") }
-        let roots = [layout.workspace, layout.workspace.resolvedForSandbox]
-        guard let relative = own.first(where: { rel in roots.contains { SandboxPath.key($0.appending(path: rel).path) == SandboxPath.key(path) } })
-        else { return false }
+        var own = [".brahma/home/\(h)", ".brahma/labs/\(h)", ".brahma/notes/agents/\(h).md"]
+        if let key = item?.key {
+            own.append(".brahma/progress/\(key).md")
+            if plan { own.append(".brahma/plans/\(key)") }
+        }
         let ws = layout.workspace.resolvedForSandbox
-        guard SandboxPath.kind(ws.appending(path: relative).path) == .link else { return false }
-        guard case .removed? = try? EngineFiles.removeNoFollow(ws.appending(path: relative), under: ws) else { return false }
+        let roots = [layout.workspace, ws]
+        // `path` as a path under the resolved workspace, whichever spelling reported it.
+        guard let relative = roots.lazy.compactMap({ root -> String? in
+            let base = SandboxPath.key(root.path) + "/", p = SandboxPath.key(path)
+            return p.hasPrefix(base) ? String(path.dropFirst(base.count)) : nil
+        }).first else { return false }
+        guard own.contains(where: { relative == $0 || relative.hasPrefix($0 + "/") }) else { return false }
+        let target = ws.appending(path: relative)
+        let removal: EngineFiles.Removal?
+        switch SandboxPath.kind(target.path) {
+        case .missing:
+            removal = nil
+        case .link:
+            removal = try? EngineFiles.removeNoFollow(target, under: ws)
+        default:
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
+            let name = "\(stamp)-\(UUID().uuidString.prefix(8))-\(target.lastPathComponent)"
+            removal = try? EngineFiles.moveNoFollow(target, under: ws, toDirectory: ".brahma/trash/\(h)", name: name)
+        }
+        guard case .removed? = removal else { return false }
         try? layout.ensure()
         return true
     }
 
-    /// The owner hears of a link where the sandbox expects one of a turn's real places, once per path while that alert is open.
-    nonisolated func noteLinkedPlace(_ path: String, agent: Agent, company: Company, repaired: Bool, now: Date) {
-        let reason = "sandbox-link:\(company.id):\(StableHash.fnv1a64(path))"
-        let text = "A turn of @\(agent.name) in \(company.name) did not start: \(Store.flat(path, max: 400)) is a symbolic link where "
-            + "the sandbox expects a real file or directory. "
-            + (repaired ? "It was one of the agent's own places: Brahma removed the link (not what it pointed to) and recreated the "
-                          + "place, so the next turn starts normally."
-                        : "Brahma did not touch it. Check what put it there, then replace the link with the real file or directory.")
-        attempt {
-            try store.writer.write { db in
-                let open = try Ask.filter(Column("companyId") == company.id && Column("kind") == AskKind.engineAlert
-                                          && Column("status") == AskStatus.pendingOwner.rawValue
-                                          && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
-                if open == 0 {
-                    try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: reason, companyId: company.id)
-                } else {
-                    try ActivityEvent(companyId: company.id, agentId: agent.id, turnId: nil, kind: .error, text: try store.redact(text),
-                                      createdAt: now).insert(db)
-                }
-            }
+    /// The owner hears of an odd entry where the sandbox expects one of a turn's real places, once per path while that alert is
+    /// open (`alertOnce`), in the words of the actual problem.
+    nonisolated func notePlaceProblem(_ path: String, what: String, agent: Agent, company: Company, repaired: Bool, now: Date) {
+        let text = "A turn of @\(agent.name) in \(company.name) did not start: \(Store.flat(path, max: 400)) \(Store.flat(what, max: 200)) "
+            + "where the sandbox expects a real file or directory. "
+            + (repaired ? "It was in one of the agent's own places: Brahma repaired it (a link removed, not what it pointed to; "
+                          + "anything else moved to .brahma/trash/\(agent.name)), so the next turn starts normally."
+                        : "Brahma did not touch it. Check what put it there, then replace it with the real file or directory.")
+        alertOnce(reason: "sandbox-link:\(company.id):\(StableHash.fnv1a64(path))", company: company, agent: agent, now: now, text: text)
+    }
+}
+
+/// The private directory a sandboxed agent's claude keeps its temp files in (`SandboxScope.claudeTmp`): it and its root are
+/// created 0700 without following a link; a root that is not this user's own directory refuses the turn.
+enum ClaudeTmp {
+    static func ensure(_ dir: URL) throws {
+        let root = dir.deletingLastPathComponent()
+        try EngineFiles.directory(workspace: root.deletingLastPathComponent(), root.lastPathComponent, mode: 0o700)
+        try EngineFiles.directory(workspace: root, dir.lastPathComponent, mode: 0o700)
+        var st = stat()
+        guard lstat(root.path, &st) == 0, st.st_uid == getuid(), st.st_mode & 0o077 == 0 else {
+            throw UnsafeEngineFile(path: root.path, problem: "is not this user's private directory")
         }
     }
 }

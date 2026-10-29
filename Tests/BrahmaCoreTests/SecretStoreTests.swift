@@ -68,9 +68,12 @@ import Testing
             let server = ((json?["mcpServers"] as? [String: Any])?["company"] as? [String: Any])
             return server?["env"] as? [String: String] ?? [:]
         }
-        #expect(try env(["BRAHMA_SECRET_STORE": "file"]) == ["BRAHMA_TURN_TOKEN": "tok", "BRAHMA_SECRET_STORE": "file"])
-        #expect(try env(["BRAHMA_SECRET_STORE": "memory"]) == ["BRAHMA_TURN_TOKEN": "tok"])
-        #expect(try env([:]) == ["BRAHMA_TURN_TOKEN": "tok"])
+        // The server's parameters ride in the env block too (1b fix round 1, I2): the turn's prefix starts it by a fixed argv.
+        let base = ["BRAHMA_TURN_TOKEN": "tok", MCPLaunch.dbVariable: p.database.path, MCPLaunch.companyVariable: company.id,
+                    MCPLaunch.agentVariable: agent.id]
+        #expect(try env(["BRAHMA_SECRET_STORE": "file"]) == base.merging(["BRAHMA_SECRET_STORE": "file"]) { $1 })
+        #expect(try env(["BRAHMA_SECRET_STORE": "memory"]) == base)
+        #expect(try env([:]) == base)
     }
 
     // MARK: FileVault

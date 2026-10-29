@@ -24,10 +24,17 @@ struct CompanyProfile: ParsableCommand {
             let known = store.catalog.pack(c.packId)?.role(role) != nil || agents.contains { $0.role == role }
             guard known else { throw fail(SandboxEditError.unknownRole(role).description) }
         }
-        do { try store.updateSandbox(companyId: c.id, .profile(profile, role: role, company: c)) } catch { throw fail("\(error)") }
+        let before = c
+        do { try store.editSandbox(companyId: c.id) { .profile(profile, role: role, company: $0) } } catch { throw fail("\(error)") }
         let updated = try store.company(id: c.id) ?? c
         let target = role.map { "role \($0)" } ?? "every agent"
         print(safe("\(updated.name): \(target) runs \(profile.rawValue)" + (profile == .full ? " (WARNING: the whole Mac)" : "")))
+        // M7: what an unconfined turn left behind cannot be ruled out by the first sandboxed one.
+        let wasWider = role.map { before.profile(forRole: $0) } ?? before.permissionProfile
+        if profile == .sandboxed, wasWider != .sandboxed {
+            print("Note: turns that ran \(wasWider.rawValue) were not confined; a process one of them left running (detached from its "
+                  + "turn) cannot be ruled out by the sandbox. Check `ps` for strays before relying on it.")
+        }
     }
 }
 
@@ -80,7 +87,7 @@ struct Network: ParsableCommand {
 
     func run() throws {
         let action = try Self.action(words, web: web)
-        if action != .list { try requireOwnerShell() }
+        try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         let patch: SandboxPatch
@@ -90,11 +97,11 @@ struct Network: ParsableCommand {
                 print(safe(c.name))
                 for line in CompanyNetwork.listing(company: c) { print(safe(line)) }
                 return
-            case .domain(let edit): patch = try .domains(edit, web: web, company: c)
-            case .local(let on): patch = SandboxPatch(allowLocalBinding: on)
-            case .toolchain(let edit): patch = try .toolchain(edit, company: c)
+            case .domain(let edit): patch = SandboxPatch(); try store.editSandbox(companyId: c.id) { try .domains(edit, web: web, company: $0) }
+            case .local(let on): patch = SandboxPatch(allowLocalBinding: on); try store.updateSandbox(companyId: c.id, patch)
+            case .toolchain(let edit): patch = SandboxPatch(); try store.editSandbox(companyId: c.id) { try .toolchain(edit, company: $0) }
             }
-            try store.updateSandbox(companyId: c.id, patch)
+            _ = patch
         } catch {
             throw fail("\(error)")
         }

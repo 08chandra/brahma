@@ -7,9 +7,9 @@ struct MCP: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mcp", abstract: "Run the company MCP server for one agent over stdio.")
 
-    @Option(help: "Path to the SQLite database.") var db: String
-    @Option(help: "Company id.") var company: String
-    @Option(help: "Agent id.") var agent: String
+    @Option(help: "Path to the SQLite database (else BRAHMA_MCP_DB).") var db: String?
+    @Option(help: "Company id (else BRAHMA_MCP_COMPANY).") var company: String?
+    @Option(help: "Agent id (else BRAHMA_MCP_AGENT).") var agent: String?
     @Option(help: "Credential kind the turn token was issued for.") var kind: String = "work"
     @Option(help: "Item id the turn token is bound to (review turns).") var item: String?
     @Option(name: .customLong("review-item"), help: "Item key of a review turn: the server offers the review tools for that item only.")
@@ -19,6 +19,17 @@ struct MCP: ParsableCommand {
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
+        // The flags, or the server's env block (a sandboxed turn's prefix starts it as just `brahma mcp`); both must agree.
+        let launch: MCPLaunch
+        do {
+            launch = try MCPLaunch.resolve(db: db, company: company, agent: agent, reviewItem: reviewItem, audit: audit,
+                                           environment: ProcessInfo.processInfo.environment)
+        } catch {
+            FileHandle.standardError.write(Data("brahma mcp: \(error)\n".utf8))
+            throw ExitCode.failure
+        }
+        let db = launch.db, company = launch.company, agent = launch.agent
+        let reviewItem = launch.reviewItem, audit = launch.audit
         if let turnAgent = ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"], turnAgent != agent {
             FileHandle.standardError.write(Data("brahma mcp: --agent does not match this turn's agent\n".utf8))
             throw ExitCode.failure

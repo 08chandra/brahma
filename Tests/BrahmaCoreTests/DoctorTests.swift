@@ -38,7 +38,7 @@ private func good(_ extra: StreamEvent? = nil) -> [[StreamEvent]] {
 }
 
 private let helpText = Doctor.requiredFlags.map { "  \($0) <value>  something" }.joined(separator: "\n")
-private func exec(version: String = "2.1.304 (Claude Code)", help: String = helpText) -> Doctor.Exec {
+private func exec(version: String = "2.1.312 (Claude Code)", help: String = helpText) -> Doctor.Exec {
     { _, args in args == ["--version"] ? version : args == ["--help"] ? help : nil }
 }
 private let t0 = Date(timeIntervalSince1970: 1_000_000)
@@ -50,7 +50,7 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         let runner = ProbeRunner(good())
         let r = await Doctor.run(claudePath: "claude", runner: runner, exec: exec(), now: t0)
         #expect(r.ok, "\(r.items)")
-        #expect(r.cliVersion == "2.1.304")
+        #expect(r.cliVersion == "2.1.312")
         #expect(r.items.map(\.name) == ["version", "flags", "probe", "resume-keeps-role", "overage", "tools-present", "sideload-allowed"])
         #expect(r.items.allSatisfy { $0.status == .pass }, "\(r.items)")
         let reqs = runner.requests
@@ -108,11 +108,11 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         let tp = item(r, "tools-present")
         #expect(tp?.status == .fail); #expect(tp?.detail.contains("NotebookEdit") == true); #expect(tp?.detail.contains("ToolSearch") == true)
         #expect(tp?.detail.contains("Bash") == false)
-        // No tools list in the init event: nothing to compare (a warning; the canary checks the real sandboxed shape).
+        // No tools list in the init event: nothing proves the tools are there (fix round 1, M2: fail).
         let none = await Doctor.run(claudePath: "claude", runner: ProbeRunner([[initEvent, limit(), result("OK")],
                                                                                [initEvent, result("BRAHMA-PROBE-7")]]),
                                     exec: exec(), now: t0)
-        #expect(item(none, "tools-present")?.status == .warn)
+        #expect(item(none, "tools-present")?.status == .fail); #expect(!none.ok)
     }
 
     @Test func sideloadFlagsDisabledByManagedSettingsFails() async throws {
@@ -128,9 +128,34 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         let r = await run()
         #expect(!r.ok); #expect(item(r, "sideload-allowed")?.status == .fail)
         #expect(item(r, "sideload-allowed")?.detail.contains("--plugin-dir") == true)
+        #expect(item(r, "sideload-allowed")?.detail.contains("--mcp-config") == true, "the company server is ignored too")
         try Data("not json".utf8).write(to: managed)
         #expect(item(await run(), "sideload-allowed")?.status == .fail, "unreadable managed settings: cannot tell")
         #expect(Doctor.managedSettingsPath == "/Library/Application Support/ClaudeCode/managed-settings.json")
+        // M3: the drop-in folder next to it counts too.
+        try Data(#"{"other": 1}"#.utf8).write(to: managed)
+        let dropIns = dir.appending(path: "managed-settings.d")
+        try FileManager.default.createDirectory(at: dropIns, withIntermediateDirectories: true)
+        try Data(#"{"x": 1}"#.utf8).write(to: dropIns.appending(path: "10-ok.json"))
+        #expect(item(await run(), "sideload-allowed")?.status == .pass)
+        try Data(#"{"disableSideloadFlags": true}"#.utf8).write(to: dropIns.appending(path: "20-lock.json"))
+        #expect(item(await run(), "sideload-allowed")?.status == .fail)
+        try FileManager.default.removeItem(at: dropIns.appending(path: "20-lock.json"))
+        // And the MDM profile, when readable.
+        let mdm = dir.appending(path: "com.anthropic.claudecode.plist")
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["disableSideloadFlags": true], format: .xml, options: 0)
+        try plist.write(to: mdm)
+        let viaMDM = await Doctor.run(claudePath: "claude", runner: ProbeRunner(good()), exec: exec(), now: t0,
+                                      managedSettingsPath: managed.path, managedPreferencesPath: mdm.path)
+        #expect(item(viaMDM, "sideload-allowed")?.status == .fail)
+    }
+
+    /// C1: exec-form hooks (and `onFailure`) are verified live on 2.1.312; an older CLI may run a hook without its arguments,
+    /// which would let it fail open, so the minimum is 2.1.312.
+    @Test func minimumVersionHasExecFormHooks() async {
+        #expect(Doctor.minimumVersion == "2.1.312")
+        let r = await Doctor.run(claudePath: "claude", runner: ProbeRunner(good()), exec: exec(version: "2.1.308 (Claude Code)"), now: t0)
+        #expect(!r.ok); #expect(item(r, "version")?.status == .fail)
     }
 
     @Test func oldVersionFails() async {
@@ -139,7 +164,7 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
     }
 
     @Test func newerVersionWarns() async {
-        let r = await Doctor.run(claudePath: "claude", runner: ProbeRunner(good()), exec: exec(version: "2.1.306 (Claude Code)"), now: t0)
+        let r = await Doctor.run(claudePath: "claude", runner: ProbeRunner(good()), exec: exec(version: "2.1.313 (Claude Code)"), now: t0)
         #expect(r.ok); #expect(item(r, "version")?.status == .warn)
     }
 
@@ -157,7 +182,7 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
                                        exec: exec(), now: t0)
         #expect(item(noUsage, "probe")?.status == .fail)
         let missingLimit = await Doctor.run(claudePath: "claude",
-                                            runner: ProbeRunner([[initEvent, result("OK")], [initEvent, result("BRAHMA-PROBE-7")]]),
+                                            runner: ProbeRunner([[initEvent, initTools, result("OK")], [initEvent, result("BRAHMA-PROBE-7")]]),
                                             exec: exec(), now: t0)
         #expect(missingLimit.ok); #expect(item(missingLimit, "probe")?.status == .warn)
     }
@@ -198,9 +223,9 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         _ = await Doctor.ensure(store: store, claudePath: "claude", runner: ProbeRunner(good()), exec: exec(), now: t0)
         let second = ProbeRunner(good())
         let r = await Doctor.ensure(store: store, claudePath: "claude", runner: second,
-                                    exec: exec(version: "2.1.310 (Claude Code)"), now: t0.addingTimeInterval(60))
-        #expect(second.requests.count == 2); #expect(r.cliVersion == "2.1.310")
-        #expect(try store.latestProbe()?.cliVersion == "2.1.310")
+                                    exec: exec(version: "2.1.314 (Claude Code)"), now: t0.addingTimeInterval(60))
+        #expect(second.requests.count == 2); #expect(r.cliVersion == "2.1.314")
+        #expect(try store.latestProbe()?.cliVersion == "2.1.314")
     }
 }
 

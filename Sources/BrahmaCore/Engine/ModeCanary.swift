@@ -53,7 +53,7 @@ public enum ModeCanary {
             var request = TurnRequest(agent: agent, company: company, prompt: "", appendSystemPrompt: nil, mcpConfigPath: config.path,
                                       workingDirectory: dir.path, profile: .workspace, environment: ["BRAHMA_AGENT_ID": "doctor-canary"])
             request.mode = d
-            request.hookCommand = TurnProfileCompiler.hookCommand(executable: hookExecutable)
+            request.hookExecutable = hookExecutable
             var messages = [message("i\(index)", "initialize"), message("s\(index)", "get_settings")]
             if index == 0 { messages.append(message("u\(index)", "get_usage", ["skip_behaviors": .bool(true)])) }
             guard let transcript = await runner.control(request, messages: messages, timeout: timeout) else { return nil }

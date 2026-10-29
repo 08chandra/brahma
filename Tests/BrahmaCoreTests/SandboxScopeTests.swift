@@ -251,11 +251,14 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         var viaLink = w.company
         viaLink.workspacePath = link.appending(path: w.company.slug).path
         let layout = SandboxLayout(paths: w.paths, company: viaLink, agentHandle: "eng-1")
-        let s = try w.scope(.work, company: viaLink, layout: layout, temp: URL(fileURLWithPath: "/tmp", isDirectory: false))
+        // The Darwin temp dir behind a link too (not `/tmp` itself: it holds Claude's shared temp dirs, unreadable to turns).
+        let tempLink = w.root.appending(path: "tlink")
+        try FileManager.default.createSymbolicLink(at: tempLink, withDestinationURL: w.userTemp)
+        let s = try w.scope(.work, company: viaLink, layout: layout, temp: tempLink)
         #expect(s.cwd.path == w.p(".brahma/wt/\(w.key)"))
         let all = [s.cwd] + s.writable + s.readable + s.readOnlyDirs + s.denyRead + s.denyWrite + s.protected
         #expect(!all.contains { $0.path.hasPrefix(link.path) })
-        #expect(s.toolchainTempWrite?.path == "/private/tmp")
+        #expect(s.toolchainTempWrite?.path == w.userTemp.resolvedForSandbox.path)
         #expect(URL(fileURLWithPath: "/tmp/x/y", isDirectory: false).resolvedForSandbox.path == "/private/tmp/x/y")
     }
 
@@ -522,6 +525,25 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         #expect(row["roleProfiles"] as String? == "{}")
         #expect(row["allowedDomains"] as String? == "[]")
         #expect(row["allowLocalBinding"] as Bool? == true)
+    }
+
+    /// M8: an owner's list edit is applied to the stored company inside the write, so two edits made from stale copies both
+    /// land (no lost update).
+    @Test func sandboxListEditsApplyToTheStoredCompany() throws {
+        let w = try SandboxWorld()
+        let stale = w.company
+        try w.store.editSandbox(companyId: stale.id, userHome: w.userHome) { try .domains(.add("one.example.com"), web: false, company: $0) }
+        try w.store.editSandbox(companyId: stale.id, userHome: w.userHome) { try .domains(.add("two.example.com"), web: false, company: $0) }
+        try w.store.editSandbox(companyId: stale.id, userHome: w.userHome) { try .toolchain(.add("/opt/tool-a"), company: $0) }
+        try w.store.editSandbox(companyId: stale.id, userHome: w.userHome) { try .toolchain(.add("/opt/tool-b"), company: $0) }
+        let c = try #require(try w.store.company(id: stale.id))
+        #expect(c.allowedDomains == ["one.example.com", "two.example.com"])
+        #expect(c.toolchainReadPaths == ["/opt/tool-a", "/opt/tool-b"])
+        // A refused edit changes nothing.
+        #expect(throws: (any Error).self) {
+            try w.store.editSandbox(companyId: stale.id, userHome: w.userHome) { try .domains(.add("api.anthropic.com"), web: false, company: $0) }
+        }
+        #expect(try w.store.company(id: stale.id)?.allowedDomains == ["one.example.com", "two.example.com"])
     }
 
     @Test func updateSandboxPersistsAndValidates() throws {

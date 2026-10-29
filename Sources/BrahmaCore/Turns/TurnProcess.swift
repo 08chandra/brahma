@@ -158,65 +158,34 @@ enum ProcessTable {
     }
 }
 
-/// How the engine recognizes a process of a sandboxed agent's turn by its sandbox, which no process can drop (setsid, a
-/// cleared environment and a double fork all keep it): its sandbox lets it write the agent's own home (every kind of turn
-/// writes there) but not the company workspace directory itself (no agent turn may; an owner's own sandboxed tool
-/// started in the workspace may). Unsandboxed processes are never matched.
+/// How the engine recognizes a sandboxed run's processes by their sandbox, which no process can drop (setsid, a cleared
+/// environment, a double fork and deleting its own files all keep it): the run's profile allows a unique mach global name
+/// (`machMarker`: `dev.brahma.run.<id>` for a check, `dev.brahma.turn.<id>` for a turn, through Claude Code's
+/// `sandbox.network.allowMachLookup`) that no service answers, and denies a sibling name. Unsandboxed processes are never
+/// matched; a sandboxed one whose policy cannot be read is `.unknown` (callers fail closed).
 struct SandboxProbe: Equatable, Sendable {
-    /// `<ws>/.brahma/home/<h>` (the kernel answers only for paths that exist; the layout creates this one).
-    var allowed: String
-    /// `<ws>`, the resolved workspace itself.
-    var denied: String
+    let machMarker: String
 
-    init(workspace: URL, handle: String) {
-        allowed = workspace.appending(path: ".brahma/home/\(handle)").path
-        denied = workspace.path
-    }
-
-    /// A per-run unique mach global name (`dev.brahma.run.<id>`) the run's profile allows and no real service answers. When
-    /// set, a process is recognized by whether its sandbox allows that lookup — which survives the process deleting its own
-    /// checkout (B-I4), unlike a path probe.
-    var machMarker: String?
-
-    /// For a sandboxed check (B-I4): recognize the run's processes by their unique mach marker, independent of any file.
-    init(machMarker: String) {
-        allowed = ""; denied = ""
-        self.machMarker = machMarker
-    }
+    init(machMarker: String) { self.machMarker = machMarker }
 
     enum Match { case mine, notMine, unknown }
 
-    /// Whether `pid` is one of this run's processes. With a `machMarker`: `.mine` when the sandbox allows this run's unique
-    /// name and refuses a sibling under the denied prefix; `.notMine` when it does not; `.unknown` when the kernel cannot
-    /// tell — including a nil sandbox status for a live process (fail closed, N1). Without a marker (1b turns), the
-    /// write-shape probe, which has no `.unknown`.
+    /// `.mine` when the sandbox allows this run's own name AND refuses a sibling under the denied prefix (another run denies
+    /// our name; a foreign sandbox that allows every lookup also allows the sibling); `.unknown` when the kernel cannot tell.
     func classify(_ pid: pid_t) -> Match {
-        if let machMarker {
-            switch SandboxCheck.isSandboxed(pid) {
-            case .some(false): return .notMine
-            case nil: return .unknown
-            case .some(true): break
-            }
-            // Ours: this run's own name allowed AND a sibling name under the denied prefix refused. Another Brahma run denies
-            // our name; a foreign sandbox that allows every lookup also allows the sibling. Either reads as not ours.
-            switch (SandboxCheck.machAllowed(pid, machMarker), SandboxCheck.machAllowed(pid, machMarker + ".not")) {
-            case (.some(true), .some(false)): return .mine
-            case (.some(false), _), (_, .some(true)): return .notMine
-            default: return .unknown
-            }
+        switch SandboxCheck.isSandboxed(pid) {
+        case .some(false): return .notMine
+        case nil: return .unknown
+        case .some(true): break
         }
-        guard SandboxCheck.isSandboxed(pid) == true else { return .notMine }
-        return SandboxCheck.writeDenied(pid, allowed) == false && SandboxCheck.writeDenied(pid, denied) == true ? .mine : .notMine
+        switch (SandboxCheck.machAllowed(pid, machMarker), SandboxCheck.machAllowed(pid, machMarker + ".not")) {
+        case (.some(true), .some(false)): return .mine
+        case (.some(false), _), (_, .some(true)): return .notMine
+        default: return .unknown
+        }
     }
 
-    /// Whether `pid` runs under a sandbox shaped like one of this agent's turns (1b; `.mine` only).
     func matches(_ pid: pid_t) -> Bool { classify(pid) == .mine }
-
-    /// The owner's processes in the table this probe matches (never this process).
-    func scan(_ table: [ProcessEntry]) -> [ProcessEntry] {
-        let uid = getuid(), me = getpid()
-        return table.filter { $0.uid == uid && $0.pid != me && !$0.isZombie && matches($0.pid) }
-    }
 }
 
 /// What a straggler sweep came to.
@@ -318,6 +287,7 @@ final class TurnContainment: @unchecked Sendable {
     private let uid = getuid()
     private let me = getpid()
     private let since: Double
+    var sinceStamp: Double { since }
     private let lock = NSLock()
     /// pid → start time of every descendant seen (a pid whose start time changed is someone else's now).
     private var tracked: [pid_t: Double] = [:]
@@ -379,7 +349,7 @@ final class TurnContainment: @unchecked Sendable {
         return table.filter { p in
             guard p.pid != leader, p.pid != me, p.uid == uid, !p.isZombie else { return false }
             if known[p.pid] == p.start || p.pgid == leader || ProcessTable.session(p) == leader { return true }
-            if let probe, probe.matches(p.pid) { return true }
+            if let probe, probe.classify(p.pid) == .mine { return true }
             // The environment is the last resort: macOS no longer shows other processes' environments (Linux does).
             return p.start >= since && (ProcessTable.environment(p.pid)?.contains(marker) ?? false)
         }
@@ -403,51 +373,191 @@ final class TurnContainment: @unchecked Sendable {
     }
 }
 
-/// The turns each agent has in flight, and what a finished turn could not kill. A new turn of the agent waits here first.
+/// What waiting for an agent's earlier turns came to: what it killed, and what would not die (or could not be accounted for).
+public struct TurnLeftovers: Equatable, Sendable {
+    public var killed: [Int32]
+    public var survivors: [Int32]
+
+    public init(killed: [Int32] = [], survivors: [Int32] = []) { self.killed = killed; self.survivors = survivors }
+}
+
+/// One turn's leader as the engine recorded it at spawn (`<runDir>/turns/<agentId>.turn`, 0600): what a restarted engine
+/// needs to kill whatever is left of the turn (B-I1). `machMarker` is the sandboxed turn's marker.
+struct TurnRecord: Codable, Equatable, Sendable {
+    var leader: pid_t
+    var leaderStart: Double
+    var since: Double
+    var machMarker: String?
+}
+
+/// The records of every agent's turns that may still have processes: written at spawn, removed once the turn left nothing.
+enum TurnRecords {
+    static func file(agentId: String, in dir: URL) throws -> URL {
+        guard agentId.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else {
+            throw SandboxError.invalidPath(agentId)
+        }
+        return dir.appending(path: "\(agentId).turn")
+    }
+
+    static func load(agentId: String, in dir: URL) throws -> [TurnRecord] {
+        let url = try file(agentId: agentId, in: dir)
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { return [] }
+        guard st.st_mode & S_IFMT == S_IFREG, let data = FileManager.default.contents(atPath: url.path) else {
+            throw SandboxError.linkedPath(url.path)
+        }
+        return try JSONDecoder().decode([TurnRecord].self, from: data)
+    }
+
+    static func save(_ records: [TurnRecord], agentId: String, in dir: URL) throws {
+        let url = try file(agentId: agentId, in: dir)
+        if records.isEmpty { unlink(url.path); return }
+        try SettingsFile.writePrivate(try JSONEncoder().encode(records), to: url)
+    }
+
+    static func add(_ record: TurnRecord, agentId: String, in dir: URL) throws {
+        try save(try load(agentId: agentId, in: dir) + [record], agentId: agentId, in: dir)
+    }
+
+    static func replace(_ old: TurnRecord, with new: TurnRecord?, agentId: String, in dir: URL) throws {
+        var all = try load(agentId: agentId, in: dir).filter { $0 != old }
+        if let new { all.append(new) }
+        try save(all, agentId: agentId, in: dir)
+    }
+
+    /// The agents with records in `dir`.
+    static func agentIds(in dir: URL) -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).compactMap { name in
+            name.hasSuffix(".turn") ? String(name.dropLast(5)) : nil
+        }
+    }
+
+    /// Kills whatever is left of the agent's recorded turns: the leader itself (when its start time still matches), every owner
+    /// process in its session or group started no earlier than it (a pid in use cannot become a group or session id), and, for a
+    /// sandboxed turn, every process whose sandbox carries its marker (`SandboxSweep`, fail closed). A record is forgotten only
+    /// once nothing of it is left. Blocking.
+    static func reap(agentId: String, in dir: URL) throws -> TurnLeftovers {
+        var out = TurnLeftovers()
+        var kept: [TurnRecord] = []
+        let me = getpid(), uid = getuid()
+        for record in try load(agentId: agentId, in: dir) {
+            var killed = Set<pid_t>()
+            func members() -> [ProcessEntry] {
+                ProcessTable.snapshot().filter { p in
+                    guard p.uid == uid, p.pid != me, !p.isZombie else { return false }
+                    if p.pid == record.leader { return p.start == record.leaderStart }
+                    guard record.leader > 0, p.start >= record.leaderStart else { return false }
+                    return p.pgid == record.leader || ProcessTable.session(p) == record.leader
+                }
+            }
+            for _ in 0..<50 {
+                let left = members()
+                if left.isEmpty { break }
+                for p in left where ProcessTable.entry(p.pid)?.start == p.start { kill(p.pid, SIGKILL); killed.insert(p.pid) }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            var survivors = members().map(\.pid)
+            if let marker = record.machMarker {
+                let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: record.since)
+                killed.formUnion(swept.killed)
+                survivors += swept.survivors
+            }
+            out.killed += killed.sorted()
+            out.survivors += survivors
+            if !survivors.isEmpty { kept.append(record) }
+        }
+        try save(kept, agentId: agentId, in: dir)
+        return out
+    }
+}
+
+/// The turns each agent has in flight, and what a finished turn could not kill. A new turn of the agent claims its slot here
+/// first: "nothing of this agent running, then begin" in one step (M3).
 final class TurnRegistry: @unchecked Sendable {
     private let lock = NSLock()
-    private var running: [String: Int] = [:]
+    private var running: Set<String> = []
     private var survivors: [String: [ProcessEntry]] = [:]
-    /// The sandbox shape of each agent's latest sandboxed turn.
-    private var probes: [String: SandboxProbe] = [:]
 
-    func begin(_ agentId: String, probe: SandboxProbe? = nil) {
-        lock.withLock {
-            running[agentId, default: 0] += 1
-            if let probe { probes[agentId] = probe }
+    /// Waits (on an awake-time deadline, and never past a cancellation) until no turn of the agent is in flight, then marks
+    /// one in flight. Throws `TurnError.earlierTurnStillRunning` on the deadline, `CancellationError` when cancelled.
+    func claim(_ agentId: String, deadline: Duration) async throws {
+        let end = AwakeTime.deadline(after: deadline)
+        while true {
+            if lock.withLock({ running.insert(agentId).inserted }) { return }
+            try await pause(until: end)
         }
     }
 
     func end(_ agentId: String, survivors left: [ProcessEntry]) {
         lock.withLock {
-            let n = (running[agentId] ?? 1) - 1
-            running[agentId] = n > 0 ? n : nil
+            running.remove(agentId)
             if left.isEmpty { survivors[agentId] = nil } else { survivors[agentId, default: []] += left }
         }
     }
 
-    /// Waits until no turn of the agent is in flight (their sweeps done), then tries the leftovers of earlier turns once more;
-    /// returns the pids still alive (empty: nothing of an earlier turn runs).
-    func waitUntilGone(_ agentId: String) async -> [pid_t] {
-        while lock.withLock({ running[agentId] != nil }) { try? await Task.sleep(for: .milliseconds(20)) }
-        // Anything still running in a sandbox shaped like this agent's turns is left over from one of them.
-        var left = lock.withLock { survivors[agentId] ?? [] }
-        if let probe = lock.withLock({ probes[agentId] }) {
-            for p in probe.scan(ProcessTable.snapshot()) where !left.contains(where: { $0.pid == p.pid && $0.start == p.start }) {
-                left.append(p)
-            }
-        }
-        guard !left.isEmpty else { return [] }
+    private func pause(until end: SuspendingClock.Instant) async throws {
+        try Task.checkCancellation()
+        guard AwakeTime.now < end else { throw TurnError.earlierTurnStillRunning(pids: []) }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+
+    /// Waits until no turn of the agent is in flight (their sweeps done; fail closed on the deadline or a cancellation), then
+    /// kills what is left of its earlier turns: what an in-flight sweep could not kill, and (`records`) whatever a recorded
+    /// turn of this or an earlier engine left. Returns what it killed and what is still alive.
+    func waitUntilGone(_ agentId: String, records: URL?, deadline: Duration) async throws -> TurnLeftovers {
+        let end = AwakeTime.deadline(after: deadline)
+        while lock.withLock({ running.contains(agentId) }) { try await pause(until: end) }
+        var out = TurnLeftovers()
+        let left = lock.withLock { survivors[agentId] ?? [] }
         var alive: [ProcessEntry] = []
         for p in left {
             guard let now = ProcessTable.entry(p.pid), now.start == p.start, !now.isZombie else { continue }
             kill(p.pid, SIGKILL)
+            out.killed.append(p.pid)
             alive.append(p)
         }
         if !alive.isEmpty { try? await Task.sleep(for: .milliseconds(100)) }
         let still = alive.filter { p in ProcessTable.entry(p.pid).map { $0.start == p.start && !$0.isZombie } ?? false }
         lock.withLock { survivors[agentId] = still.isEmpty ? nil : still }
-        return still.map(\.pid)
+        out.survivors += still.map(\.pid)
+        if let records {
+            let reaped = try await Task.detached { try TurnRecords.reap(agentId: agentId, in: records) }.value
+            out.killed += reaped.killed
+            out.survivors += reaped.survivors
+        }
+        return out
+    }
+}
+
+/// Once per engine: can the engine see what a sandbox allows? It runs a Seatbelt-sandboxed `/bin/sleep` with a known marker
+/// and asks the kernel about it. If it cannot tell, the containment of sandboxed turns is blind, and they do not start (B-I2).
+public enum ContainmentSelfTest {
+    public static let passed: Bool = run()
+
+    public static func run() -> Bool {
+        #if os(macOS)
+        let marker = "dev.brahma.turn.selftest-\(UUID().uuidString.lowercased())"
+        let profile = "(version 1)(allow default)(deny mach-lookup (global-name-prefix \"dev.brahma.turn.\"))"
+            + "(allow mach-lookup (global-name \"\(marker)\"))"
+        guard let child = try? ProcessGroupChild.spawn(executable: "/usr/bin/sandbox-exec",
+                                                      arguments: ["sandbox-exec", "-p", profile, "/bin/sleep", "5"],
+                                                      environment: ["PATH": "/usr/bin:/bin"], workingDirectory: URL(fileURLWithPath: "/"),
+                                                      output: -1, newSession: true) else { return false }
+        defer { child.signalGroup(SIGKILL); child.finish() }
+        let probe = SandboxProbe(machMarker: marker), other = SandboxProbe(machMarker: marker + "x")
+        let deadline = AwakeTime.uptime() + 3
+        while AwakeTime.uptime() < deadline {
+            // sandbox-exec applies the profile, then execs sleep: wait until the kernel reports it sandboxed.
+            if SandboxCheck.isSandboxed(child.pid) == true {
+                return probe.classify(child.pid) == .mine && other.classify(child.pid) == .notMine
+                    && probe.classify(getpid()) == .notMine
+            }
+            usleep(20_000)
+        }
+        return false
+        #else
+        return false
+        #endif
     }
 }
 
@@ -466,11 +576,11 @@ final class TurnChild: @unchecked Sendable {
     /// Spawns `executable` (`arguments[0]` included) in `workingDirectory` with exactly `environment` plus the turn's marker,
     /// stdin/stdout/stderr on the given descriptors, as a new session's leader, and starts watching its descendants.
     static func spawn(executable: String, arguments: [String], environment: [String: String], workingDirectory: String,
-                      stdin: Int32, stdout: Int32, stderr: Int32, probe: SandboxProbe? = nil) throws -> TurnChild {
+                      stdin: Int32, stdout: Int32, stderr: Int32, probe: SandboxProbe? = nil,
+                      since: Double = ProcessTable.startStamp(slack: 1)) throws -> TurnChild {
         let markerValue = UUID().uuidString.lowercased()
         var env = environment
         env[TurnContainment.markerVariable] = markerValue
-        let since = ProcessTable.startStamp(slack: 1)
         let group = try ProcessGroupChild.spawn(executable: executable, arguments: arguments, environment: env,
                                                 workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
                                                 output: stdout, stdin: stdin, stderr: stderr, newSession: true)
@@ -495,10 +605,14 @@ final class TurnChild: @unchecked Sendable {
     /// Blocks until the leader exits (it stays unreaped): its exit code, or the number of the signal that ended it.
     func waitForExit() -> Int32 { group.waitForExit() }
 
-    /// Kills every process of the turn, then reaps the leader. Blocking. Returns what could not be killed.
+    /// Kills every process of the turn (its group and session, its watched descendants, and on a sandboxed turn every process
+    /// carrying its marker, fail closed), then reaps the leader. Blocking. Returns what could not be killed or accounted for.
     func finish() -> [ProcessEntry] {
         _ = group.waitForExit()
-        let left = containment.sweep()
+        var left = Set(containment.sweep())
+        if let probe = containment.probe {
+            left.formUnion(SandboxSweep.run(probe: probe, since: containment.sinceStamp).survivors)
+        }
         group.finish()
         let table = ProcessTable.snapshot()
         return table.filter { left.contains($0.pid) }

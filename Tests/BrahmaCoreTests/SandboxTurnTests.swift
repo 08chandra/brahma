@@ -10,8 +10,9 @@ private struct SandboxTurnWorld {
     let company: Company
     let eng: Agent
 
-    init(engineProfile: PermissionProfile? = nil, profile: PermissionProfile = .sandboxed) throws {
-        world = try World(profile: engineProfile)
+    init(engineProfile: PermissionProfile? = nil, profile: PermissionProfile = .sandboxed,
+         canSeeSandboxes: @escaping @Sendable () -> Bool = { true }) throws {
+        world = try World(profile: engineProfile, canSeeSandboxes: canSeeSandboxes)
         company = try world.company("Acme", profile: profile)
         eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
     }
@@ -24,6 +25,19 @@ private struct SandboxTurnWorld {
     func tools() -> CompanyTools { CompanyTools(store: store, companyId: company.id, agentId: eng.id) }
     func events() throws -> [ActivityEvent] { try store.events(afterId: 0, companyId: company.id) }
     func ownerAlerts() throws -> [Ask] { try store.asks(companyId: company.id).filter { $0.kind == .engineAlert } }
+    var home: URL { ws.appending(path: ".brahma/home/\(eng.name)") }
+    var trash: URL { ws.appending(path: ".brahma/trash/\(eng.name)") }
+
+    /// A turn that fails at its scope, then (after the backoff) one that runs.
+    func failThenRun() async throws -> (failed: Turn, next: Turn) {
+        try world.dm(company, eng, "again")
+        try await world.cycle()
+        let failed = try #require(try world.turns(eng).last)
+        world.clock.advance(3600)
+        try world.dm(company, eng, "and again")
+        try await world.cycle()
+        return (failed, try #require(try world.turns(eng).last))
+    }
 
     func item(_ title: String = "Do it") throws -> WorkItem {
         try store.createWorkItem(companyId: company.id, by: .owner, draft: WorkItemDraft(
@@ -49,7 +63,7 @@ private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: 
         #expect(path == w.world.paths.runDir.appending(path: "\(w.eng.id).settings.json").path)
         #expect((try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int) == 0o600)
         let profile = TurnProfileCompiler.profile(for: r)
-        #expect(try String(contentsOfFile: path, encoding: .utf8) == TurnProfileCompiler.settingsJSON(profile))
+        #expect(try String(contentsOfFile: path, encoding: .utf8) == (try TurnProfileCompiler.settingsJSON(profile)))
         let decoded = try JSONDecoder().decode(ClaudeSettings.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
         #expect(decoded.sandbox?.enabled == true); #expect(decoded.sandbox?.allowUnsandboxedCommands == false)
         let a = TurnProfileCompiler.arguments(profile)
@@ -144,7 +158,7 @@ private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: 
         #expect(w.requests().count == 1, "no process was started")
         let alert = try #require(try w.ownerAlerts().last)
         #expect(alert.summary.contains(".brahma/labs/eng-1 is a symbolic link"), "\(alert.summary)")
-        #expect(alert.summary.contains("removed the link"))
+        #expect(alert.summary.contains("repaired"))
         // Repaired: the link is gone (its target untouched) and the lab is a real directory again.
         #expect(SandboxPath.kind(w.lab.path) == .directory)
         #expect(FileManager.default.fileExists(atPath: elsewhere.path))
@@ -183,9 +197,98 @@ private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: 
         #expect(try w.events().contains { $0.text.contains("left out of the sandbox") && $0.text.contains("it's") })
     }
 
+    /// B-I4: wrong-kind or linked entries anywhere in the agent's own places are repaired: a link is removed (never followed),
+    /// anything else is moved to the engine-only `.brahma/trash/<h>/` (no data lost), then the places are recreated. The
+    /// owner hears what was there; the next turn runs.
+    @Test func selfBrickedPlacesAreRepaired() async throws {
+        for (what, plant) in [
+            ("lab .git link", { (w: SandboxTurnWorld) throws in
+                let git = w.lab.appending(path: ".git")
+                try FileManager.default.removeItem(at: git)
+                try FileManager.default.createSymbolicLink(atPath: git.path, withDestinationPath: try tempDir().path)
+            }),
+            ("file at the cache", { (w: SandboxTurnWorld) throws in
+                let cache = w.home.appending(path: "cache")
+                try FileManager.default.removeItem(at: cache)
+                try Data("x".utf8).write(to: cache)
+            }),
+            ("directory at the notes file", { (w: SandboxTurnWorld) throws in
+                let notes = w.ws.appending(path: ".brahma/notes/agents/\(w.eng.name).md")
+                try FileManager.default.removeItem(at: notes)
+                try FileManager.default.createDirectory(at: notes.appending(path: "inside"), withIntermediateDirectories: true)
+            }),
+        ] as [(String, (SandboxTurnWorld) throws -> Void)] {
+            let w = try SandboxTurnWorld()
+            try w.world.dm(w.company, w.eng)
+            try await w.world.cycle()
+            #expect(try w.world.turns(w.eng).last?.outcome == .succeeded, "\(what)")
+            try plant(w)
+            let (failed, next) = try await w.failThenRun()
+            #expect(failed.outcome == .failed, "\(what)"); #expect(failed.summary?.contains("sandbox scope:") == true, "\(what)")
+            #expect(next.outcome == .succeeded, "\(what): the next turn runs")
+            let alert = try #require(try w.ownerAlerts().last, "\(what)")
+            #expect(alert.summary.contains("repaired"), "\(what): \(alert.summary)")
+            if what != "lab .git link" {
+                #expect(!SandboxPath.entries(w.trash.path).isEmpty, "\(what): moved to the trash, not deleted")
+            }
+        }
+    }
+
+    /// B-I2: when the engine cannot see what a sandbox allows (its self-test failed), sandboxed turns do not start.
+    @Test func blindContainmentRefusesSandboxedTurns() async throws {
+        let w = try SandboxTurnWorld(canSeeSandboxes: { false })
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        let failed = try #require(try w.world.turns(w.eng).last)
+        #expect(failed.outcome == .failed)
+        #expect(failed.summary?.contains("cannot see sandboxed processes") == true, "\(failed.summary ?? "")")
+        #expect(w.requests().isEmpty)
+    }
+
+    /// The marker, the record directory and the sentinel (M4: re-asserted before each sandboxed turn).
+    @Test func sandboxedTurnCarriesMarkerRecordsAndSentinel() async throws {
+        let w = try SandboxTurnWorld()
+        try? FileManager.default.removeItem(at: w.world.paths.sentinel)
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        let r = try #require(w.requests().last)
+        #expect(r.containmentMarker?.hasPrefix("dev.brahma.turn.") == true)
+        #expect(r.turnRecordDirectory?.path == w.world.paths.runDir.appending(path: "turns").path)
+        #expect(try String(contentsOf: w.world.paths.sentinel, encoding: .utf8) == "sentinel")
+        let settings = try JSONDecoder().decode(ClaudeSettings.self, from: Data(contentsOf: URL(fileURLWithPath: try #require(r.settingsFilePath))))
+        #expect(settings.sandbox?.network?.allowMachLookup == [r.containmentMarker!])
+    }
+
+    /// M1: every turn, whatever its profile, waits for the agent's earlier turn first; leftovers it killed are logged (M4).
+    @Test func everyProfileWaitsAndLeftoversAreReported() async throws {
+        let w = try SandboxTurnWorld(profile: .workspace)
+        w.world.fake.leftovers = TurnLeftovers(killed: [4343], survivors: [])
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        #expect(try w.world.turns(w.eng).last?.outcome == .succeeded)
+        #expect(try w.events().contains { $0.text.contains("4343") && $0.text.contains("left over") })
+        w.world.fake.leftovers = TurnLeftovers(killed: [], survivors: [4242])
+        w.world.clock.advance(3600)
+        try w.world.dm(w.company, w.eng, "again")
+        try await w.world.cycle()
+        let failed = try #require(try w.world.turns(w.eng).last)
+        #expect(failed.outcome == .failed); #expect(failed.summary?.contains("still running") == true)
+        #expect(try w.ownerAlerts().contains { $0.summary.contains("4242") })
+    }
+
+    /// M6: a workspace turn's denies name the data home and the other workspaces in both forms, and fail the turn (not drop the
+    /// denies) when the company list cannot be read.
+    @Test func workspaceDeniesInBothForms() async throws {
+        let w = try SandboxTurnWorld(profile: .workspace)
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        let denied = Set(try #require(w.requests().last).deniedPaths.map(\.path))
+        #expect(denied.contains(w.world.paths.home.path)); #expect(denied.contains(w.world.paths.home.resolvedForSandbox.path))
+    }
+
     @Test func earlierTurnProcessesStillRunningRefuseTheTurn() async throws {
         let w = try SandboxTurnWorld()
-        w.world.fake.survivors = [4242]
+        w.world.fake.leftovers = TurnLeftovers(killed: [], survivors: [4242])
         try w.world.dm(w.company, w.eng)
         try await w.world.cycle()
         let failed = try #require(try w.world.turns(w.eng).last)

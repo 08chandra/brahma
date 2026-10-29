@@ -272,6 +272,50 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(Grants.isPinned(secret.resolvedForSandbox.path))
     }
 
+    /// Carry-over (Task 9 re-review 2): an alias spelling is refused with its own reason, not as an overlap.
+    @Test func aliasSpellingHasItsOwnReason() throws {
+        let probe = URL(fileURLWithPath: "/System/Volumes/Data/Applications/Xcode.app/Contents/Developer")
+        do {
+            try SandboxScope.checkAllowed(probe, protected: [], deniedRoots: [])
+            Issue.record("an alias spelling was allowed")
+        } catch let e as SandboxError {
+            guard case .aliasSpelling(let path, let alias) = e else { Issue.record("\(e)"); return }
+            #expect(path == probe.path); #expect(alias == "/System/Volumes")
+            #expect(e.description.contains("alias spelling"))
+        }
+    }
+
+    /// Carry-over: identity roots keep a root that does not exist yet (by the lineage of its existing part), and build the
+    /// lineage from the resolved root.
+    @Test func identityRootsKeepMissingRootsAndResolveLinks() throws {
+        let base = try tempDir().resolvedForSandbox
+        let parent = base.appending(path: "parent")
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let missing = parent.appending(path: "not-yet/inside")
+        #expect(SandboxPath.IdentityRoots([missing]).overlapping(parent.path) == missing.path, "the parent contains it")
+        #expect(SandboxPath.IdentityRoots([missing]).containedIn(base.path) == missing.path, "an ancestor contains it")
+        let unrelated = base.appending(path: "unrelated")
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: true)
+        #expect(SandboxPath.IdentityRoots([missing]).overlapping(unrelated.path) == nil)
+        let link = base.appending(path: "via")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: parent.path)
+        #expect(SandboxPath.IdentityRoots([link.appending(path: "not-yet")]).overlapping(parent.path) != nil)
+    }
+
+    /// Carry-over: the check policy validation goes through the same alias/identity helper as turn scopes.
+    @Test func sandboxPolicyCheckRefusesAliasSpellings() throws {
+        let home = try tempDir().resolvedForSandbox
+        let secret = home.appending(path: ".ssh")
+        try FileManager.default.createDirectory(at: secret, withIntermediateDirectories: true)
+        let writable = try tempDir().resolvedForSandbox
+        let baseline = SandboxBaseline(userHome: home, protected: [secret], darwinUserTemp: nil, darwinUserCache: nil)
+        let firm = "/System/Volumes/Data" + secret.path
+        let policy = SandboxPolicy(writable: [writable], readable: [URL(fileURLWithPath: firm)], network: .none, toolchain: false)
+        #expect(throws: SandboxError.self) { try SandboxPolicyCheck.validate(policy, baseline: baseline) }
+        let fine = SandboxPolicy(writable: [writable], readable: [], network: .none, toolchain: false)
+        try SandboxPolicyCheck.validate(fine, baseline: baseline)
+    }
+
     @Test func aliasSpellingsRefused() throws {
         let g = try GrantWorld()
         let home = try tempDir().resolvedForSandbox
@@ -564,7 +608,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(TurnProfileCompiler.profile(for: r).addDirs.contains(resolved))
         // The settings write-deny it, for the sandbox and for Edit/Write.
         let profile = TurnProfileCompiler.profile(for: r)
-        let settings = try JSONDecoder().decode(ClaudeSettings.self, from: Data(TurnProfileCompiler.settingsJSON(profile).utf8))
+        let settings = try JSONDecoder().decode(ClaudeSettings.self, from: Data(try TurnProfileCompiler.settingsJSON(profile).utf8))
         #expect(settings.sandbox?.filesystem?.denyWrite?.contains(resolved) == true)
         #expect(settings.sandbox?.filesystem?.allowWrite?.contains(resolved) != true)
         let deny = try #require(settings.permissions?.deny)

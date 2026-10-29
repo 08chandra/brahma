@@ -150,6 +150,19 @@ public actor Orchestrator {
             if let sentinel = await blocking.run({ () -> String? in
                 do { try Sentinel.write(paths: paths); return nil } catch { return "\(error)" }
             }) { log("could not write the sandbox sentinel: \(sentinel)") }
+            // What an earlier engine's turns left behind (it crashed or was killed mid-turn): every recorded leader's session
+            // and group, and every sandboxed process carrying a recorded turn's marker (B-I1).
+            let records = self.turnRecordDirectory
+            let leftovers = await blocking.run { () -> [String: TurnLeftovers] in
+                var out: [String: TurnLeftovers] = [:]
+                for agentId in TurnRecords.agentIds(in: records) {
+                    out[agentId] = (try? TurnRecords.reap(agentId: agentId, in: records)) ?? TurnLeftovers(survivors: [-1])
+                }
+                return out
+            }
+            for (agentId, left) in leftovers where !left.killed.isEmpty || !left.survivors.isEmpty {
+                log("an earlier engine's turn of agent \(agentId) left processes: killed \(left.killed), still running \(left.survivors)")
+            }
             let now = clock()
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
@@ -572,6 +585,9 @@ public actor Orchestrator {
         var notLaunched: ModeNotLaunched?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
+            // Nothing of the agent's earlier turns may still run, whatever the profile (M1): this turn waits for their sweep
+            // and kills what they (or an earlier engine's) left before any of its own work.
+            try await settleEarlierTurns(agent: agent, company: company, turnId: turn.id)
             let template = store.catalog.template(role: agent.role, pack: company.packId)
             // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
             let store = self.store
@@ -818,7 +834,8 @@ public actor Orchestrator {
             request.mounts = mounts.map(\.url)
             request.planDirectory = planDirectory
             request.mode = mode
-            request.hookCommand = TurnProfileCompiler.hookCommand(executable: mcpExecutable)
+            request.hookExecutable = mcpExecutable
+            request.turnRecordDirectory = turnRecordDirectory
             request.expectations = turnExpectations(agent, company)
                 ?? TurnProfileCompiler.expectations(for: mode, agents: store.recordedBuiltinAgents())
             // The settings travel in a file only the engine can read or write (`<runDir>/<agentId>.settings.json`, 0600).
@@ -827,10 +844,12 @@ public actor Orchestrator {
             if let sandboxed {
                 request.sandbox = sandboxed.scope
                 request.shellPrefix = sandboxed.shellPrefix.path
+                request.containmentMarker = sandboxed.marker
             } else if profile == .workspace {
-                request.deniedPaths = workspaceDeniedPaths(company: company)
+                request.deniedPaths = try workspaceDeniedPaths(company: company)
             }
-            try SettingsFile.write(TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: request)), to: settingsFile)
+            let settingsText = try TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: request))
+            try await blocking.tryRun { try SettingsFile.write(settingsText, to: settingsFile) }
             // A review session is never recorded as the agent's own.
             var sessionMarked = wasResume || review != nil || audit != nil
             sentRequest = request
@@ -857,6 +876,9 @@ public actor Orchestrator {
                         guard info.status != "unknown" else { continue }
                         lastInfo = info
                         try store.saveRateLimit(info)
+                    case .sandboxNote(let text):
+                        try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
+                                                            kind: .error, text: text, createdAt: clock()))
                     case .toolUse(let name, _):
                         // Company tools log their own event from the MCP server.
                         guard !name.hasPrefix("mcp__company__") else { continue }

@@ -66,6 +66,9 @@ final class StubRunner: TurnRunning, @unchecked Sendable {
 
     var requestCount: Int { lock.withLock { _requestCount } }
 
+    /// Nothing of an earlier turn is ever left over here (the protocol's default fails closed).
+    func waitForTurnProcesses(agentId: String, records: URL) async throws -> TurnLeftovers { TurnLeftovers() }
+
     func run(_ request: TurnRequest) -> AsyncThrowingStream<StreamEvent, Error> {
         lock.withLock { _requestCount += 1 }
         let sid = request.agent.sessionId

@@ -5,7 +5,9 @@ import Foundation
 /// The turn's process lifetime (Task 1a re-review, binding on 1b): no process of a turn outlives it. The fake `claude` is
 /// `/bin/sh -c <script>` (a system binary, so it runs while new executables stall), started the way every turn is: its own
 /// session, swept when the turn ends.
-private func request(in dir: URL, agentId: String = "a1") -> TurnRequest {
+/// Each request its own agent id: the runner's per-agent registry is process-wide, and another suite's turn of "a1" must not
+/// make this one wait.
+private func request(in dir: URL, agentId: String = "c-" + UUID().uuidString.prefix(8).lowercased()) -> TurnRequest {
     let agent = Agent(id: agentId, companyId: "c1", name: "ceo", role: "ceo", model: "sonnet", sessionId: "s1",
                       sessionStarted: false, state: .running, blocker: nil, requestedBlocker: nil, paused: false,
                       readySince: nil, createdAt: Date(timeIntervalSince1970: 0))
@@ -57,6 +59,16 @@ private struct SandboxedRequestWorld {
     let ws: URL
     let home: URL
     let request: TurnRequest
+    /// The turn's mach marker (Task 2's mechanism, adopted for turns) and where its leader is recorded.
+    let marker = "dev.brahma.turn.\(UUID().uuidString.lowercased())"
+    var records: URL { dir.appending(path: "turns") }
+
+    /// A Seatbelt profile shaped like the turn's: writes in the agent's home, its marker allowed and every other turn marker
+    /// denied (as Claude Code's own profile denies unlisted mach names).
+    var profile: String {
+        "(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \"\(home.path)\"))"
+            + "(deny mach-lookup (global-name-prefix \"dev.brahma.turn.\"))(allow mach-lookup (global-name \"\(marker)\"))"
+    }
 
     init() throws {
         dir = URL(fileURLWithPath: SandboxPath.resolve(try tempDir().path), isDirectory: false)
@@ -68,11 +80,13 @@ private struct SandboxedRequestWorld {
                                  denyRead: [], denyWrite: [], protected: [],
                                  network: NetworkScope(allowedDomains: [], webDomains: [], allowLocalBinding: false),
                                  toolchainTempWrite: nil)
-        var r = Self.base(dir, agentId: "a1", name: "eng-1")
+        var r = Self.base(dir, agentId: "s-" + UUID().uuidString.prefix(8).lowercased(), name: "eng-1")
         r.profile = .sandboxed
         r.sandbox = scope
         r.shellPrefix = ws.appending(path: ".brahma/bin/shell-eng-1.sh").path
         r.settingsFilePath = dir.appending(path: "a1.settings.json").path
+        r.containmentMarker = marker
+        r.turnRecordDirectory = dir.appending(path: "turns")
         request = r
     }
 
@@ -127,15 +141,17 @@ private let perl = "/usr/bin/perl"
     }
 
     /// The escape every other channel misses: a double fork into a new session, faster than any poll, with the turn's marker
-    /// removed. On a sandboxed turn its sandbox (which it cannot drop) still gives it away. The fake CLI starts it under a
-    /// Seatbelt profile shaped like an agent's turn (writes to the agent's home, not the workspace top).
-    @Test func doubleForkedSandboxedEscapeeIsFoundByItsSandbox() async throws {
+    /// variable removed. On a sandboxed turn its sandbox still gives it away: it allows the turn's unique mach name (Task 2's
+    /// unremovable marker). It also deletes the agent's home first (the old write-shape probe's blind spot, B-I2).
+    @Test func doubleForkedSandboxedEscapeeIsFoundByItsMarker() async throws {
         let w = try SandboxedRequestWorld()
-        let pidFile = w.home.appending(path: "escapee.pid")
-        let profile = "(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \\\"\(w.home.path)\\\"))"
+        let pidFile = w.dir.appending(path: "out/escapee.pid")
+        try FileManager.default.createDirectory(at: pidFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let profile = w.profile.replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "(allow file-write* (subpath", with: "(allow file-write* (subpath \\\"\(pidFile.deletingLastPathComponent().path)\\\") (subpath")
         var runner = shRunner("""
             cat > /dev/null
-            /usr/bin/sandbox-exec -p "\(profile)" /usr/bin/env -u BRAHMA_TURN_MARK \(perl) -e 'use POSIX; exit 0 if fork; POSIX::setsid(); exit 0 if fork; open(F, ">", $ARGV[0]); print F "$$\\n"; close F; close STDOUT; close STDERR; exec "/bin/sleep", "300"' '\(pidFile.path)'
+            /usr/bin/sandbox-exec -p "\(profile)" /usr/bin/env -u BRAHMA_TURN_MARK \(perl) -e 'use POSIX; exit 0 if fork; POSIX::setsid(); exit 0 if fork; system("/bin/rm", "-rf", $ARGV[1]); open(F, ">", $ARGV[0]); print F "$$\\n"; close F; close STDOUT; close STDERR; exec "/bin/sleep", "300"' '\(pidFile.path)' '\(w.home.path)'
             while [ ! -s '\(pidFile.path)' ]; do sleep 0.05; done
             echo '\(initLine)'
             echo '\(resultLine)'
@@ -146,7 +162,7 @@ private let perl = "/usr/bin/perl"
         #expect(await gone(escapee), "a double-forked, sandboxed process outlived its turn")
     }
 
-    @Test func sandboxProbeMatchesOnlyAnAgentShapedSandbox() async throws {
+    @Test func markerProbeMatchesOnlyThisTurnsSandbox() async throws {
         let w = try SandboxedRequestWorld()
         func start(_ args: [String]) throws -> Process {
             let p = Process()
@@ -155,33 +171,140 @@ private let perl = "/usr/bin/perl"
             try p.run()
             return p
         }
-        let agentShaped = try start(["/usr/bin/sandbox-exec", "-p",
-                                     "(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \"\(w.home.path)\"))",
-                                     "/bin/sleep", "30"])
-        let workspaceWide = try start(["/usr/bin/sandbox-exec", "-p",
-                                       "(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \"\(w.ws.path)\"))",
-                                       "/bin/sleep", "30"])
-        let otherAgent = try start(["/usr/bin/sandbox-exec", "-p",
-                                    "(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \"\(w.ws.path)/.brahma/home/eng-2\"))",
-                                    "/bin/sleep", "30"])
+        let mine = try start(["/usr/bin/sandbox-exec", "-p", w.profile, "/bin/sleep", "30"])
+        let other = try start(["/usr/bin/sandbox-exec", "-p", w.profile.replacingOccurrences(of: w.marker, with: w.marker + "x"), "/bin/sleep", "30"])
+        let allowAll = try start(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/bin/sleep", "30"])
         let plain = try start(["/bin/sleep", "30"])
-        defer { for p in [agentShaped, workspaceWide, otherAgent, plain] { p.terminate() } }
+        defer { for p in [mine, other, allowAll, plain] { p.terminate() } }
         try await Task.sleep(for: .milliseconds(300))
-        let probe = SandboxProbe(workspace: w.ws, handle: "eng-1")
-        #expect(probe.matches(agentShaped.processIdentifier))
-        #expect(!probe.matches(workspaceWide.processIdentifier), "an owner's tool sandboxed to the whole workspace")
-        #expect(!probe.matches(otherAgent.processIdentifier), "another agent's turn")
-        #expect(!probe.matches(plain.processIdentifier), "not sandboxed")
-        #expect(!probe.matches(getpid()))
-        let found = probe.scan(ProcessTable.snapshot()).map(\.pid)
-        #expect(found.contains(agentShaped.processIdentifier))
-        #expect(!found.contains(plain.processIdentifier))
-        // The registry finds such a leftover before the agent's next turn (and kills it).
+        let probe = SandboxProbe(machMarker: w.marker)
+        #expect(probe.classify(mine.processIdentifier) == .mine)
+        #expect(probe.classify(other.processIdentifier) == .notMine, "another turn")
+        #expect(probe.classify(allowAll.processIdentifier) == .notMine, "a sandbox that allows every lookup")
+        #expect(probe.classify(plain.processIdentifier) == .notMine, "not sandboxed")
+        #expect(probe.classify(getpid()) == .notMine)
+    }
+
+    /// B-I2: a sandboxed process whose policy the kernel cannot read counts as a survivor (fail closed), never as "not ours".
+    @Test func unreadableSandboxCountsAsASurvivor() async throws {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sleep"); p.arguments = ["30"]
+        let since = ProcessTable.startStamp(slack: 1)
+        try p.run()
+        defer { p.terminate() }
+        let result = SandboxSweep.run(probe: SandboxProbe(machMarker: "dev.brahma.turn.none"), since: since,
+                                      classify: { $0 == p.processIdentifier ? .unknown : .notMine })
+        #expect(result.survivors.contains(p.processIdentifier)); #expect(!result.clean)
+    }
+
+    /// B-I2: once per engine, the engine checks it can see what a sandbox allows; on this Mac it can.
+    @Test func containmentSelfTestPasses() {
+        #if os(macOS)
+        #expect(ContainmentSelfTest.run())
+        #else
+        #expect(!ContainmentSelfTest.run())
+        #endif
+    }
+
+    /// B-I1: a turn's leader is recorded where a restarted engine finds it. An engine that crashed mid-turn left the leader
+    /// (in its own session) and its children running; the next engine kills them all, and only then forgets the record.
+    @Test func restartedEngineKillsAnEarlierEnginesTurn() async throws {
+        let dir = try tempDir()
+        let records = dir.appending(path: "turns")
+        let childFile = dir.appending(path: "child.pid")
+        let since = ProcessTable.startStamp(slack: 1)
+        let leader = try ProcessGroupChild.spawn(executable: "/bin/sh", arguments: ["sh", "-c", "/bin/sleep 300 & echo $! > '\(childFile.path)'; exec /bin/sleep 300"],
+                                                 environment: ["PATH": "/usr/bin:/bin"], workingDirectory: dir, output: -1, newSession: true)
+        let child = try await pid(in: childFile)
+        let start = try #require(ProcessTable.entry(leader.pid)?.start)
+        try TurnRecords.add(TurnRecord(leader: leader.pid, leaderStart: start, since: since, machMarker: nil), agentId: "a1", in: records)
+        // A fresh registry: nothing in memory knows this turn.
+        let left = try await TurnRegistry().waitUntilGone("a1", records: records, deadline: .seconds(10))
+        #expect(left.survivors.isEmpty)
+        #expect(Set(left.killed).isSuperset(of: [leader.pid, child]))
+        _ = leader.finish()
+        #expect(await gone(child))
+        #expect(try TurnRecords.load(agentId: "a1", in: records).isEmpty, "the record goes once nothing is left")
+    }
+
+    /// B-I1 with the marker: a sandboxed escapee of a crashed engine's turn (out of the session and group) is found by the
+    /// marker in the record.
+    @Test func restartedEngineKillsAMarkedEscapee() async throws {
+        let w = try SandboxedRequestWorld()
+        let pidFile = w.home.appending(path: "escapee.pid")
+        let since = ProcessTable.startStamp(slack: 1)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+        p.arguments = ["-p", w.profile, perl, "-e", "use POSIX; exit 0 if fork; POSIX::setsid(); exit 0 if fork; open(F, \">\", $ARGV[0]); print F \"$$\\n\"; close F; exec \"/bin/sleep\", \"300\"", pidFile.path]
+        try p.run(); p.waitUntilExit()
+        let escapee = try await pid(in: pidFile)
+        try TurnRecords.add(TurnRecord(leader: 999_999, leaderStart: since, since: since, machMarker: w.marker), agentId: "a1", in: w.records)
+        let left = try await TurnRegistry().waitUntilGone("a1", records: w.records, deadline: .seconds(10))
+        #expect(left.killed.contains(escapee)); #expect(left.survivors.isEmpty)
+        #expect(await gone(escapee))
+    }
+
+    /// M2: a wait that cannot finish fails closed: on its deadline, or when the waiting task is cancelled.
+    @Test func waitFailsClosedOnDeadlineAndCancellation() async throws {
         let registry = TurnRegistry()
-        registry.begin("eng", probe: probe)
-        registry.end("eng", survivors: [])
-        #expect(await registry.waitUntilGone("eng").isEmpty)
-        #expect(await gone(agentShaped.processIdentifier))
+        try await registry.claim("a1", deadline: .seconds(5))   // an in-flight turn that never ends
+        await #expect(throws: (any Error).self) { _ = try await registry.waitUntilGone("a1", records: nil, deadline: .milliseconds(200)) }
+        let waiter = Task { try await registry.waitUntilGone("a1", records: nil, deadline: .seconds(30)) }
+        waiter.cancel()
+        await #expect(throws: (any Error).self) { _ = try await waiter.value }
+        // M3: claiming is "nothing running, then begin" in one step: a second claim waits for the first to end.
+        await #expect(throws: (any Error).self) { try await registry.claim("a1", deadline: .milliseconds(200)) }
+        registry.end("a1", survivors: [])
+        try await registry.claim("a1", deadline: .seconds(1))
+        registry.end("a1", survivors: [])
+    }
+
+    /// M13: the wait overlaps a turn whose stream was dropped while its processes are still being swept.
+    @Test func waitCoversATurnStillBeingSwept() async throws {
+        let dir = try tempDir()
+        let overlap = "o-" + UUID().uuidString.prefix(8).lowercased()
+        let pidFile = dir.appending(path: "child.pid")
+        let runner = shRunner("""
+            cat > /dev/null
+            \(perl) -e 'use POSIX; POSIX::setsid(); open(F, ">", $ARGV[0]); print F "$$\\n"; close F; exec "/bin/sleep", "300"' '\(pidFile.path)' &
+            while [ ! -s '\(pidFile.path)' ]; do sleep 0.05; done
+            echo '\(initLine)'
+            exec /bin/sleep 30
+            """)
+        let turn = Task { () -> Void in
+            for try await e in runner.run(request(in: dir, agentId: overlap)) { if case .initialized = e { return } }
+        }
+        try await turn.value   // the stream is dropped after init: the runner terminates and sweeps on its own
+        let child = try await pid(in: pidFile)
+        let left = try await runner.waitForTurnProcesses(agentId: overlap, records: dir.appending(path: "turns"))
+        #expect(left.survivors.isEmpty)
+        #expect(ProcessTable.entry(child) == nil || ProcessTable.entry(child)?.isZombie == true, "swept before the wait returned")
+    }
+
+    /// M13: the runner itself refuses a sandboxed turn whose cwd became a link after the scope was computed.
+    @Test func runnerRefusesALinkedCwdBeforeSpawn() async throws {
+        let w = try SandboxedRequestWorld()
+        let lab = try #require(w.request.sandbox?.cwd)
+        try FileManager.default.removeItem(at: lab)
+        try FileManager.default.createSymbolicLink(atPath: lab.path, withDestinationPath: w.dir.path)
+        let runner = shRunner("cat > /dev/null; echo '\(initLine)'; echo '\(resultLine)'")
+        await #expect(throws: SandboxError.self) { _ = try await collect(runner.run(w.request)) }
+    }
+
+    /// Carry-over: a grant read path dropped at spawn (a link put where the approved directory was) is reported to the engine,
+    /// which logs it.
+    @Test func grantDroppedAtSpawnIsReported() async throws {
+        let w = try SandboxedRequestWorld()
+        let grant = w.dir.appending(path: "granted")
+        try FileManager.default.createDirectory(at: grant, withIntermediateDirectories: true)
+        var r = w.request
+        r.sandbox?.readOnlyDirs.append(grant); r.sandbox?.readable.append(grant); r.sandbox?.grantReadDirs.append(grant)
+        r.addDirs.append(grant.path)
+        try FileManager.default.removeItem(at: grant)
+        try FileManager.default.createSymbolicLink(atPath: grant.path, withDestinationPath: w.home.path)
+        let runner = shRunner("cat > /dev/null; echo '\(initLine)'; echo '\(resultLine)'")
+        let events = try await collect(runner.run(r))
+        #expect(events.contains { if case .sandboxNote(let text) = $0 { text.contains(grant.path) } else { false } })
     }
 
     /// A child left in the turn's own process group after `claude` exits (the plain `cmd &` case).
@@ -200,20 +323,26 @@ private let perl = "/usr/bin/perl"
         #expect(await gone(child))
     }
 
-    /// The turn's process is its own session leader, and every child sees the turn's marker.
+    /// The turn's process is its own session leader (and group leader), and every child sees the turn's marker.
     @Test func turnRunsInItsOwnSessionWithAMarker() async throws {
         let dir = try tempDir()
         let out = dir.appending(path: "ids.txt")
         let runner = shRunner("""
             cat > /dev/null
             echo "$$ $(/bin/ps -o pgid= -p $$) ${BRAHMA_TURN_MARK:-none}" > '\(out.path)'
+            /bin/sleep 1
             echo '\(initLine)'
             echo '\(resultLine)'
             """)
-        _ = try await collect(runner.run(request(in: dir)))
+        let turn = Task { try await collect(runner.run(request(in: dir))) }
+        for _ in 0..<200 where !FileManager.default.fileExists(atPath: out.path) { try await Task.sleep(for: .milliseconds(10)) }
+        try await Task.sleep(for: .milliseconds(50))
         let parts = try String(contentsOf: out, encoding: .utf8).split(separator: " ").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let leader = try #require(pid_t(parts[0]))
+        #expect(getsid(leader) == leader, "its own session")
+        _ = try await turn.value
         #expect(parts.count == 3)
-        #expect(parts[0] == parts[1], "its own process group (and session: it is the leader of both)")
+        #expect(parts[0] == parts[1], "its own process group")
         #expect(parts[2] != "none" && parts[2].count >= 32, "a per-turn marker")
         #expect(getpgid(getpid()) != pid_t(parts[1]), "not the engine's group")
     }
@@ -226,9 +355,10 @@ private let perl = "/usr/bin/perl"
             echo '\(initLine)'
             echo '\(resultLine)'
             """)
-        _ = try await collect(runner.run(request(in: dir)))
-        #expect(await runner.waitForTurnProcesses(agentId: "a1").isEmpty)
-        #expect(await runner.waitForTurnProcesses(agentId: "nobody").isEmpty)
+        let id = "n-" + UUID().uuidString.prefix(8).lowercased()
+        _ = try await collect(runner.run(request(in: dir, agentId: id)))
+        #expect(try await runner.waitForTurnProcesses(agentId: id, records: dir.appending(path: "turns")).survivors.isEmpty)
+        #expect(try await runner.waitForTurnProcesses(agentId: "nobody", records: dir.appending(path: "turns")).survivors.isEmpty)
     }
 
     @Test func processTableReadsAChildsEnvironment() async throws {

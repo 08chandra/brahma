@@ -13,7 +13,7 @@ private let company = Company(id: "c1", name: "Acme", slug: "acme", goal: "g", w
                               status: .running, usageMode: .balanced, priorityWeight: 1,
                               createdAt: Date(timeIntervalSince1970: 0))
 
-private let hook = "'/usr/local/bin/brahma' hook pre-tool"
+private let hookExe = "/usr/local/bin/brahma"
 private let disallowed = ClaudeCommand.disallowedTools.joined(separator: ",")
 
 private func decision(_ edit: (inout ModeInputs) -> Void) -> ModeDecision {
@@ -31,7 +31,7 @@ private func request(_ d: ModeDecision?, kind: TurnKind = .work, prompt: String 
                         environment: ["BRAHMA_AGENT_ID": "a1"])
     r.mode = d
     r.kind = kind
-    r.hookCommand = d == nil ? nil : hook
+    r.hookExecutable = d == nil ? nil : hookExe
     return r
 }
 
@@ -55,7 +55,7 @@ private let allModes = [quick, standard, deep, deepOpus]
         var on = TurnProfileCompiler.profile(for: request(standard))
         #expect(on.maxTurns == 40); #expect(on.maxBudgetUSD == 2.00)
         on.maxTurns = nil; on.maxBudgetUSD = nil
-        TurnProfileCompiler.apply(standard, to: &on, hookCommand: hook, kind: .work, perModeCaps: false)
+        TurnProfileCompiler.apply(standard, to: &on, hookExecutable: hookExe, kind: .work, perModeCaps: false)
         #expect(on.maxTurns == nil); #expect(on.maxBudgetUSD == nil)
         let a = TurnProfileCompiler.arguments(on)
         #expect(!a.contains("--max-turns")); #expect(!a.contains("--max-budget-usd")); #expect(a.contains("--effort"))
@@ -68,8 +68,9 @@ private let allModes = [quick, standard, deep, deepOpus]
         let settingsJSON = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disableBundledSkills\":true,"
             + "\"disableSkillShellExecution\":true,\"disableWorkflows\":true,\"enabledPlugins\":{\"cc-plugin-agents-md@builtin\":false,"
             + "\"cc-plugin-plugin-authoring@builtin\":false},"
-            + "\"fastMode\":false,\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"command\":\"\(hook) --mode quick\","
-            + "\"type\":\"command\"}],\"matcher\":\"Agent|Task|Workflow\"}]},\"maxEffortLevel\":\"low\","
+            // 1b fix round 1 (C1): the pre-tool hook in exec form, blocking when it cannot run.
+            + "\"fastMode\":false,\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"args\":[\"hook\",\"pre-tool\",\"--mode\",\"quick\"],"
+            + "\"command\":\"\(hookExe)\",\"onFailure\":\"block\",\"type\":\"command\"}],\"matcher\":\"Agent|Task|Workflow\"}]},\"maxEffortLevel\":\"low\","
             + "\"permissions\":{\"deny\":[\"Bash(claude *)\",\"Bash(*/claude *)\"]},\"workflowKeywordTriggerEnabled\":false}"
         #expect(a == [
             "-p", "--output-format", "stream-json", "--verbose",
@@ -170,11 +171,14 @@ private let allModes = [quick, standard, deep, deepOpus]
             let pre = try #require((s["hooks"] as? [String: Any])?["PreToolUse"] as? [[String: Any]])
             #expect(pre.count == 1)
             #expect(pre[0]["matcher"] as? String == "Agent|Task|Workflow")
-            let command = (pre[0]["hooks"] as? [[String: Any]])?.first?["command"] as? String
-            #expect(command == "\(hook) --mode \(d.mode.rawValue)")
+            let hook = (pre[0]["hooks"] as? [[String: Any]])?.first
+            #expect(hook?["command"] as? String == hookExe)
+            #expect(hook?["args"] as? [String] == ["hook", "pre-tool", "--mode", d.mode.rawValue])
+            #expect(hook?["onFailure"] as? String == "block")
         }
-        #expect(TurnProfileCompiler.hookCommand(executable: "/Applications/Bra hma.app/brahma") == "'/Applications/Bra hma.app/brahma' hook pre-tool")
-        #expect(TurnProfileCompiler.hookCommand(executable: "/x/it's") == "'/x/it'\\''s' hook pre-tool")
+        // Exec form passes the executable as one argv element: no shell quoting, whatever the path holds.
+        let odd = TurnProfileCompiler.preToolHook(executable: "/x/it's", mode: .standard, subagents: true)
+        #expect(odd.hooks == [HookCommand(command: "/x/it's", args: ["hook", "pre-tool", "--mode", "standard", "--subagents"])])
     }
 
     @Test func modelAllowlistRejectsFableBestDefaultOpusplan1m() throws {
@@ -241,7 +245,7 @@ private let allModes = [quick, standard, deep, deepOpus]
             #expect(env[name] == nil, "\(name)")
         }
         #expect(ChildEnvironment.engineClaudeVars.contains("CLAUDE_CODE_SHELL_PREFIX"))
-        #expect(ChildEnvironment.engineClaudeVars.count == 10)
+        #expect(ChildEnvironment.engineClaudeVars.count == 11, "1b fix round 1 adds CLAUDE_CODE_TMPDIR")
         // Everything the compiler emits is on the list.
         var d = standard; d.subagents = .forced(model: "haiku", depth: 1, concurrent: 2)
         for name in TurnProfileCompiler.profile(for: request(d)).environment.keys where name.hasPrefix("CLAUDE_CODE_") {

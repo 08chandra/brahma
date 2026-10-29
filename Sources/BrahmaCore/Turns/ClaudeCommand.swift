@@ -40,8 +40,8 @@ public struct TurnRequest: Sendable {
     public var expectations: TurnExpectations? = nil
     /// The work mode the engine chose (`ModePolicy.select`); nil for Plan 1 inputs, which compile byte-identically.
     public var mode: ModeDecision? = nil
-    /// `<quoted brahma> hook pre-tool`, the engine's PreToolUse hook; set with the mode.
-    public var hookCommand: String? = nil
+    /// The `brahma` executable whose `hook pre-tool` is the engine's PreToolUse hook (exec form); set with the mode.
+    public var hookExecutable: String? = nil
 
     // Sandboxed profile (5-lite Task 1b).
     /// The turn's scope (`SandboxScope.forTurn`): required on the Sandboxed profile, nil otherwise.
@@ -54,8 +54,13 @@ public struct TurnRequest: Sendable {
     public var settingsFilePath: String? = nil
     /// The Workspace profile's read and edit denies: the data home, the protected list, the other workspaces.
     public var deniedPaths: [URL] = []
-    /// The PostToolUse hook command (Task 10; nil until then).
-    public var postToolHookCommand: String? = nil
+    /// The PostToolUse hook (Task 10; nil until then), exec form.
+    public var postToolHook: HookCommand? = nil
+    /// The sandboxed turn's mach marker (`dev.brahma.turn.<id>`): allowed by its sandbox, so the engine can recognize the
+    /// turn's processes by their sandbox alone (Task 2's mechanism). Required on the Sandboxed profile.
+    public var containmentMarker: String? = nil
+    /// Where the runner records the turn's leader (`<runDir>/turns`), so a restarted engine can still kill what is left.
+    public var turnRecordDirectory: URL? = nil
     /// Ultra's workflow policy (Task 14u; nil until then).
     public var workflow: WorkflowPolicy? = nil
 
@@ -105,6 +110,12 @@ public enum MCPConfig {
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
         if let reviewItem { args += ["--review-item", reviewItem] } else if audit { args.append("--audit") }
         var env = [tokenVariable: turnToken]
+        // The parameters again, next to the token: a sandboxed turn's shell prefix starts the server by the fixed argv
+        // `<exe> mcp` and never evaluates the line Claude hands it (1b fix round 1, I2); the server reads them from here.
+        env[MCPLaunch.dbVariable] = paths.database.path
+        env[MCPLaunch.companyVariable] = agent.companyId
+        env[MCPLaunch.agentVariable] = agent.id
+        if let reviewItem { env[MCPLaunch.reviewItemVariable] = reviewItem } else if audit { env[MCPLaunch.auditVariable] = "1" }
         // A dev/demo home's file secret store reaches the turn's `brahma mcp` (which resolves it again against its database's
         // own home, refusing the default home), so its redactor loads the same values as the engine's. Never the agent's env.
         if environment[SecretStore.environmentVariable] == "file" { env[SecretStore.environmentVariable] = "file" }
@@ -128,5 +139,49 @@ public enum MCPConfig {
             throw CocoaError(.fileWriteUnknown)
         }
         return url.path
+    }
+}
+
+
+/// `brahma mcp`'s parameters: its flags, or its env block (`BRAHMA_MCP_*`, written next to the turn token in the 0600 MCP
+/// config). A sandboxed turn's shell prefix starts the server by the fixed argv `<exe> mcp`, so there the env block is all
+/// there is. Given both ways, they must agree.
+public struct MCPLaunch: Equatable, Sendable {
+    public static let dbVariable = "BRAHMA_MCP_DB"
+    public static let companyVariable = "BRAHMA_MCP_COMPANY"
+    public static let agentVariable = "BRAHMA_MCP_AGENT"
+    public static let reviewItemVariable = "BRAHMA_MCP_REVIEW_ITEM"
+    public static let auditVariable = "BRAHMA_MCP_AUDIT"
+
+    public var db: String
+    public var company: String
+    public var agent: String
+    public var reviewItem: String?
+    public var audit: Bool
+
+    public init(db: String, company: String, agent: String, reviewItem: String?, audit: Bool) {
+        self.db = db; self.company = company; self.agent = agent; self.reviewItem = reviewItem; self.audit = audit
+    }
+
+    public struct Failure: Error, CustomStringConvertible {
+        public let description: String
+    }
+
+    public static func resolve(db: String?, company: String?, agent: String?, reviewItem: String?, audit: Bool,
+                               environment: [String: String]) throws -> MCPLaunch {
+        func one(_ flag: String?, _ variable: String, _ name: String) throws -> String? {
+            let env = environment[variable].flatMap { $0.isEmpty ? nil : $0 }
+            if let flag, let env, flag != env { throw Failure(description: "--\(name) does not match this server's \(variable)") }
+            return flag ?? env
+        }
+        guard let db = try one(db, dbVariable, "db"), let company = try one(company, companyVariable, "company"),
+              let agent = try one(agent, agentVariable, "agent") else {
+            throw Failure(description: "missing --db, --company or --agent")
+        }
+        let item = try one(reviewItem, reviewItemVariable, "review-item")
+        let envAudit = environment[auditVariable] == "1"
+        let isAudit = audit || envAudit
+        if item != nil && isAudit { throw Failure(description: "a server is either a review or an audit server, never both") }
+        return MCPLaunch(db: db, company: company, agent: agent, reviewItem: item, audit: isAudit)
     }
 }

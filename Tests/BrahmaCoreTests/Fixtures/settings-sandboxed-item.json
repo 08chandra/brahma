@@ -16,7 +16,14 @@
       {
         "hooks" : [
           {
-            "command" : "'/usr/local/bin/brahma' hook pre-tool --mode standard",
+            "args" : [
+              "hook",
+              "pre-tool",
+              "--mode",
+              "standard"
+            ],
+            "command" : "/usr/local/bin/brahma",
+            "onFailure" : "block",
             "type" : "command"
           }
         ],
@@ -292,6 +299,10 @@
       "Edit(/$WS/.brahma/labs/eng-1/.mcp.json/**)",
       "Write(/$WS/.brahma/labs/eng-1/.mcp.json)",
       "Write(/$WS/.brahma/labs/eng-1/.mcp.json/**)",
+      "Edit(/$WS/.brahma/trash)",
+      "Edit(/$WS/.brahma/trash/**)",
+      "Write(/$WS/.brahma/trash)",
+      "Write(/$WS/.brahma/trash/**)",
       "Edit(/$WS/.brahma/cache)",
       "Edit(/$WS/.brahma/cache/**)",
       "Write(/$WS/.brahma/cache)",
@@ -509,6 +520,9 @@
         "$WS/.brahma/labs/eng-1",
         "$WS/.brahma/notes/agents/eng-1.md",
         "$WS/.brahma/bin/shell-eng-1.sh",
+        "$TMP/xcrun_db",
+        "$TMP/TemporaryItems",
+        "$DARWIN/C/com.apple.DeveloperTools",
         "$WS/.brahma/wt/$KEY",
         "$WS/.brahma/home/eng-1/cache",
         "$WS/.git/objects",
@@ -516,7 +530,8 @@
         "$WS/.git/refs/heads/item/$KEY",
         "$WS/.git/refs/heads/item/$KEY.lock",
         "$WS/.git/logs/refs/heads/item/$KEY",
-        "$WS/.brahma/progress/$KEY.md"
+        "$WS/.brahma/progress/$KEY.md",
+        "$AGENTTMP"
       ],
       "allowWrite" : [
         "$WS/.brahma/wt/$KEY",
@@ -530,13 +545,15 @@
         "$WS/.git/logs/refs/heads/item/$KEY",
         "$WS/.brahma/progress/$KEY.md",
         "$WS/.brahma/notes/agents/eng-1.md",
-        "$TMP"
+        "$TMP",
+        "$AGENTTMP"
       ],
       "denyRead" : [
         "$USERHOME",
         "$DATA",
         "/Volumes",
         "$WS/.brahma",
+        "$DARWIN",
         "$USERHOME/.ssh",
         "$USERHOME/.aws",
         "$USERHOME/.config/gh",
@@ -572,7 +589,12 @@
         "$USERHOME/Library/Application Support/Claude",
         "$USERHOME/Library/Application Support/Slack",
         "$USERHOME/Library/Application Support/1Password",
-        "$USERHOME/Library/Application Support/Code"
+        "$USERHOME/Library/Application Support/Code",
+        "/private/tmp/claude-$UID",
+        "/tmp/claude-$UID",
+        "/private/tmp/claude-tool-results",
+        "/tmp/claude-tool-results",
+        "/private/tmp/b-test"
       ],
       "denyWrite" : [
         "$USERHOME/.ssh",
@@ -616,6 +638,7 @@
         "$WS/.brahma/wt/$KEY/.mcp.json",
         "$WS/.brahma/labs/eng-1/.claude",
         "$WS/.brahma/labs/eng-1/.mcp.json",
+        "$WS/.brahma/trash",
         "$WS/.brahma/cache",
         "$WS/.brahma/resources",
         "$WS/.brahma/checks",
@@ -669,6 +692,9 @@
     "network" : {
       "allowAllUnixSockets" : false,
       "allowLocalBinding" : true,
+      "allowMachLookup" : [
+        "dev.brahma.turn.0123456789abcdef"
+      ],
       "allowedDomains" : [
         "codeload.github.com",
         "crates.io",

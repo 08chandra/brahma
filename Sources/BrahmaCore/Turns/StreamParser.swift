@@ -159,6 +159,8 @@ public enum StreamEvent: Equatable, Sendable {
     case backgroundTasks(taskIds: [String])
     /// Produced by the runner from stderr: `Effort '<x>' exceeds the cap`.
     case effortCapped(requested: String)
+    /// Produced by the runner: something about the turn's sandbox the engine should log (a grant read path dropped at spawn).
+    case sandboxNote(String)
     case other(type: String)
 }
 

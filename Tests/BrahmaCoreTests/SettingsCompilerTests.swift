@@ -19,7 +19,8 @@ private struct CompileWorld {
         root = URL(fileURLWithPath: SandboxPath.resolve(try tempDir().path), isDirectory: false)
         userHome = root.appending(path: "user")
         paths = BrahmaPaths(home: root.appending(path: "data"), workspaces: root.appending(path: "wss"))
-        userTemp = root.appending(path: "T")
+        // `<per-user Darwin folder>/T`: the folder (`$DARWIN`) is unreadable to turns except the toolchain's entries.
+        userTemp = root.appending(path: "folders/T")
         for dir in [userHome, paths.home, paths.workspaces, userTemp] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
@@ -40,7 +41,7 @@ private struct CompileWorld {
     func scope(_ kind: TurnKind, withItem: Bool = true) throws -> SandboxScope {
         try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [], backupTargets: [], kind: kind,
                                  item: withItem ? item : nil, company: company, grants: GrantInputs(),
-                                 darwinUserTemp: userTemp, userHome: userHome)
+                                 darwinUserTemp: userTemp, userHome: userHome, claudeTmpRoot: URL(fileURLWithPath: "/private/tmp/b-test"))
     }
 
     /// The compiled JSON with this world's paths replaced by `$WS`, `$DATA`, `$USERHOME` and `$TMP`.
@@ -49,6 +50,9 @@ private struct CompileWorld {
             .replacingOccurrences(of: paths.home.path, with: "$DATA")
             .replacingOccurrences(of: userHome.path, with: "$USERHOME")
             .replacingOccurrences(of: userTemp.path, with: "$TMP")
+            .replacingOccurrences(of: userTemp.deletingLastPathComponent().path, with: "$DARWIN")
+            .replacingOccurrences(of: "claude-\(getuid())", with: "claude-$UID")
+            .replacingOccurrences(of: "/private/tmp/b-test/[0-9a-f]{6}", with: "$AGENTTMP", options: .regularExpression)
             .replacingOccurrences(of: item.key, with: "$KEY")
     }
 
@@ -60,7 +64,8 @@ private struct CompileWorld {
                             environment: ["BRAHMA_AGENT_ID": eng.id])
         r.kind = kind
         r.mode = mode
-        r.hookCommand = mode == nil ? nil : hook
+        r.hookExecutable = mode == nil ? nil : hookExe
+        r.containmentMarker = scope == nil ? nil : marker
         r.sandbox = scope
         r.shellPrefix = scope == nil ? nil : layout.shellPrefix.path
         r.settingsFilePath = paths.runDir.appending(path: "\(eng.id).settings.json").path
@@ -70,7 +75,8 @@ private struct CompileWorld {
     }
 }
 
-private let hook = "'/usr/local/bin/brahma' hook pre-tool"
+private let hookExe = "/usr/local/bin/brahma"
+private let marker = "dev.brahma.turn.0123456789abcdef"
 
 private func decision(_ edit: (inout ModeInputs) -> Void) -> ModeDecision {
     var i = ModeInputs()
@@ -89,7 +95,7 @@ private let allModes = [quick, standard, deep]
 private func args(_ r: TurnRequest) -> [String] { TurnProfileCompiler.arguments(TurnProfileCompiler.profile(for: r)) }
 private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: flag).map { a[$0 + 1] } }
 private func settings(_ r: TurnRequest) -> ClaudeSettings { TurnProfileCompiler.profile(for: r).settings }
-private func json(_ r: TurnRequest) -> String { TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: r)) }
+private func json(_ r: TurnRequest) -> String { (try? TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: r))) ?? "" }
 
 private func fixture(_ name: String) throws -> String {
     let url = try #require(Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "Fixtures"))
@@ -239,11 +245,12 @@ private func pretty(_ settings: ClaudeSettings) throws -> String {
         #expect(sa != sb)
         #expect(sa.shape() == sb.shape())
         var hooked = sa
-        hooked.hooks?["PostToolUse"] = [HookMatcher(matcher: "Bash", hooks: [HookCommand(command: "x")])]
+        hooked.hooks?["PostToolUse"] = [HookMatcher(matcher: "Bash", hooks: [HookCommand(command: "x", args: [])])]
         #expect(hooked.shape() != sa.shape())
         var withPost = settings(a.request(try a.scope(.work)))
         withPost = ClaudeSettingsCompiler.compile(scope: try a.scope(.work), profile: .sandboxed, mode: standard, mounts: [],
-                                                  hookCommand: "'/x/brahma' hook post-tool", preToolHook: nil)
+                                                  postToolHook: HookCommand(command: "/x/brahma", args: ["hook", "post-tool"]),
+                                                  preToolHook: nil)
         #expect(withPost.shape() != sa.shape())
         #expect(withPost.hooks?["PostToolUse"]?.first?.matcher == "WebFetch|WebSearch|Bash|mcp__.*|Skill|Task|Agent")
         #expect(StableHash.fnv1a64("x").count == sa.shape().count)
@@ -402,13 +409,79 @@ private func pretty(_ settings: ClaudeSettings) throws -> String {
         #expect(full.permissions?.deny == ["Bash(claude *)", "Bash(*/claude *)"])
     }
 
-    @Test func preToolHookMergedUnchanged() throws {
+    /// C1: Claude Code wraps every shell-form hook in `CLAUDE_CODE_SHELL_PREFIX` (unsandboxed, so the prefix refuses it and a
+    /// PreToolUse hook fails OPEN). Every hook the engine emits is exec form (`command` = the executable, `args`), on every
+    /// profile, and blocks when it cannot run (`onFailure: block`).
+    @Test func everyHookIsExecForm() throws {
         let w = try CompileWorld()
         for profile in PermissionProfile.allCases {
-            let s = settings(w.request(profile == .sandboxed ? try w.scope(.work) : nil, profile: profile))
+            var r = w.request(profile == .sandboxed ? try w.scope(.work) : nil, profile: profile)
+            r.postToolHook = HookCommand(command: hookExe, args: ["hook", "post-tool"])
+            let s = settings(r)
             let pre = try #require(s.hooks?["PreToolUse"])
-            #expect(pre == [HookMatcher(matcher: "Agent|Task|Workflow", hooks: [HookCommand(command: "\(hook) --mode standard")])])
-            #expect(s.hooks?["PostToolUse"] == nil, "no PostToolUse hook until Task 10")
+            #expect(pre == [HookMatcher(matcher: "Agent|Task|Workflow",
+                                        hooks: [HookCommand(command: hookExe, args: ["hook", "pre-tool", "--mode", "standard"])])])
+            for (_, matchers) in s.hooks ?? [:] {
+                for hook in matchers.flatMap(\.hooks) {
+                    #expect(hook.onFailure == "block"); #expect(!hook.command.contains(" "), "exec form: one executable")
+                }
+            }
+            let json = try s.json()
+            #expect(json.contains("\"args\":[\"hook\",\"pre-tool\",\"--mode\",\"standard\"]"))
+            #expect(json.contains("\"onFailure\":\"block\""))
         }
+        var forced = standard
+        forced.subagents = .forced(model: "haiku", depth: 1, concurrent: 2)
+        let s = settings(w.request(try w.scope(.work), mode: forced))
+        #expect(s.hooks?["PreToolUse"]?.first?.hooks.first?.args == ["hook", "pre-tool", "--mode", "standard", "--subagents"])
+    }
+
+    /// Task 2's unremovable marker, adopted for turns: the sandbox allows the turn's own mach name (and no service answers it),
+    /// so the engine can recognize the turn's processes by their sandbox alone.
+    @Test func sandboxedTurnCarriesItsMachMarker() throws {
+        let w = try CompileWorld()
+        let r = w.request(try w.scope(.work))
+        #expect(settings(r).sandbox?.network?.allowMachLookup == [marker])
+        var bad = r
+        bad.containmentMarker = nil
+        #expect(throws: TurnProfileError.self) { try TurnProfileCompiler.validate(TurnProfileCompiler.profile(for: bad)) }
+        bad.containmentMarker = "dev.brahma.run.x"
+        #expect(throws: TurnProfileError.self) { try TurnProfileCompiler.validate(TurnProfileCompiler.profile(for: bad)) }
+        #expect(settings(w.request(nil, profile: .workspace)).sandbox == nil)
+    }
+
+    /// Carry-over: each sandboxed turn's claude keeps its temp files in its own private directory (`CLAUDE_CODE_TMPDIR`, short
+    /// enough for Claude Code to use it: probed live), and the shared `/tmp/claude-<uid>` (the owner's own sessions),
+    /// `/tmp/claude-tool-results` and every other agent's directory are unreadable.
+    @Test func claudeTempIsTheAgentsOwn() throws {
+        let w = try CompileWorld()
+        let scope = try w.scope(.work)
+        let tmp = try #require(scope.claudeTmp)
+        #expect(tmp.path.hasPrefix("/private/tmp/b-test/")); #expect(tmp.path.utf8.count <= SandboxScope.claudeTmpMaxLength)
+        let p = TurnProfileCompiler.profile(for: w.request(scope))
+        #expect(p.environment["CLAUDE_CODE_TMPDIR"] == tmp.path)
+        #expect(ChildEnvironment.engineClaudeVars.contains("CLAUDE_CODE_TMPDIR"))
+        let deny = Set(scope.denyRead.map(\.path))
+        for path in ["/private/tmp/claude-\(getuid())", "/tmp/claude-\(getuid())", "/private/tmp/claude-tool-results",
+                     "/tmp/claude-tool-results", "/private/tmp/b-test"] {
+            #expect(deny.contains(path), "\(path)")
+        }
+        let fs = try #require(p.settings.sandbox?.filesystem)
+        #expect(fs.allowWrite?.contains(tmp.path) == true); #expect(fs.allowRead?.contains(tmp.path) == true)
+        #expect(TurnProfileCompiler.profile(for: w.request(nil, profile: .workspace)).environment["CLAUDE_CODE_TMPDIR"] == nil)
+    }
+
+    /// Added (Task 2 twin): the per-user Darwin folder is unreadable to turns, except the toolchain's own entries.
+    @Test func darwinUserFolderIsUnreadable() throws {
+        let w = try CompileWorld()
+        // The world's "T" stands for `<darwin user dir>/T`: its parent is the folder.
+        let scope = try w.scope(.work)
+        let dir = w.userTemp.deletingLastPathComponent().path
+        let fs = try #require(settings(w.request(scope)).sandbox?.filesystem)
+        #expect(fs.denyRead?.contains(dir) == true)
+        for allowed in ["T/xcrun_db", "T/TemporaryItems", "C/com.apple.DeveloperTools"] {
+            #expect(fs.allowRead?.contains("\(dir)/\(allowed)") == true, "\(allowed)")
+        }
+        #expect(fs.allowRead?.contains(w.userTemp.path) == false, "T itself is not readable")
     }
 }

@@ -62,8 +62,9 @@ private final class CanaryRunner: TurnRunning, @unchecked Sendable {
             let args = ClaudeCommand.arguments(for: r)
             #expect(args.contains("--max-turns")); #expect(args.contains("--effort")); #expect(args.contains("--max-budget-usd"))
             // Compiled with the pre-tool hook like a real turn (fix 1 minor).
-            #expect(r.hookCommand == "'brahma' hook pre-tool")
-            #expect(args[args.firstIndex(of: "--settings")! + 1].contains("hook pre-tool --mode"))
+            #expect(r.hookExecutable == "brahma")
+            // Exec form (1b fix round 1, C1).
+            #expect(args[args.firstIndex(of: "--settings")! + 1].contains("\"args\":[\"hook\",\"pre-tool\",\"--mode\""))
         }
         #expect(result.builtinAgents == ["claude", "Explore", "general-purpose", "Plan", "statusline-setup"])
         // A CLI that applies another effort than the flag (an env override, an org cap) fails the canary.

@@ -46,7 +46,7 @@ public struct TurnProfile: Equatable, Sendable {
     /// The per-turn MCP quotas (recorded on the turn's credential row, never in argv or an environment).
     public var quotas: ModeQuotas? = nil
     /// `<quoted brahma> hook pre-tool`: the engine's PreToolUse hook on `Agent|Task|Workflow`, on every mode turn.
-    public var hookCommand: String? = nil
+    public var hookExecutable: String? = nil
     /// That hook as the settings carry it (`hooks.PreToolUse`), built by `apply`.
     public var preToolHook: HookMatcher? = nil
 
@@ -119,7 +119,7 @@ public enum TurnProfileCompiler {
             }
             if let dir = r.planDirectory { p.addDirs = [dir] }
         }
-        if let d = r.mode { apply(d, to: &p, hookCommand: r.hookCommand, kind: r.kind) }
+        if let d = r.mode { apply(d, to: &p, hookExecutable: r.hookExecutable, kind: r.kind) }
         p = restricted(p, for: r.kind)
         // F10: `--disable-slash-commands` stays unless extension parts mount (then the Skill denies replace it).
         p.disableSlashCommands = r.mounts.isEmpty
@@ -128,8 +128,9 @@ public enum TurnProfileCompiler {
         if r.profile == .sandboxed { sandboxed(r, &p) }
         p.settings = ClaudeSettingsCompiler.compile(
             scope: r.profile == .sandboxed ? r.sandbox : nil, profile: r.profile, mode: r.mode, mounts: r.mounts,
-            hookCommand: r.postToolHookCommand, preToolHook: p.preToolHook, kind: r.kind, plansDirectory: r.planDirectory,
-            deniedPaths: r.profile == .workspace ? r.deniedPaths : [], workflow: r.workflow)
+            postToolHook: r.postToolHook, preToolHook: p.preToolHook, kind: r.kind, plansDirectory: r.planDirectory,
+            deniedPaths: r.profile == .workspace ? r.deniedPaths : [], workflow: r.workflow,
+            machMarker: r.profile == .sandboxed ? r.containmentMarker : nil)
         return p
     }
 
@@ -152,6 +153,8 @@ public enum TurnProfileCompiler {
         if let scope = r.sandbox {
             p.workingDirectory = scope.cwd.path
             p.addDirs = scope.readOnlyDirs.map(\.path)
+            // Claude's own temp files (its TMPDIR) in the agent's home, not the shared `/tmp/claude-<uid>`.
+            if let tmp = scope.claudeTmp { p.environment["CLAUDE_CODE_TMPDIR"] = tmp.path }
         }
         if let prefix = r.shellPrefix { p.environment["CLAUDE_CODE_SHELL_PREFIX"] = prefix }
     }
@@ -159,7 +162,7 @@ public enum TurnProfileCompiler {
     /// The work-mode part of a profile (design §2.3): `--effort`, `--max-turns`, `--max-budget-usd`, the common settings keys
     /// (`availableModels`, `fastMode:false`, `workflowKeywordTriggerEnabled:false`, `disableWorkflows:true`, `maxEffortLevel`, the
     /// pre-tool hook), the kill-switch environment and, only once the sub-agent gate passes, the forced sub-agent controls.
-    static func apply(_ d: ModeDecision, to p: inout TurnProfile, hookCommand: String?, kind: TurnKind,
+    static func apply(_ d: ModeDecision, to p: inout TurnProfile, hookExecutable: String?, kind: TurnKind,
                       perModeCaps: Bool = ModeGates.perModeCaps) {
         p.mode = d.mode
         p.effort = d.effort
@@ -171,14 +174,12 @@ public enum TurnProfileCompiler {
         }
         p.wallClock = p.wallClock ?? d.wallClock
         p.quotas = d.quotas
-        p.hookCommand = hookCommand
+        p.hookExecutable = hookExecutable
         p.subagents = kind.isReview || kind == .plan ? .off : d.subagents
         // The settings keys (`availableModels`, `fastMode`, the workflow kill switches, `maxEffortLevel`) are compiled from the
         // decision by `ClaudeSettingsCompiler`; the pre-tool hook block is built here and merged in unchanged.
-        if let hookCommand {
-            var command = "\(hookCommand) --mode \(d.mode.rawValue)"
-            if p.subagents != .off { command += " --subagents" }
-            p.preToolHook = HookMatcher(matcher: hookMatcher, hooks: [HookCommand(command: command)])
+        if let hookExecutable {
+            p.preToolHook = preToolHook(executable: hookExecutable, mode: d.mode, subagents: p.subagents != .off)
         }
         p.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] = "1"
         p.environment["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
@@ -204,10 +205,15 @@ public enum TurnProfileCompiler {
         return TurnExpectations(agents: agents, forbiddenTools: forbidden, extraModels: extra)
     }
 
-    /// `'<executable>' hook pre-tool`, quoted for the shell that runs hook commands.
-    public static func hookCommand(executable: String) -> String {
-        "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "' hook pre-tool"
+    /// 3a's PreToolUse block in exec form: `<executable> hook pre-tool --mode <mode> [--subagents]`, blocking when it cannot
+    /// run (fix round 1, C1).
+    public static func preToolHook(executable: String, mode: WorkMode, subagents: Bool) -> HookMatcher {
+        HookMatcher(matcher: hookMatcher, hooks: [HookCommand(
+            command: executable, args: ["hook", "pre-tool", "--mode", mode.rawValue] + (subagents ? ["--subagents"] : []))])
     }
+
+    /// The prefix every sandboxed turn's mach marker has (`dev.brahma.turn.<id>`).
+    public static let containmentMarkerPrefix = "dev.brahma.turn."
 
     /// Refuses a profile whose model or fallback is not on the allowlist (owner pins included), and a Sandboxed profile that
     /// lacks any part of its sandbox (the sandbox block, the settings file, `--restricted` and `--tools`, the shell prefix):
@@ -226,6 +232,15 @@ public enum TurnProfileCompiler {
         guard let prefix = p.environment["CLAUDE_CODE_SHELL_PREFIX"], !prefix.isEmpty else {
             throw TurnProfileError.sandboxIncomplete("no shell prefix")
         }
+        // The turn's processes must be recognizable by their sandbox (Task 2's marker, adopted for turns).
+        guard let markers = sandbox.network?.allowMachLookup, markers.count == 1,
+              markers[0].hasPrefix(containmentMarkerPrefix), markers[0].count > containmentMarkerPrefix.count + 8 else {
+            throw TurnProfileError.sandboxIncomplete("no containment marker")
+        }
+        // Every hook is exec form (C1): a shell-form one would be refused by the prefix and fail open.
+        for hook in (p.settings.hooks ?? [:]).values.flatMap({ $0 }).flatMap(\.hooks) where hook.command.contains(where: \.isWhitespace) {
+            throw TurnProfileError.sandboxIncomplete("a hook is not in exec form")
+        }
     }
 
     /// Review and audit turns never get sub-agent or workflow tools, whatever the profile was widened to.
@@ -240,7 +255,8 @@ public enum TurnProfileCompiler {
     }
 
     /// The compiled settings (`p.settings`), compact, keys sorted: the settings file's bytes (or the inline `--settings`).
-    public static func settingsJSON(_ p: TurnProfile) -> String { p.settings.json() }
+    /// Throws rather than produce anything but the compiled settings (M6).
+    public static func settingsJSON(_ p: TurnProfile) throws -> String { try p.settings.json() }
 
     /// `2.00`, `0.30`, `0.0425`: two decimals, more when a small cap needs them.
     static func money(_ v: Double) -> String {
@@ -260,7 +276,12 @@ public enum TurnProfileCompiler {
         if p.restricted { a.append("--restricted") }
         if let tools = p.tools { a += ["--tools", tools.joined(separator: ",")] }
         if let prompts = p.permissionPrompts { a += ["--permission-prompts", prompts] }
-        a += ["--setting-sources", "", "--settings", p.settingsFilePath ?? settingsJSON(p)]
+        let inline: () -> String = {
+            // Only profiles without a settings file (never a sandboxed one: `validate`) carry the JSON inline; encoding plain
+            // values cannot fail, and if it ever did the turn must not start with anything else.
+            do { return try settingsJSON(p) } catch { preconditionFailure("the turn's settings could not be encoded: \(error)") }
+        }
+        a += ["--setting-sources", "", "--settings", p.settingsFilePath ?? inline()]
         if p.disableSlashCommands { a.append("--disable-slash-commands") }
         for dir in p.pluginDirs { a += ["--plugin-dir", dir] }
         a += ["--strict-mcp-config", "--mcp-config", p.mcpConfigPath,
@@ -306,6 +327,7 @@ public enum ChildEnvironment {
         "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
         "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS",
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "CLAUDE_CODE_DISABLE_FAST_MODE", "CLAUDE_CODE_DISABLE_WORKFLOWS",
+        "CLAUDE_CODE_TMPDIR",
         "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS", "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
         "CLAUDE_CODE_SHELL_PREFIX",
     ]
@@ -337,7 +359,10 @@ public enum ChildEnvironment {
         if purpose == .claude {
             for name in claudeAuth { if let v = base[name] { env[name] = v } }
         }
-        for (name, value) in extra where name.hasPrefix("BRAHMA_") && name != "BRAHMA_DEV" { env[name] = value }
+        // Never the MCP server's per-turn token: it lives only in that server's env block (fix round 1, I2(d)).
+        for (name, value) in extra where name.hasPrefix("BRAHMA_") && name != "BRAHMA_DEV" && name != MCPConfig.tokenVariable {
+            env[name] = value
+        }
         if purpose == .claude {
             for (name, value) in engineClaudeVars where Self.engineClaudeVars.contains(name) { env[name] = value }
         }

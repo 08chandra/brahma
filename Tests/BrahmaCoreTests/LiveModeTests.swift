@@ -49,7 +49,7 @@ struct LiveModeTests {
     @Test(.timeLimit(.minutes(3))) func liveQuickInitLacksTask() async throws {
         let dir = try tempDir()
         var r = try request(quick(), dir: dir)
-        r.hookCommand = TurnProfileCompiler.hookCommand(executable: try brahmaExecutable())
+        r.hookExecutable = try brahmaExecutable()
         let (info, result) = try await run(r)
         let tools = Set(try #require(info).tools)
         #expect(tools.isDisjoint(with: ["Task", "Agent", "Workflow"]), "\(tools)")

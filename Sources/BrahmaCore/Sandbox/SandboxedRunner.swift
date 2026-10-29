@@ -187,17 +187,15 @@ enum SandboxPolicyCheck {
             if !url.path.hasPrefix("/") { throw SandboxError.invalidPath(url.path) }
         }
         let roots = [baseline.userHome] + baseline.engineHomes + [URL(fileURLWithPath: "/Volumes"), URL(fileURLWithPath: "/")]
+        // The same alias/identity helper as turn scopes (`SandboxScope.checkAllowed`): no alias spelling, and overlaps judged by
+        // spelling and by device and inode (a firmlink spelling of a protected place is that place).
+        let identities = (SandboxPath.IdentityRoots(baseline.protected), SandboxPath.IdentityRoots(roots))
         for url in policy.writable + policy.readable {
             let path = url.path
             if SandboxPath.resolve(path) != path || path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) {
                 throw SandboxError.linkedPath(path)
             }
-            if let hit = baseline.protected.first(where: { SandboxPath.overlaps(path, $0.path) }) {
-                throw SandboxError.overlapsProtected(path: path, protected: hit.path)
-            }
-            if let hit = roots.first(where: { SandboxPath.isInside($0.path, path) }) {
-                throw SandboxError.overlapsProtected(path: path, protected: hit.path)
-            }
+            try SandboxScope.checkAllowed(url, protected: baseline.protected, deniedRoots: roots, byIdentity: identities)
         }
         for url in policy.writable {
             if let hit = baseline.companyWorkspaces.first(where: { SandboxPath.isInside($0.path, url.path) }) {

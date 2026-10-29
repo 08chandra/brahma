@@ -20,7 +20,7 @@ private final class StubDisk: DiskSpace, @unchecked Sendable {
 }
 
 private final class StubExec: @unchecked Sendable {
-    private let lock = NSLock(); private var _version = "2.1.304 (Claude Code)"
+    private let lock = NSLock(); private var _version = "2.1.312 (Claude Code)"
     var version: String { get { lock.withLock { _version } } set { lock.withLock { _version = newValue } } }
     var exec: Doctor.Exec {
         let help = Doctor.requiredFlags.map { "  \($0) <value>" }.joined(separator: "\n")
@@ -66,7 +66,7 @@ private struct HWorld {
         c.usageMode = .max
         try store.updateCompany(c)
         company = try onWorkspaceProfile(store, c)
-        try store.saveProbe(DoctorReport(cliVersion: "2.1.304", items: [DoctorItem(name: "version", status: .pass, detail: "2.1.304")],
+        try store.saveProbe(DoctorReport(cliVersion: "2.1.312", items: [DoctorItem(name: "version", status: .pass, detail: "2.1.312")],
                                          checkedAt: clock.now))
         orchestrator = Orchestrator(store: store, runner: fake, paths: paths, mcpExecutable: "/usr/local/bin/brahma",
                                     clock: clock.function, connectivity: probe, disk: disk, exec: exec.exec)
@@ -270,6 +270,8 @@ private struct HWorld {
         let w = try HWorld()
         w.fake.script("probe",
                       .init(events: [.initialized(sessionId: "s", model: "haiku"),
+                                     // The init tools the doctor's tools-present item checks (1b).
+                                     .initInfo(InitInfo(sessionId: "s", model: "haiku", tools: BuiltinTools.sandboxed, agents: [])),
                                      .rateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: "five_hour", isUsingOverage: false,
                                                               fiveHourUtilization: 0.1, sevenDayUtilization: 0.1, observedAt: w.clock.now)),
                                      .result(TurnResult(isError: false, subtype: "success", text: "OK", costUSD: 0.001, apiErrorStatus: nil, sessionId: "s", hasUsage: true))]),
@@ -281,14 +283,14 @@ private struct HWorld {
         #expect(try w.hold() == nil)
         #expect(w.fake.requests.isEmpty)
         // The CLI auto-updates.
-        w.exec.version = "2.1.306 (Claude Code)"
+        w.exec.version = "2.1.313 (Claude Code)"
         w.clock.advance(600); try await w.cycle()                 // version check runs
         try await w.cycle()                                       // sees the change: hold cli, re-probe runs
         #expect(try w.hold()?.reason == .cli)
         #expect(try w.events(.error).contains { $0.hasPrefix("engine paused: cli — ") })
         try await w.cycle()                                       // consumes the passing report
         #expect(try w.hold() == nil)
-        #expect(try w.store.latestProbe()?.cliVersion == "2.1.306")
+        #expect(try w.store.latestProbe()?.cliVersion == "2.1.313")
         #expect(try w.store.latestProbe()?.ok == true)
         #expect(w.fake.requests.count == 2, "exactly one doctor probe (two turns)")
         #expect(try w.alerts().isEmpty)

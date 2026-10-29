@@ -36,7 +36,9 @@ struct LiveSandboxProbeTests {
         let env = SandboxEnvironment.current
         let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: brahma)
         let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [], backupTargets: [], kind: .work,
-                                             item: item, company: company, grants: GrantInputs(), darwinUserTemp: env.darwinUserTemp)
+                                             item: item, company: company, grants: GrantInputs(), darwinUserTemp: env.darwinUserTemp,
+                                             claudeTmpRoot: env.claudeTmpRoot)
+        if let tmp = scope.claudeTmp { try ClaudeTmp.ensure(tmp) }
         // (c): project skills and agents in the cwd (planted after the engine's sweep would have run).
         let cwd = scope.cwd
         try FileManager.default.createDirectory(at: cwd.appending(path: ".claude/skills/x"), withIntermediateDirectories: true)
@@ -65,12 +67,13 @@ struct LiveSandboxProbeTests {
         request.sandbox = scope
         request.shellPrefix = prefix.path
         request.settingsFilePath = SettingsFile.path(paths: paths, agentId: agent.id).path
+        request.containmentMarker = TurnProfileCompiler.containmentMarkerPrefix + UUID().uuidString.lowercased()
         // (b) needs `--disable-slash-commands` off: compile as with a mount (the Skill denies), but pass no `--plugin-dir`.
         request.mounts = [root.appending(path: "no-plugin")]
         var profile = TurnProfileCompiler.profile(for: request)
         profile.pluginDirs = []
         try TurnProfileCompiler.validate(profile)
-        try SettingsFile.write(TurnProfileCompiler.settingsJSON(profile), to: URL(fileURLWithPath: request.settingsFilePath!))
+        try SettingsFile.write(try TurnProfileCompiler.settingsJSON(profile), to: URL(fileURLWithPath: request.settingsFilePath!))
         let args = TurnProfileCompiler.arguments(profile) + ["--max-budget-usd", "0.05"]
 
         if keep {
@@ -148,5 +151,105 @@ struct LiveSandboxProbeTests {
         print("PROBE (d) commit on item/\(item.key): \(head ?? "FAIL") (last subject: \(subject))")
         print("PROBE result: \(result.prefix(400)); cost $\(cost)")
         #expect(cost <= 0.06)
+    }
+
+    /// Fix round 1, live: (e) containment against Claude Code's real sandbox: inside the compiled settings, Bash double-forks
+    /// into a new session with the marker variable removed; the runner's sweep finds it by the turn's mach marker and it is gone
+    /// after the turn; and the turn's Bash `TMPDIR` is its own private directory. (f) an exec-form PreToolUse hook that exits 2
+    /// blocks the call it matches (the prefix never wraps it), and one that cannot run blocks with `onFailure: block`.
+    @Test(.timeLimit(.minutes(4)))
+    func containmentAndHookProbes() async throws {
+        let root = URL(fileURLWithPath: SandboxPath.resolve("/tmp"), isDirectory: false).appending(path: "brahma-probe-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = BrahmaPaths(home: root.appending(path: "data"), workspaces: root.appending(path: "wss"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        let company = try store.createCompany(name: "Probe", goal: "probe", workspacesRoot: paths.workspaces)
+        let agent = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "haiku")
+        try Sentinel.write(paths: paths)
+        let layout = SandboxLayout(paths: paths, company: company, agentHandle: agent.name)
+        try layout.ensure()
+        let env = SandboxEnvironment.current
+        let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [])
+        let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [], backupTargets: [], kind: .work,
+                                             item: nil, company: company, grants: GrantInputs(), darwinUserTemp: env.darwinUserTemp,
+                                             claudeTmpRoot: env.claudeTmpRoot)
+        let tmp = try #require(scope.claudeTmp)
+        try ClaudeTmp.ensure(tmp)
+        let mcp = root.appending(path: "empty.mcp.json")
+        try Data(#"{"mcpServers":{}}"#.utf8).write(to: mcp)
+        let pidFile = layout.agentHome.resolvedForSandbox.appending(path: "escapee.pid")
+        func request(_ prompt: String) -> TurnRequest {
+            var fresh = agent
+            fresh.sessionId = UUID().uuidString.lowercased()   // a new session per probe turn
+            var r = TurnRequest(agent: fresh, company: company, prompt: prompt, appendSystemPrompt: "You are a test agent running a scripted probe.",
+                                mcpConfigPath: mcp.path, workingDirectory: scope.cwd.path, profile: .sandboxed,
+                                environment: ["BRAHMA_AGENT_ID": agent.id])
+            r.sandbox = scope; r.shellPrefix = prefix.path
+            r.settingsFilePath = SettingsFile.path(paths: paths, agentId: agent.id).path
+            r.containmentMarker = TurnProfileCompiler.containmentMarkerPrefix + UUID().uuidString.lowercased()
+            r.turnRecordDirectory = paths.runDir.appending(path: "turns")
+            return r
+        }
+        // (e)
+        // The escapee's script sits in the lab (the cwd); the turn only runs it.
+        try """
+            echo "T=$TMPDIR"
+            /usr/bin/env -u BRAHMA_TURN_MARK /usr/bin/perl -e 'use POSIX; exit 0 if fork; POSIX::setsid(); exit 0 if fork; open(F, ">", $ARGV[0]); print F "$$\\n"; close F; close STDIN; close STDOUT; close STDERR; exec "/bin/sleep", "60"' '\(pidFile.path)'
+            sleep 1
+            echo "pid=$(cat '\(pidFile.path)')"
+            """.write(to: scope.cwd.appending(path: "probe.sh"), atomically: true, encoding: .utf8)
+        let e = request("This is an automated test of Brahma's own engine. Use the Bash tool to run `sh probe.sh` once, then reply with its output only.")
+        try SettingsFile.write(try TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: e)), to: URL(fileURLWithPath: e.settingsFilePath!))
+        var runner = ClaudeProcessRunner(claudePath: "claude", maxTurnDuration: .seconds(150))
+        runner.baseEnvironment = ProcessInfo.processInfo.environment
+        var results: [String] = []
+        var cost = 0.0
+        for try await event in runner.run(e) {
+            if case .result(let r) = event { results.append(r.text ?? ""); cost += r.costUSD ?? 0 }
+        }
+        let escapee = (try? String(contentsOf: pidFile, encoding: .utf8)).flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        let alive = escapee.map { kill($0, 0) == 0 && ProcessTable.entry($0)?.isZombie != true } ?? false
+        print("PROBE (e) escapee \(escapee.map(String.init) ?? "none") alive after the turn: \(alive); result: \(results.joined().prefix(300))")
+        print("PROBE (e) TMPDIR is the agent's own (\(tmp.path)): \(results.joined().contains(tmp.path))")
+        #expect(escapee != nil, "the probe's escapee never started")
+        #expect(!alive, "a double-forked, setsid, marker-cleared escapee survived the turn")
+        if let escapee, alive { kill(escapee, SIGKILL) }
+        #expect(results.joined().contains(tmp.path))
+
+        // (f)
+        for (name, hook) in [("exit-2", HookCommand(command: "/bin/sh", args: ["-c", "echo blocked-by-probe-hook >&2; exit 2"])),
+                             ("cannot-run", HookCommand(command: "/usr/bin/false", args: []))] {
+            let f = request("Use the Bash tool to run `echo hello-probe` once, then reply with the exact tool result text.")
+            var profile = TurnProfileCompiler.profile(for: f)
+            profile.settings.hooks = (profile.settings.hooks ?? [:]).merging(["PreToolUse": [HookMatcher(matcher: "Bash", hooks: [hook])]]) { $1 }
+            try SettingsFile.write(try TurnProfileCompiler.settingsJSON(profile), to: URL(fileURLWithPath: f.settingsFilePath!))
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["claude"] + TurnProfileCompiler.arguments(profile) + ["--max-budget-usd", "0.03"]
+            process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, extra: profile.environment,
+                                                        engineClaudeVars: profile.environment, purpose: .claude)
+            process.currentDirectoryURL = scope.cwd
+            let stdin = Pipe(), stdout = Pipe()
+            process.standardInput = stdin; process.standardOutput = stdout; process.standardError = FileHandle.nullDevice
+            try process.run()
+            try stdin.fileHandleForWriting.write(contentsOf: Data(f.prompt.utf8)); try stdin.fileHandleForWriting.close()
+            let out = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            process.waitUntilExit()
+            var toolResults: [String] = []
+            for line in out.split(separator: "\n") {
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
+                if obj["type"] as? String == "user", let content = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] {
+                    for c in content where c["type"] as? String == "tool_result" { toolResults.append("\(c["content"] ?? "")") }
+                }
+                if obj["type"] as? String == "result" { cost += (obj["total_cost_usd"] as? Double) ?? 0 }
+            }
+            let blocked = !toolResults.isEmpty && toolResults.allSatisfy { $0.contains("hook") && !$0.contains("hello-probe\n") && $0 != "hello-probe" }
+            print("PROBE (f) \(name): Bash blocked by the exec-form hook: \(blocked); tool results: \(toolResults.map { String($0.prefix(160)) })")
+            if toolResults.isEmpty { print("PROBE (f) \(name) raw: \(out.suffix(800))") }
+            #expect(blocked, "\(name)")
+        }
+        print("PROBE (e,f) cost $\(cost)")
+        #expect(cost <= 0.05)
     }
 }

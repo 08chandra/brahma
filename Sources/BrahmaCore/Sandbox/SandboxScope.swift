@@ -34,6 +34,9 @@ public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedEr
     /// directory) has a symbolic link at or above it inside the workspace: an agent can plant one, and following it would
     /// grant the turn whatever it names.
     case linkedPath(String)
+    /// A path spelled through an alias namespace (`/System/Volumes/…`, `/.nofollow`, `/.resolve`, `/.vol`) that names another
+    /// place: never an allowed entry; the real path must be used.
+    case aliasSpelling(path: String, alias: String)
 
     public var description: String {
         switch self {
@@ -47,6 +50,7 @@ public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedEr
         case .invalidHandle(let handle): "\(handle.debugDescription) cannot be an agent's sandbox handle"
         case .invalidPath(let path): "\(path.debugDescription) is not an absolute path"
         case .linkedPath(let path): "\(path) is a symbolic link where the sandbox expects a real file or directory"
+        case .aliasSpelling(let path, let alias): "\(path) is an alias spelling (under \(alias)) of another path; use the real path"
         }
     }
     public var errorDescription: String? { description }
@@ -208,12 +212,25 @@ enum SandboxPath {
     struct IdentityRoots {
         private let roots: [(path: String, id: Identity, lineage: Set<Identity>)]
 
+        /// Each root's lineage is built from its resolved path (a root spelled through a link is the place it names). A root
+        /// that does not exist (yet) is kept with the lineage of its existing part, so a path that contains where it would
+        /// be still overlaps it.
+        private let missing: [(path: String, lineage: Set<Identity>)]
+
         init(_ urls: [URL]) {
             var seen: Set<Identity> = []
-            roots = urls.compactMap { url in
-                guard let id = SandboxPath.identity(url.path), seen.insert(id).inserted else { return nil }
-                return (url.path, id, Set(SandboxPath.lineage(url.path)))
+            var kept: [(path: String, id: Identity, lineage: Set<Identity>)] = []
+            var absent: [(path: String, lineage: Set<Identity>)] = []
+            for url in urls {
+                let resolved = SandboxPath.resolve(url.path)
+                if let id = SandboxPath.identity(resolved) {
+                    if seen.insert(id).inserted { kept.append((url.path, id, Set(SandboxPath.lineage(resolved)))) }
+                } else {
+                    absent.append((url.path, Set(SandboxPath.lineage(resolved))))
+                }
             }
+            roots = kept
+            missing = absent
         }
 
         /// The first root `path` equals, lies inside or contains.
@@ -221,13 +238,15 @@ enum SandboxPath {
             let mine = SandboxPath.lineage(path)
             let inside = Set(mine)
             let id = SandboxPath.identity(path)
-            return roots.first { inside.contains($0.id) || (id.map($0.lineage.contains) ?? false) }?.path
+            if let hit = roots.first(where: { inside.contains($0.id) || (id.map($0.lineage.contains) ?? false) }) { return hit.path }
+            // A missing root: `path` contains it when `path` is an existing ancestor of it.
+            return id.flatMap { id in missing.first { $0.lineage.contains(id) }?.path }
         }
 
         /// The first root `path` equals or contains.
         func containedIn(_ path: String) -> String? {
             guard let id = SandboxPath.identity(path) else { return nil }
-            return roots.first { $0.lineage.contains(id) }?.path
+            return (roots.first { $0.lineage.contains(id) }?.path) ?? (missing.first { $0.lineage.contains(id) }?.path)
         }
     }
 
@@ -478,6 +497,15 @@ public struct SandboxScope: Equatable, Sendable {
     public var skippedUnsafe: [String] = []
     /// The read-only places that come from the owner's grants (`readOnlyDirs` holds them too): re-pinned right before spawn.
     public var grantReadDirs: [URL] = []
+    /// `<claudeTmpRoot>/<6 hex of the agent's place>`: the turn's claude keeps its temp files (its Bash `TMPDIR`) here
+    /// (`CLAUDE_CODE_TMPDIR`), not in the shared `/tmp/claude-<uid>` the owner's own sessions use. Outside the workspace, so
+    /// it is not a `writable` entry: the compiler grants it like `toolchainTempWrite`. Every agent's sibling is unreadable
+    /// (the root is in `denyRead`).
+    public var claudeTmp: URL? = nil
+
+    /// Claude Code 2.1.312 uses `CLAUDE_CODE_TMPDIR` only when its path is at most this long (probed live: 33 bytes worked,
+    /// 35 fell back to `/tmp/claude-<uid>`); the engine's own form is `/private/tmp/b-<uid>/<6 hex>`.
+    public static let claudeTmpMaxLength = 33
 
     public init(workspace: URL, cwd: URL, writable: [URL], readable: [URL], readOnlyDirs: [URL], denyRead: [URL],
                 denyWrite: [URL], protected: [URL], network: NetworkScope, toolchainTempWrite: URL?) {
@@ -553,7 +581,7 @@ public struct SandboxScope: Equatable, Sendable {
     /// writable, readable, read-only, toolchain and grant read paths.
     static func checkAllowed(_ entry: URL, protected: [URL], deniedRoots: [URL],
                              byIdentity: (protected: SandboxPath.IdentityRoots, denied: SandboxPath.IdentityRoots)) throws {
-        if let prefix = SandboxPath.alias(entry.path) { throw SandboxError.overlapsProtected(path: entry.path, protected: prefix) }
+        if let prefix = SandboxPath.alias(entry.path) { throw SandboxError.aliasSpelling(path: entry.path, alias: prefix) }
         if let hit = protected.first(where: { SandboxPath.overlaps(entry.path, $0.path) }) {
             throw SandboxError.overlapsProtected(path: entry.path, protected: hit.path)
         }
@@ -575,7 +603,7 @@ public struct SandboxScope: Equatable, Sendable {
                                     "ext-review", "hooks", "cache/shared"]
 
     /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist.
-    static let engineOnlyDotBrahma = ["cache", "resources", "checks", "wt-check", "handoffs", "releases", "artifacts",
+    static let engineOnlyDotBrahma = ["trash", "cache", "resources", "checks", "wt-check", "handoffs", "releases", "artifacts",
                                       "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "hooks", "bin", "kb"]
 
     /// Common-git-dir internals no turn writes (3a "GitCommand hardening I2": config or attributes flipped between the
@@ -601,7 +629,8 @@ public struct SandboxScope: Equatable, Sendable {
     ///   reads the worktree (read-only).
     public static func forTurn(layout: SandboxLayout, paths: BrahmaPaths, otherWorkspaces: [URL], backupTargets: [URL],
                                kind: TurnKind, item: WorkItem?, company: Company, grants: GrantInputs, darwinUserTemp: URL?,
-                               userHome: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> SandboxScope {
+                               userHome: URL = FileManager.default.homeDirectoryForCurrentUser,
+                               claudeTmpRoot: URL? = nil) throws -> SandboxScope {
         try SandboxLayout.validate(handle: layout.handle)
         if let key = item?.key, key.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) == nil {
             throw SandboxError.invalidPath(key)
@@ -681,9 +710,17 @@ public struct SandboxScope: Equatable, Sendable {
         var protected = ProtectedPaths.defaults(userHome: userHome).flatMap(both) + both(paths.home)
         protected += otherWorkspaces.flatMap(both) + backupTargets.flatMap(both)
         protected = dedupe(protected)
+        // The per-user Darwin folder (`/private/var/folders/<a>/<b>`, which holds T, C and 0: every app's temporary files) is
+        // unreadable like the home, except the toolchain's own entries below (the turn-side twin of Task 2 A-I1).
+        let darwinUserDir = darwinUserTemp.flatMap { $0.lastPathComponent == "T" ? r($0).deletingLastPathComponent() : nil }
         let deniedRoots = dedupe(both(userHome) + both(paths.home) + both(URL(fileURLWithPath: "/Volumes", isDirectory: false))
-                                 + both(dot))
-        let denyRead = dedupe(deniedRoots + protected)
+                                 + both(dot) + (darwinUserDir.map(both) ?? []))
+        // Claude Code's shared temp places: the owner's own sessions' outputs live there (same uid).
+        let claudeShared = ["claude-\(getuid())", "claude-tool-results"].flatMap { name in
+            ["/private/tmp/\(name)", "/tmp/\(name)"].map { URL(fileURLWithPath: $0, isDirectory: false) }
+        }
+        let tmpRoot = claudeTmpRoot.map(r)
+        let denyRead = dedupe(deniedRoots + protected + claudeShared + (tmpRoot.map(both) ?? []))
 
         // Read paths the owner or a grant added are checked whether or not they exist yet; only existing ones are mounted.
         // None may reach into `.brahma` (other agents' labs, homes and notes, the engine's files).
@@ -717,6 +754,12 @@ public struct SandboxScope: Equatable, Sendable {
         readable += readableDotBrahma.compactMap(engineChild)
         readable += [home, lab, notes, shellPrefix]
         readable += existingExtra
+        if let darwinUserDir {
+            // What the toolchain reads in the Darwin folder: xcrun's cache, Foundation's atomic-write staging (SwiftPM,
+            // xcodebuild; Claude's settings take paths, not Task 2's exact name patterns: a documented residual), Xcode's
+            // cached build specifications.
+            readable += ["T/xcrun_db", "T/TemporaryItems", "C/com.apple.DeveloperTools"].map { darwinUserDir.appending(path: $0) }
+        }
         // Whatever the turn runs in or writes it can read.
         readable += [cwd] + writable
 
@@ -781,6 +824,14 @@ public struct SandboxScope: Equatable, Sendable {
                                  toolchainTempWrite: darwinUserTemp.map(r))
         scope.skippedUnsafe = skipped
         scope.grantReadDirs = grantReads
+        if let tmpRoot {
+            let tmp = tmpRoot.appending(path: String(StableHash.fnv1a64(SandboxPath.key(ws.path) + "\u{0}" + h).prefix(6)))
+            guard tmp.path.utf8.count <= claudeTmpMaxLength else {
+                throw SandboxError.invalidPath("\(tmp.path) is too long for Claude Code's temp directory (\(claudeTmpMaxLength) bytes)")
+            }
+            try checkAllowed(tmp, protected: protected, deniedRoots: deniedRoots)
+            scope.claudeTmp = tmp
+        }
         try scope.validate()
         return scope
     }

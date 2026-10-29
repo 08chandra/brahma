@@ -76,7 +76,7 @@ import GRDB
         let args = ClaudeCommand.arguments(for: r)
         #expect(args.contains("--effort")); #expect(args[args.firstIndex(of: "--effort")! + 1] == "medium")
         #expect(args[args.firstIndex(of: "--max-turns")! + 1] == "40")
-        #expect(r.hookCommand == "'/usr/local/bin/brahma' hook pre-tool")
+        #expect(r.hookExecutable == "/usr/local/bin/brahma")
         #expect(TurnProfileCompiler.profile(for: r).wallClock == .seconds(1200))
         #expect(r.expectations?.forbiddenTools.contains("Task") == true)
         let t = try m.lastTurn()

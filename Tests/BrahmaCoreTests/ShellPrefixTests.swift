@@ -31,11 +31,12 @@ private struct PrefixWorld {
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: paths.sentinel.path)
     }
 
-    func run(_ prefix: URL, _ command: String, environment: [String: String]) throws -> (status: Int32, out: String, err: String) {
+    func run(_ prefix: URL, _ command: String, environment: [String: String], in cwd: URL? = nil) throws -> (status: Int32, out: String, err: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = [prefix.path, command]
         p.environment = environment
+        if let cwd { p.currentDirectoryURL = cwd }
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
@@ -99,14 +100,18 @@ private struct PrefixWorld {
         let w = try PrefixWorld()
         let text = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/bash", keepNames: ["A_KEY", "B"],
                                           mcpExecutable: "/opt/brahma/bin/brahma")
+        // Fix round 1: absolute tools (I1); the engine's MCP server by a fixed argv, never `$1` (I2); git keys by digits (M1).
         #expect(text == """
             #!/bin/sh
-            case "${BRAHMA_TURN_TOKEN:+t}:$1" in *[!-A-Za-z0-9_./:\\ \\']*) ;; "t:/opt/brahma/bin/brahma mcp "*|"t:'/opt/brahma/bin/brahma' mcp "*|"t:'/opt/brahma/bin/brahma' 'mcp' "*) exec '/bin/bash' -c "$1";; esac
-            if cat '\(w.paths.sentinel.path)' >/dev/null 2>&1; then echo "brahma: sandbox is not active; command refused" >&2; exit 126; fi
+            if [ -n "${BRAHMA_TURN_TOKEN:-}" ]; then
+              case "$1" in "/opt/brahma/bin/brahma mcp"|"/opt/brahma/bin/brahma mcp "*|"'/opt/brahma/bin/brahma' mcp"|"'/opt/brahma/bin/brahma' mcp "*|"'/opt/brahma/bin/brahma' 'mcp'"|"'/opt/brahma/bin/brahma' 'mcp' "*) unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; exec '/opt/brahma/bin/brahma' mcp;; esac
+              echo "brahma: refused" >&2; exit 126
+            fi
+            if \(ShellPrefix.tools.cat) '\(w.paths.sentinel.path)' >/dev/null 2>&1; then echo "brahma: sandbox is not active; command refused" >&2; exit 126; fi
             keep=' A_KEY B '
-            for n in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do
+            for n in $(\(ShellPrefix.tools.env) | LC_ALL=C \(ShellPrefix.tools.sed) -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do
               case "$keep" in *" $n "*) continue;; esac
-              case "$n" in GIT_CONFIG_KEY_[0-9]*) continue;; esac
+              case "${n#GIT_CONFIG_KEY_}" in "$n"|'') ;; *[!0123456789]*) ;; *) continue;; esac
               case "$n" in CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|SSH_AUTH_SOCK|AWS_*|*TOKEN*|*SECRET*|*KEY*|*token*|*secret*|*key*) unset "$n";; esac
             done
             export HOME='\(w.home)' XDG_CONFIG_HOME='\(w.home)/.config' XDG_CACHE_HOME='\(w.cache)/xdg'
@@ -131,39 +136,58 @@ private struct PrefixWorld {
         #expect(try String(contentsOf: target, encoding: .utf8) == "echo planted")
     }
 
-    /// Live probe (a): Claude Code starts its stdio MCP servers through the prefix, unsandboxed. The engine's own server (with
-    /// its per-turn token) passes; nothing else does, token or not.
-    @Test func engineMCPServerPassesTheSentinel() throws {
+    /// Live probe (a), reworked (fix round 1, I2): Claude Code starts its stdio MCP servers through the prefix, unsandboxed. With
+    /// the server's per-turn token present, a line that is the engine's MCP command runs the FIXED argv `<exe> mcp` (the server
+    /// reads its parameters from its env block); `$1` is never evaluated, so nothing on it runs. Any other line: refused.
+    @Test func engineMCPServerRunsAFixedArgv() throws {
         let w = try PrefixWorld()
         try FileManager.default.createDirectory(at: w.paths.runDir, withIntermediateDirectories: true)
         try Data("sentinel".utf8).write(to: w.paths.sentinel)   // readable: no sandbox, as for an MCP server
-        let prefix = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpExecutable: "/bin/echo")
-        let env = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": "tok", "HOME": "/Users/owner"]
-        for form in ["/bin/echo mcp --db x", "'/bin/echo' mcp --db x", "'/bin/echo' 'mcp' '--db' 'x'"] {
-            let r = try w.run(prefix, form, environment: env)
-            #expect(r.status == 0, "\(form): \(r.err)"); #expect(r.out == "mcp --db x\n", "\(form)")
-        }
-        // The server line is exec'd before the scrub and the HOME export (the script text test shows the order), so the server
-        // keeps its token; a `$` on the line is refused like any other shell syntax.
-        #expect(try w.run(prefix, "/bin/echo mcp $BRAHMA_TURN_TOKEN", environment: env).status == 126)
-        // Without the token, or any other command with it: refused.
-        #expect(try w.run(prefix, "/bin/echo mcp --db x", environment: ["PATH": "/usr/bin:/bin"]).status == 126)
-        #expect(try w.run(prefix, "/bin/echo hi", environment: env).status == 126)
-        #expect(try w.run(prefix, "/bin/echo mcpx", environment: env).status == 126)
-        #expect(try w.run(prefix, "true; /bin/echo mcp ", environment: env).status == 126)
-        // Nothing can ride along on the server's line.
+        let exe = try FakeTools.script("brahma", """
+            echo "args:$*"
+            echo "token:${BRAHMA_TURN_TOKEN:-none} oauth:${CLAUDE_CODE_OAUTH_TOKEN:-unset} api:${ANTHROPIC_API_KEY:-unset} home:$HOME"
+            """)
+        let prefix = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpExecutable: exe.path)
+        let env = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": "tok", "HOME": "/Users/owner", "CLAUDE_CODE_OAUTH_TOKEN": "o",
+                   "ANTHROPIC_API_KEY": "k"]
         let marker = w.root.appending(path: "rode-along")
-        for extra in ["; touch '\(marker.path)'", " && touch \(marker.path)", "\ntouch \(marker.path)", " $(touch \(marker.path))",
-                      " `touch \(marker.path)`", " | touch \(marker.path)", " > \(marker.path)"] {
-            #expect(try w.run(prefix, "/bin/echo mcp x" + extra, environment: env).status == 126, "\(extra)")
+        for form in ["\(exe.path) mcp --db x", "'\(exe.path)' mcp --db x", "'\(exe.path)' 'mcp' '--db' 'x'", "\(exe.path) mcp",
+                     "\(exe.path) mcp --db x; touch '\(marker.path)'", "\(exe.path) mcp $(touch \(marker.path))"] {
+            let r = try w.run(prefix, form, environment: env)
+            #expect(r.status == 0, "\(form): \(r.err)")
+            #expect(r.out == "args:mcp\ntoken:tok oauth:unset api:unset home:/Users/owner\n", "\(form)")
         }
-        #expect(!FileManager.default.fileExists(atPath: marker.path))
-        // No MCP executable named: nothing passes.
-        let plain = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [])
-        #expect(try w.run(plain, "/bin/echo mcp --db x", environment: env).status == 126)
+        #expect(!FileManager.default.fileExists(atPath: marker.path), "nothing on the line ever runs")
+        // Token set, any other line (Claude's own Bash wrapper shape included): refused, whatever the sentinel says.
+        try w.unreadableSentinel()
+        for line in ["/bin/echo hi", "\(exe.path)x mcp", "true; \(exe.path) mcp", "\(exe.path) mcp\ntouch \(marker.path)",
+                     "source /tmp/snap.sh 2>/dev/null || true && eval '\(exe.path) mcp' < /dev/null && pwd -P >| /tmp/cwd"] {
+            #expect(try w.run(prefix, line, environment: env).status == 126, "\(line)")
+        }
+        // Without the token the line is an ordinary command (sandbox, scrub, agent HOME).
+        let plain = try w.run(prefix, "/bin/echo $HOME", environment: ["PATH": "/usr/bin:/bin", "HOME": "/Users/owner"])
+        #expect(plain.out == "\(w.home)\n")
+        // No MCP executable named: a token-carrying line is refused.
+        let none = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [])
+        #expect(try w.run(none, "\(exe.path) mcp", environment: env).status == 126)
         #expect(throws: SandboxError.self) {
             _ = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpExecutable: "/x/$(id)/brahma")
         }
+    }
+
+    /// I1: the sentinel check's tools come by absolute path, never through the inherited PATH (a `cat` the agent planted in
+    /// a relative PATH entry cannot fake an unreadable sentinel).
+    @Test func plantedCatOnPathCannotDefeatTheSentinel() throws {
+        let w = try PrefixWorld()
+        try FileManager.default.createDirectory(at: w.paths.runDir, withIntermediateDirectories: true)
+        try Data("sentinel".utf8).write(to: w.paths.sentinel)   // readable: the sandbox is not active
+        let cwd = try tempDir()
+        for tool in ["cat", "env", "sed"] { try FakeTools.install(at: cwd.appending(path: "bin/\(tool)"), "exit 1") }
+        let prefix = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [])
+        let marker = w.root.appending(path: "ran")
+        let r = try w.run(prefix, "/usr/bin/touch '\(marker.path)'", environment: ["PATH": "bin:/usr/bin:/bin"], in: cwd)
+        #expect(r.status == 126, "\(r.err)")
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
     }
 
     /// Live probe (d): git needs the `GIT_CONFIG_KEY_<n>` Claude Code injects next to `GIT_CONFIG_COUNT`.
@@ -173,9 +197,11 @@ private struct PrefixWorld {
         let prefix = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [])
         let r = try w.run(prefix, "env", environment: ["PATH": "/usr/bin:/bin", "GIT_CONFIG_COUNT": "1",
                                                         "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "/x",
-                                                        "GIT_CONFIG_KEY_X": "secretish"])
+                                                        "GIT_CONFIG_KEY_X": "secretish", "GIT_CONFIG_KEY_0X": "s",
+                                                        "GIT_CONFIG_KEY_0_SECRET_TOKEN": "s", "GIT_CONFIG_KEY_": "s"])
         #expect(r.out.contains("GIT_CONFIG_KEY_0=safe.directory\n")); #expect(r.out.contains("GIT_CONFIG_COUNT=1\n"))
-        #expect(!r.out.contains("GIT_CONFIG_KEY_X"))
+        #expect(!r.out.contains("GIT_CONFIG_KEY_X")); #expect(!r.out.contains("GIT_CONFIG_KEY_0X"))
+        #expect(!r.out.contains("GIT_CONFIG_KEY_0_SECRET_TOKEN")); #expect(!r.out.contains("GIT_CONFIG_KEY_="))
     }
 
     @Test func keepNamesMustBeVariableNames() throws {
@@ -193,6 +219,18 @@ private struct PrefixWorld {
         #expect(throws: SandboxError.self) { _ = try ShellPrefix.script(layout: layout, paths: paths, shell: "/bin/zsh", keepNames: []) }
         let ok = BrahmaPaths(home: root.appending(path: "data"), workspaces: root)
         #expect(throws: SandboxError.self) { _ = try ShellPrefix.script(layout: layout, paths: ok, shell: "/bin/z'sh", keepNames: []) }
+    }
+
+    /// M7: Claude splits `CLAUDE_CODE_SHELL_PREFIX` at whitespace (` -`): a prefix path holding any is refused.
+    @Test func prefixPathWithWhitespaceRefused() throws {
+        let root = URL(fileURLWithPath: SandboxPath.resolve(try tempDir().path), isDirectory: false)
+        let paths = BrahmaPaths(home: root.appending(path: "data"), workspaces: root.appending(path: "Work -Projects"))
+        let ws = paths.workspaces.appending(path: "acme")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        let company = Company(id: "c1", name: "Acme", slug: "acme", goal: "g", workspacePath: ws.path, status: .running,
+                              usageMode: .low, priorityWeight: 1, createdAt: Date(timeIntervalSince1970: 0))
+        let layout = SandboxLayout(paths: paths, company: company, agentHandle: "eng-1")
+        #expect(throws: SandboxError.self) { _ = try ShellPrefix.write(layout: layout, paths: paths, shell: "/bin/zsh", keepNames: []) }
     }
 
     @Test func shellIsTheOwnersZshOrBash() {

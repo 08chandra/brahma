@@ -65,11 +65,38 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
         let expected: NSDictionary = ["mcpServers": ["company": [
             "command": "/usr/bin/brahma",
             "args": ["mcp", "--db", paths.database.path, "--company", "c1", "--agent", "a1"],
-            "env": ["BRAHMA_TURN_TOKEN": "tok123"] as NSDictionary,
+            // 1b fix round 1 (I2): the parameters also ride in the env block, so the shell prefix can start the server by a
+            // fixed argv (`<exe> mcp`) without evaluating the line Claude hands it.
+            "env": ["BRAHMA_TURN_TOKEN": "tok123", "BRAHMA_MCP_DB": paths.database.path, "BRAHMA_MCP_COMPANY": "c1",
+                    "BRAHMA_MCP_AGENT": "a1"] as NSDictionary,
         ] as NSDictionary] as NSDictionary]
         #expect(obj == expected)
         let attrs = try FileManager.default.attributesOfItem(atPath: path)
         #expect((attrs[.posixPermissions] as? Int) == 0o600)
+    }
+
+    /// `brahma mcp`'s parameters: its flags, or (started by the shell prefix's fixed argv) its env block; both given must agree.
+    @Test func mcpParametersFromFlagsOrEnvironment() throws {
+        let env = ["BRAHMA_MCP_DB": "/d.sqlite", "BRAHMA_MCP_COMPANY": "c1", "BRAHMA_MCP_AGENT": "a1", "BRAHMA_MCP_REVIEW_ITEM": "K-1"]
+        let fromEnv = try MCPLaunch.resolve(db: nil, company: nil, agent: nil, reviewItem: nil, audit: false, environment: env)
+        #expect(fromEnv == MCPLaunch(db: "/d.sqlite", company: "c1", agent: "a1", reviewItem: "K-1", audit: false))
+        let flags = try MCPLaunch.resolve(db: "/d.sqlite", company: "c1", agent: "a1", reviewItem: nil, audit: false, environment: [:])
+        #expect(flags == MCPLaunch(db: "/d.sqlite", company: "c1", agent: "a1", reviewItem: nil, audit: false))
+        #expect(try MCPLaunch.resolve(db: "/d.sqlite", company: "c1", agent: "a1", reviewItem: "K-1", audit: false, environment: env).reviewItem == "K-1")
+        #expect(throws: MCPLaunch.Failure.self) {
+            try MCPLaunch.resolve(db: "/other.sqlite", company: nil, agent: nil, reviewItem: nil, audit: false, environment: env)
+        }
+        #expect(throws: MCPLaunch.Failure.self) {
+            try MCPLaunch.resolve(db: nil, company: nil, agent: nil, reviewItem: nil, audit: false, environment: [:])
+        }
+        #expect(try MCPLaunch.resolve(db: nil, company: nil, agent: nil, reviewItem: nil, audit: false,
+                                      environment: ["BRAHMA_MCP_DB": "/d", "BRAHMA_MCP_COMPANY": "c", "BRAHMA_MCP_AGENT": "a",
+                                                    "BRAHMA_MCP_AUDIT": "1"]).audit)
+        #expect(throws: MCPLaunch.Failure.self) {
+            try MCPLaunch.resolve(db: nil, company: nil, agent: nil, reviewItem: nil, audit: false,
+                                  environment: ["BRAHMA_MCP_DB": "/d", "BRAHMA_MCP_COMPANY": "c", "BRAHMA_MCP_AGENT": "a", "BRAHMA_MCP_AUDIT": "1",
+                                                "BRAHMA_MCP_REVIEW_ITEM": "K"])
+        }
     }
 
     @Test func digestRendersItems() {

@@ -132,7 +132,7 @@ public final class EngineHost {
         }
         lock = acquired
         let orchestrator = Orchestrator(store: store, runner: makeRunner(resolved.claudePath), paths: paths, config: config,
-                                        mcpExecutable: resolved.mcpExecutable, profile: .workspace,
+                                        mcpExecutable: resolved.mcpExecutable, profile: nil,
                                         claudePath: resolved.claudePath, vault: secretVault,
                                         transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()),
                                         sleepGuard: SleepGuard(launcher: CaffeinateProcess.launcher()))

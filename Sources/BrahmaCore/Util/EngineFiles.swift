@@ -185,6 +185,35 @@ public enum EngineFiles {
         return try removeNoFollow(parts: parts, under: root, shown: url.path)
     }
 
+    /// Moves what is at `url` (a file, a link or a whole directory; never what a link points at), which must lie under `root`,
+    /// into `<root>/<trash>` as `name`, by descriptor (`renameat` between the two opened directories): nothing is followed,
+    /// nothing is lost. The trash directory is created (0700) without following a link.
+    @discardableResult
+    public static func moveNoFollow(_ url: URL, under root: URL, toDirectory trash: String, name: String) throws -> Removal {
+        let base = root.standardizedFileURL.path, target = url.standardizedFileURL.path
+        guard target.hasPrefix(base + "/") else { throw UnsafeEngineFile(path: url.path, problem: "is not under \(base)") }
+        let parts = target.dropFirst(base.count + 1).split(separator: "/").map { Array(String($0).utf8) }
+        guard let last = parts.last, isValidName(last), let entryName = String(bytes: last, encoding: .utf8) else {
+            throw UnsafeEngineFile(path: url.path, problem: "is not a valid file name")
+        }
+        let dfd: Int32
+        switch try openWay(root: root, parts.dropLast()[...], shown: url.path) {
+        case .missing: return .missing
+        case .blocked(let problem): return .blocked(problem)
+        case .open(let fd): dfd = fd
+        }
+        defer { close(dfd) }
+        let tfd = try openDirectory(workspace: root, trash)
+        defer { close(tfd) }
+        _ = fchmod(tfd, 0o700)
+        try checkName(name, url.path)
+        guard renameat(dfd, entryName, tfd, name) == 0 else {
+            if errno == ENOENT { return .missing }
+            throw UnsafeEngineFile(path: url.path, problem: "cannot be moved aside (\(String(cString: strerror(errno))))")
+        }
+        return .removed
+    }
+
     /// `removeNoFollow(_:under:)` for a path given as raw bytes relative to `root` (a name git reports need not be UTF-8).
     @discardableResult
     public static func removeNoFollow(relative: [UInt8], under root: URL) throws -> Removal {

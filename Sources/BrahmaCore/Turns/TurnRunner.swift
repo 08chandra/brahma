@@ -10,15 +10,19 @@ public protocol TurnRunning: Sendable {
     /// returns what it printed until each request was answered, the process exited or `timeout` passed. No prompt is sent, so
     /// no model is called. Nil when the runner cannot (test fakes): the doctor's mode-canary is then skipped.
     func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript?
-    /// Returns once no turn of `agentId` is in flight and its earlier turns' processes are gone: the pids of any that could
-    /// not be killed (empty: nothing of an earlier turn still runs). The engine waits here before it computes a turn's scope.
-    func waitForTurnProcesses(agentId: String) async -> [Int32]
+    /// Returns once no turn of `agentId` is in flight and its earlier turns' processes are gone (`records`: where turns are
+    /// recorded, so what an earlier engine left is found too): what it killed and what would not die. The engine waits here
+    /// first, every turn, every profile. Throws when it cannot finish (its deadline, a cancellation).
+    func waitForTurnProcesses(agentId: String, records: URL) async throws -> TurnLeftovers
 }
 
 extension TurnRunning {
     public func waitForChildren() async {}
     public func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? { nil }
-    public func waitForTurnProcesses(agentId: String) async -> [Int32] { [] }
+    /// A runner that cannot account for its turns' processes fails closed (M11).
+    public func waitForTurnProcesses(agentId: String, records: URL) async throws -> TurnLeftovers {
+        throw TurnError.earlierTurnStillRunning(pids: [])
+    }
 }
 
 /// What a control session printed: its stdout lines, and its exit status when it exited by itself.
@@ -93,9 +97,13 @@ public struct ClaudeProcessRunner: TurnRunning {
         await waitForChildren(pollInterval: .milliseconds(20))
     }
 
-    public func waitForTurnProcesses(agentId: String) async -> [Int32] {
-        await Self.registry.waitUntilGone(agentId)
+    public func waitForTurnProcesses(agentId: String, records: URL) async throws -> TurnLeftovers {
+        try await Self.registry.waitUntilGone(agentId, records: records, deadline: Self.turnWaitDeadline)
     }
+
+    /// How long a turn waits for the agent's previous turn to be swept before it fails closed: the kill grace, the drains and
+    /// the sweep rounds with room to spare.
+    static let turnWaitDeadline: Duration = .seconds(60)
 
     /// `onPoll` runs once per check of the live count; tests use it to prove the wait sleeps between checks.
     func waitForChildren(pollInterval: Duration = .milliseconds(20), onPoll: @escaping @Sendable () -> Void = {}) async {
@@ -188,13 +196,24 @@ public struct ClaudeProcessRunner: TurnRunning {
         var profile = TurnProfileCompiler.profile(for: request)
         try TurnProfileCompiler.validate(profile)
         let agentId = request.agent.id
-        // Nothing of an earlier turn of this agent may still run when this one starts (1a re-review, binding).
-        let earlier = await Self.registry.waitUntilGone(agentId)
-        if !earlier.isEmpty { throw TurnError.earlierTurnStillRunning(pids: earlier) }
+        // Nothing of an earlier turn of this agent may still run when this one starts (1a re-review, binding): claim the agent's
+        // slot (one step: nothing running, then begin), then kill what earlier turns, of this engine or an earlier one, left.
+        try Task.checkCancellation()
+        try await Self.registry.claim(agentId, deadline: Self.turnWaitDeadline)
+        var claimed = true
+        defer { if claimed { Self.registry.end(agentId, survivors: []) } }
+        let earlier = try await Task.detached { [records = request.turnRecordDirectory] in
+            try records.map { try TurnRecords.reap(agentId: agentId, in: $0) } ?? TurnLeftovers()
+        }.value
+        if !earlier.survivors.isEmpty { throw TurnError.earlierTurnStillRunning(pids: earlier.survivors) }
         // The scope may be some time old: its link walk again, and the cwd it starts in must be the scope's own. A grant read
         // path that is no longer pinned (a link put in its place) is dropped for this turn, and the settings written again.
         if profile.permission == .sandboxed, var scope = request.sandbox {
             let dropped = try scope.recheckBeforeSpawnDroppingGrants()
+            for url in dropped {
+                yield(.sandboxNote("@\(request.agent.name): read-path grant \(url.path) left out of this turn at its start: a link or "
+                                   + "alias was put where the approved directory was"))
+            }
             if !dropped.isEmpty {
                 let gone = Set(dropped.map(\.path))
                 request.sandbox = scope
@@ -202,7 +221,7 @@ public struct ClaudeProcessRunner: TurnRunning {
                 profile = TurnProfileCompiler.profile(for: request)
                 try TurnProfileCompiler.validate(profile)
                 if let path = request.settingsFilePath {
-                    try SettingsFile.write(TurnProfileCompiler.settingsJSON(profile), to: URL(fileURLWithPath: path))
+                    try SettingsFile.write(try TurnProfileCompiler.settingsJSON(profile), to: URL(fileURLWithPath: path))
                 }
             }
         }
@@ -233,18 +252,28 @@ public struct ClaudeProcessRunner: TurnRunning {
             for fd in [inPipe.read, inPipe.write, outPipe.read, outPipe.write] { close(fd) }
             throw error
         }
-        // A sandboxed turn's processes are also known by their sandbox (it cannot be dropped).
-        let probe = profile.permission == .sandboxed ? request.sandbox.map { SandboxProbe(workspace: $0.workspace, handle: request.agent.name) } : nil
-        Self.registry.begin(agentId, probe: probe)
+        // A sandboxed turn's processes are also known by their sandbox: its unremovable marker (Task 2's mechanism).
+        let probe = profile.permission == .sandboxed ? request.containmentMarker.map { SandboxProbe(machMarker: $0) } : nil
+        // Recorded before the spawn (and the leader added right after), so an engine that dies mid-turn leaves the next one
+        // enough to kill what is left (B-I1). A turn that cannot be recorded does not start.
+        let since = ProcessTable.startStamp(slack: 1)
+        var record = TurnRecord(leader: 0, leaderStart: since, since: since, machMarker: probe?.machMarker)
         let child: TurnChild
         do {
+            if let dir = request.turnRecordDirectory { try TurnRecords.add(record, agentId: agentId, in: dir) }
+            try Task.checkCancellation()
             child = try TurnChild.spawn(executable: executable, arguments: argv, environment: environment,
                                         workingDirectory: profile.workingDirectory,
-                                        stdin: inPipe.read, stdout: outPipe.write, stderr: errPipe.write, probe: probe)
+                                        stdin: inPipe.read, stdout: outPipe.write, stderr: errPipe.write, probe: probe, since: since)
         } catch {
             for fd in [inPipe.read, inPipe.write, outPipe.read, outPipe.write, errPipe.read, errPipe.write] { close(fd) }
-            Self.registry.end(agentId, survivors: [])
+            if let dir = request.turnRecordDirectory { try? TurnRecords.replace(record, with: nil, agentId: agentId, in: dir) }
             throw error
+        }
+        claimed = false   // from here the sweep below ends the claim, with what it could not kill
+        if let dir = request.turnRecordDirectory, let start = ProcessTable.entry(child.pid)?.start {
+            let withLeader = TurnRecord(leader: child.pid, leaderStart: start, since: since, machMarker: record.machMarker)
+            if (try? TurnRecords.replace(record, with: withLeader, agentId: agentId, in: dir)) != nil { record = withLeader }
         }
         close(inPipe.read); close(outPipe.write); close(errPipe.write)
         let input = FileHandle(fileDescriptor: inPipe.write, closeOnDealloc: true)
@@ -325,6 +354,7 @@ public struct ClaudeProcessRunner: TurnRunning {
             DispatchQueue.global().async { c.resume(returning: child.finish()) }
         }
         Self.registry.end(agentId, survivors: left)
+        if left.isEmpty, let dir = request.turnRecordDirectory { try? TurnRecords.replace(record, with: nil, agentId: agentId, in: dir) }
         if !left.isEmpty {
             FileHandle.standardError.write(Data("brahma: \(left.count) process(es) of @\(request.agent.name)'s turn could not be killed: \(left.map { String($0.pid) }.joined(separator: ", "))\n".utf8))
         }

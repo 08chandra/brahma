@@ -136,7 +136,7 @@ import GRDB
         let scope = try #require(request.sandbox)
         #expect(scope.denyRead.map(\.path).contains(drive.resolvedForSandbox.path), "\(scope.denyRead.map(\.path))")
         #expect(scope.protected.map(\.path).contains(drive.resolvedForSandbox.path), "\(scope.protected.map(\.path))")
-        let settings = TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: request))
+        let settings = try TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: request))
         #expect(settings.contains(drive.resolvedForSandbox.path))
     }
 
