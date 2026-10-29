@@ -791,6 +791,37 @@ enum Migrations {
             }
             try db.create(index: "ownerDigest_company", on: "ownerDigest", columns: ["companyId", "periodEnd"])
         }
+        m.registerMigration("v5-grants") { db in
+            // The grant ledger (Task 9). `grant` is an SQL keyword: raw SQL quotes it.
+            try db.create(table: "grant") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("askId", .text)
+                t.column("kind", .text).notNull()
+                t.column("value", .text).notNull()
+                t.column("scope", .text).notNull()
+                t.column("scopeRef", .text)
+                t.column("requesterId", .text)
+                t.column("duration", .text).notNull()
+                t.column("sprintId", .text)
+                t.column("expiresActive", .double)
+                t.column("usesLeft", .integer)
+                t.column("approvedBy", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("revokedAt", .datetime)
+                t.column("revokedBy", .text)
+                t.column("lastUsedAt", .datetime)
+                t.column("useCount", .integer).notNull().defaults(to: 0)
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(table: "accessPreset") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("presetId", .text).notNull()
+                t.column("enabled", .boolean).notNull()
+                t.primaryKey(["companyId", "presetId"])
+            }
+        }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
             // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).

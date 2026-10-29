@@ -256,6 +256,9 @@ extension Store {
             }
         case .sprintPlan:
             try reverseSprintPlan(db, ask: ask, now: now)
+        case .grant:
+            // The access it granted is gone from the next turn.
+            try revokeGrants(db, askId: ask.id, now: now)
         default:
             break
         }

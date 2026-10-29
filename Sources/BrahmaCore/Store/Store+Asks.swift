@@ -519,27 +519,44 @@ extension Store {
            let company = try company(id: seen.companyId) {
             currentHash = .some(currentDocumentHash(seen, company: company))
         }
-        return try writer.write { db in
-            var ask = try requireAsk(db, askId)
-            guard ask.kind.isDecision else {
-                throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
-            }
-            guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
-            if approve, !acknowledgeChange, ask.payload?.documentPath != nil, let proposed = ask.detailsHash,
-               let current = currentHash, current != proposed {
-                throw WorkError.conflict("\(ask.ref)'s document changed since it was proposed; read it again and approve with --ack-changed")
-            }
-            ask.ownerNote = Store.flat(note, max: Store.maxAskField)
-            ask.ownerDecidedAt = now
-            try settle(db, ask: &ask, status: approve ? .approved : .rejected, decidedBy: "owner", now: now)
-            if !approve, let ref = Self.quarantineRef(of: ask) {
-                let sha = ask.subjectId.map { String($0.drop { $0 != "@" }.dropFirst().prefix(12)) } ?? ""
-                try ActivityEvent(companyId: ask.companyId, agentId: nil, turnId: nil, kind: .work,
-                                  text: "the owner rejected \(ref): main is unchanged; the changes stay on \(ref) (\(sha)) for inspection",
-                                  createdAt: now).insert(db)
-            }
-            return ask
+        // Approving an access ask grants what the agent asked for; its value is checked again first (it reads the file system).
+        var grant: GrantApproval?
+        if approve, let seen = try ask(id: askId), seen.kind == .grant, seen.status.isPending {
+            grant = try grantApproval(askId: askId, scope: nil, duration: nil, approvedBy: "owner")
         }
+        return try writer.write { db in
+            try ownerDecide(db: db, askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange,
+                            currentHash: currentHash, grant: grant, now: now)
+        }
+    }
+
+    /// `ownerDecide` inside the caller's write transaction. `currentHash` is the document's hash read before the transaction
+    /// (`.some(nil)`: unreadable; nil: not read). Approving a `grant` ask needs `grant` (`Store.grantApproval`) and writes the
+    /// grant in the same transaction. Besides the owner paths, its one caller is an access preset the owner turned on
+    /// (`requestAccess`, owner-delegated, note `auto: <title>`).
+    func ownerDecide(db: Database, askId: String, approve: Bool, note: String, acknowledgeChange: Bool, currentHash: String??,
+                     grant: GrantApproval?, now: Date) throws -> Ask {
+        var ask = try requireAsk(db, askId)
+        guard ask.kind.isDecision else {
+            throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
+        }
+        guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
+        if approve, !acknowledgeChange, ask.payload?.documentPath != nil, let proposed = ask.detailsHash,
+           let current = currentHash, current != proposed {
+            throw WorkError.conflict("\(ask.ref)'s document changed since it was proposed; read it again and approve with --ack-changed")
+        }
+        if approve, ask.kind == .grant, grant == nil { throw WorkError.invalid("\(ask.ref) is an access request; approve it with brahma access approve") }
+        ask.ownerNote = Store.flat(note, max: Store.maxAskField)
+        ask.ownerDecidedAt = now
+        try settle(db, ask: &ask, status: approve ? .approved : .rejected, decidedBy: "owner", now: now)
+        if approve, ask.kind == .grant, let grant { try createGrant(db, ask: ask, approval: grant, now: now) }
+        if !approve, let ref = Self.quarantineRef(of: ask) {
+            let sha = ask.subjectId.map { String($0.drop { $0 != "@" }.dropFirst().prefix(12)) } ?? ""
+            try ActivityEvent(companyId: ask.companyId, agentId: nil, turnId: nil, kind: .work,
+                              text: "the owner rejected \(ref): main is unchanged; the changes stay on \(ref) (\(sha)) for inspection",
+                              createdAt: now).insert(db)
+        }
+        return ask
     }
 
     /// The owner sends a decision ask back: `rejected`, with the new direction as the answer.

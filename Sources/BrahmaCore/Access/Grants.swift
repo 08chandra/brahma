@@ -1,0 +1,234 @@
+import Foundation
+import GRDB
+
+// Grants widen one agent's (or a role's, an item's, the company's) sandbox: a Bash egress domain, a WebFetch domain, or a
+// read-only path. An agent asks with `request_access` (a `grant` ask); only the owner approves one (`Store.approveAccess`,
+// or `ownerDecide` on the ask), or an access preset the owner turned on, which goes through `ownerDecide` itself. Each turn
+// resolves the active grants (`GrantResolver`) into `GrantInputs` for `SandboxScope.forTurn`; the ledger counts each use.
+
+/// What a grant opens.
+public enum GrantKind: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
+    /// A Bash egress domain (the sandbox's network allow-list).
+    case networkDomain = "network_domain"
+    /// A WebFetch domain.
+    case webDomain = "web_domain"
+    /// A directory the turn may read (never write).
+    case readPath = "read_path"
+    /// An installed extension, `<publisher>/<id>` (Task 5a; refused until extensions are installable).
+    case `extension`
+
+    /// Reading the web is low risk; reaching a host from Bash, reading a local path or mounting code is medium.
+    public var risk: AskRisk { self == .webDomain ? .low : .medium }
+}
+
+/// Who a grant applies to.
+public enum GrantScope: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
+    /// The requester's next turn only.
+    case once
+    /// Whoever's turn works the item (`scopeRef` = the item id).
+    case item
+    /// The requester (`scopeRef` = its agent id).
+    case agent
+    /// Every agent whose role is, or covers, `scopeRef`.
+    case role
+    /// Every agent of the company.
+    case company
+}
+
+/// How long a grant lasts.
+public enum GrantDuration: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
+    /// One turn.
+    case turn
+    /// While the requester's team's (else the company's) active sprint lasts; without one, `GrantResolver.noSprintTTL` active seconds.
+    case sprint
+    /// Until revoked.
+    case always
+}
+
+/// One entry of the grant ledger, shown as `G-<number>`.
+public struct Grant: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "grant"
+
+    public var id: String
+    public var companyId: String
+    public var number: Int
+    /// The `grant` ask it came from.
+    public var askId: String?
+    public var kind: GrantKind
+    /// A normalized domain pattern, or a resolved absolute path.
+    public var value: String
+    public var scope: GrantScope
+    /// The item id, agent id or role id the scope names (nil for `once` and `company`).
+    public var scopeRef: String?
+    public var requesterId: String?
+    public var duration: GrantDuration
+    /// A `sprint` grant ends with this sprint.
+    public var sprintId: String?
+    /// Company-active seconds at which it expires.
+    public var expiresActive: Double?
+    /// nil: unlimited.
+    public var usesLeft: Int?
+    /// "owner" or "preset:<id>".
+    public var approvedBy: String
+    public var createdAt: Date
+    public var revokedAt: Date?
+    /// "owner" or "kill".
+    public var revokedBy: String?
+    public var lastUsedAt: Date?
+    public var useCount: Int = 0
+
+    public var ref: String { "G-\(number)" }
+}
+
+/// What the agent asked for, as stored in the ask's `payload.details` (JSON).
+public struct RequestedGrant: Codable, Equatable, Sendable {
+    public var kind: GrantKind
+    public var value: String
+    public var duration: GrantDuration
+
+    private enum CodingKeys: String, CodingKey { case kind = "grantKind", value, duration }
+}
+
+public enum Grants {
+    /// Until Task 5a builds the installed-extension table, every extension grant is refused with this.
+    static func noExtension(_ id: String) -> String {
+        "No extension '\(Store.flat(id, max: 200))'. Build one in your lab and use propose_extension."
+    }
+
+    /// The normalized value, or throws why it cannot be granted:
+    /// - domains: `DomainMatcher.isValidPattern` (no public-suffix wildcard, `localhost`, IP literal or `*`) and never Anthropic's;
+    /// - read paths: absolute, an existing directory, no character a sandbox profile cannot carry, not inside `/Volumes`, and
+    ///   accepted as a read path by the scope a turn would get (`SandboxScope.forTurn`: no overlap with the owner's protected
+    ///   paths, the data home, another company's workspace, a backup target or `<ws>/.brahma`; never the owner's home itself).
+    ///   Returned resolved (`resolvedForSandbox`);
+    /// - extensions: refused until extensions can be installed (Task 5a).
+    public static func validate(kind: GrantKind, value raw: String, company: Company, paths: BrahmaPaths,
+                                userHome: URL = FileManager.default.homeDirectoryForCurrentUser, otherWorkspaces: [URL] = [],
+                                backupTargets: [URL] = []) throws -> String {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        switch kind {
+        case .networkDomain, .webDomain:
+            try SandboxDomains.check(value)
+            return SandboxDomains.normalize(value)
+        case .extension:
+            throw WorkError.invalid(noExtension(value))
+        case .readPath:
+            if SandboxPath.isUnsafe(value) { throw SandboxError.unsafePathCharacter(value) }
+            guard value.hasPrefix("/") else { throw WorkError.invalid("a read path must be absolute: \(Store.flat(value, max: 200))") }
+            let resolved = URL(fileURLWithPath: value, isDirectory: false).resolvedForSandbox
+            guard SandboxPath.kind(resolved.path) == .directory else {
+                throw WorkError.invalid("a read path must be an existing directory: \(Store.flat(value, max: 200))")
+            }
+            for volumes in [URL(fileURLWithPath: "/Volumes", isDirectory: false), URL(fileURLWithPath: "/Volumes").resolvedForSandbox]
+            where SandboxPath.overlaps(resolved.path, volumes.path) {
+                throw SandboxError.overlapsProtected(path: resolved.path, protected: volumes.path)
+            }
+            // The scope a turn of this company would get with only this grant: its checks are the turn's own.
+            let layout = SandboxLayout(paths: paths, company: company, agentHandle: "grant-check")
+            _ = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: otherWorkspaces, backupTargets: backupTargets,
+                                         kind: .audit, item: nil, company: company, grants: GrantInputs(readPaths: [resolved]),
+                                         darwinUserTemp: nil, userHome: userHome)
+            return resolved.path
+        }
+    }
+
+    /// The agent's request as stored on a `grant` ask; nil for any other ask.
+    public static func requested(_ ask: Ask) -> RequestedGrant? {
+        guard ask.kind == .grant, let details = ask.payload?.details else { return nil }
+        return try? JSONDecoder().decode(RequestedGrant.self, from: Data(details.utf8))
+    }
+
+    static func details(_ request: RequestedGrant) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return String(decoding: (try? encoder.encode(request)) ?? Data(), as: UTF8.self)
+    }
+}
+
+/// Which grants a turn gets.
+public enum GrantResolver {
+    /// A `sprint` grant without an active sprint lasts this many company-active seconds (7 active days).
+    public static let noSprintTTL: TimeInterval = 7 * 86_400
+
+    /// Not revoked, not expired (`expiresActive` against company-active time), uses left, and its sprint (if any) still active.
+    public static func isLive(_ grant: Grant, activeNow: Double, sprintActive: (String) -> Bool) -> Bool {
+        guard grant.revokedAt == nil else { return false }
+        if let expires = grant.expiresActive, activeNow >= expires { return false }
+        if let uses = grant.usesLeft, uses <= 0 { return false }
+        if let sprint = grant.sprintId, !sprintActive(sprint) { return false }
+        return true
+    }
+
+    /// The live grants that apply to a turn of `agent` (working `itemId`, if any). `roles` is the agent's role plus the roles it
+    /// covers (`RoleTemplate.covers`): a `role` grant applies when its role is one of them.
+    public static func active(_ grants: [Grant], agent: Agent, roles: Set<String>, itemId: String?, activeNow: Double,
+                              sprintActive: (String) -> Bool) -> [Grant] {
+        grants.filter { g in
+            guard g.companyId == agent.companyId, isLive(g, activeNow: activeNow, sprintActive: sprintActive) else { return false }
+            switch g.scope {
+            case .once: return g.requesterId == agent.id
+            case .item: return itemId != nil && g.scopeRef == itemId
+            case .agent: return g.scopeRef == agent.id
+            case .role: return g.scopeRef.map(roles.contains) ?? false
+            case .company: return true
+            }
+        }
+    }
+
+    /// What the grants add to a turn's scope. Extension grants wait for Task 5a (none can exist yet).
+    public static func inputs(_ grants: [Grant]) -> GrantInputs {
+        func values(_ kind: GrantKind) -> [String] { Array(Set(grants.filter { $0.kind == kind }.map(\.value))).sorted() }
+        return GrantInputs(domains: values(.networkDomain), webDomains: values(.webDomain),
+                           readPaths: values(.readPath).map { URL(fileURLWithPath: $0, isDirectory: false) }, extensions: [])
+    }
+}
+
+// MARK: Presets
+
+/// Access presets the owner can turn on per company; both are off by default.
+public enum AccessPreset: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
+    /// Engineers (and the roles near them) may read well-known documentation sites.
+    case readOnlyWebForEngineers = "readonly-web-engineers"
+    /// Under the `auto` autonomy preset, low-risk web reads are approved for the requester for the sprint.
+    case autoModeLowRisk = "auto-low-risk"
+}
+
+public enum AccessPresets {
+    /// Exact host names `readonly-web-engineers` approves (never a wildcard).
+    public static let docsHosts: Set<String> = [
+        "docs.stripe.com", "docs.github.com", "docs.aws.amazon.com", "learn.microsoft.com", "cloud.google.com", "docs.npmjs.com",
+        "docs.docker.com", "kubernetes.io", "react.dev", "nextjs.org", "vuejs.org", "svelte.dev", "tailwindcss.com",
+        "www.postgresql.org", "sqlite.org", "redis.io", "docs.djangoproject.com", "fastapi.tiangolo.com",
+        "flask.palletsprojects.com", "stackoverflow.com",
+    ]
+    /// Roles whose covering roles `readonly-web-engineers` serves.
+    public static let engineeringRoles = ["engineer", "qa", "devops", "security", "architect"]
+    /// The ask category of every access request.
+    public static let category = "tooling"
+
+    public struct Decision: Equatable, Sendable {
+        public var preset: AccessPreset
+        public var scope: GrantScope
+        public var duration: GrantDuration
+        public var approvedBy: String { "preset:\(preset.rawValue)" }
+    }
+
+    /// The grant an enabled preset approves without the owner, or nil. Never for a risk of medium or more, a reserved matter,
+    /// anything but a web domain, or a wildcard.
+    public static func autoDecision(kind: GrantKind, value: String, risk: AskRisk, requesterRole: String, company: Company,
+                                    enabled: Set<AccessPreset>, pack: IndustryPack?) -> Decision? {
+        // The floor, whatever preset is on.
+        guard risk == .low, kind.risk == .low, kind == .webDomain else { return nil }
+        guard !ReservedMatters.isReserved(category, extra: pack?.reservedCategories ?? []) else { return nil }
+        let host = SandboxDomains.normalize(value)
+        guard !host.contains("*"), DomainMatcher.isValidPattern(host), !SandboxDomains.isForbidden(host) else { return nil }
+        if enabled.contains(.readOnlyWebForEngineers), docsHosts.contains(host), let pack {
+            let covered = Set(engineeringRoles.flatMap(pack.rolesCovering))
+            if covered.contains(requesterRole) { return Decision(preset: .readOnlyWebForEngineers, scope: .role, duration: .always) }
+        }
+        if enabled.contains(.autoModeLowRisk), company.autonomy == .auto {
+            return Decision(preset: .autoModeLowRisk, scope: .agent, duration: .sprint)
+        }
+        return nil
+    }
+}

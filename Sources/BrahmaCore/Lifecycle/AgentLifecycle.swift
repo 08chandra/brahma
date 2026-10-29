@@ -60,7 +60,11 @@ extension Store {
         try agent.update(db)
         try ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: nil, kind: .stateChanged,
                           text: "\(from.rawValue) -> \(to.rawValue)", createdAt: now).insert(db)
-        if to == .killed { try releaseWaiters(db: db, on: agent, now: now) }
+        if to == .killed {
+            try releaseWaiters(db: db, on: agent, now: now)
+            // Its own grants (agent scope, once) go with it; role and company grants stay.
+            try Store.revokeGrantsOfKilled(db: db, agent: agent, now: now)
+        }
         return agent
     }
 

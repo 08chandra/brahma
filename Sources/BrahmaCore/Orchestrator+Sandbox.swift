@@ -72,18 +72,37 @@ extension Orchestrator {
             }
         }
         let turn: SandboxedTurn
+        let droppedGrants: [String]
         do {
-            turn = try await blocking.tryRun {
+            (turn, droppedGrants) = try await blocking.tryRun {
                 // The owner's backup folders and WAL replica (Task 13b): protected and unreadable for every turn. Read in the
                 // blocking body (INT-M1); a database error refuses the turn rather than leave the backups unprotected (INT-I1).
                 let backups = try BackupTargets.requiredProtectedFolders(store: store)
                 try layout.ensure()
                 let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: mcp)
+                // The owner's grants that apply to this turn (Task 9). A read path that no longer passes the checks (it moved
+                // under a protected place, or is gone) is left out and logged rather than refusing the whole turn.
+                var grants = try store.activeGrants(agent: agent, itemId: item?.id)
+                var dropped: [String] = []
+                grants.removeAll { g in
+                    guard g.kind == .readPath else { return false }
+                    let ok = (try? Grants.validate(kind: .readPath, value: g.value, company: company, paths: paths, userHome: env.userHome,
+                                                   otherWorkspaces: others, backupTargets: backups)) != nil
+                    if !ok { dropped.append(g.ref) }
+                    return !ok
+                }
                 let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
-                                                     kind: kind, item: item, company: company, grants: GrantInputs(),
+                                                     kind: kind, item: item, company: company, grants: GrantResolver.inputs(grants),
                                                      darwinUserTemp: env.darwinUserTemp, userHome: env.userHome)
-                return SandboxedTurn(scope: scope, shellPrefix: prefix)
+                // Each use is counted; a one-use grant another turn took meanwhile refuses this turn (the next one recomputes).
+                let used = try store.consumeGrants(ids: grants.map(\.id), turnId: turnId, now: now)
+                if let lost = grants.first(where: { $0.usesLeft != nil && !used.contains($0.id) }) {
+                    throw SandboxRefusal(reason: "\(lost.ref) was used up by another turn meanwhile")
+                }
+                return (SandboxedTurn(scope: scope, shellPrefix: prefix), dropped)
             }
+        } catch let refusal as SandboxRefusal {
+            throw refusal
         } catch {
             let linked: String?
             switch error {
@@ -97,6 +116,10 @@ extension Orchestrator {
             }
             if let refusal = error as? SandboxError { throw SandboxRefusal(reason: refusal.description) }
             throw SandboxRefusal(reason: "the agent's places could not be prepared: \(error)")
+        }
+        if !droppedGrants.isEmpty {
+            event("@\(agent.name): read-path \(droppedGrants.count == 1 ? "grant" : "grants") \(droppedGrants.joined(separator: ", ")) "
+                  + "left out of the turn (the path no longer passes the sandbox checks)")
         }
         if !turn.scope.skippedUnsafe.isEmpty {
             let names = turn.scope.skippedUnsafe.map { Store.flat(URL(fileURLWithPath: $0).lastPathComponent, max: 80) }
