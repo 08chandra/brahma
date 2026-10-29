@@ -127,7 +127,9 @@ public actor PushDispatcher {
         var countsPrefs = prefs
         countsPrefs.pushDetail = .counts
         let counts = { NoticeDelivery.pushPlan(dueAsks: asks, notices: notices, prefs: countsPrefs, now: now, tz: tz) }
-        guard prefs.pushDetail == .titles, !store.secretsHeld else { return counts() }
+        // Counts whenever the redactor may be stale too: a secret added or changed since the last load is not yet in it, so a
+        // title could carry its value (INT-M2). A failed check reads as "reload needed".
+        guard prefs.pushDetail == .titles, !store.secretsHeld, (try? store.secretsReloadNeeded()) == false else { return counts() }
         let redact: (String) throws -> String = { [store, redactOverride] text in
             if let redactOverride { return try redactOverride(text) }
             return try store.redact(text)

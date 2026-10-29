@@ -44,9 +44,22 @@ public struct SandboxedCheckRunner: CheckRunning {
             return await fallback.run(command: command, workingDirectory: workingDirectory, timeout: timeout, outputURL: outputURL,
                                       environment: environment)
         case .sandboxed(let policy):
-            return await sandbox.run(command: command, cwd: workingDirectory, environment: environment, timeout: .seconds(timeout),
-                                     outputURL: outputURL, policy: policy)
+            let outcome = await sandbox.run(command: command, cwd: workingDirectory, environment: environment, timeout: .seconds(timeout),
+                                            outputURL: outputURL, policy: policy)
+            return Self.reclassifyNestedSandbox(outcome)
         }
+    }
+
+    /// A tool that runs its own `sandbox-exec` inside Brahma's sandbox (SwiftPM compiling a manifest, a plugin) cannot nest
+    /// and fails with `sandbox_apply: Operation not permitted`. That is not a real check failure, so it is recorded
+    /// inconclusive (not counted against the agent) with an actionable tail, rather than bouncing the item (B-I5).
+    static func reclassifyNestedSandbox(_ outcome: CheckOutcome) -> CheckOutcome {
+        guard outcome.exitCode != nil, outcome.exitCode != 0,
+              outcome.tail.contains("sandbox_apply: Operation not permitted") || outcome.tail.contains("sandbox-exec: sandbox_apply")
+        else { return outcome }
+        let hint = "this check needs --disable-sandbox for SwiftPM inside Brahma's sandbox (e.g. `swift test --disable-sandbox`), "
+            + "or build Xcode projects with `xcodebuild -project`, not Swift packages"
+        return CheckOutcome(exitCode: nil, timedOut: false, tail: outcome.tail + "\n" + hint)
     }
 }
 
@@ -101,30 +114,10 @@ extension Orchestrator {
             guard SandboxPath.kind(checkout.path) == .directory else { return .refused("the \(run.purpose.rawValue) place of \(runId) is missing") }
 
             let network = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []).allowedDomains
-            // A merge check writes only its export: no shared cache, so a submission check of this company can never have
-            // left config that runs during the merge gate (B-I3).
-            if run.purpose == .merge {
-                return .sandboxed(SandboxPolicy(writable: [checkout], readable: [wsReal], network: .outbound(allow: network), toolchain: true))
-            }
-            let layout = SandboxLayout(paths: BrahmaPaths(home: store.dataHome ?? wsReal, workspaces: wsReal.deletingLastPathComponent()),
-                                       company: company, agentHandle: "check")
-            let cacheRelative = String(layout.sharedCache.path.dropFirst(layout.workspace.path.count + 1))
-            let cache = wsReal.appending(path: cacheRelative)
-            // B-I2: `cache/shared` must be a real directory with no link anywhere below the workspace. If a check made it a
-            // link or an odd file, the engine removes it (anchored, no link followed) and recreates it, so one check cannot
-            // silently stop its company's later checks. A link above it (in `.brahma/cache`) is engine territory: refuse.
-            let cacheParent = wsReal.appending(path: ".brahma/cache")
-            if SandboxPath.kind(cache.path) != .directory || SandboxPath.linkedComponent(cache.path, under: wsReal.path) != nil {
-                if SandboxPath.linkedComponent(cacheParent.path, under: wsReal.path) != nil {
-                    return .refused("\(cacheParent.path) is not a real engine directory")
-                }
-                _ = try? EngineFiles.removeNoFollow(cache, under: cacheParent)
-            }
-            guard (try? EngineFiles.directory(workspace: wsReal, cacheRelative, mode: 0o700)) != nil,
-                  SandboxPath.kind(cache.path) == .directory, SandboxPath.linkedComponent(cache.path, under: wsReal.path) == nil else {
-                return .refused("the shared check cache of \(company.id) could not be prepared")
-            }
-            return .sandboxed(SandboxPolicy(writable: [checkout, cache], readable: [wsReal], network: .outbound(allow: network),
+            // A check writes only its own checkout/export — no writable shared cache at all (A re-review ruling). Every
+            // toolchain cache is per-run under TMPDIR (SeatbeltRunner), so nothing a check plants can run in a later check
+            // or a merge check, and there is no shared `npm` a check could break for its company's later runs.
+            return .sandboxed(SandboxPolicy(writable: [checkout], readable: [wsReal], network: .outbound(allow: network),
                                             toolchain: true))
         }
     }
@@ -135,20 +128,35 @@ extension Orchestrator {
     /// protected (`checkBaseline`).
     static func defaultCheckRunner(store: Store, paths: BrahmaPaths) -> any CheckRunning {
         let baseline: @Sendable () -> SandboxBaseline = { checkBaseline(store: store, paths: paths) }
-        return SandboxedCheckRunner(sandbox: SandboxRunners.platformDefault(baseline: baseline, proxies: EgressProxyPool()),
+        // A run that left processes behind is already recorded inconclusive (its tail says so, owner-visible on the item);
+        // the engine log names the pids too (B-I4).
+        let onStraggler: @Sendable ([pid_t]) -> Void = { pids in
+            FileHandle.standardError.write(Data(("brahma orchestrator: a sandboxed check left processes running outside its group "
+                + "(pid \(pids.map(String.init).joined(separator: ", "))); killed what could be, run recorded inconclusive\n").utf8))
+        }
+        return SandboxedCheckRunner(sandbox: SandboxRunners.platformDefault(baseline: baseline, proxies: EgressProxyPool(),
+                                                                            onStraggler: onStraggler),
                                     route: checkRoute(store: store))
     }
 
     /// The Seatbelt baseline of one check run, taken when it starts (so a backup folder added since is protected).
     static func checkBaseline(store: Store, paths: BrahmaPaths) -> SandboxBaseline {
-        var b = SandboxBaseline.current(paths: paths, otherWorkspaces: [],
-                                        backupTargets: BackupTargets.protectedFolders(store: store))
+        // The backup folders must be known to protect them: a database error fails closed (`problem`), never an empty list
+        // (INT-I1).
+        var backups: [URL] = []
+        var problems: [String] = []
+        do { backups = try BackupTargets.requiredProtectedFolders(store: store) } catch {
+            problems.append("could not read the backup targets (\(error))")
+        }
+        var b = SandboxBaseline.current(paths: paths, otherWorkspaces: [], backupTargets: backups)
         if let home = store.dataHome?.resolvedForSandbox, !b.engineHomes.contains(home) { b.engineHomes.append(home) }
         do {
             b.companyWorkspaces = try store.companies().map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false).resolvedForSandbox }
         } catch {
-            b.problem = "could not list the company workspaces (\(error))"
+            problems.append("could not list the company workspaces (\(error))")
         }
+        if let existing = b.problem { problems.insert(existing, at: 0) }
+        if !problems.isEmpty { b.problem = problems.joined(separator: "; ") }
         return b
     }
 }

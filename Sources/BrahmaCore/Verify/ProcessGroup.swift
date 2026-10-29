@@ -385,13 +385,19 @@ enum GroupExec {
         var error: String?
     }
 
-    /// `arguments` excludes argv[0]. `stdin` `-1`: `/dev/null`. `abandonAfter`: once SIGKILL has been sent, how long to wait for
-    /// the leader before giving up on it (nil: wait). Captured output is drained for up to 2 s after a normal exit and not
-    /// waited on after a timeout, so a process outside the group that holds the pipe cannot hang the caller.
+    /// Once SIGKILL has been sent, how long to wait for the leader before giving up on it by default (INT-M4): bounded, so a
+    /// process stuck in an uninterruptible wait cannot hang the engine.
+    static let defaultAbandonAfter: TimeInterval = 10
+
+    /// `arguments` excludes argv[0]. `stdin` `-1`: `/dev/null`. The working directory defaults to `/` (never the engine's own
+    /// current directory, INT-M5). `abandonAfter`: once SIGKILL has been sent, how long to wait for the leader before giving up
+    /// on it (`defaultAbandonAfter`). Captured output is drained for up to 2 s after a normal exit and not waited on after a
+    /// timeout, so a process outside the group that holds the pipe cannot hang the caller. A leader that was abandoned, or
+    /// whose exit status was lost, is reported as not succeeded (`status` -1, `error` set), never as status 0 (INT-I2).
     static func run(executable: String, arguments: [String], environment: [String: String],
-                    workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+                    workingDirectory: URL = URL(fileURLWithPath: "/", isDirectory: true),
                     stdin: Int32 = -1, output: Output, timeout: TimeInterval, killGrace: TimeInterval = 1,
-                    abandonAfter: TimeInterval? = nil,
+                    abandonAfter: TimeInterval? = GroupExec.defaultAbandonAfter,
                     clock: () -> TimeInterval = { AwakeTime.uptime() }) -> Result {
         var readEnd: Int32 = -1, writeEnd: Int32 = -1
         let outFD: Int32, errFD: Int32?
@@ -436,6 +442,13 @@ enum GroupExec {
         // A leader still there after SIGKILL is left unreaped (never signalled again by us); otherwise sweep, then reap.
         let status = abandoned ? 0 : child.finish()
         let data = capture?.finish(drain: termAt == nil ? 2 : 0) ?? Data()
+        // An abandoned leader or a lost exit status is never a success (INT-I2).
+        if abandoned {
+            return Result(launched: true, status: -1, output: data, timedOut: true, error: "\(executable) did not exit after SIGKILL; abandoned")
+        }
+        if child.lostTrack {
+            return Result(launched: true, status: -1, output: data, timedOut: termAt != nil, error: "lost track of \(executable)'s exit status")
+        }
         return Result(launched: true, status: ProcessGroupChild.exitCode(status), output: data, timedOut: termAt != nil, error: nil)
     }
 }

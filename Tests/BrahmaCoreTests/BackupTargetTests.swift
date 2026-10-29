@@ -92,6 +92,42 @@ import GRDB
         #expect(baseline.contains(replica.resolvedForSandbox.path), "\(baseline)")
     }
 
+    /// INT-I1: when the backup targets cannot be read (a stored value that does not decode), nothing that builds a sandbox
+    /// proceeds as if there were none: the check baseline gets a `problem` (so nothing runs), and a sandbox settings change
+    /// is refused.
+    @Test func unreadableBackupTargetsFailClosed() throws {
+        let env = try BackupEnv()
+        let company = try env.company()
+        try env.store.writer.write { db in try db.execute(sql: "UPDATE ownerPrefs SET backupTargets = 'not json' WHERE id = 1") }
+        #expect(throws: (any Error).self) { _ = try BackupTargets.requiredProtectedFolders(store: env.store) }
+        #expect(BackupTargets.protectedFolders(store: env.store).isEmpty, "the display-only reader still degrades")
+        let baseline = Orchestrator.checkBaseline(store: env.store, paths: env.paths)
+        #expect(baseline.problem?.contains("backup targets") == true, "\(String(describing: baseline.problem))")
+        #expect(throws: (any Error).self) {
+            try env.store.updateSandbox(companyId: company.id, SandboxPatch(allowedDomains: ["example.com"]), userHome: try tempDir())
+        }
+    }
+
+    /// INT-M3: a read grant (toolchain read path) overlapping a backup folder is refused, and a folder WAL replica is in every
+    /// turn's denyRead (not only the check baseline).
+    @Test func backupFoldersAreRefusedAsReadPathsAndDeniedToTurns() async throws {
+        let world = try World()
+        let company = try world.company("Acme", profile: .sandboxed)
+        let drive = try folder()
+        try world.store.addBackupTarget(try BackupTargets.validate(.folder(path: drive.path), paths: world.paths))
+        #expect(throws: SandboxError.self) {
+            try world.store.updateSandbox(companyId: company.id, SandboxPatch(toolchainReadPaths: [drive.path]), userHome: try tempDir())
+        }
+        let replica = try folder("replica")
+        try world.store.setWALShipping(WALShippingConfig(replica: replica.path))
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        try world.dm(company, eng)
+        try await world.cycle()
+        let request = try #require(world.fake.requests.last { $0.agent.id == eng.id })
+        let scope = try #require(request.sandbox)
+        #expect(scope.denyRead.map(\.path).contains(replica.resolvedForSandbox.path), "\(scope.denyRead.map(\.path))")
+    }
+
     @Test func folderTargetIsDeniedToSandboxedTurns() async throws {
         let world = try World()
         let company = try world.company("Acme", profile: .sandboxed)

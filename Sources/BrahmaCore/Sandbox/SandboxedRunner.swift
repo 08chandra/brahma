@@ -107,11 +107,14 @@ public struct SandboxBaseline: Equatable, Sendable {
         #if canImport(Darwin)
         let temp = darwinDirectory(_CS_DARWIN_USER_TEMP_DIR), cache = darwinDirectory(_CS_DARWIN_USER_CACHE_DIR)
         let user = darwinDirectory(_CS_DARWIN_USER_DIR)?.deletingLastPathComponent()
+        // On Darwin the per-user folder must be known: without it the profile could not deny reads of T/C/0, so fail closed
+        // rather than silently leave them readable (A-I1 gap 2).
+        let problem = user == nil ? "could not resolve the per-user Darwin directory (confstr _CS_DARWIN_USER_DIR)" : nil
         #else
-        let temp: URL? = nil, cache: URL? = nil, user: URL? = nil
+        let temp: URL? = nil, cache: URL? = nil, user: URL? = nil, problem: String? = nil
         #endif
         return SandboxBaseline(userHome: home.resolvedForSandbox, protected: protected, darwinUserTemp: temp, darwinUserCache: cache,
-                               darwinUserDir: user, engineHomes: [paths.home.resolvedForSandbox])
+                               darwinUserDir: user, engineHomes: [paths.home.resolvedForSandbox], problem: problem)
     }
 
     #if canImport(Darwin)
@@ -135,9 +138,12 @@ public struct SandboxBaseline: Equatable, Sendable {
 
 public enum SandboxRunners {
     /// `SeatbeltRunner` where `/usr/bin/sandbox-exec` is executable, else `UnavailableSandboxRunner`.
-    public static func platformDefault(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool) -> any SandboxedRunner {
+    public static func platformDefault(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool,
+                                       onStraggler: (@Sendable ([pid_t]) -> Void)? = nil) -> any SandboxedRunner {
         #if canImport(Darwin)
-        if access(SeatbeltRunner.sandboxExec, X_OK) == 0 { return SeatbeltRunner(baseline: baseline, proxies: proxies) }
+        if access(SeatbeltRunner.sandboxExec, X_OK) == 0 {
+            return SeatbeltRunner(baseline: baseline, proxies: proxies, onStraggler: onStraggler)
+        }
         #endif
         return UnavailableSandboxRunner()
     }

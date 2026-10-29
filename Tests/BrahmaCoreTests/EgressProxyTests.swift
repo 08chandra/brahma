@@ -235,8 +235,11 @@ import Glibc
     /// A vetted CONNECT is answered `200` and the bytes flow both ways (an echo server on loopback stands in for a public
     /// host: the address check is swapped for this test only).
     @Test func allowedConnectPipesBytes() throws {
+        // The echo thread is the sole owner of `server` (it closes it after its one accept); the test only waits for it, so no
+        // descriptor is closed while another thread may still be using it.
         let server = socket(AF_INET, Int32(SOCK_STREAM), 0)
-        defer { close(server) }
+        let echoDone = DispatchSemaphore(value: 0)
+        defer { _ = echoDone.wait(timeout: .now() + 15) }
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
@@ -247,6 +250,7 @@ import Glibc
         _ = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(server, $0, &len) } }
         let echoPort = UInt16(bigEndian: addr.sin_port)
         Thread.detachNewThread {
+            defer { close(server); echoDone.signal() }
             let c = accept(server, nil, nil)
             guard c >= 0 else { return }
             var buffer = [UInt8](repeating: 0, count: 1024)
@@ -321,19 +325,21 @@ import Glibc
         #expect(try Self.ask(proxy.port, big + "\r\n").hasPrefix("HTTP/1.1 403"))
     }
 
-    /// A-I2: past the per-proxy cap, new connections get 503 and are closed; the proxy keeps serving once one ends.
+    /// A-I2: past the per-proxy connection cap, new connections get 503 and are closed; the proxy keeps serving once one
+    /// ends. The pool budgets descriptors (2 per connection), not connections, so all its proxies together are bounded.
     @Test func connectionCapRefusesWith503() throws {
-        let budget = EgressProxy.Budget(limit: 8)
+        let budget = EgressProxy.Budget(limit: 16)   // descriptors
         let proxy = try EgressProxy(allow: ["example.com"], resolver: EgressProxy.systemResolve, maxConnections: 2, budget: budget)
         defer { proxy.stop() }
-        let a = try Self.open(proxy.port), b = try Self.open(proxy.port)
-        defer { close(a); close(b) }
+        // Each descriptor has exactly one owner that closes it once (a defer plus an explicit close is a double close).
+        let a = OwnedFD(try Self.open(proxy.port)), b = OwnedFD(try Self.open(proxy.port))
+        defer { a.close(); b.close() }
         Thread.sleep(forTimeInterval: 0.3)
-        let c = try Self.open(proxy.port)
-        defer { close(c) }
-        #expect(Self.reply(c).hasPrefix("HTTP/1.1 503"))
+        let c = OwnedFD(try Self.open(proxy.port))
+        defer { c.close() }
+        #expect(Self.reply(c.raw).hasPrefix("HTTP/1.1 503"))
         #expect(proxy.activeConnections == 2)
-        close(a)
+        a.close()
         // `a` ended: once its thread notices, a new connection is served again.
         var served = false
         for _ in 0..<60 where !served {
@@ -341,21 +347,44 @@ import Glibc
             served = (try? Self.ask(proxy.port, "GET / HTTP/1.1\r\n\r\n").hasPrefix("HTTP/1.1 405")) ?? false
         }
         #expect(served)
-        // The pool's global budget caps every proxy it holds together.
-        #expect(EgressProxyPool.globalLimit == 256); #expect(EgressProxy.perProxyLimit == 64)
-        let tight = EgressProxy.Budget(limit: 1)
+        // The shared descriptor budget caps every proxy of a pool together (2 fds/connection). A budget of 2 admits one
+        // connection total across the two proxies: the second is refused while the first is held.
+        #expect(EgressProxy.perProxyLimit == 64); #expect(EgressProxy.fdsPerConnection == 2)
+        #expect(EgressProxyPool.descriptorBudget >= 256)
+        let tight = EgressProxy.Budget(limit: 2)
         let p1 = try EgressProxy(allow: ["a.example.com"], resolver: { _ in nil }, budget: tight)
         let p2 = try EgressProxy(allow: ["b.example.com"], resolver: { _ in nil }, budget: tight)
         defer { p1.stop(); p2.stop() }
-        let held = try Self.open(p1.port)
-        defer { close(held) }
+        let held = OwnedFD(try Self.open(p1.port))
+        defer { held.close() }
         Thread.sleep(forTimeInterval: 0.3)
-        let other = try Self.open(p2.port)
-        defer { close(other) }
-        #expect(Self.reply(other).hasPrefix("HTTP/1.1 503"))
+        let other = OwnedFD(try Self.open(p2.port))
+        defer { other.close() }
+        #expect(Self.reply(other.raw).hasPrefix("HTTP/1.1 503"))
         // Back-off when accept fails is bounded (AwakeTime), never a spin.
         #expect(EgressProxy.acceptBackoff(failures: 1) == .milliseconds(50))
         #expect(EgressProxy.acceptBackoff(failures: 30) == .seconds(1))
+    }
+
+    /// A-I2: the resolver thread is counted against the shared descriptor budget. With room for one connection only, the
+    /// connection itself is admitted but its resolver cannot get a slot, so the CONNECT is refused at once instead of
+    /// starting another thread (which a stuck getaddrinfo could keep alive past its slot).
+    @Test func resolverThreadsCountAgainstTheBudget() throws {
+        final class Count: @unchecked Sendable { let lock = NSLock(); var n = 0 }
+        let calls = Count()
+        let proxy = try EgressProxy(allow: ["slow.example.com"], resolver: { _ in
+            calls.lock.withLock { calls.n += 1 }
+            Thread.sleep(forTimeInterval: 3)
+            return nil
+        }, budget: EgressProxy.Budget(limit: EgressProxy.fdsPerConnection))
+        defer { proxy.stop() }
+        let started = AwakeTime.now
+        #expect(try Self.ask(proxy.port, "CONNECT slow.example.com:443 HTTP/1.1\r\n\r\n").hasPrefix("HTTP/1.1 403"))
+        #expect(AwakeTime.now - started < .seconds(2), "the resolver should not have run")
+        #expect(calls.lock.withLock { calls.n } == 0)
+        // The engine raises its descriptor limit at start; the pool's budget is sized from it.
+        #expect(FileLimit.raise() != nil)
+        #expect(FileLimit.current >= 256)
     }
 
     @Test func poolSharesOneProxyPerAllowList() async throws {

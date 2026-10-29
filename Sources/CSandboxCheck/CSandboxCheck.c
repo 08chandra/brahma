@@ -7,6 +7,7 @@
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
 #define BRAHMA_SANDBOX_FILTER_NONE 0
 #define BRAHMA_SANDBOX_FILTER_PATH 1
+#define BRAHMA_SANDBOX_FILTER_GLOBAL_NAME 2
 #define BRAHMA_SANDBOX_CHECK_NO_REPORT 0x40000000
 
 int brahma_sandbox_is_sandboxed(pid_t pid) {
@@ -19,7 +20,16 @@ int brahma_sandbox_write_denied(pid_t pid, const char *path) {
     int r = sandbox_check(pid, "file-write-data", BRAHMA_SANDBOX_FILTER_PATH | BRAHMA_SANDBOX_CHECK_NO_REPORT, path);
     return r < 0 ? -1 : (r != 0 ? 1 : 0);
 }
+
+int brahma_sandbox_mach_allowed(pid_t pid, const char *name) {
+    // Whether `pid`'s sandbox would allow looking up the mach global name `name`. The engine gives each run's profile a
+    // unique such name, which no real service answers; the policy answer alone identifies the run's processes, and it does
+    // not depend on any file the process could delete.
+    int r = sandbox_check(pid, "mach-lookup", BRAHMA_SANDBOX_FILTER_GLOBAL_NAME | BRAHMA_SANDBOX_CHECK_NO_REPORT, name);
+    return r < 0 ? -1 : (r != 0 ? 0 : 1);
+}
 #else
 int brahma_sandbox_is_sandboxed(pid_t pid) { (void)pid; return -1; }
 int brahma_sandbox_write_denied(pid_t pid, const char *path) { (void)pid; (void)path; return -1; }
+int brahma_sandbox_mach_allowed(pid_t pid, const char *name) { (void)pid; (void)name; return -1; }
 #endif

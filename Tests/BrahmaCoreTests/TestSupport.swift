@@ -105,3 +105,20 @@ func onWorkspaceProfile(_ store: Store, _ company: Company) throws -> Company {
     try store.updateSandbox(companyId: company.id, SandboxPatch(profile: .workspace), userHome: try tempDir())
     return try store.company(id: company.id) ?? company
 }
+
+// MARK: descriptors
+
+/// One owner for a raw descriptor in tests: `close()` closes it at most once, and the owner closes it on deinit if nobody
+/// did. A second close of a descriptor number that was already reused by someone else (a `defer` plus an explicit close)
+/// trips macOS's EXC_GUARD and kills the test process; this makes that impossible.
+final class OwnedFD: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32
+    init(_ fd: Int32) { self.fd = fd }
+    var raw: Int32 { lock.withLock { fd } }
+    func close() {
+        let toClose: Int32 = lock.withLock { let f = fd; fd = -1; return f }
+        if toClose >= 0 { _ = Darwin.close(toClose) }
+    }
+    deinit { close() }
+}

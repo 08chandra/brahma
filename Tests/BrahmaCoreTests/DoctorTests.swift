@@ -193,18 +193,34 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
     /// The engine's bounded tool runs (doctor, rclone, zstd/gzip, lsof) all go through `GroupExec`: a hung tool's children
     /// die with it, since its whole process group is signalled.
     @Test func aHungToolsChildrenAreKilledWithItsGroup() async throws {
-        let pidFile = try tempDir().appending(path: "child.pid")
-        let script = "/bin/sleep 300 & echo $! > '\(pidFile.path)'; wait"
-        _ = try? await Doctor.execProcess(executable: "/bin/sh", arguments: ["-c", script], timeout: 0.5, blocking: Blocking())
-        let r = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", script + "; echo never"], environment: [:], timeout: 0.5)
+        // Two pid files: the doctor's run and the external tool's run are each asserted (INT-M3).
+        let dir = try tempDir()
+        let doctorPid = dir.appending(path: "doctor.pid"), toolPid = dir.appending(path: "tool.pid")
+        func script(_ f: URL) -> String { "/bin/sleep 300 & echo $! > '\(f.path)'; wait" }
+        _ = try? await Doctor.execProcess(executable: "/bin/sh", arguments: ["-c", script(doctorPid)], timeout: 0.5, blocking: Blocking())
+        let r = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", script(toolPid) + "; echo never"], environment: [:], timeout: 0.5)
         #expect(r.timedOut && r.launched)
-        let pid = try #require(Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
-        let until = AwakeTime.uptime() + 5
-        while kill(pid, 0) == 0, AwakeTime.uptime() < until { try await Task.sleep(nanoseconds: 20_000_000) }
-        #expect(kill(pid, 0) != 0, "the tool's background child outlived the timeout")
+        for file in [doctorPid, toolPid] {
+            let pid = try #require(Int32(try String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+            let until = AwakeTime.uptime() + 5
+            while kill(pid, 0) == 0, AwakeTime.uptime() < until { try await Task.sleep(nanoseconds: 20_000_000) }
+            #expect(kill(pid, 0) != 0, "\(file.lastPathComponent): the tool's background child outlived the timeout")
+        }
         // A normal run still captures stdout and stderr and returns the exit code.
         let ok = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", "echo out; echo err >&2; exit 3"], environment: [:], timeout: 10)
         #expect(ok.status == 3 && ok.output == "out\nerr\n" && !ok.timedOut, "\(ok)")
+    }
+
+    /// INT-I2/M4/M5: `GroupExec` never reports a lost or abandoned leader as success; its default working directory is `/`;
+    /// the wait after SIGKILL is bounded by default.
+    @Test func groupExecNeverReportsALostChildAsSuccess() throws {
+        #expect(GroupExec.defaultAbandonAfter > 0)
+        let cwd = GroupExec.run(executable: "/bin/pwd", arguments: [], environment: [:], output: .capture(cap: 1024, stderr: false), timeout: 10)
+        #expect(cwd.status == 0); #expect(String(decoding: cwd.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == "/")
+        // A leader that ignores everything until SIGKILL, with a tiny abandon window, is reported as a failure, not 0.
+        let abandoned = GroupExec.run(executable: "/bin/sh", arguments: ["-c", "trap '' TERM; sleep 30"], environment: [:],
+                                      output: .capture(cap: 1024, stderr: false), timeout: 0.2, killGrace: 0.1, abandonAfter: 0)
+        #expect(abandoned.status != 0 || abandoned.error == nil, "an abandoned leader must not read as success: \(abandoned)")
     }
 
     @Test func aFastProcessReturnsItsOutputAndAFailingOneNil() async throws {

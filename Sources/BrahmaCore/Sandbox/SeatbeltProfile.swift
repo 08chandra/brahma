@@ -57,8 +57,16 @@ public enum SeatbeltProfile {
     /// save its PIF cache. Residual: the owner's own builds by the same tools stage there too.
     static let toolchainTempEntries = ["xcrun_db", "TemporaryItems/NSIRD_(swift-(build|package|test|run)|xcodebuild|SWBBuildService)_"]
 
-    /// `proxyPort` is the egress proxy's port (`.outbound` and `.loopbackListen`; ignored for `.none`).
-    public static func render(policy: SandboxPolicy, baseline: SandboxBaseline, proxyPort: UInt16?) -> String {
+    /// Subpaths of the per-user Darwin cache (`C`) the toolchain reads: Xcode's cached build-system specifications and plug-in
+    /// cache (xcodebuild) and clang's module cache. Read-only, and narrowed from all of `C` (A re-review ruling) so a check
+    /// cannot read the owner's whole compiled-module cache. Compiler caches are redirected per-run (env), so `C` is not
+    /// written at all. Residual: these two are shared read, and hold no private source — only build specs and module hashes.
+    static let toolchainCacheReads = ["com.apple.DeveloperTools", "clang"]
+
+    /// `proxyPort` is the egress proxy's port (`.outbound` and `.loopbackListen`; ignored for `.none`). `marker`, when set, is
+    /// a per-run unique mach global name the profile allows (and no service answers), so the engine can recognize the run's
+    /// processes afterwards by their sandbox alone (B-I4).
+    public static func render(policy: SandboxPolicy, baseline: SandboxBaseline, proxyPort: UInt16?, marker: String? = nil) -> String {
         func r(_ url: URL) -> String { SandboxPath.resolve(url.path) }
         func subpath(_ p: String) -> String { "(subpath \(quote(p)))" }
         func unique(_ paths: [String]) -> [String] {
@@ -81,9 +89,9 @@ public enum SeatbeltProfile {
             reads += toolchainHomeReads.map { subpath(home + "/" + $0) }
             reads.append(subpath(r(URL(fileURLWithPath: "/Applications/Xcode.app"))))
             if let cache = baseline.darwinUserCache.map(r) {
-                reads.append(subpath(cache))
-                writes += [subpath(cache + "/clang"), subpath(cache + "/com.apple.DeveloperTools"),
-                           "(regex #\"^\(regexEscape(cache))/org\\.llvm\\.clang\")", subpath(cache + "/org.swift.swiftpm")]
+                // Read-only, narrowed to the two subpaths the toolchain needs; `C` is never written (compiler caches are
+                // redirected per-run via the environment).
+                reads += toolchainCacheReads.map { subpath(cache + "/" + $0) }
             }
             if let temp = baseline.darwinUserTemp.map(r) {
                 // xcrun's cache, read and written; SwiftPM's atomic writes, which Foundation stages in the per-user temp
@@ -105,11 +113,24 @@ public enum SeatbeltProfile {
                                                              "(literal \"/dev/dtracehelper\")", "(regex #\"^/dev/fd/\")"]
         lines.append("(deny file-write* (require-not (require-any " + allowedWrites.joined(separator: " ") + ")))")
         lines.append("(deny signal (target others))")
+        // A sandboxed check may not inspect other processes (open files, pid info): this stops `lsof -p <owner pid>` and the
+        // like from discovering the NSIRD_* staging names and so reaching another process's in-flight atomic saves (A
+        // re-review, NSIRD). It still sees its own and its children's.
+        lines.append("(deny process-info* (target others))")
         lines.append("(deny mach-lookup " + deniedServices.map { "(\($0.prefix ? "global-name-prefix" : "global-name") \(quote($0.name)))" }
             .joined(separator: " ") + ")")
         lines.append("(deny process-exec " + deniedExecutables.map { "(literal \(quote($0)))" }.joined(separator: " ") + ")")
         if policy.toolchain {
             lines.append("(allow mach-lookup " + toolchainServices.map { "(global-name \(quote($0)))" }.joined(separator: " ") + ")")
+        }
+        // The per-run marker: a unique global name no service answers, so the engine can identify the run's processes by
+        // their sandbox after the run, even one that deleted its own checkout (B-I4).
+        // Under `(allow default)` any unlisted mach name is allowed, so every other run's marker is denied first: only this
+        // run's own name is allowed. The probe also checks a sibling name (`marker + ".not"`) that must be denied, so a
+        // foreign sandbox that allows every lookup never reads as this run's.
+        if let marker {
+            lines.append("(deny mach-lookup (global-name-prefix \(quote(SeatbeltRunner.markerPrefix))))")
+            lines.append("(allow mach-lookup (global-name \(quote(marker))))")
         }
         lines.append("(deny network*)")
         if policy.allowedDomains != nil, let proxyPort {

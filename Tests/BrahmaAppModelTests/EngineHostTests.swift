@@ -14,6 +14,15 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
                    probe: { _ in passingReport }, ownerKeyStore: InMemoryOwnerKeyStore())
     }
 
+    /// INT-I3: the engine rebuilt after a restore carries the app's secret vault, never the unavailable default.
+    @Test func rebuiltEngineKeepsTheSecretVault() throws {
+        let (store, paths) = try makeHome()
+        let vault = MemoryVault()
+        let rebuilt = EngineHost.rebuilt(paths: paths, store: store, ownerKeyStore: InMemoryOwnerKeyStore(), secretVault: vault)
+        #expect((rebuilt.secretVault as? MemoryVault) === vault)
+        #expect(!(rebuilt.secretVault is UnavailableVault))
+    }
+
     @Test func failedProbeDoesNotTakeLock() async throws {
         let (store, paths) = try makeHome()
         let failing = DoctorReport(cliVersion: "2.1.306", items: [

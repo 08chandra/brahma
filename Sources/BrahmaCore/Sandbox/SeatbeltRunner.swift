@@ -11,11 +11,13 @@ import Glibc
 ///
 /// The environment is `environment` plus:
 /// - `TMPDIR=<writable[0]>/.brahma-tmp` (created before the run, removed after `run`);
-/// - with `toolchain`, `HOME`, `npm_config_cache`, `XDG_CACHE_HOME` and `CARGO_HOME` under the last writable entry (the
-///   cache): `home`, `npm`, `xdg`, `cargo`;
+/// - with `toolchain`, `HOME`, `CARGO_HOME`, `XDG_CACHE_HOME`, `npm_config_cache` and `CLANG_MODULE_CACHE_PATH`, all per-run
+///   under TMPDIR (no writable shared cache: nothing a check plants outlives its run);
 /// - with outbound or loopback network, `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`, `ALL_PROXY` =
 ///   `http://127.0.0.1:<proxy port>` and `NO_PROXY=localhost,127.0.0.1`.
 /// A policy that is not safe to render (`SandboxPolicyCheck`) is refused: `run` returns "could not run", `spawn` throws.
+/// Each run's profile allows a unique mach global name (`runMarker`); after the run every process still under that sandbox
+/// is killed (`SandboxSweep`, B-I4) and the outcome becomes inconclusive if there were any.
 public struct SeatbeltRunner: SandboxedRunner {
     public static let sandboxExec = "/usr/bin/sandbox-exec"
     static let tmpName = ".brahma-tmp"
@@ -24,15 +26,24 @@ public struct SeatbeltRunner: SandboxedRunner {
     let proxies: EgressProxyPool
     var termGrace: TimeInterval
     var clock: @Sendable () -> TimeInterval
+    /// Called (on the check's own thread) with the pids a run left behind that the sweep could not account for, so the
+    /// engine can log them and raise owner-visible activity. The outcome is already inconclusive by then.
+    let onStraggler: (@Sendable ([pid_t]) -> Void)?
 
-    public init(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool) {
-        self.init(baseline: baseline, proxies: proxies, termGrace: 5)
+    public init(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool,
+                onStraggler: (@Sendable ([pid_t]) -> Void)? = nil) {
+        self.init(baseline: baseline, proxies: proxies, termGrace: 5, onStraggler: onStraggler)
     }
 
     init(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool, termGrace: TimeInterval,
-         clock: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }) {
+         clock: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }, onStraggler: (@Sendable ([pid_t]) -> Void)? = nil) {
         self.baseline = baseline; self.proxies = proxies; self.termGrace = termGrace; self.clock = clock
+        self.onStraggler = onStraggler
     }
+
+    /// A unique per-run mach global name the profile allows and the sweep probes for (B-I4).
+    static let markerPrefix = "dev.brahma.run."
+    static func runMarker() -> String { markerPrefix + UUID().uuidString.lowercased() }
 
     struct Prepared {
         var arguments: [String]
@@ -41,10 +52,10 @@ public struct SeatbeltRunner: SandboxedRunner {
 
     /// Validates, renders and builds the argv and environment; creates `TMPDIR` (and, with `toolchain`, the cache's tool
     /// directories) without following a link.
-    func prepare(command: String, environment: [String: String], policy: SandboxPolicy, proxyPort: UInt16?) throws -> Prepared {
+    func prepare(command: String, environment: [String: String], policy: SandboxPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
         let base = baseline()
         try SandboxPolicyCheck.validate(policy, baseline: base)
-        let profile = SeatbeltProfile.render(policy: policy, baseline: base, proxyPort: proxyPort)
+        let profile = SeatbeltProfile.render(policy: policy, baseline: base, proxyPort: proxyPort, marker: marker)
         var env = environment
         let first = policy.writable[0]
         // B-I2: every engine file op is anchored at the parent of the writable entry and opened with O_NOFOLLOW, so an entry
@@ -52,21 +63,15 @@ public struct SeatbeltRunner: SandboxedRunner {
         try Self.ensureUnder(first, Self.tmpName, mode: 0o700)
         env["TMPDIR"] = first.appending(path: Self.tmpName).path
         if policy.toolchain {
-            // B-I3: HOME, CARGO_HOME and XDG_CACHE_HOME hold config that runs code (.npmrc, config.toml, …), so they are
-            // per-run under TMPDIR, thrown away with it. Only the npm cache (content-addressed, integrity-checked) is shared,
-            // and only when the policy gives a shared cache separate from the checkout; a merge check has none, so its npm
-            // cache is per-run too.
-            for (name, dir) in [("HOME", "home"), ("XDG_CACHE_HOME", "xdg"), ("CARGO_HOME", "cargo")] {
+            // Every toolchain cache and config dir is per-run, under TMPDIR, thrown away with it: HOME, CARGO_HOME,
+            // XDG_CACHE_HOME and the npm cache (config that runs code — .npmrc, config.toml — and, per the re-review, the npm
+            // store too: a check gets no writable shared cache at all, so nothing a submission check plants can run in a
+            // later check or a merge check). The clang module cache is redirected the same way, so the per-user Darwin cache
+            // (C) is never written.
+            for (name, dir) in [("HOME", "home"), ("XDG_CACHE_HOME", "xdg"), ("CARGO_HOME", "cargo"), ("npm_config_cache", "npm"),
+                                ("CLANG_MODULE_CACHE_PATH", "clang-modules")] {
                 try Self.ensureUnder(first, "\(Self.tmpName)/\(dir)", mode: 0o700)
                 env[name] = first.appending(path: "\(Self.tmpName)/\(dir)").path
-            }
-            let shared = policy.writable.count > 1 ? policy.writable[policy.writable.count - 1] : first
-            if shared == first {
-                try Self.ensureUnder(first, "\(Self.tmpName)/npm", mode: 0o700)
-                env["npm_config_cache"] = first.appending(path: "\(Self.tmpName)/npm").path
-            } else {
-                try Self.ensureUnder(shared, "npm", mode: 0o700)
-                env["npm_config_cache"] = shared.appending(path: "npm").path
             }
         }
         if policy.allowedDomains != nil, let proxyPort {
@@ -108,43 +113,47 @@ public struct SeatbeltRunner: SandboxedRunner {
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
         // Everything the run starts is newer than this; it bounds the B-I4 sweep so a recycled pid is never killed.
         let since = ProcessTable.startStamp(slack: 1)
-        // `prepare` (the Seatbelt render, and the `EngineFiles` mkdir/fchmod of TMPDIR and the per-run caches) is blocking,
-        // so it runs on the check's own thread next to the run, never the cooperative pool (B-M6).
+        // The per-run marker the profile allows and the sweep probes for; survives the check deleting its own checkout.
+        let marker = Self.runMarker()
+        let onStraggler = self.onStraggler
+        // `prepare` (the Seatbelt render, the `EngineFiles` mkdir/fchmod of TMPDIR and the per-run caches) and the B-I4 sweep
+        // are blocking, so they run on the check's own thread next to the run, never the cooperative pool (B-M6).
         let outcome = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<CheckOutcome, Never>) in
                 let thread = Thread { [self] in
                     let prepared: Prepared
-                    do { prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port) } catch {
+                    do { prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port, marker: marker) } catch {
                         continuation.resume(returning: GroupRun.fail("could not run the check in the sandbox: \(error)", outputURL: outputURL))
                         return
                     }
-                    continuation.resume(returning: GroupRun.run(executable: Self.sandboxExec, arguments: prepared.arguments,
-                                                                workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
-                                                                environment: prepared.environment, termGrace: grace, clock: clock,
-                                                                cancel: cancel))
+                    var result = GroupRun.run(executable: Self.sandboxExec, arguments: prepared.arguments,
+                                              workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
+                                              environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel)
+                    // B-I4: kill anything the run left behind, recognized by the run's marker (even if it deleted its
+                    // checkout). Survivors (ours that would not die, or a sandboxed process we could not classify — fail
+                    // closed) make the outcome inconclusive, so nothing escaped is ever counted as a pass or a failure.
+                    let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: since)
+                    if !swept.clean {
+                        onStraggler?(swept.all)
+                        let left = swept.survivors.isEmpty ? "" : " (\(swept.survivors.count) could not be killed)"
+                        result = CheckOutcome(exitCode: nil, timedOut: false,
+                                              tail: (result.tail.isEmpty ? "" : result.tail + "\n")
+                                                + "the check left \(swept.all.count) process(es) running outside its own group\(left); recorded inconclusive")
+                    }
+                    Self.removeTemp(policy)
+                    continuation.resume(returning: result)
                 }
                 thread.name = "brahma-sandboxed-check"
                 thread.start()
             }
         } onCancel: { cancel.set() }
-        // B-I4: kill anything the run left sandboxed for it (setsid, double fork, cleared env all keep the sandbox), before
-        // its checkout is read or removed.
-        Self.sweepStragglers(policy: policy, since: since)
-        Self.removeTemp(policy)
         return outcome
-    }
-
-    /// Kills processes still running under this run's sandbox (`SandboxProbe` on the run's own writable checkout, which only
-    /// its sandbox may write, against the read-only workspace), newer than the run. No-op when the policy has no workspace to
-    /// tell a check's sandbox apart, or off macOS.
-    static func sweepStragglers(policy: SandboxPolicy, since: Double) {
-        guard let checkout = policy.writable.first, let workspace = policy.readable.first else { return }
-        _ = SandboxSweep.run(probe: SandboxProbe(allowedWrite: checkout, deniedWrite: workspace), since: since)
     }
 
     public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
         let port = try policy.allowedDomains.map { try proxies.proxyNow(for: $0).port }
-        let prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port)
+        let marker = Self.runMarker()
+        let prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port, marker: marker)
         try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let file = open(logURL.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard file >= 0 else { throw SandboxError.invalidPath("cannot open the log \(logURL.path)") }
@@ -161,7 +170,7 @@ public struct SeatbeltRunner: SandboxedRunner {
             throw error
         }
         close(fds[1])
-        return SeatbeltProcess(child: child, policy: policy, since: since,
+        return SeatbeltProcess(child: child, marker: marker, since: since, onStraggler: onStraggler,
                                capture: OutputCapture(readEnd: fds[0], file: file, cap: ProcessCheckRunner.outputCap,
                                                       tailBytes: 4096, marker: ProcessCheckRunner.truncationMarker))
     }
@@ -173,15 +182,20 @@ public struct SeatbeltRunner: SandboxedRunner {
 public final class SeatbeltProcess: SandboxedProcess, @unchecked Sendable {
     let child: ProcessGroupChild
     private let capture: OutputCapture
-    private let policy: SandboxPolicy
+    private let marker: String
     private let since: Double
+    private let onStraggler: (@Sendable ([pid_t]) -> Void)?
     private let reaped = DispatchSemaphore(value: 0)
 
-    init(child: ProcessGroupChild, policy: SandboxPolicy, since: Double, capture: OutputCapture) {
-        self.child = child; self.policy = policy; self.since = since; self.capture = capture
-        let thread = Thread { [child, capture, reaped] in
+    init(child: ProcessGroupChild, marker: String, since: Double, onStraggler: (@Sendable ([pid_t]) -> Void)?, capture: OutputCapture) {
+        self.child = child; self.marker = marker; self.since = since; self.onStraggler = onStraggler; self.capture = capture
+        let thread = Thread { [child, capture, reaped, marker, since, onStraggler] in
             child.finish()
             _ = capture.finish(drain: 2)
+            // B-I4: once the leader is gone — whether it was terminated or exited on its own — kill anything the preview
+            // left behind, recognized by the run's marker.
+            let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: since)
+            if !swept.clean { onStraggler?(swept.all) }
             reaped.signal()
         }
         thread.name = "brahma-sandboxed-reaper"
@@ -204,14 +218,12 @@ public final class SeatbeltProcess: SandboxedProcess, @unchecked Sendable {
             while !child.hasExited(), AwakeTime.now < deadline { try? await AwakeTime.sleep(for: .milliseconds(20)) }
             if !child.hasExited() { child.signalGroup(SIGKILL) }
         }
+        // Wait for the reaper (which finishes the leader and runs the straggler sweep).
         let reaped = self.reaped
-        let (policy, since) = (self.policy, self.since)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             Thread.detachNewThread {
                 reaped.wait()
                 reaped.signal()
-                // B-I4: kill anything the preview left sandboxed for it after its leader is gone.
-                SeatbeltRunner.sweepStragglers(policy: policy, since: since)
                 continuation.resume()
             }
         }

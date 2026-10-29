@@ -199,8 +199,17 @@ public enum BackupTargets {
     /// Every configured folder target as a resolved URL. These are added to `protected` and `denyRead` for every turn (Task 1a's
     /// `backupTargets`) and every sandboxed run (Task 2's `SandboxBaseline`): an agent can neither read nor delete the backups.
     /// The WAL replica, when it is a folder, is protected the same way (it holds the database's whole history).
+    ///
+    /// Non-throwing convenience for display only; anything that builds a sandbox uses `requiredProtectedFolders`, which fails
+    /// closed when the targets cannot be read (INT-I1).
     public static func protectedFolders(store: Store) -> [URL] {
-        protectedFolders(targets: (try? store.backupTargets()) ?? [], walReplica: (try? store.walShipping())?.replica)
+        (try? requiredProtectedFolders(store: store)) ?? []
+    }
+
+    /// As `protectedFolders(store:)`, but a database error throws instead of silently leaving the backups unprotected: a
+    /// sandbox built without them would let an agent or a check read or delete the backups (INT-I1).
+    public static func requiredProtectedFolders(store: Store) throws -> [URL] {
+        protectedFolders(targets: try store.strictBackupTargets(), walReplica: try store.strictWALShipping()?.replica)
     }
 
     public static func protectedFolders(targets: [BackupTarget], walReplica: String? = nil) -> [URL] {
@@ -450,6 +459,21 @@ extension Store {
         let text: String? = try writer.read { db in try String.fetchOne(db, sql: "SELECT backupTargets FROM ownerPrefs WHERE id = 1") }
         guard let data = text?.data(using: .utf8), let list = try? JSONDecoder().decode([BackupTarget].self, from: data) else { return [] }
         return list
+    }
+
+    /// As `backupTargets()`, but a stored value that does not decode throws instead of reading as "none" (INT-I1: anything
+    /// that protects the backups must fail closed).
+    func strictBackupTargets() throws -> [BackupTarget] {
+        let text: String? = try writer.read { db in try String.fetchOne(db, sql: "SELECT backupTargets FROM ownerPrefs WHERE id = 1") }
+        guard let text, !text.isEmpty else { return [] }
+        return try JSONDecoder().decode([BackupTarget].self, from: Data(text.utf8))
+    }
+
+    /// As `walShipping()`, but an undecodable stored value throws (INT-I1).
+    func strictWALShipping() throws -> WALShippingConfig? {
+        let text: String? = try writer.read { db in try String.fetchOne(db, sql: "SELECT walShipping FROM ownerPrefs WHERE id = 1") }
+        guard let text, !text.isEmpty else { return nil }
+        return try JSONDecoder().decode(WALShippingConfig.self, from: Data(text.utf8))
     }
 
     public func setBackupTargets(_ targets: [BackupTarget]) throws {

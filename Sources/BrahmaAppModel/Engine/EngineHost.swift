@@ -54,7 +54,8 @@ public final class EngineHost {
     @ObservationIgnored private let ownerKeyStore: any OwnerKeyStore
     /// Where secret values live, for the engine's redactor: the app passes the vault `PlatformSecretVault` chose (the
     /// Keychain, or a dev/demo home's file store). The default is `UnavailableVault`, never the Keychain.
-    @ObservationIgnored private let secretVault: any SecretVault
+    /// The vault the engine reloads secrets from (non-interactive inside the Orchestrator). Internal for tests.
+    @ObservationIgnored let secretVault: any SecretVault
     @ObservationIgnored private let probe: @Sendable (String) async -> DoctorReport
     /// Retry's probe: always a real run, never the saved report.
     @ObservationIgnored private let freshProbe: @Sendable (String) async -> DoctorReport
@@ -64,6 +65,14 @@ public final class EngineHost {
     /// The running orchestrator, so `stop` can end its litestream directly.
     @ObservationIgnored private var engine: Orchestrator?
     @ObservationIgnored private var rememberedTools: Result<EngineTools, EngineSetupError>?
+
+    /// The engine the app builds again after a restore (the model has a new store). It carries the same owner key store and
+    /// the same secret vault as the first engine, so the restarted engine's redactor still loads the company's secrets and
+    /// never falls back to an unavailable vault (INT-I3).
+    public static func rebuilt(paths: BrahmaPaths, store: Store, ownerKeyStore: any OwnerKeyStore,
+                               secretVault: any SecretVault) -> EngineHost {
+        EngineHost(paths: paths, store: store, ownerKeyStore: ownerKeyStore, secretVault: secretVault)
+    }
 
     public init(paths: BrahmaPaths, store: Store,
                 makeRunner: @escaping @Sendable (String) -> any TurnRunning = { ClaudeProcessRunner(claudePath: $0) },

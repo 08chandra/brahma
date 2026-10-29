@@ -502,6 +502,22 @@ extension PushTests {
         #expect(!r.channel.sent[1].body.contains("urgent agent") && r.channel.sent[1].body == "Acme: engine alert waiting")
     }
 
+    /// INT-M2: a secret added since the last redactor load (the redactor is behind the database, though not "held") also
+    /// forces counts: a title could carry the new value before the background reload runs.
+    @Test func titlesFallBackToCountsWhenAReloadIsPending() async throws {
+        let r = try rig(detail: .titles)
+        try r.store.setSecret(companyId: r.company.id, name: "STRIPE_KEY", value: "sk_live_abcdef123456", isTest: false, vault: r.vault)
+        _ = try r.store.reloadRedactorIfNeeded(vault: r.vault)
+        try r.store.setSecret(companyId: r.company.id, name: "NEW_KEY", value: "brand-new-value-98765", isTest: false, vault: r.vault)
+        #expect(!r.store.secretsHeld); #expect(try r.store.secretsReloadNeeded())
+        try ask(r, "brand-new-value-98765 in a readable title")
+        await r.dispatcher.tick(now: noon)
+        let sent = try #require(r.channel.sent.first)
+        #expect(!(sent.title + sent.body).contains("brand-new-value"))
+        #expect(!(sent.title + sent.body).contains("readable"))
+        #expect(sent.body == "Acme: decision approval waiting")
+    }
+
     @Test func titlesFallBackToCountsWhenRedactionThrows() async throws {
         let r = try rig(detail: .titles)
         try ask(r, "plain readable agent title")

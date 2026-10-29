@@ -205,21 +205,23 @@ struct SeatbeltRunnerTests {
     /// B-I3: each run gets its own HOME, CARGO_HOME and XDG_CACHE_HOME under its TMPDIR (thrown away with it), so config a
     /// check plants there cannot run in a later check; only the npm cache is shared, and only when the policy gives a shared
     /// cache. A merge check (one writable entry) gets no shared cache: its npm cache is per-run too.
-    @Test func toolchainCachesArePerRunExceptSharedNpm() async throws {
+    /// Round 2: every toolchain cache is per-run under TMPDIR — HOME, CARGO_HOME, XDG_CACHE_HOME, the npm cache and the clang
+    /// module cache. A check gets no writable shared cache at all, so nothing it plants can run in a later check.
+    @Test func toolchainCachesAreAllPerRun() async throws {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
-        let cache = try Self.mkdir(h.appending(path: "cache"))
-        let show = "echo \"HOME=$HOME\"; echo \"CARGO=$CARGO_HOME\"; echo \"XDG=$XDG_CACHE_HOME\"; echo \"NPM=$npm_config_cache\""
-        let (submit, s) = try await Self.run(show, Self.policy(writable: [w, cache], readable: [h], toolchain: true))
-        #expect(submit.exitCode == 0)
+        let show = "for v in HOME CARGO_HOME XDG_CACHE_HOME npm_config_cache CLANG_MODULE_CACHE_PATH; do eval \"echo $v=\\$$v\"; done"
+        let (submit, s) = try await Self.run(show, Self.policy(writable: [w], readable: [h], toolchain: true))
+        #expect(submit.exitCode == 0, "\(s)")
         let tmp = w.appending(path: ".brahma-tmp")
-        #expect(s.contains("HOME=\(tmp.path)/home")); #expect(s.contains("CARGO=\(tmp.path)/cargo"))
-        #expect(s.contains("XDG=\(tmp.path)/xdg")); #expect(s.contains("NPM=\(cache.path)/npm"), "npm stays in the shared cache: \(s)")
-        // One writable entry (a merge check): the npm cache is per-run too, nothing shared.
-        let (merge, m) = try await Self.run(show, Self.policy(writable: [w], readable: [h], toolchain: true))
-        #expect(merge.exitCode == 0)
-        #expect(m.contains("NPM=\(tmp.path)/npm"), "a merge check must not share the npm cache: \(m)")
-        #expect(m.contains("HOME=\(tmp.path)/home"))
+        #expect(s.contains("HOME=\(tmp.path)/home")); #expect(s.contains("CARGO_HOME=\(tmp.path)/cargo"))
+        #expect(s.contains("XDG_CACHE_HOME=\(tmp.path)/xdg")); #expect(s.contains("npm_config_cache=\(tmp.path)/npm"))
+        #expect(s.contains("CLANG_MODULE_CACHE_PATH=\(tmp.path)/clang-modules"))
+        // Even with a second writable entry, nothing goes to it: the npm cache stays per-run under TMPDIR.
+        let other = try Self.mkdir(h.appending(path: "other"))
+        let (two, t) = try await Self.run(show, Self.policy(writable: [w, other], readable: [h], toolchain: true))
+        #expect(two.exitCode == 0)
+        #expect(t.contains("npm_config_cache=\(tmp.path)/npm"), "npm must stay per-run, never a shared entry: \(t)")
     }
 
     /// B-I2: the engine never follows a link a check planted at its own writable root. `removeTemp`, anchored at the root's
@@ -236,19 +238,77 @@ struct SeatbeltRunnerTests {
         #expect(SandboxPath.kind(root.path) == .link, "the link itself should be untouched by removeTemp")
     }
 
-    /// B-I4: a check that puts a process in a new session (`setsid`) or forks one into the background cannot outlive the run;
-    /// the sandbox-based sweep kills everything that ran under the run's sandbox.
-    @Test func setsidEscapeeIsSweptAfterTheRun() async throws {
+    /// B-I4: a check that puts a process in a new session (`POSIX::setsid`, via a double fork) cannot outlive the run; the
+    /// marker-based sweep kills it (even though it left the process group), and the run is recorded inconclusive. The marker
+    /// still identifies it after it deletes its own checkout.
+    @Test func setsidEscapeeIsSweptAndRunIsInconclusive() async throws {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
-        // `setsid` leaves the process group; a plain `&` child also outlives the shell. Both write their pid for the test.
-        let command = "/usr/bin/env setsid sh -c 'echo $$ > escapee.pid; exec sleep 300' & sleep 0.3; echo started"
+        // macOS has no `setsid` binary; use perl. The escapee forks, the parent exits, the child starts a new session, writes
+        // its pid, deletes the checkout out from under itself, then sleeps.
+        let perl = "perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); open(F, \">\", \"escapee.pid\"); print F $$; close(F); "
+            + "unlink grep { $_ ne \"escapee.pid\" } glob(\"*\"); sleep 300'"
+        let command = "\(perl) & sleep 0.5; echo started"
         let (outcome, _) = try await Self.run(command, Self.policy(writable: [w], readable: [h]), timeout: .seconds(20))
-        #expect(outcome.exitCode == 0)
+        // The escapee left a process the sandbox could not account for: inconclusive, never a pass.
+        #expect(outcome.exitCode == nil, "a straggler must make the outcome inconclusive, got exit \(String(describing: outcome.exitCode))")
+        #expect(outcome.tail.contains("inconclusive"))
         let pidText = (try? String(contentsOf: w.appending(path: "escapee.pid"), encoding: .utf8)) ?? ""
-        if let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            #expect(await Self.gone(pid), "an escaped sandboxed process survived the run")
-        }
+        let pid = try #require(Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)), "the escapee never recorded its pid")
+        #expect(await Self.gone(pid), "an escaped sandboxed process survived the run")
+    }
+
+    /// B-I4: one run's sweep never touches another run's processes. Under `(allow default)` every name is allowed unless
+    /// denied, so each profile denies the whole marker prefix and allows only its own; a long run keeps running while a
+    /// short one ends and sweeps.
+    @Test func concurrentRunsDoNotSweepEachOther() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let a = try Self.mkdir(h.appending(path: "a")), b = try Self.mkdir(h.appending(path: "b"))
+        async let long = Self.run("sleep 3; echo long-done", Self.policy(writable: [a]), timeout: .seconds(30))
+        try await Task.sleep(for: .milliseconds(500))
+        let (short, _) = try await Self.run("echo short-done", Self.policy(writable: [b]))
+        #expect(short.exitCode == 0)
+        let (longOutcome, longText) = try await long
+        #expect(longOutcome.exitCode == 0, "the long run was swept by the short one: \(longOutcome)")
+        #expect(longText.contains("long-done"))
+    }
+
+    /// A-I1 ruling test: a 0600 file in the per-user temp dir (outside the home) cannot be read inside the sandbox.
+    @Test func userTempFileUnreadable() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let base = SandboxBaseline.current(paths: BrahmaPaths(home: Self.realHome.appending(path: "Library/Application Support/Brahma"),
+                                                              workspaces: Self.realHome.appending(path: "Brahma")),
+                                           otherWorkspaces: [], backupTargets: [])
+        let temp = try #require(base.darwinUserTemp)
+        let secret = temp.appending(path: "brahma-tread-\(UUID().uuidString)")
+        try "top-secret".write(to: secret, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secret.path)
+        defer { try? FileManager.default.removeItem(at: secret) }
+        let (outcome, text) = try await Self.run("cat '\(secret.path)'", Self.policy(writable: [w]))
+        #expect(outcome.exitCode != 0); #expect(!text.contains("top-secret"))
+        // Even under the toolchain profile (which re-allows only xcrun_db and the NSIRD staging), the file is unreadable.
+        let (tc, tcText) = try await Self.run("cat '\(secret.path)'", Self.policy(writable: [w], readable: [h], toolchain: true))
+        #expect(tc.exitCode != 0); #expect(!tcText.contains("top-secret"))
+    }
+
+    /// NSIRD ruling test: a sandboxed check cannot enumerate another process's open files (`lsof -p <owner pid>`), so it
+    /// cannot discover the per-user temp staging names. It still sees its own process.
+    @Test func cannotInspectOtherProcessesOpenFiles() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        guard FileManager.default.isExecutableFile(atPath: "/usr/sbin/lsof") else { return }
+        // A long-lived process outside the sandbox with an open file whose name a check must not learn.
+        let victim = Process()
+        victim.executableURL = URL(fileURLWithPath: "/bin/sh")
+        let marker = "NSIRD-\(UUID().uuidString)"
+        victim.arguments = ["-c", "exec 9>'\(w.path)/\(marker)'; sleep 30"]
+        try victim.run()
+        defer { victim.terminate(); victim.waitUntilExit() }
+        try await Task.sleep(for: .milliseconds(200))
+        let (outcome, text) = try await Self.run("/usr/sbin/lsof -p \(victim.processIdentifier) 2>&1 || true; echo DONE", Self.policy(writable: [w]))
+        #expect(outcome.exitCode == 0)
+        #expect(!text.contains(marker), "lsof revealed another process's open file: \(text.suffix(400))")
     }
 
     @Test func securityCLIDenied() async throws {
@@ -576,15 +636,21 @@ struct SeatbeltRunnerTests {
         let b = SandboxBaseline(userHome: URL(fileURLWithPath: "/Users/o"), protected: [URL(fileURLWithPath: "/Users/o/.ssh")],
                                 darwinUserTemp: URL(fileURLWithPath: "/private/var/folders/x+y/T"),
                                 darwinUserCache: URL(fileURLWithPath: "/private/var/folders/x+y/C"),
-                                engineHomes: [URL(fileURLWithPath: "/srv/brahma home")])
-        let p = SandboxPolicy(writable: [URL(fileURLWithPath: "/srv/brahma home/run/checkouts/r1"), URL(fileURLWithPath: "/w/.brahma/cache/shared")],
+                                darwinUserDir: URL(fileURLWithPath: "/private/var/folders/x+y"),
+                                engineHomes: [URL(fileURLWithPath: "/srv/brahma home")],
+                                companyWorkspaces: [URL(fileURLWithPath: "/w"), URL(fileURLWithPath: "/other-co")])
+        let p = SandboxPolicy(writable: [URL(fileURLWithPath: "/srv/brahma home/run/checkouts/r1")],
                               readable: [URL(fileURLWithPath: "/w")], network: .loopbackListen(allow: [], ports: [4000, 4001]), toolchain: true)
-        let text = SeatbeltProfile.render(policy: p, baseline: b, proxyPort: 5555)
-        let order = ["(version 1)", "(allow default)", "(deny file-read-data (subpath \"/Users/o\") (subpath \"/Volumes\")",
+        let text = SeatbeltProfile.render(policy: p, baseline: b, proxyPort: 5555, marker: "dev.brahma.run.abc")
+        let order = ["(version 1)", "(allow default)",
+                     "(deny file-read-data (subpath \"/Users/o\") (subpath \"/Volumes\")",
                      "(allow file-read-data (subpath \"/w\")", "(deny file-read* file-read-data (subpath \"/Users/o/.ssh\")",
                      "(deny file-write* (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\")",
-                     "(deny signal (target others))", "(deny mach-lookup (global-name \"com.apple.SecurityServer\")",
+                     "(deny signal (target others))", "(deny process-info* (target others))",
+                     "(deny mach-lookup (global-name \"com.apple.SecurityServer\")",
                      "(deny process-exec (literal \"/usr/bin/osascript\")", "(allow mach-lookup (global-name \"com.apple.windowserver.active\")",
+                     "(deny mach-lookup (global-name-prefix \"dev.brahma.run.\"))",
+                     "(allow mach-lookup (global-name \"dev.brahma.run.abc\"))",
                      "(deny network*)", "(allow network-outbound (remote ip \"localhost:5555\"))",
                      "(allow network-bind network-inbound (local ip \"localhost:4000\") (local ip \"localhost:4001\"))",
                      "(allow network-outbound (remote ip \"localhost:4000\") (remote ip \"localhost:4001\"))"]
@@ -594,12 +660,23 @@ struct SeatbeltRunnerTests {
             at = found.upperBound
         }
         #expect(text.contains("(subpath \"/srv/brahma home\")"), "the engine home is denied for reading")
+        // The per-user Darwin folder (T/C/0) is denied for reading (A-I1).
+        #expect(text.contains("(subpath \"/private/var/folders/x+y\")"))
+        // The other company's workspace is denied; this run's readable workspace is not in that deny.
+        #expect(text.contains("(subpath \"/other-co\")"))
+        // Toolchain reads: the xcrun_db and NSIRD temp regexes and the two narrowed C read subpaths (no broad `(subpath C)`).
         #expect(text.contains("(regex #\"^/private/var/folders/x\\+y/T/xcrun_db\")"))
-        #expect(text.contains("(regex #\"^/private/var/folders/x\\+y/C/org\\.llvm\\.clang\")"))
+        #expect(text.contains("TemporaryItems/NSIRD_(swift-(build|package|test|run)|xcodebuild|SWBBuildService)_"))
+        #expect(text.contains("(subpath \"/private/var/folders/x+y/C/com.apple.DeveloperTools\")"))
         #expect(text.contains("(subpath \"/private/var/folders/x+y/C/clang\")"))
+        #expect(!text.contains("(subpath \"/private/var/folders/x+y/C\")"), "C is read narrowly, not wholesale")
+        // C is never written (compiler caches are per-run): no C write subpaths or org.llvm.clang write regex.
+        #expect(!text.contains("C/org.llvm.clang")); #expect(!text.contains("C/org.swift.swiftpm"))
         for literal in ["/dev/null", "/dev/tty", "/dev/dtracehelper"] { #expect(text.contains("(literal \"\(literal)\")")) }
         #expect(text.contains("(regex #\"^/dev/fd/\")"))
         #expect(!text.contains("Library/Caches/org.swift.swiftpm\") (literal"), "nothing under ~/Library is writable")
+        // No marker rendered when none is given.
+        #expect(!SeatbeltProfile.render(policy: p, baseline: b, proxyPort: 5555).contains("dev.brahma.run"))
         // .none has no network allowance at all; .outbound only the proxy.
         let none = SeatbeltProfile.render(policy: SandboxPolicy(writable: p.writable, readable: [], network: .none, toolchain: false),
                                           baseline: b, proxyPort: nil)

@@ -28,7 +28,7 @@ import Foundation
         let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let f = try GitFixture(ensure: false)
-        let ws = GitWorkspace(root: f.root, exportHome: home)
+        var ws = GitWorkspace(root: f.root, exportHome: home)
         #expect(ws.gitTemp.path == home.appending(path: "tmp").path)
         let nsTemp = FileManager.default.temporaryDirectory
         func strays() -> [String] {
@@ -40,8 +40,7 @@ import Foundation
         let mine = home.path
         final class Seen: @unchecked Sendable { let lock = NSLock(); var roots: Set<String> = [] }
         let seen = Seen()
-        GitCommand.tempRootObserver = { url in if url.path.hasPrefix(mine + "/") { seen.lock.withLock { _ = seen.roots.insert(url.path) } } }
-        defer { GitCommand.tempRootObserver = nil }
+        ws.gitTempObserver = { url in if url.path.hasPrefix(mine + "/") { seen.lock.withLock { _ = seen.roots.insert(url.path) } } }
         _ = strays()                                          // keep the helper referenced; the real check is below
         try ws.ensureRepo()                                   // init, symbolic-ref, add, commit: many git runs
         _ = try f.write("a.txt", "one")
@@ -53,6 +52,18 @@ import Foundation
         // The directory it uses is 0700, under the data home.
         var st = stat()
         #expect(stat(ws.gitTemp.path, &st) == 0 && st.st_mode & 0o777 == 0o700)
+    }
+
+    /// B-M3: a hard-linked `.git/info/exclude` is refused, never written (a write would change whatever else it links to).
+    @Test func hardLinkedExcludeIsRefused() throws {
+        let f = try GitFixture()
+        let exclude = f.root.appending(path: ".git/info/exclude")
+        let other = try tempDir().appending(path: "linked-elsewhere")
+        try "owner pattern\n".write(to: other, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: exclude)
+        try FileManager.default.linkItem(at: other, to: exclude)
+        #expect(throws: (any Error).self) { try f.ws.ensureRepo() }
+        #expect(try String(contentsOf: other, encoding: .utf8) == "owner pattern\n", "the hard-linked file was modified")
     }
 
     @Test func ensureRepoImportsExistingFiles() throws {

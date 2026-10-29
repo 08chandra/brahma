@@ -9,4 +9,9 @@ int brahma_sandbox_is_sandboxed(pid_t pid);
 /// it denies it, -1 when that cannot be told. A process without a sandbox is allowed everything (0). Nothing is logged for a denial.
 int brahma_sandbox_write_denied(pid_t pid, const char *path);
 
+/// 1 when the sandbox of process `pid` allows a mach-lookup of the global name `name`, 0 when it denies it, -1 when that
+/// cannot be told. Used with a per-run unique name no real service answers, to recognize a run's processes by their sandbox
+/// alone (independent of any file they could delete). Nothing is logged.
+int brahma_sandbox_mach_allowed(pid_t pid, const char *name);
+
 #endif

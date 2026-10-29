@@ -111,21 +111,20 @@ import GRDB
         #expect(s.fallback.calls.isEmpty)
         let call = try #require(s.sandbox.calls.first)
         let checkout = s.git.checkoutPath(runId: run.id)
-        let cache = SandboxLayout(paths: s.world.paths, company: s.company, agentHandle: "x").sharedCache
         #expect(Self.resolved(call.cwd) == Self.resolved(checkout))
-        #expect(call.policy.writable == [Self.resolved(checkout), Self.resolved(s.root).appending(path: ".brahma/cache/shared")])
-        #expect(call.policy.writable[1] == Self.resolved(cache))
+        // A check writes only its own checkout — no writable shared cache at all (round 2).
+        #expect(call.policy.writable == [Self.resolved(checkout)])
         #expect(call.policy.readable == [Self.resolved(s.root)])
         let company = try #require(try s.store.company(id: s.company.id))
         let domains = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []).allowedDomains
         #expect(call.policy.network == .outbound(allow: domains)); #expect(domains.contains("*.stripe.com"))
         #expect(call.policy.toolchain)
         #expect(call.environment["BRAHMA_AGENT_ID"] == s.eng.id); #expect(call.timeout == .seconds(600))
-        #expect(FileManager.default.fileExists(atPath: Self.resolved(cache).path), "the shared cache exists before the run")
-        // Nothing of the data home is in the policy but this run's own checkout.
+        // Nothing of the data home is in the policy but this run's own checkout, and no workspace cache either.
         for entry in call.policy.writable + call.policy.readable {
             #expect(!SandboxPath.isInside(entry.path, Self.resolved(s.world.paths.home).path))
         }
+        #expect(!call.policy.writable.contains { $0.path.contains("/.brahma/cache") })
     }
 
     @Test func fullProfileUsesFallback() async throws {
@@ -179,35 +178,24 @@ import GRDB
         #expect(s.sandbox.calls.isEmpty); #expect(s.fallback.calls.isEmpty)
     }
 
-    /// B-I2: if a check turned `.brahma/cache/shared` into a link (or a file), the engine removes it without following the
-    /// link and recreates it as a real 0700 directory, so one check cannot permanently break its company's later checks.
-    @Test func linkedSharedCacheIsRepairedByTheRoute() async throws {
+    /// Round 2: a check gets no writable shared cache at all, so its policy names only its own checkout — there is no
+    /// `.brahma/cache/shared` for a check to break, writable or otherwise.
+    @Test func checkPolicyHasNoWorkspaceCache() async throws {
         let s = try S()
         let item = try s.submitted()
         let run = try s.latest(item)
-        // The route only runs for a `running` row whose recorded directory is the engine's checkout; make that real.
         let checkout = s.git.checkoutPath(runId: run.id)
         try FileManager.default.createDirectory(at: checkout, withIntermediateDirectories: true)
         try await s.store.writer.write { db in
             try db.execute(sql: "UPDATE verificationRun SET status = 'running', workingDirectory = ? WHERE id = ?",
                            arguments: [checkout.path, run.id])
         }
-        let cacheParent = s.root.appending(path: ".brahma/cache")
-        try FileManager.default.createDirectory(at: cacheParent, withIntermediateDirectories: true)
-        let outside = try tempDir().appending(path: "elsewhere")
-        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
-        let cache = cacheParent.appending(path: "shared")
-        try? FileManager.default.removeItem(at: cache)
-        try FileManager.default.createSymbolicLink(at: cache, withDestinationURL: outside)   // a check planted this link
         guard case .sandboxed(let policy) = Orchestrator.checkRoute(store: s.store)(checkout.path) else {
-            Issue.record("the route refused instead of repairing the cache"); return
+            Issue.record("the run was not routed to the sandbox"); return
         }
-        let wsReal = s.root.resolvedForSandbox
-        let realCache = wsReal.appending(path: ".brahma/cache/shared")
-        #expect(SandboxPath.kind(realCache.path) == .directory, "the link was not replaced by a real directory")
-        #expect(SandboxPath.linkedComponent(realCache.path, under: wsReal.path) == nil)
-        #expect(policy.writable.last == realCache)
-        #expect(FileManager.default.fileExists(atPath: outside.path), "the link target must be left alone")
+        #expect(policy.writable == [Self.resolved(checkout)])
+        #expect(!policy.writable.contains { $0.path.contains("/.brahma/cache") })
+        #expect(policy.readable == [s.root.resolvedForSandbox])
     }
 
     @Test func unavailableRunnerFailsClosed() async throws {

@@ -154,18 +154,38 @@ struct SandboxProbe: Equatable, Sendable {
         denied = workspace.path
     }
 
-    /// For a sandboxed check (B-I4): the sandbox lets the process write the run's own checkout/export, which is unique to the
-    /// run, but not the company workspace (a check may only read it). Both must exist for the kernel to answer.
-    init(allowedWrite: URL, deniedWrite: URL) {
-        allowed = allowedWrite.path
-        denied = deniedWrite.path
+    /// A per-run unique mach global name (`dev.brahma.run.<id>`) the run's profile allows and no real service answers. When
+    /// set, a process is recognized by whether its sandbox allows that lookup — which survives the process deleting its own
+    /// checkout (B-I4), unlike a path probe.
+    var machMarker: String?
+
+    /// For a sandboxed check (B-I4): recognize the run's processes by their unique mach marker, independent of any file.
+    init(machMarker: String) {
+        allowed = ""; denied = ""
+        self.machMarker = machMarker
     }
 
-    /// Whether `pid` runs under a sandbox shaped like one of this agent's turns.
-    func matches(_ pid: pid_t) -> Bool {
-        guard SandboxCheck.isSandboxed(pid) == true else { return false }
-        return SandboxCheck.writeDenied(pid, allowed) == false && SandboxCheck.writeDenied(pid, denied) == true
+    enum Match { case mine, notMine, unknown }
+
+    /// Whether `pid` is one of this run's processes. With a `machMarker`, it is `.mine` when the sandbox allows that unique
+    /// lookup, `.unknown` when the kernel cannot tell (a sandboxed process whose policy could not be read — fail closed),
+    /// `.notMine` otherwise. Without a marker (1b turns), the write-shape probe, which has no `.unknown`.
+    func classify(_ pid: pid_t) -> Match {
+        guard SandboxCheck.isSandboxed(pid) == true else { return .notMine }
+        if let machMarker {
+            // Ours: this run's own name allowed AND a sibling name under the denied prefix refused. Another Brahma run denies
+            // our name; a foreign sandbox that allows every lookup also allows the sibling. Either reads as not ours.
+            switch (SandboxCheck.machAllowed(pid, machMarker), SandboxCheck.machAllowed(pid, machMarker + ".not")) {
+            case (.some(true), .some(false)): return .mine
+            case (.some(false), _), (_, .some(true)): return .notMine
+            default: return .unknown
+            }
+        }
+        return SandboxCheck.writeDenied(pid, allowed) == false && SandboxCheck.writeDenied(pid, denied) == true ? .mine : .notMine
     }
+
+    /// Whether `pid` runs under a sandbox shaped like one of this agent's turns (1b; `.mine` only).
+    func matches(_ pid: pid_t) -> Bool { classify(pid) == .mine }
 
     /// The owner's processes in the table this probe matches (never this process).
     func scan(_ table: [ProcessEntry]) -> [ProcessEntry] {
@@ -174,22 +194,48 @@ struct SandboxProbe: Equatable, Sendable {
     }
 }
 
-/// Kills whatever a finished sandboxed run left behind: processes a `probe` matches that started no earlier than the run
-/// (`since`), so a check that did `setsid sleep 300 &` or double-forked out of its process group cannot outlive the run
-/// (B-I4). Shared with Task 1b's turn cleanup, which recognizes a turn's own processes the same way (`SandboxProbe`).
-/// Each kill re-reads the process and checks its start time first, so a pid reused meanwhile is never signalled. Returns
-/// the pids still alive after `rounds`.
+/// What a straggler sweep came to.
+struct SweepResult: Sendable {
+    /// Pids confirmed to be this run's and killed.
+    var killed: [pid_t] = []
+    /// Pids left over: this run's that would not die, or sandboxed same-uid processes newer than the run whose sandbox the
+    /// kernel could not read (fail closed — treated as survivors).
+    var survivors: [pid_t] = []
+    /// True only when the run left nothing behind at all. A well-behaved check leaves no process for the sweep, so having
+    /// had to kill one (`killed`) or being unable to account for one (`survivors`) both make the run inconclusive.
+    var clean: Bool { killed.isEmpty && survivors.isEmpty }
+    /// Everything the sweep acted on or could not clear, for the log.
+    var all: [pid_t] { killed + survivors }
+}
+
+/// Kills whatever a finished sandboxed run left behind: its processes, recognized by the run's unique mach marker, that
+/// started no earlier than the run (`since`), so one that did `POSIX::setsid()` or double-forked out of its process group
+/// cannot outlive the run (B-I4). Shared with Task 1b's turn cleanup (`SandboxProbe`). Each kill re-reads the process and
+/// checks its start time first, so a pid reused meanwhile is never signalled. Fail closed: a same-uid sandboxed process
+/// newer than the run whose sandbox cannot be read counts as a survivor.
 enum SandboxSweep {
-    @discardableResult
-    static func run(probe: SandboxProbe, since: Double, rounds: Int = 50) -> [pid_t] {
-        var left: [ProcessEntry] = []
+    static func run(probe: SandboxProbe, since: Double, rounds: Int = 50) -> SweepResult {
+        let uid = getuid(), me = getpid()
+        func candidates() -> [ProcessEntry] {
+            ProcessTable.snapshot().filter { $0.uid == uid && $0.pid != me && !$0.isZombie && $0.start >= since }
+        }
+        var killed = Set<pid_t>()
+        var mine: [ProcessEntry] = []
         for _ in 0..<rounds {
-            left = probe.scan(ProcessTable.snapshot()).filter { $0.start >= since }
-            if left.isEmpty { return [] }
-            for p in left where ProcessTable.entry(p.pid)?.start == p.start { kill(p.pid, SIGKILL) }
+            mine = candidates().filter { probe.classify($0.pid) == .mine }
+            if mine.isEmpty { break }
+            for p in mine where ProcessTable.entry(p.pid)?.start == p.start { kill(p.pid, SIGKILL); killed.insert(p.pid) }
             Thread.sleep(forTimeInterval: 0.02)
         }
-        return probe.scan(ProcessTable.snapshot()).filter { $0.start >= since }.map(\.pid)
+        // After the kills: this run's processes still alive, plus any whose sandbox could not be read (fail closed).
+        var survivors: [pid_t] = []
+        for p in candidates() {
+            switch probe.classify(p.pid) {
+            case .mine, .unknown: survivors.append(p.pid)
+            case .notMine: break
+            }
+        }
+        return SweepResult(killed: Array(killed), survivors: survivors)
     }
 }
 
@@ -205,6 +251,12 @@ enum SandboxCheck {
     /// Whether `pid`'s sandbox denies it writing `path` (which must exist; an unsandboxed process: false). Nothing is logged.
     static func writeDenied(_ pid: pid_t, _ path: String) -> Bool? {
         let r = brahma_sandbox_write_denied(pid, path)
+        return r < 0 ? nil : r == 1
+    }
+
+    /// Whether `pid`'s sandbox allows a mach-lookup of the global name `name`; nil when it cannot be told.
+    static func machAllowed(_ pid: pid_t, _ name: String) -> Bool? {
+        let r = brahma_sandbox_mach_allowed(pid, name)
         return r < 0 ? nil : r == 1
     }
 }

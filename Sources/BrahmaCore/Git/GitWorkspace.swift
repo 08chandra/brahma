@@ -110,8 +110,8 @@ struct GitCommand: Sendable {
     func withIndex(_ url: URL) -> GitCommand { var copy = self; copy.indexFile = url; return copy }
 
     /// Tests only: handed the `tempRoot` of every git run, to prove the engine's captured output never lands in the shared
-    /// per-user temp dir (A-I1b). `nonisolated(unsafe)`: set once before a test, read on the git thread.
-    nonisolated(unsafe) static var tempRootObserver: (@Sendable (URL) -> Void)?
+    /// per-user temp dir (A-I1b). Injected per `GitWorkspace` instance (not a global), so it is set only where a test wants it.
+    var tempRootObserver: (@Sendable (URL) -> Void)?
 
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
@@ -319,7 +319,7 @@ struct GitCommand: Sendable {
         process.standardInput = FileHandle.nullDevice
         // Output goes to files, not pipes: concurrent children cannot hold each other's pipe ends open, and a grandchild
         // that outlives git cannot keep us waiting for end of file.
-        GitCommand.tempRootObserver?(tempRoot)
+        tempRootObserver?(tempRoot)
         try? FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
         let base = tempRoot.appending(path: "brahma-git-\(UUID().uuidString)")
@@ -536,6 +536,9 @@ public struct GitWorkspace: Sendable {
     /// Where the engine's git commands keep their captured output and private index files (A-I1b): a 0700 directory under the
     /// engine's data home (`<exportHome>/tmp`), never the shared per-user temp dir a sandboxed check could read.
     let gitTemp: URL
+    /// Tests only: handed each git command's `tempRoot`, so a test can prove the engine never writes to the shared per-user
+    /// temp dir (A-I1b). Injected on the instance; nil in production (no global).
+    var gitTempObserver: (@Sendable (URL) -> Void)?
 
     public init(root: URL, lockDirectory: URL? = nil, mergeDirectory: URL? = nil, exportHome: URL? = nil) {
         self.root = root
@@ -570,6 +573,7 @@ public struct GitWorkspace: Sendable {
         var git = GitCommand(gitDir: gitDir, workTree: root, commonDir: nil, onRefused: onUnsafeRepository)
         git.beforeRetry = gitRetryProbe
         git.tempRoot = gitTemp
+        git.tempRootObserver = gitTempObserver
         return git
     }
 
@@ -632,6 +636,7 @@ public struct GitWorkspace: Sendable {
         var git = GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir, onRefused: onUnsafeRepository)
         git.beforeRetry = gitRetryProbe
         git.tempRoot = gitTemp
+        git.tempRootObserver = gitTempObserver
         return (git, key)
     }
 
@@ -761,9 +766,15 @@ public struct GitWorkspace: Sendable {
         let current = existing.map { String(decoding: $0, as: UTF8.self) } ?? ""
         let lines = current.split(separator: "\n").map(String.init)
         let missing = Self.excludedEntries.filter { !lines.contains($0) }
-        // A real file that could not be read whole (a second hard link, or over the read cap) must never be replaced: the
-        // atomic write would drop whatever the owner put there. The entries are appended without following a link (B-M3).
+        // A real regular file the engine could not read whole is either hard-linked or over the read cap. A hard-linked one
+        // must not be touched at all (a write would change whatever else it is linked to); an oversized one is only appended
+        // to, never replaced (the atomic rewrite would drop its contents). Both are refused rather than silently rewritten
+        // (B-M3, the re-review's "refuse, not append" for hard links).
         if existing == nil, SandboxPath.kind(file.path) == .file {
+            var st = stat()
+            if lstat(file.path, &st) == 0, st.st_nlink > 1 {
+                throw GitError.failed(command: "exclude", status: -1, stderr: "\(file.path) has more than one hard link; refusing to modify it")
+            }
             guard !missing.isEmpty else { return }
             let fd = open(file.path, O_WRONLY | O_APPEND | O_NOFOLLOW)
             guard fd >= 0 else { throw GitError.failed(command: "exclude", status: -1, stderr: "cannot append to \(file.path)") }
@@ -1030,6 +1041,7 @@ public struct GitWorkspace: Sendable {
         var git = GitCommand(gitDir: mergeRepositoryPath, workTree: mergeWorktreePath, commonDir: nil)
         git.attributes = Self.engineAttributes
         git.tempRoot = gitTemp
+        git.tempRootObserver = gitTempObserver
         return git
     }
     /// Where older engines kept the merge checkout, inside the agent-writable `<ws>/.brahma`.
@@ -1308,6 +1320,7 @@ public struct GitWorkspace: Sendable {
         var source = GitCommand(gitDir: previous, workTree: mergeDirectory.deletingLastPathComponent(), commonDir: nil)
         source.attributes = Self.engineAttributes
         source.tempRoot = gitTemp
+        source.tempRootObserver = gitTempObserver
         guard try source.run(["cat-file", "-e", "\(mainHead)^{commit}"], allowFailure: true).status == 0 else { return false }
         try source.run(["update-ref", "--no-deref", "refs/brahma/heal", mainHead])
         let bundle = URL(fileURLWithPath: mergeDirectory.path + "-heal.bundle")

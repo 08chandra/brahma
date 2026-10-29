@@ -208,7 +208,8 @@ public final class Store: Sendable {
             let existed = FileManager.default.fileExists(atPath: dir.path)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             do {
-                let git = GitWorkspace(root: dir)
+                // The engine's git output for this init goes under the data home (A-I1b), never the shared per-user temp dir.
+                let git = GitWorkspace(root: dir, exportHome: dataHome)
                 try git.ensureRepo()
                 // The head the engine expects `main` to have; every claim checks it is still an ancestor of the real one.
                 if let head = try git.head(of: GitWorkspace.mainRef) {

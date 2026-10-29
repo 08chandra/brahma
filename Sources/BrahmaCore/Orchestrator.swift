@@ -136,6 +136,8 @@ public actor Orchestrator {
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
     public func start() async throws {
         try await EngineGitGuard.$engine.withValue(engineId) {
+            // Raise the descriptor limit so the egress proxies' pooled sockets cannot starve the engine's own files (A-I2).
+            if let raised = FileLimit.raise() { log("file descriptor limit: \(raised)") }
             // The first load of the secrets, in a Blocking body (vault reads may block; never on the actor).
             let (store, vault) = (self.store, self.vault)
             let failure: String? = await blocking.run {

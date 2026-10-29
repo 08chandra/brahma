@@ -63,8 +63,6 @@ extension Orchestrator {
         }
         let store = self.store, paths = self.paths, env = sandboxEnvironment, mcp = mcpExecutable
         let others = try store.companies().filter { $0.id != company.id }.map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) }
-        // The owner's backup folders and WAL replica (Task 13b): protected and unreadable for every turn.
-        let backups = BackupTargets.protectedFolders(store: store)
         let layout = SandboxLayout(paths: paths, company: company, agentHandle: agent.name)
         let now = clock()
         func event(_ text: String) {
@@ -76,6 +74,9 @@ extension Orchestrator {
         let turn: SandboxedTurn
         do {
             turn = try await blocking.tryRun {
+                // The owner's backup folders and WAL replica (Task 13b): protected and unreadable for every turn. Read in the
+                // blocking body (INT-M1); a database error refuses the turn rather than leave the backups unprotected (INT-I1).
+                let backups = try BackupTargets.requiredProtectedFolders(store: store)
                 try layout.ensure()
                 let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: mcp)
                 let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,

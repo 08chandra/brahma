@@ -133,9 +133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     secretVault: booted.secretVault)
             model.engine = engine
             // After a restore the model has a new store: the engine is rebuilt on it.
-            model.restartEngine = { [weak model, ownerKeyStore = booted.ownerKeyStore] store in
+            model.restartEngine = { [weak model, ownerKeyStore = booted.ownerKeyStore, secretVault = booted.secretVault] store in
                 guard let model else { return nil }
-                let engine = EngineHost(paths: model.paths, store: store, ownerKeyStore: ownerKeyStore)
+                let engine = EngineHost.rebuilt(paths: model.paths, store: store, ownerKeyStore: ownerKeyStore, secretVault: secretVault)
                 await engine.start(tools: EngineSetup.resolveTools())
                 return engine
             }

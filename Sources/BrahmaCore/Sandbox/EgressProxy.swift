@@ -8,6 +8,38 @@ import Glibc
 // The only way out of a sandboxed check or preview with outbound network: an HTTP CONNECT proxy on loopback that lets a
 // TLS connection through only to an allowed domain, on port 443, at a public address, resolved once.
 
+/// Raises the process's open-file soft limit toward its hard limit at engine start, so the egress proxies' pooled sockets
+/// (two descriptors per connection) cannot leave the engine without descriptors for its database, git and logs (A-I2).
+public enum FileLimit {
+    /// The target soft limit: the hard limit, capped at 10240.
+    public static let target: UInt64 = 10240
+
+    /// Raises `RLIMIT_NOFILE`'s soft limit to `min(hard, target)`; returns a one-line result for the log, or nil off Darwin.
+    @discardableResult
+    public static func raise() -> String? {
+        #if canImport(Darwin)
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return "could not read RLIMIT_NOFILE (\(errno))" }
+        let want = min(limit.rlim_max, rlim_t(target))
+        if limit.rlim_cur >= want { return "soft \(limit.rlim_cur), hard \(limit.rlim_max) (unchanged)" }
+        limit.rlim_cur = want
+        guard setrlimit(RLIMIT_NOFILE, &limit) == 0 else { return "could not raise RLIMIT_NOFILE to \(want) (\(errno))" }
+        return "raised soft limit to \(want) (hard \(limit.rlim_max))"
+        #else
+        return nil
+        #endif
+    }
+
+    /// The current soft limit (for sizing the proxy descriptor budget), or a conservative default off Darwin / on error.
+    static var current: Int {
+        #if canImport(Darwin)
+        var limit = rlimit()
+        if getrlimit(RLIMIT_NOFILE, &limit) == 0 { return Int(min(limit.rlim_cur, rlim_t(Int.max))) }
+        #endif
+        return 256
+    }
+}
+
 // MARK: Domains
 
 /// Domain allow-list patterns: an exact name, or `*.parent` for the parent's subdomains only.
@@ -182,21 +214,59 @@ public final class EgressProxy: @unchecked Sendable {
     /// The default per-proxy cap on connections being served at once (A-I2).
     public static let perProxyLimit = 64
 
-    /// A shared ceiling on how many connections may be in flight across a set of proxies (the pool gives all of its proxies
-    /// one). A connection is admitted only if both its proxy's own cap and this ceiling have room.
+    /// Descriptors a piped connection holds: the client socket and the upstream socket.
+    static let fdsPerConnection = 2
+
+    /// A shared ceiling, in descriptors, across a set of proxies (the pool gives all of its proxies one). A connection is
+    /// admitted only when both its proxy's own cap and this descriptor budget have room, so the proxies together can never
+    /// hold more than `limit` descriptors open (A-I2: budget descriptors, not connections).
     public final class Budget: @unchecked Sendable {
         private let lock = NSLock()
         private let limit: Int
-        private var count = 0
+        private var used = 0
         public init(limit: Int) { self.limit = limit }
-        func acquire() -> Bool { lock.withLock { count < limit ? { count += 1; return true }() : false } }
-        func release() { lock.withLock { if count > 0 { count -= 1 } } }
+        /// Reserves `cost` descriptors; false (reserving nothing) when that would exceed the budget.
+        func acquire(_ cost: Int) -> Bool { lock.withLock { used + cost <= limit ? { used += cost; return true }() : false } }
+        func release(_ cost: Int) { lock.withLock { used = max(0, used - cost) } }
     }
 
     /// The back-off after `failures` accept failures in a row (EMFILE/ENFILE): 50 ms doubling to 1 s, awake time, never a spin.
     static func acceptBackoff(failures: Int) -> Duration {
         let ms = min(1000, 50 << min(failures - 1, 20))
         return .milliseconds(ms)
+    }
+
+    private final class ThreadBox { let run: () -> Void; let name: String; init(_ r: @escaping () -> Void, _ n: String) { run = r; name = n } }
+
+    /// Starts `body` on a detached thread with a 512 KiB stack via `pthread_create`, whose non-zero return (out of threads)
+    /// is checked, so a failure is a dropped connection rather than a crash. Returns whether the thread started.
+    static func startThread(name: String, _ body: @escaping () -> Void) -> Bool {
+        let box = Unmanaged.passRetained(ThreadBox(body, name)).toOpaque()
+        var attr = pthread_attr_t()
+        pthread_attr_init(&attr)
+        defer { pthread_attr_destroy(&attr) }
+        pthread_attr_setdetachstate(&attr, Int32(PTHREAD_CREATE_DETACHED))
+        pthread_attr_setstacksize(&attr, 512 << 10)
+        #if canImport(Darwin)
+        var tid: pthread_t?
+        #else
+        var tid = pthread_t()
+        #endif
+        let rc = pthread_create(&tid, &attr, { arg in
+            #if canImport(Darwin)
+            let raw = arg
+            #else
+            let raw = arg!
+            #endif
+            let box = Unmanaged<ThreadBox>.fromOpaque(raw).takeRetainedValue()
+            #if canImport(Darwin)
+            pthread_setname_np(box.name)
+            #endif
+            box.run()
+            return nil
+        }, box)
+        if rc != 0 { Unmanaged<ThreadBox>.fromOpaque(box).release(); return false }
+        return true
     }
 
     public let port: UInt16
@@ -302,10 +372,11 @@ public final class EgressProxy: @unchecked Sendable {
             _ = fcntl(client, F_SETFD, FD_CLOEXEC)
             Self.noSigPipe(client)
             Self.setNonBlocking(client)
-            // Past this proxy's cap or the shared ceiling: 503 and close, never a new worker (A-I2).
+            // Past this proxy's connection cap or the shared descriptor budget (2 fds per connection): 503 and close, never
+            // a new worker (A-I2).
             let admitted = lock.withLock { () -> Bool in
                 guard !stopped, active < maxConnections else { return false }
-                if let budget, !budget.acquire() { return false }
+                if let budget, !budget.acquire(Self.fdsPerConnection) { return false }
                 active += 1
                 return true
             }
@@ -314,16 +385,23 @@ public final class EgressProxy: @unchecked Sendable {
                 close(client)
                 continue
             }
-            let thread = Thread { [self] in
+            func releaseSlot() {
+                lock.withLock { active -= 1 }
+                budget?.release(Self.fdsPerConnection)
+            }
+            // Thread allocation can fail when the machine is out of threads (pthread_create returns the error; it does not
+            // crash). Drop the connection and release its slot rather than leak it. The caps bound how many worker threads
+            // can ever exist, so this is a last resort (A-I2).
+            let started = Self.startThread(name: "brahma-egress-conn") { [self] in
                 handle(client)
                 close(client)
-                lock.withLock { active -= 1 }
-                budget?.release()
+                releaseSlot()
             }
-            thread.name = "brahma-egress-conn"
-            // If a thread cannot be started, release the slot and drop the connection; never crash (A-I2).
-            thread.stackSize = 512 << 10
-            thread.start()
+            if !started {
+                _ = Self.blockingWrite(client, Array(Self.serviceBusy.utf8))
+                close(client)
+                releaseSlot()
+            }
         }
         close(listener)
         acceptDone.signal()
@@ -405,13 +483,19 @@ public final class EgressProxy: @unchecked Sendable {
     }
 
     /// `resolver` run on a thread of its own with an awake-time deadline, so a slow DNS answer cannot hold the connection's
-    /// thread past the connect budget (A-M2). Nil on timeout.
+    /// thread past the connect budget (A-M2). The resolver thread is counted against the pool's descriptor budget (two slots,
+    /// a connection's worth) and released when it finishes — even after the deadline — so a stuck `getaddrinfo` cannot let
+    /// resolver threads pile up past the budget (A-I2). Nil on timeout, or when the budget is full.
     private func resolve(_ host: String, deadline: SuspendingClock.Instant) -> [sockaddr_storage]? {
+        if let budget, !budget.acquire(Self.fdsPerConnection) { return nil }
         let box = ResolveBox()
         let resolver = self.resolver
-        let thread = Thread { box.finish(resolver(host)) }
-        thread.name = "brahma-egress-resolve"
-        thread.start()
+        let budget = self.budget
+        let started = Self.startThread(name: "brahma-egress-resolve") {
+            box.finish(resolver(host))
+            budget?.release(Self.fdsPerConnection)
+        }
+        guard started else { budget?.release(Self.fdsPerConnection); return nil }
         return box.wait(until: deadline)
     }
 
@@ -571,11 +655,13 @@ public final class EgressProxy: @unchecked Sendable {
 /// proxy it hands out shares one connection budget, so all of them together can never hold more than `globalLimit`
 /// connections open at once (A-I2).
 public actor EgressProxyPool {
-    /// The shared ceiling on connections across every proxy of one pool.
-    public static let globalLimit = 256
+    /// The shared descriptor ceiling across every proxy of one pool: a quarter of the process's open-file soft limit (which
+    /// the engine raises at start), floored at 256 and capped at 2048, so the proxies' sockets can never starve the engine's
+    /// own database, git and log descriptors (A-I2). At 2 fds per connection this is 128–1024 connections across all proxies.
+    public static var descriptorBudget: Int { min(2048, max(256, FileLimit.current / 4)) }
     private nonisolated let proxies: Proxies
 
-    public init() { proxies = Proxies(budget: EgressProxy.Budget(limit: EgressProxyPool.globalLimit)) }
+    public init() { proxies = Proxies(budget: EgressProxy.Budget(limit: EgressProxyPool.descriptorBudget)) }
 
     public func proxy(for allow: [String]) throws -> EgressProxy { try proxies.proxy(for: allow) }
 
