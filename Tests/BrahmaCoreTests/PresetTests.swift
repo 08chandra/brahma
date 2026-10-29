@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Task 9: the two access presets. Both are off by default and never approve a medium or higher risk or a reserved matter.
-@Suite struct PresetTests {
+@Suite(.scratch) struct PresetTests {
     @Test func webPresetAutoApprovesExactDocsHost() throws {
         let g = try GrantWorld()
         try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true)

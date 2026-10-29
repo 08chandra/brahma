@@ -36,7 +36,7 @@ private final class AwakeClock: @unchecked Sendable {
     var read: TimeInterval { lock.withLock { t } }
 }
 
-@Suite struct SleepGuardTests {
+@Suite(.scratch) struct SleepGuardTests {
     private func make() -> (SleepGuard, Launches, AwakeClock) {
         let launches = Launches(), clock = AwakeClock()
         return (SleepGuard(launcher: { launches.launch() }, awake: { clock.read }), launches, clock)
@@ -167,13 +167,9 @@ private final class AwakeClock: @unchecked Sendable {
     }
 }
 
-@Suite struct CaffeinateProcessTests {
-    private func script(_ body: String) throws -> URL {
-        let url = try tempDir().appending(path: "caffeinate")
-        try Data("#!/bin/sh\n\(body)\n".utf8).write(to: url)
-        chmod(url.path, 0o755)
-        return url
-    }
+@Suite(.scratch) struct CaffeinateProcessTests {
+    /// A caffeinate stand-in from the shared fake-tool directory (one executable per body, never a fresh file per test).
+    private func script(_ body: String) throws -> URL { try FakeTools.script("caffeinate", body) }
 
     private func alive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 }
 

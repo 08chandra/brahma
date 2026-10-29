@@ -66,7 +66,7 @@ func refusal(_ body: () throws -> Any) -> String? {
     }
 }
 
-@Suite struct GrantTests {
+@Suite(.scratch) struct GrantTests {
     @Test func requestCreatesGrantAsk() throws {
         let g = try GrantWorld()
         let reply = try g.request("web_domain", "Docs.Example.com")

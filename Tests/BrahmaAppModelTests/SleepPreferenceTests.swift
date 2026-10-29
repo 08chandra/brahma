@@ -3,7 +3,7 @@ import Foundation
 import BrahmaCore
 @testable import BrahmaAppModel
 
-@MainActor @Suite struct SleepPreferenceTests {
+@MainActor @Suite(.scratch) struct SleepPreferenceTests {
     @Test func menuToggleReadsAndWritesTheOwnerPref() async throws {
         let w = try await WorkWorld.make()
         #expect(w.model.preventSleep)                                    // on by default
