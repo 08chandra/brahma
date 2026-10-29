@@ -17,7 +17,8 @@ import Glibc
 ///   `http://127.0.0.1:<proxy port>` and `NO_PROXY=localhost,127.0.0.1`.
 /// A policy that is not safe to render (`SandboxPolicyCheck`) is refused: `run` returns "could not run", `spawn` throws.
 /// Each run's profile allows a unique mach global name (`runMarker`); after the run every process still under that sandbox
-/// is killed (`SandboxSweep`, B-I4) and the outcome becomes inconclusive if there were any.
+/// is killed (`SandboxSweep`, B-I4) and reported (`onStraggler`). Killed ones leave the outcome as it was (N2); the outcome
+/// becomes inconclusive only when one could not be killed or classified, or the process table could not be read (N1).
 public struct SeatbeltRunner: SandboxedRunner {
     public static let sandboxExec = "/usr/bin/sandbox-exec"
     static let tmpName = ".brahma-tmp"

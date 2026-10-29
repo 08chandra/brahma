@@ -176,9 +176,14 @@ public struct TranscriptCapture: Sendable {
     }
 
     static func read(_ url: URL, from start: Int64, upTo end: Int64) throws -> Data {
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw CompressorError.failed("cannot open \(url.lastPathComponent) (errno \(errno))") }
         defer { close(fd) }
+        // S7: the session file sits where the agent can write; one with another hard link (an owner file linked in) or of
+        // another user is never copied into the data home.
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { throw CompressorError.failed("cannot examine \(url.lastPathComponent) (errno \(errno))") }
+        if let problem = EngineFiles.copyProblem(st) { throw CompressorError.failed("\(url.lastPathComponent) \(problem); not captured") }
         var remaining = Int(end - start)
         var data = Data(count: remaining)
         var done = 0

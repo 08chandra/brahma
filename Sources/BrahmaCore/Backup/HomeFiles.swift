@@ -46,8 +46,11 @@ enum HomeFiles {
         return fstatat(dir.fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 ? st : nil
     }
 
-    /// `name` in `dir` opened for reading: never through a link, never blocking on a FIFO, and a regular file.
-    static func openRead(_ dir: Directory, _ name: String) throws -> Int32 {
+    /// `name` in `dir` opened for reading: never through a link, never blocking on a FIFO, and a regular file. With
+    /// `copySource` (a file of the live data home about to be copied out: a snapshot, an export) it must also pass
+    /// `EngineFiles.copyProblem` on the open descriptor: a single link, this user's (S7). A snapshot's own tree, whose
+    /// unchanged files are hard links between snapshots by design, is read without it (verify, restore, mirror).
+    static func openRead(_ dir: Directory, _ name: String, copySource: Bool = false) throws -> Int32 {
         let shown = dir.shown.appending(path: name).path
         let fd = openat(dir.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else {
@@ -58,6 +61,10 @@ enum HomeFiles {
         guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG else {
             close(fd)
             throw UnsafeEngineFile(path: shown, problem: "is not a regular file")
+        }
+        if copySource, let problem = EngineFiles.copyProblem(st) {
+            close(fd)
+            throw UnsafeEngineFile(path: shown, problem: problem)
         }
         return fd
     }

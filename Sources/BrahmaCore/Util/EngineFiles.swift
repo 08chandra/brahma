@@ -21,7 +21,9 @@ public struct UnsafeEngineFile: Error, Equatable, CustomStringConvertible, Senda
 /// real directory inside the resolved workspace, opened one part at a time relative to the one before with `O_NOFOLLOW` (and
 /// created with `mkdirat` when missing), never through a link; files are opened relative to that directory with
 /// `O_NOFOLLOW`. A new file is created with `O_EXCL`; a rewrite goes to a temporary file that is renamed over the target, so a
-/// link planted at the target is replaced, never followed. Reads are capped. Removal works on descriptors only
+/// link planted at the target is replaced, never followed. Reads are capped, and return only a file that passes
+/// `copyProblem` on its open descriptor (regular, a single link, this user's: S7), so the engine never copies the bytes of
+/// an owner file an agent hard-linked into a place it can write. Removal works on descriptors only
 /// (`removeEntry`): no path is ever rebuilt, so nothing outside the workspace can be removed through a swapped link.
 public enum EngineFiles {
     public static let defaultReadLimit = 1 << 20
@@ -58,15 +60,28 @@ public enum EngineFiles {
 
     // MARK: Files
 
-    /// What is at `name` in the directory (which is created when missing).
+    /// What is at `name` in the directory (which is created when missing): `.regular` only for a file that passes
+    /// `copyProblem` (a single link, this user's); anything else is `.unsafe`, to be replaced, never read.
     public static func entry(workspace: URL, dir relative: String, name: String) throws -> Entry {
         let fd = try openDirectory(workspace: workspace, relative)
         defer { close(fd) }
         return try entry(fd: fd, name: name, shown: logical(workspace, relative).appending(path: name).path)
     }
 
-    /// At most `limit` bytes of `name`; nil when it does not exist. Throws `UnsafeEngineFile` when it is a link, not a regular
-    /// file, or has another hard link.
+    /// What keeps the bytes of an opened file from being handed to anything the engine writes (a rewrite, a copy, a prompt):
+    /// nil only for a regular file with a single link that this user owns. Anything else is treated like a link and never
+    /// copied: a second hard link may be an owner secret an agent linked into a place it can write (S7, confused deputy), and
+    /// a file of another user is not the engine's to pass on.
+    public static func copyProblem(_ st: stat) -> String? {
+        guard st.st_mode & S_IFMT == S_IFREG else { return "is not a regular file" }
+        guard st.st_nlink == 1 else { return "has another hard link" }
+        guard st.st_uid == getuid() else { return "is owned by another user (uid \(st.st_uid))" }
+        return nil
+    }
+
+    /// At most `limit` bytes of `name`; nil when it does not exist. Throws `UnsafeEngineFile` when it is a link, or fails
+    /// `copyProblem` (not a regular file, another hard link, another owner) on the opened descriptor, or a read fails part-way
+    /// (never a truncated result).
     public static func read(workspace: URL, dir relative: String, name: String, limit: Int = defaultReadLimit) throws -> Data? {
         let dfd = try openDirectory(workspace: workspace, relative)
         defer { close(dfd) }
@@ -82,8 +97,7 @@ public enum EngineFiles {
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else { throw UnsafeEngineFile(path: shown, problem: "cannot be read") }
-        guard st.st_mode & S_IFMT == S_IFREG else { throw UnsafeEngineFile(path: shown, problem: "is not a regular file") }
-        guard st.st_nlink == 1 else { throw UnsafeEngineFile(path: shown, problem: "has another hard link") }
+        if let problem = copyProblem(st) { throw UnsafeEngineFile(path: shown, problem: problem) }
         return try readAll(fd: fd, limit: limit, shown: shown)
     }
 
@@ -281,8 +295,9 @@ public enum EngineFiles {
         return removed
     }
 
-    /// At most `limit` bytes of the regular, single-link file at `url`, which must lie under `root`. `root` is resolved (the
-    /// owner may have put it behind a link); every part of `url` under it is opened without following a link. Nil otherwise.
+    /// At most `limit` bytes of the file at `url`, which must lie under `root` and pass `copyProblem` (regular, a single link,
+    /// this user's). `root` is resolved (the owner may have put it behind a link); every part of `url` under it is opened
+    /// without following a link. Nil otherwise, and on a read error part-way.
     public static func readNoFollow(_ url: URL, under root: URL, limit: Int = defaultReadLimit) -> Data? {
         let base = root.standardizedFileURL.path, target = url.standardizedFileURL.path
         guard target.hasPrefix(base + "/"), let real = resolved(base) else { return nil }
@@ -300,7 +315,7 @@ public enum EngineFiles {
         guard fd >= 0 else { return nil }
         defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1 else { return nil }
+        guard fstat(fd, &st) == 0, copyProblem(st) == nil else { return nil }
         return try? readAll(fd: fd, limit: limit, shown: url.path)
     }
 
@@ -573,7 +588,7 @@ public enum EngineFiles {
             throw UnsafeEngineFile(path: shown, problem: "cannot be inspected")
         }
         switch st.st_mode & S_IFMT {
-        case S_IFREG: return st.st_nlink == 1 ? .regular : .unsafe(UnsafeEngineFile(path: shown, problem: "has another hard link"))
+        case S_IFREG: return copyProblem(st).map { .unsafe(UnsafeEngineFile(path: shown, problem: $0)) } ?? .regular
         case S_IFLNK: return .unsafe(UnsafeEngineFile(path: shown, problem: "is a symbolic link"))
         case S_IFDIR: return .unsafe(UnsafeEngineFile(path: shown, problem: "is a directory, not a file"))
         default: return .unsafe(UnsafeEngineFile(path: shown, problem: "is not a regular file"))

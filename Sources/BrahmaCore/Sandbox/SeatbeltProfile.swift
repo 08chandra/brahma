@@ -51,7 +51,8 @@ public enum SeatbeltProfile {
 
     /// Read-only places of the toolchain under the owner's home (the home itself is otherwise unreadable).
     /// `~/Library/Caches/org.swift.swiftpm` (git mirrors of the owner's package dependencies, private ones included) is not
-    /// read: checks build with `--cache-path` under their checkout (fix round 3).
+    /// read (fix round 3). A check that has to resolve packages through it fails; the role text tells check authors so
+    /// ("resolving a package needs a cache the sandbox denies").
     static let toolchainHomeReads = ["Library/Developer", "Library/org.swift.swiftpm", ".npm"]
 
     /// Entries of the per-user temp dir the toolchain reads and writes (regexes after `^<T>/`, already escaped): xcrun's cache

@@ -54,33 +54,112 @@ import Foundation
         #expect(stat(ws.gitTemp.path, &st) == 0 && st.st_mode & 0o777 == 0o700)
     }
 
-    /// N5: a hard-linked `.git/info/exclude` is never written through: the engine writes a fresh file and renames it over the
-    /// name, so the other link keeps its content; with nothing missing nothing is written; an oversized one is left alone
-    /// (never appended to) and nothing throws, so an agent cannot block `ensureRepo` this way.
-    @Test func excludeIsReplacedNeverWrittenThrough() throws {
+    /// S7 (confused deputy): a `.git/info/exclude` that is another hard link of a file outside the workspace (an owner
+    /// secret) is never read into the rewrite. The name gets a fresh file holding only the engine's entries, the outside file
+    /// keeps its bytes and is linked from nowhere else, and the owner is told; also when the linked file already lists the
+    /// entries. An oversized exclude file is left alone (never appended to) and nothing throws.
+    @Test func excludeHardLinkedToASecretIsNeverCopied() throws {
+        let fm = FileManager.default
         let f = try GitFixture()
+        let (ws, log) = fileWatched(f)
         let exclude = f.root.appending(path: ".git/info/exclude")
-        let other = try tempDir().appending(path: "linked-elsewhere")
-        try "owner pattern\n".write(to: other, atomically: true, encoding: .utf8)
-        try FileManager.default.removeItem(at: exclude)
-        try FileManager.default.linkItem(at: other, to: exclude)
-        try f.ws.ensureRepo()
-        #expect(try String(contentsOf: other, encoding: .utf8) == "owner pattern\n", "the hard-linked file was written through")
-        let now = try String(contentsOf: exclude, encoding: .utf8)
-        #expect(now.hasPrefix("owner pattern\n") && now.contains(".brahma/\n") && now.contains(".brahma-tmp/\n"))
-        // Nothing missing: a hard link stays a hard link, untouched.
-        try FileManager.default.removeItem(at: exclude)
-        try ".brahma/\n.brahma-tmp/\n".write(to: other, atomically: false, encoding: .utf8)
-        try FileManager.default.linkItem(at: other, to: exclude)
-        try f.ws.ensureRepo()
-        var st = stat(); lstat(exclude.path, &st)
-        #expect(st.st_nlink == 2)
+        let secret = try tempDir().appending(path: "secret")
+        for body in ["SECRET-BYTES\n", ".brahma/\n.brahma-tmp/\nSECRET-BYTES\n"] {
+            try body.write(to: secret, atomically: true, encoding: .utf8)
+            try fm.removeItem(at: exclude)
+            try fm.linkItem(at: secret, to: exclude)
+            try ws.ensureRepo()
+            let now = try String(contentsOf: exclude, encoding: .utf8)
+            #expect(!now.contains("SECRET"), "the secret's bytes were copied into the exclude file")
+            #expect(now == ".brahma/\n.brahma-tmp/\n")
+            #expect(try String(contentsOf: secret, encoding: .utf8) == body, "the outside file was changed")
+            var st = stat()
+            #expect(lstat(secret.path, &st) == 0 && st.st_nlink == 1, "the exclude name still links the outside file")
+        }
+        #expect(log.all.filter { $0.contains("hard link") }.count == 2, "\(log.all)")
         // Oversized: left as it is, not appended to, and no throw.
-        try FileManager.default.removeItem(at: exclude)
+        try fm.removeItem(at: exclude)
         let big = String(repeating: "x", count: GitWorkspace.excludeReadLimit + 10)
         try big.write(to: exclude, atomically: true, encoding: .utf8)
-        try f.ws.ensureRepo()
+        try ws.ensureRepo()
         #expect(try Data(contentsOf: exclude).count == big.utf8.count)
+    }
+
+    /// `.git/info` as a file, as a link to a directory elsewhere, or as a directory the engine cannot write: the exclude
+    /// update reports it and never throws, and never follows a link (the directory it names is neither read nor written).
+    /// (Each shape then stops all engine git in the repository by the config guard's own rule, which needs a real, writable
+    /// `.git/info`; that refusal is the guard's, not the exclude update's.)
+    @Test func excludeDirectoryShapesAreReportedNeverThrown() throws {
+        let fm = FileManager.default
+        let f = try GitFixture()
+        let (ws, log) = fileWatched(f)
+        let info = f.root.appending(path: ".git/info", directoryHint: .isDirectory)
+        try fm.removeItem(at: info)
+        try "not a directory".write(to: info, atomically: true, encoding: .utf8)
+        _ = try? ws.ensureRepo()
+        #expect(try String(contentsOf: info, encoding: .utf8) == "not a directory")
+        #expect(log.all.contains { $0.contains(".git/info") && $0.contains("not a directory") }, "\(log.all)")
+        // A link to a directory elsewhere holding an "exclude" file.
+        try fm.removeItem(at: info)
+        let elsewhere = try tempDir()
+        try "SECRET\n".write(to: elsewhere.appending(path: "exclude"), atomically: true, encoding: .utf8)
+        try fm.createSymbolicLink(at: info, withDestinationURL: elsewhere)
+        _ = try? ws.ensureRepo()
+        #expect(try String(contentsOf: elsewhere.appending(path: "exclude"), encoding: .utf8) == "SECRET\n")
+        #expect(try fm.contentsOfDirectory(atPath: elsewhere.path) == ["exclude"])
+        #expect(log.all.contains { $0.contains(".git/info") && $0.contains("symbolic link") }, "\(log.all)")
+        // A real directory the engine cannot write, with the entries missing.
+        try fm.removeItem(at: info)
+        try fm.createDirectory(at: info, withIntermediateDirectories: false)
+        try "x\n".write(to: info.appending(path: "exclude"), atomically: true, encoding: .utf8)
+        chmod(info.path, 0o555)                      // exec-bit fixture: a directory the engine cannot write
+        defer { chmod(info.path, 0o755) }            // exec-bit fixture: put back for the scratch cleanup
+        _ = try? ws.ensureRepo()
+        #expect(try String(contentsOf: info.appending(path: "exclude"), encoding: .utf8) == "x\n")
+        #expect(log.all.contains { $0.contains("exclude") && $0.contains("cannot be created") }, "\(log.all)")
+    }
+
+    /// The rewrite works on bytes: what the owner had there, valid UTF-8 or not, is kept exactly.
+    @Test func excludeKeepsBytesThatAreNotUTF8() throws {
+        let f = try GitFixture()
+        let exclude = f.root.appending(path: ".git/info/exclude")
+        let original = Data([0x66, 0xFF, 0xFE, 0x2A, 0x0A, 0x62, 0xC3])     // "f\xff\xfe*\nb\xc3" (no final newline)
+        try original.write(to: exclude)
+        try f.ws.ensureRepo()
+        #expect(try Data(contentsOf: exclude) == original + Data("\n.brahma/\n.brahma-tmp/\n".utf8))
+    }
+
+    /// S7 (audit): the engine's own `git add` (auto-commit, quarantine) never stores a file that has another hard link, so an
+    /// agent that links an owner secret into its checkout cannot get those bytes into the repository; the owner is told.
+    @Test func engineCommitsLeaveMultiplyLinkedFilesOut() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = fileWatched(f)
+        let secret = try tempDir().appending(path: "secret")
+        try "SECRET-BYTES\n".write(to: secret, atomically: true, encoding: .utf8)
+        let secretBlob = try f.git(["hash-object", secret.path])
+        func inRepository() throws -> Bool { try f.git(["cat-file", "-t", secretBlob], allowFailure: true) == "blob" }
+        // An item checkout: a new hard link, and a tracked file replaced by one.
+        let wt = try ws.addWorktree(key: "ACME-1")
+        try fm.linkItem(at: secret, to: wt.appending(path: "leak.txt"))
+        try fm.removeItem(at: wt.appending(path: "a.txt"))
+        try fm.linkItem(at: secret, to: wt.appending(path: "a.txt"))
+        try f.write("ok.txt", "fine", in: wt)
+        let commit = try #require(try ws.commitAll(in: wt, message: "work"))
+        #expect(try f.git(["show", "\(commit):ok.txt"]) == "fine")
+        #expect(try f.git(["show", "\(commit):a.txt"]) == "one")
+        #expect(!(try f.git(["ls-tree", "--name-only", commit]).split(separator: "\n").contains("leak.txt")))
+        #expect(!(try inRepository()), "the secret's bytes are in the object database")
+        #expect(log.all.contains { $0.contains("leak.txt") && $0.contains("hard link") }, "\(log.all)")
+        // The root checkout's quarantine.
+        let main = try f.git(["rev-parse", "main"])
+        try fm.linkItem(at: secret, to: f.root.appending(path: "root-leak.txt"))
+        try f.write("stray.txt", "stray")
+        let q = try #require(try ws.quarantineRoot(expectedMain: main, stamp: "20261029-120000"))
+        #expect(try f.git(["show", "\(q.commit):stray.txt"]) == "stray")
+        #expect(!(try f.git(["ls-tree", "--name-only", q.commit]).split(separator: "\n").contains("root-leak.txt")))
+        #expect(!(try inRepository()), "the secret's bytes are in the object database")
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "SECRET-BYTES\n")
     }
 
     @Test func ensureRepoImportsExistingFiles() throws {

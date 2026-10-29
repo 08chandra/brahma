@@ -230,6 +230,28 @@ import GRDB
         #expect(Set(try HomeSnapshot.manifest(of: info).files.keys) == ["companies/c1/roles/ceo.md"])
     }
 
+    /// S7: a file under the home with another hard link (to a file outside, an owner secret) is never copied, by a snapshot
+    /// or by a company export: it is left out and named; the outside file is untouched.
+    @Test func multiplyLinkedFilesAreNeverCopied() throws {
+        let rig = try Rig()
+        try rig.put("companies/c1/roles/ceo.md", "ceo")
+        let secret = rig.root.appending(path: "secret")
+        try Data("SECRET-BYTES".utf8).write(to: secret)
+        try FileManager.default.linkItem(at: secret, to: rig.url("companies/c1/roles/leak.md"))
+        let result = try HomeSnapshot.take(paths: rig.paths, now: rig.clock.next())
+        #expect(try HomeSnapshot.relativeFiles(under: result.info.treeURL).sorted() == ["companies/c1/roles/ceo.md"])
+        #expect(result.problems.contains { $0.contains("leak.md") && $0.contains("hard link") }, "\(result.problems)")
+        // The exporter's tree copy.
+        let home = try HomeFiles.root(rig.paths.home, create: false)
+        let roles = try HomeFiles.walk(home, ["companies", "c1", "roles"], create: false)
+        let out = rig.root.appending(path: "export-roles", directoryHint: .isDirectory)
+        var skipped: [String] = []
+        try CompanyExporter.copyTree(from: roles, to: out, relative: "roles", sqlite: false, tmpDir: rig.paths.tmpDir, skipped: &skipped)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: out.path) == ["ceo.md"])
+        #expect(skipped.contains { $0.contains("leak.md") && $0.contains("hard link") }, "\(skipped)")
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "SECRET-BYTES")
+    }
+
     /// A manifest naming a path outside the tree (or one no snapshot writes) makes the whole restore refuse before anything
     /// changes, even when a file with the recorded hash sits where that path leads.
     @Test func manifestPathTraversalRefused() throws {

@@ -48,17 +48,36 @@ enum ProcessTable {
         #endif
     }
 
-    static func entry(_ pid: pid_t) -> ProcessEntry? {
-        guard pid > 0 else { return nil }
+    /// What reading one pid's row came to. `absent` only when the kernel said there is no such process; a read that failed
+    /// is `unreadable`, never "gone", so a caller can fail closed.
+    enum Lookup: Equatable, Sendable {
+        case found(ProcessEntry)
+        case absent
+        case unreadable
+    }
+
+    static func lookup(_ pid: pid_t) -> Lookup {
+        guard pid > 0 else { return .absent }
         #if canImport(Darwin)
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.stride
-        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0, info.kp_proc.p_pid == pid else { return nil }
-        return entry(info)
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return errno == ESRCH ? .absent : .unreadable }
+        // No such process: the call succeeds with nothing written.
+        if size == 0 { return .absent }
+        guard info.kp_proc.p_pid == pid else { return .unreadable }
+        return .found(entry(info))
         #else
-        return linuxEntry(pid)
+        if let e = linuxEntry(pid) { return .found(e) }
+        var st = stat()
+        return stat("/proc/\(pid)", &st) != 0 && errno == ENOENT ? .absent : .unreadable
         #endif
+    }
+
+    /// The row of `pid`, or nil when it is gone or could not be read (`lookup` tells the two apart).
+    static func entry(_ pid: pid_t) -> ProcessEntry? {
+        if case .found(let e) = lookup(pid) { return e }
+        return nil
     }
 
     /// Its session id (nil when it is gone).
@@ -219,13 +238,22 @@ struct SweepResult: Sendable, Equatable {
 /// started no earlier than the run (`since`), so one that did `POSIX::setsid()` or double-forked out of its process group
 /// cannot outlive the run (B-I4). Shared with Task 1b's turn cleanup (`SandboxProbe`). Each kill re-reads the process and
 /// checks its start time first, so a pid reused meanwhile is never signalled. Fails closed (N1): an unreadable process table
-/// (empty, or missing this process) or an unclassifiable live process is a survivor. `snapshot` and `classify` are
-/// injectable for tests.
+/// (empty, or missing this process) or an unclassifiable live process is a survivor, and a process whose row cannot be read
+/// counts as live (`isAlive`). `snapshot`, `classify` and `alive` are injectable for tests.
 enum SandboxSweep {
+    /// Whether `p` is still the same live process: the same pid with the same start time, not a zombie. A row that could not
+    /// be read counts as alive (fail closed): only a pid the kernel says is gone, or one now someone else's, is not.
+    static func isAlive(_ p: ProcessEntry, lookup: (pid_t) -> ProcessTable.Lookup = ProcessTable.lookup) -> Bool {
+        switch lookup(p.pid) {
+        case .found(let e): return e.start == p.start && !e.isZombie
+        case .absent: return false
+        case .unreadable: return true
+        }
+    }
     static func run(probe: SandboxProbe, since: Double, rounds: Int = 50,
                     snapshot: () -> [ProcessEntry] = ProcessTable.snapshot,
                     classify: ((pid_t) -> SandboxProbe.Match)? = nil,
-                    alive: (ProcessEntry) -> Bool = { p in ProcessTable.entry(p.pid).map { $0.start == p.start && !$0.isZombie } ?? false })
+                    alive: (ProcessEntry) -> Bool = { p in SandboxSweep.isAlive(p) })
         -> SweepResult {
         let uid = getuid(), me = getpid()
         let classify = classify ?? probe.classify

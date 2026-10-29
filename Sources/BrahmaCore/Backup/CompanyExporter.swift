@@ -100,7 +100,7 @@ public enum CompanyExporter {
         }
         let manifest = staging.appending(path: "MANIFEST.json")
         if let companyDir = source(["companies", company.id]), HomeFiles.status(companyDir, "MANIFEST.json").map({ $0.st_mode & S_IFMT == S_IFREG }) == true {
-            let input = try HomeFiles.openRead(companyDir, "MANIFEST.json")
+            let input = try HomeFiles.openRead(companyDir, "MANIFEST.json", copySource: true)
             defer { close(input) }
             try HomeSnapshot.copyFile(from: input, to: manifest)
         } else {
@@ -159,7 +159,8 @@ public enum CompanyExporter {
     static let sqliteSidecarSuffixes = [".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
 
     /// Copies the regular files and directories of a tree held open by a descriptor walk: subdirectories are opened with
-    /// `O_NOFOLLOW` (`child`), files read with `HomeFiles.openRead`; links, worktrees and caches are left out. With `sqlite`, a
+    /// `O_NOFOLLOW` (`child`), files read with `HomeFiles.openRead(copySource:)`; links, worktrees and caches are left out,
+    /// and a file with another hard link or of another user is left out and named in `skipped` (S7). With `sqlite`, a
     /// `*.sqlite` file goes through `HomeSnapshot.sqliteCopy` (a private copy, then `VACUUM INTO` and `integrity_check`; one
     /// that fails is listed in `skipped` and left out) and its sidecars are not copied.
     static func copyTree(from source: HomeFiles.Directory, to destination: URL, relative: String, sqlite: Bool, tmpDir: URL,
@@ -176,13 +177,16 @@ public enum CompanyExporter {
                 try copyTree(from: child, to: to, relative: path, sqlite: sqlite, tmpDir: tmpDir, skipped: &skipped, depth: depth + 1)
             case S_IFREG where sqlite && sqliteSidecarSuffixes.contains(where: { folded.hasSuffix($0) }):
                 continue
+            case S_IFREG where EngineFiles.copyProblem(st) != nil:
+                // S7: another hard link (perhaps an owner file linked in) or another user's file is never copied out.
+                skipped.append("\(path): \(EngineFiles.copyProblem(st) ?? ""); left out")
             case S_IFREG where sqlite && folded.hasSuffix(".sqlite"):
                 do { try HomeSnapshot.sqliteCopy(in: source, name, relative: path, expected: st, tmpDir: tmpDir, to: to) } catch {
                     unlink(to.path)
                     skipped.append("\(path): \(error)")
                 }
             case S_IFREG:
-                let input = try HomeFiles.openRead(source, name)
+                let input = try HomeFiles.openRead(source, name, copySource: true)
                 defer { close(input) }
                 try HomeSnapshot.copyFile(from: input, to: to)
             default:

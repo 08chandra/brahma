@@ -1041,8 +1041,9 @@ public actor Orchestrator {
         }
     }
 
-    /// The newest plan file: only regular, non-symlink, single-link `.md` files that really sit in `directory`, at most
-    /// `maxPlanBytes` of it. The file is opened without following a link and must still be the file that was checked.
+    /// The newest plan file: only regular, non-symlink, single-link `.md` files of this user (`EngineFiles.copyProblem`, S7)
+    /// that really sit in `directory`, at most `maxPlanBytes` of it. The file is opened without following a link and must
+    /// still be the file that was checked.
     nonisolated static func readPlan(in directory: URL, limit: Int = maxPlanBytes) -> String? {
         let fm = FileManager.default
         guard (try? fm.attributesOfItem(atPath: directory.path))?[.type] as? FileAttributeType == .typeDirectory else { return nil }
@@ -1051,7 +1052,7 @@ public actor Orchestrator {
         for name in (try? fm.contentsOfDirectory(atPath: directory.path)) ?? [] where name.hasSuffix(".md") {
             let url = directory.appending(path: name)
             var st = stat()
-            guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1,
+            guard lstat(url.path, &st) == 0, EngineFiles.copyProblem(st) == nil,
                   url.resolvingSymlinksInPath().standardizedFileURL.deletingLastPathComponent().path == base else { continue }
             let m = st.st_mtimespec
             if let b = best, (m.tv_sec, m.tv_nsec) <= (b.mtime.tv_sec, b.mtime.tv_nsec) { continue }
@@ -1063,7 +1064,7 @@ public actor Orchestrator {
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
         var st = stat()
-        guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1,
+        guard fstat(fd, &st) == 0, EngineFiles.copyProblem(st) == nil,
               st.st_dev == best.device, st.st_ino == best.inode else { return nil }
         guard let data = try? handle.read(upToCount: limit) else { return nil }
         let text = String(decoding: data, as: UTF8.self)

@@ -741,7 +741,7 @@ public struct GitWorkspace: Sendable {
             try main.run(["init", "--quiet", "--template="])
             try main.run(["symbolic-ref", "HEAD", "refs/heads/main"])
         }
-        try ensureExclude()
+        ensureExclude()
         if try head(of: "refs/heads/main") == nil {
             if try head(of: "HEAD") != nil {
                 try main.run(["branch", "main", "HEAD"])
@@ -756,54 +756,58 @@ public struct GitWorkspace: Sendable {
     /// checkout (`SeatbeltRunner`), so neither shows up as untracked work.
     static let excludedEntries = [".brahma/", ".brahma-tmp/"]
 
-    /// Adds `excludedEntries` to `.git/info/exclude`. The current file is read without following a link (a link there is
-    /// read as empty and replaced by the atomic write, never followed), so nothing it names is copied into the repository.
     /// The largest `.git/info/exclude` the engine reads; a bigger one is left alone (reported), never truncated or appended to.
     static let excludeReadLimit = 1 << 20
 
-    /// Makes `.git/info/exclude` list `excludedEntries`. The current file is read bounded and without following a link
-    /// (reading a hard-linked file is harmless); when entries are missing, a fresh file (current text plus the missing lines)
-    /// is written and renamed over the name, so a link or a second hard link is replaced, never written through, and the
-    /// other link's inode is untouched. Nothing missing: nothing is written, whatever the file's link count. An oversized or
-    /// odd entry is reported (`onUnsafeEngineFile`) and left alone. Never throws for the file's shape, so an agent that can
-    /// write `.git/info` cannot block `ensureRepo` or `quarantineRoot` (N5).
-    private func ensureExclude() throws {
-        let info = gitDir.appending(path: "info", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: info, withIntermediateDirectories: true)
-        let file = info.appending(path: "exclude")
-        var current = ""
-        var st = stat()
-        if lstat(file.path, &st) == 0 {
-            switch st.st_mode & S_IFMT {
-            case S_IFLNK: current = ""                       // replaced by the rename below, never followed
-            case S_IFREG:
-                let fd = open(file.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-                guard fd >= 0 else { onUnsafeEngineFile?(UnsafeEngineFile(path: file.path, problem: "cannot be read")); return }
-                defer { close(fd) }
-                var data = Data()
-                var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-                while data.count <= Self.excludeReadLimit {
-                    let n = read(fd, &buffer, buffer.count)
-                    if n < 0 { if errno == EINTR { continue }; break }
-                    if n == 0 { break }
-                    data.append(contentsOf: buffer[0..<n])
-                }
-                guard data.count <= Self.excludeReadLimit else {
-                    onUnsafeEngineFile?(UnsafeEngineFile(path: file.path, problem: "is larger than \(Self.excludeReadLimit) bytes; left as it is"))
+    /// Makes `.git/info/exclude` list `excludedEntries`, through `EngineFiles` anchored at the workspace: `.git` and
+    /// `.git/info` are opened one part at a time without following a link (a link or non-directory at either is refused),
+    /// and the file itself is read from its own descriptor only when it passes `EngineFiles.copyProblem` (a regular file with
+    /// a single link that this user owns). Its bytes are kept exactly (no text decoding); when entries are missing, a fresh
+    /// file (those bytes plus the missing lines) is renamed over the name, so a link at the name is replaced, never written
+    /// through. A file that fails `copyProblem` (S7: another hard link, perhaps an owner secret an agent linked there; a link;
+    /// a FIFO; another user's) is never read: the name gets a fresh file holding only the engine's entries. An oversized
+    /// file, or one whose read fails part-way, is left as it is. Every odd shape is reported (`onUnsafeEngineFile`) and
+    /// nothing throws, so an agent that can write `.git` cannot block `ensureRepo` or `quarantineRoot` (N5).
+    private func ensureExclude() {
+        let dir = ".git/info", name = "exclude"
+        let report = { (problem: UnsafeEngineFile) in onUnsafeEngineFile?(problem) }
+        do {
+            var current = Data()
+            var carried = true
+            switch try EngineFiles.entry(workspace: root, dir: dir, name: name) {
+            case .missing:
+                break
+            case .unsafe(let problem):
+                // Never read: replaced by a fresh file with the engine's entries alone (a directory there throws below).
+                report(problem)
+                carried = false
+            case .regular:
+                do {
+                    guard let data = try EngineFiles.read(workspace: root, dir: dir, name: name, limit: Self.excludeReadLimit + 1) else { break }
+                    guard data.count <= Self.excludeReadLimit else {
+                        report(UnsafeEngineFile(path: gitDir.appending(path: "info/exclude").path,
+                                                problem: "is larger than \(Self.excludeReadLimit) bytes; left as it is"))
+                        return
+                    }
+                    current = data
+                } catch let problem as UnsafeEngineFile {
+                    // Swapped since the look, or a read that failed part-way: left as it is (never rewritten from a part).
+                    report(UnsafeEngineFile(path: problem.path, problem: "\(problem.problem); left as it is"))
                     return
                 }
-                current = String(decoding: data, as: UTF8.self)
-            default:
-                onUnsafeEngineFile?(UnsafeEngineFile(path: file.path, problem: "is not a regular file; left as it is"))
-                return
             }
+            let lines = current.split(separator: 0x0A, omittingEmptySubsequences: true).map { Array($0) }
+            let missing = Self.excludedEntries.filter { !lines.contains(Array($0.utf8)) }
+            guard !missing.isEmpty || !carried else { return }
+            var text = current
+            if !text.isEmpty, text.last != 0x0A { text.append(0x0A) }
+            text.append(Data(missing.map { $0 + "\n" }.joined().utf8))
+            try EngineFiles.replace(text, workspace: root, dir: dir, name: name)
+        } catch let problem as UnsafeEngineFile {
+            report(problem)
+        } catch {
+            report(UnsafeEngineFile(path: gitDir.appending(path: "info/exclude").path, problem: "cannot be updated (\(error))"))
         }
-        let lines = current.split(separator: "\n").map(String.init)
-        let missing = Self.excludedEntries.filter { !lines.contains($0) }
-        guard !missing.isEmpty || Self.isSymlink(file) else { return }
-        let prefix = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
-        // `atomically`: written to a fresh file next to it, then renamed over the name.
-        try (current + prefix + missing.map { $0 + "\n" }.joined()).write(to: file, atomically: true, encoding: .utf8)
     }
 
     // MARK: Worktrees
@@ -1596,13 +1600,13 @@ public struct GitWorkspace: Sendable {
             }
             // `.brahma/` is the engine's (check snapshots, plans, notes, hand-offs): put back in the exclude file if an agent took
             // it out, and kept out of the quarantine commit and the clean whatever that file says.
-            try ensureExclude()
+            ensureExclude()
             try? FileManager.default.createDirectory(at: gitTemp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let index = gitTemp.appending(path: "brahma-quarantine-\(UUID().uuidString).index")
             defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
             let staged = main.withIndex(index)
             try staged.run(["read-tree", expectedMain])
-            try staged.run(["add", "-A"])
+            try staged.run(["add", "-A", "--", "."] + (try unsafeAddExcludes(staged, in: root)))
             try staged.run(["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", "--", ".brahma"])
             let tree = try staged.run(["write-tree"]).text
             let mainTree = try main.run(["rev-parse", "--verify", "\(expectedMain)^{tree}"]).text
@@ -2048,7 +2052,7 @@ public struct GitWorkspace: Sendable {
     public func commitAll(in dir: URL, message: String) throws -> String? {
         let (git, key) = try resolve(dir)
         guard let key else {
-            try addAll(git)
+            try addAll(git, in: dir)
             let staged = try git.run(["diff", "--cached", "--quiet"], allowFailure: true)
             if staged.status == 0 { return nil }
             guard staged.status == 1 else {
@@ -2067,7 +2071,7 @@ public struct GitWorkspace: Sendable {
         defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
         let private_ = git.withIndex(index)
         try private_.run(["read-tree", tip])
-        try addAll(private_)
+        try addAll(private_, in: dir)
         let tree = try private_.run(["write-tree"]).text
         if tree == (try git.run(["rev-parse", "--verify", "\(tip)^{tree}"]).text) { try verifyAfter(key: key); return nil }
         let commit = try git.run(["commit-tree", tree, "-p", tip, "-m", message]).text
@@ -2081,10 +2085,11 @@ public struct GitWorkspace: Sendable {
 
     /// `git add -A`, but never into a nested repository the index already records (a gitlink): there `add` runs `git status`
     /// inside it, with that repository's own config and attributes, filters and all. Gitlinks stay as recorded; a new
-    /// nested repository is still added (as a gitlink, without running anything in it).
+    /// nested repository is still added (as a gitlink, without running anything in it). Nor is any file added whose bytes
+    /// the engine must not copy (`unsafeAddExcludes`, S7).
     static let maxGitlinks = 1000
 
-    private func addAll(_ git: GitCommand) throws {
+    private func addAll(_ git: GitCommand, in dir: URL) throws {
         let listing = try git.run(["ls-files", "-s", "-z"])
         if listing.cut { throw GitError.failed(command: "ls-files", status: -1, stderr: "the index listing is too long") }
         var excludes: [String] = []
@@ -2098,7 +2103,41 @@ public struct GitWorkspace: Sendable {
         guard excludes.count <= Self.maxGitlinks else {
             throw GitError.failed(command: "add", status: -1, stderr: "more than \(Self.maxGitlinks) nested repositories")
         }
-        try git.run(["add", "-A", "--", "."] + excludes)
+        try git.run(["add", "-A", "--", "."] + excludes + (try unsafeAddExcludes(git, in: dir)))
+    }
+
+    /// The most files `unsafeAddExcludes` leaves out of one add; more refuses the add.
+    static let maxUnsafeAdds = 1000
+
+    /// S7: the files `git add -A` would read in `dir` (modified tracked ones and untracked ones that are not ignored, as the
+    /// command's own index sees them) that have another hard link or belong to another user (`EngineFiles.copyProblem`; a
+    /// link is stored as a link and never read through, so only regular files count). An agent can hard-link an owner file
+    /// it cannot read (a secret) into its checkout; the engine's add, which can read it, would copy its bytes into the object
+    /// database, where the agent can read them. Each is left out with an `:(exclude,literal)` pathspec and reported
+    /// (`onUnsafeEngineFile`); the file stays where it is. A listing that fails, is cut or names one that cannot be expressed
+    /// as a pathspec refuses the add (fail closed).
+    private func unsafeAddExcludes(_ git: GitCommand, in dir: URL) throws -> [String] {
+        let listing = try git.run(["ls-files", "-z", "--others", "--modified", "--exclude-standard"], maxOutput: planBarrierOutputLimit)
+        if listing.timedOut || listing.cut {
+            throw GitError.failed(command: "add", status: -1, stderr: "cannot list the files to add (\(listing.timedOut ? "timed out" : "listing too long"))")
+        }
+        let base = Array(dir.path.utf8) + [UInt8(ascii: "/")]
+        var excludes: [String] = []
+        var seen = Set<Data>()
+        for entry in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) where seen.insert(Data(entry)).inserted {
+            var st = stat()
+            let ok = (base + Array(entry) + [0]).withUnsafeBytes { raw in lstat(raw.baseAddress!.assumingMemoryBound(to: CChar.self), &st) } == 0
+            guard ok, st.st_mode & S_IFMT == S_IFREG, let problem = EngineFiles.copyProblem(st) else { continue }
+            guard let path = String(data: Data(entry), encoding: .utf8) else {
+                throw GitError.failed(command: "add", status: -1, stderr: "a file that cannot be added safely has a path that is not UTF-8")
+            }
+            onUnsafeEngineFile?(UnsafeEngineFile(path: dir.appending(path: path).path, problem: "\(problem); left out of the commit"))
+            excludes.append(":(exclude,literal)\(path)")
+        }
+        guard excludes.count <= Self.maxUnsafeAdds else {
+            throw GitError.failed(command: "add", status: -1, stderr: "more than \(Self.maxUnsafeAdds) files that cannot be added safely")
+        }
+        return excludes
     }
 
     /// The commit a checkout's branch points at (for an item worktree: `refs/heads/item/<KEY>`, never `HEAD`).

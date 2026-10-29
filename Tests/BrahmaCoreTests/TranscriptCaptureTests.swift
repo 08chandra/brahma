@@ -224,6 +224,24 @@ import GRDB
         #expect(rig.capture.capture(turn: turn, sessionId: "../../etc/passwd", store: rig.store) == .missing)
     }
 
+    /// S7: a session file with another hard link (an agent linking an owner secret where its transcript goes) is never read
+    /// into the data home: nothing is captured and the owner is told.
+    @Test func multiplyLinkedTranscriptIsNeverCopied() throws {
+        let rig = try Rig()
+        let sid = UUID().uuidString
+        let secret = rig.root.appending(path: "secret")
+        try Data(#"{"type":"user","secret":"SECRET-BYTES"}"#.utf8 + [0x0A]).write(to: secret)
+        let url = rig.file(sid)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.linkItem(at: secret, to: url)
+        let turn = try rig.turn()
+        let outcome = rig.capture.capture(turn: turn, sessionId: sid, store: rig.store)
+        if case .captured = outcome { Issue.record("a hard-linked transcript was captured") }
+        #expect(try rig.row(turn) == nil)
+        let activity = try rig.activity()
+        #expect(activity.contains { $0.contains("hard link") }, "\(activity)")
+    }
+
     @Test func newestProjectFileWins() throws {
         let rig = try Rig()
         let sid = UUID().uuidString

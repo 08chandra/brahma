@@ -206,6 +206,11 @@ public enum HomeSnapshot {
                 problems.append("\(String(reflecting: relative)): another file differs from it only in case or Unicode normalization; left out")
                 return
             }
+            // S7: a file with another hard link (or another user's) is never copied: it may be an owner file linked in.
+            if let problem = EngineFiles.copyProblem(st) {
+                problems.append("\(String(reflecting: relative)): \(problem); left out")
+                return
+            }
             let target = tree.appending(path: relative)
             let isSQLite = fold(leaf).hasSuffix(".sqlite")
             let kind = isSQLite ? "sqlite" : "file"
@@ -239,7 +244,7 @@ public enum HomeSnapshot {
                     files[relative] = .init(size: copySize, mtimeNs: mtime, sha: hash, kind: kind)
                     return
                 }
-                let input = try HomeFiles.openRead(dir, leaf)
+                let input = try HomeFiles.openRead(dir, leaf, copySource: true)
                 defer { close(input) }
                 try copyFile(from: input, to: target)
                 let hash = try fileHash(target)
@@ -382,12 +387,12 @@ public enum HomeSnapshot {
         while true {
             attempt += 1
             guard dir.isInPlace else { throw HomeSnapshotError.io("moved while it was copied") }
-            let main = try HomeFiles.openRead(dir, name)
+            let main = try HomeFiles.openRead(dir, name, copySource: true)
             defer { close(main) }
             var opened = stat()
             guard fstat(main, &opened) == 0, same(opened, expected) else { throw HomeSnapshotError.io("replaced while it was copied") }
             var wal: Int32?
-            if let st = HomeFiles.status(dir, name + "-wal"), st.st_mode & S_IFMT == S_IFREG { wal = try HomeFiles.openRead(dir, name + "-wal") }
+            if let st = HomeFiles.status(dir, name + "-wal"), st.st_mode & S_IFMT == S_IFREG { wal = try HomeFiles.openRead(dir, name + "-wal", copySource: true) }
             defer { if let wal { close(wal) } }
             var walOpened = stat()
             if let wal { fstat(wal, &walOpened) }

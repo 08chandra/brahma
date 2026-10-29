@@ -237,8 +237,9 @@ struct SeatbeltRunnerTests {
     }
 
     /// B-I4: a check that puts a process in a new session (`POSIX::setsid`, via a double fork) cannot outlive the run; the
-    /// marker-based sweep kills it (even though it left the process group), and the run is recorded inconclusive. The marker
-    /// still identifies it after it deletes its own checkout.
+    /// marker-based sweep kills it (even though it left the process group) and reports the kill, and the outcome stands (N2:
+    /// only a straggler that cannot be killed or classified makes the run inconclusive). The marker still identifies it after
+    /// it deletes its own checkout.
     @Test func setsidEscapeeIsSweptAndReported() async throws {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))

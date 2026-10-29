@@ -180,6 +180,23 @@ import GRDB
         #expect(probe.classify(getppid()) == .notMine)
     }
 
+    /// The sweep's default `alive` tells a pid that is gone from a process-table read that failed: a `sysctl` error keeps an
+    /// unclassifiable process as a survivor (fail closed); only a pid that is really gone, reused or a zombie drops out.
+    @Test func aliveFailsClosedOnALookupError() {
+        let p = Self.entry(99_997, start: 5)
+        #expect(SandboxSweep.isAlive(p, lookup: { _ in .unreadable }))
+        #expect(!SandboxSweep.isAlive(p, lookup: { _ in .absent }))
+        #expect(SandboxSweep.isAlive(p, lookup: { _ in .found(p) }))
+        var reused = p; reused.start = 6
+        #expect(!SandboxSweep.isAlive(p, lookup: { _ in .found(reused) }))
+        var zombie = p; zombie.isZombie = true
+        #expect(!SandboxSweep.isAlive(p, lookup: { _ in .found(zombie) }))
+        // The real lookup: this process is found; a pid no process can have is absent, not an error.
+        if case .found(let me) = ProcessTable.lookup(getpid()) { #expect(me.pid == getpid()) } else { Issue.record("this process was not found") }
+        #expect(ProcessTable.lookup(-5) == .absent)
+        #expect(ProcessTable.lookup(pid_t.max) == .absent)
+    }
+
     /// N1/N2: what a run left behind becomes an owner-visible activity line on its company: killed stragglers are noted (the
     /// outcome stands); unaccounted ones say the run was recorded inconclusive.
     @Test func stragglersAreReportedAsActivity() async throws {

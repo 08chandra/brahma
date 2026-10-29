@@ -109,6 +109,40 @@ import Foundation
         // A path outside the root is never read.
         #expect(EngineFiles.readNoFollow(dir.appending(path: "s/a.sh"), under: elsewhere) == nil)
     }
+
+    /// S7: every read whose bytes the engine may hand to a writer returns only a regular file with a single link that this
+    /// user owns. A name hard-linked to a file outside the workspace (an owner secret) is refused by `read`, `readNoFollow`
+    /// and `entry`; a notes append then replaces the name with a fresh file, never copying the secret, which keeps its bytes.
+    @Test func readsRefuseMultiplyLinkedAndForeignFiles() throws {
+        let fm = FileManager.default
+        let ws = try tempDir(), outside = try tempDir()
+        let secret = outside.appending(path: "secret")
+        try "SECRET-BYTES\n".write(to: secret, atomically: true, encoding: .utf8)
+        try EngineFiles.directory(workspace: ws, ".brahma/notes")
+        let named = ws.appending(path: ".brahma/notes/team.md")
+        try fm.linkItem(at: secret, to: named)
+        #expect(throws: UnsafeEngineFile.self) { try EngineFiles.read(workspace: ws, dir: ".brahma/notes", name: "team.md") }
+        #expect(EngineFiles.readNoFollow(named, under: ws) == nil)
+        guard case .unsafe = try EngineFiles.entry(workspace: ws, dir: ".brahma/notes", name: "team.md") else {
+            Issue.record("a hard link reads as a plain file"); return
+        }
+        let found = try NotesFile.append(workspace: ws, team: "team", heading: "h", lines: ["l"])
+        #expect(found?.problem.contains("hard link") == true)
+        #expect(!(try String(contentsOf: named, encoding: .utf8)).contains("SECRET"))
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "SECRET-BYTES\n")
+        var st = stat()
+        #expect(lstat(secret.path, &st) == 0 && st.st_nlink == 1)
+        // The rule itself (a file of another user cannot be made without privileges, so it is checked on a status).
+        var mine = stat()
+        mine.st_mode = S_IFREG | 0o644; mine.st_nlink = 1; mine.st_uid = getuid()
+        #expect(EngineFiles.copyProblem(mine) == nil)
+        var foreign = mine; foreign.st_uid = getuid() &+ 1
+        #expect(EngineFiles.copyProblem(foreign)?.contains("owned by") == true)
+        var linked = mine; linked.st_nlink = 2
+        #expect(EngineFiles.copyProblem(linked)?.contains("hard link") == true)
+        var fifo = mine; fifo.st_mode = S_IFIFO | 0o644
+        #expect(EngineFiles.copyProblem(fifo)?.contains("not a regular file") == true)
+    }
 }
 
 private final class Flag: @unchecked Sendable {
