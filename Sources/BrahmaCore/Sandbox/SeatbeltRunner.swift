@@ -26,17 +26,18 @@ public struct SeatbeltRunner: SandboxedRunner {
     let proxies: EgressProxyPool
     var termGrace: TimeInterval
     var clock: @Sendable () -> TimeInterval
-    /// Called (on the check's own thread) with the pids a run left behind that the sweep could not account for, so the
-    /// engine can log them and raise owner-visible activity. The outcome is already inconclusive by then.
-    let onStraggler: (@Sendable ([pid_t]) -> Void)?
+    /// Called (on the check's own thread) whenever a run left processes behind: killed ones (logged, outcome unchanged) or
+    /// ones that could not be killed or classified (the outcome is already inconclusive). The engine turns it into an
+    /// owner-visible activity line.
+    let onStraggler: (@Sendable (StragglerReport) -> Void)?
 
     public init(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool,
-                onStraggler: (@Sendable ([pid_t]) -> Void)? = nil) {
+                onStraggler: (@Sendable (StragglerReport) -> Void)? = nil) {
         self.init(baseline: baseline, proxies: proxies, termGrace: 5, onStraggler: onStraggler)
     }
 
     init(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool, termGrace: TimeInterval,
-         clock: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }, onStraggler: (@Sendable ([pid_t]) -> Void)? = nil) {
+         clock: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }, onStraggler: (@Sendable (StragglerReport) -> Void)? = nil) {
         self.baseline = baseline; self.proxies = proxies; self.termGrace = termGrace; self.clock = clock
         self.onStraggler = onStraggler
     }
@@ -123,6 +124,7 @@ public struct SeatbeltRunner: SandboxedRunner {
                 let thread = Thread { [self] in
                     let prepared: Prepared
                     do { prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port, marker: marker) } catch {
+                        Self.removeTemp(policy)   // a partly created TMPDIR goes too (N6)
                         continuation.resume(returning: GroupRun.fail("could not run the check in the sandbox: \(error)", outputURL: outputURL))
                         return
                     }
@@ -130,15 +132,17 @@ public struct SeatbeltRunner: SandboxedRunner {
                                               workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
                                               environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel)
                     // B-I4: kill anything the run left behind, recognized by the run's marker (even if it deleted its
-                    // checkout). Survivors (ours that would not die, or a sandboxed process we could not classify — fail
-                    // closed) make the outcome inconclusive, so nothing escaped is ever counted as a pass or a failure.
+                    // checkout). N2: killed stragglers leave the outcome as it is (tools that daemonize are normal) and are
+                    // reported; only ones that could not be killed or classified, or an unreadable process table, make the
+                    // run inconclusive — nothing unaccounted for is ever counted as a pass or a failure.
                     let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: since)
-                    if !swept.clean {
-                        onStraggler?(swept.all)
-                        let left = swept.survivors.isEmpty ? "" : " (\(swept.survivors.count) could not be killed)"
+                    if !swept.clean { onStraggler?(StragglerReport(checkout: policy.writable[0], result: swept)) }
+                    if swept.inconclusive {
+                        let why = swept.tableUnreadable ? "the process table could not be read"
+                            : "\(swept.survivors.count) process(es) could not be killed or identified"
                         result = CheckOutcome(exitCode: nil, timedOut: false,
                                               tail: (result.tail.isEmpty ? "" : result.tail + "\n")
-                                                + "the check left \(swept.all.count) process(es) running outside its own group\(left); recorded inconclusive")
+                                                + "the check left processes running outside its group and \(why); recorded inconclusive")
                     }
                     Self.removeTemp(policy)
                     continuation.resume(returning: result)
@@ -176,6 +180,18 @@ public struct SeatbeltRunner: SandboxedRunner {
     }
 }
 
+/// What a run (or a preview, `checkout` nil) left behind, for the engine's log and the owner's activity feed.
+public struct StragglerReport: Sendable {
+    /// The run's own checkout/export (its last path component is the verification run id).
+    public let checkout: URL?
+    let result: SweepResult
+    public var killed: [Int32] { result.killed }
+    public var survivors: [Int32] { result.survivors }
+    public var tableUnreadable: Bool { result.tableUnreadable }
+    /// The run was recorded inconclusive because of it.
+    public var inconclusive: Bool { result.inconclusive }
+}
+
 /// A process `SeatbeltRunner.spawn` started (the leader of its own group). A reaper thread waits for the leader without
 /// reaping it, sweeps what is left of its group, then reaps it; every signal goes through `ProcessGroupChild`, so none is
 /// ever sent after the reap.
@@ -184,10 +200,10 @@ public final class SeatbeltProcess: SandboxedProcess, @unchecked Sendable {
     private let capture: OutputCapture
     private let marker: String
     private let since: Double
-    private let onStraggler: (@Sendable ([pid_t]) -> Void)?
+    private let onStraggler: (@Sendable (StragglerReport) -> Void)?
     private let reaped = DispatchSemaphore(value: 0)
 
-    init(child: ProcessGroupChild, marker: String, since: Double, onStraggler: (@Sendable ([pid_t]) -> Void)?, capture: OutputCapture) {
+    init(child: ProcessGroupChild, marker: String, since: Double, onStraggler: (@Sendable (StragglerReport) -> Void)?, capture: OutputCapture) {
         self.child = child; self.marker = marker; self.since = since; self.onStraggler = onStraggler; self.capture = capture
         let thread = Thread { [child, capture, reaped, marker, since, onStraggler] in
             child.finish()
@@ -195,7 +211,7 @@ public final class SeatbeltProcess: SandboxedProcess, @unchecked Sendable {
             // B-I4: once the leader is gone — whether it was terminated or exited on its own — kill anything the preview
             // left behind, recognized by the run's marker.
             let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: since)
-            if !swept.clean { onStraggler?(swept.all) }
+            if !swept.clean { onStraggler?(StragglerReport(checkout: nil, result: swept)) }
             reaped.signal()
         }
         thread.name = "brahma-sandboxed-reaper"

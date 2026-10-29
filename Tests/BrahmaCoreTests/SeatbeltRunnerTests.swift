@@ -239,7 +239,7 @@ struct SeatbeltRunnerTests {
     /// B-I4: a check that puts a process in a new session (`POSIX::setsid`, via a double fork) cannot outlive the run; the
     /// marker-based sweep kills it (even though it left the process group), and the run is recorded inconclusive. The marker
     /// still identifies it after it deletes its own checkout.
-    @Test func setsidEscapeeIsSweptAndRunIsInconclusive() async throws {
+    @Test func setsidEscapeeIsSweptAndReported() async throws {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
         // macOS has no `setsid` binary; use perl. The escapee forks, the parent exits, the child starts a new session, writes
@@ -247,13 +247,19 @@ struct SeatbeltRunnerTests {
         let perl = "perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); open(F, \">\", \"escapee.pid\"); print F $$; close(F); "
             + "unlink grep { $_ ne \"escapee.pid\" } glob(\"*\"); sleep 300'"
         let command = "\(perl) & sleep 0.5; echo started"
-        let (outcome, _) = try await Self.run(command, Self.policy(writable: [w], readable: [h]), timeout: .seconds(20))
-        // The escapee left a process the sandbox could not account for: inconclusive, never a pass.
-        #expect(outcome.exitCode == nil, "a straggler must make the outcome inconclusive, got exit \(String(describing: outcome.exitCode))")
-        #expect(outcome.tail.contains("inconclusive"))
+        final class Reports: @unchecked Sendable { let lock = NSLock(); var all: [StragglerReport] = [] }
+        let reports = Reports()
+        let r = SeatbeltRunner(baseline: { Self.baseline() }, proxies: EgressProxyPool(), termGrace: 5,
+                               onStraggler: { report in reports.lock.withLock { reports.all.append(report) } })
+        let (outcome, _) = try await Self.run(command, Self.policy(writable: [w], readable: [h]), runner: r, timeout: .seconds(20))
+        // N2: the escapee was found (by the run's marker, though it left the group and deleted the checkout) and killed, so
+        // the outcome stands (exit 0 stays a pass) and the kill is reported, not hidden.
+        #expect(outcome.exitCode == 0, "\(outcome)")
         let pidText = (try? String(contentsOf: w.appending(path: "escapee.pid"), encoding: .utf8)) ?? ""
         let pid = try #require(Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)), "the escapee never recorded its pid")
         #expect(await Self.gone(pid), "an escaped sandboxed process survived the run")
+        let report = try #require(reports.lock.withLock { reports.all.first })
+        #expect(report.killed.contains(pid)); #expect(!report.inconclusive); #expect(report.checkout == w)
     }
 
     /// B-I4: one run's sweep never touches another run's processes. Under `(allow default)` every name is allowed unless
@@ -307,6 +313,12 @@ struct SeatbeltRunnerTests {
         let (outcome, text) = try await Self.run("/usr/sbin/lsof -p \(victim.processIdentifier) 2>&1 || true; echo DONE", Self.policy(writable: [w]))
         #expect(outcome.exitCode == 0)
         #expect(!text.contains(marker), "lsof revealed another process's open file: \(text.suffix(400))")
+        // Positive control (N7): inside the same sandbox, lsof still works on the shell's own process, which holds its own
+        // marker file open — so the negative result above is the sandbox, not lsof failing.
+        let own = "OWN-\(UUID().uuidString)"
+        let (control, controlText) = try await Self.run("exec 9>'\(own)'; /usr/sbin/lsof -p $$ 2>&1; echo DONE", Self.policy(writable: [w]))
+        #expect(control.exitCode == 0)
+        #expect(controlText.contains(own), "lsof could not list the sandboxed shell's own open file: \(controlText.suffix(400))")
     }
 
     @Test func securityCLIDenied() async throws {
@@ -662,11 +674,13 @@ struct SeatbeltRunnerTests {
         #expect(text.contains("(subpath \"/private/var/folders/x+y\")"))
         // The other company's workspace is denied; this run's readable workspace is not in that deny.
         #expect(text.contains("(subpath \"/other-co\")"))
-        // Toolchain reads: the xcrun_db and NSIRD temp regexes and the two narrowed C read subpaths (no broad `(subpath C)`).
+        // Toolchain reads: the xcrun_db and NSIRD temp regexes and the one narrowed C read subpath (no broad `(subpath C)`).
         #expect(text.contains("(regex #\"^/private/var/folders/x\\+y/T/xcrun_db\")"))
         #expect(text.contains("TemporaryItems/NSIRD_(swift-(build|package|test|run)|xcodebuild|SWBBuildService)_"))
         #expect(text.contains("(subpath \"/private/var/folders/x+y/C/com.apple.DeveloperTools\")"))
-        #expect(text.contains("(subpath \"/private/var/folders/x+y/C/clang\")"))
+        #expect(!text.contains("C/clang"), "the default module cache is not readable (fix round 3)")
+        #expect(!text.contains("Library/Caches/org.swift.swiftpm"), "the owner's SwiftPM cache is not readable (fix round 3)")
+        #expect(text.contains("(global-name \"com.apple.FSEvents\")"))
         #expect(!text.contains("(subpath \"/private/var/folders/x+y/C\")"), "C is read narrowly, not wholesale")
         // C is never written (compiler caches are per-run): no C write subpaths or org.llvm.clang write regex.
         #expect(!text.contains("C/org.llvm.clang")); #expect(!text.contains("C/org.swift.swiftpm"))
@@ -782,7 +796,9 @@ struct SeatbeltRunnerTests {
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
         let bound = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
             bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-        guard bound == 0, listen(fd, 4) == 0 else { close(fd); throw POSIXError(.EADDRINUSE) }
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard bound == 0 else { let e = errno; close(fd); throw POSIXError(POSIXErrorCode(rawValue: e) ?? .EADDRINUSE) }
+        guard listen(fd, 4) == 0 else { let e = errno; close(fd); throw POSIXError(POSIXErrorCode(rawValue: e) ?? .EADDRINUSE) }
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
         _ = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) } }
         return (fd, UInt16(bigEndian: addr.sin_port))
@@ -802,7 +818,7 @@ struct SeatbeltRunnerTests {
                 bind(probe, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
             if ok == 0 { return p }
         }
-        throw POSIXError(.EADDRINUSE)
+        throw POSIXError(.EADDRNOTAVAIL)
     }
 
     /// True when example.com:443 answers within a few seconds.

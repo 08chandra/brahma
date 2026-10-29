@@ -151,6 +151,49 @@ import GRDB
         #expect(t.sandbox.calls.count == 1); #expect(t.fallback.calls.isEmpty)
     }
 
+    // MARK: Straggler sweep (B-I4, fix round 3)
+
+    private static func entry(_ pid: pid_t, start: Double = 2e9) -> ProcessEntry {
+        ProcessEntry(pid: pid, ppid: 1, pgid: pid, uid: getuid(), start: start, isZombie: false)
+    }
+
+    /// N1: the sweep fails closed. An empty process table, or one without this process, cannot rule anything out; a live
+    /// process whose sandbox cannot be classified is a survivor. Each makes the run inconclusive.
+    @Test func sweepFailsClosedOnUnreadableState() {
+        let probe = SandboxProbe(machMarker: "dev.brahma.run.test")
+        let empty = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { [] }, classify: { _ in .notMine })
+        #expect(empty.tableUnreadable && empty.inconclusive)
+        let withoutMe = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { [Self.entry(99_999)] }, classify: { _ in .notMine })
+        #expect(withoutMe.tableUnreadable && withoutMe.inconclusive)
+        let table = [Self.entry(getpid(), start: 0), Self.entry(99_998)]
+        let unknown = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { table }, classify: { _ in .unknown },
+                                       alive: { _ in true })
+        #expect(unknown.survivors == [99_998] && unknown.inconclusive)
+        // An unclassifiable process that has already exited is not a survivor.
+        let gone = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { table }, classify: { _ in .unknown },
+                                    alive: { _ in false })
+        #expect(gone.clean)
+        // Nothing of ours, everything readable: clean.
+        let clean = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { table }, classify: { _ in .notMine })
+        #expect(clean.clean && !clean.inconclusive)
+        // The real classifier: an unsandboxed process (this one's parent shell, say) is never ours.
+        #expect(probe.classify(getppid()) == .notMine)
+    }
+
+    /// N1/N2: what a run left behind becomes an owner-visible activity line on its company: killed stragglers are noted (the
+    /// outcome stands); unaccounted ones say the run was recorded inconclusive.
+    @Test func stragglersAreReportedAsActivity() async throws {
+        let s = try S()
+        let item = try s.submitted()
+        let run = try s.latest(item)
+        let checkout = s.git.checkoutPath(runId: run.id)
+        Orchestrator.reportStragglers(StragglerReport(checkout: checkout, result: SweepResult(killed: [4242])), store: s.store)
+        Orchestrator.reportStragglers(StragglerReport(checkout: checkout, result: SweepResult(survivors: [4343])), store: s.store)
+        let lines = try await s.store.writer.read { try ActivityEvent.filter(Column("companyId") == s.company.id).fetchAll($0) }.map(\.text)
+        #expect(lines.contains { $0.contains(item.key) && $0.contains("Brahma killed them") }, "\(lines)")
+        #expect(lines.contains { $0.contains(item.key) && $0.contains("recorded inconclusive") }, "\(lines)")
+    }
+
     @Test func outsideWorkspaceRefused() async throws {
         let s = try S()
         let route = Orchestrator.checkRoute(store: s.store)

@@ -116,7 +116,11 @@ final class OwnedFD: @unchecked Sendable {
     var raw: Int32 { lock.withLock { fd } }
     func close() {
         let toClose: Int32 = lock.withLock { let f = fd; fd = -1; return f }
+        #if canImport(Darwin)
         if toClose >= 0 { _ = Darwin.close(toClose) }
+        #else
+        if toClose >= 0 { _ = Glibc.close(toClose) }
+        #endif
     }
     deinit { close() }
 }

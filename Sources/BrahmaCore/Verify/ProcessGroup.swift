@@ -398,6 +398,7 @@ enum GroupExec {
                     workingDirectory: URL = URL(fileURLWithPath: "/", isDirectory: true),
                     stdin: Int32 = -1, output: Output, timeout: TimeInterval, killGrace: TimeInterval = 1,
                     abandonAfter: TimeInterval? = GroupExec.defaultAbandonAfter,
+                    spawned: ((pid_t) -> Void)? = nil,
                     clock: () -> TimeInterval = { AwakeTime.uptime() }) -> Result {
         var readEnd: Int32 = -1, writeEnd: Int32 = -1
         let outFD: Int32, errFD: Int32?
@@ -422,6 +423,7 @@ enum GroupExec {
             if readEnd >= 0 { close(readEnd); close(writeEnd) }
             return Result(launched: false, status: -1, output: Data(), timedOut: false, error: "could not start \(executable): \(error)")
         }
+        spawned?(child.pid)   // tests only
         var capture: OutputCapture?
         if case .capture(let cap, _) = output {
             close(writeEnd)

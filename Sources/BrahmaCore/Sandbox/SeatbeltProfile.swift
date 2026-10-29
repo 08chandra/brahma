@@ -38,6 +38,8 @@ public enum SeatbeltProfile {
         (true, "com.apple.screencapture"), (false, "com.apple.coreservices.launchservicesd"),
         (false, "com.apple.coreservices.appleevents"), (true, "com.apple.accessibility"), (false, "com.apple.tccd"),
         (false, "com.apple.cfprefsd.agent"), (false, "com.apple.cfprefsd.daemon"),
+        // FSEvents could announce other processes' NSIRD_* staging names as they are created (fix round 3).
+        (false, "com.apple.FSEvents"),
     ]
 
     static let deniedExecutables = ["/usr/bin/osascript", "/usr/bin/open", "/bin/launchctl", "/usr/bin/security", "/usr/bin/sudo",
@@ -48,7 +50,9 @@ public enum SeatbeltProfile {
                                     "com.apple.fonts"]
 
     /// Read-only places of the toolchain under the owner's home (the home itself is otherwise unreadable).
-    static let toolchainHomeReads = ["Library/Developer", "Library/Caches/org.swift.swiftpm", "Library/org.swift.swiftpm", ".npm"]
+    /// `~/Library/Caches/org.swift.swiftpm` (git mirrors of the owner's package dependencies, private ones included) is not
+    /// read: checks build with `--cache-path` under their checkout (fix round 3).
+    static let toolchainHomeReads = ["Library/Developer", "Library/org.swift.swiftpm", ".npm"]
 
     /// Entries of the per-user temp dir the toolchain reads and writes (regexes after `^<T>/`, already escaped): xcrun's cache
     /// (the brief), and the item-replacement directories Foundation stages atomic writes in for the SwiftPM front ends,
@@ -57,11 +61,11 @@ public enum SeatbeltProfile {
     /// save its PIF cache. Residual: the owner's own builds by the same tools stage there too.
     static let toolchainTempEntries = ["xcrun_db", "TemporaryItems/NSIRD_(swift-(build|package|test|run)|xcodebuild|SWBBuildService)_"]
 
-    /// Subpaths of the per-user Darwin cache (`C`) the toolchain reads: Xcode's cached build-system specifications and plug-in
-    /// cache (xcodebuild) and clang's module cache. Read-only, and narrowed from all of `C` (A re-review ruling) so a check
-    /// cannot read the owner's whole compiled-module cache. Compiler caches are redirected per-run (env), so `C` is not
-    /// written at all. Residual: these two are shared read, and hold no private source — only build specs and module hashes.
-    static let toolchainCacheReads = ["com.apple.DeveloperTools", "clang"]
+    /// Subpaths of the per-user Darwin cache (`C`) the toolchain reads: only Xcode's cached build-system specifications and
+    /// plug-in cache (xcodebuild). Read-only. `C/clang` (clang's and swiftc's default implicit module cache, whose `.pcm` files
+    /// embed the text of every header built there, the owner's own included) is not readable: compiler caches are
+    /// redirected per run (`CLANG_MODULE_CACHE_PATH`), and `C` is never written.
+    static let toolchainCacheReads = ["com.apple.DeveloperTools"]
 
     /// `proxyPort` is the egress proxy's port (`.outbound` and `.loopbackListen`; ignored for `.none`). `marker`, when set, is
     /// a per-run unique mach global name the profile allows (and no service answers), so the engine can recognize the run's

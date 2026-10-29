@@ -217,10 +217,17 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         #expect(GroupExec.defaultAbandonAfter > 0)
         let cwd = GroupExec.run(executable: "/bin/pwd", arguments: [], environment: [:], output: .capture(cap: 1024, stderr: false), timeout: 10)
         #expect(cwd.status == 0); #expect(String(decoding: cwd.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == "/")
-        // A leader that ignores everything until SIGKILL, with a tiny abandon window, is reported as a failure, not 0.
+        // A leader given up on right after SIGKILL (abandonAfter 0) is reported as a failure with a reason, never status 0.
         let abandoned = GroupExec.run(executable: "/bin/sh", arguments: ["-c", "trap '' TERM; sleep 30"], environment: [:],
                                       output: .capture(cap: 1024, stderr: false), timeout: 0.2, killGrace: 0.1, abandonAfter: 0)
-        #expect(abandoned.status != 0 || abandoned.error == nil, "an abandoned leader must not read as success: \(abandoned)")
+        #expect(abandoned.status == -1 && abandoned.error != nil, "an abandoned leader must not read as success: \(abandoned)")
+        // A child reaped out from under GroupExec (its exit status lost) is a failure with a reason, never status 0, even
+        // though it really exited 0 (N4).
+        let lost = GroupExec.run(executable: "/bin/sh", arguments: ["-c", "exit 0"], environment: [:],
+                                 output: .capture(cap: 1024, stderr: false), timeout: 10,
+                                 spawned: { pid in var st: Int32 = 0; while waitpid(pid, &st, 0) < 0 && errno == EINTR {} })
+        #expect(lost.status == -1, "\(lost)")
+        #expect(lost.error?.contains("lost track") == true, "\(lost)")
     }
 
     @Test func aFastProcessReturnsItsOutputAndAFailingOneNil() async throws {

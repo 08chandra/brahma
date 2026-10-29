@@ -350,7 +350,7 @@ import Glibc
         // The shared descriptor budget caps every proxy of a pool together (2 fds/connection). A budget of 2 admits one
         // connection total across the two proxies: the second is refused while the first is held.
         #expect(EgressProxy.perProxyLimit == 64); #expect(EgressProxy.fdsPerConnection == 2)
-        #expect(EgressProxyPool.descriptorBudget >= 256)
+        #expect(EgressProxyPool.descriptorBudget >= 64 && EgressProxyPool.descriptorBudget <= max(64, FileLimit.current / 4))
         let tight = EgressProxy.Budget(limit: 2)
         let p1 = try EgressProxy(allow: ["a.example.com"], resolver: { _ in nil }, budget: tight)
         let p2 = try EgressProxy(allow: ["b.example.com"], resolver: { _ in nil }, budget: tight)

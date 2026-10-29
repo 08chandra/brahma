@@ -16,8 +16,8 @@ extension CompanyTools {
         }
         let check: JSONValue = .object([
             "type": .string("object"),
-            "description": .string("How the work is judged: a shell command the engine runs in a clean, sandboxed checkout (no home "
-                + "directory; network only to the company's allowed domains). SwiftPM needs --disable-sandbox there "
+            "description": .string("How the work is judged: a shell command the engine runs in a clean, sandboxed checkout (a fresh, "
+                + "empty home directory per run; network only to the company's allowed domains). SwiftPM needs --disable-sandbox there "
                 + "(swift test --disable-sandbox); build Xcode projects with xcodebuild -project, not Swift packages"),
             "properties": .object(["command": s.prop("string", "Shell command; exit 0 means pass"),
                                    "timeoutSeconds": s.prop("integer", "1 to 3600 (default 600)"),

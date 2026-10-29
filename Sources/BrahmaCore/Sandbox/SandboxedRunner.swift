@@ -139,7 +139,7 @@ public struct SandboxBaseline: Equatable, Sendable {
 public enum SandboxRunners {
     /// `SeatbeltRunner` where `/usr/bin/sandbox-exec` is executable, else `UnavailableSandboxRunner`.
     public static func platformDefault(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool,
-                                       onStraggler: (@Sendable ([pid_t]) -> Void)? = nil) -> any SandboxedRunner {
+                                       onStraggler: (@Sendable (StragglerReport) -> Void)? = nil) -> any SandboxedRunner {
         #if canImport(Darwin)
         if access(SeatbeltRunner.sandboxExec, X_OK) == 0 {
             return SeatbeltRunner(baseline: baseline, proxies: proxies, onStraggler: onStraggler)

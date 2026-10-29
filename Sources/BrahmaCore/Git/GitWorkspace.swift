@@ -758,33 +758,51 @@ public struct GitWorkspace: Sendable {
 
     /// Adds `excludedEntries` to `.git/info/exclude`. The current file is read without following a link (a link there is
     /// read as empty and replaced by the atomic write, never followed), so nothing it names is copied into the repository.
+    /// The largest `.git/info/exclude` the engine reads; a bigger one is left alone (reported), never truncated or appended to.
+    static let excludeReadLimit = 1 << 20
+
+    /// Makes `.git/info/exclude` list `excludedEntries`. The current file is read bounded and without following a link
+    /// (reading a hard-linked file is harmless); when entries are missing, a fresh file (current text plus the missing lines)
+    /// is written and renamed over the name, so a link or a second hard link is replaced, never written through, and the
+    /// other link's inode is untouched. Nothing missing: nothing is written, whatever the file's link count. An oversized or
+    /// odd entry is reported (`onUnsafeEngineFile`) and left alone. Never throws for the file's shape, so an agent that can
+    /// write `.git/info` cannot block `ensureRepo` or `quarantineRoot` (N5).
     private func ensureExclude() throws {
         let info = gitDir.appending(path: "info", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: info, withIntermediateDirectories: true)
         let file = info.appending(path: "exclude")
-        let existing = EngineFiles.readNoFollow(file, under: gitDir)
-        let current = existing.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        var current = ""
+        var st = stat()
+        if lstat(file.path, &st) == 0 {
+            switch st.st_mode & S_IFMT {
+            case S_IFLNK: current = ""                       // replaced by the rename below, never followed
+            case S_IFREG:
+                let fd = open(file.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                guard fd >= 0 else { onUnsafeEngineFile?(UnsafeEngineFile(path: file.path, problem: "cannot be read")); return }
+                defer { close(fd) }
+                var data = Data()
+                var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+                while data.count <= Self.excludeReadLimit {
+                    let n = read(fd, &buffer, buffer.count)
+                    if n < 0 { if errno == EINTR { continue }; break }
+                    if n == 0 { break }
+                    data.append(contentsOf: buffer[0..<n])
+                }
+                guard data.count <= Self.excludeReadLimit else {
+                    onUnsafeEngineFile?(UnsafeEngineFile(path: file.path, problem: "is larger than \(Self.excludeReadLimit) bytes; left as it is"))
+                    return
+                }
+                current = String(decoding: data, as: UTF8.self)
+            default:
+                onUnsafeEngineFile?(UnsafeEngineFile(path: file.path, problem: "is not a regular file; left as it is"))
+                return
+            }
+        }
         let lines = current.split(separator: "\n").map(String.init)
         let missing = Self.excludedEntries.filter { !lines.contains($0) }
-        // A real regular file the engine could not read whole is either hard-linked or over the read cap. A hard-linked one
-        // must not be touched at all (a write would change whatever else it is linked to); an oversized one is only appended
-        // to, never replaced (the atomic rewrite would drop its contents). Both are refused rather than silently rewritten
-        // (B-M3, the re-review's "refuse, not append" for hard links).
-        if existing == nil, SandboxPath.kind(file.path) == .file {
-            var st = stat()
-            if lstat(file.path, &st) == 0, st.st_nlink > 1 {
-                throw GitError.failed(command: "exclude", status: -1, stderr: "\(file.path) has more than one hard link; refusing to modify it")
-            }
-            guard !missing.isEmpty else { return }
-            let fd = open(file.path, O_WRONLY | O_APPEND | O_NOFOLLOW)
-            guard fd >= 0 else { throw GitError.failed(command: "exclude", status: -1, stderr: "cannot append to \(file.path)") }
-            defer { close(fd) }
-            let text = "\n" + missing.map { $0 + "\n" }.joined()
-            _ = text.withCString { write(fd, $0, strlen($0)) }
-            return
-        }
         guard !missing.isEmpty || Self.isSymlink(file) else { return }
         let prefix = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
+        // `atomically`: written to a fresh file next to it, then renamed over the name.
         try (current + prefix + missing.map { $0 + "\n" }.joined()).write(to: file, atomically: true, encoding: .utf8)
     }
 

@@ -655,13 +655,13 @@ public final class EgressProxy: @unchecked Sendable {
 /// proxy it hands out shares one connection budget, so all of them together can never hold more than `globalLimit`
 /// connections open at once (A-I2).
 public actor EgressProxyPool {
-    /// The shared descriptor ceiling across every proxy of one pool: a quarter of the process's open-file soft limit (which
-    /// the engine raises at start), floored at 256 and capped at 2048, so the proxies' sockets can never starve the engine's
-    /// own database, git and log descriptors (A-I2). At 2 fds per connection this is 128–1024 connections across all proxies.
-    public static var descriptorBudget: Int { min(2048, max(256, FileLimit.current / 4)) }
-    private nonisolated let proxies: Proxies
+    /// The shared descriptor ceiling across every proxy of one pool: a quarter of the process's open-file soft limit as it
+    /// is when the first proxy starts — after the engine raised it (`FileLimit.raise`, N3) — floored at 64 and capped at 2048,
+    /// so the proxies' sockets can never starve the engine's own database, git and log descriptors (A-I2).
+    public static var descriptorBudget: Int { min(2048, max(64, FileLimit.current / 4)) }
+    private nonisolated let proxies = Proxies()
 
-    public init() { proxies = Proxies(budget: EgressProxy.Budget(limit: EgressProxyPool.descriptorBudget)) }
+    public init() {}
 
     public func proxy(for allow: [String]) throws -> EgressProxy { try proxies.proxy(for: allow) }
 
@@ -673,15 +673,17 @@ public actor EgressProxyPool {
     private final class Proxies: @unchecked Sendable {
         private let lock = NSLock()
         private var proxies: [String: EgressProxy] = [:]
-        private let budget: EgressProxy.Budget
-        init(budget: EgressProxy.Budget) { self.budget = budget }
+        /// Made with the first proxy, so it is sized from the limit in force then (N3).
+        private var budget: EgressProxy.Budget?
 
         func proxy(for allow: [String]) throws -> EgressProxy {
             let list = Array(Set(allow.map(DomainMatcher.normalize))).sorted()
             let key = list.joined(separator: "\n")
             return try lock.withLock {
                 if let existing = proxies[key] { return existing }
-                let made = try EgressProxy(allow: list, resolver: EgressProxy.systemResolve, budget: budget)
+                let shared = budget ?? EgressProxy.Budget(limit: EgressProxyPool.descriptorBudget)
+                budget = shared
+                let made = try EgressProxy(allow: list, resolver: EgressProxy.systemResolve, budget: shared)
                 proxies[key] = made
                 return made
             }

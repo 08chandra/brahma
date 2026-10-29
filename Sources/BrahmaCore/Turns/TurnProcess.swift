@@ -167,12 +167,17 @@ struct SandboxProbe: Equatable, Sendable {
 
     enum Match { case mine, notMine, unknown }
 
-    /// Whether `pid` is one of this run's processes. With a `machMarker`, it is `.mine` when the sandbox allows that unique
-    /// lookup, `.unknown` when the kernel cannot tell (a sandboxed process whose policy could not be read — fail closed),
-    /// `.notMine` otherwise. Without a marker (1b turns), the write-shape probe, which has no `.unknown`.
+    /// Whether `pid` is one of this run's processes. With a `machMarker`: `.mine` when the sandbox allows this run's unique
+    /// name and refuses a sibling under the denied prefix; `.notMine` when it does not; `.unknown` when the kernel cannot
+    /// tell — including a nil sandbox status for a live process (fail closed, N1). Without a marker (1b turns), the
+    /// write-shape probe, which has no `.unknown`.
     func classify(_ pid: pid_t) -> Match {
-        guard SandboxCheck.isSandboxed(pid) == true else { return .notMine }
         if let machMarker {
+            switch SandboxCheck.isSandboxed(pid) {
+            case .some(false): return .notMine
+            case nil: return .unknown
+            case .some(true): break
+            }
             // Ours: this run's own name allowed AND a sibling name under the denied prefix refused. Another Brahma run denies
             // our name; a foreign sandbox that allows every lookup also allows the sibling. Either reads as not ours.
             switch (SandboxCheck.machAllowed(pid, machMarker), SandboxCheck.machAllowed(pid, machMarker + ".not")) {
@@ -181,6 +186,7 @@ struct SandboxProbe: Equatable, Sendable {
             default: return .unknown
             }
         }
+        guard SandboxCheck.isSandboxed(pid) == true else { return .notMine }
         return SandboxCheck.writeDenied(pid, allowed) == false && SandboxCheck.writeDenied(pid, denied) == true ? .mine : .notMine
     }
 
@@ -195,47 +201,58 @@ struct SandboxProbe: Equatable, Sendable {
 }
 
 /// What a straggler sweep came to.
-struct SweepResult: Sendable {
-    /// Pids confirmed to be this run's and killed.
+struct SweepResult: Sendable, Equatable {
+    /// Pids confirmed to be this run's and killed. Killing them does not change the run's outcome (N2: a tool that daemonizes
+    /// outside its group is normal); the engine logs an activity line.
     var killed: [pid_t] = []
-    /// Pids left over: this run's that would not die, or sandboxed same-uid processes newer than the run whose sandbox the
-    /// kernel could not read (fail closed — treated as survivors).
+    /// This run's processes that would not die, and sandboxed same-uid processes newer than the run whose sandbox the kernel
+    /// could not read (fail closed).
     var survivors: [pid_t] = []
-    /// True only when the run left nothing behind at all. A well-behaved check leaves no process for the sweep, so having
-    /// had to kill one (`killed`) or being unable to account for one (`survivors`) both make the run inconclusive.
-    var clean: Bool { killed.isEmpty && survivors.isEmpty }
-    /// Everything the sweep acted on or could not clear, for the log.
-    var all: [pid_t] { killed + survivors }
+    /// The process table could not be read (empty, or without this process in it): nothing can be ruled out (fail closed, N1).
+    var tableUnreadable = false
+    /// The run must be recorded inconclusive: something could not be killed or classified, or the table could not be read.
+    var inconclusive: Bool { !survivors.isEmpty || tableUnreadable }
+    var clean: Bool { killed.isEmpty && !inconclusive }
 }
 
 /// Kills whatever a finished sandboxed run left behind: its processes, recognized by the run's unique mach marker, that
 /// started no earlier than the run (`since`), so one that did `POSIX::setsid()` or double-forked out of its process group
 /// cannot outlive the run (B-I4). Shared with Task 1b's turn cleanup (`SandboxProbe`). Each kill re-reads the process and
-/// checks its start time first, so a pid reused meanwhile is never signalled. Fail closed: a same-uid sandboxed process
-/// newer than the run whose sandbox cannot be read counts as a survivor.
+/// checks its start time first, so a pid reused meanwhile is never signalled. Fails closed (N1): an unreadable process table
+/// (empty, or missing this process) or an unclassifiable live process is a survivor. `snapshot` and `classify` are
+/// injectable for tests.
 enum SandboxSweep {
-    static func run(probe: SandboxProbe, since: Double, rounds: Int = 50) -> SweepResult {
+    static func run(probe: SandboxProbe, since: Double, rounds: Int = 50,
+                    snapshot: () -> [ProcessEntry] = ProcessTable.snapshot,
+                    classify: ((pid_t) -> SandboxProbe.Match)? = nil,
+                    alive: (ProcessEntry) -> Bool = { p in ProcessTable.entry(p.pid).map { $0.start == p.start && !$0.isZombie } ?? false })
+        -> SweepResult {
         let uid = getuid(), me = getpid()
+        let classify = classify ?? probe.classify
+        var unreadable = false
         func candidates() -> [ProcessEntry] {
-            ProcessTable.snapshot().filter { $0.uid == uid && $0.pid != me && !$0.isZombie && $0.start >= since }
+            let table = snapshot()
+            // A table without this very process was not really read (sysctl failed or truncated): nothing is ruled out.
+            if table.isEmpty || !table.contains(where: { $0.pid == me }) { unreadable = true; return [] }
+            return table.filter { $0.uid == uid && $0.pid != me && !$0.isZombie && $0.start >= since }
         }
         var killed = Set<pid_t>()
-        var mine: [ProcessEntry] = []
         for _ in 0..<rounds {
-            mine = candidates().filter { probe.classify($0.pid) == .mine }
+            let mine = candidates().filter { classify($0.pid) == .mine }
             if mine.isEmpty { break }
             for p in mine where ProcessTable.entry(p.pid)?.start == p.start { kill(p.pid, SIGKILL); killed.insert(p.pid) }
             Thread.sleep(forTimeInterval: 0.02)
         }
-        // After the kills: this run's processes still alive, plus any whose sandbox could not be read (fail closed).
         var survivors: [pid_t] = []
         for p in candidates() {
-            switch probe.classify(p.pid) {
-            case .mine, .unknown: survivors.append(p.pid)
-            case .notMine: break
+            switch classify(p.pid) {
+            case .mine: survivors.append(p.pid)
+            // Unclassifiable: a survivor only if it is still the same live process (one that exited meanwhile is not).
+            case .unknown where alive(p): survivors.append(p.pid)
+            default: break
             }
         }
-        return SweepResult(killed: Array(killed), survivors: survivors)
+        return SweepResult(killed: killed.sorted().filter { !survivors.contains($0) }, survivors: survivors, tableUnreadable: unreadable)
     }
 }
 

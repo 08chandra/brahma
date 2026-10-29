@@ -128,15 +128,32 @@ extension Orchestrator {
     /// protected (`checkBaseline`).
     static func defaultCheckRunner(store: Store, paths: BrahmaPaths) -> any CheckRunning {
         let baseline: @Sendable () -> SandboxBaseline = { checkBaseline(store: store, paths: paths) }
-        // A run that left processes behind is already recorded inconclusive (its tail says so, owner-visible on the item);
-        // the engine log names the pids too (B-I4).
-        let onStraggler: @Sendable ([pid_t]) -> Void = { pids in
-            FileHandle.standardError.write(Data(("brahma orchestrator: a sandboxed check left processes running outside its group "
-                + "(pid \(pids.map(String.init).joined(separator: ", "))); killed what could be, run recorded inconclusive\n").utf8))
-        }
+        let onStraggler: @Sendable (StragglerReport) -> Void = { report in reportStragglers(report, store: store) }
         return SandboxedCheckRunner(sandbox: SandboxRunners.platformDefault(baseline: baseline, proxies: EgressProxyPool(),
                                                                             onStraggler: onStraggler),
                                     route: checkRoute(store: store))
+    }
+
+    /// What a sandboxed check left behind, as an owner-visible activity line on its item's company (and the engine log):
+    /// killed stragglers are noted (the outcome stands), unkillable or unidentifiable ones say the run was recorded
+    /// inconclusive (B-I4, N1/N2).
+    static func reportStragglers(_ report: StragglerReport, store: Store) {
+        let pids = (report.killed + report.survivors).map(String.init).joined(separator: ", ")
+        FileHandle.standardError.write(Data(("brahma orchestrator: a sandboxed check left processes outside its group (pid \(pids)); "
+            + (report.inconclusive ? "recorded inconclusive" : "killed") + "\n").utf8))
+        guard let runId = report.checkout?.lastPathComponent,
+              let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) else { return }
+        let key = (try? store.workItem(id: run.itemId))?.key ?? run.itemId
+        let text: String
+        if report.inconclusive {
+            text = "\(key): its check left processes running that could not be "
+                + (report.tableUnreadable ? "accounted for (the process table could not be read)" : "killed or identified")
+                + "; the run was recorded inconclusive"
+        } else {
+            text = "\(key): its check left \(report.killed.count) process(es) running outside its group; Brahma killed them"
+        }
+        try? store.appendEvent(ActivityEvent(companyId: run.companyId, agentId: run.requestedBy, turnId: nil,
+                                             kind: report.inconclusive ? .error : .work, text: text, createdAt: Store.now()))
     }
 
     /// The Seatbelt baseline of one check run, taken when it starts (so a backup folder added since is protected).

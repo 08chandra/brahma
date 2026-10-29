@@ -54,16 +54,33 @@ import Foundation
         #expect(stat(ws.gitTemp.path, &st) == 0 && st.st_mode & 0o777 == 0o700)
     }
 
-    /// B-M3: a hard-linked `.git/info/exclude` is refused, never written (a write would change whatever else it links to).
-    @Test func hardLinkedExcludeIsRefused() throws {
+    /// N5: a hard-linked `.git/info/exclude` is never written through: the engine writes a fresh file and renames it over the
+    /// name, so the other link keeps its content; with nothing missing nothing is written; an oversized one is left alone
+    /// (never appended to) and nothing throws, so an agent cannot block `ensureRepo` this way.
+    @Test func excludeIsReplacedNeverWrittenThrough() throws {
         let f = try GitFixture()
         let exclude = f.root.appending(path: ".git/info/exclude")
         let other = try tempDir().appending(path: "linked-elsewhere")
         try "owner pattern\n".write(to: other, atomically: true, encoding: .utf8)
         try FileManager.default.removeItem(at: exclude)
         try FileManager.default.linkItem(at: other, to: exclude)
-        #expect(throws: (any Error).self) { try f.ws.ensureRepo() }
-        #expect(try String(contentsOf: other, encoding: .utf8) == "owner pattern\n", "the hard-linked file was modified")
+        try f.ws.ensureRepo()
+        #expect(try String(contentsOf: other, encoding: .utf8) == "owner pattern\n", "the hard-linked file was written through")
+        let now = try String(contentsOf: exclude, encoding: .utf8)
+        #expect(now.hasPrefix("owner pattern\n") && now.contains(".brahma/\n") && now.contains(".brahma-tmp/\n"))
+        // Nothing missing: a hard link stays a hard link, untouched.
+        try FileManager.default.removeItem(at: exclude)
+        try ".brahma/\n.brahma-tmp/\n".write(to: other, atomically: false, encoding: .utf8)
+        try FileManager.default.linkItem(at: other, to: exclude)
+        try f.ws.ensureRepo()
+        var st = stat(); lstat(exclude.path, &st)
+        #expect(st.st_nlink == 2)
+        // Oversized: left as it is, not appended to, and no throw.
+        try FileManager.default.removeItem(at: exclude)
+        let big = String(repeating: "x", count: GitWorkspace.excludeReadLimit + 10)
+        try big.write(to: exclude, atomically: true, encoding: .utf8)
+        try f.ws.ensureRepo()
+        #expect(try Data(contentsOf: exclude).count == big.utf8.count)
     }
 
     @Test func ensureRepoImportsExistingFiles() throws {
