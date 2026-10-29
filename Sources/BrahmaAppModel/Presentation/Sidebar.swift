@@ -4,7 +4,11 @@ import BrahmaCore
 public enum SidebarItem: Hashable, Sendable {
     case missionControl, activity, agents
     case backlog, board, inbox
+    /// Inbox › Grants (the ledger and presets) and Inbox › Digest.
+    case inboxGrants, inboxDigest
     case settingsBackups
+    /// Company › Settings: permissions, network, secrets, notifications.
+    case companySettings
     case channel(id: String)
     case dm(handle: String)
 }

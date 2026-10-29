@@ -74,6 +74,45 @@ struct ColumnHeader: View {
     }
 }
 
+// MARK: - Segmented control
+
+/// Segmented control (LOW | BALANCED | MAX, EVERYTHING | IMPORTANT | AUTO): uppercase labels, accent for the selected one.
+struct Segmented<Value: Hashable>: View {
+    let options: [(Value, String)]
+    let selection: Value
+    let label: String
+    let select: (Value) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(options.enumerated()), id: \.offset) { index, entry in
+                let (value, title) = entry
+                let selected = value == selection
+                if index > 0 { Hairline(axis: .vertical, color: BrahmaTheme.lineStrong) }
+                Button { if !selected { select(value) } } label: {
+                    Text(verbatim: title.uppercased())
+                        .font(BrahmaTheme.label)
+                        .tracking(BrahmaTheme.labelTracking)
+                        .foregroundStyle(selected ? Color.white : BrahmaTheme.text1)
+                        .padding(.horizontal, 9)
+                        .frame(height: 20)
+                        .background(selected ? BrahmaTheme.accent : BrahmaTheme.bg3)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(verbatim: title))
+                .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+            }
+        }
+        .fixedSize()
+        .clipShape(RoundedRectangle(cornerRadius: BrahmaTheme.radius))
+        .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius).strokeBorder(BrahmaTheme.lineStrong, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Text(verbatim: label))
+        .help(label)
+    }
+}
+
 // MARK: - Buttons and fields
 
 /// Small bordered button; `primary` = accent fill.

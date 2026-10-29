@@ -19,8 +19,11 @@ struct Sidebar: View {
                 NavRow(title: "Backlog", icon: "list.bullet.indent", item: .backlog, model: model)
                 NavRow(title: "Board", icon: "rectangle.split.3x1", item: .board, model: model)
                 NavRow(title: "Inbox", icon: "tray", item: .inbox, model: model, count: model.inboxCount)
+                NavRow(title: "Grants", icon: "key", item: .inboxGrants, model: model, indent: true)
+                NavRow(title: "Digest", icon: "doc.text", item: .inboxDigest, model: model, indent: true)
 
                 SectionHeader(title: "Settings")
+                NavRow(title: "Company", icon: "slider.horizontal.3", item: .companySettings, model: model)
                 NavRow(title: "Backups", icon: "externaldrive", item: .settingsBackups, model: model)
 
                 if !sections.channels.isEmpty {
@@ -129,10 +132,13 @@ private struct NavRow: View {
     let model: AppModel
     /// An accent count chip (the Inbox); hidden at 0.
     var count = 0
+    /// A sub-row (Inbox › Grants, Inbox › Digest).
+    var indent = false
 
     var body: some View {
         let selected = model.sidebarSelection == item
         RowShell(item: item, model: model) {
+            if indent { Spacer().frame(width: BrahmaTheme.spaceM) }
             Image(systemName: icon)
                 .font(.system(size: 10))
                 .foregroundStyle(selected ? BrahmaTheme.accent : BrahmaTheme.text2)

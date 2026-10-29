@@ -18,7 +18,38 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
 struct DevGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self, DigestNow.self])
+        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self])
+
+    /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
+    struct Access: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "File an access request as an agent.")
+        @Argument var company: String
+        @Option(help: "Handle of the agent asking.") var by: String
+        @Option(help: "network_domain, web_domain or read_path.") var kind: String
+        @Option var value: String
+        @Option var reason: String
+        @Option(help: "Work item key.") var item: String?
+        @Option(help: "The scope the agent proposes: once, item, agent, role or company.") var scope: GrantScope?
+        @Option(help: "The duration the agent asks for: turn, sprint or always.") var duration: GrantDuration?
+
+        func run() throws {
+            try requireDev()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: by)
+            guard let grantKind = GrantKind(rawValue: kind) else { throw fail("kind must be network_domain, web_domain or read_path") }
+            let itemId = try item.map { key -> String in
+                guard let i = try store.workItem(companyId: c.id, key: key) else { throw fail("no work item \(key.uppercased())") }
+                return i.id
+            }
+            let result = try refusing {
+                try store.requestAccess(companyId: c.id, agentId: agent.id, kind: grantKind, value: value, reason: reason,
+                                        itemId: itemId, scope: scope, duration: duration)
+            }
+            print(safe(describe(result.ask, store: store) + (result.deduped ? " (already requested)" : "")
+                       + (result.grant.map { " \($0.ref) by \($0.approvedBy)" } ?? "")))
+        }
+    }
 
     struct Propose: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "File an ask as an agent.")

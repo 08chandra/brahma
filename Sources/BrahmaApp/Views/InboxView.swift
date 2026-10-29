@@ -36,7 +36,15 @@ struct InboxView: View {
                 MonoChip(text: "\(mine.count)", color: BrahmaTheme.text1)
             }
             .padding(.top, BrahmaTheme.spaceXS)
-            ForEach(mine) { row in InboxCard(model: model, row: row) }
+            ForEach(mine) { row in
+                if row.section == .pending, row.kind == .grant, let card = model.accessCard(askId: row.id) {
+                    AccessCardView(model: model, card: card).id(card.id)
+                } else if row.section == .pending, row.kind == .request {
+                    SecretRequestCard(model: model, row: row)
+                } else {
+                    InboxCard(model: model, row: row)
+                }
+            }
         }
     }
 }

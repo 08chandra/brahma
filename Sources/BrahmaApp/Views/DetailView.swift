@@ -36,8 +36,14 @@ struct DetailView: View {
                     BoardView(model: model)
                 case .inbox:
                     InboxView(model: model)
+                case .inboxGrants:
+                    GrantsView(model: model)
+                case .inboxDigest:
+                    DigestView(model: model.digest)
                 case .settingsBackups:
                     BackupsView(model: model.backups)
+                case .companySettings:
+                    CompanySettingsView(model: model)
                 case .channel, .dm:
                     if let chat = model.chat {
                         VSplitView {

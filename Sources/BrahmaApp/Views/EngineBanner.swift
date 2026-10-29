@@ -13,11 +13,21 @@ struct EngineBanner: View {
     /// Agents are paused until the secrets load; the button asks the owner (a Keychain prompt may follow).
     var secrets: String?
     var loadSecrets: () -> Void = {}
+    /// "Sandbox check failed or pending for claude <v> — see Inbox", while that engine alert waits in the Inbox.
+    var sandbox: String?
+    var openInbox: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 0) {
             if let notice {
                 bar(color: BrahmaTheme.warning, icon: "exclamationmark.triangle.fill") { Text(verbatim: notice) }
+            }
+            if let sandbox {
+                bar(color: BrahmaTheme.danger, icon: "shield.lefthalf.filled") {
+                    Text(verbatim: sandbox)
+                    Spacer(minLength: 12)
+                    Button("Open Inbox", action: openInbox).buttonStyle(.brahma)
+                }
             }
             if let secrets {
                 bar(color: BrahmaTheme.danger, icon: "key.fill") {

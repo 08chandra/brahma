@@ -30,6 +30,8 @@ public struct Snapshot: Equatable, Sendable {
     public var usage: RateLimitInfo?
     /// Selected company's work, Inbox and health.
     public var work = WorkSnapshot.empty
+    /// The Claude Code version the last doctor run saw (the sandbox banner names it).
+    public var claudeVersion: String?
 
     public static let empty = Snapshot(companies: [], agents: [], channels: [], unreadByChannel: [:], lastTurns: [:], usage: nil)
 
@@ -53,6 +55,7 @@ public struct Snapshot: Equatable, Sendable {
         var snap = Snapshot.empty
         snap.companies = summaries
         snap.usage = try store.latestRateLimit()
+        snap.claudeVersion = try store.latestProbe()?.cliVersion
         if let id = selectedCompanyId {
             snap.agents = try store.agents(companyId: id)
             snap.channels = try store.channels(companyId: id)

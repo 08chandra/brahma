@@ -5,6 +5,8 @@ public enum SelectTarget: Equatable, Sendable {
     case backlog, board, inbox
     /// Settings › Backups.
     case backups
+    /// Inbox › Grants, Inbox › Digest, Company › Settings.
+    case grants, digest, companySettings
     case item(key: String)
     /// `ask:<id>`: the Inbox, with that ask called out.
     case ask(id: String)
@@ -23,6 +25,9 @@ public enum SelectTarget: Equatable, Sendable {
         case "board": self = .board
         case "inbox": self = .inbox
         case "backups": self = .backups
+        case "grants": self = .grants
+        case "digest": self = .digest
+        case "settings": self = .companySettings
         case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)

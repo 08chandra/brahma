@@ -18,6 +18,7 @@ export BRAHMA_HOME="$TMP/home"
 # ad-hoc-signed binary makes macOS ask for the login password on every Keychain access). The CLI and app refuse
 # this for the default data home.
 export BRAHMA_OWNER_KEY_STORE=file
+export BRAHMA_SECRET_STORE=file
 export BRAHMA_WORKSPACES="$TMP/workspaces"
 export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"
 mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"

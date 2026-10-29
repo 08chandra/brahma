@@ -30,6 +30,7 @@ else
   # Keychain-keyed, so the file store is never forced onto it (export BRAHMA_OWNER_KEY_STORE=file yourself if it
   # was seeded that way).
   export BRAHMA_OWNER_KEY_STORE=file
+  export BRAHMA_SECRET_STORE=file
   export BRAHMA_HOME="$TMP/home"
   export BRAHMA_WORKSPACES="$TMP/workspaces"
   mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"
@@ -41,7 +42,7 @@ ARGS=(--ui-snapshot "$OUT")
 if [ -n "$SELECT" ]; then ARGS+=(--select "$SELECT"); fi
 # The work screens are seeded in Initech; everything else keeps the first company. BRAHMA_SNAPSHOT_COMPANY overrides.
 COMPANY="${BRAHMA_SNAPSHOT_COMPANY:-}"
-case "$SELECT" in backlog|board|inbox|item:*) [ -n "$COMPANY" ] || COMPANY=Initech ;; esac
+case "$SELECT" in backlog|board|inbox|grants|digest|settings|item:*) [ -n "$COMPANY" ] || COMPANY=Initech ;; esac
 if [ -n "$COMPANY" ]; then ARGS+=(--company "$COMPANY"); fi
 # Order matters: AppKit mis-parses a bare "--flag=value" before a "--flag value" pair as a file to open.
 .build/Brahma.app/Contents/MacOS/Brahma "${ARGS[@]}" --smoke-hold=4

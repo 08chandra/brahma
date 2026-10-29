@@ -22,8 +22,13 @@ public final class AppModel {
     public var startupNotice: String?
     /// Shown while this process cannot read every secret (agents are paused): "Load secrets" asks the owner (`loadSecrets`).
     public internal(set) var secretsBanner: String?
-    /// The interactive secret store for the owner's Load secrets action (set by the app; nil in tests unless given).
-    @ObservationIgnored public var ownerSecretVault: (any SecretVault)?
+    /// The interactive secret store for the owner's Load secrets action, Company › Settings › Secrets and the phone-alert
+    /// credentials (set by the app; nil in tests unless given).
+    @ObservationIgnored public var ownerSecretVault: (any SecretVault)? {
+        didSet { settings.vault = ownerSecretVault }
+    }
+    /// Provides a requested secret (`Store.provideSecret`, Task 4-wire). Nil until the app wires it: the card then says so.
+    @ObservationIgnored public var secretProvider: (any SecretProviding)?
     /// The owner's `preventSleep` pref (the menu's "Prevent sleep while agents run"); refreshed every tick.
     public internal(set) var preventSleep = OwnerPrefs.defaults.preventSleep
     public var activityFilter: ActivityFilter = .all
@@ -36,6 +41,12 @@ public final class AppModel {
     public private(set) var search: SearchModel
     /// Settings › Backups.
     public private(set) var backups: BackupsModel
+    /// Inbox › Grants and the access cards.
+    public private(set) var access: AccessModel
+    /// Company › Settings.
+    public private(set) var settings: SettingsModel
+    /// Inbox › Digest.
+    public private(set) var digest: DigestModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
     public var highlightedMessageId: String?
     /// The ask a notification banner pointed at (set by `ask:<id>`); the Inbox calls it out.
@@ -67,6 +78,20 @@ public final class AppModel {
         self.clock = clock
         self.search = SearchModel(store: store)
         self.backups = BackupsModel(store: store, paths: paths)
+        self.access = AccessModel(store: store)
+        self.settings = SettingsModel(store: store)
+        self.digest = DigestModel(store: store)
+        wireSubmodels()
+    }
+
+    /// The per-company models follow the selection and refresh the snapshot after a change.
+    private func wireSubmodels() {
+        access.afterChange = { [weak self] in await self?.tick(forceSnapshot: true) }
+        settings.afterChange = { [weak self] in await self?.tick(forceSnapshot: true) }
+        settings.vault = ownerSecretVault
+        access.companyId = selectedCompanyId
+        settings.companyId = selectedCompanyId
+        digest.companyId = selectedCompanyId
     }
 
     public var selectedCompany: CompanySummary? {
@@ -125,6 +150,10 @@ public final class AppModel {
             store = reopened
             search = SearchModel(store: reopened)
             backups = BackupsModel(store: reopened, paths: paths)
+            access = AccessModel(store: reopened)
+            settings = SettingsModel(store: reopened)
+            digest = DigestModel(store: reopened)
+            wireSubmodels()
             snapshot = .empty
             activity = []
             loaded = false
@@ -166,6 +195,9 @@ public final class AppModel {
             }.value
             self.cursor = cursor
             selectedCompanyId = firstId
+            access.companyId = firstId
+            settings.companyId = firstId
+            digest.companyId = firstId
             try await reloadSelected()
             loaded = true
         } catch {
@@ -244,6 +276,10 @@ public final class AppModel {
 
     public func selectCompany(_ id: String) async {
         selectedCompanyId = id
+        access.companyId = id
+        settings.companyId = id
+        digest.companyId = id
+        settings.pendingFull = nil
         sidebarSelection = .missionControl
         chat = nil
         selectedAgentId = nil
@@ -283,6 +319,9 @@ public final class AppModel {
         case .board: select(.board)
         case .inbox: select(.inbox)
         case .backups: select(.settingsBackups)
+        case .grants: select(.inboxGrants)
+        case .digest: select(.inboxDigest)
+        case .companySettings: select(.companySettings)
         case .ask(let id):
             select(.inbox)
             highlightedAskId = id

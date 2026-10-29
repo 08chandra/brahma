@@ -34,6 +34,7 @@ import BrahmaCore
         #expect(SelectTarget("activity") == .activity)
         #expect(SelectTarget("agents") == .agents)
         #expect(SelectTarget("backups") == .backups)
+        #expect(SelectTarget("grants") == .grants && SelectTarget("digest") == .digest && SelectTarget("settings") == .companySettings)
         #expect(SelectTarget("agent:CTO") == .agent(handle: "cto"))
         #expect(SelectTarget("channel:General") == .channel(name: "general"))
         #expect(SelectTarget("dm:CEO") == .dm(handle: "ceo"))

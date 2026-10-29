@@ -14,6 +14,8 @@ B=.build/Brahma.app/Contents/Helpers/brahma
 # BRAHMA_OWNER_KEY_STORE=file keeps the owner-key hash in the temp home (dev/demo only; refused for the default data
 # home), so seeding never touches the login Keychain, which prompts for the password after every rebuild.
 export BRAHMA_OWNER_KEY_STORE=file
+# Same for secrets: the seeded test key goes to a file vault in the temp home, never the login Keychain.
+export BRAHMA_SECRET_STORE=file
 if [ ! -f "$BRAHMA_HOME/owner.key" ]; then
   /usr/bin/script -q /dev/null "$B" owner init </dev/null >/dev/null
 fi
@@ -55,3 +57,15 @@ BRAHMA_DEV=1 "$B" dev decide Initech A-2 --by ceo --approve >/dev/null
 "$B" items add Initech --type task --title "Streak counter" --parent INITE-1 --tier s --priority 1 \
   --check "test -f streak.txt" --path . --description "Count consecutive days" >/dev/null
 "$B" items add Initech --type bug --title "Reminder fires twice" --owner eng-1 --priority 1 >/dev/null
+
+# Access Center (Plan 5-lite): a pending web_domain ask from @eng-1 on INITE-2, one active role grant (G-1) and one revoked
+# grant (G-2), the test secret STRIPE_TEST_KEY (value in the dev file vault, BRAHMA_SECRET_STORE=file), and a stored digest.
+BRAHMA_DEV=1 "$B" dev access Initech --by eng-1 --kind web_domain --value docs.stripe.com \
+  --reason "Read the webhook signing docs for the reminder service" --item INITE-2 --scope item --duration sprint >/dev/null
+BRAHMA_DEV=1 "$B" dev access Initech --by devops-1 --kind web_domain --value docs.github.com --reason "Actions reference" >/dev/null
+"$B" access approve Initech A-4 --scope role --duration always --note "docs only" >/dev/null
+BRAHMA_DEV=1 "$B" dev access Initech --by devops-1 --kind network_domain --value api.stripe.com --reason "Hit the test API" >/dev/null
+"$B" access approve Initech A-5 --scope agent --duration sprint >/dev/null
+"$B" grants revoke Initech G-2 >/dev/null
+printf 'sk_test_51SeedOnlyNotARealKey0000\n' | "$B" secret set Initech STRIPE_TEST_KEY --test >/dev/null
+BRAHMA_DEV=1 "$B" dev digest Initech >/dev/null
