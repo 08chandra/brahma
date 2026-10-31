@@ -623,7 +623,7 @@ public struct SandboxScope: Equatable, Sendable {
                                     "hooks", "cache/shared", "preview/logs"]
 
     /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist. `preview` is Plan L's
-    /// (`EngineLayout.previewDir`; its runs are data-home exports, its logs are written by the engine and the previews).
+    /// (`EngineLayout.previewDir`; its runs are data-home exports, its logs are written by the engine only).
     static let engineOnlyDotBrahma = ["trash", "cache", "resources", "checks", "wt-check", "handoffs", "releases", "artifacts",
                                       "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "ext-try", "hooks", "bin", "kb",
                                       "preview"]

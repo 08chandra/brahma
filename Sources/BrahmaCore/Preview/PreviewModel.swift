@@ -270,14 +270,15 @@ public enum LoopbackURL {
 
 /// The sandbox of a preview server (builder-check 8).
 public enum PreviewPolicy {
-    /// Writes only its own fresh export `run` (which holds its TMPDIR and, with the toolchain, its per-run HOME and caches)
-    /// and the preview logs; reads only `run`; listens on and connects to only its own loopback `port`, and reaches the
+    /// Writes only its own fresh export `run` (which holds its TMPDIR and, with the toolchain, its per-run HOME and caches);
+    /// the log is written by the engine (it opens the log and pipes the server's output into it), so the logs directory is
+    /// in no writable list and a server cannot swap it for a link (F1); reads only `run`; listens on and connects to only its own loopback `port`, and reaches the
     /// company's allowed domains (registries, owner-added, `grantDomains`) only through the egress proxy. No writable shared
     /// cache (PR-19): nothing one build plants can run in a later one. Every path is resolved (`SandboxPolicyCheck`).
     public static func server(_ l: EngineLayout, run: URL, company: Company, port: Int, grantDomains: [String] = []) -> SandboxPolicy {
         let allow = CompanyNetwork.scope(company: company, grantDomains: grantDomains, grantWebDomains: []).allowedDomains
         let ports = UInt16(exactly: port).map { [$0] } ?? []
-        return SandboxPolicy(writable: [run.resolvedForSandbox, l.previewLogs.resolvedForSandbox], readable: [run.resolvedForSandbox],
+        return SandboxPolicy(writable: [run.resolvedForSandbox], readable: [run.resolvedForSandbox],
                              network: .loopbackListen(allow: allow, ports: ports), toolchain: true)
     }
 }

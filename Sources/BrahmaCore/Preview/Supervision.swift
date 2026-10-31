@@ -11,10 +11,11 @@ import FoundationNetworking
 // The helpers that supervise preview servers: their logs, their ports, the probes that tell whether one is up and where it
 // listens, and the table of processes the engine started.
 
-/// A preview's log (`EngineLayout.previewLog(name:)`): agent-controlled text, appended by the server and the engine. Opened
-/// without following a link at its name, and only when it is a regular file with a single link that this user owns
-/// (`EngineFiles.copyProblem`): a planted link or second hard link is never read or rewritten. Its directory
-/// (`.brahma/preview/logs`) is engine-made and write-denied to turns, so only the last component needs the no-follow open.
+/// A preview's log (`EngineLayout.previewLog(name:)`): agent-controlled text, appended by the engine (the server's output
+/// reaches it through a pipe the engine reads; no preview policy writes the logs directory). Every open is a descriptor walk
+/// from the workspace (`EngineFiles.openFileNoFollow`: `.brahma`, `preview` and `logs` each opened with `O_NOFOLLOW`, never
+/// created), then the log itself with `O_NOFOLLOW`, and only a regular file with a single link that this user owns is read
+/// or rewritten: a link planted anywhere on the way, or a second hard link, is refused and its target left alone.
 public enum PreviewLog {
     /// Past this size the log is trimmed (5 MB) …
     public static let cap = 5_242_880
@@ -24,42 +25,38 @@ public enum PreviewLog {
     /// How much of the end of a log `tail` reads.
     static let tailWindow = 65_536
 
-    /// Trims the log in place (same file, so a server appending to it keeps writing to it) when it is over `cap`. A missing
-    /// log is fine; a link, a hard-linked or foreign file throws.
-    public static func trimIfNeeded(_ url: URL) throws {
-        let fd = open(url.path, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else {
-            if errno == ENOENT { return }
-            throw UnsafeEngineFile(path: url.path, problem: "cannot be opened (\(String(cString: strerror(errno))))")
-        }
+    static func relative(_ name: String) -> String { ".brahma/preview/logs/\(name).log" }
+
+    /// Trims surface `name`'s log in place (same file, so the engine's open appender keeps writing to it) when it is over
+    /// `cap`. A missing log is fine; a link on the way, a hard-linked or foreign file throws `UnsafeEngineFile`.
+    public static func trimIfNeeded(_ l: EngineLayout, name: String) throws {
+        guard let fd = try EngineFiles.openFileNoFollow(under: l.workspace, relative(name), flags: O_RDWR) else { return }
         defer { close(fd) }
+        let shown = l.previewLog(name: name).path
         var st = stat()
-        guard fstat(fd, &st) == 0 else { throw UnsafeEngineFile(path: url.path, problem: "cannot be inspected") }
-        if let problem = EngineFiles.copyProblem(st) { throw UnsafeEngineFile(path: url.path, problem: problem) }
+        guard fstat(fd, &st) == 0 else { throw UnsafeEngineFile(path: shown, problem: "cannot be inspected") }
         let size = Int(st.st_size)
         guard size > cap else { return }
-        var tail = try read(fd, offset: size - keep, count: keep, path: url.path)
+        var tail = try read(fd, offset: size - keep, count: keep, path: shown)
         if let newline = tail.firstIndex(of: 10) { tail = tail[tail.index(after: newline)...] }
         let kept = Data(trimmedMarker.utf8) + tail
-        // Rewritten from the start, then cut: what the server appends meanwhile may be lost, never anything else kept.
+        // Rewritten from the start, then cut: what is appended meanwhile may be lost, never anything else kept.
         let written = kept.withUnsafeBytes { pwrite(fd, $0.baseAddress, kept.count, 0) }
         guard written == kept.count, ftruncate(fd, off_t(kept.count)) == 0 else {
-            throw UnsafeEngineFile(path: url.path, problem: "could not be trimmed (\(String(cString: strerror(errno))))")
+            throw UnsafeEngineFile(path: shown, problem: "could not be trimmed (\(String(cString: strerror(errno))))")
         }
     }
 
-    /// The last `lines` lines of the log (from its last 64 KB), without their newlines; empty when it is missing, a link, a
-    /// hard-linked or foreign file. Agent-controlled text: quote or flatten it before showing it.
-    public static func tail(_ url: URL, lines: Int) -> [String] {
-        guard lines > 0 else { return [] }
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { return [] }
+    /// The last `lines` lines of surface `name`'s log (from its last 64 KB), without their newlines; empty when it is
+    /// missing or refused (a link on the way, a hard-linked or foreign file). Agent-controlled text: quote or flatten it.
+    public static func tail(_ l: EngineLayout, name: String, lines: Int) -> [String] {
+        guard lines > 0, let fd = try? EngineFiles.openFileNoFollow(under: l.workspace, relative(name), flags: O_RDONLY) else { return [] }
         defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0, EngineFiles.copyProblem(st) == nil else { return [] }
+        guard fstat(fd, &st) == 0 else { return [] }
         let size = Int(st.st_size)
         let start = max(0, size - tailWindow)
-        guard var data = try? read(fd, offset: start, count: size - start, path: url.path) else { return [] }
+        guard var data = try? read(fd, offset: start, count: size - start, path: l.previewLog(name: name).path) else { return [] }
         if start > 0, let newline = data.firstIndex(of: 10) { data = data[data.index(after: newline)...] }
         var all = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         if all.last == "" { all.removeLast() }
