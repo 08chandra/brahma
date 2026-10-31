@@ -91,11 +91,48 @@ import GRDB
         #expect(decided.status == .rejected && decided.ownerNote == "not this sprint")
         #expect(a.access.cards.isEmpty)
         #expect(try a.store.grants(companyId: a.w.company.id, includeInactive: true).isEmpty)
-        // A reason is required.
+        // A reason is required; the refusal sits on that card only and goes when the card goes.
         let again = try a.request(.webDomain, "docs.github.com")
         #expect(!(await a.access.deny(askId: again.id, reason: "  ")))
-        #expect(a.access.error != nil)
+        #expect(a.access.cardErrors[again.id] != nil && a.access.error == nil)
         #expect(try a.store.ask(id: again.id)?.status == .pendingOwner)
+        #expect(await a.access.deny(askId: again.id, reason: "no"))
+        #expect(a.access.cardErrors.isEmpty)
+    }
+
+    /// The card names the item from `ask.itemId` even when the snapshot lacks the item (then by id), and a proposed scope the
+    /// card cannot offer falls back to agent.
+    @Test func itemScopeFollowsTheAsk() async throws {
+        let a = try await AccessWorld.make()
+        let item = try a.w.item("Stripe hooks")
+        let ask = try a.request(.webDomain, "docs.stripe.com", itemId: item.id, scope: .item)
+        let missing = try #require(AccessCard.make(ask: ask, handles: [:], itemKeys: [:]))
+        #expect(missing.hasItem && missing.itemKey == item.id && missing.scope == .item)
+        #expect(missing.availableScopes.contains(.item))
+        var noItem = ask
+        noItem.itemId = nil
+        let fallback = try #require(AccessCard.make(ask: noItem, handles: [:], itemKeys: [:]))
+        #expect(!fallback.hasItem && fallback.scope == .agent && !fallback.availableScopes.contains(.item))
+    }
+
+    /// The sandbox banner keys on the pinned sandbox-check alert reason only: a `sandbox-link` alert (or any other) does not light it.
+    @Test func sandboxBannerKeysOnThePinnedReason() async throws {
+        let a = try await AccessWorld.make()
+        await a.w.refresh()
+        #expect(a.w.model.sandboxBanner == nil)
+        try EngineAlerts.raise(store: a.store, text: "a link where the sandbox expects a directory", now: Date(),
+                               reason: "sandbox-link:\(a.w.company.id):123", companyId: a.w.company.id)
+        await a.w.refresh()
+        #expect(a.w.model.work.inbox.contains { $0.kind == .engineAlert })
+        #expect(a.w.model.sandboxBanner == nil)
+        try EngineAlerts.raise(store: a.store, text: "Sandbox check failed for claude 2.1.0", now: Date(),
+                               reason: EngineAlerts.sandboxCheckReason, companyId: a.w.company.id)
+        await a.w.refresh()
+        #expect(a.w.model.sandboxBanner == "Sandbox check failed or pending for claude ? — see Inbox")
+        // Acknowledging the alert clears it.
+        let alert = try #require(a.w.model.work.inbox.first { $0.subjectId == EngineAlerts.askSubject(reason: EngineAlerts.sandboxCheckReason) })
+        _ = await a.w.model.acknowledge(askId: alert.id)
+        #expect(a.w.model.sandboxBanner == nil)
     }
 
     @Test func grantRowsText() async throws {
@@ -136,9 +173,11 @@ import GRDB
         #expect(a.access.grants.count == 1)
         #expect(!a.access.grants[0].isActive && a.access.grants[0].expiresText == "revoked by owner")
         #expect(try a.store.grants(companyId: a.w.company.id).isEmpty)
-        // Revoking again is refused with the store's reason.
+        // Revoking again is refused with the store's reason; the next good reload clears it.
         #expect(!(await a.access.revoke(number: grant.number)))
         #expect(a.access.error?.contains("already revoked") == true)
+        await a.access.reload()
+        #expect(a.access.error == nil)
     }
 
     @Test func presetToggle() async throws {

@@ -23,40 +23,34 @@ extension AppModel {
         return company.permissionProfile == .full || company.roleProfiles.values.contains(.full)
     }
 
-    /// Shown while an engine alert about the sandbox check (3a's doctor / the sandboxed-check canary) waits in the Inbox.
+    /// Shown while the sandbox-check engine alert (`EngineAlerts.sandboxCheckReason`, raised by the sandboxed-check canary) waits in
+    /// the Inbox. Keyed on that one alert's subject, never on text: a `sandbox-link` alert or agent words do not light it.
     public var sandboxBanner: String? {
-        let pending = work.inbox.contains { ask in
-            ask.kind == .engineAlert && ask.requesterId == "system"
-                && ((ask.subjectId ?? "").lowercased().contains("sandbox") || ask.title.lowercased().contains("sandbox check"))
-        }
+        let subject = EngineAlerts.askSubject(reason: EngineAlerts.sandboxCheckReason)
+        let pending = work.inbox.contains { $0.kind == .engineAlert && $0.requesterId == "system" && $0.subjectId == subject }
         guard pending else { return nil }
         return "Sandbox check failed or pending for claude \(snapshot.claudeVersion ?? "?") — see Inbox"
     }
 
-    /// The secret `request` card's `Provide…`: the owner's value goes to the vault through `secretProvider`.
-    @discardableResult
-    public func provideSecret(askId: String, form: SecretsForm) async -> Bool {
-        if let why = form.validate() { errorMessage = why; return false }
+    /// The secret `request` card's `Provide…`: the owner's value goes to the vault through `secretProvider`. Returns why it was
+    /// not stored (shown in the sheet), or nil when it was.
+    public func provideSecret(askId: String, form: SecretsForm) async -> String? {
+        if let why = form.validate() { return why }
         guard let provider = secretProvider else {
-            errorMessage = "Providing a secret from the app needs Brahma's secret-request support (Task 4-wire), which this build lacks."
-            return false
+            return "Providing a secret from the app needs Brahma's secret-request support (Task 4-wire), which this build lacks."
         }
-        guard let vault = ownerSecretVault else {
-            errorMessage = "No secrets vault is available in this app, so nothing was stored."
-            return false
-        }
+        guard let vault = ownerSecretVault else { return "No secrets vault is available in this app, so nothing was stored." }
         let (store, name, value, isTest) = (self.store, form.trimmedName, form.value, form.isTest)
         do {
             try await Task.detached { try provider.provideSecret(store: store, askId: askId, name: name, value: value, isTest: isTest, vault: vault) }.value
             await tick(forceSnapshot: true)
-            return true
+            return nil
         } catch let e as WorkError {
-            errorMessage = e.message
+            return e.message
         } catch let e as SecretError {
-            errorMessage = e.message
+            return e.message
         } catch {
-            errorMessage = "Couldn't provide the secret: \(error)"
+            return "Couldn't provide the secret: \(error)"
         }
-        return false
     }
 }

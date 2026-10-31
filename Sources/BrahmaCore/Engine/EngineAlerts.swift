@@ -29,6 +29,13 @@ public enum EngineAlerts {
     /// The reason that keys the alert about an engine file under `.brahma/` that was a link or not a regular file.
     public static let engineFileReason = "engine-file"
 
+    /// The reason that keys the alert of a failed or pending sandbox check of the installed Claude Code (Task 3's canary raises
+    /// it with this constant). The app's "Sandbox check failed or pending for claude <v>" banner shows while that ask is open.
+    public static let sandboxCheckReason = "sandbox-check"
+
+    /// The `subjectId` of the `engineAlert` ask filed for `reason` (what the app compares against).
+    public static func askSubject(reason: String) -> String { Store.engineAlertKey(reason) }
+
     static func engineFileText(_ problem: UnsafeEngineFile) -> String {
         "The engine refused to write through \(Store.flat(problem.path, max: 400)): it \(problem.problem). Something in the "
             + "workspace (an agent, or another program) put it there; nothing outside the workspace was written. Check the file."

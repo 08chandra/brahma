@@ -54,7 +54,7 @@ struct AccessCardView: View {
             Text(verbatim: card.sentence(scope: scope, duration: duration))
                 .font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text0)
                 .fixedSize(horizontal: false, vertical: true)
-            if let error = model.access.error, model.access.cards.contains(where: { $0.id == card.id }) || !busy {
+            if let error = model.access.cardErrors[card.id] {
                 Text(verbatim: error).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.danger).textSelection(.enabled)
             }
             TextField("Note", text: $note, prompt: Text(verbatim: "Add a note (optional)")).brahmaField()
@@ -125,7 +125,7 @@ struct SecretRequestCard: View {
         VStack(alignment: .leading, spacing: BrahmaTheme.spaceS) {
             HStack(spacing: BrahmaTheme.spaceS) {
                 CapsLabel("Secret request · \(row.ref)", font: BrahmaTheme.panelTitle, color: BrahmaTheme.text1)
-                StatusChip(label: row.riskLabel, color: BrahmaTheme.warning)
+                StatusChip(label: row.riskLabel, color: riskColor)
                 WarningChip(label: "reserved")
                 Spacer(minLength: 0)
             }
@@ -159,6 +159,13 @@ struct SecretRequestCard: View {
             .background(BrahmaTheme.bg1)
             .preferredColorScheme(.dark)
         }
+    }
+
+    /// `success` low, `warning` medium, `danger` high, from the ask's risk.
+    private var riskColor: Color {
+        if row.riskLabel.hasPrefix("High") { return BrahmaTheme.danger }
+        if row.riskLabel.hasPrefix("Medium") { return BrahmaTheme.warning }
+        return BrahmaTheme.success
     }
 
     /// The first token of the title that is a valid secret name ("secret STRIPE_KEY for INITE-2" → STRIPE_KEY).

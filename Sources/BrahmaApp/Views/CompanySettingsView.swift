@@ -22,14 +22,13 @@ struct CompanySettingsView: View {
         }
         .background(BrahmaTheme.bg0)
         .task(id: model.selectedCompanyId) { await settings.reload() }
-        .alert("Switch to Full?", isPresented: Binding(get: { settings.pendingFull != nil }, set: { if !$0 { settings.pendingFull = nil } })) {
-            Button("Switch to Full", role: .destructive) {
-                let role = settings.pendingFull?.role
-                Task { await settings.setProfile(.full, role: role, confirmed: true) }
-            }
+        // The pending value is handed to the actions: the binding's reset on dismissal never changes what is confirmed.
+        .alert(Text(verbatim: "Switch to Full?"), isPresented: Binding(get: { settings.pendingFull != nil }, set: { if !$0 { settings.pendingFull = nil } }),
+               presenting: settings.pendingFull) { pending in
+            Button("Switch to Full", role: .destructive) { Task { await settings.confirmFull(pending) } }
             Button("Cancel", role: .cancel) { settings.pendingFull = nil }
-        } message: {
-            Text(verbatim: SettingsModel.fullWarning)
+        } message: { pending in
+            Text(verbatim: settings.fullConfirmation(pending))
         }
     }
 }
@@ -279,24 +278,23 @@ private struct SecretsPanel: View {
             }
         })
         .sheet(isPresented: $showSheet) {
-            SecretSheet { form in await settings.addSecret(form) }
+            SecretSheet { form in await settings.addSecret(form) ? nil : (settings.error ?? "Not stored.") }
                 .background(BrahmaTheme.bg1)
                 .preferredColorScheme(.dark)
         }
-        .alert("Remove \(confirmRemove ?? "")?", isPresented: Binding(get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } })) {
-            Button("Remove", role: .destructive) {
-                if let name = confirmRemove { Task { await settings.removeSecret(name: name) } }
-                confirmRemove = nil
-            }
-            Button("Cancel", role: .cancel) { confirmRemove = nil }
-        } message: {
-            Text(verbatim: "The value leaves the vault. Agents that were given it as a test key lose it from their next turn.")
+        .alert(Text(verbatim: "Remove this secret?"), isPresented: Binding(get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } }),
+               presenting: confirmRemove) { name in
+            Button("Remove", role: .destructive) { Task { await settings.removeSecret(name: name) } }
+            Button("Cancel", role: .cancel) {}
+        } message: { name in
+            Text(verbatim: "Remove \(name)? The value leaves the vault. Agents that were given it as a test key lose it from their next turn.")
         }
     }
 
     private func stamp(_ date: Date) -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = settings.timeZone
         f.dateFormat = "yyyy-MM-dd HH:mm"
         return f.string(from: date)
     }

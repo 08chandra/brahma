@@ -58,8 +58,8 @@ struct TopBar: View {
                         .frame(width: 22, height: 22).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Company settings")
-                .accessibilityLabel(Text("Company settings"))
+                .help("Auto-merge and budget")
+                .accessibilityLabel(Text("Auto-merge and budget"))
                 .popover(isPresented: $showSettings, arrowEdge: .bottom) { CompanySettingsPopover(model: model) }
                 let running = summary.company.status == .running
                 Button {
@@ -183,13 +183,13 @@ private struct WhyPopover: View {
     }
 }
 
-/// Company-level switches: the auto-merge toggle (off by default) and where this week's budget went, by work mode.
+/// The top bar's quick switches (Company › Settings holds the rest): the auto-merge toggle (off by default) and where this week's budget went, by work mode.
 private struct CompanySettingsPopover: View {
     let model: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: BrahmaTheme.spaceM) {
-            CapsLabel("Company settings")
+            CapsLabel("Auto-merge and budget")
             Toggle(isOn: Binding(get: { model.autoMergeSmall }, set: { on in Task { await model.setAutoMergeSmall(on) } })) {
                 Text(verbatim: "Auto-merge small changes").font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text0)
             }

@@ -18,6 +18,8 @@ public final class SettingsModel {
     public private(set) var roles: [String] = []
     public private(set) var prefs = OwnerPrefs.defaults
     public private(set) var secrets: [SecretMeta] = []
+    /// The owner's time zone (every calendar-facing string here).
+    public private(set) var timeZone: TimeZone = .current
     /// Full chosen without the confirmation: the view shows `fullWarning`, then calls `setProfile(.full, role:, confirmed: true)`.
     public var pendingFull: PendingFull?
     public private(set) var error: String?
@@ -81,10 +83,14 @@ public final class SettingsModel {
         }
     }
 
-    public func reload() async {
+    /// Rereads everything shown here; a good read clears the last refusal.
+    public func reload() async { await reload(keepingError: false) }
+
+    /// After an action: the action's own refusal (set just before) outlives the reread.
+    private func reload(keepingError: Bool) async {
         let store = self.store
         let companyId = self.companyId
-        struct Read: Sendable { var company: Company?; var roles: [String]; var prefs: OwnerPrefs; var secrets: [SecretMeta] }
+        struct Read: Sendable { var company: Company?; var roles: [String]; var prefs: OwnerPrefs; var secrets: [SecretMeta]; var zone: TimeZone }
         do {
             let read: Read = try await Task.detached {
                 var company: Company?
@@ -97,12 +103,14 @@ public final class SettingsModel {
                     roles = set.sorted()
                     secrets = try store.secrets(companyId: companyId)
                 }
-                return Read(company: company, roles: roles, prefs: try store.ownerPrefs(), secrets: secrets)
+                return Read(company: company, roles: roles, prefs: try store.ownerPrefs(), secrets: secrets, zone: store.ownerTimeZone())
             }.value
             company = read.company
             roles = read.roles
             prefs = read.prefs
             secrets = read.secrets
+            timeZone = read.zone
+            if !keepingError { error = nil }
         } catch {
             self.error = "\(error)"
         }
@@ -125,6 +133,18 @@ public final class SettingsModel {
             return false
         }
         return await sandbox(companyId, .profile(profile, role: role, company: company))
+    }
+
+    /// The Full confirmation's text names its target: "Company <name>: " or "Role <role>: " before the brief's sentence.
+    public func fullConfirmation(_ pending: PendingFull) -> String {
+        let target = pending.role.map { "Role \($0)" } ?? "Company \(company?.name ?? "")"
+        return target + ": " + Self.fullWarning
+    }
+
+    /// The owner confirmed Full for exactly the target that was presented (the company, or one role).
+    @discardableResult
+    public func confirmFull(_ pending: PendingFull) async -> Bool {
+        await setProfile(.full, role: pending.role, confirmed: true)
     }
 
     public func clearRoleProfile(_ role: String) async {
@@ -180,7 +200,7 @@ public final class SettingsModel {
         let ok = await run("change the sandbox settings") {
             try store.updateSandbox(companyId: companyId, try make(), userHome: home)
         } != nil
-        await reload()
+        await reload(keepingError: true)
         if ok { await afterChange?() }
         return ok
     }
@@ -195,7 +215,7 @@ public final class SettingsModel {
         guard let vault else { error = "No secrets vault is available in this app, so nothing was stored."; return false }
         let (store, name, value, isTest) = (self.store, form.trimmedName, form.value, form.isTest)
         let ok = await run("store the secret") { try store.setSecret(companyId: companyId, name: name, value: value, isTest: isTest, vault: vault) } != nil
-        await reload()
+        await reload(keepingError: true)
         return ok
     }
 
@@ -204,7 +224,7 @@ public final class SettingsModel {
         guard let vault else { error = "No secrets vault is available in this app, so nothing was removed."; return }
         let store = self.store
         _ = await run("remove the secret") { try store.deleteSecret(companyId: companyId, name: name, vault: vault) }
-        await reload()
+        await reload(keepingError: true)
     }
 
     // MARK: Notifications
@@ -214,7 +234,7 @@ public final class SettingsModel {
     public func savePrefs(_ prefs: OwnerPrefs) async -> Bool {
         let store = self.store
         let ok = await run("save the preferences") { try store.updateOwnerPrefs(prefs) } != nil
-        await reload()
+        await reload(keepingError: true)
         return ok
     }
 
@@ -230,7 +250,7 @@ public final class SettingsModel {
             try PushSettings.setNtfy(store: store, vault: vault, topic: topic, server: server.isEmpty ? nil : server,
                                      token: (token?.isEmpty ?? true) ? nil : token)
         } != nil
-        await reload()
+        await reload(keepingError: true)
         return ok
     }
 
@@ -242,7 +262,7 @@ public final class SettingsModel {
             try PushSettings.setPushover(store: store, vault: vault, appToken: appToken.trimmingCharacters(in: .whitespacesAndNewlines),
                                          userKey: userKey.trimmingCharacters(in: .whitespacesAndNewlines))
         } != nil
-        await reload()
+        await reload(keepingError: true)
         return ok
     }
 
@@ -251,7 +271,7 @@ public final class SettingsModel {
         guard let vault else { error = "No vault is available in this app for the push credentials."; return false }
         let store = self.store
         let ok = await run("turn phone alerts off") { try PushSettings.turnOff(store: store, vault: vault) } != nil
-        await reload()
+        await reload(keepingError: true)
         return ok
     }
 
@@ -259,7 +279,7 @@ public final class SettingsModel {
     public func setPushDetail(_ detail: PushDetail) async -> Bool {
         let store = self.store
         let ok = await run("change the alert detail") { try store.setPushDetail(detail) } != nil
-        await reload()
+        await reload(keepingError: true)
         return ok
     }
 

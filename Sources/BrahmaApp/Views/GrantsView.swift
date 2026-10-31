@@ -20,13 +20,13 @@ struct GrantsView: View {
         }
         .background(BrahmaTheme.bg0)
         .task(id: model.selectedCompanyId) { await access.reload() }
-        .alert(confirmRevoke.map(access.revokeConfirmation) ?? "", isPresented: Binding(
-            get: { confirmRevoke != nil }, set: { if !$0 { confirmRevoke = nil } })) {
-            Button("Revoke", role: .destructive) {
-                if let row = confirmRevoke { Task { await access.revoke(number: row.number) } }
-                confirmRevoke = nil
-            }
-            Button("Cancel", role: .cancel) { confirmRevoke = nil }
+        // The presented row is handed to the action: the binding's reset on dismissal never changes what is revoked.
+        .alert(Text(verbatim: "Revoke this grant?"), isPresented: Binding(get: { confirmRevoke != nil }, set: { if !$0 { confirmRevoke = nil } }),
+               presenting: confirmRevoke) { row in
+            Button("Revoke", role: .destructive) { Task { await access.revoke(number: row.number) } }
+            Button("Cancel", role: .cancel) {}
+        } message: { row in
+            Text(verbatim: access.revokeConfirmation(row))
         }
     }
 

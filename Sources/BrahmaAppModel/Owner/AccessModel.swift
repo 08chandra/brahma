@@ -14,6 +14,7 @@ public struct AccessCard: Equatable, Identifiable, Sendable {
     public var value: String
     /// "@eng-1".
     public var requester: String
+    /// The item's key (or its id when the key is not in the snapshot); nil when the ask names no item.
     public var itemKey: String?
     public var reason: String
     public var risk: AskRisk
@@ -34,10 +35,12 @@ public struct AccessCard: Equatable, Identifiable, Sendable {
     /// Nil for any ask that is not an access request.
     public static func make(ask: Ask, handles: [String: String], itemKeys: [String: String], roles: [String: String] = [:]) -> AccessCard? {
         guard ask.kind == .grant, let requested = Grants.requested(ask) else { return nil }
-        let scope = ask.proposedGrant.flatMap { GrantScope(rawValue: $0.scope) } ?? .agent
+        var scope = ask.proposedGrant.flatMap { GrantScope(rawValue: $0.scope) } ?? .agent
+        // An item scope is offered only with an item (`ask.itemId`, whether or not the snapshot holds the item).
+        if scope == .item, ask.itemId == nil { scope = .agent }
         let requester = ask.requesterId == "system" ? "Brahma" : "@" + (handles[ask.requesterId] ?? "?")
         return AccessCard(id: ask.id, ref: ask.ref, kind: requested.kind, value: requested.value, requester: requester,
-                          itemKey: ask.itemId.flatMap { itemKeys[$0] }, reason: ask.summary, risk: ask.risk,
+                          itemKey: ask.itemId.map { itemKeys[$0] ?? $0 }, reason: ask.summary, risk: ask.risk,
                           riskLabel: InboxRows.riskLabel(ask.risk), scope: scope, duration: requested.duration,
                           role: roles[ask.requesterId])
     }
@@ -150,7 +153,10 @@ public final class AccessModel {
     public private(set) var presets: Set<AccessPreset> = []
     /// Lists revoked, used and expired grants too.
     public var showInactive = false
+    /// The last refusal of a ledger or preset action; cleared by the next successful reload or action.
     public private(set) var error: String?
+    /// The last refusal of an approve or deny, by ask id (shown on that card only).
+    public private(set) var cardErrors: [String: String] = [:]
     public var companyId: String?
     @ObservationIgnored private let store: Store
     /// The owner's machine as grant values are checked against it (tests inject a temp home).
@@ -164,7 +170,10 @@ public final class AccessModel {
 
     public func revokeConfirmation(_ row: GrantRow) -> String { "Revoke \(row.ref)? It stops at the agent's next turn." }
 
-    public func reload() async {
+    /// Rereads the cards, ledger and presets; a good read clears the last ledger refusal (card refusals go with their cards).
+    public func reload() async { await reload(keepingError: false) }
+
+    private func reload(keepingError: Bool) async {
         guard let companyId else { cards = []; grants = []; presets = []; return }
         let (store, inactive) = (self.store, showInactive)
         struct Read: Sendable { var cards: [AccessCard]; var grants: [GrantRow]; var presets: Set<AccessPreset> }
@@ -190,6 +199,8 @@ public final class AccessModel {
             cards = read.cards
             grants = read.grants
             presets = read.presets
+            if !keepingError { error = nil }
+            cardErrors = cardErrors.filter { id, _ in read.cards.contains { $0.id == id } }
         } catch {
             self.error = "\(error)"
         }
@@ -199,7 +210,9 @@ public final class AccessModel {
     @discardableResult
     public func approve(askId: String, scope: GrantScope, duration: GrantDuration, note: String = "") async -> Grant? {
         let (store, env) = (self.store, environment)
-        let grant = await run("approve") { try store.approveAccess(askId: askId, scope: scope, duration: duration, note: note, environment: env) }
+        let grant = await run("approve", askId: askId) {
+            try store.approveAccess(askId: askId, scope: scope, duration: duration, note: note, environment: env)
+        }
         await changed()
         return grant
     }
@@ -208,9 +221,9 @@ public final class AccessModel {
     @discardableResult
     public func deny(askId: String, reason: String) async -> Bool {
         let why = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !why.isEmpty else { error = "Say why: the agent reads the reason."; return false }
+        guard !why.isEmpty else { cardErrors[askId] = "Say why: the agent reads the reason."; return false }
         let store = self.store
-        let ask = await run("deny") { try store.ownerDecide(askId: askId, approve: false, note: why) }
+        let ask = await run("deny", askId: askId) { try store.ownerDecide(askId: askId, approve: false, note: why) }
         await changed()
         return ask != nil
     }
@@ -228,23 +241,27 @@ public final class AccessModel {
         guard let companyId else { return }
         let store = self.store
         _ = await run("change the preset") { try store.setPreset(companyId: companyId, preset, enabled: enabled) }
-        await reload()
+        await reload(keepingError: true)
     }
 
     private func changed() async {
-        await reload()
+        await reload(keepingError: true)
         await afterChange?()
     }
 
-    private func run<T: Sendable>(_ what: String, _ body: @escaping @Sendable () throws -> T) async -> T? {
+    /// Runs one store call off the main actor. A refusal goes to `cardErrors[askId]` when an ask is named, else to `error`.
+    private func run<T: Sendable>(_ what: String, askId: String? = nil, _ body: @escaping @Sendable () throws -> T) async -> T? {
+        func fail(_ message: String) {
+            if let askId { cardErrors[askId] = message } else { error = message }
+        }
         do {
             let value = try await Task.detached { try body() }.value
-            error = nil
+            if let askId { cardErrors[askId] = nil } else { error = nil }
             return value
         } catch let e as WorkError {
-            error = e.message
+            fail(e.message)
         } catch {
-            self.error = "Couldn't \(what): \(error)"
+            fail("Couldn't \(what): \(error)")
         }
         return nil
     }

@@ -60,6 +60,23 @@ import GRDB
         #expect(s.w.model.fullAccess)
     }
 
+    /// The confirmation acts on the value that was presented: a role-scoped pending Full confirms to that role only, and the text names it.
+    @Test func fullConfirmationNamesAndKeepsItsTarget() async throws {
+        let s = try await World.make()
+        #expect(!(await s.settings.setProfile(.full, role: "engineer")))
+        let pending = try #require(s.settings.pendingFull)
+        #expect(pending.role == "engineer")
+        #expect(s.settings.fullConfirmation(pending) == "Role engineer: " + SettingsModel.fullWarning)
+        #expect(s.settings.fullConfirmation(SettingsModel.PendingFull(role: nil)) == "Company Acme: " + SettingsModel.fullWarning)
+        // The dismissal may clear `pendingFull` before the action runs; the action still has the presented value.
+        s.settings.pendingFull = nil
+        #expect(await s.settings.confirmFull(pending))
+        let company = try #require(try s.w.store.company(id: s.w.company.id))
+        #expect(company.permissionProfile == .sandboxed, "the company itself stays as it was")
+        #expect(company.roleProfiles == ["engineer": .full])
+        #expect(s.settings.pendingFull == nil)
+    }
+
     @Test func addDomainValidates() async throws {
         let s = try await World.make()
         #expect(!(await s.settings.addDomain("localhost", web: false)))
@@ -113,6 +130,7 @@ import GRDB
         #expect(await s.settings.addSecret(SecretsForm(name: "STRIPE_TEST_KEY", value: "sk_test_abcdef", isTest: true)))
         #expect(s.settings.error == nil)
         #expect(s.settings.secrets.map(\.name) == ["STRIPE_TEST_KEY"] && s.settings.secrets[0].isTest)
+        #expect(s.settings.timeZone == s.w.store.ownerTimeZone())
         #expect(try s.vault.value(companyId: s.w.company.id, name: "STRIPE_TEST_KEY") == "sk_test_abcdef")
         #expect(!(await s.settings.addSecret(SecretsForm(name: "bad-name", value: "x"))))
         #expect(s.settings.error != nil && s.settings.secrets.count == 1)

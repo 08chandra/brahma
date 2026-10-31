@@ -2,12 +2,12 @@ import SwiftUI
 import BrahmaCore
 import BrahmaAppModel
 
-/// Adds a secret: the name, a `SecureField` for the value, and the `Test key` toggle. `save` returns whether it was stored (the
-/// model shows why not); the value never leaves this sheet except to the vault.
+/// Adds a secret: the name, a `SecureField` for the value, and the `Test key` toggle. `save` returns why it was not stored (shown
+/// here), or nil when it was; the value never leaves this sheet except to the vault.
 struct SecretSheet: View {
     var title = "Add a secret"
     var initialName = ""
-    let save: @MainActor (SecretsForm) async -> Bool
+    let save: @MainActor (SecretsForm) async -> String?
     @Environment(\.dismiss) private var dismiss
     @State private var form = SecretsForm()
     @State private var busy = false
@@ -47,9 +47,9 @@ struct SecretSheet: View {
                     if let why = form.validate() { problem = why; return }
                     busy = true
                     Task {
-                        let ok = await save(form)
+                        let failure = await save(form)
                         busy = false
-                        if ok { dismiss() } else { problem = "Not stored; see the message in the settings panel." }
+                        if let failure { problem = failure } else { dismiss() }
                     }
                 }
                 .buttonStyle(.brahmaPrimary)

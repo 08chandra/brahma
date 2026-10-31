@@ -30,6 +30,7 @@ public final class DigestModel {
             digest = read.digest
             rendered = read.digest.map { SafeMarkdown.render($0.markdown) }
             periodLine = read.digest.map { Self.period($0, timeZone: read.zone) }
+            error = nil
         } catch {
             self.error = "\(error)"
         }
