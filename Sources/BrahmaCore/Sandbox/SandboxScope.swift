@@ -617,13 +617,16 @@ public struct SandboxScope: Equatable, Sendable {
     /// git and Bash to start; `ext` holds mounted extension parts whose scripts run in Bash; `cache/shared` is the read-only
     /// layer checks write. `ext-review` is not one (10b, B-M9): a proposed extension's review page quotes unapproved skill
     /// text, so only the turns of its internal reviewer read it (`reviewPages`), and the owner in the app. `ext-try` (the owner's
-    /// `ext try` copies) is readable only by that one throwaway turn.
+    /// `ext try` copies) is readable only by that one throwaway turn. `preview/logs` holds the preview servers' logs
+    /// (Plan L): a failure DM points the setter at it.
     static let readableDotBrahma = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext",
-                                    "hooks", "cache/shared"]
+                                    "hooks", "cache/shared", "preview/logs"]
 
-    /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist.
+    /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist. `preview` is Plan L's
+    /// (`EngineLayout.previewDir`; its runs are data-home exports, its logs are written by the engine and the previews).
     static let engineOnlyDotBrahma = ["trash", "cache", "resources", "checks", "wt-check", "handoffs", "releases", "artifacts",
-                                      "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "ext-try", "hooks", "bin", "kb"]
+                                      "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "ext-try", "hooks", "bin", "kb",
+                                      "preview"]
 
     /// Common-git-dir internals no turn writes (3a "GitCommand hardening I2": config or attributes flipped between the
     /// engine's scan and its run), listed even before they exist.
