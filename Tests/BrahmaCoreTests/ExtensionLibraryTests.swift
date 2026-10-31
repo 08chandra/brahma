@@ -73,7 +73,7 @@ import GRDB
             #expect(!scope.writable.contains { SandboxPath.overlaps($0.path, resolvedPlugin) }, "\(kind)")
             #expect(scope.cwd.resolvedForSandbox.path != resolvedPlugin)
             #expect(scope.denyWrite.contains { resolvedPlugin.hasPrefix($0.path + "/") }, "\(kind): \(scope.denyWrite)")
-            let settings = ClaudeSettingsCompiler.compile(scope: scope, profile: .sandboxed, mode: nil, mounts: [plugin], hookCommand: nil, preToolHook: nil)
+            let settings = ClaudeSettingsCompiler.compile(scope: scope, profile: .sandboxed, mode: nil, mounts: [plugin], postToolHook: nil, preToolHook: nil)
             #expect(!(settings.sandbox?.filesystem?.allowWrite ?? []).contains { SandboxPath.overlaps($0, resolvedPlugin) })
         }
         // Mounted for the engineer now.
