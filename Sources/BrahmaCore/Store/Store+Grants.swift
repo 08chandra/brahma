@@ -64,7 +64,8 @@ extension Store {
             if scope == .item, itemId == nil { throw WorkError.invalid("scope item needs an item") }
             let context = try grantCheckContext(companyId: companyId)
             normalized = try Grants.validate(kind: kind, value: value, company: context.company, paths: context.paths,
-                                             environment: environment, otherWorkspaces: context.others, backupTargets: context.backups)
+                                             environment: environment, otherWorkspaces: context.others, backupTargets: context.backups,
+                                             installedExtensions: try grantableExtensions(companyId: companyId))
         } catch {
             let detail = (error as? WorkError)?.message ?? "\(error)"
             try writer.write { db in
@@ -129,6 +130,15 @@ extension Store {
 
     /// The company and what a grant value is checked against: the data home (a stand-in for an in-memory store), every other
     /// company's workspace and the owner's backup folders.
+    /// `<publisher>/<id>` of every installed, enabled extension of the company: what an `extension` grant may name (Task 5a).
+    func grantableExtensions(companyId: String) throws -> Set<String> {
+        var out: Set<String> = []
+        for e in try installedExtensions(companyId: companyId) where e.enabled {
+            if let p = try extensionPackage(hash: e.hash) { out.insert(ExtensionRef(publisher: p.publisher, id: e.id).key) }
+        }
+        return out
+    }
+
     func grantCheckContext(companyId: String) throws -> (company: Company, paths: BrahmaPaths, others: [URL], backups: [URL]) {
         let (fetched, others) = try writer.read { db in
             (try Company.fetchOne(db, key: companyId),
@@ -166,7 +176,8 @@ extension Store {
         guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
         let context = try grantCheckContext(companyId: ask.companyId)
         let value = try Grants.validate(kind: requested.kind, value: requested.value, company: context.company, paths: context.paths,
-                                        environment: environment, otherWorkspaces: context.others, backupTargets: context.backups)
+                                        environment: environment, otherWorkspaces: context.others, backupTargets: context.backups,
+                                        installedExtensions: try grantableExtensions(companyId: ask.companyId))
         // A read path is pinned at request: if it now resolves elsewhere (a link was put in its place), it is not what was asked.
         if requested.kind == .readPath, !Grants.isPinned(requested.value) || SandboxPath.key(value) != SandboxPath.key(requested.value) {
             throw WorkError.invalid("\(requested.value) is no longer the directory that was requested (a symbolic link replaced it "

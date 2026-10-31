@@ -30,6 +30,11 @@ public struct RoleTemplate: Codable, Equatable, Sendable {
     public var covers: [String]
     public var skills: [String] = []
     public var connectors: [String] = []
+    /// The extensions the pack suggests for the role (Task 5a), publisher-matched at mount time (`RoleBundle`). The legacy
+    /// `skills`/`connectors` strings decode into `brahma/<id>` refs (recorded in `legacyExtensionWarnings`).
+    public var extensions: [ExtensionRef] = []
+    /// What `init(from:)` had to guess: one line per legacy string turned into a ref. `validate()` warns, never errors.
+    public var legacyExtensionWarnings: [String] = []
     /// item-type id -> playbook text (<= `maxPlaybook` chars).
     public var playbooks: [String: String] = [:]
 
@@ -38,14 +43,14 @@ public struct RoleTemplate: Codable, Equatable, Sendable {
 
     public init(id: String, title: String, kind: RoleKind, handlePrefix: String, prompt: String, companyTools: [String],
                 models: [String: String], roleWeight: Int, covers: [String] = [], skills: [String] = [],
-                connectors: [String] = [], playbooks: [String: String] = [:]) {
+                connectors: [String] = [], playbooks: [String: String] = [:], extensions: [ExtensionRef] = []) {
         self.id = id; self.title = title; self.kind = kind; self.handlePrefix = handlePrefix; self.prompt = prompt
         self.companyTools = companyTools; self.models = models; self.roleWeight = roleWeight; self.covers = covers
-        self.skills = skills; self.connectors = connectors; self.playbooks = playbooks
+        self.skills = skills; self.connectors = connectors; self.playbooks = playbooks; self.extensions = extensions
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, kind, handlePrefix, prompt, companyTools, models, roleWeight, covers, skills, connectors, playbooks
+        case id, title, kind, handlePrefix, prompt, companyTools, models, roleWeight, covers, skills, connectors, playbooks, extensions
     }
 
     public init(from d: Decoder) throws {
@@ -62,6 +67,21 @@ public struct RoleTemplate: Codable, Equatable, Sendable {
         skills = try c.decodeIfPresent([String].self, forKey: .skills) ?? []
         connectors = try c.decodeIfPresent([String].self, forKey: .connectors) ?? []
         playbooks = try c.decodeIfPresent([String: String].self, forKey: .playbooks) ?? [:]
+        extensions = try c.decodeIfPresent([ExtensionRef].self, forKey: .extensions) ?? []
+        // Legacy strings: `skills`/`connectors` name first-party ids; they decode as `brahma/<id>` refs with a warning.
+        for legacy in skills + connectors where ExtensionId.isValid(legacy) && !extensions.contains(where: { $0.id == legacy }) {
+            extensions.append(ExtensionRef(publisher: ExtensionPublisher.brahma, id: legacy))
+            legacyExtensionWarnings.append("role \(id): legacy '\(legacy)' read as extension brahma/\(legacy)")
+        }
+    }
+
+    /// Refs that cannot name an installable extension (a bad id or publisher): pack `validate()` warns on them, never errors.
+    public var extensionWarnings: [String] {
+        legacyExtensionWarnings + extensions.compactMap { ref in
+            if let p = ExtensionId.problem(ref.id) { return "role \(id): extension ref \(ref.key): \(p)" }
+            if !ExtensionPublisher.isValid(ref.publisher) { return "role \(id): extension ref \(ref.key) has an unknown publisher" }
+            return nil
+        }
     }
 
     /// Fallback for a role id no pack defines: individual contributor, base+work tools, sonnet, weight 0.
@@ -210,6 +230,9 @@ public struct IndustryPack: Codable, Equatable, Sendable {
     public func rolesCovering(_ id: String) -> [String] {
         roles.filter { $0.id == id || $0.covers.contains(id) }.map(\.id)
     }
+
+    /// Warnings `validate()` never fails on: unknown or legacy extension refs (Task 5a).
+    public var warnings: [String] { roles.flatMap(\.extensionWarnings) }
 
     public func validate() throws {
         func fail(_ reason: String) -> PackError { .invalid(pack: id, reason: reason) }

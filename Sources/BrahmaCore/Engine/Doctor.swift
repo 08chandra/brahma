@@ -63,9 +63,10 @@ public enum Doctor {
     public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async throws -> String?
 
     /// `hookExecutable`: the `brahma` the mode-canary's profiles name in their pre-tool hook, as real turns do.
+    /// `sandbox`: the sandboxed runner the `plugin-details-inert` fixture (Task 5a) runs the CLI under; without one that item is skipped.
     public static func run(claudePath: String, runner: any TurnRunning, exec: @escaping Exec = defaultExec,
                            now: Date = .now, hookExecutable: String = "brahma",
-                           managedSettingsPath: String = Doctor.managedSettingsPath) async -> DoctorReport {
+                           managedSettingsPath: String = Doctor.managedSettingsPath, sandbox: (any SandboxedRunner)? = nil) async -> DoctorReport {
         let found = await versionOutcome(claudePath: claudePath, exec: exec)
         guard let version = found.version else {
             let detail = found.timedOut?.description ?? "can't run '\(claudePath) --version'; is Claude Code installed?"
@@ -77,6 +78,7 @@ public enum Doctor {
         items += probe.items
         items.append(toolsItem(probe.tools))
         items.append(sideloadItem(path: managedSettingsPath))
+        if let sandbox { items.append(await pluginDetailsItem(claudePath: claudePath, sandbox: sandbox)) }
         var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
         // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
         if let canary = await ModeCanary.run(runner: runner, hookExecutable: hookExecutable) {

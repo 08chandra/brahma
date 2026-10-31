@@ -101,7 +101,7 @@ public enum Grants {
         $0.contains(".") && !["co.uk", "org.uk", "com.au"].contains($0)
     }).union(["trycloudflare.com", "fly.dev", "onrender.com", "r2.dev", "ngrok.app", "web.core.windows.net"])
 
-    /// Until Task 5a builds the installed-extension table, every extension grant is refused with this.
+    /// An extension that is not installed (and enabled) in the company is refused with this.
     static func noExtension(_ id: String) -> String {
         "No extension '\(Store.flat(id, max: 200))'. Build one in your lab and use propose_extension."
     }
@@ -118,7 +118,7 @@ public enum Grants {
     /// - extensions: refused until extensions can be installed (Task 5a).
     public static func validate(kind: GrantKind, value raw: String, company: Company, paths: BrahmaPaths,
                                 environment: SandboxEnvironment = .owner, otherWorkspaces: [URL] = [],
-                                backupTargets: [URL] = []) throws -> String {
+                                backupTargets: [URL] = [], installedExtensions: Set<String> = []) throws -> String {
         let value = raw.trimmingCharacters(in: .whitespaces)
         switch kind {
         case .networkDomain, .webDomain:
@@ -135,7 +135,9 @@ public enum Grants {
             }
             return domain
         case .extension:
-            throw WorkError.invalid(noExtension(value))
+            // `<publisher>/<id>`, installed and enabled in this company (`installedExtensions` holds those keys).
+            guard let ref = ExtensionRef.parse(value), installedExtensions.contains(ref.key) else { throw WorkError.invalid(noExtension(value)) }
+            return ref.key
         case .readPath:
             if SandboxPath.isUnsafe(value) { throw SandboxError.unsafePathCharacter(value) }
             guard value.hasPrefix("/") else { throw WorkError.invalid("a read path must be absolute: \(Store.flat(value, max: 200))") }
@@ -272,11 +274,11 @@ public enum GrantResolver {
         }
     }
 
-    /// What the grants add to a turn's scope. Extension grants wait for Task 5a (none can exist yet).
+    /// What the grants add to a turn's scope (extension grants as `<publisher>/<id>`, resolved by `RoleBundle`).
     public static func inputs(_ grants: [Grant]) -> GrantInputs {
         func values(_ kind: GrantKind) -> [String] { Array(Set(grants.filter { $0.kind == kind }.map(\.value))).sorted() }
         return GrantInputs(domains: values(.networkDomain), webDomains: values(.webDomain),
-                           readPaths: values(.readPath).map { URL(fileURLWithPath: $0, isDirectory: false) }, extensions: [])
+                           readPaths: values(.readPath).map { URL(fileURLWithPath: $0, isDirectory: false) }, extensions: values(.extension))
     }
 }
 

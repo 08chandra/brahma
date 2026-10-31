@@ -54,6 +54,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var fullReview: Bool = false
     /// Judged work turns in a row without work-item progress (the watchdog, 14b).
     public var turnsWithoutProgress: Int = 0
+    /// A `sessionResetReason` waiting for the next turn (`Store.forceFreshSession`, Task 5a); `startTurn` moves it onto the turn.
+    public var pendingSessionReset: String? = nil
 }
 
 /// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and
@@ -64,9 +66,13 @@ public struct SessionMeta: Codable, Equatable, Sendable {
     public var tools: String?
     public var endedAt: Double?
     public var lastTurnId: String?
+    /// The frozen mount set (`ExtensionLibrary.mountSetHash`) of the session; a different set forces a fresh session.
+    public var mountSetHash: String? = nil
 
-    public init(cwd: String? = nil, model: String? = nil, tools: String? = nil, endedAt: Double? = nil, lastTurnId: String? = nil) {
+    public init(cwd: String? = nil, model: String? = nil, tools: String? = nil, endedAt: Double? = nil, lastTurnId: String? = nil,
+                mountSetHash: String? = nil) {
         self.cwd = cwd; self.model = model; self.tools = tools; self.endedAt = endedAt; self.lastTurnId = lastTurnId
+        self.mountSetHash = mountSetHash
     }
 }
 

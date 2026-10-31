@@ -41,6 +41,11 @@ struct CompanyGroup: ParsableCommand {
             }
             let (store, paths2) = try openStore()
             let c = try store.createCompany(name: name, goal: goal, workspacesRoot: paths2.workspaces, packId: pack)
+            // The engine-owned pre-commit hook (Task 5a); a refusal is reported, the company stands.
+            do {
+                let layout = SandboxLayout(paths: paths2, company: c, agentHandle: "engine")
+                try CompanyHooks.install(layout: layout, git: GitWorkspace(root: layout.workspace, exportHome: paths2.home))
+            } catch { FileHandle.standardError.write(Data("brahma: could not install the pre-commit hook: \(safe("\(error)"))\n".utf8)) }
             print("\(c.id)  \(c.workspacePath)")
             if let staffed {
                 let hired = try store.applyOrg(companyId: c.id, plan: staffed.seated, pack: industry, vacancies: staffed.vacancies)

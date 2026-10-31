@@ -55,7 +55,8 @@ import GRDB
     // MARK: Kinds, table, routing
 
     @Test func askKindsAndReservedList() {
-        #expect(AskKind.reserved.map(\.rawValue) == ["request", "grant", "deploy", "humanTask", "outbox", "spend", "staffing", "stage", "role"])
+        // `extension` joined the reserved list in 5-lite Task 5a (install, remove, rollback and binding asks; owner-only under every preset).
+        #expect(AskKind.reserved.map(\.rawValue) == ["request", "grant", "deploy", "humanTask", "outbox", "spend", "staffing", "stage", "role", "extension"])
         for k in AskKind.reserved { #expect(AskKind(rawValue: k.rawValue) == k); #expect(k.isReservedKind) }
         #expect(AskKind.gates.map(\.rawValue) == ["prd", "architecture", "sprintPlan", "release"])
         #expect(AskKind.prd.isGate && !AskKind.other.isGate && !AskKind.boost.isReservedKind)

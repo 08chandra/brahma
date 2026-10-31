@@ -63,6 +63,32 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         #expect(reqs[0].environment["BRAHMA_AGENT_ID"] != nil)
     }
 
+    /// `plugin-details-inert` (Task 5a): `claude plugin details` on a fixture plugin with hooks and an MCP server, run under the
+    /// sandboxed runner with hooks off, creates no marker file. A CLI that ran either part fails the item.
+    @Test func pluginDetailsIsInert() async throws {
+        let inert = try FakeTools.script("claude", "echo 'Always-on context: 10 tokens'; exit 0")
+        let runner = RecordingRunner()
+        let r = await Doctor.run(claudePath: inert.path, runner: ProbeRunner(good()), exec: exec(), now: t0, sandbox: runner)
+        let found = try #require(item(r, "plugin-details-inert"))
+        #expect(found.status == .pass, "\(found.detail)")
+        let call = try #require(runner.calls.first)
+        #expect(call.policy.network == .none); #expect(call.command.contains("plugin details"))
+        #expect(call.command.contains("--settings '{\"disableAllHooks\":true}'") && call.command.contains("--strict-mcp-config"))
+        #expect(call.environment["CLAUDE_CONFIG_DIR"]?.hasSuffix("/cc") == true)
+        // The fixture really has both parts, so a CLI that honoured them would leave the marker.
+        let hostile = try FakeTools.script("claude", """
+        for a in "$@"; do
+          if [ -f "$a/hooks/hooks.json" ]; then sh -c "$(sed -n 's/.*"command": *"\\([^"]*\\)".*/\\1/p' "$a/hooks/hooks.json" | head -1)"; fi
+        done
+        exit 0
+        """)
+        let r2 = await Doctor.run(claudePath: hostile.path, runner: ProbeRunner(good()), exec: exec(), now: t0, sandbox: RecordingRunner())
+        #expect(item(r2, "plugin-details-inert")?.status == .fail, "\(String(describing: item(r2, "plugin-details-inert")))")
+        #expect(!r2.ok)
+        // Without a sandbox runner the item is not run (the doctor command always passes one).
+        #expect(item(await Doctor.run(claudePath: inert.path, runner: ProbeRunner(good()), exec: exec(), now: t0), "plugin-details-inert") == nil)
+    }
+
     @Test func sandboxFlagsAreRequired() async {
         for flag in ["--restricted", "--tools", "--plugin-dir", "--permission-prompts"] {
             #expect(Doctor.requiredFlags.contains(flag), "\(flag)")

@@ -30,8 +30,10 @@ public struct AskKind: RawRepresentable, Hashable, Codable, Sendable, DatabaseVa
     public static let staffing = AskKind("staffing")
     public static let stage = AskKind("stage")
     public static let role = AskKind("role")
+    /// An extension install, update, removal or binding (Task 5a): reserved, owner-only under every preset.
+    public static let `extension` = AskKind("extension")
 
-    public static let reserved: [AskKind] = [.request, .grant, .deploy, .humanTask, .outbox, .spend, .staffing, .stage, .role]
+    public static let reserved: [AskKind] = [.request, .grant, .deploy, .humanTask, .outbox, .spend, .staffing, .stage, .role, .extension]
     public static let gates: [AskKind] = [.prd, .architecture, .sprintPlan, .release]
 
     public var isReservedKind: Bool { Self.reserved.contains(self) }
@@ -59,6 +61,7 @@ public struct AskKind: RawRepresentable, Hashable, Codable, Sendable, DatabaseVa
         case "staffing": "Staffing"
         case "stage": "Stage"
         case "role": "Role"
+        case "extension": "Extension"
         default: rawValue
         }
     }

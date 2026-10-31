@@ -109,6 +109,14 @@ struct GitCommand: Sendable {
 
     func withIndex(_ url: URL) -> GitCommand { var copy = self; copy.indexFile = url; return copy }
 
+    /// The one `core.hooksPath` value the config allowlist admits: `<workspace>/.brahma/hooks` of the repository this command
+    /// runs in (the common dir's parent). Nil for a repository that is not a company workspace (a lab, the merge repository).
+    var engineHooksPath: String? {
+        let common = commonDir ?? gitDir
+        guard common.lastPathComponent == ".git" else { return nil }
+        return common.deletingLastPathComponent().appending(path: ".brahma/hooks").path
+    }
+
     /// Tests only: handed the `tempRoot` of every git run, to prove the engine's captured output never lands in the shared
     /// per-user temp dir (A-I1b). Injected per `GitWorkspace` instance (not a global), so it is set only where a test wants it.
     var tempRootObserver: (@Sendable (URL) -> Void)?
@@ -390,13 +398,16 @@ enum RepoConfigGuard {
     /// Is this config key one the engine runs git with? Only what git itself and the engine write, and inert settings;
     /// everything else (any program, helper, driver, include, remote or alias) refuses the repository. Keys come canonical
     /// from `git config --list`: section and variable lowercased, a subsection as written (dots and all).
-    static func isAllowed(_ key: String) -> Bool {
+    static func isAllowed(_ key: String, value: String = "", hooksPath: String? = nil) -> Bool {
         let lower = key.lowercased()
         guard let firstDot = lower.firstIndex(of: "."), let lastDot = lower.lastIndex(of: ".") else { return false }
         let section = lower[..<firstDot], variable = lower[lower.index(after: lastDot)...]
         let hasSubsection = firstDot != lastDot
         switch section {
         case "core":
+            // `core.hooksPath` only when it names exactly the engine's own hooks directory of this workspace (`CompanyHooks`);
+            // engine git overrides it with `/dev/null` anyway, so this admits the agents' advisory hook and nothing else.
+            if !hasSubsection, variable == "hookspath", let hooksPath { return value == hooksPath }
             return !hasSubsection && ["repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
                                       "precomposeunicode", "symlinks", "worktree"].contains(variable)
         // Only the extensions the engine works with: another ref storage (reftable) or a partial clone breaks its checks.
@@ -432,7 +443,7 @@ enum RepoConfigGuard {
                 let text = String(decoding: entry, as: UTF8.self)
                 let key = String(text.prefix { $0 != "\n" })
                 let value = text.contains("\n") ? String(text[text.index(after: text.firstIndex(of: "\n")!)...]) : ""
-                if !isAllowed(key) { refused.append(GitWorkspace.shown(key)) }
+                if !isAllowed(key, value: value, hooksPath: git.engineHooksPath) { refused.append(GitWorkspace.shown(key)) }
                 if key.lowercased() == "extensions.objectformat", value.lowercased() == "sha256" { sha256 = true }
             }
             let unique = refused.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
@@ -729,6 +740,25 @@ public struct GitWorkspace: Sendable {
     // MARK: Repository
 
     /// Makes `<ws>` a git repository on `main` with every existing file imported, and keeps `.brahma/` out of it.
+    /// `core.hooksPath` as the workspace's config FILE has it, or nil (`--file`: the engine's own `-c core.hooksPath=/dev/null`
+    /// would otherwise answer).
+    public func hooksPath() throws -> String? {
+        var git = main
+        git.skipsRepositoryCheck = true   // a config read; see `setHooksPath`
+        let out = try git.run(["config", "--file", gitDir.appending(path: "config").path, "--get", "core.hooksPath"], allowFailure: true)
+        guard out.status == 0 else { return nil }
+        return out.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Points `core.hooksPath` at the engine's hooks directory (`CompanyHooks.install`). The repository check is skipped for
+    /// this one write: a config set to another value would refuse every engine command, this one included, and `git config`
+    /// runs no hook, filter, driver or helper (the command-line config still switches them all off).
+    public func setHooksPath(_ dir: URL) throws {
+        var git = main
+        git.skipsRepositoryCheck = true
+        try git.run(["config", "core.hooksPath", dir.path])
+    }
+
     public func ensureRepo() throws {
         let fm = FileManager.default
         var isDir: ObjCBool = false

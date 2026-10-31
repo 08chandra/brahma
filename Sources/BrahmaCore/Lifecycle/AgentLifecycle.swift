@@ -85,9 +85,10 @@ extension Store {
     public func startTurn(agentId: String, now: Date = Store.now()) throws -> Turn {
         try writer.write { db in
             guard let agent = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
-            let turn = Turn(id: UUID().uuidString, agentId: agentId, companyId: agent.companyId, startedAt: now,
+            var turn = Turn(id: UUID().uuidString, agentId: agentId, companyId: agent.companyId, startedAt: now,
                             endedAt: nil, outcome: .inProgress, summary: nil, costUSD: nil)
             try turn.insert(db)
+            turn.sessionResetReason = try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turn.id)
             return turn
         }
     }
@@ -106,7 +107,7 @@ extension Store {
         guard var turn = try Turn.fetchOne(db, key: id) else { throw StoreError.notFound }
         guard turn.outcome == .inProgress else { return false }
         turn.outcome = outcome; turn.summary = summary; turn.costUSD = costUSD; turn.infra = infra; turn.endedAt = now
-        turn.reportedStatus = reportedStatus; turn.sessionResetReason = sessionResetReason
+        turn.reportedStatus = reportedStatus; turn.sessionResetReason = sessionResetReason ?? turn.sessionResetReason
         try turn.update(db)
         try db.execute(sql: "DELETE FROM turnCredential WHERE turnId = ?", arguments: [id])
         try db.execute(sql: "DELETE FROM turnQuotaUsage WHERE turnId = ?", arguments: [id])

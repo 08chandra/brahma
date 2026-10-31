@@ -99,6 +99,9 @@ struct Approve: ParsableCommand {
             done = try refusing { try store.ownerReplan(askId: a.id, text: replan) }
         } else if a.kind == .engineAlert || (a.fyi && a.status == .approved) {
             done = try refusing { try store.acknowledge(askId: a.id) }
+        } else if a.kind == .extension, !reject {
+            // An extension install is materialized by the app before it is approved; the CLI never decides it (Task 5a).
+            throw fail(ExtensionLibrary.cliApproveRefusal)
         } else {
             done = try refusing { try store.ownerDecide(askId: a.id, approve: !reject, note: note, acknowledgeChange: ackChanged) }
         }

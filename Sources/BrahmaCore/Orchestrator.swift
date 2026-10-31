@@ -154,6 +154,17 @@ public actor Orchestrator {
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
             try await recoverMerges()
+            // The engine-owned pre-commit hook of every company workspace (Task 5a); a refusal is logged, never fatal.
+            let companies = try store.companies()
+            for failure in await blocking.run({ () -> [String] in
+                companies.compactMap { company in
+                    do {
+                        let layout = SandboxLayout(paths: paths, company: company, agentHandle: "engine")
+                        try CompanyHooks.install(layout: layout, git: store.gitWorkspace(root: layout.workspace, companyId: company.id))
+                        return nil
+                    } catch { return "\(company.name): \(error)" }
+                }
+            }) { log("could not install the pre-commit hook: \(failure)") }
             try SystemTimers.ensure(store: store, now: now, digestTime: store.ownerPrefs().digestHourMinute)
             ensuredTimerCompanies = Set(try store.companies().map(\.id))
             startWALShipping()
@@ -549,6 +560,8 @@ public actor Orchestrator {
         // The session this turn runs in, whether it resumed one, and what it ran with.
         var scope = SessionScope.base
         var wasResume = false
+        var mounts: [ExtensionMount] = []
+        var mountSetHash: String?
         var workingDirectory = ""
         var toolsKey = ""
         var usedModel = agent.model
@@ -686,19 +699,36 @@ public actor Orchestrator {
                                      barrier: barrier)
                 }
 
+                // The extension parts this turn mounts (Task 5a): the pack's suggestions, the company's overrides and the agent's
+                // extension grants, rehashed; their declared egress joins the scope below. Blocking (it hashes the trees).
+                let mountKind = kind, mountItemId = scope.itemId
+                mounts = try await blocking.tryRun {
+                    let grants = GrantResolver.inputs(try store.activeGrants(agent: agent, itemId: mountItemId, kind: mountKind))
+                    return try ExtensionLibrary.mounts(company: company, role: agent.role, agent: agent, grants: grants, profile: profile,
+                                                       kind: mountKind, store: store, paths: paths, now: self.clock())
+                }
                 // A sandboxed turn runs where its scope says (the item worktree for a leaseholder, the plans directory for a plan
                 // turn, else the lab), computed before the session is chosen so its stored cwd is the one the turn uses.
                 if profile == .sandboxed {
                     let prepared = try await prepareSandbox(agent: agent, company: company, kind: kind,
-                                                            item: checkout != nil ? c.item : nil, turnId: turn.id)
+                                                            item: checkout != nil ? c.item : nil, turnId: turn.id,
+                                                            extraDomains: ExtensionLibrary.agentNetwork(mounts))
                     sandboxed = prepared
                     workingDirectory = prepared.scope.cwd.path
                     addDirs = prepared.scope.readOnlyDirs.map(\.path)
                     toolsKey += "|sandboxed"
                 }
 
+                // The mount set is frozen per session (Task 5a): a different set on this turn forces a fresh session, never --resume.
+                var slot = try store.sessionSlot(agent: agent, scope: scope)
+                mountSetHash = ExtensionLibrary.mountSetHash(mounts)
+                if slot.started, let frozen = slot.mountSetHash, frozen != mountSetHash {
+                    try store.forceFreshSession(agentId: agent.id, itemId: scope.itemId, reason: "mounts changed", now: clock())
+                    try store.applyPendingSessionReset(agentId: agent.id, turnId: turn.id)
+                    let renewed = try store.agent(id: agent.id) ?? agent
+                    slot = try store.sessionSlot(agent: renewed, scope: scope)
+                }
                 // Warm-only resume: a cold or large session starts over with the role card, the orientation and Continuity.
-                let slot = try store.sessionSlot(agent: agent, scope: scope)
                 slotModel = slot.model
                 slotTools = slot.tools
                 let transcript = store.sessionTranscriptTokens(turnId: slot.lastTurnId)
@@ -785,6 +815,7 @@ public actor Orchestrator {
                 environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
                               "BRAHMA_WORKSPACES": paths.workspaces.path])
             request.kind = review != nil ? .review : audit != nil ? .audit : kind
+            request.mounts = mounts.map(\.url)
             request.planDirectory = planDirectory
             request.mode = mode
             request.hookCommand = TurnProfileCompiler.hookCommand(executable: mcpExecutable)
@@ -812,7 +843,8 @@ public actor Orchestrator {
                         sawInit = true
                         initModel = reported
                         if !sessionMarked {
-                            try store.markSessionStarted(agentId: agent.id, scope: scope, cwd: workingDirectory, model: model, tools: toolsKey)
+                            try store.markSessionStarted(agentId: agent.id, scope: scope, cwd: workingDirectory, model: model, tools: toolsKey,
+                                                         mountSetHash: mountSetHash)
                             sessionMarked = true
                         }
                     case .initInfo(let info):
@@ -1169,9 +1201,10 @@ extension Store {
         try writer.write { db in
             guard let a = try Agent.fetchOne(db, key: agentId), a.state == .ready, !a.paused else { return nil }
             let agent = try Store.transition(db: db, agentId: agentId, to: .running, now: now)
-            let turn = Turn(id: UUID().uuidString, agentId: agentId, companyId: agent.companyId, startedAt: now,
+            var turn = Turn(id: UUID().uuidString, agentId: agentId, companyId: agent.companyId, startedAt: now,
                             endedAt: nil, outcome: .inProgress, summary: nil, costUSD: nil)
             try turn.insert(db)
+            turn.sessionResetReason = try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turn.id)
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: turn.id, kind: .turnStarted,
                               text: "@\(agent.name) turn started", createdAt: now).insert(db)
             return (agent, turn)

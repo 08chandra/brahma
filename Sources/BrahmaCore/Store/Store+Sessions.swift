@@ -55,6 +55,8 @@ public struct ItemSession: Codable, Equatable, Sendable, FetchableRecord, Persis
     public var lastEndedAt: Date? = nil
     public var lastTurnId: String? = nil
     public var createdAt: Date
+    /// The frozen mount set of the session (Task 5a).
+    public var mountSetHash: String? = nil
 }
 
 /// The state of one session as the orchestrator needs it, whichever table it lives in.
@@ -67,6 +69,7 @@ public struct SessionSlot: Equatable, Sendable {
     public var tools: String?
     public var endedAt: Date?
     public var lastTurnId: String?
+    public var mountSetHash: String? = nil
 }
 
 extension Store {
@@ -85,12 +88,12 @@ extension Store {
     }
 
     public func markItemSessionStarted(agentId: String, itemId: String, cwd: String? = nil, model: String? = nil,
-                                       tools: String? = nil) throws {
+                                       tools: String? = nil, mountSetHash: String? = nil) throws {
         try writer.write { db in
             try db.execute(sql: """
                 UPDATE agentSession SET started = 1, cwd = COALESCE(?, cwd), sessionModel = COALESCE(sessionModel, ?),
-                sessionTools = COALESCE(?, sessionTools) WHERE agentId = ? AND itemId = ?
-                """, arguments: [cwd, model, tools, agentId, itemId])
+                sessionTools = COALESCE(?, sessionTools), mountSetHash = COALESCE(?, mountSetHash) WHERE agentId = ? AND itemId = ?
+                """, arguments: [cwd, model, tools, mountSetHash, agentId, itemId])
         }
     }
 
@@ -113,23 +116,25 @@ extension Store {
         case .base:
             let m = agent.sessionMeta
             return SessionSlot(scope: scope, sessionId: agent.sessionId, started: agent.sessionStarted, cwd: m?.cwd, model: m?.model,
-                               tools: m?.tools, endedAt: m?.endedAt.map { Date(timeIntervalSince1970: $0) }, lastTurnId: m?.lastTurnId)
+                               tools: m?.tools, endedAt: m?.endedAt.map { Date(timeIntervalSince1970: $0) }, lastTurnId: m?.lastTurnId,
+                               mountSetHash: m?.mountSetHash)
         case .item(let itemId):
             let s = try itemSession(agentId: agent.id, itemId: itemId)
             return SessionSlot(scope: scope, sessionId: s.sessionId, started: s.started, cwd: s.cwd, model: s.sessionModel,
-                               tools: s.sessionTools, endedAt: s.lastEndedAt, lastTurnId: s.lastTurnId)
+                               tools: s.sessionTools, endedAt: s.lastEndedAt, lastTurnId: s.lastTurnId, mountSetHash: s.mountSetHash)
         }
     }
 
-    func markSessionStarted(agentId: String, scope: SessionScope, cwd: String, model: String, tools: String) throws {
+    func markSessionStarted(agentId: String, scope: SessionScope, cwd: String, model: String, tools: String, mountSetHash: String? = nil) throws {
         switch scope {
         case .item(let itemId):
-            try markItemSessionStarted(agentId: agentId, itemId: itemId, cwd: cwd, model: model, tools: tools)
+            try markItemSessionStarted(agentId: agentId, itemId: itemId, cwd: cwd, model: model, tools: tools, mountSetHash: mountSetHash)
         case .base:
             try writer.write { db in
                 guard var agent = try Agent.fetchOne(db, key: agentId) else { return }
                 var meta = agent.sessionMeta ?? SessionMeta()
                 meta.cwd = cwd; meta.model = model; meta.tools = tools
+                if let mountSetHash { meta.mountSetHash = mountSetHash }
                 agent.sessionMeta = meta
                 agent.sessionStarted = true
                 try agent.update(db, columns: ["sessionMeta", "sessionStarted"])

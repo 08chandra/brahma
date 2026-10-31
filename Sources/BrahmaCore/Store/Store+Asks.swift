@@ -535,7 +535,7 @@ extension Store {
     /// the owner paths, its one caller is an access preset the owner turned on (`requestAccess`, owner-delegated, note
     /// `auto: <title>`, `decidedBy` `preset:<id>`).
     func ownerDecide(db: Database, askId: String, approve: Bool, note: String, acknowledgeChange: Bool, currentHash: String??,
-                     grant: GrantApproval?, decidedBy: String = "owner", now: Date) throws -> Ask {
+                     grant: GrantApproval?, decidedBy: String = "owner", extensionApproved: Bool = false, now: Date) throws -> Ask {
         var ask = try requireAsk(db, askId)
         guard ask.kind.isDecision else {
             throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
@@ -549,6 +549,9 @@ extension Store {
             let slug = try Company.fetchOne(db, key: ask.companyId)?.slug ?? "<co>"
             throw WorkError.invalid("approve access with: brahma access approve \(slug) \(ask.ref) --scope … --duration …")
         }
+        // An extension ask is carried out by `ExtensionLibrary.approve` (the app) before it is approved; a plain approve is refused.
+        if approve, ask.kind == .extension, !extensionApproved { throw WorkError.invalid(ExtensionLibrary.cliApproveRefusal) }
+        if !approve, ask.kind == .extension { try ExtensionLibrary.declined(db, ask: ask, now: now) }
         ask.ownerNote = Store.flat(note, max: Store.maxAskField)
         ask.ownerDecidedAt = now
         try settle(db, ask: &ask, status: approve ? .approved : .rejected, decidedBy: decidedBy, now: now)

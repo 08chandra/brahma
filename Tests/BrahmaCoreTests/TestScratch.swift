@@ -181,7 +181,7 @@ enum Scratch {
 
     /// Executable regular files under `dir` that a test made itself: not a hard link of a shared fake (`FakeTools`), not a
     /// name the test declared with `FakeTools.fixtureMode`, and not inside `.git/` (git's own sample hooks and checkouts)
-    /// or `.brahma/bin/` (the engine's shell prefix, the subject's own output).
+    /// or `.brahma/bin/` and `.brahma/hooks/` (the engine's shell prefix and pre-commit hook, the subject's own output).
     static func strayExecutables(in dir: URL, allowedNames: Set<String>) -> [String] {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isExecutableKey, .isDirectoryKey]
         guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: Array(keys), options: []) else { return [] }
@@ -190,7 +190,7 @@ enum Scratch {
             guard let v = try? url.resourceValues(forKeys: keys) else { continue }
             let name = url.lastPathComponent
             if v.isDirectory == true {
-                if name == ".git" || (name == "bin" && url.deletingLastPathComponent().lastPathComponent == ".brahma") { e.skipDescendants() }
+                if name == ".git" || ((name == "bin" || name == "hooks") && url.deletingLastPathComponent().lastPathComponent == ".brahma") { e.skipDescendants() }
                 continue
             }
             guard v.isRegularFile == true, v.isExecutable == true, !allowedNames.contains(name) else { continue }

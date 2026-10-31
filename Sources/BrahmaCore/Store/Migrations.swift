@@ -705,6 +705,53 @@ enum Migrations {
         m.registerMigration("v5-restore") { db in
             try createRestoreTables(db)
         }
+        m.registerMigration("v5-extensions") { db in
+            // Verified packages by tree hash. publisher/source/treeSha256 come from the installer's fetch path, never the package.
+            try db.create(table: "extensionPackage") { t in
+                t.primaryKey("hash", .text)
+                t.column("id", .text).notNull()
+                t.column("version", .text).notNull()
+                t.column("publisher", .text).notNull()
+                t.column("sourceType", .text).notNull()
+                t.column("sourceUrl", .text)
+                t.column("sourceSha", .text)
+                t.column("treeSha256", .text).notNull()
+                // The plugin parts alone (what the workspace mounts and the compiler rehashes).
+                t.column("pluginTreeSha256", .text).notNull()
+                t.column("fetchedAt", .datetime).notNull()
+                t.column("lintFacts", .text)   // JSON
+                t.column("notices", .text)     // JSON
+            }
+            try db.create(table: "companyExtension") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("id", .text).notNull()
+                t.column("hash", .text).notNull()
+                t.column("enabled", .boolean).notNull().defaults(to: true)
+                t.column("installedAskId", .text)
+                t.column("installedAt", .datetime).notNull()
+                t.primaryKey(["companyId", "id"])
+            }
+            try db.create(table: "extensionBinding") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("id", .text).notNull()
+                t.column("scope", .text).notNull()   // role|agent
+                t.column("target", .text).notNull()
+                t.column("op", .text).notNull()      // add|remove
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(table: "extensionEvent") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("extId", .text).notNull()
+                t.column("kind", .text).notNull()    // staged|installed|declined|mountBlocked|tamper|try|removed
+                t.column("detail", .text)
+                t.column("createdAt", .datetime).notNull()
+            }
+            // The frozen mount set of a session; a different set on the next turn forces a fresh session.
+            try db.alter(table: "agentSession") { t in t.add(column: "mountSetHash", .text) }
+            // A reason waiting for the agent's next turn (`Store.forceFreshSession`).
+            try db.alter(table: "agent") { t in t.add(column: "pendingSessionReset", .text) }
+        }
         m.registerMigration("v5-timers") { db in
             try db.create(table: "timer") { t in
                 t.primaryKey("id", .text)

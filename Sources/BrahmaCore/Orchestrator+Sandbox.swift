@@ -77,7 +77,9 @@ extension Orchestrator {
     /// company's workspace protected, no backup targets until Task 13b). Workspace entries left out of the scope are
     /// logged. (No sweep of `<cwd>/.claude`: probe (c) showed project skills and agents do not load in a sandboxed turn.) A refused scope throws `SandboxRefusal`; a link in one of the agent's own places
     /// is removed (never followed) so its next turn can start, and the owner is told the path either way.
-    nonisolated func prepareSandbox(agent: Agent, company: Company, kind: TurnKind, item: WorkItem?, turnId: String) async throws -> SandboxedTurn {
+    /// `extraDomains`: the egress the turn's mounted extensions declare (`ExtensionLibrary.agentNetwork`, Task 5a), joined to the grants'.
+    nonisolated func prepareSandbox(agent: Agent, company: Company, kind: TurnKind, item: WorkItem?, turnId: String,
+                                    extraDomains: [String] = []) async throws -> SandboxedTurn {
         let left = await runner.waitForTurnProcesses(agentId: agent.id)
         if !left.isEmpty {
             throw SandboxRefusal(reason: "processes of an earlier turn are still running (pid \(left.map(String.init).joined(separator: ", ")))")
@@ -115,9 +117,11 @@ extension Orchestrator {
                 }
                 grants.removeAll { g in dropped.contains { $0.ref == g.ref } }
                 let rebuild: @Sendable (GrantInputs) throws -> SandboxScope = { inputs in
-                    try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
-                                             kind: kind, item: item, company: company, grants: inputs,
-                                             darwinUserTemp: env.darwinUserTemp, userHome: env.userHome)
+                    var inputs = inputs
+                    inputs.domains = Array(Set(inputs.domains + extraDomains)).sorted()
+                    return try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
+                                                    kind: kind, item: item, company: company, grants: inputs,
+                                                    darwinUserTemp: env.darwinUserTemp, userHome: env.userHome)
                 }
                 let scope = try rebuild(GrantResolver.inputs(grants))
                 return (SandboxedTurn(scope: scope, shellPrefix: prefix, grants: grants, rebuild: rebuild, item: item), dropped)
