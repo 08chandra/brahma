@@ -816,6 +816,9 @@ public struct SandboxScope: Equatable, Sendable {
             // A turn without an item writes nothing in the common git dir.
             denyWrite += both(git)
         }
+        // Claude Code's shared temp places (its default write grant has them): never written by a turn either, so it cannot
+        // plant files the owner's own sessions later read (fix round 2, B-N3).
+        denyWrite += claudeShared + ["/private/tmp/claude", "/tmp/claude"].map { URL(fileURLWithPath: $0, isDirectory: false) }
         denyWrite = dedupe(denyWrite)
 
         let network = CompanyNetwork.scope(company: company, grantDomains: grants.domains, grantWebDomains: grants.webDomains)

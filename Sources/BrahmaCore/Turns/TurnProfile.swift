@@ -237,9 +237,10 @@ public enum TurnProfileCompiler {
               markers[0].hasPrefix(containmentMarkerPrefix), markers[0].count > containmentMarkerPrefix.count + 8 else {
             throw TurnProfileError.sandboxIncomplete("no containment marker")
         }
-        // Every hook is exec form (C1): a shell-form one would be refused by the prefix and fail open.
-        for hook in (p.settings.hooks ?? [:]).values.flatMap({ $0 }).flatMap(\.hooks) where hook.command.contains(where: \.isWhitespace) {
-            throw TurnProfileError.sandboxIncomplete("a hook is not in exec form")
+        // Every hook is exec form (C1; the type always encodes `args`) with an absolute executable (fix round 2, A-N2): a
+        // relative one would be looked up through the turn's PATH. A space in the path is fine: exec form does not split it.
+        for hook in (p.settings.hooks ?? [:]).values.flatMap({ $0 }).flatMap(\.hooks) where !hook.command.hasPrefix("/") {
+            throw TurnProfileError.sandboxIncomplete("a hook's executable is not an absolute path")
         }
     }
 

@@ -286,6 +286,28 @@ private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: 
         #expect(denied.contains(w.world.paths.home.path)); #expect(denied.contains(w.world.paths.home.resolvedForSandbox.path))
     }
 
+    /// Fix round 2 (B-N5): a wait that cannot finish (its deadline, a corrupt record) refuses the turn AND tells the owner once;
+    /// its wording does not depend on the profile.
+    @Test func throwingWaitAlertsTheOwner() async throws {
+        let w = try SandboxTurnWorld(profile: .workspace)
+        w.world.fake.waitError = TurnRecords.Corrupt(path: "/x/turns/a.turn", quarantinedTo: "/x/turns/quarantine/a.turn")
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        let failed = try #require(try w.world.turns(w.eng).last)
+        #expect(failed.outcome == .failed)
+        #expect(failed.summary?.contains("sandbox scope:") == false, "\(failed.summary ?? "")")
+        #expect(failed.summary?.contains("earlier turn") == true, "\(failed.summary ?? "")")
+        #expect(try w.ownerAlerts().contains { $0.summary.contains("/x/turns/a.turn") })
+    }
+
+    /// Fix round 2 (B-N6): a failed containment self-test is an owner alert, not only per-turn summaries.
+    @Test func blindContainmentAlertsTheOwner() async throws {
+        let w = try SandboxTurnWorld(canSeeSandboxes: { false })
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        #expect(try w.ownerAlerts().contains { $0.summary.contains("cannot see sandboxed processes") })
+    }
+
     @Test func earlierTurnProcessesStillRunningRefuseTheTurn() async throws {
         let w = try SandboxTurnWorld()
         w.world.fake.leftovers = TurnLeftovers(killed: [], survivors: [4242])

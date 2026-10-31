@@ -34,7 +34,10 @@ struct LiveSandboxProbeTests {
         let layout = SandboxLayout(paths: paths, company: company, agentHandle: agent.name)
         try layout.ensure()
         let env = SandboxEnvironment.current
-        let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: brahma)
+        let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [],
+                                           mcpServer: ShellPrefix.MCPServer(executable: brahma, database: paths.database.path,
+                                                                            companyId: company.id, agentId: agent.id,
+                                                                            ownerHome: env.userHome.path))
         let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [], backupTargets: [], kind: .work,
                                              item: item, company: company, grants: GrantInputs(), darwinUserTemp: env.darwinUserTemp,
                                              claudeTmpRoot: env.claudeTmpRoot)
@@ -196,8 +199,9 @@ struct LiveSandboxProbeTests {
         try """
             echo "T=$TMPDIR"
             /usr/bin/env -u BRAHMA_TURN_MARK /usr/bin/perl -e 'use POSIX; exit 0 if fork; POSIX::setsid(); exit 0 if fork; open(F, ">", $ARGV[0]); print F "$$\\n"; close F; close STDIN; close STDOUT; close STDERR; exec "/bin/sleep", "60"' '\(pidFile.path)'
-            sleep 1
+            sleep 4
             echo "pid=$(cat '\(pidFile.path)')"
+            echo probe > /private/tmp/claude-$(id -u)/brahma-probe-planted 2>/dev/null && echo "planted=yes" || echo "planted=no"
             """.write(to: scope.cwd.appending(path: "probe.sh"), atomically: true, encoding: .utf8)
         let e = request("This is an automated test of Brahma's own engine. Use the Bash tool to run `sh probe.sh` once, then reply with its output only.")
         try SettingsFile.write(try TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: e)), to: URL(fileURLWithPath: e.settingsFilePath!))
@@ -205,9 +209,28 @@ struct LiveSandboxProbeTests {
         runner.baseEnvironment = ProcessInfo.processInfo.environment
         var results: [String] = []
         var cost = 0.0
+        // While the turn runs (its script sleeps after starting the escapee), the engine's marker probe must classify the
+        // escapee as this turn's (fix round 2, I3): proof the marker is what finds it in Claude's real sandbox.
+        let marker = try #require(e.containmentMarker)
+        let watcher = Task.detached { () -> SandboxProbe.Match? in
+            for _ in 0..<600 {
+                if let text = try? String(contentsOf: pidFile, encoding: .utf8), let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    return SandboxProbe(machMarker: marker).classify(pid)
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return nil
+        }
         for try await event in runner.run(e) {
             if case .result(let r) = event { results.append(r.text ?? ""); cost += r.costUSD ?? 0 }
         }
+        let matched = await watcher.value
+        print("PROBE (e) marker probe while it ran: \(matched.map { "\($0)" } ?? "never saw the pid")")
+        #expect(matched == .mine)
+        let planted = FileManager.default.fileExists(atPath: "/private/tmp/claude-\(getuid())/brahma-probe-planted")
+        print("PROBE (e) a turn could write into the owner's /private/tmp/claude-<uid>: \(planted)")
+        #expect(!planted, "B-N3: the shared Claude temp dir must not be writable from a turn")
+        if planted { try? FileManager.default.removeItem(atPath: "/private/tmp/claude-\(getuid())/brahma-probe-planted") }
         let escapee = (try? String(contentsOf: pidFile, encoding: .utf8)).flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
         let alive = escapee.map { kill($0, 0) == 0 && ProcessTable.entry($0)?.isZombie != true } ?? false
         print("PROBE (e) escapee \(escapee.map(String.init) ?? "none") alive after the turn: \(alive); result: \(results.joined().prefix(300))")
@@ -219,7 +242,9 @@ struct LiveSandboxProbeTests {
 
         // (f)
         for (name, hook) in [("exit-2", HookCommand(command: "/bin/sh", args: ["-c", "echo blocked-by-probe-hook >&2; exit 2"])),
-                             ("cannot-run", HookCommand(command: "/usr/bin/false", args: []))] {
+                             ("fails", HookCommand(command: "/usr/bin/false", args: [])),
+                             // A moved or deleted `brahma`: the executable cannot be spawned at all (fix round 2, A-N3).
+                             ("missing-path", HookCommand(command: "/nonexistent/brahma", args: ["hook", "pre-tool"]))] {
             let f = request("Use the Bash tool to run `echo hello-probe` once, then reply with the exact tool result text.")
             var profile = TurnProfileCompiler.profile(for: f)
             profile.settings.hooks = (profile.settings.hooks ?? [:]).merging(["PreToolUse": [HookMatcher(matcher: "Bash", hooks: [hook])]]) { $1 }

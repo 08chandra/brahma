@@ -65,10 +65,9 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
         let expected: NSDictionary = ["mcpServers": ["company": [
             "command": "/usr/bin/brahma",
             "args": ["mcp", "--db", paths.database.path, "--company", "c1", "--agent", "a1"],
-            // 1b fix round 1 (I2): the parameters also ride in the env block, so the shell prefix can start the server by a
-            // fixed argv (`<exe> mcp`) without evaluating the line Claude hands it.
-            "env": ["BRAHMA_TURN_TOKEN": "tok123", "BRAHMA_MCP_DB": paths.database.path, "BRAHMA_MCP_COMPANY": "c1",
-                    "BRAHMA_MCP_AGENT": "a1"] as NSDictionary,
+            // 1b fix round 2 (A-N1): the database, company and agent are baked into the prefix's fixed argv, never taken
+            // from an env block; only the token (and a review item or the audit flag) rides here.
+            "env": ["BRAHMA_TURN_TOKEN": "tok123"] as NSDictionary,
         ] as NSDictionary] as NSDictionary]
         #expect(obj == expected)
         let attrs = try FileManager.default.attributesOfItem(atPath: path)

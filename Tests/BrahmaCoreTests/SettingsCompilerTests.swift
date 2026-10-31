@@ -436,6 +436,28 @@ private func pretty(_ settings: ClaudeSettings) throws -> String {
         #expect(s.hooks?["PreToolUse"]?.first?.hooks.first?.args == ["hook", "pre-tool", "--mode", "standard", "--subagents"])
     }
 
+    /// Fix round 2 (A-N2): what validation checks of a hook is what matters: an absolute executable and an encoded `args`. A path
+    /// with a space is a fine exec-form executable; a relative one is refused.
+    @Test func hookValidationChecksTheExecutableNotItsSpaces() throws {
+        let w = try CompileWorld()
+        var r = w.request(try w.scope(.work))
+        r.hookExecutable = "/Applications/Bra hma.app/Contents/MacOS/brahma"
+        try TurnProfileCompiler.validate(TurnProfileCompiler.profile(for: r))
+        r.hookExecutable = "brahma"
+        #expect(throws: TurnProfileError.self) { try TurnProfileCompiler.validate(TurnProfileCompiler.profile(for: r)) }
+    }
+
+    /// Fix round 2 (B-N3): the owner's shared Claude temp places are write-denied too (Claude's default write grant includes
+    /// them), in both spellings.
+    @Test func sharedClaudeTempIsWriteDenied() throws {
+        let w = try CompileWorld()
+        let deny = Set(try w.scope(.work).denyWrite.map(\.path))
+        for path in ["/private/tmp/claude-\(getuid())", "/tmp/claude-\(getuid())", "/private/tmp/claude", "/tmp/claude",
+                     "/private/tmp/claude-tool-results", "/tmp/claude-tool-results"] {
+            #expect(deny.contains(path), "\(path)")
+        }
+    }
+
     /// Task 2's unremovable marker, adopted for turns: the sandbox allows the turn's own mach name (and no service answers it),
     /// so the engine can recognize the turn's processes by their sandbox alone.
     @Test func sandboxedTurnCarriesItsMachMarker() throws {

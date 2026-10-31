@@ -90,18 +90,16 @@ struct Network: ParsableCommand {
         try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
-        let patch: SandboxPatch
         do {
             switch action {
             case .list:
                 print(safe(c.name))
                 for line in CompanyNetwork.listing(company: c) { print(safe(line)) }
                 return
-            case .domain(let edit): patch = SandboxPatch(); try store.editSandbox(companyId: c.id) { try .domains(edit, web: web, company: $0) }
-            case .local(let on): patch = SandboxPatch(allowLocalBinding: on); try store.updateSandbox(companyId: c.id, patch)
-            case .toolchain(let edit): patch = SandboxPatch(); try store.editSandbox(companyId: c.id) { try .toolchain(edit, company: $0) }
+            case .domain(let edit): try store.editSandbox(companyId: c.id) { try .domains(edit, web: web, company: $0) }
+            case .local(let on): try store.updateSandbox(companyId: c.id, SandboxPatch(allowLocalBinding: on))
+            case .toolchain(let edit): try store.editSandbox(companyId: c.id) { try .toolchain(edit, company: $0) }
             }
-            _ = patch
         } catch {
             throw fail("\(error)")
         }

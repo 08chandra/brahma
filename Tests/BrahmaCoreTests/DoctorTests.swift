@@ -148,6 +148,15 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         let viaMDM = await Doctor.run(claudePath: "claude", runner: ProbeRunner(good()), exec: exec(), now: t0,
                                       managedSettingsPath: managed.path, managedPreferencesPath: mdm.path)
         #expect(item(viaMDM, "sideload-allowed")?.status == .fail)
+        try FileManager.default.removeItem(at: mdm)
+        // Fix round 2: a drop-in folder that cannot be listed fails (it may hold the setting).
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: dropIns.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dropIns.path) }   // exec-bit fixture: a directory mode
+        #expect(item(await run(), "sideload-allowed")?.status == .fail)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dropIns.path)   // exec-bit fixture: a directory mode
+        // And the per-user MDM profile.
+        #expect(Doctor.managedPreferencePaths(user: "owner") == ["/Library/Managed Preferences/com.anthropic.claudecode.plist",
+                                                                  "/Library/Managed Preferences/owner/com.anthropic.claudecode.plist"])
     }
 
     /// C1: exec-form hooks (and `onFailure`) are verified live on 2.1.312; an older CLI may run a hook without its arguments,

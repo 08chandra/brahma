@@ -69,8 +69,7 @@ import Testing
             return server?["env"] as? [String: String] ?? [:]
         }
         // The server's parameters ride in the env block too (1b fix round 1, I2): the turn's prefix starts it by a fixed argv.
-        let base = ["BRAHMA_TURN_TOKEN": "tok", MCPLaunch.dbVariable: p.database.path, MCPLaunch.companyVariable: company.id,
-                    MCPLaunch.agentVariable: agent.id]
+        let base = ["BRAHMA_TURN_TOKEN": "tok"]   // fix round 2: the server's identity is in its argv, not its env
         #expect(try env(["BRAHMA_SECRET_STORE": "file"]) == base.merging(["BRAHMA_SECRET_STORE": "file"]) { $1 })
         #expect(try env(["BRAHMA_SECRET_STORE": "memory"]) == base)
         #expect(try env([:]) == base)

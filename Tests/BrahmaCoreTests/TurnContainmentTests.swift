@@ -244,6 +244,67 @@ private let perl = "/usr/bin/perl"
         #expect(await gone(escapee))
     }
 
+    /// Fix round 2 (B-N1): a record whose leader's pid now belongs to another process (a different start time) matches nothing
+    /// by group or session: that pid's session and group are the new holder's, never the old turn's.
+    @Test func reusedLeaderPidIsNotMatchedByGroupOrSession() async throws {
+        let dir = try tempDir()
+        let records = dir.appending(path: "turns")
+        let childFile = dir.appending(path: "child.pid")
+        let holder = try ProcessGroupChild.spawn(executable: "/bin/sh", arguments: ["sh", "-c", "/bin/sleep 300 & echo $! > '\(childFile.path)'; exec /bin/sleep 300"],
+                                                 environment: ["PATH": "/usr/bin:/bin"], workingDirectory: dir, output: -1, newSession: true)
+        defer { holder.signalGroup(SIGKILL); _ = holder.finish() }
+        let child = try await pid(in: childFile)
+        let start = try #require(ProcessTable.entry(holder.pid)?.start)
+        // The record names that pid, but an older leader (it ran before and exited; the pid was handed out again).
+        try TurnRecords.add(TurnRecord(leader: holder.pid, leaderStart: start - 3600, since: start - 3600, machMarker: nil),
+                            agentId: "a1", in: records)
+        let left = try TurnRecords.reap(agentId: "a1", in: records)
+        #expect(left.killed.isEmpty, "\(left)")
+        #expect(kill(child, 0) == 0, "the new holder's session was left alone")
+        #expect(kill(holder.pid, 0) == 0)
+        #expect(try TurnRecords.load(agentId: "a1", in: records).isEmpty)
+    }
+
+    /// Fix round 2 (B-N2): a process table that cannot be read rules nothing out: a survivor, and the record is kept.
+    @Test func unreadableProcessTableKeepsTheRecord() throws {
+        let dir = try tempDir()
+        let records = dir.appending(path: "turns")
+        let record = TurnRecord(leader: 4242, leaderStart: 1, since: 1, machMarker: "dev.brahma.turn.0123456789abcdef")
+        try TurnRecords.add(record, agentId: "a1", in: records)
+        let left = try TurnRecords.reap(agentId: "a1", in: records, snapshot: { [] })
+        #expect(left.survivors == [-1])
+        #expect(try TurnRecords.load(agentId: "a1", in: records) == [record])
+    }
+
+    /// Fix round 2 (B-N5): a record that cannot be read is moved aside (never left to block the agent forever); the caller is
+    /// told which file it was.
+    @Test func corruptRecordIsQuarantined() throws {
+        let dir = try tempDir()
+        let records = dir.appending(path: "turns")
+        try FileManager.default.createDirectory(at: records, withIntermediateDirectories: true)
+        try Data("not json".utf8).write(to: records.appending(path: "a1.turn"))
+        do {
+            _ = try TurnRecords.reap(agentId: "a1", in: records)
+            Issue.record("a corrupt record was read")
+        } catch let e as TurnRecords.Corrupt {
+            #expect(e.path.hasSuffix("a1.turn"))
+            #expect(FileManager.default.fileExists(atPath: e.quarantinedTo))
+        }
+        #expect(!FileManager.default.fileExists(atPath: records.appending(path: "a1.turn").path))
+        #expect(try TurnRecords.reap(agentId: "a1", in: records) == TurnLeftovers())
+    }
+
+    /// Fix round 2 (B-N6): a failed containment self-test is retried after a backoff, not remembered for the engine's life.
+    @Test func selfTestRetriesAfterABackoff() {
+        let runs = Counter(), ok = Counter()
+        let test = ContainmentSelfTest(run: { runs.add(); return ok.value > 0 }, backoff: 10)
+        #expect(!test.check(now: 0)); #expect(runs.value == 1)
+        #expect(!test.check(now: 5)); #expect(runs.value == 1, "within the backoff: not re-run")
+        ok.add()
+        #expect(test.check(now: 11)); #expect(runs.value == 2)
+        #expect(test.check(now: 1000)); #expect(runs.value == 2, "a pass is kept")
+    }
+
     /// M2: a wait that cannot finish fails closed: on its deadline, or when the waiting task is cancelled.
     @Test func waitFailsClosedOnDeadlineAndCancellation() async throws {
         let registry = TurnRegistry()
@@ -386,4 +447,10 @@ private let perl = "/usr/bin/perl"
         #expect(ProcessTable.snapshot().contains { $0.pid == getpid() })
         #expect(ProcessTable.entry(-5) == nil)
     }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock(); private var n = 0
+    func add() { lock.withLock { n += 1 } }
+    var value: Int { lock.withLock { n } }
 }

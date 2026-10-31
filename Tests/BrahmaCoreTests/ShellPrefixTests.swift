@@ -22,6 +22,11 @@ private struct PrefixWorld {
     }
 
     var home: String { layout.agentHome.path }
+
+    func server(_ exe: String) -> ShellPrefix.MCPServer {
+        ShellPrefix.MCPServer(executable: exe, database: paths.database.path, companyId: company.id, agentId: "a1",
+                              ownerHome: "/Users/owner")
+    }
     var cache: String { layout.agentCache.path }
 
     /// The sentinel as an unsandboxed test needs it: present but unreadable (mode 000), the way the sandbox makes it look.
@@ -99,12 +104,18 @@ private struct PrefixWorld {
     @Test func scriptIsTheBriefsBodyAndRewrittenOnlyWhenChanged() throws {
         let w = try PrefixWorld()
         let text = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/bash", keepNames: ["A_KEY", "B"],
-                                          mcpExecutable: "/opt/brahma/bin/brahma")
+                                          mcpServer: w.server("/opt/brahma/bin/brahma"))
         // Fix round 1: absolute tools (I1); the engine's MCP server by a fixed argv, never `$1` (I2); git keys by digits (M1).
         #expect(text == """
             #!/bin/sh
             if [ -n "${BRAHMA_TURN_TOKEN:-}" ]; then
-              case "$1" in "/opt/brahma/bin/brahma mcp"|"/opt/brahma/bin/brahma mcp "*|"'/opt/brahma/bin/brahma' mcp"|"'/opt/brahma/bin/brahma' mcp "*|"'/opt/brahma/bin/brahma' 'mcp'"|"'/opt/brahma/bin/brahma' 'mcp' "*) unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; exec '/opt/brahma/bin/brahma' mcp;; esac
+              case "$1" in "/opt/brahma/bin/brahma mcp"|"/opt/brahma/bin/brahma mcp "*|"'/opt/brahma/bin/brahma' mcp"|"'/opt/brahma/bin/brahma' mcp "*|"'/opt/brahma/bin/brahma' 'mcp'"|"'/opt/brahma/bin/brahma' 'mcp' "*)
+                set -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME='/Users/owner' BRAHMA_AGENT_ID='a1' BRAHMA_HOME='\(w.paths.home.path)' BRAHMA_WORKSPACES='\(w.paths.workspaces.path)' "BRAHMA_TURN_TOKEN=$BRAHMA_TURN_TOKEN"
+                if [ "${BRAHMA_SECRET_STORE:-}" = file ]; then set -- "$@" BRAHMA_SECRET_STORE=file; fi
+                if [ -n "${BRAHMA_MCP_REVIEW_ITEM:-}" ]; then set -- "$@" "BRAHMA_MCP_REVIEW_ITEM=$BRAHMA_MCP_REVIEW_ITEM"; fi
+                if [ "${BRAHMA_MCP_AUDIT:-}" = 1 ]; then set -- "$@" BRAHMA_MCP_AUDIT=1; fi
+                exec "$@" '/opt/brahma/bin/brahma' mcp --db '\(w.paths.database.path)' --company 'c1' --agent 'a1';;
+              esac
               echo "brahma: refused" >&2; exit 126
             fi
             if \(ShellPrefix.tools.cat) '\(w.paths.sentinel.path)' >/dev/null 2>&1; then echo "brahma: sandbox is not active; command refused" >&2; exit 126; fi
@@ -145,18 +156,41 @@ private struct PrefixWorld {
         try Data("sentinel".utf8).write(to: w.paths.sentinel)   // readable: no sandbox, as for an MCP server
         let exe = try FakeTools.script("brahma", """
             echo "args:$*"
-            echo "token:${BRAHMA_TURN_TOKEN:-none} oauth:${CLAUDE_CODE_OAUTH_TOKEN:-unset} api:${ANTHROPIC_API_KEY:-unset} home:$HOME"
+            /usr/bin/env | /usr/bin/sort | /usr/bin/grep -v -e '^PWD=' -e '^SHLVL=' -e '^_=' -e '^OLDPWD='
             """)
-        let prefix = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpExecutable: exe.path)
-        let env = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": "tok", "HOME": "/Users/owner", "CLAUDE_CODE_OAUTH_TOKEN": "o",
-                   "ANTHROPIC_API_KEY": "k"]
+        let server = w.server(exe.path)
+        let prefix = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpServer: server)
+        // Fix round 2 (A-N1): the server's identity is baked into the argv, and only a fixed allowlist of variables reaches it
+        // (`env -i`): a forged env block cannot choose the database, company, agent, data home or a preload library.
+        let env = ["PATH": "/usr/bin:/bin", "BRAHMA_TURN_TOKEN": "tok", "HOME": "/Users/forged", "CLAUDE_CODE_OAUTH_TOKEN": "o",
+                   "ANTHROPIC_API_KEY": "k", "BRAHMA_MCP_DB": "/agent/fake.sqlite", "BRAHMA_MCP_COMPANY": "other",
+                   "BRAHMA_MCP_AGENT": "other", "BRAHMA_HOME": "/agent/home", "BRAHMA_AGENT_ID": "other", "LD_PRELOAD": "/agent/x.so",
+                   "BRAHMA_SECRET_STORE": "file", "BRAHMA_MCP_REVIEW_ITEM": "K-1"]
+        let expected = """
+            args:mcp --db \(w.paths.database.path) --company c1 --agent a1
+            BRAHMA_AGENT_ID=a1
+            BRAHMA_HOME=\(w.paths.home.path)
+            BRAHMA_MCP_REVIEW_ITEM=K-1
+            BRAHMA_SECRET_STORE=file
+            BRAHMA_TURN_TOKEN=tok
+            BRAHMA_WORKSPACES=\(w.paths.workspaces.path)
+            HOME=/Users/owner
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+            """
         let marker = w.root.appending(path: "rode-along")
         for form in ["\(exe.path) mcp --db x", "'\(exe.path)' mcp --db x", "'\(exe.path)' 'mcp' '--db' 'x'", "\(exe.path) mcp",
                      "\(exe.path) mcp --db x; touch '\(marker.path)'", "\(exe.path) mcp $(touch \(marker.path))"] {
             let r = try w.run(prefix, form, environment: env)
             #expect(r.status == 0, "\(form): \(r.err)")
-            #expect(r.out == "args:mcp\ntoken:tok oauth:unset api:unset home:/Users/owner\n", "\(form)")
+            #expect(r.out == expected, "\(form): \(r.out)")
         }
+        // Only `file` passes as the secret store, and the audit flag only as `1`.
+        let quiet = try w.run(prefix, "\(exe.path) mcp", environment: ["BRAHMA_TURN_TOKEN": "tok", "BRAHMA_SECRET_STORE": "memory",
+                                                                          "BRAHMA_MCP_AUDIT": "yes"])
+        #expect(!quiet.out.contains("BRAHMA_SECRET_STORE")); #expect(!quiet.out.contains("BRAHMA_MCP_AUDIT"))
+        let audit = try w.run(prefix, "\(exe.path) mcp", environment: ["BRAHMA_TURN_TOKEN": "tok", "BRAHMA_MCP_AUDIT": "1"])
+        #expect(audit.out.contains("BRAHMA_MCP_AUDIT=1\n"))
         #expect(!FileManager.default.fileExists(atPath: marker.path), "nothing on the line ever runs")
         // Token set, any other line (Claude's own Bash wrapper shape included): refused, whatever the sentinel says.
         try w.unreadableSentinel()
@@ -167,11 +201,15 @@ private struct PrefixWorld {
         // Without the token the line is an ordinary command (sandbox, scrub, agent HOME).
         let plain = try w.run(prefix, "/bin/echo $HOME", environment: ["PATH": "/usr/bin:/bin", "HOME": "/Users/owner"])
         #expect(plain.out == "\(w.home)\n")
-        // No MCP executable named: a token-carrying line is refused.
+        // No MCP server named: a token-carrying line is refused.
         let none = try ShellPrefix.write(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [])
         #expect(try w.run(none, "\(exe.path) mcp", environment: env).status == 126)
         #expect(throws: SandboxError.self) {
-            _ = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpExecutable: "/x/$(id)/brahma")
+            _ = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpServer: w.server("/x/$(id)/brahma"))
+        }
+        var odd = w.server(exe.path); odd.companyId = "c'1"
+        #expect(throws: SandboxError.self) {
+            _ = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpServer: odd)
         }
     }
 

@@ -322,12 +322,28 @@ public enum ShellPrefix {
         #endif
     }()
 
+    /// The engine's own company MCP server as the prefix starts it: the executable and, baked into the fixed argv, the database,
+    /// company and agent it serves (fix round 2, A-N1), so a forged env block cannot choose them; `ownerHome` is its `HOME`.
+    public struct MCPServer: Equatable, Sendable {
+        public var executable: String
+        public var database: String
+        public var companyId: String
+        public var agentId: String
+        public var ownerHome: String
+
+        public init(executable: String, database: String, companyId: String, agentId: String, ownerHome: String) {
+            self.executable = executable; self.database = database; self.companyId = companyId; self.agentId = agentId
+            self.ownerHome = ownerHome
+        }
+    }
+
     /// The script: the brief's body, with these changes (live probes, Step 1; fix round 1):
     /// - Claude Code starts stdio MCP servers through the prefix too, outside the sandbox. A process carrying the per-turn
     ///   `BRAHMA_TURN_TOKEN` (only the company server's env block has it; never claude's own environment) is either the engine's
-    ///   own server, started by the FIXED argv `<mcpExecutable> mcp` (it reads its parameters from its env block; the auth
-    ///   variables are unset first), or refused (126). The line Claude hands over is only compared, never evaluated.
-    ///   Without `mcpExecutable` every token-carrying line is refused.
+    ///   own server, started by the FIXED argv `<exe> mcp --db <db> --company <c> --agent <a>` under `env -i` with a fixed
+    ///   allowlist (PATH, the owner's HOME, the engine's BRAHMA_AGENT_ID/HOME/WORKSPACES, and from the block only the token, a
+    ///   `file` secret store, the review item and the audit flag, which the credential checks), or refused (126). The line Claude
+    ///   hands over is only compared, never evaluated. Without `mcpServer` every token-carrying line is refused.
     /// - `cat`, `env` and `sed` by absolute path (`tools`).
     /// - `GIT_CONFIG_KEY_<digits>` (the git settings Claude Code injects next to `GIT_CONFIG_COUNT`) survive the scrub; nothing
     ///   else that holds `KEY` does.
@@ -335,23 +351,38 @@ public enum ShellPrefix {
     /// or `%00` is refused (`SandboxError.unsafePathCharacter`); a keep name that is not a variable name is dropped (it is then
     /// scrubbed like any other). No bracket range is used in a `case` (locale-independent); `sed`'s runs with `LC_ALL=C`.
     public static func script(layout: SandboxLayout, paths: BrahmaPaths, shell: String, keepNames: [String],
-                              mcpExecutable: String? = nil) throws -> String {
+                              mcpServer: MCPServer? = nil) throws -> String {
         // The agent's places as the turn's scope names them: built under the resolved workspace.
         let ws = layout.workspace.resolvedForSandbox
         let home = ws.appending(path: ".brahma/home/\(layout.handle)").path
         let cache = ws.appending(path: ".brahma/home/\(layout.handle)/cache").path
         let sentinel = paths.sentinel.path
-        for value in [home, cache, sentinel, shell] + (mcpExecutable.map { [$0] } ?? [])
+        let serverPaths = mcpServer.map { [$0.executable, $0.database, $0.ownerHome, paths.home.path, paths.workspaces.path] } ?? []
+        for value in [home, cache, sentinel, shell] + serverPaths
         where SandboxPath.isUnsafe(value) || !value.hasPrefix("/") || value.contains("$") || value.contains("`") {
             throw SandboxError.unsafePathCharacter(value)
         }
-        let keep = keepNames.filter { $0.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil }
-        let serverForms = mcpExecutable.map { exe in
-            ["\"\(exe) mcp\"", "\"\(exe) mcp \"*", "\"'\(exe)' mcp\"", "\"'\(exe)' mcp \"*", "\"'\(exe)' 'mcp'\"", "\"'\(exe)' 'mcp' \"*"]
-                .joined(separator: "|")
+        if let mcpServer {
+            for id in [mcpServer.companyId, mcpServer.agentId]
+            where id.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) == nil {
+                throw SandboxError.unsafePathCharacter(id)
+            }
         }
-        let serverCase = mcpExecutable.map { exe in
-            "  case \"$1\" in \(serverForms!)) unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; exec '\(exe)' mcp;; esac\n"
+        let keep = keepNames.filter { $0.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil }
+        let serverCase = mcpServer.map { m in
+            let exe = m.executable
+            let forms = ["\"\(exe) mcp\"", "\"\(exe) mcp \"*", "\"'\(exe)' mcp\"", "\"'\(exe)' mcp \"*", "\"'\(exe)' 'mcp'\"",
+                         "\"'\(exe)' 'mcp' \"*"].joined(separator: "|")
+            return """
+                  case "$1" in \(forms))
+                    set -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME='\(m.ownerHome)' BRAHMA_AGENT_ID='\(m.agentId)' BRAHMA_HOME='\(paths.home.path)' BRAHMA_WORKSPACES='\(paths.workspaces.path)' "BRAHMA_TURN_TOKEN=$BRAHMA_TURN_TOKEN"
+                    if [ "${BRAHMA_SECRET_STORE:-}" = file ]; then set -- "$@" BRAHMA_SECRET_STORE=file; fi
+                    if [ -n "${BRAHMA_MCP_REVIEW_ITEM:-}" ]; then set -- "$@" "BRAHMA_MCP_REVIEW_ITEM=$BRAHMA_MCP_REVIEW_ITEM"; fi
+                    if [ "${BRAHMA_MCP_AUDIT:-}" = 1 ]; then set -- "$@" BRAHMA_MCP_AUDIT=1; fi
+                    exec "$@" '\(exe)' mcp --db '\(m.database)' --company '\(m.companyId)' --agent '\(m.agentId)';;
+                  esac
+
+                """
         } ?? ""
         return """
             #!/bin/sh
@@ -377,14 +408,14 @@ public enum ShellPrefix {
     /// replaced), only when its content differs. Blocking. Returns its path (as the layout names it).
     @discardableResult
     public static func write(layout: SandboxLayout, paths: BrahmaPaths, shell: String, keepNames: [String],
-                             mcpExecutable: String? = nil) throws -> URL {
+                             mcpServer: MCPServer? = nil) throws -> URL {
         try SandboxLayout.validate(handle: layout.handle)
         // Claude Code splits `CLAUDE_CODE_SHELL_PREFIX` at whitespace (M7): the prefix's own path holds none.
         let prefixPath = layout.workspace.resolvedForSandbox.appending(path: ".brahma/bin/\(layout.shellPrefix.lastPathComponent)").path
         for path in [prefixPath, layout.shellPrefix.path] where path.contains(where: \.isWhitespace) {
             throw SandboxError.unsafePathCharacter(path)
         }
-        let text = try script(layout: layout, paths: paths, shell: shell, keepNames: keepNames, mcpExecutable: mcpExecutable)
+        let text = try script(layout: layout, paths: paths, shell: shell, keepNames: keepNames, mcpServer: mcpServer)
         let data = Data(text.utf8)
         let name = layout.shellPrefix.lastPathComponent
         let existing = try? EngineFiles.read(workspace: layout.workspace, dir: ".brahma/bin", name: name, limit: 64 * 1024)

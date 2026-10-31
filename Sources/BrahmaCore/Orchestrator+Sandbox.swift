@@ -59,6 +59,14 @@ struct SandboxedTurn: Sendable {
     var item: WorkItem? = nil
     /// The turn's mach marker (`dev.brahma.turn.<id>`), compiled into its sandbox.
     var marker: String = ""
+    /// The turn's kind (fix round 2, B-N4): a grant rebuild that fails repairs only what is the agent's own on this kind.
+    var kind: TurnKind = .work
+}
+
+/// A turn that does not start because the agent's earlier turns are not accounted for (any profile): `earlier turn: <why>`.
+struct EarlierTurnRefusal: Error, CustomStringConvertible {
+    var reason: String
+    var description: String { "earlier turn: \(reason)" }
 }
 
 /// A sandboxed turn that does not start (its scope was refused, or its places could not be made): `sandbox scope: <why>`.
@@ -96,7 +104,18 @@ extension Orchestrator {
         do {
             left = try await runner.waitForTurnProcesses(agentId: agent.id, records: turnRecordDirectory)
         } catch {
-            throw SandboxRefusal(reason: "processes of an earlier turn could not be accounted for (\(error))")
+            // A deadline, a cancellation, or a record that could not be read (it is quarantined, so it cannot block the agent
+            // forever): the owner hears of it once (fix round 2, B-N5).
+            let what: String
+            if let corrupt = error as? TurnRecords.Corrupt {
+                what = "the record of its earlier turns (\(corrupt.path)) could not be read and was moved to \(corrupt.quarantinedTo); "
+                    + "processes that turn left may still be running"
+            } else {
+                what = "its earlier turns' processes could not be accounted for (\(error))"
+            }
+            alertOnce(reason: "turn-wait:\(agent.id)", company: company, agent: agent, now: clock(),
+                      text: "A turn of @\(agent.name) in \(company.name) did not start: \(what). Check `ps` for strays.")
+            throw EarlierTurnRefusal(reason: what)
         }
         let now = clock()
         if !left.killed.isEmpty {
@@ -111,8 +130,9 @@ extension Orchestrator {
             let pids = left.survivors.map(String.init).joined(separator: ", ")
             alertOnce(reason: "turn-leftovers:\(agent.id)", company: company, agent: agent, now: now,
                       text: "@\(agent.name)'s turns do not start in \(company.name): processes of an earlier turn are still running "
-                        + "and could not be killed (pid \(pids)). Check them (`ps -p \(pids)`) and stop them.")
-            throw SandboxRefusal(reason: "processes of an earlier turn are still running (pid \(pids))")
+                        + "and could not be killed, or could not be told apart (pid \(pids); -1: the process table could not be "
+                        + "read; a pid may be an unrelated process the kernel could not classify). Check them (`ps -p \(pids)`).")
+            throw EarlierTurnRefusal(reason: "processes of an earlier turn are still running (pid \(pids))")
         }
     }
 
@@ -144,6 +164,11 @@ extension Orchestrator {
         // The containment of a sandboxed turn finds its processes by their sandbox; blind, it could not (B-I2).
         let env = sandboxEnvironment
         guard await blocking.run({ env.canSeeSandboxes() }) else {
+            // Retried after a backoff (`ContainmentSelfTest`); the owner hears of it once (fix round 2, B-N6).
+            alertOnce(reason: "containment-self-test", company: company, agent: agent, now: clock(),
+                      text: "Sandboxed turns in \(company.name) do not start: Brahma cannot see sandboxed processes on this Mac (its "
+                        + "containment self-test failed), so it could not make sure nothing of a turn outlives it. It retries "
+                        + "shortly; if this stays, run `brahma doctor`.")
             throw SandboxRefusal(reason: "cannot see sandboxed processes on this Mac (the containment self-test failed), so no "
                                  + "sandboxed turn starts")
         }
@@ -167,7 +192,10 @@ extension Orchestrator {
                 // The prefix's backstop, re-asserted before every sandboxed turn (M4).
                 try Sentinel.write(paths: paths)
                 try layout.ensure()
-                let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [], mcpExecutable: mcp)
+                let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [],
+                                                   mcpServer: ShellPrefix.MCPServer(executable: mcp, database: paths.database.path,
+                                                                                    companyId: company.id, agentId: agent.id,
+                                                                                    ownerHome: env.userHome.path))
                 // The owner's grants that apply to this turn (Task 9). A read path that no longer is what was approved (a link,
                 // an alias or a file is where the directory was) is revoked and the owner told; one that is missing for now or
                 // newly overlaps a protected place is only left out of this turn. The turn runs either way.
@@ -192,7 +220,7 @@ extension Orchestrator {
                 let scope = try rebuild(GrantResolver.inputs(grants))
                 if let tmp = scope.claudeTmp { try ClaudeTmp.ensure(tmp) }
                 return (SandboxedTurn(scope: scope, shellPrefix: prefix, grants: grants, rebuild: rebuild, item: item,
-                                      marker: TurnProfileCompiler.containmentMarkerPrefix + UUID().uuidString.lowercased()), dropped)
+                                      marker: TurnProfileCompiler.containmentMarkerPrefix + UUID().uuidString.lowercased(), kind: kind), dropped)
             }
         } catch {
             throw await sandboxRefusal(error, agent: agent, company: company, layout: layout, item: item, kind: kind, now: now)
@@ -233,7 +261,7 @@ extension Orchestrator {
             } catch {
                 throw await sandboxRefusal(error, agent: agent, company: company,
                                            layout: SandboxLayout(paths: paths, company: company, agentHandle: agent.name),
-                                           item: item, kind: .work, now: clock())
+                                           item: item, kind: turn.kind, now: clock())
             }
             turn.grants = grants
         }

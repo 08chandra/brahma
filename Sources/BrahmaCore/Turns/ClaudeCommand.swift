@@ -110,11 +110,8 @@ public enum MCPConfig {
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
         if let reviewItem { args += ["--review-item", reviewItem] } else if audit { args.append("--audit") }
         var env = [tokenVariable: turnToken]
-        // The parameters again, next to the token: a sandboxed turn's shell prefix starts the server by the fixed argv
-        // `<exe> mcp` and never evaluates the line Claude hands it (1b fix round 1, I2); the server reads them from here.
-        env[MCPLaunch.dbVariable] = paths.database.path
-        env[MCPLaunch.companyVariable] = agent.companyId
-        env[MCPLaunch.agentVariable] = agent.id
+        // A sandboxed turn's shell prefix starts the server by a fixed argv with the database, company and agent baked in (1b
+        // fix rounds 1-2); only what the turn's credential checks rides here.
         if let reviewItem { env[MCPLaunch.reviewItemVariable] = reviewItem } else if audit { env[MCPLaunch.auditVariable] = "1" }
         // A dev/demo home's file secret store reaches the turn's `brahma mcp` (which resolves it again against its database's
         // own home, refusing the default home), so its redactor loads the same values as the engine's. Never the agent's env.

@@ -399,14 +399,28 @@ enum TurnRecords {
         return dir.appending(path: "\(agentId).turn")
     }
 
+    /// A record file that cannot be read (not a regular file, not the format): moved aside to `quarantinedTo` so it cannot
+    /// refuse the agent's turns forever; the caller tells the owner (fix round 2, B-N5).
+    struct Corrupt: Error, CustomStringConvertible {
+        let path: String
+        let quarantinedTo: String
+        var description: String { "the turn record \(path) could not be read; it was moved to \(quarantinedTo)" }
+    }
+
     static func load(agentId: String, in dir: URL) throws -> [TurnRecord] {
         let url = try file(agentId: agentId, in: dir)
         var st = stat()
         guard lstat(url.path, &st) == 0 else { return [] }
-        guard st.st_mode & S_IFMT == S_IFREG, let data = FileManager.default.contents(atPath: url.path) else {
-            throw SandboxError.linkedPath(url.path)
+        if st.st_mode & S_IFMT == S_IFREG, let data = FileManager.default.contents(atPath: url.path),
+           let records = try? JSONDecoder().decode([TurnRecord].self, from: data) {
+            return records
         }
-        return try JSONDecoder().decode([TurnRecord].self, from: data)
+        let aside = dir.appending(path: "quarantine/\(url.lastPathComponent).\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: aside.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        // A rename moves the entry itself (a link stays a link; nothing is followed).
+        guard rename(url.path, aside.path) == 0 else { throw SandboxError.linkedPath(url.path) }
+        throw Corrupt(path: url.path, quarantinedTo: aside.path)
     }
 
     static func save(_ records: [TurnRecord], agentId: String, in dir: URL) throws {
@@ -436,17 +450,25 @@ enum TurnRecords {
     /// process in its session or group started no earlier than it (a pid in use cannot become a group or session id), and, for a
     /// sandboxed turn, every process whose sandbox carries its marker (`SandboxSweep`, fail closed). A record is forgotten only
     /// once nothing of it is left. Blocking.
-    static func reap(agentId: String, in dir: URL) throws -> TurnLeftovers {
+    /// `snapshot` is injectable for tests. Fails closed (fix round 2, B-N2): a table that cannot be read (empty, or without
+    /// this very process) rules nothing out: a survivor (`-1`), and the record is kept.
+    static func reap(agentId: String, in dir: URL, snapshot: @escaping () -> [ProcessEntry] = ProcessTable.snapshot) throws -> TurnLeftovers {
         var out = TurnLeftovers()
         var kept: [TurnRecord] = []
         let me = getpid(), uid = getuid()
         for record in try load(agentId: agentId, in: dir) {
             var killed = Set<pid_t>()
+            var unreadable = false
+            // A pid in use cannot become a group or session id, so while the old leader's pid is held by ANOTHER process (a
+            // different start time), every group or session match is that process's, never the old turn's (fix round 2, B-N1).
+            let reused = ProcessTable.entry(record.leader).map { $0.start != record.leaderStart } ?? false
             func members() -> [ProcessEntry] {
-                ProcessTable.snapshot().filter { p in
+                let table = snapshot()
+                guard !table.isEmpty, table.contains(where: { $0.pid == me }) else { unreadable = true; return [] }
+                return table.filter { p in
                     guard p.uid == uid, p.pid != me, !p.isZombie else { return false }
                     if p.pid == record.leader { return p.start == record.leaderStart }
-                    guard record.leader > 0, p.start >= record.leaderStart else { return false }
+                    guard record.leader > 0, !reused, p.start >= record.leaderStart else { return false }
                     return p.pgid == record.leader || ProcessTable.session(p) == record.leader
                 }
             }
@@ -458,10 +480,12 @@ enum TurnRecords {
             }
             var survivors = members().map(\.pid)
             if let marker = record.machMarker {
-                let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: record.since)
+                let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: record.since, snapshot: snapshot)
                 killed.formUnion(swept.killed)
                 survivors += swept.survivors
+                if swept.tableUnreadable { unreadable = true }
             }
+            if unreadable { survivors.append(-1) }
             out.killed += killed.sorted()
             out.survivors += survivors
             if !survivors.isEmpty { kept.append(record) }
@@ -529,12 +553,36 @@ final class TurnRegistry: @unchecked Sendable {
     }
 }
 
-/// Once per engine: can the engine see what a sandbox allows? It runs a Seatbelt-sandboxed `/bin/sleep` with a known marker
-/// and asks the kernel about it. If it cannot tell, the containment of sandboxed turns is blind, and they do not start (B-I2).
-public enum ContainmentSelfTest {
-    public static let passed: Bool = run()
+/// Can the engine see what a sandbox allows? It runs a Seatbelt-sandboxed `/bin/sleep` with a known marker and asks the kernel
+/// about it. If it cannot tell, the containment of sandboxed turns is blind, and they do not start (B-I2). A pass is kept; a
+/// failure is retried after a backoff, never remembered for the engine's life (fix round 2, B-N6).
+public final class ContainmentSelfTest: @unchecked Sendable {
+    public static let shared = ContainmentSelfTest(run: ContainmentSelfTest.probe, backoff: 30)
+    /// The engine's default answer (`SandboxEnvironment.canSeeSandboxes`).
+    public static var passed: Bool { shared.check(now: AwakeTime.uptime()) }
 
-    public static func run() -> Bool {
+    private let run: @Sendable () -> Bool
+    private let backoff: TimeInterval
+    private let lock = NSLock()
+    private var ok = false
+    private var retryAt: TimeInterval?
+
+    init(run: @escaping @Sendable () -> Bool, backoff: TimeInterval) { self.run = run; self.backoff = backoff }
+
+    /// The last answer, re-checked when it was a failure whose backoff (`now`: awake seconds) has passed.
+    func check(now: TimeInterval) -> Bool {
+        lock.withLock {
+            if ok { return true }
+            if let retryAt, now < retryAt { return false }
+            ok = run()
+            retryAt = ok ? nil : now + backoff
+            return ok
+        }
+    }
+
+    public static func run() -> Bool { probe() }
+
+    @Sendable static func probe() -> Bool {
         #if os(macOS)
         let marker = "dev.brahma.turn.selftest-\(UUID().uuidString.lowercased())"
         let profile = "(version 1)(allow default)(deny mach-lookup (global-name-prefix \"dev.brahma.turn.\"))"
@@ -545,7 +593,7 @@ public enum ContainmentSelfTest {
                                                       output: -1, newSession: true) else { return false }
         defer { child.signalGroup(SIGKILL); child.finish() }
         let probe = SandboxProbe(machMarker: marker), other = SandboxProbe(machMarker: marker + "x")
-        let deadline = AwakeTime.uptime() + 3
+        let deadline = AwakeTime.uptime() + 5
         while AwakeTime.uptime() < deadline {
             // sandbox-exec applies the profile, then execs sleep: wait until the kernel reports it sandboxed.
             if SandboxCheck.isSandboxed(child.pid) == true {
@@ -611,10 +659,14 @@ final class TurnChild: @unchecked Sendable {
         _ = group.waitForExit()
         var left = Set(containment.sweep())
         if let probe = containment.probe {
-            left.formUnion(SandboxSweep.run(probe: probe, since: containment.sinceStamp).survivors)
+            let swept = SandboxSweep.run(probe: probe, since: containment.sinceStamp)
+            left.formUnion(swept.survivors)
+            // An unreadable table rules nothing out (fix round 2, B-N2): the turn's record stays, the next turn re-checks.
+            if swept.tableUnreadable { left.insert(-1) }
         }
         group.finish()
         let table = ProcessTable.snapshot()
-        return table.filter { left.contains($0.pid) }
+        let unaccounted = left.contains(-1) ? [ProcessEntry(pid: -1, ppid: 0, pgid: 0, uid: getuid(), start: 0, isZombie: false)] : []
+        return table.filter { left.contains($0.pid) } + unaccounted
     }
 }

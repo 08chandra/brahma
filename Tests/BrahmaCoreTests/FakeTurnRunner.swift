@@ -82,7 +82,13 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
     /// What `waitForTurnProcesses` reports (processes of an earlier turn it killed, and any it could not).
     var leftovers: TurnLeftovers { get { lock.withLock { _leftovers } } set { lock.withLock { _leftovers = newValue } } }
     private var _leftovers = TurnLeftovers()
-    func waitForTurnProcesses(agentId: String, records: URL) async throws -> TurnLeftovers { leftovers }
+    /// What `waitForTurnProcesses` throws instead, when set.
+    var waitError: (any Error)? { get { lock.withLock { _waitError } } set { lock.withLock { _waitError = newValue } } }
+    private var _waitError: (any Error)?
+    func waitForTurnProcesses(agentId: String, records: URL) async throws -> TurnLeftovers {
+        if let e = waitError { throw e }
+        return leftovers
+    }
     var maxConcurrent: Int { lock.withLock { _maxConcurrent } }
 
     func script(_ handle: String, _ s: Script...) {

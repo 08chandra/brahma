@@ -63,6 +63,11 @@ public enum Doctor {
     /// The MDM profile Claude Code also reads (`com.anthropic.claudecode`).
     public static let managedPreferencesPath = "/Library/Managed Preferences/com.anthropic.claudecode.plist"
 
+    /// The MDM profiles Claude Code reads: the machine's and the user's (fix round 2).
+    public static func managedPreferencePaths(user: String = NSUserName()) -> [String] {
+        [managedPreferencesPath, "/Library/Managed Preferences/\(user)/com.anthropic.claudecode.plist"]
+    }
+
     /// Runs an executable with arguments and returns its stdout, or nil when it cannot run; throws `ExecTimedOut` when it hangs. Injected by tests.
     public typealias Exec = @Sendable (_ executable: String, _ arguments: [String]) async throws -> String?
 
@@ -71,7 +76,7 @@ public enum Doctor {
     public static func run(claudePath: String, runner: any TurnRunning, exec: @escaping Exec = defaultExec,
                            now: Date = .now, hookExecutable: String = "brahma",
                            managedSettingsPath: String = Doctor.managedSettingsPath,
-                           managedPreferencesPath: String = Doctor.managedPreferencesPath,
+                           managedPreferencesPath: String? = nil,
                            sandbox: (any SandboxedRunner)? = nil) async -> DoctorReport {
         let found = await versionOutcome(claudePath: claudePath, exec: exec)
         guard let version = found.version else {
@@ -83,7 +88,7 @@ public enum Doctor {
         let probe = await runProbe(runner: runner)
         items += probe.items
         items.append(toolsItem(probe.tools))
-        items.append(sideloadItem(path: managedSettingsPath, preferences: managedPreferencesPath))
+        items.append(sideloadItem(path: managedSettingsPath, preferences: managedPreferencesPath.map { [$0] } ?? managedPreferencePaths()))
         if let sandbox { items.append(await pluginDetailsItem(claudePath: claudePath, sandbox: sandbox)) }
         var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
         // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
@@ -221,7 +226,7 @@ public enum Doctor {
     /// its `managed-settings.d/*.json` drop-ins, the MDM profile (M3). Set, the CLI ignores `--plugin-dir` (extension parts would
     /// silently not load) and `--mcp-config` (every turn would lose its company server). Managed settings that cannot be read
     /// fail: the doctor cannot tell.
-    static func sideloadItem(path: String, preferences: String = managedPreferencesPath) -> DoctorItem {
+    static func sideloadItem(path: String, preferences: [String] = managedPreferencePaths()) -> DoctorItem {
         let name = "sideload-allowed"
         let fm = FileManager.default
         var documents: [(String, [String: Any]?)] = []
@@ -229,13 +234,18 @@ public enum Doctor {
             documents.append((path, fm.contents(atPath: path).flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }))
         }
         let dropIns = URL(fileURLWithPath: path).deletingLastPathComponent().appending(path: "managed-settings.d")
-        if let names = try? fm.contentsOfDirectory(atPath: dropIns.path) {
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: dropIns.path, isDirectory: &isDir) {
+            // A drop-in folder that cannot be listed may hold the setting: the doctor cannot tell.
+            guard isDir.boolValue, let names = try? fm.contentsOfDirectory(atPath: dropIns.path) else {
+                return DoctorItem(name: name, status: .fail, detail: "can't read the managed settings folder \(dropIns.path)")
+            }
             for file in names.sorted() where file.hasSuffix(".json") {
                 let p = dropIns.appending(path: file).path
                 documents.append((p, fm.contents(atPath: p).flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }))
             }
         }
-        if fm.fileExists(atPath: preferences) {
+        for preferences in preferences where fm.fileExists(atPath: preferences) {
             documents.append((preferences, fm.contents(atPath: preferences).flatMap {
                 (try? PropertyListSerialization.propertyList(from: $0, format: nil)) as? [String: Any]
             }))
