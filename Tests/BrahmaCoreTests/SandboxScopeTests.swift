@@ -793,6 +793,26 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         }
     }
 
+    /// Plan L (PR-7): `.brahma/preview` is engine-only (write-denied on every turn, even before it exists); its `logs` are
+    /// readable when they exist (the failure DM points the setter at the log), and nothing else of it is.
+    @Test func previewDirIsEngineOnlyAndItsLogsReadable() throws {
+        let w = try SandboxWorld()
+        let before = try w.scope(.work)
+        #expect(before.denyWrite.paths.contains(w.p(".brahma/preview")))
+        #expect(!before.readable.paths.contains(w.p(".brahma/preview/logs")), "not mounted while missing")
+        let l = EngineLayout(workspace: w.ws)
+        try FileManager.default.createDirectory(at: l.previewLogs, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: l.previewDir.appending(path: "other"), withIntermediateDirectories: true)
+        for kind in TurnKind.allCases {
+            let s = try w.scope(kind)
+            #expect(s.denyWrite.paths.contains(w.p(".brahma/preview")), "\(kind)")
+            #expect(s.readable.paths.contains(w.p(".brahma/preview/logs")), "\(kind)")
+            #expect(!s.readable.paths.contains(w.p(".brahma/preview")) && !s.readable.paths.contains(w.p(".brahma/preview/other")), "\(kind)")
+            #expect(!s.writable.paths.contains { $0 == w.p(".brahma/preview") || $0.hasPrefix(w.p(".brahma/preview") + "/") }, "\(kind)")
+        }
+        #expect(l.previewLogs.path == w.p(".brahma/preview/logs"))
+    }
+
     @Test func mergeRepoNotReachable() throws {
         let w = try SandboxWorld()
         let git = w.store.gitWorkspace(root: w.ws, companyId: w.company.id)
