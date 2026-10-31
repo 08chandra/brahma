@@ -212,7 +212,7 @@ struct LiveSandboxProbeTests {
         // While the turn runs (its script sleeps after starting the escapee), the engine's marker probe must classify the
         // escapee as this turn's (fix round 2, I3): proof the marker is what finds it in Claude's real sandbox.
         let marker = try #require(e.containmentMarker)
-        let watcher = Task.detached { () -> SandboxProbe.Match? in
+        let watcher = Task.detached { () -> SandboxProbe.Match? in   // scope-escape: reads the pid file and probes the process table; makes no scratch dirs
             for _ in 0..<600 {
                 if let text = try? String(contentsOf: pidFile, encoding: .utf8), let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
                     return SandboxProbe(machMarker: marker).classify(pid)
