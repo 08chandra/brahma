@@ -351,6 +351,36 @@ public enum EngineFiles {
         return try? readAll(fd: fd, limit: limit, shown: url.path)
     }
 
+    /// The file `<root>/<relative>` opened with `flags` (plus `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`) relative to a descriptor
+    /// walk from `root` (resolved; every directory on the way opened with `O_NOFOLLOW`, never created), for an engine file
+    /// that a sandboxed process can reach (a preview's log). Nil when the file or a directory on the way does not exist.
+    /// Throws `UnsafeEngineFile` when a part of the way is a link or not a directory, the file is a link, or it fails
+    /// `copyProblem` (not regular, another hard link, another owner). The caller closes the descriptor.
+    static func openFileNoFollow(under root: URL, _ relative: String, flags: Int32) throws -> Int32? {
+        let parts = relative.split(separator: "/").map { Array($0.utf8) }
+        guard let name = parts.last, isValidName(name) else {
+            throw UnsafeEngineFile(path: root.appending(path: relative).path, problem: "is not a valid file name")
+        }
+        let dfd: Int32
+        switch try openWay(root: root, parts.dropLast(), shown: root.appending(path: relative).path) {
+        case .missing: return nil
+        case .blocked(let problem): throw problem
+        case .open(let fd): dfd = fd
+        }
+        defer { close(dfd) }
+        let shown = root.appending(path: relative).path
+        let fd = withCName(name) { openat(dfd, $0, flags | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
+        guard fd >= 0 else {
+            let err = errno
+            if err == ENOENT { return nil }
+            throw UnsafeEngineFile(path: shown, problem: err == ELOOP ? "is a symbolic link" : "cannot be opened (\(String(cString: strerror(err))))")
+        }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { close(fd); throw UnsafeEngineFile(path: shown, problem: "cannot be inspected") }
+        if let problem = copyProblem(st) { close(fd); throw UnsafeEngineFile(path: shown, problem: problem) }
+        return fd
+    }
+
     // MARK: Open directories (engine checkouts)
 
     /// An engine directory opened by the safe walk and held open, so a caller that must hand its path to another program
