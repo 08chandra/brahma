@@ -64,7 +64,10 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var countedTokens: Int { inputTokens + outputTokens + cacheCreationTokens }
 }
 
-public enum ActivityKind: String, Codable, Sendable { case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval }
+/// What an activity line is about. `preview` and `release` are Plan L's (preview surfaces; releases and deploys).
+public enum ActivityKind: String, Codable, Sendable {
+    case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval, preview, release
+}
 
 public struct ActivityEvent: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "activityEvent"
