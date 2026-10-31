@@ -19,7 +19,8 @@ import BrahmaCore
     }
 
     @Test(arguments: [(ActivityFilter.messages, ActivityKind.message, true), (.messages, .turnStarted, false), (.turns, .toolUse, true),
-                      (.states, .stateChanged, true), (.problems, .usage, true), (.problems, .message, false), (.all, .error, true)])
+                      (.states, .stateChanged, true), (.problems, .usage, true), (.problems, .message, false), (.all, .error, true),
+                      (.work, .preview, true), (.work, .release, true), (.problems, .preview, false), (.messages, .release, false)])
     func filterKinds(f: ActivityFilter, k: ActivityKind, ok: Bool) { #expect(f.includes(k) == ok) }
 
     @Test func agentBadgeLabels() throws {
