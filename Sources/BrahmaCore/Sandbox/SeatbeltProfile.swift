@@ -10,6 +10,7 @@ import Foundation
 /// (deny file-read* file-read-data (subpath "<each protected>") (subpath "<each other company workspace>"))
 /// (deny file-write* (require-not (require-any (subpath "<each writable>") <toolchain writes>
 ///     (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper") (regex #"^/dev/fd/"))))
+/// (deny file-link file-clone (require-not (require-any (subpath "<each writable>"))))      ; fix round 5
 /// (deny signal (target others))
 /// (deny mach-lookup … the brief's names … (global-name "com.apple.cfprefsd.agent") (global-name "com.apple.cfprefsd.daemon"))
 /// (deny process-exec …)
@@ -117,6 +118,12 @@ public enum SeatbeltProfile {
         let allowedWrites = writable.map(subpath) + writes + ["(literal \"/dev/null\")", "(literal \"/dev/tty\")",
                                                              "(literal \"/dev/dtracehelper\")", "(regex #\"^/dev/fd/\")"]
         lines.append("(deny file-write* (require-not (require-any " + allowedWrites.joined(separator: " ") + ")))")
+        // A hard link would give a file the command cannot read a readable name inside a writable entry, and a clone
+        // (`clonefile`, `cp -c`) a single-link copy of it that passes the engine's `EngineFiles.copyProblem`. Seatbelt already
+        // refuses both for a source the command may not read (probed, fix round 5); this says so explicitly and for every
+        // source outside the writable entries (`file-link` is checked on both of its paths, `file-clone` on the source).
+        // Links and clones inside a writable entry still work; a plain `cp` from a readable entry falls back to copying.
+        lines.append("(deny file-link file-clone (require-not (require-any " + writable.map(subpath).joined(separator: " ") + ")))")
         lines.append("(deny signal (target others))")
         // A sandboxed check may not inspect other processes (open files, pid info): this stops `lsof -p <owner pid>` and the
         // like from discovering the NSIRD_* staging names and so reaching another process's in-flight atomic saves (A

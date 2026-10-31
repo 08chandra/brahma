@@ -162,6 +162,117 @@ import Foundation
         #expect(try String(contentsOf: secret, encoding: .utf8) == "SECRET-BYTES\n")
     }
 
+    /// I1 (fix round 5): `commitAll` runs inside the agent's own turn (submit, release), so the agent's processes are alive
+    /// while it stages. The engine stages each path itself from a descriptor it checked (`EngineFiles.copyProblem` on that
+    /// descriptor); no `git add` ever reads the tree by path. Between the listing and the staging the agent swaps a listed
+    /// file for a hard link to an outside secret and un-ignores another such link: the secret's bytes never reach the object
+    /// database (every object is checked), the outside file is untouched, the rest of the work is committed and the owner is told.
+    @Test func engineStagingNeverCopiesAFileSwappedOrUnignoredAfterTheListing() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var (ws, log) = fileWatched(f)
+        let secret = try tempDir().appending(path: "secret")
+        try "SECRET-BYTES\n".write(to: secret, atomically: true, encoding: .utf8)
+        let secretBlob = try f.git(["hash-object", secret.path])
+        let wt = try ws.addWorktree(key: "ACME-1")
+        try f.write("f.txt", "innocent", in: wt)
+        try f.write("ok.txt", "fine", in: wt)
+        try f.write(".gitignore", "leak.txt\n", in: wt)
+        try fm.linkItem(at: secret, to: wt.appending(path: "leak.txt"))          // ignored when the engine lists
+        ws.testHook = { stage in
+            guard stage == "listed" else { return }
+            // The swap: the innocent file the listing saw becomes a hard link to the secret.
+            try? FileManager.default.removeItem(at: wt.appending(path: "f.txt"))
+            try? FileManager.default.linkItem(at: secret, to: wt.appending(path: "f.txt"))
+            // The flip: `leak.txt` is no longer ignored.
+            try? "".write(to: wt.appending(path: ".gitignore"), atomically: true, encoding: .utf8)
+        }
+        let commit = try #require(try ws.commitAll(in: wt, message: "work"))
+        let names = try f.git(["ls-tree", "-r", "--name-only", commit]).split(separator: "\n").map(String.init)
+        #expect(names.contains("ok.txt") && names.contains("a.txt"), "\(names)")
+        #expect(!names.contains("f.txt") && !names.contains("leak.txt"), "\(names)")
+        // The whole object store: never the secret's id, never its bytes.
+        let ids = try f.git(["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])
+        #expect(!ids.contains(secretBlob), "the secret blob is in the object database")
+        let everyObject = try f.git(["cat-file", "--batch-all-objects", "--batch"])
+        #expect(!everyObject.contains("SECRET-BYTES"), "the secret's bytes are in the object database")
+        #expect(try String(contentsOf: secret, encoding: .utf8) == "SECRET-BYTES\n", "the outside file was changed")
+        #expect(log.all.contains { $0.contains("f.txt") && $0.contains("hard link") }, "\(log.all)")
+        #expect(!log.all.contains { $0.contains("leak.txt") }, "a file the listing never saw is not reported: \(log.all)")
+        ws.testHook = nil
+    }
+
+    /// The engine's staging keeps what `git add` kept: a symlink inside the checkout is stored as a link (mode 120000, its
+    /// target as the blob), an executable file as 100755, a removed tracked file is removed, and a new nested repository is
+    /// recorded as a gitlink of its HEAD without running anything in it. A link pointing outside the checkout (relative or
+    /// absolute) is left out and reported.
+    @Test func engineStagingKeepsLinksModesDeletionsAndNestedRepositories() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one", "gone.txt": "bye"])
+        let (ws, log) = fileWatched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        try fm.removeItem(at: wt.appending(path: "gone.txt"))
+        let tool = try f.write("tool.sh", "#!/bin/sh\n", in: wt)
+        try FakeTools.fixtureMode(0o755, at: tool)                   // exec-bit fixture: the mode under review, never run
+        try fm.createDirectory(at: wt.appending(path: "d"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(atPath: wt.appending(path: "inside").path, withDestinationPath: "a.txt")
+        try fm.createSymbolicLink(atPath: wt.appending(path: "d/up").path, withDestinationPath: "../a.txt")
+        try fm.createSymbolicLink(atPath: wt.appending(path: "outside").path, withDestinationPath: "d/../../../etc/hosts")
+        try fm.createSymbolicLink(atPath: wt.appending(path: "absolute").path, withDestinationPath: "/etc/hosts")
+        let sub = wt.appending(path: "sub")
+        try fm.createDirectory(at: sub, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "-q"], in: sub)
+        try f.write("f", "s\n", in: sub)
+        try GitFixture.plainGit(["add", "f"], in: sub)
+        try GitFixture.plainGit(["commit", "-q", "-m", "s"], in: sub)
+        let subHead = try GitFixture.plainGit(["rev-parse", "HEAD"], in: sub)
+        let commit = try #require(try ws.commitAll(in: wt, message: "shapes"))
+        let entries = try f.git(["ls-tree", "-r", commit]).split(separator: "\n").map(String.init)
+        func entry(_ path: String) -> String? { entries.first { $0.hasSuffix("\t\(path)") } }
+        #expect(entry("tool.sh")?.hasPrefix("100755 blob") == true, "\(entries)")
+        #expect(entry("a.txt")?.hasPrefix("100644 blob") == true, "\(entries)")
+        #expect(entry("inside")?.hasPrefix("120000 blob") == true, "\(entries)")
+        #expect(try f.git(["show", "\(commit):inside"]) == "a.txt")
+        #expect(entry("d/up")?.hasPrefix("120000 blob") == true, "\(entries)")
+        #expect(try f.git(["show", "\(commit):d/up"]) == "../a.txt")
+        #expect(entry("sub") == "160000 commit \(subHead)\tsub", "\(entries)")
+        #expect(entry("gone.txt") == nil && entry("outside") == nil && entry("absolute") == nil, "\(entries)")
+        #expect(log.all.contains { $0.contains("outside") && $0.contains("points outside") }, "\(log.all)")
+        #expect(log.all.contains { $0.contains("absolute") && $0.contains("points outside") }, "\(log.all)")
+        // The refused links stay where they are: the engine leaves them out, it never removes them.
+        var st = stat()
+        #expect(lstat(wt.appending(path: "outside").path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK)
+        #expect(lstat(wt.appending(path: "absolute").path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK)
+    }
+
+    /// M2 (fix round 5): `.brahma/` is the engine's. It stays out of the import commit and the quarantine commit (and so out of
+    /// the object database, which item turns can read) even when the exclude file could not be fixed (here: oversized, left
+    /// alone), because the engine's staging never takes it, whatever `.git/info/exclude` says.
+    @Test func importAndQuarantineLeaveBrahmaOutWhateverTheExcludeFileSays() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(ensure: false)
+        try GitFixture.plainGit(["init", "-q", "--initial-branch=main"], in: f.root)
+        try f.write(".git/info/exclude", String(repeating: "x", count: GitWorkspace.excludeReadLimit + 10))
+        try f.write("a.txt", "one")
+        let engineFile = try f.write(".brahma/notes/x.md", "ENGINE-NOTES-X")
+        let (ws, _) = fileWatched(f)
+        try ws.ensureRepo()
+        #expect(try f.git(["ls-tree", "-r", "--name-only", "main"]) == "a.txt")
+        func inRepository(_ url: URL) throws -> Bool {
+            try f.git(["cat-file", "-t", try f.git(["hash-object", url.path])], allowFailure: true) == "blob"
+        }
+        #expect(!(try inRepository(engineFile)), "the engine's file was imported")
+        #expect(try f.git(["check-ignore", "-q", ".brahma/notes/x.md"], allowFailure: true) == "", "the fixture holds: nothing ignores .brahma")
+        // The quarantine of the root checkout.
+        let main = try f.git(["rev-parse", "main"])
+        try f.write("stray.txt", "stray")
+        let more = try f.write(".brahma/notes/y.md", "ENGINE-NOTES-Y")
+        let q = try #require(try ws.quarantineRoot(expectedMain: main, stamp: "20261031-120000"))
+        #expect(Set(try f.git(["ls-tree", "-r", "--name-only", q.commit]).split(separator: "\n").map(String.init)) == ["a.txt", "stray.txt"])
+        #expect(!(try inRepository(more)), "the engine's file was quarantined")
+        #expect(fm.fileExists(atPath: more.path), "the clean removed the engine's file")
+    }
+
     @Test func ensureRepoImportsExistingFiles() throws {
         let f = try GitFixture(files: ["a.txt": "one", "src/b.swift": "two"])
         let files = try f.git(["ls-tree", "-r", "--name-only", "main"]).split(separator: "\n").map(String.init)
@@ -269,7 +380,8 @@ import Foundation
             try f.ws.commitAll(in: f.root, message: "stuck")
             Issue.record("expected a failure")
         } catch GitError.failed(let command, _, let stderr) {
-            #expect(command.contains("add")); #expect(stderr.contains("index.lock"))
+            // The engine's staging writes the index with `update-index` (fix round 5); that is the command the lock stops.
+            #expect(command.contains("update-index")); #expect(stderr.contains("index.lock"))
         }
         try? FileManager.default.removeItem(at: lock)
     }

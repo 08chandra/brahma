@@ -181,6 +181,35 @@ struct SeatbeltRunnerTests {
         #expect(d.exitCode != 0); #expect(!dText.contains("top-secret"))
     }
 
+    /// Fix round 5 probe (Task 3 canary obligation b): a hard link would give an unreadable file a readable name inside the
+    /// writable entry, and a clone (`cp -c`, `clonefile`) a single-link copy that passes the engine's `copyProblem`. Both are
+    /// denied for every source outside the writable entries: a protected path, the unreadable home, and a readable entry too
+    /// (`file-link` / `file-clone` with the source outside writable). Inside a writable entry both still work, and a plain
+    /// `cp` from a readable entry falls back from cloning to copying.
+    @Test func hardLinksAndClonesFromOutsideTheWritableAreDenied() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let fm = FileManager.default
+        let w = try Self.mkdir(h.appending(path: "w"))
+        try Self.file(h.appending(path: "secret/x"), "top-secret")
+        try Self.file(h.appending(path: "nr/f"), "hidden-text")
+        try Self.file(h.appending(path: "pub/y"), "public-text")
+        let r = Self.runner(Self.baseline(protected: [h.appending(path: "secret")]))
+        let p = Self.policy(writable: [w], readable: [h.appending(path: "pub")])
+        for (source, label) in [("../secret/x", "protected"), ("../nr/f", "home"), ("../pub/y", "readable")] {
+            let (a, aText) = try await Self.run("ln \(source) l-\(label) && cat l-\(label)", p, runner: r)
+            #expect(a.exitCode != 0, "ln from \(label): \(aText)")
+            #expect(!aText.contains("-text") && !aText.contains("top-secret"), "ln from \(label): \(aText)")
+            #expect(!fm.fileExists(atPath: w.appending(path: "l-\(label)").path), "a hard link from \(label) was made")
+            let (b, bText) = try await Self.run("cp -c \(source) c-\(label) && cat c-\(label)", p, runner: r)
+            #expect(b.exitCode != 0, "clone from \(label): \(bText)")
+            #expect(!bText.contains("-text") && !bText.contains("top-secret"), "clone from \(label): \(bText)")
+            #expect(!fm.fileExists(atPath: w.appending(path: "c-\(label)").path), "a clone from \(label) was made")
+        }
+        let (ok, okText) = try await Self.run("echo in > a && ln a b && cp -c a c && cp ../pub/y d && cat b c d", p, runner: r)
+        #expect(ok.exitCode == 0, "\(okText)")
+        #expect(okText.contains("in\nin\npublic-text"), "\(okText)")
+    }
+
     // MARK: Escapes
 
     @Test func launchctlSubmitDenied() async throws {
@@ -657,6 +686,7 @@ struct SeatbeltRunnerTests {
                      "(deny file-read-data (subpath \"/Users/o\") (subpath \"/Volumes\")",
                      "(allow file-read-data (subpath \"/w\")", "(deny file-read* file-read-data (subpath \"/Users/o/.ssh\")",
                      "(deny file-write* (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\")",
+                     "(deny file-link file-clone (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\"))))",
                      "(deny signal (target others))", "(deny process-info* (target others))",
                      "(deny mach-lookup (global-name \"com.apple.SecurityServer\")",
                      "(deny process-exec (literal \"/usr/bin/osascript\")", "(allow mach-lookup (global-name \"com.apple.windowserver.active\")",

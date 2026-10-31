@@ -291,18 +291,54 @@ struct GitCommand: Sendable {
                            environment: env, label: "config --list", maxOutput: 1 << 20)
     }
 
-    /// Runs git with stdin `/dev/null` and a 60 s timeout. Stderr containing `index.lock` is retried 3 times at 200 ms.
-    /// A non-zero status throws unless `allowFailure`.
+    /// What git reads on its stdin: nothing (`/dev/null`, the default), the bytes given, or a stream `body` writes into a pipe
+    /// on its own thread while git runs (the engine feeding file bytes from descriptors it checked, `GitWorkspace.stage`).
+    /// A stream runs once: it is not replayed on an `index.lock` retry (the commands that take one never lock the index).
+    enum Stdin {
+        case none
+        case data(Data)
+        case stream(@Sendable (StdinPipe) throws -> Void)
+    }
+
+    /// The write end of git's stdin for `Stdin.stream`. `write` sends every byte or throws (git went away, the timeout killed
+    /// it); `SIGPIPE` is turned off on the descriptor so a broken pipe is an error here, never a signal to the engine.
+    final class StdinPipe: @unchecked Sendable {
+        private let fd: Int32
+        fileprivate init(fd: Int32) {
+            self.fd = fd
+            _ = fcntl(fd, F_SETNOSIGPIPE, 1)
+        }
+        func write(_ data: Data) throws {
+            try data.withUnsafeBytes { try write($0) }
+        }
+        func write(_ bytes: UnsafeRawBufferPointer) throws {
+            var offset = 0
+            while offset < bytes.count {
+                let n = Foundation.write(fd, bytes.baseAddress! + offset, bytes.count - offset)
+                if n < 0 {
+                    if errno == EINTR || errno == EAGAIN { continue }
+                    throw GitError.failed(command: "stdin", status: -1, stderr: "git stopped reading its input (\(String(cString: strerror(errno))))")
+                }
+                offset += n
+            }
+        }
+        fileprivate func finish() { close(fd) }
+    }
+
+    /// Runs git with a 60 s timeout; stdin is `/dev/null` unless `stdin` says otherwise. Stderr containing `index.lock` is
+    /// retried 3 times at 200 ms (not for a stream). A non-zero status throws unless `allowFailure`.
     @discardableResult
-    func run(_ args: [String], allowFailure: Bool = false, maxOutput: Int = GitCommand.maxCapture) throws -> Output {
+    func run(_ args: [String], allowFailure: Bool = false, maxOutput: Int = GitCommand.maxCapture, stdin: Stdin = .none) throws -> Output {
         var attempt = 0
         while true {
             // Scanned again before a retry: the config may have changed while git waited for the lock.
             let attrSource = try prepare(args)
             let out = try runOnce(arguments(args, attrSource: attrSource), environment: environment(),
-                                  label: args.joined(separator: " "), maxOutput: maxOutput)
+                                  label: args.joined(separator: " "), maxOutput: maxOutput, stdin: stdin)
             if out.status == 0 || allowFailure && !out.stderr.contains("index.lock") { return out }
-            if out.stderr.contains("index.lock"), attempt < Self.lockRetries {
+            var retriable = true
+            if case .stream = stdin { retriable = false }
+            if retriable, out.stderr.contains("index.lock"), attempt < Self.lockRetries {
                 attempt += 1
                 beforeRetry?(attempt)
                 Thread.sleep(forTimeInterval: Self.lockRetryDelay)
@@ -314,13 +350,26 @@ struct GitCommand: Sendable {
         }
     }
 
-    private func runOnce(_ argv: [String], environment: [String: String], label: String, maxOutput: Int) throws -> Output {
+    /// The error a stdin feeder met, handed back to the thread that waits for git.
+    private final class FeedResult: @unchecked Sendable {
+        let done = DispatchSemaphore(value: 0)
+        var error: (any Error)?
+    }
+
+    private func runOnce(_ argv: [String], environment: [String: String], label: String, maxOutput: Int, stdin: Stdin = .none) throws -> Output {
         EngineGitGuard.willRunGit("git \(label)")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = argv
         process.environment = environment
-        process.standardInput = FileHandle.nullDevice
+        var feed: (pipe: Pipe, result: FeedResult)?
+        switch stdin {
+        case .none: process.standardInput = FileHandle.nullDevice
+        case .data, .stream:
+            let pipe = Pipe()
+            process.standardInput = pipe.fileHandleForReading
+            feed = (pipe, FeedResult())
+        }
         // Output goes to files, not pipes: concurrent children cannot hold each other's pipe ends open, and a grandchild
         // that outlives git cannot keep us waiting for end of file.
         tempRootObserver?(tempRoot)
@@ -339,13 +388,33 @@ struct GitCommand: Sendable {
         process.standardOutput = outHandle
         process.standardError = errHandle
         do { try process.run() } catch {
+            if let feed { try? feed.pipe.fileHandleForReading.close(); try? feed.pipe.fileHandleForWriting.close() }
             throw GitError.failed(command: label, status: -1, stderr: "\(error)")
+        }
+        if let feed {
+            // Only git holds the read end now, so it sees end of file when the feeder closes the write end.
+            try? feed.pipe.fileHandleForReading.close()
+            let writer = StdinPipe(fd: dup(feed.pipe.fileHandleForWriting.fileDescriptor))
+            try? feed.pipe.fileHandleForWriting.close()
+            let result = feed.result
+            Thread {
+                defer { writer.finish(); result.done.signal() }
+                do {
+                    switch stdin {
+                    case .data(let data): try writer.write(data)
+                    case .stream(let body): try body(writer)
+                    case .none: break
+                    }
+                } catch { result.error = error }
+            }.start()
         }
         let timedOut = TimeoutFlag()
         let timer = DispatchWorkItem { timedOut.mark(); process.terminate() }
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.timeout, execute: timer)
         process.waitUntilExit()
         timer.cancel()
+        // Git has exited, so the feeder's next write fails and it finishes; nothing waits on a live pipe.
+        feed?.result.done.wait()
         func read(_ url: URL, limit: Int) -> (Data, Bool) {
             guard let h = try? FileHandle(forReadingFrom: url) else { return (Data(), false) }
             defer { try? h.close() }
@@ -356,7 +425,13 @@ struct GitCommand: Sendable {
         let (stdout, cut) = read(outURL, limit: maxOutput)
         var stderr = String(decoding: read(errURL, limit: 64 * 1024).0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if timedOut.cut { stderr = "timed out after \(Int(Self.timeout)) s" + (stderr.isEmpty ? "" : ": \(stderr)") }
-        return Output(status: process.terminationStatus, stdout: stdout, stderr: stderr, cut: cut, timedOut: timedOut.cut)
+        var status = process.terminationStatus
+        if let error = feed?.result.error {
+            // The input ended early: whatever git made of the part it got does not count as success.
+            if status == 0 { status = -1 }
+            stderr = "\(error)" + (stderr.isEmpty ? "" : ": \(stderr)")
+        }
+        return Output(status: status, stdout: stdout, stderr: stderr, cut: cut, timedOut: timedOut.cut)
     }
 }
 
@@ -791,7 +866,8 @@ public struct GitWorkspace: Sendable {
             if try head(of: "HEAD") != nil {
                 try main.run(["branch", "main", "HEAD"])
             } else {
-                try main.run(["add", "-A"])
+                // The owner's existing files, through the engine's own staging (never `add -A`; `.brahma/` stays out, M2).
+                try stage(main, in: root, relative: "")
                 try main.run(["commit", "--quiet", "--allow-empty", "--no-verify", "-m", "Import existing files"])
             }
         }
@@ -1651,7 +1727,8 @@ public struct GitWorkspace: Sendable {
             defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
             let staged = main.withIndex(index)
             try staged.run(["read-tree", expectedMain])
-            try staged.run(["add", "-A", "--", "."] + (try unsafeAddExcludes(staged, in: root)))
+            // The engine's staging never takes `.brahma/` (M2); the `rm --cached` drops anything `main` already tracks there.
+            try stage(staged, in: root, relative: "")
             try staged.run(["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", "--", ".brahma"])
             let tree = try staged.run(["write-tree"]).text
             let mainTree = try main.run(["rev-parse", "--verify", "\(expectedMain)^{tree}"]).text
@@ -2087,17 +2164,18 @@ public struct GitWorkspace: Sendable {
 
     // MARK: Commits and refs
 
-    /// Stages everything and commits it; the new commit, or nil when there was nothing to commit.
+    /// Stages everything (`stage`: the engine feeds each file from a descriptor it checked; no `git add` reads the tree) and
+    /// commits it; the new commit, or nil when there was nothing to commit.
     ///
     /// In an item worktree the commit is built outside `HEAD`: a private index is read from the item branch's tip, the work
-    /// is added to it, `write-tree` and `commit-tree` make the commit, and `refs/heads/item/<KEY>` is advanced with
+    /// is staged into it, `write-tree` and `commit-tree` make the commit, and `refs/heads/item/<KEY>` is advanced with
     /// `update-ref <ref> <new> <expected old>`. Whatever `HEAD` says at that moment (a turn may rewrite it between the check
     /// and here), no other branch can move, and a branch that moved meanwhile makes the swap fail.
     @discardableResult
     public func commitAll(in dir: URL, message: String) throws -> String? {
         let (git, key) = try resolve(dir)
         guard let key else {
-            try addAll(git, in: dir)
+            try stage(git, in: dir, relative: "")
             let staged = try git.run(["diff", "--cached", "--quiet"], allowFailure: true)
             if staged.status == 0 { return nil }
             guard staged.status == 1 else {
@@ -2116,7 +2194,7 @@ public struct GitWorkspace: Sendable {
         defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
         let private_ = git.withIndex(index)
         try private_.run(["read-tree", tip])
-        try addAll(private_, in: dir)
+        try stage(private_, in: dir, relative: ".brahma/wt/" + key)
         let tree = try private_.run(["write-tree"]).text
         if tree == (try git.run(["rev-parse", "--verify", "\(tip)^{tree}"]).text) { try verifyAfter(key: key); return nil }
         let commit = try git.run(["commit-tree", tree, "-p", tip, "-m", message]).text
@@ -2128,61 +2206,188 @@ public struct GitWorkspace: Sendable {
         return commit
     }
 
-    /// `git add -A`, but never into a nested repository the index already records (a gitlink): there `add` runs `git status`
-    /// inside it, with that repository's own config and attributes, filters and all. Gitlinks stay as recorded; a new
-    /// nested repository is still added (as a gitlink, without running anything in it). Nor is any file added whose bytes
-    /// the engine must not copy (`unsafeAddExcludes`, S7).
-    static let maxGitlinks = 1000
-
-    private func addAll(_ git: GitCommand, in dir: URL) throws {
-        let listing = try git.run(["ls-files", "-s", "-z"])
-        if listing.cut { throw GitError.failed(command: "ls-files", status: -1, stderr: "the index listing is too long") }
-        var excludes: [String] = []
-        for entry in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) where entry.starts(with: Data("160000 ".utf8)) {
-            guard let tab = entry.firstIndex(of: UInt8(ascii: "\t")),
-                  let path = String(data: Data(entry[entry.index(after: tab)...]), encoding: .utf8) else {
-                throw GitError.failed(command: "add", status: -1, stderr: "a nested repository has a path that is not UTF-8")
-            }
-            excludes.append(":(exclude,literal)\(path)")
-        }
-        guard excludes.count <= Self.maxGitlinks else {
-            throw GitError.failed(command: "add", status: -1, stderr: "more than \(Self.maxGitlinks) nested repositories")
-        }
-        try git.run(["add", "-A", "--", "."] + excludes + (try unsafeAddExcludes(git, in: dir)))
-    }
-
-    /// The most files `unsafeAddExcludes` leaves out of one add; more refuses the add.
+    /// The most paths `stage` leaves out of one commit; more refuses the commit.
     static let maxUnsafeAdds = 1000
 
-    /// S7: the files `git add -A` would read in `dir` (modified tracked ones and untracked ones that are not ignored, as the
-    /// command's own index sees them) that have another hard link or belong to another user (`EngineFiles.copyProblem`; a
-    /// link is stored as a link and never read through, so only regular files count). An agent can hard-link an owner file
-    /// it cannot read (a secret) into its checkout; the engine's add, which can read it, would copy its bytes into the object
-    /// database, where the agent can read them. Each is left out with an `:(exclude,literal)` pathspec and reported
-    /// (`onUnsafeEngineFile`); the file stays where it is. A listing that fails, is cut or names one that cannot be expressed
-    /// as a pathspec refuses the add (fail closed).
-    private func unsafeAddExcludes(_ git: GitCommand, in dir: URL) throws -> [String] {
-        let listing = try git.run(["ls-files", "-z", "--others", "--modified", "--exclude-standard"], maxOutput: planBarrierOutputLimit)
+    /// The largest file of a nested repository (`HEAD`, a loose ref, `packed-refs`) the engine reads to record a gitlink.
+    static let gitlinkReadLimit = 1 << 20
+
+    /// Engine-fed staging (I1, fix round 5): what `git add -A` did for the engine, without git ever reading the checkout.
+    ///
+    /// `commitAll` on an item worktree runs inside the agent's own turn (submit, release), with the agent's processes alive.
+    /// A `git add` that reads the tree by path can be raced: a listed innocent file swapped for a hard link to an owner secret,
+    /// or an ignored one un-ignored between the listing and the add, and git writes the secret's blob into the shared object
+    /// database, which item turns can read. So no `add` runs on an agent tree (nor on the root checkout). Instead:
+    /// - the candidates are listed once (`ls-files --others --modified --deleted --exclude-standard` on the command's own
+    ///   index, so `.gitignore` and the exclude file are honoured as git honours them; a path under `.brahma/` or
+    ///   `.brahma-tmp/` is never one, whatever the exclude file says, M2);
+    /// - each is reached through descriptors only (`EngineFiles.staged`: every part `O_NOFOLLOW`, the verdict from `fstat` of
+    ///   the open descriptor) and must pass `EngineFiles.copyProblem` on that descriptor; its bytes go from that descriptor
+    ///   to `git fast-import` (blobs only, marks exported), and the index takes them with `update-index -z --index-info`
+    ///   (`<mode> <id>\t<path>`: `--cacheinfo` for every entry in one stdin, mode `0` removing a deleted one);
+    /// - a symbolic link is stored as a link (mode 120000, its target as the blob) only when the target stays inside the
+    ///   checkout (lexically: absolute inside it, or relative without climbing above its root); otherwise it is refused;
+    /// - a new nested repository is recorded as a gitlink of its `HEAD`, read through the same descriptors (no git runs in
+    ///   it); one that cannot be read is refused;
+    /// - a refused path is left out and reported (`onUnsafeEngineFile`), the file stays where it is; more than
+    ///   `maxUnsafeAdds` refusals, a listing that fails or is cut, or a file that changes size while it is fed, refuses the
+    ///   commit (fail closed).
+    /// Nothing travels on argv: the listing and the entries both go over stdin / stdout with NUL separators (M3).
+    private func stage(_ git: GitCommand, in dir: URL, relative: String) throws {
+        let listing = try git.run(["ls-files", "-z", "--others", "--modified", "--deleted", "--exclude-standard"], maxOutput: planBarrierOutputLimit)
         if listing.timedOut || listing.cut {
-            throw GitError.failed(command: "add", status: -1, stderr: "cannot list the files to add (\(listing.timedOut ? "timed out" : "listing too long"))")
+            throw GitError.failed(command: "stage", status: -1, stderr: "cannot list the files to commit (\(listing.timedOut ? "timed out" : "listing too long"))")
         }
-        let base = Array(dir.path.utf8) + [UInt8(ascii: "/")]
-        var excludes: [String] = []
+        testHook?("listed")
+        let top = try EngineFiles.openWalked(workspace: root, relative)
+        let roots: Set<String> = [top.real, dir.path, dir.standardizedFileURL.path]
+        let excluded = Self.excludedEntries.map { Array($0.dropLast().utf8) }
+        enum Source { case descriptor(Int32, Int64, shown: String), bytes([UInt8]) }
+        struct Entry { var mode: String; var mark: Int?; var id: String?; var path: [UInt8] }
+        var blobs: [Source] = []
+        var entries: [Entry] = []
+        var refused = 0
+        defer { for case .descriptor(let fd, _, _) in blobs { close(fd) } }
         var seen = Set<Data>()
-        for entry in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) where seen.insert(Data(entry)).inserted {
-            var st = stat()
-            let ok = (base + Array(entry) + [0]).withUnsafeBytes { raw in lstat(raw.baseAddress!.assumingMemoryBound(to: CChar.self), &st) } == 0
-            guard ok, st.st_mode & S_IFMT == S_IFREG, let problem = EngineFiles.copyProblem(st) else { continue }
-            guard let path = String(data: Data(entry), encoding: .utf8) else {
-                throw GitError.failed(command: "add", status: -1, stderr: "a file that cannot be added safely has a path that is not UTF-8")
+        for raw in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) where seen.insert(Data(raw)).inserted {
+            let isDirectory = raw.last == UInt8(ascii: "/")
+            let bytes = Array(isDirectory ? raw.dropLast() : raw[...])
+            let parts = bytes.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true).map(Array.init)
+            guard let first = parts.first, !excluded.contains(first) else { continue }
+            let shown = dir.path + "/" + String(decoding: bytes, as: UTF8.self)
+            func refuse(_ problem: String) {
+                refused += 1
+                onUnsafeEngineFile?(UnsafeEngineFile(path: shown, problem: "\(problem); left out of the commit"))
             }
-            onUnsafeEngineFile?(UnsafeEngineFile(path: dir.appending(path: path).path, problem: "\(problem); left out of the commit"))
-            excludes.append(":(exclude,literal)\(path)")
+            if isDirectory {
+                // `ls-files --others` lists a nested repository as `dir/`.
+                do { entries.append(Entry(mode: "160000", id: try gitlinkHead(top, parts, shown: shown), path: bytes)) }
+                catch let problem as UnsafeEngineFile { refuse("is a nested repository whose HEAD cannot be read: \(problem.problem)") }
+                continue
+            }
+            switch EngineFiles.staged(in: top, relative: parts, shown: shown) {
+            case .missing, .directory:
+                // Gone, or a directory in its place (whose files list on their own): the index entry goes.
+                entries.append(Entry(mode: "0", path: bytes))
+            case .file(let fd, let size, let executable):
+                blobs.append(.descriptor(fd, size, shown: shown))
+                entries.append(Entry(mode: executable ? "100755" : "100644", mark: blobs.count, path: bytes))
+            case .link(let target):
+                guard Self.linkStaysInside(target: target, from: parts.dropLast(), roots: roots) else {
+                    refuse("is a symbolic link that points outside the checkout")
+                    continue
+                }
+                blobs.append(.bytes(target))
+                entries.append(Entry(mode: "120000", mark: blobs.count, path: bytes))
+            case .refused(let problem):
+                refuse(problem.problem)
+            }
         }
-        guard excludes.count <= Self.maxUnsafeAdds else {
-            throw GitError.failed(command: "add", status: -1, stderr: "more than \(Self.maxUnsafeAdds) files that cannot be added safely")
+        guard refused <= Self.maxUnsafeAdds else {
+            throw GitError.failed(command: "stage", status: -1, stderr: "more than \(Self.maxUnsafeAdds) files that cannot be committed safely")
         }
-        return excludes
+        if entries.isEmpty { return }
+        var ids: [Int: String] = [:]
+        if !blobs.isEmpty {
+            try? FileManager.default.createDirectory(at: gitTemp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let marks = gitTemp.appending(path: "brahma-marks-\(UUID().uuidString)")
+            defer { _ = try? EngineFiles.removeNoFollow(marks, under: gitTemp) }
+            let sources = blobs
+            try git.run(["fast-import", "--quiet", "--done", "--export-marks=\(marks.path)"], stdin: .stream { pipe in
+                var buffer = [UInt8](repeating: 0, count: 256 * 1024)
+                for (n, source) in sources.enumerated() {
+                    switch source {
+                    case .bytes(let target):
+                        try pipe.write(Data("blob\nmark :\(n + 1)\ndata \(target.count)\n".utf8) + Data(target) + Data("\n".utf8))
+                    case .descriptor(let fd, let size, let shown):
+                        try pipe.write(Data("blob\nmark :\(n + 1)\ndata \(size)\n".utf8))
+                        var left = size
+                        while left > 0 {
+                            let got = Foundation.read(fd, &buffer, Int(min(Int64(buffer.count), left)))
+                            if got < 0 { if errno == EINTR { continue }; throw GitError.failed(command: "fast-import", status: -1, stderr: "\(shown) cannot be read") }
+                            if got == 0 { throw GitError.failed(command: "fast-import", status: -1, stderr: "\(shown) changed while it was being committed") }
+                            try buffer.withUnsafeBytes { try pipe.write(UnsafeRawBufferPointer(rebasing: $0[0..<got])) }
+                            left -= Int64(got)
+                        }
+                        try pipe.write(Data("\n".utf8))
+                    }
+                }
+                try pipe.write(Data("done\n".utf8))
+            })
+            guard let exported = EngineFiles.readNoFollow(marks, under: gitTemp, limit: planBarrierOutputLimit) else {
+                throw GitError.failed(command: "fast-import", status: -1, stderr: "the marks file cannot be read")
+            }
+            for line in String(decoding: exported, as: UTF8.self).split(separator: "\n") {
+                let fields = line.split(separator: " ")
+                guard fields.count == 2, fields[0].hasPrefix(":"), let mark = Int(fields[0].dropFirst()) else { continue }
+                let id = String(fields[1])
+                guard id.count == 40 || id.count == 64, id.allSatisfy({ $0.isHexDigit }) else { continue }
+                ids[mark] = id
+            }
+            guard ids.count == blobs.count else {
+                throw GitError.failed(command: "fast-import", status: -1, stderr: "\(blobs.count - ids.count) blobs were not written")
+            }
+        }
+        let zero: String
+        if let any = ids.values.first { zero = String(repeating: "0", count: any.count) }
+        else { zero = String(repeating: "0", count: try git.run(["rev-parse", "--show-object-format"]).text == "sha256" ? 64 : 40) }
+        var info = Data()
+        for entry in entries {
+            let id = entry.mode == "0" ? zero : (entry.id ?? ids[entry.mark ?? 0] ?? zero)
+            info.append(contentsOf: "\(entry.mode) \(id)\t".utf8)
+            info.append(contentsOf: entry.path)
+            info.append(0)
+        }
+        try git.run(["update-index", "-z", "--index-info"], stdin: .data(info))
+    }
+
+    /// Whether a symbolic link at `from` (the directory parts of its path inside the checkout) with `target` stays inside the
+    /// checkout: an absolute target must be one of `roots` or under one; a relative one may not climb above the root.
+    static func linkStaysInside(target: [UInt8], from: ArraySlice<[UInt8]>, roots: Set<String>) -> Bool {
+        guard !target.isEmpty, !target.contains(0) else { return false }
+        if target.first == UInt8(ascii: "/") {
+            guard let text = String(bytes: target, encoding: .utf8) else { return false }
+            return roots.contains { text == $0 || text.hasPrefix($0 + "/") }
+        }
+        var depth = from.count
+        for part in target.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true) {
+            if part == [0x2e] { continue }
+            if part == [0x2e, 0x2e] { depth -= 1; if depth < 0 { return false } } else { depth += 1 }
+        }
+        return true
+    }
+
+    /// The commit a nested repository's `HEAD` names, read through descriptors (`.git/HEAD`, then the loose ref it points at,
+    /// else `packed-refs`); never a git run inside it. Throws `UnsafeEngineFile` when it cannot be read or resolved.
+    private func gitlinkHead(_ top: EngineFiles.OpenDirectory, _ parts: [[UInt8]], shown: String) throws -> String {
+        let gitParts = parts + [Array(".git".utf8)]
+        func read(_ more: [String], _ what: String) throws -> String {
+            let path = gitParts + more.map { Array($0.utf8) }
+            guard let data = try EngineFiles.readStaged(in: top, relative: path, limit: Self.gitlinkReadLimit, shown: "\(shown)/.git/\(more.joined(separator: "/"))") else {
+                throw UnsafeEngineFile(path: shown, problem: "\(what) is missing")
+            }
+            return String(decoding: data, as: UTF8.self)
+        }
+        func commit(_ text: String) -> String? {
+            let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (t.count == 40 || t.count == 64) && t.allSatisfy(\.isHexDigit) ? t : nil
+        }
+        let head = try read(["HEAD"], "HEAD").trimmingCharacters(in: .whitespacesAndNewlines)
+        if let id = commit(head) { return id }
+        guard head.hasPrefix("ref: ") else { throw UnsafeEngineFile(path: shown, problem: "HEAD is neither a commit nor a ref") }
+        let ref = String(head.dropFirst("ref: ".count))
+        let refParts = ref.split(separator: "/").map(String.init)
+        guard !refParts.isEmpty, refParts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }),
+              ref.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || "/_.-".unicodeScalars.contains($0) }) else {
+            throw UnsafeEngineFile(path: shown, problem: "HEAD names an odd ref")
+        }
+        if let loose = try? read(refParts, ref), let id = commit(loose) { return id }
+        if let packed = try? read(["packed-refs"], "packed-refs") {
+            for line in packed.split(separator: "\n") where line.hasSuffix(" " + ref) {
+                if let id = commit(String(line.dropLast(ref.count + 1))) { return id }
+            }
+        }
+        throw UnsafeEngineFile(path: shown, problem: "\(ref) cannot be resolved")
     }
 
     /// The commit a checkout's branch points at (for an item worktree: `refs/heads/item/<KEY>`, never `HEAD`).

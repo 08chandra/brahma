@@ -426,6 +426,94 @@ public enum EngineFiles {
         return OpenDirectory(fd: fd, real: real, shown: logical(workspace, relative))
     }
 
+    // MARK: Staging (engine-fed commits)
+
+    /// What the engine found at a path of a checkout it is about to commit (`GitWorkspace.stage`), reached through
+    /// descriptors only: every directory on the way opened `O_NOFOLLOW` relative to the one before, the name itself opened
+    /// `O_NOFOLLOW`, and the verdict taken from `fstat` of that open descriptor, never from a look at the path. Whatever the
+    /// agent swaps in afterwards, the bytes git gets are the bytes of the file that was checked.
+    enum Staged {
+        /// Nothing there (or a directory on the way is gone).
+        case missing
+        /// A regular file that passes `copyProblem`, open for reading; the caller closes `fd`. `executable` is the owner's x bit.
+        case file(fd: Int32, size: Int64, executable: Bool)
+        /// A symbolic link and its target, as `readlinkat` gives it.
+        case link(target: [UInt8])
+        /// A directory.
+        case directory
+        /// Anything else, with the reason: a link or non-directory on the way, a file failing `copyProblem` (another hard
+        /// link, another owner, not regular), a name that cannot be opened.
+        case refused(UnsafeEngineFile)
+    }
+
+    /// Opens `parts` (a path relative to `top`, raw bytes, no `.`/`..`) as `Staged`.
+    static func staged(in top: OpenDirectory, relative parts: [[UInt8]], shown: String) -> Staged {
+        guard let name = parts.last, parts.allSatisfy(isValidName) else {
+            return .refused(UnsafeEngineFile(path: shown, problem: "is not a valid path"))
+        }
+        let way = walkWay(from: top.fd, parts.dropLast(), shown: shown)
+        let dfd: Int32
+        switch way {
+        case .missing: return .missing
+        case .blocked(let problem): return .refused(problem)
+        case .open(let fd): dfd = fd
+        }
+        defer { if dfd != top.fd { close(dfd) } }
+        let fd = withCName(name) { openat(dfd, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
+        if fd < 0 {
+            let err = errno
+            if err == ENOENT { return .missing }
+            if err == ELOOP {
+                var buffer = [UInt8](repeating: 0, count: Int(PATH_MAX) + 1)
+                let n = withCName(name) { readlinkat(dfd, $0, &buffer, buffer.count - 1) }
+                guard n > 0 else { return .refused(UnsafeEngineFile(path: shown, problem: "is a symbolic link that cannot be read")) }
+                return .link(target: Array(buffer[0..<Int(n)]))
+            }
+            return .refused(UnsafeEngineFile(path: shown, problem: "cannot be opened (\(String(cString: strerror(err))))"))
+        }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            close(fd)
+            return .refused(UnsafeEngineFile(path: shown, problem: "cannot be inspected"))
+        }
+        if st.st_mode & S_IFMT == S_IFDIR { close(fd); return .directory }
+        if let problem = copyProblem(st) { close(fd); return .refused(UnsafeEngineFile(path: shown, problem: problem)) }
+        return .file(fd: fd, size: Int64(st.st_size), executable: st.st_mode & S_IXUSR != 0)
+    }
+
+    /// At most `limit` bytes of the regular file at `parts` under `top`, reached as `staged` reaches it and read from its own
+    /// descriptor only when it passes `copyProblem`; nil when it does not exist. Throws `UnsafeEngineFile` for every other shape.
+    static func readStaged(in top: OpenDirectory, relative parts: [[UInt8]], limit: Int, shown: String) throws -> Data? {
+        switch staged(in: top, relative: parts, shown: shown) {
+        case .missing: return nil
+        case .file(let fd, _, _):
+            defer { close(fd) }
+            return try readAll(fd: fd, limit: limit, shown: shown)
+        case .link: throw UnsafeEngineFile(path: shown, problem: "is a symbolic link")
+        case .directory: throw UnsafeEngineFile(path: shown, problem: "is a directory, not a file")
+        case .refused(let problem): throw problem
+        }
+    }
+
+    /// Each of `parts` opened `O_NOFOLLOW | O_DIRECTORY` relative to the one before, starting from `from` (which is handed
+    /// back untouched when there is nothing to walk; the caller never closes it).
+    private static func walkWay(from: Int32, _ parts: ArraySlice<[UInt8]>, shown: String) -> Way {
+        var fd = from
+        for part in parts {
+            let next = withCName(part) { openat(fd, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
+            if next < 0 {
+                let err = errno
+                let problem = withCName(part) { openProblem(dfd: fd, String(cString: $0), errno: err) }
+                if fd != from { close(fd) }
+                if err == ENOENT { return .missing }
+                return .blocked(UnsafeEngineFile(path: shown, problem: "has \(String(decoding: part, as: UTF8.self)) on the way that \(problem)"))
+            }
+            if fd != from { close(fd) }
+            fd = next
+        }
+        return .open(fd)
+    }
+
     /// Tests only: called with the directory's path and the name of each directory entry about to be removed.
     nonisolated(unsafe) static var removalProbe: ((_ parent: String, _ name: String) -> Void)?
 
