@@ -137,12 +137,32 @@ import Foundation
         // PR-16: one export per surface, commit and start; a valid 3a run id.
         let sha = "0123456789abcdef0123456789abcdef01234567"
         let id = try EngineLayout.previewRunId(surfaceId: "8F3A2B1C-0000-4000-8000-000000000000", commit: sha, start: 2)
-        #expect(id == "prev-8f3a2b1c-0123456789ab-2")
+        #expect(id == "prev-8F3A2B1C-0000-4000-8000-000000000000-0123456789ab-2")
+        #expect(id.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil, "a valid 3a run id")
         #expect(try EngineLayout.previewRunId(surfaceId: "other-surface", commit: sha, start: 2) != id)
         #expect(try EngineLayout.previewRunId(surfaceId: "8F3A2B1C-0000-4000-8000-000000000000", commit: sha, start: 3) != id)
         #expect(throws: WorkError.self) { try EngineLayout.previewRunId(surfaceId: "s", commit: "not-a-sha", start: 1) }
         #expect(throws: WorkError.self) { try EngineLayout.previewRunId(surfaceId: "../x", commit: sha, start: 1) }
         #expect(throws: WorkError.self) { try EngineLayout.previewRunId(surfaceId: "s", commit: sha, start: -1) }
+    }
+
+    /// F3 (PR-16): the whole surface id is in the run id, so surfaces that share a prefix never share an export; a UUID id
+    /// leaves room for any realistic start count, and one too long for a run id is refused, never cut.
+    @Test func previewRunIdsNeverCollide() throws {
+        let sha = "0123456789abcdef0123456789abcdef01234567"
+        let a = try EngineLayout.previewRunId(surfaceId: "preview-web-a", commit: sha, start: 1)
+        let b = try EngineLayout.previewRunId(surfaceId: "preview-web-b", commit: sha, start: 1)
+        #expect(a != b)
+        let uuids = (0..<50).map { _ in UUID().uuidString }
+        let ids = try uuids.map { try EngineLayout.previewRunId(surfaceId: $0, commit: sha, start: 1) }
+        #expect(Set(ids).count == uuids.count)
+        let shared = "12345678-0000-4000-8000-00000000000"
+        #expect(try EngineLayout.previewRunId(surfaceId: shared + "1", commit: sha, start: 1)
+                != (try EngineLayout.previewRunId(surfaceId: shared + "2", commit: sha, start: 1)))
+        let uuid = "8F3A2B1C-0000-4000-8000-000000000000"
+        #expect(try EngineLayout.previewRunId(surfaceId: uuid, commit: sha, start: 999_999_999).count == 64)
+        #expect(throws: WorkError.self) { try EngineLayout.previewRunId(surfaceId: uuid, commit: sha, start: 1_000_000_000) }
+        #expect(throws: WorkError.self) { try EngineLayout.previewRunId(surfaceId: String(repeating: "a", count: 60), commit: sha, start: 1) }
     }
 
     @Test func serverPolicyIsScoped() throws {
@@ -156,7 +176,9 @@ import Foundation
         let run = BrahmaPaths(home: home, workspaces: wss).exportDir(runId: "prev-s1-0123456789ab-1")
         try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
         let p = PreviewPolicy.server(l, run: run, company: company, port: 47123)
-        #expect(p.writable == [run.resolvedForSandbox, l.previewLogs.resolvedForSandbox])
+        // F1: only its own export; the engine writes the log, so the logs directory is in no writable list.
+        #expect(p.writable == [run.resolvedForSandbox])
+        #expect(!p.writable.contains { $0.path.hasPrefix(l.previewDir.resolvedForSandbox.path) })
         #expect(p.readable == [run.resolvedForSandbox])
         let defaults = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []).allowedDomains
         #expect(p.network == .loopbackListen(allow: defaults, ports: [47123]))
