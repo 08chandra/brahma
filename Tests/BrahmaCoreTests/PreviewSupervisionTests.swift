@@ -69,13 +69,14 @@ import Glibc
         #expect(env["PORT"] == "47123" && env["HOST"] == "127.0.0.1" && env["BRAHMA_AGENT_ID"] == "preview")
         #expect(env["GITHUB_TOKEN"] == nil && env["BRAHMA_DEV"] == nil && env["PATH"] == "/bin:/usr/bin")
         let sandbox = FakeSandbox()
-        let log = dir.appending(path: "web.log")
+        let layout = EngineLayout(workspace: dir)
+        let log = layout.previewLog(name: "web")
         let process = try sandbox.spawn(command: "pwd; echo $PORT $HOST $BRAHMA_AGENT_ID", cwd: run, environment: env, logURL: log,
                                         policy: Self.policy)
         #expect(await Self.waitUntil(.seconds(10)) { !process.isAlive() })
         await process.terminate(grace: .seconds(1))
         #expect(process.exitStatus() == 0)
-        let lines = PreviewLog.tail(log, lines: 10)
+        let lines = PreviewLog.tail(layout, name: "web", lines: 10)
         #expect(lines.count == 2, "\(lines)")
         #expect(lines.first.map { $0 == run.path || $0 == run.resolvedForSandbox.path } == true, "\(lines)")
         #expect(lines.last == "47123 127.0.0.1 preview")
@@ -89,42 +90,77 @@ import Glibc
         #expect(sandbox.calls.map(\.kind) == [.spawn, .run] && sandbox.calls[1].output == out)
     }
 
+    /// A log for `name` with `text` in a workspace's `.brahma/preview/logs`.
+    @discardableResult
+    static func writeLog(_ l: EngineLayout, _ name: String, _ text: String) throws -> URL {
+        try FileManager.default.createDirectory(at: l.previewLogs, withIntermediateDirectories: true)
+        let url = l.previewLog(name: name)
+        try Data(text.utf8).write(to: url)
+        return url
+    }
+
+    static func size(_ url: URL) -> Int? { (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int }
+
+    static let bigLog: String = String(repeating: String(repeating: "x", count: 99) + "\n", count: 60_000) + "the last line\n"  // 6 MB
+
     @Test func logIsCapped() throws {
-        let dir = try tempDir()
-        let log = dir.appending(path: "web.log")
-        let line = String(repeating: "x", count: 99) + "\n"
-        var text = String(repeating: line, count: 60_000)                   // 6 000 000 bytes
-        text += "the last line\n"
-        try Data(text.utf8).write(to: log)
-        try PreviewLog.trimIfNeeded(log)
-        let size = try #require(try FileManager.default.attributesOfItem(atPath: log.path)[.size] as? Int)
+        let l = EngineLayout(workspace: try tempDir())
+        let log = try Self.writeLog(l, "web", Self.bigLog)
+        try PreviewLog.trimIfNeeded(l, name: "web")
+        let size = try #require(Self.size(log))
         #expect(size <= PreviewLog.keep + 64, "\(size)")
         #expect(size > PreviewLog.keep / 2)
-        #expect(PreviewLog.tail(log, lines: 1) == ["the last line"])
+        #expect(PreviewLog.tail(l, name: "web", lines: 1) == ["the last line"])
         // It starts on a whole line.
         let first = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").dropFirst().first
-        #expect(first.map { $0 == Substring(line.dropLast()) } == true)
+        #expect(first.map { $0 == Substring(String(repeating: "x", count: 99)) } == true)
         // Under the cap: untouched.
-        let small = dir.appending(path: "small.log")
-        try Data("a\nb\n".utf8).write(to: small)
-        try PreviewLog.trimIfNeeded(small)
+        let small = try Self.writeLog(l, "small", "a\nb\n")
+        try PreviewLog.trimIfNeeded(l, name: "small")
         #expect(try String(contentsOf: small, encoding: .utf8) == "a\nb\n")
-        #expect(PreviewLog.tail(small, lines: 1) == ["b"] && PreviewLog.tail(small, lines: 5) == ["a", "b"])
-        #expect(PreviewLog.tail(dir.appending(path: "missing.log"), lines: 3) == [])
+        #expect(PreviewLog.tail(l, name: "small", lines: 1) == ["b"] && PreviewLog.tail(l, name: "small", lines: 5) == ["a", "b"])
+        #expect(PreviewLog.tail(l, name: "missing", lines: 3) == [])
+        try PreviewLog.trimIfNeeded(l, name: "missing")
+        #expect(PreviewLog.tail(EngineLayout(workspace: try tempDir()), name: "web", lines: 3) == [], "no logs dir yet")
         // A link planted at the log's name is never followed, read or trimmed.
-        let target = dir.appending(path: "target")
-        try Data(text.utf8).write(to: target)
-        let linked = dir.appending(path: "linked.log")
-        try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: target)
-        #expect(throws: (any Error).self) { try PreviewLog.trimIfNeeded(linked) }
-        #expect(PreviewLog.tail(linked, lines: 1) == [])
-        #expect((try FileManager.default.attributesOfItem(atPath: target.path)[.size] as? Int) == text.utf8.count)
+        let target = try tempDir().appending(path: "target")
+        try Data(Self.bigLog.utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: l.previewLog(name: "linked"), withDestinationURL: target)
+        #expect(throws: UnsafeEngineFile.self) { try PreviewLog.trimIfNeeded(l, name: "linked") }
+        #expect(PreviewLog.tail(l, name: "linked", lines: 1) == [])
+        #expect(Self.size(target) == Self.bigLog.utf8.count)
         // Nor a second hard link (it may be someone else's file).
-        let hard = dir.appending(path: "hard.log")
-        try FileManager.default.linkItem(at: target, to: hard)
-        #expect(throws: (any Error).self) { try PreviewLog.trimIfNeeded(hard) }
-        #expect(PreviewLog.tail(hard, lines: 1) == [])
-        #expect((try FileManager.default.attributesOfItem(atPath: target.path)[.size] as? Int) == text.utf8.count)
+        try FileManager.default.linkItem(at: target, to: l.previewLog(name: "hard"))
+        #expect(throws: UnsafeEngineFile.self) { try PreviewLog.trimIfNeeded(l, name: "hard") }
+        #expect(PreviewLog.tail(l, name: "hard", lines: 1) == [])
+        #expect(Self.size(target) == Self.bigLog.utf8.count)
+    }
+
+    /// F1: a link anywhere on the way to the log (the `logs` directory itself, or `preview`, swapped for a link to an owner
+    /// directory) is never followed: tail reads nothing and trim refuses, and the owner's file is left as it was.
+    @Test func symlinkedLogsDirIsRefused() throws {
+        let owner = try tempDir()
+        let secret = owner.appending(path: "web.log")
+        try Data(Self.bigLog.utf8).write(to: secret)
+        for linked in ["logs", "preview"] {
+            let l = EngineLayout(workspace: try tempDir())
+            try FileManager.default.createDirectory(at: l.previewDir, withIntermediateDirectories: true)
+            let place = linked == "logs" ? l.previewLogs : l.previewDir
+            if linked == "preview" {
+                try FileManager.default.removeItem(at: l.previewDir)
+                // `preview` → a dir whose `logs` is the owner's directory.
+                let fake = try tempDir()
+                try FileManager.default.createSymbolicLink(at: fake.appending(path: "logs"), withDestinationURL: owner)
+                try FileManager.default.createSymbolicLink(at: place, withDestinationURL: fake)
+            } else {
+                try FileManager.default.createSymbolicLink(at: place, withDestinationURL: owner)
+            }
+            // The path does reach the owner's file: only the walk keeps the engine from following it.
+            #expect(FileManager.default.fileExists(atPath: l.previewLog(name: "web").path), "\(linked)")
+            #expect(PreviewLog.tail(l, name: "web", lines: 1) == [], "\(linked)")
+            #expect(throws: UnsafeEngineFile.self, "\(linked)") { try PreviewLog.trimIfNeeded(l, name: "web") }
+            #expect(Self.size(secret) == Self.bigLog.utf8.count, "\(linked): the owner's file is untouched")
+        }
     }
 
     @Test func portAllocatorSkipsBusy() throws {
