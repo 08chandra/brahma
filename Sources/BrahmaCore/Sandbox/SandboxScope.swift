@@ -598,13 +598,15 @@ public struct SandboxScope: Equatable, Sendable {
 
     /// The `.brahma` children every turn may read when they exist (5L-1). `hooks` and the shell prefix must be readable for
     /// git and Bash to start; `ext` holds mounted extension parts whose scripts run in Bash; `cache/shared` is the read-only
-    /// layer checks write.
+    /// layer checks write. `preview/logs` holds the preview servers' logs (Plan L): a failure DM points the setter at it.
     static let readableDotBrahma = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext",
-                                    "ext-review", "hooks", "cache/shared"]
+                                    "ext-review", "hooks", "cache/shared", "preview/logs"]
 
-    /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist.
+    /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist. `preview` is Plan L's
+    /// (`EngineLayout.previewDir`; its runs are data-home exports, its logs are written by the engine and the previews).
     static let engineOnlyDotBrahma = ["trash", "cache", "resources", "checks", "wt-check", "handoffs", "releases", "artifacts",
-                                      "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "hooks", "bin", "kb"]
+                                      "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "hooks", "bin", "kb",
+                                      "preview"]
 
     /// Common-git-dir internals no turn writes (3a "GitCommand hardening I2": config or attributes flipped between the
     /// engine's scan and its run), listed even before they exist.
