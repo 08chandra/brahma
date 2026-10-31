@@ -111,6 +111,8 @@ private struct ActivityRow: View {
         case .error: "exclamationmark.triangle"
         case .work: "checklist"
         case .approval: "checkmark.seal"
+        case .preview: "play.rectangle"
+        case .release: "shippingbox"
         }
     }
 
@@ -125,6 +127,8 @@ private struct ActivityRow: View {
         case .error: BrahmaTheme.danger
         case .work: BrahmaTheme.accent
         case .approval: BrahmaTheme.warning
+        case .preview: BrahmaTheme.running
+        case .release: BrahmaTheme.success
         }
     }
 }
