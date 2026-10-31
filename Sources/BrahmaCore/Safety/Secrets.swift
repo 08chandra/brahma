@@ -268,7 +268,9 @@ public final class Redactor: @unchecked Sendable {
     private var failures: [Failure] = []
     private var tickets = 0
     private var installedTicket = 0
-    /// Serializes whole reloads (metadata read, vault reads, install) of one store; recursive for `ownerLoadSecrets`.
+    /// Serializes whole reloads (metadata read, vault reads, install) of one store. `ownerLoadSecrets` bumps the secrets'
+    /// `updatedAt` outside it and then takes it through `reloadRedactorIfNeeded`; recursive only so a reentrant caller can
+    /// never deadlock on it.
     private let reloadLock = NSRecursiveLock()
     private var loader: (@Sendable () -> Void)?
     private var loaderTried = false
@@ -487,8 +489,12 @@ public final class Redactor: @unchecked Sendable {
     }
 
     /// Rewrites the file in place (same inode and permissions) when it contains a secret. Works on bytes, so a file
-    /// with invalid UTF-8 keeps its other bytes exactly. Throws when the file cannot be read or written.
+    /// with invalid UTF-8 keeps its other bytes exactly. Throws when the file cannot be read or written, and refuses a
+    /// path that is not a regular file (a link planted where a check log should be is never written through).
     public func scrubFile(_ url: URL) throws {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: url.path]) }
+        guard (st.st_mode & S_IFMT) == S_IFREG else { throw CocoaError(.fileReadUnsupportedScheme, userInfo: [NSFilePathErrorKey: url.path]) }
         let original = try Data(contentsOf: url)
         var data = original
         for e in snapshot() {
@@ -600,6 +606,16 @@ public enum SecretScan {
             // Outside a counted hunk (a bare fragment): every `+` line is an added line.
             if line.hasPrefix("+") { lineNumber += 1; scan(String(line.dropFirst())) }
         }
+        return out
+    }
+
+    /// What the change `base..head` leaks, read through 3a's hardened git helper (`GitWorkspace.scanDiff`: the engine's own
+    /// git dir and config, never the worktree's `.git` file): `findings(diff:knownValues:)` over the whole patch. A patch
+    /// git cut short at the capture limit cannot be scanned and is itself a finding (fail closed). Findings never carry a value.
+    public static func check(git: GitWorkspace, base: String, head: String, knownValues: [(String, String)]) throws -> [String] {
+        let diff = try git.scanDiff(base: base, head: head)
+        var out = findings(diff: diff.text, knownValues: knownValues)
+        if diff.cut { out.append("the change is too large to scan for secrets (more than \(diff.limitMB) MB of diff)") }
         return out
     }
 

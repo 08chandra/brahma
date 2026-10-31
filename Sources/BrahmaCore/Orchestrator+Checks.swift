@@ -142,13 +142,21 @@ extension Orchestrator {
             await mergeCheckExported(company: company)
         }
         let holder = (try? store.lease(itemId: run.itemId))?.agentId ?? run.requestedBy
+        // The item's check runs with the test keys its holder took (`use_secret`, Task 4-wire); a database error means none.
+        let secrets = (try? store.injectableSecrets(forCheckOf: run.itemId)) ?? [:]
         let environment = ChildEnvironment.make(base: checkBaseEnvironment, extra: holder.map { ["BRAHMA_AGENT_ID": $0] } ?? [:],
-                                                purpose: .check)
+                                                purpose: .check, secrets: secrets)
         let output = run.outputPath.map { URL(fileURLWithPath: $0) }
             ?? paths.companyDir(run.companyId).appending(path: "check-output/\(run.id).log")
         let outcome = await checkRunner.run(command: run.command, workingDirectory: dir,
                                             timeout: TimeInterval(run.timeoutSeconds), outputURL: output, environment: environment)
-        await blocking.run { git.removeRunWorktree(runId: run.id) }
+        // The check's log file is agent output: scrubbed in place before anything reads it (the tail is redacted as it is stored).
+        let redactor = store.redactor
+        await blocking.run {
+            git.removeRunWorktree(runId: run.id)
+            do { try redactor.scrubFile(output) } catch let e as CocoaError where e.code == .fileNoSuchFile {
+            } catch { self.log("could not scrub the check log of run \(run.id): \(error)") }
+        }
         if Task.isCancelled { return }
         // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
         let passed = outcome.exitCode == 0 && !outcome.timedOut

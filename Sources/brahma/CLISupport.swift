@@ -40,9 +40,10 @@ func openStore(lazySecrets: Bool = true) throws -> (Store, BrahmaPaths) {
             guard let vault = try? cliSecretVault(interactive: false) else { return }
             _ = try? store.reloadRedactorIfNeeded(vault: vault, logFailures: false)
             guard store.secretsHeld else { return }
-            let failed = store.redactor.failedNames
-            let names = failed.isEmpty ? "" : " (\(safe(failed.joined(separator: ", "))))"
-            FileHandle.standardError.write(Data("brahma: secrets not loaded\(names); run `brahma secret load` in Terminal, then try again\n".utf8))
+            // The same wording by reason as the owner notice and the app banner (names and reasons, never values): a read
+            // that needs permission points at `brahma secret load`, anything else at `secret set` / `secret rm`.
+            let why = store.secretsHoldText() ?? "secrets are not loaded; run `brahma secret load` in Terminal, then try again"
+            FileHandle.standardError.write(Data("brahma: \(safe(why))\n".utf8))
         }
     }
     return (store, paths)

@@ -220,10 +220,13 @@ extension TurnRunnerTests {
         ])
         var req = request(in: dir)
         req.environment = ["BRAHMA_AGENT_ID": "a1"]
+        // The turn's injected test keys (Task 4-wire) survive the drop; a name that may not be injected is dropped.
+        req.secrets = ["TEST_KEY": "test-key-value-1", "GIT_SSH_KEY": "never"]
         _ = try await collect(runner.run(req))
         let env = try String(contentsOf: dir.appending(path: "env.txt"), encoding: .utf8)
         #expect(env.contains("BRAHMA_AGENT_ID=a1"))
         #expect(!env.contains("FAKE_SECRET_TOKEN")); #expect(!env.contains("BRAHMA_DEV")); #expect(!env.contains("RANDOM_VAR"))
         #expect(env.contains("PATH=/usr/bin:/bin"))
+        #expect(env.contains("TEST_KEY=test-key-value-1")); #expect(!env.contains("GIT_SSH_KEY"))
     }
 }

@@ -15,7 +15,234 @@ public struct SecretMeta: Codable, Equatable, Sendable, FetchableRecord, Persist
     public var lastUsedAt: Date?
 }
 
+/// One agent's use of a test key while it works on one item (`use_secret`). The key is put in the environment of that
+/// agent's work turns and of that item's checks while the row is open: it ends when the lease goes or the item leaves
+/// `inProgress`/`inReview` (`endSecretUses`), and injection also checks the live lease and status, never the row alone.
+public struct SecretUse: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord, Identifiable {
+    public static let databaseTableName = "secretUse"
+
+    public var id: String
+    public var companyId: String
+    public var agentId: String
+    public var secretName: String
+    public var itemId: String?
+    public var grantedAt: Date
+    public var endedAt: Date? = nil
+}
+
+/// What a `request_secret` ask carries in its payload details: never a value.
+public struct RequestedSecret: Codable, Equatable, Sendable {
+    public var request = "secret"
+    public var name: String
+    /// The agent's proposal; the owner decides the flag when providing the secret.
+    public var test: Bool
+}
+
+public enum SecretRequests {
+    public static func requested(_ ask: Ask) -> RequestedSecret? {
+        guard ask.kind == .request, let details = ask.payload?.details,
+              let decoded = try? JSONDecoder().decode(RequestedSecret.self, from: Data(details.utf8)), decoded.request == "secret" else { return nil }
+        return decoded
+    }
+
+    static func details(_ request: RequestedSecret) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return String(decoding: (try? encoder.encode(request)) ?? Data(), as: UTF8.self)
+    }
+}
+
 extension Store {
+    // MARK: Agent requests and uses (Task 4-wire)
+
+    /// `request_secret`: files a `request` ask (risk high, straight to the owner) for a secret the agent needs. Its requester
+    /// must be an active agent of the company (`.forbidden("not in your company")`); `AskQuota` applies in the write that
+    /// files it. An open request for the same name in the company is returned instead (`deduped`). A name that already is
+    /// a secret of the company is not requested again. The reason is redacted like any ask text; no value is ever involved.
+    @discardableResult
+    public func requestSecret(companyId: String, agentId: String, name: String, reason: String, test: Bool,
+                              now: Date = Store.now()) throws -> (ask: Ask, deduped: Bool) {
+        try writer.write { db in
+            guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId else {
+                throw WorkError.forbidden("not in your company")
+            }
+            guard agent.state != .killed else { throw WorkError.forbidden("this agent is not active in the company") }
+            guard SecretName.isValid(name) else { throw WorkError.invalid(SecretError.invalidName.message) }
+            if test, !SecretName.isInjectable(name) {
+                throw WorkError.invalid("\(name) cannot be a test key (\(SecretError.notInjectable.message)); ask for it engine-held")
+            }
+            if let existing = try SecretMeta.filter(Column("companyId") == companyId && Column("name") == name).fetchOne(db) {
+                throw WorkError.conflict(existing.isTest
+                    ? "\(name) already exists; take it with use_secret"
+                    : "\(name) already exists and is engine-held: connectors use it for you, and agents never receive it")
+            }
+            let open = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.request
+                                      && [AskStatus.pendingInternal.rawValue, AskStatus.pendingOwner.rawValue].contains(Column("status")))
+                .order(Column("number")).fetchAll(db)
+            if let same = open.first(where: { SecretRequests.requested($0)?.name == name }) { return (same, true) }
+            let ask = try propose(db: db, companyId: companyId, by: .agent(agentId), kind: .request, risk: .high, category: nil,
+                                  title: "Secret \(name)", summary: reason,
+                                  payload: AskPayload(details: SecretRequests.details(RequestedSecret(name: name, test: test))),
+                                  document: nil, itemId: nil, subjectId: nil, supersedes: nil, requestId: nil, decisionClass: .taste,
+                                  viaOwner: true, now: now)
+            return (ask, false)
+        }
+    }
+
+    /// The owner provides the secret a `request` ask is for: the value goes to the vault (`setSecret`, with the flag the owner
+    /// chose, whatever the request proposed) and the ask is approved through `ownerDecide` with the note "provided". The
+    /// value never touches the ask or any other row.
+    @discardableResult
+    public func provideSecret(askId: String, value: String, isTest: Bool, vault: any SecretVault, now: Date = Store.now()) throws -> Ask {
+        guard let ask = try ask(id: askId) else { throw WorkError.notFound("no such ask") }
+        guard ask.kind == .request, let request = SecretRequests.requested(ask) else {
+            throw WorkError.invalid("\(ask.ref) is not a secret request")
+        }
+        guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
+        try setSecret(companyId: ask.companyId, name: request.name, value: value, isTest: isTest, vault: vault, now: now)
+        return try ownerDecide(askId: askId, approve: true, note: "provided", now: now)
+    }
+
+    /// `use_secret`: opens a use of a TEST key for the item the agent holds. The agent must be an active agent of the company
+    /// (`.forbidden("not in your company")`); the secret must exist in that company and be a test key; the agent must hold an
+    /// `inProgress` item. One open row per (agent, name, item); `secret.lastUsedAt` moves. Returns the item's key.
+    @discardableResult
+    public func openSecretUse(companyId: String, agentId: String, name: String, now: Date = Store.now()) throws -> (key: String, use: SecretUse) {
+        try writer.write { db in
+            guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId else {
+                throw WorkError.forbidden("not in your company")
+            }
+            guard agent.state != .killed else { throw WorkError.forbidden("this agent is not active in the company") }
+            guard SecretName.isValid(name) else { throw WorkError.invalid(SecretError.invalidName.message) }
+            guard let meta = try SecretMeta.filter(Column("companyId") == companyId && Column("name") == name).fetchOne(db) else {
+                throw WorkError.notFound("No secret named \(name); ask with request_secret")
+            }
+            guard meta.isTest else {
+                throw WorkError.invalid("\(name) is engine-held: connectors use it for you, and agents never receive it")
+            }
+            guard let lease = try WorkLease.filter(Column("agentId") == agentId).fetchOne(db),
+                  let item = try WorkItem.fetchOne(db, key: lease.itemId), item.companyId == companyId else {
+                throw WorkError.conflict("you hold no work item; claim one first, then use_secret while you work on it")
+            }
+            guard item.status == .inProgress else {
+                throw WorkError.conflict("\(item.key) is \(item.status.title.lowercased()), not in progress")
+            }
+            try db.execute(sql: "UPDATE secret SET lastUsedAt = ? WHERE id = ?", arguments: [now, meta.id])
+            if let open = try SecretUse.filter(Column("agentId") == agentId && Column("secretName") == name && Column("itemId") == item.id
+                                               && Column("endedAt") == nil).fetchOne(db) {
+                return (item.key, open)
+            }
+            let use = SecretUse(id: UUID().uuidString, companyId: companyId, agentId: agentId, secretName: name, itemId: item.id,
+                                grantedAt: now)
+            try use.insert(db)
+            try ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .work,
+                              text: "@\(agent.name) takes test key \(name) for \(item.key) from its next turn", createdAt: now).insert(db)
+            return (item.key, use)
+        }
+    }
+
+    /// Ends every open use of the item: the lease went, or the item left `inProgress`/`inReview`.
+    static func endSecretUses(db: Database, itemId: String, now: Date) throws {
+        try db.execute(sql: "UPDATE secretUse SET endedAt = ? WHERE itemId = ? AND endedAt IS NULL", arguments: [now, itemId])
+    }
+
+    /// Ends every open use of the agent (it was killed).
+    static func endSecretUses(db: Database, agentId: String, now: Date) throws {
+        try db.execute(sql: "UPDATE secretUse SET endedAt = ? WHERE agentId = ? AND endedAt IS NULL", arguments: [now, agentId])
+    }
+
+    /// Once per tick: closes any open use whose lease or item status no longer carries it (defence in depth behind the
+    /// explicit ends).
+    func sweepSecretUses(now: Date) throws {
+        try writer.write { db in
+            try db.execute(sql: """
+                UPDATE secretUse SET endedAt = ? WHERE endedAt IS NULL AND (itemId IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM workLease l WHERE l.itemId = secretUse.itemId AND l.agentId = secretUse.agentId)
+                    OR NOT EXISTS (SELECT 1 FROM workItem i WHERE i.id = secretUse.itemId AND i.companyId = secretUse.companyId
+                                   AND i.status IN ('inProgress', 'inReview')))
+                """, arguments: [now])
+        }
+    }
+
+    /// The names of the test keys the agent's turns on the item (and the item's checks) get: open uses whose secret is still
+    /// a test key of the same company, whose lease the agent still holds, and whose item is `inProgress` or `inReview`;
+    /// only names `SecretName.isInjectable` accepts. Sorted.
+    public func injectableSecretNames(agentId: String, itemId: String) throws -> [String] {
+        try writer.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT DISTINCT u.secretName FROM secretUse u
+                JOIN secret s ON s.companyId = u.companyId AND s.name = u.secretName AND s.isTest = 1
+                JOIN workLease l ON l.itemId = u.itemId AND l.agentId = u.agentId
+                JOIN workItem i ON i.id = u.itemId AND i.companyId = u.companyId AND i.status IN ('inProgress', 'inReview')
+                JOIN agent a ON a.id = u.agentId AND a.companyId = u.companyId
+                WHERE u.agentId = ? AND u.itemId = ? AND u.endedAt IS NULL
+                ORDER BY u.secretName
+                """, arguments: [agentId, itemId])
+        }.filter { SecretName.isInjectable($0) }
+    }
+
+    /// `injectableSecretNames` with their values, from the redactor's loaded set (a value not loaded yet is left out: the
+    /// engine admits nothing while the redactor is behind). For `ChildEnvironment.make(secrets:)`.
+    public func injectableSecrets(agentId: String, itemId: String) throws -> [String: String] {
+        let names = try injectableSecretNames(agentId: agentId, itemId: itemId)
+        guard !names.isEmpty, let companyId = try writer.read({ db in try Agent.fetchOne(db, key: agentId)?.companyId }) else { return [:] }
+        let cache = redactor.cachedValues()
+        var out: [String: String] = [:]
+        for name in names { if let loaded = cache["\(companyId):\(name)"] { out[name] = loaded.value } }
+        return out
+    }
+
+    /// The test keys the item's check runs with: the lease holder's open uses on it.
+    func injectableSecrets(forCheckOf itemId: String) throws -> [String: String] {
+        guard let holder = try lease(itemId: itemId)?.agentId else { return [:] }
+        return try injectableSecrets(agentId: holder, itemId: itemId)
+    }
+
+    /// The company's secret values the leak scans look for (test and engine-held alike), from the redactor's loaded set.
+    /// They go only into `SecretScan`, whose findings name the secret and never the value.
+    func knownSecretValues(companyId: String) -> [(String, String)] {
+        redactor.cachedValues().filter { $0.key.hasPrefix("\(companyId):") }.map { ($0.value.name, $0.value.value) }
+            .sorted { $0.0 < $1.0 }
+    }
+
+    // MARK: The recorded branch head (scan (a))
+
+    /// Records the item branch's head the engine saw (at claim, at the end of a holder's turn, after an engine rebase), while
+    /// the item is leased.
+    func recordLeaseHead(itemId: String, commit: String) throws {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET leaseHeadCommit = ? WHERE id = ? AND EXISTS (SELECT 1 FROM workLease WHERE itemId = ?)",
+                           arguments: [commit, itemId, itemId])
+        }
+    }
+
+    // MARK: Redaction helpers for the remaining write paths
+
+    func redact(_ payload: AskPayload?) throws -> AskPayload? {
+        guard var p = payload else { return nil }
+        p.question = try redact(p.question)
+        p.details = try redact(p.details)
+        p.recommendation = try redact(p.recommendation)
+        p.stakes = try redact(p.stakes)
+        p.proposal = try redact(p.proposal)
+        p.options = try p.options.map { o in
+            var o = o
+            o.label = try redact(o.label); o.pros = try redact(o.pros); o.cons = try redact(o.cons)
+            o.effort = try redact(o.effort); o.risk = try redact(o.risk)
+            return o
+        }
+        return p
+    }
+
+    func redact(_ draft: HandoffDraft) throws -> HandoffDraft {
+        var d = draft
+        d.goal = try redact(d.goal)
+        d.decisions = try d.decisions.map { try redact($0) }
+        d.openQuestions = try d.openQuestions.map { try redact($0) }
+        d.fileRefs = try d.fileRefs.map { try redact($0) }
+        return d
+    }
+
     // MARK: Redaction
 
     /// The one helper every Store write of agent- or tool-produced text goes through. Throws `secretsNotLoaded` until the
@@ -30,7 +257,8 @@ extension Store {
     /// A loader `redact` runs once, on the first redacting write before the redactor has loaded (instead of throwing at
     /// once). The CLI sets it to a non-interactive load, so read-only commands never touch the vault. It may run inside a
     /// write transaction: it must read the database only through `reloadRedactorIfNeeded` (reentrant reads) and must not
-    /// log (`logFailures: false`).
+    /// log (`logFailures: false`). Set it only on a file-backed store (a `DatabasePool`): its reentrant reads from inside a
+    /// write would deadlock the single connection of `Store.inMemory` (a `DatabaseQueue`) if another thread held the reload lock.
     public var redactorLoader: (@Sendable () -> Void)? {
         get { redactor.lazyLoader }
         set { redactor.lazyLoader = newValue }

@@ -30,6 +30,9 @@ public struct TurnRequest: Sendable {
     public var addDirs: [String] = []
     /// Engine-set `BRAHMA_*` variables for the child; everything else comes from `ChildEnvironment`.
     public var environment: [String: String] = [:]
+    /// The test keys this turn gets (`use_secret`, Task 4-wire): applied by `ChildEnvironment.make(secrets:)` after its drop
+    /// step, the only way a secret value reaches a child. Never part of argv, the settings or any record.
+    public var secrets: [String: String] = [:]
     /// Review and audit turns are compiled clean-context: no `Task`, `Agent` or `Workflow` tools.
     public var kind: TurnKind = .work
     /// A plan turn writes its plan here (`<ws>/.brahma/plans/<KEY>/`), the only place it may write.

@@ -3008,6 +3008,20 @@ public struct GitWorkspace: Sendable {
         return out
     }
 
+    /// The whole patch between two commits for the leak scan (`SecretScan.check`): no context lines, no rename detection (a
+    /// renamed file's lines are added lines), up to git's capture limit (`cut` says there was more). Through `GitCommand`
+    /// like every engine call: the git dir comes from the engine's records, never from a worktree's `.git` file.
+    func scanDiff(base: String, head: String) throws -> (text: String, cut: Bool, limitMB: Int) {
+        try Self.validRef(base); try Self.validRef(head)
+        let out = try main.run(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "-U0", base, head])
+        return (String(decoding: out.stdout, as: UTF8.self), out.cut, GitCommand.maxCapture >> 20)
+    }
+
+    /// The empty tree of this repository (its hash algorithm's), the base of a scan for a branch with no common history.
+    func emptyTree() throws -> String {
+        try main.run(["hash-object", "-t", "tree", "/dev/null"]).text
+    }
+
     /// The patch between two commits, cut to `maxLines` lines and `maxChars` characters.
     public func diff(base: String, head: String, maxLines: Int = 400, maxChars: Int = 40_000) throws -> (text: String, truncated: Bool) {
         try Self.validRef(base); try Self.validRef(head)

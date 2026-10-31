@@ -716,6 +716,11 @@ enum Migrations {
                 t.column("endedAt", .datetime)
             }
         }
+        m.registerMigration("v5-secrets-2") { db in
+            // The item branch's head as the engine last recorded it (at claim, after each of the holder's turns, after an
+            // engine rebase): `submit_for_review` refuses a branch that is not a fast-forward of it (Task 4-wire, scan (a)).
+            try db.alter(table: "workItem") { t in t.add(column: "leaseHeadCommit", .text) }
+        }
         m.registerMigration("v5-restore") { db in
             try createRestoreTables(db)
         }

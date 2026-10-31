@@ -426,9 +426,29 @@ extension CompanyTools {
             throw ToolError(message: "your worktree for \(target.key) is missing; release the item and claim it again")
         }
         let worktree = git.worktreePath(key: target.key)
+        // Scan (a), first step (Task 4-wire): the branch must be a fast-forward of the head the engine recorded (at claim, or at
+        // the end of the holder's last turn). The turn's own commits pass; a rewritten or foreign-moved branch does not, and
+        // nothing is committed for it. (An equality check would refuse every turn that commits before it submits.)
+        if let recorded = target.leaseHeadCommit ?? target.baseCommit {
+            guard let branchHead = try git.head(of: git.branchRef(key: target.key)), try git.isAncestor(recorded, of: branchHead) else {
+                throw ToolError(message: "\(target.key)'s branch moved outside your turn; ask your manager")
+            }
+        }
         guard let commit = try git.commitAll(in: worktree, message: "\(target.key): submit round \(target.reviewRound + 1)")
                 ?? git.head(of: git.branchRef(key: target.key)) else { throw ToolError(message: "\(target.key) has no commit to submit") }
         if commit == target.baseCommit { throw ToolError(message: "\(target.key) has no changes to submit") }
+        // Scan (a), second step: what the change adds against `main` is scanned for the company's known secret values and
+        // the leak patterns. A finding names the rule or the secret, never a value; the item stays in progress.
+        let scanBase = try git.mergeBase(GitWorkspace.mainRef, commit) ?? target.baseCommit ?? git.emptyTree()
+        let findings = try SecretScan.check(git: git, base: scanBase, head: commit, knownValues: store.knownSecretValues(companyId: companyId))
+        if !findings.isEmpty {
+            let shown = Store.sanitizedFlags(findings).joined(separator: "; ")
+            try? store.appendEvent(ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .error,
+                                                 text: "submit of \(target.key) refused: the change contains what looks like a secret (\(shown))",
+                                                 createdAt: Store.now()))
+            throw ToolError(message: "\(target.key) was not submitted: the change contains what looks like a secret (\(shown)). "
+                            + "Remove it from the files on your branch (take it from your environment instead) and submit again.")
+        }
 
         // Weakening is measured against the base the engine recorded at claim, never the live `main` (an agent can move that ref).
         // History and check-script flags come first: the flag list is capped, and test-file flags (one per file) must not push them out.

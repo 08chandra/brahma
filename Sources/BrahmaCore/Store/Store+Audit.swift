@@ -461,7 +461,7 @@ extension Store {
                 throw WorkError.forbidden("this audit turn is limited to \(keys.isEmpty ? "its batch" : keys.joined(separator: ", "))")
             }
             guard sample.auditedAt == nil else { throw WorkError.conflict("\(item.key) was already audited") }
-            let body = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = try redact(notes).trimmingCharacters(in: .whitespacesAndNewlines)   // raw first
             guard body.count <= Self.maxAuditNotes else { throw WorkError.invalid("the notes are longer than \(Self.maxAuditNotes) characters") }
             if !ok, body.isEmpty { throw WorkError.invalid("a failed audit needs notes: say what is wrong") }
             sample.auditedAt = now

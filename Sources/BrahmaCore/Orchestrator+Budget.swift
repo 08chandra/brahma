@@ -155,7 +155,10 @@ extension Store {
         item.updatedAt = now
         try item.update(db)
         let lease = try WorkLease.fetchOne(db, key: item.id)
-        if lease != nil { try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id]) }
+        if lease != nil {
+            try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id])
+            try Store.endSecretUses(db: db, itemId: item.id, now: now)
+        }
 
         try recordItemEvent(db: db, item: item, actor: "system", kind: .statusChanged,
                             text: "\(from.title) → \(WorkItemStatus.blocked.title): over budget", now: now)

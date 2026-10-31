@@ -18,6 +18,8 @@ enum MergeResult: Equatable, Sendable {
     case conflict(files: [String], mergeBase: String, mainCommit: String, itemCommit: String)
     /// The item's branch is no longer the verified commit (it is `head`): nothing was merged.
     case branchMoved(head: String?)
+    /// The merge step's leak scan (`SecretScan.check` of `main...verified`, Task 4-wire) found these: nothing was merged.
+    case secretsFound(findings: [String])
 }
 
 extension Store {
@@ -265,6 +267,11 @@ extension Store {
             return expected
         }
         guard let expected else { return nil }
+        // Scan (b), Task 4-wire: what the verified commit adds against `main` is scanned again right before it lands (a value
+        // may have become a known secret since the submit). A finding bounces the item to its holder (`finishMerge`).
+        let scanBase = try git.mergeBase(GitWorkspace.mainRef, verified) ?? item.baseCommit ?? git.emptyTree()
+        let findings = try SecretScan.check(git: git, base: scanBase, head: verified, knownValues: knownSecretValues(companyId: company.id))
+        if !findings.isEmpty { return .secretsFound(findings: findings) }
         var pending: String?
         let outcome: GitWorkspace.LandOutcome
         do {
@@ -330,6 +337,8 @@ extension Store {
     ///   review (`finishVerification`); without a check its review is of the rebased head.
     /// - `.conflict`: the item goes back to its holder with a conflict brief; its verification is cleared.
     /// - `.branchMoved`: the branch is not what was checked and reviewed: the item goes back to its holder, nothing merged.
+    /// - `.secretsFound`: the merge-step leak scan found something: the item goes back to its holder with the findings
+    ///   (never a value), its verification cleared, nothing merged.
     func finishMerge(itemId: String, result: MergeResult, now: Date = Store.now()) throws {
         guard let item = try workItem(id: itemId), let company = try company(id: item.companyId) else { throw WorkError.notFound("no such work item") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
@@ -412,6 +421,34 @@ extension Store {
                     try current.update(db)
                     try recordItemEvent(db: db, item: current, actor: "system", kind: .edited, text: "rebased onto main at \(head.prefix(7))", now: now)
                 }
+            }
+            // The engine moved the branch: the rebased head is the recorded head the next submit is measured against.
+            try recordLeaseHead(itemId: itemId, commit: head)
+
+        case .secretsFound(let findings):
+            let shown = Self.sanitizedFlags(findings).joined(separator: "; ")
+            try writer.write { db in
+                guard var current = try WorkItem.fetchOne(db, key: itemId), current.status == .inReview, current.mergeState == .pending
+                else { return }
+                current.mergeState = .none
+                current.reviewAttempts = 0
+                current.autoApproved = false
+                // The next merge must be of work that passed its check (and its scans) again.
+                current.verifiedRevision = nil
+                current.verifiedCommit = nil
+                current.updatedAt = now
+                try current.update(db)
+                let returned = try engineSetStatus(db: db, itemId: itemId, to: .inProgress, now: now)
+                try Store.refreshLease(db, itemId: itemId, companyId: current.companyId)
+                let holder = try Self.leaseHolderId(db: db, itemId: itemId) ?? current.ownerId
+                try recordItemEvent(db: db, item: returned, actor: "system", kind: .verificationFailed,
+                                    text: "not merged: the change contains what looks like a secret (\(shown)). Remove it from the branch and submit again.",
+                                    alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+                guard let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed else { return }
+                try MessageRouter(store: self).sendDM(
+                    db: db, companyId: current.companyId, from: .system, to: agent.name,
+                    text: "\(current.key) was not merged: the change contains what looks like a secret (\(shown)). "
+                        + "Remove it from the files on item/\(current.key) (take it from your environment instead) and submit again.", now: now)
             }
 
         case .conflict(let files, let mergeBase, let mainCommit, let itemCommit):

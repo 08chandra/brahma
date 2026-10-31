@@ -20,6 +20,9 @@ public enum PushSettings {
 
         let newNormalized = try PushURL.normalized(server: newServer)
         let sameServer = before.pushProvider == .ntfy && (try? PushURL.normalized(server: before.pushServer)) == newNormalized
+        // The version moves before the vault does (7b re-review): a channel built from the old settings while the new token
+        // is being written is stale from the start and rebuilt once the settings land.
+        try store.bumpPushCredentialsVersion()
         if let token {
             try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken,
                           value: try OwnerCredential.boundNtfyToken(token, server: newServer))
@@ -27,21 +30,22 @@ public enum PushSettings {
             try vault.delete(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken)
         }
         if before.pushProvider != .ntfy { try deletePushover(vault) }
-        try store.setPush(provider: .ntfy, topic: topic, server: newServer, credentialsChanged: true, now: now)
+        try store.setPush(provider: .ntfy, topic: topic, server: newServer, now: now)
     }
 
     public static func setPushover(store: Store, vault: any SecretVault, appToken: String, userKey: String,
                                    now: Date = Store.now()) throws {
         guard OwnerCredential.valid(appToken) else { throw PushError.badCredential("Pushover app token") }
         guard OwnerCredential.valid(userKey) else { throw PushError.badCredential("Pushover user key") }
+        try store.bumpPushCredentialsVersion()
         try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverAppToken, value: appToken)
         try vault.set(companyId: OwnerCredential.scope, name: OwnerCredential.pushoverUserKey, value: userKey)
         try vault.delete(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken)
-        try store.setPush(provider: .pushover, credentialsChanged: true, now: now)
+        try store.setPush(provider: .pushover, now: now)
     }
 
     public static func turnOff(store: Store, vault: any SecretVault, now: Date = Store.now()) throws {
-        try store.setPush(provider: nil, credentialsChanged: true, now: now)
+        try store.setPush(provider: nil, now: now)
         try vault.delete(companyId: OwnerCredential.scope, name: OwnerCredential.ntfyToken)
         try deletePushover(vault)
     }

@@ -208,7 +208,7 @@ extension Store {
                 SELECT COUNT(*) FROM turn WHERE agentId = ? AND kind = 'review' AND itemId = ? AND outcome = 'inProgress'
                 """, arguments: [agentId, item.id]) ?? 0
             guard inTurn > 0 else { throw WorkError.forbidden(Self.reviewTurnOnlyMessage) }
-            let body = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = try redact(notes).trimmingCharacters(in: .whitespacesAndNewlines)   // raw first
             guard body.count <= Self.maxReviewNotes else {
                 throw WorkError.invalid("the notes are longer than \(Self.maxReviewNotes) characters")
             }

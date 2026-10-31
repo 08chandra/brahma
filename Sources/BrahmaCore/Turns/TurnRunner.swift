@@ -239,7 +239,7 @@ public struct ClaudeProcessRunner: TurnRunning {
             argv = ["env", claudePath] + leadingArguments + args
         }
         let environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
-                                                engineClaudeVars: profile.environment, purpose: .claude)
+                                                engineClaudeVars: profile.environment, purpose: .claude, secrets: request.secrets)
 
         // The parent's ends are close-on-exec, so no other child ever holds them; the child's ends are dup'ed onto 0, 1, 2.
         func makePipe() throws -> (read: Int32, write: Int32) {

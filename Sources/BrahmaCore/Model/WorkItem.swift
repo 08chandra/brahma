@@ -173,6 +173,9 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var checkSpecSetBy: String? = nil
     /// Failed (non-inconclusive) check outcomes since the latest claim; the third takes the item back (loop guard, 14b).
     public var failedChecksSinceClaim: Int = 0
+    /// The item branch's head as the engine last recorded it: at claim, at the end of each of the holder's turns and after an
+    /// engine rebase (Task 4-wire). `submit_for_review` refuses a branch that is not a fast-forward of it.
+    public var leaseHeadCommit: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

@@ -91,11 +91,11 @@ public struct CompanyTools: Sendable {
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
     public static let highRiskTools: Set<String> = ["decide", "propose_decision", "escalate_decision", "request_from_owner",
                                                     "request_mode", "plan_sprint", "close_sprint", "confirm_spec",
-                                                    "request_access"]
-    /// What a plan turn's server leaves out: everything that changes work, leases, decisions or channels.
+                                                    "request_access", "request_secret"]
+    /// What a plan turn's server leaves out: everything that changes work, leases, decisions, channels or a turn's environment.
     static let planTurnExcluded: Set<String> = Set(["claim_lease", "release_lease", "submit_for_review", "update_work_item",
                                                     "create_work_item", "link_dependency", "write_handoff", "create_channel",
-                                                    "set_blocked"])
+                                                    "set_blocked", "use_secret"])
         .union(highRiskTools)
     static let updateLowRiskFields: Set<String> = ["key", "status", "blockedReason", "blockedOnAsk", "notes", "linkedBranch"]
 

@@ -8,7 +8,7 @@ import BrahmaKeychain
 struct SecretGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "secret", abstract: "Store, list and remove a company's secrets (owner only).",
-        subcommands: [Set.self, List.self, Remove.self, Load.self])
+        subcommands: [Set.self, List.self, Remove.self, Load.self, Provide.self])
 
     struct Set: ParsableCommand {
         static let configuration = CommandConfiguration(
@@ -91,6 +91,41 @@ struct SecretGroup: ParsableCommand {
                 throw fail("could not load \(report.failed.count) secret(s); agents stay paused")
             }
             print("loaded \(report.loaded) secret\(report.loaded == 1 ? "" : "s")")
+        }
+    }
+
+    /// Answers an agent's `request_secret` ask (`A-<n>`): the value goes to the vault, the ask is approved as "provided".
+    struct Provide: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Provide the secret an agent asked for (ask A-<n>). The value is read from standard input (or prompted for in a terminal).")
+        @Argument(help: "Company name or slug.") var company: String
+        @Argument(help: "The ask, for example A-3.") var ask: String
+        @Flag(help: "Store it as a test key (the agent may take it into its environment with use_secret); default engine-held.")
+        var test = false
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let selected = try resolveCompany(store, company)
+            guard let found = try store.ask(companyId: selected.id, ref: ask.uppercased()) else { throw fail("no ask \(safe(ask)) in \(safe(selected.name))") }
+            guard let request = SecretRequests.requested(found) else { throw fail("\(found.ref) is not a secret request") }
+            let value: String
+            do {
+                if isatty(STDIN_FILENO) != 0 {
+                    guard let line = getpass("Value for \(request.name): ") else { throw SecretError.emptyValue }
+                    guard let typed = String(validatingCString: line) else { throw SecretError.notUTF8 }
+                    value = typed
+                    guard !value.isEmpty else { throw SecretError.emptyValue }
+                } else {
+                    value = try SecretInput.read(from: .standardInput)
+                }
+                _ = try store.provideSecret(askId: found.id, value: value, isTest: test, vault: try cliSecretVault(interactive: true))
+            } catch let e as SecretError {
+                throw fail(e.message)
+            } catch let e as WorkError {
+                throw fail(e.message)
+            }
+            print("provided \(request.name) for \(safe(selected.name)) (\(test ? "test key" : "engine-held")); \(found.ref) approved")
         }
     }
 

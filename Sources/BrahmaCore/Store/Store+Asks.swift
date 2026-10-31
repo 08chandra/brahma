@@ -272,6 +272,8 @@ extension Store {
                                                   && Column("requestId") == rid).fetchOne(db) {
             return existing
         }
+        // Every piece of text the ask stores is redacted raw, before cleaning, limits or flattening (Task 4-wire).
+        let title = try redact(title), summary = try redact(summary), payload = try redact(payload)
         guard decisionClass != .mechanical else { throw WorkError.invalid("a mechanical decision is recorded, not filed as an ask") }
         guard kind.isDecision else { throw WorkError.invalid("\(kind.rawValue) asks are not proposed; use request_from_owner") }
         // Counted in the write that inserts, so two concurrent filings cannot both pass.
@@ -401,9 +403,10 @@ extension Store {
             if let rid, let existing = try Ask.filter(Column("companyId") == companyId && Column("requesterId") == requester.id
                                                       && Column("requestId") == rid).fetchOne(db) { return existing }
             if quotaExempt == nil, requester.id != "system" { try AskQuota.check(db: db, agentId: requester.id) }
-            let cleanTitle = try Store.cleanAskTitle(title)
-            guard let q = try Store.limitedText(question, Store.maxAskField, "the question") else { throw WorkError.invalid("the question is empty") }
-            let body = AskPayload(question: q, details: try Store.limitedText(details, Store.maxAskText, "the details"))
+            // Redacted raw, before cleaning and limits (Task 4-wire).
+            let cleanTitle = try Store.cleanAskTitle(try redact(title))
+            guard let q = try Store.limitedText(try redact(question), Store.maxAskField, "the question") else { throw WorkError.invalid("the question is empty") }
+            let body = AskPayload(question: q, details: try Store.limitedText(try redact(details), Store.maxAskText, "the details"))
             if let h = expiresInHours, !(h > 0 && h <= Store.maxExpiryHours) {
                 throw WorkError.invalid("expires_in_hours must be between 0 and \(Int(Store.maxExpiryHours))")
             }

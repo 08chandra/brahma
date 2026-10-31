@@ -203,7 +203,9 @@ public struct KeychainVault: SecretVault {
             return sec("SecItemCopyMatching") { SecItemCopyMatching(q as CFDictionary, &out) }
         }
         if status == errSecItemNotFound { return nil }
-        if status == errSecInteractionNotAllowed || status == errSecAuthFailed { throw SecretError.needsPermission }
+        // A read that would have prompted (background), a denied prompt, or a cancelled one (`errSecUserCanceled`, -128): the
+        // owner's permission is what is missing, so the hold text points at `brahma secret load` / Load secrets.
+        if status == errSecInteractionNotAllowed || status == errSecAuthFailed || status == errSecUserCanceled { throw SecretError.needsPermission }
         guard status == errSecSuccess, let data = out as? Data else { throw SecretError.vaultFailed("read failed (OSStatus \(status))") }
         return try SecretValue.decode(data)
     }

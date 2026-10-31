@@ -379,7 +379,10 @@ extension Store {
             } else if let s = statusChange, s.to == .ready || s.to == .backlog {
                 releasedLease = (lease, "moved to \(s.to.title)")
             }
-            if releasedLease != nil { try lease.delete(db) }
+            if releasedLease != nil {
+                try lease.delete(db)
+                try Store.endSecretUses(db: db, itemId: item.id, now: now)
+            }
         }
         if !specChanged.isEmpty || checkChanged {
             // Whoever changes the spec vouches for it only if they are trusted; anyone else un-confirms it.
@@ -576,6 +579,8 @@ extension Store {
         item.updatedAt = now
         try item.update(db)
         if to == .done { try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id]) }
+        // A test key is in the holder's environment only while the item is in progress or in review (its checks).
+        if to != .inProgress, to != .inReview { try Store.endSecretUses(db: db, itemId: item.id, now: now) }
         try recordItemEvent(db: db, item: item, actor: "system", kind: event,
                             text: text ?? "\(from.title) → \(to.title)", now: now)
         if to == .done { try completeItem(db: db, item: item, now: now) }

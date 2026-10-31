@@ -387,6 +387,9 @@ public actor Orchestrator {
         // ready items to idle individual contributors. Nothing here waits on git.
         let reaped = try store.reapLeases(now: now)
         leaseMaintenance(now: now, companies: companies, reaped: reaped, held: held)
+        // Test-key uses whose lease or item status no longer carries them are closed (Task 4-wire; injection checks the
+        // live lease and status as well).
+        try store.sweepSecretUses(now: now)
 
         // A restore left its marker: re-adopt every repository's main (never waits on git).
         restoreMarkerTick(companies: companies)
@@ -636,6 +639,8 @@ public actor Orchestrator {
         // launch gives them back (I2).
         var spentGrants: [String] = []
         var launched = false
+        // A leaseholder's work turn: its item's branch head is recorded again when the turn ends (scan (a), Task 4-wire).
+        var leaseHead: (git: GitWorkspace, item: WorkItem)?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             // Nothing of the agent's earlier turns may still run, whatever the profile (M1): this turn waits for their sweep
@@ -726,6 +731,7 @@ public actor Orchestrator {
                     addDirs = [wt.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
                     checkout = wt
                     git = g
+                    if c.lease?.agentId == agent.id { leaseHead = (g, leased) }
                 }
                 // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
                 // leaseholder's updates are its work, so its turns stay work turns.
@@ -934,9 +940,15 @@ public actor Orchestrator {
                     : try store.issueTurnCredential(turnId: turn.id, quotas: mode.quotas)
             }
             try store.setTurnMode(turnId: turn.id, decision: mode)
-            let request = try turnRequest(
+            var request = try turnRequest(
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
                                                    reviewItem: review?.item.key, audit: audit != nil))
+            // The test keys the holder took with `use_secret` (Task 4-wire): only a work turn on the leased item, applied by the
+            // runner after `ChildEnvironment`'s drop step; a plan, review, audit or notice turn gets none. Read after the sandbox
+            // gate (a read, nothing consumed), never part of the gated shape.
+            if kind == .work, let leased = leaseHead?.item {
+                request.secrets = try store.injectableSecrets(agentId: agent.id, itemId: leased.id)
+            }
             let compiled = TurnProfileCompiler.profile(for: request)
             // Backstop: the shape that runs is the shape that was gated (they differ only if a string-free field changed).
             if let gate, compiled.settings.shape() != gatedShape {
@@ -1107,6 +1119,17 @@ public actor Orchestrator {
         // A plan turn must not have changed the worktree: the engine checks and resets before anything else looks at it (git,
         // off the cooperative pool).
         if let plan { await blocking.run { self.finishPlanTurn(plan, agent: agent, end: end, now: now) } }
+        // The holder's own commits of this turn become the recorded head: the next `submit_for_review` accepts fast-forwards
+        // of it and refuses anything else (a rewritten or foreign-moved branch). Recorded only while the agent still holds
+        // the lease (git, off the cooperative pool).
+        if let leaseHead {
+            let (store, key, itemId, agentId) = (self.store, leaseHead.item.key, leaseHead.item.id, agent.id)
+            await blocking.run {
+                guard (try? store.lease(itemId: itemId))?.agentId == agentId,
+                      let head = try? leaseHead.git.head(of: leaseHead.git.branchRef(key: key)) else { return }
+                do { try store.recordLeaseHead(itemId: itemId, commit: head) } catch { self.log("could not record the head of \(key): \(error)") }
+            }
+        }
 
         // A resumed session that no longer exists: it is reset and the agent is ready again at once (no penalty). The next
         // turn starts a fresh session. A fresh session that is "not found" again is an ordinary failure.

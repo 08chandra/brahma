@@ -62,6 +62,7 @@ extension Store {
     func writeHandoff(db: Database, item: WorkItem, authorId: String, authorHandle: String, draft: HandoffDraft, auto: Bool,
                              now: Date) throws -> Handoff {
         guard let company = try Company.fetchOne(db, key: item.companyId) else { throw WorkError.notFound("no such company") }
+        let draft = try redact(draft)   // raw, before any trimming, limits or flattening: a multi-line secret still matches
         var recipientHandle: String?
         if let to = draft.toAgentId {
             guard let agent = try Agent.fetchOne(db, key: to), agent.companyId == item.companyId else {

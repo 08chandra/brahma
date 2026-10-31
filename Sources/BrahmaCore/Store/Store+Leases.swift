@@ -206,6 +206,7 @@ extension Store {
                 throw WorkError.conflict("\(item.key) is in review; the engine releases its lease when the review ends")
             }
             try lease.delete(db)
+            try Store.endSecretUses(db: db, itemId: itemId, now: now)
             if item.status == .inProgress { item.status = .ready }
             if undoOwner, item.ownerId == agentId { item.ownerId = nil }
             item.updatedAt = now
@@ -252,6 +253,7 @@ extension Store {
 
     private func reapOne(_ db: Database, _ lease: WorkLease, now: Date) throws {
         try lease.delete(db)
+        try Store.endSecretUses(db: db, itemId: lease.itemId, now: now)
         guard var item = try WorkItem.fetchOne(db, key: lease.itemId) else { return }
         let holder = try Agent.fetchOne(db, key: lease.agentId)
         var text = "lease of @\(holder?.name ?? "?") expired"
@@ -271,6 +273,7 @@ extension Store {
     /// removes the worktrees) and it is unassigned from every item that is not done.
     func releaseWork(of agent: Agent, db: Database, now: Date) throws {
         try db.execute(sql: "UPDATE workLease SET expiresActive = -1 WHERE agentId = ?", arguments: [agent.id])
+        try Store.endSecretUses(db: db, agentId: agent.id, now: now)
         let owned = try WorkItem.filter(Column("ownerId") == agent.id && Column("status") != WorkItemStatus.done.rawValue)
             .order(Column("number")).fetchAll(db)
         for var item in owned {

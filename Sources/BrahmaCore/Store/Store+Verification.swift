@@ -105,6 +105,8 @@ extension Store {
     /// history with `main`) the head of `main` is used. A later claim of the same revision keeps the first baseline.
     func ensureCheckSnapshot(item: WorkItem, workspace: URL) throws {
         let git = gitWorkspace(root: workspace, companyId: item.companyId)
+        // The branch head at claim is the first recorded head (scan (a), Task 4-wire): a submit accepts only fast-forwards of it.
+        if let head = try git.head(of: git.branchRef(key: item.key)) { try recordLeaseHead(itemId: item.id, commit: head) }
         var base = item.baseCommit
         if base == nil {
             base = try git.mergeBase(GitWorkspace.mainRef, git.branchRef(key: item.key))
@@ -386,7 +388,7 @@ extension Store {
             let held = try EngineHold.fetchOne(db, key: 1) != nil
             let infra = !exitedClean && (couldNotRun || held || EngineHealth.classify(text: outcome.tail, apiErrorStatus: nil) == .network)
             run.exitCode = outcome.exitCode.map(Int.init)
-            run.outputTail = String(outcome.tail.suffix(Self.tailLimit))
+            run.outputTail = String(try redact(outcome.tail).suffix(Self.tailLimit))   // redacted raw, before the cut
             run.finishedAt = now
             run.status = exitedClean ? .passed : infra ? .inconclusive : outcome.timedOut ? .timedOut : .failed
             guard var item = try WorkItem.fetchOne(db, key: run.itemId), try !Self.isStale(db, run: run, item: item) else {
@@ -506,7 +508,7 @@ extension Store {
     func returnUnexportable(runId: String, reason: String, now: Date = Store.now()) throws {
         try writer.write { db in
             guard var run = try VerificationRun.fetchOne(db, key: runId), run.status == .running || run.status == .queued else { return }
-            let shown = Self.flat(reason, max: 400)
+            let shown = Self.flat(try redact(reason), max: 400)
             run.status = .error; run.outputTail = shown; run.finishedAt = now
             try run.update(db)
             guard let item = try WorkItem.fetchOne(db, key: run.itemId), try !Self.isStale(db, run: run, item: item) else { return }

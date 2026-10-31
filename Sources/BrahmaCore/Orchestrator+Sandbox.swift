@@ -192,7 +192,10 @@ extension Orchestrator {
                 // The prefix's backstop, re-asserted before every sandboxed turn (M4).
                 try Sentinel.write(paths: paths)
                 try layout.ensure()
-                let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [],
+                // The Bash prefix scrubs secret-looking variables except the test keys this work turn gets (`use_secret`, Task
+                // 4-wire): the same names the runner injects. Names only; a database error refuses the turn.
+                let keep = kind == .work ? try item.map { try store.injectableSecretNames(agentId: agent.id, itemId: $0.id) } ?? [] : []
+                let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: keep,
                                                    mcpServer: ShellPrefix.MCPServer(executable: mcp, database: paths.database.path,
                                                                                     companyId: company.id, agentId: agent.id,
                                                                                     ownerHome: env.userHome.path))

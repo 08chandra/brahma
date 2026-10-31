@@ -922,7 +922,10 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(try brahma(["secret", "list", "Acme"], home: home).status == 0)
         let write = try brahma(["say", "Acme", "#general", "hello"], home: home)
         #expect(write.status != 0); #expect(write.stderr.contains("secrets are not loaded yet"), "\(write.stderr)")
-        #expect(write.stderr.contains("brahma secret load"), "\(write.stderr)")
+        // The lazy loader's line says why, by reason (the same wording as the owner notice): a corrupt vault is not a
+        // permission problem, so it points at `secret set` / `secret rm`, and names the secret, never a value.
+        #expect(write.stderr.contains("API_KEY (the secrets vault failed: the vault file is corrupt)"), "\(write.stderr)")
+        #expect(write.stderr.contains("brahma secret set"), "\(write.stderr)")
         let failedLoad = try brahma(["secret", "load", "Acme"], home: home)
         #expect(failedLoad.status == 1); #expect(failedLoad.stderr.contains("API_KEY"), "\(failedLoad.stderr)")
         try FileManager.default.removeItem(at: file)

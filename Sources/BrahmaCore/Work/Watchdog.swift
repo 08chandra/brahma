@@ -193,7 +193,10 @@ extension Store {
     func watchdogEscalate(db: Database, agent: Agent, item: WorkItem?, reason: String, stopReason: String, now: Date) throws -> Blocker {
         if var item {
             let lease = try WorkLease.fetchOne(db, key: item.id)
-            if lease != nil { try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id]) }
+            if lease != nil {
+                try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id])
+                try Store.endSecretUses(db: db, itemId: item.id, now: now)
+            }
             let from = item.status
             let budgetBlocked = from == .blocked && item.stopReason == "budget"
             if !budgetBlocked {
