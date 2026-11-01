@@ -14,7 +14,7 @@ import GRDB
 
     @Test func newCompaniesDefaultToBalancedSoftware() throws {
         let (_, c) = try make()
-        #expect(c.usageMode == .balanced); #expect(c.packId == "software"); #expect(c.packVersion == 1)
+        #expect(c.usageMode == .balanced); #expect(c.packId == "software"); #expect(c.packVersion == PackCatalog.builtin.pack("software")!.version)
         let s = try Store.inMemory()
         #expect(throws: OrgError.unknownPack) { try s.createCompany(name: "X", goal: "g", workspacesRoot: try tempDir(), packId: "nope") }
     }

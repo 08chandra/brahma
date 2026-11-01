@@ -641,7 +641,52 @@ enum Migrations {
             }
         }
         registerPlan5(&m)
+        registerPlanL(&m)
         return m
+    }
+
+    /// Plan L migrations (PR-21): registered after every 5-lite migration, never inside `registerPlan5`, in landing order
+    /// vL-preview, vL-hosting, vL-release, vL-human-tasks, vL-import. Never edit an earlier one.
+    static func registerPlanL(_ m: inout DatabaseMigrator) {
+        m.registerMigration("vL-preview") { db in
+            // The previews a company runs from `main` (`PreviewSurface`) and the engine's record of each one's process
+            // (`PreviewState`). `kind` is text so a row a later plan writes still loads; `smoke` and `exits` are JSON arrays.
+            try db.execute(sql: """
+                CREATE TABLE previewSurface (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    companyId TEXT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    build TEXT,
+                    run TEXT,
+                    url TEXT,
+                    smoke TEXT NOT NULL DEFAULT '[]',
+                    setById TEXT NOT NULL,
+                    createdAt DATETIME NOT NULL,
+                    updatedAt DATETIME NOT NULL,
+                    UNIQUE(companyId, name)
+                );
+                CREATE TABLE previewState (
+                    surfaceId TEXT PRIMARY KEY NOT NULL REFERENCES previewSurface(id) ON DELETE CASCADE,
+                    companyId TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    "commit" TEXT,
+                    port INTEGER,
+                    resolvedURL TEXT,
+                    pid INTEGER,
+                    message TEXT,
+                    logPath TEXT,
+                    exits TEXT NOT NULL DEFAULT '[]',
+                    restartRequestedAt DATETIME,
+                    startedAt DATETIME,
+                    updatedAt DATETIME NOT NULL
+                );
+                CREATE INDEX previewState_company ON previewState(companyId);
+                CREATE INDEX previewState_port ON previewState(port);
+                """)
+        }
+        // vL-hosting (Task 4)
     }
 
     /// Task 12 fix 1 (`v5-restore`): one row per restore (`nonce`, also in the restore marker; `consumedAt` once the engine has
