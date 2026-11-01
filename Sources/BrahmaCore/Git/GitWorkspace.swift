@@ -1038,22 +1038,34 @@ public struct GitWorkspace: Sendable {
     ///
     /// `keepIf` is asked under the item's lock, after any concurrent add has finished: when it returns true (a lease exists
     /// now) nothing is removed, and when it throws nothing is removed either (an unreadable database is not "no lease").
-    public func removeWorktree(key: String, keepIf: () throws -> Bool) throws {
+    ///
+    /// Returns the engine's own auto-commit (its parent, the branch tip it was stacked on, and the new commit) when there was
+    /// uncommitted work, so the caller can record it as the item's head (`Store.removeItemWorktree`, 4-wire fix round 4).
+    @discardableResult
+    public func removeWorktree(key: String, keepIf: () throws -> Bool) throws -> AutoCommit? {
         try Self.validKey(key)
-        try withKeyLock(key) {
-            if try keepIf() { return }
-            try removeWorktreeLocked(key: key)
+        return try withKeyLock(key) { () -> AutoCommit? in
+            if try keepIf() { return nil }
+            return try removeWorktreeLocked(key: key)
         }
     }
 
-    private func removeWorktreeLocked(key: String) throws {
+    /// The engine's own commit of a worktree's leftover work: `commit` has the single parent `parent`.
+    public struct AutoCommit: Equatable, Sendable {
+        public var parent: String
+        public var commit: String
+    }
+
+    private func removeWorktreeLocked(key: String) throws -> AutoCommit? {
+        var made: AutoCommit?
         let command = "worktree remove \(key)"
         let wt = try engineDirectory(".brahma/wt", command: command)
         switch wt.kind(of: key) {
         case .link:
             try? wt.remove(key)
         case .directory where FileManager.default.fileExists(atPath: adminDir(key: key).path):
-            try commitAll(in: worktreePath(key: key), message: "\(key): auto-commit before release")
+            if let c = try commitAllWithParent(in: worktreePath(key: key), message: "\(key): auto-commit before release"),
+               let parent = c.parent { made = AutoCommit(parent: parent, commit: c.commit) }
             // The work is committed. The checkout goes through the walked directory's descriptor, never by a path a link on
             // the way could send elsewhere (so not `git worktree remove`); git then forgets it (`prune`).
             try withWorktreeRecords { try removeEngineEntry(key, in: wt, command: command) }
@@ -1061,6 +1073,7 @@ public struct GitWorkspace: Sendable {
             break
         }
         _ = try? withWorktreeRecords { _ = try? main.run(["worktree", "prune"]) }
+        return made
     }
 
     // MARK: Engine checkout places under .brahma
@@ -2173,6 +2186,11 @@ public struct GitWorkspace: Sendable {
     /// and here), no other branch can move, and a branch that moved meanwhile makes the swap fail.
     @discardableResult
     public func commitAll(in dir: URL, message: String) throws -> String? {
+        try commitAllWithParent(in: dir, message: message)?.commit
+    }
+
+    /// `commitAll`, also naming the branch tip the commit was stacked on (nil outside an item worktree).
+    func commitAllWithParent(in dir: URL, message: String) throws -> (parent: String?, commit: String)? {
         let (git, key) = try resolve(dir)
         guard let key else {
             try stage(git, in: dir, relative: "")
@@ -2182,7 +2200,7 @@ public struct GitWorkspace: Sendable {
                 throw GitError.failed(command: "diff --cached --quiet", status: staged.status, stderr: staged.stderr)
             }
             try git.run(["commit", "--quiet", "--no-verify", "-m", message])
-            return try git.run(["rev-parse", "HEAD"]).text
+            return (nil, try git.run(["rev-parse", "HEAD"]).text)
         }
         let ref = branchRef(key: key)
         guard let tip = try ownTip(git, ref) else {
@@ -2203,7 +2221,7 @@ public struct GitWorkspace: Sendable {
         // The worktree's own index follows the branch, so the checkout is clean afterwards.
         try? git.run(["read-tree", commit])
         try verifyAfter(key: key)
-        return commit
+        return (tip, commit)
     }
 
     /// The most paths `stage` leaves out of one commit; more refuses the commit.
@@ -3024,7 +3042,7 @@ public struct GitWorkspace: Sendable {
     /// hash on a `commit <hash>` line, then its diff in the same form as `scanDiff`.
     func scanLog(base: String, head: String) throws -> (text: String, cut: Bool) {
         try Self.validRef(base); try Self.validRef(head)
-        let out = try main.run(["log", "--format=commit %H", "-p", "-U0", "--text", "--no-ext-diff", "--no-textconv", "--no-color",
+        let out = try main.run(["log", "--format=commit %H", "--encoding=none", "--no-decorate", "-p", "-U0", "--text", "--no-ext-diff", "--no-textconv", "--no-color",
                                 "--no-renames", "--cc", "--no-show-signature", "\(base)..\(head)"])
         return (String(decoding: out.stdout, as: UTF8.self), out.cut)
     }
@@ -3034,7 +3052,11 @@ public struct GitWorkspace: Sendable {
     /// capture limit like the other scans (`cut` fails closed).
     func scanMessages(base: String, head: String) throws -> (text: String, cut: Bool) {
         try Self.validRef(base); try Self.validRef(head)
-        let out = try main.run(["log", "--pretty=raw", "--no-color", "--no-show-signature", "--no-abbrev", "\(base)..\(head)"])
+        // `--encoding=none`: the bytes as stored, never re-encoded from a commit's `encoding` header (an IBM037 or UTF-16
+        // header would turn the record into text no pattern matches; 4-wire fix round 4, B2). `--no-decorate`: a
+        // `log.decorate` setting cannot change the `commit <hash>` lines.
+        let out = try main.run(["log", "--pretty=raw", "--encoding=none", "--no-decorate", "--no-color", "--no-show-signature",
+                                "--no-abbrev", "\(base)..\(head)"])
         return (String(decoding: out.stdout, as: UTF8.self), out.cut)
     }
 

@@ -163,6 +163,26 @@ extension Store {
         }
     }
 
+    /// Removes an item's worktree unless it is leased again (`GitWorkspace.removeWorktree`), and records the engine's own
+    /// auto-commit of leftover work as the item's head — by compare-and-set: only when the recorded head is the commit's
+    /// parent and the item is not flagged (4-wire fix round 4, B1). Anything else (the branch moved meanwhile) is left for
+    /// the next claim to flag. Every engine path that removes an item worktree goes through here: release, reassignment,
+    /// the reap after a stop, kill or expiry, the sweep, and the cleanup after a landing.
+    @discardableResult
+    public func removeItemWorktree(git: GitWorkspace, companyId: String, key: String) throws -> GitWorkspace.AutoCommit? {
+        let made = try git.removeWorktree(key: key, keepIf: { try lease(companyId: companyId, key: key) != nil })
+        if let made { try recordEngineAutoCommit(companyId: companyId, key: key, made) }
+        return made
+    }
+
+    func recordEngineAutoCommit(companyId: String, key: String, _ made: GitWorkspace.AutoCommit) throws {
+        try writer.write { db in
+            try db.execute(sql: """
+                UPDATE workItem SET leaseHeadCommit = ? WHERE companyId = ? AND key = ? AND leaseHeadCommit = ? AND branchMoved = 0
+                """, arguments: [made.commit, companyId, key, made.parent])
+        }
+    }
+
     /// At claim (4-wire fix round 3, R2): the branch head becomes the recorded head, unless the item already has a recorded
     /// head the branch no longer is — a move while nobody held the lease. That is flagged (with no flagged holder, so only an
     /// executive or the owner can re-adopt it), not adopted. An item already flagged keeps its flag and its flagged holder.

@@ -60,7 +60,7 @@ extension Orchestrator {
             // error is not "no lease" (nothing is removed then).
             await blocking.run {
                 do {
-                    try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
+                    try store.removeItemWorktree(git: git, companyId: companyId, key: key)
                 } catch { self.log("could not remove worktree \(key): \(error)") }
             }
         }
@@ -78,7 +78,7 @@ extension Orchestrator {
             // Only registered `item/<KEY>` worktrees; engine checkouts (".preview", ".merge", ...) are never listed. One
             // item that cannot be decided (busy lock, unreadable lease) is skipped; the others are still swept.
             for (key, _) in items {
-                do { try git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil }) }
+                do { try store.removeItemWorktree(git: git, companyId: companyId, key: key) }
                 catch { self.log("worktree sweep skipped \(key): \(error)") }
             }
         }

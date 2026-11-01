@@ -393,18 +393,25 @@ extension CompanyTools {
     /// Removes the item's worktree unless a lease exists again by the time the item's lock is taken (a new claim won the
     /// race), or the lease cannot be read.
     private func removeWorktreeUnlessLeased(key: String) throws {
-        let (store, companyId) = (self.store, self.companyId)
-        try gitWorkspace(try workspace()).removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
+        try store.removeItemWorktree(git: gitWorkspace(try workspace()), companyId: companyId, key: key)
     }
 
     private func releaseLease(_ target: WorkItem, note: String?) throws -> String {
-        // The holder's own commits of this turn become the recorded head before the lease goes (as at a turn's end), so the
-        // next claim does not take them for a move while nobody held the item (4-wire fix round 3, R2).
+        // The holder's own commits of this turn, and the engine's auto-commit of what it left uncommitted (made here, while
+        // the lease is still held), become the recorded head before the lease goes (as at a turn's end), so the next claim
+        // does not take them for a move while nobody held the item (4-wire fix rounds 3 and 4, R2/B1).
         let git = gitWorkspace(try workspace())
-        if try store.lease(itemId: target.id)?.agentId == agentId, let me = try store.agent(id: agentId),
-           let head = try git.head(of: git.branchRef(key: target.key)) {
+        if try store.lease(itemId: target.id)?.agentId == agentId, let me = try store.agent(id: agentId) {
+            if target.status != .inReview, git.hasCheckout(key: target.key) {   // an item in review is never released
+                _ = try git.commitAll(in: git.worktreePath(key: target.key), message: "\(target.key): auto-commit before release")
+            }
+            guard let head = try git.head(of: git.branchRef(key: target.key)) else { return try finishRelease(target, note: note) }
             try store.recordTurnEndHead(item: target, agent: me, head: head, isDescendant: { try git.isAncestor($0, of: head) }, now: Store.now())
         }
+        return try finishRelease(target, note: note)
+    }
+
+    private func finishRelease(_ target: WorkItem, note: String?) throws -> String {
         try store.releaseLease(itemId: target.id, agentId: agentId, note: note)
         var tail = "Your work is saved on branch \(gitWorkspace(try workspace()).branch(key: target.key))."
         do { try removeWorktreeUnlessLeased(key: target.key) } catch {

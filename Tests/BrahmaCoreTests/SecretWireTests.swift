@@ -1086,6 +1086,81 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         #expect(!refusal.contains(aws))
     }
 
+    // MARK: 4-wire fix round 4
+
+    @Test func dirtyReleaseThenReclaimIsNotFlagged() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.commitInWorktree(i, ["src/a.txt": "a\n"])
+        let committed = try #require(try w.branchHead(i))
+        try w.write("src/left.txt", "left uncommitted\n", in: wt)
+        _ = try w.call(w.eng, "release_lease", ["key": .string(i.key)])
+        let head = try #require(try w.branchHead(i))
+        #expect(head != committed, "the engine auto-committed the leftover work")
+        #expect(try w.fresh(i).leaseHeadCommit == head)
+        try w.claim(i, w.eng)
+        #expect(!(try w.fresh(i).branchMoved)); #expect(try w.fresh(i).leaseHeadCommit == head)
+    }
+
+    @Test func reassignOfADirtyWorktreeThenSweepIsNotFlagged() async throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        let recorded = try #require(try w.fresh(i).leaseHeadCommit)
+        try w.write("src/left.txt", "left uncommitted\n", in: wt)
+        // The owner reassigns (no tool removes the worktree): the sweep finds it unleased and auto-commits.
+        var patch = WorkItemPatch(); patch.ownerId = .some(w.eng2.id)
+        _ = try w.store.updateWorkItem(id: i.id, by: .owner, patch: patch)
+        #expect(try w.store.lease(itemId: i.id) == nil)
+        await w.world.orchestrator.sweepNow(company: w.company)
+        let head = try #require(try w.branchHead(i))
+        #expect(head != recorded); #expect(try w.fresh(i).leaseHeadCommit == head, "the engine's own commit is recorded (CAS)")
+        try w.claim(i, w.eng2)
+        #expect(!(try w.fresh(i).branchMoved))
+        // A foreign move while unleased is still flagged.
+        _ = try w.call(w.eng2, "release_lease", ["key": .string(i.key)])
+        let tree = try GitFixture.plainGit(["rev-parse", "\(head)^{tree}"], in: w.root)
+        let orphan = try GitFixture.plainGit(["commit-tree", tree, "-m", "foreign"], in: w.root)
+        try GitFixture.plainGit(["update-ref", w.ws.branchRef(key: i.key), orphan], in: w.root)
+        try w.claim(i, w.eng2)
+        #expect(try w.fresh(i).branchMoved)
+    }
+
+    @Test func reapOfADirtyWorktreeIsNotFlagged() async throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        let recorded = try #require(try w.fresh(i).leaseHeadCommit)
+        try w.write("src/left.txt", "left uncommitted\n", in: wt)
+        // The holder is stopped for good (killed): the tick reaps its lease and removes the worktree, auto-committing.
+        try w.db { db in try db.execute(sql: "UPDATE agent SET state = 'killed' WHERE id = ?", arguments: [w.eng.id]) }
+        try await w.cycle()
+        #expect(try w.store.lease(itemId: i.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: wt.path))
+        let head = try #require(try w.branchHead(i))
+        #expect(head != recorded); #expect(try w.fresh(i).leaseHeadCommit == head)
+        var patch = WorkItemPatch(); patch.ownerId = .some(w.eng2.id)
+        _ = try w.store.updateWorkItem(id: i.id, by: .owner, patch: patch)
+        if try w.store.lease(itemId: i.id) == nil { try w.claim(i, w.eng2) }
+        #expect(!(try w.fresh(i).branchMoved))
+    }
+
+    @Test func reencodedCommitMessagesAreScannedAsBytes() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.write("src/w.txt", "w\n", in: wt)
+        try GitFixture.plainGit(["add", "-A"], in: wt)
+        // The message bytes are ASCII, but the header says IBM037: re-encoded, they would match nothing.
+        try GitFixture.plainGit(["-c", "i18n.commitEncoding=IBM037", "commit", "-q", "-m", "key \(aws)"], in: wt)
+        let leak = try #require(try w.branchHead(i))
+        #expect(try GitFixture.plainGit(["cat-file", "commit", leak], in: w.root).contains("encoding IBM037"))
+        let refusal = w.failure { try w.submit(i, w.eng) }
+        #expect(refusal.contains("aws-key in a commit message or header") && refusal.contains("commit \(leak.prefix(7))"),
+                Comment(rawValue: refusal))
+    }
+
     // MARK: Push settings (7b re-review carry-overs)
 
     @Test func pushCredentialsVersionBumpsBeforeTheVaultIsWritten() throws {

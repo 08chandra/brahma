@@ -381,7 +381,7 @@ extension Store {
             guard landed else { return }
             // Housekeeping: a leftover worktree is swept later, so none of this is fatal.
             let (store, companyId, key) = (self, company.id, item.key)
-            try? git.removeWorktree(key: key, keepIf: { try store.lease(companyId: companyId, key: key) != nil })
+            try? store.removeItemWorktree(git: git, companyId: companyId, key: key)
             try? git.deleteBranch(key: key)
             try? clearBaseCommit(itemId: itemId)
             try MergeSafety(store: self).afterLanding(companyId: company.id, mergedKey: item.key)
