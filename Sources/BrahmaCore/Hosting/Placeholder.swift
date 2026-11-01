@@ -1,17 +1,17 @@
 import Foundation
 
 /// The engine-written site a rollback deploys when there is no previous release: one `index.html` in
-/// `EngineLayout.placeholderDir`. Its content is engine-fixed (so a plan's hash covers its `cwdPath`, not the file), and it
-/// is rewritten before each placeholder rollback, through `EngineFiles` (no link under `.brahma` is ever followed).
+/// `ReleaseLayout.placeholderDir`, under the data home (I3). Its content is engine-fixed (so a plan's hash covers its
+/// `cwdPath`, not the file), and it is rewritten before each placeholder rollback, through `EngineFiles` (no link is ever
+/// followed).
 public enum Placeholder {
-    static let relative = ".brahma/releases/placeholder"
-
     /// Replaces `layout.placeholderDir` with a folder holding only `index.html`; returns the folder.
     @discardableResult
-    public static func write(to layout: EngineLayout, companyName: String) throws -> URL {
-        try EngineFiles.remove(workspace: layout.workspace, dir: ".brahma/releases", name: "placeholder")
-        try EngineFiles.directory(workspace: layout.workspace, relative)
-        try EngineFiles.replace(Data(html(companyName: companyName).utf8), workspace: layout.workspace, dir: relative, name: "index.html")
+    public static func write(to layout: ReleaseLayout, companyName: String) throws -> URL {
+        try BrahmaPaths.ensurePrivateDirectory(layout.root)
+        try EngineFiles.remove(workspace: layout.root, dir: "", name: "placeholder")
+        try EngineFiles.directory(workspace: layout.root, "placeholder")
+        try EngineFiles.replace(Data(html(companyName: companyName).utf8), workspace: layout.root, dir: "placeholder", name: "index.html")
         return layout.placeholderDir
     }
 
