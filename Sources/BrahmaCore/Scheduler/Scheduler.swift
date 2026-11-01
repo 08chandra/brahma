@@ -35,12 +35,19 @@ public struct Candidate: Sendable {
 public enum Scheduler {
     /// How many more turns may start right now: the global cap (hard and safety caps, halved under memory warning) less
     /// what is running. Zero under a hold (an engine hold or the owner's stop) or critical memory pressure. Admission and engine dispatch share this count.
-    public static func freeSlots(config: SchedulerConfig, running: Int, otherChildren: Int = 0,
+    /// `safetyOnly`: child processes that count against the safety cap only, never the plan tier's hard cap (running
+    /// preview servers and preview starts: memory and process safety, not usage). Free slots are
+    /// `min(hardCap − running − otherChildren, safetyCap − running − otherChildren − safetyOnly)`, both halved (never below 1)
+    /// under `.warning`.
+    public static func freeSlots(config: SchedulerConfig, running: Int, otherChildren: Int = 0, safetyOnly: Int = 0,
                                  pressure: MemoryPressure = .normal, held: Bool = false) -> Int {
         if held || pressure == .critical { return 0 }
-        var cap = min(config.effectiveHardCap, config.safetyCap)
-        if pressure == .warning { cap = max(1, cap / 2) }
-        return max(cap - running - otherChildren, 0)
+        var hard = config.effectiveHardCap, safety = config.safetyCap
+        if pressure == .warning {
+            let cap = max(1, min(hard, safety) / 2)
+            hard = min(hard, cap); safety = min(safety, cap)
+        }
+        return max(min(hard - running - otherChildren, safety - running - otherChildren - safetyOnly), 0)
     }
 
     /// Pure: picks which ready agents to start now. Weighted round-robin across companies, bounded by the
@@ -54,11 +61,11 @@ public enum Scheduler {
     /// - `paceStrict`: pace-closed companies whose spend has reached the owner's reserve (`util >= 1 - reserve`);
     ///   the critical-path exemption ends there and nothing is admitted.
     public static func select(candidates: [Candidate], runningByCompany: [String: Int], config: SchedulerConfig,
-                              usage: (Company) -> UsageDecision, otherChildren: Int = 0,
+                              usage: (Company) -> UsageDecision, otherChildren: Int = 0, safetyOnly: Int = 0,
                               pressure: MemoryPressure = .normal, held: Bool = false,
                               paceClosed: Set<String> = [], paceStrict: Set<String> = []) -> [Agent] {
         var globalFree = freeSlots(config: config, running: runningByCompany.values.reduce(0, +), otherChildren: otherChildren,
-                                   pressure: pressure, held: held)
+                                   safetyOnly: safetyOnly, pressure: pressure, held: held)
         if globalFree <= 0 { return [] }
 
         var companies: [String: Company] = [:]
