@@ -26,7 +26,12 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
     /// When set, `spawn` throws it (after recording the call).
     var spawnError: (any Error)?
 
+    private var spawned: [Int32] = []
+
     var calls: [Call] { lock.withLock { recorded } }
+    /// The pid (process group) of every process `spawn` started, in order.
+    var spawnedPids: [Int32] { lock.withLock { spawned } }
+    var lastSpawnedPid: Int32? { spawnedPids.last }
     private func record(_ call: Call) { lock.withLock { recorded.append(call) } }
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
@@ -54,6 +59,7 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
         defer { close(file) }
         let child = try ProcessGroupChild.spawn(executable: "/bin/sh", arguments: ["/bin/sh", "-c", command], environment: environment,
                                                 workingDirectory: cwd, output: file)
+        lock.withLock { spawned.append(child.pid) }
         return FakeSandboxProcess(child: child)
     }
 }
