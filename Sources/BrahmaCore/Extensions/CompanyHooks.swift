@@ -6,8 +6,9 @@ import Foundation
 public enum CompanyHooks {
     public static let banner = "Brahma: possible secret"
 
-    /// The POSIX `sh` pre-commit script: every added line of the staged diff (the `+++` file headers left out; no external diff
-    /// or textconv driver) is written once to a temporary file and matched against every `SecretScan` pattern with `grep -E -e`
+    /// The POSIX `sh` pre-commit script: every added line of the staged diff (marked `>` with `--output-indicator-new`, taken
+    /// only inside hunks, so no file header is ever content and no content is ever mistaken for a header; `--text`, no external
+    /// diff or textconv driver; a trailing CR dropped) is written once to a temporary file and matched against every `SecretScan` pattern with `grep -E -e`
     /// (the pattern may start with `-`); a match blocks the commit and names the rule, never the match. Deleted test files are
     /// reported, and the commit goes through. A clean commit prints nothing.
     public static let preCommit: String = {
@@ -16,8 +17,15 @@ public enum CompanyHooks {
             "#!/bin/sh",
             "# Brahma pre-commit hook (engine-owned; reinstalled when it differs). Advisory: --no-verify bypasses it.",
             "added=$(mktemp \"${TMPDIR:-/tmp}/brahma-hook.XXXXXX\") || exit 0",
-            "trap 'rm -f \"$added\"' EXIT",
-            "git diff --cached -U0 --no-color --no-ext-diff --no-textconv | grep -v '^+++ ' | grep '^+' | cut -c2- > \"$added\"",
+            "trap 'rm -f \"$added\" \"$added.lines\"' EXIT",
+            // Added lines carry `>` (never `+`, which a `+++ b/path` header shares with content starting `++ `); only lines
+            // inside a hunk count (state resets at each `diff --git`); `--text` scans binary-attributed files; a trailing CR
+            // is dropped so a CRLF line matches like an LF one. A diff that fails is reported, never silently clean.
+            "if ! git diff --cached -U0 --no-color --no-ext-diff --no-textconv --text --output-indicator-new='>' > \"$added\"; then",
+            "  echo \"Brahma: could not read the staged changes; the secret scan did not run.\" >&2",
+            "  exit 0",
+            "fi",
+            "awk '/^diff --git /{h=0; next} /^@@/{h=1; next} h && substr($0, 1, 1) == \">\" {s = substr($0, 2); sub(/\\r$/, \"\", s); print s}' \"$added\" > \"$added.lines\" && mv \"$added.lines\" \"$added\"",
         ]
         for p in SecretScan.patterns {
             lines.append("if grep -E -q -e '\(p.ere)' \"$added\"; then")

@@ -115,6 +115,65 @@ import Foundation
         #expect(SecretScan.patterns.allSatisfy { !$0.ere.contains("'") }, "the EREs are single-quoted in the script")
     }
 
+    /// S14 (fix round 1b): added lines are taken by their `>` marker inside hunks only. Content that starts with `++ ` or
+    /// `+++ ` (which rendered like a `+++ b/path` header) is scanned; a real header (a path that looks like a key) is not
+    /// content; a binary-attributed file is scanned (`--text`); a CRLF line is scanned.
+    @Test func addedLineMarkersAreUnambiguous() throws {
+        let key = "AKIAABCDEFGHIJKLMNOP"
+        let blocked = "Brahma: possible secret (aws-key) in staged changes — commit blocked."
+        func attempt(_ files: [String: Data], attributes: String? = nil) throws -> (status: Int32, stderr: String) {
+            let f = try Fixture()
+            _ = try f.install()
+            if let attributes {
+                try f.git.write(".gitattributes", attributes)
+                try f.git.git(["add", ".gitattributes"])
+                try f.git.git(["-c", "core.hooksPath=/dev/null", "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "-m", "attrs"])
+            }
+            for (name, data) in files {
+                try data.write(to: f.git.root.appending(path: name))
+                try f.git.git(["add", "--", name])
+            }
+            return try Self.commit(f, "change")
+        }
+        for content in ["++ \(key)\n", "+++ \(key)\n", "+++ b/\(key)\n", "x\n++ \(key)\n"] {
+            let r = try attempt(["notes.txt": Data(content.utf8)])
+            #expect(r.status != 0, "\(content.debugDescription)"); #expect(r.stderr.contains(blocked), "\(content.debugDescription): \(r.stderr)")
+        }
+        // A real `+++ b/<path>` header whose path looks like a key is never scanned as content.
+        let header = try attempt(["\(key).txt": Data("nothing here\n".utf8)])
+        #expect(header.status == 0, "\(header.stderr)"); #expect(header.stderr.isEmpty, "\(header.stderr)")
+        // A binary-attributed file (and one holding NUL bytes) is still scanned.
+        let binary = try attempt(["blob.bin": Data([0, 1, 2]) + Data("\n\(key)\n".utf8)], attributes: "*.bin binary\n")
+        #expect(binary.status != 0, "\(binary.stderr)"); #expect(binary.stderr.contains(blocked))
+        // A CRLF line.
+        let crlf = try attempt(["win.txt": Data("first\r\nkey = \(key)\r\n".utf8)])
+        #expect(crlf.status != 0, "\(crlf.stderr)"); #expect(crlf.stderr.contains(blocked))
+        #expect(CompanyHooks.preCommit.contains("--text --output-indicator-new='>'"))
+    }
+
+    /// The hook's extraction keeps exactly the added lines' content, CR stripped, and nothing from the headers.
+    @Test func extractionKeepsOnlyAddedContent() throws {
+        let f = try Fixture()
+        _ = try f.install()
+        try f.git.write("README.md", "# hi\r\n++ two\n+++ three\n")
+        try f.git.write("new.txt", "added\r\n")
+        try f.git.git(["add", "-A"])
+        let script = CompanyHooks.preCommit.split(separator: "\n").map(String.init)
+        let awk = try #require(script.first { $0.hasPrefix("awk ") })
+        // The script's own awk program (`awk '<program>' "$added" > …`).
+        let program = try #require(awk.components(separatedBy: " \"$added\" > ").first.map { String($0.dropFirst(4)) })
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "git diff --cached -U0 --no-color --no-ext-diff --no-textconv --text --output-indicator-new='>' | awk \(program)"]
+        p.currentDirectoryURL = f.git.root
+        var env = ProcessInfo.processInfo.environment; env["GIT_CONFIG_GLOBAL"] = "/dev/null"; p.environment = env
+        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        try p.run()
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        #expect(text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init).sorted() == ["", "# hi", "++ two", "+++ three", "added"].sorted(), "\(text.debugDescription)")
+    }
+
     @Test func warnsOnDeletedTests() throws {
         let f = try Fixture()
         _ = try f.install()
