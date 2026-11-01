@@ -448,9 +448,6 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         try w.commitMain(["README.md": "hello\n"])
         let i = try w.item()
         // A branch with no common history is planted before the claim (what an agent can do with plain git).
-        let tree = try GitFixture.plainGit(["hash-object", "-t", "tree", "-w", "--stdin"], in: w.root, env: [:], allowFailure: true)
-        let blob = try GitFixture.plainGit(["hash-object", "-w", "--stdin"], in: w.root, env: [:], allowFailure: true)
-        _ = (tree, blob)
         let orphan = try GitFixture.plainGit(["commit-tree", try GitFixture.plainGit(["hash-object", "-t", "tree", "-w", "--stdin"], in: w.root), "-m", "orphan"], in: w.root)
         try GitFixture.plainGit(["branch", w.ws.branch(key: i.key), orphan], in: w.root)
         let wt = try w.claim(i, w.eng)
@@ -790,6 +787,203 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         let plan = try #require(w.requests(w.eng2).last)
         #expect(plan.kind == .plan); #expect(plan.secrets.isEmpty)
         #expect(!(try String(contentsOfFile: try #require(plan.shellPrefix), encoding: .utf8)).contains("TEST_KEY"))
+    }
+
+    // MARK: 4-wire fix round 2
+
+    /// Moves the item branch to a commit that does not descend from the recorded head (as something outside the holder's
+    /// turns could) and runs the turn-start continuity check, which flags it.
+    private func moveAndFlag(_ w: W, _ i: WorkItem, holder: Agent) throws {
+        let recorded = try #require(try w.fresh(i).leaseHeadCommit)
+        let tree = try GitFixture.plainGit(["rev-parse", "\(recorded)^{tree}"], in: w.root)
+        let orphan = try GitFixture.plainGit(["commit-tree", tree, "-m", "moved \(UUID().uuidString)"], in: w.root)
+        try GitFixture.plainGit(["update-ref", w.ws.branchRef(key: i.key), orphan], in: w.root)
+        #expect(!(try w.store.checkBranchContinuity(item: try w.fresh(i), agent: holder, head: try w.branchHead(i), now: w.now)))
+        #expect(try w.fresh(i).branchMoved)
+    }
+
+    @Test func readoptAuthorityAndFlagHandling() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let mgr2 = try w.store.hire(companyId: w.company.id, name: "mgr-2", role: "manager", model: "sonnet")
+        let ceo = try w.store.hire(companyId: w.company.id, name: "ceo", role: "ceo", model: "sonnet")
+        let i = try w.item(); try w.claim(i, w.eng)
+        // Nothing flagged: nothing to re-adopt (a lead cannot silently adopt a move before it is detected).
+        let unflagged = w.failure { try w.call(w.mgr, "readopt_branch", ["key": .string(i.key)]) }
+        #expect(unflagged.contains("nothing to re-adopt"), Comment(rawValue: unflagged))
+        try moveAndFlag(w, i, holder: w.eng)
+        // N4: an item already flagged is not flagged again at the next turn start (no repeated activity, event or alert).
+        let (activity, events, alerts) = (try w.activity().count, try w.events(i).count, try w.alerts().count)
+        #expect(!(try w.store.checkBranchContinuity(item: try w.fresh(i), agent: w.eng, head: try w.branchHead(i), now: w.now)))
+        #expect(try w.activity().count == activity); #expect(try w.events(i).count == events); #expect(try w.alerts().count == alerts)
+        // The holder (an engineer) and an unrelated lead are refused; the holder's direct manager may, and is recorded.
+        #expect(throws: WorkError.self) { try w.store.readoptBranch(itemId: i.id, by: .agent(w.eng.id), head: try w.branchHead(i)) }
+        let unrelated = w.failure { try w.call(mgr2, "readopt_branch", ["key": .string(i.key)]) }
+        #expect(unrelated.contains("only the holder's manager"), Comment(rawValue: unrelated))
+        #expect(try w.fresh(i).branchMoved)
+        #expect(try w.call(w.mgr, "readopt_branch", ["key": .string(i.key)]).contains(i.key))
+        #expect(!(try w.fresh(i).branchMoved))
+        #expect(try w.events(i).contains { $0.actorId == w.mgr.id && $0.text.contains("re-adopted") && $0.text.contains("@mgr") })
+        // The owner may.
+        try moveAndFlag(w, i, holder: w.eng)
+        let byOwner = try w.store.readoptBranch(itemId: i.id, by: .owner, head: try w.branchHead(i))
+        #expect(!byOwner.branchMoved); #expect(byOwner.leaseHeadCommit == (try w.branchHead(i)))
+        #expect(try w.events(i).contains { $0.actorId == "owner" && $0.text.contains("re-adopted") })
+        // A lead that holds the item cannot re-adopt its own branch (S12); an executive can.
+        let j = try w.item("Lead's own"); try w.claim(j, w.mgr)
+        try moveAndFlag(w, j, holder: w.mgr)
+        let own = w.failure { try w.call(w.mgr, "readopt_branch", ["key": .string(j.key)]) }
+        #expect(own.contains("you hold"), Comment(rawValue: own)); #expect(try w.fresh(j).branchMoved)
+        #expect(try w.call(ceo, "readopt_branch", ["key": .string(j.key)]).contains(j.key))
+        #expect(!(try w.fresh(j).branchMoved))
+        // N5: a high-risk tool (quota-counted, out of plan turns, denied under taint).
+        #expect(CompanyTools.highRiskTools.contains("readopt_branch"))
+    }
+
+    @Test func flaggedHolderCannotClearTheFlagByReclaiming() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); try w.claim(i, w.eng)
+        try moveAndFlag(w, i, holder: w.eng)
+        _ = try w.call(w.eng, "release_lease", ["key": .string(i.key)])
+        let wt = try w.claim(i, w.eng)
+        #expect(try w.fresh(i).branchMoved, "a claim records the head but never clears the flag")
+        #expect(try w.fresh(i).leaseHeadCommit == (try w.branchHead(i)))
+        try w.write("src/work.txt", "work\n", in: wt)
+        #expect(w.failure { try w.submit(i, w.eng) } == "\(i.key)'s branch moved outside your turn; ask your manager")
+        #expect(try w.fresh(i).status == .inProgress)
+    }
+
+    @Test func continuityReadsTheItemAgain() throws {
+        // N3: a stale snapshot (taken before an engine move was recorded) does not flag the engine's own move.
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        let stale = try w.fresh(i)
+        try w.commitInWorktree(i, ["src/a.txt": "a\n"])
+        let moved = try #require(try w.branchHead(i))
+        try w.store.recordLeaseHead(itemId: i.id, commit: moved)
+        _ = wt
+        #expect(try w.store.checkBranchContinuity(item: stale, agent: w.eng, head: moved, now: w.now))
+        #expect(!(try w.fresh(i).branchMoved))
+    }
+
+    @Test func crlfAndCombiningMarkLinesAreScanned() throws {
+        // N2, unit: a combining mark after the `+` does not hide the line; a CRLF line is its own line, also for known values.
+        let zwj = "diff --git a/c b/c\n--- a/c\n+++ b/c\n@@ -0,0 +1 @@\n+\u{200D}\(aws)\n"
+        #expect(SecretScan.findings(diff: zwj, knownValues: []).contains { $0.contains("aws-key") })
+        #expect(SecretScan.findings(diff: "+\u{301}\(aws)\n", knownValues: []).count == 1, "bare fragment too")
+        let value = "crlf-known-value-123"
+        let crlf = "diff --git a/c.env b/c.env\n--- a/c.env\n+++ b/c.env\n@@ -1 +1 @@\n-API=changeme\r\n+API=\(value)\r\n"
+        let known = SecretScan.findings(diff: crlf, knownValues: [("CRLF_KEY", value)])
+        #expect(known == ["known secret CRLF_KEY in c.env (added line 1)"], "\(known)")
+    }
+
+    @Test func crlfEditsAreCaughtByBothScans() throws {
+        let w = try W()
+        try w.commitMain(["c.env": "API=changeme\r\nNAME=x\r\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        let main = try w.mainHead()
+        // scanDiff: a modification of an existing CRLF file (patterns and known values).
+        let value = "crlf-known-value-123"
+        try w.commitInWorktree(i, ["c.env": "API=\(aws)\r\nNAME=\(value)\r\n"], message: "edit")
+        let leak = try #require(try w.branchHead(i))
+        let diff = try w.ws.scanDiff(base: main, head: leak).text
+        #expect(diff.contains("\r\n"), "the fixture really is CRLF")
+        let endpoint = SecretScan.findings(diff: diff, knownValues: [("CRLF_KEY", value)])
+        #expect(endpoint.contains { $0.contains("aws-key") && $0.contains("c.env") }, "\(endpoint)")
+        #expect(endpoint.contains { $0.contains("known secret CRLF_KEY") }, "\(endpoint)")
+        // scanLog: modified then reverted in a later commit (the endpoint diff is empty): the history still carries it.
+        try w.commitInWorktree(i, ["c.env": "API=changeme\r\nNAME=x\r\n", "src/w.txt": "w\n"], message: "revert")
+        #expect(SecretScan.findings(diff: try w.ws.scanDiff(base: main, head: try #require(try w.branchHead(i))).text, knownValues: [])
+            .isEmpty)
+        let refusal = w.failure { try w.submit(i, w.eng) }
+        #expect(refusal.contains("aws-key") && refusal.contains("commit \(leak.prefix(7))"), Comment(rawValue: refusal))
+        #expect(!refusal.contains(aws)); _ = wt
+    }
+
+    @Test func commitMessagesAreScannedAndFindingsDeduped() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.commitInWorktree(i, ["src/w.txt": "w\n"], message: "use key \(aws)")
+        let refusal = w.failure { try w.submit(i, w.eng) }
+        #expect(refusal.contains("aws-key in a commit message or author"), Comment(rawValue: refusal))
+        #expect(!refusal.contains(aws))
+        #expect(refusal.contains("If that turn ends without an accepted submit"), "the refusal names the recovery path")
+        // Author fields too, through the same scan.
+        try GitFixture.plainGit(["reset", "-q", "--soft", try w.mainHead()], in: wt)
+        try GitFixture.plainGit(["-c", "user.email=\(aws)@example.com", "commit", "-q", "-m", "clean"], in: wt)
+        #expect(w.failure { try w.submit(i, w.eng) }.contains("aws-key in a commit message or author"))
+        // One finding per (rule, place): the same secret in a commit and in the endpoint diff is reported once.
+        try GitFixture.plainGit(["reset", "-q", "--soft", try w.mainHead()], in: wt)
+        try w.write(".env", "AWS=\(aws)\n", in: wt)
+        try GitFixture.plainGit(["add", "-A"], in: wt)
+        try GitFixture.plainGit(["commit", "-q", "-m", "env"], in: wt)
+        let found = try SecretScan.check(git: w.ws, base: try w.mainHead(), head: try #require(try w.branchHead(i)), knownValues: [])
+        #expect(found.filter { $0.hasPrefix("aws-key in .env") }.count == 1, "\(found)")
+    }
+
+    @Test func secondConcurrentProvideLeavesTheWinnersValue() throws {
+        let w = try W()
+        _ = try w.call(w.eng, "request_secret", ["name": .string("RACE_KEY"), "reason": .string("r"), "test": .bool(true)])
+        let ask = try #require(try w.asks().first)
+        /// The first provide lands while the second is between its pre-check and its write (two taps, or the app and the CLI).
+        final class RacingVault: SecretVault, @unchecked Sendable {
+            let inner: MemoryVault
+            var hook: (() throws -> Void)?
+            init(inner: MemoryVault) { self.inner = inner }
+            func set(companyId: String, name: String, value: String) throws { try inner.set(companyId: companyId, name: name, value: value) }
+            func value(companyId: String, name: String) throws -> String? {
+                if let h = hook { hook = nil; try h() }
+                return try inner.value(companyId: companyId, name: name)
+            }
+            func delete(companyId: String, name: String) throws { try inner.delete(companyId: companyId, name: name) }
+        }
+        let racing = RacingVault(inner: w.vault)
+        let (store, vault) = (w.store, w.vault)
+        racing.hook = { _ = try store.provideSecret(askId: ask.id, value: "first-value-123456", isTest: false, vault: vault) }
+        #expect(throws: WorkError.self) {
+            try w.store.provideSecret(askId: ask.id, value: "second-value-12345", isTest: true, vault: racing)
+        }
+        #expect(try w.vault.value(companyId: w.company.id, name: "RACE_KEY") == "first-value-123456", "the winner's value stays")
+        #expect(try w.store.secrets(companyId: w.company.id).map(\.isTest) == [false], "under the winner's flag")
+        #expect(try w.store.ask(id: ask.id)?.status == .approved)
+        // A vault that cannot store leaves the ask pending and no row behind.
+        _ = try w.call(w.eng, "request_secret", ["name": .string("DOWN_KEY"), "reason": .string("r"), "test": .bool(true)])
+        let down = try #require(try w.asks().first { $0.title == "Secret DOWN_KEY" })
+        struct Down: Error {}
+        final class FailingVault: SecretVault, @unchecked Sendable {
+            func set(companyId: String, name: String, value: String) throws { throw Down() }
+            func value(companyId: String, name: String) throws -> String? { nil }
+            func delete(companyId: String, name: String) throws {}
+        }
+        #expect(throws: Down.self) { try w.store.provideSecret(askId: down.id, value: "down-value-123456", isTest: true, vault: FailingVault()) }
+        #expect(try w.store.ask(id: down.id)?.status.isPending == true)
+        #expect(!(try w.store.secrets(companyId: w.company.id).contains { $0.name == "DOWN_KEY" }))
+    }
+
+    @Test func auditTurnsGetNoSecretsOrKeepNames() async throws {
+        let w = try W(profile: .sandboxed)
+        try w.set("TEST_KEY", "test-key-value-12345", test: true)
+        // The auditor holds a key for an item of its own; its audit turn gets nothing.
+        let mine = try w.item("Mine"); try w.claim(mine, w.rev)
+        _ = try w.call(w.rev, "use_secret", ["name": .string("TEST_KEY")])
+        try w.commitMain(["README.md": "hello\n"])
+        let base = try w.mainHead()
+        try w.commitMain(["src/audited.txt": "audited\n"])
+        let merged = try w.mainHead()
+        let done = try w.item("Audited", command: nil, reviewer: w.rev)   // the sample is routed to the item's reviewer
+        try w.db { db in
+            var sample = ReviewAudit(itemId: done.id, companyId: w.company.id, sampledActive: 0, authorId: w.eng.id)
+            sample.baseCommit = base; sample.mergedCommit = merged
+            try sample.insert(db)
+        }
+        try await w.cycle()
+        let audit = try #require(w.requests(w.rev).last { $0.kind == .audit }, "an audit turn ran")
+        #expect(audit.secrets.isEmpty)
+        let prefix = audit.shellPrefix.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? ""
+        #expect(!prefix.contains("TEST_KEY"))
     }
 
     // MARK: Push settings (7b re-review carry-overs)

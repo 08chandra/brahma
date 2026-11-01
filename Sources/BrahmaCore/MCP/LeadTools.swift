@@ -41,7 +41,8 @@ extension CompanyTools {
                 ], required: ["sprint", "summary", "lessons"])),
             ToolSpec(name: "readopt_branch", description: """
                 Take an item's branch as it is after it was found moved outside its holder's turns (the engine flagged it and \
-                refuses its submits). Look at the branch first; re-adopting records its current head so the holder can submit again.
+                refuses its submits). Only the holder's direct manager or an executive can, never the holder itself. Look at the branch \
+                first; re-adopting records its current head and your name so the holder can submit again.
                 """, inputSchema: schema(["key": prop("string", "Work item key, e.g. ACME-12")], required: ["key"])),
             ToolSpec(name: "propose_decision", description: """
                 File a decision for approval: a PRD, an architecture, a release, or any other choice (sprint plans use plan_sprint). \
@@ -109,8 +110,9 @@ extension CompanyTools {
 
     // MARK: Tools
 
-    /// `readopt_branch {key}` (managers and executives): an item branch found moved outside its holder's turns is taken as it
-    /// is, so the holder can submit again (`Store.readoptBranch`; the current head comes from the engine's git).
+    /// `readopt_branch {key}` (the holder's direct manager or an executive, never the holder itself): an item branch flagged
+    /// as moved outside its holder's turns is taken as it is, so the holder can submit again (`Store.readoptBranch`; the
+    /// current head comes from the engine's git). High risk: quota-counted, out of plan turns, denied under taint.
     private func readoptBranch(_ args: [String: JSONValue]) throws -> String {
         let key = try text(args, "key").uppercased()
         guard let item = try store.workItem(companyId: companyId, key: key) else { throw ToolError(message: "no work item \(Store.flat(key, max: 40))") }

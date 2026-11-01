@@ -3029,6 +3029,15 @@ public struct GitWorkspace: Sendable {
         return (String(decoding: out.stdout, as: UTF8.self), out.cut)
     }
 
+    /// Every commit in `base..head` with its message and its author and committer names and emails, for the leak scan
+    /// (`SecretScan.messageFindings`): each record starts with a `commit <hash>` line.
+    func scanMessages(base: String, head: String) throws -> (text: String, cut: Bool) {
+        try Self.validRef(base); try Self.validRef(head)
+        let out = try main.run(["log", "--format=commit %H%n%B%n%an%n%ae%n%cn%n%ce", "--no-color", "--no-show-signature",
+                                "\(base)..\(head)"])
+        return (String(decoding: out.stdout, as: UTF8.self), out.cut)
+    }
+
     /// The empty tree of this repository (its hash algorithm's), the base of a scan for a branch with no common history.
     func emptyTree() throws -> String {
         try main.run(["hash-object", "-t", "tree", "/dev/null"]).text

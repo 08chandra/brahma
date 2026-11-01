@@ -551,6 +551,16 @@ public enum SecretScan {
 
     private static let commitMarker = try! NSRegularExpression(pattern: #"^commit ([0-9a-f]{40,64})$"#)
 
+    /// One finding: what matched (`what`: the rule or `known secret NAME`), where (`place`: a path, `a file name`, `a commit
+    /// message`), and the text shown (which may also name the commit and the line). Findings are the same finding when
+    /// `what` and `place` agree (`key`), whichever commit or scan reported them first.
+    struct Finding: Equatable {
+        var what: String
+        var place: String
+        var text: String
+        var key: String { "\(what)|\(place)" }
+    }
+
     /// What the added lines of a unified diff (or of `git log -p` output, where `commit <hash>` lines name each commit)
     /// leak, as short text naming the rule (or the secret's name) and where. A finding never contains the matched text.
     /// Context and removed lines are not scanned; the `+++ b/path` header sets the path and the path itself is scanned (a
@@ -558,105 +568,180 @@ public enum SecretScan {
     /// declares, so an added line that happens to start with `++` is still scanned. Content git could not show as text
     /// (`Binary files … differ`, `GIT binary patch`) cannot be scanned and is a finding of its own (fail closed).
     ///
+    /// The diff is parsed on BYTES (4-wire fix round 2, N2): lines split on `\n` only, one trailing `\r` is stripped (a CRLF
+    /// line is its own line), and every prefix test is on the first byte(s), so a combining mark after the `+` (`+\u{200D}…`)
+    /// cannot merge with the marker into one Character and hide the line. The rest of a line is decoded lossily for the
+    /// patterns; known values are matched on the bytes. A (rule, place) pair is reported once.
+    ///
     /// Known values shorter than `Redactor.minLength` are skipped, and each is matched raw, percent-encoded and
     /// JSON-escaped.
     public static func findings(diff: String, knownValues: [(String, String)]) -> [String] {
-        let known: [(name: String, forms: [String])] = knownValues.filter { $0.1.count >= Redactor.minLength }
-            .map { ($0.0, Redactor.forms(of: $0.1)) }
-        var out: [String] = []
+        scan(diff: diff, known: knownForms(knownValues)).map(\.text)
+    }
+
+    typealias KnownForms = [(name: String, forms: [[UInt8]])]
+
+    static func knownForms(_ knownValues: [(String, String)]) -> KnownForms {
+        knownValues.filter { $0.1.count >= Redactor.minLength }.map { ($0.0, Redactor.forms(of: $0.1).map { Array($0.utf8) }) }
+    }
+
+    static func scan(diff: String, known: KnownForms) -> [Finding] {
+        var out: [Finding] = []
         var seen = Set<String>()
         var commit: String?
-        var path = "?"
+        var path: ArraySlice<UInt8> = ArraySlice("?".utf8)
         var lineNumber = 0
         var oldLeft = 0, newLeft = 0
-        var previous = ""
+        var previous: ArraySlice<UInt8> = []
 
         func report(_ what: String, where place: String? = nil, line: Bool = true) {
             let where_ = place ?? safePath(path, known: known)
             var detail: [String] = []
             if let commit { detail.append("commit \(commit.prefix(7))") }
             if line { detail.append("added line \(lineNumber)") }
-            let text = "\(what) in \(where_)" + (detail.isEmpty ? "" : " (\(detail.joined(separator: ", ")))")
-            if seen.insert("\(what)|\(where_)|\(commit ?? "")").inserted { out.append(text) }
+            let f = Finding(what: what, place: where_, text: "\(what) in \(where_)" + (detail.isEmpty ? "" : " (\(detail.joined(separator: ", ")))"))
+            if seen.insert(f.key).inserted { out.append(f) }
         }
-        func matches(_ text: String) -> [String] {
-            var hits: [String] = []
-            for p in compiled where p.regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil { hits.append(p.label) }
-            for k in known where k.forms.contains(where: { text.contains($0) }) { hits.append("known secret \(k.name)") }
-            return hits
-        }
-        func scan(_ added: String) { for hit in matches(added) { report(hit) } }
+        func scanAdded(_ added: ArraySlice<UInt8>) { for hit in matches(added, known: known) { report(hit) } }
 
-        for rawLine in diff.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(rawLine)
+        let bytes = Array(diff.utf8)
+        for raw in bytes.split(separator: 0x0A, omittingEmptySubsequences: false) {
+            let line = raw.last == 0x0D ? raw.dropLast() : raw
             defer { previous = line }
+            let first = line.first
             if oldLeft > 0 || newLeft > 0 {
-                switch line.first {
-                case "+": newLeft -= 1; lineNumber += 1; scan(String(line.dropFirst()))
-                case "-": oldLeft -= 1
-                case " ": oldLeft -= 1; newLeft -= 1; lineNumber += 1
-                case "\\": break   // "\ No newline at end of file"
+                switch first {
+                case 0x2B: newLeft -= 1; lineNumber += 1; scanAdded(line.dropFirst())   // "+"
+                case 0x2D: oldLeft -= 1                                                   // "-"
+                case 0x20: oldLeft -= 1; newLeft -= 1; lineNumber += 1                    // " "
+                case 0x5C: break                                                          // "\ No newline at end of file"
                 default: oldLeft = 0; newLeft = 0   // a truncated hunk: fall back to the bare-fragment rule below
                 }
                 if oldLeft > 0 || newLeft > 0 { continue }
-                if line.first == "+" || line.first == "-" || line.first == " " || line.first == "\\" { continue }
+                if first == 0x2B || first == 0x2D || first == 0x20 || first == 0x5C { continue }
             }
-            if let m = commitMarker.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)), let r = Range(m.range(at: 1), in: line) {
-                commit = String(line[r]); path = "?"; lineNumber = 0
-                continue
-            }
-            if line.hasPrefix("@@"), let m = hunkHeader.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
-                func number(_ i: Int, default d: Int) -> Int {
-                    Range(m.range(at: i), in: line).flatMap { Int(line[$0]) } ?? d
+            if line.starts(with: "commit ".utf8) {
+                let text = String(decoding: line, as: UTF8.self)
+                if let m = commitMarker.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)), let r = Range(m.range(at: 1), in: text) {
+                    commit = String(text[r]); path = ArraySlice("?".utf8); lineNumber = 0
+                    continue
                 }
-                oldLeft = number(2, default: 1); newLeft = number(4, default: 1)
-                lineNumber = number(3, default: 1) - 1
-                continue
             }
-            if line.hasPrefix("diff --git ") {
+            if line.starts(with: "@@".utf8) {
+                let text = String(decoding: line, as: UTF8.self)
+                if let m = hunkHeader.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) {
+                    func number(_ i: Int, default d: Int) -> Int {
+                        Range(m.range(at: i), in: text).flatMap { Int(text[$0]) } ?? d
+                    }
+                    oldLeft = number(2, default: 1); newLeft = number(4, default: 1)
+                    lineNumber = number(3, default: 1) - 1
+                    continue
+                }
+            }
+            if line.starts(with: "diff --git ".utf8) {
                 // The new file's name, from the header (`diff --git a/x b/x`): scanned even when the file has no text hunk.
-                let halves = line.dropFirst("diff --git ".count)
-                if let split = halves.range(of: " b/", options: .backwards) {
-                    path = String(halves[split.upperBound...])
-                    for hit in matches(path) { report(hit, where: "a file name", line: false) }
+                let halves = line.dropFirst("diff --git ".utf8.count)
+                if let at = lastIndex(of: Array(" b/".utf8), in: halves) {
+                    path = halves[(at + 3)...]
+                    for hit in matches(path, known: known) { report(hit, where: "a file name", line: false) }
                 }
                 continue
             }
-            if line.hasPrefix("+++ ") && previous.hasPrefix("--- ") {
-                path = String(line.dropFirst(4))
-                if path.hasPrefix("b/") { path.removeFirst(2) }
-                if path != "/dev/null" { for hit in matches(path) { report(hit, where: "a file name", line: false) } }
+            if line.starts(with: "+++ ".utf8) && previous.starts(with: "--- ".utf8) {
+                var p = line.dropFirst(4)
+                if p.starts(with: "b/".utf8) { p = p.dropFirst(2) }
+                path = p
+                if !p.elementsEqual("/dev/null".utf8) { for hit in matches(p, known: known) { report(hit, where: "a file name", line: false) } }
                 continue
             }
-            if line.hasPrefix("Binary files ") && line.hasSuffix(" differ") || line == "GIT binary patch" {
+            if line.starts(with: "Binary files ".utf8) && line.reversed().starts(with: " differ".utf8.reversed())
+                || line.elementsEqual("GIT binary patch".utf8) {
                 report("unscannable binary content", line: false)
                 continue
             }
             // Outside a counted hunk (a bare fragment): every `+` line is an added line.
-            if line.hasPrefix("+") { lineNumber += 1; scan(String(line.dropFirst())) }
+            if first == 0x2B { lineNumber += 1; scanAdded(line.dropFirst()) }
         }
         return out
     }
 
-    /// What the change `base..head` leaks, read through 3a's hardened git helper (`GitWorkspace.scanDiff`: the engine's own
-    /// git dir and config, never the worktree's `.git` file): `findings(diff:knownValues:)` over the whole patch. A patch
-    /// git cut short at the capture limit cannot be scanned and is itself a finding (fail closed). Findings never carry a value.
+    /// What commit messages and the author/committer fields leak (`GitWorkspace.scanMessages` output: a `commit <hash>`
+    /// line, then the message, the author name and email, the committer name and email). Each commit's record is matched
+    /// as a whole (a known value spanning lines is found too); findings name the commit, never the text.
+    static func messageFindings(log: String, known: KnownForms) -> [Finding] {
+        var out: [Finding] = []
+        var seen = Set<String>()
+        var commit: String?
+        var record: [UInt8] = []
+        func flush() {
+            defer { record.removeAll(keepingCapacity: true) }
+            guard !record.isEmpty else { return }
+            for hit in matches(record[...], known: known) {
+                let place = "a commit message or author"
+                let f = Finding(what: hit, place: place, text: "\(hit) in \(place)" + (commit.map { " (commit \($0.prefix(7)))" } ?? ""))
+                if seen.insert(f.key).inserted { out.append(f) }
+            }
+        }
+        for raw in Array(log.utf8).split(separator: 0x0A, omittingEmptySubsequences: false) {
+            let line = raw.last == 0x0D ? raw.dropLast() : raw
+            if line.starts(with: "commit ".utf8) {
+                let text = String(decoding: line, as: UTF8.self)
+                if let m = commitMarker.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)), let r = Range(m.range(at: 1), in: text) {
+                    flush()
+                    commit = String(text[r])
+                    continue
+                }
+            }
+            record.append(contentsOf: line); record.append(0x0A)
+        }
+        flush()
+        return out
+    }
+
+    /// The rules and known secrets the bytes match: patterns on the lossy decoding, known values on the bytes themselves.
+    private static func matches(_ bytes: ArraySlice<UInt8>, known: KnownForms) -> [String] {
+        let text = String(decoding: bytes, as: UTF8.self)
+        var hits: [String] = []
+        for p in compiled where p.regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil { hits.append(p.label) }
+        for k in known where k.forms.contains(where: { lastIndex(of: $0, in: bytes) != nil }) { hits.append("known secret \(k.name)") }
+        return hits
+    }
+
+    /// Where `needle` last occurs in `hay` (an index of `hay`), or nil.
+    private static func lastIndex(of needle: [UInt8], in hay: ArraySlice<UInt8>) -> Int? {
+        guard let head = needle.first, needle.count <= hay.count else { return nil }
+        var i = hay.endIndex - needle.count
+        while i >= hay.startIndex {
+            if hay[i] == head, hay[i..<(i + needle.count)].elementsEqual(needle) { return i }
+            i -= 1
+        }
+        return nil
+    }
+
+    /// What the change `base..head` leaks, read through 3a's hardened git helper (`GitWorkspace.scanLog`/`scanDiff`/
+    /// `scanMessages`: the engine's own git dir and config, never the worktree's `.git` file): every commit's added lines,
+    /// the endpoint diff, and every commit's message and author/committer fields. A finding is reported once per (rule,
+    /// place), whichever scan saw it first. Output git cut short at the capture limit cannot be scanned and is itself a
+    /// finding (fail closed). Findings never carry a value.
     public static func check(git: GitWorkspace, base: String, head: String, knownValues: [(String, String)]) throws -> [String] {
+        let known = knownForms(knownValues)
         // Every commit's added lines (a value committed and deleted later is in main's history all the same), then the
-        // endpoint diff (content an evil merge introduces shows in no single commit's patch).
+        // endpoint diff (content an evil merge introduces shows in no single commit's patch), then the messages (they land
+        // in main's history with the commits).
         let log = try git.scanLog(base: base, head: head)
-        var out = findings(diff: log.text, knownValues: knownValues)
         let diff = try git.scanDiff(base: base, head: head)
-        for f in findings(diff: diff.text, knownValues: knownValues) where !out.contains(f) { out.append(f) }
-        if log.cut || diff.cut { out.append("the change is too large to scan for secrets (more than \(diff.limitMB) MB of diff)") }
+        let messages = try git.scanMessages(base: base, head: head)
+        var seen = Set<String>()
+        var out: [String] = []
+        for f in scan(diff: log.text, known: known) + scan(diff: diff.text, known: known) + messageFindings(log: messages.text, known: known)
+        where seen.insert(f.key).inserted { out.append(f.text) }
+        if log.cut || diff.cut || messages.cut { out.append("the change is too large to scan for secrets (more than \(diff.limitMB) MB of diff)") }
         return out
     }
 
     /// The file path for a finding, unless the path itself holds a secret.
-    private static func safePath(_ path: String, known: [(name: String, forms: [String])]) -> String {
-        let range = NSRange(path.startIndex..., in: path)
-        if compiled.contains(where: { $0.regex.firstMatch(in: path, range: range) != nil }) { return "(path withheld)" }
-        if known.contains(where: { $0.forms.contains(where: { path.contains($0) }) }) { return "(path withheld)" }
-        return path
+    private static func safePath(_ path: ArraySlice<UInt8>, known: KnownForms) -> String {
+        if !matches(path, known: known).isEmpty { return "(path withheld)" }
+        return String(decoding: path, as: UTF8.self)
     }
 }

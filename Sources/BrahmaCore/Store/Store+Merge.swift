@@ -26,7 +26,9 @@ extension Store {
     /// What the holder is told to do about a leaked commit: the branch is rewritten in the holder's own turn (continuity
     /// between turns permits that) and submitted again in the same turn.
     static let secretRecovery = "Rewrite your branch in this turn so no commit carries it (reset to main and recommit without it, "
-        + "or squash), take the value from your environment instead, then submit again in the same turn."
+        + "or squash; a commit message or author carrying it is rewritten too), take the value from your environment instead, "
+        + "then submit again in the same turn. If that turn ends without an accepted submit, the rewrite flags the branch and "
+        + "only your manager (or the owner) can re-adopt it."
     static let maxBriefFiles = 50
     static let maxBriefDiffLines = 200
     /// Merge attempts of one item that may fail in a row before it goes back to its holder and the queue moves on.
@@ -385,6 +387,9 @@ extension Store {
         case .rebased(let head):
             let base = try? git.mergeBase(GitWorkspace.mainRef, head)
             try writer.write { db in
+                // The engine moved the branch: the rebased head is the recorded head the next submit (and the next holder
+                // turn's continuity check) is measured against, recorded in the same write as the merge-state change.
+                try Self.recordLeaseHead(db: db, itemId: itemId, commit: head)
                 guard var current = try WorkItem.fetchOne(db, key: itemId), current.status == .inReview else { return }
                 // Auto-merge was switched off while this merge ran (`revokeAutoApprovals`): the branch already carries the
                 // rebased commit, so the rebase is applied all the same and the item goes to its reviewer from there.
@@ -426,8 +431,6 @@ extension Store {
                     try recordItemEvent(db: db, item: current, actor: "system", kind: .edited, text: "rebased onto main at \(head.prefix(7))", now: now)
                 }
             }
-            // The engine moved the branch: the rebased head is the recorded head the next submit is measured against.
-            try recordLeaseHead(itemId: itemId, commit: head)
 
         case .secretsFound(let findings):
             let shown = Self.sanitizedFlags(findings).joined(separator: "; ")
