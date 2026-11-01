@@ -109,13 +109,9 @@ struct GitCommand: Sendable {
 
     func withIndex(_ url: URL) -> GitCommand { var copy = self; copy.indexFile = url; return copy }
 
-    /// The one `core.hooksPath` value the config allowlist admits: `<workspace>/.brahma/hooks` of the repository this command
-    /// runs in (the common dir's parent). Nil for a repository that is not a company workspace (a lab, the merge repository).
-    var engineHooksPath: String? {
-        let common = commonDir ?? gitDir
-        guard common.lastPathComponent == ".git" else { return nil }
-        return common.deletingLastPathComponent().appending(path: ".brahma/hooks").path
-    }
+    /// The one `core.hooksPath` value the config allowlist admits: `<workspace>/.brahma/hooks`, set by `GitWorkspace` only for a
+    /// company workspace (never a lab under `.brahma/labs`, the merge repository or a standalone repo). Nil admits none.
+    var engineHooksPath: String? = nil
 
     /// Tests only: handed the `tempRoot` of every git run, to prove the engine's captured output never lands in the shared
     /// per-user temp dir (A-I1b). Injected per `GitWorkspace` instance (not a global), so it is set only where a test wants it.
@@ -580,8 +576,14 @@ public struct GitWorkspace: Sendable {
     public func branchRef(key: String) -> String { "refs/heads/item/\(key)" }
     private var gitDir: URL { root.appending(path: ".git", directoryHint: .isDirectory) }
     private func adminDir(key: String) -> URL { gitDir.appending(path: "worktrees/\(key)", directoryHint: .isDirectory) }
+    /// `<root>/.brahma/hooks` for a company workspace; nil when the root lies inside a `.brahma` directory (a lab).
+    private var engineHooksPath: String? {
+        root.pathComponents.contains(".brahma") ? nil : root.appending(path: ".brahma/hooks").path
+    }
+
     private var main: GitCommand {
         var git = GitCommand(gitDir: gitDir, workTree: root, commonDir: nil, onRefused: onUnsafeRepository)
+        git.engineHooksPath = engineHooksPath
         git.beforeRetry = gitRetryProbe
         git.tempRoot = gitTemp
         git.tempRootObserver = gitTempObserver
@@ -645,6 +647,7 @@ public struct GitWorkspace: Sendable {
                                   stderr: "the worktree of \(key) was repointed (\(detail)); what the engine records was put back and nothing was run in it")
         }
         var git = GitCommand(gitDir: adminDir(key: key), workTree: worktreePath(key: key), commonDir: gitDir, onRefused: onUnsafeRepository)
+        git.engineHooksPath = engineHooksPath
         git.beforeRetry = gitRetryProbe
         git.tempRoot = gitTemp
         git.tempRootObserver = gitTempObserver
@@ -740,22 +743,34 @@ public struct GitWorkspace: Sendable {
     // MARK: Repository
 
     /// Makes `<ws>` a git repository on `main` with every existing file imported, and keeps `.brahma/` out of it.
-    /// `core.hooksPath` as the workspace's config FILE has it, or nil (`--file`: the engine's own `-c core.hooksPath=/dev/null`
-    /// would otherwise answer).
+    /// `core.hooksPath` as the workspace's config FILES have it (`config`, then `config.worktree`, which wins), or nil
+    /// (`--file`: the engine's own `-c core.hooksPath=/dev/null` would otherwise answer). Nil also when either file is a link.
     public func hooksPath() throws -> String? {
         var git = main
         git.skipsRepositoryCheck = true   // a config read; see `setHooksPath`
-        let out = try git.run(["config", "--file", gitDir.appending(path: "config").path, "--get", "core.hooksPath"], allowFailure: true)
-        guard out.status == 0 else { return nil }
-        return out.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var found: String?
+        for name in ["config", "config.worktree"] {
+            let file = gitDir.appending(path: name)
+            guard SandboxPath.kind(file.path) == .file else { if SandboxPath.kind(file.path) == .link { return nil }; continue }
+            let out = try git.run(["config", "--file", file.path, "--get", "core.hooksPath"], allowFailure: true)
+            if out.status == 0 { found = out.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+        return found
     }
 
-    /// Points `core.hooksPath` at the engine's hooks directory (`CompanyHooks.install`). The repository check is skipped for
-    /// this one write: a config set to another value would refuse every engine command, this one included, and `git config`
-    /// runs no hook, filter, driver or helper (the command-line config still switches them all off).
+    /// Points `core.hooksPath` at the engine's hooks directory (`CompanyHooks.install`) in `config`, and removes it from
+    /// `config.worktree` (which would win). Refused when either file is a symbolic link. The repository check is skipped for
+    /// these config writes: a config set to another value would refuse every engine command, this one included, and `git
+    /// config` runs no hook, filter, driver or helper (the command-line config still switches them all off).
     public func setHooksPath(_ dir: URL) throws {
+        for name in ["config", "config.worktree"] where SandboxPath.kind(gitDir.appending(path: name).path) == .link {
+            throw GitError.failed(command: "config core.hooksPath", status: -1, stderr: ".git/\(name) is a symbolic link; refused")
+        }
         var git = main
         git.skipsRepositoryCheck = true
+        if SandboxPath.kind(gitDir.appending(path: "config.worktree").path) == .file {
+            _ = try git.run(["config", "--file", gitDir.appending(path: "config.worktree").path, "--unset-all", "core.hooksPath"], allowFailure: true)
+        }
         try git.run(["config", "core.hooksPath", dir.path])
     }
 

@@ -113,7 +113,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         """)
         let f = try PluginFixture(files: ["hooks/hooks.json": #"{"hooks":{}}"#, "tests/cases/a.yaml": "x: 1"])
         let paths = ownerPaths(try tempDir())
-        let staged = try ExtensionImporter.stage(source: .folder(f.root), paths: paths)
+        let staged = try await ExtensionImporter.stage(source: .folder(f.root), paths: paths, sandbox: RecordingRunner())
         // The stager already dropped hooks/; plant one again on the staged copy, as a hostile package would be after staging.
         try Data("{}".utf8).write(to: {
             let d = staged.dir.appending(path: "hooks", directoryHint: .isDirectory)
@@ -131,14 +131,12 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let argv = try String(contentsOf: scratch.appending(path: "claude-argv.log"), encoding: .utf8).split(separator: "\n").map(String.init)
         #expect(argv.count == 2)
         let copy = scratch.appending(path: "plugin").path
-        #expect(argv[0].hasPrefix("plugin validate --strict \(copy) ") || argv[0].hasPrefix("plugin validate --strict \(copy)\n"), "\(argv[0])")
-        #expect(argv[1].hasPrefix("plugin details \(copy)"), "\(argv[1])")
-        for line in argv {
-            // `$*` joins the argv with spaces: the empty `--setting-sources` value shows as two spaces.
-            #expect(line.contains("--setting-sources  --strict-mcp-config"), "\(line)")
-            #expect(line.contains("--settings {\"disableAllHooks\":true}"), "\(line)")
-            #expect(!line.contains(staged.dir.path), "only the allowlisted copy is ever named")
-        }
+        // C2: the global options come BEFORE `plugin` (the subcommands refuse them), `details` takes the plugin NAME with `--plugin-dir`.
+        // `$*` joins the argv with spaces: the empty `--setting-sources` value shows as two spaces.
+        let hardening = "--setting-sources  --strict-mcp-config --settings {\"disableAllHooks\":true}"
+        #expect(argv[0] == "\(hardening) plugin validate --strict \(copy)", "\(argv[0])")
+        #expect(argv[1] == "\(hardening) --plugin-dir \(copy) plugin details demo", "\(argv[1])")
+        for line in argv { #expect(!line.contains(staged.dir.path), "only the allowlisted copy is ever named") }
         for c in calls {
             #expect(c.cwd == scratch); #expect(c.policy.network == .none); #expect(!c.policy.toolchain)
             #expect(c.policy.writable == [scratch])
@@ -161,6 +159,56 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(out2.issues.contains { $0.code == "EXT026" && $0.severity == .error })
         #expect(out2.issues.contains { $0.code == "EXT027" && $0.severity == .warning && $0.message.contains("unavailable") })
         #expect(out2.alwaysOnTokens == nil)
+        // A CLI that does not know the options (a usage error) is "unavailable", never a refusal of the package.
+        let usage = try FakeTools.script("claude", "echo \"error: unknown option '--setting-sources'\" >&2; exit 1")
+        let out3 = await ExtensionValidator.claudeChecks(staged: staged.dir, check: ClaudeCheck(runner: RecordingRunner(), claudePath: usage.path, scratch: try tempDir()))
+        #expect(!out3.issues.contains { $0.code == "EXT026" }); #expect(out3.issues.contains { $0.code == "EXT027" })
+        // M8: a claude whose directory is the home (or an ancestor of a protected path) gets no readable entry: unavailable.
+        let home = try tempDir()
+        let wrapper = home.appending(path: "claude")
+        try FakeTools.install(at: wrapper, "exit 0")
+        let out4 = await ExtensionValidator.claudeChecks(staged: staged.dir, check: ClaudeCheck(runner: RecordingRunner(), claudePath: wrapper.path, scratch: try tempDir(), userHome: home))
+        #expect(out4.issues.contains { $0.code == "EXT027" && $0.message.contains("unavailable") }, "\(out4.issues)")
+    }
+
+    /// I1: Claude's checks run only on a package the validator passed; a refused package never starts `claude`.
+    @Test func claudeChecksSkippedWhenValidatorErrors() async throws {
+        let w = try ExtWorld()
+        let runner = RecordingRunner()
+        let claude = ClaudeCheck(runner: runner, claudePath: try FakeTools.script("claude", "exit 0").path, scratch: try tempDir())
+        let bad = try PluginFixture(id: "bad", files: ["skills/bad/scripts/setup.py": "import os"])
+        await #expect(throws: ExtensionError.self) { try await w.propose(bad, claude: claude) }
+        #expect(runner.calls.isEmpty, "claude never ran on a refused package")
+        _ = try await w.propose(try PluginFixture(), claude: claude)
+        #expect(runner.calls.count == 2)
+    }
+
+    /// I5: `--fix` and `--lock` refuse while the folder holds a link (nothing is written through a shared inode).
+    @Test func fixRefusesWithLinks() throws {
+        let home = try tempDir()
+        let f = try PluginFixture(files: ["skills/demo/SKILL.md": PluginFixture.skillMD(name: "demo", frontmatter: "allowed-tools: Bash")])
+        let outside = try tempDir().appending(path: "outside.md")
+        try Data("secret\n".utf8).write(to: outside)
+        try FileManager.default.linkItem(at: outside, to: f.root.appending(path: "skills/demo/notes.md"))
+        let fixed = try brahma(["ext", "lint", f.root.path, "--fix"], home: home)
+        #expect(fixed.status == 1); #expect(fixed.stderr.contains("EXT006") || fixed.stdout.contains("EXT006"), "\(fixed.stdout + fixed.stderr)")
+        #expect(try f.read("skills/demo/SKILL.md").contains("allowed-tools"), "nothing was changed")
+        #expect(!f.exists("ext.lock.json"))
+        #expect(try brahma(["ext", "lint", f.root.path, "--lock"], home: home).status == 1)
+        #expect(try String(contentsOf: outside, encoding: .utf8) == "secret\n")
+    }
+
+    /// BRAHMA_LIVE: the real CLI (no model call) accepts the hardened argv on the clean template and runs none of a hostile
+    /// fixture's hook, MCP server, skill-frontmatter hook or agent-frontmatter MCP server.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1")) func liveClaudeChecksRunOnTheTemplate() async throws {
+        let claude = try #require((ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map { "\($0)/claude" }
+                                      .first { FileManager.default.isExecutableFile(atPath: $0) }, "claude on PATH")
+        let dir = try tempDir().appending(path: "live-skill")
+        try ExtensionTemplates.write(id: "live-skill", to: dir, withBin: false)
+        let out = await ExtensionValidator.claudeChecks(staged: dir, check: ClaudeCheck(runner: RecordingRunner(), claudePath: claude, scratch: try tempDir()))
+        #expect(out.issues.isEmpty, "\(out.issues)"); #expect(out.alwaysOnTokens != nil)
+        let item = await Doctor.pluginDetailsItem(claudePath: claude, sandbox: RecordingRunner())
+        #expect(item.status == .pass, "\(item.detail)")
     }
 
     @Test func newSkillTemplateLintsClean() throws {

@@ -9,7 +9,9 @@ import Glibc
 // under the limits (no links, devices or odd names; nothing outside the package root), then decomposed: the plugin parts
 // are kept, `bin/` helpers are renamed `<id>-*`, and every part Brahma does not run (MCP servers, hooks, LSP, monitors,
 // settings, output styles, themes, workflows, channels, userConfig, dependencies, a root CLAUDE.md) is dropped with a
-// notice. Brahma copies plugin folders itself; it never asks the Claude CLI to install anything.
+// notice, as is every top-level entry outside the allowlist. A zip is inventoried (central directory) and refused on any
+// limit before `/usr/bin/unzip` runs under the sandboxed runner. Brahma copies plugin folders itself; it never asks the
+// Claude CLI to install anything.
 
 /// Where a package comes from. The installer records the publisher and source from this, never from the package.
 public enum ExtensionSource: Sendable {
@@ -29,6 +31,10 @@ public struct ExtensionSourceFacts: Codable, Equatable, Sendable {
     public var sourceType: String
     public var sourceUrl: String?
     public var sourceSha: String?
+
+    public init(publisher: String, sourceType: String, sourceUrl: String?, sourceSha: String?) {
+        self.publisher = publisher; self.sourceType = sourceType; self.sourceUrl = sourceUrl; self.sourceSha = sourceSha
+    }
 }
 
 /// A staged, decomposed package: the staging dir, the id, the import notices and the source facts.
@@ -39,23 +45,37 @@ public struct StagedExtension: Sendable {
     public var source: ExtensionSourceFacts
 }
 
+/// The archive limits (S10): what a zip may declare before anything is extracted.
+public enum ZipLimits {
+    /// Declared uncompressed bytes over compressed bytes; above this the archive is a bomb.
+    public static let maxRatio = 100
+}
+
 public enum ExtensionImporter {
+    /// What the extraction script prints when the archive's real bytes pass the quota.
+    static let quotaMarker = "brahma-zip-quota-exceeded"
+
     static func mcpNotice(_ name: String) -> String { "This plugin's MCP server \(name) was not imported; connectors arrive in a later Brahma release." }
     static func hookNotice(_ event: String) -> String { "This plugin's \(event) hook will not run in Brahma." }
 
+    /// Top-level names the decompose step turns into notices; they are copied so it can read them.
+    static let noticedTopLevel: Set<String> = ["hooks", "hooks.json", ".mcp.json", ".lsp.json", "settings.json", "monitors", "output-styles",
+                                               "themes", "workflows", "CLAUDE.md", "SKILL.md"]
+
     /// Stages `source` under the limits and decomposes it. `userHome` is the owner's home for the plugin-cache import (the
     /// account's home by default); `environment` is the process environment (an agent turn, `BRAHMA_AGENT_ID`, may never
-    /// import from the owner's Claude Code).
+    /// import from the owner's Claude Code); `sandbox` runs `unzip` for a zip source.
     public static func stage(source: ExtensionSource, paths: BrahmaPaths, userHome: URL? = nil,
                              environment: [String: String] = ProcessInfo.processInfo.environment,
-                             labArchive: ((_ agentId: String, _ path: String, _ commit: String, _ into: URL) throws -> Void)? = nil) throws -> StagedExtension {
+                             sandbox: any SandboxedRunner,
+                             labArchive: ((_ agentId: String, _ path: String, _ commit: String, _ into: URL) throws -> Void)? = nil) async throws -> StagedExtension {
         let staging = paths.extensionsDir.staging
         try BrahmaPaths.ensurePrivateDirectory(paths.extensionsDir.root)
         try BrahmaPaths.ensurePrivateDirectory(staging)
         let dir = staging.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         do {
-            return try stage(source: source, into: dir, paths: paths, userHome: userHome, environment: environment, labArchive: labArchive)
+            return try await stage(source: source, into: dir, paths: paths, userHome: userHome, environment: environment, sandbox: sandbox, labArchive: labArchive)
         } catch {
             try? FileManager.default.removeItem(at: dir)
             throw error
@@ -63,33 +83,31 @@ public enum ExtensionImporter {
     }
 
     private static func stage(source: ExtensionSource, into dir: URL, paths: BrahmaPaths, userHome: URL?, environment: [String: String],
-                              labArchive: ((String, String, String, URL) throws -> Void)?) throws -> StagedExtension {
+                              sandbox: any SandboxedRunner, labArchive: ((String, String, String, URL) throws -> Void)?) async throws -> StagedExtension {
         var notices: [String] = []
         let facts: ExtensionSourceFacts
         var bare = false
+        func noticeSkipped(_ skipped: [String]) {
+            for name in skipped { notices.append("\(Store.flat(name, max: 80)) was not imported (not a plugin part).") }
+        }
         switch source {
         case .folder(let url):
-            try copyTree(from: url, to: dir)
+            noticeSkipped(try copyTree(from: url, to: dir, topLevelFilter: isCopiedTopLevel))
             facts = ExtensionSourceFacts(publisher: ExtensionPublisher.local, sourceType: "folder", sourceUrl: url.path, sourceSha: nil)
         case .bareSkill(let url):
             guard FileManager.default.fileExists(atPath: url.appending(path: "SKILL.md").path) else {
                 throw ExtensionError.message("\(url.path) holds no SKILL.md")
             }
             bare = true
-            try copyTree(from: url, to: dir.appending(path: ".skill"))
+            _ = try copyTree(from: url, to: dir.appending(path: ".skill"))
             facts = ExtensionSourceFacts(publisher: ExtensionPublisher.local, sourceType: "bareSkill", sourceUrl: url.path, sourceSha: nil)
         case .zip(let url):
-            var st = stat()
-            guard stat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { throw ExtensionError.message("\(url.path) is not a file") }
-            guard st.st_size <= ExtensionLimits.maxBytes else { throw ExtensionError.message("the zip is larger than \(ExtensionLimits.maxBytes) bytes") }
-            let unzipped = dir.appending(path: ".unzip", directoryHint: .isDirectory)
-            try FileManager.default.createDirectory(at: unzipped, withIntermediateDirectories: false)
-            try unzip(url, into: unzipped)
+            let unzipped = try await extractZip(url, under: dir, sandbox: sandbox)
             // One top-level folder (the package) or the package files themselves.
             let entries = try FileManager.default.contentsOfDirectory(atPath: unzipped.path).filter { $0 != "__MACOSX" }
             let root = entries.count == 1 && SandboxPath.kind(unzipped.appending(path: entries[0]).path) == .directory
                 ? unzipped.appending(path: entries[0]) : unzipped
-            try copyTree(from: root, to: dir)
+            noticeSkipped(try copyTree(from: root, to: dir, topLevelFilter: isCopiedTopLevel))
             try FileManager.default.removeItem(at: unzipped)
             facts = ExtensionSourceFacts(publisher: ExtensionPublisher.local, sourceType: "zip", sourceUrl: url.path,
                                          sourceSha: FileManager.default.contents(atPath: url.path).map(SHA256.hex))
@@ -105,7 +123,7 @@ public enum ExtensionImporter {
             guard let version = newestVersion(in: cache) else {
                 throw ExtensionError.message("no installed plugin \(marketplace)/\(plugin) in \(home.path)/.claude/plugins/cache")
             }
-            try copyTree(from: cache.appending(path: version), to: dir)
+            noticeSkipped(try copyTree(from: cache.appending(path: version), to: dir, topLevelFilter: isCopiedTopLevel))
             facts = ExtensionSourceFacts(publisher: ExtensionPublisher.claudeCode(marketplace: marketplace), sourceType: "claudeCode",
                                          sourceUrl: "\(marketplace)/\(plugin)@\(version)", sourceSha: nil)
         case .lab(let agentId, let path, let commit):
@@ -113,7 +131,7 @@ public enum ExtensionImporter {
             let archived = dir.appending(path: ".archive", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: false)
             try labArchive(agentId, path, commit, archived)
-            try copyTree(from: archived, to: dir)
+            noticeSkipped(try copyTree(from: archived, to: dir, topLevelFilter: isCopiedTopLevel))
             try FileManager.default.removeItem(at: archived)
             facts = ExtensionSourceFacts(publisher: "lab:\(agentId)", sourceType: "lab", sourceUrl: path, sourceSha: commit)
         }
@@ -121,18 +139,41 @@ public enum ExtensionImporter {
         return StagedExtension(dir: dir, id: id, notices: notices, source: facts)
     }
 
+    /// Which top-level entries of a plugin source are copied: the allowlisted ones and those decompose notices; `node_modules`
+    /// refuses the import; everything else is skipped with a notice (I6).
+    static func isCopiedTopLevel(_ name: String) throws -> Bool {
+        if name == "node_modules" { throw ExtensionError.message("a top-level node_modules/ is refused; nothing is installed at runtime") }
+        if noticedTopLevel.contains(name) { return true }
+        switch ExtensionValidator.classify(topLevel: name) {
+        case .refused: return false
+        default: return true
+        }
+    }
+
     // MARK: Copy under the limits
 
     /// Copies `source` into `dest` (created): regular files and directories only, modes normalized (0755 under `bin/`, else
-    /// 0644), every name checked, the limits enforced. A link, device or odd name refuses the import.
-    public static func copyTree(from source: URL, to dest: URL) throws {
+    /// 0644), every name checked, the limits enforced. A link, device or odd name refuses the import, except at the top level
+    /// when `topLevelFilter` says the entry is not copied anyway (it is skipped and returned). Returns the skipped names.
+    @discardableResult
+    public static func copyTree(from source: URL, to dest: URL, topLevelFilter: ((String) throws -> Bool)? = nil) throws -> [String] {
         let fm = FileManager.default
         guard SandboxPath.kind(source.path) == .directory else { throw ExtensionError.message("\(source.path) is not a directory") }
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)
         var count = 0
         var total: Int64 = 0
+        var skipped: [String] = []
         for f in try PackageWalk.files(root: source, includeDirectories: true) {
             let name = f.url.lastPathComponent
+            let top = String(f.relative.split(separator: "/").first ?? "")
+            if skipped.contains(top) { continue }
+            if let topLevelFilter, !f.relative.contains("/") {
+                if name == ".DS_Store" { continue }
+                let wanted = try topLevelFilter(name)
+                let isPart = wanted && !noticedTopLevel.contains(name)
+                // A link or odd file at a plugin-part name refuses the import; at any other name it is skipped with a notice.
+                if !wanted || ((f.kind == .link || f.kind == .other) && !isPart) { skipped.append(name); continue }
+            }
             guard ExtensionLimits.isSafeName(name) else {
                 throw ExtensionError.message("'\(Store.flat(f.relative, max: 80))' holds a control, hidden or bidi character")
             }
@@ -165,22 +206,75 @@ public enum ExtensionImporter {
                 try fm.setAttributes([.posixPermissions: f.relative.hasPrefix("bin/") && executable ? 0o755 : 0o644], ofItemAtPath: target.path)
             }
         }
+        return skipped.sorted()
     }
 
-    static func unzip(_ zip: URL, into dir: URL) throws {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["unzip", "-q", "-o", "-n", zip.path, "-d", dir.path]
-        p.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        p.standardInput = FileHandle.nullDevice; p.standardOutput = FileHandle.nullDevice
-        let err = Pipe()
-        p.standardError = err
-        try p.run()
-        let stderr = err.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            throw ExtensionError.message("unzip failed: \(Store.flat(String(decoding: stderr, as: UTF8.self), max: 200))")
+    // MARK: Zip
+
+    /// Inventories the archive (its central directory, never the entry data) and refuses more than `maxFiles` entries, more than
+    /// `maxBytes` declared uncompressed, a compression ratio over `ZipLimits.maxRatio`, a symlink entry, an absolute name, a `..`
+    /// component, an unsafe name or zip64. Then `/usr/bin/unzip -q -n` runs under the sandboxed runner (writable: the unzip
+    /// directory only; network none; `ulimit -f` as the byte quota), and what came out is checked against the limits again.
+    static func extractZip(_ zip: URL, under dir: URL, sandbox: any SandboxedRunner) async throws -> URL {
+        var st = stat()
+        guard stat(zip.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { throw ExtensionError.message("\(zip.path) is not a file") }
+        guard st.st_size <= ExtensionLimits.maxBytes else { throw ExtensionError.message("the zip is larger than \(ExtensionLimits.maxBytes) bytes") }
+        guard let data = FileManager.default.contents(atPath: zip.path) else { throw ExtensionError.message("cannot read \(zip.path)") }
+        let entries = try ZipInventory.entries(of: data)
+        var files = 0, uncompressed = 0, compressed = 0
+        for e in entries {
+            if e.isSymlink { throw ExtensionError.message("the zip holds a symbolic link entry (\(Store.flat(e.name, max: 80))); links are refused") }
+            if e.name.hasPrefix("/") || e.name.hasPrefix("\\") || e.name.range(of: "^[A-Za-z]:", options: .regularExpression) != nil {
+                throw ExtensionError.message("the zip holds an absolute entry name (\(Store.flat(e.name, max: 80)))")
+            }
+            let parts = e.name.split(separator: "/").map(String.init)
+            if parts.contains("..") { throw ExtensionError.message("the zip holds a '..' component (\(Store.flat(e.name, max: 80)))") }
+            for part in parts where !ExtensionLimits.isSafeName(part) {
+                throw ExtensionError.message("'\(Store.flat(e.name, max: 80))' holds a control, hidden or bidi character")
+            }
+            if e.isDirectory { continue }
+            files += 1
+            uncompressed += e.uncompressedSize; compressed += e.compressedSize
         }
+        guard files <= ExtensionLimits.maxFiles else { throw ExtensionError.message("the zip declares \(files) entries; at most \(ExtensionLimits.maxFiles)") }
+        guard uncompressed <= ExtensionLimits.maxBytes else {
+            throw ExtensionError.message("the zip declares \(uncompressed) uncompressed bytes; at most \(ExtensionLimits.maxBytes)")
+        }
+        guard uncompressed <= ZipLimits.maxRatio * max(compressed, 1) else {
+            throw ExtensionError.message("the zip's compression ratio (\(uncompressed) in \(compressed) bytes) is over \(ZipLimits.maxRatio):1")
+        }
+        // The bytes inventoried are the bytes extracted: a private copy of the archive (the source may change under us).
+        let held = dir.appending(path: ".zip", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: held, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let archive = held.appending(path: "archive.zip")
+        guard FileManager.default.createFile(atPath: archive.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+            throw ExtensionError.message("cannot hold a copy of the zip")
+        }
+        defer { try? FileManager.default.removeItem(at: held) }
+        let unzipped = dir.appending(path: ".unzip", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: unzipped, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        // The running byte quota over the whole archive: every entry's real (inflated) bytes are streamed through `head`, which
+        // stops after one byte over `maxBytes`; a central directory that under-declares its sizes is caught here, before
+        // anything is written. Then the extraction, with `ulimit -f` capping any one file at `maxBytes`.
+        let q = ExtensionValidator.shellQuote
+        let limit = ExtensionLimits.maxBytes
+        let blocks = (limit + 511) / 512   // `ulimit -f` counts 512-byte blocks
+        let command = "total=$(\(q("/usr/bin/unzip")) -p \(q(archive.path)) 2>/dev/null | /usr/bin/head -c \(limit + 1) | /usr/bin/wc -c | /usr/bin/tr -d ' '); "
+            + "if [ \"$total\" -gt \(limit) ]; then echo \"\(quotaMarker)\"; exit 3; fi; "
+            + "ulimit -f \(blocks) && " + [q("/usr/bin/unzip"), "-q", "-n", q(archive.path), "-d", q(unzipped.path)].joined(separator: " ")
+        let env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        let policy = SandboxPolicy(writable: [unzipped], readable: [held], network: .none, toolchain: false)
+        let out = await sandbox.run(command: command, cwd: unzipped, environment: env, timeout: .seconds(120),
+                                    outputURL: dir.appending(path: ".unzip.log"), policy: policy)
+        try? FileManager.default.removeItem(at: dir.appending(path: ".unzip.log"))
+        guard out.exitCode == 0 else {
+            try? FileManager.default.removeItem(at: unzipped)
+            if out.tail.contains(quotaMarker) {
+                throw ExtensionError.message("the zip inflates to more than \(limit) bytes (its central directory under-declares the sizes); refused")
+            }
+            throw ExtensionError.message("unzip failed: \(Store.flat(out.tail, max: 200))")
+        }
+        return unzipped
     }
 
     static func ownerHome() -> URL {
@@ -223,14 +317,14 @@ public enum ExtensionImporter {
             let skillDir = dir.appending(path: ".skill")
             let text = try String(contentsOf: skillDir.appending(path: "SKILL.md"), encoding: .utf8)
             guard let fm_ = Frontmatter.parse(text), let name = fm_.value("name"), !name.isEmpty else {
-                throw ExtensionError.message("SKILL.md has no frontmatter name to use as the id")
+                throw ExtensionError.message("SKILL.md has no frontmatter name to use as the id (or its frontmatter is not the strict subset)")
             }
             if let problem = ExtensionId.problem(name) { throw ExtensionError.message(problem) }
             let description = fm_.value("description") ?? "Skill \(name)."
             try fm.createDirectory(at: dir.appending(path: "skills"), withIntermediateDirectories: true)
             try fm.moveItem(at: skillDir, to: dir.appending(path: "skills/\(name)"))
             try fm.createDirectory(at: dir.appending(path: ".claude-plugin"), withIntermediateDirectories: true)
-            let manifest = ExtensionManifest(name: name, version: "0.1.0", description: String(description.prefix(ExtensionLimits.maxDescription)),
+            let manifest = ExtensionManifest(name: name, version: "0.1.0", description: String(description.unicodeScalars.prefix(ExtensionLimits.maxDescription)),
                                              author: .object(["name": .string("imported")]))
             try manifest.json().write(to: dir.appending(path: ExtensionManifest.path))
             notices.append("A plugin.json was generated for the bare skill '\(name)'.")
@@ -257,9 +351,7 @@ public enum ExtensionImporter {
 
         // The manifest: the parts Brahma does not run are dropped with their notices; benign metadata is dropped quietly.
         if let hooks = object.removeValue(forKey: "hooks") { notices += hookNotices(hooks, root: dir) }
-        if let servers = object.removeValue(forKey: "mcpServers")?.objectValue {
-            for name in servers.keys.sorted() { notices.append(mcpNotice(Store.flat(name, max: 60))) }
-        }
+        if let servers = object.removeValue(forKey: "mcpServers") { notices += mcpNotices(servers, root: dir) }
         if object.removeValue(forKey: "lspServers") != nil { notices.append("This plugin's LSP server was not imported; LSP servers never run in Brahma.") }
         if object.removeValue(forKey: "channels") != nil { notices.append("This plugin's channels were not imported.") }
         if let config = object.removeValue(forKey: "userConfig")?.objectValue {
@@ -277,7 +369,13 @@ public enum ExtensionImporter {
                 + (deps.objectValue?.keys.sorted() ?? [])
             for d in names { notices.append("This plugin depends on \(Store.flat(d, max: 60)); it was not installed (install it separately if you need it).") }
         }
-        for key in ["homepage", "repository", "license", "keywords", "commands", "agents", "skills"] where object[key] != nil {
+        // Component paths (custom locations) and other metadata are dropped with a notice; the referenced folders fall to the
+        // top-level filter, so only the standard locations are used.
+        for key in ["commands", "agents", "skills", "outputStyles", "hooksPath"] where object[key] != nil {
+            object.removeValue(forKey: key)
+            notices.append("The manifest key \(key) (a component path) was dropped; only the standard folders are used.")
+        }
+        for key in ["homepage", "repository", "license", "keywords", "icon"] where object[key] != nil {
             object.removeValue(forKey: key)
             notices.append("The manifest key \(key) was dropped (not part of the 4-key manifest).")
         }
@@ -287,12 +385,12 @@ public enum ExtensionImporter {
         if object["author"] == nil { object["author"] = .object(["name": .string("unknown")]); notices.append("The manifest had no author; 'unknown' was set.") }
         try ExtensionJSON.encode(JSONValue.object(object)).write(to: dir.appending(path: ExtensionManifest.path))
 
-        // Files and directories Brahma does not run.
+        // Files and directories Brahma does not run (compared lowercased).
         for name in try fm.contentsOfDirectory(atPath: dir.path) {
             let url = dir.appending(path: name)
-            switch name {
-            case "hooks":
-                let json = url.appending(path: "hooks.json")
+            switch name.lowercased() {
+            case "hooks", "hooks.json":
+                let json = SandboxPath.kind(url.path) == .directory ? url.appending(path: "hooks.json") : url
                 if let d = fm.contents(atPath: json.path), let v = try? JSONDecoder().decode(JSONValue.self, from: d) { notices += hookNotices(v, root: dir) }
                 else { notices.append(hookNotice("every")) }
                 try fm.removeItem(at: url)
@@ -304,9 +402,9 @@ public enum ExtensionImporter {
                 try fm.removeItem(at: url)
             case ".lsp.json":
                 notices.append("This plugin's LSP server (.lsp.json) was not imported; LSP servers never run in Brahma."); try fm.removeItem(at: url)
-            case "settings.json", "monitors", "output-styles", "themes", "workflows", "CLAUDE.md":
+            case "settings.json", "monitors", "output-styles", "themes", "workflows", "claude.md":
                 notices.append("This plugin's \(name) was not imported; it reconfigures the harness and is not a plugin part."); try fm.removeItem(at: url)
-            case ".DS_Store", ".git", ".orphaned_at":
+            case ".ds_store", ".git", ".orphaned_at":
                 try fm.removeItem(at: url)
             default: break
             }
@@ -330,13 +428,46 @@ public enum ExtensionImporter {
         if let o = value.objectValue {
             let map = o["hooks"]?.objectValue ?? o
             events = map.keys.sorted()
-        } else if let path = value.stringValue, ExtensionLimits.isSafeName(path.replacingOccurrences(of: "/", with: "_")),
-                  !path.contains(".."), let d = FileManager.default.contents(atPath: root.appending(path: path).path),
-                  let v = try? JSONDecoder().decode(JSONValue.self, from: d) {
+        } else if let path = value.stringValue, let file = insidePackage(path, root: root),
+                  let d = FileManager.default.contents(atPath: file.path), let v = try? JSONDecoder().decode(JSONValue.self, from: d) {
             events = (v.objectValue?["hooks"]?.objectValue ?? v.objectValue ?? [:]).keys.sorted()
+            try? FileManager.default.removeItem(at: file)
         }
         if events.isEmpty { return [hookNotice("every")] }
         return events.map { hookNotice(Store.flat($0, max: 40)) }
+    }
+
+    /// Notices for a manifest `mcpServers` value in every form: an inline map (one per server), a path or a list of paths (the
+    /// servers of each referenced file, which is then dropped; a missing file is noticed by its path).
+    static func mcpNotices(_ value: JSONValue, root: URL) -> [String] {
+        if let servers = value.objectValue {
+            return servers.keys.sorted().map { mcpNotice(Store.flat($0, max: 60)) }
+        }
+        let paths = value.stringValue.map { [$0] } ?? (value.arrayValue ?? []).compactMap(\.stringValue)
+        var out: [String] = []
+        for path in paths {
+            if let file = insidePackage(path, root: root), let d = FileManager.default.contents(atPath: file.path),
+               let v = try? JSONDecoder().decode(JSONValue.self, from: d), let servers = v.objectValue?["mcpServers"]?.objectValue ?? v.objectValue, !servers.isEmpty {
+                out += servers.keys.sorted().map { mcpNotice(Store.flat($0, max: 60)) }
+                try? FileManager.default.removeItem(at: file)
+                let parent = file.deletingLastPathComponent()
+                if parent.path != root.path, (try? FileManager.default.contentsOfDirectory(atPath: parent.path))?.isEmpty == true {
+                    try? FileManager.default.removeItem(at: parent)
+                }
+            } else {
+                out.append(mcpNotice("(\(Store.flat(path, max: 60)))"))
+            }
+        }
+        return out.isEmpty ? [mcpNotice("(unnamed)")] : out
+    }
+
+    /// A manifest-relative path (`./x/y.json`) as a URL inside the package, or nil when it escapes or is unsafe.
+    static func insidePackage(_ path: String, root: URL) -> URL? {
+        var p = path
+        if p.hasPrefix("./") { p.removeFirst(2) }
+        let parts = p.split(separator: "/").map(String.init)
+        guard !p.hasPrefix("/"), !parts.isEmpty, parts.allSatisfy({ $0 != ".." && ExtensionLimits.isSafeName($0) }) else { return nil }
+        return root.appending(path: parts.joined(separator: "/"))
     }
 
     static func looksSecret(key: String, spec: JSONValue) -> Bool {
@@ -345,5 +476,60 @@ public enum ExtensionImporter {
         if lower.hasSuffix("key") { return true }
         if spec.objectValue?["sensitive"]?.boolValue == true { return true }
         return false
+    }
+}
+
+/// A reader of a zip's central directory: the entries' names, sizes and kinds, never their data.
+enum ZipInventory {
+    struct Entry: Equatable, Sendable {
+        var name: String
+        var compressedSize: Int
+        var uncompressedSize: Int
+        var isSymlink: Bool
+        var isDirectory: Bool
+    }
+
+    static func entries(of data: Data) throws -> [Entry] {
+        let bytes = [UInt8](data)
+        func u16(_ i: Int) -> Int { Int(bytes[i]) | Int(bytes[i + 1]) << 8 }
+        func u32(_ i: Int) -> Int { u16(i) | u16(i + 2) << 16 }
+        // The end-of-central-directory record: signature 0x06054b50 within the last 64 KB + 22 bytes.
+        guard bytes.count >= 22 else { throw ExtensionError.message("not a zip archive") }
+        var eocd = -1
+        var i = bytes.count - 22
+        let floor = max(0, bytes.count - 22 - 65535)
+        while i >= floor {
+            if bytes[i] == 0x50, bytes[i + 1] == 0x4b, bytes[i + 2] == 0x05, bytes[i + 3] == 0x06 { eocd = i; break }
+            i -= 1
+        }
+        guard eocd >= 0 else { throw ExtensionError.message("not a zip archive (no central directory)") }
+        if eocd >= 20, bytes[eocd - 20] == 0x50, bytes[eocd - 19] == 0x4b, bytes[eocd - 18] == 0x06, bytes[eocd - 17] == 0x07 {
+            throw ExtensionError.message("zip64 archives are refused")
+        }
+        let count = u16(eocd + 10), cdSize = u32(eocd + 12), cdOffset = u32(eocd + 16)
+        guard count != 0xFFFF, cdSize != 0xFFFFFFFF, cdOffset != 0xFFFFFFFF else { throw ExtensionError.message("zip64 archives are refused") }
+        guard cdOffset + cdSize <= eocd, cdSize >= 0 else { throw ExtensionError.message("the zip's central directory is out of bounds") }
+        var out: [Entry] = []
+        var p = cdOffset
+        for _ in 0..<count {
+            guard p + 46 <= bytes.count, bytes[p] == 0x50, bytes[p + 1] == 0x4b, bytes[p + 2] == 0x01, bytes[p + 3] == 0x02 else {
+                throw ExtensionError.message("the zip's central directory is malformed")
+            }
+            let madeBy = u16(p + 4) >> 8
+            let compressed = u32(p + 20), uncompressed = u32(p + 24)
+            let nameLength = u16(p + 28), extraLength = u16(p + 30), commentLength = u16(p + 32)
+            let external = u32(p + 38)
+            guard compressed != 0xFFFFFFFF, uncompressed != 0xFFFFFFFF else { throw ExtensionError.message("zip64 archives are refused") }
+            let nameStart = p + 46
+            guard nameStart + nameLength <= bytes.count else { throw ExtensionError.message("the zip's central directory is malformed") }
+            let name = String(decoding: bytes[nameStart..<nameStart + nameLength], as: UTF8.self)
+            // Unix attributes live in the high 16 bits when the entry was made on Unix (3) or macOS (19).
+            let unixMode = (madeBy == 3 || madeBy == 19) ? (external >> 16) & 0xFFFF : 0
+            let isSymlink = (unixMode & 0o170000) == 0o120000
+            let isDirectory = name.hasSuffix("/") || (unixMode & 0o170000) == 0o040000 || (external & 0x10) != 0
+            out.append(Entry(name: name, compressedSize: compressed, uncompressedSize: uncompressed, isSymlink: isSymlink, isDirectory: isDirectory))
+            p = nameStart + nameLength + extraLength + commentLength
+        }
+        return out
     }
 }

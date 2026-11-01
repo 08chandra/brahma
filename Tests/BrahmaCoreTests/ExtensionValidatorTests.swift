@@ -66,6 +66,47 @@ import Foundation
         Refusal(name: "brahma-json-connector", code: "EXT024") {
             try $0.write("brahma.json", #"{"brahma": 1, "connector": {"transport": "http", "url": "https://x"}}"#)
         },
+        // C1 / S9: frontmatter the parser used to skip (and Claude Code loads) is now normalized or refused, never passed through.
+        Refusal(name: "bom-fence", code: "EXT001") {
+            _ = try $0.writeBytes("skills/demo/SKILL.md", [0xEF, 0xBB, 0xBF] + Array("---\nname: demo\ndescription: d\nhooks: {}\n---\nx\n".utf8))
+        },
+        Refusal(name: "crlf-frontmatter", code: "EXT001") {
+            try $0.write("skills/demo/SKILL.md", "---\r\nname: demo\r\ndescription: d\r\nhooks: {}\r\n---\r\nx\r\n")
+        },
+        Refusal(name: "indented-mapping", code: "EXT010") {
+            try $0.write("skills/demo/SKILL.md", "---\n  name: demo\n  allowed-tools: Bash\n---\nx\n")
+        },
+        Refusal(name: "invalid-utf8-md", code: "EXT010") {
+            _ = try $0.writeBytes("skills/demo/SKILL.md", Array("---\nname: demo\ndescription: d\n".utf8) + [0xFF] + Array("\n---\nx\n".utf8))
+        },
+        Refusal(name: "oversized-md", code: "EXT023") {
+            try $0.write("skills/demo/reference/big.md", "---\nname: x\n---\n" + String(repeating: "a", count: ExtensionLimits.maxScannedBytes + 1))
+        },
+        Refusal(name: "skill-md-case", code: "EXT004") {
+            try FileManager.default.moveItem(at: $0.root.appending(path: "skills/demo/SKILL.md"), to: $0.root.appending(path: "skills/demo/SKILL.MD"))
+        },
+        Refusal(name: "duplicate-keys", code: "EXT010") {
+            try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: a\ndescription: b\n---\nx\n")
+        },
+        Refusal(name: "yaml-anchor", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: &a demo\ndescription: d\n---\nx\n") },
+        Refusal(name: "yaml-alias", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: *a\n---\nx\n") },
+        Refusal(name: "yaml-tag", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: !!str d\n---\nx\n") },
+        Refusal(name: "flow-mapping", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\n{name: demo, description: d}\n---\nx\n") },
+        Refusal(name: "tab-indent", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\nmetadata:\n\tx: 1\n---\nx\n") },
+        Refusal(name: "explicit-key", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\n? name\n: demo\n---\nx\n") },
+        Refusal(name: "yaml-document-marker", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\n...\n---\nhooks: {}\n---\nx\n") },
+        Refusal(name: "merge-key", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\n<<: *base\n---\nx\n") },
+        Refusal(name: "blank-line-before-fence", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "\n---\nname: demo\nhooks: {}\n---\nx\n") },
+        Refusal(name: "indented-fence", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "  ---\nname: demo\nhooks: {}\n---\nx\n") },
+        Refusal(name: "flow-anchor", code: "EXT010") { try $0.write("agents/helper.md", "---\nname: helper\ndescription: h\ntools: [&t Read]\n---\nx\n") },
+        Refusal(name: "nested-flow", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\nmetadata: {a: {b: 1}}\n---\nx\n") },
+        Refusal(name: "multiline-flow", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\nmetadata: {a: 1,\n  hooks: 2}\n---\nx\n") },
+        Refusal(name: "escaped-hidden-value", code: "EXT016") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: \"Demo\\u202E skill\"\n---\nx\n") },
+        Refusal(name: "unclosed-fence", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\nno fence\n") },
+        Refusal(name: "setuid-bin", code: "EXT013") {
+            let url = try $0.bin("demo-tool")
+            try FakeTools.fixtureMode(0o4755, at: url)
+        },
         Refusal(name: "bad-id", code: "EXT009") {
             try $0.write(".claude-plugin/plugin.json", PluginFixture.manifestJSON(id: "Demo_1"))
         },
@@ -79,6 +120,29 @@ import Foundation
         try row.plant(f)
         let r = ExtensionValidator.validate(staged: f.root)
         #expect(Self.codes(r).contains(row.code), "\(row.name): \(r.issues)")
+    }
+
+    /// The strict subset: what the six C1 cases and friends must never do is pass through. A refused frontmatter never yields a
+    /// stripped-only warning, and a clean one parses (quoted values included, M4).
+    @Test func strictFrontmatterSubset() throws {
+        for text in ["---\nname: demo\ndescription: d\ncontext: \"fork\"\nagent: 'helper'\nwhen_to_use: \"when: needed\"\n---\nx\n",
+                     "---\nname: demo\ndescription: d\nmetadata:\n  author: me\n  tags:\n    - a\n---\nx\n"] {
+            let f = try PluginFixture(files: ["skills/demo/SKILL.md": text, "agents/helper.md": PluginFixture.agentMD(name: "helper")])
+            #expect(ExtensionValidator.validate(staged: f.root).errors.isEmpty, "\(text)")
+        }
+        // Single-line flow lists (quoted `*` inside is text) and block scalars holding YAML-looking text are accepted.
+        let agent = "---\nname: helper\ndescription: h\ntools: [Read, \"Grep\"]\n---\nx\n"
+        let block = "---\nname: demo\ndescription: |\n  Use when: [this or *that* & more\n  !important: yes\n---\nx\n"
+        let flows = try PluginFixture(files: ["skills/demo/SKILL.md": block, "agents/helper.md": agent])
+        #expect(ExtensionValidator.validate(staged: flows.root, options: ValidationOptions(roleTools: ["Read", "Grep"])).errors.isEmpty,
+                "\(ExtensionValidator.validate(staged: flows.root, options: ValidationOptions(roleTools: ["Read", "Grep"])).errors)")
+        #expect(Frontmatter.flowProblem("[Read, \"Bash(git:*)\"]") == nil)
+        #expect(Frontmatter.flowProblem("[Read, *x]") != nil); #expect(Frontmatter.flowProblem("[Read") != nil)
+        let fm = try #require(Frontmatter.parse("---\nname: demo\ndescription: \"a: b\"\n---\nx\n"))
+        #expect(fm.value("description") == "a: b")
+        // Canonical form: LF, no BOM, allowlisted keys only, in the order written.
+        let canonical = try #require(Frontmatter.canonical("\u{FEFF}---\r\nname: demo\r\nallowed-tools: Bash\r\ndescription: d\r\n---\r\nBody\r\n", allowed: ExtensionValidator.skillKeys))
+        #expect(canonical == "---\nname: demo\ndescription: d\n---\nBody\n")
     }
 
     @Test func cleanPluginPasses() throws {
@@ -173,10 +237,43 @@ import Foundation
         let f = try PluginFixture(manifest: PluginFixture.manifestJSON(id: "demo").replacingOccurrences(of: "A demo", with: "A\u{202E} demo"))
         let r = ExtensionValidator.validate(staged: f.root)
         #expect(r.errors.contains { $0.code == "EXT016" && $0.path == ".claude-plugin/plugin.json" }, "\(r.issues)")
-        // In a skill body it is a flag on the card (a warning), with the line.
+        // In a plugin-part file it is an error (I3), with the line; in a README it is a flag on the card.
         let g = try PluginFixture(files: ["skills/demo/SKILL.md": PluginFixture.skillMD(name: "demo", body: "Run it.\u{200B}\n")])
-        let w = try #require(ExtensionValidator.validate(staged: g.root).warnings.first { $0.code == "EXT016" })
-        #expect(w.path == "skills/demo/SKILL.md"); #expect(w.line == 8)
+        let e = try #require(ExtensionValidator.validate(staged: g.root).errors.first { $0.code == "EXT016" })
+        #expect(e.path == "skills/demo/SKILL.md"); #expect(e.line == 8)
+        let readme = try PluginFixture(files: ["README.md": "# demo\u{200B}\n"])
+        #expect(ExtensionValidator.validate(staged: readme.root).warnings.contains { $0.code == "EXT016" && $0.path == "README.md" })
+    }
+
+    /// I3: hidden characters are found in decoded JSON and frontmatter values, the wider ranges count, and brahma.json is an error.
+    @Test func hiddenUnicodeInDecodedValues() throws {
+        let escaped = try PluginFixture(manifest: #"{"name": "demo", "version": "1.0.0", "description": "A\u202E demo", "author": {"name": "T"}}"#)
+        #expect(ExtensionValidator.validate(staged: escaped.root).errors.contains { $0.code == "EXT016" && $0.path == ".claude-plugin/plugin.json" })
+        let sidecar = try PluginFixture(files: ["brahma.json": "{\"brahma\": 1, \"suits\": {\"tags\": [\"dev\u{200B}\"]}}"])
+        #expect(ExtensionValidator.validate(staged: sidecar.root).errors.contains { $0.code == "EXT016" && $0.path == "brahma.json" })
+        // A tag character (ASCII smuggling), a variation selector, U+2028, a Hangul filler, a C1 control: errors in a plugin-part .md.
+        for hidden in ["\u{E0041}", "\u{FE0F}", "\u{2028}", "\u{3164}", "\u{0085}", "\u{034F}"] {
+            let f = try PluginFixture(files: ["skills/demo/SKILL.md": PluginFixture.skillMD(name: "demo", body: "Run it.\(hidden)\n")])
+            #expect(ExtensionValidator.validate(staged: f.root).errors.contains { $0.code == "EXT016" }, "\(hidden.unicodeScalars.map { String($0.value, radix: 16) }.joined())")
+        }
+        // In a frontmatter value it is an error too (the description is always-on text).
+        let fm = try PluginFixture(files: ["skills/demo/SKILL.md": "---\nname: demo\ndescription: \"Demo\u{200B} skill\"\n---\nx\n"])
+        #expect(ExtensionValidator.validate(staged: fm.root).errors.contains { $0.code == "EXT016" })
+        #expect(!ExtensionLimits.isSafeName("a\u{0085}b")); #expect(ExtensionLimits.isHiddenOrBidi("\u{E0001}"))
+    }
+
+    /// I4: the 1,024-character cap applies to every skill, command and agent description (counted in Unicode scalars).
+    @Test func descriptionCapAppliesToFrontmatter() throws {
+        let long = String(repeating: "d", count: 1025)
+        let skill = try PluginFixture(files: ["skills/demo/SKILL.md": "---\nname: demo\ndescription: \(long)\n---\nx\n"])
+        #expect(ExtensionValidator.validate(staged: skill.root).errors.contains { $0.code == "EXT023" && $0.path == "skills/demo/SKILL.md" })
+        let agent = try PluginFixture(files: ["agents/helper.md": "---\nname: helper\ndescription: \(long)\n---\nx\n"])
+        #expect(ExtensionValidator.validate(staged: agent.root).errors.contains { $0.code == "EXT023" })
+        // Combining marks count: 600 base characters each carrying a combining mark is 1,200 scalars.
+        let padded = String(repeating: "e\u{0301}", count: 600)
+        let combining = try PluginFixture(files: ["commands/go.md": "---\ndescription: \(padded)\n---\nx\n"])
+        #expect(ExtensionValidator.validate(staged: combining.root).errors.contains { $0.code == "EXT023" })
+        #expect(ExtensionValidator.validate(staged: try PluginFixture().root).errors.isEmpty)
     }
 
     @Test func binPrefixEnforced() throws {
@@ -216,7 +313,7 @@ import Foundation
         #expect(!e.message.contains("AKIAABCDEFGHIJKLMNOP"), "the finding never shows the secret")
     }
 
-    @Test func limitsEnforced() throws {
+    @Test func limitsEnforced() async throws {
         #expect(ExtensionLimits.maxBytes == 20 * 1024 * 1024); #expect(ExtensionLimits.maxFiles == 2000)
         #expect(ExtensionLimits.maxDescription == 1024)
         // Description over 1,024 characters.
@@ -227,10 +324,10 @@ import Foundation
         let g = try PluginFixture()
         for n in 0..<ExtensionLimits.maxFiles { try g.write("assets/f\(n).txt", "x") }
         let paths = ownerPaths(try tempDir())
-        #expect(throws: ExtensionError.self) { try ExtensionImporter.stage(source: .folder(g.root), paths: paths) }
+        await #expect(throws: ExtensionError.self) { try await ExtensionImporter.stage(source: .folder(g.root), paths: paths, sandbox: RecordingRunner()) }
         // A name with a control or bidi character is refused by the stager too.
         let h = try PluginFixture(files: ["assets/evil\u{202E}txt.md": "x"])
-        #expect(throws: ExtensionError.self) { try ExtensionImporter.stage(source: .folder(h.root), paths: paths) }
+        await #expect(throws: ExtensionError.self) { try await ExtensionImporter.stage(source: .folder(h.root), paths: paths, sandbox: RecordingRunner()) }
     }
 
     @Test func lintFlagsAreWarnings() throws {
@@ -282,5 +379,16 @@ import Foundation
         // A hand-edited lock is refused.
         try f.write("ext.lock.json", (try f.read("ext.lock.json")).replacingOccurrences(of: "\"0644\"", with: "\"0600\""))
         #expect(ExtensionValidator.validate(staged: f.root).errors.contains { $0.code == "EXT025" })
+        // M6: the lock is compared byte-for-byte in canonical form: an unknown key or a reformatted file is refused too.
+        try lock.write(to: f.root)
+        try f.write("ext.lock.json", (try f.read("ext.lock.json")).replacingOccurrences(of: "\"format\" : 1", with: "\"format\" : 1,\n  \"extra\" : true"))
+        #expect(ExtensionValidator.validate(staged: f.root).errors.contains { $0.code == "EXT025" }, "unknown key")
+        try lock.write(to: f.root)
+        try f.write("ext.lock.json", (try f.read("ext.lock.json")).replacingOccurrences(of: "\n", with: ""))
+        #expect(ExtensionValidator.validate(staged: f.root).errors.contains { $0.code == "EXT025" }, "reformatted")
+        // Only alwaysOnTokens may differ (Claude's details run fills it).
+        var tokens = lock; tokens.lint.alwaysOnTokens = 42
+        try tokens.write(to: f.root)
+        #expect(ExtensionValidator.validate(staged: f.root).errors.isEmpty)
     }
 }

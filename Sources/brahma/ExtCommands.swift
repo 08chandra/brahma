@@ -47,6 +47,14 @@ struct ExtLint: AsyncParsableCommand {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDir), isDir.boolValue else { throw fail("\(source.path) is not a directory") }
         let paths = BrahmaPaths.fromEnvironment()
+        if lock || fix {
+            // Nothing is written into a folder that holds a link (I5): the walk's EXT006 issues refuse both.
+            let links = ExtensionValidator.validate(staged: source).issues.filter { $0.code == LintCode.linkRefused.rawValue }
+            if !links.isEmpty {
+                for i in links { FileHandle.standardError.write(Data("\(safe("ERROR  \(i.code)  \(i.path)  \(i.message)"))\n".utf8)) }
+                throw fail("refusing to write into a folder that holds a link; remove it first")
+            }
+        }
         if lock {
             do { try ExtensionValidator.writeLock(root: source) } catch let e as ExtensionError { throw fail(e.message) }
             print("wrote \(safe(source.appending(path: ExtensionLock.path).path))")
@@ -71,7 +79,8 @@ struct ExtLint: AsyncParsableCommand {
         let staged = scratch.appending(path: "staged", directoryHint: .isDirectory)
         do { try ExtensionImporter.copyTree(from: source, to: staged) } catch let e as ExtensionError { throw fail(e.message) }
         var result = ExtensionValidator.validate(staged: staged)
-        if !noClaude, let claude = Self.claudePath(), result.manifest != nil {
+        // I1: Claude's own checks run only on a package the validator passed.
+        if !noClaude, let claude = Self.claudePath(), result.errors.isEmpty, result.manifest != nil {
             let runner: any SandboxedRunner
             if let (store, p) = try? openStore(lazySecrets: true) { runner = Orchestrator.ownerSandboxRunner(store: store, paths: p) }
             else { runner = UnavailableSandboxRunner() }
@@ -118,7 +127,9 @@ private func proposeInstall(source: ExtensionSource, company: String, roles: [St
     let (store, paths) = try openStore()
     let c = try resolveCompany(store, company)
     let staged: StagedExtension
-    do { staged = try ExtensionImporter.stage(source: source, paths: paths) } catch let e as ExtensionError { throw fail(e.message) }
+    do {
+        staged = try await ExtensionImporter.stage(source: source, paths: paths, sandbox: Orchestrator.ownerSandboxRunner(store: store, paths: paths))
+    } catch let e as ExtensionError { throw fail(e.message) }
     for n in staged.notices { FileHandle.standardError.write(Data("note: \(safe(n))\n".utf8)) }
     var claude: ClaudeCheck?
     if let path = ExtLint.claudePath() {

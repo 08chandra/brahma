@@ -6,22 +6,27 @@ import Foundation
 public enum CompanyHooks {
     public static let banner = "Brahma: possible secret"
 
-    /// The POSIX `sh` pre-commit script: added lines of the staged diff against every `SecretScan` pattern (a match blocks the
-    /// commit and names the rule, never the match); deleted test files are reported, and the commit goes through.
+    /// The POSIX `sh` pre-commit script: every added line of the staged diff (the `+++` file headers left out; no external diff
+    /// or textconv driver) is written once to a temporary file and matched against every `SecretScan` pattern with `grep -E -e`
+    /// (the pattern may start with `-`); a match blocks the commit and names the rule, never the match. Deleted test files are
+    /// reported, and the commit goes through. A clean commit prints nothing.
     public static let preCommit: String = {
+        precondition(SecretScan.patterns.allSatisfy { !$0.ere.contains("'") }, "the EREs are single-quoted in the hook script")
         var lines = [
             "#!/bin/sh",
             "# Brahma pre-commit hook (engine-owned; reinstalled when it differs). Advisory: --no-verify bypasses it.",
-            "added=$(git diff --cached -U0 --no-color | grep -E '^\\+[^+]' | cut -c2-)",
+            "added=$(mktemp \"${TMPDIR:-/tmp}/brahma-hook.XXXXXX\") || exit 0",
+            "trap 'rm -f \"$added\"' EXIT",
+            "git diff --cached -U0 --no-color --no-ext-diff --no-textconv | grep -v '^+++ ' | grep '^+' | cut -c2- > \"$added\"",
         ]
         for p in SecretScan.patterns {
-            lines.append("if printf '%s\\n' \"$added\" | grep -E -q '\(p.ere)'; then")
+            lines.append("if grep -E -q -e '\(p.ere)' \"$added\"; then")
             lines.append("  echo \"\(banner) (\(p.label)) in staged changes — commit blocked.\" >&2")
             lines.append("  exit 1")
             lines.append("fi")
         }
         lines += [
-            "deleted=$(git diff --cached --name-status --diff-filter=D | cut -f2- | grep -E '(^|/)(Tests?|__tests__|spec|specs)/|[._-](test|spec)\\.|Tests?\\.swift$' | tr '\\n' ' ' | sed 's/ $//')",
+            "deleted=$(git diff --cached --name-status --diff-filter=D --no-ext-diff --no-textconv | cut -f2- | grep -E '(^|/)(Tests?|__tests__|spec|specs)/|[._-](test|spec)\\.|Tests?\\.swift$' | tr '\\n' ' ' | sed 's/ $//')",
             "if [ -n \"$deleted\" ]; then",
             "  echo \"Brahma: you deleted test files: $deleted. Your reviewer must approve this explicitly.\" >&2",
             "fi",

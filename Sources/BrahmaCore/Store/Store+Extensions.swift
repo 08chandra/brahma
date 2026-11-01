@@ -25,14 +25,17 @@ public struct ExtensionPackage: Codable, Equatable, Sendable, FetchableRecord, P
     public var lintFactsJSON: String?
     /// JSON `[String]`.
     public var noticesJSON: String?
+    /// JSON `BrahmaSidecar` as parsed at propose (what mounts read; never the store copy on disk).
+    public var sidecarJSON: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case hash, id, version, publisher, sourceType, sourceUrl, sourceSha, treeSha256, pluginTreeSha256, fetchedAt
-        case lintFactsJSON = "lintFacts", noticesJSON = "notices"
+        case lintFactsJSON = "lintFacts", noticesJSON = "notices", sidecarJSON = "sidecar"
     }
 
     public var lintFacts: LintFacts? { lintFactsJSON.flatMap { try? JSONDecoder().decode(LintFacts.self, from: Data($0.utf8)) } }
     public var notices: [String] { noticesJSON.flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } ?? [] }
+    public var sidecar: BrahmaSidecar? { sidecarJSON.flatMap { try? JSONDecoder().decode(BrahmaSidecar.self, from: Data($0.utf8)) } }
 }
 
 /// What a company has installed: one row per extension id, pointing at the approved package hash.
@@ -45,6 +48,12 @@ public struct CompanyExtension: Codable, Equatable, Sendable, FetchableRecord, P
     public var enabled: Bool = true
     public var installedAskId: String?
     public var installedAt: Date
+    /// Set at approve from the approved ask's payload: this company's view of where its copy came from (B-I1). The package
+    /// row is shared by hash and insert-only, so another company's proposal of the same bytes never relabels these.
+    public var publisher: String = ""
+    public var sourceType: String = ""
+    public var sourceUrl: String? = nil
+    public var sourceSha: String? = nil
 }
 
 /// A company override: `add` or `remove` of an extension for a role (`scope role`, `target <role>` or `*` for every role)
@@ -122,7 +131,8 @@ extension Store {
 
     /// Makes the agent's next turn start a fresh session (Task 5a, reused by Task 10). With an item, that item's `agentSession`
     /// row is deleted; without one, `agent.sessionId` is rotated and `sessionStarted` cleared. Either way the next turn's
-    /// `sessionResetReason` is `reason` (`startTurn` applies it).
+    /// `freshSessionReason` is `reason` (`startTurn`/`beginTurn` apply it). The turn stays a counted work turn: only
+    /// `sessionResetReason` (a failed "session not found" turn) takes a turn out of budgets, the watchdog and Continuity.
     public func forceFreshSession(agentId: String, itemId: String?, reason: String, now: Date = Store.now()) throws {
         try writer.write { db in try Store.forceFreshSession(db: db, agentId: agentId, itemId: itemId, reason: reason, now: now) }
     }
@@ -136,7 +146,8 @@ extension Store {
         try db.execute(sql: "UPDATE agent SET pendingSessionReset = ? WHERE id = ?", arguments: [Store.flat(reason, max: 200), agentId])
     }
 
-    /// Moves a pending session-reset reason onto `turnId` (the turn that starts the fresh session) and clears it.
+    /// Moves a pending fresh-session reason onto `turnId` (the turn that starts the fresh session, as `freshSessionReason`) and
+    /// clears it.
     @discardableResult
     public func applyPendingSessionReset(agentId: String, turnId: String) throws -> String? {
         try writer.write { db in try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turnId) }
@@ -144,7 +155,7 @@ extension Store {
 
     static func applyPendingSessionReset(db: Database, agentId: String, turnId: String) throws -> String? {
         guard let reason = try String.fetchOne(db, sql: "SELECT pendingSessionReset FROM agent WHERE id = ?", arguments: [agentId]) else { return nil }
-        try db.execute(sql: "UPDATE turn SET sessionResetReason = ? WHERE id = ?", arguments: [reason, turnId])
+        try db.execute(sql: "UPDATE turn SET freshSessionReason = ? WHERE id = ?", arguments: [reason, turnId])
         try db.execute(sql: "UPDATE agent SET pendingSessionReset = NULL WHERE id = ?", arguments: [agentId])
         return reason
     }

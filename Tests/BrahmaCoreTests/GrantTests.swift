@@ -411,12 +411,13 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect((try await g.nextScope()).readOnlyDirs.map(\.path).contains(grant.value))
     }
 
-    @Test func extensionRefusalsDoNotUseTheBudget() throws {
+    /// Extension grants are real since Task 5a, so their refusals count like every other (5a fix round 1, M7).
+    @Test func extensionRefusalsUseTheBudget() throws {
         let g = try GrantWorld()
-        for n in 0...AccessRefusals.perActiveDay {
-            #expect(refusal { try g.request("extension", "acme/x\(n)") }?.hasPrefix("No extension") == true)
+        for n in 0..<AccessRefusals.perActiveDay {
+            #expect(refusal { try g.request("extension", "local/x\(n)") }?.hasPrefix("No extension") == true)
         }
-        #expect(try g.request("web_domain", "fine.example.com").hasPrefix("Requested A-1"))
+        #expect(refusal { try g.request("web_domain", "fine.example.com") } == AccessRefusals.message)
         #expect(Grants.pathRefusal.contains("brahma access"))
     }
 

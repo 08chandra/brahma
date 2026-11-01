@@ -738,7 +738,7 @@ public actor Orchestrator {
                 // The mount set is frozen per session (Task 5a): a different set on this turn forces a fresh session, never --resume.
                 var slot = try store.sessionSlot(agent: agent, scope: scope)
                 mountSetHash = ExtensionLibrary.mountSetHash(mounts)
-                if slot.started, let frozen = slot.mountSetHash, frozen != mountSetHash {
+                if slot.started, (slot.mountSetHash ?? ExtensionLibrary.mountSetHash([])) != mountSetHash {
                     try store.forceFreshSession(agentId: agent.id, itemId: scope.itemId, reason: "mounts changed", now: clock())
                     try store.applyPendingSessionReset(agentId: agent.id, turnId: turn.id)
                     let renewed = try store.agent(id: agent.id) ?? agent
@@ -1226,7 +1226,7 @@ extension Store {
             var turn = Turn(id: UUID().uuidString, agentId: agentId, companyId: agent.companyId, startedAt: now,
                             endedAt: nil, outcome: .inProgress, summary: nil, costUSD: nil)
             try turn.insert(db)
-            turn.sessionResetReason = try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turn.id)
+            turn.freshSessionReason = try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turn.id)
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: turn.id, kind: .turnStarted,
                               text: "@\(agent.name) turn started", createdAt: now).insert(db)
             return (agent, turn)

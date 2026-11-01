@@ -91,12 +91,12 @@ struct ExtWorld {
     var paths: BrahmaPaths { world.paths }
     var ws: URL { URL(fileURLWithPath: company.workspacePath, isDirectory: false) }
 
-    func stage(_ fixture: PluginFixture) throws -> StagedExtension {
-        try ExtensionImporter.stage(source: .folder(fixture.root), paths: paths)
+    func stage(_ fixture: PluginFixture) async throws -> StagedExtension {
+        try await ExtensionImporter.stage(source: .folder(fixture.root), paths: paths, sandbox: RecordingRunner())
     }
 
     func propose(_ fixture: PluginFixture, roles: [String] = ["engineer"], claude: ClaudeCheck? = nil) async throws -> Ask {
-        try await ExtensionLibrary.propose(staged: try stage(fixture), store: store, paths: paths, companyId: company.id,
+        try await ExtensionLibrary.propose(staged: try await stage(fixture), store: store, paths: paths, companyId: company.id,
                                            requester: .system, roles: roles, claude: claude, now: world.clock.now)
     }
 
@@ -160,5 +160,48 @@ final class RecordingRunner: SandboxedRunner, @unchecked Sendable {
 
     func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
         throw SandboxError.unavailable
+    }
+}
+
+/// Writes a zip of STORED entries with arbitrary names and attributes (what `zip` refuses to produce: `..`, absolute names,
+/// symlink entries, thousands of entries), so the importer's pre-extraction checks can be tested.
+struct ZipBuilder {
+    struct Entry { var name: String; var data: Data; var symlink = false; var declaredSize: Int? = nil }
+    var entries: [Entry] = []
+
+    /// `declaredSize` is what the central directory claims the entry inflates to (a lie, when set).
+    mutating func add(_ name: String, _ text: String, symlink: Bool = false, declaredSize: Int? = nil) {
+        entries.append(Entry(name: name, data: Data(text.utf8), symlink: symlink, declaredSize: declaredSize))
+    }
+
+    func write(to url: URL) throws {
+        var out = Data(), central = Data()
+        func le16(_ v: Int) -> [UInt8] { [UInt8(v & 0xff), UInt8((v >> 8) & 0xff)] }
+        func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xff), UInt8((v >> 8) & 0xff), UInt8((v >> 16) & 0xff), UInt8((v >> 24) & 0xff)] }
+        for e in entries {
+            let name = Array(e.name.utf8), crc = ZipBuilder.crc32(e.data), size = UInt32(e.data.count), offset = UInt32(out.count)
+            let fixed: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(size) + le16(name.count) + le16(0)
+            out += Data([0x50, 0x4b, 0x03, 0x04] + fixed + name) + e.data
+            let mode: UInt32 = e.symlink ? 0o120777 : 0o100644
+            let declared: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
+                + le16(name.count) + le16(0)
+            central += Data([0x50, 0x4b, 0x01, 0x02] + le16(0x031e) + declared + le16(0) + le16(0) + le16(0) + le32(mode << 16) + le32(offset) + name)
+        }
+        let cdOffset = UInt32(out.count)
+        out += central
+        out += Data([0x50, 0x4b, 0x05, 0x06] + le16(0) + le16(0) + le16(entries.count) + le16(entries.count) + le32(UInt32(central.count)) + le32(cdOffset) + le16(0))
+        try out.write(to: url)
+    }
+
+    static func crc32(_ data: Data) -> UInt32 {
+        var table = [UInt32](repeating: 0, count: 256)
+        for i in 0..<256 {
+            var c = UInt32(i)
+            for _ in 0..<8 { c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1 }
+            table[i] = c
+        }
+        var crc: UInt32 = 0xFFFFFFFF
+        for b in data { crc = table[Int((crc ^ UInt32(b)) & 0xff)] ^ (crc >> 8) }
+        return crc ^ 0xFFFFFFFF
     }
 }

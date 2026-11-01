@@ -1,10 +1,16 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 // The extension validator (Task 5a): an allowlist over a staged package. Hooks, MCP and LSP servers, monitors, plugin
 // settings, output styles, themes, workflows, install scripts, links and binaries outside `assets/` are refused from every
-// source; frontmatter is allowlisted on every `.md` under `skills/`, `commands/` and `agents/`; the hygiene scans raise
-// flags that ride on the owner's card. Claude's own `plugin validate --strict` and `plugin details` run only on an
-// allowlisted copy, under the sandboxed runner, with hooks off and no network.
+// source; frontmatter is allowlisted on every `.md` under `skills/`, `commands/` and `agents/` under a strict YAML subset
+// (anything that does not parse cleanly is refused, never passed through); the hygiene scans raise flags that ride on the
+// owner's card. Claude's own `plugin validate --strict` and `plugin details` run only on an allowlisted copy, under the
+// sandboxed runner, with hooks off and no network.
 
 /// Stable issue codes (`EXT001 hook-refused` ...), the names `--json` and the card show.
 public enum LintCode: String, CaseIterable, Sendable {
@@ -125,15 +131,19 @@ public struct ValidationResult: Sendable {
     public var id: String? { manifest?.name }
 }
 
-/// Claude's own checks: the runner, the CLI and the scratch directory (the only writable place).
+/// Claude's own checks: the runner, the CLI and the scratch directory (the only writable place). `userHome` is the owner's
+/// home (the account's by default): the CLI's own directory is made readable only when it is not the home, an ancestor of
+/// it, or a protected path.
 public struct ClaudeCheck: Sendable {
     public var runner: any SandboxedRunner
     public var claudePath: String
     public var scratch: URL
     public var timeout: Duration = .seconds(120)
+    public var userHome: URL
 
-    public init(runner: any SandboxedRunner, claudePath: String, scratch: URL, timeout: Duration = .seconds(120)) {
+    public init(runner: any SandboxedRunner, claudePath: String, scratch: URL, timeout: Duration = .seconds(120), userHome: URL? = nil) {
         self.runner = runner; self.claudePath = claudePath; self.scratch = scratch; self.timeout = timeout
+        self.userHome = userHome ?? ExtensionImporter.ownerHome()
     }
 }
 
@@ -154,6 +164,8 @@ public enum ExtensionValidator {
     static let agentKeys: Set<String> = ["name", "description", "tools", "disallowedTools", "color", "skills"]
     static let strippedKeys: Set<String> = ["allowed-tools", "model"]
     static let agentRefusedKeys: Set<String> = ["permissionMode", "isolation", "background"]
+    /// Names refused anywhere below the top level (compared lowercased).
+    static let refusedNested: Set<String> = ["hooks", "hooks.json", ".mcp.json", ".lsp.json", "node_modules"]
 
     // MARK: Structure
 
@@ -191,6 +203,12 @@ public enum ExtensionValidator {
         case .other: return name == "assets"
         default: return false
         }
+    }
+
+    /// Whether a relative path is a plugin-part Markdown file (skills, commands, agents; `.md` matched case-insensitively).
+    static func isPluginPartMarkdown(_ relative: String) -> Bool {
+        let lower = relative.lowercased()
+        return lower.hasSuffix(".md") && (lower.hasPrefix("skills/") || lower.hasPrefix("commands/") || lower.hasPrefix("agents/"))
     }
 
     public static func validate(staged root: URL, options: ValidationOptions = ValidationOptions()) -> ValidationResult {
@@ -242,12 +260,13 @@ public enum ExtensionValidator {
                 r.manifest = m
                 id = m.name
                 if let problem = ExtensionId.problem(m.name) { issue(.badId, ExtensionManifest.path, problem) }
-                if m.description.count > ExtensionLimits.maxDescription {
-                    issue(.limits, ExtensionManifest.path, "description is \(m.description.count) characters; at most \(ExtensionLimits.maxDescription)")
+                if m.description.unicodeScalars.count > ExtensionLimits.maxDescription {
+                    issue(.limits, ExtensionManifest.path, "description is \(m.description.unicodeScalars.count) characters; at most \(ExtensionLimits.maxDescription)")
                 }
-                if hiddenLine(in: String(decoding: data, as: UTF8.self)) != nil {
-                    issue(.unicode, ExtensionManifest.path, "plugin.json holds a hidden, zero-width or bidi character")
-                }
+            }
+            // Hidden characters in the decoded strings (escapes included) or the raw bytes.
+            if ExtensionLimits.hasHidden(.object(p.object)) || ExtensionLimits.hiddenLine(in: String(decoding: data, as: UTF8.self)) != nil {
+                issue(.unicode, ExtensionManifest.path, "plugin.json holds a hidden, zero-width or bidi character")
             }
         } else {
             issue(.manifestKey, ExtensionManifest.path, "no .claude-plugin/plugin.json (exactly name, version, description and author)")
@@ -270,10 +289,10 @@ public enum ExtensionValidator {
                 }
                 continue
             }
-            // Refused names anywhere below the top level (a refused top-level entry was already reported once).
+            // Refused names anywhere below the top level, whatever their case (a refused top-level entry was already reported once).
             if case .refused = classify(topLevel: top) { continue }
             for (i, component) in parts.enumerated() where i > 0 {
-                switch component {
+                switch component.lowercased() {
                 case "hooks", "hooks.json": issue(.hookRefused, f.relative, "hooks never run in Brahma")
                 case ".mcp.json": issue(.mcpRefused, f.relative, "an MCP server never runs from a package")
                 case ".lsp.json": issue(.lspRefused, f.relative, "an LSP server never runs from a package")
@@ -287,20 +306,22 @@ public enum ExtensionValidator {
             case "skills":
                 if parts.count == 2, f.kind == .directory {
                     skills.append(parts[1])
-                    if !FileManager.default.fileExists(atPath: f.url.appending(path: "SKILL.md").path) {
-                        issue(.entryRefused, f.relative, "a skill directory needs a SKILL.md")
+                    let names = (try? FileManager.default.contentsOfDirectory(atPath: f.url.path)) ?? []
+                    if !names.contains("SKILL.md") { issue(.entryRefused, f.relative, "a skill directory needs a SKILL.md (named exactly so)") }
+                    for n in names where n.lowercased() == "skill.md" && n != "SKILL.md" {
+                        issue(.entryRefused, "\(f.relative)/\(n)", "the skill file is named exactly SKILL.md; '\(n)' is refused")
                     }
                 } else if parts.count == 2 {
                     issue(.entryRefused, f.relative, "skills/ holds skill directories, each with a SKILL.md")
                 }
             case "commands":
                 if f.kind == .regular {
-                    if f.relative.hasSuffix(".md") { commands.append(String(parts.last!.dropLast(3))) }
+                    if f.relative.lowercased().hasSuffix(".md") { commands.append(String(parts.last!.dropLast(3))) }
                     else { issue(.entryRefused, f.relative, "commands/ holds only .md files") }
                 }
             case "agents":
                 if f.kind == .regular {
-                    if f.relative.hasSuffix(".md") { agents.append(String(parts.last!.dropLast(3))) }
+                    if f.relative.lowercased().hasSuffix(".md") { agents.append(String(parts.last!.dropLast(3))) }
                     else { issue(.entryRefused, f.relative, "agents/ holds only .md files") }
                 }
             case "bin":
@@ -310,7 +331,7 @@ public enum ExtensionValidator {
             }
         }
 
-        // 4. Install scripts, binaries outside assets/, modes, bin names.
+        // 4. Install scripts, binaries outside assets/, modes (setuid/setgid/sticky included), bin names.
         for f in regular {
             let name = f.url.lastPathComponent, lower = name.lowercased()
             let inBin = f.relative.hasPrefix("bin/"), inAssets = f.relative.hasPrefix("assets/")
@@ -321,21 +342,17 @@ public enum ExtensionValidator {
                 issue(.installScript, f.relative, "\(name) is an install script; nothing is installed at runtime")
             }
             if !inAssets, isBinary(f) { issue(.binaryOutsideAssets, f.relative, "a binary outside assets/ is refused") }
-            let bits = Int(f.mode & 0o777)
-            if inBin {
+            let bits = Int(f.mode & 0o7777)
+            if bits & 0o7000 != 0 {
+                issue(.mode, f.relative, "setuid, setgid and sticky bits are refused", fix: "chmod \(inBin ? "0755" : "0644") \(f.relative)")
+                r.fixes.append(.chmod(path: f.relative, mode: inBin ? 0o755 : 0o644))
+            } else if inBin {
                 if bits & 0o111 == 0 {
                     issue(.mode, f.relative, "bin/ helpers must be executable (0755)", fix: "chmod 0755 \(f.relative)")
                     r.fixes.append(.chmod(path: f.relative, mode: 0o755))
                 } else if bits != 0o755 {
                     issue(.mode, f.relative, "mode \(String(format: "%04o", bits)); bin/ helpers are 0755", fix: "chmod 0755 \(f.relative)", severity: .warning)
                     r.fixes.append(.chmod(path: f.relative, mode: 0o755))
-                }
-                if !id.isEmpty, !name.hasPrefix(id + "-") {
-                    issue(.binPrefix, f.relative, "bin/ names are prefixed with the extension id", fix: "rename to bin/\(id)-\(name)")
-                    r.fixes.append(.renameBin(from: f.relative, to: "bin/\(id)-\(name)"))
-                }
-                if let owner = options.installedBins[name], owner != id {
-                    issue(.binCollision, f.relative, "bin/\(name) collides with the installed extension '\(owner)'")
                 }
             } else if bits & 0o111 != 0 {
                 issue(.mode, f.relative, "only bin/ helpers may be executable; text is 0644", fix: "chmod 0644 \(f.relative)")
@@ -344,49 +361,86 @@ public enum ExtensionValidator {
                 issue(.mode, f.relative, "mode \(String(format: "%04o", bits)); text is 0644", fix: "chmod 0644 \(f.relative)", severity: .warning)
                 r.fixes.append(.chmod(path: f.relative, mode: 0o644))
             }
+            if inBin {
+                if !id.isEmpty, !name.hasPrefix(id + "-") {
+                    issue(.binPrefix, f.relative, "bin/ names are prefixed with the extension id", fix: "rename to bin/\(id)-\(name)")
+                    r.fixes.append(.renameBin(from: f.relative, to: "bin/\(id)-\(name)"))
+                }
+                if let owner = options.installedBins[name], owner != id {
+                    issue(.binCollision, f.relative, "bin/\(name) collides with the installed extension '\(owner)'")
+                }
+            }
             if f.relative.hasPrefix("skills/"), f.relative.contains("/scripts/") { r.lintFacts.executes.scripts = true }
         }
         r.lintFacts.executes.bin = !binNames.isEmpty
 
-        // 5. Agent names first (a skill's `agent:` may name one), then every .md under skills/, commands/ and agents/.
-        for f in regular where f.relative.hasPrefix("agents/") && f.relative.hasSuffix(".md") {
-            if let text = text(of: f), let fm = Frontmatter.parse(text), let name = fm.value("name") { agentNames.insert(name) }
-            agentNames.insert(String(f.url.lastPathComponent.dropLast(3)))
-        }
-        for f in regular where f.relative.hasSuffix(".md") {
-            let isAgent = f.relative.hasPrefix("agents/")
-            let isSkillOrCommand = f.relative.hasPrefix("skills/") || f.relative.hasPrefix("commands/")
-            guard isAgent || isSkillOrCommand, let text = text(of: f) else { continue }
+        // 5. Plugin-part Markdown: every file is read whole (oversized, undecodable or malformed frontmatter is an error, never
+        // skipped); agent names first (a skill's `agent:` may name one).
+        var parsed: [String: Frontmatter] = [:]
+        for f in regular where isPluginPartMarkdown(f.relative) {
+            if f.size > Int64(ExtensionLimits.maxScannedBytes) {
+                issue(.limits, f.relative, "a plugin-part Markdown file over \(ExtensionLimits.maxScannedBytes) bytes is refused"); continue
+            }
+            guard let data = FileManager.default.contents(atPath: f.url.path) else { issue(.frontmatterKey, f.relative, "cannot be read"); continue }
+            guard let raw = String(data: data, encoding: .utf8) else { issue(.frontmatterKey, f.relative, "is not valid UTF-8"); continue }
+            let text = Frontmatter.normalize(raw)
             if text.contains("!`") { r.lintFacts.executes.bangInjection = true }
-            guard let fm = Frontmatter.parse(text) else { continue }
+            if let line = ExtensionLimits.hiddenLine(in: text) {
+                issue(.unicode, f.relative, line: line, "a hidden, zero-width, bidi or tag character in a plugin-part file")
+                r.lintFacts.hiddenUnicode.append(f.relative)
+            }
+            switch Frontmatter.strictParse(text) {
+            case .none: break
+            case .invalid(let why, let line): issue(.frontmatterKey, f.relative, line: line, "frontmatter is not the strict subset Brahma accepts: \(why)")
+            case .ok(let fm):
+                parsed[f.relative] = fm
+                // A hidden character spelled as a YAML escape (`"‮"`) in a frontmatter value is an error too (I3).
+                for e in fm.entries where ([e.value] + e.continuation).contains(where: { Frontmatter.escapedScalars(in: $0).contains(where: ExtensionLimits.isHiddenOrBidi) }) {
+                    issue(.unicode, f.relative, line: e.line, "frontmatter '\(e.key)' holds an escaped hidden, zero-width, bidi or tag character")
+                    r.lintFacts.hiddenUnicode.append(f.relative)
+                }
+            }
+        }
+        for (path, fm) in parsed where path.hasPrefix("agents/") {
+            if let name = fm.value("name") { agentNames.insert(name) }
+            agentNames.insert(String(URL(fileURLWithPath: path).lastPathComponent.dropLast(3)))
+        }
+        for (path, fm) in parsed.sorted(by: { $0.key < $1.key }) {
+            let isAgent = path.hasPrefix("agents/")
             for entry in fm.entries {
                 let key = entry.key
                 switch key {
-                case "hooks": issue(.hookRefused, f.relative, line: entry.line, "frontmatter hooks: hooks never run in Brahma")
-                case "mcpServers": issue(.mcpRefused, f.relative, line: entry.line, "frontmatter mcpServers: an MCP server never runs from a package")
-                case "lspServers": issue(.lspRefused, f.relative, line: entry.line, "frontmatter lspServers: an LSP server never runs from a package")
+                case "hooks": issue(.hookRefused, path, line: entry.line, "frontmatter hooks: hooks never run in Brahma")
+                case "mcpServers": issue(.mcpRefused, path, line: entry.line, "frontmatter mcpServers: an MCP server never runs from a package")
+                case "lspServers": issue(.lspRefused, path, line: entry.line, "frontmatter lspServers: an LSP server never runs from a package")
                 case _ where strippedKeys.contains(key):
-                    issue(.frontmatterStripped, f.relative, line: entry.line,
+                    issue(.frontmatterStripped, path, line: entry.line,
                           "'\(key)' pre-approves tools or pins a model and is stripped", fix: "remove '\(key)' from the frontmatter", severity: .warning)
-                    r.fixes.append(.stripFrontmatter(path: f.relative, key: key))
-                    r.lintFacts.stripped.append("\(f.relative): \(key)")
+                    r.fixes.append(.stripFrontmatter(path: path, key: key))
+                    r.lintFacts.stripped.append("\(path): \(key)")
                 case _ where isAgent && agentRefusedKeys.contains(key):
-                    issue(.frontmatterKey, f.relative, line: entry.line, "agent frontmatter '\(key)' is refused (it widens what the agent may do)")
+                    issue(.frontmatterKey, path, line: entry.line, "agent frontmatter '\(key)' is refused (it widens what the agent may do)")
                 case _ where isAgent && !agentKeys.contains(key):
-                    issue(.frontmatterKey, f.relative, line: entry.line, "agent frontmatter '\(Store.flat(key, max: 40))' is not allowed")
+                    issue(.frontmatterKey, path, line: entry.line, "agent frontmatter '\(Store.flat(key, max: 40))' is not allowed")
                 case _ where !isAgent && !skillKeys.contains(key):
-                    issue(.frontmatterKey, f.relative, line: entry.line, "frontmatter '\(Store.flat(key, max: 40))' is not allowed")
+                    issue(.frontmatterKey, path, line: entry.line, "frontmatter '\(Store.flat(key, max: 40))' is not allowed")
                 case "context" where !isAgent:
-                    if entry.value != "fork" { issue(.frontmatterKey, f.relative, line: entry.line, "context may only be 'fork'") }
+                    if fm.value("context") != "fork" { issue(.frontmatterKey, path, line: entry.line, "context may only be 'fork'") }
                 case "agent" where !isAgent:
-                    if !agentNames.contains(entry.value), !builtinAgents.contains(entry.value) {
-                        issue(.frontmatterKey, f.relative, line: entry.line, "agent '\(Store.flat(entry.value, max: 40))' is neither in this extension nor built in")
+                    let agent = fm.value("agent") ?? ""
+                    if !agentNames.contains(agent), !builtinAgents.contains(agent) {
+                        issue(.frontmatterKey, path, line: entry.line, "agent '\(Store.flat(agent, max: 40))' is neither in this extension nor built in")
                     }
                 case "tools" where isAgent:
                     let allowed = Set(options.roleTools)
                     let extra = fm.list("tools").filter { !allowed.contains($0) }
                     if !extra.isEmpty {
-                        issue(.agentTools, f.relative, line: entry.line, "agent tools must be a subset of the role's: \(extra.map { Store.flat($0, max: 40) }.joined(separator: ", "))")
+                        issue(.agentTools, path, line: entry.line, "agent tools must be a subset of the role's: \(extra.map { Store.flat($0, max: 40) }.joined(separator: ", "))")
+                    }
+                case "description", "when_to_use":
+                    let count = (fm.value(key) ?? "").unicodeScalars.count
+                    if count > ExtensionLimits.maxDescription {
+                        issue(.limits, path, line: entry.line, "\(key) is \(count) characters; at most \(ExtensionLimits.maxDescription)")
                     }
                 default: break
                 }
@@ -398,7 +452,7 @@ public enum ExtensionValidator {
         for f in regular where f.size <= Int64(ExtensionLimits.maxScannedBytes) {
             guard let text = text(of: f) else { continue }
             let isConfig = f.relative == ExtensionManifest.path || f.relative == BrahmaSidecar.path
-            if let line = hiddenLine(in: text), !isConfig {
+            if !isConfig, !isPluginPartMarkdown(f.relative), let line = ExtensionLimits.hiddenLine(in: text) {
                 issue(.unicode, f.relative, line: line, "a hidden, zero-width or bidi character", severity: .warning)
                 r.lintFacts.hiddenUnicode.append(f.relative)
             }
@@ -412,10 +466,16 @@ public enum ExtensionValidator {
         }
         r.lintFacts.hosts = hosts.sorted()
 
-        // 7. The sidecar, then undeclared hosts.
-        if let s = BrahmaSidecar.read(root) {
+        // 7. The sidecar (hidden characters in it are an error), then undeclared hosts.
+        if let data = FileManager.default.contents(atPath: root.appending(path: BrahmaSidecar.path).path) {
+            let s = BrahmaSidecar.parse(data)
             for problem in s.problems { issue(.sidecar, BrahmaSidecar.path, problem) }
             r.sidecar = s.sidecar
+            if let tree = try? JSONDecoder().decode(JSONValue.self, from: data), ExtensionLimits.hasHidden(tree) {
+                issue(.unicode, BrahmaSidecar.path, "brahma.json holds a hidden, zero-width or bidi character")
+            } else if ExtensionLimits.hiddenLine(in: String(decoding: data, as: UTF8.self)) != nil {
+                issue(.unicode, BrahmaSidecar.path, "brahma.json holds a hidden, zero-width or bidi character")
+            }
         }
         let declared = Set(r.sidecar?.agentNetwork ?? [])
         for h in r.lintFacts.hosts where !declared.contains(h) {
@@ -424,8 +484,7 @@ public enum ExtensionValidator {
 
         // 8. Namespace: a skill's frontmatter name should be its directory name.
         for s in skills {
-            if let text = try? String(contentsOf: root.appending(path: "skills/\(s)/SKILL.md"), encoding: .utf8),
-               let name = Frontmatter.parse(text)?.value("name"), name != s {
+            if let fm = parsed["skills/\(s)/SKILL.md"], let name = fm.value("name"), name != s {
                 issue(.namespace, "skills/\(s)/SKILL.md", "skill name '\(Store.flat(name, max: 40))' differs from its directory '\(s)'", severity: .warning)
             }
         }
@@ -433,10 +492,9 @@ public enum ExtensionValidator {
         r.lintFacts.skills = skills.sorted(); r.lintFacts.commands = commands.sorted(); r.lintFacts.agents = agents.sorted()
         r.lintFacts.parts = pluginParts.filter { FileManager.default.fileExists(atPath: root.appending(path: $0).path) }.sorted()
 
-        // 9. The lock: it must be exactly what lint would generate.
+        // 9. The lock: byte for byte what lint would generate (canonical JSON, no unknown keys).
         if FileManager.default.fileExists(atPath: root.appending(path: ExtensionLock.path).path), let m = r.manifest {
-            if let have = ExtensionLock.read(root: root), let want = try? ExtensionLock.generate(root: root, id: m.name, version: m.version, lint: r.lintFacts),
-               have.matches(want) {
+            if let want = try? ExtensionLock.generate(root: root, id: m.name, version: m.version, lint: r.lintFacts), ExtensionLock.verify(root: root, generated: want) {
             } else {
                 issue(.lockMismatch, ExtensionLock.path, "ext.lock.json differs from what lint generates (it is never hand-edited)",
                       fix: "regenerate with brahma ext lint --lock")
@@ -449,18 +507,38 @@ public enum ExtensionValidator {
 
     // MARK: Fix
 
-    /// Applies the result's fixes to the package in place; returns what was done. The lock is regenerated last, from a fresh
-    /// validation, so it describes the fixed tree.
+    /// Applies the result's fixes to the package in place; returns what was done. Refused while the result holds a link issue
+    /// (EXT006): nothing is ever written through a shared inode. Every file is opened `O_NOFOLLOW`, must be a regular file
+    /// with one link, and is changed through that descriptor. The lock is regenerated last, from a fresh validation.
     @discardableResult
     public static func fix(staged root: URL, result: ValidationResult) throws -> [String] {
+        if let link = result.issues.first(where: { $0.code == LintCode.linkRefused.rawValue }) {
+            throw ExtensionError.message("refusing to fix a package that holds a link (\(link.path)); remove it first")
+        }
         var done: [String] = []
         for f in result.fixes {
             switch f {
             case .stripFrontmatter(let path, let key):
                 let url = root.appending(path: path)
-                let text = try String(contentsOf: url, encoding: .utf8)
+                let fd = try openOwnRegular(url)
+                defer { close(fd) }
+                var data = Data()
+                while true {
+                    var buffer = [UInt8](repeating: 0, count: 65536)
+                    let n = read(fd, &buffer, buffer.count)
+                    if n <= 0 { break }
+                    data.append(buffer, count: n)
+                }
+                guard let text = String(data: data, encoding: .utf8) else { throw ExtensionError.message("\(path) is not UTF-8") }
                 if let stripped = Frontmatter.strip(key: key, from: text) {
-                    try Data(stripped.utf8).write(to: url)
+                    guard ftruncate(fd, 0) == 0, lseek(fd, 0, SEEK_SET) == 0 else { throw ExtensionError.message("cannot rewrite \(path)") }
+                    let bytes = Array(stripped.utf8)
+                    var written = 0
+                    while written < bytes.count {
+                        let n = bytes.withUnsafeBufferPointer { write(fd, $0.baseAddress! + written, bytes.count - written) }
+                        guard n > 0 else { throw ExtensionError.message("cannot rewrite \(path)") }
+                        written += n
+                    }
                     done.append("stripped '\(key)' from \(path)")
                 }
             case .renameBin(let from, let to):
@@ -469,7 +547,9 @@ public enum ExtensionValidator {
                 try FileManager.default.moveItem(at: root.appending(path: from), to: dest)
                 done.append("renamed \(from) to \(to)")
             case .chmod(let path, let mode):
-                try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: root.appending(path: path).path)
+                let fd = try openOwnRegular(root.appending(path: path))
+                defer { close(fd) }
+                guard fchmod(fd, mode_t(mode)) == 0 else { throw ExtensionError.message("cannot chmod \(path)") }
                 done.append("chmod \(String(format: "%04o", mode)) \(path)")
             case .regenerateLock:
                 break
@@ -482,57 +562,100 @@ public enum ExtensionValidator {
         return done
     }
 
+    /// A descriptor on `url` opened without following a link, checked to be this user's regular file with one link.
+    static func openOwnRegular(_ url: URL) throws -> Int32 {
+        let fd = open(url.path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw ExtensionError.message("cannot open \(url.lastPathComponent) (\(String(cString: strerror(errno))))") }
+        var st = stat()
+        guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1, st.st_uid == getuid() else {
+            close(fd)
+            throw ExtensionError.message("\(url.lastPathComponent) is not a plain file of this user with one link; refused")
+        }
+        return fd
+    }
+
     /// Writes the lock lint would generate for the tree as it is now (the package must have a valid manifest).
     public static func writeLock(root: URL, alwaysOnTokens: Int? = nil) throws {
         let again = validate(staged: root)
+        if let link = again.issues.first(where: { $0.code == LintCode.linkRefused.rawValue }) {
+            throw ExtensionError.message("refusing to write a lock for a package that holds a link (\(link.path))")
+        }
         guard let m = again.manifest else { throw ExtensionError.message("cannot write a lock without a valid plugin.json") }
         var facts = again.lintFacts
         if let alwaysOnTokens { facts.alwaysOnTokens = alwaysOnTokens }
         try ExtensionLock.generate(root: root, id: m.name, version: m.version, lint: facts).write(to: root)
     }
 
+    /// Rewrites every plugin-part Markdown file in canonical form: LF line endings, no BOM, and a frontmatter holding only the
+    /// allowlisted keys (`skillKeys` for skills and commands, `agentKeys` for agents), serialized by the engine. Claude Code then
+    /// reads exactly what the engine wrote. The tree must have passed `validate` (every file parses under the strict subset).
+    public static func canonicalize(staged root: URL) throws {
+        for f in try PackageWalk.files(root: root) where f.kind == .regular && isPluginPartMarkdown(f.relative) {
+            guard let data = FileManager.default.contents(atPath: f.url.path), let raw = String(data: data, encoding: .utf8) else {
+                throw ExtensionError.message("\(f.relative) is not UTF-8")
+            }
+            let allowed = f.relative.hasPrefix("agents/") ? agentKeys : skillKeys
+            guard let canonical = Frontmatter.canonical(raw, allowed: allowed) else {
+                throw ExtensionError.message("\(f.relative): the frontmatter does not parse under the strict subset")
+            }
+            if Data(canonical.utf8) != data { try Data(canonical.utf8).write(to: f.url) }
+        }
+    }
+
     // MARK: Claude's own checks
 
     /// `claude plugin validate --strict` and `claude plugin details`, on an allowlisted copy at `<scratch>/plugin` only, under the
-    /// sandboxed runner: no network, writable = the scratch dir, `--setting-sources ""`, `--strict-mcp-config`,
-    /// `--settings '{"disableAllHooks":true}'`, `HOME` and `CLAUDE_CONFIG_DIR` inside the scratch. A failing `validate` is an
-    /// error; a `details` that cannot run or report is recorded as unavailable (a warning).
+    /// sandboxed runner: no network, writable = the scratch dir, the global options `--setting-sources ""`,
+    /// `--strict-mcp-config`, `--settings '{"disableAllHooks":true}'` BEFORE `plugin`, `--plugin-dir <copy>` for `details <id>`;
+    /// `HOME` and `CLAUDE_CONFIG_DIR` inside the scratch. A failing `validate` is an error; a CLI that cannot run, refuses the
+    /// options or cannot report is recorded as unavailable (a warning).
     public static func claudeChecks(staged root: URL, check: ClaudeCheck) async -> ClaudeCheckResult {
         var out = ClaudeCheckResult()
         let fm = FileManager.default
         let copy = check.scratch.appending(path: "plugin", directoryHint: .isDirectory)
         let config = check.scratch.appending(path: "cc", directoryHint: .isDirectory)
         let home = check.scratch.appending(path: "home", directoryHint: .isDirectory)
+        func unavailable(_ why: String) -> ClaudeCheckResult {
+            var o = out
+            o.issues.append(LintIssue(.claudeDetails, path: ".", message: "claude checks unavailable: \(Store.flat(why, max: 300))", severity: .warning))
+            return o
+        }
+        let id: String
         do {
+            id = try ExtensionManifest.read(root).name
             try fm.createDirectory(at: check.scratch, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             if fm.fileExists(atPath: copy.path) { try fm.removeItem(at: copy) }
             try allowlistedCopy(of: root, to: copy)
             try fm.createDirectory(at: config, withIntermediateDirectories: true)
             try fm.createDirectory(at: home, withIntermediateDirectories: true)
-        } catch {
-            out.issues.append(LintIssue(.claudeDetails, path: ".", message: "claude checks unavailable: \(error)", severity: .warning))
-            return out
-        }
+        } catch { return unavailable("\(error)") }
         var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         env["HOME"] = home.path
         env["CLAUDE_CONFIG_DIR"] = config.path
         env.removeValue(forKey: "TMPDIR")
-        var readable: [URL] = []
-        let resolved = URL(fileURLWithPath: check.claudePath).resolvedForSandbox.deletingLastPathComponent()
-        if resolved.path != "/" { readable.append(resolved) }
+        // The CLI's own directory is readable, unless that would widen the policy to the owner's home or a protected path (M8).
+        guard let readable = readableClaudeDirectory(check.claudePath, userHome: check.userHome) else {
+            return unavailable("the claude binary at \(check.claudePath) sits in a directory the sandbox may not read whole")
+        }
         let policy = SandboxPolicy(writable: [check.scratch], readable: readable, network: .none, toolchain: false)
-        func command(_ sub: [String]) -> String { claudeCommand(check.claudePath, sub, plugin: copy.path) }
-        let validateOut = await check.runner.run(command: command(["validate", "--strict"]), cwd: check.scratch, environment: env,
-                                                 timeout: check.timeout, outputURL: check.scratch.appending(path: "validate.log"), policy: policy)
+        let validateOut = await check.runner.run(command: claudeCommand(check.claudePath, ["plugin", "validate", "--strict", copy.path]),
+                                                 cwd: check.scratch, environment: env, timeout: check.timeout,
+                                                 outputURL: check.scratch.appending(path: "validate.log"), policy: policy)
         switch validateOut.exitCode {
         case 0?: break
         case nil:
             out.issues.append(LintIssue(.claudeDetails, path: ".", message: "claude plugin validate unavailable: \(Store.flat(validateOut.tail, max: 200))", severity: .warning))
         case let code?:
-            out.issues.append(LintIssue(.claudeValidate, path: ".", message: "claude plugin validate --strict failed (\(code)): \(Store.flat(validateOut.tail, max: 400))"))
+            if isUsageError(validateOut.tail) {
+                out.issues.append(LintIssue(.claudeDetails, path: ".", message: "claude plugin validate unavailable (this CLI refuses the options): \(Store.flat(validateOut.tail, max: 200))",
+                                            severity: .warning))
+            } else {
+                out.issues.append(LintIssue(.claudeValidate, path: ".", message: "claude plugin validate --strict failed (\(code)): \(Store.flat(validateOut.tail, max: 400))"))
+            }
         }
-        let detailsOut = await check.runner.run(command: command(["details"]), cwd: check.scratch, environment: env,
-                                                timeout: check.timeout, outputURL: check.scratch.appending(path: "details.log"), policy: policy)
+        let detailsOut = await check.runner.run(command: claudeCommand(check.claudePath, ["--plugin-dir", copy.path, "plugin", "details", id]),
+                                                cwd: check.scratch, environment: env, timeout: check.timeout,
+                                                outputURL: check.scratch.appending(path: "details.log"), policy: policy)
         if detailsOut.exitCode == 0, let tokens = alwaysOnTokens(in: detailsOut.tail) {
             out.alwaysOnTokens = tokens
         } else {
@@ -542,13 +665,30 @@ public enum ExtensionValidator {
         return out
     }
 
-    /// Copies only the allowlisted parts (regular files, modes normalized): what Claude's checks and the workspace mount see.
+    /// The directory of the resolved `claude` binary as the one readable policy entry, `[]` when it is `/`, or nil when reading it
+    /// whole would reach the owner's home, an ancestor of it, or a protected path.
+    static func readableClaudeDirectory(_ claudePath: String, userHome: URL) -> [URL]? {
+        let dir = URL(fileURLWithPath: claudePath).resolvedForSandbox.deletingLastPathComponent()
+        if dir.path == "/" { return [] }
+        let home = userHome.resolvedForSandbox.path
+        if dir.path == home || home.hasPrefix(dir.path + "/") { return nil }
+        for protected in ProtectedPaths.defaults(userHome: userHome) where SandboxPath.overlaps(dir.path, protected.resolvedForSandbox.path) { return nil }
+        return [dir]
+    }
+
+    static func isUsageError(_ tail: String) -> Bool {
+        let lower = tail.lowercased()
+        return lower.contains("unknown option") || lower.contains("unknown command") || lower.contains("too many arguments") || lower.contains("usage:")
+    }
+
+    /// Copies only the allowlisted parts (regular files, modes normalized): what Claude's checks see. Nested refused names are
+    /// left out whatever their case.
     static func allowlistedCopy(of root: URL, to dest: URL, parts: ((String) -> Bool) = isAllowlistedForClaude) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)
         for f in try PackageWalk.files(root: root) where f.kind == .regular {
             guard let top = f.relative.split(separator: "/").first.map(String.init), parts(top) else { continue }
-            if f.relative.split(separator: "/").dropFirst().contains(where: { ["hooks", "hooks.json", ".mcp.json", ".lsp.json", "node_modules"].contains(String($0)) }) { continue }
+            if f.relative.split(separator: "/").dropFirst().contains(where: { refusedNested.contains(String($0).lowercased()) }) { continue }
             let target = dest.appending(path: f.relative)
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             guard let data = fm.contents(atPath: f.url.path) else { throw ExtensionError.message("cannot read \(f.relative)") }
@@ -559,7 +699,7 @@ public enum ExtensionValidator {
     }
 
     static func alwaysOnTokens(in text: String) -> Int? {
-        for pattern in [#"(?i)always[- ]on[^0-9\n]{0,60}?([0-9][0-9,]*)"#, #""alwaysOnTokens"\s*:\s*([0-9]+)"#, #"(?i)([0-9][0-9,]*)\s+tokens\b"#] {
+        for pattern in [#"(?i)always[- ]on[^0-9\n]{0,60}?([0-9][0-9,]*)"#, #""alwaysOnTokens"\s*:\s*([0-9]+)"#, #"(?i)([0-9][0-9,]*)\s+tok(ens)?\b"#] {
             if let m = try? NSRegularExpression(pattern: pattern).firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
                let r = Range(m.range(at: 1), in: text), let n = Int(text[r].replacingOccurrences(of: ",", with: "")) {
                 return n
@@ -570,10 +710,12 @@ public enum ExtensionValidator {
 
     static func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
-    /// `'<claude>' plugin <sub…> '<plugin>' --setting-sources '' --strict-mcp-config --settings '{"disableAllHooks":true}'`.
-    static func claudeCommand(_ claude: String, _ sub: [String], plugin: String) -> String {
-        ([shellQuote(claude), "plugin"] + sub + [shellQuote(plugin), "--setting-sources", "''", "--strict-mcp-config", "--settings",
-                                                 shellQuote("{\"disableAllHooks\":true}")]).joined(separator: " ")
+    /// `'<claude>' --setting-sources '' --strict-mcp-config --settings '{"disableAllHooks":true}' <rest…>`: the global hardening
+    /// options come first (the `plugin` subcommands refuse them); paths and names are quoted, flags are not.
+    static func claudeCommand(_ claude: String, _ rest: [String]) -> String {
+        let hardening = ["--setting-sources", "''", "--strict-mcp-config", "--settings", shellQuote("{\"disableAllHooks\":true}")]
+        let tail = rest.map { $0.hasPrefix("--") || ["plugin", "validate", "details"].contains($0) ? $0 : shellQuote($0) }
+        return ([shellQuote(claude)] + hardening + tail).joined(separator: " ")
     }
 
     // MARK: Helpers
@@ -582,15 +724,6 @@ public enum ExtensionValidator {
         guard f.size <= Int64(ExtensionLimits.maxScannedBytes), let data = FileManager.default.contents(atPath: f.url.path) else { return nil }
         if data.prefix(8192).contains(0) { return nil }
         return String(data: data, encoding: .utf8)
-    }
-
-    /// The first line (1-based) holding a hidden, zero-width or bidi scalar.
-    static func hiddenLine(in text: String) -> Int? {
-        for (i, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated()
-        where line.unicodeScalars.contains(where: ExtensionLimits.isHiddenOrBidi) {
-            return i + 1
-        }
-        return nil
     }
 
     static func isBinary(_ f: PackageFile) -> Bool {
@@ -613,33 +746,165 @@ public enum ExtensionValidator {
     }
 }
 
-/// The YAML subset a plugin's frontmatter uses: top-level `key: value` lines between the `---` fences; indented lines belong
-/// to the key above them (a map or a list).
+/// The strict YAML subset a plugin's frontmatter may use, between `---` fences at the very start of the file:
+/// - every non-blank line at column 0 is `key: value` or `key:` with `key` matching `^[A-Za-z_][A-Za-z0-9_-]*$`;
+/// - indented lines (spaces only) belong to the key above them (a map or a list) and never come before the first key;
+/// - no tabs, no `? ` explicit keys, no flow mappings or sequences at the top (`{`, `[`), no anchors, aliases or tags
+///   (`&`, `*`, `!`) at the start of a value, no `<<` merge keys, no `...`/`%` document markers, no duplicate keys;
+/// - the input is normalized first (BOM stripped, CRLF/CR → LF), and the closing fence must appear within 64 KB.
 struct Frontmatter {
     struct Entry { var key: String; var value: String; var line: Int; var continuation: [String] }
     var entries: [Entry]
     /// The line of the closing fence.
     var end: Int
 
-    static func parse(_ text: String) -> Frontmatter? {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else { return nil }
+    enum ParseResult {
+        /// Not a frontmatter file (the first line is not a fence).
+        case none
+        case ok(Frontmatter)
+        case invalid(String, line: Int?)
+    }
+
+    static let fenceLimit = 64 * 1024
+    static let keyPattern = try! NSRegularExpression(pattern: "^[A-Za-z_][A-Za-z0-9_-]*$")
+
+    /// BOM stripped, CRLF and CR turned into LF.
+    static func normalize(_ text: String) -> String {
+        var t = text
+        if t.hasPrefix("\u{FEFF}") { t.removeFirst() }
+        return t.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+    }
+
+    /// Whether the (normalized) text starts like a fence: `---` after optional blank space.
+    static func looksFenced(_ text: String) -> Bool {
+        text.split(separator: "\n", omittingEmptySubsequences: false).first.map { $0.trimmingCharacters(in: .whitespaces) == "---" } ?? false
+    }
+
+    static func strictParse(_ normalized: String) -> ParseResult {
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let first = lines.first else { return .none }
+        guard first == "---" else {
+            // A fence after leading blank space or blank lines is "fence-like" and refused; anything else is plain Markdown.
+            if let fenceLike = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+               lines[fenceLike].trimmingCharacters(in: .whitespaces).hasPrefix("---") {
+                return .invalid("the opening fence must be exactly --- on the first line", line: fenceLike + 1)
+            }
+            return .none
+        }
         var entries: [Entry] = []
+        var seen: Set<String> = []
+        var bytes = first.utf8.count + 1
         var i = 1
         while i < lines.count {
             let line = lines[i]
-            if line.trimmingCharacters(in: .whitespaces) == "---" { return Frontmatter(entries: entries, end: i + 1) }
-            if line.first == " " || line.first == "\t" || line.isEmpty || line.hasPrefix("#") {
-                if !entries.isEmpty, !line.isEmpty, !line.hasPrefix("#") { entries[entries.count - 1].continuation.append(line) }
+            let number = i + 1
+            bytes += line.utf8.count + 1
+            if bytes > fenceLimit { return .invalid("the frontmatter does not close within \(fenceLimit) bytes", line: number) }
+            if line == "---" { return .ok(Frontmatter(entries: entries, end: number)) }
+            if line.trimmingCharacters(in: .whitespaces) == "---" { return .invalid("the closing fence must be exactly ---", line: number) }
+            if line.contains("\t") { return .invalid("tabs are not allowed", line: number) }
+            if line.isEmpty || line.trimmingCharacters(in: .whitespaces).isEmpty { i += 1; continue }
+            if line.hasPrefix("#") { i += 1; continue }
+            if line.hasPrefix(" ") {
+                guard let last = entries.last else { return .invalid("an indented line before the first key", line: number) }
+                // A block scalar's (`|`, `>`) indented lines are literal text; anything else is checked like a value.
+                let isBlockScalar = last.value.hasPrefix("|") || last.value.hasPrefix(">")
+                if !isBlockScalar, let bad = badValueStart(line.trimmingCharacters(in: .whitespaces)) { return .invalid(bad, line: number) }
+                entries[entries.count - 1].continuation.append(line)
                 i += 1; continue
             }
-            if let colon = line.firstIndex(of: ":") {
-                let key = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
-                let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-                entries.append(Entry(key: key, value: value, line: i + 1, continuation: []))
+            if line == "..." || line.hasPrefix("... ") || line.hasPrefix("%") { return .invalid("a YAML document marker inside the frontmatter", line: number) }
+            if line.hasPrefix("?") || line.hasPrefix("{") || line.hasPrefix("[") || line.hasPrefix("-") || line.hasPrefix("<<") {
+                return .invalid("explicit keys, flow collections, top-level lists and merge keys are not allowed", line: number)
             }
+            guard let colon = line.firstIndex(of: ":") else { return .invalid("a line that is not `key: value`", line: number) }
+            let key = String(line[..<colon])
+            let after = line.index(after: colon)
+            guard after == line.endIndex || line[after] == " " else { return .invalid("a line that is not `key: value`", line: number) }
+            guard keyPattern.firstMatch(in: key, range: NSRange(key.startIndex..., in: key)) != nil else {
+                return .invalid("key '\(Store.flat(key, max: 40))' is not a plain identifier", line: number)
+            }
+            guard seen.insert(key).inserted else { return .invalid("duplicate key '\(key)'", line: number) }
+            let value = String(line[after...]).trimmingCharacters(in: .whitespaces)
+            if let bad = badValueStart(value) { return .invalid(bad, line: number) }
+            entries.append(Entry(key: key, value: value, line: number, continuation: []))
             i += 1
         }
+        return .invalid("the frontmatter never closes", line: nil)
+    }
+
+    /// Anchors, aliases, tags and flow collections at the start of a value (or a list item) are refused.
+    static func badValueStart(_ value: String) -> String? {
+        var v = value
+        if v.hasPrefix("- ") { v = String(v.dropFirst(2)).trimmingCharacters(in: .whitespaces) }
+        else if let colon = v.firstIndex(of: ":"), !v.hasPrefix("\""), !v.hasPrefix("'"), !v.hasPrefix("["), !v.hasPrefix("{") {
+            // a nested `key: value` line: check its value
+            v = String(v[v.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        }
+        if v.hasPrefix("&") || v.hasPrefix("*") || v.hasPrefix("!") { return "anchors, aliases and tags are not allowed" }
+        if v.hasPrefix("{") || v.hasPrefix("[") { return flowProblem(v) }
+        return nil
+    }
+
+    /// A flow value (`[a, b]`, `{}`) is accepted only when it closes on its own line, nests no further flow collection, and
+    /// holds no anchor, alias or tag at the start of any item (quoted text is skipped). Nil when it is clean.
+    static func flowProblem(_ v: String) -> String? {
+        var depth = 0, quote: Character? = nil, tokenStart = true, closed = false
+        for c in v {
+            if closed { if c == " " { continue }; if c == "#" { break }; return "text after a flow collection is not allowed" }
+            if let q = quote { if c == q { quote = nil }; continue }
+            switch c {
+            case "\"", "'": quote = c; tokenStart = false
+            case "[", "{":
+                depth += 1
+                if depth > 1 { return "nested flow collections are not allowed" }
+                tokenStart = true
+            case "]", "}":
+                depth -= 1
+                if depth == 0 { closed = true }
+            case ",", ":": tokenStart = true
+            case " ": break
+            case "&", "*", "!":
+                if tokenStart { return "anchors, aliases and tags are not allowed" }
+                tokenStart = false
+            default: tokenStart = false
+            }
+        }
+        if quote != nil || depth != 0 || !closed { return "a flow collection must close on its own line" }
+        return nil
+    }
+
+    /// The scalars YAML double-quoted escapes would produce (`\uXXXX`, `\UXXXXXXXX`, `\xXX`, `\N`, `\_`, `\L`, `\P`), so a
+    /// hidden character spelled as an escape is found too.
+    static func escapedScalars(in line: String) -> [Unicode.Scalar] {
+        var out: [Unicode.Scalar] = []
+        let chars = Array(line)
+        var i = 0
+        while i < chars.count {
+            guard chars[i] == "\\", i + 1 < chars.count else { i += 1; continue }
+            let kind = chars[i + 1]
+            let width: Int? = kind == "x" ? 2 : kind == "u" ? 4 : kind == "U" ? 8 : nil
+            if let width {
+                let hex = String(chars[(i + 2)..<min(chars.count, i + 2 + width)])
+                if hex.count == width, let n = UInt32(hex, radix: 16), let s = Unicode.Scalar(n) { out.append(s) }
+                i += 2 + width
+                continue
+            }
+            switch kind {
+            case "N": out.append("\u{85}")
+            case "_": out.append("\u{A0}")
+            case "L": out.append("\u{2028}")
+            case "P": out.append("\u{2029}")
+            default: break
+            }
+            i += 2
+        }
+        return out
+    }
+
+    /// The parsed frontmatter when the (raw) text is a clean fence; nil otherwise (both "no fence" and "malformed").
+    static func parse(_ text: String) -> Frontmatter? {
+        if case .ok(let fm) = strictParse(normalize(text)) { return fm }
         return nil
     }
 
@@ -668,13 +933,37 @@ struct Frontmatter {
 
     /// The text without `key` (and its indented continuation lines); nil when the key is not there.
     static func strip(key: String, from text: String) -> String? {
-        guard let fm = parse(text), let e = fm.entries.first(where: { $0.key == key }) else { return nil }
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let normalized = normalize(text)
+        guard let fm = parse(normalized), let e = fm.entries.first(where: { $0.key == key }) else { return nil }
+        var lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let start = e.line - 1
         var endIndex = start + 1
-        while endIndex < lines.count, lines[endIndex].first == " " || lines[endIndex].first == "\t" { endIndex += 1 }
+        while endIndex < lines.count, lines[endIndex].first == " " { endIndex += 1 }
         lines.removeSubrange(start..<endIndex)
         return lines.joined(separator: "\n")
+    }
+
+    /// The canonical form of a plugin-part file: normalized text; when it is fenced, a frontmatter holding only the `allowed`
+    /// keys in the order written (each with its continuation lines), the engine's fences, then the body with a final newline.
+    /// Nil when the fence does not parse under the strict subset.
+    static func canonical(_ text: String, allowed: Set<String>) -> String? {
+        let normalized = normalize(text)
+        var out: String
+        switch strictParse(normalized) {
+        case .invalid: return nil
+        case .none: out = normalized
+        case .ok(let fm):
+            let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            out = "---\n"
+            for e in fm.entries where allowed.contains(e.key) {
+                out += e.value.isEmpty ? "\(e.key):\n" : "\(e.key): \(e.value)\n"
+                for c in e.continuation { out += c + "\n" }
+            }
+            out += "---\n"
+            out += lines.dropFirst(fm.end).joined(separator: "\n")
+        }
+        if !out.hasSuffix("\n") { out += "\n" }
+        return out
     }
 }
 

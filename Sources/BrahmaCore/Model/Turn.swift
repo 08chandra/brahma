@@ -30,6 +30,9 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     /// Set when the session this turn used no longer existed ("session not found"): the turn is ignored by budgets, the
     /// watchdog and facts, and the agent is ready again at once.
     public var sessionResetReason: String? = nil
+    /// Set when the turn started a fresh session on purpose ("mounts changed", a Task 10 reset): a counted work turn, unlike a
+    /// `sessionResetReason` turn (Task 5a fix round 1, B-I3).
+    public var freshSessionReason: String? = nil
     /// The last `STATUS:` line of the turn's result (`DONE`, `DONE_WITH_CONCERNS`, `BLOCKED`, `NEEDS_CONTEXT`).
     public var reportedStatus: String? = nil
     /// Why the prompt cache broke on a resume: the model or the tool set changed.

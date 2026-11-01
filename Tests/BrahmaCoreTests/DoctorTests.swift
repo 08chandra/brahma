@@ -66,20 +66,36 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
     /// `plugin-details-inert` (Task 5a): `claude plugin details` on a fixture plugin with hooks and an MCP server, run under the
     /// sandboxed runner with hooks off, creates no marker file. A CLI that ran either part fails the item.
     @Test func pluginDetailsIsInert() async throws {
-        let inert = try FakeTools.script("claude", "echo 'Always-on context: 10 tokens'; exit 0")
+        // What the real CLI prints for the fixture (probed on 2.1.312): the inline source and both parts counted, none run.
+        let inert = try FakeTools.script("claude", """
+        echo 'doctor-fixture 1.0.0'; echo '  Source: doctor-fixture@inline'; echo 'Component inventory'
+        echo '  Skills (1)  doctor-fixture'; echo '  Agents (1)  helper'; echo '  Hooks (1)  SessionStart'; echo '  MCP servers (1)  fixture'
+        echo 'Projected token cost'; echo '  Always-on:   ~14 tok   added to every session'; exit 0
+        """)
         let runner = RecordingRunner()
         let r = await Doctor.run(claudePath: inert.path, runner: ProbeRunner(good()), exec: exec(), now: t0, sandbox: runner)
         let found = try #require(item(r, "plugin-details-inert"))
         #expect(found.status == .pass, "\(found.detail)")
         let call = try #require(runner.calls.first)
-        #expect(call.policy.network == .none); #expect(call.command.contains("plugin details"))
-        #expect(call.command.contains("--settings '{\"disableAllHooks\":true}'") && call.command.contains("--strict-mcp-config"))
+        #expect(call.policy.network == .none)
+        // C2: global options first, then `--plugin-dir <dir> plugin details <name>`.
+        let hardening = "--setting-sources '' --strict-mcp-config --settings '{\"disableAllHooks\":true}'"
+        #expect(call.command.contains("' \(hardening) --plugin-dir '"), "\(call.command)")
+        #expect(call.command.hasSuffix("plugin details 'doctor-fixture'"), "\(call.command)")
         #expect(call.environment["CLAUDE_CONFIG_DIR"]?.hasSuffix("/cc") == true)
-        // The fixture really has both parts, so a CLI that honoured them would leave the marker.
+        // Exit 0 alone proves nothing: without the inventory the item warns.
+        let silent = try FakeTools.script("claude", "exit 0")
+        let r0 = await Doctor.run(claudePath: silent.path, runner: ProbeRunner(good()), exec: exec(), now: t0, sandbox: RecordingRunner())
+        #expect(item(r0, "plugin-details-inert")?.status == .warn)
+        let usage = try FakeTools.script("claude", "echo \"error: unknown option '--setting-sources'\" >&2; exit 1")
+        #expect(item(await Doctor.run(claudePath: usage.path, runner: ProbeRunner(good()), exec: exec(), now: t0, sandbox: RecordingRunner()), "plugin-details-inert")?.status == .warn)
+        // The fixture really has every part (hooks/, .mcp.json, a skill-frontmatter hook, an agent-frontmatter MCP server), so a
+        // CLI that honoured any of them would leave a marker.
         let hostile = try FakeTools.script("claude", """
         for a in "$@"; do
-          if [ -f "$a/hooks/hooks.json" ]; then sh -c "$(sed -n 's/.*"command": *"\\([^"]*\\)".*/\\1/p' "$a/hooks/hooks.json" | head -1)"; fi
+          if [ -f "$a/skills/doctor-fixture/SKILL.md" ]; then sh -c "$(sed -n 's/.*command: *"\\([^"]*\\)".*/\\1/p' "$a/skills/doctor-fixture/SKILL.md" | head -1)"; fi
         done
+        echo '  Source: doctor-fixture@inline'; echo '  Hooks (1)'; echo '  MCP servers (1)'
         exit 0
         """)
         let r2 = await Doctor.run(claudePath: hostile.path, runner: ProbeRunner(good()), exec: exec(), now: t0, sandbox: RecordingRunner())

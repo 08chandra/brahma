@@ -20,11 +20,17 @@ public struct ExtensionAskPayload: Codable, Equatable, Sendable {
     public var stagedPath: String?
     /// `bind`/`unbind`: the role.
     public var role: String?
+    /// The fetch path (install only): copied onto the company's row at approve (B-I1).
+    public var sourceType: String? = nil
+    public var sourceUrl: String? = nil
+    public var sourceSha: String? = nil
 
     public init(action: String, extId: String, hash: String, publisher: String, roles: [String], notices: [String], lintSummary: [String],
-                executes: LintFacts.Executes, alwaysOnTokens: Int?, stagedPath: String?, role: String? = nil) {
+                executes: LintFacts.Executes, alwaysOnTokens: Int?, stagedPath: String?, role: String? = nil,
+                sourceType: String? = nil, sourceUrl: String? = nil, sourceSha: String? = nil) {
         self.action = action; self.extId = extId; self.hash = hash; self.publisher = publisher; self.roles = roles; self.notices = notices
         self.lintSummary = lintSummary; self.executes = executes; self.alwaysOnTokens = alwaysOnTokens; self.stagedPath = stagedPath; self.role = role
+        self.sourceType = sourceType; self.sourceUrl = sourceUrl; self.sourceSha = sourceSha
     }
 
     public static func read(_ ask: Ask) -> ExtensionAskPayload? {
@@ -58,16 +64,23 @@ public enum ExtensionLibrary {
     public static func propose(staged: StagedExtension, store: Store, paths: BrahmaPaths, companyId: String, requester: Sender,
                                roles: [String], claude: ClaudeCheck? = nil, now: Date = Store.now()) async throws -> Ask {
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
-        var result = ExtensionValidator.validate(staged: staged.dir,
-                                                 options: ValidationOptions(installedBins: try store.installedBins(companyId: companyId, paths: paths)))
+        let options = ValidationOptions(installedBins: try store.installedBins(companyId: companyId, paths: paths))
+        let first = ExtensionValidator.validate(staged: staged.dir, options: options)
+        guard first.errors.isEmpty, first.manifest != nil else { throw ExtensionError(issues: first.errors) }
+        // S9: every plugin-part Markdown file is rewritten in canonical form (allowlisted keys only, LF, no BOM) BEFORE hashing,
+        // so the lock, the hash, the review page and the mounted copy all describe exactly what Claude Code will read.
+        try ExtensionValidator.canonicalize(staged: staged.dir)
+        var result = ExtensionValidator.validate(staged: staged.dir, options: options)
+        guard result.errors.isEmpty, let manifest = result.manifest else { throw ExtensionError(issues: result.errors) }
         var alwaysOn: Int?
         if let claude {
+            // I1: Claude's own checks run only on a package the validator passed.
             let checks = await ExtensionValidator.claudeChecks(staged: staged.dir, check: claude)
             result.issues += checks.issues
             result.issues.sort()
             alwaysOn = checks.alwaysOnTokens
+            guard result.errors.isEmpty else { throw ExtensionError(issues: result.errors) }
         }
-        guard result.errors.isEmpty, let manifest = result.manifest else { throw ExtensionError(issues: result.errors) }
         let id = manifest.name
         for role in roles where role.range(of: "^[a-z][a-z0-9-]{0,31}$", options: .regularExpression) == nil {
             throw ExtensionError.message("'\(Store.flat(role, max: 40))' is not a role id")
@@ -90,16 +103,19 @@ public enum ExtensionLibrary {
                                        sourceType: staged.source.sourceType, sourceUrl: staged.source.sourceUrl, sourceSha: staged.source.sourceSha,
                                        treeSha256: treeHash, pluginTreeSha256: pluginHash, fetchedAt: now,
                                        lintFactsJSON: String(decoding: ExtensionJSON.encode(facts), as: UTF8.self),
-                                       noticesJSON: String(decoding: ExtensionJSON.encode(staged.notices), as: UTF8.self))
+                                       noticesJSON: String(decoding: ExtensionJSON.encode(staged.notices), as: UTF8.self),
+                                       sidecarJSON: result.sidecar.map { String(decoding: ExtensionJSON.encode($0), as: UTF8.self) })
         let payload = ExtensionAskPayload(action: "install", extId: id, hash: treeHash, publisher: staged.source.publisher, roles: roles,
                                           notices: staged.notices, lintSummary: result.warnings.map { "\($0.code) \($0.path): \($0.message)" },
-                                          executes: facts.executes, alwaysOnTokens: alwaysOn, stagedPath: staged.dir.path)
+                                          executes: facts.executes, alwaysOnTokens: alwaysOn, stagedPath: staged.dir.path,
+                                          sourceType: staged.source.sourceType, sourceUrl: staged.source.sourceUrl, sourceSha: staged.source.sourceSha)
         let page = try reviewPage(staged: staged, manifest: manifest, result: result, payload: payload)
         let sender: Sender = { if case .owner = requester { return .system } else { return requester } }()
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         // A synchronous closure, so the write is GRDB's blocking one (this function is async).
         let file: () throws -> Ask = { try store.writer.write { db in
-            try package.save(db)
+            // Insert-only (B-I1): the shared row keeps its first fetch facts; each company's view lives on its own row at approve.
+            if try ExtensionPackage.fetchOne(db, key: treeHash) == nil { try package.insert(db) }
             // The review page is named after the ask it belongs to, so the number is taken inside the write.
             let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM ask WHERE companyId = ?", arguments: [companyId])) ?? 1
             _ = try EngineFiles.directory(workspace: workspace, reviewDir)
@@ -196,6 +212,9 @@ public enum ExtensionLibrary {
                 var row = try CompanyExtension.fetchOne(db, key: ["companyId": company.id, "id": id])
                     ?? CompanyExtension(companyId: company.id, id: id, hash: hash, installedAskId: ask.id, installedAt: now)
                 row.hash = hash; row.enabled = true; row.installedAskId = ask.id; row.installedAt = now
+                // The publisher and source the owner approved on the card, for this company (B-I1).
+                row.publisher = payload.publisher; row.sourceType = payload.sourceType ?? package.sourceType
+                row.sourceUrl = payload.sourceUrl ?? package.sourceUrl; row.sourceSha = payload.sourceSha ?? package.sourceSha
                 try row.save(db)
                 // A re-install lifts the "removed by owner" override; the ticked roles get add bindings.
                 try db.execute(sql: "DELETE FROM extensionBinding WHERE companyId = ? AND id = ? AND op = 'remove'", arguments: [company.id, id])
@@ -211,11 +230,9 @@ public enum ExtensionLibrary {
             }
             try? FileManager.default.removeItem(at: staged)
         case "remove":
-            try remove(companyId: company.id, id: id, store: store, paths: paths, now: now)
-            try decide(store, ask)
+            try remove(companyId: company.id, id: id, store: store, paths: paths, now: now, deciding: ask)
         case "rollback":
-            try rollback(companyId: company.id, id: id, store: store, paths: paths, now: now)
-            try decide(store, ask)
+            try rollback(companyId: company.id, id: id, store: store, paths: paths, now: now, deciding: ask)
         case "bind", "unbind":
             guard let role = payload.role else { throw WorkError.invalid("\(ask.ref) names no role") }
             try store.writer.write { db in
@@ -242,7 +259,10 @@ public enum ExtensionLibrary {
     /// the owner's decision transaction.
     static func declined(_ db: Database, ask: Ask, now: Date) throws {
         guard let payload = ExtensionAskPayload.read(ask) else { return }
-        if let path = payload.stagedPath, path.contains("/extensions/staging/"), SandboxPath.kind(path) == .directory {
+        // Only `<…>/extensions/staging/<one component>` is ever removed (M8): the staging root is known exactly from the path's shape.
+        if let path = payload.stagedPath, let staging = path.range(of: "/extensions/staging/"),
+           !path[staging.upperBound...].isEmpty, !path[staging.upperBound...].contains("/"),
+           SandboxPath.kind(path) == .directory, SandboxPath.linkedComponent(path, under: String(path[..<staging.lowerBound]) + "/extensions") == nil {
             try? FileManager.default.removeItem(atPath: path)
         }
         try Store.recordExtensionEvent(db, companyId: ask.companyId, extId: payload.extId, kind: "declined", detail: "\(ask.ref) \(payload.action)", now: now)
@@ -285,21 +305,30 @@ public enum ExtensionLibrary {
 
     static func makeReadOnly(_ root: URL) {
         for f in (try? PackageWalk.files(root: root)) ?? [] where f.kind == .regular {
-            chmod(f.url.path, (f.mode & 0o111) != 0 ? 0o555 : 0o444)
+            chmodNoFollow(f.url.path, (f.mode & 0o111) != 0 ? 0o555 : 0o444)
         }
     }
 
     static func makeWritable(_ root: URL) {
-        for f in (try? PackageWalk.files(root: root, includeDirectories: true)) ?? [] {
-            chmod(f.url.path, f.kind == .directory ? 0o755 : ((f.mode & 0o111) != 0 ? 0o755 : 0o644))
+        for f in (try? PackageWalk.files(root: root, includeDirectories: true)) ?? [] where f.kind == .directory || f.kind == .regular {
+            chmodNoFollow(f.url.path, f.kind == .directory ? 0o755 : ((f.mode & 0o111) != 0 ? 0o755 : 0o644))
         }
+    }
+
+    /// `chmod` that never follows a symbolic link (M2): a link planted where a file was is left alone.
+    static func chmodNoFollow(_ path: String, _ mode: mode_t) {
+        #if canImport(Darwin)
+        _ = fchmodat(AT_FDCWD, path, mode, AT_SYMLINK_NOFOLLOW)
+        #else
+        if SandboxPath.kind(path) != .link { _ = chmod(path, mode) }
+        #endif
     }
 
     // MARK: Remove and roll back
 
     /// Unmounts from the next session (the mount set changes), removes the bindings and the extension grants, and keeps a
     /// "removed by owner" override when the pack still suggests the extension. The store copies stay for a later rollback.
-    public static func remove(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now()) throws {
+    public static func remove(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now(), deciding ask: Ask? = nil) throws {
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         guard try store.installedExtensions(companyId: companyId).contains(where: { $0.id == id }) else { throw WorkError.notFound("no extension '\(id)'") }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -317,17 +346,22 @@ public enum ExtensionLibrary {
             try Store.revoke(db, grants, by: "owner", why: "extension \(id) removed", now: now)
             if suggested { try ExtensionBinding(companyId: companyId, id: id, scope: "role", target: "*", op: "remove", createdAt: now).insert(db) }
             try Store.recordExtensionEvent(db, companyId: companyId, extId: id, kind: "removed", detail: suggested ? "pack suggestion overridden" : nil, now: now)
+            if let ask {
+                _ = try store.ownerDecide(db: db, askId: ask.id, approve: true, note: "", acknowledgeChange: true, currentHash: nil, grant: nil,
+                                          extensionApproved: true, now: now)
+            }
         }
     }
 
     /// Back to the previous approved hash (its store copy is still there); the workspace plugin parts are materialized again
     /// when missing. Immediate: it was already approved once.
-    public static func rollback(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now()) throws {
+    public static func rollback(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now(), deciding ask: Ask? = nil) throws {
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         guard let current = try store.installedExtensions(companyId: companyId).first(where: { $0.id == id }) else { throw WorkError.notFound("no extension '\(id)'") }
-        let installs = try store.extensionEvents(companyId: companyId, extId: id).filter { $0.kind == "installed" }
-        let hashes = installs.compactMap { $0.detail?.split(separator: " ").first.map(String.init) }
-        guard let previous = hashes.reversed().first(where: { $0 != current.hash && $0.count == 64 }),
+        // The install history (rollbacks excluded): the version approved right before the current one (M10: idempotent).
+        let hashes = try store.extensionEvents(companyId: companyId, extId: id).filter { $0.kind == "installed" }
+            .compactMap { $0.detail?.split(separator: " ").first.map(String.init) }.filter { $0.count == 64 }
+        guard let at = hashes.lastIndex(of: current.hash), at > 0, let previous = hashes[..<at].last(where: { $0 != current.hash }),
               let package = try store.extensionPackage(hash: previous) else {
             throw WorkError.invalid("no earlier approved version of '\(id)' to roll back to")
         }
@@ -337,7 +371,11 @@ public enum ExtensionLibrary {
         try materialize(staged: storeDir, id: id, hash: previous, pluginHash: package.pluginTreeSha256, workspace: workspace, paths: paths)
         try store.writer.write { db in
             try db.execute(sql: "UPDATE companyExtension SET hash = ?, installedAt = ? WHERE companyId = ? AND id = ?", arguments: [previous, now, companyId, id])
-            try Store.recordExtensionEvent(db, companyId: companyId, extId: id, kind: "installed", detail: "\(previous) rollback from \(current.hash.prefix(12))", now: now)
+            try Store.recordExtensionEvent(db, companyId: companyId, extId: id, kind: "rollback", detail: "\(previous) from \(current.hash.prefix(12))", now: now)
+            if let ask {
+                _ = try store.ownerDecide(db: db, askId: ask.id, approve: true, note: "", acknowledgeChange: true, currentHash: nil, grant: nil,
+                                          extensionApproved: true, now: now)
+            }
         }
     }
 
@@ -354,31 +392,36 @@ public enum ExtensionLibrary {
         guard !installed.isEmpty else { return [] }
         var packages: [String: ExtensionPackage] = [:]
         for e in installed { if let p = try store.extensionPackage(hash: e.hash) { packages[e.id] = p } }
-        let have = installed.compactMap { e in packages[e.id].map { RoleBundle.Installed(id: e.id, publisher: $0.publisher, hash: e.hash, enabled: e.enabled) } }
+        // The publisher is the company's own (set at approve), never the shared package row's (B-I1).
+        let have = installed.filter { packages[$0.id] != nil && !$0.publisher.isEmpty }
+            .map { RoleBundle.Installed(id: $0.id, publisher: $0.publisher, hash: $0.hash, enabled: $0.enabled) }
         let template = store.catalog.pack(company.packId)?.role(role)
         let chosen = RoleBundle.effective(packRefs: template?.extensions ?? [], bindings: try store.extensionBindings(companyId: company.id),
                                           grants: grants.extensions, installed: have, role: role, agentId: agent.id, profile: profile)
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        let resolvedWorkspace = workspace.resolvedForSandbox.path
         var out: [ExtensionMount] = []
         for ext in chosen {
             guard let package = packages[ext.id] else { continue }
             let hash12 = String(ext.hash.prefix(12))
             let pluginDir = workspace.appending(path: ".brahma/ext/\(ext.id)/\(hash12)/plugin", directoryHint: .notDirectory)
-            let storeDir = paths.extensionsDir.store.appending(path: "\(ext.id)/\(hash12)", directoryHint: .isDirectory)
-            // Full rehash (cached on the files' inode, size and ctime within this engine run).
-            guard RehashCache.verify(pluginDir, expected: package.pluginTreeSha256) else {
-                try blocked(store: store, company: company, id: ext.id, now: now)
+            // The plugin dir and every component down from the workspace must be real (M4), and the tree must hash as recorded
+            // (a full rehash, cached on the files' inode, size and ctime within this engine run).
+            let realDir = URL(fileURLWithPath: resolvedWorkspace).appending(path: ".brahma/ext/\(ext.id)/\(hash12)/plugin", directoryHint: .notDirectory)
+            guard SandboxPath.linkedComponent(realDir.path, under: resolvedWorkspace) == nil, RehashCache.verify(realDir, expected: package.pluginTreeSha256) else {
+                try blocked(store: store, company: company, id: ext.id, hash: ext.hash, missing: SandboxPath.kind(realDir.path) == .missing, now: now)
                 continue
             }
             var network: [String] = []
-            if let side = BrahmaSidecar.read(storeDir)?.sidecar {
+            // The sidecar as recorded at propose (M3), never the store copy on disk.
+            if let side = package.sidecar {
                 network = side.agentNetwork
                 if let missing = side.hostTools.first(where: { !HostTools.isAvailable($0) }) {
                     HostTools.notice(store: store, companyId: company.id, id: ext.id, tool: missing, now: now)
                     continue
                 }
             }
-            out.append(ExtensionMount(id: ext.id, hash: ext.hash, url: pluginDir, publisher: package.publisher, agentNetwork: network))
+            out.append(ExtensionMount(id: ext.id, hash: ext.hash, url: pluginDir, publisher: ext.publisher, agentNetwork: network))
         }
         return out
     }
@@ -393,19 +436,34 @@ public enum ExtensionLibrary {
         Array(Set(mounts.flatMap(\.agentNetwork))).sorted()
     }
 
-    static func blocked(store: Store, company: Company, id: String, now: Date) throws {
+    /// A blocked mount: one `tamper` event per (company, extension, hash) per engine run (M13), one open alert; a missing tree is
+    /// told apart from a changed one.
+    static func blocked(store: Store, company: Company, id: String, hash: String, missing: Bool, now: Date) throws {
         let reason = "ext-tamper:\(company.id):\(id)"
+        let detail = missing ? "the mounted tree is missing on disk; not mounted" : "the mounted tree does not hash as recorded; not mounted"
+        let firstTime = TamperLog.lock.withLock { TamperLog.seen.insert("\(company.id)|\(id)|\(hash)|\(missing)").inserted }
+        guard firstTime else { return }
         try store.writer.write { db in
-            try Store.recordExtensionEvent(db, companyId: company.id, extId: id, kind: "tamper", detail: "the mounted tree does not hash as recorded; not mounted", now: now)
+            try Store.recordExtensionEvent(db, companyId: company.id, extId: id, kind: "tamper", detail: detail, now: now)
             let open = try Ask.filter(Column("companyId") == company.id && Column("kind") == AskKind.engineAlert
                                       && Column("status") == AskStatus.pendingOwner.rawValue
                                       && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
             if open == 0 {
-                try EngineAlerts.raise(store: store, db: db, text: "Extension \(id) in \(company.name) was changed on disk after it was approved; "
-                                       + "Brahma stopped mounting it. Remove it and install it again from a trusted source.", now: now, reason: reason, companyId: company.id)
+                let text = missing
+                    ? "Extension \(id) in \(company.name) is missing from the workspace (\(hash.prefix(12))); Brahma stopped mounting it. "
+                      + "Roll it back or install it again."
+                    : "Extension \(id) in \(company.name) was changed on disk after it was approved; Brahma stopped mounting it. "
+                      + "Remove it and install it again from a trusted source."
+                try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: reason, companyId: company.id)
             }
         }
     }
+}
+
+/// Which tampers this engine run has already recorded.
+enum TamperLog {
+    static let lock = NSLock()
+    nonisolated(unsafe) static var seen: Set<String> = []
 }
 
 /// Within one engine run, a tree whose files have the same inode, size and ctime hashes the same; otherwise it is rehashed whole.
@@ -418,7 +476,7 @@ enum RehashCache {
         var stamp = ""
         for f in files {
             var st = stat()
-            guard lstat(f.url.path, &st) == 0 else { return false }
+            guard lstat(f.url.path, &st) == 0, st.st_nlink == 1 || f.kind == .directory else { return false }
             stamp += "\(f.relative)|\(st.st_ino)|\(st.st_size)|\(st.st_ctimespec.tv_sec).\(st.st_ctimespec.tv_nsec)\n"
         }
         if let known = lock.withLock({ cache[root.path] }), known.stamp == stamp { return known.hash == expected }

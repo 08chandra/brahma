@@ -53,9 +53,7 @@ extension Store {
         try AskQuota.check(store: self, agentId: agentId)
         try writer.read { db in
             let since = try Store.activeNow(db: db, companyId: companyId) - AccessRefusals.window
-            // Extension requests are refused by design until Task 5a: they do not use up the budget.
-            let refused = try AccessRefusal.filter(Column("agentId") == agentId && Column("createdActive") > since
-                                                   && Column("kind") != GrantKind.extension.rawValue).fetchCount(db)
+            let refused = try AccessRefusal.filter(Column("agentId") == agentId && Column("createdActive") > since).fetchCount(db)
             if refused >= AccessRefusals.perActiveDay { throw WorkError.invalid(AccessRefusals.message) }
         }
         // 3. The value (reads the file system for a path: outside any transaction).
@@ -132,11 +130,9 @@ extension Store {
     /// company's workspace and the owner's backup folders.
     /// `<publisher>/<id>` of every installed, enabled extension of the company: what an `extension` grant may name (Task 5a).
     func grantableExtensions(companyId: String) throws -> Set<String> {
-        var out: Set<String> = []
-        for e in try installedExtensions(companyId: companyId) where e.enabled {
-            if let p = try extensionPackage(hash: e.hash) { out.insert(ExtensionRef(publisher: p.publisher, id: e.id).key) }
-        }
-        return out
+        // The publisher is the company's own (set at approve), never the shared package row's (B-I1).
+        Set(try installedExtensions(companyId: companyId).filter { $0.enabled && !$0.publisher.isEmpty }
+                .map { ExtensionRef(publisher: $0.publisher, id: $0.id).key })
     }
 
     func grantCheckContext(companyId: String) throws -> (company: Company, paths: BrahmaPaths, others: [URL], backups: [URL]) {

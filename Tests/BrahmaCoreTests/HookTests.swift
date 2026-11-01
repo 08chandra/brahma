@@ -67,6 +67,54 @@ import Foundation
         #expect(try f.git.git(["log", "--oneline"]).split(separator: "\n").count == 2)
     }
 
+    /// A staged value for every SecretScan pattern; the test fails when a pattern gains no sample here.
+    static let samples: [String: String] = [
+        "aws-key": "AKIAABCDEFGHIJKLMNOP", "private-key": "-----BEGIN RSA PRIVATE KEY-----", "github-token": "ghp_" + String(repeating: "a", count: 36),
+        "github-pat": "github_pat_" + String(repeating: "a", count: 60), "slack-token": "xoxb-1234567890abcdef",
+        "openai-style": "sk-" + String(repeating: "a", count: 24), "stripe-live": "sk_live_" + String(repeating: "a", count: 24),
+        "google-api": "AIza" + String(repeating: "a", count: 35),
+    ]
+
+    private static func commit(_ f: Fixture, _ message: String) throws -> (status: Int32, stderr: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = ["git", "-C", f.git.root.path, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q", "-m", message]
+        var env = ProcessInfo.processInfo.environment
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        p.environment = env
+        let err = Pipe()
+        p.standardError = err; p.standardOutput = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+        try p.run()
+        let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        return (p.terminationStatus, stderr)
+    }
+
+    /// B-I2: every pattern blocks (the `private-key` ERE starts with `-`, which needs `grep -e`), a line whose content starts
+    /// with `+` is scanned too (M1), and a clean commit prints nothing.
+    @Test(arguments: SecretScan.patterns.map(\.label)) func everySecretPatternBlocks(_ label: String) throws {
+        let f = try Fixture()
+        _ = try f.install()
+        let sample = try #require(Self.samples[label], "add a sample for \(label)")
+        try f.git.write("leak.txt", "x = \(sample)\n")
+        try f.git.git(["add", "leak.txt"])
+        let r = try Self.commit(f, "leak")
+        #expect(r.status != 0, "\(label)")
+        #expect(r.stderr.contains("Brahma: possible secret (\(label)) in staged changes — commit blocked."), "\(label): \(r.stderr)")
+        #expect(!r.stderr.contains(sample)); #expect(!r.stderr.contains("grep:"), "\(r.stderr)")
+        // The same value on a line that itself starts with `+`.
+        try f.git.write("leak.txt", "+\(sample)\n")
+        try f.git.git(["add", "leak.txt"])
+        #expect(try Self.commit(f, "leak2").status != 0, "\(label): a line starting with + is scanned")
+        try f.git.git(["rm", "-q", "--cached", "leak.txt"])
+        try f.git.write("fine.txt", "+nothing to see\n")
+        try f.git.git(["add", "fine.txt"])
+        let clean = try Self.commit(f, "clean")
+        #expect(clean.status == 0); #expect(clean.stderr.isEmpty, "a clean commit prints nothing: \(clean.stderr)")
+        #expect(CompanyHooks.preCommit.contains("--no-ext-diff --no-textconv"))
+        #expect(SecretScan.patterns.allSatisfy { !$0.ere.contains("'") }, "the EREs are single-quoted in the script")
+    }
+
     @Test func warnsOnDeletedTests() throws {
         let f = try Fixture()
         _ = try f.install()

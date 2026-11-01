@@ -54,7 +54,7 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var fullReview: Bool = false
     /// Judged work turns in a row without work-item progress (the watchdog, 14b).
     public var turnsWithoutProgress: Int = 0
-    /// A `sessionResetReason` waiting for the next turn (`Store.forceFreshSession`, Task 5a); `startTurn` moves it onto the turn.
+    /// A `freshSessionReason` waiting for the next turn (`Store.forceFreshSession`, Task 5a); `startTurn` moves it onto the turn.
     public var pendingSessionReset: String? = nil
 }
 

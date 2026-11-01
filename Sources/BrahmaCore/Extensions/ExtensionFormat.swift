@@ -12,13 +12,36 @@ public enum ExtensionLimits {
     /// The largest text file the lint scans whole (bigger ones are hashed only).
     public static let maxScannedBytes = 2 * 1024 * 1024
 
-    /// Unicode scalars that hide or reorder text: zero-width, bidi controls, soft hyphen, word joiner and the like.
+    /// Unicode scalars that hide, pad or reorder text: zero-width and bidi controls, soft hyphen, word joiner, the C1 controls,
+    /// line/paragraph separators, combining grapheme joiner, Hangul and Khmer fillers, Mongolian and musical format controls,
+    /// variation selectors, and the tag characters (U+E0000–E007F, the "ASCII smuggling" carrier).
     public static func isHiddenOrBidi(_ s: Unicode.Scalar) -> Bool {
         switch s.value {
-        case 0x200B...0x200F, 0x202A...0x202E, 0x2060...0x2064, 0x2066...0x2069, 0xFEFF, 0x00AD, 0x061C, 0x180E, 0xFFF9...0xFFFB:
+        case 0x200B...0x200F, 0x202A...0x202E, 0x2060...0x2064, 0x2066...0x2069, 0xFEFF, 0x00AD, 0x061C, 0x180E, 0xFFF9...0xFFFB,
+             0x0080...0x009F, 0x2028, 0x2029, 0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x17B4, 0x17B5, 0x180B...0x180D,
+             0x1D173...0x1D17A, 0xFE00...0xFE0F, 0xE0100...0xE01EF, 0xE0000...0xE007F:
             return true
         default:
             return false
+        }
+    }
+
+    /// The first line (1-based) of `text` holding a hidden scalar, or nil.
+    public static func hiddenLine(in text: String) -> Int? {
+        for (i, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated()
+        where line.unicodeScalars.contains(where: isHiddenOrBidi) {
+            return i + 1
+        }
+        return nil
+    }
+
+    /// Whether any string value in a decoded JSON tree holds a hidden scalar (keys included).
+    public static func hasHidden(_ value: JSONValue) -> Bool {
+        switch value {
+        case .string(let s): return s.unicodeScalars.contains(where: isHiddenOrBidi)
+        case .array(let a): return a.contains(where: hasHidden)
+        case .object(let o): return o.contains { $0.key.unicodeScalars.contains(where: isHiddenOrBidi) || hasHidden($0.value) }
+        default: return false
         }
     }
 
@@ -317,20 +340,43 @@ public struct ExtensionLock: Codable, Equatable, Sendable {
         return ExtensionLock(id: id, version: version, treeSha256: treeHash(entries: entries), files: entries, lint: lint.lockSummary)
     }
 
+    /// The decoded lock, or nil when the file is missing, malformed or holds any key the format does not define (strict).
     public static func read(root: URL) -> ExtensionLock? {
         guard let data = FileManager.default.contents(atPath: root.appending(path: path).path) else { return nil }
+        return decode(data)
+    }
+
+    static let knownKeys: Set<String> = ["format", "id", "version", "treeSha256", "files", "lint", "tools"]
+    static let fileKeys: Set<String> = ["path", "mode", "sha256"]
+    static let lintKeys: Set<String> = ["executes", "hosts", "alwaysOnTokens"]
+    static let executesKeys: Set<String> = ["bin", "scripts", "bangInjection"]
+
+    static func decode(_ data: Data) -> ExtensionLock? {
+        guard let tree = try? JSONDecoder().decode(JSONValue.self, from: data), let top = tree.objectValue,
+              Set(top.keys).isSubset(of: knownKeys),
+              let files = top["files"]?.arrayValue, files.allSatisfy({ Set($0.objectValue?.keys.map { $0 } ?? []).isSubset(of: fileKeys) }),
+              let lint = top["lint"]?.objectValue, Set(lint.keys).isSubset(of: lintKeys),
+              Set(lint["executes"]?.objectValue?.keys.map { $0 } ?? []).isSubset(of: executesKeys)
+        else { return nil }
         return try? JSONDecoder().decode(ExtensionLock.self, from: data)
     }
 
+    /// The canonical bytes (sorted keys, pretty, stable).
+    public func canonical() -> Data { ExtensionJSON.encode(self) }
+
     public func write(to root: URL) throws {
-        try ExtensionJSON.encode(self).write(to: root.appending(path: Self.path))
+        try canonical().write(to: root.appending(path: Self.path))
     }
 
-    /// Equal apart from `lint.alwaysOnTokens`, which only Claude's own `details` run knows.
-    public func matches(_ other: ExtensionLock) -> Bool {
-        var a = self, b = other
+    /// Whether the lock file at `root` is exactly the canonical serialization of what lint generates (byte for byte), apart from
+    /// `lint.alwaysOnTokens`, which only Claude's own `details` run knows. A file with an unknown key, a reformatted file or a
+    /// changed entry never matches.
+    public static func verify(root: URL, generated: ExtensionLock) -> Bool {
+        guard let data = FileManager.default.contents(atPath: root.appending(path: path).path), let have = decode(data),
+              have.canonical() == data else { return false }
+        var a = have, b = generated
         a.lint.alwaysOnTokens = 0; b.lint.alwaysOnTokens = 0
-        return a == b
+        return a.canonical() == b.canonical()
     }
 }
 

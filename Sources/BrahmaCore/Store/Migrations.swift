@@ -752,6 +752,27 @@ enum Migrations {
             // A reason waiting for the agent's next turn (`Store.forceFreshSession`).
             try db.alter(table: "agent") { t in t.add(column: "pendingSessionReset", .text) }
         }
+        m.registerMigration("v5-extensions-2") { db in
+            // Task 5a fix round 1. B-I1: publisher and source per company (copied at approve from the approved payload). M3: the
+            // sidecar as parsed at propose. B-I3: a fresh-session reason that keeps the turn counted (unlike `sessionResetReason`).
+            try db.alter(table: "companyExtension") { t in
+                t.add(column: "publisher", .text).notNull().defaults(to: "")
+                t.add(column: "sourceType", .text).notNull().defaults(to: "")
+                t.add(column: "sourceUrl", .text)
+                t.add(column: "sourceSha", .text)
+            }
+            // Rows installed before this migration take the facts their package row held when they were approved (the shared row
+            // was only relabeled by a later proposal, which this round stops); otherwise they would never mount again.
+            try db.execute(sql: """
+                UPDATE companyExtension SET
+                  publisher = COALESCE((SELECT publisher FROM extensionPackage p WHERE p.hash = companyExtension.hash), ''),
+                  sourceType = COALESCE((SELECT sourceType FROM extensionPackage p WHERE p.hash = companyExtension.hash), ''),
+                  sourceUrl = (SELECT sourceUrl FROM extensionPackage p WHERE p.hash = companyExtension.hash),
+                  sourceSha = (SELECT sourceSha FROM extensionPackage p WHERE p.hash = companyExtension.hash)
+                """)
+            try db.alter(table: "extensionPackage") { t in t.add(column: "sidecar", .text) }
+            try db.alter(table: "turn") { t in t.add(column: "freshSessionReason", .text) }
+        }
         m.registerMigration("v5-timers") { db in
             try db.create(table: "timer") { t in
                 t.primaryKey("id", .text)
