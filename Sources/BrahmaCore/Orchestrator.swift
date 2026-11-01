@@ -108,6 +108,9 @@ public actor Orchestrator {
     /// Phone alerts (Task 7b): one dispatcher for the engine's life, and its pass in flight (a pass never overlaps itself).
     nonisolated let pushDispatcher: PushDispatcher
     var pushTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
+    /// Plan L previews: the runner (one for the engine's life) and its reconcile pass in flight (`previewTick`).
+    let previewRunner: PreviewRunner
+    var previewTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -130,7 +133,15 @@ public actor Orchestrator {
                 backupTools: BackupTools = .system,
                 walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) },
                 sleepGuard: SleepGuard = .disabled,
-                sandboxCanary: SandboxCanaryGate? = nil) {
+                sandboxCanary: SandboxCanaryGate? = nil, previewDeps: PreviewDependencies? = nil) {
+        let engineBlocking = Blocking()
+        self.blocking = engineBlocking
+        // Previews (Plan L): the platform sandbox with the checks' baseline by default (`defaultPreviewDependencies`).
+        let previewDeps = previewDeps ?? Orchestrator.defaultPreviewDependencies(store: store, paths: paths)
+        self.previewRunner = PreviewRunner(store: store, paths: paths, deps: previewDeps,
+                                           sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
+                                           timeouts: PreviewTimeouts(), memory: { memory.current != .normal }, clock: clock,
+                                           blocking: engineBlocking, environment: checkBaseEnvironment)
         self.backupTools = backupTools; self.walSleeper = walSleeper; self.sleepGuard = sleepGuard
         // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
         let vault = vault.nonInteractive()
@@ -260,8 +271,9 @@ public actor Orchestrator {
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
-    /// Child processes that are not turns: engine-run checks and merges. They count against the same safety cap as turns.
-    var otherChildren: Int { checkTasks.count + mergeTasks.count }
+    /// Child processes that are not turns: engine-run checks, merges and previews (running servers and starts in flight). They
+    /// count against the same safety cap as turns.
+    var otherChildren: Int { checkTasks.count + mergeTasks.count + previewRunner.activeChildren }
 
     nonisolated let backupTools: BackupTools
     nonisolated let walSleeper: WALShipper.Sleeper
@@ -269,7 +281,7 @@ public actor Orchestrator {
     var walShipper: WALShipper?
 
     /// This engine's limit on concurrently running blocking (git) bodies.
-    let blocking = Blocking()
+    let blocking: Blocking
     /// Marks this engine's tasks for `EngineGitGuard`.
     nonisolated let engineId = UUID().uuidString
 
@@ -284,7 +296,7 @@ public actor Orchestrator {
     /// next is started synchronously inside that tick, so nothing is "queued" outside these sets.)
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
-            && secretsTask == nil && pushTask == nil
+            && secretsTask == nil && pushTask == nil && previewTask == nil
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -294,7 +306,7 @@ public actor Orchestrator {
     }
 
     private func busyDescription() -> String {
-        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted()) secrets=\(secretsTask == nil ? "idle" : "reloading")"
+        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted()) previews=\(previewTask == nil ? "idle" : "reconciling") secrets=\(secretsTask == nil ? "idle" : "reloading")"
     }
 
     private func idleWaiterTimedOut(_ id: Int) {
@@ -344,9 +356,11 @@ public actor Orchestrator {
         stopWALShipping()
         await stopSleepPrevention()
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
-            + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? [])
+            + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? []) + (previewTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
+        // Every preview's process group is stopped with the engine (the next engine starts them again).
+        await previewRunner.stopAll()
         await runner.waitForChildren()
     }
 
@@ -505,6 +519,8 @@ public actor Orchestrator {
         // 5. Engine-run checks first (cheap, and they unblock reviews), then select and launch turns around them.
         startChecks(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
         startMerges(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+        // 5b. Previews (Plan L): one reconcile pass at a time, after the merge step.
+        previewTick(held: held)
 
         infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })

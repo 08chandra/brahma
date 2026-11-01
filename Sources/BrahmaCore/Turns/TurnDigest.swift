@@ -52,6 +52,8 @@ public struct TurnContext: Sendable {
     public var notesPath: String? = nil
     /// The current item's spending against its tier (`BudgetText.parts`), for the budget line.
     public var budget: String? = nil
+    /// The company's preview surfaces with their states, in position order (the `Previews:` line).
+    public var previews: [(surface: PreviewSurface, state: PreviewState?)] = []
 
     public var scope: SessionScope { item.map { .item($0.id) } ?? .base }
 
@@ -95,6 +97,8 @@ public struct TurnContext: Sendable {
             let progress = try store.sprintProgress(sprint)
             c.sprint = sprint; c.sprintDone = progress.done; c.sprintTotal = progress.total
         }
+        let states = try store.previewStates(companyId: company.id)
+        c.previews = try store.previewSurfaces(companyId: company.id).map { ($0, states[$0.id]) }
         let notes = NotesFile.path(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), team: agent.team)
         if FileManager.default.fileExists(atPath: notes.path) { c.notesPath = notes.path }
 
@@ -138,6 +142,20 @@ public enum TurnDigest {
     public static let maxReports = 20
     public static let maxInbox = 20
     static let maxReviewNotes = 8192
+    public static let maxPreviewLine = 400
+
+    /// `Previews: <name> <status>[ <url>] @<sha7> · …` (the URL while running), one flattened line of at most
+    /// `maxPreviewLine` characters (a cut line ends in …); nil without surfaces.
+    public static func previewLine(_ previews: [(surface: PreviewSurface, state: PreviewState?)]) -> String? {
+        guard !previews.isEmpty else { return nil }
+        let parts = previews.map { surface, state -> String in
+            var part = "\(surface.name) \((state?.status ?? .idle).title)"
+            if state?.status == .running, let url = state?.resolvedURL { part += " " + url }
+            if let commit = state?.commit { part += " @" + commit.prefix(7) }
+            return part
+        }
+        return ReviewDigest.flat("Previews: " + parts.joined(separator: " · "), max: maxPreviewLine - 1)
+    }
 
     public static func render(_ c: TurnContext, agent: Agent, company: Company) -> String {
         var out: [String] = ["# Orientation"]
@@ -154,6 +172,7 @@ public enum TurnDigest {
         let more = c.reports.count > maxReports ? " and \(c.reports.count - maxReports) more" : ""
         out.append("Org: you report to @\(c.manager ?? "owner") · reports: \(c.reports.isEmpty ? "none" : reports + more)"
                    + " · team: \(c.team.map { ReviewDigest.flat($0, max: 60) } ?? "none")")
+        if let previews = previewLine(c.previews) { out.append(previews) }
         out.append("Team roster:")
         if c.roster.isEmpty { out.append("- (nobody else yet)") }
         for r in c.roster.prefix(maxRoster) {
