@@ -11,6 +11,7 @@ struct FakeHostingAdapter: HostingAdapter {
     var cli = "fake@1"
     var toolNetwork: [String] = []
     var network: [String] = []
+    var providerConfigNames: [String] = []
     /// The loopback server over `FAKE_HOST_ROOT`.
     var server: URL?
 

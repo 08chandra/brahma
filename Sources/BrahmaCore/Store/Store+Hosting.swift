@@ -82,22 +82,14 @@ extension Store {
         }
     }
 
-    /// What the company still needs before it can deploy. The token counts as present when its secret is recorded and the
-    /// vault, read without ever prompting, still has it (a read that would need the owner's permission counts as present:
-    /// the value is there). `npmPresent` nil: look for `npm` on the PATH.
-    public func hostingReadiness(companyId: String, vault: any SecretVault, npmPresent: Bool? = nil,
+    /// What the company still needs before it can deploy. A display path: it never reads the vault. The token counts as
+    /// present when its secret is recorded (`secrets(companyId:)` metadata); the value is read only by the deploy step.
+    /// `vault` is kept for the brief's signature and unused. `npmPresent` nil: look for `npm` on the PATH.
+    public func hostingReadiness(companyId: String, vault: (any SecretVault)? = nil, npmPresent: Bool? = nil,
                                  adapters: HostingAdapters.Lookup = HostingAdapters.production) throws -> HostingReadiness {
         let settings = try hosting(companyId: companyId)
-        let provider = settings?.provider ?? .default
-        let tokenName = adapters(provider).tokenSecret
-        var token = try secrets(companyId: companyId).contains { $0.name == tokenName }
-        if token {
-            do { token = try vault.nonInteractive().value(companyId: companyId, name: tokenName) != nil } catch SecretError.needsPermission {
-                token = true
-            } catch {
-                token = false
-            }
-        }
+        let tokenName = adapters(settings?.provider ?? .default).tokenSecret
+        let token = try secrets(companyId: companyId).contains { $0.name == tokenName }
         return HostingReadiness(configured: settings?.outputDir != nil, tokenPresent: token,
                                 accountPresent: settings?.accountId != nil,
                                 npmPresent: npmPresent ?? HostingReadiness.npmOnPath())

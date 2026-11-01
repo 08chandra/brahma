@@ -30,9 +30,14 @@ public struct VercelAdapter: HostingAdapter {
         guard s.accountId != nil else { throw WorkError.invalid(Self.accountMessage) }
     }
 
-    /// The fixed environment (PR-3, PR-15): the account and project, no telemetry, CI. `VERCEL_TOKEN` is added by the executor.
-    func env(_ s: HostingSettings) -> [String: String] {
-        ["VERCEL_ORG_ID": s.accountId ?? "", "VERCEL_PROJECT_ID": s.project, "VERCEL_TELEMETRY_DISABLED": "1", "CI": "1"]
+    /// Nothing beyond `ProviderConfigCheck.boundedNames` (the `.vercel` project link and `.git`, up to the release root; I3).
+    public var providerConfigNames: [String] { [] }
+
+    /// The fixed environment (PR-3, PR-15): the account and project, no telemetry, CI, and git's discovery stopped at the
+    /// release root (I3). `VERCEL_TOKEN` is added by the executor.
+    func env(_ i: DeployInput) -> [String: String] {
+        ["VERCEL_ORG_ID": i.settings.accountId ?? "", "VERCEL_PROJECT_ID": i.settings.project, "VERCEL_TELEMETRY_DISABLED": "1",
+         "CI": "1", "GIT_CEILING_DIRECTORIES": i.gitCeiling]
     }
 
     func deployStep(_ i: DeployInput) -> DeployStep {
@@ -44,7 +49,7 @@ public struct VercelAdapter: HostingAdapter {
         try validate(i.settings)
         try i.validate()
         return try DeployPlan(steps: [deployStep(i)], stageFrom: ["."], cwdPath: i.inRelease("upload"), network: network,
-                              tokenSecret: tokenSecret, env: env(i.settings), build: i.settings.build, outputDir: i.settings.outputDir)
+                              tokenSecret: tokenSecret, env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
     }
 
     /// `vercel rollback <previous deploy URL> --yes` from an empty `releaseDir/rollback`, else the placeholder deployed.
@@ -52,27 +57,34 @@ public struct VercelAdapter: HostingAdapter {
         try validate(i.settings)
         try i.validate()
         if let previous = i.previousDeployURL {
-            guard Self.isDeployURL(previous) else { throw WorkError.invalid("the previous deploy URL is not a vercel.app URL") }
+            guard Self.isDeployURL(previous, project: i.settings.project) else { throw WorkError.invalid("the previous deploy URL is not a vercel.app URL") }
             return try DeployPlan(steps: [DeployStep(label: "rollback", argv: [i.bin("vercel"), "rollback", previous, "--yes"])],
                                   stageFrom: [], cwdPath: i.inRelease("rollback"), network: network, tokenSecret: tokenSecret,
-                                  env: env(i.settings), build: i.settings.build, outputDir: i.settings.outputDir)
+                                  env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
         }
         return try DeployPlan(steps: [deployStep(i)], stageFrom: [], cwdPath: i.placeholderDir.path, network: network,
-                              tokenSecret: tokenSecret, env: env(i.settings), build: i.settings.build, outputDir: i.settings.outputDir)
+                              tokenSecret: tokenSecret, env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
     }
 
     static func isDeployURL(_ s: String) -> Bool {
         s.range(of: "^https://[a-z0-9][a-z0-9-]*\\.vercel\\.app$", options: .regularExpression) != nil
     }
 
-    /// The last output line that is exactly a `https://….vercel.app` URL (the CLI prints the deployment's URL alone on its
-    /// last stdout line), other than the production alias.
+    /// A per-deploy URL of this project: `https://<project>-<…>.vercel.app`.
+    static func isDeployURL(_ s: String, project: String) -> Bool {
+        isDeployURL(s) && s.hasPrefix("https://\(project)-")
+    }
+
+    /// From the deploy step's stdout only (M2), never merged or streamed build logs: the last "Production: <url>" line, else
+    /// the last line that is exactly a URL. Either way a per-deploy URL of the configured project, never the alias.
     public func deployURL(fromOutput: String, settings: HostingSettings) -> URL? {
-        let alias = "https://\(settings.project).vercel.app"
-        for line in fromOutput.split(whereSeparator: \.isNewline).reversed() {
-            let s = line.trimmingCharacters(in: .whitespaces)
-            if Self.isDeployURL(s), s != alias { return URL(string: s) }
+        let lines = fromOutput.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+        for line in lines.reversed() {
+            guard let r = line.range(of: "Production: ") else { continue }
+            let url = line[r.upperBound...].split(separator: " ").first.map(String.init) ?? ""
+            if Self.isDeployURL(url, project: settings.project) { return URL(string: url) }
         }
+        for line in lines.reversed() where Self.isDeployURL(line, project: settings.project) { return URL(string: line) }
         return nil
     }
 
