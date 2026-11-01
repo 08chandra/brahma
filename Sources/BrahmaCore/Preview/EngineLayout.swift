@@ -19,14 +19,12 @@ public struct EngineLayout: Equatable, Sendable {
     public var previewLogs: URL { previewDir.appending(path: "logs", directoryHint: .isDirectory) }
     /// `.brahma/preview/logs/<name>.log` (a surface name is one safe path component, `PreviewSurface.validate`).
     public func previewLog(name: String) -> URL { previewLogs.appending(path: "\(name).log", directoryHint: .notDirectory) }
-    /// `.brahma/releases`: read-only to every turn and in no build, preview or check writable list.
+    /// `.brahma/releases`: read-only to every turn and in no build, preview or check writable list. It holds only what the
+    /// owner and agents may read (the redacted deploy logs and release metadata); every deploy runs under the data home
+    /// (`ReleaseLayout`), outside the workspace and its repository.
     public var releasesDir: URL { dotBrahma.appending(path: "releases", directoryHint: .isDirectory) }
     /// `releasesDir/R-<n>`.
     public func releaseDir(_ number: Int) -> URL { releasesDir.appending(path: "R-\(number)", directoryHint: .isDirectory) }
-    /// `releasesDir/tools/<cli>`: the engine-installed provider CLI.
-    public func deployTools(cli: String) -> URL { releasesDir.appending(path: "tools/\(cli)", directoryHint: .isDirectory) }
-    /// `releasesDir/placeholder`: the engine-written placeholder site.
-    public var placeholderDir: URL { releasesDir.appending(path: "placeholder", directoryHint: .isDirectory) }
 
     /// The export run id of one start of one preview surface at one commit (PR-16): `prev-<surfaceId>-<sha12>-<start>`, with
     /// the whole surface id (letters, digits and dashes, as stored), so no two surfaces or starts ever share an export. It is a
@@ -42,4 +40,30 @@ public struct EngineLayout: Equatable, Sendable {
         guard id.count <= 64 else { throw WorkError.invalid("preview surface id too long for a run id") }
         return id
     }
+}
+
+/// The engine-only places a company's deploys run in, under the data home (`<home>/run/releases/<companyId>`), never in a
+/// workspace: a provider CLI started with the token in a deploy's `upload/` finds no workspace config above it (a
+/// `wrangler.toml`, a `.vercel`, the workspace's `.git`; I3). Raw deploy and rollback output is kept here too (PR-7); only the
+/// redacted copy goes to `EngineLayout.releaseDir(n)`.
+public struct ReleaseLayout: Equatable, Sendable {
+    /// `<home>/run/releases/<companyId>`: every deploy's `GIT_CEILING_DIRECTORIES` and the boundary of the config check.
+    public let root: URL
+
+    public init(paths: BrahmaPaths, companyId: String) throws {
+        guard companyId.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil else {
+            throw WorkError.invalid("invalid company id")
+        }
+        root = paths.releasesDir.appending(path: companyId, directoryHint: .isDirectory)
+    }
+
+    public init(root: URL) { self.root = root }
+
+    /// `root/R-<n>`: the release's engine-only working folder.
+    public func releaseDir(_ number: Int) -> URL { root.appending(path: "R-\(number)", directoryHint: .isDirectory) }
+    /// `root/tools/<cli>`: the engine-installed provider CLI (outside every workspace, so no workspace `node_modules` is on
+    /// its module path).
+    public func deployTools(cli: String) -> URL { root.appending(path: "tools/\(cli)", directoryHint: .isDirectory) }
+    /// `root/placeholder`: the engine-written placeholder site (`Placeholder.write`).
+    public var placeholderDir: URL { root.appending(path: "placeholder", directoryHint: .isDirectory) }
 }

@@ -132,8 +132,13 @@ import Foundation
         #expect(l.previewLog(name: "web").path == "/w/acme/.brahma/preview/logs/web.log")
         #expect(l.releasesDir.path == "/w/acme/.brahma/releases")
         #expect(l.releaseDir(3).path == "/w/acme/.brahma/releases/R-3")
-        #expect(l.deployTools(cli: "wrangler").path == "/w/acme/.brahma/releases/tools/wrangler")
-        #expect(l.placeholderDir.path == "/w/acme/.brahma/releases/placeholder")
+        // Deploys run under the data home, never in the workspace (Task 4 I3).
+        let r = try ReleaseLayout(paths: BrahmaPaths(home: URL(fileURLWithPath: "/h", isDirectory: true), workspaces: ws), companyId: "C1")
+        #expect(r.root.path == "/h/run/releases/C1")
+        #expect(r.releaseDir(3).path == "/h/run/releases/C1/R-3")
+        #expect(r.deployTools(cli: "wrangler").path == "/h/run/releases/C1/tools/wrangler")
+        #expect(r.placeholderDir.path == "/h/run/releases/C1/placeholder")
+        #expect(throws: WorkError.self) { try ReleaseLayout(paths: BrahmaPaths(home: ws, workspaces: ws), companyId: "../x") }
         // PR-16: one export per surface, commit and start; a valid 3a run id.
         let sha = "0123456789abcdef0123456789abcdef01234567"
         let id = try EngineLayout.previewRunId(surfaceId: "8F3A2B1C-0000-4000-8000-000000000000", commit: sha, start: 2)
