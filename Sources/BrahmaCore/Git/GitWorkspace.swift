@@ -3065,6 +3065,24 @@ public struct GitWorkspace: Sendable {
         try main.run(["hash-object", "-t", "tree", "/dev/null"]).text
     }
 
+    /// Whether `commit`'s tree has a directory (a tree entry, not a link or a submodule) at `path`, read from the object
+    /// database; nothing is read from a working tree. Plan L decides from it whether a Pages deploy stages `functions/`
+    /// (PR-24), so the plan is the same at propose time and when the executor renders it again.
+    public func treeHasDirectory(at commit: String, path: String) throws -> Bool {
+        try Self.validCommit(commit)
+        guard !path.isEmpty, !path.hasPrefix(":"), !path.hasPrefix("-"), !path.hasPrefix("/"), !path.hasSuffix("/") else { return false }
+        let listing = try main.run(["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", path],
+                                   allowFailure: true, maxOutput: 1 << 16)
+        guard listing.status == 0 else { return false }
+        for entry in String(decoding: listing.stdout, as: UTF8.self).split(separator: "\0", omittingEmptySubsequences: true) {
+            let halves = entry.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+            guard halves.count == 2, String(halves[1]) == path else { continue }
+            let meta = halves[0].split(separator: " ")
+            if meta.count == 3, meta[0] == "040000", meta[1] == "tree" { return true }
+        }
+        return false
+    }
+
     /// The patch between two commits, cut to `maxLines` lines and `maxChars` characters.
     public func diff(base: String, head: String, maxLines: Int = 400, maxChars: Int = 40_000) throws -> (text: String, truncated: Bool) {
         try Self.validRef(base); try Self.validRef(head)

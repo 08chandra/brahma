@@ -686,7 +686,24 @@ enum Migrations {
                 CREATE INDEX previewState_port ON previewState(port);
                 """)
         }
-        // vL-hosting (Task 4)
+        m.registerMigration("vL-hosting") { db in
+            // One row per company: the owner's provider, project, account and production URL, and the ops agent's build,
+            // output folder, smoke requests (a JSON array of `SmokeRequest`) and expected text. Never a token.
+            try db.create(table: "hosting") { t in
+                t.primaryKey("companyId", .text).references("company", onDelete: .cascade)
+                t.column("provider", .text).notNull()
+                t.column("project", .text).notNull()
+                t.column("accountId", .text)
+                t.column("productionURL", .text)
+                t.column("customDomain", .text)
+                t.column("build", .text)
+                t.column("outputDir", .text)
+                t.column("smoke", .text).notNull().defaults(to: "[]")
+                t.column("expectText", .text)
+                t.column("configuredById", .text)
+                t.column("updatedAt", .datetime).notNull()
+            }
+        }
     }
 
     /// Task 12 fix 1 (`v5-restore`): one row per restore (`nonce`, also in the restore marker; `consumedAt` once the engine has
