@@ -199,7 +199,7 @@ public enum EngineFiles {
         let dfd: Int32
         switch try openWay(root: root, parts.dropLast()[...], shown: url.path) {
         case .missing: return .missing
-        case .blocked(let problem): return .blocked(problem)
+        case .blocked(let problem, _): return .blocked(problem)
         case .open(let fd): dfd = fd
         }
         defer { close(dfd) }
