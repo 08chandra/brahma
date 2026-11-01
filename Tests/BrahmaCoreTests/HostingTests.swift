@@ -28,9 +28,17 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
     return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))
 }
 
+/// A vault whose every read fails the test: readiness must never read a value.
+private struct RefusingVault: SecretVault {
+    func set(companyId: String, name: String, value: String) throws { Issue.record("vault written") }
+    func value(companyId: String, name: String) throws -> String? { Issue.record("vault read"); return nil }
+    func delete(companyId: String, name: String) throws { Issue.record("vault written") }
+}
+
 @Suite(.scratch) struct HostingTests {
     static let sha = "0123456789abcdef0123456789abcdef01234567"
-    static let layout = EngineLayout(workspace: URL(fileURLWithPath: "/ws/acme", isDirectory: true))
+    /// Deploys run under the data home (I3), never in a workspace.
+    static let layout = ReleaseLayout(root: URL(fileURLWithPath: "/h/run/releases/C1", isDirectory: true))
 
     static func settings(_ provider: HostingProviderID = .cloudflarePages, project: String = "acme", outputDir: String? = "dist",
                          accountId: String? = "0123abcd", build: String? = nil, productionURL: String? = nil) -> HostingSettings {
@@ -41,9 +49,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
     static func input(_ s: HostingSettings, adapter: any HostingAdapter, commit: String = sha, version: String = "0.1.0",
                       release: Int = 1, previousUpload: URL? = nil, previousDeployURL: String? = nil,
                       functions: Bool = false) -> DeployInput {
-        DeployInput(settings: s, commit: commit, version: version, releaseDir: layout.releaseDir(release),
-                    deployTools: layout.deployTools(cli: adapter.cli), previousUpload: previousUpload,
-                    previousDeployURL: previousDeployURL, placeholderDir: layout.placeholderDir, functionsInCommit: functions)
+        DeployInput(settings: s, commit: commit, version: version, layout: layout, release: release, cli: adapter.cli,
+                    previousUpload: previousUpload, previousDeployURL: previousDeployURL, functionsInCommit: functions)
     }
 
     static func message(_ body: () throws -> Void) -> String? {
@@ -74,7 +81,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(plan.stageFrom == ["dist"])
         #expect(plan.tokenSecret == "CLOUDFLARE_API_TOKEN")
         #expect(plan.network == ["api.cloudflare.com"])
-        #expect(plan.env == ["CLOUDFLARE_ACCOUNT_ID": "0123abcd", "WRANGLER_SEND_METRICS": "false", "CI": "1"])
+        #expect(plan.env == ["CLOUDFLARE_ACCOUNT_ID": "0123abcd", "WRANGLER_SEND_METRICS": "false", "CI": "1",
+                             "GIT_CEILING_DIRECTORIES": "/h/run/releases/C1"])
+        #expect(plan.cwdPath == "/h/run/releases/C1/R-1/upload")
         // Token-free: the token is only ever the step environment's CLOUDFLARE_API_TOKEN, added by the executor from the vault.
         for arg in plan.steps.flatMap(\.argv) {
             #expect(!arg.contains("CLOUDFLARE_API_TOKEN") && !arg.contains("$"), "\(arg)")
@@ -135,8 +144,15 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let output = try Self.fixture("wrangler-deploy")
         let s = Self.settings()
         let url = cf.deployURL(fromOutput: output, settings: s)
-        #expect(url?.absoluteString == "https://1a2b3c4d.acme-9x.pages.dev")
-        #expect(cf.smokeBase(s, deployURL: url)?.absoluteString == "https://acme-9x.pages.dev")
+        #expect(url?.absoluteString == "https://1a2b3c4d.acme.pages.dev")
+        #expect(cf.smokeBase(s, deployURL: url)?.absoluteString == "https://acme.pages.dev")
+        // M1: only wrangler's "Deployment complete!" line counts, and only this project's URL on it. A URL a build log or a
+        // function echoed elsewhere is ignored, even this project's.
+        let echoed = "building... see https://deadbeef.acme.pages.dev\nhttps://cafef00d.acme.pages.dev\n" + output
+        #expect(cf.deployURL(fromOutput: echoed, settings: s)?.absoluteString == "https://1a2b3c4d.acme.pages.dev")
+        #expect(cf.deployURL(fromOutput: "https://deadbeef.acme.pages.dev\n", settings: s) == nil)
+        #expect(cf.deployURL(fromOutput: "✨ Deployment complete! Take a peek over at https://1a2b3c4d.acme-other.pages.dev", settings: s) == nil)
+        #expect(cf.deployURL(fromOutput: "✨ Deployment complete! Take a peek over at https://1a2b3c4d.acme.pages.dev.evil.com", settings: s) == nil)
         // The stored production URL wins.
         #expect(cf.smokeBase(Self.settings(productionURL: "https://www.acme.com"), deployURL: url)?.absoluteString == "https://www.acme.com")
         // Another project's URL in the output is not this deploy's.
@@ -157,7 +173,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let bin = Self.layout.deployTools(cli: v.cli).path + "/node_modules/.bin/vercel"
         // PR-15: the project comes from VERCEL_ORG_ID + VERCEL_PROJECT_ID, never `vercel link`.
         #expect(plan.steps.map(\.argv) == [[bin, "deploy", "--prod", "--yes"]])
-        #expect(plan.env == ["VERCEL_ORG_ID": "team_abc", "VERCEL_PROJECT_ID": "acme", "VERCEL_TELEMETRY_DISABLED": "1", "CI": "1"])
+        #expect(plan.env == ["VERCEL_ORG_ID": "team_abc", "VERCEL_PROJECT_ID": "acme", "VERCEL_TELEMETRY_DISABLED": "1", "CI": "1",
+                             "GIT_CEILING_DIRECTORIES": "/h/run/releases/C1"])
         #expect(plan.stageFrom == ["."])
         #expect(plan.cwdPath == Self.layout.releaseDir(1).appending(path: "upload").path)
         for arg in plan.steps.flatMap(\.argv) { #expect(!arg.contains("VERCEL_TOKEN") && !arg.contains("$") && arg != "link", "\(arg)") }
@@ -168,6 +185,14 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let output = try Self.fixture("vercel-deploy")
         let deployed = v.deployURL(fromOutput: output, settings: s)
         #expect(deployed?.absoluteString == "https://acme-k3j4h5g6f-acme-team.vercel.app")
+        // M2: the "Production:" line wins over a later bare URL line (stdout only; a merged build log is never parsed), and
+        // only this project's per-deploy URLs count.
+        let merged = "Production: https://acme-k3j4h5g6f-acme-team.vercel.app [12s]\nhttps://acme-evil00-x.vercel.app\n"
+        #expect(v.deployURL(fromOutput: merged, settings: s)?.absoluteString == "https://acme-k3j4h5g6f-acme-team.vercel.app")
+        #expect(v.deployURL(fromOutput: "https://acme-k3j4h5g6f-acme-team.vercel.app\n", settings: s)?.absoluteString
+                == "https://acme-k3j4h5g6f-acme-team.vercel.app")
+        #expect(v.deployURL(fromOutput: "Production: https://globex-a1-x.vercel.app\nhttps://evil-b2.vercel.app\n", settings: s) == nil)
+        #expect(v.deployURL(fromOutput: "https://acme.vercel.app\n", settings: s) == nil)
         #expect(v.smokeBase(s, deployURL: deployed)?.absoluteString == "https://acme.vercel.app")
         #expect(v.smokeBase(Self.settings(.vercel, productionURL: "https://acme.com"), deployURL: deployed)?.absoluteString == "https://acme.com")
         // Rollback: the previous deploy URL, from an empty releaseDir/rollback, with the same env.
@@ -269,9 +294,56 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
                 == "no output_dir is set yet; set it with set_deploy_config")
     }
 
+    /// I3 (c): the executor's check before a token-holding step: no provider config in or above the deploy folder.
+    @Test func providerConfigInOrAboveDeployFolderRefused() throws {
+        let home = try tempDir()
+        let layout = try ReleaseLayout(paths: BrahmaPaths(home: home, workspaces: try tempDir()), companyId: "C1")
+        let upload = layout.releaseDir(1).appending(path: "upload")
+        try FileManager.default.createDirectory(at: upload.appending(path: "dist"), withIntermediateDirectories: true)
+        let cf = CloudflarePagesAdapter(), v = VercelAdapter()
+        let s = Self.settings()
+        let input = DeployInput(settings: s, commit: Self.sha, version: "0.1.0", layout: layout, release: 1, cli: cf.cli)
+        let plan = try cf.deployPlan(input)
+        #expect(plan.cwdPath == upload.path)
+        #expect(throws: Never.self) { try cf.refuseProviderConfig(plan, releaseRoot: layout.root) }
+        func refusal(_ adapter: any HostingAdapter, _ p: DeployPlan) -> String? {
+            Self.message { try adapter.refuseProviderConfig(p, releaseRoot: layout.root) }
+        }
+        // In the folder, or any ancestor: refused, and the planted file is named.
+        for (dir, name) in [(upload, "wrangler.toml"), (layout.releaseDir(1), "wrangler.json"), (layout.root, "wrangler.jsonc"),
+                            (home, "wrangler.toml"), (upload, ".vercel"), (layout.root, ".git")] {
+            let planted = dir.appending(path: name)
+            if name.hasPrefix(".") { try FileManager.default.createDirectory(at: planted, withIntermediateDirectories: true) }
+            else { try "x".write(to: planted, atomically: true, encoding: .utf8) }
+            #expect(refusal(cf, plan) == "refusing to deploy: \(planted.path) would configure the provider CLI", "\(planted.path)")
+            try FileManager.default.removeItem(at: planted)
+        }
+        // A link counts too (nothing is followed).
+        let link = upload.appending(path: "wrangler.toml")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/nonexistent")
+        #expect(refusal(cf, plan) != nil)
+        try FileManager.default.removeItem(at: link)
+        // A `.git` above the release root is git's ceiling's job, not a refusal; Vercel ignores wrangler's files.
+        try FileManager.default.createDirectory(at: home.appending(path: ".git"), withIntermediateDirectories: true)
+        #expect(refusal(cf, plan) == nil)
+        let vplan = try v.deployPlan(DeployInput(settings: Self.settings(.vercel), commit: Self.sha, version: "0.1.0", layout: layout,
+                                                 release: 1, cli: v.cli))
+        try "x".write(to: upload.appending(path: "wrangler.toml"), atomically: true, encoding: .utf8)
+        #expect(refusal(v, vplan) == nil)
+        try FileManager.default.createDirectory(at: upload.appending(path: ".vercel"), withIntermediateDirectories: true)
+        #expect(refusal(v, vplan) != nil)
+        // A folder outside the release root (a workspace) is refused outright.
+        var outside = plan; outside.cwdPath = "/ws/acme/.brahma/releases/R-1/upload"
+        #expect(refusal(cf, outside) == "the deploy folder /ws/acme/.brahma/releases/R-1/upload is outside the engine's releases folder")
+        // And DeployInput refuses places outside its root.
+        var bad = input; bad.releaseDir = URL(fileURLWithPath: "/ws/acme/.brahma/releases/R-1")
+        #expect(Self.message { _ = try cf.deployPlan(bad) } == "deploys run under the engine's releases folder")
+        var sneaky = input; sneaky.releaseDir = layout.root.appending(path: "../other/R-1")
+        #expect(Self.message { _ = try cf.deployPlan(sneaky) } == "deploys run under the engine's releases folder")
+    }
+
     @Test func placeholderIsEngineWritten() throws {
-        let ws = try tempDir()
-        let layout = EngineLayout(workspace: ws)
+        let layout = try ReleaseLayout(paths: BrahmaPaths(home: try tempDir(), workspaces: try tempDir()), companyId: "C1")
         let dir = try Placeholder.write(to: layout, companyName: "Acme <Labs>")
         #expect(dir == layout.placeholderDir)
         let html = try String(contentsOf: layout.placeholderDir.appending(path: "index.html"), encoding: .utf8)
@@ -389,11 +461,10 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         try store.setHosting(companyId: c.id, by: .owner, provider: .vercel)
         #expect(try store.hostingReadiness(companyId: c.id, vault: vault, npmPresent: true)
                 == HostingReadiness(configured: true, tokenPresent: false, accountPresent: false, npmPresent: true))
-        // A recorded secret the vault no longer has is missing.
+        // Decided from the secret's metadata only: readiness never reads the vault (a display path).
         try store.setSecret(companyId: c.id, name: "VERCEL_TOKEN", value: "vercel-token-value-123456", isTest: false, vault: vault)
-        #expect(try store.hostingReadiness(companyId: c.id, vault: vault, npmPresent: true).tokenPresent)
-        try vault.delete(companyId: c.id, name: "VERCEL_TOKEN")
-        #expect(!(try store.hostingReadiness(companyId: c.id, vault: vault, npmPresent: true).tokenPresent))
+        #expect(try store.hostingReadiness(companyId: c.id, vault: RefusingVault(), npmPresent: true).tokenPresent)
+        #expect(try store.hostingReadiness(companyId: c.id, npmPresent: true).tokenPresent)
     }
 
     @Test func doctorNpmItemOnlyWithHosting() async throws {

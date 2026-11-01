@@ -17,6 +17,9 @@ public struct BrahmaPaths: Sendable, Equatable {
     /// (`GitWorkspace.checkoutPath`).
     public func checkoutDir(runId: String) -> URL { runDir.appending(path: "checkouts/\(runId)", directoryHint: .isDirectory) }
 
+    /// `<home>/run/releases`: every company's engine-only deploy folders (`ReleaseLayout`), outside every workspace.
+    public var releasesDir: URL { runDir.appending(path: "releases", directoryHint: .isDirectory) }
+
     /// `<home>/run/.sentinel`: the file whose readability tells the agent shell prefix the sandbox is not active (Task 1b).
     public var sentinel: URL { runDir.appending(path: ".sentinel") }
 
