@@ -283,9 +283,16 @@ public actor Orchestrator {
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
-    /// Child processes that are not turns: engine-run checks, merges and previews (running servers and starts in flight). They
-    /// count against the same safety cap as turns.
-    var otherChildren: Int { checkTasks.count + mergeTasks.count + previewRunner.activeChildren }
+    /// Child processes that are not turns: engine-run checks and merges. They count against the same caps as turns.
+    var otherChildren: Int { checkTasks.count + mergeTasks.count }
+
+    /// Previews' child processes (running servers and starts in flight): against the safety cap only, never the plan tier's
+    /// hard cap (`Scheduler.freeSlots(safetyOnly:)`, Task 3 fix I1).
+    var previewChildren: Int { previewRunner.activeChildren }
+
+    /// What keeps the Mac awake: turns, checks, merges and preview starts in flight; a preview server that is merely running
+    /// does not (Task 3 fix I1).
+    var awakeWork: Int { runningCount() + otherChildren + previewRunner.startsInFlight }
 
     nonisolated let backupTools: BackupTools
     nonisolated let walSleeper: WALShipper.Sleeper
@@ -408,7 +415,7 @@ public actor Orchestrator {
         cfg.ownerReserve = 1 - store.weeklyShare()
         let companies = try store.companies()
         // Turns, checks and merges in flight keep the Mac awake (and for a minute after the last one), if the owner allows it.
-        sleepGuard.update(running: runningCount() + otherChildren, enabled: (try? store.ownerPrefs().preventSleep) ?? false, now: now)
+        sleepGuard.update(running: awakeWork, enabled: (try? store.ownerPrefs().preventSleep) ?? false, now: now)
         let calibration = try store.usageCalibration()
         let reservedLE = store.openReservationLE()
 
@@ -551,14 +558,15 @@ public actor Orchestrator {
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
-                                        usage: { decisions[$0.id] ?? .open }, otherChildren: otherChildren, pressure: pressure,
+                                        usage: { decisions[$0.id] ?? .open }, otherChildren: otherChildren,
+                                        safetyOnly: previewChildren, pressure: pressure,
                                         held: held, paceClosed: paceClosed, paceStrict: paceStrict)
         for agent in selected { launch(agent, now: now) }
 
         // 6. Engine dispatch, after admission: only into the slots admission left over, and only for companies whose gate,
         //    pace and concurrency cap would let a new agent run. Leases are never reserved for agents admission would refuse.
         if !held {
-            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: otherChildren,
+            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
                                            pressure: pressure, held: held)
             var companyFree: [String: Int] = [:]
             for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id) {
