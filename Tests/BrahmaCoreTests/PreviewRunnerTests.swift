@@ -24,25 +24,30 @@ import Glibc
         let devops: Agent
         let f: GitFixture
         let sandbox: FakeSandbox
+        /// The Full-mode runner (PR-5): only a Full company's previews may reach it.
+        let unsandboxed: FakeSandbox
         let http: FakeHTTPProbe
         let listen: FakeListenProbe
         let deps: PreviewDependencies
         let memory = Flag()
         let runner: PreviewRunner
 
-        static let fast = PreviewTimeouts(ready: .seconds(20), poll: .milliseconds(50))
+        /// The fakes answer at once, so the ready budget is only a hang bound: nothing here races the clock (X1).
+        static let fast = PreviewTimeouts(ready: .seconds(600), poll: .milliseconds(50))
 
-        init(build: String? = nil, run: String = "sleep 300", http: FakeHTTPProbe = FakeHTTPProbe([FakeHTTPProbe.ok()])) throws {
+        init(build: String? = nil, run: String = "sleep 300", http: FakeHTTPProbe = FakeHTTPProbe([FakeHTTPProbe.ok()]),
+             profile: PermissionProfile = .workspace, config: SchedulerConfig = World.config()) throws {
             let root = try tempDir()
             let data = root.appending(path: "data", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
             let store = try Store(path: data.appending(path: "brahma.sqlite").path)
             sandbox = FakeSandbox()
+            unsandboxed = FakeSandbox()
             self.http = http
             listen = FakeListenProbe()
-            deps = PreviewDependencies.fake(sandbox: sandbox, http: http, listen: listen)
-            w = try World(store: store, previewDeps: deps)
-            company = try w.company("Acme")
+            deps = PreviewDependencies.fake(sandbox: sandbox, http: http, listen: listen, unsandboxed: unsandboxed)
+            w = try World(store: store, config: config, previewDeps: deps)
+            company = try w.company("Acme", profile: profile)
             devops = try w.hire(company, "devops")
             f = GitFixture(existing: URL(fileURLWithPath: company.workspacePath, isDirectory: true))
             let (memory, paths) = (self.memory, w.paths)
@@ -102,11 +107,20 @@ import Glibc
         }
 
         func stop() async { await runner.stopAll() }
+
+        /// Another runner on the same store, as a new engine would have: its own process table and fake sandbox.
+        func freshRunner(sandbox: FakeSandbox = FakeSandbox(), memory: @escaping @Sendable () -> Bool = { false }) -> (PreviewRunner, FakeSandbox) {
+            let paths = w.paths
+            let runner = PreviewRunner(store: store, paths: paths, deps: .fake(sandbox: sandbox, http: http, listen: listen),
+                                       sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
+                                       timeouts: Fx.fast, memory: memory, clock: w.clock.function)
+            return (runner, sandbox)
+        }
     }
 
     static func alive(_ pid: Int32?) -> Bool { pid.map { kill(-$0, 0) == 0 } ?? false }
 
-    static func waitUntil(_ timeout: Duration = .seconds(15), _ condition: () throws -> Bool) async rethrows -> Bool {
+    static func waitUntil(_ timeout: Duration = .seconds(60), _ condition: () throws -> Bool) async rethrows -> Bool {
         let deadline = AwakeTime.deadline(after: timeout)
         while AwakeTime.now < deadline {
             if try condition() { return true }
@@ -136,6 +150,7 @@ import Glibc
         #expect(spawn.environment["PORT"] == String(port) && spawn.environment["HOST"] == "127.0.0.1")
         #expect(spawn.policy.writable == [spawn.cwd.resolvedForSandbox] && spawn.policy.network == .loopbackListen(allow: spawn.policy.allowedDomains ?? [], ports: [UInt16(port)]))
         #expect(try x.activity().contains("Preview web running at http://127.0.0.1:\(port)/"))
+        #expect(x.unsandboxed.calls.isEmpty, "a Workspace company's preview is sandboxed")
         await x.stop()
     }
 
@@ -205,12 +220,15 @@ import Glibc
         await x.stop()
     }
 
+    /// Each server runs until the test lets it exit (a `stop` file in its run dir), so no start races the clock (X1).
     @Test func crashLoopStops() async throws {
-        let x = try Fx(run: "sleep 1")
+        let x = try Fx(run: "while [ ! -e stop ]; do sleep 0.05; done; exit 1")
         for round in 1...3 {
             await x.pass()
             #expect(x.spawns.count == round)
+            #expect(try x.state().status == .running)
             let pid = try x.state().pid
+            try "".write(to: try #require(x.spawns.last?.cwd).appending(path: "stop"), atomically: true, encoding: .utf8)
             #expect(await Self.waitUntil { !Self.alive(pid) })
             try? await AwakeTime.sleep(for: .milliseconds(100))
             await x.pass()                            // the exit is noticed
@@ -343,15 +361,124 @@ import Glibc
         await fresh.stopAll()
     }
 
+    /// Fix I1 (controller ruling): previews count against the safety cap only, never the plan tier's hard cap, and a running
+    /// server alone does not keep the Mac awake.
     @Test func previewsCountInSafetyCap() async throws {
-        let x = try Fx()
-        #expect(await x.w.orchestrator.otherChildren == 0)
+        var cfg = World.config(hardCap: 1)
+        cfg.safetyCap = 64
+        let x = try Fx(config: cfg)
+        let o = x.w.orchestrator
+        #expect(await o.previewChildren == 0)
         try await x.w.cycle()
-        await x.w.orchestrator.previewRunner.waitForStarts()
+        await o.previewRunner.waitForStarts()
         #expect(try x.state().status == .running)
-        #expect(await x.w.orchestrator.otherChildren == 1, "1 running preview is 1 non-claude child")
-        await x.w.orchestrator.previewRunner.stopAll()
-        #expect(await x.w.orchestrator.otherChildren == 0)
+        #expect(await o.previewChildren == 1, "1 running preview is 1 non-claude child for the safety cap")
+        #expect(await o.otherChildren == 0, "and none for the hard cap")
+        #expect(await o.awakeWork == 0, "a running preview alone does not hold the sleep guard")
+        // With the hard cap at 1 and the preview running, a turn still gets the slot.
+        try x.w.dm(x.company, x.devops)
+        try await x.w.cycle()
+        #expect(try x.w.turns(x.devops).count == 1)
+        await o.previewRunner.stopAll()
+        #expect(await o.previewChildren == 0)
+        // The safety cap still sees it: with a safety cap of 1, the running preview leaves no slot for a turn.
+        #expect(Scheduler.freeSlots(config: cfg, running: 0, otherChildren: 0, safetyOnly: 1) == 1)
+        var tight = cfg
+        tight.safetyCap = 1
+        #expect(Scheduler.freeSlots(config: tight, running: 0, otherChildren: 0, safetyOnly: 1) == 0)
+        #expect(Scheduler.freeSlots(config: tight, running: 0, otherChildren: 0, safetyOnly: 0) == 1)
+    }
+
+    @Test func safetyCapPreviewBlocksTurns() async throws {
+        var cfg = World.config(hardCap: 4)
+        cfg.safetyCap = 1
+        let x = try Fx(config: cfg)
+        let o = x.w.orchestrator
+        try await x.w.cycle()
+        await o.previewRunner.waitForStarts()
+        #expect(try x.state().status == .running)
+        try x.w.dm(x.company, x.devops)
+        try await x.w.cycle()
+        #expect(try x.w.turns(x.devops).isEmpty, "the preview fills the safety cap of 1")
+        await o.previewRunner.stopAll()
+    }
+
+    /// Fix I2: the Full-mode route mirrors the checks' (`Orchestrator.checkRoute`).
+    @Test func routingFollowsChecks() throws {
+        let x = try Fx()
+        let byAgent = try x.surface("web")
+        var byOwner = byAgent; byOwner.setById = "owner"
+        var c = x.company
+        c.permissionProfile = .workspace
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent))
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner))
+        c.permissionProfile = .sandboxed
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent))
+        c.permissionProfile = .full
+        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent), "Full company, Full role")
+        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner), "an owner-set surface follows the company")
+        c.roleProfiles = [x.devops.role: .workspace]
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent), "Full company, non-Full setter role")
+        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner))
+    }
+
+    @Test func fullCompanyPreviewRunsUnsandboxed() async throws {
+        let x = try Fx(profile: .full)
+        await x.pass()
+        #expect(try x.state().status == .running)
+        #expect(x.sandbox.calls.isEmpty)
+        #expect(x.unsandboxed.calls.map(\.kind) == [.spawn])
+        await x.stop()
+    }
+
+    /// Fix I3 (a): an earlier engine's live group (its runner gone without a stop) is killed by the next runner's first pass,
+    /// and the surface restarts.
+    @Test func engineStartKillsOrphanGroup() async throws {
+        let x = try Fx()
+        await x.pass()
+        var record = try x.state()
+        let orphan = try #require(record.pid)
+        #expect(Self.alive(orphan))
+        // The record's times bracket the real process start whatever the load (the test clock is not wall time).
+        record.startedAt = Date().addingTimeInterval(-3600)
+        record.updatedAt = Date().addingTimeInterval(3600)
+        try x.store.savePreviewState(record)
+        let (fresh, sandbox) = x.freshRunner()
+        await fresh.reconcile(now: x.now)
+        await fresh.waitForStarts()
+        #expect(await Self.waitUntil { !Self.alive(orphan) }, "the orphan group is killed")
+        let s = try x.state()
+        #expect(s.status == .running && s.pid != orphan && sandbox.spawnedPids.count == 1, "\(s)")
+        await fresh.stopAll()
+        await x.stop()
+    }
+
+    /// Fix I3 (b): a recorded pid that is not its group's leader, or whose start is outside the record, is never signalled;
+    /// the record still becomes `stopped`.
+    @Test func engineStartSparesForeignProcesses() async throws {
+        let x = try Fx(run: "sleep 300 & echo $! > child.pid; wait")
+        await x.pass()
+        let leader = try #require(try x.state().pid)
+        let cwd = try #require(x.spawns.last?.cwd)
+        #expect(await Self.waitUntil { ((try? String(contentsOf: cwd.appending(path: "child.pid"), encoding: .utf8)) ?? "").hasSuffix("\n") })
+        let child = try #require(Int32(try String(contentsOf: cwd.appending(path: "child.pid"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        let wide = (Date().addingTimeInterval(-3600), Date().addingTimeInterval(3600))
+        for (pid, startedAt) in [(child, wide.0), (leader, Date().addingTimeInterval(1800))] {
+            var record = try x.state()
+            record.status = .running; record.pid = pid; record.startedAt = startedAt; record.updatedAt = wide.1
+            try x.store.savePreviewState(record)
+            let (fresh, sandbox) = x.freshRunner(memory: { true })   // under pressure: recovered, not restarted
+            await fresh.reconcile(now: x.now)
+            await fresh.waitForStarts()
+            try? await AwakeTime.sleep(for: .milliseconds(300))
+            #expect(kill(child, 0) == 0 && Self.alive(leader), "pid \(pid) was not signalled")
+            let s = try x.state()
+            #expect(s.status == .stopped && s.pid == nil, "\(s)")
+            #expect(sandbox.calls.isEmpty)
+        }
+        await x.stop()
+        #expect(await Self.waitUntil { !Self.alive(leader) })
     }
 
     @Test func stopAllOnShutdown() async throws {
