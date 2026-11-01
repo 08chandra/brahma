@@ -1,0 +1,8 @@
+Vercel CLI 65.9.0
+Retrieving project…
+Deploying acme-team/acme
+Uploading [====================] (3.1KB/3.1KB)
+Inspect: https://vercel.com/acme-team/acme/9xYzAbCdEfGh [2s]
+Production: https://acme-k3j4h5g6f-acme-team.vercel.app [12s]
+Aliased: https://acme.vercel.app [12s]
+https://acme-k3j4h5g6f-acme-team.vercel.app
