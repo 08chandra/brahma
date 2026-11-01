@@ -17,7 +17,7 @@ import Foundation
     static let gitCommandFiles: Set<String> = ["Sources/BrahmaCore/Git/GitWorkspace.swift"]
     static let blockingOnlyHelpers = ["prepareReview", "prepareAudit", "escalate", "touchesScope", "finishPlanTurn"]
     /// What runs git when called (GitWorkspace methods, the store's git steps, Plan L's `EngineExport` and the helpers above).
-    static let gitCalls = #"\bEngineExport\.(export|remove)\b|\.(ensureRepo|addWorktree|removeWorktree|itemWorktrees|deleteBranch|addRunWorktree|removeRunWorktrees?|addEngineExport|commitAll|headCommit|resetHard|planBarrier|enforcePlanBarrier|isDirty|head\(of|mergeBase|isAncestor|nameStatus|blobs|diff\(base|changeStats|log\(base|commitsBehind|mergeConflicts|fileDiff|checkedOutRef|mainIsSymbolic|landVerified|quarantineRoot|mergeQuarantine|prepareRepo|checkMain|ensureCheckSnapshot|performMerge\(item|finishMerge|recoverMerges\(\)|assessAutoMerge|acceptMainCommit|installedGitVersion|installedGitMerges|hooksPath|setHooksPath)\b|\bCompanyHooks\.install\(|\bTurnContext\.load\(|\b(prepareReview|prepareAudit|finishPlanTurn|touchesScope)\(|\bescalate\(itemId:"#
+    static let gitCalls = #"\bEngineExport\.(export|remove)\b|\.(ensureRepo|addWorktree|removeWorktree|itemWorktrees|deleteBranch|addRunWorktree|removeRunWorktrees?|addEngineExport|commitAll|headCommit|resetHard|planBarrier|enforcePlanBarrier|isDirty|head\(of|mergeBase|isAncestor|nameStatus|blobs|treeHasDirectory|diff\(base|changeStats|log\(base|commitsBehind|mergeConflicts|fileDiff|checkedOutRef|mainIsSymbolic|landVerified|quarantineRoot|mergeQuarantine|prepareRepo|checkMain|ensureCheckSnapshot|performMerge\(item|finishMerge|recoverMerges\(\)|assessAutoMerge|acceptMainCommit|installedGitVersion|installedGitMerges|hooksPath|setHooksPath)\b|\bCompanyHooks\.install\(|\bTurnContext\.load\(|\b(prepareReview|prepareAudit|finishPlanTurn|touchesScope)\(|\bescalate\(itemId:"#
 
     static func sources(under dir: String) throws -> [(path: String, text: String)] {
         let base = packageRoot.appending(path: dir)
@@ -92,6 +92,21 @@ import Foundation
         let calls = regex.matches(in: code, range: NSRange(location: 0, length: chars.count)).map(\.range.location)
         #expect(calls.count == 2)
         #expect(calls.filter { at in !blocking.contains { $0.contains(at) } }.count == 1, "the export outside blocking.run")
+    }
+
+    /// Plan L's Pages `functions/` decision reads the commit's tree with git (`GitWorkspace.treeHasDirectory`, PR-24): the scan
+    /// counts it, so an engine call outside a blocking body is reported statically, not only at run time.
+    @Test func treeHasDirectoryCountsAsAGitCall() throws {
+        let regex = try NSRegularExpression(pattern: Self.gitCalls)
+        func hits(_ code: String) -> Bool { regex.firstMatch(in: code, range: NSRange(location: 0, length: code.utf16.count)) != nil }
+        #expect(hits("let functions = try git.treeHasDirectory(at: commit, path: \"functions\")"))
+        #expect(!hits("let functions = input.functionsInCommit"))
+        let code = Self.code("func render() {\n    _ = try? git.treeHasDirectory(at: c, path: \"functions\")\n    blocking.run { try? git.treeHasDirectory(at: c, path: \"functions\") }\n}")
+        let chars = Array(code.utf16)
+        let blocking = Self.closureRanges(in: code, opener: #"blocking\.(try)?[rR]un\s*(\(\s*)?\{"#, chars: chars)
+        let calls = regex.matches(in: code, range: NSRange(location: 0, length: chars.count)).map(\.range.location)
+        #expect(calls.count == 2)
+        #expect(calls.filter { at in !blocking.contains { $0.contains(at) } }.count == 1, "the tree read outside blocking.run")
     }
 
     /// The extent of each closure opened by `opener` (brace matched from its `{`).
