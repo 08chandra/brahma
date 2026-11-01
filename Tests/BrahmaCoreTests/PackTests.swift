@@ -9,7 +9,14 @@ import Foundation
 
     @Test func builtinSoftwarePackIsValid() throws {
         let p = try #require(PackCatalog.builtin.pack("software")); try p.validate()
-        #expect(p.version == 1); #expect(p.roles.count == 13)
+        #expect(p.version == 2); #expect(p.roles.count == 13)
+        // Plan L: the ops tools on devops, architect and every executive (including the merged roles).
+        for id in ["devops", "architect", "ceo", "cpo", "cto", "ceo-cpo", "cto-architect"] {
+            #expect(Set(p.role(id)!.companyTools).isSuperset(of: CompanyToolNames.ops), "\(id)")
+        }
+        for id in ["director", "manager", "engineer", "designer", "qa", "security"] {
+            #expect(Set(p.role(id)!.companyTools).isDisjoint(with: CompanyToolNames.ops), "\(id)")
+        }
         #expect(p.roles.allSatisfy { !$0.prompt.isEmpty && $0.prompt.count <= 5000 && $0.prompt.contains($0.title) })
         #expect(p.roles.allSatisfy { $0.prompt.hasSuffix("STATUS: DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT") })
         #expect(p.roles.allSatisfy { $0.playbooks.values.allSatisfy { $0.count <= 2500 } })
@@ -30,17 +37,17 @@ import Foundation
     }
 
     @Test func filePackWithHigherVersionOverrides() throws {
-        let dir = try tempDir(); var p = software; p.version = 2; p.title = "Software v2"
+        let dir = try tempDir(); var p = software; p.version = software.version + 1; p.title = "Software v2"
         try encoded(p).write(to: dir.appending(path: "software.json"))
         var lower = software; lower.version = 0; lower.id = "other"; lower.title = "Other"
         try encoded(lower).write(to: dir.appending(path: "other.json"))
         var same = software; same.id = "other"; same.version = 0; same.title = "Ignored"
         try encoded(same).write(to: dir.appending(path: "z.json"))
         let c = try PackCatalog.load(directory: dir)
-        #expect(c.pack("software")?.title == "Software v2"); #expect(c.pack("software")?.version == 2)
+        #expect(c.pack("software")?.title == "Software v2"); #expect(c.pack("software")?.version == software.version + 1)
         #expect(c.pack("other")?.title == "Other")
         // A lower or equal version never replaces the built-in.
-        var old = software; old.version = 1; old.title = "Same version"
+        var old = software; old.title = "Same version"
         let dir2 = try tempDir(); try encoded(old).write(to: dir2.appending(path: "s.json"))
         #expect(try PackCatalog.load(directory: dir2).pack("software")?.title == software.title)
     }
@@ -122,7 +129,7 @@ import Foundation
         #expect(!FileManager.default.fileExists(atPath: file.path))
         let first = try RoleCards.load(paths: paths, agent: agent, company: company, template: t)
         #expect(FileManager.default.fileExists(atPath: file.path))
-        #expect(first.hasPrefix("---\n")); #expect(first.contains("pack: software@1")); #expect(first.contains("id: engineer"))
+        #expect(first.hasPrefix("---\n")); #expect(first.contains("pack: software@\(PackCatalog.builtin.pack("software")!.version)")); #expect(first.contains("id: engineer"))
         #expect(first.contains(t.prompt)); #expect(!first.contains("playbook"))
         try "OWNER EDIT".write(to: file, atomically: true, encoding: .utf8)
         #expect(try RoleCards.load(paths: paths, agent: agent, company: company, template: t) == "OWNER EDIT")
