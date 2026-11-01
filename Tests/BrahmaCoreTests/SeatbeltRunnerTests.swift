@@ -278,6 +278,148 @@ struct SeatbeltRunnerTests {
         }
     }
 
+    /// Fix round 8 nit: the data-home carve-out at run time. A check's own checkout inside the data home clones files and
+    /// directories inside itself, and a readable workspace inside the data home (BRAHMA_WORKSPACES under BRAHMA_HOME) still
+    /// clones its files (the round-8 minor); a sibling run's checkout, the database and any directory outside the checkout
+    /// do not clone.
+    @Test func dataHomeCarveOutClonesOnlyTheRunsOwnEntries() async throws {
+        let home = try tempDir().resolvedForSandbox.appending(path: "home")   // a custom BRAHMA_HOME outside the user's home
+        let fm = FileManager.default
+        let ck = try Self.mkdir(home.appending(path: "run/checkouts/r1"))
+        try Self.file(ck.appending(path: "a"), "own-text")
+        try Self.file(ck.appending(path: "in/x/f"), "own-inner")
+        try Self.file(ck.appending(path: "clone.pl"), Self.clonePerl)
+        try Self.file(home.appending(path: "run/checkouts/r2/f"), "other-run")
+        try Self.file(home.appending(path: "brahma.sqlite"), "the-database")
+        let ws = home.appending(path: "workspaces/acme")
+        try Self.file(ws.appending(path: "f"), "workspace-text")
+        let r = Self.runner(Self.baseline(engineHomes: [home]))
+        let p = Self.policy(writable: [ck], readable: [ws])
+        let pairs = ["\(ck.path)/a=b", "\(ck.path)/in=in2", "\(ws.path)/f=c-ws", "\(home.path)/run/checkouts/r2/f=c-sib",
+                     "\(home.path)/run/checkouts/r2=c-sibdir", "\(home.path)/brahma.sqlite=c-db", "\(ws.path)=c-wsdir"]
+        let (outcome, text) = try await Self.run("/usr/bin/perl clone.pl " + pairs.map { "'\($0)'" }.joined(separator: " "), p, runner: r)
+        #expect(outcome.exitCode == 0, "\(text)")
+        for allowed in ["\(ck.path)/a", "\(ck.path)/in", "\(ws.path)/f"] { #expect(text.contains("\(allowed): ok\n"), "\(allowed): \(text)") }
+        for refused in ["\(home.path)/run/checkouts/r2/f", "\(home.path)/run/checkouts/r2", "\(home.path)/brahma.sqlite", ws.path] {
+            #expect(text.contains("\(refused): errno 1\n"), "\(refused) was cloned: \(text)")
+        }
+        #expect((try? String(contentsOf: ck.appending(path: "in2/x/f"), encoding: .utf8)) == "own-inner")
+        #expect((try? String(contentsOf: ck.appending(path: "c-ws"), encoding: .utf8)) == "workspace-text")
+        for name in ["c-sib", "c-sibdir", "c-db", "c-wsdir"] { #expect(!fm.fileExists(atPath: ck.appending(path: name).path), "\(name)") }
+    }
+
+    /// Detaches (forced) every disk image whose file lies under `dir`, from outside the sandbox.
+    static func detachImages(under dir: URL) {
+        guard let info = try? Self.outside("/usr/bin/hdiutil", ["info"]).output else { return }
+        for block in info.components(separatedBy: "================================================") where block.contains(dir.path) {
+            if let range = block.range(of: #"/dev/disk[0-9]+"#, options: .regularExpression) {
+                _ = try? Self.outside("/usr/bin/hdiutil", ["detach", "-force", String(block[range])])
+            }
+        }
+    }
+
+    /// Whether a disk image under `dir` is attached, or anything is mounted on one of `points` (from outside the sandbox).
+    static func imageState(under dir: URL, points: [URL]) throws -> (attached: Bool, mounted: [String]) {
+        let info = try Self.outside("/usr/bin/hdiutil", ["info"]).output
+        let mounts = try Self.outside("/sbin/mount", []).output.split(separator: "\n").map(String.init)
+        return (info.contains(dir.path), mounts.filter { line in points.contains { line.contains(" on \($0.path) (") } })
+    }
+
+    /// Fix round 8 (Critical): DiskArbitration mounts as root outside the sandbox, so `file-mount` alone did not stop
+    /// `hdiutil makehybrid` → `attach -nomount` → `diskutil mount -mountPoint <dir>` from laying an agent-built filesystem over
+    /// a data-home directory the profile denies. With its lookup denied: the sandboxed chain attaches nothing; a device the
+    /// test attaches from outside cannot be mounted from inside over the denied directory or a readable one; a plain
+    /// `hdiutil attach` (auto-mount at /Volumes) attaches nothing. The directories are unchanged.
+    @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/hdiutil"), "no hdiutil"))
+    func diskArbitrationMountsAreRefused() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        defer { Self.detachImages(under: h) }
+        let fm = FileManager.default
+        let w = try Self.mkdir(h.appending(path: "w"))
+        try Self.file(w.appending(path: "src/planted.txt"), "AGENT-PLANTED")
+        let home = h.appending(path: "datahome")
+        let db = home.appending(path: "db")
+        try Self.file(db.appending(path: "orig"), "engine-private")
+        let pub = h.appending(path: "r/pub")
+        try Self.file(pub.appending(path: "p"), "public-text")
+        let r = Self.runner(Self.baseline(engineHomes: [home]))
+        let p = Self.policy(writable: [w], readable: [h.appending(path: "r")])
+        let image = w.appending(path: "x.iso.dmg")
+        func unchanged() throws {
+            #expect(Set(try fm.contentsOfDirectory(atPath: db.path)) == ["orig"])
+            #expect(Set(try fm.contentsOfDirectory(atPath: pub.path)) == ["p"])
+        }
+
+        // The reviewer's chain, all inside the sandbox.
+        let chain = """
+        /usr/bin/hdiutil makehybrid -quiet -hfs -o x.iso src || exit 10
+        dev=$(/usr/bin/hdiutil attach -nomount x.iso.dmg | /usr/bin/awk '/Apple_HFS/ { print $1 }')
+        if [ -z "$dev" ]; then echo NO-DEVICE; exit 3; fi
+        /usr/sbin/diskutil mount -mountPoint '\(db.path)' "$dev"
+        """
+        let (a, aText) = try await Self.run(chain, p, runner: r, timeout: .seconds(120))
+        #expect(fm.fileExists(atPath: image.path), "makehybrid did not run: \(aText)")
+        #expect(a.exitCode != 0, "\(aText)"); #expect(aText.contains("NO-DEVICE"), "the sandboxed attach made a device: \(aText)")
+        var state = try Self.imageState(under: h, points: [db, pub])
+        #expect(!state.attached, "the sandboxed attach attached the image: \(aText)"); #expect(state.mounted.isEmpty, "\(state.mounted)")
+        try unchanged()
+
+        // A real device (attached from outside): the sandboxed mount step alone, over the denied and the readable directory.
+        let attached = try Self.outside("/usr/bin/hdiutil", ["attach", "-nomount", image.path])
+        let device = try #require(attached.output.split(separator: "\n").first { $0.contains("Apple_HFS") }?
+            .split(separator: " ", omittingEmptySubsequences: true).first.map(String.init), "\(attached.output)")
+        for point in [db, pub] {
+            let (m, mText) = try await Self.run("/usr/sbin/diskutil mount -mountPoint '\(point.path)' \(device)", p, runner: r, timeout: .seconds(60))
+            #expect(m.exitCode != 0, "mounted over \(point.path): \(mText)")
+        }
+        state = try Self.imageState(under: h, points: [db, pub])
+        #expect(state.mounted.isEmpty, "\(state.mounted)")
+        try unchanged()
+        Self.detachImages(under: h)
+
+        // A plain attach, which would auto-mount at /Volumes.
+        let (c, cText) = try await Self.run("/usr/bin/hdiutil attach x.iso.dmg", p, runner: r, timeout: .seconds(60))
+        state = try Self.imageState(under: h, points: [URL(fileURLWithPath: "/Volumes/src")])
+        // `hdiutil` lists each device it attached (and where it mounted); with DiskArbitration denied it lists none.
+        #expect(!cText.contains("/dev/disk") && !state.attached && state.mounted.isEmpty,
+                "a plain attach attached the image (exit \(String(describing: c.exitCode))): \(cText) \(state.mounted)")
+    }
+
+    /// Fix round 8: the everyday copies and git still work with DiskArbitration denied: from a readable entry `cp -c`,
+    /// `cp -cR`, `ditto` and `ditto --clone`; and git (init, commit, clone of a readable repository, worktree) in the
+    /// writable entry.
+    @Test(.enabled(if: Toolchain.xcodeAvailable))
+    func copiesAndGitStillWorkWithDiskArbitrationDenied() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let r = h.appending(path: "r")
+        try Self.file(r.appending(path: "pub/p"), "public-text")
+        try Self.file(r.appending(path: "pub/sub/q"), "nested-text")
+        let repo = r.appending(path: "repo")
+        try Self.file(repo.appending(path: "a.txt"), "repo-text")
+        let git = Toolchain.developerDir + "/usr/bin/git"
+        for args in [["init", "-q", "--initial-branch=main"], ["add", "a.txt"],
+                     ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "one"]] {
+            let out = try Self.outside(git, ["-C", repo.path] + args)
+            #expect(out.status == 0, "\(out.output)")
+        }
+        var env = Self.env
+        env["DEVELOPER_DIR"] = Toolchain.developerDir
+        let command = """
+        set -e
+        cp -c '\(r.path)/pub/p' a; cp -cR '\(r.path)/pub' b; ditto '\(r.path)/pub' c; ditto --clone '\(r.path)/pub' d
+        cat a b/sub/q c/p d/sub/q
+        G='\(git)'
+        "$G" clone -q '\(repo.path)' cl
+        cd cl; echo more > b.txt; "$G" add b.txt; "$G" -c user.name=t -c user.email=t@t commit -q -m two
+        "$G" worktree add -q ../wt2 -b side; "$G" log --oneline | wc -l
+        """
+        let (outcome, text) = try await Self.run(command, Self.policy(writable: [w], readable: [r], toolchain: true), env: env)
+        #expect(outcome.exitCode == 0, "\(text)")
+        #expect(text.contains("public-textnested-textpublic-textnested-text"), "\(text)")
+        #expect(FileManager.default.fileExists(atPath: w.appending(path: "wt2/a.txt").path), "\(text)")
+    }
+
     // MARK: Escapes
 
     @Test func launchctlSubmitDenied() async throws {
@@ -758,7 +900,7 @@ struct SeatbeltRunnerTests {
                      "(deny file-clone (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\") (subpath \"/w\")",
                      "(deny file-clone (require-all (vnode-type DIRECTORY) (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\")))))",
                      "(deny file-clone (subpath \"/Users/o/.ssh\") (subpath \"/other-co\"))",
-                     "(deny file-clone (require-all (require-any (subpath \"/srv/brahma home\")) (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\")))))",
+                     "(deny file-clone (require-all (require-any (subpath \"/srv/brahma home\")) (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\") (subpath \"/w\")))))",
                      "(deny file-mount file-unmount file-mount-update)",
                      "(deny signal (target others))", "(deny process-info* (target others))",
                      "(deny mach-lookup (global-name \"com.apple.SecurityServer\")",
@@ -785,6 +927,7 @@ struct SeatbeltRunnerTests {
         #expect(!text.contains("C/clang"), "the default module cache is not readable (fix round 3)")
         #expect(!text.contains("Library/Caches/org.swift.swiftpm"), "the owner's SwiftPM cache is not readable (fix round 3)")
         #expect(text.contains("(global-name \"com.apple.FSEvents\")"))
+        #expect(text.contains("(global-name \"com.apple.DiskArbitration.diskarbitrationd\")"), "DiskArbitration mounts outside the sandbox (round 8)")
         #expect(!text.contains("(subpath \"/private/var/folders/x+y/C\")"), "C is read narrowly, not wholesale")
         // C is never written (compiler caches are per-run): no C write subpaths or org.llvm.clang write regex.
         #expect(!text.contains("C/org.llvm.clang")); #expect(!text.contains("C/org.swift.swiftpm"))

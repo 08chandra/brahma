@@ -14,10 +14,11 @@ import Foundation
 /// (deny file-clone (require-not (require-any (subpath "<each writable>") <each readable + toolchain read>)))  ; fix round 6
 /// (deny file-clone (require-all (vnode-type DIRECTORY) (require-not (require-any (subpath "<each writable>")))))  ; round 7
 /// (deny file-clone (subpath "<each protected>") (subpath "<each other company workspace>"))                      ; round 7
-/// (deny file-clone (require-all (subpath "<each engine home>") (require-not (require-any (subpath "<each writable>")))))
+/// (deny file-clone (require-all (subpath "<each engine home>") (require-not (require-any (subpath "<each writable + readable>")))))
 /// (deny file-mount file-unmount file-mount-update)                                                               ; round 7
 /// (deny signal (target others))
-/// (deny mach-lookup … the brief's names … (global-name "com.apple.cfprefsd.agent") (global-name "com.apple.cfprefsd.daemon"))
+/// (deny mach-lookup … the brief's names … (global-name "com.apple.cfprefsd.agent") (global-name "com.apple.cfprefsd.daemon")
+///     … (global-name "com.apple.DiskArbitration.diskarbitrationd"))                                               ; round 8
 /// (deny process-exec …)
 /// (allow mach-lookup (global-name "com.apple.windowserver.active") …)          ; toolchain only
 /// (deny network*)
@@ -46,6 +47,11 @@ public enum SeatbeltProfile {
         (false, "com.apple.cfprefsd.agent"), (false, "com.apple.cfprefsd.daemon"),
         // FSEvents could announce other processes' NSIRD_* staging names as they are created (fix round 3).
         (false, "com.apple.FSEvents"),
+        // DiskArbitration mounts as root outside the sandbox for any client that can look it up: `hdiutil makehybrid` →
+        // `attach -nomount` → `diskutil mount -mountPoint <dir>` laid an agent-built filesystem read-write over a data-home
+        // directory the profile denies (fix round 8, probed), and a plain `hdiutil attach` auto-mounted at /Volumes. With the
+        // lookup denied neither attaches or mounts anything; `file-mount` below stops a direct `mount_*`.
+        (false, "com.apple.DiskArbitration.diskarbitrationd"),
     ]
 
     static let deniedExecutables = ["/usr/bin/osascript", "/usr/bin/open", "/bin/launchctl", "/usr/bin/security", "/usr/bin/sudo",
@@ -141,15 +147,22 @@ public enum SeatbeltProfile {
         // `fs::copy`); `fclonefileat` on a directory descriptor is caught by the same rule (probed).
         let writableAny = "(require-any " + writable.map(subpath).joined(separator: " ") + ")"
         lines.append("(deny file-clone (require-all (vnode-type DIRECTORY) (require-not \(writableAny))))")
+        // The data home's own entries in the policy keep their clone rights (fix round 8): a check's checkout inside it (it
+        // clones inside itself), and a readable entry inside it (BRAHMA_WORKSPACES under BRAHMA_HOME), whose files the
+        // command can read anyway. `validate` keeps every entry from containing the data home, so nothing else of it is
+        // inside them; directory clones from a readable entry stay denied by the rule above, and protected paths and other
+        // workspaces by the one below.
+        let ownAny = "(require-any " + unique(writable + readable).map(subpath).joined(separator: " ") + ")"
         if !protected.isEmpty { lines.append("(deny file-clone " + protected.map(subpath).joined(separator: " ") + ")") }
         let engineHomes = unique(baseline.engineHomes.map(r))
         if !engineHomes.isEmpty {
             // A check's own checkout under the data home stays clonable inside itself.
-            lines.append("(deny file-clone (require-all (require-any " + engineHomes.map(subpath).joined(separator: " ") + ") (require-not \(writableAny))))")
+            lines.append("(deny file-clone (require-all (require-any " + engineHomes.map(subpath).joined(separator: " ") + ") (require-not \(ownAny))))")
         }
         // Mounts (fix round 7 audit, probed): `hdiutil attach -mountpoint <readable dir>` from inside the sandbox had
         // DiskArbitration (outside it) mount an agent-made image over a directory the command may only read, replacing what
-        // the engine and the owner see there after the run. Seatbelt's `file-mount` check stops every explicit mount point.
+        // the engine and the owner see there after the run. Seatbelt's `file-mount` check stops a `mount(2)` made inside the
+        // sandbox only; DiskArbitration mounts from outside it, so its lookup is denied too (`deniedServices`, round 8).
         lines.append("(deny file-mount file-unmount file-mount-update)")
         lines.append("(deny signal (target others))")
         // A sandboxed check may not inspect other processes (open files, pid info): this stops `lsof -p <owner pid>` and the
