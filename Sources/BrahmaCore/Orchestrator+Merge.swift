@@ -11,7 +11,7 @@ extension Orchestrator {
         guard !held, pressure != .critical else { return }
         mergeBackoff = mergeBackoff.filter { $0.value > now }
         for company in companies where company.status == .running && mergeTasks[company.id] == nil && mergeBackoff[company.id] == nil {
-            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren,
+            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
                                             pressure: pressure, held: held)
             guard slots > 0 else { return }
             guard let item = try? store.nextPendingMerge(companyId: company.id) else { continue }

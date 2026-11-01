@@ -27,7 +27,7 @@ extension Orchestrator {
         guard !held, pressure != .critical else { return }
         for _ in 0..<5 {
             let room = config.maxConcurrentChecks - checkTasks.count
-            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren,
+            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
                                             pressure: pressure, held: held)
             let want = min(room, slots)
             guard want > 0, let runs = try? store.queuedVerifications(limit: want), !runs.isEmpty else { return }
