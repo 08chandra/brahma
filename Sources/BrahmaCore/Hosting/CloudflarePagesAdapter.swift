@@ -25,10 +25,15 @@ public struct CloudflarePagesAdapter: HostingAdapter {
         guard s.accountId != nil else { throw WorkError.invalid(Self.accountMessage) }
     }
 
-    /// The fixed environment: the account, no metrics, CI (non-interactive). The token is added by the executor as
-    /// `CLOUDFLARE_API_TOKEN`, from the vault, and never appears here or in argv.
-    func env(_ s: HostingSettings) -> [String: String] {
-        ["CLOUDFLARE_ACCOUNT_ID": s.accountId ?? "", "WRANGLER_SEND_METRICS": "false", "CI": "1"]
+    /// wrangler's config files, refused in or above a deploy folder (`ProviderConfigCheck`, I3).
+    public var providerConfigNames: [String] { ProviderConfigCheck.wranglerConfigs }
+
+    /// The fixed environment: the account, no metrics, CI (non-interactive), and git's discovery stopped at the release
+    /// root (I3). The token is added by the executor as `CLOUDFLARE_API_TOKEN`, from the vault, and never appears here or in
+    /// argv.
+    func env(_ i: DeployInput) -> [String: String] {
+        ["CLOUDFLARE_ACCOUNT_ID": i.settings.accountId ?? "", "WRANGLER_SEND_METRICS": "false", "CI": "1",
+         "GIT_CEILING_DIRECTORIES": i.gitCeiling]
     }
 
     func deployStep(_ i: DeployInput, directory: String, message: String) -> DeployStep {
@@ -48,7 +53,7 @@ public struct CloudflarePagesAdapter: HostingAdapter {
                                 argv: [i.bin("wrangler"), "pages", "project", "create", i.settings.project, "--production-branch", "main"],
                                 okIfOutputContains: "already exists")
         return try DeployPlan(steps: [create, deployStep(i, directory: output, message: "Release \(i.version)")], stageFrom: stage,
-                              cwdPath: i.inRelease("upload"), network: network, tokenSecret: tokenSecret, env: env(i.settings),
+                              cwdPath: i.inRelease("upload"), network: network, tokenSecret: tokenSecret, env: env(i),
                               build: i.settings.build, outputDir: i.settings.outputDir)
     }
 
@@ -63,30 +68,30 @@ public struct CloudflarePagesAdapter: HostingAdapter {
             cwd = i.placeholderDir.path; directory = "."; message = "Placeholder"
         }
         return try DeployPlan(steps: [deployStep(i, directory: directory, message: message)], stageFrom: [], cwdPath: cwd,
-                              network: network, tokenSecret: tokenSecret, env: env(i.settings), build: i.settings.build,
+                              network: network, tokenSecret: tokenSecret, env: env(i), build: i.settings.build,
                               outputDir: i.settings.outputDir)
     }
 
-    /// The last `https://<8 hex>.<subdomain>.pages.dev` in the output whose subdomain is the project's (`<project>` or
-    /// `<project>-<suffix>`, when the name was taken): deploy output may echo other text.
+    /// The deploy URL from wrangler's own last "Deployment complete!" line only, pinned to the configured project:
+    /// `https://<8 hex>.<project>.pages.dev` (M1). A URL echoed anywhere else in the output (a build log, a function's
+    /// bundling output) is ignored.
     public func deployURL(fromOutput: String, settings: HostingSettings) -> URL? {
-        let pattern = try? NSRegularExpression(pattern: "https://[0-9a-f]{8}\\.([a-z0-9-]+)\\.pages\\.dev")
-        let text = fromOutput as NSString
-        let matches = pattern?.matches(in: fromOutput, range: NSRange(location: 0, length: text.length)) ?? []
-        for m in matches.reversed() {
-            let sub = text.substring(with: m.range(at: 1))
-            guard sub == settings.project || sub.hasPrefix(settings.project + "-") else { continue }
-            return URL(string: text.substring(with: m.range))
+        let project = NSRegularExpression.escapedPattern(for: settings.project)
+        guard let pattern = try? NSRegularExpression(pattern: "https://[0-9a-f]{8}\\.\(project)\\.pages\\.dev(?![A-Za-z0-9.-])") else {
+            return nil
         }
-        return nil
+        guard let line = fromOutput.split(whereSeparator: \.isNewline).last(where: { $0.contains("Deployment complete!") }) else {
+            return nil
+        }
+        let text = String(line) as NSString
+        guard let m = pattern.firstMatch(in: text as String, range: NSRange(location: 0, length: text.length)) else { return nil }
+        return URL(string: text.substring(with: m.range))
     }
 
-    /// The stored production URL, else `https://<subdomain>.pages.dev` from the deploy URL.
+    /// The stored production URL, else `https://<project>.pages.dev` (the deploy URL is pinned to it).
     public func smokeBase(_ s: HostingSettings, deployURL: URL?) -> URL? {
         if let p = s.productionURL { return URL(string: p) }
-        guard let host = deployURL?.host, host.hasSuffix(".pages.dev") else { return nil }
-        let parts = host.split(separator: ".")
-        guard parts.count == 4 else { return nil }
-        return URL(string: "https://\(parts[1]).pages.dev")
+        guard deployURL != nil else { return nil }
+        return URL(string: "https://\(s.project).pages.dev")
     }
 }
