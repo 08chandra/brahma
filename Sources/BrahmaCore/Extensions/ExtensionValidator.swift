@@ -767,6 +767,20 @@ public enum ExtensionValidator {
 /// - no tabs, no `? ` explicit keys, no flow mappings or sequences at the top (`{`, `[`), no anchors, aliases or tags
 ///   (`&`, `*`, `!`) at the start of a value, no `<<` merge keys, no `...`/`%` document markers, no duplicate keys;
 /// - the input is normalized first (BOM stripped, CRLF/CR → LF), and the closing fence must appear within 64 KB.
+/// Byte-wise (UTF-8) prefix, suffix and containment tests for the frontmatter parser: a `Character` comparison would let a
+/// combining mark or emoji modifier merge into the ASCII it follows (`---\u{301}` is not `hasPrefix("---")`), while Claude Code
+/// and YAML parsers read code units (N-1b).
+extension StringProtocol {
+    func bytePrefix(_ p: String) -> Bool { utf8.starts(with: p.utf8) }
+    func byteSuffix(_ p: String) -> Bool { utf8.reversed().starts(with: p.utf8.reversed()) }
+    func byteContains(_ p: String) -> Bool {
+        let hay = Array(utf8), needle = Array(p.utf8)
+        guard !needle.isEmpty, hay.count >= needle.count else { return needle.isEmpty }
+        for i in 0...(hay.count - needle.count) where hay[i] == needle[0] && Array(hay[i..<(i + needle.count)]) == needle { return true }
+        return false
+    }
+}
+
 struct Frontmatter {
     struct Entry {
         var key: String
@@ -817,12 +831,15 @@ struct Frontmatter {
     static let fenceLimit = 64 * 1024
     /// What ends a frontmatter for Claude Code wherever it appears.
     static let fenceMark = "---"
+
+    /// Whether `s` holds `---` anywhere, by UTF-8 bytes (0x2D 0x2D 0x2D), whatever follows the dashes.
+    static func hasFenceMark<S: StringProtocol>(_ s: S) -> Bool { s.byteContains(fenceMark) }
     static let keyPattern = try! NSRegularExpression(pattern: "^[A-Za-z_][A-Za-z0-9_-]*$")
 
     /// BOM stripped, CRLF and CR turned into LF.
     static func normalize(_ text: String) -> String {
         var t = text
-        if t.hasPrefix("\u{FEFF}") { t.removeFirst() }
+        if t.bytePrefix("\u{FEFF}") { t.removeFirst() }
         return t.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
     }
 
@@ -837,7 +854,7 @@ struct Frontmatter {
         guard first == "---" else {
             // A fence after leading blank space or blank lines is "fence-like" and refused; anything else is plain Markdown.
             if let fenceLike = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
-               lines[fenceLike].trimmingCharacters(in: .whitespaces).hasPrefix("---") {
+               lines[fenceLike].trimmingCharacters(in: .whitespaces).bytePrefix("---") {
                 return .invalid("the opening fence must be exactly --- on the first line", line: fenceLike + 1)
             }
             return .none
@@ -855,7 +872,7 @@ struct Frontmatter {
                 for k in entries.indices where strictKeys.contains(entries[k].key) {
                     do {
                         entries[k].parsed = try parseValue(key: entries[k].key, inline: entries[k].value, continuation: entries[k].continuation)
-                        if entries[k].parsed.strings.contains(where: { $0.contains(fenceMark) }) {
+                        if entries[k].parsed.strings.contains(where: { hasFenceMark($0) }) {
                             throw Refusal("'---' inside a value (Claude Code would end the frontmatter there)")
                         }
                     }
@@ -867,23 +884,23 @@ struct Frontmatter {
             if line.trimmingCharacters(in: .whitespaces) == "---" { return .invalid("the closing fence must be exactly ---", line: number) }
             // N-1: Claude Code ends the frontmatter at the first `---` anywhere (mid-line, in quotes, in a comment), so the keys
             // after it would be checked here and never applied there.
-            if line.contains(fenceMark) { return .invalid("'---' inside the frontmatter (Claude Code would end it there)", line: number) }
-            if line.contains("\t") { return .invalid("tabs are not allowed", line: number) }
+            if hasFenceMark(line) { return .invalid("'---' inside the frontmatter (Claude Code would end it there)", line: number) }
+            if line.byteContains("\t") { return .invalid("tabs are not allowed", line: number) }
             if line.trimmingCharacters(in: .whitespaces).isEmpty {
                 if !entries.isEmpty { entries[entries.count - 1].continuation.append("") }
                 i += 1; continue
             }
-            if line.hasPrefix("#") { i += 1; continue }
-            if line.hasPrefix(" ") {
+            if line.bytePrefix("#") { i += 1; continue }
+            if line.bytePrefix(" ") {
                 guard let last = entries.last else { return .invalid("an indented line before the first key", line: number) }
                 // A block scalar's (`|`, `>`) indented lines are literal text; anything else is checked like a value.
-                let isBlockScalar = last.value.hasPrefix("|") || last.value.hasPrefix(">")
+                let isBlockScalar = last.value.bytePrefix("|") || last.value.bytePrefix(">")
                 if !isBlockScalar, let bad = badValueStart(line.trimmingCharacters(in: .whitespaces)) { return .invalid(bad, line: number) }
                 entries[entries.count - 1].continuation.append(line)
                 i += 1; continue
             }
-            if line == "..." || line.hasPrefix("... ") || line.hasPrefix("%") { return .invalid("a YAML document marker inside the frontmatter", line: number) }
-            if line.hasPrefix("?") || line.hasPrefix("{") || line.hasPrefix("[") || line.hasPrefix("-") || line.hasPrefix("<<") {
+            if line == "..." || line.bytePrefix("... ") || line.bytePrefix("%") { return .invalid("a YAML document marker inside the frontmatter", line: number) }
+            if line.bytePrefix("?") || line.bytePrefix("{") || line.bytePrefix("[") || line.bytePrefix("-") || line.bytePrefix("<<") {
                 return .invalid("explicit keys, flow collections, top-level lists and merge keys are not allowed", line: number)
             }
             guard let colon = line.firstIndex(of: ":") else { return .invalid("a line that is not `key: value`", line: number) }
@@ -905,21 +922,21 @@ struct Frontmatter {
     /// Anchors, aliases, tags and flow collections at the start of a value (or a list item) are refused.
     static func badValueStart(_ value: String) -> String? {
         var v = value
-        if v.hasPrefix("- ") { v = String(v.dropFirst(2)).trimmingCharacters(in: .whitespaces) }
-        else if let colon = v.firstIndex(of: ":"), !v.hasPrefix("\""), !v.hasPrefix("'"), !v.hasPrefix("["), !v.hasPrefix("{") {
+        if v.bytePrefix("- ") { v = String(v.dropFirst(2)).trimmingCharacters(in: .whitespaces) }
+        else if let colon = v.firstIndex(of: ":"), !v.bytePrefix("\""), !v.bytePrefix("'"), !v.bytePrefix("["), !v.bytePrefix("{") {
             // a nested `key: value` line: check its value
             v = String(v[v.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
         }
-        if v.hasPrefix("&") || v.hasPrefix("*") || v.hasPrefix("!") { return "anchors, aliases and tags are not allowed" }
-        if v.hasPrefix("{") || v.hasPrefix("[") { return flowProblem(v) }
+        if v.bytePrefix("&") || v.bytePrefix("*") || v.bytePrefix("!") { return "anchors, aliases and tags are not allowed" }
+        if v.bytePrefix("{") || v.bytePrefix("[") { return flowProblem(v) }
         return nil
     }
 
     /// A flow value (`[a, b]`, `{}`) is accepted only when it closes on its own line, nests no further flow collection, and
     /// holds no anchor, alias or tag at the start of any item (quoted text is skipped). Nil when it is clean.
     static func flowProblem(_ v: String) -> String? {
-        var depth = 0, quote: Character? = nil, tokenStart = true, closed = false
-        for c in v {
+        var depth = 0, quote: Unicode.Scalar? = nil, tokenStart = true, closed = false
+        for c in v.unicodeScalars {
             if closed { if c == " " { continue }; if c == "#" { break }; return "text after a flow collection is not allowed" }
             if let q = quote { if c == q { quote = nil }; continue }
             switch c {
@@ -947,15 +964,15 @@ struct Frontmatter {
     /// hidden character spelled as an escape is found too.
     static func escapedScalars(in line: String) -> [Unicode.Scalar] {
         var out: [Unicode.Scalar] = []
-        let chars = Array(line)
+        let chars = Array(line.unicodeScalars)
         var i = 0
         while i < chars.count {
             guard chars[i] == "\\", i + 1 < chars.count else { i += 1; continue }
             let kind = chars[i + 1]
             let width: Int? = kind == "x" ? 2 : kind == "u" ? 4 : kind == "U" ? 8 : nil
             if let width {
-                let hex = String(chars[(i + 2)..<min(chars.count, i + 2 + width)])
-                if hex.count == width, let n = UInt32(hex, radix: 16), let s = Unicode.Scalar(n) { out.append(s) }
+                let hex = scalarString(chars[(i + 2)..<min(chars.count, i + 2 + width)])
+                if hex.unicodeScalars.count == width, let n = UInt32(hex, radix: 16), let s = Unicode.Scalar(n) { out.append(s) }
                 i += 2 + width
                 continue
             }
@@ -985,7 +1002,7 @@ struct Frontmatter {
         case .list, .map: return nil
         case .raw:
             let v = e.value
-            if (v.hasPrefix("\"") && v.hasSuffix("\"") && v.count >= 2) || (v.hasPrefix("'") && v.hasSuffix("'") && v.count >= 2) {
+            if (v.bytePrefix("\"") && v.byteSuffix("\"") && v.count >= 2) || (v.bytePrefix("'") && v.byteSuffix("'") && v.count >= 2) {
                 return String(v.dropFirst().dropLast())
             }
             return v
@@ -1002,11 +1019,11 @@ struct Frontmatter {
         case .raw:
             var items: [String] = []
             var inline = e.value
-            if inline.hasPrefix("["), inline.hasSuffix("]") { inline = String(inline.dropFirst().dropLast()) }
+            if inline.bytePrefix("["), inline.byteSuffix("]") { inline = String(inline.dropFirst().dropLast()) }
             items += inline.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             for c in e.continuation {
                 let t = c.trimmingCharacters(in: .whitespaces)
-                if t.hasPrefix("- ") { items.append(String(t.dropFirst(2)).trimmingCharacters(in: .whitespaces)) }
+                if t.bytePrefix("- ") { items.append(String(t.dropFirst(2)).trimmingCharacters(in: .whitespaces)) }
             }
             return items.filter { !$0.isEmpty }.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) }
         }
@@ -1026,7 +1043,7 @@ struct Frontmatter {
         var cont = raw
         while let last = cont.last, last.trimmingCharacters(in: .whitespaces).isEmpty { cont.removeLast() }
         while let first = cont.first, first.trimmingCharacters(in: .whitespaces).isEmpty { cont.removeFirst() }
-        let isBlock = v.hasPrefix("|") || v.hasPrefix(">")
+        let isBlock = v.bytePrefix("|") || v.bytePrefix(">")
         if mapKeys.contains(key) {
             if v.isEmpty { return .map(try nestedMap(cont)) }
             guard cont.isEmpty, v == "{}" else { throw Refusal("a map of names to text or lists, written as indented `name: value` lines") }
@@ -1051,7 +1068,7 @@ struct Frontmatter {
             if let first = t.unicodeScalars.first, "-?:,[]{}#&*!|>'\"%@`".unicodeScalars.contains(first) {
                 throw Refusal("a continuation line starts with '\(Character(first))'")
             }
-            if t.contains(": ") || t.hasSuffix(":") || t.contains(" #") { throw Refusal("a continuation line looks like a key or a comment") }
+            if t.byteContains(": ") || t.byteSuffix(":") || t.byteContains(" #") { throw Refusal("a continuation line looks like a key or a comment") }
             lines.append(t)
         }
         return .scalar(fold([head] + lines), plain: false)
@@ -1071,9 +1088,9 @@ struct Frontmatter {
     /// One-line scalar: empty, plain (a ` #` comment dropped), single-quoted or double-quoted (escapes decoded).
     static func singleScalar(_ v: String) throws -> Value {
         if v.isEmpty { return .scalar("", plain: true) }
-        if v.hasPrefix("\"") { return .scalar(try doubleQuoted(v), plain: false) }
-        if v.hasPrefix("'") { return .scalar(try singleQuoted(v), plain: false) }
-        if v.hasPrefix("[") || v.hasPrefix("{") { throw Refusal("a list or map is not allowed here") }
+        if v.bytePrefix("\"") { return .scalar(try doubleQuoted(v), plain: false) }
+        if v.bytePrefix("'") { return .scalar(try singleQuoted(v), plain: false) }
+        if v.bytePrefix("[") || v.bytePrefix("{") { throw Refusal("a list or map is not allowed here") }
         if let first = v.unicodeScalars.first, "@`%|>".unicodeScalars.contains(first) { throw Refusal("a value may not start with '\(Character(first))'") }
         var text = v
         if let r = text.range(of: " #") { text = String(text[..<r.lowerBound]) }
@@ -1081,7 +1098,7 @@ struct Frontmatter {
     }
 
     static func singleQuoted(_ v: String) throws -> String {
-        let chars = Array(v)
+        let chars = Array(v.unicodeScalars)
         var out = "", i = 1
         while i < chars.count {
             if chars[i] == "'" {
@@ -1089,42 +1106,48 @@ struct Frontmatter {
                 try requireOnlyComment(chars[(i + 1)...])
                 return out
             }
-            out.append(chars[i]); i += 1
+            out.unicodeScalars.append(chars[i]); i += 1
         }
         throw Refusal("a single-quoted value must close on its line")
     }
 
     static func doubleQuoted(_ v: String) throws -> String {
-        let chars = Array(v)
+        let chars = Array(v.unicodeScalars)
         var out = "", i = 1
         while i < chars.count {
             let c = chars[i]
             if c == "\"" { try requireOnlyComment(chars[(i + 1)...]); return out }
-            if c != "\\" { out.append(c); i += 1; continue }
+            if c != "\\" { out.unicodeScalars.append(c); i += 1; continue }
             guard i + 1 < chars.count else { break }
             let k = chars[i + 1]
-            let simple: [Character: String] = ["\\": "\\", "\"": "\"", "/": "/", "n": "\n", "t": "\t", "r": "\r", "0": "\0", "a": "\u{07}",
+            let simple: [Unicode.Scalar: String] = ["\\": "\\", "\"": "\"", "/": "/", "n": "\n", "t": "\t", "r": "\r", "0": "\0", "a": "\u{07}",
                                                "b": "\u{08}", "e": "\u{1B}", "f": "\u{0C}", "v": "\u{0B}", " ": " ", "N": "\u{85}",
                                                "_": "\u{A0}", "L": "\u{2028}", "P": "\u{2029}"]
             if let s = simple[k] { out += s; i += 2; continue }
             let width: Int? = k == "x" ? 2 : k == "u" ? 4 : k == "U" ? 8 : nil
-            guard let width, i + 2 + width <= chars.count, let n = UInt32(String(chars[(i + 2)..<(i + 2 + width)]), radix: 16),
+            guard let width, i + 2 + width <= chars.count, let n = UInt32(scalarString(chars[(i + 2)..<(i + 2 + width)]), radix: 16),
                   let scalar = Unicode.Scalar(n) else { throw Refusal("an unsupported escape in a double-quoted value") }
             out.unicodeScalars.append(scalar); i += 2 + width
         }
         throw Refusal("a double-quoted value must close on its line")
     }
 
-    static func requireOnlyComment(_ rest: ArraySlice<Character>) throws {
-        let t = String(rest).trimmingCharacters(in: .whitespaces)
-        guard t.isEmpty || t.hasPrefix("#") else { throw Refusal("text after a quoted value") }
+    static func scalarString(_ s: ArraySlice<Unicode.Scalar>) -> String {
+        var out = ""
+        out.unicodeScalars.append(contentsOf: s)
+        return out
+    }
+
+    static func requireOnlyComment(_ rest: ArraySlice<Unicode.Scalar>) throws {
+        let t = scalarString(rest).trimmingCharacters(in: .whitespaces)
+        guard t.isEmpty || t.bytePrefix("#") else { throw Refusal("text after a quoted value") }
     }
 
     /// `|`, `|-`, `>`, `>-`: the indented lines, the indentation of the first one removed (no line may have less); `>` folds.
     static func blockScalar(header: String, lines raw: [String]) throws -> String {
         let h = header.split(separator: " ", maxSplits: 1).first.map(String.init) ?? header
         guard ["|", "|-", ">", ">-"].contains(h) else { throw Refusal("block scalar header '\(Store.flat(h, max: 8))' is not supported (|, |-, > or >-)") }
-        if header.count > h.count, !header.dropFirst(h.count).trimmingCharacters(in: .whitespaces).hasPrefix("#") { throw Refusal("text after a block scalar header") }
+        if header.count > h.count, !header.dropFirst(h.count).trimmingCharacters(in: .whitespaces).bytePrefix("#") { throw Refusal("text after a block scalar header") }
         var lines = raw
         while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
         guard let firstText = lines.first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return "" }
@@ -1137,13 +1160,13 @@ struct Frontmatter {
         }
         while content.first == "" { content.removeFirst() }
         var text: String
-        if h.hasPrefix("|") {
+        if h.bytePrefix("|") {
             text = content.joined(separator: "\n")
         } else {
-            guard !content.contains(where: { $0.hasPrefix(" ") }) else { throw Refusal("a folded (>) block with more-indented lines is not supported") }
+            guard !content.contains(where: { $0.bytePrefix(" ") }) else { throw Refusal("a folded (>) block with more-indented lines is not supported") }
             text = fold(content)
         }
-        if !h.hasSuffix("-") { text += "\n" }
+        if !h.byteSuffix("-") { text += "\n" }
         return text
     }
 
@@ -1155,7 +1178,7 @@ struct Frontmatter {
         for l in lines {
             guard l.prefix(while: { $0 == " " }).count == indent else { throw Refusal("list items must share one indentation") }
             let t = String(l.dropFirst(indent))
-            guard t.hasPrefix("- ") else { throw Refusal("a list holds only `- item` lines") }
+            guard t.bytePrefix("- ") else { throw Refusal("a list holds only `- item` lines") }
             out.append(try listItem(String(t.dropFirst(2)).trimmingCharacters(in: .whitespaces)))
         }
         return out
@@ -1163,27 +1186,27 @@ struct Frontmatter {
 
     static func listItem(_ t: String) throws -> String {
         guard case .scalar(let s, let plain) = try singleScalar(t) else { throw Refusal("a list item must be text") }
-        if plain, s.contains(": ") || s.hasSuffix(":") { throw Refusal("a list item may not be a map") }
+        if plain, s.byteContains(": ") || s.byteSuffix(":") { throw Refusal("a list item may not be a map") }
         return s
     }
 
     /// `a, b`, `"a, b"` or a one-line `[a, "b"]`.
     static func inlineList(_ v: String) throws -> [String] {
-        if v.hasPrefix("{") { throw Refusal("a list, not a map") }
-        guard v.hasPrefix("[") else {
+        if v.bytePrefix("{") { throw Refusal("a list, not a map") }
+        guard v.bytePrefix("[") else {
             guard case .scalar(let s, _) = try singleScalar(v) else { throw Refusal("a list") }
             return commaList(s)
         }
-        guard let close = v.lastIndex(of: "]") else { throw Refusal("a flow list must close on its line") }
-        try requireOnlyComment(Array(v[v.index(after: close)...])[...])
-        let inner = v[v.index(after: v.startIndex)..<close]
-        var items: [String] = [], current = "", quote: Character? = nil
-        for c in inner {
-            if let q = quote { current.append(c); if c == q { quote = nil }; continue }
-            if c == "\"" || c == "'" { quote = c; current.append(c); continue }
+        let scalars = Array(v.unicodeScalars)
+        guard let close = scalars.lastIndex(of: "]") else { throw Refusal("a flow list must close on its line") }
+        try requireOnlyComment(scalars[(close + 1)...])
+        var items: [String] = [], current = "", quote: Unicode.Scalar? = nil
+        for c in scalars[1..<close] {
+            if let q = quote { current.unicodeScalars.append(c); if c == q { quote = nil }; continue }
+            if c == "\"" || c == "'" { quote = c; current.unicodeScalars.append(c); continue }
             if c == "[" || c == "{" || c == "]" || c == "}" { throw Refusal("nested flow collections are not allowed") }
             if c == "," { items.append(current); current = ""; continue }
-            current.append(c)
+            current.unicodeScalars.append(c)
         }
         guard quote == nil else { throw Refusal("a quoted list item must close") }
         items.append(current)
@@ -1222,7 +1245,7 @@ struct Frontmatter {
             }
             if v.isEmpty, !deeper.isEmpty { out.append((k, .list(try blockList(deeper)))); continue }
             guard deeper.isEmpty else { throw Refusal("metadata values are one line, or `- item` lines under an empty value") }
-            out.append((k, v.hasPrefix("[") ? .list(try inlineList(v)) : try singleScalar(v)))
+            out.append((k, v.bytePrefix("[") ? .list(try inlineList(v)) : try singleScalar(v)))
         }
         return out
     }
@@ -1250,7 +1273,7 @@ struct Frontmatter {
 
     static func emitScalar(_ s: String, plain: Bool) -> String {
         if plain, s.isEmpty { return "" }
-        if plain, !s.hasSuffix(" "), safePlain.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil { return s }
+        if plain, !s.byteSuffix(" "), safePlain.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil { return s }
         return quoted(s)
     }
 
@@ -1299,7 +1322,7 @@ struct Frontmatter {
             for e in fm.entries where allowed.contains(e.key) {
                 guard let emitted = emit(e.key, e.parsed) else { return nil }
                 // The writer never emits a fence mark inside the body (N-1); a value that would need one is never written.
-                guard !emitted.contains(where: { $0.contains(fenceMark) }) else {
+                guard !emitted.contains(where: { hasFenceMark($0) }) else {
                     assertionFailure("canonical frontmatter would hold '---'"); return nil
                 }
                 for l in emitted { out += l + "\n" }
@@ -1307,7 +1330,7 @@ struct Frontmatter {
             out += "---\n"
             out += lines.dropFirst(fm.end).joined(separator: "\n")
         }
-        if !out.hasSuffix("\n") { out += "\n" }
+        if !out.byteSuffix("\n") { out += "\n" }
         return out
     }
 }

@@ -115,6 +115,19 @@ import Foundation
             try $0.write("agents/helper.md", "---\nname: helper\ncolor: \"a---b\"\ndescription: Helps.\ntools: [\"Read\"]\n---\nx\n")
         },
         Refusal(name: "fence-in-command-value", code: "EXT010") { try $0.write("commands/go.md", "---\nargument-hint: \"x---y\"\ndescription: Go.\n---\nx\n") },
+        // N-1b: a combining mark or emoji modifier after the dashes merges them into one Character; the check is byte-wise.
+        Refusal(name: "fence-combining-skill", code: "EXT010") {
+            try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: \"a---\u{0301}b\"\nwhen_to_use: " + String(repeating: "long ", count: 150) + "\n---\nx\n")
+        },
+        Refusal(name: "fence-combining-plain", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: a---\u{0301}b\n---\nx\n") },
+        Refusal(name: "fence-emoji-modifier", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: \"a---\u{1F3FB}b\"\n---\nx\n") },
+        Refusal(name: "fence-escaped-combining", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: \"a---\\u0301b\"\n---\nx\n") },
+        Refusal(name: "fence-combining-agent", code: "EXT010") {
+            try $0.write("agents/helper.md", "---\nname: helper\ncolor: \"a---\u{0301}b\"\ndescription: Helps.\ntools: [\"Read\"]\n---\nx\n")
+        },
+        Refusal(name: "fence-combining-command", code: "EXT010") { try $0.write("commands/go.md", "---\nargument-hint: \"x---\u{0301}y\"\ndescription: Go.\n---\nx\n") },
+        Refusal(name: "closing-fence-combining", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\n---\u{0301}\nhooks: {}\n---\nx\n") },
+        Refusal(name: "opening-fence-combining", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\u{0301}\nname: demo\nhooks: {}\n---\nx\n") },
         Refusal(name: "unclosed-fence", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\nno fence\n") },
         Refusal(name: "setuid-bin", code: "EXT013") {
             let url = try $0.bin("demo-tool")
@@ -224,6 +237,14 @@ import Foundation
         let body = canonical.split(separator: "\n", omittingEmptySubsequences: false).dropFirst().prefix { $0 != "---" }
         #expect(!body.contains { $0.contains("---") }); #expect(canonical.hasSuffix("Body\n\n---\n\nMore.\n"))
         #expect(Frontmatter.canonical("---\nname: demo\ndescription: \"a\\x2d--b\"\n---\nx\n", allowed: ExtensionValidator.skillKeys) == nil)
+        // N-1b: the fence test is byte-wise: a Character search misses `---` merged with a combining mark; this one does not.
+        #expect(!"a---\u{0301}b".contains("---"), "the grapheme trap this guards against")
+        for merged in ["a---\u{0301}b", "a---\u{1F3FB}b", "---\u{0301}", "x--\u{0301}---"] { #expect(Frontmatter.hasFenceMark(merged), "\(merged.debugDescription)") }
+        #expect(!Frontmatter.hasFenceMark("a -- b - c")); #expect(!Frontmatter.hasFenceMark("-\u{0301}--"))
+        // An escaped combining mark is not a merge: the decoded value holds `---` and is refused too.
+        #expect(Frontmatter.canonical("---\nname: demo\ndescription: \"a\\x2d\\x2d\\x2d\\u0301b\"\n---\nx\n", allowed: ExtensionValidator.skillKeys) == nil)
+        // Every canonical frontmatter line is free of the fence bytes.
+        #expect(!body.contains { Frontmatter.hasFenceMark($0) })
     }
 
     @Test func cleanPluginPasses() throws {
