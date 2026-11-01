@@ -27,8 +27,9 @@ public final class AppModel {
     @ObservationIgnored public var ownerSecretVault: (any SecretVault)? {
         didSet { settings.vault = ownerSecretVault }
     }
-    /// Provides a requested secret (`Store.provideSecret`, Task 4-wire). Nil until the app wires it: the card then says so.
-    @ObservationIgnored public var secretProvider: (any SecretProviding)?
+    /// Provides a requested secret (`Store.provideSecret`, Task 4-wire, through `StoreSecretProvider`). Nil makes the card say
+    /// the build cannot provide secrets.
+    @ObservationIgnored public var secretProvider: (any SecretProviding)? = StoreSecretProvider()
     /// The owner's `preventSleep` pref (the menu's "Prevent sleep while agents run"); refreshed every tick.
     public internal(set) var preventSleep = OwnerPrefs.defaults.preventSleep
     public var activityFilter: ActivityFilter = .all

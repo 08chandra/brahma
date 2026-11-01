@@ -7,6 +7,19 @@ public protocol SecretProviding: Sendable {
     func provideSecret(store: Store, askId: String, name: String, value: String, isTest: Bool, vault: any SecretVault) throws
 }
 
+/// The real provider: `Store.provideSecret` (vault write, metadata row and approval as one unit with respect to the pending →
+/// approved transition). The name the owner sees in the sheet must be the one the request is for.
+public struct StoreSecretProvider: SecretProviding {
+    public init() {}
+
+    public func provideSecret(store: Store, askId: String, name: String, value: String, isTest: Bool, vault: any SecretVault) throws {
+        guard let ask = try store.ask(id: askId) else { throw WorkError.notFound("no such ask") }
+        guard let requested = SecretRequests.requested(ask) else { throw WorkError.invalid("\(ask.ref) is not a secret request") }
+        guard requested.name == name else { throw WorkError.invalid("\(ask.ref) asks for \(requested.name), not \(name)") }
+        _ = try store.provideSecret(askId: askId, value: value, isTest: isTest, vault: vault)
+    }
+}
+
 extension AppModel {
     /// The access cards of the Inbox (one per pending `grant` ask), from the snapshot.
     public var accessCards: [AccessCard] {
