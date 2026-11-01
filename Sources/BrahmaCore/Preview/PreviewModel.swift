@@ -50,18 +50,15 @@ public struct SmokeRequest: Codable, Equatable, Sendable {
     static let parseError = WorkError.invalid("smoke requests look like \"GET /health 200\" or \"POST /items {json} 201\"")
 
     /// `<METHOD> <path> [<body>] [<status>]`: the method (any case), a path starting with exactly one `/`, then optionally
-    /// a body (everything up to the status, spaces kept) and an expected status 100–599 as the last word.
+    /// a body (everything up to the status, spaces kept) and an expected status 100–599 as the last word. The result
+    /// passes `isValid` (the one rule set for a request, shared with `PreviewSurface.validate`).
     public static func parse(_ s: String) throws -> SmokeRequest {
         let text = s.trimmingCharacters(in: .whitespaces)
-        guard !text.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { throw parseError }
         let words = text.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
         guard words.count == 2 else { throw parseError }
-        let method = words[0].uppercased()
-        guard methods.contains(method) else { throw parseError }
         var rest = words[1].trimmingCharacters(in: .whitespaces)
         let pathEnd = rest.firstIndex(of: " ") ?? rest.endIndex
         let path = String(rest[..<pathEnd])
-        guard isSmokePath(path) else { throw parseError }
         rest = String(rest[pathEnd...]).trimmingCharacters(in: .whitespaces)
         var status: Int?
         if let last = rest.split(separator: " ").last, last.allSatisfy(\.isASCII), last.allSatisfy(\.isNumber), last.count <= 3 {
@@ -69,8 +66,18 @@ public struct SmokeRequest: Codable, Equatable, Sendable {
             status = code
             rest = String(rest.dropLast(last.count)).trimmingCharacters(in: .whitespaces)
         }
-        guard rest.count <= bodyKept else { throw parseError }
-        return SmokeRequest(method: method, path: path, body: rest.isEmpty ? nil : rest, expectStatus: status)
+        let request = SmokeRequest(method: words[0].uppercased(), path: path, body: rest.isEmpty ? nil : rest, expectStatus: status)
+        guard request.isValid else { throw parseError }
+        return request
+    }
+
+    /// The one per-request rule set, whether the request was parsed from text or decoded from a tool call or the database:
+    /// an allowed method, a path that starts with exactly one `/`, a body of at most `bodyKept` characters, an expected
+    /// status 100–599, and no control character anywhere.
+    public var isValid: Bool {
+        guard Self.methods.contains(method), Self.isSmokePath(path), (body ?? "").count <= Self.bodyKept else { return false }
+        if let expectStatus, !(100...599).contains(expectStatus) { return false }
+        return ![method, path, body ?? ""].contains { $0.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) }
     }
 
     /// Starts with exactly one `/`.
@@ -139,7 +146,7 @@ public struct PreviewSurface: Codable, Equatable, Sendable, Identifiable, Fetcha
             }
         }
         try LoopbackURL.validate(url)
-        guard smoke.count <= SmokeRequest.max, smoke.allSatisfy({ SmokeRequest.isSmokePath($0.path) }) else {
+        guard smoke.count <= SmokeRequest.max, smoke.allSatisfy(\.isValid) else {
             throw WorkError.invalid("up to 10 smoke requests, each path starting with /")
         }
     }
