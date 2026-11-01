@@ -130,6 +130,31 @@ import GRDB
         #expect(throws: (any Error).self) { try DataHomeGuard.lockDown(paths: paths) }
     }
 
+    /// M3: a bad directory does not stop the others; every bad one is reported.
+    @Test func lockDownContinuesPastABadDirectory() throws {
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        let fm = FileManager.default
+        try fm.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        try fm.createDirectory(at: paths.backupsDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])  // exec-bit fixture: a directory mode lockDown must tighten
+        let other = root.appending(path: "elsewhere")
+        try fm.createDirectory(at: other, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])  // exec-bit fixture: a directory lockDown must leave alone
+        try fm.createSymbolicLink(at: paths.runDir, withDestinationURL: other)
+        try Data("x".utf8).write(to: paths.tmpDir)
+        var reason = ""
+        do { try DataHomeGuard.lockDown(paths: paths) } catch let e as DataHomeError { reason = e.reason }
+        #expect(reason.contains(paths.runDir.path) && reason.contains("symbolic link"), "\(reason)")
+        #expect(reason.contains(paths.tmpDir.path) && reason.contains("not a directory"), "\(reason)")
+        for dir in [paths.home, paths.backupsDir] {
+            var st = stat()
+            #expect(lstat(dir.path, &st) == 0)
+            #expect(st.st_mode & 0o777 == 0o700, "\(dir.path) locked down past the bad ones")
+        }
+        var st = stat()
+        #expect(stat(other.path, &st) == 0)
+        #expect(st.st_mode & 0o777 == 0o755, "a link's target is never changed")
+    }
+
     @Test func turnPidRecordedAndReadBack() throws {
         let store = try Store.inMemory()
         let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())

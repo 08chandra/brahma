@@ -94,7 +94,10 @@ public enum Doctor {
         // The sandbox canary (Task 3): `sandbox-backend`, `sandbox-canary`, `sandbox-helpers`. The doctor only reports them; the
         // engine's per-launch gate records a pass for the shapes its turns use.
         if let canary, let canaryPaths {
-            items += await canary.run(paths: canaryPaths, claudePath: claudePath, runner: runner, shape: "doctor")
+            // The doctor asks about no turn's shape (it records nothing): the key names this CLI build and macOS only.
+            let key = SandboxCanaryKey(fingerprint: (try? CLIFingerprint.of(claudePath: claudePath))?.key ?? "unavailable",
+                                       shape: "doctor", osVersion: ProcessInfo.processInfo.operatingSystemVersionString)
+            items += await canary.run(paths: canaryPaths, claudePath: claudePath, runner: runner, key: key, settings: nil).items
         }
         var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
         // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).

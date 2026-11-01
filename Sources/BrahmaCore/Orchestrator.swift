@@ -53,6 +53,8 @@ public actor Orchestrator {
     /// Keys whose wait was logged (once per key), and when each key's last canary failed (awake seconds).
     var canaryLogged = Set<String>()
     var canaryFailedAt: [String: Double] = [:]
+    /// Key text → the compiled settings of the first turn that waited for it: what that key's canary run is given (I3).
+    var canarySettings: [String: ClaudeSettings] = [:]
     /// The CLI fingerprint, re-read at most every `SandboxCanaryGate.fingerprintCacheSeconds`.
     var fingerprintCache: (value: CLIFingerprint, at: Double)?
 
@@ -172,6 +174,14 @@ public actor Orchestrator {
             if let problem = await blocking.run({ () -> String? in
                 do { try DataHomeGuard.lockDown(paths: paths); return nil } catch { return "\(error)" }
             }) { log("data home: \(problem)") }
+            // What an interrupted sandbox canary left (a crash mid-run): its throwaway company, tokens and run files (M6). Only
+            // with a gate: without one no canary of this engine ever ran.
+            if sandboxCanary != nil {
+                let userHome = sandboxEnvironment.userHome
+                for removed in await blocking.run({ SandboxCanary.sweepStale(paths: paths, userHome: userHome) }) {
+                    log("removed a stale sandbox canary leftover: \(removed)")
+                }
+            }
             // The shell prefix's backstop: only an unsandboxed process can read it (the sandbox denies the data home).
             if let sentinel = await blocking.run({ () -> String? in
                 do { try Sentinel.write(paths: paths); return nil } catch { return "\(error)" }
@@ -498,9 +508,12 @@ public actor Orchestrator {
         let ready = try store.agents(states: [.ready])
         // The holder of an item whose merge is running gets no work turn until the merge ends.
         let mergingHolders = (try? store.agentsLockedOutByMerges()) ?? []
+        // Agents waiting for a sandbox canary get no slot (I1): otherwise they would win fair share every tick and be dropped
+        // at launch, starving the Workspace and Full companies. From memory, no I/O.
+        let canaryHeldIds = canaryTick(ready: ready, companies: byId)
         let candidates = ready.compactMap { a -> Candidate? in
             guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil, !mergingHolders.contains(a.id),
-                  let c = byId[a.companyId] else { return nil }
+                  !canaryHeldIds.contains(a.id), let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
@@ -587,6 +600,13 @@ public actor Orchestrator {
 
     // MARK: Turn (off the actor)
 
+    /// A session change a turn needs (I2): decided while the turn is prepared, written only once it passed the sandbox gate.
+    enum SessionChange { case forceFresh, reset }
+
+    /// The MCP config path of the provisional request the sandbox gate compiles (the real file is written after the gate; the
+    /// settings shape ignores strings).
+    static let gateMCPPlaceholder = "/dev/null"
+
     private nonisolated func performTurn(agent: Agent, turn: Turn) async {
         var ctx: TurnContext?
         var state = TurnStreamState()
@@ -612,6 +632,10 @@ public actor Orchestrator {
         var modeDecision: ModeDecision?
         var notLaunched: ModeNotLaunched?
         var sandboxUnverified = false
+        // The one-use grants this turn spent, and whether its process started: a turn that spent grants and then did not
+        // launch gives them back (I2).
+        var spentGrants: [String] = []
+        var launched = false
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             // Nothing of the agent's earlier turns may still run, whatever the profile (M1): this turn waits for their sweep
@@ -645,6 +669,9 @@ public actor Orchestrator {
             var planDirectory: String?
             var facts: ItemModeFacts?
             var itemBudget = false
+            // A session change this turn needs, decided here and written only once the turn passed the sandbox gate (I2): a
+            // turn that does not launch keeps the agent's session.
+            var sessionChange: SessionChange?
 
             if let review {
                 sent.sessionId = UUID().uuidString
@@ -768,10 +795,10 @@ public actor Orchestrator {
                 var slot = try store.sessionSlot(agent: agent, scope: scope)
                 mountSetHash = ExtensionLibrary.mountSetHash(mounts)
                 if slot.started, (slot.mountSetHash ?? ExtensionLibrary.mountSetHash([])) != mountSetHash {
-                    try store.forceFreshSession(agentId: agent.id, itemId: scope.itemId, reason: "mounts changed", now: clock())
-                    try store.applyPendingSessionReset(agentId: agent.id, turnId: turn.id)
-                    let renewed = try store.agent(id: agent.id) ?? agent
-                    slot = try store.sessionSlot(agent: renewed, scope: scope)
+                    // Decided as the fresh slot `forceFreshSession` leaves; written after the gate (`sessionChange`).
+                    sessionChange = .forceFresh
+                    slot.started = false; slot.cwd = nil; slot.model = nil; slot.tools = nil; slot.endedAt = nil
+                    slot.lastTurnId = nil; slot.mountSetHash = nil
                 }
                 // Warm-only resume: a cold or large session starts over with the role card, the orientation and Continuity.
                 slotModel = slot.model
@@ -787,13 +814,9 @@ public actor Orchestrator {
                     wasResume = true
                     sessionTokens = transcript ?? 0
                 case .fresh(let reason):
-                    if reason != .new {
-                        try store.resetSession(agentId: agent.id, scope: scope)
-                        let renewed = try store.agent(id: agent.id) ?? agent
-                        sent.sessionId = try store.sessionSlot(agent: renewed, scope: scope).sessionId
-                    } else {
-                        sent.sessionId = slot.sessionId
-                    }
+                    // A reset is written after the gate (`sessionChange`), which then sets the new session id.
+                    if reason != .new, sessionChange == nil { sessionChange = .reset }
+                    sent.sessionId = slot.sessionId
                     sent.sessionStarted = false
                     c.fresh = true
                     slotModel = nil
@@ -816,12 +839,6 @@ public actor Orchestrator {
             if !mode.launch, review == nil {
                 throw ModeNotLaunched(reason: mode.reason, overBudgetItem: scope.itemId)
             }
-            // The turn launches: its one-use grants are spent now, never by a turn that does not run.
-            if var prepared = sandboxed, !prepared.grants.isEmpty {
-                try await consumeSandboxGrants(&prepared, agent: agent, company: company, item: prepared.item, turnId: turn.id)
-                sandboxed = prepared
-                addDirs = prepared.scope.readOnlyDirs.map(\.path)
-            }
             let model = mode.model
             sent.model = model
             usedModel = model
@@ -833,6 +850,71 @@ public actor Orchestrator {
                 if let old = slotModel, old != model { changes.append("model \(old) -> \(model)") }
                 if let old = slotTools, old != toolsKey { changes.append("tools changed") }
                 if !changes.isEmpty { cacheBreak = changes.joined(separator: "; ") }
+            }
+
+            // The turn's request; `mcpConfigPath` is the one string not known before the gate (the shape ignores strings).
+            let settingsFile = SettingsFile.path(paths: paths, agentId: agent.id)
+            func turnRequest(mcpConfigPath: String) throws -> TurnRequest {
+                var request = TurnRequest(
+                    agent: sent, company: company, prompt: turnPrompt, appendSystemPrompt: systemPrompt,
+                    mcpConfigPath: mcpConfigPath,
+                    workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
+                    environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
+                                  "BRAHMA_WORKSPACES": paths.workspaces.path])
+                request.kind = review != nil ? .review : audit != nil ? .audit : kind
+                request.mounts = mounts.map(\.url)
+                request.planDirectory = planDirectory
+                request.mode = mode
+                request.hookExecutable = mcpExecutable
+                request.turnRecordDirectory = turnRecordDirectory
+                request.expectations = turnExpectations(agent, company)
+                    ?? TurnProfileCompiler.expectations(for: mode, agents: store.recordedBuiltinAgents())
+                // The settings travel in a file only the engine can read or write (`<runDir>/<agentId>.settings.json`, 0600).
+                request.settingsFilePath = settingsFile.path
+                if let sandboxed {
+                    request.sandbox = sandboxed.scope
+                    request.shellPrefix = sandboxed.shellPrefix.path
+                    request.containmentMarker = sandboxed.marker
+                } else if profile == .workspace {
+                    request.deniedPaths = try workspaceDeniedPaths(company: company)
+                }
+                return request
+            }
+            // The per-launch sandbox gate (Task 3, I2), before anything of the turn is consumed or created: no one-use grant
+            // spent, no session reset, no credential, no MCP file. The shape is the one this turn would run with.
+            let gate = profile == .sandboxed ? sandboxCanary : nil
+            var gatedShape: String?
+            if let gate {
+                let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
+                try await requireSandboxVerified(gate: gate, settings: settings, agent: agent, company: company)
+                gatedShape = settings.shape()
+            }
+            // The turn launches: its one-use grants are spent now, never by a turn that does not run. A turn that does not
+            // launch after all gives them back (`spentGrants`, below).
+            if var prepared = sandboxed, !prepared.grants.isEmpty {
+                let asked = prepared.grants.count
+                try await consumeSandboxGrants(&prepared, agent: agent, company: company, item: prepared.item, turnId: turn.id)
+                spentGrants = prepared.grants.map(\.id)
+                sandboxed = prepared
+                addDirs = prepared.scope.readOnlyDirs.map(\.path)
+                // A grant lost meanwhile rebuilt the scope: its shape is gated again before anything else is created.
+                if prepared.grants.count != asked, let gate {
+                    let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
+                    try await requireSandboxVerified(gate: gate, settings: settings, agent: agent, company: company)
+                    gatedShape = settings.shape()
+                }
+            }
+            // The session change decided above, now that the turn launches.
+            switch sessionChange {
+            case .forceFresh?:
+                try store.forceFreshSession(agentId: agent.id, itemId: scope.itemId, reason: "mounts changed", now: clock())
+                try store.applyPendingSessionReset(agentId: agent.id, turnId: turn.id)
+                sent.sessionId = try store.sessionSlot(agent: try store.agent(id: agent.id) ?? agent, scope: scope).sessionId
+            case .reset?:
+                try store.resetSession(agentId: agent.id, scope: scope)
+                sent.sessionId = try store.sessionSlot(agent: try store.agent(id: agent.id) ?? agent, scope: scope).sessionId
+            case nil:
+                break
             }
 
             let turnToken: String
@@ -852,34 +934,13 @@ public actor Orchestrator {
                     : try store.issueTurnCredential(turnId: turn.id, quotas: mode.quotas)
             }
             try store.setTurnMode(turnId: turn.id, decision: mode)
-            var request = TurnRequest(
-                agent: sent, company: company, prompt: turnPrompt, appendSystemPrompt: systemPrompt,
+            let request = try turnRequest(
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
-                                                   reviewItem: review?.item.key, audit: audit != nil),
-                workingDirectory: workingDirectory, profile: profile, addDirs: addDirs,
-                environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path,
-                              "BRAHMA_WORKSPACES": paths.workspaces.path])
-            request.kind = review != nil ? .review : audit != nil ? .audit : kind
-            request.mounts = mounts.map(\.url)
-            request.planDirectory = planDirectory
-            request.mode = mode
-            request.hookExecutable = mcpExecutable
-            request.turnRecordDirectory = turnRecordDirectory
-            request.expectations = turnExpectations(agent, company)
-                ?? TurnProfileCompiler.expectations(for: mode, agents: store.recordedBuiltinAgents())
-            // The settings travel in a file only the engine can read or write (`<runDir>/<agentId>.settings.json`, 0600).
-            let settingsFile = SettingsFile.path(paths: paths, agentId: agent.id)
-            request.settingsFilePath = settingsFile.path
-            if let sandboxed {
-                request.sandbox = sandboxed.scope
-                request.shellPrefix = sandboxed.shellPrefix.path
-                request.containmentMarker = sandboxed.marker
-            } else if profile == .workspace {
-                request.deniedPaths = try workspaceDeniedPaths(company: company)
-            }
+                                                   reviewItem: review?.item.key, audit: audit != nil))
             let compiled = TurnProfileCompiler.profile(for: request)
-            if profile == .sandboxed, let gate = sandboxCanary {
-                try await requireSandboxVerified(gate: gate, shape: compiled.settings.shape(), agent: agent, company: company)
+            // Backstop: the shape that runs is the shape that was gated (they differ only if a string-free field changed).
+            if let gate, compiled.settings.shape() != gatedShape {
+                try await requireSandboxVerified(gate: gate, settings: compiled.settings, agent: agent, company: company)
             }
             let settingsText = try TurnProfileCompiler.settingsJSON(compiled)
             try await blocking.tryRun { try SettingsFile.write(settingsText, to: settingsFile) }
@@ -889,6 +950,7 @@ public actor Orchestrator {
             // Leaving the loop early (`break`) drops the stream, which terminates the child process.
             do {
                 events: for try await event in runner.run(request) {
+                    launched = true
                     state.apply(event)
                     switch event {
                     case .initialized(_, let reported):
@@ -932,6 +994,11 @@ public actor Orchestrator {
             sandboxUnverified = true
         } catch {
             failure = String(describing: error)
+        }
+        if !launched, !spentGrants.isEmpty {
+            let ids = spentGrants
+            attempt { try store.restoreGrants(ids: ids) }
+            log("@\(agent.name)'s turn did not start: its one-use grants were given back")
         }
 
         let now = clock()

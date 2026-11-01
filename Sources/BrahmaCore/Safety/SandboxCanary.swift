@@ -5,15 +5,21 @@ import Darwin
 import Glibc
 #endif
 
-/// The installed `claude` as the sandbox canary keys it: its real path, size and modification time (a `stat`, no process).
-/// A new CLI build (an update, a reinstall, a `touch`) is a new fingerprint and needs a new canary pass.
+/// The installed `claude` as the sandbox canary keys it: its real path, size, inode, modification and status-change times (a
+/// `stat`, no process). A new CLI build (an update, a reinstall, a `touch`, a same-size copy with its mtime kept: its ctime
+/// cannot be set from userland) is a new fingerprint and needs a new canary pass.
 public struct CLIFingerprint: Equatable, Sendable {
     public var realPath: String
     public var size: Int64
     /// Nanoseconds since 1970.
     public var mtime: Int64
+    public var inode: UInt64
+    /// Nanoseconds since 1970.
+    public var ctime: Int64
 
-    public init(realPath: String, size: Int64, mtime: Int64) { self.realPath = realPath; self.size = size; self.mtime = mtime }
+    public init(realPath: String, size: Int64, mtime: Int64, inode: UInt64 = 0, ctime: Int64 = 0) {
+        self.realPath = realPath; self.size = size; self.mtime = mtime; self.inode = inode; self.ctime = ctime
+    }
 
     public struct Unavailable: Error, Equatable, CustomStringConvertible {
         public var claudePath: String
@@ -37,21 +43,39 @@ public struct CLIFingerprint: Equatable, Sendable {
         var st = stat()
         guard stat(resolved, &st) == 0 else { throw Unavailable(claudePath: claudePath) }
         #if canImport(Darwin)
-        let m = st.st_mtimespec
+        let m = st.st_mtimespec, c = st.st_ctimespec
         #else
-        let m = st.st_mtim
+        let m = st.st_mtim, c = st.st_ctim
         #endif
-        return CLIFingerprint(realPath: resolved, size: Int64(st.st_size), mtime: Int64(m.tv_sec) * 1_000_000_000 + Int64(m.tv_nsec))
+        func ns(_ t: timespec) -> Int64 { Int64(t.tv_sec) * 1_000_000_000 + Int64(t.tv_nsec) }
+        return CLIFingerprint(realPath: resolved, size: Int64(st.st_size), mtime: ns(m), inode: UInt64(st.st_ino), ctime: ns(c))
     }
 
     /// The `StableHash` of the fields: the `sandboxCanary.cliFingerprint` column.
-    public var key: String { StableHash.fnv1a64("\(realPath)\u{0}\(size)\u{0}\(mtime)") }
+    public var key: String { StableHash.fnv1a64("\(realPath)\u{0}\(size)\u{0}\(mtime)\u{0}\(inode)\u{0}\(ctime)") }
 }
 
-/// Runs the sandbox canary for one settings shape: the doctor items `sandbox-backend`, `sandbox-canary` and `sandbox-helpers`.
-/// The per-launch gate (`Orchestrator`) records a pass (`Store.recordCanary`) only when every item passes.
+/// What one canary run checked: the doctor items `sandbox-backend`, `sandbox-canary` and `sandbox-helpers`, and the key it
+/// actually verified (the CLI build it ran, the shape of the settings it ran under, the macOS version); nil when it verified
+/// none (setup failed).
+public struct CanaryRun: Sendable {
+    public var items: [DoctorItem]
+    public var verified: SandboxCanaryKey?
+
+    public init(items: [DoctorItem], verified: SandboxCanaryKey?) { self.items = items; self.verified = verified }
+
+    /// Whether this run is a pass for `key`: every item passed and it verified exactly that key.
+    public func passes(_ key: SandboxCanaryKey) -> Bool {
+        !items.isEmpty && items.allSatisfy { $0.status == .pass } && verified == key
+    }
+}
+
+/// Runs the sandbox canary for one key. `key` is what the asking turn needs verified (its CLI build, settings shape and macOS
+/// version), `settings` that turn's compiled settings (nil from the doctor). The per-launch gate (`Orchestrator`) records a
+/// pass (`Store.recordCanary`) only when `CanaryRun.passes(key)`.
 public protocol SandboxCanaryRunning: Sendable {
-    func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, shape: String) async -> [DoctorItem]
+    func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey,
+             settings: ClaudeSettings?) async -> CanaryRun
 }
 
 /// The production canary. It builds a throwaway company under `paths.workspaces/.brahma-canary-<id>/`, plants tokens where no
@@ -86,12 +110,10 @@ public struct SandboxCanary: SandboxCanaryRunning {
         public var dataHomeToken: URL
         public var otherCompanyToken: URL
         public var otherCompany: URL
-        var removals: [URL]
+        var removals: [(url: URL, root: URL)]
 
-        /// Removes everything the canary made (links are removed, never followed).
-        public func cleanup() {
-            for url in removals.reversed() { try? FileManager.default.removeItem(at: url) }
-        }
+        /// Removes everything the canary made, by descriptor (`EngineFiles.removeNoFollow`: a link is removed, never followed).
+        public func cleanup() { SandboxCanary.remove(removals) }
     }
 
     /// Builds the throwaway company, plants the tokens and compiles the canary turn. Blocking (git, files). On a throw nothing
@@ -106,7 +128,8 @@ public struct SandboxCanary: SandboxCanaryRunning {
         let runDir = paths.runDir.appending(path: "canary-\(id)", directoryHint: .isDirectory)
         let agentId = "canary-\(id)"
         let settingsFile = SettingsFile.path(paths: paths, agentId: agentId)
-        var removals = [ws, other, homeDir, runDir, settingsFile]
+        var removals: [(url: URL, root: URL)] = [(ws, paths.workspaces), (other, paths.workspaces), (homeDir, environment.userHome),
+                                                  (runDir, paths.runDir), (settingsFile, paths.runDir)]
         do {
             for dir in [ws, other, homeDir] {
                 guard !fm.fileExists(atPath: dir.path) else { throw DataHomeError(reason: "\(dir.path) already exists") }
@@ -135,7 +158,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
                                                  claudeTmpRoot: environment.claudeTmpRoot)
             if let tmp = scope.claudeTmp {
                 try ClaudeTmp.ensure(tmp)
-                removals.append(tmp)
+                removals.append((tmp, tmp.deletingLastPathComponent()))
             }
             let mcpConfig = runDir.appending(path: "empty.mcp.json")
             try SettingsFile.writePrivate(Data("{\"mcpServers\":{}}".utf8), to: mcpConfig)
@@ -158,9 +181,39 @@ public struct SandboxCanary: SandboxCanaryRunning {
             return Prepared(request: request, settings: profile.settings, token: token, userHomeToken: userHomeToken,
                             dataHomeToken: dataHomeToken, otherCompanyToken: otherToken, otherCompany: other, removals: removals)
         } catch {
-            for url in removals.reversed() { try? fm.removeItem(at: url) }
+            remove(removals)
             throw error
         }
+    }
+
+    static func remove(_ removals: [(url: URL, root: URL)]) {
+        for (url, root) in removals.reversed() { _ = try? EngineFiles.removeNoFollow(url, under: root) }
+    }
+
+    /// The names a canary's throwaway places carry: `.brahma-canary-*` in the workspaces root and the owner's home, `canary-*`
+    /// in the run directory.
+    ///
+    /// Removes throwaway places an interrupted canary left (a crash mid-run), by descriptor, never following a link. Only
+    /// entries older than `olderThan` seconds go, so a canary running now (the engine's or the doctor's) keeps its own.
+    /// Blocking. Returns what it removed.
+    @discardableResult
+    public static func sweepStale(paths: BrahmaPaths, userHome: URL, olderThan: TimeInterval = 3600, now: Date = Date()) -> [String] {
+        var removed: [String] = []
+        for (root, prefix) in [(paths.workspaces, ".brahma-canary-"), (paths.runDir, "canary-"), (userHome, ".brahma-canary-")] {
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] where name.hasPrefix(prefix) {
+                let url = root.appending(path: name)
+                var st = stat()
+                guard lstat(url.path, &st) == 0 else { continue }
+                #if canImport(Darwin)
+                let modified = Double(st.st_mtimespec.tv_sec)
+                #else
+                let modified = Double(st.st_mtim.tv_sec)
+                #endif
+                guard now.timeIntervalSince1970 - modified > olderThan else { continue }
+                if case .removed? = try? EngineFiles.removeNoFollow(url, under: root) { removed.append(url.path) }
+            }
+        }
+        return removed
     }
 
     /// Whether the compiled settings deny reading the owner's home, the data home and the other company's workspace.
@@ -171,8 +224,11 @@ public struct SandboxCanary: SandboxCanaryRunning {
             .map(\.0)
     }
 
-    public func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, shape: String) async -> [DoctorItem] {
+    public func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey,
+                    settings: ClaudeSettings?) async -> CanaryRun {
         let env = environment, hook = hookExecutable
+        await Doctor.execBlocking.run { _ = Self.sweepStale(paths: paths, userHome: env.userHome) }
+        var verified: SandboxCanaryKey?
         let prepared: Result<Prepared, any Error> = await Doctor.execBlocking.run {
             Result { try Self.prepare(paths: paths, environment: env, hookExecutable: hook) }
         }
@@ -182,6 +238,12 @@ public struct SandboxCanary: SandboxCanaryRunning {
             items.append(DoctorItem(name: "sandbox-backend", status: .fail, detail: "the canary could not be set up: \(Store.flat("\(error)", max: 300))"))
             items.append(DoctorItem(name: "sandbox-canary", status: .fail, detail: "the canary turn could not be built: \(Store.flat("\(error)", max: 300))"))
         case .success(let p):
+            // What this run verifies: the CLI build it fingerprints now, the shape of the settings it compiled (its own itemless
+            // turn, not necessarily the asking turn's: then the gate records nothing), this macOS.
+            if let fp = try? CLIFingerprint.of(claudePath: claudePath) {
+                verified = SandboxCanaryKey(fingerprint: fp.key, shape: p.settings.shape(),
+                                            osVersion: ProcessInfo.processInfo.operatingSystemVersionString)
+            }
             items.append(await Self.backendItem(token: p.dataHomeToken, secret: p.token, sandbox: sandbox))
             let missing = Self.missingDenies(p, paths: paths, environment: env)
             if !missing.isEmpty {
@@ -196,7 +258,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
             await Doctor.execBlocking.run { p.cleanup() }
         }
         items.append(DoctorItem(name: "sandbox-helpers", status: .warn, detail: "not checked: \(Self.pendingOwnerDecision)"))
-        return items
+        return CanaryRun(items: items, verified: verified)
     }
 
     /// `sandbox-backend`: the sandboxed runner's `cat` of the planted data-home token fails and prints nothing of it. No model.
@@ -210,10 +272,22 @@ public struct SandboxCanary: SandboxCanaryRunning {
             return DoctorItem(name: name, status: .fail, detail: "can't prepare a scratch directory: \(error)")
         }
         let cwd = scratch.resolvedForSandbox
-        let out = await sandbox.run(command: "/bin/cat '\(token.path)'", cwd: cwd,
-                                    environment: ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general),
-                                    timeout: .seconds(30), outputURL: cwd.appending(path: "out.log"),
-                                    policy: SandboxPolicy(writable: [cwd], readable: [], network: .none, toolchain: false))
+        let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        let policy = SandboxPolicy(writable: [cwd], readable: [], network: .none, toolchain: false)
+        // Positive control first: the same policy must run a command that reads a file of its own; otherwise a refusal below
+        // could only mean the sandboxed runner runs nothing at all.
+        let control = cwd.appending(path: "control.txt"), controlText = "BRAHMA-CONTROL-\(UUID().uuidString)"
+        do { try SettingsFile.writePrivate(Data(controlText.utf8), to: control) } catch {
+            return DoctorItem(name: name, status: .fail, detail: "can't prepare the control file: \(error)")
+        }
+        let ok = await sandbox.run(command: "/bin/cat '\(control.path)'", cwd: cwd, environment: environment, timeout: .seconds(30),
+                                   outputURL: cwd.appending(path: "control.log"), policy: policy)
+        guard ok.exitCode == 0, ok.tail.contains(controlText) else {
+            return DoctorItem(name: name, status: .fail,
+                              detail: "the sandboxed runner could not run a command (control: exit \(ok.exitCode.map(String.init) ?? "none"))")
+        }
+        let out = await sandbox.run(command: "/bin/cat '\(token.path)'", cwd: cwd, environment: environment,
+                                    timeout: .seconds(30), outputURL: cwd.appending(path: "out.log"), policy: policy)
         if out.tail.contains(secret) || out.exitCode == 0 {
             return DoctorItem(name: name, status: .fail, detail: "a sandboxed command read a file in the data home: the sandbox does not hold")
         }

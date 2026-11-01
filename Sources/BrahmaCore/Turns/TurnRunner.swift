@@ -45,6 +45,9 @@ public enum TurnError: Error, Equatable {
     case interrupted(pendingTasks: Int)
     /// Processes of an earlier turn of the agent could not be killed: no new turn of it starts.
     case earlierTurnStillRunning(pids: [Int32])
+    /// The turn's leader could not be recorded under the run directory right after the spawn (M8): the owner-command ancestry
+    /// check would not know it, so the turn is stopped (fail closed) and the reason logged.
+    case leaderNotRecorded(reason: String)
 }
 
 extension TurnError: CustomStringConvertible {
@@ -55,6 +58,7 @@ extension TurnError: CustomStringConvertible {
         case .interrupted(let n): "interrupted(pendingTasks: \(n))"
         case .earlierTurnStillRunning(let pids):
             "sandbox scope: processes of an earlier turn are still running (pid \(pids.map(String.init).joined(separator: ", ")))"
+        case .leaderNotRecorded(let reason): "the turn's leader could not be recorded (\(reason)); the turn was stopped"
         }
     }
 }
@@ -272,10 +276,22 @@ public struct ClaudeProcessRunner: TurnRunning {
         }
         claimed = false   // from here the sweep below ends the claim, with what it could not kill
         yield(.spawned(pid: child.pid))
+        // Fail closed (M8): a leader the records do not know is a hole in the owner-command ancestry check, so a turn whose
+        // leader record cannot be written is stopped now and the owner told why.
+        var leaderUnrecorded: String?
         if let dir = request.turnRecordDirectory, let start = ProcessTable.entry(child.pid)?.start {
             let withLeader = TurnRecord(leader: child.pid, leaderStart: start, since: since, machMarker: record.machMarker)
-            if (try? TurnRecords.replace(record, with: withLeader, agentId: agentId, in: dir)) != nil { record = withLeader }
+            do {
+                try TurnRecords.replace(record, with: withLeader, agentId: agentId, in: dir)
+                record = withLeader
+            } catch {
+                leaderUnrecorded = Store.flat("\(error)", max: 300)
+                yield(.sandboxNote("@\(request.agent.name): the turn's leader (pid \(child.pid)) could not be recorded "
+                                   + "(\(leaderUnrecorded ?? "")); the owner-command guard would not see it, so the turn was stopped"))
+                child.terminate(grace: Self.killGrace)
+            }
         }
+        let unrecorded = leaderUnrecorded
         close(inPipe.read); close(outPipe.write); close(errPipe.write)
         let input = FileHandle(fileDescriptor: inPipe.write, closeOnDealloc: true)
         let stdout = FileHandle(fileDescriptor: outPipe.read, closeOnDealloc: true)
@@ -326,6 +342,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         var state = TurnStreamState()
         await withTaskCancellationHandler {
             for await line in lines {
+                guard unrecorded == nil else { continue }
                 if request.emitRawLines { yield(.raw(line)) }
                 guard let events = StreamParser.parseAll(line: line) else { continue }
                 for event in events {
@@ -362,6 +379,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         }
         if let requested = TurnAudit.effortCap(in: stderrTail) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
+        if let unrecorded { throw TurnError.leaderNotRecorded(reason: unrecorded) }
         let sawResult = state.sawResult
         // The last result is authoritative even if the process lingered past it and had to be killed ...
         if sawResult, !state.hasPendingWork { return }

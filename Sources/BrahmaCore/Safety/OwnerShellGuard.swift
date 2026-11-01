@@ -38,30 +38,41 @@ public enum DataHomeGuard {
     }
 
     /// Makes the data home, its run directory, its temp directory and its backups 0700, creating missing ones. A link or a
-    /// non-directory where one of them should be is refused, never followed or replaced.
+    /// non-directory where one of them should be is refused, never followed or replaced. Each directory is opened without
+    /// following a link (`O_DIRECTORY | O_NOFOLLOW`) and changed through that descriptor (`fstat`, `fchmod`), so nothing can be
+    /// swapped in between the check and the change. A bad directory does not stop the others (M3): every problem is reported,
+    /// in one error, after all of them were tried.
     public static func lockDown(paths: BrahmaPaths) throws {
+        var problems: [String] = []
         for dir in [paths.home, paths.runDir, paths.tmpDir, paths.backupsDir] {
-            var st = stat()
-            if lstat(dir.path, &st) != 0 {
-                guard errno == ENOENT else {
-                    throw DataHomeError(reason: "can't inspect \(Store.flat(dir.path, max: 300)) (errno \(errno))")
-                }
-                if mkdir(dir.path, 0o700) != 0, errno != EEXIST {
-                    throw DataHomeError(reason: "can't create \(Store.flat(dir.path, max: 300)) (errno \(errno))")
-                }
-                guard lstat(dir.path, &st) == 0 else { throw DataHomeError(reason: "can't create \(Store.flat(dir.path, max: 300))") }
-            }
-            guard st.st_mode & S_IFMT == S_IFDIR else {
-                let what = st.st_mode & S_IFMT == S_IFLNK ? "a symbolic link" : "not a directory"
-                throw DataHomeError(reason: "\(Store.flat(dir.path, max: 300)) is \(what); the data home's private directories must be real directories")
-            }
-            guard st.st_uid == getuid() else {
-                throw DataHomeError(reason: "\(Store.flat(dir.path, max: 300)) is not owned by this user")
-            }
-            if st.st_mode & 0o777 != 0o700, chmod(dir.path, 0o700) != 0 {
-                throw DataHomeError(reason: "can't make \(Store.flat(dir.path, max: 300)) private (errno \(errno))")
-            }
+            if let problem = lockDown(dir) { problems.append(problem) }
         }
+        guard problems.isEmpty else { throw DataHomeError(reason: problems.joined(separator: "; ")) }
+    }
+
+    /// One directory: nil when it is (now) a private directory of this user, else why not.
+    private static func lockDown(_ dir: URL) -> String? {
+        let path = dir.path, shown = Store.flat(path, max: 300)
+        if mkdir(path, 0o700) != 0, errno != EEXIST { return "can't create \(shown) (errno \(errno))" }
+        let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            let err = errno
+            var st = stat()
+            if lstat(path, &st) == 0 {
+                let what = st.st_mode & S_IFMT == S_IFLNK ? "a symbolic link" : st.st_mode & S_IFMT == S_IFDIR ? nil : "not a directory"
+                if let what { return "\(shown) is \(what); the data home's private directories must be real directories" }
+            }
+            return "can't open \(shown) (errno \(err))"
+        }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { return "can't inspect \(shown) (errno \(errno))" }
+        guard st.st_mode & S_IFMT == S_IFDIR else {
+            return "\(shown) is not a directory; the data home's private directories must be real directories"
+        }
+        guard st.st_uid == getuid() else { return "\(shown) is not owned by this user" }
+        if st.st_mode & 0o777 != 0o700, fchmod(fd, 0o700) != 0 { return "can't make \(shown) private (errno \(errno))" }
+        return nil
     }
 }
 

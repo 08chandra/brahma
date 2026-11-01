@@ -24,7 +24,8 @@ extension Store {
         try writer.write { db in _ = try Turn.filter(key: turnId).updateAll(db, Column("pid").set(to: pid)) }
     }
 
-    /// The processes of the turns still in progress: an owner command whose ancestor is one of them is refused.
+    /// The processes of the turns still in progress, as the database recorded them (informational: no start-time check, so a
+    /// crash's leftover row could name a reused pid). The owner-command guard uses `recordedTurnLeaders` instead.
     public func runningTurnPids() throws -> Set<Int32> {
         try writer.read { db in try Self.runningTurnPids(db) }
     }
@@ -32,23 +33,6 @@ extension Store {
     static func runningTurnPids(_ db: Database) throws -> Set<Int32> {
         Set(try Int32.fetchAll(db, sql: "SELECT pid FROM turn WHERE outcome = ? AND pid IS NOT NULL",
                                arguments: [TurnOutcome.inProgress.rawValue]))
-    }
-
-    /// The same for a CLI process, read-only (no migration, no checkpoint): none when there is no database yet, it has no
-    /// `turn.pid` yet (an engine older than Task 3 recorded none), or it cannot be read (a damaged database must still let the
-    /// owner run `brahma restore`; the command itself reports the damage). An agent cannot make it unreadable: the sandbox
-    /// denies it the data home.
-    public static func runningTurnPids(databasePath: String) -> Set<Int32> {
-        guard FileManager.default.fileExists(atPath: databasePath) else { return [] }
-        var config = Configuration()
-        config.readonly = true
-        config.busyMode = .timeout(5)
-        guard let queue = try? DatabaseQueue(path: databasePath, configuration: config) else { return [] }
-        defer { try? queue.close() }
-        return (try? queue.read { db -> Set<Int32> in
-            guard try db.tableExists("turn"), try db.columns(in: "turn").contains(where: { $0.name == "pid" }) else { return [] }
-            return try runningTurnPids(db)
-        }) ?? []
     }
 
     /// The live leaders of the turns the runner recorded under `<runDir>/turns` (`TurnRecords`), read without changing
@@ -83,14 +67,29 @@ extension Store {
         try sandboxVerified(fingerprint: key.fingerprint, shape: key.shape, osVersion: key.osVersion)
     }
 
-    /// Records a passing canary (replacing an earlier pass of the same key) and answers the open sandbox-check alert.
-    public func recordCanary(_ key: SandboxCanaryKey, detail: String, now: Date = Store.now()) throws {
+    /// Records a passing canary (replacing an earlier pass of the same key) and, with `resolveAlert`, answers the open
+    /// sandbox-check alert (the gate passes false while another key is still failing).
+    public func recordCanary(_ key: SandboxCanaryKey, detail: String, now: Date = Store.now(), resolveAlert: Bool = true) throws {
         try writer.write { db in
             try db.execute(sql: """
                 INSERT OR REPLACE INTO sandboxCanary (cliFingerprint, settingsShape, osVersion, cliVersion, passedAt, detail)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """, arguments: [key.fingerprint, key.shape, key.osVersion, key.cliVersion, now, detail])
-            try resolveEngineAlerts(db, reasons: [EngineAlerts.sandboxCheckReason], now: now)
+            if resolveAlert { try resolveEngineAlerts(db, reasons: [EngineAlerts.sandboxCheckReason], now: now) }
+        }
+    }
+
+    /// Gives back one use of each grant (I2): a turn that consumed them and then did not launch. A grant revoked since stays
+    /// revoked; only its counts go back.
+    func restoreGrants(ids: [String], now: Date = Store.now()) throws {
+        guard !ids.isEmpty else { return }
+        try writer.write { db in
+            for id in ids {
+                guard var g = try Grant.fetchOne(db, key: id), g.useCount > 0 else { continue }
+                g.useCount -= 1
+                if let uses = g.usesLeft { g.usesLeft = uses + 1 }
+                try g.update(db)
+            }
         }
     }
 }

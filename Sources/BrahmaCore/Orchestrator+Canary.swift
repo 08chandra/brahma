@@ -28,7 +28,7 @@ struct SandboxNotVerified: Error, CustomStringConvertible {
 }
 
 extension Orchestrator {
-    static func canaryTaskName(_ key: SandboxCanaryKey) -> String { "sandbox-canary:\(key.text)" }
+    static func canaryTaskName(_ key: SandboxCanaryKey) -> String { canaryTaskPrefix + key.text }
 
     /// The canary key of a sandboxed turn of this shape (the fingerprint cached for 5 s of awake time).
     func canaryKey(gate: SandboxCanaryGate, shape: String) throws -> SandboxCanaryKey {
@@ -44,20 +44,23 @@ extension Orchestrator {
                                 cliVersion: (try? store.latestProbe())?.cliVersion)
     }
 
-    /// Before a sandboxed turn launches: its key must have passed the canary. Otherwise the agent waits (`canaryHeld`), one
-    /// canary run is scheduled for the key, the wait is logged once per key, and `SandboxNotVerified` is thrown.
-    nonisolated func requireSandboxVerified(gate: SandboxCanaryGate, shape: String, agent: Agent, company: Company) async throws {
+    /// Before a sandboxed turn launches (before anything of it is consumed or created): its key must have passed the canary.
+    /// Otherwise the agent waits (`canaryWaiting`, filtered out before `Scheduler.select`), a canary run is scheduled for the
+    /// key with `settings`, the wait is logged once per key, and `SandboxNotVerified` is thrown. A CLI that cannot be
+    /// fingerprinted fails the turn (`SandboxRefusal`), never launches it.
+    nonisolated func requireSandboxVerified(gate: SandboxCanaryGate, settings: ClaudeSettings, agent: Agent, company: Company) async throws {
         let key: SandboxCanaryKey
-        do { key = try await canaryKey(gate: gate, shape: shape) } catch {
+        do { key = try await canaryKey(gate: gate, shape: settings.shape()) } catch {
             throw SandboxRefusal(reason: "\(error)")
         }
         if try store.sandboxVerified(key) { return }
-        await waitForCanary(key, agent: agent, company: company)
+        await waitForCanary(key, settings: settings, agent: agent, company: company)
         throw SandboxNotVerified(key: key)
     }
 
-    private func waitForCanary(_ key: SandboxCanaryKey, agent: Agent, company: Company) {
+    private func waitForCanary(_ key: SandboxCanaryKey, settings: ClaudeSettings, agent: Agent, company: Company) {
         canaryWaiting[agent.id] = key
+        if canarySettings[key.text] == nil { canarySettings[key.text] = settings }
         if canaryLogged.insert(key.text).inserted {
             let text = "sandbox not verified (claude \(key.cliVersion ?? "?"), new settings shape or macOS update); checking"
             attempt {
@@ -68,7 +71,19 @@ extension Orchestrator {
         scheduleCanary(key)
     }
 
-    /// Whether `agent` still waits for a canary: until its key passed, or its company no longer runs it sandboxed.
+    /// Each tick, before `Scheduler.select` (I1): drops waits whose agent no longer runs sandboxed, starts the next due canary,
+    /// and returns the agents still waiting, which get no slot. From memory only: no I/O per tick.
+    func canaryTick(ready: [Agent], companies: [String: Company]) -> Set<String> {
+        guard !canaryWaiting.isEmpty else { return [] }
+        for a in ready where canaryWaiting[a.id] != nil {
+            if let c = companies[a.companyId], turnProfile(agent: a, company: c) != .sandboxed { canaryWaiting[a.id] = nil }
+        }
+        for key in Set(canaryWaiting.values).sorted(by: { $0.text < $1.text }) { scheduleCanary(key) }
+        return Set(canaryWaiting.keys)
+    }
+
+    /// Whether `agent` still waits for a canary (the backstop in `launch`): until its key passed, or its company no longer runs
+    /// it sandboxed.
     func canaryHeld(_ agent: Agent) -> Bool {
         guard let key = canaryWaiting[agent.id] else { return false }
         let stillSandboxed = (try? store.company(id: agent.companyId)).flatMap { $0 }.map { turnProfile(agent: agent, company: $0) == .sandboxed } ?? false
@@ -76,36 +91,51 @@ extension Orchestrator {
             canaryWaiting[agent.id] = nil
             return false
         }
-        scheduleCanary(key)
         return true
     }
 
-    /// One canary run per key at a time, detached; a key that did not pass is retried after `retryAfter`.
+    /// One canary run at a time engine-wide (M5), detached; a key that did not pass is retried after `retryAfter`; the other
+    /// keys wait for later ticks.
     func scheduleCanary(_ key: SandboxCanaryKey) {
         guard let gate = sandboxCanary else { return }
-        let name = Self.canaryTaskName(key)
-        guard healthTasks[name] == nil else { return }
+        guard !healthTasks.keys.contains(where: { $0.hasPrefix(Self.canaryTaskPrefix) }) else { return }
         if let failed = canaryFailedAt[key.text], AwakeTime.uptime() - failed < gate.retryAfter { return }
-        let paths = self.paths
-        healthTasks[name] = Task.detached { [self] in
-            let items = await gate.canary.run(paths: paths, claudePath: gate.claudePath, runner: gate.runner, shape: key.shape)
-            await canaryFinished(key, items: items)
+        let paths = self.paths, settings = canarySettings[key.text]
+        healthTasks[Self.canaryTaskName(key)] = Task.detached { [self] in
+            let run = await gate.canary.run(paths: paths, claudePath: gate.claudePath, runner: gate.runner, key: key, settings: settings)
+            await canaryFinished(key, run: run)
         }
     }
 
-    /// A pass (every item) is recorded and answers the alert; anything else raises the pinned sandbox-check alert once while
-    /// it is open, and the key is retried later.
-    func canaryFinished(_ key: SandboxCanaryKey, items: [DoctorItem]) {
+    static let canaryTaskPrefix = "sandbox-canary:"
+
+    /// A pass (every item, for exactly this key: `CanaryRun.passes`) is recorded and frees the agents waiting for it; the
+    /// sandbox-check alert is answered only when no other key is failing (M2). Anything else raises the pinned sandbox-check
+    /// alert once while it is open, and the key is retried later.
+    func canaryFinished(_ key: SandboxCanaryKey, run: CanaryRun) {
         healthTasks[Self.canaryTaskName(key)] = nil
         let now = clock()
-        if !items.isEmpty, items.allSatisfy({ $0.status == .pass }) {
+        if run.passes(key) {
             canaryFailedAt[key.text] = nil
-            attempt { try store.recordCanary(key, detail: items.map { "\($0.name): \($0.detail)" }.joined(separator: "; "), now: now) }
+            canarySettings[key.text] = nil
+            let resolve = canaryFailedAt.isEmpty
+            attempt {
+                try store.recordCanary(key, detail: run.items.map { "\($0.name): \($0.detail)" }.joined(separator: "; "), now: now,
+                                       resolveAlert: resolve)
+            }
+            canaryWaiting = canaryWaiting.filter { $0.value != key }
             log("sandbox canary passed (claude \(key.cliVersion ?? "?"))")
             return
         }
         canaryFailedAt[key.text] = AwakeTime.uptime()
-        let bad = items.filter { $0.status != .pass }.map { "\($0.name): \($0.detail)" }
+        // The CLI build or macOS changed under the wait: this key can never be verified again, so its agents go back to the
+        // gate, which asks for the current key.
+        if let verified = run.verified, verified.fingerprint != key.fingerprint || verified.osVersion != key.osVersion {
+            canaryWaiting = canaryWaiting.filter { $0.value != key }
+            canarySettings[key.text] = nil
+        }
+        var bad = run.items.filter { $0.status != .pass }.map { "\($0.name): \($0.detail)" }
+        if run.verified != key, !run.items.isEmpty { bad.append("canary shape differs from the turn's (nothing recorded)") }
         let detail = bad.isEmpty ? "the canary reported nothing" : bad.joined(separator: "; ")
         log("sandbox canary did not pass: \(detail)")
         attempt {
