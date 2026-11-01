@@ -79,7 +79,7 @@ public enum PreviewLog {
     }
 }
 
-/// Engine-wide preview ports. Task 2 adds the per-surface rule (`port(for:store:)`).
+/// Engine-wide preview ports, and the per-surface rule (`port(for:store:)`).
 public enum PortAllocator {
     public static let range = 47100...47999
 
@@ -87,6 +87,31 @@ public enum PortAllocator {
     public static func allocate(excluding: Set<Int>) throws -> Int {
         for port in range where !excluding.contains(port) && isFree(port) { return port }
         throw WorkError.conflict("no free preview port in \(range.lowerBound)…\(range.upperBound)")
+    }
+
+    /// The port a surface starts on.
+    /// - A `{port}` surface keeps the port its state records while no other surface records it and it is free or held by
+    ///   the surface itself (its state is not `stopped`); otherwise one is allocated, excluding every company's recorded
+    ///   `previewState.port`.
+    /// - A literal port (in `url`) is returned as it is, unless another surface, of any company, holds it in a non-stopped
+    ///   state: `"port <p> is used by preview <company>/<name>; use {port} in run and url"`.
+    public static func port(for surface: PreviewSurface, store: Store) throws -> Int {
+        guard let url = surface.url else { throw WorkError.invalid("a web preview needs run and url") }
+        let holders = try store.previewPortHolders()
+        let others = holders.filter { $0.surfaceId != surface.id }
+        if url.contains(LoopbackURL.placeholder) {
+            if let mine = holders.first(where: { $0.surfaceId == surface.id }),
+               !others.contains(where: { $0.port == mine.port && $0.holds }),
+               mine.holds || isFree(mine.port) {
+                return mine.port
+            }
+            return try allocate(excluding: Set(holders.map(\.port)))
+        }
+        guard let literal = LoopbackURL.resolve(url, port: nil)?.port else { throw LoopbackURL.urlRefusal }
+        if let holder = others.first(where: { $0.port == literal && $0.holds }) {
+            throw WorkError.conflict("port \(literal) is used by preview \(holder.companySlug)/\(holder.name); use {port} in run and url")
+        }
+        return literal
     }
 
     /// Whether a TCP socket can bind `127.0.0.1:<port>` (closed again at once).
