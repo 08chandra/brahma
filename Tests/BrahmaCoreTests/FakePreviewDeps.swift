@@ -45,9 +45,9 @@ final class FakeListenProbe: ListenProbing, @unchecked Sendable {
 }
 
 extension PreviewDependencies {
-    /// Fakes for every dependency (a fresh process table).
+    /// Fakes for every dependency (a fresh process table), the Full-mode runner included (never the real unsandboxed one).
     static func fake(sandbox: FakeSandbox = FakeSandbox(), http: FakeHTTPProbe = FakeHTTPProbe([FakeHTTPProbe.ok()]),
-                     listen: FakeListenProbe = FakeListenProbe()) -> PreviewDependencies {
-        PreviewDependencies(sandbox: sandbox, http: http, listen: listen, processes: SpawnedProcesses())
+                     listen: FakeListenProbe = FakeListenProbe(), unsandboxed: FakeSandbox = FakeSandbox()) -> PreviewDependencies {
+        PreviewDependencies(sandbox: sandbox, http: http, listen: listen, processes: SpawnedProcesses(), unsandboxed: unsandboxed)
     }
 }
