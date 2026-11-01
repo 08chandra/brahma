@@ -21,6 +21,17 @@ extension Store {
     static let previewRestartForbidden = "only the owner or the agent who set a preview may restart it"
     static let noSuchPreview = "no such preview"
 
+    /// Who may change or remove an existing surface: the owner, or the agent who set it. An owner-set surface is immutable to
+    /// every agent (including whoever set it before the owner took it over); agents propose a change via an ask.
+    static func checkMayChange(_ db: Database, _ surface: PreviewSurface, actor: String) throws {
+        guard actor != "owner", actor != surface.setById else { return }
+        if surface.setById == "owner" {
+            throw WorkError.forbidden("preview \(surface.name) was set by the owner; propose a change with request_from_owner")
+        }
+        let setter = (try Agent.fetchOne(db, key: surface.setById))?.name ?? surface.setById
+        throw WorkError.forbidden("only the owner or @\(setter) may change or remove preview \(surface.name); propose the change with request_from_owner")
+    }
+
     /// The sender's id when it may act on `companyId`: the owner, or an agent of that company that is not killed. Any other
     /// agent (or `.system`) is `WorkError.forbidden("not in your company")` (cross-company ids).
     static func previewActor(_ db: Database, companyId: String, by: Sender) throws -> String {
@@ -36,8 +47,8 @@ extension Store {
     }
 
     /// Creates or replaces the surface named `draft.name` in the company (one row per name, `UNIQUE(companyId, name)`): a new
-    /// one takes the next position and an idle state row; an existing one keeps its id and position, takes the new fields and
-    /// setter, and is asked to restart (`restartRequestedAt`). The draft is validated as a `PreviewSurface` (its messages) after
+    /// one takes the next position and an idle state row; an existing one (changed only by the owner or its setter,
+    /// `checkMayChange`) keeps its id and position, takes the new fields and setter, and is asked to restart (`restartRequestedAt`). The draft is validated as a `PreviewSurface` (its messages) after
     /// each smoke line is parsed. The ninth surface is refused with `"a company can have at most 8 previews"`. Every command,
     /// URL and smoke line is agent text: redacted before it is stored. Returns the stored surface.
     public func upsertPreviewSurface(companyId: String, by: Sender, _ draft: PreviewDraft, now: Date = Store.now()) throws -> PreviewSurface {
@@ -49,6 +60,7 @@ extension Store {
             let existing = try PreviewSurface.filter(Column("companyId") == companyId && Column("name") == draft.name).fetchOne(db)
             var surface: PreviewSurface
             if var current = existing {
+                try Self.checkMayChange(db, current, actor: actor)
                 current.kind = draft.kind; current.build = build; current.run = run; current.url = url; current.smoke = smoke
                 current.setById = actor; current.updatedAt = now
                 surface = current
@@ -73,13 +85,13 @@ extension Store {
                     try PreviewState(surfaceId: surface.id, companyId: companyId, status: .idle, restartRequestedAt: now, updatedAt: now).insert(db)
                 }
             }
-            try Self.recordPreviewEvent(db, companyId: companyId, actor: actor, text: "set preview \(surface.name) (\(surface.kind))", now: now)
+            try Self.recordPreviewEvent(db, companyId: companyId, actor: actor, text: "\(existing == nil ? "set" : "updated") preview \(surface.name) (\(surface.kind))", now: now)
             return surface
         }
     }
 
     /// Removes the surface named `name` (its state row cascades); the engine stops its process on its next pass. The owner or
-    /// an agent of the company; `"no preview named <name>"` when there is none. Returns the removed surface.
+    /// the agent who set it (`checkMayChange`); `"no preview named <name>"` when there is none. Returns the removed surface.
     @discardableResult
     public func removePreviewSurface(companyId: String, name: String, by: Sender, now: Date = Store.now()) throws -> PreviewSurface {
         try writer.write { db in
@@ -87,6 +99,7 @@ extension Store {
             guard let surface = try PreviewSurface.filter(Column("companyId") == companyId && Column("name") == name).fetchOne(db) else {
                 throw WorkError.notFound("no preview named \(Self.flat(name, max: 40))")
             }
+            try Self.checkMayChange(db, surface, actor: actor)
             try surface.delete(db)
             try Self.recordPreviewEvent(db, companyId: companyId, actor: actor, text: "removed preview \(surface.name)", now: now)
             return surface
