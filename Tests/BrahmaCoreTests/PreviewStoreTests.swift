@@ -75,11 +75,11 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         // A fresh state row, idle, with no port yet.
         let states = try t.store.previewStates(companyId: t.acme.id)
         #expect(states[web.id]?.status == .idle); #expect(states[web.id]?.port == nil)
-        // The CTO (an executive) may set one too; a second set of the same name updates in place (same id, same position).
-        let again = t.set(t.cto, "web", extra: ["run": .string("npm run dev")])
+        // A second set of the same name by its setter updates in place (same id, same position).
+        let again = t.set(t.devops, "web", extra: ["run": .string("npm run dev")])
         #expect(again.ok, "\(again.text)")
         let updated = try t.surface(t.acme, "web")
-        #expect(updated.id == web.id); #expect(updated.run == "npm run dev"); #expect(updated.setById == t.cto.id); #expect(updated.position == 0)
+        #expect(updated.id == web.id); #expect(updated.run == "npm run dev"); #expect(updated.setById == t.devops.id); #expect(updated.position == 0)
         #expect(try t.store.previewSurfaces(companyId: t.acme.id).count == 1)
         // A change asks the engine for a restart.
         #expect(try t.store.previewStates(companyId: t.acme.id)[web.id]?.restartRequestedAt != nil)
@@ -89,8 +89,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(t.set(t.devops, "api", extra: ["kind": .string("cli")]).text == "only web previews are available yet")
         #expect(t.set(t.devops, "api", extra: ["smoke": .array([.string("FETCH /x")])]).text
                 == "smoke requests look like \"GET /health 200\" or \"POST /items {json} 201\"")
-        // The cap: 8 per company (the first is `web`).
-        for i in 2...8 { #expect(t.set(t.cto, "p\(i)").ok) }
+        // The cap: 8 per company (the first is `web`); the CTO (an executive) may set them too.
+        for i in 2...7 { #expect(t.set(t.cto, "p\(i)").ok) }
+        #expect(t.set(t.devops, "p8").ok)
         let ninth = t.set(t.devops, "p9")
         #expect(!ninth.ok); #expect(ninth.text == "a company can have at most 8 previews")
         #expect(try t.store.previewSurfaces(companyId: t.acme.id).map(\.position) == Array(0..<8))
@@ -119,7 +120,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try t.store.previewSurfaces(companyId: t.acme.id).map(\.name) == ["web", "p2", "p3", "p4", "p5", "p6", "p7", "p9"])
         // The activity feed records both.
         let events = try t.store.events(afterId: 0).filter { $0.kind == .preview }.map(\.text)
-        #expect(events.contains("@devops-1 set preview web (web)")); #expect(events.contains("@devops-1 removed preview p8"))
+        #expect(events.contains("@devops-1 set preview web (web)")); #expect(events.contains("@devops-1 updated preview web (web)"))
+        #expect(events.contains("@cto set preview p2 (web)")); #expect(events.contains("@devops-1 removed preview p8"))
     }
 
     @Test func storeChecksTheSenderAndTheCompany() throws {
@@ -135,12 +137,14 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(Self.message { try t.store.requestPreviewRestart(surfaceId: web.id, by: other) } == "not in your company")
         #expect(Self.message { try t.store.requestPreviewRestart(surfaceId: web.id, by: .system) } == "not in your company")
         // A restart is the owner's or the setter's; another agent of the company is refused.
-        let set = try t.store.upsertPreviewSurface(companyId: t.acme.id, by: .agent(t.devops.id), draft)
-        #expect(set.setById == t.devops.id)
-        #expect(Self.message { try t.store.requestPreviewRestart(surfaceId: web.id, by: .agent(t.cto.id)) } == "only the owner or the agent who set a preview may restart it")
-        try t.store.requestPreviewRestart(surfaceId: web.id, by: .agent(t.devops.id))
+        let apiDraft = PreviewDraft(name: "api", kind: "web", run: "npm start", url: "http://127.0.0.1:{port}/")
+        let api = try t.store.upsertPreviewSurface(companyId: t.acme.id, by: .agent(t.devops.id), apiDraft)
+        #expect(api.setById == t.devops.id)
+        #expect(Self.message { try t.store.requestPreviewRestart(surfaceId: api.id, by: .agent(t.cto.id)) } == "only the owner or the agent who set a preview may restart it")
+        try t.store.requestPreviewRestart(surfaceId: api.id, by: .agent(t.devops.id))
         try t.store.requestPreviewRestart(surfaceId: web.id, by: .owner)
         #expect(try t.store.previewStates(companyId: t.acme.id)[web.id]?.restartRequestedAt != nil)
+        _ = try t.store.removePreviewSurface(companyId: t.acme.id, name: "api", by: .agent(t.devops.id))
         #expect(Self.message { try t.store.requestPreviewRestart(surfaceId: "nope", by: .owner) } == "no such preview")
         // savePreviewState round-trips every column; removing the surface cascades to it.
         let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -155,6 +159,44 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         _ = try t.store.removePreviewSurface(companyId: t.acme.id, name: "web", by: .owner)
         #expect(try t.store.previewStates(companyId: t.acme.id).isEmpty)
         #expect(try t.store.writer.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM previewState") } == 0)
+    }
+
+    /// C1: an existing surface is changed or removed only by the owner or its setter; an owner-set one is immutable to agents.
+    @Test func existingSurfaceChangedOnlyByOwnerOrSetter() throws {
+        let t = try T()
+        let setter = "only the owner or @devops-1 may change or remove preview web; propose the change with request_from_owner"
+        #expect(t.set(t.devops, "web").ok)
+        // Another agent's edit and remove are refused (the executive too), and nothing changed.
+        let edit = t.set(t.cto, "web", extra: ["run": .string("evil")])
+        #expect(!edit.ok); #expect(edit.text == setter)
+        let remove = t.set(t.cto, "web", extra: ["remove": .bool(true)])
+        #expect(!remove.ok); #expect(remove.text == setter)
+        #expect(Self.message { _ = try t.store.removePreviewSurface(companyId: t.acme.id, name: "web", by: .agent(t.eng.id)) } == setter)
+        #expect(try t.surface(t.acme, "web").run == "npm start"); #expect(try t.surface(t.acme, "web").setById == t.devops.id)
+        // The setter may edit and remove.
+        #expect(t.set(t.devops, "web", extra: ["run": .string("npm run dev")]).ok)
+        #expect(try t.surface(t.acme, "web").run == "npm run dev")
+        #expect(t.set(t.devops, "web", extra: ["remove": .bool(true)]).ok)
+        #expect(try t.store.previewSurfaces(companyId: t.acme.id).isEmpty)
+        // The owner may edit and remove an agent's surface …
+        #expect(t.set(t.devops, "web").ok)
+        let draft = PreviewDraft(name: "web", kind: "web", run: "PORT={port} npm start", url: "http://127.0.0.1:{port}/")
+        let taken = try t.store.upsertPreviewSurface(companyId: t.acme.id, by: .owner, draft)
+        #expect(taken.setById == "owner"); #expect(taken.run == "PORT={port} npm start")
+        // … after which it is the owner's: the original setter (and everyone else) is refused, and pointed at an ask.
+        let ownerSet = "preview web was set by the owner; propose a change with request_from_owner"
+        for agent in [t.devops, t.cto] {
+            let e = t.set(agent, "web", extra: ["run": .string("x")]); #expect(!e.ok); #expect(e.text == ownerSet)
+            let r = t.set(agent, "web", extra: ["remove": .bool(true)]); #expect(!r.ok); #expect(r.text == ownerSet)
+        }
+        #expect(try t.surface(t.acme, "web").run == "PORT={port} npm start")
+        _ = try t.store.removePreviewSurface(companyId: t.acme.id, name: "web", by: .owner)
+        #expect(try t.store.previewSurfaces(companyId: t.acme.id).isEmpty)
+        // Every change names its actor in the activity feed.
+        let events = try t.store.events(afterId: 0).filter { $0.kind == .preview }.map(\.text)
+        #expect(events.contains("@devops-1 updated preview web (web)")); #expect(events.contains("@devops-1 removed preview web"))
+        #expect(events.contains("owner updated preview web (web)")); #expect(events.contains("owner removed preview web"))
+        #expect(!events.contains { $0.hasPrefix("@cto") })
     }
 
     // MARK: Ports
