@@ -1,0 +1,10 @@
+# SYNTHETIC (needs owner token): composed from wrangler 4.156.0's own output strings, not a recorded run. Replace with the
+# owner's probe output (Plan L Task 4 Step 1, PR-14).
+ ⛅️ wrangler 4.156.0
+───────────────────
+✨ Successfully created the 'acme' project. It will be available at https://acme-9x.pages.dev/ once you create your first deployment.
+Uploading... (3/3)
+✨ Success! Uploaded 3 files (1.42 sec)
+
+🌎 Deploying...
+✨ Deployment complete! Take a peek over at https://1a2b3c4d.acme-9x.pages.dev ✨ Deployment alias URL: https://main.acme-9x.pages.dev
