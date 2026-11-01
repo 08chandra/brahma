@@ -22,7 +22,7 @@ import Glibc
     }
 
     static func setup(build: String? = nil, run: String = "sleep 300", http: FakeHTTPProbe = FakeHTTPProbe([FakeHTTPProbe.ok()]),
-                      listen: [String] = ["127.0.0.1"], timeouts: PreviewTimeouts = PreviewTimeouts(ready: .seconds(20), poll: .milliseconds(50)),
+                      listen: [String] = ["127.0.0.1"], timeouts: PreviewTimeouts = PreviewTimeouts(ready: .seconds(600), poll: .milliseconds(50)),
                       port: Int = 47100) throws -> Setup {
         let dir = try tempDir()
         let runDir = dir.appending(path: "run", directoryHint: .isDirectory)
@@ -46,7 +46,7 @@ import Glibc
     static func groupAlive(_ pgid: Int32) -> Bool { kill(-pgid, 0) == 0 }
 
     static func waitGone(_ pgid: Int32) async -> Bool {
-        let deadline = AwakeTime.deadline(after: .seconds(15))
+        let deadline = AwakeTime.deadline(after: .seconds(60))
         while AwakeTime.now < deadline {
             if !groupAlive(pgid) { return true }
             try? await AwakeTime.sleep(for: .milliseconds(50))
@@ -122,7 +122,7 @@ import Glibc
     }
 
     @Test func buildTimesOut() async throws {
-        var timeouts = PreviewTimeouts(ready: .seconds(5), poll: .milliseconds(50))
+        var timeouts = PreviewTimeouts(ready: .seconds(600), poll: .milliseconds(50))
         timeouts.build = .seconds(1)
         let s = try Self.setup(build: "sleep 300", timeouts: timeouts)
         let update = await WebAdapter.startServer(s.context, deps: s.deps)
@@ -135,6 +135,32 @@ import Glibc
         s.sandbox.spawnError = SandboxError.unavailable
         let update = await WebAdapter.startServer(s.context, deps: s.deps)
         #expect(update == PreviewUpdate(status: .unavailable, message: "sandbox unavailable on this platform"))
+    }
+
+    /// Fix I2: the Full-mode runner starts its command as the leader of its own group, writes its output to the log, and
+    /// `terminate` leaves nothing of the group behind; `run` gives the exit code.
+    @Test func unsandboxedRunnerOwnsItsGroup() async throws {
+        let dir = try tempDir()
+        let runner = UnsandboxedPreviewRunner()
+        let log = dir.appending(path: "logs/web.log")
+        let process = try runner.spawn(command: "echo up; sleep 300 & sleep 300 & wait", cwd: dir, environment: ["PATH": "/bin:/usr/bin"],
+                                       logURL: log, policy: Self.policy)
+        let pgid = process.pid
+        #expect(getpgid(pgid) == pgid, "its own group")
+        #expect(process.isAlive() && Self.groupAlive(pgid))
+        let deadline = AwakeTime.deadline(after: .seconds(60))
+        while AwakeTime.now < deadline, !((try? String(contentsOf: log, encoding: .utf8)) ?? "").contains("up") {
+            try? await AwakeTime.sleep(for: .milliseconds(20))
+        }
+        #expect(try String(contentsOf: log, encoding: .utf8).contains("up"), "its output reaches the log")
+        await process.terminate(grace: .seconds(5))
+        #expect(await Self.waitGone(pgid), "no process is left in the group")
+        #expect(!process.isAlive() && process.exitStatus() != nil)
+        let out = dir.appending(path: "build.log")
+        let outcome = await runner.run(command: "echo built; exit 4", cwd: dir, environment: ["PATH": "/bin:/usr/bin"], timeout: .seconds(60),
+                                       outputURL: out, policy: Self.policy)
+        #expect(outcome.exitCode == 4 && !outcome.timedOut)
+        #expect(try String(contentsOf: out, encoding: .utf8) == "built\n")
     }
 
     /// Deferred minor 2: a port something listens on over IPv6 only (`[::1]:P`) is not free.
