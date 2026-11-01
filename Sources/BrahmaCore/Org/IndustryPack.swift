@@ -7,14 +7,17 @@ public enum CompanyToolNames {
     public static let work = ["list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency",
                               "comment_work_item", "claim_lease", "release_lease", "submit_for_review", "write_handoff",
                               "propose_decision", "request_from_owner", "escalate_decision", "request_mode",
-                              "request_access", "request_secret", "use_secret"]
+                              "request_access", "request_secret", "use_secret", "request_human_task"]
     public static let lead = ["plan_sprint", "close_sprint", "confirm_spec", "readopt_branch"]
     public static let executive = ["decide"]
+    /// Plan L's ops tools: previews, smoke checks, hosting and deploy proposals. The software pack gives them to devops,
+    /// architects and every executive; every other role gets `"<tool> is not available to your role"`.
+    public static let ops = ["set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy"]
     /// Review turns only, regardless of role. `create_work_item` files follow-ups instead of blocking on mechanical fixes.
     public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review"]
     /// Audit turns only (9c), regardless of role: the verdict on each auto-merge of the turn's batch.
     public static let audit = ["audit"]
-    public static var all: [String] { base + work + lead + executive + ["review"] + audit }
+    public static var all: [String] { base + work + lead + executive + ops + ["review"] + audit }
 }
 
 public struct RoleTemplate: Codable, Equatable, Sendable {
