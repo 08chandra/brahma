@@ -161,6 +161,11 @@ public enum StreamEvent: Equatable, Sendable {
     case effortCapped(requested: String)
     /// Produced by the runner: something about the turn's sandbox the engine should log (a grant read path dropped at spawn).
     case sandboxNote(String)
+    /// Produced by the runner right after it started the CLI: the turn's process (Task 3, `Store.setTurnPid`).
+    case spawned(pid: Int32)
+    /// Produced by the runner only when the request asks for it (`TurnRequest.emitRawLines`, the sandbox canary): one stdout
+    /// line as printed, before its parsed events.
+    case raw(String)
     case other(type: String)
 }
 

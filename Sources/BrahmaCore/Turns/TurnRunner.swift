@@ -271,6 +271,7 @@ public struct ClaudeProcessRunner: TurnRunning {
             throw error
         }
         claimed = false   // from here the sweep below ends the claim, with what it could not kill
+        yield(.spawned(pid: child.pid))
         if let dir = request.turnRecordDirectory, let start = ProcessTable.entry(child.pid)?.start {
             let withLeader = TurnRecord(leader: child.pid, leaderStart: start, since: since, machMarker: record.machMarker)
             if (try? TurnRecords.replace(record, with: withLeader, agentId: agentId, in: dir)) != nil { record = withLeader }
@@ -325,6 +326,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         var state = TurnStreamState()
         await withTaskCancellationHandler {
             for await line in lines {
+                if request.emitRawLines { yield(.raw(line)) }
                 guard let events = StreamParser.parseAll(line: line) else { continue }
                 for event in events {
                     state.apply(event)

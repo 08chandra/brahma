@@ -24,6 +24,14 @@ func openStore(lazySecrets: Bool = true) throws -> (Store, BrahmaPaths) {
     let catalog = PackCatalog.loadOrBuiltin(directory: paths.packsDir) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
     let store = try Store(path: paths.database.path, catalog: catalog, backupsDir: paths.backupsDir)
     cliTimeZone = store.ownerTimeZone()
+    // The data home must lie outside every workspace, its private directories 0700 (Task 3).
+    do { try DataHomeGuard.validate(paths: paths, workspacePaths: try store.companies().map(\.workspacePath)) } catch {
+        throw fail("\(error)")
+    }
+    // A data-home directory that is not private is fixed; one that cannot be (a link, a file) is reported, never followed.
+    do { try DataHomeGuard.lockDown(paths: paths) } catch {
+        FileHandle.standardError.write(Data("brahma: \(safe("\(error)"))\n".utf8))
+    }
     // Every write of redactable text fails closed until the redactor has loaded the secrets (`Store.secretsHeld`). The load
     // is lazy: it runs once, non-interactively, on the first redacting write, so read-only commands never touch the vault.
     // An agent's shell (BRAHMA_AGENT_ID) never reads secret values: its writes keep failing closed.
@@ -114,13 +122,16 @@ func ownerKeyStore(for paths: BrahmaPaths) throws -> any OwnerKeyStore {
 /// key; only the app and `brahma owner init` do. Nothing skips this check; `BRAHMA_OWNER_KEY_STORE=file` only moves
 /// the hash into a temp/demo data home.
 ///
-/// This is a deterrent, not a security boundary: until 5-lite read-denies the data home and Keychain services to
-/// agents, an agent shell can still read the key and hash, or fake a TTY with `script`.
+/// Task 3: a turn is refused by its environment and by its ancestry: a process whose ancestor is a running turn's process
+/// (`Store.recordedTurnLeaders`: the runner's turn records, read without opening the database) is inside that turn. On the Sandboxed profile the sandbox denies the data home and the Keychain
+/// services anyway; on the Workspace profile this check is a deterrent, not a security boundary (README).
 func requireOwnerShell() throws {
-    if ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] != nil {
-        throw fail("owner commands can't run inside an agent turn")
-    }
     let paths = BrahmaPaths.fromEnvironment()
+    let running = Store.recordedTurnLeaders(paths: paths)
+    if let why = OwnerShellGuard.refusal(environment: ProcessInfo.processInfo.environment,
+                                         ancestors: ProcessAncestry.chain(of: getpid()), runningTurnPids: running) {
+        throw fail(why)
+    }
     guard OwnerKey.verify(paths: paths, store: try ownerKeyStore(for: paths)) else {
         throw fail("owner key missing or invalid; run 'brahma owner init' in Terminal or open the app")
     }

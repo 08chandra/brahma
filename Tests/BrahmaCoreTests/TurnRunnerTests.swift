@@ -34,7 +34,11 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             cat '\(fixture.path)'
             """)
         let runner = ClaudeProcessRunner(claudePath: script.path)
-        let events = try await collect(runner.run(request(in: dir)))
+        let all = try await collect(runner.run(request(in: dir)))
+        // Task 3: the runner's first event is the spawned process.
+        guard case .spawned(let pid)? = all.first else { Issue.record("no spawned event first"); return }
+        #expect(pid > 0)
+        let events = Array(all.dropFirst())
         #expect(events.count == 5, "init, its details, assistant text, rate limit, result")
         guard case .initialized(let session, _) = events.first else { Issue.record("no init"); return }
         #expect(session == "7081f66a-b7b1-4f6f-96e7-c690d4b0cec0")
@@ -62,6 +66,7 @@ private func collect(_ stream: AsyncThrowingStream<StreamEvent, Error>) async th
             #expect(code == 3)
             #expect(stderrTail.contains("something went wrong"))
         }
+        seen.removeAll { if case .spawned = $0 { true } else { false } }
         #expect(seen == [.initialized(sessionId: "s1", model: "m"),
                          .initInfo(InitInfo(sessionId: "s1", model: "m", tools: [], agents: []))])
     }

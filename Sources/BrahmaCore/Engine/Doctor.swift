@@ -77,7 +77,8 @@ public enum Doctor {
                            now: Date = .now, hookExecutable: String = "brahma",
                            managedSettingsPath: String = Doctor.managedSettingsPath,
                            managedPreferencesPath: String? = nil,
-                           sandbox: (any SandboxedRunner)? = nil) async -> DoctorReport {
+                           sandbox: (any SandboxedRunner)? = nil,
+                           canary: (any SandboxCanaryRunning)? = nil, canaryPaths: BrahmaPaths? = nil) async -> DoctorReport {
         let found = await versionOutcome(claudePath: claudePath, exec: exec)
         guard let version = found.version else {
             let detail = found.timedOut?.description ?? "can't run '\(claudePath) --version'; is Claude Code installed?"
@@ -90,6 +91,11 @@ public enum Doctor {
         items.append(toolsItem(probe.tools))
         items.append(sideloadItem(path: managedSettingsPath, preferences: managedPreferencesPath.map { [$0] } ?? managedPreferencePaths()))
         if let sandbox { items.append(await pluginDetailsItem(claudePath: claudePath, sandbox: sandbox)) }
+        // The sandbox canary (Task 3): `sandbox-backend`, `sandbox-canary`, `sandbox-helpers`. The doctor only reports them; the
+        // engine's per-launch gate records a pass for the shapes its turns use.
+        if let canary, let canaryPaths {
+            items += await canary.run(paths: canaryPaths, claudePath: claudePath, runner: runner, shape: "doctor")
+        }
         var report = DoctorReport(cliVersion: version, items: items, checkedAt: now)
         // The mode-canary: each mode's compiled argv answers control requests with no model call (design §6.4).
         if let canary = await ModeCanary.run(runner: runner, hookExecutable: hookExecutable) {

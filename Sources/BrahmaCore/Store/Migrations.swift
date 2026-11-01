@@ -680,6 +680,20 @@ enum Migrations {
                 t.add(column: "toolchainReadPaths", .text).notNull().defaults(to: "[]")
             }
         }
+        m.registerMigration("v5-owner-guard") { db in
+            // Task 3: the process of each turn (an owner command whose ancestor is a running turn is refused), and the sandbox
+            // canary's passes, keyed by the CLI build, the settings shape and the macOS version.
+            try db.alter(table: "turn") { t in t.add(column: "pid", .integer) }
+            try db.create(table: "sandboxCanary") { t in
+                t.column("cliFingerprint", .text).notNull()
+                t.column("settingsShape", .text).notNull()
+                t.column("osVersion", .text).notNull()
+                t.column("cliVersion", .text)
+                t.column("passedAt", .datetime).notNull()
+                t.column("detail", .text)
+                t.primaryKey(["cliFingerprint", "settingsShape", "osVersion"])
+            }
+        }
         m.registerMigration("v5-secrets") { db in
             // Names and flags only; values live in the Keychain (or another SecretVault), never here.
             try db.create(table: "secret") { t in

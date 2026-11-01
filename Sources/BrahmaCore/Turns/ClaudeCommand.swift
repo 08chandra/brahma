@@ -63,6 +63,8 @@ public struct TurnRequest: Sendable {
     public var turnRecordDirectory: URL? = nil
     /// Ultra's workflow policy (Task 14u; nil until then).
     public var workflow: WorkflowPolicy? = nil
+    /// The runner yields every stdout line as `.raw` too (the sandbox canary reads tool results the parser only digests).
+    public var emitRawLines = false
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,

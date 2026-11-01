@@ -11,9 +11,12 @@ struct Doctor: AsyncParsableCommand {
         try requireOwnerShell()
         signal(SIGPIPE, SIG_IGN)
         let (store, paths) = try openStore()
+        let hook = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let sandbox = Orchestrator.ownerSandboxRunner(store: store, paths: paths)
         let report = await BrahmaCore.Doctor.run(claudePath: ExtLint.claudePath() ?? "claude", runner: ClaudeProcessRunner(),
-                                                 hookExecutable: Bundle.main.executablePath ?? CommandLine.arguments[0],
-                                                 sandbox: Orchestrator.ownerSandboxRunner(store: store, paths: paths))
+                                                 hookExecutable: hook, sandbox: sandbox,
+                                                 canary: SandboxCanary(environment: .owner, sandbox: sandbox, hookExecutable: hook),
+                                                 canaryPaths: paths)
         try? store.saveProbe(report)
         for item in report.items {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")

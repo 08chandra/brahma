@@ -61,6 +61,8 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     public var modelsUsed: String? = nil
     /// This turn's cost in `total_cost_usd` list-equivalent dollars.
     public var costLE: Double? = nil
+    /// The turn's process (the CLI it spawned), recorded right after the spawn (`StreamEvent.spawned`, `v5-owner-guard`).
+    public var pid: Int32? = nil
 
     /// Tokens that count against a tier: input, output and cache creation. Cache reads are the same context re-read on
     /// every call and would charge a long conversation many times over, so they stay out.

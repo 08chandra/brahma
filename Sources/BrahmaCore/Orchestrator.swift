@@ -44,6 +44,17 @@ public actor Orchestrator {
     /// Per-turn transcript capture (`TranscriptCapture`); nil: off (the library default, as for `vault`). The app and
     /// `brahma run` pass one reading the Claude CLI's real transcript directory.
     nonisolated let transcripts: TranscriptCapture?
+    /// The per-launch sandbox gate (Task 3): no sandboxed turn starts until the canary passed for the CLI build, the turn's
+    /// settings shape and the macOS version. Nil: no gate (a fake runner has no CLI to verify; `Orchestrator.init` sets one for
+    /// the real runner unless the host passes its own).
+    nonisolated let sandboxCanary: SandboxCanaryGate?
+    /// Agent id → the canary key its last turn waited for: not launched again until that key passed.
+    var canaryWaiting: [String: SandboxCanaryKey] = [:]
+    /// Keys whose wait was logged (once per key), and when each key's last canary failed (awake seconds).
+    var canaryLogged = Set<String>()
+    var canaryFailedAt: [String: Double] = [:]
+    /// The CLI fingerprint, re-read at most every `SandboxCanaryGate.fingerprintCacheSeconds`.
+    var fingerprintCache: (value: CLIFingerprint, at: Double)?
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
@@ -116,7 +127,8 @@ public actor Orchestrator {
                 transcripts: TranscriptCapture? = nil,
                 backupTools: BackupTools = .system,
                 walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) },
-                sleepGuard: SleepGuard = .disabled) {
+                sleepGuard: SleepGuard = .disabled,
+                sandboxCanary: SandboxCanaryGate? = nil) {
         self.backupTools = backupTools; self.walSleeper = walSleeper; self.sleepGuard = sleepGuard
         // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
         let vault = vault.nonInteractive()
@@ -129,6 +141,13 @@ public actor Orchestrator {
         self.sandboxEnvironment = sandboxEnvironment
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
         self.claudePath = claudePath
+        // The real CLI is always gated; a fake runner only when the host asks for it.
+        self.sandboxCanary = sandboxCanary ?? (runner is ClaudeProcessRunner
+            ? SandboxCanaryGate(canary: SandboxCanary(environment: sandboxEnvironment,
+                                                      sandbox: Orchestrator.ownerSandboxRunner(store: store, paths: paths),
+                                                      hookExecutable: mcpExecutable),
+                                runner: runner, claudePath: claudePath)
+            : nil)
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths)
         self.checkBaseEnvironment = checkBaseEnvironment
@@ -145,8 +164,15 @@ public actor Orchestrator {
                 do { try store.reloadRedactorIfNeeded(vault: vault); return nil } catch { return "\(error)" }
             }
             if let failure { log("could not load secrets: \(failure)") }
-            // The shell prefix's backstop: only an unsandboxed process can read it (the sandbox denies the data home).
+            // The data home lies outside every workspace and its private directories are 0700 (Task 3).
             let paths = self.paths
+            let workspaces = try store.companies().map(\.workspacePath)
+            try await blocking.tryRun { try DataHomeGuard.validate(paths: paths, workspacePaths: workspaces) }
+            // One that cannot be made private (a link, a file) is logged, never followed; the owner sees it in the log.
+            if let problem = await blocking.run({ () -> String? in
+                do { try DataHomeGuard.lockDown(paths: paths); return nil } catch { return "\(error)" }
+            }) { log("data home: \(problem)") }
+            // The shell prefix's backstop: only an unsandboxed process can read it (the sandbox denies the data home).
             if let sentinel = await blocking.run({ () -> String? in
                 do { try Sentinel.write(paths: paths); return nil } catch { return "\(error)" }
             }) { log("could not write the sandbox sentinel: \(sentinel)") }
@@ -528,6 +554,8 @@ public actor Orchestrator {
     }
 
     private func launch(_ agent: Agent, now: Date) {
+        // Waiting for a sandbox canary (Task 3): stays ready, no turn, until its key passed.
+        if canaryHeld(agent) { return }
         // No empty turns: nothing to answer, no due notice, no review, no lease to keep working on. No process is started.
         if (try? store.hasActionableWork(agentId: agent.id)) == false {
             attempt { try store.transition(agentId: agent.id, to: .sleeping, now: now, if: { $0.state == .ready && !$0.paused }) }
@@ -583,6 +611,7 @@ public actor Orchestrator {
         var plan: PlanWatch?
         var modeDecision: ModeDecision?
         var notLaunched: ModeNotLaunched?
+        var sandboxUnverified = false
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             // Nothing of the agent's earlier turns may still run, whatever the profile (M1): this turn waits for their sweep
@@ -848,7 +877,11 @@ public actor Orchestrator {
             } else if profile == .workspace {
                 request.deniedPaths = try workspaceDeniedPaths(company: company)
             }
-            let settingsText = try TurnProfileCompiler.settingsJSON(TurnProfileCompiler.profile(for: request))
+            let compiled = TurnProfileCompiler.profile(for: request)
+            if profile == .sandboxed, let gate = sandboxCanary {
+                try await requireSandboxVerified(gate: gate, shape: compiled.settings.shape(), agent: agent, company: company)
+            }
+            let settingsText = try TurnProfileCompiler.settingsJSON(compiled)
             try await blocking.tryRun { try SettingsFile.write(settingsText, to: settingsFile) }
             // A review session is never recorded as the agent's own.
             var sessionMarked = wasResume || review != nil || audit != nil
@@ -876,6 +909,8 @@ public actor Orchestrator {
                         guard info.status != "unknown" else { continue }
                         lastInfo = info
                         try store.saveRateLimit(info)
+                    case .spawned(let pid):
+                        try store.setTurnPid(turnId: turn.id, pid: pid)
                     case .sandboxNote(let text):
                         try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
                                                             kind: .error, text: text, createdAt: clock()))
@@ -893,6 +928,8 @@ public actor Orchestrator {
             worktreeUnavailable = e
         } catch let e as ModeNotLaunched {
             notLaunched = e
+        } catch is SandboxNotVerified {
+            sandboxUnverified = true
         } catch {
             failure = String(describing: error)
         }
@@ -916,7 +953,10 @@ public actor Orchestrator {
             }
             return until
         }
-        if let notLaunched {
+        if sandboxUnverified {
+            // Nothing was started: the agent is ready again with no penalty and waits for the canary (`canaryHeld`).
+            end = .interrupted()
+        } else if let notLaunched {
             // Nothing was started. The no-launch rule blocks the item over budget (its lease goes back, the manager is told) and
             // the agent is ready again with no penalty; a model outside the allowlist is the owner's to fix.
             if let itemId = notLaunched.overBudgetItem {

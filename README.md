@@ -197,6 +197,8 @@ brahma doctor                                               probe the installed 
 
 ### Workspace profile limits
 
+Workspace profile only: an agent's Bash is not sandboxed. The engine refuses owner commands from inside a turn, but a determined process can escape that check; use Sandboxed (the default).
+
 **Checks and merges run as your user.** Each item's check runs in that item's git worktree with `/bin/sh`.
 Verification, merges and owner approvals are engine-owned for every agent tool, but under the workspace profile an
 agent's shell can still edit the database or the git repository directly, or run the brahma CLI. Brahma refuses owner
