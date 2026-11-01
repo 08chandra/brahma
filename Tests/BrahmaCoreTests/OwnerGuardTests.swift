@@ -117,15 +117,17 @@ import GRDB
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])  // exec-bit fixture: a directory mode lockDown must tighten
         try FileManager.default.createDirectory(at: paths.backupsDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])  // exec-bit fixture: a directory mode lockDown must tighten
         try DataHomeGuard.lockDown(paths: paths)
-        for dir in [paths.home, paths.runDir, paths.tmpDir, paths.backupsDir] {
+        for dir in [paths.home, paths.runDir, paths.backupsDir] {
             var st = stat()
             #expect(lstat(dir.path, &st) == 0, "\(dir.path)")
             #expect(st.st_mode & 0o777 == 0o700, "\(dir.path): \(String(st.st_mode & 0o777, radix: 8))")
         }
+        // An absent private directory is left absent (its writer creates it 0700), so read-only owner commands touch nothing.
+        var absent = stat()
+        #expect(lstat(paths.tmpDir.path, &absent) != 0 && errno == ENOENT, "tmp must not be created by lockDown")
         // A link where a private directory should be is refused, never followed.
         let other = root.appending(path: "elsewhere")
         try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
-        try FileManager.default.removeItem(at: paths.tmpDir)
         try FileManager.default.createSymbolicLink(at: paths.tmpDir, withDestinationURL: other)
         #expect(throws: (any Error).self) { try DataHomeGuard.lockDown(paths: paths) }
     }

@@ -44,16 +44,24 @@ public enum DataHomeGuard {
     /// in one error, after all of them were tried.
     public static func lockDown(paths: BrahmaPaths) throws {
         var problems: [String] = []
-        for dir in [paths.home, paths.runDir, paths.tmpDir, paths.backupsDir] {
-            if let problem = lockDown(dir) { problems.append(problem) }
+        // Only the data home itself is created here; `run`, `tmp` and `backups` are created (0700) by their own writers, so a
+        // read-only owner command (`brahma transcript`, `restore --dry-run`) leaves the tree untouched. Existing ones are tightened.
+        if let problem = lockDown(paths.home, create: true) { problems.append(problem) }
+        for dir in [paths.runDir, paths.tmpDir, paths.backupsDir] {
+            if let problem = lockDown(dir, create: false) { problems.append(problem) }
         }
         guard problems.isEmpty else { throw DataHomeError(reason: problems.joined(separator: "; ")) }
     }
 
     /// One directory: nil when it is (now) a private directory of this user, else why not.
-    private static func lockDown(_ dir: URL) -> String? {
+    private static func lockDown(_ dir: URL, create: Bool) -> String? {
         let path = dir.path, shown = Store.flat(path, max: 300)
-        if mkdir(path, 0o700) != 0, errno != EEXIST { return "can't create \(shown) (errno \(errno))" }
+        if create {
+            if mkdir(path, 0o700) != 0, errno != EEXIST { return "can't create \(shown) (errno \(errno))" }
+        } else {
+            var st = stat()
+            if lstat(path, &st) != 0, errno == ENOENT { return nil }
+        }
         let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else {
             let err = errno
