@@ -102,6 +102,19 @@ import Foundation
         Refusal(name: "nested-flow", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\nmetadata: {a: {b: 1}}\n---\nx\n") },
         Refusal(name: "multiline-flow", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\nmetadata: {a: 1,\n  hooks: 2}\n---\nx\n") },
         Refusal(name: "escaped-hidden-value", code: "EXT016") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: \"Demo\\u202E skill\"\n---\nx\n") },
+        // N-1: Claude Code ends the frontmatter at the first `---` anywhere; each of these is refused.
+        Refusal(name: "fence-in-quoted-value", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: \"a --- b\"\n---\nx\n") },
+        Refusal(name: "fence-in-plain-value", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: a---b\n---\nx\n") },
+        Refusal(name: "fence-in-block-scalar", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: |\n  text --- more\n---\nx\n") },
+        Refusal(name: "fence-escaped", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: \"a\\x2d--b\"\n---\nx\n") },
+        Refusal(name: "fence-in-comment", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\n# --- note\ndescription: d\n---\nx\n") },
+        Refusal(name: "fence-reviewer-probe", code: "EXT010") {
+            try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: short ---\nwhen_to_use: " + String(repeating: "long ", count: 150) + "\n---\nx\n")
+        },
+        Refusal(name: "fence-in-agent-value", code: "EXT010") {
+            try $0.write("agents/helper.md", "---\nname: helper\ncolor: \"a---b\"\ndescription: Helps.\ntools: [\"Read\"]\n---\nx\n")
+        },
+        Refusal(name: "fence-in-command-value", code: "EXT010") { try $0.write("commands/go.md", "---\nargument-hint: \"x---y\"\ndescription: Go.\n---\nx\n") },
         Refusal(name: "unclosed-fence", code: "EXT010") { try $0.write("skills/demo/SKILL.md", "---\nname: demo\ndescription: d\nno fence\n") },
         Refusal(name: "setuid-bin", code: "EXT013") {
             let url = try $0.bin("demo-tool")
@@ -199,6 +212,18 @@ import Foundation
         let emitted = Set(fm.entries.flatMap { Frontmatter.emit($0.key, $0.parsed) ?? [] })
         let written = canonical.split(separator: "\n").map(String.init).dropFirst().prefix { $0 != "---" }
         #expect(written.allSatisfy { emitted.contains($0) }, "\(Array(written))")
+    }
+
+    /// N-1: ordinary frontmatter (dashes that are not a fence mark, a `---` rule in the body) is unaffected, and the canonical
+    /// writer never emits a fence mark inside the body.
+    @Test func fenceMarkOnlyRefusedInsideFrontmatter() throws {
+        let text = "---\nname: demo\ndescription: a -- b - c\n---\nBody\n\n---\n\nMore.\n"
+        let f = try PluginFixture(files: ["skills/demo/SKILL.md": text])
+        #expect(ExtensionValidator.validate(staged: f.root).errors.isEmpty, "\(ExtensionValidator.validate(staged: f.root).errors)")
+        let canonical = try #require(Frontmatter.canonical(text, allowed: ExtensionValidator.skillKeys))
+        let body = canonical.split(separator: "\n", omittingEmptySubsequences: false).dropFirst().prefix { $0 != "---" }
+        #expect(!body.contains { $0.contains("---") }); #expect(canonical.hasSuffix("Body\n\n---\n\nMore.\n"))
+        #expect(Frontmatter.canonical("---\nname: demo\ndescription: \"a\\x2d--b\"\n---\nx\n", allowed: ExtensionValidator.skillKeys) == nil)
     }
 
     @Test func cleanPluginPasses() throws {

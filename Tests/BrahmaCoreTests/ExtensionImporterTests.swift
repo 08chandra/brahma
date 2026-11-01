@@ -169,6 +169,12 @@ import Foundation
         try await refused({ z in z.add("demo/assets/big", "a", declaredSize: ExtensionLimits.maxBytes + 1) }, "uncompressed")
         try await refused({ z in z.add("demo/skills/demo/link", "/etc/passwd", symlink: true) }, "symbolic link")
         try await refused({ z in z.add("/etc/demo.md", "x") }, "absolute")
+        // N-2: a symlink entry is refused whatever host made it (Info-ZIP honours the mode bits for several), and any type that
+        // is neither a file nor a directory is refused too.
+        for host in [2, 3, 5, 16, 19, 30] {
+            try await refused({ z in z.add("demo/skills/demo/link", "/etc/passwd", host: host, mode: 0o120777) }, "symbolic link")
+        }
+        try await refused({ z in z.add("demo/assets/fifo", "", mode: 0o010644) }, "unsupported file type")
         try await refused({ z in z.add("demo/../../escape.md", "x") }, "..")
         try await refused({ z in z.add("demo\\..\\..\\escape.md", "x") }, "'..'")   // m-5: `\` separates too
         try await refused({ z in z.add("demo/assets/evil\u{202E}txt.md", "x") }, "control, hidden or bidi")

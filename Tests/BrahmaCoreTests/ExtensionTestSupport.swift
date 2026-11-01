@@ -166,7 +166,7 @@ final class RecordingRunner: SandboxedRunner, @unchecked Sendable {
 /// Writes a zip of STORED entries with arbitrary names and attributes (what `zip` refuses to produce: `..`, absolute names,
 /// symlink entries, thousands of entries), so the importer's pre-extraction checks can be tested.
 struct ZipBuilder {
-    struct Entry { var name: String; var data: Data; var symlink = false; var declaredSize: Int? = nil }
+    struct Entry { var name: String; var data: Data; var symlink = false; var declaredSize: Int? = nil; var host = 3; var mode: UInt32? = nil }
     var entries: [Entry] = []
     /// What the end record claims the entry count is (a lie, when set).
     var countOverride: Int? = nil
@@ -174,8 +174,8 @@ struct ZipBuilder {
     var fakeCentral: [String]? = nil
 
     /// `declaredSize` is what the central directory claims the entry inflates to (a lie, when set).
-    mutating func add(_ name: String, _ text: String, symlink: Bool = false, declaredSize: Int? = nil) {
-        entries.append(Entry(name: name, data: Data(text.utf8), symlink: symlink, declaredSize: declaredSize))
+    mutating func add(_ name: String, _ text: String, symlink: Bool = false, declaredSize: Int? = nil, host: Int = 3, mode: UInt32? = nil) {
+        entries.append(Entry(name: name, data: Data(text.utf8), symlink: symlink, declaredSize: declaredSize, host: host, mode: mode))
     }
 
     func write(to url: URL) throws {
@@ -189,10 +189,10 @@ struct ZipBuilder {
             let fixed: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
                 + le16(name.count) + le16(0)
             out += Data([0x50, 0x4b, 0x03, 0x04] + fixed + name) + e.data
-            let mode: UInt32 = e.symlink ? 0o120777 : 0o100644
+            let mode: UInt32 = e.mode ?? (e.symlink ? 0o120777 : 0o100644)
             let declared: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
                 + le16(name.count) + le16(0)
-            let header = Data([0x50, 0x4b, 0x01, 0x02] + le16(0x031e) + declared + le16(0) + le16(0) + le16(0) + le32(mode << 16) + le32(offset) + name)
+            let header = Data([0x50, 0x4b, 0x01, 0x02] + le16(e.host << 8 | 0x1e) + declared + le16(0) + le16(0) + le16(0) + le32(mode << 16) + le32(offset) + name)
             headers[e.name] = header
             central += header
         }

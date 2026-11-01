@@ -815,6 +815,8 @@ struct Frontmatter {
     }
 
     static let fenceLimit = 64 * 1024
+    /// What ends a frontmatter for Claude Code wherever it appears.
+    static let fenceMark = "---"
     static let keyPattern = try! NSRegularExpression(pattern: "^[A-Za-z_][A-Za-z0-9_-]*$")
 
     /// BOM stripped, CRLF and CR turned into LF.
@@ -851,13 +853,21 @@ struct Frontmatter {
             if bytes > fenceLimit { return .invalid("the frontmatter does not close within \(fenceLimit) bytes", line: number) }
             if line == "---" {
                 for k in entries.indices where strictKeys.contains(entries[k].key) {
-                    do { entries[k].parsed = try parseValue(key: entries[k].key, inline: entries[k].value, continuation: entries[k].continuation) }
+                    do {
+                        entries[k].parsed = try parseValue(key: entries[k].key, inline: entries[k].value, continuation: entries[k].continuation)
+                        if entries[k].parsed.strings.contains(where: { $0.contains(fenceMark) }) {
+                            throw Refusal("'---' inside a value (Claude Code would end the frontmatter there)")
+                        }
+                    }
                     catch let r as Refusal { return .invalid("'\(entries[k].key)': \(r.why)", line: entries[k].line) }
                     catch { return .invalid("'\(entries[k].key)': \(error)", line: entries[k].line) }
                 }
                 return .ok(Frontmatter(entries: entries, end: number))
             }
             if line.trimmingCharacters(in: .whitespaces) == "---" { return .invalid("the closing fence must be exactly ---", line: number) }
+            // N-1: Claude Code ends the frontmatter at the first `---` anywhere (mid-line, in quotes, in a comment), so the keys
+            // after it would be checked here and never applied there.
+            if line.contains(fenceMark) { return .invalid("'---' inside the frontmatter (Claude Code would end it there)", line: number) }
             if line.contains("\t") { return .invalid("tabs are not allowed", line: number) }
             if line.trimmingCharacters(in: .whitespaces).isEmpty {
                 if !entries.isEmpty { entries[entries.count - 1].continuation.append("") }
@@ -1288,6 +1298,10 @@ struct Frontmatter {
             // Emitted from the parsed values only: no source line is ever copied into the frontmatter.
             for e in fm.entries where allowed.contains(e.key) {
                 guard let emitted = emit(e.key, e.parsed) else { return nil }
+                // The writer never emits a fence mark inside the body (N-1); a value that would need one is never written.
+                guard !emitted.contains(where: { $0.contains(fenceMark) }) else {
+                    assertionFailure("canonical frontmatter would hold '---'"); return nil
+                }
                 for l in emitted { out += l + "\n" }
             }
             out += "---\n"

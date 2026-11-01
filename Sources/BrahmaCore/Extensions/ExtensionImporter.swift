@@ -538,7 +538,6 @@ enum ZipInventory {
             guard p + 46 <= eocd, bytes[p] == 0x50, bytes[p + 1] == 0x4b, bytes[p + 2] == 0x01, bytes[p + 3] == 0x02 else {
                 throw refuse("a central header is missing")
             }
-            let madeBy = u16(p + 4) >> 8
             let flags = u16(p + 8), method = u16(p + 10), crc = u32(p + 16)
             let compressed = u32(p + 20), uncompressed = u32(p + 24)
             let nameLength = u16(p + 28), extraLength = u16(p + 30), entryComment = u16(p + 32)
@@ -567,10 +566,16 @@ enum ZipInventory {
             guard dataEnd <= cdOffset else { throw refuse("an entry's data runs into the central directory") }
             locals.append(Local(offset: l, end: dataEnd))
             let name = String(decoding: nameBytes, as: UTF8.self)
-            // Unix attributes live in the high 16 bits when the entry was made on Unix (3) or macOS (19).
-            let unixMode = (madeBy == 3 || madeBy == 19) ? (external >> 16) & 0xFFFF : 0
-            let isSymlink = (unixMode & 0o170000) == 0o120000
-            let isDirectory = name.hasSuffix("/") || (unixMode & 0o170000) == 0o040000 || (external & 0x10) != 0
+            // N-2: Info-ZIP honours Unix mode bits in the high 16 bits for several made-by hosts (Unix, VMS, Atari, BeOS,
+            // AtheOS, …), so they are read whatever the host: a symlink is flagged, and any type that is neither a regular file
+            // nor a directory refuses the archive.
+            let unixMode = (external >> 16) & 0xFFFF
+            let type = unixMode & 0o170000
+            let isSymlink = type == 0o120000
+            guard type == 0 || type == 0o100000 || type == 0o040000 || isSymlink else {
+                throw ExtensionError.message("the zip holds an entry of an unsupported file type (\(Store.flat(name, max: 80)))")
+            }
+            let isDirectory = name.hasSuffix("/") || type == 0o040000 || (external & 0x10) != 0
             out.append(Entry(name: name, compressedSize: compressed, uncompressedSize: uncompressed, isSymlink: isSymlink, isDirectory: isDirectory))
             p = nameStart + nameLength + extraLength + entryComment
         }
