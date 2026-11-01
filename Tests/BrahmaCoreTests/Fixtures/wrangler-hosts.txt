@@ -1,0 +1,6 @@
+# PROVISIONAL, UNVERIFIED (needs owner token, PR-14): no real deploy has run under the sandbox's egress proxy yet.
+# The owner's probe (Plan L Task 4 Step 1) replaces this with every host EgressProxy allowed or denied.
+# install (token-free): registry.npmjs.org
+# cloudflare-pages deploy: api.cloudflare.com
+# vercel deploy: api.vercel.com vercel.com
+api.cloudflare.com
