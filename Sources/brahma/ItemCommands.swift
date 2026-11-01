@@ -48,7 +48,27 @@ private func handleMap(_ store: Store, _ company: Company) throws -> [String: St
 struct ItemsGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "items", abstract: "List, show and change work items.",
-        subcommands: [List.self, Show.self, Add.self, Edit.self, Depend.self, Confirm.self], defaultSubcommand: List.self)
+        subcommands: [List.self, Show.self, Add.self, Edit.self, Depend.self, Confirm.self, Readopt.self], defaultSubcommand: List.self)
+
+    /// An item branch the engine found moved outside its holder's turns: the owner takes it as it is, so submits work again.
+    struct Readopt: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "readopt", abstract: "Re-adopt an item's branch after it was found moved outside its holder's turns (owner only).")
+        @Argument var company: String
+        @Argument(help: "Item key, e.g. ACME-12.") var key: String
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let i = try resolveItem(store, c, key)
+            let git = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true))
+            do {
+                let adopted = try store.readoptBranch(itemId: i.id, by: .owner, head: try git.head(of: git.branchRef(key: i.key)))
+                print("re-adopted item/\(adopted.key) at \(adopted.leaseHeadCommit?.prefix(7) ?? "?")")
+            } catch let e as WorkError { throw fail(e.message) }
+        }
+    }
 
     struct List: ParsableCommand {
         static let configuration = CommandConfiguration(commandName: "list", abstract: "List work items.")

@@ -8,7 +8,7 @@ public enum CompanyToolNames {
                               "comment_work_item", "claim_lease", "release_lease", "submit_for_review", "write_handoff",
                               "propose_decision", "request_from_owner", "escalate_decision", "request_mode",
                               "request_access", "request_secret", "use_secret"]
-    public static let lead = ["plan_sprint", "close_sprint", "confirm_spec"]
+    public static let lead = ["plan_sprint", "close_sprint", "confirm_spec", "readopt_branch"]
     public static let executive = ["decide"]
     /// Review turns only, regardless of role. `create_work_item` files follow-ups instead of blocking on mechanical fixes.
     public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review"]

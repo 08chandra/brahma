@@ -176,6 +176,9 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     /// The item branch's head as the engine last recorded it: at claim, at the end of each of the holder's turns and after an
     /// engine rebase (Task 4-wire). `submit_for_review` refuses a branch that is not a fast-forward of it.
     public var leaseHeadCommit: String? = nil
+    /// The branch was found moved outside the holder's turns (its head at a turn's start was not `leaseHeadCommit`, or a turn
+    /// rewrote it without submitting): submits are refused until a manager or the owner re-adopts it (`readoptBranch`).
+    public var branchMoved: Bool = false
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

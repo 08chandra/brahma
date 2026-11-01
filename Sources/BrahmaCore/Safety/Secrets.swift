@@ -492,6 +492,8 @@ public final class Redactor: @unchecked Sendable {
     /// with invalid UTF-8 keeps its other bytes exactly. Throws when the file cannot be read or written, and refuses a
     /// path that is not a regular file (a link planted where a check log should be is never written through).
     public func scrubFile(_ url: URL) throws {
+        // A redactor that has not loaded cannot tell what to scrub: refusing is the only safe answer (the caller withholds the file).
+        guard hasLoaded else { throw SecretError.secretsNotLoaded }
         var st = stat()
         guard lstat(url.path, &st) == 0 else { throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: url.path]) }
         guard (st.st_mode & S_IFMT) == S_IFREG else { throw CocoaError(.fileReadUnsupportedScheme, userInfo: [NSFilePathErrorKey: url.path]) }
@@ -547,10 +549,14 @@ public enum SecretScan {
 
     private static let hunkHeader = try! NSRegularExpression(pattern: #"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"#)
 
-    /// What the added lines of a unified diff leak, as short text naming the rule (or the secret's name) and where. A
-    /// finding never contains the matched text. Context and removed lines are not scanned, and neither are the
-    /// `+++ b/path` file headers; a line is told apart from a header by counting the lines each hunk declares, so an
-    /// added line that happens to start with `++` is still scanned.
+    private static let commitMarker = try! NSRegularExpression(pattern: #"^commit ([0-9a-f]{40,64})$"#)
+
+    /// What the added lines of a unified diff (or of `git log -p` output, where `commit <hash>` lines name each commit)
+    /// leak, as short text naming the rule (or the secret's name) and where. A finding never contains the matched text.
+    /// Context and removed lines are not scanned; the `+++ b/path` header sets the path and the path itself is scanned (a
+    /// file named after a secret is a finding); a line is told apart from a header by counting the lines each hunk
+    /// declares, so an added line that happens to start with `++` is still scanned. Content git could not show as text
+    /// (`Binary files … differ`, `GIT binary patch`) cannot be scanned and is a finding of its own (fail closed).
     ///
     /// Known values shorter than `Redactor.minLength` are skipped, and each is matched raw, percent-encoded and
     /// JSON-escaped.
@@ -559,22 +565,27 @@ public enum SecretScan {
             .map { ($0.0, Redactor.forms(of: $0.1)) }
         var out: [String] = []
         var seen = Set<String>()
+        var commit: String?
         var path = "?"
         var lineNumber = 0
         var oldLeft = 0, newLeft = 0
         var previous = ""
 
-        func report(_ what: String) {
-            let where_ = safePath(path, known: known)
-            let line = "\(what) in \(where_) (added line \(lineNumber))"
-            if seen.insert("\(what)|\(where_)").inserted { out.append(line) }
+        func report(_ what: String, where place: String? = nil, line: Bool = true) {
+            let where_ = place ?? safePath(path, known: known)
+            var detail: [String] = []
+            if let commit { detail.append("commit \(commit.prefix(7))") }
+            if line { detail.append("added line \(lineNumber)") }
+            let text = "\(what) in \(where_)" + (detail.isEmpty ? "" : " (\(detail.joined(separator: ", ")))")
+            if seen.insert("\(what)|\(where_)|\(commit ?? "")").inserted { out.append(text) }
         }
-        func scan(_ added: String) {
-            for p in compiled where p.regex.firstMatch(in: added, range: NSRange(added.startIndex..., in: added)) != nil {
-                report(p.label)
-            }
-            for k in known where k.forms.contains(where: { added.contains($0) }) { report("known secret \(k.name)") }
+        func matches(_ text: String) -> [String] {
+            var hits: [String] = []
+            for p in compiled where p.regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil { hits.append(p.label) }
+            for k in known where k.forms.contains(where: { text.contains($0) }) { hits.append("known secret \(k.name)") }
+            return hits
         }
+        func scan(_ added: String) { for hit in matches(added) { report(hit) } }
 
         for rawLine in diff.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine)
@@ -590,6 +601,10 @@ public enum SecretScan {
                 if oldLeft > 0 || newLeft > 0 { continue }
                 if line.first == "+" || line.first == "-" || line.first == " " || line.first == "\\" { continue }
             }
+            if let m = commitMarker.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)), let r = Range(m.range(at: 1), in: line) {
+                commit = String(line[r]); path = "?"; lineNumber = 0
+                continue
+            }
             if line.hasPrefix("@@"), let m = hunkHeader.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
                 func number(_ i: Int, default d: Int) -> Int {
                     Range(m.range(at: i), in: line).flatMap { Int(line[$0]) } ?? d
@@ -598,9 +613,23 @@ public enum SecretScan {
                 lineNumber = number(3, default: 1) - 1
                 continue
             }
+            if line.hasPrefix("diff --git ") {
+                // The new file's name, from the header (`diff --git a/x b/x`): scanned even when the file has no text hunk.
+                let halves = line.dropFirst("diff --git ".count)
+                if let split = halves.range(of: " b/", options: .backwards) {
+                    path = String(halves[split.upperBound...])
+                    for hit in matches(path) { report(hit, where: "a file name", line: false) }
+                }
+                continue
+            }
             if line.hasPrefix("+++ ") && previous.hasPrefix("--- ") {
                 path = String(line.dropFirst(4))
                 if path.hasPrefix("b/") { path.removeFirst(2) }
+                if path != "/dev/null" { for hit in matches(path) { report(hit, where: "a file name", line: false) } }
+                continue
+            }
+            if line.hasPrefix("Binary files ") && line.hasSuffix(" differ") || line == "GIT binary patch" {
+                report("unscannable binary content", line: false)
                 continue
             }
             // Outside a counted hunk (a bare fragment): every `+` line is an added line.
@@ -613,9 +642,13 @@ public enum SecretScan {
     /// git dir and config, never the worktree's `.git` file): `findings(diff:knownValues:)` over the whole patch. A patch
     /// git cut short at the capture limit cannot be scanned and is itself a finding (fail closed). Findings never carry a value.
     public static func check(git: GitWorkspace, base: String, head: String, knownValues: [(String, String)]) throws -> [String] {
+        // Every commit's added lines (a value committed and deleted later is in main's history all the same), then the
+        // endpoint diff (content an evil merge introduces shows in no single commit's patch).
+        let log = try git.scanLog(base: base, head: head)
+        var out = findings(diff: log.text, knownValues: knownValues)
         let diff = try git.scanDiff(base: base, head: head)
-        var out = findings(diff: diff.text, knownValues: knownValues)
-        if diff.cut { out.append("the change is too large to scan for secrets (more than \(diff.limitMB) MB of diff)") }
+        for f in findings(diff: diff.text, knownValues: knownValues) where !out.contains(f) { out.append(f) }
+        if log.cut || diff.cut { out.append("the change is too large to scan for secrets (more than \(diff.limitMB) MB of diff)") }
         return out
     }
 

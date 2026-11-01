@@ -823,7 +823,7 @@ import GRDB
         #expect(try r.store.lease(itemId: b.id)?.agentId == r.eng2.id)
         let event = try #require(try r.events(b, .mergeConflict).first)
         #expect(event.text.contains("src/work.txt"))
-        let dm = try #require(try r.dms(r.eng2).last { $0.hasPrefix("\(b.key) could not be merged into main. Rebase item/\(b.key) on main, resolve these files, then resubmit:") })
+        let dm = try #require(try r.dms(r.eng2).last { $0.hasPrefix("\(b.key) could not be merged into main. In this turn, rebase item/\(b.key) on main, resolve these files, then resubmit:") })
         #expect(dm.contains("\n    | src/work.txt"))
         let notice = try r.store.pendingNotices(agentId: r.eng2.id).first { $0.event.kind == .mergeConflict }
         #expect(notice?.notice.wakes == true)

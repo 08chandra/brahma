@@ -106,7 +106,7 @@ extension Store {
     func ensureCheckSnapshot(item: WorkItem, workspace: URL) throws {
         let git = gitWorkspace(root: workspace, companyId: item.companyId)
         // The branch head at claim is the first recorded head (scan (a), Task 4-wire): a submit accepts only fast-forwards of it.
-        if let head = try git.head(of: git.branchRef(key: item.key)) { try recordLeaseHead(itemId: item.id, commit: head) }
+        if let head = try git.head(of: git.branchRef(key: item.key)) { try recordLeaseHead(itemId: item.id, commit: head, atClaim: true) }
         var base = item.baseCommit
         if base == nil {
             base = try git.mergeBase(GitWorkspace.mainRef, git.branchRef(key: item.key))
@@ -209,6 +209,8 @@ extension Store {
             item.reviewAttempts = 0
             item.mergeState = .none
             item.autoApproved = false
+            // The engine accepted this head: it is the recorded head the holder's next turn starts from (scan (a)).
+            item.leaseHeadCommit = commit
             item.submitSummary = text
             item.reviewRound += 1
             item.status = .inReview

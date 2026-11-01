@@ -39,6 +39,10 @@ extension CompanyTools {
                     "sprint": prop("string", "Sprint, e.g. Sprint 3"), "summary": prop("string", "Review summary"),
                     "lessons": prop("string", "Retro lessons, one per line"),
                 ], required: ["sprint", "summary", "lessons"])),
+            ToolSpec(name: "readopt_branch", description: """
+                Take an item's branch as it is after it was found moved outside its holder's turns (the engine flagged it and \
+                refuses its submits). Look at the branch first; re-adopting records its current head so the holder can submit again.
+                """, inputSchema: schema(["key": prop("string", "Work item key, e.g. ACME-12")], required: ["key"])),
             ToolSpec(name: "propose_decision", description: """
                 File a decision for approval: a PRD, an architecture, a release, or any other choice (sprint plans use plan_sprint). \
                 Write it as a brief: stakes in plain language, your recommendation, up to four options, whether it is \
@@ -93,6 +97,7 @@ extension CompanyTools {
             case "request_mode": return try requestMode(args)
             case "plan_sprint": return try planSprint(args)
             case "close_sprint": return try closeSprint(args)
+            case "readopt_branch": return try readoptBranch(args)
             default: return nil
             }
         } catch let e as WorkError {
@@ -103,6 +108,18 @@ extension CompanyTools {
     }
 
     // MARK: Tools
+
+    /// `readopt_branch {key}` (managers and executives): an item branch found moved outside its holder's turns is taken as it
+    /// is, so the holder can submit again (`Store.readoptBranch`; the current head comes from the engine's git).
+    private func readoptBranch(_ args: [String: JSONValue]) throws -> String {
+        let key = try text(args, "key").uppercased()
+        guard let item = try store.workItem(companyId: companyId, key: key) else { throw ToolError(message: "no work item \(Store.flat(key, max: 40))") }
+        guard let company = try store.company(id: companyId) else { throw ToolError(message: "no such company") }
+        let git = store.gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: companyId)
+        let head = try git.head(of: git.branchRef(key: item.key))
+        let adopted = try store.readoptBranch(itemId: item.id, by: .agent(agentId), head: head)
+        return "Re-adopted item/\(adopted.key) at \(adopted.leaseHeadCommit?.prefix(7) ?? "?"); its holder can submit again."
+    }
 
     private func proposeDecision(_ args: [String: JSONValue]) throws -> String {
         let kindName = try text(args, "kind")

@@ -756,8 +756,9 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         +clean line
         """
         #expect(SecretScan.findings(diff: diff, knownValues: [("STRIPE_KEY", "sk_test_abcdef123456")]).isEmpty)
-        // The `+++` file header is not an added line, even when the path looks like a key.
-        #expect(SecretScan.findings(diff: "--- a/x\n+++ b/\(aws)\n", knownValues: []).isEmpty)
+        // The `+++` file header is not an added line; a path that looks like a key is reported as a file name (4-wire fix 1, M3).
+        #expect(SecretScan.findings(diff: "--- a/x\n+++ b/\(aws)\n", knownValues: []) == ["aws-key in a file name"])
+        #expect(SecretScan.findings(diff: "--- a/x\n+++ b/plain.txt\n", knownValues: []).isEmpty)
         #expect(SecretScan.findings(diff: "+\(aws)\n", knownValues: []).count == 1)
         #expect(SecretScan.findings(diff: "", knownValues: []).isEmpty)
     }
@@ -932,6 +933,28 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         let rm = try brahma(["secret", "rm", "Acme", "API_KEY"], home: home)
         #expect(rm.status == 0, "\(rm.stderr)")
         #expect(try brahma(["secret", "list", "Acme"], home: home).stdout.contains("no secrets"))
+    }
+
+    /// `brahma secret provide <co> A-<n>` answers an agent's request: the value goes to the vault, the ask is approved.
+    @Test func secretProvideAnswersTheAsk() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        let paths = ownerPaths(home)
+        let store = try Store(path: paths.database.path)
+        let company = try #require(try store.companies().first)
+        let eng = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        let ask = try store.requestSecret(companyId: company.id, agentId: eng.id, name: "PROVIDED_KEY", reason: "r", test: true).ask
+        try store.close()
+        let missing = try brahma(["secret", "provide", "Acme", "A-9"], home: home, stdin: "x\n")
+        #expect(missing.status == 1); #expect(missing.stderr.contains("no ask A-9"), "\(missing.stderr)")
+        let provide = try brahma(["secret", "provide", "Acme", ask.ref, "--test"], home: home, stdin: "provided-cli-value-77\n")
+        #expect(provide.status == 0, "\(provide.stderr)"); #expect(provide.stdout.contains("provided PROVIDED_KEY")); #expect(provide.stdout.contains("\(ask.ref) approved"))
+        let list = try brahma(["secret", "list", "Acme"], home: home)
+        #expect(list.stdout.contains("PROVIDED_KEY  test"), Comment(rawValue: list.stdout))
+        let again = try brahma(["secret", "provide", "Acme", ask.ref], home: home, stdin: "another-value-77\n")
+        #expect(again.status == 1); #expect(again.stderr.contains("already approved"), "\(again.stderr)")
+        let db = try Data(contentsOf: paths.database)
+        #expect(db.range(of: Data("provided-cli-value-77".utf8)) == nil)
     }
 
     // None of these reach the Keychain: they fail before the vault is touched, or only read metadata.

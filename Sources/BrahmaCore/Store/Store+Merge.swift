@@ -23,6 +23,10 @@ enum MergeResult: Equatable, Sendable {
 }
 
 extension Store {
+    /// What the holder is told to do about a leaked commit: the branch is rewritten in the holder's own turn (continuity
+    /// between turns permits that) and submitted again in the same turn.
+    static let secretRecovery = "Rewrite your branch in this turn so no commit carries it (reset to main and recommit without it, "
+        + "or squash), take the value from your environment instead, then submit again in the same turn."
     static let maxBriefFiles = 50
     static let maxBriefDiffLines = 200
     /// Merge attempts of one item that may fail in a row before it goes back to its holder and the queue moves on.
@@ -269,7 +273,7 @@ extension Store {
         guard let expected else { return nil }
         // Scan (b), Task 4-wire: what the verified commit adds against `main` is scanned again right before it lands (a value
         // may have become a known secret since the submit). A finding bounces the item to its holder (`finishMerge`).
-        let scanBase = try git.mergeBase(GitWorkspace.mainRef, verified) ?? item.baseCommit ?? git.emptyTree()
+        let scanBase = try git.mergeBase(expected, verified) ?? item.baseCommit ?? git.emptyTree()   // the recorded main, never the live ref
         let findings = try SecretScan.check(git: git, base: scanBase, head: verified, knownValues: knownSecretValues(companyId: company.id))
         if !findings.isEmpty { return .secretsFound(findings: findings) }
         var pending: String?
@@ -442,13 +446,12 @@ extension Store {
                 try Store.refreshLease(db, itemId: itemId, companyId: current.companyId)
                 let holder = try Self.leaseHolderId(db: db, itemId: itemId) ?? current.ownerId
                 try recordItemEvent(db: db, item: returned, actor: "system", kind: .verificationFailed,
-                                    text: "not merged: the change contains what looks like a secret (\(shown)). Remove it from the branch and submit again.",
+                                    text: "not merged: the change contains what looks like a secret (\(shown)). \(Store.secretRecovery)",
                                     alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
                 guard let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed else { return }
                 try MessageRouter(store: self).sendDM(
                     db: db, companyId: current.companyId, from: .system, to: agent.name,
-                    text: "\(current.key) was not merged: the change contains what looks like a secret (\(shown)). "
-                        + "Remove it from the files on item/\(current.key) (take it from your environment instead) and submit again.", now: now)
+                    text: "\(current.key) was not merged: the change contains what looks like a secret (\(shown)). \(Store.secretRecovery)", now: now)
             }
 
         case .conflict(let files, let mergeBase, let mainCommit, let itemCommit):
@@ -476,7 +479,7 @@ extension Store {
                 let block = shown.map { "    | \($0)" }.joined(separator: "\n")
                 try MessageRouter(store: self).sendDM(
                     db: db, companyId: current.companyId, from: .system, to: agent.name,
-                    text: "\(current.key) could not be merged into main. Rebase item/\(current.key) on main, resolve these files, then resubmit:\n"
+                    text: "\(current.key) could not be merged into main. In this turn, rebase item/\(current.key) on main, resolve these files, then resubmit:\n"
                         + block + "\nConflict brief: \(brief.path)", now: now)
             }
 

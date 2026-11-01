@@ -3013,8 +3013,20 @@ public struct GitWorkspace: Sendable {
     /// like every engine call: the git dir comes from the engine's records, never from a worktree's `.git` file.
     func scanDiff(base: String, head: String) throws -> (text: String, cut: Bool, limitMB: Int) {
         try Self.validRef(base); try Self.validRef(head)
-        let out = try main.run(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "-U0", base, head])
+        // `--text`: every file is shown as text, whatever a `.gitattributes` says or a NUL byte suggests; the engine's forced
+        // `-diff` attribute (which would make every file "binary") is overridden too. What git still cannot show as text is a
+        // fail-closed finding (`SecretScan.findings`).
+        let out = try main.run(["diff", "--text", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "-U0", base, head])
         return (String(decoding: out.stdout, as: UTF8.self), out.cut, GitCommand.maxCapture >> 20)
+    }
+
+    /// Every commit in `base..head` with its patch (merges against each parent, `--cc`), for the leak scan: each commit's
+    /// hash on a `commit <hash>` line, then its diff in the same form as `scanDiff`.
+    func scanLog(base: String, head: String) throws -> (text: String, cut: Bool) {
+        try Self.validRef(base); try Self.validRef(head)
+        let out = try main.run(["log", "--format=commit %H", "-p", "-U0", "--text", "--no-ext-diff", "--no-textconv", "--no-color",
+                                "--no-renames", "--cc", "--no-show-signature", "\(base)..\(head)"])
+        return (String(decoding: out.stdout, as: UTF8.self), out.cut)
     }
 
     /// The empty tree of this repository (its hash algorithm's), the base of a scan for a branch with no common history.

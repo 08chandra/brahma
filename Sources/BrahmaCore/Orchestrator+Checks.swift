@@ -4,6 +4,8 @@ extension Orchestrator {
     /// Times one merge-check run is put back in the queue because its export failed for Brahma's own reasons before it is
     /// recorded inconclusive (and so retried, then returned, through the usual inconclusive path).
     static let maxMergeCheckDeferrals = 10
+    /// The tail recorded for a run whose log could not be scrubbed of secrets (the log itself is removed).
+    static let withheldCheckTail = "check output withheld: its log could not be scrubbed of secrets"
 
     /// Start-up: runs the previous process left running are queued again, and leftover check checkouts are removed (git,
     /// off the cooperative pool: `Blocking`).
@@ -148,15 +150,17 @@ extension Orchestrator {
                                                 purpose: .check, secrets: secrets)
         let output = run.outputPath.map { URL(fileURLWithPath: $0) }
             ?? paths.companyDir(run.companyId).appending(path: "check-output/\(run.id).log")
-        let outcome = await checkRunner.run(command: run.command, workingDirectory: dir,
+        var outcome = await checkRunner.run(command: run.command, workingDirectory: dir,
                                             timeout: TimeInterval(run.timeoutSeconds), outputURL: output, environment: environment)
-        // The check's log file is agent output: scrubbed in place before anything reads it (the tail is redacted as it is stored).
-        let redactor = store.redactor
-        await blocking.run {
+        // The check's log file is agent output: scrubbed in place before anything reads it (the tail is redacted as it is
+        // stored). A log that cannot be scrubbed is removed (`scrubCheckLog`) and the run's tail withheld: fail closed.
+        let scrubbing = self.store
+        let scrubbed: Bool = await blocking.run {
             git.removeRunWorktree(runId: run.id)
-            do { try redactor.scrubFile(output) } catch let e as CocoaError where e.code == .fileNoSuchFile {
-            } catch { self.log("could not scrub the check log of run \(run.id): \(error)") }
+            do { try scrubbing.scrubCheckLog(output); return true } catch let e as CocoaError where e.code == .fileNoSuchFile { return true }
+            catch { self.log("could not scrub the check log of run \(run.id): \(error)"); return false }
         }
+        if !scrubbed { outcome = CheckOutcome(exitCode: outcome.exitCode, timedOut: outcome.timedOut, tail: Self.withheldCheckTail) }
         if Task.isCancelled { return }
         // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
         let passed = outcome.exitCode == 0 && !outcome.timedOut

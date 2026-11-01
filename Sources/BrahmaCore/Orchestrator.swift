@@ -639,8 +639,9 @@ public actor Orchestrator {
         // launch gives them back (I2).
         var spentGrants: [String] = []
         var launched = false
-        // A leaseholder's work turn: its item's branch head is recorded again when the turn ends (scan (a), Task 4-wire).
-        var leaseHead: (git: GitWorkspace, item: WorkItem)?
+        // A leaseholder's work turn: continuity of its item's branch is checked at the start (the head must be the recorded one)
+        // and the head is recorded again at the end (scan (a), Task 4-wire). `held`: continuity held at the start.
+        var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool)?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             // Nothing of the agent's earlier turns may still run, whatever the profile (M1): this turn waits for their sweep
@@ -731,7 +732,15 @@ public actor Orchestrator {
                     addDirs = [wt.path, workspace.appending(path: ".brahma", directoryHint: .isDirectory).path]
                     checkout = wt
                     git = g
-                    if c.lease?.agentId == agent.id { leaseHead = (g, leased) }
+                    if c.lease?.agentId == agent.id {
+                        // The branch must be where the engine left it (git, off the cooperative pool); a move outside the holder's
+                        // turns flags the item and refuses its submits until a manager re-adopts it.
+                        let now = clock()
+                        let held = try await blocking.tryRun {
+                            try store.checkBranchContinuity(item: leased, agent: agent, head: try g.head(of: g.branchRef(key: leased.key)), now: now)
+                        }
+                        leaseHead = (g, leased, held)
+                    }
                 }
                 // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
                 // leaseholder's updates are its work, so its turns stay work turns.
@@ -1119,15 +1128,17 @@ public actor Orchestrator {
         // A plan turn must not have changed the worktree: the engine checks and resets before anything else looks at it (git,
         // off the cooperative pool).
         if let plan { await blocking.run { self.finishPlanTurn(plan, agent: agent, end: end, now: now) } }
-        // The holder's own commits of this turn become the recorded head: the next `submit_for_review` accepts fast-forwards
-        // of it and refuses anything else (a rewritten or foreign-moved branch). Recorded only while the agent still holds
-        // the lease (git, off the cooperative pool).
-        if let leaseHead {
-            let (store, key, itemId, agentId) = (self.store, leaseHead.item.key, leaseHead.item.id, agent.id)
+        // The holder's own commits of this turn become the recorded head when they descend from it (or a submit the engine
+        // accepted recorded a new one); a rewrite that was not submitted in this turn flags the branch instead. Only when
+        // continuity held at the start, and only while the agent still holds the lease (git, off the cooperative pool).
+        if let leaseHead, leaseHead.held {
+            let (store, git, key) = (self.store, leaseHead.git, leaseHead.item.key)
             await blocking.run {
-                guard (try? store.lease(itemId: itemId))?.agentId == agentId,
-                      let head = try? leaseHead.git.head(of: leaseHead.git.branchRef(key: key)) else { return }
-                do { try store.recordLeaseHead(itemId: itemId, commit: head) } catch { self.log("could not record the head of \(key): \(error)") }
+                do {
+                    guard let head = try git.head(of: git.branchRef(key: key)) else { return }
+                    try store.recordTurnEndHead(item: leaseHead.item, agent: agent, head: head,
+                                                isDescendant: { try git.isAncestor($0, of: head) }, now: now)
+                } catch { self.log("could not record the head of \(key): \(error)") }
             }
         }
 

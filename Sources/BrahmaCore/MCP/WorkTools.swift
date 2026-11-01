@@ -426,20 +426,30 @@ extension CompanyTools {
             throw ToolError(message: "your worktree for \(target.key) is missing; release the item and claim it again")
         }
         let worktree = git.worktreePath(key: target.key)
-        // Scan (a), first step (Task 4-wire): the branch must be a fast-forward of the head the engine recorded (at claim, or at
-        // the end of the holder's last turn). The turn's own commits pass; a rewritten or foreign-moved branch does not, and
-        // nothing is committed for it. (An equality check would refuse every turn that commits before it submits.)
-        if let recorded = target.leaseHeadCommit ?? target.baseCommit {
-            guard let branchHead = try git.head(of: git.branchRef(key: target.key)), try git.isAncestor(recorded, of: branchHead) else {
-                throw ToolError(message: "\(target.key)'s branch moved outside your turn; ask your manager")
-            }
+        // Scan (a), first step (Task 4-wire): continuity between turns. A branch found moved at the start of one of the
+        // holder's turns (or rewritten in a turn that did not submit) stays refused until a manager or the owner re-adopts it.
+        let moved = "\(target.key)'s branch moved outside your turn; ask your manager"
+        if target.branchMoved { throw ToolError(message: moved) }
+        // What the submitted commit must build on: the head recorded at the start of this turn (the turn's own commits), or
+        // the company's recorded `main` / the branch's recorded base (an in-turn rewrite such as the conflict brief's rebase).
+        // Never the live `main` ref, which an agent can move. An orphan branch (no record at all) is flagged as having no
+        // common history and scanned against the empty tree.
+        let recordedMain = try store.company(id: companyId)?.mainCommit
+        let roots = [target.leaseHeadCommit, recordedMain, target.baseCommit].compactMap { $0 }
+        func buildsOnRecord(_ commit: String) throws -> Bool {
+            try roots.isEmpty || roots.contains { try git.isAncestor($0, of: commit) }
         }
+        // Nothing is committed for a submit that would be refused anyway.
+        guard let before = try git.head(of: git.branchRef(key: target.key)), try buildsOnRecord(before) else { throw ToolError(message: moved) }
         guard let commit = try git.commitAll(in: worktree, message: "\(target.key): submit round \(target.reviewRound + 1)")
                 ?? git.head(of: git.branchRef(key: target.key)) else { throw ToolError(message: "\(target.key) has no commit to submit") }
+        // Checked again on the commit that is actually submitted (the ref could have moved between the check and the commit).
+        guard try buildsOnRecord(commit) else { throw ToolError(message: moved) }
         if commit == target.baseCommit { throw ToolError(message: "\(target.key) has no changes to submit") }
-        // Scan (a), second step: what the change adds against `main` is scanned for the company's known secret values and
-        // the leak patterns. A finding names the rule or the secret, never a value; the item stays in progress.
-        let scanBase = try git.mergeBase(GitWorkspace.mainRef, commit) ?? target.baseCommit ?? git.emptyTree()
+        // Scan (a), second step: every commit's added lines and the endpoint diff against the recorded `main` are scanned for
+        // the company's known secret values and the leak patterns. A finding names the rule or the secret and the commit,
+        // never a value; the item stays in progress.
+        let scanBase = try recordedMain.flatMap { try git.mergeBase($0, commit) } ?? target.baseCommit ?? git.emptyTree()
         let findings = try SecretScan.check(git: git, base: scanBase, head: commit, knownValues: store.knownSecretValues(companyId: companyId))
         if !findings.isEmpty {
             let shown = Store.sanitizedFlags(findings).joined(separator: "; ")
@@ -447,7 +457,7 @@ extension CompanyTools {
                                                  text: "submit of \(target.key) refused: the change contains what looks like a secret (\(shown))",
                                                  createdAt: Store.now()))
             throw ToolError(message: "\(target.key) was not submitted: the change contains what looks like a secret (\(shown)). "
-                            + "Remove it from the files on your branch (take it from your environment instead) and submit again.")
+                            + Store.secretRecovery)
         }
 
         // Weakening is measured against the base the engine recorded at claim, never the live `main` (an agent can move that ref).

@@ -14,17 +14,18 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
     private struct W {
         let world: World
         let company: Company, other: Company
-        let mgr: Agent, eng: Agent, rev: Agent, outsider: Agent
+        let mgr: Agent, eng: Agent, eng2: Agent, rev: Agent, outsider: Agent
         let vault: MemoryVault
         var store: Store { world.store }
         var now: Date { world.clock.now }
         var root: URL { URL(fileURLWithPath: company.workspacePath, isDirectory: true) }
         var ws: GitWorkspace { GitWorkspace(root: root) }
 
-        init(profile: PermissionProfile = .workspace) throws {
+        init(profile: PermissionProfile = .workspace,
+             planSelector: @escaping @Sendable (Agent, WorkItem, Company) -> Bool = { _, _, _ in false }) throws {
             let v = MemoryVault()
             vault = v
-            world = try World(vault: v)
+            world = try World(planSelector: planSelector, vault: v)
             company = try world.company("Acme", profile: profile)
             other = try world.company("Bolt", profile: profile)
             mgr = try world.hire(company, "mgr", role: "manager")
@@ -33,6 +34,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
                 try store.hire(companyId: companyId, name: n, role: "engineer", model: "sonnet", managerId: managerId)
             }
             eng = try report("eng-1")
+            eng2 = try report("eng-2")
             rev = try report("rev")
             outsider = try store.hire(companyId: other.id, name: "bolt-eng", role: "engineer", model: "sonnet")
         }
@@ -96,11 +98,27 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         func branchHead(_ i: WorkItem) throws -> String? { try ws.head(of: ws.branchRef(key: i.key)) }
         func mainHead() throws -> String { try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: root) }
         /// The reviewer approves in a review turn, as the review tool does at the engine level.
-        func approve(_ i: WorkItem) throws {
-            let turn = try store.startTurn(agentId: rev.id, now: now)
+        func approve(_ i: WorkItem, by reviewer: Agent? = nil) throws {
+            let a = reviewer ?? rev
+            let turn = try store.startTurn(agentId: a.id, now: now)
             try store.setTurnContext(turnId: turn.id, kind: .review, itemId: i.id)
-            _ = try store.review(itemId: i.id, by: rev.id, decision: .approve, notes: "fine", approveFlags: true,
+            _ = try store.review(itemId: i.id, by: a.id, decision: .approve, notes: "fine", approveFlags: true,
                                  currentHead: try branchHead(i), now: now)
+        }
+        /// A commit the holder makes with its own git in its worktree.
+        func commitInWorktree(_ i: WorkItem, _ files: [String: String], message: String = "work") throws {
+            let wt = ws.worktreePath(key: i.key)
+            for (path, text) in files { try write(path, text, in: wt) }
+            try GitFixture.plainGit(["add", "-A"], in: wt)
+            try GitFixture.plainGit(["commit", "-q", "-m", message], in: wt)
+        }
+        func activity() throws -> [String] { try store.events(afterId: 0, companyId: company.id).map(\.text) }
+        func alerts() throws -> [Ask] { try asks().filter { $0.kind == .engineAlert } }
+        /// One holder work turn whose script runs `body` in the worktree.
+        func turn(_ a: Agent, _ body: @escaping @Sendable (TurnRequest) throws -> Void = { _ in }) async throws {
+            world.fake.script(a.name, .init(sideEffect: body))
+            try world.dm(company, a)
+            try await cycle()
         }
         func dms(to a: Agent) throws -> [String] {
             try store.writer.read { db in
@@ -325,7 +343,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         try w.write("src/config.txt", "key=\(value)\n", in: wt)
         let refusal = w.failure { try w.submit(i, w.eng) }
         #expect(refusal.contains("known secret STRIPE_TEST_KEY"), Comment(rawValue: refusal))
-        #expect(refusal.contains("src/config.txt"))
+        #expect(refusal.contains("src/config.txt")); #expect(refusal.lowercased().contains("rewrite"), "the recovery is an in-turn rewrite")
         #expect(!refusal.contains(value))
         #expect(try w.fresh(i).status == .inProgress)
         #expect(try w.store.latestVerification(itemId: i.id) == nil)
@@ -335,7 +353,11 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         #expect(encoded != value)
         try w.write("src/config.txt", "url=https://x/?k=\(encoded)\n", in: wt)
         #expect(w.failure { try w.submit(i, w.eng) }.contains("known secret STRIPE_TEST_KEY"))
+        // The value is in two earlier commits of the branch: a clean file is not enough, the branch is rewritten (in this turn).
         try w.write("src/config.txt", "key=from-the-environment\n", in: wt)
+        #expect(w.failure { try w.submit(i, w.eng) }.contains("known secret STRIPE_TEST_KEY"), "history is scanned too")
+        try GitFixture.plainGit(["reset", "-q", "--soft", try w.mainHead()], in: wt)
+        try GitFixture.plainGit(["commit", "-q", "-m", "clean"], in: wt)
         #expect(try w.submit(i, w.eng).hasPrefix("Submitted \(i.key)"))
     }
 
@@ -348,6 +370,99 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         #expect(refusal.contains(sample.hasPrefix("AKIA") ? "aws-key" : "private-key"), Comment(rawValue: refusal))
         #expect(!refusal.contains(sample))
         #expect(try w.fresh(i).status == .inProgress)
+    }
+
+    @Test func submitRefusesSecretInHistory() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.commitInWorktree(i, [".env": "AWS=\(aws)\n"], message: "oops")
+        let leak = try #require(try w.branchHead(i))
+        try FileManager.default.removeItem(at: wt.appending(path: ".env"))
+        try w.commitInWorktree(i, ["src/work.txt": "work\n"], message: "remove .env")
+        let refusal = w.failure { try w.submit(i, w.eng) }
+        #expect(refusal.contains("aws-key"), Comment(rawValue: refusal)); #expect(refusal.contains(".env"))
+        #expect(refusal.contains("commit \(leak.prefix(7))"), Comment(rawValue: refusal)); #expect(!refusal.contains(aws))
+        #expect(refusal.lowercased().contains("rewrite"), "the recovery is an in-turn rewrite")
+        #expect(try w.fresh(i).status == .inProgress)
+        // The holder rewrites in its turn: the leaked commit is gone, the submit passes (same turn: continuity held at start).
+        try GitFixture.plainGit(["reset", "-q", "--soft", try w.mainHead()], in: wt)
+        try GitFixture.plainGit(["commit", "-q", "-m", "clean"], in: wt)
+        #expect(try w.submit(i, w.eng).hasPrefix("Submitted \(i.key)"))
+    }
+
+    @Test func scanSeesBinaryAndAttributeMarkedFiles() throws {
+        let w = try W()
+        // (a) main marks a path binary and another -diff; (c) ordinary text under the engine's forced attributes.
+        try w.commitMain(["README.md": "hello\n", ".gitattributes": "*.bin binary\n*.dat -diff\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.write("creds.bin", "key: \(aws)\n", in: wt)
+        let a = w.failure { try w.submit(i, w.eng) }
+        #expect(a.contains("aws-key") && a.contains("creds.bin"), Comment(rawValue: a))
+        try FileManager.default.removeItem(at: wt.appending(path: "creds.bin"))
+        try w.write("creds.dat", "key: \(aws)\n", in: wt)
+        let d = w.failure { try w.submit(i, w.eng) }
+        #expect(d.contains("aws-key") && d.contains("creds.dat"), Comment(rawValue: d))
+        // (b) a file git itself sees as binary (a NUL byte) is scanned as text or refused, never passed.
+        try FileManager.default.removeItem(at: wt.appending(path: "creds.dat"))
+        try Data("x\u{0}y\n\(aws)\n".utf8).write(to: wt.appending(path: "blob.bin"))
+        let b = w.failure { try w.submit(i, w.eng) }
+        #expect(b.contains("aws-key") || b.contains("binary"), Comment(rawValue: b))
+        #expect(!b.contains(aws)); #expect(try w.fresh(i).status == .inProgress)
+        // (c) plain text still caught (regression against the `-diff` override making every file binary).
+        try FileManager.default.removeItem(at: wt.appending(path: "blob.bin"))
+        try w.write("src/plain.txt", "\(aws)\n", in: wt)
+        #expect(w.failure { try w.submit(i, w.eng) }.contains("aws-key"))
+    }
+
+    @Test func binaryLinesAreFailClosedFindings() {
+        let diff = """
+            diff --git a/x.bin b/x.bin
+            new file mode 100644
+            index 0000000..1111111
+            Binary files /dev/null and b/x.bin differ
+            """
+        let found = SecretScan.findings(diff: diff, knownValues: [])
+        #expect(found.count == 1); #expect(found.first?.contains("x.bin") == true); #expect(found.first?.contains("binary") == true)
+        let patch = "diff --git a/y.bin b/y.bin\nindex 1..2 100644\nGIT binary patch\nliteral 5\nMcmZQzWMnpa\n\n"
+        #expect(SecretScan.findings(diff: patch, knownValues: []).contains { $0.contains("y.bin") })
+        // Per-commit output names the commit; a secret-looking file name is a finding of its own.
+        let log = "commit " + String(repeating: "a", count: 40) + "\n\ndiff --git a/\(aws).json b/\(aws).json\nnew file mode 100644\n--- /dev/null\n+++ b/\(aws).json\n@@ -0,0 +1 @@\n+{}\n"
+        let named = SecretScan.findings(diff: log, knownValues: [])
+        #expect(named.contains { $0.contains("aws-key") && $0.contains("file name") && $0.contains("commit aaaaaaa") }, "\(named)")
+        #expect(!named.contains { $0.contains(aws) })
+    }
+
+    @Test func submitRefusesSecretInFilePath() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.write("keys/\(aws).pem", "nothing here\n", in: wt)
+        let refusal = w.failure { try w.submit(i, w.eng) }
+        #expect(refusal.contains("aws-key") && refusal.contains("file name"), Comment(rawValue: refusal))
+        #expect(!refusal.contains(aws)); #expect(try w.fresh(i).status == .inProgress)
+    }
+
+    @Test func orphanBranchScanUsesTheEmptyTree() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item()
+        // A branch with no common history is planted before the claim (what an agent can do with plain git).
+        let tree = try GitFixture.plainGit(["hash-object", "-t", "tree", "-w", "--stdin"], in: w.root, env: [:], allowFailure: true)
+        let blob = try GitFixture.plainGit(["hash-object", "-w", "--stdin"], in: w.root, env: [:], allowFailure: true)
+        _ = (tree, blob)
+        let orphan = try GitFixture.plainGit(["commit-tree", try GitFixture.plainGit(["hash-object", "-t", "tree", "-w", "--stdin"], in: w.root), "-m", "orphan"], in: w.root)
+        try GitFixture.plainGit(["branch", w.ws.branch(key: i.key), orphan], in: w.root)
+        let wt = try w.claim(i, w.eng)
+        #expect(try w.fresh(i).baseCommit == nil)
+        try w.write("src/creds.txt", "\(aws)\n", in: wt)
+        let refusal = w.failure { try w.submit(i, w.eng) }
+        #expect(refusal.contains("aws-key"), Comment(rawValue: refusal))
+        try w.write("src/creds.txt", "clean\n", in: wt)
+        try GitFixture.plainGit(["reset", "-q", "--soft", orphan], in: wt)
+        try GitFixture.plainGit(["add", "-A"], in: wt)
+        try GitFixture.plainGit(["commit", "-q", "-m", "clean"], in: wt)
+        #expect(try w.submit(i, w.eng).hasPrefix("Submitted \(i.key)"))
     }
 
     @Test func submitRefusesMovedBranch() throws {
@@ -391,10 +506,86 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         try await w.cycle()
         let afterTurn = try #require(try w.branchHead(i))
         #expect(try w.fresh(i).leaseHeadCommit == afterTurn); #expect(afterTurn != atClaim)
-        // A rewrite back to an earlier commit is not a fast-forward of what was recorded: refused.
+        #expect(!(try w.fresh(i).branchMoved))
+        // A rewrite between turns (back to the claim head) breaks continuity at the next turn's start: flagged, and the submit
+        // is refused until a manager re-adopts the branch; then it is the recorded head again.
         try GitFixture.plainGit(["update-ref", w.ws.branchRef(key: i.key), atClaim], in: w.root)
+        try await w.turn(w.eng)
+        #expect(try w.fresh(i).branchMoved); #expect(try w.fresh(i).leaseHeadCommit == afterTurn, "the record does not follow the move")
+        #expect(try w.activity().contains { $0.contains("moved outside") && $0.contains(i.key) })
+        #expect(try w.alerts().contains { $0.title.contains(i.key) })
         try w.write("src/again.txt", "again\n", in: wt)
         #expect(w.failure { try w.submit(i, w.eng) } == "\(i.key)'s branch moved outside your turn; ask your manager")
+        let own = w.failure { try w.call(w.eng, "readopt_branch", ["key": .string(i.key)]) }
+        #expect(own.contains("manager") || own.contains("role"), "the holder cannot re-adopt its own branch: \(own)")
+        #expect(try w.call(w.mgr, "readopt_branch", ["key": .string(i.key)]).contains(i.key))
+        let readopted = try w.fresh(i)
+        #expect(!readopted.branchMoved); #expect(readopted.leaseHeadCommit == atClaim)
+        #expect(try w.submit(i, w.eng).hasPrefix("Submitted \(i.key)"))
+    }
+
+    @Test func rewriteInOneTurnRefusesSubmitInTheNext() async throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try await w.turn(w.eng) { _ in   // the record moves to the holder's own commit
+            try "a\n".write(to: wt.appending(path: "a.txt"), atomically: true, encoding: .utf8)
+            try GitFixture.plainGit(["add", "-A"], in: wt)
+            try GitFixture.plainGit(["commit", "-q", "-m", "a"], in: wt)
+        }
+        let recorded = try #require(try w.fresh(i).leaseHeadCommit)
+        #expect(recorded == (try w.branchHead(i)))
+        // In its next turn the holder rewrites the branch (a reset and a new commit) but does not submit: continuity held at
+        // the start of that turn, so the rewrite is its own, but the record does not advance to a non-descendant...
+        try await w.turn(w.eng) { _ in
+            try GitFixture.plainGit(["reset", "-q", "--hard", "HEAD~1"], in: wt)
+            try "b\n".write(to: wt.appending(path: "b.txt"), atomically: true, encoding: .utf8)
+            try GitFixture.plainGit(["add", "-A"], in: wt)
+            try GitFixture.plainGit(["commit", "-q", "-m", "rewritten"], in: wt)
+        }
+        // ...and the submit in the turn after is refused.
+        #expect(try w.fresh(i).leaseHeadCommit == recorded); #expect(try w.fresh(i).branchMoved)
+        try await w.turn(w.eng) { _ in
+            let out = (try? CompanyTools(store: w.store, companyId: w.company.id, agentId: w.eng.id)
+                .call(name: "submit_for_review", arguments: ["key": .string(i.key), "summary": .string("done")])) ?? "refused"
+            guard out == "refused" else { throw FakeError(description: out) }
+        }
+        #expect(try w.world.turns(w.eng).last?.outcome == .succeeded)
+        #expect(try w.fresh(i).status == .inProgress)
+        #expect(w.failure { try w.submit(i, w.eng) } == "\(i.key)'s branch moved outside your turn; ask your manager")
+    }
+
+    @Test func conflictRebaseResubmitInTurnAccepted() async throws {
+        let w = try W()
+        try w.commitMain(["src/work.txt": "base\n"])
+        let a = try w.item("a", reviewer: w.mgr), b = try w.item("b", reviewer: w.mgr)
+        let wa = try w.claim(a, w.eng), wb = try w.claim(b, w.eng2)
+        try w.write("src/work.txt", "from a\n", in: wa)
+        try w.write("src/work.txt", "from b\n", in: wb)
+        try w.submit(a, w.eng); try w.submit(b, w.eng2)
+        try await w.cycle()
+        try w.approve(a, by: w.mgr); try w.approve(b, by: w.mgr)
+        for _ in 0..<6 where try w.fresh(a).status != .done { try await w.cycle() }
+        #expect(try w.fresh(a).status == .done)
+        for _ in 0..<4 where try w.fresh(b).status != .inProgress { try await w.cycle() }
+        #expect(try w.fresh(b).status == .inProgress, "b's rebase conflicted and it is back with its holder")
+        #expect(try w.events(b).contains { $0.kind == .mergeConflict })
+        // The holder follows the conflict brief in its turn: rebase onto main, resolve, resubmit. All in one turn: accepted.
+        let main = try w.mainHead()
+        try await w.turn(w.eng2) { _ in
+            let tools = CompanyTools(store: w.store, companyId: w.company.id, agentId: w.eng2.id)
+            _ = try GitFixture.plainGit(["rebase", main], in: wb, allowFailure: true)
+            try "merged\n".write(to: wb.appending(path: "src/work.txt"), atomically: true, encoding: .utf8)
+            try GitFixture.plainGit(["add", "-A"], in: wb)
+            try GitFixture.plainGit(["-c", "core.editor=true", "rebase", "--continue"], in: wb, env: ["GIT_EDITOR": "true"])
+            let out = try tools.call(name: "submit_for_review", arguments: ["key": .string(b.key), "summary": .string("rebased")])
+            guard out.hasPrefix("Submitted \(b.key)") else { throw FakeError(description: out) }
+        }
+        let last = try w.world.turns(w.eng2).last
+        #expect(last?.outcome == .succeeded, Comment(rawValue: last?.summary ?? ""))
+        #expect(try w.fresh(b).status == .inReview); #expect(!(try w.fresh(b).branchMoved))
+        #expect(try w.fresh(b).leaseHeadCommit == (try w.branchHead(b)), "the accepted submit is the recorded head")
+        #expect(try w.ws.isAncestor(main, of: try #require(try w.branchHead(b))))
     }
 
     @Test func mergeStepRescans() async throws {
@@ -402,7 +593,11 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         try w.commitMain(["README.md": "hello\n"])
         let value = "leak-value-abcdef-123456"
         let i = try w.item(reviewer: w.rev); let wt = try w.claim(i, w.eng)
-        try w.write("src/config.txt", "token=\(value)\n", in: wt)
+        // The value is committed, then removed in a later commit: the endpoint diff is clean, the history is not.
+        try w.commitInWorktree(i, ["src/config.txt": "token=\(value)\n"], message: "leak")
+        let leak = try #require(try w.branchHead(i))
+        try FileManager.default.removeItem(at: wt.appending(path: "src/config.txt"))
+        try w.commitInWorktree(i, ["src/work.txt": "work\n"], message: "cleanup")
         try w.submit(i, w.eng)
         try await w.cycle()   // the check passes
         #expect(try w.fresh(i).verifiedCommit != nil)
@@ -417,7 +612,8 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         #expect(back.status == .inProgress); #expect(back.mergeState == .none); #expect(back.verifiedCommit == nil)
         let event = try #require(try w.events(i).last { $0.kind == .verificationFailed })
         #expect(event.text.contains("known secret LEAK_KEY"), Comment(rawValue: event.text)); #expect(!event.text.contains(value))
-        #expect(try w.dms(to: w.eng).contains { $0.contains("known secret LEAK_KEY") })
+        #expect(event.text.contains("commit \(leak.prefix(7))"), "the finding names the commit")
+        #expect(try w.dms(to: w.eng).contains { $0.contains("known secret LEAK_KEY") && $0.lowercased().contains("rewrite") })
         #expect(try w.store.lease(itemId: i.id)?.agentId == w.eng.id)
         #expect(!(try dumpDatabase(w.store)).contains(value))
     }
@@ -522,6 +718,78 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         let sample = try #require(try w.store.reviewAudits(companyId: w.company.id).first { $0.itemId == done.id })
         #expect(sample.notes == "leaked [redacted REVIEW_KEY]")
         #expect(!(try dumpDatabase(w.store)).contains("second-line-77"))
+    }
+
+    @Test func failedScrubWithholdsTheLog() throws {
+        // A store that has secrets but has not loaded them (a fresh process whose vault is down) must not leave a raw log.
+        let home = try tempDir()
+        let path = home.appending(path: "brahma.sqlite").path
+        let vault = MemoryVault()
+        let first = try Store(path: path)
+        let company = try first.createCompany(name: "Acme", goal: "g", workspacesRoot: home.appending(path: "ws"))
+        try first.setSecret(companyId: company.id, name: "LOG_KEY", value: "log-key-value-12345", isTest: true, vault: vault)
+        try first.close()
+        let reopened = try Store(path: path)
+        #expect(reopened.secretsHeld)
+        let log = home.appending(path: "check.log")
+        try "env LOG_KEY=log-key-value-12345\n".write(to: log, atomically: true, encoding: .utf8)
+        #expect(throws: (any Error).self) { try reopened.scrubCheckLog(log) }
+        #expect(!FileManager.default.fileExists(atPath: log.path), "a log that cannot be scrubbed is removed")
+        // A loaded store scrubs in place; a link where the log should be is refused and removed too.
+        _ = try reopened.reloadRedactorIfNeeded(vault: vault, force: true)
+        try "env LOG_KEY=log-key-value-12345\n".write(to: log, atomically: true, encoding: .utf8)
+        try reopened.scrubCheckLog(log)
+        #expect(try String(contentsOf: log, encoding: .utf8) == "env LOG_KEY=[redacted LOG_KEY]\n")
+        let target = home.appending(path: "target.txt")
+        try "keep me\n".write(to: target, atomically: true, encoding: .utf8)
+        let link = home.appending(path: "link.log")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        #expect(throws: (any Error).self) { try reopened.scrubCheckLog(link) }
+        #expect(!FileManager.default.fileExists(atPath: link.path)); #expect(try String(contentsOf: target, encoding: .utf8) == "keep me\n")
+        #expect(throws: (any Error).self) { try Redactor().scrubFile(target) }   // never loaded: refuses rather than passing the file
+        try reopened.close()
+    }
+
+    @Test func provideSecretIsAtomicAndGenericApproveRefuses() throws {
+        let w = try W()
+        _ = try w.call(w.eng, "request_secret", ["name": .string("ATOMIC_KEY"), "reason": .string("r"), "test": .bool(true)])
+        let ask = try #require(try w.asks().first)
+        // The generic owner approve does not approve a secret request: there is nothing to approve without a value.
+        let generic = w.failure { try w.store.ownerDecide(askId: ask.id, approve: true, note: "ok"); return "approved" }
+        #expect(generic.contains("provide"), Comment(rawValue: generic))
+        #expect(try w.store.ask(id: ask.id)?.status == .pendingOwner)
+        #expect(try w.store.secrets(companyId: w.company.id).isEmpty)
+        // Rejecting it is still the owner's call.
+        _ = try w.store.ownerDecide(askId: ask.id, approve: false, note: "no")
+        // A request decided meanwhile cannot be provided for, and the vault keeps no value from the attempt.
+        #expect(throws: WorkError.self) { try w.store.provideSecret(askId: ask.id, value: "late-value-123456", isTest: true, vault: w.vault) }
+        #expect(try w.vault.value(companyId: w.company.id, name: "ATOMIC_KEY") == nil)
+        #expect(try w.store.secrets(companyId: w.company.id).isEmpty)
+    }
+
+    @Test func nonWorkTurnsGetNoSecretsOrKeepNames() async throws {
+        let w = try W(profile: .sandboxed, planSelector: { _, item, _ in item.title == "Planned" })
+        try w.set("TEST_KEY", "test-key-value-12345", test: true)
+        // A review turn of an agent that holds a key elsewhere: nothing injected, nothing kept.
+        let mine = try w.item("Mine"); try w.claim(mine, w.rev)
+        _ = try w.call(w.rev, "use_secret", ["name": .string("TEST_KEY")])
+        try w.commitMain(["README.md": "hello\n"])
+        let theirs = try w.item("Theirs", reviewer: w.rev); let wt = try w.claim(theirs, w.eng)
+        try w.write("src/work.txt", "work\n", in: wt)
+        try w.submit(theirs, w.eng)
+        try await w.cycle()   // the check
+        try await w.cycle()   // the review turn of rev
+        let review = try #require(w.requests(w.rev).last { $0.kind == .review })
+        #expect(review.secrets.isEmpty)
+        #expect(!(try String(contentsOfFile: try #require(review.shellPrefix), encoding: .utf8)).contains("TEST_KEY"))
+        // A plan turn on the leased item: nothing injected, nothing kept.
+        let planned = try w.item("Planned"); try w.claim(planned, w.eng2)
+        _ = try w.call(w.eng2, "use_secret", ["name": .string("TEST_KEY")])
+        try w.world.dm(w.company, w.eng2)
+        try await w.cycle()
+        let plan = try #require(w.requests(w.eng2).last)
+        #expect(plan.kind == .plan); #expect(plan.secrets.isEmpty)
+        #expect(!(try String(contentsOfFile: try #require(plan.shellPrefix), encoding: .utf8)).contains("TEST_KEY"))
     }
 
     // MARK: Push settings (7b re-review carry-overs)

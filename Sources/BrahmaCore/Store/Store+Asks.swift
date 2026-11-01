@@ -538,8 +538,14 @@ extension Store {
     /// the owner paths, its one caller is an access preset the owner turned on (`requestAccess`, owner-delegated, note
     /// `auto: <title>`, `decidedBy` `preset:<id>`).
     func ownerDecide(db: Database, askId: String, approve: Bool, note: String, acknowledgeChange: Bool, currentHash: String??,
-                     grant: GrantApproval?, decidedBy: String = "owner", extensionApproved: Bool = false, now: Date) throws -> Ask {
+                     grant: GrantApproval?, decidedBy: String = "owner", extensionApproved: Bool = false,
+                     providingSecret: Bool = false, now: Date) throws -> Ask {
         var ask = try requireAsk(db, askId)
+        // A secret request is approved only by providing the secret (`Store.provideSecret`): a bare approve has no value to give.
+        if approve, ask.kind == .request, SecretRequests.requested(ask) != nil, !providingSecret {
+            let slug = try Company.fetchOne(db, key: ask.companyId)?.slug ?? "<co>"
+            throw WorkError.invalid("provide the secret instead: brahma secret provide \(slug) \(ask.ref) [--test] (or in the app)")
+        }
         guard ask.kind.isDecision else {
             throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
         }

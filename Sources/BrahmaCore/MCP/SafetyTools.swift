@@ -17,8 +17,8 @@ extension CompanyTools {
                 ], required: ["name", "reason"])),
             ToolSpec(name: "use_secret", description: """
                 Take a test key into your environment for the work item you hold. It is there from your next turn (not this \
-                one), for your turns and the item's checks, until you release the item or it leaves In progress. Engine-held \
-                secrets cannot be taken: connectors use them for you.
+                one), for your turns on the item and the item's checks, while the item is In progress or In review and you hold \
+                it; it goes when you release the item or it is done. Engine-held secrets cannot be taken: connectors use them for you.
                 """, inputSchema: schema(["name": prop("string", "Secret name, as the owner stored it")], required: ["name"])),
             ToolSpec(name: "request_access", description: """
                 Ask the owner for access your sandbox does not give you: a Bash egress domain (network_domain), a WebFetch \

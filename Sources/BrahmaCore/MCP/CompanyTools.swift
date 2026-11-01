@@ -95,7 +95,7 @@ public struct CompanyTools: Sendable {
     /// What a plan turn's server leaves out: everything that changes work, leases, decisions, channels or a turn's environment.
     static let planTurnExcluded: Set<String> = Set(["claim_lease", "release_lease", "submit_for_review", "update_work_item",
                                                     "create_work_item", "link_dependency", "write_handoff", "create_channel",
-                                                    "set_blocked", "use_secret"])
+                                                    "set_blocked", "use_secret", "readopt_branch"])
         .union(highRiskTools)
     static let updateLowRiskFields: Set<String> = ["key", "status", "blockedReason", "blockedOnAsk", "notes", "linkedBranch"]
 

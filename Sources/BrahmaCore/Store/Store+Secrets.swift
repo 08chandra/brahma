@@ -99,8 +99,100 @@ extension Store {
             throw WorkError.invalid("\(ask.ref) is not a secret request")
         }
         guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
-        try setSecret(companyId: ask.companyId, name: request.name, value: value, isTest: isTest, vault: vault, now: now)
-        return try ownerDecide(askId: askId, approve: true, note: "provided", now: now)
+        let hadValue = try vault.value(companyId: ask.companyId, name: request.name) != nil
+        try validateSecret(companyId: ask.companyId, name: request.name, value: value, isTest: isTest)
+        // The vault first, then the metadata row and the decision in ONE write that checks the ask is still pending. If
+        // that write fails (the ask was decided meanwhile), the value is taken out of the vault again (best effort; a
+        // value that was already there before stays, replaced).
+        try vault.set(companyId: ask.companyId, name: request.name, value: value)
+        do {
+            return try writer.write { db in
+                guard let current = try Ask.fetchOne(db, key: askId), current.status.isPending else {
+                    throw WorkError.conflict("\(ask.ref) is already \((try Ask.fetchOne(db, key: askId))?.status.rawValue ?? "gone")")
+                }
+                try upsertSecretMeta(db, companyId: ask.companyId, name: request.name, isTest: isTest, now: now)
+                return try ownerDecide(db: db, askId: askId, approve: true, note: "provided", acknowledgeChange: false, currentHash: nil,
+                                       grant: nil, providingSecret: true, now: now)
+            }
+        } catch {
+            if !hadValue { try? vault.delete(companyId: ask.companyId, name: request.name) }
+            throw error
+        }
+    }
+
+    /// A check's log file is agent output: scrubbed in place before anything reads it. A scrub that cannot be done (the
+    /// redactor has not loaded, the path is not a regular file, the rewrite failed) removes the file and throws, so no raw
+    /// output is ever left behind; the caller records a withheld tail instead.
+    public func scrubCheckLog(_ url: URL) throws {
+        do { try redactor.scrubFile(url) } catch {
+            var st = stat()
+            if lstat(url.path, &st) == 0 { unlink(url.path) }
+            throw error
+        }
+    }
+
+    // MARK: Branch continuity between the holder's turns (scan (a))
+
+    /// At the start of a holder's work turn on its leased item: the branch head must be the recorded head. If it is not, the
+    /// branch moved outside the holder's turns: the item is flagged (`branchMoved`), the company hears (an `error` activity
+    /// line and an engine alert naming the key) and `submit_for_review` is refused until a manager or the owner re-adopts
+    /// it. Returns whether continuity held (a never-recorded head counts as held: the claim records one).
+    func checkBranchContinuity(item: WorkItem, agent: Agent, head: String?, now: Date) throws -> Bool {
+        guard let recorded = item.leaseHeadCommit else { return true }
+        if head == recorded { return !item.branchMoved }
+        try flagBranchMoved(item: item, agent: agent, why: "its head is \(head?.prefix(7) ?? "gone"), not the recorded \(recorded.prefix(7))", now: now)
+        return false
+    }
+
+    /// Marks the branch moved (see `checkBranchContinuity`) and tells the company.
+    func flagBranchMoved(item: WorkItem, agent: Agent, why: String, now: Date) throws {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET branchMoved = 1 WHERE id = ?", arguments: [item.id])
+            let text = "item/\(item.key) moved outside @\(agent.name)'s turn (\(why)); submits are refused until a manager re-adopts the branch (readopt_branch)"
+            try ActivityEvent(companyId: item.companyId, agentId: agent.id, turnId: nil, kind: .error, text: text, createdAt: now).insert(db)
+            if let current = try WorkItem.fetchOne(db, key: item.id) {
+                try recordItemEvent(db: db, item: current, actor: "system", kind: .edited, text: "branch moved outside the holder's turn (\(why))",
+                                    alsoNotify: [agent.managerId].compactMap { $0 }, now: now)
+            }
+            try EngineAlerts.raise(store: self, db: db, text: "\(item.key): \(text)", now: now,
+                                   reason: Self.branchMovedAlertReason(item.id), companyId: item.companyId)
+        }
+    }
+
+    static func branchMovedAlertReason(_ itemId: String) -> String { "branch-moved:\(itemId)" }
+
+    /// At the end of a holder's work turn (continuity held at its start): the branch head becomes the recorded head when it
+    /// descends from the recorded one (the turn's own commits, or a submit the engine accepted); a rewrite that was not
+    /// submitted in the same turn flags the branch instead.
+    func recordTurnEndHead(item: WorkItem, agent: Agent, head: String, isDescendant: (String) throws -> Bool, now: Date) throws {
+        guard let current = try workItem(id: item.id), try lease(itemId: item.id)?.agentId == agent.id, !current.branchMoved else { return }
+        guard let recorded = current.leaseHeadCommit else { try recordLeaseHead(itemId: item.id, commit: head); return }
+        if head == recorded { return }
+        if try isDescendant(recorded) {
+            try recordLeaseHead(itemId: item.id, commit: head)
+        } else {
+            try flagBranchMoved(item: current, agent: agent, why: "the turn rewrote it to \(head.prefix(7)) without submitting", now: now)
+        }
+    }
+
+    /// A manager (a lead of the company) or the owner takes the branch as it is: its current head becomes the recorded head
+    /// and the moved flag clears, so the holder can submit again. Needs a lease on the item.
+    @discardableResult
+    public func readoptBranch(itemId: String, by sender: Sender, head: String?, now: Date = Store.now()) throws -> WorkItem {
+        try writer.write { db in
+            guard let item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
+            let actor = try resolveActor(db, sender, companyId: item.companyId)
+            guard actor.privileged || actor.isLead else { throw WorkError.forbidden("only a manager or the owner can re-adopt \(item.key)'s branch") }
+            guard try WorkLease.fetchOne(db, key: itemId) != nil else { throw WorkError.conflict("\(item.key) is not leased; the next claim records its branch") }
+            guard let head else { throw WorkError.conflict("item/\(item.key) has no head to adopt") }
+            try db.execute(sql: "UPDATE workItem SET leaseHeadCommit = ?, branchMoved = 0 WHERE id = ?", arguments: [head, itemId])
+            try resolveEngineAlerts(db, reasons: [Self.branchMovedAlertReason(itemId)], now: now)
+            let holder = try Self.leaseHolderId(db: db, itemId: itemId)
+            try recordItemEvent(db: db, item: item, actor: actor.id, kind: .edited,
+                                text: "branch re-adopted at \(head.prefix(7)) by @\(actor.handle); submits are accepted again",
+                                alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
+            return try WorkItem.fetchOne(db, key: itemId) ?? item
+        }
     }
 
     /// `use_secret`: opens a use of a TEST key for the item the agent holds. The agent must be an active agent of the company
@@ -209,9 +301,9 @@ extension Store {
 
     /// Records the item branch's head the engine saw (at claim, at the end of a holder's turn, after an engine rebase), while
     /// the item is leased.
-    func recordLeaseHead(itemId: String, commit: String) throws {
+    func recordLeaseHead(itemId: String, commit: String, atClaim: Bool = false) throws {
         try writer.write { db in
-            try db.execute(sql: "UPDATE workItem SET leaseHeadCommit = ? WHERE id = ? AND EXISTS (SELECT 1 FROM workLease WHERE itemId = ?)",
+            try db.execute(sql: "UPDATE workItem SET leaseHeadCommit = ?\(atClaim ? ", branchMoved = 0" : "") WHERE id = ? AND EXISTS (SELECT 1 FROM workLease WHERE itemId = ?)",
                            arguments: [commit, itemId, itemId])
         }
     }
@@ -470,6 +562,13 @@ extension Store {
     /// redactor of a running engine picks the new value up on its next tick.
     public func setSecret(companyId: String, name: String, value: String, isTest: Bool, vault: any SecretVault,
                           now: Date = Store.now()) throws {
+        try validateSecret(companyId: companyId, name: name, value: value, isTest: isTest)
+        // Vault first: a vault that cannot store leaves no metadata row for a value that is not there.
+        try vault.set(companyId: companyId, name: name, value: value)
+        try writer.write { db in try upsertSecretMeta(db, companyId: companyId, name: name, isTest: isTest, now: now) }
+    }
+
+    func validateSecret(companyId: String, name: String, value: String, isTest: Bool) throws {
         guard SecretName.isValid(name) else { throw SecretError.invalidName }
         if isTest {
             // A test key goes into agents' environments: only names `SecretName.isInjectable` accepts.
@@ -479,17 +578,16 @@ extension Store {
         }
         guard !value.isEmpty else { throw SecretError.emptyValue }
         guard try company(id: companyId) != nil else { throw SecretError.unknownCompany }
-        // Vault first: a vault that cannot store leaves no metadata row for a value that is not there.
-        try vault.set(companyId: companyId, name: name, value: value)
-        try writer.write { db in
-            if var row = try SecretMeta.filter(Column("companyId") == companyId && Column("name") == name).fetchOne(db) {
-                row.isTest = isTest
-                row.updatedAt = now
-                try row.update(db)
-            } else {
-                try SecretMeta(id: UUID().uuidString, companyId: companyId, name: name, isTest: isTest, createdAt: now,
-                               updatedAt: now, lastUsedAt: nil).insert(db)
-            }
+    }
+
+    func upsertSecretMeta(_ db: Database, companyId: String, name: String, isTest: Bool, now: Date) throws {
+        if var row = try SecretMeta.filter(Column("companyId") == companyId && Column("name") == name).fetchOne(db) {
+            row.isTest = isTest
+            row.updatedAt = now
+            try row.update(db)
+        } else {
+            try SecretMeta(id: UUID().uuidString, companyId: companyId, name: name, isTest: isTest, createdAt: now,
+                           updatedAt: now, lastUsedAt: nil).insert(db)
         }
     }
 

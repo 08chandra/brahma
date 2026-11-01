@@ -719,7 +719,12 @@ enum Migrations {
         m.registerMigration("v5-secrets-2") { db in
             // The item branch's head as the engine last recorded it (at claim, after each of the holder's turns, after an
             // engine rebase): `submit_for_review` refuses a branch that is not a fast-forward of it (Task 4-wire, scan (a)).
-            try db.alter(table: "workItem") { t in t.add(column: "leaseHeadCommit", .text) }
+            try db.alter(table: "workItem") { t in
+                t.add(column: "leaseHeadCommit", .text)
+                // Set when the branch head at the start of a holder turn was not the recorded head (a move outside the holder's
+                // turns): `submit_for_review` is refused until a manager or the owner re-adopts the branch (`readopt_branch`).
+                t.add(column: "branchMoved", .boolean).notNull().defaults(to: false)
+            }
         }
         m.registerMigration("v5-restore") { db in
             try createRestoreTables(db)
