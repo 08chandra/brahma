@@ -60,7 +60,7 @@ private struct MCPWorld {
         "list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency", "comment_work_item", "claim_lease",
         "release_lease", "submit_for_review", "confirm_spec", "plan_sprint", "close_sprint",
         "propose_decision", "request_from_owner", "escalate_decision", "decide", "request_mode", "write_handoff",
-        "request_access"]
+        "request_access", "request_human_task", "set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy"]
     #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
     #expect(tools.count == expected.count)
     for t in tools { #expect((t["inputSchema"] as? [String: Any])?["type"] as? String == "object") }

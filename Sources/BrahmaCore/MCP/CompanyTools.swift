@@ -89,9 +89,11 @@ public struct CompanyTools: Sendable {
     static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item"]
     /// High-authority company tools (design §2.2): one call per turn when sub-agents are on, none on a plan turn, denied under
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
-    public static let highRiskTools: Set<String> = ["decide", "propose_decision", "escalate_decision", "request_from_owner",
-                                                    "request_mode", "plan_sprint", "close_sprint", "confirm_spec",
-                                                    "request_access"]
+    /// Plan L's ops tools (`CompanyToolNames.ops`) are high risk too (PR-35 part 2t: this is the built gate until 5-lite's
+    /// `TaintPolicy` lands).
+    public static let highRiskTools: Set<String> = Set(["decide", "propose_decision", "escalate_decision", "request_from_owner",
+                                                        "request_mode", "plan_sprint", "close_sprint", "confirm_spec",
+                                                        "request_access"]).union(CompanyToolNames.ops)
     /// What a plan turn's server leaves out: everything that changes work, leases, decisions or channels.
     static let planTurnExcluded: Set<String> = Set(["claim_lease", "release_lease", "submit_for_review", "update_work_item",
                                                     "create_work_item", "link_dependency", "write_handoff", "create_channel",
@@ -159,7 +161,7 @@ public struct CompanyTools: Sendable {
 
     /// The same list for every role (a stable prompt prefix); `call` enforces what the caller's role may use.
     public func specs() -> [ToolSpec] {
-        let all = Self.baseSpecs() + Self.workSpecs() + Self.inboxToolSpecs() + Self.safetyToolSpecs()
+        let all = Self.allSpecs()
         // An audit turn sees the audit tool only (`audit` is listed only here).
         if auditTurnId != nil { return [Self.auditSpec()] }
         if planTurn, reviewItemId == nil { return all.filter { !Self.planTurnExcluded.contains($0.name) } }
@@ -168,7 +170,12 @@ public struct CompanyTools: Sendable {
         return all.filter { CompanyToolNames.review.contains($0.name) } + [Self.reviewSpec()]
     }
 
-    private static let implemented: Set<String> = Set((baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs()).map(\.name))
+    /// Every tool group's specs (the stable, role-independent list).
+    private static func allSpecs() -> [ToolSpec] {
+        baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs() + previewToolSpecs() + deployToolSpecs() + humanTaskToolSpecs()
+    }
+
+    private static let implemented: Set<String> = Set(allSpecs().map(\.name))
 
     private static func baseSpecs() -> [ToolSpec] {
         let s = Self.self
@@ -305,6 +312,9 @@ public struct CompanyTools: Sendable {
                 if let result = try callWork(name, args) { return result }
                 if let result = try dispatchInbox(name, args) { return result }
                 if let result = try dispatchSafety(name, args) { return result }
+                if let result = try dispatchPreview(name, args) { return result }
+                if let result = try dispatchDeploy(name, args) { return result }
+                if let result = try dispatchHumanTask(name, args) { return result }
                 throw ToolError(message: "unknown tool: \(name)")
             }
         } catch let e as ToolError {
