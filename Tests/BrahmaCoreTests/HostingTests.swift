@@ -208,6 +208,29 @@ private struct RefusingVault: SecretVault {
         #expect(!VercelAdapter.hobbyNote.isEmpty)
     }
 
+    /// C2: the whole URL is matched, from the escaped project, with a fixed-length hash right after it.
+    @Test func vercelDeployURLIsMatchedWhole() {
+        // A correct URL of this project is accepted.
+        #expect(VercelAdapter.isDeployURL("https://acme-k3j4h5g6f-acme-team.vercel.app", project: "acme"))
+        #expect(VercelAdapter.isDeployURL("https://acme-k3j4h5g6f-acme-team.vercel.app/", project: "acme"))
+        #expect(VercelAdapter.isDeployURL("https://my-site-0a1b2c3d4-team.vercel.app", project: "my-site"))
+        // A foreign project that starts with this one's name is rejected, wherever its segments fall.
+        for foreign in ["https://acme-evil-k3j4h5g6f-acme-team.vercel.app", "https://acme-evil-x-k3j4h5g6f-team.vercel.app",
+                        "https://acme-k3j4h5g6-team.vercel.app", "https://acme-k3j4h5g6fz-team.vercel.app",
+                        "https://acme-K3J4H5G6F-team.vercel.app", "https://acme-k3j4h5g6f-team.vercel.app.evil.com",
+                        "https://acme-k3j4h5g6f-team.vercel.app/path", "https://x.acme-k3j4h5g6f-team.vercel.app",
+                        "http://acme-k3j4h5g6f-team.vercel.app", "https://acme.vercel.app"] {
+            #expect(!VercelAdapter.isDeployURL(foreign, project: "acme"), "\(foreign)")
+        }
+        let s = Self.settings(.vercel, accountId: "team_abc")
+        #expect(VercelAdapter().deployURL(fromOutput: "Production: https://acme-evil-k3j4h5g6f-acme-team.vercel.app [3s]\n", settings: s) == nil)
+        // Regex metacharacters in a project name match only literally.
+        #expect(VercelAdapter.isDeployURL("https://a.b-k3j4h5g6f-team.vercel.app", project: "a.b"))
+        #expect(!VercelAdapter.isDeployURL("https://aXb-k3j4h5g6f-team.vercel.app", project: "a.b"))
+        #expect(!VercelAdapter.isDeployURL("https://aaab-k3j4h5g6f-team.vercel.app", project: "a+b"))
+        #expect(VercelAdapter.isDeployURL("https://a+b-k3j4h5g6f-team.vercel.app", project: "a+b"))
+    }
+
     // MARK: Plans
 
     @Test func planHashCoversBuildOutputAndCwd() throws {
