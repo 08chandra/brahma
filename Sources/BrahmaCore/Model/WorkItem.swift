@@ -179,6 +179,9 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     /// The branch was found moved outside the holder's turns (its head at a turn's start was not `leaseHeadCommit`, or a turn
     /// rewrote it without submitting): submits are refused until a manager or the owner re-adopts it (`readoptBranch`).
     public var branchMoved: Bool = false
+    /// Who held the lease when `branchMoved` was set (nil when nobody did): re-adopting is refused to that agent and needs
+    /// its direct manager, an executive or the owner, whoever holds the item since. Cleared only with the flag.
+    public var branchMovedHolderId: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

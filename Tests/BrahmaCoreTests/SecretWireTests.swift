@@ -819,7 +819,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         // The holder (an engineer) and an unrelated lead are refused; the holder's direct manager may, and is recorded.
         #expect(throws: WorkError.self) { try w.store.readoptBranch(itemId: i.id, by: .agent(w.eng.id), head: try w.branchHead(i)) }
         let unrelated = w.failure { try w.call(mgr2, "readopt_branch", ["key": .string(i.key)]) }
-        #expect(unrelated.contains("only the holder's manager"), Comment(rawValue: unrelated))
+        #expect(unrelated.contains("only the manager"), Comment(rawValue: unrelated))
         #expect(try w.fresh(i).branchMoved)
         #expect(try w.call(w.mgr, "readopt_branch", ["key": .string(i.key)]).contains(i.key))
         #expect(!(try w.fresh(i).branchMoved))
@@ -908,13 +908,13 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         let i = try w.item(); let wt = try w.claim(i, w.eng)
         try w.commitInWorktree(i, ["src/w.txt": "w\n"], message: "use key \(aws)")
         let refusal = w.failure { try w.submit(i, w.eng) }
-        #expect(refusal.contains("aws-key in a commit message or author"), Comment(rawValue: refusal))
+        #expect(refusal.contains("aws-key in a commit message or header"), Comment(rawValue: refusal))
         #expect(!refusal.contains(aws))
         #expect(refusal.contains("If that turn ends without an accepted submit"), "the refusal names the recovery path")
         // Author fields too, through the same scan.
         try GitFixture.plainGit(["reset", "-q", "--soft", try w.mainHead()], in: wt)
         try GitFixture.plainGit(["-c", "user.email=\(aws)@example.com", "commit", "-q", "-m", "clean"], in: wt)
-        #expect(w.failure { try w.submit(i, w.eng) }.contains("aws-key in a commit message or author"))
+        #expect(w.failure { try w.submit(i, w.eng) }.contains("aws-key in a commit message or header"))
         // One finding per (rule, place): the same secret in a commit and in the endpoint diff is reported once.
         try GitFixture.plainGit(["reset", "-q", "--soft", try w.mainHead()], in: wt)
         try w.write(".env", "AWS=\(aws)\n", in: wt)
@@ -984,6 +984,106 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         #expect(audit.secrets.isEmpty)
         let prefix = audit.shellPrefix.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? ""
         #expect(!prefix.contains("TEST_KEY"))
+    }
+
+    // MARK: 4-wire fix round 3
+
+    @Test func reassignDoesNotLaunderReadoptAuthority() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let mgr2 = try w.store.hire(companyId: w.company.id, name: "mgr-2", role: "manager", model: "sonnet")
+        let eng3 = try w.store.hire(companyId: w.company.id, name: "eng-3", role: "engineer", model: "sonnet", managerId: mgr2.id)
+        // (a) A flagged lead holder hands its item to its own report, who claims it; the lead still cannot re-adopt.
+        let j = try w.item("Lead's own"); try w.claim(j, w.mgr)
+        try moveAndFlag(w, j, holder: w.mgr)
+        #expect(try w.fresh(j).branchMovedHolderId == w.mgr.id)
+        _ = try w.call(w.mgr, "release_lease", ["key": .string(j.key)])
+        _ = try w.call(w.mgr, "update_work_item", ["key": .string(j.key), "owner": .string(w.eng.name)])
+        try w.claim(j, w.eng)
+        #expect(try w.fresh(j).branchMoved, "a reassignment keeps the flag")
+        let a = w.failure { try w.call(w.mgr, "readopt_branch", ["key": .string(j.key)]) }
+        #expect(a.contains("you held"), Comment(rawValue: a)); #expect(try w.fresh(j).branchMoved)
+        // (b) An unrelated lead reassigns someone else's flagged item to its own report, who claims it; still refused.
+        let i = try w.item(); try w.claim(i, w.eng2)
+        try moveAndFlag(w, i, holder: w.eng2)
+        _ = try w.call(mgr2, "update_work_item", ["key": .string(i.key), "owner": .string(eng3.name)])
+        try w.claim(i, eng3)
+        #expect(try w.fresh(i).branchMoved)
+        let b = w.failure { try w.call(mgr2, "readopt_branch", ["key": .string(i.key)]) }
+        #expect(b.contains("only the manager of the agent that held"), Comment(rawValue: b)); #expect(try w.fresh(i).branchMoved)
+        // The flagged holder's manager may, after the reassignment; the flag and its holder clear together.
+        #expect(try w.call(w.mgr, "readopt_branch", ["key": .string(i.key)]).contains(i.key))
+        #expect(!(try w.fresh(i).branchMoved)); #expect(try w.fresh(i).branchMovedHolderId == nil)
+    }
+
+    @Test func moveWhileUnleasedIsFlaggedAtClaim() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let ceo = try w.store.hire(companyId: w.company.id, name: "ceo", role: "ceo", model: "sonnet")
+        let i = try w.item(); try w.claim(i, w.eng)
+        // The holder's own commits, then a release in the same turn: the next claim takes them as recorded, no flag.
+        try w.commitInWorktree(i, ["src/a.txt": "a\n"])
+        _ = try w.call(w.eng, "release_lease", ["key": .string(i.key)])
+        try w.claim(i, w.eng)
+        #expect(!(try w.fresh(i).branchMoved)); #expect(try w.fresh(i).leaseHeadCommit == (try w.branchHead(i)))
+        // A move while nobody holds it is flagged at the next claim, not adopted.
+        _ = try w.call(w.eng, "release_lease", ["key": .string(i.key)])
+        let recorded = try #require(try w.fresh(i).leaseHeadCommit)
+        let tree = try GitFixture.plainGit(["rev-parse", "\(recorded)^{tree}"], in: w.root)
+        let orphan = try GitFixture.plainGit(["commit-tree", tree, "-m", "while unleased"], in: w.root)
+        try GitFixture.plainGit(["update-ref", w.ws.branchRef(key: i.key), orphan], in: w.root)
+        let wt = try w.claim(i, w.eng)
+        #expect(try w.fresh(i).branchMoved); #expect(try w.fresh(i).branchMovedHolderId == nil)
+        #expect(try w.fresh(i).leaseHeadCommit == recorded, "the foreign head is not adopted")
+        try w.write("src/b.txt", "b\n", in: wt)
+        #expect(w.failure { try w.submit(i, w.eng) } == "\(i.key)'s branch moved outside your turn; ask your manager")
+        // Nobody held it: no holder's manager qualifies; an executive does.
+        let byManager = w.failure { try w.call(w.mgr, "readopt_branch", ["key": .string(i.key)]) }
+        #expect(byManager.contains("only the manager"), Comment(rawValue: byManager))
+        #expect(try w.call(ceo, "readopt_branch", ["key": .string(i.key)]).contains(i.key))
+        #expect(!(try w.fresh(i).branchMoved))
+    }
+
+    @Test func quotedAndSpacedFileNamesAreScanned() throws {
+        // Unit: a quoted header (a tab in the name) and a directory ending in " b", both for empty files (no ---/+++ lines).
+        let quoted = "diff --git \"a/\(aws)\\tt\" \"b/\(aws)\\tt\"\nnew file mode 100644\nindex 0000000..e69de29\n"
+        #expect(SecretScan.findings(diff: quoted, knownValues: []).contains { $0.contains("aws-key in a file name") })
+        let spaced = "diff --git a/\(aws) b/z b/\(aws) b/z\nnew file mode 100644\nindex 0000000..e69de29\n"
+        #expect(SecretScan.findings(diff: spaced, knownValues: []).contains { $0.contains("aws-key in a file name") })
+        // After a quoted header the path is that file's, not the previous one's.
+        let next = "diff --git a/one b/one\n--- /dev/null\n+++ b/one\n@@ -0,0 +1 @@\n+fine\n"
+            + "diff --git \"a/x\\ty\" \"b/x\\ty\"\nnew file mode 100644\n--- /dev/null\n+++ \"b/x\\ty\"\n@@ -0,0 +1 @@\n+\(aws)\n"
+        #expect(SecretScan.findings(diff: next, knownValues: []) == ["aws-key in x\ty (added line 1)"])
+        #expect(SecretScan.headerNewName(ArraySlice("a/p b/q b/p b/q".utf8)).map { String(decoding: $0, as: UTF8.self) } == "p b/q")
+        // Real git: empty files with such names are refused at submit.
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.write("\(aws)\tt", "", in: wt)
+        let tab = w.failure { try w.submit(i, w.eng) }
+        #expect(tab.contains("aws-key") && tab.contains("file name"), Comment(rawValue: tab)); #expect(!tab.contains(aws))
+        try GitFixture.plainGit(["reset", "-q", "--hard", try w.mainHead()], in: wt)   // the rewrite drops that commit
+        try w.write("\(aws) b/z", "", in: wt)
+        let dir = w.failure { try w.submit(i, w.eng) }
+        #expect(dir.contains("aws-key") && dir.contains("file name"), Comment(rawValue: dir))
+    }
+
+    @Test func extraCommitHeadersAreScanned() throws {
+        let w = try W()
+        try w.commitMain(["README.md": "hello\n"])
+        let i = try w.item(); let wt = try w.claim(i, w.eng)
+        try w.commitInWorktree(i, ["src/w.txt": "w\n"])
+        let parent = try #require(try w.branchHead(i))
+        let tree = try GitFixture.plainGit(["rev-parse", "\(parent)^{tree}"], in: w.root)
+        let object = "tree \(tree)\nparent \(parent)\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\nx-note \(aws)\n\nplain message\n"
+        let file = try tempDir().appending(path: "commit.txt")
+        try object.write(to: file, atomically: true, encoding: .utf8)
+        let crafted = try GitFixture.plainGit(["hash-object", "-t", "commit", "-w", "--literally", file.path], in: w.root)
+        try GitFixture.plainGit(["reset", "-q", "--hard", crafted], in: wt)   // the holder's own move, in its turn
+        let refusal = w.failure { try w.submit(i, w.eng) }
+        #expect(refusal.contains("aws-key in a commit message or header") && refusal.contains("commit \(crafted.prefix(7))"),
+                Comment(rawValue: refusal))
+        #expect(!refusal.contains(aws))
     }
 
     // MARK: Push settings (7b re-review carry-overs)

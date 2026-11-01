@@ -157,24 +157,47 @@ extension Store {
             if current.branchMoved { return false }
             guard let recorded = current.leaseHeadCommit else { return true }
             if head == recorded { return true }
-            try flagBranchMoved(db: db, item: current, agent: agent,
+            try flagBranchMoved(db: db, item: current, agent: agent, holderId: agent.id,
                                 why: "its head is \(head?.prefix(7) ?? "gone"), not the recorded \(recorded.prefix(7))", now: now)
             return false
         }
     }
 
-    /// Marks the branch moved (see `checkBranchContinuity`) and tells the company.
-    func flagBranchMoved(item: WorkItem, agent: Agent, why: String, now: Date) throws {
-        try writer.write { db in try flagBranchMoved(db: db, item: item, agent: agent, why: why, now: now) }
+    /// At claim (4-wire fix round 3, R2): the branch head becomes the recorded head, unless the item already has a recorded
+    /// head the branch no longer is — a move while nobody held the lease. That is flagged (with no flagged holder, so only an
+    /// executive or the owner can re-adopt it), not adopted. An item already flagged keeps its flag and its flagged holder.
+    func recordClaimHead(itemId: String, head: String, now: Date) throws {
+        try writer.write { db in
+            guard let item = try WorkItem.fetchOne(db, key: itemId) else { return }
+            if !item.branchMoved, let recorded = item.leaseHeadCommit, recorded != head,
+               let claimantId = try Self.leaseHolderId(db: db, itemId: itemId), let claimant = try Agent.fetchOne(db, key: claimantId) {
+                try flagBranchMoved(db: db, item: item, agent: claimant, holderId: nil,
+                                    why: "it moved while nobody held it: its head is \(head.prefix(7)), not the recorded \(recorded.prefix(7))",
+                                    now: now)
+                return
+            }
+            try Self.recordLeaseHead(db: db, itemId: itemId, commit: head)
+        }
     }
 
-    func flagBranchMoved(db: Database, item: WorkItem, agent: Agent, why: String, now: Date) throws {
-        try db.execute(sql: "UPDATE workItem SET branchMoved = 1 WHERE id = ?", arguments: [item.id])
-        let text = "item/\(item.key) moved outside @\(agent.name)'s turn (\(why)); submits are refused until a manager re-adopts the branch (readopt_branch)"
+    /// Marks the branch moved (see `checkBranchContinuity`) and tells the company.
+    func flagBranchMoved(item: WorkItem, agent: Agent, why: String, now: Date) throws {
+        try writer.write { db in try flagBranchMoved(db: db, item: item, agent: agent, holderId: agent.id, why: why, now: now) }
+    }
+
+    /// `holderId` is who held the lease when the move was found (the flagged holder, `branchMovedHolderId`): the agent whose
+    /// turn found it; nil for a move while nobody held the item. A flag already set is never overwritten.
+    func flagBranchMoved(db: Database, item: WorkItem, agent: Agent, holderId: String?, why: String, now: Date) throws {
+        let flagged = holderId
+        try db.execute(sql: "UPDATE workItem SET branchMoved = 1, branchMovedHolderId = ? WHERE id = ? AND branchMoved = 0",
+                       arguments: [flagged, item.id])
+        let text = flagged == nil
+            ? "item/\(item.key) moved while nobody held it (\(why)); submits are refused until an executive or the owner re-adopts the branch (readopt_branch)"
+            : "item/\(item.key) moved outside @\(agent.name)'s turn (\(why)); submits are refused until a manager re-adopts the branch (readopt_branch)"
         try ActivityEvent(companyId: item.companyId, agentId: agent.id, turnId: nil, kind: .error, text: text, createdAt: now).insert(db)
         if let current = try WorkItem.fetchOne(db, key: item.id) {
             try recordItemEvent(db: db, item: current, actor: "system", kind: .edited, text: "branch moved outside the holder's turn (\(why))",
-                                alsoNotify: [agent.managerId].compactMap { $0 }, now: now)
+                                alsoNotify: flagged == nil ? [] : [agent.managerId].compactMap { $0 }, now: now)
         }
         try EngineAlerts.raise(store: self, db: db, text: "\(item.key): \(text)", now: now,
                                reason: Self.branchMovedAlertReason(item.id), companyId: item.companyId)
@@ -198,8 +221,9 @@ extension Store {
 
     /// Takes a branch flagged as moved as it is: its current head becomes the recorded head and the flag clears, so the
     /// holder can submit again. Only for a flagged, leased item (`"nothing to re-adopt"` otherwise). Who may (4-wire fix
-    /// round 2, S12): the owner; otherwise never the leaseholder itself, and only an executive of the company or the
-    /// holder's direct manager (`managerId`). The item events record who re-adopted it.
+    /// rounds 2 and 3, S12/R1): the owner; otherwise never the agent that held the item when it was flagged
+    /// (`branchMovedHolderId`) nor the current leaseholder, and only an executive of the company or the direct manager of the
+    /// FLAGGED holder — a reassignment (which any lead can make) changes neither. The item events record who re-adopted it.
     @discardableResult
     public func readoptBranch(itemId: String, by sender: Sender, head: String?, now: Date = Store.now()) throws -> WorkItem {
         try writer.write { db in
@@ -208,18 +232,21 @@ extension Store {
             guard try WorkLease.fetchOne(db, key: itemId) != nil, let holderId = try Self.leaseHolderId(db: db, itemId: itemId) else {
                 throw WorkError.conflict("\(item.key) is not leased; the next claim records its branch")
             }
+            guard item.branchMoved else { throw WorkError.conflict("\(item.key)'s branch is not flagged as moved: nothing to re-adopt") }
             if !actor.privileged {
                 guard actor.id != holderId else {
                     throw WorkError.forbidden("you hold \(item.key): its branch is re-adopted by your manager or the owner, not by you")
                 }
-                let holder = try Agent.fetchOne(db, key: holderId)
-                guard actor.kind == .executive || (holder?.managerId != nil && holder?.managerId == actor.id) else {
-                    throw WorkError.forbidden("only the holder's manager, an executive or the owner can re-adopt \(item.key)'s branch")
+                guard actor.id != item.branchMovedHolderId else {
+                    throw WorkError.forbidden("you held \(item.key) when its branch was flagged: your manager or the owner re-adopts it, not you")
+                }
+                let flagged = try item.branchMovedHolderId.flatMap { try Agent.fetchOne(db, key: $0) }
+                guard actor.kind == .executive || (flagged?.managerId != nil && flagged?.managerId == actor.id) else {
+                    throw WorkError.forbidden("only the manager of the agent that held \(item.key) when it was flagged, an executive or the owner can re-adopt its branch")
                 }
             }
-            guard item.branchMoved else { throw WorkError.conflict("\(item.key)'s branch is not flagged as moved: nothing to re-adopt") }
             guard let head else { throw WorkError.conflict("item/\(item.key) has no head to adopt") }
-            try db.execute(sql: "UPDATE workItem SET leaseHeadCommit = ?, branchMoved = 0 WHERE id = ?", arguments: [head, itemId])
+            try db.execute(sql: "UPDATE workItem SET leaseHeadCommit = ?, branchMoved = 0, branchMovedHolderId = NULL WHERE id = ?", arguments: [head, itemId])
             try resolveEngineAlerts(db, reasons: [Self.branchMovedAlertReason(itemId)], now: now)
             try recordItemEvent(db: db, item: item, actor: actor.id, kind: .edited,
                                 text: "branch re-adopted at \(head.prefix(7)) by @\(actor.handle); submits are accepted again",

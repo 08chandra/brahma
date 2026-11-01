@@ -398,6 +398,13 @@ extension CompanyTools {
     }
 
     private func releaseLease(_ target: WorkItem, note: String?) throws -> String {
+        // The holder's own commits of this turn become the recorded head before the lease goes (as at a turn's end), so the
+        // next claim does not take them for a move while nobody held the item (4-wire fix round 3, R2).
+        let git = gitWorkspace(try workspace())
+        if try store.lease(itemId: target.id)?.agentId == agentId, let me = try store.agent(id: agentId),
+           let head = try git.head(of: git.branchRef(key: target.key)) {
+            try store.recordTurnEndHead(item: target, agent: me, head: head, isDescendant: { try git.isAncestor($0, of: head) }, now: Store.now())
+        }
         try store.releaseLease(itemId: target.id, agentId: agentId, note: note)
         var tail = "Your work is saved on branch \(gitWorkspace(try workspace()).branch(key: target.key))."
         do { try removeWorktreeUnlessLeased(key: target.key) } catch {

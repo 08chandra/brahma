@@ -26,7 +26,7 @@ extension Store {
     /// What the holder is told to do about a leaked commit: the branch is rewritten in the holder's own turn (continuity
     /// between turns permits that) and submitted again in the same turn.
     static let secretRecovery = "Rewrite your branch in this turn so no commit carries it (reset to main and recommit without it, "
-        + "or squash; a commit message or author carrying it is rewritten too), take the value from your environment instead, "
+        + "or squash; a commit message, author or header carrying it is rewritten too), take the value from your environment instead, "
         + "then submit again in the same turn. If that turn ends without an accepted submit, the rewrite flags the branch and "
         + "only your manager (or the owner) can re-adopt it."
     static let maxBriefFiles = 50
@@ -360,6 +360,8 @@ extension Store {
                 let wasStatus = current.status
                 current.mergeState = .none
                 current.mergedCommit = head
+                // The branch goes with the landing: a reopened item starts a new record at its next claim (R2).
+                current.leaseHeadCommit = nil
                 current.updatedAt = now
                 try current.update(db)
                 // Risk-tiered review: an auto-approved item that lands is an auto-merge, and every one is queued for an audit.

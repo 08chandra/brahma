@@ -639,16 +639,19 @@ public enum SecretScan {
                 }
             }
             if line.starts(with: "diff --git ".utf8) {
-                // The new file's name, from the header (`diff --git a/x b/x`): scanned even when the file has no text hunk.
+                // The file's names, from the header (`diff --git a/x b/x`): scanned even when the file has no text hunk
+                // (an empty file, a mode change, a deletion). The whole header is matched as it stands, then the new name
+                // (C-unquoted when git quoted it) is matched and becomes the path (4-wire fix round 3, R3).
                 let halves = line.dropFirst("diff --git ".utf8.count)
-                if let at = lastIndex(of: Array(" b/".utf8), in: halves) {
-                    path = halves[(at + 3)...]
-                    for hit in matches(path, known: known) { report(hit, where: "a file name", line: false) }
-                }
+                for hit in matches(halves, known: known) { report(hit, where: "a file name", line: false) }
+                path = headerNewName(halves) ?? halves
+                for hit in matches(path, known: known) { report(hit, where: "a file name", line: false) }
                 continue
             }
             if line.starts(with: "+++ ".utf8) && previous.starts(with: "--- ".utf8) {
                 var p = line.dropFirst(4)
+                for hit in matches(p, known: known) { report(hit, where: "a file name", line: false) }
+                if p.first == 0x22, let (unquoted, end) = cUnquote(p, from: p.startIndex), end == p.endIndex { p = unquoted[...] }
                 if p.starts(with: "b/".utf8) { p = p.dropFirst(2) }
                 path = p
                 if !p.elementsEqual("/dev/null".utf8) { for hit in matches(p, known: known) { report(hit, where: "a file name", line: false) } }
@@ -665,9 +668,11 @@ public enum SecretScan {
         return out
     }
 
-    /// What commit messages and the author/committer fields leak (`GitWorkspace.scanMessages` output: a `commit <hash>`
-    /// line, then the message, the author name and email, the committer name and email). Each commit's record is matched
-    /// as a whole (a known value spanning lines is found too); findings name the commit, never the text.
+    /// What commit objects leak beyond their patches (`GitWorkspace.scanMessages` output, `git log --pretty=raw`: a
+    /// `commit <hash>` line, then every header of the object as stored — tree, parents, author, committer, and any extra
+    /// header such as `gpgsig`, `mergetag` or a crafted one (4-wire fix round 3, R4) — then the message, indented by four
+    /// spaces, which are taken off). Each commit's record is matched as a whole (a known value spanning lines is found
+    /// too); findings name the commit, never the text.
     static func messageFindings(log: String, known: KnownForms) -> [Finding] {
         var out: [Finding] = []
         var seen = Set<String>()
@@ -677,7 +682,7 @@ public enum SecretScan {
             defer { record.removeAll(keepingCapacity: true) }
             guard !record.isEmpty else { return }
             for hit in matches(record[...], known: known) {
-                let place = "a commit message or author"
+                let place = "a commit message or header"
                 let f = Finding(what: hit, place: place, text: "\(hit) in \(place)" + (commit.map { " (commit \($0.prefix(7)))" } ?? ""))
                 if seen.insert(f.key).inserted { out.append(f) }
             }
@@ -692,7 +697,7 @@ public enum SecretScan {
                     continue
                 }
             }
-            record.append(contentsOf: line); record.append(0x0A)
+            record.append(contentsOf: line.starts(with: "    ".utf8) ? line.dropFirst(4) : line); record.append(0x0A)
         }
         flush()
         return out
@@ -705,6 +710,76 @@ public enum SecretScan {
         for p in compiled where p.regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil { hits.append(p.label) }
         for k in known where k.forms.contains(where: { lastIndex(of: $0, in: bytes) != nil }) { hits.append("known secret \(k.name)") }
         return hits
+    }
+
+    /// The new file's name (without `b/`) from a `diff --git` header remainder (`a/<old> b/<new>`): git C-quotes a name with
+    /// a tab, a newline, `"`, `\` or a control character (`"b/…"`); with renames off both names are the same, which settles
+    /// a path that itself contains ` b/`. Nil when the header cannot be read (the caller then uses the remainder as it is).
+    static func headerNewName(_ halves: ArraySlice<UInt8>) -> ArraySlice<UInt8>? {
+        func stripB(_ name: ArraySlice<UInt8>) -> ArraySlice<UInt8> { name.starts(with: "b/".utf8) ? name.dropFirst(2) : name }
+        if halves.first == 0x22 {
+            // `"a/…" "b/…"` or `"a/…" b/…`
+            guard let (_, end) = cUnquote(halves, from: halves.startIndex), end < halves.endIndex, halves[end] == 0x20 else { return nil }
+            let second = halves[(end + 1)...]
+            if second.first == 0x22 {
+                guard let (b, bEnd) = cUnquote(second, from: second.startIndex), bEnd == second.endIndex else { return nil }
+                return stripB(b[...])
+            }
+            return stripB(second)
+        }
+        if halves.last == 0x22 {
+            // `a/… "b/…"`: the quoted token that ends exactly at the end.
+            var i = halves.startIndex
+            while let at = halves[i...].firstIndex(of: 0x22) {
+                if at > halves.startIndex, halves[at - 1] == 0x20, let (b, end) = cUnquote(halves, from: at), end == halves.endIndex {
+                    return stripB(b[...])
+                }
+                i = at + 1
+            }
+            return nil
+        }
+        // Unquoted: `a/P b/P`, the same P twice (renames are off), whatever P contains.
+        let n = halves.count
+        if n >= 5, (n - 5) % 2 == 0, halves.starts(with: "a/".utf8) {
+            let p = (n - 5) / 2, s = halves.startIndex
+            let a = halves[(s + 2)..<(s + 2 + p)], sep = halves[(s + 2 + p)..<(s + 5 + p)], b = halves[(s + 5 + p)...]
+            if sep.elementsEqual(" b/".utf8), a.elementsEqual(b) { return b }
+        }
+        if let at = lastIndex(of: Array(" b/".utf8), in: halves) { return halves[(at + 3)...] }
+        return nil
+    }
+
+    /// Git's C-quoted string starting at `start` (a `"`): its bytes and the index just after the closing quote.
+    static func cUnquote(_ bytes: ArraySlice<UInt8>, from start: Int) -> ([UInt8], Int)? {
+        guard start < bytes.endIndex, bytes[start] == 0x22 else { return nil }
+        var out: [UInt8] = []
+        var i = start + 1
+        while i < bytes.endIndex {
+            let c = bytes[i]
+            if c == 0x22 { return (out, i + 1) }
+            if c == 0x5C {
+                guard i + 1 < bytes.endIndex else { return nil }
+                let e = bytes[i + 1]
+                switch e {
+                case UInt8(ascii: "a"): out.append(0x07); i += 2
+                case UInt8(ascii: "b"): out.append(0x08); i += 2
+                case UInt8(ascii: "t"): out.append(0x09); i += 2
+                case UInt8(ascii: "n"): out.append(0x0A); i += 2
+                case UInt8(ascii: "v"): out.append(0x0B); i += 2
+                case UInt8(ascii: "f"): out.append(0x0C); i += 2
+                case UInt8(ascii: "r"): out.append(0x0D); i += 2
+                case UInt8(ascii: "0")...UInt8(ascii: "3"):
+                    guard i + 3 < bytes.endIndex else { return nil }
+                    let digits = bytes[(i + 1)...(i + 3)]
+                    guard digits.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "7")).contains($0) }) else { return nil }
+                    out.append(digits.reduce(0) { $0 &* 8 &+ ($1 - UInt8(ascii: "0")) }); i += 4
+                default: out.append(e); i += 2   // \" and \\
+                }
+                continue
+            }
+            out.append(c); i += 1
+        }
+        return nil
     }
 
     /// Where `needle` last occurs in `hay` (an index of `hay`), or nil.

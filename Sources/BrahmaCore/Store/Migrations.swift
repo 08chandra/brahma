@@ -724,6 +724,9 @@ enum Migrations {
                 // Set when the branch head at the start of a holder turn was not the recorded head (a move outside the holder's
                 // turns): `submit_for_review` is refused until a manager or the owner re-adopts the branch (`readopt_branch`).
                 t.add(column: "branchMoved", .boolean).notNull().defaults(to: false)
+                // Who held the lease when the branch was flagged (nil: nobody did): `readopt_branch` is refused to that agent
+                // and needs its direct manager (or an executive, or the owner), whoever holds the item later.
+                t.add(column: "branchMovedHolderId", .text)
             }
         }
         m.registerMigration("v5-restore") { db in

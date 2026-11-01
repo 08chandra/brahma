@@ -107,7 +107,7 @@ extension Store {
         let git = gitWorkspace(root: workspace, companyId: item.companyId)
         // The branch head at claim is the recorded head (scan (a), Task 4-wire): a submit accepts only fast-forwards of it. A
         // branch flagged as moved stays flagged through a release and a new claim; only `readoptBranch` clears it.
-        if let head = try git.head(of: git.branchRef(key: item.key)) { try recordLeaseHead(itemId: item.id, commit: head) }
+        if let head = try git.head(of: git.branchRef(key: item.key)) { try recordClaimHead(itemId: item.id, head: head, now: Store.now()) }
         var base = item.baseCommit
         if base == nil {
             base = try git.mergeBase(GitWorkspace.mainRef, git.branchRef(key: item.key))
