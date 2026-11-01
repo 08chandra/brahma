@@ -352,6 +352,42 @@ import Foundation
         #expect(log.all.contains { $0.contains("/e ") && $0.contains("symbolic link") }, "\(log.all)")
     }
 
+    /// NB4 narrowed (fix round 7): only ENOTDIR / ELOOP on the way make a tracked path a deletion. A directory the engine
+    /// cannot open (`chmod 000`: EACCES; EMFILE, EIO and the rest alike) refuses the path with an alert and keeps its entry.
+    @Test func unopenableWayKeepsTheTrackedEntryAndAlerts() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one", "d/x": "x"])
+        let (ws, log) = fileWatched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        try f.write("d/x", "changed", in: wt)
+        try f.write("b.txt", "two", in: wt)
+        let d = wt.appending(path: "d")
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: d.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: d.path) }
+        let commit = try #require(try ws.commitAll(in: wt, message: "unopenable d"))
+        let names = Set(try f.git(["ls-tree", "-r", "--name-only", commit]).split(separator: "\n").map(String.init))
+        #expect(names == ["a.txt", "b.txt", "d/x"], "\(names)")
+        #expect(try f.git(["show", "\(commit):d/x"]) == "x", "the recorded d/x is kept")
+        #expect(log.all.contains { $0.contains("d/x") && $0.contains("left out of the commit") }, "\(log.all)")
+    }
+
+    /// Fix round 7 ordering: the refusal count runs before any blob is written, so a commit refused for too many refusals
+    /// leaves none of the accepted files' blobs in the object database; the refusals collected are still reported.
+    @Test func tooManyRefusalsWriteNoBlobAndAreStillReported() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var (ws, log) = fileWatched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let ok = try f.write("ok.txt", "ROUND7-ACCEPTED-BUT-NEVER-STORED", in: wt)
+        try f.write("h1", "linked", in: wt)
+        try fm.linkItem(at: wt.appending(path: "h1"), to: wt.appending(path: "h2"))
+        ws.unsafeAddLimit = 1
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "too many") }
+        let id = try f.git(["hash-object", ok.path])
+        #expect(try f.git(["cat-file", "-t", id], allowFailure: true) != "blob", "an accepted blob was written before the refusal")
+        #expect(log.all.contains { $0.contains("/h1") } && log.all.contains { $0.contains("/h2") }, "\(log.all)")
+    }
+
     /// M2 (fix round 5): `.brahma/` is the engine's. It stays out of the import commit and the quarantine commit (and so out of
     /// the object database, which item turns can read) even when the exclude file could not be fixed (here: oversized, left
     /// alone), because the engine's staging never takes it, whatever `.git/info/exclude` says.

@@ -227,7 +227,7 @@ public enum EngineFiles {
         let dfd: Int32
         switch try openWay(root: root, parts.dropLast(), shown: shown) {
         case .missing: return .missing
-        case .blocked(let problem): return .blocked(problem)
+        case .blocked(let problem, _): return .blocked(problem)
         case .open(let fd): dfd = fd
         }
         defer { close(dfd) }
@@ -249,14 +249,17 @@ public enum EngineFiles {
         return .removed
     }
 
-    private enum Way { case open(Int32), missing, blocked(UnsafeEngineFile) }
+    /// `blocked` carries the `openat` errno: only ENOTDIR and ELOOP (a file or a link on the way) mean the path is out of
+    /// reach; anything else (EACCES, EMFILE, EIO, ...) is a refusal (NB4).
+    private enum Way { case open(Int32), missing, blocked(UnsafeEngineFile, errno: Int32) }
 
     /// `root` resolved and opened, then each of `parts` opened relative to the one before with `O_NOFOLLOW` (never created).
     private static func openWay(root: URL, _ parts: ArraySlice<[UInt8]>, shown: String) throws -> Way {
         guard let real = resolved(root.path) else { return .missing }
         var fd = open(real, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard fd >= 0 else {
-            return errno == ENOENT ? .missing : .blocked(UnsafeEngineFile(path: root.path, problem: "cannot be opened as a directory"))
+            let err = errno
+            return err == ENOENT ? .missing : .blocked(UnsafeEngineFile(path: root.path, problem: "cannot be opened as a directory"), errno: err)
         }
         var reached = root.path
         for part in parts {
@@ -270,7 +273,7 @@ public enum EngineFiles {
                 let err = errno
                 let problem = withCName(part) { openProblem(dfd: fd, String(cString: $0), errno: err) }
                 close(fd)
-                return err == ENOENT ? .missing : .blocked(UnsafeEngineFile(path: reached, problem: problem))
+                return err == ENOENT ? .missing : .blocked(UnsafeEngineFile(path: reached, problem: problem), errno: err)
             }
             close(fd)
             fd = next
@@ -441,8 +444,8 @@ public enum EngineFiles {
         case link(target: [UInt8])
         /// A directory.
         case directory
-        /// The way to it is blocked: a directory on the way is now a file or a link (ENOTDIR, ELOOP). Nothing was read; for a
-        /// commit the path is simply gone (NB4).
+        /// The way to it is blocked: a directory on the way is now a file or a link (ENOTDIR, ELOOP, and only those). Nothing
+        /// was read; for a commit the path is simply gone (NB4). Any other error on the way is `refused`.
         case unreachable(UnsafeEngineFile)
         /// Anything else, with the reason: a file failing `copyProblem` (another hard link, another owner, not regular), a
         /// name that cannot be opened.
@@ -458,7 +461,10 @@ public enum EngineFiles {
         let dfd: Int32
         switch way {
         case .missing: return .missing
-        case .blocked(let problem): return .unreachable(problem)
+        case .blocked(let problem, let err):
+            // Only a file or a link where a directory was makes the path gone (NB4); a directory the engine cannot open
+            // (EACCES after `chmod 000`, EMFILE, EIO, ...) is refused, so its tracked files are kept and the owner told.
+            return err == ENOTDIR || err == ELOOP ? .unreachable(problem) : .refused(problem)
         case .open(let fd): dfd = fd
         }
         defer { if dfd != top.fd { close(dfd) } }
@@ -529,7 +535,7 @@ public enum EngineFiles {
                 let problem = withCName(part) { openProblem(dfd: fd, String(cString: $0), errno: err) }
                 if fd != from { close(fd) }
                 if err == ENOENT { return .missing }
-                return .blocked(UnsafeEngineFile(path: shown, problem: "has \(String(decoding: part, as: UTF8.self)) on the way that \(problem)"))
+                return .blocked(UnsafeEngineFile(path: shown, problem: "has \(String(decoding: part, as: UTF8.self)) on the way that \(problem)"), errno: err)
             }
             if fd != from { close(fd) }
             fd = next

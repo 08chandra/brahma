@@ -214,6 +214,70 @@ struct SeatbeltRunnerTests {
         #expect(okText.contains("in\nin\npublic-text"), "\(okText)")
     }
 
+    /// `clonefile(2)` from inside the sandbox, through Perl's `syscall` (`SYS_clonefileat`, 462; `AT_FDCWD` is -2): one line
+    /// per `source=destination` argument, `ok` or `errno <n>`. `cp -c -R` and `ditto --clone` walk file by file; only the
+    /// system call clones a whole directory in one step.
+    static let clonePerl = #"for (@ARGV) { my ($s, $d) = split /=/, $_; $! = 0; my $r = syscall(462, -2, $s, -2, $d, 0); print "$s: ", ($r == 0 ? "ok" : "errno " . ($! + 0)), "\n" }"#
+
+    /// Fix round 7 (S13 + NB5-regression), with the real `sandbox-exec`: another company's workspace nested inside a readable
+    /// entry cannot be cloned out file by file, nor by cloning the readable directory around it (Seatbelt checks only a
+    /// directory clone's top, so a directory clone is allowed only inside a writable entry); a readable file still clones and a
+    /// directory inside the writable entry still clones.
+    @Test func clonefileOfNestedDeniedSubtreesIsRefused() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let fm = FileManager.default
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let r = h.appending(path: "r")
+        try Self.file(r.appending(path: "other/o"), "OTHER-COMPANY-TEXT")
+        try Self.file(r.appending(path: "pub/p"), "public-text")
+        try Self.file(w.appending(path: "in/x/f"), "inner-text")
+        try Self.file(w.appending(path: "clone.pl"), Self.clonePerl)
+        var b = Self.baseline()
+        b.companyWorkspaces = [r.appending(path: "other")]
+        let p = Self.policy(writable: [w], readable: [r])
+        let pairs = ["\(r.path)/other/o=c-other", "\(r.path)/other=c-otherdir", "\(r.path)=c-rdir", "\(r.path)/pub=c-pubdir",
+                     "\(r.path)/pub/p=c-pub", "\(w.path)/in=c-in"]
+        let (outcome, text) = try await Self.run("/usr/bin/perl clone.pl " + pairs.map { "'\($0)'" }.joined(separator: " "), p, runner: Self.runner(b))
+        #expect(outcome.exitCode == 0, "\(text)")
+        for refused in ["\(r.path)/other/o", "\(r.path)/other", "\(r.path)", "\(r.path)/pub"] {
+            #expect(text.contains("\(refused): errno 1\n"), "clonefile(\(refused)) was not refused: \(text)")
+        }
+        for name in ["c-other", "c-otherdir", "c-rdir", "c-pubdir"] {
+            #expect(!fm.fileExists(atPath: w.appending(path: name).path), "\(name) was cloned")
+        }
+        #expect(text.contains("\(r.path)/pub/p: ok\n"), "\(text)"); #expect(text.contains("\(w.path)/in: ok\n"), "\(text)")
+        #expect((try? String(contentsOf: w.appending(path: "c-pub"), encoding: .utf8)) == "public-text")
+        #expect((try? String(contentsOf: w.appending(path: "c-in/x/f"), encoding: .utf8)) == "inner-text")
+    }
+
+    /// Fix round 7 (S13): a protected path nested inside a readable root. `validate` refuses such a policy, so the rendered
+    /// profile is run with `sandbox-exec` directly: the clone of the protected file is refused, and stays refused with the
+    /// protected read deny taken out (the explicit `file-clone` deny alone holds), while a normal readable file still clones.
+    @Test func clonefileOfAProtectedFileUnderAReadableRootIsRefused() throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let r = h.appending(path: "r")
+        try Self.file(r.appending(path: "prot/s"), "TOP-SECRET")
+        try Self.file(r.appending(path: "pub/p"), "public-text")
+        let script = w.appending(path: "clone.pl")
+        try Self.file(script, Self.clonePerl)
+        let profile = SeatbeltProfile.render(policy: Self.policy(writable: [w], readable: [r]),
+                                             baseline: Self.baseline(protected: [r.appending(path: "prot")]), proxyPort: nil)
+        let cloneDeny = profile.split(separator: "\n").first { $0.hasPrefix("(deny file-clone (subpath ") }
+        #expect(cloneDeny?.contains("(subpath \(SeatbeltProfile.quote(r.appending(path: "prot").path)))") == true, "\(profile)")
+        let withoutReadDeny = profile.split(separator: "\n").filter { !$0.hasPrefix("(deny file-read* file-read-data") }.joined(separator: "\n")
+        for (label, text) in [("full", profile), ("clone deny alone", withoutReadDeny)] {
+            for name in ["c-prot", "c-pub"] { try? FileManager.default.removeItem(at: w.appending(path: name)) }
+            let (status, out) = try Self.outside("/usr/bin/sandbox-exec", ["-p", text, "/usr/bin/perl", script.path,
+                                                                            "\(r.path)/prot/s=\(w.path)/c-prot", "\(r.path)/pub/p=\(w.path)/c-pub"],
+                                                 environment: Self.env)
+            #expect(status == 0, "\(label): \(out)")
+            #expect(out.contains("\(r.path)/prot/s: errno 1\n"), "\(label): the protected file was cloned: \(out)")
+            #expect(!FileManager.default.fileExists(atPath: w.appending(path: "c-prot").path), "\(label)")
+            #expect(out.contains("\(r.path)/pub/p: ok\n"), "\(label): \(out)")
+        }
+    }
+
     // MARK: Escapes
 
     @Test func launchctlSubmitDenied() async throws {
@@ -692,6 +756,10 @@ struct SeatbeltRunnerTests {
                      "(deny file-write* (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\")",
                      "(deny file-link (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\"))))",
                      "(deny file-clone (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\") (subpath \"/w\")",
+                     "(deny file-clone (require-all (vnode-type DIRECTORY) (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\")))))",
+                     "(deny file-clone (subpath \"/Users/o/.ssh\") (subpath \"/other-co\"))",
+                     "(deny file-clone (require-all (require-any (subpath \"/srv/brahma home\")) (require-not (require-any (subpath \"/srv/brahma home/run/checkouts/r1\")))))",
+                     "(deny file-mount file-unmount file-mount-update)",
                      "(deny signal (target others))", "(deny process-info* (target others))",
                      "(deny mach-lookup (global-name \"com.apple.SecurityServer\")",
                      "(deny process-exec (literal \"/usr/bin/osascript\")", "(allow mach-lookup (global-name \"com.apple.windowserver.active\")",

@@ -12,6 +12,10 @@ import Foundation
 ///     (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper") (regex #"^/dev/fd/"))))
 /// (deny file-link (require-not (require-any (subpath "<each writable>"))))                              ; fix round 5
 /// (deny file-clone (require-not (require-any (subpath "<each writable>") <each readable + toolchain read>)))  ; fix round 6
+/// (deny file-clone (require-all (vnode-type DIRECTORY) (require-not (require-any (subpath "<each writable>")))))  ; round 7
+/// (deny file-clone (subpath "<each protected>") (subpath "<each other company workspace>"))                      ; round 7
+/// (deny file-clone (require-all (subpath "<each engine home>") (require-not (require-any (subpath "<each writable>")))))
+/// (deny file-mount file-unmount file-mount-update)                                                               ; round 7
 /// (deny signal (target others))
 /// (deny mach-lookup … the brief's names … (global-name "com.apple.cfprefsd.agent") (global-name "com.apple.cfprefsd.daemon"))
 /// (deny process-exec …)
@@ -128,6 +132,25 @@ public enum SeatbeltProfile {
         // specific errors (Rust's `fs::copy`) keep working (fix round 6, NB5). Links and clones inside a writable entry work.
         lines.append("(deny file-link (require-not (require-any " + writable.map(subpath).joined(separator: " ") + ")))")
         lines.append("(deny file-clone (require-not (require-any " + unique(writable.map(subpath) + reads).joined(separator: " ") + ")))")
+        // Fix round 7 (S13, NB5-regression): the clone allowance is the readable entries MINUS the protected paths, the
+        // other companies' workspaces and the data home, said by explicit denies after the allowance. And a directory clone
+        // copies the whole hierarchy in the kernel while Seatbelt checks only its top (probed: `clonefile(R)` copied a
+        // read-denied `R/prot/s`, which `cat` then printed), so a directory is clonable only from inside a writable entry,
+        // which holds nothing the command may not read (`validate` keeps protected paths, other workspaces and the data
+        // home's other parts out of every writable entry). A file clone from a readable entry still works (Rust's
+        // `fs::copy`); `fclonefileat` on a directory descriptor is caught by the same rule (probed).
+        let writableAny = "(require-any " + writable.map(subpath).joined(separator: " ") + ")"
+        lines.append("(deny file-clone (require-all (vnode-type DIRECTORY) (require-not \(writableAny))))")
+        if !protected.isEmpty { lines.append("(deny file-clone " + protected.map(subpath).joined(separator: " ") + ")") }
+        let engineHomes = unique(baseline.engineHomes.map(r))
+        if !engineHomes.isEmpty {
+            // A check's own checkout under the data home stays clonable inside itself.
+            lines.append("(deny file-clone (require-all (require-any " + engineHomes.map(subpath).joined(separator: " ") + ") (require-not \(writableAny))))")
+        }
+        // Mounts (fix round 7 audit, probed): `hdiutil attach -mountpoint <readable dir>` from inside the sandbox had
+        // DiskArbitration (outside it) mount an agent-made image over a directory the command may only read, replacing what
+        // the engine and the owner see there after the run. Seatbelt's `file-mount` check stops every explicit mount point.
+        lines.append("(deny file-mount file-unmount file-mount-update)")
         lines.append("(deny signal (target others))")
         // A sandboxed check may not inspect other processes (open files, pid info): this stops `lsof -p <owner pid>` and the
         // like from discovering the NSIRD_* staging names and so reaching another process's in-flight atomic saves (A
