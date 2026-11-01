@@ -2212,6 +2212,22 @@ public struct GitWorkspace: Sendable {
     /// The largest file of a nested repository (`HEAD`, a loose ref, `packed-refs`) the engine reads to record a gitlink.
     static let gitlinkReadLimit = 1 << 20
 
+    /// How many checked file descriptors `stage` may hold open at once while it feeds blobs (NB1). The feeder opens, checks,
+    /// feeds and closes one file at a time, so one is enough; the cap fails closed should that ever change. Test seam.
+    var stagingDescriptorCap = 8
+
+    /// A top-level name as the engine compares it (S11.2): case-folded (`.caseInsensitive`, close to APFS's) and in the
+    /// canonical composed form, so `.BRAHMA` or a decomposed spelling names the same directory as `.brahma`.
+    static func foldedName(_ bytes: [UInt8]) -> String {
+        String(decoding: bytes, as: UTF8.self).folding(options: [.caseInsensitive], locale: nil).precomposedStringWithCanonicalMapping
+    }
+
+    /// The engine's own top-level directories (`excludedEntries`), folded.
+    static let engineNames: Set<String> = Set(excludedEntries.map { foldedName(Array($0.dropLast().utf8)) })
+
+    /// Whether a top-level name is one of the engine's own directories, by folded name.
+    static func isEngineName(_ bytes: [UInt8]) -> Bool { engineNames.contains(foldedName(bytes)) }
+
     /// Engine-fed staging (I1, fix round 5): what `git add -A` did for the engine, without git ever reading the checkout.
     ///
     /// `commitAll` on an item worktree runs inside the agent's own turn (submit, release), with the agent's processes alive.
@@ -2219,16 +2235,21 @@ public struct GitWorkspace: Sendable {
     /// or an ignored one un-ignored between the listing and the add, and git writes the secret's blob into the shared object
     /// database, which item turns can read. So no `add` runs on an agent tree (nor on the root checkout). Instead:
     /// - the candidates are listed once (`ls-files --others --modified --deleted --exclude-standard` on the command's own
-    ///   index, so `.gitignore` and the exclude file are honoured as git honours them; a path under `.brahma/` or
-    ///   `.brahma-tmp/` is never one, whatever the exclude file says, M2);
+    ///   index, so `.gitignore` and the exclude file are honoured as git honours them). A path whose first part is one of
+    ///   the engine's directories, by folded name (`isEngineName`: case and canonical form, S11.2) or by (device, inode), is
+    ///   never one, whatever the exclude file says (M2); one whose first part folds to `.git` is refused;
     /// - each is reached through descriptors only (`EngineFiles.staged`: every part `O_NOFOLLOW`, the verdict from `fstat` of
     ///   the open descriptor) and must pass `EngineFiles.copyProblem` on that descriptor; its bytes go from that descriptor
-    ///   to `git fast-import` (blobs only, marks exported), and the index takes them with `update-index -z --index-info`
+    ///   to `git fast-import` (blobs only, marks exported), one file at a time inside the feeder (opened, checked, fed,
+    ///   closed; `stagingDescriptorCap` fails closed, NB1), and the index takes them with `update-index -z --index-info`
     ///   (`<mode> <id>\t<path>`: `--cacheinfo` for every entry in one stdin, mode `0` removing a deleted one);
-    /// - a symbolic link is stored as a link (mode 120000, its target as the blob) only when the target stays inside the
-    ///   checkout (lexically: absolute inside it, or relative without climbing above its root); otherwise it is refused;
-    /// - a new nested repository is recorded as a gitlink of its `HEAD`, read through the same descriptors (no git runs in
-    ///   it); one that cannot be read is refused;
+    /// - a path that is gone, or whose way is now blocked by a file or a link (nothing read, NB4), becomes a deletion;
+    /// - a symbolic link is stored as a link (mode 120000, its target as the blob) only when `linkProblem` is nil: no `..`
+    ///   part, an absolute target inside the checkout once `.` parts are dropped, and no link among the directories it
+    ///   passes through (checked through descriptors); otherwise it is refused (S11.1 / NB3);
+    /// - a nested repository (new, listed as `dir/`; or tracked as a gitlink, listed as `dir` when its HEAD moved, NB2) is
+    ///   recorded as a gitlink of its `HEAD`, read through the same descriptors (no git runs in it); one whose HEAD cannot be
+    ///   read keeps its recorded commit (new: refused), with an alert;
     /// - a refused path is left out and reported (`onUnsafeEngineFile`), the file stays where it is; more than
     ///   `maxUnsafeAdds` refusals, a listing that fails or is cut, or a file that changes size while it is fed, refuses the
     ///   commit (fail closed).
@@ -2238,101 +2259,164 @@ public struct GitWorkspace: Sendable {
         if listing.timedOut || listing.cut {
             throw GitError.failed(command: "stage", status: -1, stderr: "cannot list the files to commit (\(listing.timedOut ? "timed out" : "listing too long"))")
         }
+        // The tracked gitlinks (NB2): a nested repository whose HEAD moved lists as `sub` (a directory) and must be updated,
+        // never deleted; one whose HEAD cannot be read keeps its recorded commit.
+        let indexed = try git.run(["ls-files", "-s", "-z"], maxOutput: planBarrierOutputLimit)
+        if indexed.timedOut || indexed.cut {
+            throw GitError.failed(command: "stage", status: -1, stderr: "cannot list the index (\(indexed.timedOut ? "timed out" : "listing too long"))")
+        }
+        var gitlinksSeen: [Data: String] = [:]
+        for entry in indexed.stdout.split(separator: 0, omittingEmptySubsequences: true) where entry.starts(with: Data("160000 ".utf8)) {
+            guard let tab = entry.firstIndex(of: UInt8(ascii: "\t")) else { continue }
+            let fields = String(decoding: entry[..<tab], as: UTF8.self).split(separator: " ")
+            guard fields.count == 3 else { continue }
+            gitlinksSeen[Data(entry[entry.index(after: tab)...])] = String(fields[1])
+        }
         testHook?("listed")
         let top = try EngineFiles.openWalked(workspace: root, relative)
         let roots: Set<String> = [top.real, dir.path, dir.standardizedFileURL.path]
-        let excluded = Self.excludedEntries.map { Array($0.dropLast().utf8) }
-        enum Source { case descriptor(Int32, Int64, shown: String), bytes([UInt8]) }
-        struct Entry { var mode: String; var mark: Int?; var id: String?; var path: [UInt8] }
-        var blobs: [Source] = []
-        var entries: [Entry] = []
-        var refused = 0
-        defer { for case .descriptor(let fd, _, _) in blobs { close(fd) } }
+        // The engine's directories by identity too (S11.2): whatever a listing calls them, the same inode is never staged.
+        let engineIdentities = Self.excludedEntries.compactMap { EngineFiles.identity(in: top, name: Array($0.dropLast().utf8)) }
+        struct Candidate { var bytes: [UInt8]; var parts: [[UInt8]]; var isDirectory: Bool; var shown: String }
+        var found: [Candidate] = []
+        var problems: [UnsafeEngineFile] = []
         var seen = Set<Data>()
         for raw in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) where seen.insert(Data(raw)).inserted {
             let isDirectory = raw.last == UInt8(ascii: "/")
             let bytes = Array(isDirectory ? raw.dropLast() : raw[...])
             let parts = bytes.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true).map(Array.init)
-            guard let first = parts.first, !excluded.contains(first) else { continue }
+            guard let first = parts.first else { continue }
+            if Self.isEngineName(first) { continue }
+            if let identity = EngineFiles.identity(in: top, name: first), engineIdentities.contains(where: { $0 == identity }) { continue }
             let shown = dir.path + "/" + String(decoding: bytes, as: UTF8.self)
-            func refuse(_ problem: String) {
-                refused += 1
-                onUnsafeEngineFile?(UnsafeEngineFile(path: shown, problem: "\(problem); left out of the commit"))
-            }
-            if isDirectory {
-                // `ls-files --others` lists a nested repository as `dir/`.
-                do { entries.append(Entry(mode: "160000", id: try gitlinkHead(top, parts, shown: shown), path: bytes)) }
-                catch let problem as UnsafeEngineFile { refuse("is a nested repository whose HEAD cannot be read: \(problem.problem)") }
+            if Self.foldedName(first) == ".git" {
+                problems.append(UnsafeEngineFile(path: shown, problem: "has a reserved name; left out of the commit"))
                 continue
             }
-            switch EngineFiles.staged(in: top, relative: parts, shown: shown) {
-            case .missing, .directory:
-                // Gone, or a directory in its place (whose files list on their own): the index entry goes.
-                entries.append(Entry(mode: "0", path: bytes))
-            case .file(let fd, let size, let executable):
-                blobs.append(.descriptor(fd, size, shown: shown))
-                entries.append(Entry(mode: executable ? "100755" : "100644", mark: blobs.count, path: bytes))
-            case .link(let target):
-                guard Self.linkStaysInside(target: target, from: parts.dropLast(), roots: roots) else {
-                    refuse("is a symbolic link that points outside the checkout")
-                    continue
-                }
-                blobs.append(.bytes(target))
-                entries.append(Entry(mode: "120000", mark: blobs.count, path: bytes))
-            case .refused(let problem):
-                refuse(problem.problem)
-            }
+            found.append(Candidate(bytes: bytes, parts: parts, isDirectory: isDirectory, shown: shown))
         }
-        guard refused <= Self.maxUnsafeAdds else {
-            throw GitError.failed(command: "stage", status: -1, stderr: "more than \(Self.maxUnsafeAdds) files that cannot be committed safely")
+        struct Entry { var mode: String; var mark: Int?; var id: String?; var path: [UInt8] }
+        /// What the feeder collects while it runs on its own thread; read here only after git has exited.
+        final class Staging: @unchecked Sendable {
+            var entries: [Entry] = []
+            var problems: [UnsafeEngineFile] = []
+            var marks = 0
+            var open = 0
         }
-        if entries.isEmpty { return }
+        let staging = Staging()
+        staging.problems = problems
         var ids: [Int: String] = [:]
-        if !blobs.isEmpty {
+        let candidates = found, recordedGitlinks = gitlinksSeen
+        if !candidates.isEmpty {
             try? FileManager.default.createDirectory(at: gitTemp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let marks = gitTemp.appending(path: "brahma-marks-\(UUID().uuidString)")
             defer { _ = try? EngineFiles.removeNoFollow(marks, under: gitTemp) }
-            let sources = blobs
+            let cap = stagingDescriptorCap
+            // One file at a time (NB1): opened, checked, fed and closed inside the feeder, so the engine holds one checked
+            // descriptor however many files the agent made.
             try git.run(["fast-import", "--quiet", "--done", "--export-marks=\(marks.path)"], stdin: .stream { pipe in
                 var buffer = [UInt8](repeating: 0, count: 256 * 1024)
-                for (n, source) in sources.enumerated() {
-                    switch source {
-                    case .bytes(let target):
-                        try pipe.write(Data("blob\nmark :\(n + 1)\ndata \(target.count)\n".utf8) + Data(target) + Data("\n".utf8))
-                    case .descriptor(let fd, let size, let shown):
-                        try pipe.write(Data("blob\nmark :\(n + 1)\ndata \(size)\n".utf8))
-                        var left = size
-                        while left > 0 {
-                            let got = Foundation.read(fd, &buffer, Int(min(Int64(buffer.count), left)))
-                            if got < 0 { if errno == EINTR { continue }; throw GitError.failed(command: "fast-import", status: -1, stderr: "\(shown) cannot be read") }
-                            if got == 0 { throw GitError.failed(command: "fast-import", status: -1, stderr: "\(shown) changed while it was being committed") }
-                            try buffer.withUnsafeBytes { try pipe.write(UnsafeRawBufferPointer(rebasing: $0[0..<got])) }
-                            left -= Int64(got)
+                func blob(_ count: Int64, _ feed: () throws -> Void) throws -> Int {
+                    staging.marks += 1
+                    try pipe.write(Data("blob\nmark :\(staging.marks)\ndata \(count)\n".utf8))
+                    try feed()
+                    try pipe.write(Data("\n".utf8))
+                    return staging.marks
+                }
+                func refuse(_ shown: String, _ problem: String) {
+                    staging.problems.append(UnsafeEngineFile(path: shown, problem: "\(problem); left out of the commit"))
+                }
+                func gitlink(_ c: Candidate, recorded: String?) throws {
+                    do { staging.entries.append(Entry(mode: "160000", id: try self.gitlinkHead(top, c.parts, shown: c.shown), path: c.bytes)) }
+                    catch let problem as UnsafeEngineFile {
+                        if let recorded {
+                            staging.entries.append(Entry(mode: "160000", id: recorded, path: c.bytes))
+                            staging.problems.append(UnsafeEngineFile(path: c.shown, problem: "is a nested repository whose HEAD cannot be read (\(problem.problem)); its recorded commit is kept"))
+                        } else {
+                            refuse(c.shown, "is a nested repository whose HEAD cannot be read: \(problem.problem)")
                         }
-                        try pipe.write(Data("\n".utf8))
+                    }
+                }
+                for c in candidates {
+                    if c.isDirectory {
+                        // `ls-files --others` lists a new nested repository as `dir/`.
+                        try gitlink(c, recorded: nil)
+                        continue
+                    }
+                    guard staging.open < cap else {
+                        throw GitError.failed(command: "stage", status: -1, stderr: "the staging would hold more than \(cap) descriptors")
+                    }
+                    switch EngineFiles.staged(in: top, relative: c.parts, shown: c.shown) {
+                    case .missing, .unreachable:
+                        // Gone, or a file or link now stands where a directory on the way was (NB4): the index entry goes.
+                        staging.entries.append(Entry(mode: "0", path: c.bytes))
+                    case .directory:
+                        let recorded = recordedGitlinks[Data(c.bytes)]
+                        if recorded != nil || EngineFiles.wayKind(in: top, relative: c.parts + [Array(".git".utf8)]) == .real {
+                            try gitlink(c, recorded: recorded)
+                        } else {
+                            // A directory in its place, whose files list on their own.
+                            staging.entries.append(Entry(mode: "0", path: c.bytes))
+                        }
+                    case .file(let fd, let size, let executable):
+                        staging.open += 1
+                        defer { close(fd); staging.open -= 1 }
+                        let mark = try blob(size) {
+                            var left = size
+                            while left > 0 {
+                                let got = Foundation.read(fd, &buffer, Int(min(Int64(buffer.count), left)))
+                                if got < 0 { if errno == EINTR { continue }; throw GitError.failed(command: "fast-import", status: -1, stderr: "\(c.shown) cannot be read") }
+                                if got == 0 { throw GitError.failed(command: "fast-import", status: -1, stderr: "\(c.shown) changed while it was being committed") }
+                                try buffer.withUnsafeBytes { try pipe.write(UnsafeRawBufferPointer(rebasing: $0[0..<got])) }
+                                left -= Int64(got)
+                            }
+                        }
+                        staging.entries.append(Entry(mode: executable ? "100755" : "100644", mark: mark, path: c.bytes))
+                    case .link(let target):
+                        if let problem = Self.linkProblem(target: target, from: c.parts.dropLast(), top: top, roots: roots) {
+                            refuse(c.shown, "is a symbolic link that \(problem)")
+                            continue
+                        }
+                        let mark = try blob(Int64(target.count)) { try pipe.write(Data(target)) }
+                        staging.entries.append(Entry(mode: "120000", mark: mark, path: c.bytes))
+                    case .refused(let problem):
+                        refuse(c.shown, problem.problem)
                     }
                 }
                 try pipe.write(Data("done\n".utf8))
             })
-            guard let exported = EngineFiles.readNoFollow(marks, under: gitTemp, limit: planBarrierOutputLimit) else {
-                throw GitError.failed(command: "fast-import", status: -1, stderr: "the marks file cannot be read")
-            }
-            for line in String(decoding: exported, as: UTF8.self).split(separator: "\n") {
-                let fields = line.split(separator: " ")
-                guard fields.count == 2, fields[0].hasPrefix(":"), let mark = Int(fields[0].dropFirst()) else { continue }
-                let id = String(fields[1])
-                guard id.count == 40 || id.count == 64, id.allSatisfy({ $0.isHexDigit }) else { continue }
-                ids[mark] = id
-            }
-            guard ids.count == blobs.count else {
-                throw GitError.failed(command: "fast-import", status: -1, stderr: "\(blobs.count - ids.count) blobs were not written")
+            if staging.marks > 0 {
+                guard let exported = EngineFiles.readNoFollow(marks, under: gitTemp, limit: planBarrierOutputLimit) else {
+                    throw GitError.failed(command: "fast-import", status: -1, stderr: "the marks file cannot be read")
+                }
+                for line in String(decoding: exported, as: UTF8.self).split(separator: "\n") {
+                    let fields = line.split(separator: " ")
+                    guard fields.count == 2, fields[0].hasPrefix(":"), let mark = Int(fields[0].dropFirst()) else { continue }
+                    let id = String(fields[1])
+                    guard id.count == 40 || id.count == 64, id.allSatisfy({ $0.isHexDigit }) else { continue }
+                    ids[mark] = id
+                }
+                guard ids.count == staging.marks else {
+                    throw GitError.failed(command: "fast-import", status: -1, stderr: "\(staging.marks - ids.count) blobs were not written")
+                }
             }
         }
+        for problem in staging.problems { onUnsafeEngineFile?(problem) }
+        guard staging.problems.count <= Self.maxUnsafeAdds else {
+            throw GitError.failed(command: "stage", status: -1, stderr: "more than \(Self.maxUnsafeAdds) files that cannot be committed safely")
+        }
+        let entries = staging.entries
+        if entries.isEmpty { return }
         let zero: String
         if let any = ids.values.first { zero = String(repeating: "0", count: any.count) }
+        else if let any = entries.compactMap(\.id).first { zero = String(repeating: "0", count: any.count) }
         else { zero = String(repeating: "0", count: try git.run(["rev-parse", "--show-object-format"]).text == "sha256" ? 64 : 40) }
         var info = Data()
         for entry in entries {
+            guard let first = entry.path.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true).first,
+                  !Self.isEngineName(Array(first)), Self.foldedName(Array(first)) != ".git" else {
+                throw GitError.failed(command: "stage", status: -1, stderr: "an index entry names a reserved directory")
+            }
             let id = entry.mode == "0" ? zero : (entry.id ?? ids[entry.mark ?? 0] ?? zero)
             info.append(contentsOf: "\(entry.mode) \(id)\t".utf8)
             info.append(contentsOf: entry.path)
@@ -2341,20 +2425,27 @@ public struct GitWorkspace: Sendable {
         try git.run(["update-index", "-z", "--index-info"], stdin: .data(info))
     }
 
-    /// Whether a symbolic link at `from` (the directory parts of its path inside the checkout) with `target` stays inside the
-    /// checkout: an absolute target must be one of `roots` or under one; a relative one may not climb above the root.
-    static func linkStaysInside(target: [UInt8], from: ArraySlice<[UInt8]>, roots: Set<String>) -> Bool {
-        guard !target.isEmpty, !target.contains(0) else { return false }
+    /// Why a symbolic link at `from` (the directory parts of its path inside the checkout) with `target` is not stored, or
+    /// nil when it is (S11.1 / NB3): no empty target, no NUL, no `..` part anywhere; an absolute target, with its `.` parts
+    /// dropped, must be one of `roots` or under one; and every directory the target passes through inside the checkout must
+    /// be a real directory (checked through descriptors against `top`), never itself a link.
+    static func linkProblem(target: [UInt8], from: ArraySlice<[UInt8]>, top: EngineFiles.OpenDirectory, roots: Set<String>) -> String? {
+        guard !target.isEmpty, !target.contains(0) else { return "has an empty or odd target" }
+        let parts = target.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true).filter { $0 != [0x2e] }.map(Array.init)
+        if parts.contains([0x2e, 0x2e]) { return "has a `..` part in its target" }
+        var way: [[UInt8]]
         if target.first == UInt8(ascii: "/") {
-            guard let text = String(bytes: target, encoding: .utf8) else { return false }
-            return roots.contains { text == $0 || text.hasPrefix($0 + "/") }
+            guard let text = String(bytes: target, encoding: .utf8) else { return "has a target that is not UTF-8" }
+            let normalized = "/" + parts.map { String(decoding: $0, as: UTF8.self) }.joined(separator: "/")
+            guard let root = roots.first(where: { normalized == $0 || normalized.hasPrefix($0 + "/") }) else { return "points outside the checkout" }
+            _ = text
+            way = normalized.dropFirst(root.count).split(separator: "/", omittingEmptySubsequences: true).map { Array(String($0).utf8) }
+        } else {
+            way = Array(from) + parts
         }
-        var depth = from.count
-        for part in target.split(separator: UInt8(ascii: "/"), omittingEmptySubsequences: true) {
-            if part == [0x2e] { continue }
-            if part == [0x2e, 0x2e] { depth -= 1; if depth < 0 { return false } } else { depth += 1 }
-        }
-        return true
+        guard !way.isEmpty else { return nil }
+        way.removeLast()
+        return EngineFiles.wayKind(in: top, relative: way) == .blocked ? "passes through a symbolic link" : nil
     }
 
     /// The commit a nested repository's `HEAD` names, read through descriptors (`.git/HEAD`, then the loose ref it points at,

@@ -204,8 +204,9 @@ import Foundation
 
     /// The engine's staging keeps what `git add` kept: a symlink inside the checkout is stored as a link (mode 120000, its
     /// target as the blob), an executable file as 100755, a removed tracked file is removed, and a new nested repository is
-    /// recorded as a gitlink of its HEAD without running anything in it. A link pointing outside the checkout (relative or
-    /// absolute) is left out and reported.
+    /// recorded as a gitlink of its HEAD without running anything in it. A link is refused (left out, reported) when its
+    /// target holds a `..` part at all, points outside the checkout (absolute, after `.` parts are dropped), or passes through
+    /// a part that is itself a link (fix round 6, S11.1 / NB3).
     @Test func engineStagingKeepsLinksModesDeletionsAndNestedRepositories() throws {
         let fm = FileManager.default
         let f = try GitFixture(files: ["a.txt": "one", "gone.txt": "bye"])
@@ -215,10 +216,16 @@ import Foundation
         let tool = try f.write("tool.sh", "#!/bin/sh\n", in: wt)
         try FakeTools.fixtureMode(0o755, at: tool)                   // exec-bit fixture: the mode under review, never run
         try fm.createDirectory(at: wt.appending(path: "d"), withIntermediateDirectories: true)
+        try f.write("d/x", "x", in: wt)
         try fm.createSymbolicLink(atPath: wt.appending(path: "inside").path, withDestinationPath: "a.txt")
-        try fm.createSymbolicLink(atPath: wt.appending(path: "d/up").path, withDestinationPath: "../a.txt")
+        try fm.createSymbolicLink(atPath: wt.appending(path: "d/up").path, withDestinationPath: "../a.txt")                 // `..`: refused
+        try fm.createSymbolicLink(atPath: wt.appending(path: "down").path, withDestinationPath: "d/./x")                    // `.` is fine
         try fm.createSymbolicLink(atPath: wt.appending(path: "outside").path, withDestinationPath: "d/../../../etc/hosts")
         try fm.createSymbolicLink(atPath: wt.appending(path: "absolute").path, withDestinationPath: "/etc/hosts")
+        try fm.createSymbolicLink(atPath: wt.appending(path: "absdot").path, withDestinationPath: wt.path + "/./a.txt")   // inside once `.` goes
+        try fm.createSymbolicLink(atPath: wt.appending(path: "absup").path, withDestinationPath: wt.path + "/d/../../K-1/a.txt")
+        try fm.createSymbolicLink(atPath: wt.appending(path: "dlink").path, withDestinationPath: "d")                      // a link to a directory: fine
+        try fm.createSymbolicLink(atPath: wt.appending(path: "vialink").path, withDestinationPath: "dlink/x")              // through a link: refused
         let sub = wt.appending(path: "sub")
         try fm.createDirectory(at: sub, withIntermediateDirectories: true)
         try GitFixture.plainGit(["init", "-q"], in: sub)
@@ -233,16 +240,116 @@ import Foundation
         #expect(entry("a.txt")?.hasPrefix("100644 blob") == true, "\(entries)")
         #expect(entry("inside")?.hasPrefix("120000 blob") == true, "\(entries)")
         #expect(try f.git(["show", "\(commit):inside"]) == "a.txt")
-        #expect(entry("d/up")?.hasPrefix("120000 blob") == true, "\(entries)")
-        #expect(try f.git(["show", "\(commit):d/up"]) == "../a.txt")
+        for kept in ["down", "absdot", "dlink"] { #expect(entry(kept)?.hasPrefix("120000 blob") == true, "\(kept): \(entries)") }
+        #expect(try f.git(["show", "\(commit):down"]) == "d/./x")
         #expect(entry("sub") == "160000 commit \(subHead)\tsub", "\(entries)")
-        #expect(entry("gone.txt") == nil && entry("outside") == nil && entry("absolute") == nil, "\(entries)")
-        #expect(log.all.contains { $0.contains("outside") && $0.contains("points outside") }, "\(log.all)")
-        #expect(log.all.contains { $0.contains("absolute") && $0.contains("points outside") }, "\(log.all)")
+        #expect(entry("gone.txt") == nil, "\(entries)")
+        for refused in ["d/up", "outside", "absolute", "absup", "vialink"] {
+            #expect(entry(refused) == nil, "\(refused): \(entries)")
+            #expect(log.all.contains { $0.contains("/\(refused) ") && $0.contains("symbolic link") }, "\(refused): \(log.all)")
+        }
         // The refused links stay where they are: the engine leaves them out, it never removes them.
         var st = stat()
         #expect(lstat(wt.appending(path: "outside").path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK)
         #expect(lstat(wt.appending(path: "absolute").path, &st) == 0 && st.st_mode & S_IFMT == S_IFLNK)
+    }
+
+    /// NB2 (fix round 6): a tracked gitlink whose nested `HEAD` moved is updated to the new commit, never turned into a
+    /// deletion (`ls-files` lists it as `sub`, a directory, with no trailing slash). A nested repository whose HEAD cannot be
+    /// read any more keeps the recorded id.
+    @Test func trackedGitlinkWhoseHeadMovedIsUpdatedNotRemoved() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = fileWatched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let sub = wt.appending(path: "sub")
+        try fm.createDirectory(at: sub, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "-q"], in: sub)
+        try f.write("f", "one\n", in: sub)
+        try GitFixture.plainGit(["add", "f"], in: sub)
+        try GitFixture.plainGit(["commit", "-q", "-m", "one"], in: sub)
+        let first = try GitFixture.plainGit(["rev-parse", "HEAD"], in: sub)
+        let c1 = try #require(try ws.commitAll(in: wt, message: "with sub"))
+        #expect(try f.git(["ls-tree", c1, "sub"]) == "160000 commit \(first)\tsub")
+        // The nested HEAD moves.
+        try f.write("f", "two\n", in: sub)
+        try GitFixture.plainGit(["commit", "-q", "-am", "two"], in: sub)
+        let second = try GitFixture.plainGit(["rev-parse", "HEAD"], in: sub)
+        #expect(second != first)
+        let c2 = try #require(try ws.commitAll(in: wt, message: "sub moved"))
+        #expect(try f.git(["ls-tree", c2, "sub"]) == "160000 commit \(second)\tsub", "the gitlink was not updated")
+        #expect(try f.git(["ls-tree", "-r", "--name-only", c2]).split(separator: "\n").contains("a.txt"))
+        #expect(log.all.isEmpty, "\(log.all)")
+        // Its HEAD moves again but the engine may not read it (a second hard link on `.git/HEAD` fails `copyProblem`; git
+        // itself still lists `sub` as changed): the recorded commit stays, nothing is deleted, and the owner is told.
+        try f.write("f", "three\n", in: sub)
+        try GitFixture.plainGit(["commit", "-q", "-am", "three"], in: sub)
+        try fm.linkItem(at: sub.appending(path: ".git/HEAD"), to: try tempDir().appending(path: "head-link"))
+        try f.write("b.txt", "two", in: wt)
+        let c3 = try #require(try ws.commitAll(in: wt, message: "sub unreadable"))
+        #expect(try f.git(["ls-tree", c3, "sub"]) == "160000 commit \(second)\tsub", "the gitlink was dropped or changed")
+        #expect(try f.git(["show", "\(c3):b.txt"]) == "two")
+        #expect(log.all.contains { $0.contains("/sub ") && $0.contains("HEAD cannot be read") && $0.contains("recorded commit is kept") }, "\(log.all)")
+    }
+
+    /// S11.2 (fix round 6): the engine's directories are matched by folded name (case- and canonical-equivalence-insensitive,
+    /// like `refuseCollidingPaths`) and by (device, inode), so `.BRAHMA/secret` or `.Brahma-Tmp/x` in a checkout whose
+    /// exclude file is broken is never staged, and never reaches the object database.
+    @Test func foldedEngineDirectoryNamesAreNeverStaged() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        // The exclude file is left alone (oversized), so nothing ignores the engine's names.
+        try f.write(".git/info/exclude", String(repeating: "x", count: GitWorkspace.excludeReadLimit + 10))
+        let (ws, _) = fileWatched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let secret = try f.write(".BRAHMA/secret", "ENGINE-SECRET", in: wt)
+        try f.write(".Brahma-Tmp/scratch", "ENGINE-TMP", in: wt)
+        try f.write("ok.txt", "fine", in: wt)
+        #expect(try f.git(["check-ignore", "-q", ".BRAHMA/secret"], in: wt, allowFailure: true) == "", "the fixture holds: nothing ignores it")
+        let commit = try #require(try ws.commitAll(in: wt, message: "work"))
+        #expect(Set(try f.git(["ls-tree", "-r", "--name-only", commit]).split(separator: "\n").map(String.init)) == ["a.txt", "ok.txt"])
+        let blob = try f.git(["hash-object", secret.path])
+        #expect(!(try f.git(["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"]).contains(blob)), "the secret's blob is in the object database")
+        // The folding: case, and canonical equivalence (an NFD spelling equals its NFC one), as Swift compares strings.
+        #expect(GitWorkspace.isEngineName(Array(".BRAHMA".utf8)) && GitWorkspace.isEngineName(Array(".Brahma-TMP".utf8)))
+        #expect(!GitWorkspace.isEngineName(Array(".brahma2".utf8)) && !GitWorkspace.isEngineName(Array("brahma".utf8)))
+        #expect(GitWorkspace.foldedName(Array("\u{00E9}".utf8)) == GitWorkspace.foldedName(Array("e\u{0301}".utf8)))
+        #expect(GitWorkspace.foldedName(Array("\u{00C9}".utf8)) == GitWorkspace.foldedName(Array("e\u{0301}".utf8)))
+    }
+
+    /// NB1 (fix round 6): the staging holds one checked descriptor at a time (open, check, feed, close, inside the feeder),
+    /// so an agent with ten thousand files cannot exhaust the engine's descriptors. Shown with the budget seam: a cap of one
+    /// still commits hundreds of files; a cap of zero fails closed.
+    @Test func stagingHoldsOneDescriptorAtATime() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        var ws = f.ws
+        let wt = try ws.addWorktree(key: "K-1")
+        for i in 0..<300 { try f.write("many/f\(i).txt", "x\(i)", in: wt) }
+        ws.stagingDescriptorCap = 1
+        let commit = try #require(try ws.commitAll(in: wt, message: "many"))
+        #expect(try f.git(["ls-tree", "-r", "--name-only", commit]).split(separator: "\n").count == 301)
+        try f.write("one-more.txt", "y", in: wt)
+        ws.stagingDescriptorCap = 0
+        #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "no budget") }
+    }
+
+    /// NB4 (fix round 6): a tracked path whose way is now blocked (a file or a link where a directory was) is a deletion,
+    /// not a refusal: nothing is read, no alert is raised for it, and the index ends up right even when the blocker itself is
+    /// refused (a link pointing outside).
+    @Test func blockedWayIsADeletionNotARefusal() throws {
+        let fm = FileManager.default
+        let f = try GitFixture(files: ["a.txt": "one", "d/x": "x", "e/y": "y"])
+        let (ws, log) = fileWatched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        try fm.removeItem(at: wt.appending(path: "d"))
+        try f.write("d", "now a file", in: wt)
+        try fm.removeItem(at: wt.appending(path: "e"))
+        try fm.createSymbolicLink(atPath: wt.appending(path: "e").path, withDestinationPath: "/etc")
+        let commit = try #require(try ws.commitAll(in: wt, message: "switches"))
+        let names = Set(try f.git(["ls-tree", "-r", "--name-only", commit]).split(separator: "\n").map(String.init))
+        #expect(names == ["a.txt", "d"], "\(names)")
+        #expect(try f.git(["show", "\(commit):d"]) == "now a file")
+        #expect(!log.all.contains { $0.contains("d/x") || $0.contains("e/y") }, "a blocked way was reported: \(log.all)")
+        #expect(log.all.contains { $0.contains("/e ") && $0.contains("symbolic link") }, "\(log.all)")
     }
 
     /// M2 (fix round 5): `.brahma/` is the engine's. It stays out of the import commit and the quarantine commit (and so out of

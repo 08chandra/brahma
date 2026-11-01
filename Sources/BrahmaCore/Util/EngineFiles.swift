@@ -441,8 +441,11 @@ public enum EngineFiles {
         case link(target: [UInt8])
         /// A directory.
         case directory
-        /// Anything else, with the reason: a link or non-directory on the way, a file failing `copyProblem` (another hard
-        /// link, another owner, not regular), a name that cannot be opened.
+        /// The way to it is blocked: a directory on the way is now a file or a link (ENOTDIR, ELOOP). Nothing was read; for a
+        /// commit the path is simply gone (NB4).
+        case unreachable(UnsafeEngineFile)
+        /// Anything else, with the reason: a file failing `copyProblem` (another hard link, another owner, not regular), a
+        /// name that cannot be opened.
         case refused(UnsafeEngineFile)
     }
 
@@ -455,7 +458,7 @@ public enum EngineFiles {
         let dfd: Int32
         switch way {
         case .missing: return .missing
-        case .blocked(let problem): return .refused(problem)
+        case .blocked(let problem): return .unreachable(problem)
         case .open(let fd): dfd = fd
         }
         defer { if dfd != top.fd { close(dfd) } }
@@ -491,8 +494,28 @@ public enum EngineFiles {
             return try readAll(fd: fd, limit: limit, shown: shown)
         case .link: throw UnsafeEngineFile(path: shown, problem: "is a symbolic link")
         case .directory: throw UnsafeEngineFile(path: shown, problem: "is a directory, not a file")
-        case .refused(let problem): throw problem
+        case .unreachable(let problem), .refused(let problem): throw problem
         }
+    }
+
+    /// What the directory way `parts` under `top` is, walked with `O_NOFOLLOW | O_DIRECTORY` part by part.
+    enum WayKind: Equatable { case real, missing, blocked }
+
+    static func wayKind(in top: OpenDirectory, relative parts: [[UInt8]]) -> WayKind {
+        guard parts.allSatisfy(isValidName) else { return .blocked }
+        switch walkWay(from: top.fd, parts[...], shown: top.shown.path) {
+        case .missing: return .missing
+        case .blocked: return .blocked
+        case .open(let fd): if fd != top.fd { close(fd) }; return .real
+        }
+    }
+
+    /// The (device, inode) of `name` directly in `top`, never following a link; nil when it is not there.
+    static func identity(in top: OpenDirectory, name: [UInt8]) -> (dev: dev_t, ino: ino_t)? {
+        guard isValidName(name) else { return nil }
+        var st = stat()
+        guard withCName(name, { fstatat(top.fd, $0, &st, AT_SYMLINK_NOFOLLOW) }) == 0 else { return nil }
+        return (st.st_dev, st.st_ino)
     }
 
     /// Each of `parts` opened `O_NOFOLLOW | O_DIRECTORY` relative to the one before, starting from `from` (which is handed
