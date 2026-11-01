@@ -71,9 +71,12 @@ public struct PreviewDependencies: Sendable {
     public var http: any HTTPProbing
     public var listen: any ListenProbing
     public var processes: SpawnedProcesses
+    /// What a Full company's previews run through when its checks would run unsandboxed too (PR-5).
+    public var unsandboxed: any SandboxedRunner
 
-    public init(sandbox: any SandboxedRunner, http: any HTTPProbing, listen: any ListenProbing, processes: SpawnedProcesses) {
-        self.sandbox = sandbox; self.http = http; self.listen = listen; self.processes = processes
+    public init(sandbox: any SandboxedRunner, http: any HTTPProbing, listen: any ListenProbing, processes: SpawnedProcesses,
+                unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner()) {
+        self.sandbox = sandbox; self.http = http; self.listen = listen; self.processes = processes; self.unsandboxed = unsandboxed
     }
 
     /// The real probes (`URLSessionHTTPProbe`, `LsofListenProbe`) and a fresh process table around `sandbox`.

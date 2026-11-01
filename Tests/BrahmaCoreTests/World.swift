@@ -74,7 +74,7 @@ struct World {
          vault: any SecretVault = MemoryVault(), profile: PermissionProfile? = nil,
          transcriptSource: TranscriptSource? = nil, sleepGuard: SleepGuard = .disabled,
          canSeeSandboxes: @escaping @Sendable () -> Bool = { true }, sandboxCanary: SandboxCanaryGate? = nil,
-         stopObservers: [any EmergencyStopObserver] = []) throws {
+         stopObservers: [any EmergencyStopObserver] = [], previewDeps: PreviewDependencies = .fake()) throws {
         self.store = try store ?? Store.inMemory()
         try self.store.setPlanTier(.max20x)   // Plan 1 tests assume the 2/6/16 mode caps
         router = MessageRouter(store: self.store)
@@ -93,7 +93,7 @@ struct World {
                                     planSelector: planSelector, vault: vault,
                                     transcripts: transcriptSource.map { TranscriptCapture(paths: worldPaths, source: $0, compressor: .gzip) },
                                     sleepGuard: sleepGuard, sandboxCanary: sandboxCanary, stopObservers: stopObservers,
-                                    stopPollSleep: stopPoll.sleep)
+                                    stopPollSleep: stopPoll.sleep, previewDeps: previewDeps)
     }
 
     static func config(hardCap: Int = 16, turnBudget: Int = 30) -> SchedulerConfig {
