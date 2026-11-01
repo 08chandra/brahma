@@ -429,3 +429,20 @@ extension Doctor {
         }
     }
 }
+
+// MARK: Hosting (Plan L Task 4)
+
+extension Doctor {
+    /// `npm` when any company has hosting: the engine installs the pinned provider CLI with it. A warning only; it never
+    /// blocks turns. The pins and deploy hosts are provisional until the owner's provider probe (PR-14).
+    public static func npmItem(store: Store, exec: @escaping Exec = defaultExec) async -> DoctorItem? {
+        guard (try? store.anyHosting()) == true else { return nil }
+        let out = try? await exec("npm", ["--version"])
+        let version = out?.split(whereSeparator: \.isWhitespace).first.map(String.init)
+        guard let version, version.first?.isNumber == true else {
+            return DoctorItem(name: "npm", status: .warn, detail: "install Node.js to deploy")
+        }
+        return DoctorItem(name: "npm", status: .pass,
+                          detail: "\(version) (deploy CLI pins and hosts unverified: needs the owner's provider token)")
+    }
+}
