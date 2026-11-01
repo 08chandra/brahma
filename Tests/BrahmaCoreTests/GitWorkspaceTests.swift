@@ -363,7 +363,7 @@ import Foundation
         try f.write("b.txt", "two", in: wt)
         let d = wt.appending(path: "d")
         try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: d.path)
-        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: d.path) }
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: d.path) }  // exec-bit fixture: restores the directory mode the test removed
         let commit = try #require(try ws.commitAll(in: wt, message: "unopenable d"))
         let names = Set(try f.git(["ls-tree", "-r", "--name-only", commit]).split(separator: "\n").map(String.init))
         #expect(names == ["a.txt", "b.txt", "d/x"], "\(names)")
