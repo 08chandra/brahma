@@ -175,37 +175,65 @@ public struct DeployPlan: Codable, Equatable, Sendable {
 }
 
 /// What an adapter composes a plan from. For a rollback, `settings`, `commit` and `version` are the release being restored.
+/// Every place is under the company's data-home `ReleaseLayout` (`releaseRoot`), never in a workspace (I3); `validate`
+/// refuses anything else.
 public struct DeployInput: Sendable {
     public var settings: HostingSettings
     public var commit: String
     public var version: String
-    /// `EngineLayout.releaseDir(n)`.
+    /// `ReleaseLayout.root`: the deploy's `GIT_CEILING_DIRECTORIES` and the boundary of `ProviderConfigCheck`.
+    public var releaseRoot: URL
+    /// `ReleaseLayout.releaseDir(n)`.
     public var releaseDir: URL
-    /// `EngineLayout.deployTools(cli:)`: the engine-installed provider CLI (`node_modules/.bin/<cli>`).
+    /// `ReleaseLayout.deployTools(cli:)`: the engine-installed provider CLI (`node_modules/.bin/<cli>`).
     public var deployTools: URL
     /// The previous deployed release's `upload/` (Cloudflare rollback).
     public var previousUpload: URL?
     /// The previous deployed release's deploy URL (Vercel rollback).
     public var previousDeployURL: String?
-    /// `EngineLayout.placeholderDir` (`Placeholder.write`).
+    /// `ReleaseLayout.placeholderDir` (`Placeholder.write`).
     public var placeholderDir: URL
     /// Whether the commit's tree has a `functions` folder (`GitWorkspace.treeHasDirectory`, PR-24): decided from the commit,
     /// never from the export, so the plan is the same at propose time and when the executor renders it again.
     public var functionsInCommit: Bool
 
-    public init(settings: HostingSettings, commit: String, version: String, releaseDir: URL, deployTools: URL,
+    public init(settings: HostingSettings, commit: String, version: String, releaseRoot: URL, releaseDir: URL, deployTools: URL,
                 previousUpload: URL? = nil, previousDeployURL: String? = nil, placeholderDir: URL, functionsInCommit: Bool = false) {
-        self.settings = settings; self.commit = commit; self.version = version; self.releaseDir = releaseDir
-        self.deployTools = deployTools; self.previousUpload = previousUpload; self.previousDeployURL = previousDeployURL
-        self.placeholderDir = placeholderDir; self.functionsInCommit = functionsInCommit
+        self.settings = settings; self.commit = commit; self.version = version; self.releaseRoot = releaseRoot
+        self.releaseDir = releaseDir; self.deployTools = deployTools; self.previousUpload = previousUpload
+        self.previousDeployURL = previousDeployURL; self.placeholderDir = placeholderDir; self.functionsInCommit = functionsInCommit
     }
 
-    /// The commit and version every adapter puts in argv.
+    /// The places of release `number` of `layout`, with the adapter's tools.
+    public init(settings: HostingSettings, commit: String, version: String, layout: ReleaseLayout, release number: Int, cli: String,
+                previousUpload: URL? = nil, previousDeployURL: String? = nil, functionsInCommit: Bool = false) {
+        self.init(settings: settings, commit: commit, version: version, releaseRoot: layout.root,
+                  releaseDir: layout.releaseDir(number), deployTools: layout.deployTools(cli: cli), previousUpload: previousUpload,
+                  previousDeployURL: previousDeployURL, placeholderDir: layout.placeholderDir, functionsInCommit: functionsInCommit)
+    }
+
+    /// The commit and version every adapter puts in argv, and every place inside `releaseRoot`.
     func validate() throws {
         guard commit.range(of: "^[0-9a-f]{7,64}$", options: .regularExpression) != nil else { throw WorkError.invalid("invalid commit") }
         guard version.range(of: "^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$", options: .regularExpression) != nil else {
             throw WorkError.invalid("invalid release version")
         }
+        let root = releaseRoot.standardizedFileURL.path
+        guard root.hasPrefix("/"), root != "/" else { throw WorkError.invalid("deploys run under the engine's releases folder") }
+        for place in [releaseDir, deployTools, placeholderDir] + (previousUpload.map { [$0] } ?? []) {
+            let path = place.standardizedFileURL.path
+            guard path.hasPrefix(root + "/"), !place.path.contains("/../") else {
+                throw WorkError.invalid("deploys run under the engine's releases folder")
+            }
+        }
+    }
+
+    /// `GIT_CEILING_DIRECTORIES`: the release root (and its resolved form when that differs), so git started by a provider
+    /// CLI never discovers a repository above the deploy folder.
+    var gitCeiling: String {
+        let plain = releaseRoot.standardizedFileURL.path
+        let resolved = releaseRoot.resolvingSymlinksInPath().standardizedFileURL.path
+        return resolved == plain ? plain : plain + ":" + resolved
     }
 
     /// `releaseDir/<name>`, absolute.
@@ -213,6 +241,46 @@ public struct DeployInput: Sendable {
 
     /// `<deployTools>/node_modules/.bin/<name>`: the engine-installed binary (builder-check 2: never `npx`).
     func bin(_ name: String) -> String { deployTools.appending(path: "node_modules/.bin/\(name)", directoryHint: .notDirectory).path }
+}
+
+/// The executor's last check before a deploy or rollback step runs with the token (Task 7 calls it; I3): no provider
+/// config a CLI would pick up may sit in the step's directory or above it. Fails closed.
+public enum ProviderConfigCheck {
+    /// What wrangler reads from its directory or any ancestor.
+    public static let wranglerConfigs = ["wrangler.toml", "wrangler.json", "wrangler.jsonc"]
+
+    /// Found only between the deploy folder and the release root: git stops at `GIT_CEILING_DIRECTORIES` above it, and the
+    /// Vercel CLI reads `.vercel` only in its folder (and at a git root, which the ceiling keeps inside the release root).
+    public static let boundedNames = [".git", ".vercel"]
+
+    /// Throws when `cwd` is not inside `boundary`, when any of `names` exists (as anything, a link included) in `cwd` or any
+    /// ancestor up to the file system root (wrangler searches that far), or when one of `boundedNames` exists in `cwd` or an
+    /// ancestor up to and including `boundary`. Nothing is followed or read.
+    public static func check(cwd: String, boundary: URL, names: [String]) throws {
+        let root = boundary.standardizedFileURL.path
+        let start = URL(fileURLWithPath: cwd).standardizedFileURL.path
+        guard cwd.hasPrefix("/"), !cwd.contains("/../"), start == root || start.hasPrefix(root + "/") else {
+            throw WorkError.invalid("the deploy folder \(cwd) is outside the engine's releases folder")
+        }
+        var dir = URL(fileURLWithPath: start, isDirectory: true)
+        var insideBoundary = true
+        while true {
+            var found = names.filter { exists(dir.appending(path: $0).path) }
+            if insideBoundary { found += boundedNames.filter { exists(dir.appending(path: $0).path) } }
+            if let name = found.first {
+                throw WorkError.invalid("refusing to deploy: \(dir.appending(path: name).path) would configure the provider CLI")
+            }
+            if dir.path == root { insideBoundary = false }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path || dir.path == "/" { return }
+            dir = parent
+        }
+    }
+
+    static func exists(_ path: String) -> Bool {
+        var st = stat()
+        return lstat(path, &st) == 0
+    }
 }
 
 /// Shell quoting for displaying argv (the steps are executed as argv, never through a shell).
@@ -252,8 +320,19 @@ public protocol HostingAdapter: Sendable {
     func deployPlan(_ i: DeployInput) throws -> DeployPlan
     /// The previous release, else the placeholder.
     func rollbackPlan(_ i: DeployInput) throws -> DeployPlan
+    /// The deploy URL, read from the deploy step's STDOUT only (never stderr, never streamed build logs).
     func deployURL(fromOutput: String, settings: HostingSettings) -> URL?
     func smokeBase(_ s: HostingSettings, deployURL: URL?) -> URL?
+    /// The provider config files `ProviderConfigCheck` refuses in or above a deploy folder, up to the file system root
+    /// (`.git` and `.vercel` are always refused up to the release root).
+    var providerConfigNames: [String] { get }
+}
+
+extension HostingAdapter {
+    /// `ProviderConfigCheck` for a plan of this adapter: what the executor calls before every step (Task 7).
+    public func refuseProviderConfig(_ plan: DeployPlan, releaseRoot: URL) throws {
+        try ProviderConfigCheck.check(cwd: plan.cwdPath, boundary: releaseRoot, names: providerConfigNames)
+    }
 }
 
 /// The production adapters. Immutable: tests inject their own lookup (`ReleaseExecutor(adapters:)`,
