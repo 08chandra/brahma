@@ -1,6 +1,6 @@
 import Foundation
 
-/// The built-in `software` industry pack, version 1. Role cards follow the Role Card v2 layout.
+/// The built-in `software` industry pack, version 2 (Plan L added the ops tools). Role cards follow the Role Card v2 layout.
 public enum SoftwarePack {
     static let statusLine = "STATUS: DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT"
 
@@ -13,7 +13,10 @@ public enum SoftwarePack {
     ]
 
     private static let exec = CompanyToolNames.base + CompanyToolNames.work + CompanyToolNames.lead + CompanyToolNames.executive
+        + CompanyToolNames.ops
     private static let ic = CompanyToolNames.base + CompanyToolNames.work
+    /// Devops and architects: the ops tools too (previews, smoke checks, hosting, deploy proposals).
+    private static let opsIC = ic + CompanyToolNames.ops
     private static func models(_ a: String, _ b: String, _ c: String) -> [String: String] { ["low": a, "balanced": b, "max": c] }
 
     // MARK: Role card bodies
@@ -472,7 +475,7 @@ public enum SoftwarePack {
     }
 
     public static let pack = IndustryPack(
-        id: "software", version: 1, title: "Software company",
+        id: "software", version: 2, title: "Software company",
         roles: [
             role("ceo", "CEO", .executive, "ceo", ceoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
             role("cpo", "CPO", .executive, "cpo", cpoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
@@ -480,7 +483,7 @@ public enum SoftwarePack {
             role("ceo-cpo", "CEO & CPO", .executive, "ceo", ceoCpoBody, exec, models("sonnet", "sonnet", "sonnet"), 3, covers: ["ceo", "cpo"]),
             role("cto-architect", "CTO & Architect", .executive, "cto", ctoArchitectBody, exec, models("sonnet", "sonnet", "sonnet"), 3,
                  covers: ["cto", "architect"]),
-            role("architect", "Architect", .architect, "arch", architectBody, ic, models("sonnet", "sonnet", "sonnet"), 2),
+            role("architect", "Architect", .architect, "arch", architectBody, opsIC, models("sonnet", "sonnet", "sonnet"), 2),
             role("director", "Director", .manager, "dir", directorBody, ic + CompanyToolNames.lead, models("sonnet", "sonnet", "sonnet"), 1,
                  playbooks: managerPlaybooks),
             role("manager", "Engineering manager", .manager, "mgr", managerBody, ic + CompanyToolNames.lead,
@@ -490,7 +493,7 @@ public enum SoftwarePack {
             role("designer", "Designer", .individual, "design", designerBody, ic, models("haiku", "sonnet", "sonnet"), 0,
                  playbooks: designerPlaybooks),
             role("qa", "QA", .individual, "qa", qaBody, ic, models("haiku", "sonnet", "sonnet"), 0, playbooks: qaPlaybooks),
-            role("devops", "DevOps/SRE", .individual, "devops", devopsBody, ic, models("sonnet", "sonnet", "sonnet"), 0),
+            role("devops", "DevOps/SRE", .individual, "devops", devopsBody, opsIC, models("sonnet", "sonnet", "sonnet"), 0),
             role("security", "Security", .individual, "sec", securityBody, ic, models("sonnet", "sonnet", "sonnet"), 0),
         ],
         itemTypes: [
