@@ -170,6 +170,7 @@ import Foundation
         try await refused({ z in z.add("demo/skills/demo/link", "/etc/passwd", symlink: true) }, "symbolic link")
         try await refused({ z in z.add("/etc/demo.md", "x") }, "absolute")
         try await refused({ z in z.add("demo/../../escape.md", "x") }, "..")
+        try await refused({ z in z.add("demo\\..\\..\\escape.md", "x") }, "'..'")   // m-5: `\` separates too
         try await refused({ z in z.add("demo/assets/evil\u{202E}txt.md", "x") }, "control, hidden or bidi")
         #expect(ZipLimits.maxRatio == 100)
         // A real archive: the extraction runs /usr/bin/unzip under the runner, writable = the unzip dir only, no network, a byte quota.
@@ -227,6 +228,66 @@ import Foundation
         let error = await errorOf { _ = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: RecordingRunner()) }
         #expect((error as? ExtensionError)?.message.contains("inflates to more than") == true, "\(String(describing: error))")
         #expect(((try? FileManager.default.contentsOfDirectory(atPath: p.extensionsDir.staging.path)) ?? []).isEmpty, "staging is clean")
+    }
+
+    /// I-2 (fix round 2): the inventory is self-consistent or the archive is refused before anything is extracted: an end
+    /// record that under-counts (the reviewer's 65,537 entries plus a symlink behind "1 entry"), a benign fake directory in front
+    /// of the real one, prepended bytes, and a local header that differs from its central entry. A normal archive still imports,
+    /// with unzip's own listing compared to the inventory first.
+    @Test func zipInventoryMustBeSelfConsistent() async throws {
+        let p = try paths()
+        func refused(_ z: ZipBuilder, _ fragment: String, patch: ((inout [UInt8]) -> Void)? = nil) async throws {
+            let zip = try tempDir().appending(path: "crafted.zip")
+            try z.write(to: zip)
+            if let patch { var b = [UInt8](try Data(contentsOf: zip)); patch(&b); try Data(b).write(to: zip) }
+            let runner = RecordingRunner()
+            let error = await errorOf { _ = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: runner) }
+            #expect((error as? ExtensionError)?.message.contains(fragment) == true, "\(fragment): \(String(describing: error))")
+            #expect(runner.calls.isEmpty, "\(fragment): nothing was extracted or even listed")
+            #expect(((try? FileManager.default.contentsOfDirectory(atPath: p.extensionsDir.staging.path)) ?? []).isEmpty)
+        }
+        func base() -> ZipBuilder {
+            var z = ZipBuilder()
+            z.add("demo/.claude-plugin/plugin.json", PluginFixture.manifestJSON(id: "demo"))
+            z.add("demo/a.txt", "a")
+            return z
+        }
+        var undercount = base()
+        undercount.add("demo/link", "/etc/passwd", symlink: true)
+        undercount.countOverride = 1
+        try await refused(undercount, "not self-consistent")
+        var many = base()
+        for n in 0..<65_537 { many.add("d/\(n)", "") }
+        many.add("demo/evil", "/etc/passwd", symlink: true)
+        many.countOverride = 1
+        try await refused(many, "not self-consistent")
+        var fake = base()
+        fake.add("demo/link", "/etc/passwd", symlink: true)
+        fake.fakeCentral = ["demo/a.txt"]
+        try await refused(fake, "not self-consistent")
+        // Bytes in front of the first entry (Info-ZIP would re-base the offsets).
+        try await refused(base(), "not self-consistent") { b in
+            b.insert(contentsOf: [0, 0, 0, 0], at: 0)
+            for i in 0..<(b.count - 4) where b[i] == 0x50 && b[i + 1] == 0x4b && b[i + 2] == 0x05 && b[i + 3] == 0x06 {
+                let off = Int(b[i + 16]) | Int(b[i + 17]) << 8 | Int(b[i + 18]) << 16 | Int(b[i + 19]) << 24
+                let moved = off + 4
+                for k in 0..<4 { b[i + 16 + k] = UInt8((moved >> (8 * k)) & 0xff) }
+            }
+        }
+        // A local header whose name differs from its central entry.
+        try await refused(base(), "not self-consistent") { b in
+            if let i = (0..<(b.count - 30)).first(where: { b[$0] == 0x50 && b[$0 + 1] == 0x4b && b[$0 + 2] == 0x03 && b[$0 + 3] == 0x04 }) { b[i + 30] = UInt8(ascii: "x") }
+        }
+        // A normal archive imports; the one sandboxed command lists with zipinfo and compares before unzip extracts.
+        let f = try PluginFixture(files: ["README.md": "# demo"])
+        let zip = try tempDir().appending(path: "demo.zip")
+        try Self.zip(dir: f.root.deletingLastPathComponent(), name: "demo", to: zip)
+        let runner = RecordingRunner()
+        _ = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: runner)
+        let command = try #require(runner.calls.first?.command)
+        let listAt = try #require(command.range(of: "/usr/bin/zipinfo' -1 ")), unzipAt = try #require(command.range(of: "/usr/bin/unzip' -q -n "))
+        #expect(listAt.lowerBound < unzipAt.lowerBound); #expect(command.contains("/usr/bin/cmp -s - "))
+        #expect(runner.calls.count == 1)
     }
 
     static func zip(dir: URL, name: String, to zip: URL) throws {

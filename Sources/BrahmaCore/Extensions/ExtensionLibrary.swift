@@ -69,7 +69,12 @@ public enum ExtensionLibrary {
         guard first.errors.isEmpty, first.manifest != nil else { throw ExtensionError(issues: first.errors) }
         // S9: every plugin-part Markdown file is rewritten in canonical form (allowlisted keys only, LF, no BOM) BEFORE hashing,
         // so the lock, the hash, the review page and the mounted copy all describe exactly what Claude Code will read.
-        try ExtensionValidator.canonicalize(staged: staged.dir)
+        // A lock the first validation verified describes the source bytes; after the engine's own rewrite it is regenerated so
+        // it describes the canonical tree (the second validation checks it again).
+        if try ExtensionValidator.canonicalize(staged: staged.dir),
+           FileManager.default.fileExists(atPath: staged.dir.appending(path: ExtensionLock.path).path) {
+            try ExtensionValidator.writeLock(root: staged.dir)
+        }
         var result = ExtensionValidator.validate(staged: staged.dir, options: options)
         guard result.errors.isEmpty, let manifest = result.manifest else { throw ExtensionError(issues: result.errors) }
         var alwaysOn: Int?
@@ -367,6 +372,12 @@ public enum ExtensionLibrary {
         }
         let storeDir = paths.extensionsDir.store.appending(path: "\(id)/\(previous.prefix(12))", directoryHint: .isDirectory)
         guard SandboxPath.kind(storeDir.path) == .directory else { throw WorkError.invalid("the earlier version of '\(id)' is no longer in the store") }
+        // m-3: the store copy must still pass today's validator and already be in canonical form (a copy an older engine wrote
+        // may not be); otherwise it is installed again through propose, never mounted as it is.
+        let recheck = ExtensionValidator.validate(staged: storeDir)
+        guard recheck.errors.isEmpty, try ExtensionValidator.isCanonical(root: storeDir) else {
+            throw WorkError.invalid("the earlier version of '\(id)' does not pass the current checks; install it again instead of rolling back")
+        }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         try materialize(staged: storeDir, id: id, hash: previous, pluginHash: package.pluginTreeSha256, workspace: workspace, paths: paths)
         try store.writer.write { db in

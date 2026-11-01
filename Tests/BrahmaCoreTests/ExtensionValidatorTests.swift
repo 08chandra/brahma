@@ -145,6 +145,62 @@ import Foundation
         #expect(canonical == "---\nname: demo\ndescription: d\n---\nBody\n")
     }
 
+    /// I-1 (fix round 2): values are parsed in full (as YAML folds them) and checked in full; the canonical rewrite is emitted
+    /// from those parsed values, never from source lines.
+    @Test func fullValuesAreCheckedAndRewritten() throws {
+        func errors(_ files: [String: String], tools: [String] = ["Read", "Grep"]) -> [LintIssue] {
+            let f = try! PluginFixture(files: files)
+            return ExtensionValidator.validate(staged: f.root, options: ValidationOptions(roleTools: tools)).errors
+        }
+        let agent = { (fm: String) in "---\nname: helper\ndescription: Helps.\n\(fm)\n---\nHelp.\n" }
+        // The reviewer's probes: a list continued on the next line, and a flow list under an empty value, are refused.
+        #expect(errors(["agents/helper.md": agent("tools: Read,\n  Workflow, mcp__evil__run")]).contains { $0.code == "EXT010" })
+        #expect(errors(["agents/helper.md": agent("tools:\n  [Read, Workflow]")]).contains { $0.code == "EXT010" })
+        // A block sequence: every element is checked against the role's tools.
+        let extra = errors(["agents/helper.md": agent("tools:\n  - Read\n  - mcp__evil__run")])
+        #expect(extra.contains { $0.code == "EXT012" && $0.message.contains("mcp__evil__run") }, "\(extra)")
+        #expect(errors(["agents/helper.md": agent("tools: [Read, \"mcp__evil__run\"]")]).contains { $0.code == "EXT012" })
+        #expect(errors(["agents/helper.md": agent("tools: Read, mcp__evil__run")]).contains { $0.code == "EXT012" })
+        // Descriptions: a block scalar or a folded plain value over the cap is refused, whatever its first line holds.
+        let block = "description: >\n" + (0..<60).map { _ in "  " + String(repeating: "word ", count: 10) }.joined(separator: "\n")
+        #expect(errors(["skills/demo/SKILL.md": "---\nname: demo\n\(block)\n---\nx\n"]).contains { $0.code == "EXT023" })
+        let folded = "description: start\n" + (0..<60).map { _ in "  " + String(repeating: "more ", count: 10) }.joined(separator: "\n")
+        #expect(errors(["skills/demo/SKILL.md": "---\nname: demo\n\(folded)\n---\nx\n"]).contains { $0.code == "EXT023" })
+        let literal = "when_to_use: |\n" + (0..<60).map { _ in "  " + String(repeating: "case ", count: 10) }.joined(separator: "\n")
+        #expect(errors(["skills/demo/SKILL.md": "---\nname: demo\ndescription: d\n\(literal)\n---\nx\n"]).contains { $0.code == "EXT023" })
+        // Forms outside the subset are refused: a continuation that looks like a key, quoted multi-line, keep chomping, nesting.
+        for bad in ["description: start\n  hooks: x", "description: \"open\n  close\"", "description: |+\n  x", "description: |2\n  x",
+                    "metadata:\n  a:\n    b: 1", "name: [demo]", "description: >\n  a\n    more indented"] {
+            #expect(errors(["skills/demo/SKILL.md": "---\n\(bad)\n---\nx\n"]).contains { $0.code == "EXT010" }, "\(bad)")
+        }
+        // Under the cap: each value is written back as one engine-made line.
+        let source = "---\nname: demo\ndescription: >\n  Line one\n  line two.\n\n  Second: paragraph.\nwhen_to_use: start\n  and more\n"
+            + "disable-model-invocation: true\nmetadata:\n  author: me\n  tags:\n    - a\n    - \"b c\"\nallowed-tools:\n  - Bash\n---\nBody\n"
+        let canonical = try #require(Frontmatter.canonical(source, allowed: ExtensionValidator.skillKeys))
+        #expect(canonical == """
+        ---
+        name: demo
+        description: "Line one line two.\\nSecond: paragraph.\\n"
+        when_to_use: "start and more"
+        disable-model-invocation: true
+        metadata:
+          author: me
+          tags: ["a", "b c"]
+        ---
+        Body
+
+        """, "\(canonical)")
+        let tools = try #require(Frontmatter.canonical(agent("tools:\n  - Read\n  - Grep"), allowed: ExtensionValidator.agentKeys))
+        #expect(tools.contains("\ntools: [\"Read\", \"Grep\"]\n"), "\(tools)")
+        // The rewrite reads back to the same values (it is a fixed point), and every frontmatter line is one the engine wrote.
+        #expect(Frontmatter.canonical(canonical, allowed: ExtensionValidator.skillKeys) == canonical)
+        let fm = try #require(Frontmatter.parse(canonical))
+        #expect(fm.value("description") == "Line one line two.\nSecond: paragraph.\n"); #expect(fm.value("when_to_use") == "start and more")
+        let emitted = Set(fm.entries.flatMap { Frontmatter.emit($0.key, $0.parsed) ?? [] })
+        let written = canonical.split(separator: "\n").map(String.init).dropFirst().prefix { $0 != "---" }
+        #expect(written.allSatisfy { emitted.contains($0) }, "\(Array(written))")
+    }
+
     @Test func cleanPluginPasses() throws {
         let f = try PluginFixture(files: ["README.md": "# demo", "LICENSE": "MIT", "skills/demo/reference/guide.md": "# g",
                                           "commands/greet.md": "---\ndescription: Greet.\n---\nSay hi.", "tests/cases/a.yaml": "x: 1"])

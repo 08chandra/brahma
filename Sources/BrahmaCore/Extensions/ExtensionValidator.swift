@@ -395,7 +395,8 @@ public enum ExtensionValidator {
             case .ok(let fm):
                 parsed[f.relative] = fm
                 // A hidden character spelled as a YAML escape (`"‮"`) in a frontmatter value is an error too (I3).
-                for e in fm.entries where ([e.value] + e.continuation).contains(where: { Frontmatter.escapedScalars(in: $0).contains(where: ExtensionLimits.isHiddenOrBidi) }) {
+                for e in fm.entries where ([e.value] + e.continuation).contains(where: { Frontmatter.escapedScalars(in: $0).contains(where: ExtensionLimits.isHiddenOrBidi) })
+                    || e.parsed.strings.contains(where: { $0.unicodeScalars.contains(where: ExtensionLimits.isHiddenOrBidi) }) {
                     issue(.unicode, f.relative, line: e.line, "frontmatter '\(e.key)' holds an escaped hidden, zero-width, bidi or tag character")
                     r.lintFacts.hiddenUnicode.append(f.relative)
                 }
@@ -589,7 +590,9 @@ public enum ExtensionValidator {
     /// Rewrites every plugin-part Markdown file in canonical form: LF line endings, no BOM, and a frontmatter holding only the
     /// allowlisted keys (`skillKeys` for skills and commands, `agentKeys` for agents), serialized by the engine. Claude Code then
     /// reads exactly what the engine wrote. The tree must have passed `validate` (every file parses under the strict subset).
-    public static func canonicalize(staged root: URL) throws {
+    @discardableResult
+    public static func canonicalize(staged root: URL) throws -> Bool {
+        var changed = false
         for f in try PackageWalk.files(root: root) where f.kind == .regular && isPluginPartMarkdown(f.relative) {
             guard let data = FileManager.default.contents(atPath: f.url.path), let raw = String(data: data, encoding: .utf8) else {
                 throw ExtensionError.message("\(f.relative) is not UTF-8")
@@ -598,8 +601,20 @@ public enum ExtensionValidator {
             guard let canonical = Frontmatter.canonical(raw, allowed: allowed) else {
                 throw ExtensionError.message("\(f.relative): the frontmatter does not parse under the strict subset")
             }
-            if Data(canonical.utf8) != data { try Data(canonical.utf8).write(to: f.url) }
+            if Data(canonical.utf8) != data { try Data(canonical.utf8).write(to: f.url); changed = true }
         }
+        return changed
+    }
+
+    /// Whether every plugin-part Markdown file under `root` is already in canonical form (a store copy written by an older
+    /// engine may not be).
+    public static func isCanonical(root: URL) throws -> Bool {
+        for f in try PackageWalk.files(root: root) where f.kind == .regular && isPluginPartMarkdown(f.relative) {
+            guard let data = FileManager.default.contents(atPath: f.url.path), let raw = String(data: data, encoding: .utf8),
+                  let canonical = Frontmatter.canonical(raw, allowed: f.relative.hasPrefix("agents/") ? agentKeys : skillKeys),
+                  Data(canonical.utf8) == data else { return false }
+        }
+        return true
     }
 
     // MARK: Claude's own checks
@@ -753,7 +768,41 @@ public enum ExtensionValidator {
 ///   (`&`, `*`, `!`) at the start of a value, no `<<` merge keys, no `...`/`%` document markers, no duplicate keys;
 /// - the input is normalized first (BOM stripped, CRLF/CR → LF), and the closing fence must appear within 64 KB.
 struct Frontmatter {
-    struct Entry { var key: String; var value: String; var line: Int; var continuation: [String] }
+    struct Entry {
+        var key: String
+        var value: String
+        var line: Int
+        var continuation: [String]
+        /// The full value as the engine parsed it (allowlisted keys only; `.raw` for keys that are refused or stripped, whose
+        /// value is never written back).
+        var parsed: Value = .raw
+    }
+
+    /// A parsed frontmatter value: what the validator checks and the only thing the canonical rewrite writes.
+    indirect enum Value {
+        case raw
+        /// `plain`: written without quotes in the source (so YAML may read it as a bool or a number, and so does the rewrite).
+        case scalar(String, plain: Bool)
+        case list([String])
+        case map([(key: String, value: Value)])
+
+        var strings: [String] {
+            switch self {
+            case .raw: return []
+            case .scalar(let s, _): return [s]
+            case .list(let l): return l
+            case .map(let m): return m.flatMap { [$0.key] + $0.value.strings }
+            }
+        }
+    }
+
+    struct Refusal: Error { var why: String; init(_ why: String) { self.why = why } }
+
+    /// Keys whose value is a list (`a, b`, `[a, b]` or `- a` lines) and the one key that may hold a map.
+    static let listKeys: Set<String> = ["tools", "disallowedTools", "skills"]
+    static let mapKeys: Set<String> = ["metadata"]
+    /// Keys parsed in full (everything the rewrite can write back).
+    static var strictKeys: Set<String> { ExtensionValidator.skillKeys.union(ExtensionValidator.agentKeys) }
     var entries: [Entry]
     /// The line of the closing fence.
     var end: Int
@@ -800,10 +849,20 @@ struct Frontmatter {
             let number = i + 1
             bytes += line.utf8.count + 1
             if bytes > fenceLimit { return .invalid("the frontmatter does not close within \(fenceLimit) bytes", line: number) }
-            if line == "---" { return .ok(Frontmatter(entries: entries, end: number)) }
+            if line == "---" {
+                for k in entries.indices where strictKeys.contains(entries[k].key) {
+                    do { entries[k].parsed = try parseValue(key: entries[k].key, inline: entries[k].value, continuation: entries[k].continuation) }
+                    catch let r as Refusal { return .invalid("'\(entries[k].key)': \(r.why)", line: entries[k].line) }
+                    catch { return .invalid("'\(entries[k].key)': \(error)", line: entries[k].line) }
+                }
+                return .ok(Frontmatter(entries: entries, end: number))
+            }
             if line.trimmingCharacters(in: .whitespaces) == "---" { return .invalid("the closing fence must be exactly ---", line: number) }
             if line.contains("\t") { return .invalid("tabs are not allowed", line: number) }
-            if line.isEmpty || line.trimmingCharacters(in: .whitespaces).isEmpty { i += 1; continue }
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                if !entries.isEmpty { entries[entries.count - 1].continuation.append("") }
+                i += 1; continue
+            }
             if line.hasPrefix("#") { i += 1; continue }
             if line.hasPrefix(" ") {
                 guard let last = entries.last else { return .invalid("an indented line before the first key", line: number) }
@@ -908,27 +967,297 @@ struct Frontmatter {
         return nil
     }
 
+    /// The full (folded, unquoted, unescaped) scalar value of `key`; nil when absent or not a scalar.
     func value(_ key: String) -> String? {
         guard let e = entries.first(where: { $0.key == key }) else { return nil }
-        let v = e.value
-        if (v.hasPrefix("\"") && v.hasSuffix("\"") && v.count >= 2) || (v.hasPrefix("'") && v.hasSuffix("'") && v.count >= 2) {
-            return String(v.dropFirst().dropLast())
+        switch e.parsed {
+        case .scalar(let s, _): return s
+        case .list, .map: return nil
+        case .raw:
+            let v = e.value
+            if (v.hasPrefix("\"") && v.hasSuffix("\"") && v.count >= 2) || (v.hasPrefix("'") && v.hasSuffix("'") && v.count >= 2) {
+                return String(v.dropFirst().dropLast())
+            }
+            return v
         }
-        return v
     }
 
-    /// A comma list (`a, b`), a flow list (`[a, b]`) or a block list (`- a`).
+    /// Every element of a list key, in full (a comma string is split the way Claude Code splits it).
     func list(_ key: String) -> [String] {
         guard let e = entries.first(where: { $0.key == key }) else { return [] }
-        var items: [String] = []
-        var inline = e.value
-        if inline.hasPrefix("["), inline.hasSuffix("]") { inline = String(inline.dropFirst().dropLast()) }
-        items += inline.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-        for c in e.continuation {
-            let t = c.trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("- ") { items.append(String(t.dropFirst(2)).trimmingCharacters(in: .whitespaces)) }
+        switch e.parsed {
+        case .list(let l): return l
+        case .scalar(let s, _): return Frontmatter.commaList(s)
+        case .map: return []
+        case .raw:
+            var items: [String] = []
+            var inline = e.value
+            if inline.hasPrefix("["), inline.hasSuffix("]") { inline = String(inline.dropFirst().dropLast()) }
+            items += inline.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            for c in e.continuation {
+                let t = c.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("- ") { items.append(String(t.dropFirst(2)).trimmingCharacters(in: .whitespaces)) }
+            }
+            return items.filter { !$0.isEmpty }.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) }
         }
-        return items.filter { !$0.isEmpty }.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) }
+    }
+
+    static func commaList(_ s: String) -> [String] {
+        s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    // MARK: Values (the supported subset)
+
+    /// The full value of an allowlisted key, as YAML would read it, within a small subset: one-line plain or quoted scalars, a
+    /// plain scalar folded over indented lines, block scalars `|` `|-` `>` `>-`, lists (`a, b`, a one-line `[a, b]`, or `- a`
+    /// lines under an empty value) for `listKeys`, and one level of `name: value` (values scalar or list) for `metadata`.
+    /// Anything else throws.
+    static func parseValue(key: String, inline v: String, continuation raw: [String]) throws -> Value {
+        var cont = raw
+        while let last = cont.last, last.trimmingCharacters(in: .whitespaces).isEmpty { cont.removeLast() }
+        while let first = cont.first, first.trimmingCharacters(in: .whitespaces).isEmpty { cont.removeFirst() }
+        let isBlock = v.hasPrefix("|") || v.hasPrefix(">")
+        if mapKeys.contains(key) {
+            if v.isEmpty { return .map(try nestedMap(cont)) }
+            guard cont.isEmpty, v == "{}" else { throw Refusal("a map of names to text or lists, written as indented `name: value` lines") }
+            return .map([])
+        }
+        if listKeys.contains(key) {
+            guard !isBlock else { throw Refusal("a list, not a block scalar") }
+            if v.isEmpty { return .list(try blockList(cont)) }
+            guard cont.isEmpty else { throw Refusal("a list continues on the next line; write it on one line or as `- item` lines") }
+            return .list(try inlineList(v))
+        }
+        if isBlock { return .scalar(try blockScalar(header: v, lines: raw), plain: false) }
+        if cont.isEmpty { return try singleScalar(v) }
+        // A plain scalar folded over indented lines (YAML joins them with spaces; a blank line is a newline).
+        guard !v.isEmpty, case .scalar(let head, true) = try singleScalar(v) else {
+            throw Refusal("a multi-line value is supported only as plain text or a block scalar (| or >)")
+        }
+        var lines: [String] = []
+        for c in cont {
+            let t = c.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { lines.append(""); continue }
+            if let first = t.unicodeScalars.first, "-?:,[]{}#&*!|>'\"%@`".unicodeScalars.contains(first) {
+                throw Refusal("a continuation line starts with '\(Character(first))'")
+            }
+            if t.contains(": ") || t.hasSuffix(":") || t.contains(" #") { throw Refusal("a continuation line looks like a key or a comment") }
+            lines.append(t)
+        }
+        return .scalar(fold([head] + lines), plain: false)
+    }
+
+    /// YAML line folding: lines joined by a space; each blank line becomes a newline.
+    static func fold(_ lines: [String]) -> String {
+        var out = "", pending = 0, started = false
+        for l in lines {
+            if l.isEmpty { pending += 1; continue }
+            if started { out += pending > 0 ? String(repeating: "\n", count: pending) : " " }
+            out += l; started = true; pending = 0
+        }
+        return out
+    }
+
+    /// One-line scalar: empty, plain (a ` #` comment dropped), single-quoted or double-quoted (escapes decoded).
+    static func singleScalar(_ v: String) throws -> Value {
+        if v.isEmpty { return .scalar("", plain: true) }
+        if v.hasPrefix("\"") { return .scalar(try doubleQuoted(v), plain: false) }
+        if v.hasPrefix("'") { return .scalar(try singleQuoted(v), plain: false) }
+        if v.hasPrefix("[") || v.hasPrefix("{") { throw Refusal("a list or map is not allowed here") }
+        if let first = v.unicodeScalars.first, "@`%|>".unicodeScalars.contains(first) { throw Refusal("a value may not start with '\(Character(first))'") }
+        var text = v
+        if let r = text.range(of: " #") { text = String(text[..<r.lowerBound]) }
+        return .scalar(text.trimmingCharacters(in: .whitespaces), plain: true)
+    }
+
+    static func singleQuoted(_ v: String) throws -> String {
+        let chars = Array(v)
+        var out = "", i = 1
+        while i < chars.count {
+            if chars[i] == "'" {
+                if i + 1 < chars.count, chars[i + 1] == "'" { out.append("'"); i += 2; continue }
+                try requireOnlyComment(chars[(i + 1)...])
+                return out
+            }
+            out.append(chars[i]); i += 1
+        }
+        throw Refusal("a single-quoted value must close on its line")
+    }
+
+    static func doubleQuoted(_ v: String) throws -> String {
+        let chars = Array(v)
+        var out = "", i = 1
+        while i < chars.count {
+            let c = chars[i]
+            if c == "\"" { try requireOnlyComment(chars[(i + 1)...]); return out }
+            if c != "\\" { out.append(c); i += 1; continue }
+            guard i + 1 < chars.count else { break }
+            let k = chars[i + 1]
+            let simple: [Character: String] = ["\\": "\\", "\"": "\"", "/": "/", "n": "\n", "t": "\t", "r": "\r", "0": "\0", "a": "\u{07}",
+                                               "b": "\u{08}", "e": "\u{1B}", "f": "\u{0C}", "v": "\u{0B}", " ": " ", "N": "\u{85}",
+                                               "_": "\u{A0}", "L": "\u{2028}", "P": "\u{2029}"]
+            if let s = simple[k] { out += s; i += 2; continue }
+            let width: Int? = k == "x" ? 2 : k == "u" ? 4 : k == "U" ? 8 : nil
+            guard let width, i + 2 + width <= chars.count, let n = UInt32(String(chars[(i + 2)..<(i + 2 + width)]), radix: 16),
+                  let scalar = Unicode.Scalar(n) else { throw Refusal("an unsupported escape in a double-quoted value") }
+            out.unicodeScalars.append(scalar); i += 2 + width
+        }
+        throw Refusal("a double-quoted value must close on its line")
+    }
+
+    static func requireOnlyComment(_ rest: ArraySlice<Character>) throws {
+        let t = String(rest).trimmingCharacters(in: .whitespaces)
+        guard t.isEmpty || t.hasPrefix("#") else { throw Refusal("text after a quoted value") }
+    }
+
+    /// `|`, `|-`, `>`, `>-`: the indented lines, the indentation of the first one removed (no line may have less); `>` folds.
+    static func blockScalar(header: String, lines raw: [String]) throws -> String {
+        let h = header.split(separator: " ", maxSplits: 1).first.map(String.init) ?? header
+        guard ["|", "|-", ">", ">-"].contains(h) else { throw Refusal("block scalar header '\(Store.flat(h, max: 8))' is not supported (|, |-, > or >-)") }
+        if header.count > h.count, !header.dropFirst(h.count).trimmingCharacters(in: .whitespaces).hasPrefix("#") { throw Refusal("text after a block scalar header") }
+        var lines = raw
+        while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
+        guard let firstText = lines.first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return "" }
+        let indent = firstText.prefix { $0 == " " }.count
+        var content: [String] = []
+        for l in lines {
+            if l.trimmingCharacters(in: .whitespaces).isEmpty { content.append(""); continue }
+            guard l.prefix(while: { $0 == " " }).count >= indent else { throw Refusal("a block scalar line is less indented than its first line") }
+            content.append(String(l.dropFirst(indent)))
+        }
+        while content.first == "" { content.removeFirst() }
+        var text: String
+        if h.hasPrefix("|") {
+            text = content.joined(separator: "\n")
+        } else {
+            guard !content.contains(where: { $0.hasPrefix(" ") }) else { throw Refusal("a folded (>) block with more-indented lines is not supported") }
+            text = fold(content)
+        }
+        if !h.hasSuffix("-") { text += "\n" }
+        return text
+    }
+
+    /// `- item` lines, all at one indentation, each a one-line plain or quoted scalar.
+    static func blockList(_ lines: [String]) throws -> [String] {
+        guard let first = lines.first else { return [] }
+        let indent = first.prefix { $0 == " " }.count
+        var out: [String] = []
+        for l in lines {
+            guard l.prefix(while: { $0 == " " }).count == indent else { throw Refusal("list items must share one indentation") }
+            let t = String(l.dropFirst(indent))
+            guard t.hasPrefix("- ") else { throw Refusal("a list holds only `- item` lines") }
+            out.append(try listItem(String(t.dropFirst(2)).trimmingCharacters(in: .whitespaces)))
+        }
+        return out
+    }
+
+    static func listItem(_ t: String) throws -> String {
+        guard case .scalar(let s, let plain) = try singleScalar(t) else { throw Refusal("a list item must be text") }
+        if plain, s.contains(": ") || s.hasSuffix(":") { throw Refusal("a list item may not be a map") }
+        return s
+    }
+
+    /// `a, b`, `"a, b"` or a one-line `[a, "b"]`.
+    static func inlineList(_ v: String) throws -> [String] {
+        if v.hasPrefix("{") { throw Refusal("a list, not a map") }
+        guard v.hasPrefix("[") else {
+            guard case .scalar(let s, _) = try singleScalar(v) else { throw Refusal("a list") }
+            return commaList(s)
+        }
+        guard let close = v.lastIndex(of: "]") else { throw Refusal("a flow list must close on its line") }
+        try requireOnlyComment(Array(v[v.index(after: close)...])[...])
+        let inner = v[v.index(after: v.startIndex)..<close]
+        var items: [String] = [], current = "", quote: Character? = nil
+        for c in inner {
+            if let q = quote { current.append(c); if c == q { quote = nil }; continue }
+            if c == "\"" || c == "'" { quote = c; current.append(c); continue }
+            if c == "[" || c == "{" || c == "]" || c == "}" { throw Refusal("nested flow collections are not allowed") }
+            if c == "," { items.append(current); current = ""; continue }
+            current.append(c)
+        }
+        guard quote == nil else { throw Refusal("a quoted list item must close") }
+        items.append(current)
+        let trimmed = items.map { $0.trimmingCharacters(in: .whitespaces) }
+        if trimmed == [""] { return [] }
+        guard !trimmed.contains("") else { throw Refusal("an empty list item") }
+        return try trimmed.map(listItem)
+    }
+
+    /// `metadata`: indented `name: value` lines at one indentation; a value is a one-line scalar or list, or `- item` lines
+    /// indented under an empty value.
+    static func nestedMap(_ lines: [String]) throws -> [(key: String, value: Value)] {
+        guard let first = lines.first else { return [] }
+        let indent = first.prefix { $0 == " " }.count
+        var out: [(key: String, value: Value)] = []
+        var seen: Set<String> = []
+        var i = 0
+        while i < lines.count {
+            let l = lines[i]
+            if l.trimmingCharacters(in: .whitespaces).isEmpty { i += 1; continue }
+            guard l.prefix(while: { $0 == " " }).count == indent else { throw Refusal("metadata holds one level of `name: value` lines") }
+            let t = String(l.dropFirst(indent))
+            guard let colon = t.firstIndex(of: ":") else { throw Refusal("a metadata line that is not `name: value`") }
+            let k = String(t[..<colon])
+            let after = t.index(after: colon)
+            guard after == t.endIndex || t[after] == " ", keyPattern.firstMatch(in: k, range: NSRange(k.startIndex..., in: k)) != nil else {
+                throw Refusal("a metadata line that is not `name: value`")
+            }
+            guard seen.insert(k).inserted else { throw Refusal("duplicate metadata key '\(k)'") }
+            let v = String(t[after...]).trimmingCharacters(in: .whitespaces)
+            var deeper: [String] = []
+            i += 1
+            while i < lines.count, lines[i].trimmingCharacters(in: .whitespaces).isEmpty || lines[i].prefix(while: { $0 == " " }).count > indent {
+                if !lines[i].trimmingCharacters(in: .whitespaces).isEmpty { deeper.append(lines[i]) }
+                i += 1
+            }
+            if v.isEmpty, !deeper.isEmpty { out.append((k, .list(try blockList(deeper)))); continue }
+            guard deeper.isEmpty else { throw Refusal("metadata values are one line, or `- item` lines under an empty value") }
+            out.append((k, v.hasPrefix("[") ? .list(try inlineList(v)) : try singleScalar(v)))
+        }
+        return out
+    }
+
+    // MARK: Canonical serialization
+
+    /// Plain text the rewrite may leave unquoted (it reads back identically, typed as the source typed it).
+    static let safePlain = try! NSRegularExpression(pattern: "^[A-Za-z0-9][A-Za-z0-9 _./@()+,'!?&*%=;-]*$")
+
+    static func quoted(_ s: String) -> String {
+        var out = "\""
+        for u in s.unicodeScalars {
+            switch u {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\t": out += "\\t"
+            case "\r": out += "\\r"
+            default:
+                if u.value < 0x20 || u.value == 0x7F { out += String(format: "\\u%04X", u.value) } else { out.unicodeScalars.append(u) }
+            }
+        }
+        return out + "\""
+    }
+
+    static func emitScalar(_ s: String, plain: Bool) -> String {
+        if plain, s.isEmpty { return "" }
+        if plain, !s.hasSuffix(" "), safePlain.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil { return s }
+        return quoted(s)
+    }
+
+    /// The engine's serialization of one entry: a one-line scalar, a one-line flow list, or (metadata) one level of such lines.
+    static func emit(_ key: String, _ value: Value, indent: String = "") -> [String]? {
+        switch value {
+        case .raw: return nil
+        case .scalar(let s, let plain):
+            let v = emitScalar(s, plain: plain)
+            return [v.isEmpty ? "\(indent)\(key):" : "\(indent)\(key): \(v)"]
+        case .list(let items): return ["\(indent)\(key): [" + items.map(quoted).joined(separator: ", ") + "]"]
+        case .map(let entries):
+            if entries.isEmpty { return ["\(indent)\(key): {}"] }
+            var out = ["\(indent)\(key):"]
+            for e in entries { guard let lines = emit(e.key, e.value, indent: indent + "  ") else { return nil }; out += lines }
+            return out
+        }
     }
 
     /// The text without `key` (and its indented continuation lines); nil when the key is not there.
@@ -944,7 +1273,8 @@ struct Frontmatter {
     }
 
     /// The canonical form of a plugin-part file: normalized text; when it is fenced, a frontmatter holding only the `allowed`
-    /// keys in the order written (each with its continuation lines), the engine's fences, then the body with a final newline.
+    /// keys in the order written, each serialized by the engine from its parsed value (`emit`), the engine's fences, then the
+    /// body with a final newline.
     /// Nil when the fence does not parse under the strict subset.
     static func canonical(_ text: String, allowed: Set<String>) -> String? {
         let normalized = normalize(text)
@@ -955,9 +1285,10 @@ struct Frontmatter {
         case .ok(let fm):
             let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
             out = "---\n"
+            // Emitted from the parsed values only: no source line is ever copied into the frontmatter.
             for e in fm.entries where allowed.contains(e.key) {
-                out += e.value.isEmpty ? "\(e.key):\n" : "\(e.key): \(e.value)\n"
-                for c in e.continuation { out += c + "\n" }
+                guard let emitted = emit(e.key, e.parsed) else { return nil }
+                for l in emitted { out += l + "\n" }
             }
             out += "---\n"
             out += lines.dropFirst(fm.end).joined(separator: "\n")

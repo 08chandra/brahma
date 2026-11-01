@@ -772,6 +772,8 @@ enum Migrations {
                 """)
             try db.alter(table: "extensionPackage") { t in t.add(column: "sidecar", .text) }
             try db.alter(table: "turn") { t in t.add(column: "freshSessionReason", .text) }
+            // m-4: turns recorded before this migration with the old marker are counted work turns.
+            try db.execute(sql: "UPDATE turn SET freshSessionReason = sessionResetReason, sessionResetReason = NULL WHERE sessionResetReason = 'mounts changed'")
         }
         m.registerMigration("v5-timers") { db in
             try db.create(table: "timer") { t in

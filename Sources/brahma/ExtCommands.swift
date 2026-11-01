@@ -159,7 +159,7 @@ private func proposeAction(_ action: String, company: String, id: String, role: 
     guard let installed = try store.installedExtensions(companyId: c.id).first(where: { $0.id == id }) else { throw fail("no extension '\(id)' in \(c.name)") }
     guard let package = try store.extensionPackage(hash: installed.hash) else { throw fail("no package record for \(id)") }
     if let role, role.range(of: "^[a-z][a-z0-9-]{0,31}$", options: .regularExpression) == nil { throw fail("'\(role)' is not a role id") }
-    let payload = ExtensionAskPayload(action: action, extId: id, hash: installed.hash, publisher: package.publisher, roles: role.map { [$0] } ?? [],
+    let payload = ExtensionAskPayload(action: action, extId: id, hash: installed.hash, publisher: installed.publisher, roles: role.map { [$0] } ?? [],
                                       notices: [], lintSummary: [], executes: package.lintFacts?.executes ?? .init(), alwaysOnTokens: nil,
                                       stagedPath: nil, role: role)
     let encoded = try JSONEncoder().encode(payload)
@@ -228,7 +228,7 @@ struct ExtList: ParsableCommand {
             let p = try store.extensionPackage(hash: e.hash)
             let roles = bindings.filter { $0.id == e.id && $0.op == "add" && $0.scope == "role" }.map(\.target)
             let removed = bindings.filter { $0.id == e.id && $0.op == "remove" }.map { "\($0.scope) \($0.target)" }
-            print(safe("\(e.id)  \(p?.version ?? "?")  \(p?.publisher ?? "?")  \(e.hash.prefix(12))  \(e.enabled ? "enabled" : "disabled")  "
+            print(safe("\(e.id)  \(p?.version ?? "?")  \(e.publisher.isEmpty ? "?" : e.publisher)  \(e.hash.prefix(12))  \(e.enabled ? "enabled" : "disabled")  "
                        + "roles: \(roles.isEmpty ? "(none)" : roles.joined(separator: ", "))" + (removed.isEmpty ? "" : "  removed for: \(removed.joined(separator: ", "))")))
         }
         let pending = try store.asks(companyId: c.id, statuses: [.pendingInternal, .pendingOwner]).filter { $0.kind == .extension }
@@ -251,7 +251,8 @@ struct ExtShow: ParsableCommand {
         guard let e = try store.installedExtensions(companyId: c.id).first(where: { $0.id == id }) else { throw fail("no extension '\(id)' in \(c.name)") }
         let p = try store.extensionPackage(hash: e.hash)
         print(safe("\(e.id) \(p?.version ?? "?")"))
-        print(safe("  publisher: \(p?.publisher ?? "?")  source: \(p?.sourceType ?? "?") \(p?.sourceUrl ?? "")"))
+        // m-1: this company's own publisher and source (set at approve), never the shared package row's.
+        print(safe("  publisher: \(e.publisher.isEmpty ? "?" : e.publisher)  source: \(e.sourceType.isEmpty ? "?" : e.sourceType) \(e.sourceUrl ?? "")"))
         print(safe("  tree: \(e.hash)"))
         if let f = p?.lintFacts {
             print(safe("  parts: \(f.parts.joined(separator: ", "))  skills: \(f.skills.joined(separator: ", "))  commands: \(f.commands.joined(separator: ", "))  agents: \(f.agents.joined(separator: ", "))"))

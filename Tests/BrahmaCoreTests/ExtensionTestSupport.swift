@@ -168,6 +168,10 @@ final class RecordingRunner: SandboxedRunner, @unchecked Sendable {
 struct ZipBuilder {
     struct Entry { var name: String; var data: Data; var symlink = false; var declaredSize: Int? = nil }
     var entries: [Entry] = []
+    /// What the end record claims the entry count is (a lie, when set).
+    var countOverride: Int? = nil
+    /// Names of a benign central directory written before the real one, which the end record points at (a lie, when set).
+    var fakeCentral: [String]? = nil
 
     /// `declaredSize` is what the central directory claims the entry inflates to (a lie, when set).
     mutating func add(_ name: String, _ text: String, symlink: Bool = false, declaredSize: Int? = nil) {
@@ -178,28 +182,40 @@ struct ZipBuilder {
         var out = Data(), central = Data()
         func le16(_ v: Int) -> [UInt8] { [UInt8(v & 0xff), UInt8((v >> 8) & 0xff)] }
         func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xff), UInt8((v >> 8) & 0xff), UInt8((v >> 16) & 0xff), UInt8((v >> 24) & 0xff)] }
+        var headers: [String: Data] = [:]
         for e in entries {
             let name = Array(e.name.utf8), crc = ZipBuilder.crc32(e.data), size = UInt32(e.data.count), offset = UInt32(out.count)
-            let fixed: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(size) + le16(name.count) + le16(0)
+            // The declared size is the same lie in the local header and the central entry (a self-consistent archive).
+            let fixed: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
+                + le16(name.count) + le16(0)
             out += Data([0x50, 0x4b, 0x03, 0x04] + fixed + name) + e.data
             let mode: UInt32 = e.symlink ? 0o120777 : 0o100644
             let declared: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
                 + le16(name.count) + le16(0)
-            central += Data([0x50, 0x4b, 0x01, 0x02] + le16(0x031e) + declared + le16(0) + le16(0) + le16(0) + le32(mode << 16) + le32(offset) + name)
+            let header = Data([0x50, 0x4b, 0x01, 0x02] + le16(0x031e) + declared + le16(0) + le16(0) + le16(0) + le32(mode << 16) + le32(offset) + name)
+            headers[e.name] = header
+            central += header
         }
-        let cdOffset = UInt32(out.count)
+        var cdOffset = UInt32(out.count), cdSize = UInt32(central.count)
+        if let fake = fakeCentral {
+            let fakeData = fake.compactMap { headers[$0] }.reduce(Data(), +)
+            out += fakeData
+            cdOffset = UInt32(out.count - fakeData.count); cdSize = UInt32(fakeData.count)
+        }
         out += central
-        out += Data([0x50, 0x4b, 0x05, 0x06] + le16(0) + le16(0) + le16(entries.count) + le16(entries.count) + le32(UInt32(central.count)) + le32(cdOffset) + le16(0))
+        let count = countOverride ?? (fakeCentral?.count ?? entries.count)
+        out += Data([0x50, 0x4b, 0x05, 0x06] + le16(0) + le16(0) + le16(count) + le16(count) + le32(cdSize) + le32(cdOffset) + le16(0))
         try out.write(to: url)
     }
 
+    static let crcTable: [UInt32] = (0..<256).map { i in
+        var c = UInt32(i)
+        for _ in 0..<8 { c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1 }
+        return c
+    }
+
     static func crc32(_ data: Data) -> UInt32 {
-        var table = [UInt32](repeating: 0, count: 256)
-        for i in 0..<256 {
-            var c = UInt32(i)
-            for _ in 0..<8 { c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1 }
-            table[i] = c
-        }
+        let table = crcTable
         var crc: UInt32 = 0xFFFFFFFF
         for b in data { crc = table[Int((crc ^ UInt32(b)) & 0xff)] ^ (crc >> 8) }
         return crc ^ 0xFFFFFFFF

@@ -330,12 +330,32 @@ import GRDB
                 """)
             try db.execute(sql: "INSERT INTO companyExtension (companyId, id, hash, enabled, installedAt) VALUES ('c1', 'demo', 'h1', 1, '2026-01-01 00:00:00.000')")
             try db.execute(sql: "INSERT INTO companyExtension (companyId, id, hash, enabled, installedAt) VALUES ('c1', 'gone', 'h2', 1, '2026-01-01 00:00:00.000')")
+            // m-4: a turn the old code marked "mounts changed" (uncounted) becomes a counted fresh-session turn.
+            try db.execute(sql: "INSERT INTO turn (id, agentId, companyId, startedAt, outcome, sessionResetReason) VALUES ('t1', 'a1', 'c1', '2026-01-01 00:00:00.000', 'completed', 'mounts changed')")
+            try db.execute(sql: "INSERT INTO turn (id, agentId, companyId, startedAt, outcome, sessionResetReason) VALUES ('t2', 'a1', 'c1', '2026-01-01 00:00:00.000', 'failed', 'session not found')")
         }
         try Migrations.migrator().migrate(pool)
         let rows = try pool.read { db in try Row.fetchAll(db, sql: "SELECT id, publisher, sourceType, sourceUrl FROM companyExtension ORDER BY id") }
         #expect(rows.map { $0["publisher"] as String } == ["local", ""])
         #expect(rows.first?["sourceType"] as String? == "folder"); #expect(rows.first?["sourceUrl"] as String? == "/src/demo")
+        let turns = try pool.read { db in try Row.fetchAll(db, sql: "SELECT id, sessionResetReason, freshSessionReason FROM turn ORDER BY id") }
+        #expect(turns.map { $0["freshSessionReason"] as String? } == ["mounts changed", nil])
+        #expect(turns.map { $0["sessionResetReason"] as String? } == [nil, "session not found"])
         try pool.close()
+    }
+
+    /// m-3: a rollback re-validates the store copy; one that is no longer canonical (an older engine's copy) is refused.
+    @Test func rollbackRevalidatesTheStoreCopy() async throws {
+        let w = try ExtWorld()
+        let v1 = try await w.install(try PluginFixture())
+        let ask = try await w.propose(try PluginFixture(manifest: #"{"name": "demo", "version": "1.1.0", "description": "v2.", "author": {"name": "T"}}"#))
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
+        let old = w.paths.extensionsDir.store.appending(path: "demo/\(v1.hash.prefix(12))/skills/demo/SKILL.md")
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: old.path)
+        let text = try String(contentsOf: old, encoding: .utf8)
+        try Data(text.replacingOccurrences(of: "\n", with: "\r\n").utf8).write(to: old)
+        #expect(throws: WorkError.self) { try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now) }
+        #expect(try w.installed("demo")?.hash != v1.hash)
     }
 
     /// M3: the sidecar used at mount time is the one recorded at propose, not whatever the store copy says now.

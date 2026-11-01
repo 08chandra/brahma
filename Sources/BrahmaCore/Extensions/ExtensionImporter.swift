@@ -54,6 +54,8 @@ public enum ZipLimits {
 public enum ExtensionImporter {
     /// What the extraction script prints when the archive's real bytes pass the quota.
     static let quotaMarker = "brahma-zip-quota-exceeded"
+    /// What it prints when `zipinfo -1` disagrees with the inventory.
+    static let listingMarker = "brahma-zip-listing-differs"
 
     static func mcpNotice(_ name: String) -> String { "This plugin's MCP server \(name) was not imported; connectors arrive in a later Brahma release." }
     static func hookNotice(_ event: String) -> String { "This plugin's \(event) hook will not run in Brahma." }
@@ -227,7 +229,8 @@ public enum ExtensionImporter {
             if e.name.hasPrefix("/") || e.name.hasPrefix("\\") || e.name.range(of: "^[A-Za-z]:", options: .regularExpression) != nil {
                 throw ExtensionError.message("the zip holds an absolute entry name (\(Store.flat(e.name, max: 80)))")
             }
-            let parts = e.name.split(separator: "/").map(String.init)
+            // m-5: Info-ZIP turns `\` into `/` for entries made on FAT, so both separate components.
+            let parts = e.name.split(whereSeparator: { $0 == "/" || $0 == "\\" }).map(String.init)
             if parts.contains("..") { throw ExtensionError.message("the zip holds a '..' component (\(Store.flat(e.name, max: 80)))") }
             for part in parts where !ExtensionLimits.isSafeName(part) {
                 throw ExtensionError.message("'\(Store.flat(e.name, max: 80))' holds a control, hidden or bidi character")
@@ -259,7 +262,14 @@ public enum ExtensionImporter {
         let q = ExtensionValidator.shellQuote
         let limit = ExtensionLimits.maxBytes
         let blocks = (limit + 511) / 512   // `ulimit -f` counts 512-byte blocks
-        let command = "total=$(\(q("/usr/bin/unzip")) -p \(q(archive.path)) 2>/dev/null | /usr/bin/head -c \(limit + 1) | /usr/bin/wc -c | /usr/bin/tr -d ' '); "
+        // I-2 (b): the extractor's own listing (`zipinfo -1`, Info-ZIP's reader) must equal the inventory exactly, names and
+        // order, before anything is extracted.
+        let expected = held.appending(path: "expected.txt")
+        guard FileManager.default.createFile(atPath: expected.path, contents: Data(entries.map { $0.name + "\n" }.joined().utf8),
+                                             attributes: [.posixPermissions: 0o600]) else { throw ExtensionError.message("cannot write the zip listing") }
+        let command = "\(q("/usr/bin/zipinfo")) -1 \(q(archive.path)) 2>/dev/null | /usr/bin/cmp -s - \(q(expected.path)) "
+            + "|| { echo \"\(listingMarker)\"; exit 4; }; "
+            + "total=$(\(q("/usr/bin/unzip")) -p \(q(archive.path)) 2>/dev/null | /usr/bin/head -c \(limit + 1) | /usr/bin/wc -c | /usr/bin/tr -d ' '); "
             + "if [ \"$total\" -gt \(limit) ]; then echo \"\(quotaMarker)\"; exit 3; fi; "
             + "ulimit -f \(blocks) && " + [q("/usr/bin/unzip"), "-q", "-n", q(archive.path), "-d", q(unzipped.path)].joined(separator: " ")
         let env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
@@ -269,6 +279,9 @@ public enum ExtensionImporter {
         try? FileManager.default.removeItem(at: dir.appending(path: ".unzip.log"))
         guard out.exitCode == 0 else {
             try? FileManager.default.removeItem(at: unzipped)
+            if out.tail.contains(listingMarker) {
+                throw ExtensionError.message("the zip's entries as unzip lists them differ from its directory; refused")
+            }
             if out.tail.contains(quotaMarker) {
                 throw ExtensionError.message("the zip inflates to more than \(limit) bytes (its central directory under-declares the sizes); refused")
             }
@@ -506,30 +519,68 @@ enum ZipInventory {
         if eocd >= 20, bytes[eocd - 20] == 0x50, bytes[eocd - 19] == 0x4b, bytes[eocd - 18] == 0x06, bytes[eocd - 17] == 0x07 {
             throw ExtensionError.message("zip64 archives are refused")
         }
-        let count = u16(eocd + 10), cdSize = u32(eocd + 12), cdOffset = u32(eocd + 16)
+        // I-2: the inventory must be self-consistent, exactly as a standard archive is laid out, so no reader can see an entry
+        // it does not: one disk; entries on this disk == total; no data after the EOCD but its comment; the central directory
+        // ends exactly at the EOCD; the walk of exactly `count` headers consumes exactly `cdSize` bytes; every local header
+        // matches its central entry; the local entries tile the archive from byte 0 up to the central directory.
+        func refuse(_ why: String) -> ExtensionError { ExtensionError.message("the zip's directory is not self-consistent (\(why)); refused") }
+        let disk = u16(eocd + 4), cdDisk = u16(eocd + 6), onDisk = u16(eocd + 8)
+        let count = u16(eocd + 10), cdSize = u32(eocd + 12), cdOffset = u32(eocd + 16), commentLength = u16(eocd + 20)
         guard count != 0xFFFF, cdSize != 0xFFFFFFFF, cdOffset != 0xFFFFFFFF else { throw ExtensionError.message("zip64 archives are refused") }
-        guard cdOffset + cdSize <= eocd, cdSize >= 0 else { throw ExtensionError.message("the zip's central directory is out of bounds") }
+        guard disk == 0, cdDisk == 0, onDisk == count else { throw refuse("multi-disk fields") }
+        guard eocd + 22 + commentLength == bytes.count else { throw refuse("data after the end record") }
+        guard cdOffset + cdSize == eocd else { throw refuse("the central directory does not end at the end record") }
+        struct Local { var offset: Int; var end: Int }
+        var locals: [Local] = []
         var out: [Entry] = []
         var p = cdOffset
         for _ in 0..<count {
-            guard p + 46 <= bytes.count, bytes[p] == 0x50, bytes[p + 1] == 0x4b, bytes[p + 2] == 0x01, bytes[p + 3] == 0x02 else {
-                throw ExtensionError.message("the zip's central directory is malformed")
+            guard p + 46 <= eocd, bytes[p] == 0x50, bytes[p + 1] == 0x4b, bytes[p + 2] == 0x01, bytes[p + 3] == 0x02 else {
+                throw refuse("a central header is missing")
             }
             let madeBy = u16(p + 4) >> 8
+            let flags = u16(p + 8), method = u16(p + 10), crc = u32(p + 16)
             let compressed = u32(p + 20), uncompressed = u32(p + 24)
-            let nameLength = u16(p + 28), extraLength = u16(p + 30), commentLength = u16(p + 32)
-            let external = u32(p + 38)
-            guard compressed != 0xFFFFFFFF, uncompressed != 0xFFFFFFFF else { throw ExtensionError.message("zip64 archives are refused") }
+            let nameLength = u16(p + 28), extraLength = u16(p + 30), entryComment = u16(p + 32)
+            let entryDisk = u16(p + 34), external = u32(p + 38), localOffset = u32(p + 42)
+            guard compressed != 0xFFFFFFFF, uncompressed != 0xFFFFFFFF, localOffset != 0xFFFFFFFF else { throw ExtensionError.message("zip64 archives are refused") }
+            guard entryDisk == 0 else { throw refuse("an entry on another disk") }
             let nameStart = p + 46
-            guard nameStart + nameLength <= bytes.count else { throw ExtensionError.message("the zip's central directory is malformed") }
-            let name = String(decoding: bytes[nameStart..<nameStart + nameLength], as: UTF8.self)
+            guard nameStart + nameLength + extraLength + entryComment <= eocd else { throw refuse("a central header runs past the directory") }
+            let nameBytes = Array(bytes[nameStart..<nameStart + nameLength])
+            // The local header: same name, method, sizes and CRC (sizes and CRC may be deferred to a data descriptor, bit 3).
+            let l = localOffset
+            guard l + 30 <= cdOffset, bytes[l] == 0x50, bytes[l + 1] == 0x4b, bytes[l + 2] == 0x03, bytes[l + 3] == 0x04 else {
+                throw refuse("an entry's local header is missing")
+            }
+            let localFlags = u16(l + 6), localNameLength = u16(l + 26), localExtra = u16(l + 28)
+            guard l + 30 + localNameLength + localExtra <= cdOffset, Array(bytes[(l + 30)..<(l + 30 + localNameLength)]) == nameBytes,
+                  u16(l + 8) == method, (localFlags & 0x08) == (flags & 0x08) else { throw refuse("a local header differs from its central entry") }
+            if flags & 0x08 == 0 {
+                guard u32(l + 14) == crc, u32(l + 18) == compressed, u32(l + 22) == uncompressed else { throw refuse("a local header's sizes differ") }
+            }
+            var dataEnd = l + 30 + localNameLength + localExtra + compressed
+            if flags & 0x08 != 0 {
+                let signed = dataEnd + 4 <= cdOffset && bytes[dataEnd] == 0x50 && bytes[dataEnd + 1] == 0x4b && bytes[dataEnd + 2] == 0x07 && bytes[dataEnd + 3] == 0x08
+                dataEnd += signed ? 16 : 12
+            }
+            guard dataEnd <= cdOffset else { throw refuse("an entry's data runs into the central directory") }
+            locals.append(Local(offset: l, end: dataEnd))
+            let name = String(decoding: nameBytes, as: UTF8.self)
             // Unix attributes live in the high 16 bits when the entry was made on Unix (3) or macOS (19).
             let unixMode = (madeBy == 3 || madeBy == 19) ? (external >> 16) & 0xFFFF : 0
             let isSymlink = (unixMode & 0o170000) == 0o120000
             let isDirectory = name.hasSuffix("/") || (unixMode & 0o170000) == 0o040000 || (external & 0x10) != 0
             out.append(Entry(name: name, compressedSize: compressed, uncompressedSize: uncompressed, isSymlink: isSymlink, isDirectory: isDirectory))
-            p = nameStart + nameLength + extraLength + commentLength
+            p = nameStart + nameLength + extraLength + entryComment
         }
+        guard p == cdOffset + cdSize else { throw refuse("the central directory holds more or fewer headers than the end record counts") }
+        var at = 0
+        for local in locals.sorted(by: { $0.offset < $1.offset }) {
+            guard local.offset == at else { throw refuse(local.offset < at ? "entries overlap" : "bytes between entries") }
+            at = local.end
+        }
+        guard at == cdOffset else { throw refuse("bytes between the last entry and the central directory") }
         return out
     }
 }
