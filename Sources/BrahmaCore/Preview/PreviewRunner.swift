@@ -86,6 +86,8 @@ public actor PreviewRunner {
 
     /// Non-turn child work previews hold for the safety cap: every running server plus every start not yet spawned.
     public nonisolated var activeChildren: Int { deps.processes.count + pending.count }
+    /// Starts in flight that have not spawned their server yet (exports, builds): what keeps the Mac awake for previews.
+    public nonisolated var startsInFlight: Int { pending.count }
 
     // MARK: The pass
 
