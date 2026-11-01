@@ -91,10 +91,10 @@ public enum PortAllocator {
 
     /// The port a surface starts on.
     /// - A `{port}` surface keeps the port its state records while no other surface records it and it is free or held by
-    ///   the surface itself (its state is not `stopped`); otherwise one is allocated, excluding every company's recorded
+    ///   the surface itself (building, starting or running); otherwise one is allocated, excluding every company's recorded
     ///   `previewState.port`.
-    /// - A literal port (in `url`) is returned as it is, unless another surface, of any company, holds it in a non-stopped
-    ///   state: `"port <p> is used by preview <company>/<name>; use {port} in run and url"`.
+    /// - A literal port (in `url`) is returned as it is, unless another surface, of any company, holds it (building,
+    ///   starting or running): `"port <p> is used by preview <company>/<name>; use {port} in run and url"`.
     public static func port(for surface: PreviewSurface, store: Store) throws -> Int {
         guard let url = surface.url else { throw WorkError.invalid("a web preview needs run and url") }
         let holders = try store.previewPortHolders()
@@ -114,14 +114,23 @@ public enum PortAllocator {
         return literal
     }
 
-    /// Whether a TCP socket can bind `127.0.0.1:<port>` (closed again at once).
+    /// Whether a TCP socket can bind `127.0.0.1:<port>` and, where the machine has IPv6, `[::1]:<port>` (each closed again
+    /// at once), so a listener on `::1` or a dual-stack `[::]` is seen too (deferred minor 2).
     static func isFree(_ port: Int) -> Bool {
         guard let p = UInt16(exactly: port) else { return false }
+        return bindsIPv4(p) && bindsIPv6(p) != false
+    }
+
+    private static func tcpSocket(_ family: Int32) -> Int32 {
         #if canImport(Darwin)
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        socket(family, SOCK_STREAM, 0)
         #else
-        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        socket(family, Int32(SOCK_STREAM.rawValue), 0)
         #endif
+    }
+
+    private static func bindsIPv4(_ p: UInt16) -> Bool {
+        let fd = tcpSocket(AF_INET)
         guard fd >= 0 else { return false }
         defer { close(fd) }
         var addr = sockaddr_in()
@@ -132,6 +141,24 @@ public enum PortAllocator {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
         return bound == 0
+    }
+
+    /// Nil when this machine has no IPv6 loopback (nothing can listen there either).
+    private static func bindsIPv6(_ p: UInt16) -> Bool? {
+        let fd = tcpSocket(AF_INET6)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var one: Int32 = 1
+        _ = setsockopt(fd, Int32(IPPROTO_IPV6), IPV6_V6ONLY, &one, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = in_port_t(p.bigEndian)
+        addr.sin6_addr = in6addr_loopback
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
+        }
+        if bound == 0 { return true }
+        return errno == EADDRNOTAVAIL ? nil : false
     }
 }
 
