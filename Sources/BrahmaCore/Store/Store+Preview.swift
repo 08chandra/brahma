@@ -145,6 +145,32 @@ extension Store {
         try writer.write { db in try state.save(db) }
     }
 
+    /// The engine's read-modify-write of one surface's state, in one transaction, so a flag the owner or an agent set meanwhile
+    /// (`restartRequestedAt`) is never lost and a recorded port is reserved in the same write that records the start. A
+    /// missing state row is created (idle); nil when the surface itself is gone (nothing written).
+    @discardableResult
+    func updatePreviewState(surfaceId: String, now: Date, _ body: @escaping (inout PreviewState) -> Void) throws -> PreviewState? {
+        try writer.write { db in
+            guard let surface = try PreviewSurface.fetchOne(db, key: surfaceId) else { return nil }
+            var state = try PreviewState.fetchOne(db, key: surfaceId)
+                ?? PreviewState(surfaceId: surfaceId, companyId: surface.companyId, status: .idle, updatedAt: now)
+            body(&state)
+            state.updatedAt = now
+            try state.save(db)
+            return state
+        }
+    }
+
+    /// Records a building, starting or running surface as `stopped` with `message` (no pid, no URL); any other state is left.
+    func markPreviewStopped(surfaceId: String, message: String, now: Date) throws {
+        try writer.write { db in
+            guard var state = try PreviewState.fetchOne(db, key: surfaceId),
+                  [.building, .starting, .running].contains(state.status) else { return }
+            state.status = .stopped; state.message = message; state.pid = nil; state.resolvedURL = nil; state.updatedAt = now
+            try state.update(db)
+        }
+    }
+
     /// Asks the engine to restart a surface: the owner, or the agent who set it (`"only the owner or the agent who set a
     /// preview may restart it"`); an agent of another company sees `"not in your company"`; an unknown id `"no such preview"`.
     public func requestPreviewRestart(surfaceId: String, by: Sender, now: Date = Store.now()) throws {
@@ -168,7 +194,8 @@ extension Store {
     }
 }
 
-/// A recorded preview port: whose it is, and whether that surface still holds it (any status but `stopped`).
+/// A recorded preview port: whose it is, and whether that surface still holds it: only while it is building, starting or
+/// running (deferred minor 4: a failed, idle, stopped or unavailable surface's port is only skipped by `allocate`).
 struct PreviewPortHolder: Equatable, Sendable {
     var surfaceId: String
     var companyId: String
@@ -177,5 +204,5 @@ struct PreviewPortHolder: Equatable, Sendable {
     var port: Int
     var status: PreviewStatus
 
-    var holds: Bool { status != .stopped }
+    var holds: Bool { [.building, .starting, .running].contains(status) }
 }
