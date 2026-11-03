@@ -364,7 +364,7 @@ public enum EngineFiles {
         let dfd: Int32
         switch try openWay(root: root, parts.dropLast(), shown: root.appending(path: relative).path) {
         case .missing: return nil
-        case .blocked(let problem): throw problem
+        case .blocked(let problem, _): throw problem
         case .open(let fd): dfd = fd
         }
         defer { close(dfd) }
