@@ -21,6 +21,8 @@ extension Orchestrator {
             attempt {
                 switch timer.action {
                 case .job(let name): try fireJob(timer, name: name, next: next, now: now)
+                // While the owner's stop holds a `.turn` timer stays due and fires after the resume (Task 7c).
+                case .turn where engineStoppedNow: break
                 case .turn(let agentId, let prompt): try fireTurn(timer, agentId: agentId, prompt: prompt, next: next, now: now)
                 }
             }
@@ -68,8 +70,8 @@ extension Orchestrator {
 }
 
 extension Orchestrator {
-    /// Whether only the stop notice may be pushed. Task 7c: true while `engineStopped` holds. Until it exists nothing is held.
-    var pushOnlyStopNotice: Bool { false }
+    /// Whether only the stop notice may be pushed: true while the owner's stop holds (Task 7c; set by the tick's first step).
+    var pushOnlyStopNotice: Bool { engineStoppedNow }
 
     func pushTaskDone() { pushTask = nil }
 

@@ -61,7 +61,7 @@ public actor Orchestrator {
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     private var runningByCompany: [String: Int] = [:]
     /// Agent id → its turn task.
-    private var tasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
+    var tasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Health work that must never block a tick (doctor re-probe, `claude --version`, HTTPS probe, disk checks).
     var healthTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     var health = HealthState()
@@ -108,6 +108,14 @@ public actor Orchestrator {
     /// Phone alerts (Task 7b): one dispatcher for the engine's life, and its pass in flight (a pass never overlaps itself).
     nonisolated let pushDispatcher: PushDispatcher
     var pushTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
+    /// The owner's emergency stop (Task 7c): what else a stop reaches (previews, deploys, merge queues, browsers, connectors).
+    nonisolated let stopObservers: [any EmergencyStopObserver]
+    /// How a running turn's supervision waits between its reads of the stop (awake time; tests inject their own).
+    nonisolated let stopPollSleep: @Sendable (Duration) async throws -> Void
+    /// Whether the last tick saw the stop, and the stop (its `since`) whose observers already ran: once per stop.
+    var engineStoppedNow = false
+    var stopObserved: Date?
+    var stopObserverTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -130,7 +138,10 @@ public actor Orchestrator {
                 backupTools: BackupTools = .system,
                 walSleeper: @escaping WALShipper.Sleeper = { try await AwakeTime.sleep(for: $0) },
                 sleepGuard: SleepGuard = .disabled,
-                sandboxCanary: SandboxCanaryGate? = nil) {
+                sandboxCanary: SandboxCanaryGate? = nil,
+                stopObservers: [any EmergencyStopObserver] = [],
+                stopPollSleep: @escaping @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) }) {
+        self.stopObservers = stopObservers; self.stopPollSleep = stopPollSleep
         self.backupTools = backupTools; self.walSleeper = walSleeper; self.sleepGuard = sleepGuard
         // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
         let vault = vault.nonInteractive()
@@ -284,7 +295,7 @@ public actor Orchestrator {
     /// next is started synchronously inside that tick, so nothing is "queued" outside these sets.)
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
-            && secretsTask == nil && pushTask == nil
+            && secretsTask == nil && pushTask == nil && stopObserverTask == nil
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -344,7 +355,7 @@ public actor Orchestrator {
         stopWALShipping()
         await stopSleepPrevention()
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
-            + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? [])
+            + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? []) + (stopObserverTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
         await runner.waitForChildren()
@@ -362,6 +373,9 @@ public actor Orchestrator {
     }
 
     private func schedule(now: Date) throws {
+        // The owner's emergency stop, first: running turns and checks are cancelled and nothing below admits anything.
+        let stopped = try store.engineStopped()
+        enforceStop(stopped, now: now)
         // Secrets another process added or removed: reloaded in the background (a Blocking body, non-interactive reads, with
         // backoff after failures); until then admission is held.
         let secretsPending = reloadSecretsIfDue()
@@ -370,7 +384,7 @@ public actor Orchestrator {
         try healthTick(now: now)
         // Fail closed on secrets: until every secret's value is loaded into the redactor (`Store.secretsHeld`), nothing that
         // would let an agent write text starts: no turn, check, merge or dispatch. The reload logged which secret failed.
-        let held = try store.engineHold() != nil || store.secretsHeld || secretsPending
+        let held = try stopped != nil || store.engineHold() != nil || store.secretsHeld || secretsPending
         let pressure = memory.current
         logPressure(pressure, now: now)
         // The owner's plan tier and weekly share apply from the next tick after they are changed.
@@ -589,7 +603,14 @@ public actor Orchestrator {
         runningByCompany[running.companyId, default: 0] += 1
         // The task inherits actor isolation, so it cannot run (or end) before this method returns.
         tasks[running.id] = Task {
-            await self.performTurn(agent: running, turn: turn)
+            // The turn's supervision re-reads the owner's stop every second (`EmergencyStop.pollInterval`): a stop cancels the
+            // turn even before the next tick sees it. Whichever ends first ends the other; the turn always runs to its record.
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await self.performTurn(agent: running, turn: turn) }
+                group.addTask { await self.waitForStop() }
+                await group.next()
+                group.cancelAll()
+            }
             self.turnEnded(agentId: running.id, companyId: running.companyId)
         }
     }

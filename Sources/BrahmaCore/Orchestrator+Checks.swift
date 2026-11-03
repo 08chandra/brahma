@@ -161,7 +161,7 @@ extension Orchestrator {
             catch { self.log("could not scrub the check log of run \(run.id): \(error)"); return false }
         }
         if !scrubbed { outcome = CheckOutcome(exitCode: outcome.exitCode, timedOut: outcome.timedOut, tail: Self.withheldCheckTail) }
-        if Task.isCancelled { return }
+        if Task.isCancelled { checkCancelled(run: run); return }
         // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
         let passed = outcome.exitCode == 0 && !outcome.timedOut
         let assessing = self.store

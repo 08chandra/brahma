@@ -70,4 +70,26 @@ import BrahmaCore
         #expect(rows.first { $0.id == acme.id }?.toggleTitle == "Pause Acme")
         #expect(rows.first { $0.id == globex.id }?.toggleTitle == "Resume Globex")
     }
+
+    /// Task 7c: the menu offers STOP EVERYTHING; while stopped it shows the stop line and Resume, and the app shows the banner.
+    @Test func emergencyStopAndResume() async throws {
+        let (store, paths) = try makeHome()
+        _ = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+        let model = AppModel(store: store, paths: paths)
+        await model.load()
+        #expect(!model.menuBar.stopped && model.menuBar.stopLine == nil && model.stopBanner == nil)
+        await model.stopEverything()
+        #expect(try store.engineStopped()?.by == "app")
+        #expect(model.isStopped)
+        #expect(model.menuBar.stopped)
+        #expect(model.menuBar.stopLine?.hasPrefix("STOPPED by the owner since ") == true)
+        #expect(model.stopBanner == "Everything is stopped. Resume when you're ready.")
+        await model.resumeAfterStop()
+        #expect(try store.engineStopped() == nil)
+        #expect(!model.isStopped && model.stopBanner == nil && !model.menuBar.stopped)
+
+        let row = EngineStopRow(since: Date(timeIntervalSince1970: 0), by: "cli", note: nil)
+        let utc = try #require(TimeZone(identifier: "UTC"))
+        #expect(MenuBarSummary.make(companies: [], engine: nil, stop: row, timeZone: utc).stopLine == "STOPPED by the owner since 00:00")
+    }
 }

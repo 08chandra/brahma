@@ -9,6 +9,7 @@ struct TopBar: View {
     @State private var confirmAuto = false
     @State private var showWhy = false
     @State private var showSettings = false
+    @State private var confirmStop = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,11 +25,27 @@ struct TopBar: View {
             guard !Task.isCancelled else { return }
             await model.runSearch()
         }
+        .alert("Stop everything?", isPresented: $confirmStop) {
+            Button("Stop everything", role: .destructive) { Task { await model.stopEverything() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(verbatim: EmergencyStop.confirmText)
+        }
         .alert("Switch to Auto?", isPresented: $confirmAuto) {
             Button("Switch") { Task { await model.setAutonomy(.auto) } }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(verbatim: "PRD, architecture, sprint plan and release asks will no longer wait for you once the C-suite approves; you get an FYI instead. Reserved matters (money, contracts, pricing, legal, staffing, stage changes and similar) and questions always need you. Asks already waiting still need you.")
+        }
+    }
+
+    /// STOP EVERYTHING (Task 7c), confirmed first; hidden while the stop holds (the banner offers Resume).
+    @ViewBuilder private var stopButton: some View {
+        if !model.isStopped {
+            Button { confirmStop = true } label: { Label(EmergencyStop.buttonTitle, systemImage: "stop.fill") }
+                .buttonStyle(.brahmaDanger)
+                .fixedSize()
+                .help(EmergencyStop.confirmText)
         }
     }
 
@@ -69,8 +86,10 @@ struct TopBar: View {
                 }
                 .buttonStyle(BrahmaButtonStyle(primary: !running))
                 .fixedSize()
+                stopButton
             } else {
                 Spacer()
+                stopButton
             }
         }
         .padding(.leading, BrahmaTheme.trafficLightInset)

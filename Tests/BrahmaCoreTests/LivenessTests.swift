@@ -44,7 +44,7 @@ import GRDB
     @Test func explainerOrderAndCopy() {
         var input = StallInput()
         input.running = 0
-        input.stopped = true
+        input.stoppedSince = Self.now
         input.hold = StallHold(reason: "network", detail: "3 failures in 5 min", since: Self.now)
         input.companyPaused = true
         input.doctorOk = false; input.doctorDetail = "flags: --fallback-model missing"
@@ -61,7 +61,7 @@ import GRDB
         let report = StallExplainer.explain(input, timeZone: Self.utc, now: Self.now)
         #expect(report.running == 0)
         #expect(report.reasons == [
-            "stopped by the owner",
+            "stopped by the owner since 08:00",
             "engine paused: network (3 failures in 5 min) since 08:00",
             "company is paused",
             "Claude Code check failing: flags: --fallback-model missing",
@@ -110,9 +110,9 @@ import GRDB
         input.companyPaused = true; input.readyItems = 1
         #expect(StallExplainer.explain(input, timeZone: Self.utc, now: Self.now).reasons.first
                 == "engine paused: account (not logged in) since 08:00")
-        input.stopped = true
+        input.stoppedSince = Self.now
         #expect(StallExplainer.explain(input, timeZone: Self.utc, now: Self.now).reasons.prefix(2)
-                == ["stopped by the owner", "engine paused: account (not logged in) since 08:00"])
+                == ["stopped by the owner since 08:00", "engine paused: account (not logged in) since 08:00"])
     }
 
     @Test func storeStallReportReadsTheCompany() throws {

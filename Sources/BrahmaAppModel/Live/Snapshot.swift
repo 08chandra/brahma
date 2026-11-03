@@ -32,6 +32,8 @@ public struct Snapshot: Equatable, Sendable {
     public var work = WorkSnapshot.empty
     /// The Claude Code version the last doctor run saw (the sandbox banner names it).
     public var claudeVersion: String?
+    /// The owner's emergency stop (Task 7c), across every company; nil while not stopped.
+    public var stop: EngineStopRow?
 
     public static let empty = Snapshot(companies: [], agents: [], channels: [], unreadByChannel: [:], lastTurns: [:], usage: nil)
 
@@ -56,6 +58,7 @@ public struct Snapshot: Equatable, Sendable {
         snap.companies = summaries
         snap.usage = try store.latestRateLimit()
         snap.claudeVersion = try store.latestProbe()?.cliVersion
+        snap.stop = try store.engineStopped()
         if let id = selectedCompanyId {
             snap.agents = try store.agents(companyId: id)
             snap.channels = try store.channels(companyId: id)

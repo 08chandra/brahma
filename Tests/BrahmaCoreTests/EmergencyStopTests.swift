@@ -1,0 +1,249 @@
+import Testing
+import Foundation
+import GRDB
+@testable import BrahmaCore
+
+/// Counts its `stopAll` calls (Task 7c observers).
+private actor CountingObserver: EmergencyStopObserver {
+    private(set) var reasons: [String] = []
+    func stopAll(reason: String) async { reasons.append(reason) }
+}
+
+@Suite(.scratch, .serialized) struct EmergencyStopTests {
+    // MARK: Engine
+
+    @Test func stopCancelsRunningTurnsAsInterrupted() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let hold = Gate(), started = Gate()
+        w.fake.onRun = { _ in started.open() }
+        w.fake.script("ceo", .init(gate: hold))
+        try w.dm(c, ceo)
+        await w.orchestrator.tick()
+        await started.wait()
+        #expect(await w.orchestrator.runningCount() == 1)
+
+        try w.store.emergencyStop(note: "panic", by: "owner", now: w.clock.now)
+        await w.orchestrator.tick()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        hold.open()
+
+        #expect(try w.turns(ceo).map(\.outcome) == [.interrupted])
+        let agent = try w.agent(ceo)
+        #expect(agent.state == .ready, "back to ready, as at quit")
+        #expect(agent.consecutiveFailures == 0, "not counted against the agent")
+        #expect(try w.pending(ceo) == 1, "its inbox is kept")
+    }
+
+    @Test func stopKillsChecksAsInconclusive() async throws {
+        let w = try World(); let c = try w.company("Acme")
+        let mgr = try w.hire(c, "mgr", role: "manager")
+        let eng = try w.store.hire(companyId: c.id, name: "eng", role: "engineer", model: "sonnet", managerId: mgr.id)
+        let item = try submittedItem(w, c, eng)
+        let started = Gate()
+        w.checks.onRun { _ in
+            started.open()
+            // Runs until cancelled, as a real check does until its group is signalled.
+            let release = Gate()
+            await withTaskCancellationHandler { await release.wait() } onCancel: { release.open() }
+            return CheckOutcome(exitCode: nil, timedOut: false, tail: "killed")
+        }
+        await w.orchestrator.tick()
+        await started.wait()
+
+        try w.store.emergencyStop(note: nil, by: "owner", now: w.clock.now)
+        await w.orchestrator.tick()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+
+        let runs = try runsOf(w, item)
+        #expect(runs.map(\.status) == [.inconclusive, .queued], "recorded inconclusive and queued again, never failed")
+        #expect(try w.store.workItem(id: item.id)?.status == .inReview, "not returned to its holder")
+        #expect(w.checks.calls.count == 1)
+    }
+
+    @Test func nothingAdmittedWhileStopped() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let eng = try w.hire(c, "eng", role: "engineer")
+        _ = try submittedItem(w, c, eng)
+        try w.store.emergencyStop(note: nil, by: "cli", now: w.clock.now)
+        try w.dm(c, ceo)
+        for _ in 0..<3 { try await w.cycle() }
+        #expect(w.fake.requests.isEmpty, "no turn")
+        #expect(w.checks.calls.isEmpty, "no check")
+        #expect(try w.agent(ceo).state == .ready)
+        #expect(Scheduler.freeSlots(config: World.config(), running: 0, held: true) == 0)
+    }
+
+    @Test func observersCalledOncePerStop() async throws {
+        let observer = CountingObserver()
+        let w = try World(stopObservers: [observer])
+        _ = try w.company("Acme")
+        try w.store.emergencyStop(note: "deploy looks wrong", by: "app", now: w.clock.now)
+        for _ in 0..<3 { try await w.cycle() }
+        #expect(await observer.reasons == ["stopped by the owner: deploy looks wrong"])
+        // Pressing it again while stopped is the same stop.
+        try w.store.emergencyStop(note: "again", by: "app", now: w.clock.now)
+        try await w.cycle()
+        #expect(await observer.reasons.count == 1)
+        // A new stop after a resume runs them again.
+        try w.store.resumeAfterStop(now: w.clock.now)
+        try await w.cycle()
+        w.clock.advance(5)
+        try w.store.emergencyStop(note: nil, by: "app", now: w.clock.now)
+        try await w.cycle(); try await w.cycle()
+        #expect(await observer.reasons == ["stopped by the owner: deploy looks wrong", "stopped by the owner"])
+    }
+
+    @Test func resumeRestoresScheduling() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        try w.store.emergencyStop(note: nil, by: "owner", now: w.clock.now)
+        try w.dm(c, ceo)
+        try await w.cycle()
+        #expect(w.fake.requests.isEmpty)
+        #expect(try w.store.resumeAfterStop(now: w.clock.now))
+        #expect(try w.store.resumeAfterStop(now: w.clock.now) == false, "idempotent")
+        try await w.cycle()
+        #expect(try w.turns(ceo).map(\.outcome) == [.succeeded])
+    }
+
+    @Test func activeClockFrozenWhileStopped() async throws {
+        let w = try World(); let c = try w.company("Acme")
+        try await w.cycle()
+        w.clock.advance(30); try await w.cycle()
+        let before = w.store.activeNow(companyId: c.id)
+        #expect(before >= 30)
+        try w.store.emergencyStop(note: nil, by: "owner", now: w.clock.now)
+        #expect(w.store.isFrozen(companyId: c.id))
+        w.clock.advance(30); try await w.cycle()
+        w.clock.advance(30); try await w.cycle()
+        #expect(w.store.activeNow(companyId: c.id) == before, "frozen, like a hold")
+        try w.store.resumeAfterStop(now: w.clock.now)
+        #expect(!w.store.isFrozen(companyId: c.id))
+        try await w.cycle()
+        w.clock.advance(30); try await w.cycle()
+        #expect(w.store.activeNow(companyId: c.id) == before + 30, "the stopped time is never counted afterwards")
+    }
+
+    @Test func stallReasonFirst() async throws {
+        let w = try World(); let c = try w.company("Acme"); _ = try w.hire(c, "ceo")
+        try w.store.setHold(reason: .network, detail: "offline", now: w.clock.now)
+        let row = try w.store.emergencyStop(note: nil, by: "owner", now: w.clock.now)
+        let reasons = try w.store.stallReport(companyId: c.id, now: w.clock.now).reasons
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = w.store.ownerTimeZone(); f.dateFormat = "HH:mm"
+        #expect(reasons.first == "stopped by the owner since \(f.string(from: row.since))")
+        #expect(reasons.dropFirst().first?.hasPrefix("engine paused") == true)
+        #expect(EmergencyStop.statusLine(row, timeZone: w.store.ownerTimeZone()) == "STOPPED by the owner since \(f.string(from: row.since))")
+    }
+
+    @Test func migrationSlotFollowsPushBeforeDigests() throws {
+        let names = Migrations.migrator().migrations
+        let i = try #require(names.firstIndex(of: "v5-stop"))
+        #expect(names[i - 1] == "v5-push-2")
+        #expect(names[i + 1] == "v5-digests")
+        let store = try Store.inMemory()
+        let row = try store.emergencyStop(note: "a\nb", by: "owner", now: Date(timeIntervalSince1970: 1_800_000_000))
+        #expect(row.note == "a b", "flattened to one line")
+        #expect(try store.engineStopped() == row)
+        // The table holds one row at most.
+        #expect(throws: (any Error).self) {
+            try store.writer.write { db in try db.execute(sql: "INSERT INTO engineStop(id, since, \"by\") VALUES (2, ?, 'owner')", arguments: [Date()]) }
+        }
+    }
+
+    // MARK: Owner only
+
+    @Test func ownerOnly() throws {
+        // Not a company tool: no tool of an agent's server can stop or resume, and the tools' code never calls either.
+        let store = try Store.inMemory()
+        let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+        let a = try store.hire(companyId: c.id, name: "ceo", role: "ceo", model: "sonnet")
+        let names = CompanyTools(store: store, companyId: c.id, agentId: a.id).specs().map(\.name)
+        #expect(!names.contains { $0.contains("stop") || $0.contains("resume") || $0.contains("emergency") }, "\(names)")
+        let mcp = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "Sources/BrahmaCore/MCP")
+        for case let file as URL in try #require(FileManager.default.enumerator(at: mcp, includingPropertiesForKeys: nil))
+        where file.pathExtension == "swift" {
+            let text = try String(contentsOf: file, encoding: .utf8)
+            #expect(!text.contains("emergencyStop(") && !text.contains("resumeAfterStop("), "\(file.lastPathComponent)")
+        }
+        #expect(throws: EmergencyStopError.invalidActor("agent")) { try store.emergencyStop(note: nil, by: "agent", now: Date()) }
+
+        // From an agent's shell the CLI refuses both.
+        let owner = try OwnerTestHome()
+        for args in [["stop"], ["resume"]] {
+            let r = try cli(args, home: owner.url, extra: ["BRAHMA_AGENT_ID": a.id])
+            #expect(r.status != 0, "\(args) ran from an agent's shell")
+        }
+        let db = try Store(path: ownerPaths(owner.url).database.path)
+        #expect(try db.engineStopped() == nil)
+    }
+
+    // MARK: CLI without an engine
+
+    @Test func cliStopKillsPidsWithoutEngine() throws {
+        let owner = try OwnerTestHome()
+        let paths = ownerPaths(owner.url)
+        let store = try Store(path: paths.database.path)
+        let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+        let a = try store.hire(companyId: c.id, name: "ceo", role: "ceo", model: "sonnet")
+        try store.transition(agentId: a.id, to: .ready, now: Date()) { _ in true }
+        let (_, turn) = try #require(try store.beginTurn(agentId: a.id, now: Date()))
+        // A turn's process: the leader of its own group, recorded as the turn's pid. No engine runs.
+        let child = try ProcessGroupChild.spawn(executable: "/bin/sleep", arguments: ["sleep", "300"], environment: [:],
+                                                workingDirectory: try tempDir(), output: -1)
+        defer { _ = child.signalGroup(SIGKILL); child.finish() }
+        try store.setTurnPid(turnId: turn.id, pid: child.pid)
+
+        let stop = try cli(["stop", "--note", "test stop"], home: owner.url)
+        #expect(stop.status == 0, "\(stop.stderr)")
+        #expect(stop.stdout.hasPrefix("STOPPED by the owner since "), "\(stop.stdout)")
+        // The CLI waited until the group was gone (or killed it): the leader has exited, unreaped (a zombie of this test).
+        #expect(child.hasExited(), "the turn's group survived brahma stop")
+        #expect(ProcessGroupChild.exitCode(child.finish()) == 128 + SIGTERM)
+        #expect(try store.engineStopped()?.by == "cli")
+        #expect(try store.engineStopped()?.note == "test stop")
+
+        // Idempotent; status says so first; resume ends it.
+        let again = try cli(["stop"], home: owner.url)
+        #expect(again.status == 0, "\(again.stderr)")
+        let status = try cli(["status"], home: owner.url)
+        #expect(status.stdout.hasPrefix("STOPPED by the owner since "), "\(status.stdout)")
+        let resume = try cli(["resume"], home: owner.url)
+        #expect(resume.status == 0, "\(resume.stderr)")
+        #expect(try store.engineStopped() == nil)
+        let after = try cli(["status"], home: owner.url)
+        #expect(!after.stdout.contains("STOPPED"))
+    }
+
+    // MARK: Helpers
+
+    private func runsOf(_ w: World, _ item: WorkItem) throws -> [VerificationRun] {
+        try w.store.writer.read { try VerificationRun.filter(Column("itemId") == item.id).order(Column.rowID).fetchAll($0) }
+    }
+
+    /// An item submitted for review by `eng` (its check queued).
+    private func submittedItem(_ w: World, _ c: Company, _ eng: Agent) throws -> WorkItem {
+        let item = try w.store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Do it", checkSpec: CheckSpec(command: "true", paths: ["src/p1"]), status: .ready), now: w.clock.now)
+        let tools = CompanyTools(store: w.store, companyId: c.id, agentId: eng.id)
+        _ = try tools.call(name: "claim_lease", arguments: ["key": .string(item.key)])
+        let wt = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true)).worktreePath(key: item.key)
+        let file = wt.appending(path: "src/work.txt")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "work".write(to: file, atomically: true, encoding: .utf8)
+        _ = try tools.call(name: "submit_for_review", arguments: ["key": .string(item.key), "summary": .string("did it")])
+        return item
+    }
+
+    private func cli(_ args: [String], home: URL, extra: [String: String] = [:]) throws -> (status: Int32, stdout: String, stderr: String) {
+        let p = Process()
+        p.executableURL = brahmaExecutableURL()
+        p.arguments = args
+        p.environment = cliEnvironment(home: home).merging(extra) { _, new in new }
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out; p.standardError = err; p.standardInput = FileHandle.nullDevice
+        try p.run()
+        let o = out.fileHandleForReading.readDataToEndOfFile(), e = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: e, as: UTF8.self))
+    }
+}

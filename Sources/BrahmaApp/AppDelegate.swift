@@ -171,6 +171,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
     }
 
+    /// The emergency stop's confirmation from the menu bar extra (an NSMenu cannot host a SwiftUI alert): true to stop.
+    func confirmEmergencyStop() -> Bool {
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Stop everything?"
+        alert.informativeText = EmergencyStop.confirmText
+        alert.addButton(withTitle: "Stop everything")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     /// Brings the main window back (and the Dock icon) after it was closed into the menu bar.
     func openMainWindowFromMenu() {
         NSApp.setActivationPolicy(.regular)

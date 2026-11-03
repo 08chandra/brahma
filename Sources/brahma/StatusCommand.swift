@@ -7,6 +7,10 @@ struct Status: ParsableCommand {
 
     func run() throws {
         let (store, _) = try openStore()
+        // The owner's stop comes first (Task 7c).
+        if let stop = try store.engineStopped() {
+            print(EmergencyStop.statusLine(stop, timeZone: store.ownerTimeZone()))
+        }
         for c in try store.companies() {
             let agents = try store.agents(companyId: c.id)
             let names = Dictionary(uniqueKeysWithValues: agents.map { ($0.id, $0.name) })

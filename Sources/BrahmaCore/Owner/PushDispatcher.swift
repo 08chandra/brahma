@@ -76,8 +76,8 @@ public actor PushDispatcher {
         self.awake = awake; self.clock = clock; self.redactOverride = redact
     }
 
-    /// One pass. `onlyStopNotice` is the hook for Task 7c: while `engineStopped` holds, only the stop notice may be pushed, so
-    /// nothing else is sent (7c replaces this early return with the stop-notice path).
+    /// One pass. `onlyStopNotice`: while the owner's stop holds (Task 7c) nothing is pushed. The owner pressed it, so no
+    /// separate stop notice is sent; what came due meanwhile goes after the resume.
     public func tick(now: Date, onlyStopNotice: Bool = false) async {
         if onlyStopNotice { return }
         guard let prefs = try? store.ownerPrefs(), let provider = prefs.pushProvider else { cached = nil; return }

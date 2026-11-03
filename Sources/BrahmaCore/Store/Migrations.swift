@@ -877,6 +877,17 @@ enum Migrations {
             // Bumped when a push credential changes, so the engine's cached channel (and its one vault read) is redone then.
             try db.alter(table: "ownerPrefs") { t in t.add(column: "pushCredentialsVersion", .integer).notNull().defaults(to: 0) }
         }
+        m.registerMigration("v5-stop") { db in
+            // The owner's emergency stop (Task 7c): at most one row; while it exists nothing runs, in any company.
+            try db.execute(sql: """
+                CREATE TABLE engineStop (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    since DATETIME NOT NULL,
+                    "by" TEXT NOT NULL,
+                    note TEXT
+                )
+                """)
+        }
         m.registerMigration("v5-digests") { db in
             try db.create(table: "ownerDigest") { t in
                 t.primaryKey("id", .text)

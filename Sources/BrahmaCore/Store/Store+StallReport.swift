@@ -13,6 +13,7 @@ extension Store {
             input.running = live.filter { $0.state == .running }.count
             for a in live { input.stateCounts[a.state.rawValue, default: 0] += 1 }
             input.companyPaused = company.status == .paused
+            input.stoppedSince = try Store.engineStopped(db)?.since
             if let hold = try EngineHold.fetchOne(db, key: 1) {
                 input.hold = StallHold(reason: hold.reason.rawValue, detail: hold.detail, since: hold.since)
             }

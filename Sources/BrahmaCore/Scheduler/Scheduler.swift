@@ -34,7 +34,7 @@ public struct Candidate: Sendable {
 
 public enum Scheduler {
     /// How many more turns may start right now: the global cap (hard and safety caps, halved under memory warning) less
-    /// what is running. Zero under a hold or critical memory pressure. Admission and engine dispatch share this count.
+    /// what is running. Zero under a hold (an engine hold or the owner's stop) or critical memory pressure. Admission and engine dispatch share this count.
     public static func freeSlots(config: SchedulerConfig, running: Int, otherChildren: Int = 0,
                                  pressure: MemoryPressure = .normal, held: Bool = false) -> Int {
         if held || pressure == .critical { return 0 }
@@ -46,7 +46,7 @@ public enum Scheduler {
     /// Pure: picks which ready agents to start now. Weighted round-robin across companies, bounded by the
     /// global cap (min of hard and safety caps) and each company's usage-mode cap.
     ///
-    /// - `held`: an engine hold (or, later, an owner stop) admits nothing. `pressure == .critical` admits nothing;
+    /// - `held`: an engine hold, held secrets or the owner's emergency stop (Task 7c) admits nothing. `pressure == .critical` admits nothing;
     ///   `.warning` halves the global cap (never below 1).
     /// - `otherChildren`: child processes that are not turns (checks, merges) and count against the same cap.
     /// - `paceClosed`: companies shut only by the weekly pace; their critical-path candidates

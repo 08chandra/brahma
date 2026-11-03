@@ -91,8 +91,8 @@ public struct StallBlockerGroup: Equatable, Sendable {
 public struct StallInput: Equatable, Sendable {
     public var running: Int = 0
     public var companyPaused: Bool = false
-    /// The owner stopped the engine (Plan 5-lite sets it); rendered before the hold.
-    public var stopped: Bool = false
+    /// When the owner stopped everything (Task 7c), nil while not stopped; rendered first, before the hold.
+    public var stoppedSince: Date? = nil
     public var hold: StallHold? = nil
     public var doctorOk: Bool = true
     public var doctorDetail: String = ""
@@ -145,7 +145,7 @@ public enum StallExplainer {
         }
         func plural(_ n: Int, _ one: String, _ many: String) -> String { n == 1 ? one : many }
         var reasons: [String] = []
-        if input.stopped { reasons.append("stopped by the owner") }
+        if let since = input.stoppedSince { reasons.append(EmergencyStop.stallReason(since: since, timeZone: timeZone)) }
         if let hold = input.hold {
             reasons.append("engine paused: \(hold.reason) (\(hold.detail)) since \(format("HH:mm", hold.since))")
         }

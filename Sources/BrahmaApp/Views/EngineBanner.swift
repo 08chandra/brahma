@@ -16,9 +16,19 @@ struct EngineBanner: View {
     /// "Sandbox check failed or pending for claude <v> — see Inbox", while that engine alert waits in the Inbox.
     var sandbox: String?
     var openInbox: () -> Void = {}
+    /// The owner's emergency stop (Task 7c), in `danger`, with Resume.
+    var stopped: String?
+    var resume: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 0) {
+            if let stopped {
+                bar(color: BrahmaTheme.danger, icon: "stop.circle.fill") {
+                    Text(verbatim: stopped)
+                    Spacer(minLength: 12)
+                    Button("Resume", action: resume).buttonStyle(.brahmaPrimary)
+                }
+            }
             if let notice {
                 bar(color: BrahmaTheme.warning, icon: "exclamationmark.triangle.fill") { Text(verbatim: notice) }
             }

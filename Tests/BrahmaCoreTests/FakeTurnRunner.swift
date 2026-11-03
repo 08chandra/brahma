@@ -101,7 +101,12 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
                             apiErrorStatus: nil, sessionId: r.agent.sessionId))]
     }
 
+    /// Called as each turn reaches the runner (a test opens a `Gate` here to know the turn is in flight).
+    var onRun: (@Sendable (TurnRequest) -> Void)? { get { lock.withLock { _onRun } } set { lock.withLock { _onRun = newValue } } }
+    private var _onRun: (@Sendable (TurnRequest) -> Void)?
+
     func run(_ request: TurnRequest) -> AsyncThrowingStream<StreamEvent, Error> {
+        onRun?(request)
         let script: Script = lock.withLock {
             _requests.append(request)
             current += 1

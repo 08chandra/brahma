@@ -21,8 +21,13 @@ public struct MenuBarSummary: Equatable, Sendable {
     public var badge: Int = 0
     /// Why nothing is running, for the first running company with nothing running; nil when all is well.
     public var stall: String? = nil
+    /// The owner's emergency stop holds (Task 7c): the menu offers Resume instead of STOP EVERYTHING.
+    public var stopped: Bool = false
+    /// The stop's first line ("STOPPED by the owner since HH:mm"), nil while not stopped.
+    public var stopLine: String? = nil
 
-    public static func make(companies: [CompanySummary], engine: EngineStatus?) -> MenuBarSummary {
+    public static func make(companies: [CompanySummary], engine: EngineStatus?, stop: EngineStopRow? = nil,
+                            timeZone: TimeZone = .current) -> MenuBarSummary {
         let running = companies.reduce(0) { $0 + $1.counts.running }
         let ready = companies.reduce(0) { $0 + $1.counts.ready }
         let totals = companies.isEmpty
@@ -44,7 +49,8 @@ public struct MenuBarSummary: Equatable, Sendable {
         }
         return MenuBarSummary(totals: totals, pending: "\(waiting) waiting on you · \(unread) unread",
                               engine: engineLine(engine), rows: rows, anyRunningAgents: running > 0,
-                              badge: companies.reduce(0) { $0 + $1.inboxCount }, stall: stall)
+                              badge: companies.reduce(0) { $0 + $1.inboxCount }, stall: stall,
+                              stopped: stop != nil, stopLine: stop.map { EmergencyStop.statusLine($0, timeZone: timeZone) })
     }
 
     private static func engineLine(_ status: EngineStatus?) -> String {
@@ -62,6 +68,6 @@ public struct MenuBarSummary: Equatable, Sendable {
 
 extension AppModel {
     public var menuBar: MenuBarSummary {
-        MenuBarSummary.make(companies: snapshot.companies, engine: engine?.status)
+        MenuBarSummary.make(companies: snapshot.companies, engine: engine?.status, stop: snapshot.stop, timeZone: snapshot.work.timeZone)
     }
 }

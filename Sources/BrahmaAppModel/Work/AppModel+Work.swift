@@ -46,6 +46,10 @@ extension AppModel {
 
     public var holdBanner: String? { work.hold.map(HoldText.banner) }
 
+    /// The owner's emergency stop (Task 7c): whether it holds, and the `danger` banner while it does.
+    public var isStopped: Bool { snapshot.stop != nil }
+    public var stopBanner: String? { snapshot.stop == nil ? nil : EmergencyStop.bannerText }
+
     public var canRetryEngine: Bool { work.hold.map(HoldText.canRetry) ?? false }
 
     public var autonomy: AutonomyPreset { selectedCompany?.company.autonomy ?? .important }
@@ -220,6 +224,20 @@ extension AppModel {
             try store.saveProbe(report)
             try store.clearHoldAfterDoctor(now: Date())
         }
+    }
+
+    /// STOP EVERYTHING (after the owner confirmed `EmergencyStop.confirmText`): the stop is recorded, then every recorded turn's
+    /// process group is signalled from here as well, so an engine that is wedged (or runs in a terminal) cannot keep agents
+    /// running. The engine cancels its turns and checks at its next tick.
+    public func stopEverything() async {
+        await ownerWrite("stop everything") { store in
+            try store.emergencyStop(note: nil, by: "app", now: Date())
+            _ = EmergencyStop.signalGroups(EmergencyStop.recordedGroups(store: store))
+        }
+    }
+
+    public func resumeAfterStop() async {
+        await ownerWrite("resume") { store in try store.resumeAfterStop(now: Date()) }
     }
 
     // MARK: Internals

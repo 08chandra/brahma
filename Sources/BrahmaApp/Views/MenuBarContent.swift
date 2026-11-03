@@ -1,4 +1,5 @@
 import SwiftUI
+import BrahmaCore
 import BrahmaAppModel
 
 /// A native NSMenu (`.menuBarExtraStyle(.menu)`): the theme does not apply. Data lines are `Text(verbatim:)`
@@ -9,6 +10,17 @@ struct MenuBarContent: View {
     var body: some View {
         if let model = delegate.model {
             let summary = model.menuBar
+            // The owner's emergency stop (Task 7c): first, with the global shortcut ⌃⌥⌘. while the menu is open.
+            if let line = summary.stopLine {
+                Text(verbatim: line)
+                Button("Resume") { Task { await model.resumeAfterStop() } }
+            } else {
+                Button(EmergencyStop.buttonTitle) {
+                    if delegate.confirmEmergencyStop() { Task { await model.stopEverything() } }
+                }
+                .keyboardShortcut(".", modifiers: [.control, .option, .command])
+            }
+            Divider()
             Text(verbatim: summary.totals)
             Text(verbatim: summary.pending)
             Text(verbatim: summary.engine)

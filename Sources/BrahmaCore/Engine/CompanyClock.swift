@@ -77,7 +77,8 @@ extension Store {
     /// pause or a hold is never counted afterwards.
     public func accrueActiveTime(now: Date) throws {
         try writer.write { db in
-            let held = try EngineHold.fetchOne(db, key: 1) != nil
+            // An engine hold or the owner's stop freezes every company's clock.
+            let held = try EngineHold.fetchOne(db, key: 1) != nil || Store.engineStopped(db) != nil
             for company in try Company.fetchAll(db) {
                 var row = try CompanyActivity.fetchOne(db, key: company.id)
                     ?? CompanyActivity(companyId: company.id, activeSeconds: 0, lastAccruedAt: nil)
@@ -111,10 +112,10 @@ extension Store {
     }
 
     /// The one place that says when active time stands still: an engine hold, or a company that is not running
-    /// (or does not exist). The future owner stop (5-lite) joins here.
+    /// (or does not exist), or the owner's emergency stop (Task 7c).
     public func isFrozen(companyId: String) -> Bool {
         (try? writer.read { db in
-            if try EngineHold.fetchOne(db, key: 1) != nil { return true }
+            if try EngineHold.fetchOne(db, key: 1) != nil || Store.engineStopped(db) != nil { return true }
             return try Company.fetchOne(db, key: companyId)?.status != .running
         }) ?? true
     }

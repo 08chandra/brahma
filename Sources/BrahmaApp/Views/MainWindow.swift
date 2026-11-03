@@ -40,7 +40,8 @@ private struct Shell: View {
                     EngineBanner(engine: model.engine, notice: model.startupNotice, hold: model.holdBanner,
                                  canRetryHold: model.canRetryEngine, retryHold: { Task { await model.retryEngine() } },
                                  secrets: model.secretsBanner, loadSecrets: { Task { await model.loadSecrets() } },
-                                 sandbox: model.sandboxBanner, openInbox: { model.select(.inbox) })
+                                 sandbox: model.sandboxBanner, openInbox: { model.select(.inbox) },
+                                 stopped: model.stopBanner, resume: { Task { await model.resumeAfterStop() } })
                     DetailView(model: model)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }

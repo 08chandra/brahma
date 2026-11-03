@@ -118,14 +118,17 @@ struct Segmented<Value: Hashable>: View {
 /// Small bordered button; `primary` = accent fill.
 struct BrahmaButtonStyle: ButtonStyle {
     var primary = false
+    /// The emergency stop (Task 7c): a `danger` fill.
+    var danger = false
 
     func makeBody(configuration: Configuration) -> some View {
-        StyledButton(configuration: configuration, primary: primary)
+        StyledButton(configuration: configuration, primary: primary, danger: danger)
     }
 
     private struct StyledButton: View {
         let configuration: ButtonStyleConfiguration
         let primary: Bool
+        let danger: Bool
         @Environment(\.isEnabled) private var isEnabled
         @State private var hovered = false
 
@@ -133,18 +136,19 @@ struct BrahmaButtonStyle: ButtonStyle {
             configuration.label
                 .font(.system(size: 11, weight: .medium))
                 .labelStyle(CompactLabelStyle())
-                .foregroundStyle(primary ? Color.white : BrahmaTheme.text0)
+                .foregroundStyle(primary || danger ? Color.white : BrahmaTheme.text0)
                 .padding(.horizontal, 10)
                 .frame(minHeight: 22)
                 .background(RoundedRectangle(cornerRadius: BrahmaTheme.radius).fill(fill))
                 .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius)
-                    .strokeBorder(primary ? BrahmaTheme.accent : BrahmaTheme.lineStrong, lineWidth: 1))
+                    .strokeBorder(danger ? BrahmaTheme.danger : primary ? BrahmaTheme.accent : BrahmaTheme.lineStrong, lineWidth: 1))
                 .opacity(isEnabled ? 1 : 0.4)
                 .contentShape(Rectangle())
                 .onHover { inside in withAnimation(BrahmaTheme.fast) { hovered = inside } }
         }
 
         private var fill: Color {
+            if danger { return configuration.isPressed || hovered ? BrahmaTheme.danger.opacity(0.8) : BrahmaTheme.danger }
             if primary { return configuration.isPressed ? BrahmaTheme.accentDim : BrahmaTheme.accent }
             if configuration.isPressed { return BrahmaTheme.bg4 }
             return hovered && isEnabled ? BrahmaTheme.bg4 : BrahmaTheme.bg3
@@ -164,6 +168,7 @@ private struct CompactLabelStyle: LabelStyle {
 extension ButtonStyle where Self == BrahmaButtonStyle {
     static var brahma: BrahmaButtonStyle { BrahmaButtonStyle() }
     static var brahmaPrimary: BrahmaButtonStyle { BrahmaButtonStyle(primary: true) }
+    static var brahmaDanger: BrahmaButtonStyle { BrahmaButtonStyle(danger: true) }
 }
 
 /// Bordered `bg2` input field (apply to a `TextField`).
