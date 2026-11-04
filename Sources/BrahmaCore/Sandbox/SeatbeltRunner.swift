@@ -118,6 +118,7 @@ public struct SeatbeltRunner: SandboxedRunner {
         // The per-run marker the profile allows and the sweep probes for; survives the check deleting its own checkout.
         let marker = Self.runMarker()
         let onStraggler = self.onStraggler
+        let groups = ChildGroups.current
         // `prepare` (the Seatbelt render, the `EngineFiles` mkdir/fchmod of TMPDIR and the per-run caches) and the B-I4 sweep
         // are blocking, so they run on the check's own thread next to the run, never the cooperative pool (B-M6).
         let outcome = await withTaskCancellationHandler {
@@ -131,7 +132,8 @@ public struct SeatbeltRunner: SandboxedRunner {
                     }
                     var result = GroupRun.run(executable: Self.sandboxExec, arguments: prepared.arguments,
                                               workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
-                                              environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel)
+                                              environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel,
+                                              groups: groups)
                     // B-I4: kill anything the run left behind, recognized by the run's marker (even if it deleted its
                     // checkout). N2: killed stragglers leave the outcome as it is (tools that daemonize are normal) and are
                     // reported; only ones that could not be killed or classified, or an unreadable process table, make the

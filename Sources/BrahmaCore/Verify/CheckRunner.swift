@@ -46,6 +46,7 @@ public struct ProcessCheckRunner: CheckRunning {
                     environment: [String: String]) async -> CheckOutcome {
         let cancel = GroupRun.CancelFlag()
         let (grace, clock) = (termGrace, self.clock)
+        let groups = ChildGroups.current
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<CheckOutcome, Never>) in
                 // A thread of its own: a check can run for an hour and must not occupy a Dispatch or Swift concurrency worker.
@@ -53,7 +54,7 @@ public struct ProcessCheckRunner: CheckRunning {
                     continuation.resume(returning: GroupRun.run(executable: "/bin/sh", arguments: ["/bin/sh", "-c", command],
                                                                 workingDirectory: workingDirectory, timeout: timeout,
                                                                 outputURL: outputURL, environment: environment, termGrace: grace,
-                                                                clock: clock, cancel: cancel))
+                                                                clock: clock, cancel: cancel, groups: groups))
                 }
                 thread.name = "brahma-check"
                 thread.start()

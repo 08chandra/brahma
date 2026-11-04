@@ -3,6 +3,56 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
+/// The in-turn stop poll's sleeper for orchestrator tests (Task 7c fix round 1, I2): a wait ends only when a test calls
+/// `step()` (one waiter per step) or the wait is cancelled, so no World test runs a wall-clock poll. `waiting` lets a test
+/// wait until a poll is parked, on an event, not a timer.
+final class PollSteps: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
+    private var parked: [CheckedContinuation<Void, Never>] = []
+
+    func sleep(_ duration: Duration) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, any Error>) in
+                let (cancelled, notify) = lock.withLock { () -> (Bool, [CheckedContinuation<Void, Never>]) in
+                    // Cancelled before it parked (the handler ran first and found nothing to end): ends at once.
+                    if Task.isCancelled { return (true, []) }
+                    waiters[id] = c
+                    defer { parked.removeAll() }
+                    return (false, parked)
+                }
+                if cancelled { c.resume(throwing: CancellationError()) }
+                for p in notify { p.resume() }
+            }
+        } onCancel: {
+            let c = lock.withLock { waiters.removeValue(forKey: id) }
+            c?.resume(throwing: CancellationError())
+        }
+    }
+
+    /// Ends every parked wait: each poll reads the stop once.
+    func step() {
+        let all = lock.withLock { () -> [CheckedContinuation<Void, any Error>] in
+            defer { waiters.removeAll() }
+            return Array(waiters.values)
+        }
+        for c in all { c.resume() }
+    }
+
+    /// Returns once at least one poll is parked.
+    func waiting() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let now = lock.withLock { () -> Bool in
+                if !waiters.isEmpty { return true }
+                parked.append(c)
+                return false
+            }
+            if now { c.resume() }
+        }
+    }
+}
+
 /// A store, router, fake runner and orchestrator on a throwaway home, for orchestrator-level tests.
 struct World {
     let store: Store
@@ -10,6 +60,8 @@ struct World {
     let clock = TestClock()
     let fake = FakeTurnRunner()
     let checks = FakeCheckRunner()
+    /// The in-turn stop poll: parked until a test steps it (I2).
+    let stopPoll = PollSteps()
     let paths: BrahmaPaths
     let orchestrator: Orchestrator
 
@@ -40,7 +92,8 @@ struct World {
                                     checkBaseEnvironment: checkEnvironment ?? ProcessInfo.processInfo.environment,
                                     planSelector: planSelector, vault: vault,
                                     transcripts: transcriptSource.map { TranscriptCapture(paths: worldPaths, source: $0, compressor: .gzip) },
-                                    sleepGuard: sleepGuard, sandboxCanary: sandboxCanary, stopObservers: stopObservers)
+                                    sleepGuard: sleepGuard, sandboxCanary: sandboxCanary, stopObservers: stopObservers,
+                                    stopPollSleep: stopPoll.sleep)
     }
 
     static func config(hardCap: Int = 16, turnBudget: Int = 30) -> SchedulerConfig {

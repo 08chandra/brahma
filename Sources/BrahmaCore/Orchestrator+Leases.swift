@@ -59,6 +59,8 @@ extension Orchestrator {
             // Decided under the item's lock: a new claim may have taken the item since it was reaped, and a database
             // error is not "no lease" (nothing is removed then).
             await blocking.run {
+                // The owner's stop holds every git change (S15): the worktree stays; the sweep after the resume removes it.
+                guard !self.stoppedNow else { return }
                 do {
                     try store.removeItemWorktree(git: git, companyId: companyId, key: key)
                 } catch { self.log("could not remove worktree \(key): \(error)") }
@@ -78,6 +80,7 @@ extension Orchestrator {
             // Only registered `item/<KEY>` worktrees; engine checkouts (".preview", ".merge", ...) are never listed. One
             // item that cannot be decided (busy lock, unreadable lease) is skipped; the others are still swept.
             for (key, _) in items {
+                guard !self.stoppedNow else { return }     // held by the owner's stop (S15); the next sweep goes on
                 do { try store.removeItemWorktree(git: git, companyId: companyId, key: key) }
                 catch { self.log("worktree sweep skipped \(key): \(error)") }
             }
@@ -133,6 +136,13 @@ extension Orchestrator {
         let git = store.gitWorkspace(root: ws, companyId: company.id)
         spawnGit("dispatch:\(agent.id)") { [self] in
             var failed: String?
+            // The owner's stop came between the claim and the worktree (S15): no branch or worktree is made; the lease goes back.
+            if stoppedNow {
+                _ = try? store.releaseLease(itemId: item.id, agentId: agent.id, note: "stopped by the owner before its worktree was made",
+                                            undoOwner: wasUnowned, now: clock())
+                await dispatchDone(agentId: agent.id, failedItem: nil, now: clock())
+                return
+            }
             do {
                 try await blocking.tryRun {
                     try store.prepareRepo(company: company)

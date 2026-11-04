@@ -755,6 +755,69 @@ import GRDB
         #expect(try GitFixture.plainGit(["status", "--porcelain"], in: r.root).isEmpty)
     }
 
+    // MARK: The owner's stop mid-merge (Task 7c fix round 1, S15)
+
+    /// The stop is raised at the last seam before `main`'s compare-and-swap: main does not move, the item keeps its approval
+    /// and its place (no failure, no fault), the feed says so, and it lands after the resume.
+    @Test func stopAtMainSeamLeavesMainUnchanged() async throws {
+        let r = try R()
+        let i = try await r.approved(file: "src/a.txt")
+        let verified = try #require(try r.fresh(i).verifiedCommit)
+        let before = try r.mainHead()
+        let store = r.store, now = r.now
+        store.mergeRefProbe.set { ref in
+            if ref == GitWorkspace.mainRef { _ = try? store.emergencyStop(note: nil, by: "owner", now: now) }
+        }
+        try await r.cycle()
+        store.mergeRefProbe.set(nil)
+        #expect(try store.engineStopped() != nil)
+        #expect(try r.mainHead() == before, "main never moved")
+        let held = try r.fresh(i)
+        #expect(held.status == .inReview); #expect(held.mergeState == .pending); #expect(held.verifiedCommit == verified)
+        #expect(try store.isMerging(itemId: i.id) == false, "back in the queue")
+        #expect(try store.company(id: r.company.id)?.mainCommit == before)
+        let companyId = r.company.id
+        let pending = try await store.writer.read { db -> String? in
+            try String.fetchOne(db, sql: "SELECT pendingMainCommit FROM company WHERE id = ?", arguments: [companyId])
+        }
+        #expect(pending == nil, "the pending record is cleared")
+        #expect(try r.events(i, .mergeFailed).isEmpty)
+        let feed = try store.events(afterId: 0, companyId: r.company.id).map(\.text)
+        #expect(feed.contains { $0.contains("merge of \(i.key) was stopped by the owner before main moved") }, "\(feed)")
+        #expect(try r.alerts().isEmpty, "not a company fault")
+        // Nothing starts while stopped; after the resume it lands.
+        try await r.cycle()
+        #expect(try r.mainHead() == before)
+        try store.resumeAfterStop(now: r.now)
+        let done = try await r.drive(i)
+        #expect(done.status == .done); #expect(try r.mainHead() == verified)
+    }
+
+    /// The stop between the rebase's merge-tree check and the item branch's compare-and-swap: neither the branch nor main moves.
+    @Test func stopAtBranchSeamLeavesRefsUnchanged() async throws {
+        let r = try R()
+        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
+        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
+        _ = try await r.drive(a)
+        let verifiedB = try #require(try r.fresh(b).verifiedCommit)
+        let main = try r.mainHead()
+        let store = r.store, now = r.now, branch = r.ws.branchRef(key: b.key)
+        store.mergeRefProbe.set { ref in
+            if ref == branch { _ = try? store.emergencyStop(note: nil, by: "owner", now: now) }
+        }
+        try await r.cycle()
+        store.mergeRefProbe.set(nil)
+        #expect(try store.engineStopped() != nil)
+        #expect(try r.head(b) == verifiedB, "the branch was not moved")
+        #expect(try r.mainHead() == main)
+        let held = try r.fresh(b)
+        #expect(held.mergeState == .pending); #expect(held.verifiedCommit == verifiedB); #expect(held.status == .inReview)
+        #expect(try r.events(b, .mergeFailed).isEmpty)
+        try store.resumeAfterStop(now: r.now)
+        try await r.cycle()
+        #expect(try r.fresh(b).mergeState == .verifying, "after the resume the rebase goes on as usual")
+    }
+
     @Test func rebaseReverifiesBeforeMerge() async throws {
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")

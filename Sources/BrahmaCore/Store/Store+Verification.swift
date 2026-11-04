@@ -322,6 +322,15 @@ extension Store {
         }
     }
 
+    /// A run the owner's stop cut short (Task 7c fix round 1, I1): the same run goes back to the queue, due at once. It is
+    /// not an attempt: nothing is recorded, its history (`history`) does not grow, and the item keeps its state.
+    func requeueStoppedVerification(runId: String) throws {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE verificationRun SET status = 'queued', startedAt = NULL, outputPath = NULL, notBeforeActive = NULL "
+                + "WHERE id = ? AND status = 'running'", arguments: [runId])
+        }
+    }
+
     // MARK: Outcomes
 
     /// A run is stale when the item's check changed, the item left review, or (for a submit run) the item was submitted again.

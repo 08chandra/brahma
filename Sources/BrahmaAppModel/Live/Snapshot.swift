@@ -34,6 +34,8 @@ public struct Snapshot: Equatable, Sendable {
     public var claudeVersion: String?
     /// The owner's emergency stop (Task 7c), across every company; nil while not stopped.
     public var stop: EngineStopRow?
+    /// The owner's time zone (`Store.ownerTimeZone`): the stop's time is shown in it, as `brahma status` and the stall reason do.
+    public var ownerTimeZone: TimeZone = .current
 
     public static let empty = Snapshot(companies: [], agents: [], channels: [], unreadByChannel: [:], lastTurns: [:], usage: nil)
 
@@ -59,6 +61,7 @@ public struct Snapshot: Equatable, Sendable {
         snap.usage = try store.latestRateLimit()
         snap.claudeVersion = try store.latestProbe()?.cliVersion
         snap.stop = try store.engineStopped()
+        snap.ownerTimeZone = store.ownerTimeZone()
         if let id = selectedCompanyId {
             snap.agents = try store.agents(companyId: id)
             snap.channels = try store.channels(companyId: id)

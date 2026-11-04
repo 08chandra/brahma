@@ -68,6 +68,6 @@ public struct MenuBarSummary: Equatable, Sendable {
 
 extension AppModel {
     public var menuBar: MenuBarSummary {
-        MenuBarSummary.make(companies: snapshot.companies, engine: engine?.status, stop: snapshot.stop, timeZone: snapshot.work.timeZone)
+        MenuBarSummary.make(companies: snapshot.companies, engine: engine?.status, stop: snapshot.stop, timeZone: snapshot.ownerTimeZone)
     }
 }

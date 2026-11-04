@@ -29,6 +29,13 @@ public protocol EmergencyStopObserver: Sendable {
     func stopAll(reason: String) async
 }
 
+/// The owner's stop was seen right before a merge moved a ref (Task 7c fix round 1, S15): nothing was moved, and the merge is
+/// put back in its queue, never counted against the item or the company.
+public struct StoppedByOwner: Error, Equatable, CustomStringConvertible {
+    public init() {}
+    public var description: String { "stopped by the owner" }
+}
+
 public enum EmergencyStopError: Error, Equatable, CustomStringConvertible {
     case invalidActor(String)
     public var description: String {
@@ -151,8 +158,14 @@ public enum EmergencyStop {
     }
 
     /// The groups of every turn the database records as in progress (`Store.runningTurnPids`; each turn's `claude` leads its
-    /// own session and group). Preview processes join here when previews exist (Plan L's `previewState`).
+    /// own session and group), and of every check and merge child the engine recorded at spawn (`ChildGroups`, under the
+    /// data home's `run/children`; only leaders whose start time still matches). Preview processes join here when previews
+    /// exist (Plan L's `previewState`).
     public static func recordedGroups(store: Store) -> Set<Int32> {
-        (try? store.runningTurnPids()) ?? []
+        var groups = (try? store.runningTurnPids()) ?? []
+        if let home = store.dataHome {
+            groups.formUnion(ChildGroups.liveLeaders(in: ChildGroups.directory(runDir: home.appending(path: "run", directoryHint: .isDirectory))))
+        }
+        return groups
     }
 }

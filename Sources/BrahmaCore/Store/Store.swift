@@ -36,6 +36,7 @@ public final class Store: Sendable {
     let dataHome: URL?
     /// How long engine git waits for an item's lock before skipping the item (tests shorten it).
     let gitLockTimeout = GitLockTimeout()
+    let mergeRefProbe = MergeRefProbe()
     /// How much output a plan-turn barrier git call may produce before the barrier fails closed (tests shrink it).
     let planBarrierOutputLimit = GitOutputLimit()
     /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
@@ -330,6 +331,15 @@ final class GitOutputLimit: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 32 * 1024 * 1024
     var bytes: Int { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
+}
+
+/// Tests only: called by a merge with each ref's name right before its stop check (`Store.performMerge`; "" for the check
+/// before anything is done), so a test can raise the owner's stop at exactly that seam.
+final class MergeRefProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var body: (@Sendable (String) -> Void)?
+    func set(_ new: (@Sendable (String) -> Void)?) { lock.withLock { body = new } }
+    func call(_ ref: String) { lock.withLock { body }?(ref) }
 }
 
 final class GitLockTimeout: @unchecked Sendable {

@@ -127,6 +127,8 @@ extension Orchestrator {
                 return MainReading(company: company, recorded: recorded, head: head, symbolic: symbolic)
             }
         }
+        // The owner's stop holds the re-adoption (S15): the marker stays and is taken up after the resume.
+        if stoppedNow { return }
         let now = clock()
         let consumed: Bool
         do {

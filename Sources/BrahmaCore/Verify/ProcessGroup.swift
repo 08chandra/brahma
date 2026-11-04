@@ -296,7 +296,7 @@ enum GroupRun {
 
     static func run(executable: String, arguments: [String], workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
                     environment: [String: String], termGrace: TimeInterval, clock: @Sendable () -> TimeInterval,
-                    cancel: CancelFlag, observer: ProcessGroupChild.Observer? = nil) -> CheckOutcome {
+                    cancel: CancelFlag, observer: ProcessGroupChild.Observer? = nil, groups: ChildGroups? = nil) -> CheckOutcome {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: workingDirectory.path, isDirectory: &isDir), isDir.boolValue else {
@@ -326,6 +326,9 @@ enum GroupRun {
             return fail("could not start the check: \(error)", outputURL: outputURL)
         }
         close(writeEnd)
+        // Recorded for the owner's stop (`EmergencyStop.recordedGroups`) until it is reaped.
+        let record = groups?.record(child.pid)
+        defer { groups?.forget(record, pid: child.pid) }
         // From here the reader owns `readEnd` and `file`.
         let capture = OutputCapture(readEnd: readEnd, file: file, cap: ProcessCheckRunner.outputCap,
                                     tailBytes: ProcessCheckRunner.tailChars * 4, marker: ProcessCheckRunner.truncationMarker)

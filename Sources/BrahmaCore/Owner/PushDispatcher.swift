@@ -76,13 +76,16 @@ public actor PushDispatcher {
         self.awake = awake; self.clock = clock; self.redactOverride = redact
     }
 
-    /// One pass. `onlyStopNotice`: while the owner's stop holds (Task 7c) nothing is pushed. The owner pressed it, so no
-    /// separate stop notice is sent; what came due meanwhile goes after the resume.
+    /// One pass. `onlyStopNotice`: while the owner's stop holds (Task 7c) the one stop notice is all that may go
+    /// (`sendStopNotice`); what came due meanwhile goes after the resume.
     public func tick(now: Date, onlyStopNotice: Bool = false) async {
-        if onlyStopNotice { return }
         guard let prefs = try? store.ownerPrefs(), let provider = prefs.pushProvider else { cached = nil; return }
         let uptime = awake()
         guard uptime >= retryNotBefore else { return }
+        if onlyStopNotice {
+            await sendStopNotice(prefs: prefs, provider: provider, uptime: uptime, now: now)
+            return
+        }
 
         // Due work first: nothing due, or nothing that may go yet, reads no credential and logs no failure.
         guard let asks = try? store.dueAskNotices(forPush: true), let notices = try? store.duePushNotices() else { return }
@@ -169,6 +172,38 @@ public actor PushDispatcher {
             try? store.logPush(ok: false, status: nil, detail: String(Store.flat("not configured: " + text, max: 120)), now: clock())
             await alert(label: Store.flat(text, max: 80), now: now, company: nil)
             return nil
+        }
+    }
+
+    /// The text of the stop notice: engine text only (the owner's note is never sent), so it is the same in `titles` and
+    /// `counts` mode.
+    static func stopNoticeBody(_ row: EngineStopRow, timeZone: TimeZone) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = timeZone; f.dateFormat = "HH:mm"
+        return "Everything stopped by the owner at \(f.string(from: row.since)). Nothing runs until you resume."
+    }
+
+    /// `pushLog.detail` of the stop notice for one stop (its `since`): what makes it go once per stop, across restarts.
+    static func stopNoticeDetail(_ row: EngineStopRow) -> String { "stop \(Int(row.since.timeIntervalSince1970 * 1000))" }
+
+    /// One push per stop (Task 7c fix round 1, M1 ruling), urgent so quiet hours do not hold it, within the daily cap and the
+    /// channel's retry window; deduplicated through the delivery log. A failure is logged as any push's is and tried again
+    /// after `minInterval`.
+    private func sendStopNotice(prefs: OwnerPrefs, provider: PushProvider, uptime: TimeInterval, now: Date) async {
+        guard let row = try? store.engineStopped(), let log = try? store.pushLog(limit: 500) else { return }
+        let detail = Self.stopNoticeDetail(row)
+        guard !log.contains(where: { $0.ok && $0.detail == detail }) else { return }
+        let tz = store.ownerTimeZone()
+        guard let counts = try? store.pushCounts(since: Self.ownerDayStart(now, tz: tz)), counts.sent < Self.dailyCap else { return }
+        guard let channel = await channel(prefs: prefs, provider: provider, uptime: uptime, now: now) else { return }
+        let r = await channel.send(title: "Brahma", body: Self.stopNoticeBody(row, timeZone: tz), priority: .urgent, deepLink: nil)
+        if r.ok {
+            try? store.logPush(ok: true, status: r.status, detail: detail, now: clock())
+            consecutiveFailures = 0; failureAlerted = false
+        } else {
+            if Task.isCancelled { return }
+            cached = nil
+            await failed(status: r.status, text: r.error ?? "failed", detail: "stop", uptime: uptime, now: now, company: nil)
         }
     }
 

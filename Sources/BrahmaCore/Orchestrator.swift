@@ -400,13 +400,13 @@ public actor Orchestrator {
         // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
         // ready items to idle individual contributors. Nothing here waits on git.
         let reaped = try store.reapLeases(now: now)
-        leaseMaintenance(now: now, companies: companies, reaped: reaped, held: held)
+        leaseMaintenance(now: now, companies: companies, reaped: stopped == nil ? reaped : [], held: held)
         // Test-key uses whose lease or item status no longer carries them are closed (Task 4-wire; injection checks the
         // live lease and status as well).
         try store.sweepSecretUses(now: now)
 
-        // A restore left its marker: re-adopt every repository's main (never waits on git).
-        restoreMarkerTick(companies: companies)
+        // A restore left its marker: re-adopt every repository's main (never waits on git). Held while the owner's stop holds.
+        if stopped == nil { restoreMarkerTick(companies: companies) }
 
         // Sleeping agents whose debounced work notices have come due.
         attempt { try store.wakeDueNotices(now: now) }

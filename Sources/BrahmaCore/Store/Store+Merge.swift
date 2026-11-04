@@ -250,9 +250,19 @@ extension Store {
     /// Everything up to the landing (the guard, the checkout, a quarantine) and the locks, moving `main`, the merge repository
     /// and `main`'s history fail as `MergeInfrastructureError`: the company's fault, never counted against the item. Stale
     /// lock files left in the workspace repository are removed and reported to the owner (`reportMergeTamper`).
-    func performMerge(item: WorkItem, company: Company, now: Date) throws -> MergeResult? {
+    ///
+    /// The owner's stop (Task 7c fix round 1, S15) is read before anything is done, before a quarantine, and again right
+    /// before each ref the landing moves (`landVerified`'s `beforeRefMove`): once it is raised the merge throws
+    /// `StoppedByOwner` with nothing moved (a pending `main` record is cleared). `childGroups` records each git it runs.
+    func performMerge(item: WorkItem, company: Company, now: Date, childGroups: ChildGroups? = nil) throws -> MergeResult? {
         let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-        let git = gitWorkspace(root: root, companyId: company.id)
+        var git = gitWorkspace(root: root, companyId: company.id)
+        git.childGroups = childGroups
+        let stopGate: (String) throws -> Void = { [self] ref in
+            mergeRefProbe.call(ref)
+            if try engineStopped() != nil { throw StoppedByOwner() }
+        }
+        try stopGate("")
         guard let verified = item.verifiedCommit else { throw WorkError.conflict("\(item.key) has no verified commit") }
         let expected: String? = try MergeInfrastructureError.wrapping {
             // `main` must still be what the engine expects; if it was changed outside Brahma the merge is held (the guard
@@ -267,6 +277,7 @@ extension Store {
             if try quarantineHeld(companyId: company.id) { return nil }
             guard let expected = try self.company(id: company.id)?.mainCommit else { return nil }
             if try git.isDirty(in: root) {
+                try stopGate("refs/quarantine")
                 try quarantineRoot(company: company, git: git, expectedMain: expected, now: now)
                 return nil
             }
@@ -284,7 +295,7 @@ extension Store {
             outcome = try git.landVerified(key: item.key, verified: verified, expectedMain: expected, recordPending: { next in
                 try MergeInfrastructureError.wrapping { try self.setPendingMainCommit(companyId: company.id, next) }
                 pending = next
-            }, tamper: { removed in self.reportMergeTamper(company: company, removed: removed, now: now) })
+            }, tamper: { removed in self.reportMergeTamper(company: company, removed: removed, now: now) }, beforeRefMove: stopGate)
         } catch {
             if let pending { try? clearPendingMainCommit(companyId: company.id, ifEqual: pending) }
             throw error

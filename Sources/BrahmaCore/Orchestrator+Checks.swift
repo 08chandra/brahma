@@ -11,6 +11,8 @@ extension Orchestrator {
     /// off the cooperative pool: `Blocking`).
     func recoverChecks(now: Date) async throws {
         try store.recoverVerifications(now: now)
+        // Records of check and merge children the previous process left whose leader is gone (S15).
+        ChildGroups.removeStale(in: ChildGroups.directory(runDir: paths.runDir))
         for company in try store.companies() {
             let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
             guard FileManager.default.fileExists(atPath: ws.appending(path: ".git").path) else { continue }
@@ -150,8 +152,12 @@ extension Orchestrator {
                                                 purpose: .check, secrets: secrets)
         let output = run.outputPath.map { URL(fileURLWithPath: $0) }
             ?? paths.companyDir(run.companyId).appending(path: "check-output/\(run.id).log")
-        var outcome = await checkRunner.run(command: run.command, workingDirectory: dir,
-                                            timeout: TimeInterval(run.timeoutSeconds), outputURL: output, environment: environment)
+        // The check's process group is recorded while it runs, so the owner's stop can kill it without the engine (S15).
+        let runner = checkRunner
+        var outcome = await ChildGroups.$current.withValue(checkChildGroups) {
+            await runner.run(command: run.command, workingDirectory: dir,
+                             timeout: TimeInterval(run.timeoutSeconds), outputURL: output, environment: environment)
+        }
         // The check's log file is agent output: scrubbed in place before anything reads it (the tail is redacted as it is
         // stored). A log that cannot be scrubbed is removed (`scrubCheckLog`) and the run's tail withheld: fail closed.
         let scrubbing = self.store
@@ -161,7 +167,9 @@ extension Orchestrator {
             catch { self.log("could not scrub the check log of run \(run.id): \(error)"); return false }
         }
         if !scrubbed { outcome = CheckOutcome(exitCode: outcome.exitCode, timedOut: outcome.timedOut, tail: Self.withheldCheckTail) }
-        if Task.isCancelled { checkCancelled(run: run); return }
+        // Cut short by shutdown or by the owner's stop (which may have killed the group itself, from `brahma stop`): never an
+        // outcome; a stopped run goes back to the queue as it was (I1).
+        if Task.isCancelled || stoppedNow { checkCancelled(run: run); return }
         // Risk-tiered review: a clean submit pass is measured (engine-recorded commits only) before it is recorded.
         let passed = outcome.exitCode == 0 && !outcome.timedOut
         let assessing = self.store

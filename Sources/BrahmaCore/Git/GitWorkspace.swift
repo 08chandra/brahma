@@ -31,7 +31,8 @@ struct MergeInfrastructureError: Error, CustomStringConvertible, LocalizedError 
 
     /// Runs `body`, reporting whatever it throws as the company's fault.
     static func wrapping<T>(_ body: () throws -> T) throws -> T {
-        do { return try body() } catch let e as MergeInfrastructureError { throw e } catch { throw MergeInfrastructureError(underlying: error) }
+        do { return try body() } catch let e as MergeInfrastructureError { throw e } catch let e as StoppedByOwner { throw e }
+        catch { throw MergeInfrastructureError(underlying: error) }
     }
 }
 
@@ -116,6 +117,10 @@ struct GitCommand: Sendable {
     /// Tests only: handed the `tempRoot` of every git run, to prove the engine's captured output never lands in the shared
     /// per-user temp dir (A-I1b). Injected per `GitWorkspace` instance (not a global), so it is set only where a test wants it.
     var tempRootObserver: (@Sendable (URL) -> Void)?
+
+    /// Set for a merge's git (Task 7c fix round 1, S15): each git is spawned as the leader of its own process group and
+    /// recorded there until it is reaped, so the owner's stop can signal it even when the engine is wedged.
+    var childGroups: ChildGroups?
 
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
@@ -387,7 +392,20 @@ struct GitCommand: Sendable {
         }
         process.standardOutput = outHandle
         process.standardError = errHandle
-        do { try process.run() } catch {
+        // A merge's git leads its own group, recorded for the owner's stop until it is reaped (`childGroups`).
+        let grouped: ProcessGroupChild?
+        do {
+            if childGroups != nil {
+                let input = feed.map { $0.pipe.fileHandleForReading.fileDescriptor } ?? -1
+                grouped = try ProcessGroupChild.spawn(
+                    executable: "/usr/bin/env", arguments: ["/usr/bin/env"] + argv, environment: environment,
+                    workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+                    output: outHandle.fileDescriptor, stdin: input, stderr: errHandle.fileDescriptor)
+            } else {
+                try process.run()
+                grouped = nil
+            }
+        } catch {
             if let feed { try? feed.pipe.fileHandleForReading.close(); try? feed.pipe.fileHandleForWriting.close() }
             throw GitError.failed(command: label, status: -1, stderr: "\(error)")
         }
@@ -408,10 +426,20 @@ struct GitCommand: Sendable {
                 } catch { result.error = error }
             }.start()
         }
+        let record = grouped.flatMap { childGroups?.record($0.pid) }
         let timedOut = TimeoutFlag()
-        let timer = DispatchWorkItem { timedOut.mark(); process.terminate() }
+        let timer = DispatchWorkItem { timedOut.mark(); if let grouped { grouped.signalGroup(SIGTERM) } else { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.timeout, execute: timer)
-        process.waitUntilExit()
+        var groupedStatus: Int32 = 0
+        if let grouped {
+            // Foundation's convention: the exit code, or the number of the signal that ended it.
+            let raw = grouped.finish()
+            groupedStatus = raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f
+            if grouped.lostTrack { groupedStatus = -1 }
+            childGroups?.forget(record, pid: grouped.pid)
+        } else {
+            process.waitUntilExit()
+        }
         timer.cancel()
         // Git has exited, so the feeder's next write fails and it finishes; nothing waits on a live pipe.
         feed?.result.done.wait()
@@ -425,7 +453,7 @@ struct GitCommand: Sendable {
         let (stdout, cut) = read(outURL, limit: maxOutput)
         var stderr = String(decoding: read(errURL, limit: 64 * 1024).0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if timedOut.cut { stderr = "timed out after \(Int(Self.timeout)) s" + (stderr.isEmpty ? "" : ": \(stderr)") }
-        var status = process.terminationStatus
+        var status = grouped == nil ? process.terminationStatus : groupedStatus
         if let error = feed?.result.error {
             // The input ended early: whatever git made of the part it got does not count as success.
             if status == 0 { status = -1 }
@@ -621,6 +649,9 @@ public struct GitWorkspace: Sendable {
     /// Tests only: handed each git command's `tempRoot`, so a test can prove the engine never writes to the shared per-user
     /// temp dir (A-I1b). Injected on the instance; nil in production (no global).
     var gitTempObserver: (@Sendable (URL) -> Void)?
+    /// A merge's workspace (Task 7c fix round 1): every git it runs leads its own process group, recorded here for the
+    /// owner's stop (`GitCommand.childGroups`).
+    var childGroups: ChildGroups?
 
     public init(root: URL, lockDirectory: URL? = nil, mergeDirectory: URL? = nil, exportHome: URL? = nil) {
         self.root = root
@@ -662,6 +693,7 @@ public struct GitWorkspace: Sendable {
         git.beforeRetry = gitRetryProbe
         git.tempRoot = gitTemp
         git.tempRootObserver = gitTempObserver
+        git.childGroups = childGroups
         return git
     }
 
@@ -726,6 +758,7 @@ public struct GitWorkspace: Sendable {
         git.beforeRetry = gitRetryProbe
         git.tempRoot = gitTemp
         git.tempRootObserver = gitTempObserver
+        git.childGroups = childGroups
         return (git, key)
     }
 
@@ -1198,6 +1231,7 @@ public struct GitWorkspace: Sendable {
         git.attributes = Self.engineAttributes
         git.tempRoot = gitTemp
         git.tempRootObserver = gitTempObserver
+        git.childGroups = childGroups
         return git
     }
     /// Where older engines kept the merge checkout, inside the agent-writable `<ws>/.brahma`.
@@ -1241,8 +1275,12 @@ public struct GitWorkspace: Sendable {
     /// history that cannot be fetched, handing a result back to the workspace. A verified commit git cannot fetch (fsck
     /// refuses it, an object is missing), check out, rebase or merge, a branch with no history in common with `main` and a
     /// result that fails its checks fail as `GitError`: they count against the item.
+    ///
+    /// `beforeRefMove` runs with the ref's name right before each ref this landing moves (the item branch's compare-and-swap
+    /// after a rebase, `main`'s compare-and-swap): whatever it throws (the owner's stop, `StoppedByOwner`) leaves that ref
+    /// where it was and ends the landing.
     func landVerified(key: String, verified: String, expectedMain: String, recordPending: (String) throws -> Void,
-                      tamper: ([String]) -> Void = { _ in }) throws -> LandOutcome {
+                      tamper: ([String]) -> Void = { _ in }, beforeRefMove: (String) throws -> Void = { _ in }) throws -> LandOutcome {
         try Self.validKey(key); try Self.validCommit(verified); try Self.validCommit(expectedMain)
         return try withKeyLock(key, infrastructure: true) {
             try withMainLock(infrastructure: true) {
@@ -1253,7 +1291,8 @@ public struct GitWorkspace: Sendable {
                 let mainHead = try MergeInfrastructureError.wrapping { try head(of: Self.mainRef) }
                 guard let mainHead, mainHead == expectedMain else { return .mainMoved(head: mainHead) }
                 return try withEngineLock {
-                    try landLocked(key: key, verified: verified, mainHead: mainHead, recordPending: recordPending, tamper: tamper)
+                    try landLocked(key: key, verified: verified, mainHead: mainHead, recordPending: recordPending, tamper: tamper,
+                                   beforeRefMove: beforeRefMove)
                 }
             }
         }
@@ -1261,7 +1300,7 @@ public struct GitWorkspace: Sendable {
 
     /// `landVerified` from step 3 on; the caller holds the item's, main's and the engine repository's locks.
     private func landLocked(key: String, verified: String, mainHead: String, recordPending: (String) throws -> Void,
-                            tamper: ([String]) -> Void) throws -> LandOutcome {
+                            tamper: ([String]) -> Void, beforeRefMove: (String) throws -> Void) throws -> LandOutcome {
         let git = try MergeInfrastructureError.wrapping { () throws -> GitCommand in
             let git = try freshEngineRepository()
             retireWorkspaceMergeCheckouts()
@@ -1274,7 +1313,9 @@ public struct GitWorkspace: Sendable {
             throw GitError.failed(command: "merge-base", status: -1, stderr: "item/\(key) shares no history with main")
         }
         if base == mainHead {
-            try MergeInfrastructureError.wrapping { try moveMainLocked(from: mainHead, to: verified, recordPending: recordPending) }
+            try MergeInfrastructureError.wrapping {
+                try moveMainLocked(from: mainHead, to: verified, recordPending: recordPending, beforeRefMove: beforeRefMove)
+            }
             return .fastForwarded(mainHead: verified)
         }
         // The engine repository's config and attributes are written again before anything there touches a tree.
@@ -1311,6 +1352,7 @@ public struct GitWorkspace: Sendable {
         // carries what will be checked and landed. An author who moved it meanwhile wins nothing.
         let moved = try MergeInfrastructureError.wrapping { () throws -> GitCommand.Output in
             try handBack(git, result: rebased, prerequisites: [mainHead, verified])
+            try beforeRefMove(branchRef(key: key))
             return try main.run(["update-ref", branchRef(key: key), rebased, verified], allowFailure: true)
         }
         guard moved.status == 0 else { return .branchMoved(head: try MergeInfrastructureError.wrapping { try head(of: branchRef(key: key)) }) }
@@ -1364,7 +1406,8 @@ public struct GitWorkspace: Sendable {
     /// Fast-forwards `refs/heads/main` from `old` to `new` (the caller holds main's lock): the expected next head is recorded
     /// first, then a compare-and-swap `update-ref`, then a check that `main` is `new`. The root checkout, when it is on
     /// `main`, follows with a two-tree `read-tree` (which never overwrites local edits).
-    private func moveMainLocked(from old: String, to new: String, recordPending: (String) throws -> Void) throws {
+    private func moveMainLocked(from old: String, to new: String, recordPending: (String) throws -> Void,
+                                beforeRefMove: (String) throws -> Void = { _ in }) throws {
         guard try isAncestor(old, of: new) else {
             throw GitError.failed(command: "update-ref \(Self.mainRef)", status: -1, stderr: "not a fast-forward of main")
         }
@@ -1372,6 +1415,8 @@ public struct GitWorkspace: Sendable {
             throw GitError.failed(command: "update-ref \(Self.mainRef)", status: -1, stderr: "main is a symbolic ref")
         }
         try recordPending(new)
+        // The last moment before `main` moves (the owner's stop is read here; the caller clears the pending record).
+        try beforeRefMove(Self.mainRef)
         try main.run(["update-ref", "--no-deref", Self.mainRef, new, old])
         guard try head(of: Self.mainRef) == new else {
             throw GitError.failed(command: "update-ref \(Self.mainRef)", status: -1, stderr: "main is not at \(new.prefix(7)) after the update")
@@ -1477,6 +1522,7 @@ public struct GitWorkspace: Sendable {
         source.attributes = Self.engineAttributes
         source.tempRoot = gitTemp
         source.tempRootObserver = gitTempObserver
+        source.childGroups = childGroups
         guard try source.run(["cat-file", "-e", "\(mainHead)^{commit}"], allowFailure: true).status == 0 else { return false }
         try source.run(["update-ref", "--no-deref", "refs/brahma/heal", mainHead])
         let bundle = URL(fileURLWithPath: mergeDirectory.path + "-heal.bundle")

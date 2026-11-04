@@ -28,6 +28,20 @@ extension Orchestrator {
 
     func mergeEnded(companyId: String) { mergeTasks[companyId] = nil }
 
+    /// Where a merge's git children are recorded for the owner's stop (`ChildGroups`, kind `merge`).
+    nonisolated var mergeChildGroups: ChildGroups { ChildGroups(dir: ChildGroups.directory(runDir: paths.runDir), kind: "merge") }
+
+    /// A merge the owner's stop cut short: one engine event in the company's feed; the item stays `pending` (requeued by
+    /// `endMerging`), with no backoff, no failure count and no company fault.
+    nonisolated func mergeStopped(company: Company, item: WorkItem, error: any Error) {
+        log("the merge of \(item.key) was stopped by the owner before main moved (\(error))")
+        do {
+            try store.appendEvent(ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .error,
+                                                text: "the merge of \(item.key) was stopped by the owner before main moved; it keeps its approval and merges after the resume",
+                                                createdAt: clock()))
+        } catch { log("could not record the stopped merge of \(item.key): \(error)") }
+    }
+
     func holdMerges(companyId: String, until: Date) { mergeBackoff[companyId] = until }
 
     /// Crash recovery: no merge runs at start-up. Reads `main` and the installed git's version (git: off the cooperative pool).
@@ -87,8 +101,9 @@ extension Orchestrator {
             do { try store.endMerging(itemId: item.id) } catch { log("could not end the merge of \(item.key): \(error)") }
         }
         do {
-            let (store, now) = (self.store, clock())
-            guard let result = try await blocking.tryRun({ try store.performMerge(item: item, company: company, now: now) }) else {
+            let (store, now, groups) = (self.store, clock(), mergeChildGroups)
+            if Task.isCancelled, (try? store.engineStopped()) != nil { throw StoppedByOwner() }
+            guard let result = try await blocking.tryRun({ try store.performMerge(item: item, company: company, now: now, childGroups: groups) }) else {
                 await holdMerges(companyId: company.id, until: clock().addingTimeInterval(Self.mergeRetry))
                 return
             }
@@ -96,6 +111,10 @@ extension Orchestrator {
             // Recording a landing also removes the item's worktree and branch and looks at the other branches (git).
             let finished = clock()
             try await blocking.tryRun { try store.finishMerge(itemId: item.id, result: result, now: finished) }
+        } catch let error where error is StoppedByOwner || (try? store.engineStopped()) != nil {
+            // The owner's stop (S15): seen before a ref moved, or its signal killed the merge's git. Nothing moved; the item
+            // keeps its approval and its place and merges after the resume, never charged to it or to the company.
+            mergeStopped(company: company, item: item, error: error)
         } catch let error where Self.isCompanyMergeFault(error) {
             log("could not merge \(item.key) (\(company.name)'s merge step failed): \(error)")
             let version = await blocking.run { GitWorkspace.installedGitVersion }

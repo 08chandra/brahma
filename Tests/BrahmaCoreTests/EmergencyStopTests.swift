@@ -9,6 +9,13 @@ private actor CountingObserver: EmergencyStopObserver {
     func stopAll(reason: String) async { reasons.append(reason) }
 }
 
+/// A thread-safe count (the fake check's calls).
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    func next() -> Int { lock.withLock { n += 1; return n } }
+}
+
 @Suite(.scratch, .serialized) struct EmergencyStopTests {
     // MARK: Engine
 
@@ -34,7 +41,7 @@ private actor CountingObserver: EmergencyStopObserver {
         #expect(try w.pending(ceo) == 1, "its inbox is kept")
     }
 
-    @Test func stopKillsChecksAsInconclusive() async throws {
+    @Test func stopKillsChecksAndRequeuesThem() async throws {
         let w = try World(); let c = try w.company("Acme")
         let mgr = try w.hire(c, "mgr", role: "manager")
         let eng = try w.store.hire(companyId: c.id, name: "eng", role: "engineer", model: "sonnet", managerId: mgr.id)
@@ -55,9 +62,132 @@ private actor CountingObserver: EmergencyStopObserver {
         try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
 
         let runs = try runsOf(w, item)
-        #expect(runs.map(\.status) == [.inconclusive, .queued], "recorded inconclusive and queued again, never failed")
+        #expect(runs.map(\.status) == [.queued], "the same run back in the queue: no attempt recorded, never failed (I1)")
+        #expect(runs.first?.notBeforeActive == nil, "no delay")
         #expect(try w.store.workItem(id: item.id)?.status == .inReview, "not returned to its holder")
         #expect(w.checks.calls.count == 1)
+    }
+
+    /// I1: three stops during one item's check never use up its inconclusive budget; after the resume the check runs at once.
+    @Test func threeStopsThenResumeRunsTheCheck() async throws {
+        let w = try World(); let c = try w.company("Acme")
+        let mgr = try w.hire(c, "mgr", role: "manager")
+        let eng = try w.store.hire(companyId: c.id, name: "eng", role: "engineer", model: "sonnet", managerId: mgr.id)
+        let item = try submittedItem(w, c, eng)
+        let calls = Counter()
+        let started = [Gate(), Gate(), Gate()]
+        w.checks.onRun { _ in
+            let n = calls.next()
+            guard n <= 3 else { return CheckOutcome(exitCode: 0, timedOut: false, tail: "ok") }
+            started[n - 1].open()
+            let release = Gate()
+            await withTaskCancellationHandler { await release.wait() } onCancel: { release.open() }
+            return CheckOutcome(exitCode: nil, timedOut: false, tail: "killed")
+        }
+        for round in 1...3 {
+            await w.orchestrator.tick()
+            await started[round - 1].wait()
+            try w.store.emergencyStop(note: nil, by: "owner", now: w.clock.now)
+            try await w.cycle()
+            let runs = try runsOf(w, item)
+            #expect(runs.map(\.status) == [.queued], "round \(round): back in the queue as it was")
+            #expect(try w.store.workItem(id: item.id)?.status == .inReview, "round \(round): never handed back")
+            try w.store.resumeAfterStop(now: w.clock.now)
+        }
+        try await w.cycle()
+        #expect(w.checks.calls.count == 4, "admitted right after the resume, no 300 s wait")
+        let runs = try runsOf(w, item)
+        #expect(runs.map(\.status) == [.passed])
+        #expect(runs.first?.attempt == 1, "no attempt was spent on the stops")
+        let after = try #require(try w.store.workItem(id: item.id))
+        #expect(after.status == .inReview); #expect(after.verifiedCommit != nil)
+    }
+
+    /// I2: the in-turn poll alone (no tick) cancels a running turn once it reads the stop.
+    @Test func pollCancelsTurnWithoutTick() async throws {
+        let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+        let hold = Gate(), started = Gate()
+        w.fake.onRun = { _ in started.open() }
+        w.fake.script("ceo", .init(gate: hold))
+        try w.dm(c, ceo)
+        await w.orchestrator.tick()
+        await started.wait()
+        await w.stopPoll.waiting()
+        // A poll that reads no stop keeps the turn running.
+        w.stopPoll.step()
+        await w.stopPoll.waiting()
+        #expect(await w.orchestrator.runningCount() == 1)
+        try w.store.emergencyStop(note: nil, by: "cli", now: w.clock.now)
+        w.stopPoll.step()
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))   // no tick in between
+        hold.open()
+        #expect(try w.turns(ceo).map(\.outcome) == [.interrupted])
+        #expect(try w.agent(ceo).state == .ready)
+    }
+
+    // MARK: Check and merge process groups (S15)
+
+    /// A real check (`ProcessCheckRunner`, a FakeTools sleeper) is recorded while it runs; signalling the recorded groups the
+    /// way `brahma stop` does, with no engine involved, ends it, and its record goes.
+    @Test func recordedCheckGroupIsKilledByStop() async throws {
+        let dir = try tempDir()
+        let recorded = Gate(), forgotten = Gate()
+        var made = ChildGroups(dir: dir.appending(path: "children"), kind: "check")
+        made.observer = { e in if case .recorded = e { recorded.open() } else { forgotten.open() } }
+        let groups = made
+        let sleeper = try FakeTools.script("check-sleeper", "sleep 300 & wait")
+        let runner = ProcessCheckRunner()
+        let output = dir.appending(path: "out.log")
+        let run = Task.detached { () async -> CheckOutcome in   // scope-escape: runs the check, no scratch dirs
+            await ChildGroups.$current.withValue(groups) { @Sendable () async -> CheckOutcome in
+                await runner.run(command: sleeper.path, workingDirectory: dir, timeout: 3600,
+                                 outputURL: output, environment: ["PATH": "/usr/bin:/bin"])
+            }
+        }
+        await recorded.wait()
+        let leaders = ChildGroups.liveLeaders(in: groups.dir)
+        #expect(leaders.count == 1)
+        let signalled = EmergencyStop.signalGroups(leaders)
+        #expect(signalled.terminated == leaders.sorted())
+        let outcome = await run.value
+        await forgotten.wait()
+        #expect(outcome.exitCode != 0, "\(outcome)")
+        #expect(ChildGroups.liveLeaders(in: groups.dir).isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: groups.dir.path).filter { $0.hasSuffix(".group") }.isEmpty)
+    }
+
+    /// A merge's git (`GitCommand.childGroups`) leads its own recorded group: a git stuck mid-command (on its input, standing
+    /// in for a hung merge step) is ended by signalling the recorded groups, and the engine's own group is never touched.
+    @Test func recordedMergeGitGroupIsKilledByStop() async throws {
+        let repo = try tempDir()
+        _ = try GitFixture.plainGit(["init", "-q", "-b", "main"], in: repo)
+        let recorded = Gate(), forgotten = Gate()
+        var made = ChildGroups(dir: try tempDir().appending(path: "children"), kind: "merge")
+        made.observer = { e in if case .recorded = e { recorded.open() } else { forgotten.open() } }
+        let groups = made
+        var git = GitCommand(gitDir: repo.appending(path: ".git"), workTree: repo, commonDir: nil)
+        git.tempRoot = try tempDir()
+        git.childGroups = groups
+        let release = DispatchSemaphore(value: 0)
+        let command = git
+        let run = Task.detached { () -> String in   // scope-escape: runs one git, no scratch dirs
+            let feed: GitCommand.Stdin = .stream({ pipe in
+                try pipe.write(Data("partial".utf8))
+                release.wait()                           // git waits for the rest of its input
+            })
+            do { return "status \(try command.run(["hash-object", "--stdin"], allowFailure: true, stdin: feed).status)" }
+            catch { return "threw \(error)" }
+        }
+        await recorded.wait()
+        let leaders = ChildGroups.liveLeaders(in: groups.dir)
+        #expect(leaders.count == 1)
+        #expect(!leaders.contains(getpgrp()), "its own group, never the engine's")
+        #expect(EmergencyStop.signalGroups(leaders).terminated == leaders.sorted())
+        await forgotten.wait()
+        release.signal()
+        let status = await run.value
+        #expect(status != "status 0", "the killed git is not a success: \(status)")
+        #expect(ChildGroups.liveLeaders(in: groups.dir).isEmpty)
     }
 
     @Test func nothingAdmittedWhileStopped() async throws {
@@ -212,6 +342,54 @@ private actor CountingObserver: EmergencyStopObserver {
         #expect(try store.engineStopped() == nil)
         let after = try cli(["status"], home: owner.url)
         #expect(!after.stdout.contains("STOPPED"))
+    }
+
+    /// `brahma stop` with no engine signals the check and merge groups the engine recorded (S15), not only turns.
+    @Test func cliStopKillsRecordedCheckAndMergeGroups() throws {
+        let owner = try OwnerTestHome()
+        let paths = ownerPaths(owner.url)
+        _ = try Store(path: paths.database.path)
+        let dir = ChildGroups.directory(runDir: paths.runDir)
+        var children: [ProcessGroupChild] = []
+        defer { for c in children { _ = c.signalGroup(SIGKILL); c.finish() } }
+        for kind in ["check", "merge"] {
+            let child = try ProcessGroupChild.spawn(executable: "/bin/sleep", arguments: ["sleep", "300"], environment: [:],
+                                                    workingDirectory: try tempDir(), output: -1)
+            children.append(child)
+            #expect(ChildGroups(dir: dir, kind: kind).record(child.pid) != nil)
+        }
+        let stop = try cli(["stop"], home: owner.url)
+        #expect(stop.status == 0, "\(stop.stderr)")
+        for child in children {
+            #expect(child.hasExited(), "a recorded group survived brahma stop")
+            #expect(ProcessGroupChild.exitCode(child.finish()) == 128 + SIGTERM)
+        }
+        #expect(ChildGroups.liveLeaders(in: dir).isEmpty)
+        ChildGroups.removeStale(in: dir)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasSuffix(".group") }.isEmpty)
+    }
+
+    // MARK: Stop notice (M1 ruling)
+
+    @Test func stopNoticeIsPushedOncePerStop() async throws {
+        let store = try Store.inMemory()
+        _ = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+        try store.setPush(provider: .ntfy, topic: "long-random-topic-9f3a")
+        let channel = FakePushChannel()
+        let d = PushDispatcher(store: store, vault: MemoryVault(), channel: channel, awake: { 1_000_000 })
+        let row = try store.emergencyStop(note: "secret note", by: "owner", now: Date(timeIntervalSince1970: 1_800_000_000))
+        await d.tick(now: Date(), onlyStopNotice: true)
+        await d.tick(now: Date(), onlyStopNotice: true)
+        let sent = channel.sent
+        #expect(sent.count == 1, "once per stop")
+        #expect(sent.first?.body == PushDispatcher.stopNoticeBody(row, timeZone: store.ownerTimeZone()))
+        #expect(sent.first?.body.contains("secret note") == false, "the owner's note never leaves")
+        #expect(sent.first?.priority == .urgent)
+        // A new stop after a resume is a new notice.
+        try store.resumeAfterStop(now: Date())
+        try store.emergencyStop(note: nil, by: "cli", now: Date(timeIntervalSince1970: 1_800_000_600))
+        await d.tick(now: Date(), onlyStopNotice: true)
+        #expect(channel.sent.count == 2)
     }
 
     // MARK: Helpers
