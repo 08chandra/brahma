@@ -1,8 +1,7 @@
 import Foundation
 
-/// The hosting and deploy tools (Plan L: `set_deploy_config` Task 4, `set_smoke_check` Task 5, `propose_deploy` Task 6). Until
-/// its task lands `propose_deploy` answers `"<tool> is not available yet"` (PR-20); the names are already in `CompanyToolNames.ops`
-/// so roles, the high-risk gate and the plan-turn exclusion cover them from the start. Every handler resolves the company
+/// The hosting and deploy tools (Plan L: `set_deploy_config` Task 4, `set_smoke_check` Task 5, `propose_deploy` Task 6). The
+/// names are in `CompanyToolNames.ops`, so roles, the high-risk gate and the plan-turn exclusion cover them. Every handler resolves the company
 /// from the acting agent only, and none of them deploys anything: only the engine's release executor does, after the owner.
 extension CompanyTools {
     static let notAvailableYet = "is not available yet"
@@ -30,8 +29,14 @@ extension CompanyTools {
                     "timeout_seconds": prop("integer", "Timeout in seconds (default 600, at most 3600)"),
                     "clear": prop("boolean", "Remove the smoke check instead"),
                 ], required: [])),
-            ToolSpec(name: "propose_deploy", description: "Propose a deploy of main for the owner's approval (not available yet).",
-                     inputSchema: schema([:], required: [])),
+            ToolSpec(name: "propose_deploy", description: """
+                Propose deploying the current main as a release, for the owner's approval. The engine records the exact deploy \
+                and rollback commands; once the owner approves it builds (sandboxed), smoke-checks main, deploys and checks the \
+                site. Needs set_deploy_config, a passing set_smoke_check on main and the owner's hosting token.
+                """, inputSchema: schema([
+                    "version": prop("string", "Release version, e.g. 0.1.0 (1–32 letters, digits, '.', '+' or '-'; unique)"),
+                    "notes": prop("string", "Release notes for the owner: what changed"),
+                ], required: ["version"])),
         ]
     }
 
@@ -41,7 +46,7 @@ extension CompanyTools {
             switch name {
             case "set_deploy_config": return try setDeployConfig(args)
             case "set_smoke_check": return try setSmokeCheck(args)
-            case "propose_deploy": throw ToolError(message: "\(name) \(Self.notAvailableYet)")
+            case "propose_deploy": return try proposeDeploy(args)
             default: return nil
             }
         } catch let e as WorkError {
@@ -50,6 +55,13 @@ extension CompanyTools {
     }
 
     // MARK: Tools
+
+    private func proposeDeploy(_ args: [String: JSONValue]) throws -> String {
+        let version = try string(args, "version")
+        let notes = try optionalString(args, "notes")
+        let (release, _) = try store.proposeDeploy(companyId: companyId, by: agentId, version: version, notes: notes)
+        return Store.proposedDeployText(release)
+    }
 
     private func setSmokeCheck(_ args: [String: JSONValue]) throws -> String {
         if let clear = args["clear"], clear != .null {

@@ -118,7 +118,7 @@ public enum SoftwarePack {
 
     ## Decision rights
     - Decides: architecture, stack, interfaces between teams, engineering standards.
-    - Proposes: release and architecture asks that need the owner (propose_decision).
+    - Proposes: architecture asks that need the owner (propose_decision); releases go through propose_deploy.
     - Never: merges around a red check; spends the company's innovation tokens without recording them.
 
     ## Principles
@@ -368,7 +368,7 @@ public enum SoftwarePack {
     You are DevOps/SRE. You get verified work to users safely and reversibly, and you keep the pipeline and environments healthy.
 
     ## Responsibilities
-    - Run release items: integrate main, run the full suite, confirm review freshness, sync docs and version, then raise the release ask with propose_decision.
+    - Run release items: integrate main, run the full suite, confirm review freshness, sync docs and version, then propose the deploy with propose_deploy (the engine records the exact deploy and rollback commands for the owner).
     - Deploy only through approved connectors, with a stated rollback plan first.
     - After deploy, run canary checks (errors, latency, key pages) and report.
     - Maintain build, CI and environment configuration through ordinary items.
