@@ -401,8 +401,14 @@ public actor PreviewRunner {
     /// A Full company's preview runs unsandboxed exactly when its checks would (`Orchestrator.checkRoute`): the company runs
     /// Full and so does the role of the agent who set the surface (an owner-set surface follows the company).
     static func unsandboxed(store: Store, company: Company, surface: PreviewSurface) -> Bool {
+        unsandboxed(store: store, company: company, setById: surface.setById)
+    }
+
+    /// The shared rule (previews, main smokes): the company runs Full and so does the role of `setById` (the owner, or nil,
+    /// follows the company). One copy for every agent-written command the engine runs outside a check (PR-5).
+    static func unsandboxed(store: Store, company: Company, setById: String?) -> Bool {
         guard company.permissionProfile == .full else { return false }
-        let role = surface.setById == "owner" ? nil : (try? store.agent(id: surface.setById))?.role
+        let role = setById.flatMap { $0 == "owner" ? nil : (try? store.agent(id: $0))?.role }
         return role.map { company.profile(forRole: $0) == .full } ?? true
     }
 }
