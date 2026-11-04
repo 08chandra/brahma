@@ -18,14 +18,14 @@ import GRDB
         let unsandboxed: FakeSandbox
         let data: URL
 
-        init(profile: PermissionProfile = .workspace) throws {
+        init(profile: PermissionProfile = .workspace, memory: StubMemory = StubMemory(), config: SchedulerConfig = World.config()) throws {
             let root = try tempDir()
             data = root.appending(path: "data", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
             let store = try Store(path: data.appending(path: "brahma.sqlite").path)
             sandbox = FakeSandbox()
             unsandboxed = FakeSandbox()
-            w = try World(store: store, smokeSandbox: sandbox, smokeUnsandboxed: unsandboxed)
+            w = try World(store: store, config: config, memory: memory, smokeSandbox: sandbox, smokeUnsandboxed: unsandboxed)
             company = try w.company("Acme", profile: profile)
             devops = try w.hire(company, "devops-1", role: "devops")
             eng = try w.hire(company, "eng-1", role: "engineer")
@@ -85,11 +85,9 @@ import GRDB
         try await fx.w.cycle()
         #expect(try fx.runs().count == 1)
         // A release's own smoke (Task 7's path) is a new row keyed by its release, reused for that release only.
-        let release = try await fx.store.runSmoke(companyId: fx.company.id, commit: head, reason: .release, releaseId: "rel-1",
-                                                  checks: fx.w.orchestrator.smokeChecks, now: fx.w.clock.now)
+        let release = try await fx.w.orchestrator.runSmoke(companyId: fx.company.id, commit: head, reason: .release, releaseId: "rel-1")
         #expect(release.status == .passed); #expect(release.releaseId == "rel-1"); #expect(release.id != run.id)
-        let again = try await fx.store.runSmoke(companyId: fx.company.id, commit: head, reason: .release, releaseId: "rel-1",
-                                                checks: fx.w.orchestrator.smokeChecks, now: fx.w.clock.now)
+        let again = try await fx.w.orchestrator.runSmoke(companyId: fx.company.id, commit: head, reason: .release, releaseId: "rel-1")
         #expect(again.id == release.id); #expect(fx.sandbox.calls.count == 2)
     }
 
@@ -205,9 +203,114 @@ import GRDB
         #expect(try fx.store.nextQueuedSmoke(companyId: fx.company.id)?.id == two.id)
         // A run an earlier engine left running is no result at the next start: error, no red bug.
         try fx.store.writer.write { db in try db.execute(sql: "UPDATE mainSmokeRun SET status = 'running' WHERE id = ?", arguments: [two.id]) }
-        try fx.store.interruptRunningSmokes(now: fx.w.clock.now)
+        _ = try fx.store.recoverSmokes(now: fx.w.clock.now)
         let interrupted = try #require(try fx.store.mainSmokeRun(id: two.id))
         #expect(interrupted.status == .error); #expect(interrupted.outputTail == "engine restarted")
         #expect(try fx.current().redBugItemId == nil)
+    }
+
+    // MARK: Fix round 1
+
+    /// Polls (bounded; never a race on the result) until `body` holds.
+    static func eventually(_ body: () throws -> Bool) async throws {
+        for _ in 0..<6000 where try !body() { try await Task.sleep(for: .milliseconds(20)) }
+    }
+
+    @Test func fullModeSmokesRunUnsandboxed() async throws {
+        let fx = try Fx(profile: .full)
+        try fx.setSmoke("test -f a.txt")
+        let head = try fx.merge(["a.txt": "x"])
+        try await fx.w.cycle()
+        #expect(fx.sandbox.calls.isEmpty); #expect(fx.unsandboxed.calls.count == 1)
+        #expect(try fx.runs().first?.status == .passed)
+        #expect(try ReleasePolicy.mainIsGreen(store: fx.store, company: try fx.current(), at: head) == (true, nil))
+    }
+
+    @Test func smokesWaitForCapacity() async throws {
+        let memory = StubMemory(.critical)
+        let fx = try Fx(memory: memory)
+        try fx.setSmoke("true")
+        try fx.merge(["a.txt": "x"])
+        try await fx.w.cycle()
+        #expect(try fx.runs().map(\.status) == [.queued]); #expect(fx.sandbox.calls.isEmpty)
+        memory.set(.normal)
+        try await fx.w.cycle()
+        #expect(try fx.runs().map(\.status) == [.passed])
+        // No free slot (hard cap 0): queued, not started.
+        let tight = try Fx(config: World.config(hardCap: 0))
+        try tight.setSmoke("true")
+        try tight.merge(["a.txt": "x"])
+        try await tight.w.cycle()
+        #expect(try tight.runs().map(\.status) == [.queued]); #expect(tight.sandbox.calls.isEmpty)
+    }
+
+    @Test func shutdownRequeuesMergeSmokeWithoutRedBug() async throws {
+        let fx = try Fx()
+        try fx.setSmoke("sleep 120")
+        try fx.merge(["a.txt": "x"])
+        let engine = fx.w.orchestrator
+        let loop = Task { await engine.runForever(interval: .milliseconds(20)) }
+        try await Self.eventually { !fx.sandbox.calls.isEmpty }
+        let cwd = try #require(fx.sandbox.calls.first?.cwd)
+        loop.cancel()
+        await loop.value
+        let run = try #require(try fx.runs().first)
+        #expect(try fx.runs().count == 1)
+        #expect(run.status == .queued); #expect(run.startedAt == nil)
+        #expect(try fx.current().redBugItemId == nil)
+        #expect(!FileManager.default.fileExists(atPath: cwd.path))
+        // A run that is not a merge run at main is recorded "engine stopped" instead (no result, no red bug).
+        let manual = try fx.store.requestManualSmoke(companyId: fx.company.id, by: .owner, now: fx.w.clock.now)
+        let stopped = try fx.store.requeueOrError(manual, tail: "engine stopped", now: fx.w.clock.now)
+        #expect(stopped.status == .error); #expect(stopped.outputTail == "engine stopped")
+        #expect(try fx.current().redBugItemId == nil)
+    }
+
+    @Test func orchestratorStartRecoversRunningSmoke() async throws {
+        let fx = try Fx()
+        try fx.setSmoke("test -f a.txt")
+        let head = try fx.merge(["a.txt": "x"])
+        var run = try #require(try fx.store.queueMergeSmokeIfNeeded(companyId: fx.company.id, now: fx.w.clock.now))
+        // An earlier engine died mid-run: the row is running, its export and its raw log are left behind.
+        let stale = try EngineExport.export(store: fx.store, company: try fx.current(), runId: run.runId, commit: head)
+        let log = fx.w.orchestrator.smokeChecks.outputURL(run)
+        try FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("raw output\n".utf8).write(to: log)
+        run.status = .running; run.startedAt = fx.w.clock.now; run.outputPath = log.path
+        let running = run
+        try await fx.store.writer.write { db in try running.update(db) }
+        try await fx.w.orchestrator.start()
+        let recovered = try #require(try fx.store.mainSmokeRun(id: run.id))
+        #expect(recovered.status == .queued)
+        #expect(!FileManager.default.fileExists(atPath: stale.path))
+        // The raw log was scrubbed in place (or removed when it could not be).
+        if FileManager.default.fileExists(atPath: log.path) { #expect(try String(contentsOf: log, encoding: .utf8) == "raw output\n") }
+        // The same row runs again: main can be green without a new merge.
+        try await fx.w.cycle()
+        #expect(try fx.store.mainSmokeRun(id: run.id)?.status == .passed)
+        #expect(try fx.runs().count == 1)
+        #expect(try ReleasePolicy.mainIsGreen(store: fx.store, company: try fx.current(), at: head) == (true, nil))
+    }
+
+    @Test func releaseSmokeIsNeverSupersededAndNeedsMain() async throws {
+        let fx = try Fx()
+        try fx.setSmoke("sleep 2")
+        let old = try fx.merge(["a.txt": "x"])
+        let head = try fx.merge(["b.txt": "y"])
+        let queued = try #require(try fx.store.queueMergeSmokeIfNeeded(companyId: fx.company.id, now: fx.w.clock.now))
+        let engine = fx.w.orchestrator, companyId = fx.company.id
+        let release = Task { try await engine.runSmoke(companyId: companyId, commit: head, reason: .release, releaseId: "rel-1") }
+        try await Self.eventually { !fx.sandbox.calls.isEmpty }
+        // While the release smoke runs, its row is already running: a newer queued run supersedes only queued rows.
+        let rel = try #require(try fx.runs().first { $0.reason == .release })
+        #expect(rel.status == .running)
+        try fx.store.requestManualSmoke(companyId: companyId, by: .owner, now: fx.w.clock.now)
+        let done = try await release.value
+        #expect(done.status == .passed); #expect(done.id == rel.id); #expect(done.startedAt != nil)
+        #expect(try fx.store.mainSmokeRun(id: queued.id)?.status == .error)   // superseded by the manual request
+        // The commit must be the engine-accepted main.
+        await #expect(throws: WorkError.invalid("\(old.prefix(7)) is not the engine-accepted main")) {
+            try await engine.runSmoke(companyId: companyId, commit: old, reason: .release, releaseId: "rel-2")
+        }
     }
 }
