@@ -55,6 +55,15 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// `Store.setUltraShare` (the owner's `brahma settings ultra-share`); `updateCompany` keeps the stored value.
     public var ultraShare: Double = UltraCaps.max5x.share
 
+    // Smoke check on main (Plan L, `"vL-release"`). Changed only through `Store.setSmokeCheck` and the engine's smoke runs;
+    // `updateCompany` keeps the stored values.
+    /// The command the engine runs on every new `main` (and before every deploy); nil: none, and deploys are blocked.
+    public var smokeCheck: CheckSpec? = nil
+    /// The ops agent who set `smokeCheck` (its runs carry that agent's `BRAHMA_AGENT_ID`).
+    public var smokeCheckSetById: String? = nil
+    /// The open system bug filed when main went red (`"Main is red at <sha7>: smoke check failed"`), until a green run.
+    public var redBugItemId: String? = nil
+
     /// The profile a turn of an agent with this role runs under: the role's override, else the company's.
     public func profile(forRole role: String) -> PermissionProfile { roleProfiles[role] ?? permissionProfile }
 }

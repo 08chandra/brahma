@@ -102,10 +102,11 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(!eng.ok); #expect(eng.text == "set_preview_command is not available to your role")
         for tool in ["set_smoke_check", "set_deploy_config", "propose_deploy"] {
             #expect(t.call(t.eng, tool, [:]).text == "\(tool) is not available to your role")
-            // Stubs until Tasks 5–6 land, for the roles that have them; set_deploy_config (Task 4) is real.
-            if tool != "set_deploy_config" { #expect(t.call(t.devops, tool, [:]).text == "\(tool) is not available yet") }
+            // A stub until Task 6 lands, for the roles that have it; set_deploy_config (Task 4) and set_smoke_check (Task 5) are real.
+            if tool == "propose_deploy" { #expect(t.call(t.devops, tool, [:]).text == "\(tool) is not available yet") }
         }
         #expect(t.call(t.devops, "set_deploy_config", [:]).text == "missing required argument: output_dir")
+        #expect(t.call(t.devops, "set_smoke_check", [:]).text == "missing required argument: command")
         #expect(t.call(t.eng, "request_human_task", [:]).text == "request_human_task is not available yet")
         // Removal, and the tool's company is the acting agent's (Globex never sees Acme's surfaces).
         #expect(try t.store.previewSurfaces(companyId: t.globex.id).isEmpty)
