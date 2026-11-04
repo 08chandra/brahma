@@ -256,6 +256,10 @@ public final class Store: Sendable {
                 kept.webDomains = stored.webDomains
                 kept.allowLocalBinding = stored.allowLocalBinding
                 kept.toolchainReadPaths = stored.toolchainReadPaths
+                // The smoke check and the red-main bug change only through `setSmokeCheck` and the engine's smoke runs.
+                kept.smokeCheck = stored.smokeCheck
+                kept.smokeCheckSetById = stored.smokeCheckSetById
+                kept.redBugItemId = stored.redBugItemId
             }
             try kept.update(db)
         }
