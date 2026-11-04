@@ -117,33 +117,66 @@ extension Store {
 
     // MARK: Running
 
-    /// At engine start: every run an earlier engine left `running` is `error` ("engine restarted"), with no red-main effect.
-    func interruptRunningSmokes(now: Date) throws {
+    /// Start-up recovery (fix I1): every run an earlier engine left `running` is handled here, and its stale export and raw
+    /// log are cleaned up by the caller (`Orchestrator.recoverSmokes`):
+    /// - a `merge` run at the engine-accepted main goes back to `queued` in place (the partial unique index keeps one merge
+    ///   row per commit, so it must be the same row), and runs again;
+    /// - any other is `error` ("engine restarted"), with no red-main effect.
+    /// Returns the runs that were running (their old state), for the clean-up.
+    func recoverSmokes(now: Date) throws -> [MainSmokeRun] {
         try writer.write { db in
-            try db.execute(sql: "UPDATE mainSmokeRun SET status = ?, outputTail = ?, finishedAt = ? WHERE status = ?",
-                           arguments: [MainSmokeStatus.error.rawValue, ReleasePolicy.engineRestarted, now, MainSmokeStatus.running.rawValue])
+            let running = try MainSmokeRun.filter(Column("status") == MainSmokeStatus.running.rawValue).fetchAll(db)
+            for var run in running {
+                let main = try Company.fetchOne(db, key: run.companyId)?.mainCommit
+                if run.reason == .merge, run.commit == main {
+                    Self.resetToQueued(&run)
+                } else {
+                    run.status = .error; run.outputTail = ReleasePolicy.engineRestarted; run.finishedAt = now
+                }
+                try run.update(db)
+            }
+            return running
         }
     }
 
-    /// The one path that executes a smoke run (Task 7 calls it with reason `release`):
-    /// 1. insert or reuse the row: a `merge` run at `commit` is reused (PR-12), a `release` run is reused by `releaseId`, a
-    ///    `manual` run is always a new row;
-    /// 2. `EngineExport` the commit into a fresh `.git`-free tree under the data home (`smoke-<id>`);
-    /// 3. run the company's smoke check there through `checks` (sandboxed with a check-shaped policy, or unsandboxed exactly
-    ///    when a check of the company would be, PR-5);
-    /// 4. record the outcome (and the red-main rule).
-    /// A finished run that is reused is returned as it is. The caller holds the company's smoke slot (`SmokeSlots`, PR-36).
-    public func runSmoke(companyId: String, commit: String, reason: MainSmokeReason, releaseId: String? = nil,
-                         checks: SmokeChecks, now: Date = Store.now()) async throws -> MainSmokeRun {
-        try await runSmoke(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId, checks: checks,
-                           blocking: Blocking(maxConcurrent: 1), clock: { now })
+    static func resetToQueued(_ run: inout MainSmokeRun) {
+        run.status = .queued; run.startedAt = nil; run.finishedAt = nil; run.exitCode = nil; run.outputTail = nil; run.outputPath = nil
     }
 
+    /// Puts a `merge` run that could not finish for the engine's own reasons (cancelled at shutdown, an export failure) back
+    /// to `queued` in place while its commit is still the engine-accepted main; otherwise records it `error` with `tail`.
+    func requeueOrError(_ run: MainSmokeRun, tail: String, now: Date) throws -> MainSmokeRun {
+        try writer.write { db in
+            var run = run
+            let main = try Company.fetchOne(db, key: run.companyId)?.mainCommit
+            if run.reason == .merge, run.commit == main {
+                Self.resetToQueued(&run)
+            } else {
+                run.status = .error; run.outputTail = try redact(tail); run.finishedAt = now
+            }
+            try run.update(db)
+            return run
+        }
+    }
+
+    static func notMain(_ commit: String) -> String { "\(commit.prefix(7)) is not the engine-accepted main" }
+
+    /// The one path that executes a smoke run outside the tick (Task 7 calls it with reason `release`, through
+    /// `Orchestrator.runSmoke`, which holds the company's smoke slot and passes the engine's `Blocking` and clock):
+    /// 1. in one write: `commit` must be the engine-accepted main (`company.mainCommit`, else `"<sha7> is not the
+    ///    engine-accepted main"`); then the row is inserted or reused, and claimed `running` in that same write, so a queued
+    ///    run's superseding can never touch it (fix I3a). A `merge` run at `commit` is reused (PR-12) and claimed if queued;
+    ///    a `release` run is reused by `releaseId`; a `manual` run is always a new row. A reused run that is not queued is
+    ///    returned as it is;
+    /// 2. `EngineExport` the commit into a fresh `.git`-free tree under the data home (`smoke-<id>`);
+    /// 3. run the company's smoke check there through `checks` (PR-5);
+    /// 4. record the outcome (and the red-main rule).
     func runSmoke(companyId: String, commit: String, reason: MainSmokeReason, releaseId: String?, checks: SmokeChecks,
                   blocking: Blocking, clock: @escaping @Sendable () -> Date) async throws -> MainSmokeRun {
         let now = clock()
-        let run: MainSmokeRun = try await writer.write { db in
-            guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+        let claimed: (MainSmokeRun, Company, Bool) = try await writer.write { db in
+            guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
+            guard company.mainCommit == commit else { throw WorkError.invalid(Self.notMain(commit)) }
             var existing: MainSmokeRun?
             switch reason {
             case .merge:
@@ -157,16 +190,18 @@ extension Store {
             case .manual:
                 existing = nil
             }
-            if let existing { return existing }
-            let run = MainSmokeRun(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId, createdAt: now)
-            try run.insert(db)
-            return run
+            var run = existing ?? MainSmokeRun(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId, createdAt: now)
+            if existing != nil, run.status != .queued { return (run, company, false) }
+            run.status = .running; run.startedAt = now; run.outputPath = checks.outputURL(run).path
+            if existing == nil { try run.insert(db) } else { try run.update(db) }
+            return (run, company, true)
         }
-        return try await executeSmoke(runId: run.id, checks: checks, blocking: blocking, clock: clock)
+        guard claimed.2 else { return claimed.0 }
+        return try await performSmoke(claimed.0, company: claimed.1, checks: checks, blocking: blocking, clock: clock)
     }
 
-    /// Executes the queued (or, for `runSmoke`'s fresh row, new) run `runId` once: claimed `queued` → `running` in one write,
-    /// so a second caller gets the row as it is. Never throws for the run's own failures; they are its recorded outcome.
+    /// Executes the queued run `runId` once (the tick's path): claimed `queued` → `running` in one write, so a second caller
+    /// gets the row as it is. Never throws for the run's own failures; they are its recorded outcome.
     func executeSmoke(runId: String, checks: SmokeChecks, blocking: Blocking, clock: @escaping @Sendable () -> Date) async throws -> MainSmokeRun {
         let claimed: (MainSmokeRun, Company)? = try await writer.write { db in
             guard var run = try MainSmokeRun.fetchOne(db, key: runId), run.status == .queued,
@@ -181,6 +216,12 @@ extension Store {
             guard let row = try mainSmokeRun(id: runId) else { throw WorkError.notFound("no such smoke run") }
             return row
         }
+        return try await performSmoke(run, company: company, checks: checks, blocking: blocking, clock: clock)
+    }
+
+    /// Steps 2–4 of a claimed (`running`) run.
+    private func performSmoke(_ run: MainSmokeRun, company: Company, checks: SmokeChecks, blocking: Blocking,
+                              clock: @escaping @Sendable () -> Date) async throws -> MainSmokeRun {
         guard let spec = company.smokeCheck else {
             return try finishSmoke(run, outcome: CheckOutcome(exitCode: nil, timedOut: false, tail: ReleasePolicy.noSmokeCheck),
                                    spec: nil, now: clock())
@@ -198,8 +239,8 @@ extension Store {
             }
         }
         guard let export = exported else {
-            return try finishSmoke(run, outcome: CheckOutcome(exitCode: nil, timedOut: false, tail: "could not export \(run.sha7)"),
-                                   spec: spec, now: clock())
+            // The engine's own failure, not main's: a merge run goes back to the queue (the tick backs off, fix I1).
+            return try requeueOrError(run, tail: "could not export \(run.sha7)", now: clock())
         }
         let unsandboxed = PreviewRunner.unsandboxed(store: self, company: company, setById: company.smokeCheckSetById)
         let runner = unsandboxed ? checks.unsandboxed : checks.sandbox
@@ -210,16 +251,22 @@ extension Store {
         var outcome = await runner.run(command: spec.command, cwd: export, environment: environment,
                                        timeout: .seconds(spec.timeoutSeconds), outputURL: output, policy: policy)
         if !unsandboxed { outcome = SandboxedCheckRunner.reclassifyNestedSandbox(outcome) }
-        // Cancelled (the engine is stopping): no result, never a red bug.
-        if Task.isCancelled { outcome = CheckOutcome(exitCode: nil, timedOut: false, tail: ReleasePolicy.engineStopped) }
+        let cancelled = Task.isCancelled
         // The export is deleted; the log (agent output) is scrubbed in place, or removed and its tail withheld.
         let scrubbed: Bool = await blocking.run {
             EngineExport.remove(store: store, company: company, runId: run.runId)
-            do { try store.scrubCheckLog(output); return true } catch let e as CocoaError where e.code == .fileNoSuchFile { return true }
-            catch { return false }
+            return store.scrubOrRemoveSmokeLog(output)
         }
+        // Cancelled (the engine is stopping): no result and never a red bug; a merge run is queued again for the next engine.
+        if cancelled { return try requeueOrError(run, tail: ReleasePolicy.engineStopped, now: clock()) }
         if !scrubbed { outcome = CheckOutcome(exitCode: outcome.exitCode, timedOut: outcome.timedOut, tail: Orchestrator.withheldCheckTail) }
         return try finishSmoke(run, outcome: outcome, spec: spec, now: clock())
+    }
+
+    /// Scrubs a smoke log in place (`scrubCheckLog`, which removes a log it cannot scrub). True when it is clean or absent.
+    func scrubOrRemoveSmokeLog(_ url: URL) -> Bool {
+        do { try scrubCheckLog(url); return true } catch let e as CocoaError where e.code == .fileNoSuchFile { return true }
+        catch { return false }
     }
 
     /// The check-shaped policy of a sandboxed smoke (PR-5): writes and reads only its export, the company's outbound
