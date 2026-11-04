@@ -33,6 +33,9 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
     /// Set when the turn started a fresh session on purpose ("mounts changed", a Task 10 reset): a counted work turn, unlike a
     /// `sessionResetReason` turn (Task 5a fix round 1, B-I3).
     public var freshSessionReason: String? = nil
+    /// When the turn first read outside content, and what it was (`TaintPolicy.source`; Task 10).
+    public var taintedAt: Date? = nil
+    public var taintSource: String? = nil
     /// The last `STATUS:` line of the turn's result (`DONE`, `DONE_WITH_CONCERNS`, `BLOCKED`, `NEEDS_CONTEXT`).
     public var reportedStatus: String? = nil
     /// Why the prompt cache broke on a resume: the model or the tool set changed.

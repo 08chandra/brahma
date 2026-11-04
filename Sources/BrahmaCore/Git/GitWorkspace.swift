@@ -3213,4 +3213,23 @@ extension GitWorkspace {
         git.tempRoot = dir.appending(path: ".git/brahma-tmp", directoryHint: .isDirectory)
         try git.run(["init", "--quiet", "--template=", "-b", "main"])
     }
+
+    /// Lab provenance (Task 10): the commits on the repository's local branches that `since` does not reach, oldest first, at
+    /// most `limit`. The repository is this workspace's root (an agent's lab), read through `GitCommand` (its config scanned,
+    /// programs off). A `since` the repository no longer has lists every commit again. Blocking.
+    public func labCommits(since: String?, limit: Int = 1000) throws -> [String] {
+        func list(_ exclude: String?) throws -> GitCommand.Output {
+            try main.run(["rev-list", "--reverse", "--topo-order", "--max-count=\(limit)", "--branches"]
+                         + (exclude.map { ["--not", $0] } ?? []), allowFailure: true)
+        }
+        if let since { try Self.validRef(since) }
+        var out = try list(since)
+        if out.status != 0, since != nil { out = try list(nil) }
+        // A repository with no commit yet lists nothing.
+        if out.status != 0 {
+            guard try head(of: "HEAD") != nil else { return [] }
+            throw GitError.failed(command: "rev-list", status: out.status, stderr: String(out.stderr.prefix(500)))
+        }
+        return out.text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    }
 }

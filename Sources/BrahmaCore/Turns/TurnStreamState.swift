@@ -66,7 +66,7 @@ public struct TurnStreamState: Equatable, Sendable {
             pendingTasks = Set(ids)
         case .effortCapped(let requested):
             effortCapRequested = requested
-        case .initialized, .assistantText, .rateLimit, .other, .sandboxNote, .spawned, .raw:
+        case .initialized, .assistantText, .rateLimit, .other, .sandboxNote, .spawned, .raw, .toolCall:
             break
         }
     }

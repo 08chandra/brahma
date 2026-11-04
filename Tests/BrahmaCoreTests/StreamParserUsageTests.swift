@@ -66,11 +66,16 @@ private func fold(_ fixture: String) throws -> TurnStreamState {
 
     @Test func multipleToolUseBlocksAllYielded() throws {
         let line = #"{"type":"assistant","message":{"content":[{"type":"text","text":"x"},{"type":"tool_use","name":"Read","input":{"p":1}},{"type":"tool_use","name":"Grep","input":{"p":2}}]}}"#
-        let all = try #require(StreamParser.parseAll(line: line))
+        let parsed = try #require(StreamParser.parseAll(line: line))
+        // Each block is a `.toolUse` followed by its `.toolCall` (Task 10).
+        #expect(parsed.count == 4)
+        guard case .toolCall("Read", let input) = parsed[1] else { Issue.record("expected the Read call's input"); return }
+        #expect(input == ["p": .number(1)])
+        let all = parsed.filter { if case .toolUse = $0 { true } else { false } }
         #expect(all.count == 2)
         guard case .toolUse(let n1, _) = all[0], case .toolUse(let n2, _) = all[1] else { Issue.record("expected two tool uses"); return }
         #expect([n1, n2] == ["Read", "Grep"])
-        #expect(StreamParser.parse(line: line) == all.first, "parse is the first event")
+        #expect(StreamParser.parse(line: line) == parsed.first, "parse is the first event")
         let user = #"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"1"},{"type":"tool_result","tool_use_id":"b","content":[{"type":"text","text":"2"}]}]}}"#
         let results = try #require(StreamParser.parseAll(line: user))
         #expect(results.count == 2)

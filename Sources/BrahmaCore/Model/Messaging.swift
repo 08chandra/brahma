@@ -46,6 +46,8 @@ public struct Message: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var senderId: String
     public var text: String
     public var createdAt: Date
+    /// Set by the router (Task 10): `impersonation` when an agent's text claims to be the owner (`OwnerImpersonation`).
+    public var flag: String? = nil
 }
 
 public struct InboxItem: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {

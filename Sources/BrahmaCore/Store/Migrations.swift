@@ -942,6 +942,39 @@ enum Migrations {
             }
             try db.create(index: "accessRefusal_agent", on: "accessRefusal", columns: ["agentId", "createdActive"])
         }
+        m.registerMigration("v5-taint") { db in
+            // Task 10: a turn that read outside content (when, and from what); the agent's session-wide taint and the fresh
+            // session a refused high-risk call asked for; the router's flag on a message (`impersonation`).
+            try db.alter(table: "turn") { t in
+                t.add(column: "taintedAt", .datetime)
+                t.add(column: "taintSource", .text)
+            }
+            try db.alter(table: "agent") { t in
+                t.add(column: "sessionTainted", .boolean).notNull().defaults(to: false)
+                t.add(column: "freshSessionRequested", .boolean).notNull().defaults(to: false)
+                // B-M12 (5a): the session scope a pending fresh-session reason belongs to ('' = the base session, else the item
+                // id); only a turn in that scope takes the reason. NULL: recorded before this migration (any scope).
+                t.add(column: "pendingSessionResetScope", .text)
+            }
+            try db.alter(table: "message") { t in t.add(column: "flag", .text) }
+            // Lab provenance (for Task 10b): every commit of an agent's lab, with the taint state of the turn that first saw it.
+            try db.create(table: "labCommit") { t in
+                t.column("agentId", .text).notNull().references("agent", onDelete: .cascade)
+                t.column("sha", .text).notNull()
+                t.column("turnId", .text)
+                t.column("tainted", .boolean).notNull()
+                t.column("recordedAt", .datetime).notNull()
+                t.primaryKey(["agentId", "sha"])
+            }
+            // Hook gates passed per CLI build (`V-1`: PostToolUse fires for sub-agent and workflow-agent calls). Until V-1 is
+            // recorded for the running CLI, a turn that can fan out is tainted at launch.
+            try db.create(table: "hookGate") { t in
+                t.column("gate", .text).notNull()
+                t.column("cliFingerprint", .text).notNull()
+                t.column("passedAt", .datetime).notNull()
+                t.primaryKey(["gate", "cliFingerprint"])
+            }
+        }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
             // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).

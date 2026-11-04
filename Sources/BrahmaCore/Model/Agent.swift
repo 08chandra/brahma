@@ -56,6 +56,12 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var turnsWithoutProgress: Int = 0
     /// A `freshSessionReason` waiting for the next turn (`Store.forceFreshSession`, Task 5a); `startTurn` moves it onto the turn.
     public var pendingSessionReset: String? = nil
+    /// The session scope `pendingSessionReset` belongs to ('' the base session, else the item id); nil: any (B-M12).
+    public var pendingSessionResetScope: String? = nil
+    /// The agent's session read outside content (Task 10, `Store.markTainted`): its high-risk company tools are refused.
+    public var sessionTainted: Bool = false
+    /// A high-risk call was refused under taint: the turn's end starts a fresh session (`Store.clearTaintIfRequested`).
+    public var freshSessionRequested: Bool = false
 }
 
 /// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and

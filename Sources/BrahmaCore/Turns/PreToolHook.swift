@@ -30,7 +30,16 @@ public enum PreToolHook {
         /// A session is tainted once its flag file exists (5-lite writes it).
         public static func tainted(flagFile: String?) -> Bool {
             guard let flagFile, !flagFile.isEmpty else { return false }
-            return FileManager.default.fileExists(atPath: flagFile)
+            return TaintFlag.exists(URL(fileURLWithPath: flagFile))
+        }
+
+        /// Task 10: the flag file, or the agent's `sessionTainted` in the database. A database or agent that cannot be read
+        /// counts as tainted (fail closed).
+        public static func tainted(flagFile: String?, database: String?, agentId: String?) -> Bool {
+            if tainted(flagFile: flagFile) { return true }
+            guard let database, !database.isEmpty, let agentId, !agentId.isEmpty else { return false }
+            guard let store = try? Store(path: database), let agent = try? store.agent(id: agentId) else { return true }
+            return agent.sessionTainted
         }
     }
 
@@ -41,7 +50,7 @@ public enum PreToolHook {
         let tool = input["tool_name"]?.stringValue ?? ""
         let args = input["tool_input"]?.objectValue ?? [:]
         guard ["Agent", "Task", "Workflow"].contains(tool) else { return .allow }
-        if context.tainted { return .deny("Brahma: this session is tainted; sub-agents and workflows are off for it") }
+        if context.tainted { return .deny(TaintPolicy.fanOutDenied) }
         if tool == "Workflow" {
             guard context.mode == .ultra else {
                 return .deny("Brahma: workflows run only on an approved Ultra turn; this is a \(context.mode.title) turn")

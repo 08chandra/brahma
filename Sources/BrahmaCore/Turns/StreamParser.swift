@@ -146,6 +146,10 @@ public enum StreamEvent: Equatable, Sendable {
     case assistantText(String)
     /// One `tool_use` block. `inputDigest` is a hash of the input with keys sorted, so key order never matters.
     case toolUse(name: String, inputDigest: String)
+    /// The same `tool_use` block with its input (Task 10's backup taint), right after its `.toolUse`; a sub-agent's blocks (they
+    /// carry `parent_tool_use_id`) too. A name-only event (`task_progress.last_tool_name`, `workflow_progress[].lastToolName`)
+    /// has an empty input.
+    case toolCall(name: String, input: [String: JSONValue])
     /// One `tool_result` block: a hash of its content (and error flag).
     case toolResult(digest: String)
     case rateLimit(RateLimitInfo)
@@ -223,8 +227,15 @@ public enum StreamParser {
                 return WorkflowAgentInfo(agentId: agentId, label: a["label"] as? String, state: a["state"] as? String,
                                          tokens: (a["tokens"] as? NSNumber)?.intValue)
             }
+            // The sub-agent's or workflow agents' latest tool, by name only (Task 10's backup taint reads it).
+            var names: [String] = []
+            if let last = object["last_tool_name"] as? String { names.append(last) }
+            for a in object["workflow_progress"] as? [[String: Any]] ?? [] {
+                if let last = a["lastToolName"] as? String, !names.contains(last) { names.append(last) }
+            }
             return [.taskProgress(taskId: id, totalTokens: (usage?["total_tokens"] as? NSNumber)?.intValue,
                                   toolUses: (usage?["tool_uses"] as? NSNumber)?.intValue, agents: agents)]
+                + names.map { .toolCall(name: $0, input: [:]) }
         case "task_notification":
             guard let id = object["task_id"] as? String else { return other }
             return [.taskNotification(taskId: id, status: object["status"] as? String)]
@@ -238,9 +249,10 @@ public enum StreamParser {
 
     private static func parseAssistant(_ object: [String: Any]) -> [StreamEvent] {
         let blocks = (object["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
-        let uses: [StreamEvent] = blocks.compactMap { block in
-            guard block["type"] as? String == "tool_use", let name = block["name"] as? String else { return nil }
-            return .toolUse(name: name, inputDigest: digest(of: block["input"] ?? [String: Any]()))
+        let uses: [StreamEvent] = blocks.flatMap { block -> [StreamEvent] in
+            guard block["type"] as? String == "tool_use", let name = block["name"] as? String else { return [] }
+            return [.toolUse(name: name, inputDigest: digest(of: block["input"] ?? [String: Any]())),
+                    .toolCall(name: name, input: JSONValue.from(block["input"]).objectValue ?? [:])]
         }
         if !uses.isEmpty { return uses }
         let text = blocks

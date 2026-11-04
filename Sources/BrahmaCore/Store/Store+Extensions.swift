@@ -143,20 +143,25 @@ extension Store {
         } else {
             try resetSession(db: db, agentId: agentId, scope: .base)
         }
-        try db.execute(sql: "UPDATE agent SET pendingSessionReset = ? WHERE id = ?", arguments: [Store.flat(reason, max: 200), agentId])
+        // B-M12: the reason belongs to the scope whose session was reset; a turn in another scope leaves it pending.
+        try db.execute(sql: "UPDATE agent SET pendingSessionReset = ?, pendingSessionResetScope = ? WHERE id = ?",
+                       arguments: [Store.flat(reason, max: 200), Store.scopeKey(itemId), agentId])
     }
 
     /// Moves a pending fresh-session reason onto `turnId` (the turn that starts the fresh session, as `freshSessionReason`) and
-    /// clears it.
+    /// clears it. With `scope`, only when the reason was stored for that scope (B-M12); nil applies it whatever its scope.
     @discardableResult
-    public func applyPendingSessionReset(agentId: String, turnId: String) throws -> String? {
-        try writer.write { db in try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turnId) }
+    public func applyPendingSessionReset(agentId: String, turnId: String, scope: SessionScope? = nil) throws -> String? {
+        try writer.write { db in try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turnId, scope: scope) }
     }
 
-    static func applyPendingSessionReset(db: Database, agentId: String, turnId: String) throws -> String? {
-        guard let reason = try String.fetchOne(db, sql: "SELECT pendingSessionReset FROM agent WHERE id = ?", arguments: [agentId]) else { return nil }
+    static func applyPendingSessionReset(db: Database, agentId: String, turnId: String, scope: SessionScope? = nil) throws -> String? {
+        guard let row = try Row.fetchOne(db, sql: "SELECT pendingSessionReset, pendingSessionResetScope FROM agent WHERE id = ?",
+                                         arguments: [agentId]),
+              let reason: String = row["pendingSessionReset"] else { return nil }
+        if let scope, let stored: String = row["pendingSessionResetScope"], stored != scopeKey(scope.itemId) { return nil }
         try db.execute(sql: "UPDATE turn SET freshSessionReason = ? WHERE id = ?", arguments: [reason, turnId])
-        try db.execute(sql: "UPDATE agent SET pendingSessionReset = NULL WHERE id = ?", arguments: [agentId])
+        try db.execute(sql: "UPDATE agent SET pendingSessionReset = NULL, pendingSessionResetScope = NULL WHERE id = ?", arguments: [agentId])
         return reason
     }
 }

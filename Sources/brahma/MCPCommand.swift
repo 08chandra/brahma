@@ -112,7 +112,9 @@ struct MCP: ParsableCommand {
         try? check()
         let server = MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: me.id, reviewItemId: reviewItemId,
                                                    auditTurnId: auditTurnId, quotas: quotas, quotaTurnId: context.turnId,
-                                                   planTurn: planTurn), beforeCall: check)
+                                                   planTurn: planTurn,
+                                                   // The hook's fail-closed mark: present, every high-risk call is refused.
+                                                   taintFlag: TaintFlag.url(home: secretPaths.home, agentId: me.id)), beforeCall: check)
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

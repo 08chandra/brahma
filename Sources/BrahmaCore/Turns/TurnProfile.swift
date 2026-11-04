@@ -119,7 +119,7 @@ public enum TurnProfileCompiler {
             }
             if let dir = r.planDirectory { p.addDirs = [dir] }
         }
-        if let d = r.mode { apply(d, to: &p, hookExecutable: r.hookExecutable, kind: r.kind) }
+        if let d = r.mode { apply(d, to: &p, hookExecutable: r.hookExecutable, kind: r.kind, taint: taintArguments(r)) }
         p = restricted(p, for: r.kind)
         // F10: `--disable-slash-commands` stays unless extension parts mount (then the Skill denies replace it).
         p.disableSlashCommands = r.mounts.isEmpty
@@ -163,7 +163,7 @@ public enum TurnProfileCompiler {
     /// (`availableModels`, `fastMode:false`, `workflowKeywordTriggerEnabled:false`, `disableWorkflows:true`, `maxEffortLevel`, the
     /// pre-tool hook), the kill-switch environment and, only once the sub-agent gate passes, the forced sub-agent controls.
     static func apply(_ d: ModeDecision, to p: inout TurnProfile, hookExecutable: String?, kind: TurnKind,
-                      perModeCaps: Bool = ModeGates.perModeCaps) {
+                      perModeCaps: Bool = ModeGates.perModeCaps, taint: [String] = []) {
         p.mode = d.mode
         p.effort = d.effort
         p.maxEffortLevel = d.maxEffortLevel
@@ -179,7 +179,7 @@ public enum TurnProfileCompiler {
         // The settings keys (`availableModels`, `fastMode`, the workflow kill switches, `maxEffortLevel`) are compiled from the
         // decision by `ClaudeSettingsCompiler`; the pre-tool hook block is built here and merged in unchanged.
         if let hookExecutable {
-            p.preToolHook = preToolHook(executable: hookExecutable, mode: d.mode, subagents: p.subagents != .off)
+            p.preToolHook = preToolHook(executable: hookExecutable, mode: d.mode, subagents: p.subagents != .off, taint: taint)
         }
         p.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] = "1"
         p.environment["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
@@ -207,9 +207,18 @@ public enum TurnProfileCompiler {
 
     /// 3a's PreToolUse block in exec form: `<executable> hook pre-tool --mode <mode> [--subagents]`, blocking when it cannot
     /// run (fix round 1, C1).
-    public static func preToolHook(executable: String, mode: WorkMode, subagents: Bool) -> HookMatcher {
+    /// Task 10 adds the session's taint sources: `--taint-file <flag> --db <db> --agent <id>`.
+    public static func preToolHook(executable: String, mode: WorkMode, subagents: Bool, taint: [String] = []) -> HookMatcher {
         HookMatcher(matcher: hookMatcher, hooks: [HookCommand(
-            command: executable, args: ["hook", "pre-tool", "--mode", mode.rawValue] + (subagents ? ["--subagents"] : []))])
+            command: executable, args: ["hook", "pre-tool", "--mode", mode.rawValue] + (subagents ? ["--subagents"] : []) + taint)])
+    }
+
+    /// The pre-tool hook's taint arguments of a request (Task 10; none when the request names no taint sources).
+    static func taintArguments(_ r: TurnRequest) -> [String] {
+        var out: [String] = []
+        if let f = r.taintFlagFile { out += ["--taint-file", f] }
+        if let db = r.taintDatabase { out += ["--db", db, "--agent", r.agent.id] }
+        return out
     }
 
     /// The prefix every sandboxed turn's mach marker has (`dev.brahma.turn.<id>`).

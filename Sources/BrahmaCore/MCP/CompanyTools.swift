@@ -64,23 +64,26 @@ public struct CompanyTools: Sendable {
     let quotaTurnId: String?
     /// A plan turn's server: the mutating work and decision tools are not offered.
     let planTurn: Bool
+    /// The session's taint flag file (`<home>/run/taint/<agent>`, Task 10): present means tainted. Nil: the store's data home's.
+    let taintFlag: URL?
     let counter = TurnQuotaCounter()
 
     public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
-                quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false) {
+                quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil) {
         self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, auditTurnId: auditTurnId,
-                  quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, diagnostics: { line in
+                  quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, taintFlag: taintFlag, diagnostics: { line in
             FileHandle.standardError.write(Data((line + "\n").utf8))
         })
     }
 
     init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
-         quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false,
+         quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
          diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
         self.reviewItemId = reviewItemId
         self.auditTurnId = reviewItemId == nil ? auditTurnId : nil
         self.quotas = quotas; self.quotaTurnId = quotaTurnId; self.planTurn = planTurn
+        self.taintFlag = taintFlag ?? store.dataHome.flatMap { TaintFlag.url(home: $0, agentId: agentId) }
     }
 
     static let turnEndedMessage = "this turn has ended; its tools no longer work"
@@ -216,6 +219,7 @@ public struct CompanyTools: Sendable {
             }
             guard live else { throw ToolError(message: Self.turnEndedMessage) }
         }
+        try refuseUnderTaint(name, me)
         if auditTurnId != nil { return try callInAuditTurn(name: name, arguments: arguments) }
         if reviewItemId != nil { return try callInReviewTurn(name: name, arguments: arguments) }
         if name == "review" { throw ToolError(message: Store.reviewTurnOnlyMessage) }
@@ -240,6 +244,20 @@ public struct CompanyTools: Sendable {
             if reserved, let kind { releaseQuota(kind) }
             throw error
         }
+    }
+
+    /// Task 10's gate: a high-risk tool (anything outside `TaintPolicy.taintSafeTools`) on a tainted session (the agent row or
+    /// the flag file) is refused, and the turn's end starts a fresh session.
+    private func refuseUnderTaint(_ name: String, _ me: Agent) throws {
+        guard TaintPolicy.isHighRisk(name) else { return }
+        let flagged = taintFlag.map(TaintFlag.exists) ?? false
+        guard me.sessionTainted || flagged else { return }
+        do { try store.requestFreshSession(agentId: agentId) } catch {
+            diagnostics("brahma mcp: could not request a fresh session for \(agentId): \(error)")
+        }
+        var source = me.sessionTainted ? (try? store.latestTaintSource(agentId: agentId)) ?? nil : nil
+        if source == nil, flagged { source = taintFlag.flatMap(TaintFlag.source) }
+        throw ToolError(message: TaintPolicy.refusal(tool: name, source: source ?? "outside content"))
     }
 
     /// Tools that only read an item stay available while it merges.

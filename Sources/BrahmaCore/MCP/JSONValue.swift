@@ -37,3 +37,20 @@ public enum JSONValue: Codable, Equatable, Sendable {
     var objectValue: [String: JSONValue]? { if case .object(let o) = self { o } else { nil } }
     var boolValue: Bool? { if case .bool(let b) = self { b } else { nil } }
 }
+
+extension JSONValue {
+    /// A `JSONSerialization` value as a `JSONValue` (anything else is `.null`).
+    static func from(_ value: Any?) -> JSONValue {
+        switch value {
+        case nil: return .null
+        case let s as String: return .string(s)
+        case let n as NSNumber:
+            // `JSONSerialization` gives booleans as NSNumber (objCType "c"); tell them apart without CoreFoundation.
+            if String(cString: n.objCType) == "c" { return .bool(n.boolValue) }
+            return .number(n.doubleValue)
+        case let o as [String: Any]: return .object(o.mapValues { from($0) })
+        case let a as [Any]: return .array(a.map { from($0) })
+        default: return .null
+        }
+    }
+}

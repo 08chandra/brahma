@@ -102,8 +102,11 @@ public struct MessageRouter: Sendable {
     /// event, inside the caller's transaction.
     private func deliver(_ db: Database, channel: Channel, from: Sender, text: String, now: Date) throws -> PostResult {
         let text = try store.redact(text)
+        // Task 10: agent text that claims to be the owner is flagged (digest prefix, activity, the app's chip); it never acts.
+        let impersonates = OwnerImpersonation.flags(text: text, sender: from)
         let message = Message(id: UUID().uuidString, companyId: channel.companyId, channelId: channel.id,
-                              senderId: from.id, text: text, createdAt: now)
+                              senderId: from.id, text: text, createdAt: now,
+                              flag: impersonates ? OwnerImpersonation.flag : nil)
         try message.insert(db)
 
         var recipientIds = try String.fetchAll(db, sql: "SELECT member FROM channelMember WHERE channelId = ? ORDER BY rowid",
@@ -173,6 +176,11 @@ public struct MessageRouter: Sendable {
         if case .agent(let id) = from { eventAgent = id }
         try ActivityEvent(companyId: channel.companyId, agentId: eventAgent, turnId: nil, kind: .message,
                           text: "#\(channel.name) @\(handle): \(text.prefix(200))", createdAt: now).insert(db)
+        if impersonates {
+            try ActivityEvent(companyId: channel.companyId, agentId: eventAgent, turnId: nil, kind: .error,
+                              text: "@\(handle)'s message in #\(channel.name) claims to be the owner; flagged unverified (it changes nothing)",
+                              createdAt: now).insert(db)
+        }
         return PostResult(message: message, broadcastApplied: applied, broadcastRefusal: refusal)
     }
 

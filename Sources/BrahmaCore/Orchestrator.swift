@@ -663,8 +663,12 @@ public actor Orchestrator {
         // A leaseholder's work turn: continuity of its item's branch is checked at the start (the head must be the recorded one)
         // and the head is recorded again at the end (scan (a), Task 4-wire). `held`: continuity held at the start.
         var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool)?
+        // Task 10: the turn's taint (marked once, from the stream's backup path) and the workspace whose lab is recorded at the end.
+        var taintMarked = false
+        var labWorkspace: URL?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
+            labWorkspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
             // Nothing of the agent's earlier turns may still run, whatever the profile (M1): this turn waits for their sweep
             // and kills what they (or an earlier engine's) left before any of its own work.
             try await settleEarlierTurns(agent: agent, company: company, turnId: turn.id)
@@ -907,6 +911,10 @@ public actor Orchestrator {
                     ?? TurnProfileCompiler.expectations(for: mode, agents: store.recordedBuiltinAgents())
                 // The settings travel in a file only the engine can read or write (`<runDir>/<agentId>.settings.json`, 0600).
                 request.settingsFilePath = settingsFile.path
+                // Task 10: every turn records its taint through the PostToolUse hook; the pre-tool hook reads it back.
+                request.postToolHook = TaintPolicy.postToolHook(executable: mcpExecutable, database: paths.database.path, agentId: agent.id)
+                request.taintFlagFile = TaintFlag.url(home: paths.home, agentId: agent.id)?.path
+                request.taintDatabase = paths.database.path
                 if let sandboxed {
                     request.sandbox = sandboxed.scope
                     request.shellPrefix = sandboxed.shellPrefix.path
@@ -944,13 +952,18 @@ public actor Orchestrator {
             switch sessionChange {
             case .forceFresh?:
                 try store.forceFreshSession(agentId: agent.id, itemId: scope.itemId, reason: "mounts changed", now: clock())
-                try store.applyPendingSessionReset(agentId: agent.id, turnId: turn.id)
+                try store.applyPendingSessionReset(agentId: agent.id, turnId: turn.id, scope: scope)
                 sent.sessionId = try store.sessionSlot(agent: try store.agent(id: agent.id) ?? agent, scope: scope).sessionId
             case .reset?:
                 try store.resetSession(agentId: agent.id, scope: scope)
                 sent.sessionId = try store.sessionSlot(agent: try store.agent(id: agent.id) ?? agent, scope: scope).sessionId
             case nil:
                 break
+            }
+            // A reason an earlier turn left (Task 10's taint reset, B-M12): only a turn of its own scope takes it. Review and audit
+            // turns run in throwaway sessions and leave it pending.
+            if review == nil, audit == nil, sessionChange != .forceFresh {
+                try store.applyPendingSessionReset(agentId: agent.id, turnId: turn.id, scope: scope)
             }
 
             let turnToken: String
@@ -983,6 +996,17 @@ public actor Orchestrator {
             // Backstop: the shape that runs is the shape that was gated (they differ only if a string-free field changed).
             if let gate, compiled.settings.shape() != gatedShape {
                 try await requireSandboxVerified(gate: gate, settings: compiled.settings, agent: agent, company: company)
+            }
+            // Pre-taint (Task 10, F4): a turn that can fan out is tainted at launch until this CLI build passed V-1 (PostToolUse
+            // fires for sub-agent and workflow calls), unless it has no network and no web tools.
+            var builtins = Set(compiled.tools ?? compiled.allowedTools)
+            if compiled.settings.enableWorkflows == true { builtins.insert("Workflow") }
+            if !builtins.isDisjoint(with: ["Task", "Agent", "Workflow"]) {
+                let verified = await postToolGateVerified()
+                if TaintPolicy.preTaint(tools: builtins, network: sandboxed?.scope.network, hookVerified: verified) {
+                    try store.markTainted(agentId: agent.id, source: TaintPolicy.preTaintSource, now: clock())
+                    taintMarked = true
+                }
             }
             let settingsText = try TurnProfileCompiler.settingsJSON(compiled)
             try await blocking.tryRun { try SettingsFile.write(settingsText, to: settingsFile) }
@@ -1018,6 +1042,16 @@ public actor Orchestrator {
                     case .sandboxNote(let text):
                         try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
                                                             kind: .error, text: text, createdAt: clock()))
+                    case .toolCall(let name, let input):
+                        // The backup taint path (Task 10): every tool call, the sub-agents' and workflow agents' included.
+                        guard !taintMarked else { continue }
+                        let companyId = agent.companyId
+                        if let source = TaintPolicy.source(toolName: name, toolInput: input, publisher: { id in
+                            (try? store.extensionPublisher(companyId: companyId, extId: id)) ?? nil
+                        }) {
+                            try store.markTainted(agentId: agent.id, source: source, now: clock())
+                            taintMarked = true
+                        }
                     case .toolUse(let name, _):
                         // Company tools log their own event from the MCP server.
                         guard !name.hasPrefix("mcp__company__") else { continue }
@@ -1190,6 +1224,18 @@ public actor Orchestrator {
                                       deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use,
                                       telemetry: telemetry, now: now)
         }
+        // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
+        // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.
+        if launched, let labWorkspace {
+            let (store, handle, turnId, ended) = (self.store, agent.name, turn.id, now)
+            let tainted = ((try? store.agent(id: agent.id)) ?? nil)?.sessionTainted ?? true
+            let outcome = await blocking.run {
+                LabProvenance.record(store: store, workspace: labWorkspace, handle: handle, companyId: agent.companyId,
+                                     agentId: agent.id, turnId: turnId, tainted: tainted, now: ended)
+            }
+            if case .refused(let why) = outcome { log("@\(agent.name)'s lab commits were not recorded (tainted instead): \(why)") }
+        }
+        attempt { try store.clearTaintIfRequested(agentId: agent.id, scope: scope, now: now) }
         // Task 13a: the turn's slice of the Claude session transcript, redacted and stored. Never fails the turn.
         if let transcripts, let sessionId = state.result?.sessionId ?? state.inits.last?.sessionId ?? (sawInit ? sentRequest?.agent.sessionId : nil) {
             let (store, turn, ended) = (self.store, turn, now)
@@ -1388,7 +1434,7 @@ extension Store {
             var turn = Turn(id: UUID().uuidString, agentId: agentId, companyId: agent.companyId, startedAt: now,
                             endedAt: nil, outcome: .inProgress, summary: nil, costUSD: nil)
             try turn.insert(db)
-            turn.freshSessionReason = try Store.applyPendingSessionReset(db: db, agentId: agentId, turnId: turn.id)
+            // A pending fresh-session reason is applied once the turn's scope is known (`performTurn`, B-M12).
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: turn.id, kind: .turnStarted,
                               text: "@\(agent.name) turn started", createdAt: now).insert(db)
             return (agent, turn)

@@ -28,6 +28,13 @@ struct SandboxNotVerified: Error, CustomStringConvertible {
 }
 
 extension Orchestrator {
+    /// Whether the running CLI build passed Task 10's `V-1` hook gate. Without a canary gate (no CLI to fingerprint) or a
+    /// fingerprint, it has not (fail closed: fan-out turns are pre-tainted).
+    func postToolGateVerified() -> Bool {
+        guard let gate = sandboxCanary, let key = try? canaryKey(gate: gate, shape: "") else { return false }
+        return (try? store.hookGatePassed(TaintPolicy.postToolGate, fingerprint: key.fingerprint)) ?? false
+    }
+
     static func canaryTaskName(_ key: SandboxCanaryKey) -> String { canaryTaskPrefix + key.text }
 
     /// The canary key of a sandboxed turn of this shape (the fingerprint cached for 5 s of awake time).

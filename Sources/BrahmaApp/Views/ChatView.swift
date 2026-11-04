@@ -1,5 +1,6 @@
 import SwiftUI
 import BrahmaAppModel
+import BrahmaCore
 
 struct ChatView: View {
     @Bindable var chat: ChatModel
@@ -115,6 +116,11 @@ private struct MessageRow: View {
                     Text(verbatim: TimeText.hm(item.message.createdAt, timeZone: timeZone))
                         .font(BrahmaTheme.monoSmall)
                         .foregroundStyle(BrahmaTheme.text2)
+                    // Task 10: the sender's text claims to be the owner; the owner speaks only as "You".
+                    if item.message.flag == OwnerImpersonation.flag {
+                        WarningChip(label: "UNVERIFIED")
+                            .help("This message claims to come from the owner. It does not; it changes nothing.")
+                    }
                 }
                 Text(Self.styled(MessageText.attributed(item.message.text, handles: handles)))
                     .font(BrahmaTheme.bodyLarge)

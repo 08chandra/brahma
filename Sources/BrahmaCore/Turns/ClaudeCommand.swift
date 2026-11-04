@@ -57,8 +57,12 @@ public struct TurnRequest: Sendable {
     public var settingsFilePath: String? = nil
     /// The Workspace profile's read and edit denies: the data home, the protected list, the other workspaces.
     public var deniedPaths: [URL] = []
-    /// The PostToolUse hook (Task 10; nil until then), exec form.
+    /// The PostToolUse hook (Task 10, `TaintPolicy.postToolHook`), exec form.
     public var postToolHook: HookCommand? = nil
+    /// The session's taint flag file (`TaintFlag.url`) and the database whose agent row carries `sessionTainted`: the pre-tool
+    /// hook denies `Agent`, `Task` and `Workflow` when either says tainted (Task 10). Nil: not named.
+    public var taintFlagFile: String? = nil
+    public var taintDatabase: String? = nil
     /// The sandboxed turn's mach marker (`dev.brahma.turn.<id>`): allowed by its sandbox, so the engine can recognize the
     /// turn's processes by their sandbox alone (Task 2's mechanism). Required on the Sandboxed profile.
     public var containmentMarker: String? = nil

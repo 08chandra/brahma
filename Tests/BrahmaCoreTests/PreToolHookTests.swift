@@ -63,7 +63,7 @@ import Testing
     @Test func deniesFanOutWhenTainted() {
         let tainted = PreToolHook.Context(mode: .ultra, subagents: true, tainted: true)
         for tool in ["Agent", "Task", "Workflow"] {
-            #expect(denied(PreToolHook.decide(input(tool, ["script": .string("x")]), context: tainted))?.contains("tainted") == true)
+            #expect(denied(PreToolHook.decide(input(tool, ["script": .string("x")]), context: tainted)) == TaintPolicy.fanOutDenied)
         }
         // A taint flag file marks the session (5-lite writes it; the hook reads it).
         let dir = (try? tempDir()) ?? URL(fileURLWithPath: "/tmp")
