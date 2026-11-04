@@ -119,6 +119,11 @@ public actor Orchestrator {
     /// Plan L previews: the runner (one for the engine's life) and its reconcile pass in flight (`previewTick`).
     let previewRunner: PreviewRunner
     var previewTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
+    /// Plan L main smokes (`smokeTick`): what they run through, one slot per company shared with a release's smoke (PR-36),
+    /// and the run in flight per company.
+    nonisolated let smokeChecks: SmokeChecks
+    public nonisolated let smokeSlots = SmokeSlots()
+    var smokeTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -144,7 +149,8 @@ public actor Orchestrator {
                 sandboxCanary: SandboxCanaryGate? = nil,
                 stopObservers: [any EmergencyStopObserver] = [],
                 stopPollSleep: @escaping @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) },
-                previewDeps: PreviewDependencies? = nil) {
+                previewDeps: PreviewDependencies? = nil,
+                smokeChecks: SmokeChecks? = nil) {
         self.stopObservers = stopObservers; self.stopPollSleep = stopPollSleep
         let engineBlocking = Blocking()
         self.blocking = engineBlocking
@@ -176,6 +182,7 @@ public actor Orchestrator {
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths)
         self.checkBaseEnvironment = checkBaseEnvironment
+        self.smokeChecks = smokeChecks ?? Orchestrator.defaultSmokeChecks(store: store, paths: paths, environment: checkBaseEnvironment)
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -225,6 +232,8 @@ public actor Orchestrator {
             let now = clock()
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
+            // Main smokes an earlier engine left running are no result (`error`, "engine restarted"); never a red bug.
+            try store.interruptRunningSmokes(now: now)
             try await recoverMerges()
             // The engine-owned pre-commit hook of every company workspace (Task 5a); a refusal is logged, never fatal.
             let companies = try store.companies()
@@ -283,8 +292,8 @@ public actor Orchestrator {
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
-    /// Child processes that are not turns: engine-run checks and merges. They count against the same caps as turns.
-    var otherChildren: Int { checkTasks.count + mergeTasks.count }
+    /// Child processes that are not turns: engine-run checks, merges and main smokes. They count against the same caps as turns.
+    var otherChildren: Int { checkTasks.count + mergeTasks.count + smokeTasks.count }
 
     /// Previews' child processes (running servers and starts in flight): against the safety cap only, never the plan tier's
     /// hard cap (`Scheduler.freeSlots(safetyOnly:)`, Task 3 fix I1).
@@ -315,7 +324,7 @@ public actor Orchestrator {
     /// next is started synchronously inside that tick, so nothing is "queued" outside these sets.)
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
-            && secretsTask == nil && pushTask == nil && stopObserverTask == nil && previewTask == nil
+            && secretsTask == nil && pushTask == nil && stopObserverTask == nil && previewTask == nil && smokeTasks.isEmpty
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -325,7 +334,7 @@ public actor Orchestrator {
     }
 
     private func busyDescription() -> String {
-        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted()) previews=\(previewTask == nil ? "idle" : "reconciling") secrets=\(secretsTask == nil ? "idle" : "reloading")"
+        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted()) previews=\(previewTask == nil ? "idle" : "reconciling") smokes=\(smokeTasks.keys.sorted()) secrets=\(secretsTask == nil ? "idle" : "reloading")"
     }
 
     private func idleWaiterTimedOut(_ id: Int) {
@@ -375,6 +384,7 @@ public actor Orchestrator {
         stopWALShipping()
         await stopSleepPrevention()
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
+            + Array(smokeTasks.values)
             + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? []) + (stopObserverTask.map { [$0] } ?? []) + (previewTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
@@ -543,6 +553,8 @@ public actor Orchestrator {
         startMerges(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
         // 5b. Previews (Plan L): one reconcile pass at a time, after the merge step.
         previewTick(held: held)
+        // 5c. The smoke check on main (Plan L): queue a run for a new main, run queued ones one at a time per company.
+        smokeTick(now: now, held: held, companies: companies)
 
         infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
