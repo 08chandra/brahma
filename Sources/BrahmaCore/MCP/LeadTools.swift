@@ -45,11 +45,12 @@ extension CompanyTools {
                 first; re-adopting records its current head and your name so the holder can submit again.
                 """, inputSchema: schema(["key": prop("string", "Work item key, e.g. ACME-12")], required: ["key"])),
             ToolSpec(name: "propose_decision", description: """
-                File a decision for approval: a PRD, an architecture, a release, or any other choice (sprint plans use plan_sprint). \
+                File a decision for approval: a PRD, an architecture, or any other choice (sprint plans use plan_sprint; releases \
+                use propose_deploy). \
                 Write it as a brief: stakes in plain language, your recommendation, up to four options, whether it is \
                 reversible, and the exact proposal. Mechanical matters are recorded without an approval.
                 """, inputSchema: schema([
-                    "kind": prop("string", "prd, architecture, release or other"),
+                    "kind": prop("string", "prd, architecture or other"),
                     "title": prop("string", "One line"), "summary": prop("string", "What and why"),
                     "category": prop("string", "Required for other: e.g. general, tooling, pricing, legal"),
                     "risk": prop("string", "low, medium or high"),
@@ -128,6 +129,9 @@ extension CompanyTools {
         let kindName = try text(args, "kind")
         if kindName.lowercased() == AskKind.sprintPlan.rawValue.lowercased() {
             throw ToolError(message: "sprint plans are filed with plan_sprint")
+        }
+        if kindName.lowercased() == AskKind.release.rawValue.lowercased() {
+            throw ToolError(message: ReleasePolicy.releaseKindRedirect)
         }
         let allowed: [AskKind] = [.prd, .architecture, .release, .other]
         guard let kind = allowed.first(where: { $0.rawValue.lowercased() == kindName.lowercased() }) else {
