@@ -323,3 +323,249 @@ extension Store {
         }
     }
 }
+
+// MARK: - Releases (Task 6)
+
+/// Files the hosting-account human task when a deploy is proposed without the provider token or the account ID (refusal 7
+/// of `Store.proposeDeploy`). Returns the open ask, filing it only when none is open (deduped). Task 9 replaces the stub.
+public protocol HumanTaskFiling: Sendable {
+    func fileHostingAccount(store: Store, companyId: String, provider: HostingProviderID, now: Date) throws -> Ask
+}
+
+/// Until Task 9: an `info` ask with the hosting-account task's title, filed by the engine (`.system`, PR-28: no agent quota
+/// is charged), at most one open per company.
+public struct StubHumanTaskFiling: HumanTaskFiling {
+    public init() {}
+
+    public static func hostingAccountTitle(_ provider: HostingProviderID) -> String {
+        switch provider {
+        case .cloudflarePages: "Create a Cloudflare account and an API token"
+        case .vercel: "Create a Vercel account and a token"
+        }
+    }
+
+    public func fileHostingAccount(store: Store, companyId: String, provider: HostingProviderID, now: Date) throws -> Ask {
+        let title = Self.hostingAccountTitle(provider)
+        if let open = try store.asks(companyId: companyId, statuses: [.pendingOwner, .pendingInternal])
+            .first(where: { $0.kind == .info && $0.requesterId == "system" && $0.title == title }) {
+            return open
+        }
+        let token = HostingAdapters.adapter(provider).tokenSecret
+        return try store.requestFromOwner(companyId: companyId, by: .system, title: title, question: """
+            Deploys to \(provider.title) need an account and an API token. Create them, store the token as the company \
+            secret \(token) and set the account ID in hosting settings, then answer here.
+            """, now: now)
+    }
+}
+
+extension Store {
+    // MARK: Reading
+
+    /// The company's releases, newest first.
+    public func releases(companyId: String, limit: Int = 200) throws -> [Release] {
+        try writer.read { db in
+            try Release.filter(Column("companyId") == companyId).order(Column("number").desc).limit(limit).fetchAll(db)
+        }
+    }
+
+    /// `R-<n>` of the company (any case), or nil: another company's release is never found.
+    public func release(companyId: String, ref: String) throws -> Release? {
+        let t = ref.trimmingCharacters(in: .whitespaces)
+        guard t.uppercased().hasPrefix("R-"), let n = Int(t.dropFirst(2)), n > 0 else { return nil }
+        return try writer.read { db in
+            try Release.filter(Column("companyId") == companyId && Column("number") == n).fetchOne(db)
+        }
+    }
+
+    /// Where the company's deploys run: `<data home>/run/releases/<companyId>` (the same place the executor uses). An
+    /// in-memory store has no data home; it uses a stand-in under the temporary directory (nothing is written there).
+    func releaseLayout(companyId: String) throws -> ReleaseLayout {
+        let home = dataHome ?? FileManager.default.temporaryDirectory.appending(path: "brahma-memory-home", directoryHint: .isDirectory)
+        return try ReleaseLayout(paths: BrahmaPaths(home: home, workspaces: home), companyId: companyId)
+    }
+
+    // MARK: Proposing
+
+    /// What `propose_deploy` answers on success.
+    public static func proposedDeployText(_ r: Release) -> String {
+        "Proposed \(r.ref) (release \(r.version) at \(r.sha7)); waiting on the owner."
+    }
+
+    /// An ops agent (a role whose pack template lists `propose_deploy`) proposes deploying the engine-accepted `main` as
+    /// release `version`. The refusals, in order: the version; a duplicate version; another open release; no output folder;
+    /// no smoke check; no `npm` (the owner is told); no token or account (the hosting-account human task is filed, deduped);
+    /// `main` not green at its head. On success the release (`proposed`) and its owner-only `deploy` ask are written in one
+    /// transaction, with the exact deploy and rollback plans composed by the provider's adapter (injected, PR-25).
+    /// Token presence is decided from secret metadata only; `vault` is kept for the brief's signature and unused.
+    @discardableResult
+    public func proposeDeploy(companyId: String, by agentId: String, version rawVersion: String, notes: String?,
+                              now: Date = Store.now(), vault: (any SecretVault)? = nil,
+                              adapters: HostingAdapters.Lookup = HostingAdapters.production, layout: ReleaseLayout? = nil,
+                              npmPresent: Bool? = nil, humanTasks: any HumanTaskFiling = StubHumanTaskFiling()) throws -> (Release, Ask) {
+        let version = rawVersion.trimmingCharacters(in: .whitespaces)
+        let notes = try Store.limitedText(try redact(notes), Store.maxAskText, "the notes")
+        // Who and the cheap refusals (1–5), read in one snapshot.
+        let (company, settings) = try writer.read { db -> (Company, HostingSettings?) in
+            guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId, agent.state != .killed else {
+                throw WorkError.forbidden("not in your company")
+            }
+            guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
+            guard catalog.template(role: agent.role, pack: company.packId).companyTools.contains("propose_deploy") else {
+                throw WorkError.forbidden(ReleasePolicy.proposeRole)
+            }
+            try Self.checkReleaseSlot(db, companyId: companyId, version: version)
+            let settings = try HostingSettings.fetchOne(db, key: companyId)
+            return (company, settings)
+        }
+        guard let settings, settings.outputDir != nil else { throw WorkError.invalid(ReleasePolicy.noOutputDir) }
+        guard let smokeCheck = company.smokeCheck else { throw WorkError.invalid(ReleasePolicy.noSmokeCheck) }
+        // 6. npm, which installs the provider CLI.
+        guard npmPresent ?? HostingReadiness.npmOnPath() else {
+            try notifyOwner(companyId: companyId, title: "Deploying needs Node.js",
+                            body: "Install Node.js (npm) on this Mac so \(company.name) can deploy, then ask again.", now: now)
+            throw WorkError.invalid(ReleasePolicy.noNpm)
+        }
+        // 7. The token and the account (metadata only; the executor reads the token at deploy time).
+        let adapter = adapters(settings.provider)
+        let tokenPresent = try secrets(companyId: companyId).contains { $0.name == adapter.tokenSecret }
+        guard tokenPresent, settings.accountId != nil else {
+            let task = try humanTasks.fileHostingAccount(store: self, companyId: companyId, provider: settings.provider, now: now)
+            throw WorkError.invalid("The hosting token is missing; I asked the owner (\(task.ref)). Propose again when it is done.")
+        }
+        // 8. Main must be green at its engine-accepted head (PR-22).
+        guard let commit = company.mainCommit else { throw WorkError.invalid(Self.noMainYet) }
+        let green = try ReleasePolicy.mainIsGreen(store: self, company: company, at: commit)
+        guard green.green else { throw WorkError.invalid(green.reason ?? ReleasePolicy.noSmokeCheck) }
+
+        // The plans, composed outside the write: the commit's tree decides `functions` (PR-24).
+        let layout = try layout ?? releaseLayout(companyId: companyId)
+        let functions = try gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: companyId)
+            .treeHasDirectory(at: commit, path: "functions")
+        let (number, previous) = try writer.read { db -> (Int, Release?) in
+            let n = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM release WHERE companyId = ?",
+                                      arguments: [companyId])) ?? 1
+            let prev = try Release.filter(Column("companyId") == companyId && Column("status") == ReleaseStatus.deployed.rawValue)
+                .order(Column("number").desc).fetchOne(db)
+            return (n, prev)
+        }
+        let input = DeployInput(settings: settings, commit: commit, version: version, layout: layout, release: number, cli: adapter.cli,
+                                previousUpload: previous.map { layout.releaseDir($0.number).appending(path: "upload", directoryHint: .isDirectory) },
+                                previousDeployURL: previous?.deployURL, functionsInCommit: functions)
+        let plan = try adapter.deployPlan(input)
+        let rollback = try adapter.rollbackPlan(input)
+        let sha7 = String(commit.prefix(7))
+        let proposal = Self.deployProposal(settings: settings, adapter: adapter, smokeCheck: smokeCheck, sha7: sha7, plan: plan,
+                                           rollback: rollback)
+
+        return try writer.write { db in
+            // The slot again, in the write that takes it (a concurrent proposal, or a version taken meanwhile).
+            try Self.checkReleaseSlot(db, companyId: companyId, version: version)
+            let latestNumber = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM release WHERE companyId = ?",
+                                                 arguments: [companyId])) ?? 1
+            let latestMain = try Company.fetchOne(db, key: companyId)?.mainCommit
+            guard latestNumber == number, latestMain == commit else {
+                throw WorkError.conflict("main or the releases changed while proposing; propose again")
+            }
+            var release = Release(companyId: companyId, number: number, version: version, provider: settings.provider,
+                                  project: settings.project, commit: commit, previousReleaseId: previous?.id, build: settings.build,
+                                  outputDir: settings.outputDir, plan: plan, rollbackPlan: rollback, notes: notes, proposedById: agentId,
+                                  createdAt: now)
+            let summary = notes ?? "Release \(version) of main at \(sha7)."
+            let ask = try propose(db: db, companyId: companyId, by: .agent(agentId), kind: .deploy, risk: .high, category: nil,
+                                  title: "Deploy \(version) to \(settings.provider.title) at \(sha7)", summary: summary,
+                                  payload: AskPayload(proposal: proposal), document: nil, itemId: nil, subjectId: release.id,
+                                  supersedes: nil, requestId: nil, decisionClass: .taste, viaOwner: true, now: now)
+            release.askId = ask.id
+            try release.insert(db)
+            let agentName = try Agent.fetchOne(db, key: agentId)?.name ?? "agent"
+            try ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .release,
+                              text: "@\(agentName) proposed \(release.ref): release \(version) at \(sha7) (\(ask.ref) waits on the owner)",
+                              createdAt: now).insert(db)
+            return (release, ask)
+        }
+    }
+
+    /// Refusals 1–3: the version's form, a version already used, another open release.
+    static func checkReleaseSlot(_ db: Database, companyId: String, version: String) throws {
+        guard ReleasePolicy.validVersion(version) else { throw WorkError.invalid(ReleasePolicy.badVersion) }
+        if try Release.filter(Column("companyId") == companyId && Column("version") == version).fetchCount(db) > 0 {
+            throw WorkError.conflict("release \(version) already exists")
+        }
+        if let open = try Release.filter(Column("companyId") == companyId && ReleaseStatus.openRawValues.contains(Column("status")))
+            .order(Column("number")).fetchOne(db) {
+            throw WorkError.conflict("\(open.ref) is still \(open.status.rawValue)")
+        }
+    }
+
+    /// The deploy ask's `proposal`: exactly what the engine will do. Agent-written fields (the build, the smoke command, smoke
+    /// paths and the expected text) are flattened to one line each; `propose` redacts the whole text before it is stored.
+    static func deployProposal(settings: HostingSettings, adapter: any HostingAdapter, smokeCheck: CheckSpec, sha7: String,
+                               plan: DeployPlan, rollback: DeployPlan) -> String {
+        let build = settings.build.map { flat($0, max: HostingSettings.maxBuild) } ?? "none"
+        let base = adapter.smokeBase(settings, deployURL: nil)?.absoluteString ?? "the deploy URL"
+        let requests = settings.smoke.isEmpty ? [SmokeRequest(method: "GET", path: "/")] : settings.smoke
+        let lines = requests.map { r in
+            flat([r.method, r.path, r.body, r.expectStatus.map(String.init)].compactMap { $0 }.joined(separator: " "), max: 300)
+        }.joined(separator: ", ")
+        let expecting = settings.expectText.map { ", expecting \"\(flat($0, max: HostingSettings.maxExpectText))\"" } ?? ""
+        return """
+            Build (sandboxed, no token): \(build) → \(settings.outputDir ?? "")
+            Smoke on main at \(sha7) just before deploying: \(flat(smokeCheck.command, max: 2000))
+            Deploy (engine, token $\(plan.tokenSecret) from Keychain), in order:
+            \(plan.display)
+            Rollback recorded now:
+            \(rollback.display)
+            Smoke after deploy: \(base) \(lines)\(expecting)
+            """
+    }
+
+    // MARK: The owner's decision
+
+    /// The `deploy` ask's final status moves its release (`applyAskEffects`): rejected (or expired) → `rejected`; approved →
+    /// `approved` with `approvedAt` and `approvedBy "owner"`. Both only while the release is still `proposed`, so applying an
+    /// effect again changes nothing.
+    func applyDeployEffects(_ db: Database, ask: Ask, now: Date) throws {
+        guard var release = try deployRelease(db, ask: ask), release.status == .proposed else { return }
+        switch ask.status {
+        case .approved:
+            release.status = .approved
+            release.approvedAt = now
+            release.approvedBy = "owner"
+        case .rejected, .expired:
+            release.status = .rejected
+            release.finishedAt = now
+        default:
+            return
+        }
+        try release.update(db)
+        try ActivityEvent(companyId: release.companyId, agentId: nil, turnId: nil, kind: .release,
+                          text: "\(release.ref) (release \(release.version)) was \(release.status == .approved ? "approved" : "rejected") by the owner",
+                          createdAt: now).insert(db)
+    }
+
+    /// The owner rescinds an approved `deploy` ask (`reverseAskEffects`): before the executor started, the release is
+    /// `cancelled`; once it started nothing changes, and the owner is told to roll back instead.
+    func reverseDeployEffects(_ db: Database, ask: Ask, now: Date) throws {
+        guard var release = try deployRelease(db, ask: ask) else { return }
+        switch release.status {
+        case .approved, .proposed:
+            release.status = .cancelled
+            release.finishedAt = now
+            try release.update(db)
+            try ActivityEvent(companyId: release.companyId, agentId: nil, turnId: nil, kind: .release,
+                              text: "\(release.ref) (release \(release.version)) was cancelled: the owner rescinded \(ask.ref)",
+                              createdAt: now).insert(db)
+        case .rejected, .cancelled:
+            return
+        default:
+            try notifyOwner(db: db, companyId: release.companyId, kind: .system, urgency: .normal,
+                            title: "\(release.ref) already started", body: "Use Roll back in Releases if you want it undone.", now: now)
+        }
+    }
+
+    /// The release a `deploy` ask decides (by its `askId`, in the ask's company).
+    private func deployRelease(_ db: Database, ask: Ask) throws -> Release? {
+        guard ask.kind == .deploy else { return nil }
+        return try Release.filter(Column("companyId") == ask.companyId && Column("askId") == ask.id).fetchOne(db)
+    }
+}
