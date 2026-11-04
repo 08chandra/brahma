@@ -117,9 +117,15 @@ public actor SmokeSlots {
     /// Runs `body` holding `companyId`'s slot, waiting for it first.
     public func withSlot<T: Sendable>(_ companyId: String, _ body: @Sendable () async -> T) async -> T {
         await acquire(companyId)
-        let value = await body()
-        release(companyId)
-        return value
+        defer { release(companyId) }
+        return await body()
+    }
+
+    /// `withSlot` for a body that throws (the slot is released either way).
+    public func withSlot<T: Sendable>(_ companyId: String, _ body: @Sendable () async throws -> T) async throws -> T {
+        await acquire(companyId)
+        defer { release(companyId) }
+        return try await body()
     }
 
     private func acquire(_ companyId: String) async {

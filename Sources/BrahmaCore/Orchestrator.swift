@@ -116,6 +116,8 @@ public actor Orchestrator {
     nonisolated let smokeChecks: SmokeChecks
     public nonisolated let smokeSlots = SmokeSlots()
     var smokeTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
+    /// Company id → when its merge smoke, re-queued after the engine's own failure (an export), may start again.
+    var smokeBackoff: [String: Date] = [:]
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -220,8 +222,8 @@ public actor Orchestrator {
             let now = clock()
             _ = try store.recoverInterruptedTurns(now: now)
             try await recoverChecks(now: now)
-            // Main smokes an earlier engine left running are no result (`error`, "engine restarted"); never a red bug.
-            try store.interruptRunningSmokes(now: now)
+            // Main smokes an earlier engine left running: merge runs at main queued again, the rest `error` (fix I1).
+            try await recoverSmokes(now: now)
             try await recoverMerges()
             // The engine-owned pre-commit hook of every company workspace (Task 5a); a refusal is logged, never fatal.
             let companies = try store.companies()
@@ -539,7 +541,7 @@ public actor Orchestrator {
         // 5b. Previews (Plan L): one reconcile pass at a time, after the merge step.
         previewTick(held: held)
         // 5c. The smoke check on main (Plan L): queue a run for a new main, run queued ones one at a time per company.
-        smokeTick(now: now, held: held, companies: companies)
+        smokeTick(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
 
         infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
