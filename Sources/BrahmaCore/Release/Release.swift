@@ -51,7 +51,100 @@ public struct MainSmokeRun: Codable, Equatable, Sendable, FetchableRecord, Persi
     public var failure: String { exitCode.map { "exit \($0)" } ?? "timed out" }
 }
 
-/// The release rules (Plan L). Task 6 adds the release types next to these.
+/// Where a release is (Plan L Task 6). Only the engine writes it: `Store.proposeDeploy` (`proposed`), the owner's decision on
+/// its `deploy` ask (`approved`, `rejected`, `cancelled`) and, from Task 7, the release executor (the rest).
+public enum ReleaseStatus: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
+    case proposed, approved, building, deploying, smoking, deployed, failed, rejected, cancelled, interrupted, rolledBack
+
+    public var title: String {
+        switch self {
+        case .proposed: "Proposed"
+        case .approved: "Approved"
+        case .building: "Building"
+        case .deploying: "Deploying"
+        case .smoking: "Smoke testing"
+        case .deployed: "Deployed"
+        case .failed: "Failed"
+        case .rejected: "Rejected"
+        case .cancelled: "Cancelled"
+        case .interrupted: "Interrupted"
+        case .rolledBack: "Rolled back"
+        }
+    }
+
+    /// `proposed` through `smoking`: a company has at most one open release.
+    public var isOpen: Bool { [.proposed, .approved, .building, .deploying, .smoking].contains(self) }
+
+    static let openRawValues = allCases.filter(\.isOpen).map(\.rawValue)
+}
+
+/// Where the rollback of a release is (Task 8 runs it; the owner requests it).
+public enum RollbackStatus: String, Codable, Sendable, DatabaseValueConvertible {
+    case requested, running, succeeded, failed, interrupted
+}
+
+/// One release of a company (table `release`, migration `vL-release`): one row per column. `plan` and `rollbackPlan` are the
+/// exact engine-composed commands the owner approves (`DeployPlan`, stored as JSON); `build` and `outputDir` are copied from
+/// the hosting settings at propose time and are the only values the executor uses (builder-check 6). `notes`, `outputTail`,
+/// `rollbackOutputTail`, `failedReason` and `smokeResults` hold agent-controlled text.
+public struct Release: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "release"
+
+    public var id: String
+    public var companyId: String
+    public var number: Int
+    public var version: String
+    public var status: ReleaseStatus
+    public var provider: HostingProviderID
+    public var project: String
+    /// The engine-accepted `main` at propose time (PR-22).
+    public var commit: String
+    /// The company's last `deployed` release when this one was proposed (what its rollback restores).
+    public var previousReleaseId: String?
+    public var build: String?
+    public var outputDir: String?
+    public var plan: DeployPlan
+    /// `plan.hash` at propose time; the executor refuses a plan whose hash differs.
+    public var commandsHash: String
+    public var rollbackPlan: DeployPlan
+    public var notes: String?
+    public var askId: String?
+    public var proposedById: String
+    public var approvedBy: String?
+    public var deployURL: String?
+    public var productionURL: String?
+    public var smokeStatus: String?
+    public var smokeResults: [SmokeResult]
+    public var outputTail: String?
+    public var failedReason: String?
+    public var backupRef: String?
+    public var rollbackStatus: RollbackStatus?
+    public var rollbackRequestedAt: Date?
+    public var rollbackStartedAt: Date?
+    public var rolledBackAt: Date?
+    public var rollbackOutputTail: String?
+    public var createdAt: Date
+    public var approvedAt: Date?
+    public var startedAt: Date?
+    public var deployedAt: Date?
+    public var finishedAt: Date?
+
+    public init(id: String = UUID().uuidString.lowercased(), companyId: String, number: Int, version: String,
+                status: ReleaseStatus = .proposed, provider: HostingProviderID, project: String, commit: String,
+                previousReleaseId: String? = nil, build: String?, outputDir: String?, plan: DeployPlan, rollbackPlan: DeployPlan,
+                notes: String? = nil, askId: String? = nil, proposedById: String, createdAt: Date) {
+        self.id = id; self.companyId = companyId; self.number = number; self.version = version; self.status = status
+        self.provider = provider; self.project = project; self.commit = commit; self.previousReleaseId = previousReleaseId
+        self.build = build; self.outputDir = outputDir; self.plan = plan; self.commandsHash = plan.hash
+        self.rollbackPlan = rollbackPlan; self.notes = notes; self.askId = askId; self.proposedById = proposedById
+        self.smokeResults = []; self.createdAt = createdAt
+    }
+
+    public var ref: String { "R-\(number)" }
+    public var sha7: String { String(commit.prefix(7)) }
+}
+
+/// The release rules (Plan L).
 public enum ReleasePolicy {
     public static let buildTimeout: Duration = .seconds(1800)
     public static let stepTimeout: Duration = .seconds(900)
@@ -60,6 +153,12 @@ public enum ReleasePolicy {
     public static let smokeTimeoutMax = 3600
 
     static let noSmokeCheck = "set_smoke_check first; deploys need a smoke check on main"
+    static let badVersion = "release versions are 1–32 letters, digits, '.', '+' or '-'"
+    static let noOutputDir = "set_deploy_config first (output_dir is missing)"
+    static let noNpm = "deploying needs Node.js (npm) on this Mac; the owner has been told"
+    static let proposeRole = "propose_deploy is not available to your role"
+    /// `propose_decision {kind: "release"}` is refused with this pointer (PR-26).
+    public static let releaseKindRedirect = "propose releases with propose_deploy so they carry the exact deploy and rollback commands"
     static let superseded = "superseded"
     static let engineStopped = "engine stopped"
     static let engineRestarted = "engine restarted"
