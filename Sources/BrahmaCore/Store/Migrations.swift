@@ -704,6 +704,72 @@ enum Migrations {
                 t.column("updatedAt", .datetime).notNull()
             }
         }
+        m.registerMigration("vL-release") { db in
+            // The smoke check on main (Task 5) and the release table in full (Task 6 needs no migration of its own).
+            try db.alter(table: "company") { t in
+                t.add(column: "smokeCheck", .text)           // JSON CheckSpec
+                t.add(column: "smokeCheckSetById", .text)
+                t.add(column: "redBugItemId", .text)
+            }
+            try db.create(table: "mainSmokeRun") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("commit", .text).notNull()
+                t.column("status", .text).notNull()
+                t.column("exitCode", .integer)
+                t.column("outputPath", .text)
+                t.column("outputTail", .text)
+                t.column("reason", .text).notNull()          // merge | release | manual
+                t.column("releaseId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("startedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            // PR-12: one merge run per commit; release runs are keyed by their release; manual runs are always new rows.
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX mainSmokeRun_merge ON mainSmokeRun(companyId, "commit") WHERE reason = 'merge';
+                CREATE INDEX mainSmokeRun_company ON mainSmokeRun(companyId, status);
+                """)
+            try db.create(table: "release") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("version", .text).notNull()
+                t.column("status", .text).notNull()
+                t.column("provider", .text).notNull()
+                t.column("project", .text).notNull()
+                t.column("commit", .text).notNull()
+                t.column("previousReleaseId", .text)
+                t.column("build", .text)
+                t.column("outputDir", .text)
+                t.column("plan", .text).notNull()
+                t.column("commandsHash", .text).notNull()
+                t.column("rollbackPlan", .text).notNull()
+                t.column("notes", .text)
+                t.column("askId", .text)
+                t.column("proposedById", .text).notNull()
+                t.column("approvedBy", .text)
+                t.column("deployURL", .text)
+                t.column("productionURL", .text)
+                t.column("smokeStatus", .text)
+                t.column("smokeResults", .text).notNull().defaults(to: "[]")
+                t.column("outputTail", .text)
+                t.column("failedReason", .text)
+                t.column("backupRef", .text)
+                t.column("rollbackStatus", .text)
+                t.column("rollbackRequestedAt", .datetime)
+                t.column("rollbackStartedAt", .datetime)
+                t.column("rolledBackAt", .datetime)
+                t.column("rollbackOutputTail", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("approvedAt", .datetime)
+                t.column("startedAt", .datetime)
+                t.column("deployedAt", .datetime)
+                t.column("finishedAt", .datetime)
+                t.uniqueKey(["companyId", "number"])
+                t.uniqueKey(["companyId", "version"])
+            }
+        }
     }
 
     /// Task 12 fix 1 (`v5-restore`): one row per restore (`nonce`, also in the restore marker; `consumedAt` once the engine has
