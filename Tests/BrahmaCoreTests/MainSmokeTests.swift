@@ -17,6 +17,7 @@ import GRDB
         let sandbox: FakeSandbox
         let unsandboxed: FakeSandbox
         let data: URL
+        let vault = MemoryVault()
 
         init(profile: PermissionProfile = .workspace, memory: StubMemory = StubMemory(), config: SchedulerConfig = World.config()) throws {
             let root = try tempDir()
@@ -25,7 +26,7 @@ import GRDB
             let store = try Store(path: data.appending(path: "brahma.sqlite").path)
             sandbox = FakeSandbox()
             unsandboxed = FakeSandbox()
-            w = try World(store: store, config: config, memory: memory, smokeSandbox: sandbox, smokeUnsandboxed: unsandboxed)
+            w = try World(store: store, config: config, memory: memory, vault: vault, smokeSandbox: sandbox, smokeUnsandboxed: unsandboxed)
             company = try w.company("Acme", profile: profile)
             devops = try w.hire(company, "devops-1", role: "devops")
             eng = try w.hire(company, "eng-1", role: "engineer")
@@ -270,12 +271,14 @@ import GRDB
         let fx = try Fx()
         try fx.setSmoke("test -f a.txt")
         let head = try fx.merge(["a.txt": "x"])
+        // A registered secret (MemoryVault) the stale log leaked: start-up loads the redactor, then scrubs the log.
+        try fx.store.setSecret(companyId: fx.company.id, name: "API_TOKEN", value: "tok-0123456789", isTest: false, vault: fx.vault)
         var run = try #require(try fx.store.queueMergeSmokeIfNeeded(companyId: fx.company.id, now: fx.w.clock.now))
         // An earlier engine died mid-run: the row is running, its export and its raw log are left behind.
         let stale = try EngineExport.export(store: fx.store, company: try fx.current(), runId: run.runId, commit: head)
         let log = fx.w.orchestrator.smokeChecks.outputURL(run)
         try FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("raw output\n".utf8).write(to: log)
+        try Data("raw output tok-0123456789\n".utf8).write(to: log)
         run.status = .running; run.startedAt = fx.w.clock.now; run.outputPath = log.path
         let running = run
         try await fx.store.writer.write { db in try running.update(db) }
@@ -284,7 +287,10 @@ import GRDB
         #expect(recovered.status == .queued)
         #expect(!FileManager.default.fileExists(atPath: stale.path))
         // The raw log was scrubbed in place (or removed when it could not be).
-        if FileManager.default.fileExists(atPath: log.path) { #expect(try String(contentsOf: log, encoding: .utf8) == "raw output\n") }
+        if FileManager.default.fileExists(atPath: log.path) {
+            let text = try String(contentsOf: log, encoding: .utf8)
+            #expect(!text.contains("tok-0123456789")); #expect(text.contains("[redacted API_TOKEN]"))
+        }
         // The same row runs again: main can be green without a new merge.
         try await fx.w.cycle()
         #expect(try fx.store.mainSmokeRun(id: run.id)?.status == .passed)
@@ -294,21 +300,31 @@ import GRDB
 
     @Test func releaseSmokeIsNeverSupersededAndNeedsMain() async throws {
         let fx = try Fx()
-        try fx.setSmoke("sleep 2")
+        try fx.setSmoke("true")
         let old = try fx.merge(["a.txt": "x"])
         let head = try fx.merge(["b.txt": "y"])
         let queued = try #require(try fx.store.queueMergeSmokeIfNeeded(companyId: fx.company.id, now: fx.w.clock.now))
-        let engine = fx.w.orchestrator, companyId = fx.company.id
-        let release = Task { try await engine.runSmoke(companyId: companyId, commit: head, reason: .release, releaseId: "rel-1") }
-        try await Self.eventually { !fx.sandbox.calls.isEmpty }
-        // While the release smoke runs, its row is already running: a newer queued run supersedes only queued rows.
-        let rel = try #require(try fx.runs().first { $0.reason == .release })
-        #expect(rel.status == .running)
-        try fx.store.requestManualSmoke(companyId: companyId, by: .owner, now: fx.w.clock.now)
-        let done = try await release.value
-        #expect(done.status == .passed); #expect(done.id == rel.id); #expect(done.startedAt != nil)
-        #expect(try fx.store.mainSmokeRun(id: queued.id)?.status == .error)   // superseded by the manual request
-        // The commit must be the engine-accepted main.
+        let (store, companyId, now) = (fx.store, fx.company.id, fx.w.clock.now)
+        // Right after runSmoke's write and before its export, a newer run is queued (the tick, or the owner): the release row
+        // must already be running there, so superseding (queued rows only) cannot touch it. No sleeps: the seam runs inline.
+        final class Seen: @unchecked Sendable { let lock = NSLock(); var status: MainSmokeStatus?; var supersededBy: String? }
+        let seen = Seen()
+        var checks = fx.w.orchestrator.smokeChecks
+        checks.afterClaim = { run in
+            let manual = try? store.requestManualSmoke(companyId: companyId, by: .owner, now: now)
+            let status = try? store.mainSmokeRun(id: run.id)?.status
+            seen.lock.withLock { seen.status = status; seen.supersededBy = manual?.id }
+        }
+        let done = try await store.runSmoke(companyId: companyId, commit: head, reason: .release, releaseId: "rel-1", checks: checks,
+                                            blocking: Blocking(), clock: { now })
+        #expect(seen.lock.withLock { seen.status } == .running)
+        #expect(seen.lock.withLock { seen.supersededBy } != nil)
+        #expect(done.status == .passed); #expect(done.reason == .release); #expect(done.releaseId == "rel-1")
+        #expect(try fx.store.mainSmokeRun(id: done.id)?.status == .passed)
+        #expect(fx.sandbox.calls.count == 1)
+        #expect(try fx.store.mainSmokeRun(id: queued.id)?.status == .error)   // the queued merge row was superseded instead
+        // The commit must be the engine-accepted main (through the engine's entry, which holds the slot).
+        let engine = fx.w.orchestrator
         await #expect(throws: WorkError.invalid("\(old.prefix(7)) is not the engine-accepted main")) {
             try await engine.runSmoke(companyId: companyId, commit: old, reason: .release, releaseId: "rel-2")
         }
