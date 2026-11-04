@@ -92,6 +92,8 @@ public struct SmokeChecks: Sendable {
     public var unsandboxed: any SandboxedRunner
     public var paths: BrahmaPaths
     public var environment: [String: String]
+    /// Test seam: called by `Store.runSmoke` right after its insert-and-claim write, before the export (nil in production).
+    var afterClaim: (@Sendable (MainSmokeRun) -> Void)? = nil
 
     public init(sandbox: any SandboxedRunner, unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner(), paths: BrahmaPaths,
                 environment: [String: String] = ProcessInfo.processInfo.environment) {
