@@ -225,6 +225,7 @@ extension Store {
     func applyAskEffects(_ db: Database, ask: Ask, now: Date) throws {
         if ask.status == .rejected { try actingCEODeclined(db, ask: ask, now: now) }
         if ask.kind == .sprintPlan { try applySprintPlanEffects(db, ask: ask, now: now) }
+        if ask.kind == .deploy { try applyDeployEffects(db, ask: ask, now: now) }
         guard ask.status == .approved, let oldId = ask.supersedesId, var old = try Ask.fetchOne(db, key: oldId),
               old.companyId == ask.companyId else { return }
         guard ![AskStatus.rejected, .expired, .rescinded, .superseded].contains(old.status) else { return }
