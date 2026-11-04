@@ -197,6 +197,7 @@ extension Store {
             return (run, company, true)
         }
         guard claimed.2 else { return claimed.0 }
+        checks.afterClaim?(claimed.0)
         return try await performSmoke(claimed.0, company: claimed.1, checks: checks, blocking: blocking, clock: clock)
     }
 
