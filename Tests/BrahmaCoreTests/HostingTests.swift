@@ -432,10 +432,7 @@ private struct RefusingVault: SecretVault {
         #expect(Self.message { try store.setDeployConfig(companyId: c.id, by: theirs.id, build: nil, outputDir: "x", smoke: [], expectText: nil) }
                 == "not in your company")
         #expect(try store.hosting(companyId: other.id) == nil)
-        // The stubs of later tasks answer "not available yet"; the tool is high-risk (no plan turns, one per turn).
-        do { _ = try tools.call(name: "propose_deploy", arguments: [:]); Issue.record("stub ran") } catch let e as ToolError {
-            #expect(e.message == "propose_deploy is not available yet")
-        }
+        // The deploy tools are high-risk (no plan turns, one per turn).
         #expect(CompanyTools.highRiskTools.isSuperset(of: ["set_deploy_config", "set_smoke_check", "propose_deploy"]))
         let plan = CompanyTools(store: store, companyId: c.id, agentId: devops.id, planTurn: true)
         #expect(!plan.specs().map(\.name).contains("set_deploy_config"))
