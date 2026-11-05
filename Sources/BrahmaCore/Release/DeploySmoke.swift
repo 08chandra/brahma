@@ -9,6 +9,7 @@ import Foundation
 /// - `expectText`, when set, must be in the first 64 KB of the body of the `/` request (a `GET /` is added for it when the
 ///   list has no `/` request, so the text is never silently unchecked).
 /// - Every URL is the base with the request's path appended, and must stay on the base's host.
+/// - Cancellation (the owner's stop, the engine's shutdown) ends it at once: no further request or wait, and not `ok`.
 /// The results are the last round's. Response bodies and errors are agent-controlled text (`SmokeResult`).
 public enum DeploySmoke {
     public static let attempts = 6
@@ -26,12 +27,15 @@ public enum DeploySmoke {
         }
         var results: [SmokeResult] = []
         for attempt in 1...attempts {
+            // Cancelled (the owner's stop, the engine's shutdown: `ReleaseExecutor.stoppable`): no further request or wait.
+            if Task.isCancelled { break }
             results = []
             for request in list {
+                if Task.isCancelled { break }
                 results.append(await probe(base: base, request: request, expectText: request.path == "/" ? expectText : nil, http: http))
             }
-            if results.allSatisfy(\.ok) { return (true, results) }
-            if attempt < attempts { await sleep(interval) }
+            if !Task.isCancelled, results.count == list.count, results.allSatisfy(\.ok) { return (true, results) }
+            if attempt < attempts, !Task.isCancelled { await sleep(interval) }
         }
         return (false, results)
     }
