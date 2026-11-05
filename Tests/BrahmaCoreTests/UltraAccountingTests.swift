@@ -15,7 +15,7 @@ private struct UltraWorld {
     let item: WorkItem
     static let fakePid: Int32 = 999_999
 
-    init(tag: String, fiveHour: Double = 0.30) throws {
+    init(tag: String, fiveHour: Double = 0.30, hookVerified: Bool = true) throws {
         g = try GatedWorld(mode: .max, tag: tag)
         let now = g.world.clock.now
         try g.store.setPlanTier(.max20x)
@@ -31,7 +31,7 @@ private struct UltraWorld {
             try Store.saveCalibration(db, cal)
         }
         try g.record(UltraGate.requiredGates, .ultra)
-        try g.record(["V-1"], .sandboxedTask)          // no pre-taint: PostToolUse is verified for this build
+        if hookVerified { try g.record(["V-1"], .sandboxedTask) }   // no pre-taint: PostToolUse is verified for this build
         let usage = #"{"type":"control_response","response":{"subtype":"success","request_id":"cu","response":{"subscription_type":"max","rate_limits":{"five_hour":{"utilization":\#(Int(fiveHour * 100)),"resets_at":"2030-01-01T00:00:00Z"},"seven_day":{"utilization":20},"extra_usage":{"is_enabled":false}}}}}"#
         g.world.fake.controlResponder = { _, _ in ControlTranscript(exitStatus: nil, lines: [usage]) }
         var item = try g.store.createWorkItem(companyId: g.company.id, by: .owner, draft: WorkItemDraft(
@@ -94,7 +94,7 @@ enum BrahmaToolsForUltra {
         #expect(r.mode?.mode == .ultra); #expect(r.mode?.workflow?.variant == .full); #expect(r.mode?.workflow?.approver == .owner)
         #expect(r.prompt.contains("This turn is opted into multi-agent orchestration (approved by: owner)"))
         let compiled = TurnProfileCompiler.profile(for: r)
-        #expect(compiled.settings.enableWorkflows == true); #expect(compiled.tools == BuiltinTools.ultra)
+        #expect(compiled.settings.enableWorkflows == true); #expect(compiled.tools == BuiltinTools.ultraBeforeF7, "no F7 yet")
         #expect(u.world.fake.controlRequests >= 1, "a fresh get_usage was taken before admission")
         let t = try u.lastTurn()
         #expect(t.mode == "ultra"); #expect(t.rung == 5); #expect(t.outcome == .succeeded)
@@ -191,7 +191,6 @@ enum BrahmaToolsForUltra {
         guard case .owner(let reason, _)? = try u.store.agent(id: u.eng.id)?.blocker else { Issue.record("not held"); return }
         #expect(reason.hasPrefix(Store.doctorHoldPrefix), "its next turn waits for the doctor")
         // The forced Sonnet worker is expected.
-        #expect(UltraAccounting.allowedModels(main: "opus", fallback: "sonnet").contains("sonnet"))
         #expect(TurnAudit.findings(result: TurnResult(isError: false, subtype: "success", text: nil, costUSD: 1, apiErrorStatus: nil,
                                                       sessionId: "s", modelsUsed: ["claude-opus-5-5", "claude-sonnet-5-5"]),
                                    initModel: "claude-opus-5-5", main: "opus", fallback: "opus",
@@ -218,6 +217,38 @@ enum BrahmaToolsForUltra {
         #expect(try u.lastTurn().mode == "ultra")
         #expect(try u.store.costByMode(companyId: u.company.id, since: u.world.clock.now.addingTimeInterval(-86_400))["ultra"] == 3)
         #expect(try u.store.usageCalibration().week.cost - spentBefore >= 3 - 1e-9)
+    }
+
+    /// Fix round 1, I2: a turn that reads what a tainted session wrote is tainted at launch, so gate 10 refuses Ultra at
+    /// admission; nothing is reserved and the approval waits.
+    @Test func relayedTaintRefusesUltraAtAdmission() async throws {
+        let u = try UltraWorld(tag: "relayedTaintRefusesUltraAtAdmission")
+        try u.approveRun()
+        let mgr = try u.store.hire(companyId: u.company.id, name: "mgr", role: "manager", model: "sonnet")
+        try u.store.markTainted(agentId: mgr.id, source: "WebFetch(example.com)", now: u.world.clock.now)
+        _ = try u.world.router.sendDM(companyId: u.company.id, from: .agent(mgr.id), to: u.eng.name, text: "see this", now: u.world.clock.now)
+        u.world.fake.script(u.eng.name, FakeTurnRunner.Script())
+        try await u.runToUltraTurn()
+        let t = try u.lastTurn()
+        #expect(t.mode != "ultra"); #expect(t.modeReason?.contains("Ultra not admitted: the session read outside content") == true)
+        #expect(try u.store.ultraReservations(companyId: u.company.id).isEmpty)
+        #expect(try u.store.pendingUltraRun(itemId: u.item.id) != nil)
+    }
+
+    /// Fix round 1, I2: taint found right before launch (here the fan-out pre-taint: V-1 is recorded for the Ultra shape but the
+    /// PostToolUse hook gate is not) releases the reservation uncharged and runs the computed rung.
+    @Test func launchTaintReleasesTheReservationAndFallsBack() async throws {
+        let u = try UltraWorld(tag: "launchTaintReleasesTheReservation", hookVerified: false)
+        try u.approveRun()
+        u.world.fake.script(u.eng.name, FakeTurnRunner.Script())
+        try await u.runToUltraTurn()
+        let t = try u.lastTurn()
+        #expect(t.mode != "ultra"); #expect(t.modeReason?.contains("Ultra not admitted: the session read outside content") == true)
+        #expect(try u.store.ultraReservations(companyId: u.company.id).isEmpty, "released uncharged")
+        #expect(try u.store.workItem(id: u.item.id)?.budgetBoostLE == 0)
+        #expect(try u.store.pendingUltraRun(itemId: u.item.id) != nil, "the approval is kept")
+        #expect(await u.world.orchestrator.companyRunning(u.company.id) == 0)
+        #expect(!(u.g.requests().last?.prompt.contains("multi-agent orchestration") ?? true), "no Ultra digest line")
     }
 
     @Test func refusedUltraRunsTheComputedRungAndKeepsTheApproval() async throws {

@@ -616,7 +616,14 @@ public enum ModePolicy {
         if subagents != .off { d.quotas.highRisk = 1 }
         if !launch { d.launch = false }
         // R5 (Task 14u): an admitted Ultra run replaces the computed rung; a refused one is recorded and the rung runs.
-        if let u = i.ultra, i.turnKind == .work, i.hasItem { return ultra(u, computed: d, i: i, sessionModel: session) }
+        if let u = i.ultra, i.turnKind == .work, i.hasItem {
+            // A role card capped below R5 never runs Ultra (fix round 1, M3), whatever was admitted.
+            if let cap = i.roleMaxRung, cap < ModeRung.r5.level {
+                d.reasons.append("Ultra not admitted: the role is capped at R\(cap)")
+                return d
+            }
+            return ultra(u, computed: d, i: i, sessionModel: session)
+        }
         if let why = i.ultraRefusal { d.reasons.append("Ultra not admitted: \(why)") }
         return d
     }
@@ -634,6 +641,9 @@ public enum ModePolicy {
         out.subagents = .forced(model: UltraVariant.workerModel, depth: 1, concurrent: UltraVariant.maxConcurrentSubagents)
         out.workflow = UltraWorkflow(variant: u.variant, approver: u.approver, maxConcurrentAgents: u.workflowAgents)
         out.cacheBreak = false
+        // S26: no high-risk company call at all, counted or not (a deny rule cannot target a spec or assignee change through
+        // `update_work_item`; this quota refuses it).
+        out.quotas.highRisk = 0
         return out
     }
 

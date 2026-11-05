@@ -153,9 +153,11 @@ public struct UltraGateInputs: Equatable, Sendable {
     public var initToolsHaveWorkflow = false
     /// The CLI version, for the explainer.
     public var cliVersion: String? = nil
-    // 2. Overage.
+    // 2. Overage: admitted only on positive evidence that extra usage is off.
     public var overageStatus: String? = nil
     public var isUsingOverage = false
+    /// `get_usage`'s `rate_limits.extra_usage.is_enabled` (the fresh reading; nil: not read).
+    public var extraUsageEnabled: Bool? = nil
     // 3. Plan tier.
     public var planTier: PlanTier = .max5x
     public var planTierConfirmed = false
@@ -184,6 +186,8 @@ public struct UltraGateInputs: Equatable, Sendable {
     public var usageMode: UsageMode = .balanced
     public var trust = "T1"
     public var sessionTainted = false
+    /// The role card's rung cap (nil: none); a role capped below R5 never runs Ultra.
+    public var roleMaxRung: Int? = nil
 
     public init() {}
 }
@@ -193,8 +197,13 @@ public enum UltraGate {
     public static let fiveHourNow = 0.60
     /// ...and the projection with every open reservation and this run's cap (p80) at most this.
     public static let fiveHourProjected = 0.85
-    /// The probe gates gate 1 needs for the Ultra shape (V-9 is Task 3's nested-claude canary probe; pending the owner).
-    public static let requiredGates = ["U-1", "U-3", "V-1", "V-2", "V-8", "V-9"]
+    /// The probe gates gate 1 needs: every gate of the Ultra shape (fix round 1, I3: Ultra stays off until `brahma mode gates
+    /// --run` recorded every Ultra gate passed). V-9 is Task 3's nested-claude canary probe, pending the owner.
+    public static var requiredGates: [String] { ProbeGates.catalog(.ultra) }
+    /// `overageStatus` values that say extra usage is off (S27: anything else, or nothing, is not evidence).
+    public static let overageOff: Set<String> = ["rejected", "disabled", "not_allowed", "off"]
+    /// The trust levels that may run Ultra (fail closed: an unknown level may not).
+    public static let trustedLevels: Set<String> = ["T1", "T2", "T3", "T4"]
 
     /// The hard gates in order; the first that fails refuses the run with its one reason. A refusal runs the computed
     /// non-Ultra rung (`ModeInputs.ultraRefusal`).
@@ -219,8 +228,14 @@ public enum UltraGate {
         } else if !i.initToolsHaveWorkflow {
             fail(1, "the CLI offers no Workflow tool")
         }
-        // 2. No overage possible.
-        if i.overageStatus == "allowed" || i.isUsingOverage { fail(2, "extra usage is on") }
+        // 2. No overage possible, on positive evidence (S27): the fresh reading says extra usage is off, or the CLI's status is a
+        // known "off" and no overage is in use. Nothing or an unknown status fails closed (before the fresh reading is taken,
+        // only a positive "on" is judged).
+        if i.overageStatus == "allowed" || i.isUsingOverage || i.extraUsageEnabled == true {
+            fail(2, "extra usage is on")
+        } else if !skipFresh, i.extraUsageEnabled != false, !(i.overageStatus.map(overageOff.contains) ?? false) {
+            fail(2, "extra usage status unknown (\(i.overageStatus ?? "none"))")
+        }
         // 3. Plan tier.
         if i.planTier == .pro {
             fail(3, "the Pro plan has no Ultra")
@@ -276,7 +291,8 @@ public enum UltraGate {
         }
         // 10. Mode and trust.
         if i.usageMode == .low { fail(10, "Low usage mode") }
-        if i.trust == "T0" { fail(10, "trust T0") }
+        if !trustedLevels.contains(i.trust) { fail(10, "trust \(i.trust)") }
+        if let cap = i.roleMaxRung, cap < ModeRung.r5.level { fail(10, "the role is capped at R\(cap)") }
         if i.sessionTainted { fail(10, "the session read outside content") }
         return out
     }
@@ -323,9 +339,10 @@ public enum UltraApproval {
     }
 
     public static let runOnce = "Run Ultra once"
-    public static let thoroughInstead = "Thorough instead"
     public static let keepGoing = "No, keep going"
-    public static var options: [AskOption] { [AskOption(label: runOnce), AskOption(label: thoroughInstead), AskOption(label: keepGoing)] }
+    /// Approve or reject: the owner's decision has no third path, so the brief's "Thorough instead" is not offered (fix round
+    /// 1, M1; the owner can still set the item's intensity to Thorough).
+    public static var options: [AskOption] { [AskOption(label: runOnce), AskOption(label: keepGoing)] }
     /// A boost ask expires after one active day.
     public static let expirySeconds: Double = 86_400
 
@@ -362,11 +379,6 @@ public enum UltraAccounting {
         return killed ? max(own, cap) : own
     }
 
-    /// The models an Ultra turn may bill: its main and fallback model and the forced worker; anything else alerts (design
-    /// §3.8.8; the safety fallbacks are only recorded, `TurnAudit`).
-    public static func allowedModels(main: String, fallback: String) -> Set<String> {
-        [main, fallback, UltraVariant.workerModel]
-    }
 }
 
 /// The plan tier the engine uses (design §3.7, owner answer 2026-10-21): the configured tier, unless the CLI's

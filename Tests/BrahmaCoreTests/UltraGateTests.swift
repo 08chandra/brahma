@@ -16,6 +16,7 @@ func passingUltraGates() -> UltraGateInputs {
     g.pctPerDollar5h = 0.01         // $15 is 15% of five hours
     g.pace = .onPace; g.sevenDayUtil = 0.20; g.allowedWeek = 0.50
     g.freshFiveHourUtil = 0.30
+    g.extraUsageEnabled = false
     g.allowanceLeftLE = 50
     g.freeSlots = 8
     g.usageMode = .max
@@ -95,7 +96,8 @@ private struct ApprovalWorld {
     }
 
     @Test func ultraRefusedUntilU3AndV1V2V8V9Pass() async throws {
-        #expect(UltraGate.requiredGates == ["U-1", "U-3", "V-1", "V-2", "V-8", "V-9"])
+        // Fix round 1, I3: every gate of the Ultra shape, not a subset.
+        #expect(UltraGate.requiredGates == ProbeGates.catalog(.ultra)); #expect(UltraGate.requiredGates.count == 14)
         for missing in UltraGate.requiredGates {
             var g = passingUltraGates(); g.passedGates.remove(missing); g.cliVersion = "2.1.320"
             #expect(UltraGate.admit(.small, g) == .failure(UltraRefusal(gate: 1, reason: "probe gate \(missing) failing for claude 2.1.320")))
@@ -326,7 +328,8 @@ private struct ApprovalWorld {
         #expect(r.kind == .ultraAsked)
         let ask = try #require(try w.boosts(item).first)
         #expect(ask.status == .pendingOwner); #expect(!ask.fyi)
-        #expect(ask.payload?.options.map(\.label) == ["Run Ultra once", "Thorough instead", "No, keep going"])
+        // M1: approve or reject only; "Thorough instead" had no effect and is not offered.
+        #expect(ask.payload?.options.map(\.label) == ["Run Ultra once", "No, keep going"])
         #expect(ask.summary.hasPrefix("\(item.key) 'Hard thing' wants an Ultra run: @mgr: needs a sweep. Up to $15.00 LE ≈ ?% of this week"))
         #expect(ask.expiresActive == ask.createdActive + 86_400, "it expires after one active day")
         // A second request gets the open ask; the request's cooldown applies to a repeat.
@@ -345,7 +348,7 @@ private struct ApprovalWorld {
             let item = try w.item()
             let a = try w.store.fileFailurePathBoost(companyId: w.company.id, itemId: item.id, reason: "2 counted failed checks at R4", now: w.now)
             #expect(a.status == .pendingOwner, "\(preset)"); #expect(a.requesterId == "system"); #expect(a.risk == .high)
-            #expect(a.payload?.options.count == 3); #expect(a.summary.contains("wants an Ultra run: 2 counted failed checks at R4"))
+            #expect(a.payload?.options.count == 2); #expect(a.summary.contains("wants an Ultra run: 2 counted failed checks at R4"))
             _ = try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now)
             let run = try #require(try w.store.pendingUltraRun(itemId: item.id))
             #expect(run.origin == .failurePath); #expect(run.variant == .full)
@@ -413,6 +416,112 @@ private struct ApprovalWorld {
         #expect(UltraGate.admit(.small, g) == .failure(UltraRefusal(gate: 10, reason: "the session read outside content")))
         g = passingUltraGates(); g.trust = "T0"
         #expect(UltraGate.failures(.small, g).first?.gate == 10)
+    }
+}
+
+/// Fix round 1 (S26–S28, I2–I4 and the security minors), gate-level.
+@Suite(.scratch, .serialized) struct UltraGateFixTests {
+    @Test func gate1RequiresEveryUltraGate() {
+        for missing in ProbeGates.catalog(.ultra) {
+            var g = passingUltraGates(); g.passedGates.remove(missing)
+            #expect(UltraGate.failures(.small, g).first?.gate == 1, "\(missing) unproven must refuse")
+        }
+        // The six gates of the first build are no longer enough.
+        var six = passingUltraGates(); six.passedGates = ["U-1", "U-3", "V-1", "V-2", "V-8", "V-9"]
+        #expect(UltraGate.failures(.small, six).first?.gate == 1)
+    }
+
+    @Test func gate2FailsClosedWithoutEvidence() {
+        var g = passingUltraGates(); g.extraUsageEnabled = nil; g.overageStatus = nil
+        #expect(UltraGate.admit(.small, g) == .failure(UltraRefusal(gate: 2, reason: "extra usage status unknown (none)")))
+        g.overageStatus = "something_new"
+        #expect(UltraGate.failures(.small, g).first?.gate == 2, "an unknown status is not evidence")
+        g.overageStatus = "rejected"
+        #expect(UltraGate.admit(.small, g) == .success(.small), "a known off status and no overage in use")
+        g.isUsingOverage = true
+        #expect(UltraGate.failures(.small, g).first?.gate == 2)
+        g = passingUltraGates(); g.overageStatus = nil; g.extraUsageEnabled = false
+        #expect(UltraGate.admit(.small, g) == .success(.small), "the fresh reading says extra usage is off")
+        g.extraUsageEnabled = true
+        #expect(UltraGate.failures(.small, g).first == UltraRefusal(gate: 2, reason: "extra usage is on"))
+        // Before the fresh reading only a positive "on" is judged.
+        var early = passingUltraGates(); early.extraUsageEnabled = nil
+        #expect(UltraGate.failures(.small, early, skipFresh: true).isEmpty)
+    }
+
+    @Test func trustFailsClosedAndRoleCapHoldsAtR5() {
+        for trust in ["T0", "", "t1", "T9", "admin"] {
+            var g = passingUltraGates(); g.trust = trust
+            #expect(UltraGate.failures(.small, g).first?.gate == 10, "trust '\(trust)'")
+        }
+        var t2 = passingUltraGates(); t2.trust = "T2"
+        #expect(UltraGate.admit(.small, t2) == .success(.small))
+        var capped = passingUltraGates(); capped.roleMaxRung = 3
+        #expect(UltraGate.failures(.small, capped).first == UltraRefusal(gate: 10, reason: "the role is capped at R3"))
+        // And the policy never compiles R5 for such a role, whatever was admitted.
+        var i = eligibleUltraInputs(); i.roleMaxRung = 3
+        i.ultra = UltraAdmission(variant: .full, approver: .owner, workflowAgents: 2, basis: "confirmed tier L")
+        let d = ModePolicy.select(i)
+        #expect(d.mode != .ultra); #expect(d.workflow == nil); #expect(d.reason.contains("Ultra not admitted: the role is capped at R3"))
+    }
+
+    /// S28: the count gates are judged again in the reserving transaction: of two admissions racing for one concurrent slot,
+    /// exactly one reserves; the per-day caps hold the same way.
+    @Test func reserveRechecksCountGatesInTransaction() async throws {
+        let store = try Store.inMemory()
+        let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+        let eng = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        try await store.writer.write { db in
+            var cal = UsageCalibration()
+            cal.week.samples = Array(repeating: 0.001, count: 10)
+            try Store.saveCalibration(db, cal)
+        }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let items = try (0..<4).map { n in
+            try store.createWorkItem(companyId: company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "I\(n)", ownerId: eng.id,
+                                                                                             status: .ready), now: now)
+        }
+        let small = PendingUltraRun(variant: .small, approver: .owner, origin: .assignee, askId: nil)
+        let reserved = await withTaskGroup(of: Bool.self) { group in
+            for n in 0..<2 {
+                group.addTask {
+                    (try? store.reserveUltra(turnId: "t\(n)", companyId: company.id, itemId: items[n].id, run: small, caps: .max5x, now: now)) != nil
+                }
+            }
+            var ok = 0
+            for await r in group where r { ok += 1 }
+            return ok
+        }
+        #expect(reserved == 1, "the concurrent cap (1 on max5x) admits exactly one")
+        #expect(try store.runningUltraCount() == 1)
+        // Released, the second run of the day reserves; a third is over the day's cap (2 on max5x).
+        let first = try #require(try store.ultraReservations(companyId: company.id).first)
+        try await store.writer.write { db in try Store.releaseUltra(db: db, turnId: first.turnId, actualLE: 1, now: now) }
+        try store.reserveUltra(turnId: "t2", companyId: company.id, itemId: items[2].id, run: small, caps: .max5x, now: now)
+        try await store.writer.write { db in try Store.releaseUltra(db: db, turnId: "t2", actualLE: 1, now: now) }
+        #expect(throws: UltraRefusal.self) {
+            try store.reserveUltra(turnId: "t3", companyId: company.id, itemId: items[3].id, run: small, caps: .max5x, now: now)
+        }
+        // A refused reservation consumed nothing.
+        #expect(try store.workItem(id: items[3].id)?.budgetBoostLE == 0)
+        #expect(try store.ultraReservation(turnId: "t3") == nil)
+        // The allowance is judged there too.
+        try store.setUltraShare(companyId: company.id, percent: 0)
+        #expect(throws: UltraRefusal.self) {
+            try store.reserveUltra(turnId: "t4", companyId: company.id, itemId: items[3].id, run: small, caps: .max20x, now: now)
+        }
+    }
+
+    /// I4: gate 9 counts slots as the scheduler does (the engine's hard cap and its engine-wide room).
+    @Test func gate9UsesTheSchedulersEffectiveCap() async throws {
+        let w = try World(config: World.config(hardCap: 2))
+        let c = try w.company("Acme", mode: .max, profile: .sandboxed)
+        let a = try w.hire(c, "eng-1", role: "engineer")
+        #expect(PlanTier.max20x.modeCap(.max) == 16)
+        #expect(await w.orchestrator.ultraFreeSlots(company: c, includingAsking: false) == 2)
+        let g = await w.orchestrator.ultraGateInputs(company: c, agent: a, profile: .sandboxed)
+        #expect(g.freeSlots == 2)
+        #expect(UltraGate.failures(.small, g).contains { $0.gate == 9 }, "16 by the tier, but the engine runs at most 2")
     }
 }
 

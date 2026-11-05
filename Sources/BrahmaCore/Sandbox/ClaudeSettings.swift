@@ -137,8 +137,10 @@ public enum BuiltinTools {
     /// drops `WebFetch` and `WebSearch` (`taskTurn`).
     public static let withTask: [String] = sandboxed + ["Task"]
     public static let plan: [String] = sandboxed.filter { $0 != "Edit" && $0 != "NotebookEdit" }
-    /// Task 14u.
+    /// Task 14u, once F7-agents passed (only Brahma's worker agent types load).
     public static let ultra: [String] = sandboxed + ["Task", "Workflow"]
+    /// An Ultra turn before F7-agents passed (fix round 1, I1): no web tools and no Task; its fan-out is the Workflow tool's.
+    public static let ultraBeforeF7: [String] = sandboxed.filter { $0 != "WebFetch" && $0 != "WebSearch" } + ["Workflow"]
     public static let review: [String] = ["Bash", "Read", "Skill", "ToolSearch"]
 
     /// `withTask` without the web tools: the Task turn until F7 passes.
@@ -158,9 +160,12 @@ public enum ClaudeSettingsCompiler {
                                              "Bash(crontab *)", "Bash(at *)", "Bash(sudo *)", "Bash(screencapture *)"]
     /// Ultra (Task 14u, design §2.2): the high-authority company tools a workflow could otherwise call many times as the parent,
     /// denied outright rather than counted, and the bundled skills that would start their own fan-out.
-    public static let ultraMCPDenies = ["decide", "propose_decision", "escalate_decision", "request_from_owner", "request_access",
-                                       "request_secret", "plan_sprint", "close_sprint", "propose_extension", "request_mode"]
-        .map { "mcp__company__\($0)" }
+    /// Derived from `CompanyTools.highRiskTools` (S26), so a high-risk tool added later is denied too, plus the Ultra-specific
+    /// extras.
+    public static var ultraMCPDenies: [String] {
+        CompanyTools.highRiskTools.union(ultraExtraMCPDenies).sorted().map { "mcp__company__\($0)" }
+    }
+    static let ultraExtraMCPDenies: Set<String> = ["propose_extension"]
     public static let ultraSkillDenies = ["Skill(deep-research)", "Skill(ultrareview)"]
     /// The Task 10 PostToolUse hook's matcher.
     public static let postToolMatcher = "WebFetch|WebSearch|Bash|mcp__.*|Skill|Task|Agent"

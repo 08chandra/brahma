@@ -84,7 +84,10 @@ extension Store {
     /// The hard gates' inputs the store can read (design §3.6), for `company` under `profile`. `fingerprint`: the running CLI
     /// build whose Ultra probe gates count (nil: none); `running`: the company's turns in flight that hold its slots (not the
     /// asking turn). The fresh reading (gate 6), the agent's trust and taint are the caller's.
-    public func ultraGateInputs(company: Company, profile: PermissionProfile, fingerprint: String?, running: Int, now: Date) -> UltraGateInputs {
+    /// `freeSlots`: gate 9's count as the engine's scheduler sees it (`Orchestrator.ultraFreeSlots`); nil: the plan tier's
+    /// usage-mode cap less `running` (a CLI with no engine to ask).
+    public func ultraGateInputs(company: Company, profile: PermissionProfile, fingerprint: String?, running: Int, freeSlots: Int? = nil,
+                                now: Date) -> UltraGateInputs {
         var g = UltraGateInputs()
         g.profile = profile
         if let fingerprint { g.passedGates = (try? passedProbeGates(fingerprint: fingerprint, shape: .ultra)) ?? [] }
@@ -114,7 +117,7 @@ extension Store {
         g.ultraRunsToday = today.all
         g.fullUltraRunsToday = today.full
         g.runningUltra = (try? runningUltraCount()) ?? 0
-        g.freeSlots = g.planTier.modeCap(company.usageMode) - running
+        g.freeSlots = freeSlots ?? (g.planTier.modeCap(company.usageMode) - running)
         g.usageMode = company.usageMode
         return g
     }

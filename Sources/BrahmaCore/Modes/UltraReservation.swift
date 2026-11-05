@@ -36,10 +36,17 @@ extension Store {
 
     /// Reserves the run's cap for `turnId` and consumes its approval, in one transaction: the item's budget grows by the cap
     /// once (`budgetBoostLE`), the owner's Ultra intensity (one run) goes back to `auto`, and the item records who approved it.
+    ///
+    /// S28: the count gates are judged again inside this transaction (the database's writer is the one serialization point), so
+    /// two admissions racing for the last concurrent slot, the day's last run or the allowance's last cap cannot both reserve:
+    /// the loser gets the `UltraRefusal` and runs the computed rung. `caps`: the plan tier's caps (nil: the count gates are not
+    /// re-judged, for callers that only consume an approval).
     @discardableResult
-    func reserveUltra(turnId: String, companyId: String, itemId: String, run: PendingUltraRun, now: Date) throws -> UltraReservation {
+    func reserveUltra(turnId: String, companyId: String, itemId: String, run: PendingUltraRun, caps: UltraCaps? = nil,
+                      now: Date) throws -> UltraReservation {
         try writer.write { db in
             if let existing = try UltraReservation.fetchOne(db, key: turnId) { return existing }
+            if let caps { try Store.recheckUltraCounts(db: db, companyId: companyId, variant: run.variant, caps: caps, now: now) }
             let r = UltraReservation(turnId: turnId, companyId: companyId, itemId: itemId, variant: run.variant, capLE: run.variant.capLE,
                                      approvedBy: run.approver.rawValue, askId: run.askId, createdAt: now, releasedAt: nil, actualLE: nil)
             try r.insert(db)
@@ -53,6 +60,28 @@ extension Store {
                                         + TurnProfileCompiler.money(run.variant.capLE) + " LE for it", now: now)
             }
             return r
+        }
+    }
+
+    /// Gates 7 and 8 again, in the reserving transaction (S28).
+    static func recheckUltraCounts(db: Database, companyId: String, variant: UltraVariant, caps: UltraCaps, now: Date) throws {
+        let running = try UltraReservation.filter(Column("releasedAt") == nil).fetchCount(db)
+        if running >= caps.concurrent {
+            throw UltraRefusal(gate: 8, reason: "another Ultra turn is running (at most \(caps.concurrent) at once)")
+        }
+        let tz = try String.fetchOne(db, sql: "SELECT timeZone FROM ownerSettings WHERE id = 1").flatMap(TimeZone.init(identifier:)) ?? .current
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = tz
+        let today = try UltraReservation.filter(Column("companyId") == companyId && Column("createdAt") >= calendar.startOfDay(for: now)).fetchAll(db)
+        if today.count >= caps.perCompanyDay {
+            throw UltraRefusal(gate: 8, reason: "\(today.count) Ultra run(s) today already (at most \(caps.perCompanyDay))")
+        }
+        let full = today.filter { $0.variant == .full }.count
+        if variant == .full, full >= caps.fullPerCompanyDay {
+            throw UltraRefusal(gate: 8, reason: "\(full) full Ultra run(s) today already (at most \(caps.fullPerCompanyDay))")
+        }
+        guard let allowance = try ultraAllowance(db: db, companyId: companyId, now: now), allowance.leftLE + 1e-9 >= variant.capLE else {
+            throw UltraRefusal(gate: 7, reason: "allowance used")
         }
     }
 

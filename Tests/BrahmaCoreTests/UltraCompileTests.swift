@@ -80,7 +80,7 @@ private func compiled(_ r: TurnRequest) -> TurnProfile { TurnProfileCompiler.pro
         // (a) settings, (b) --tools, (c) permissions.allow.
         #expect(p.settings.enableWorkflows == true); #expect(p.settings.disableWorkflows == nil)
         #expect(p.settings.workflowSizeGuideline == "medium")
-        #expect(value(a, "--tools")?.split(separator: ",").map(String.init) == BuiltinTools.ultra)
+        #expect(value(a, "--tools")?.split(separator: ",").map(String.init) == BuiltinTools.ultraBeforeF7)
         #expect(p.settings.permissions?.allow?.contains("Workflow") == true)
         #expect(!(value(a, "--disallowed-tools") ?? "").split(separator: ",").contains("Workflow"))
         #expect(value(a, "--model") == "sonnet"); #expect(value(a, "--effort") == "high")
@@ -167,6 +167,70 @@ private func compiled(_ r: TurnRequest) -> TurnProfile { TurnProfileCompiler.pro
         let p = compiled(try w.request(ultraDecision()))
         #expect(p.environment["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "2400000")
         #expect(p.wallClock == .seconds(45 * 60))
+    }
+
+    /// S26: every high-risk company tool is denied on Ultra (the set, so a later addition is covered), and the high-risk quota is
+    /// 0, which refuses a spec or assignee change through `update_work_item` (no deny rule can target its arguments).
+    @Test func ultraDeniesEveryHighRiskToolAndRefusesSpecEdits() throws {
+        let w = try UltraCompileWorld()
+        let d = ultraDecision()
+        let deny = Set(compiled(try w.request(d)).settings.permissions?.deny ?? [])
+        for tool in CompanyTools.highRiskTools { #expect(deny.contains("mcp__company__\(tool)"), "\(tool)") }
+        #expect(deny.contains("mcp__company__confirm_spec")); #expect(deny.contains("mcp__company__readopt_branch"))
+        #expect(d.quotas.highRisk == 0)
+        let tools = CompanyTools(store: w.store, companyId: w.company.id, agentId: w.eng.id, quotas: d.quotas)
+        #expect {
+            try tools.call(name: "update_work_item", arguments: ["key": .string(w.item.key), "title": .string("A bigger thing")])
+        } throws: { "\($0)".contains("high-risk") }
+        #expect(try w.store.workItem(id: w.item.id)?.title == "Thing")
+    }
+
+    /// I1: before F7-agents passed an Ultra turn has neither web tools nor Task; after, the full Ultra tool set.
+    @Test func ultraHasNoWebOrTaskBeforeF7() throws {
+        let w = try UltraCompileWorld()
+        let before = compiled(try w.request(ultraDecision()))
+        let tools = before.tools ?? []
+        #expect(tools.contains("Workflow"))
+        for t in ["WebFetch", "WebSearch", "Task"] { #expect(!tools.contains(t), "\(t)") }
+        #expect(before.disallowedTools.contains("Task")); #expect(before.disallowedTools.contains("Agent"))
+        #expect(!before.allowedTools.contains("Task"))
+        var r = try w.request(ultraDecision())
+        r.taskWebTools = true
+        let after = compiled(r)
+        #expect(after.tools == BuiltinTools.ultra); #expect(!after.disallowedTools.contains("Task"))
+    }
+
+    /// The built-in agents switch (F7): never emitted, and dropped by the child environment, until F7-agents passed.
+    @Test func builtinAgentsSwitchOnlyAfterF7() throws {
+        let w = try UltraCompileWorld()
+        let name = ChildEnvironment.builtinAgentsSwitch
+        #expect(name == "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS")
+        var task = ModePolicy.select({ var i = ModeInputs(); i.hasItem = true; i.tier = .s; i.subagentGate = true; return i }())
+        task.maxBudgetUSD = 1
+        for d in [ultraDecision(), task] {
+            let off = compiled(try w.request(d))
+            #expect(off.environment[name] == nil); #expect(!off.builtinAgentsDisabled)
+            // Even handed the variable, the child environment drops it.
+            let env = ChildEnvironment.make(base: ["PATH": "/usr/bin"], extra: [:], engineClaudeVars: [name: "1"], purpose: .claude,
+                                            allowBuiltinAgentsSwitch: off.builtinAgentsDisabled)
+            #expect(env[name] == nil)
+            var r = try w.request(d)
+            r.taskWebTools = true
+            let on = compiled(r)
+            #expect(on.environment[name] == "1"); #expect(on.builtinAgentsDisabled)
+            let child = ChildEnvironment.make(base: ["PATH": "/usr/bin"], extra: on.environment, engineClaudeVars: on.environment,
+                                              purpose: .claude, allowBuiltinAgentsSwitch: on.builtinAgentsDisabled)
+            #expect(child[name] == "1")
+        }
+        // Never on a turn that does not fan out, nor on a review turn.
+        var plain = try w.request(ModePolicy.select({ var i = ModeInputs(); i.hasItem = true; i.tier = .s; return i }()))
+        plain.taskWebTools = true
+        #expect(compiled(plain).environment[name] == nil)
+        var review = try w.request(ultraDecision(), kind: .review)
+        review.taskWebTools = true
+        #expect(compiled(review).environment[name] == nil)
+        // A general-purpose child never gets it.
+        #expect(ChildEnvironment.make(base: [:], engineClaudeVars: [name: "1"], purpose: .general, allowBuiltinAgentsSwitch: true)[name] == nil)
     }
 
     @Test func ultraOnlySandboxed() throws {

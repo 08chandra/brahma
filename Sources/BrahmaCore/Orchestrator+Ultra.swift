@@ -53,18 +53,22 @@ extension Orchestrator {
     /// eligible (effective values) and every hard gate holds, the fresh `get_usage` last. Otherwise the refusal is returned
     /// (the turn runs the computed rung and records it). Nothing is written here: the reservation is made only once the turn
     /// passed the sandbox gate (`reserveUltraRun`).
+    /// `relayedTaint`: the turn reads what a tainted session wrote, so it is tainted at launch (fix round 1, I2: gate 10 counts it).
     nonisolated func ultraPreflight(kind: TurnKind, itemBudget: Bool, facts: ItemModeFacts?, inputs: ModeInputs, agent: Agent,
-                                    company: Company, profile: PermissionProfile) async -> (plan: UltraPlan?, refusal: String?, trigger: Bool) {
+                                    company: Company, profile: PermissionProfile,
+                                    relayedTaint: Bool = false) async -> (plan: UltraPlan?, refusal: String?, trigger: Bool) {
         guard kind == .work, itemBudget, let f = facts, let run = try? store.pendingUltraRun(itemId: f.item.id) else { return (nil, nil, false) }
         var i = inputs
         i.ultraTrigger = run.origin == .failurePath
         guard let basis = UltraEligibility.basis(i) else { return (nil, UltraEligibility.check(i), i.ultraTrigger) }
         var g = await ultraGateInputs(company: company, agent: agent, profile: profile)
+        if relayedTaint { g.sessionTainted = true }
+        g.roleMaxRung = inputs.roleMaxRung
         if let first = UltraGate.failures(run.variant, g, skipFresh: true).first { return (nil, first.reason, i.ultraTrigger) }
         // Gate 6, from a reading taken now (zero inference): only once everything cheaper passed.
         let fresh = await ControlProbe.getUsage(runner: runner, paths: paths, hookExecutable: mcpExecutable)
         g.freshFiveHourUtil = fresh?.fiveHourUtil
-        if fresh?.extraUsageEnabled == true { g.overageStatus = "allowed" }
+        g.extraUsageEnabled = fresh?.extraUsageEnabled
         switch UltraGate.admit(run.variant, g) {
         case .failure(let refusal):
             return (nil, refusal.reason, i.ultraTrigger)
@@ -79,8 +83,8 @@ extension Orchestrator {
     /// gates and the company's free slots (this turn already holds one).
     nonisolated func ultraGateInputs(company: Company, agent: Agent, profile: PermissionProfile) async -> UltraGateInputs {
         let now = clock()
-        let running = await companyRunning(company.id)
-        var g = store.ultraGateInputs(company: company, profile: profile, fingerprint: probeFingerprint(), running: max(0, running - 1), now: now)
+        let slots = await ultraFreeSlots(company: company, includingAsking: true)
+        var g = store.ultraGateInputs(company: company, profile: profile, fingerprint: probeFingerprint(), running: 0, freeSlots: slots, now: now)
         if let mismatch = store.planTierResolution().mismatch { notePlanTierMismatch(mismatch, now: now) }
         g.trust = agent.trustLevel
         g.sessionTainted = ((try? store.agent(id: agent.id)) ?? nil)?.sessionTainted ?? true
@@ -104,8 +108,8 @@ extension Orchestrator {
     /// The company's own status for `UltraStatus.explain` (F9): the standing gates, judged for Ultra-small.
     public nonisolated func ultraStatus(companyId: String) async -> [String] {
         guard let company = try? store.company(id: companyId) else { return [] }
-        let g = store.ultraGateInputs(company: company, profile: company.permissionProfile, fingerprint: probeFingerprint(),
-                                      running: await companyRunning(company.id), now: clock())
+        let g = store.ultraGateInputs(company: company, profile: company.permissionProfile, fingerprint: probeFingerprint(), running: 0,
+                                      freeSlots: await ultraFreeSlots(company: company, includingAsking: false), now: clock())
         return UltraStatus.explain(g)
     }
 
@@ -113,7 +117,7 @@ extension Orchestrator {
 
     /// Reserves the admitted run's cap (and consumes its approval), and holds the extra slots its workflow agents take.
     nonisolated func reserveUltraRun(_ plan: UltraPlan, turnId: String, companyId: String, itemId: String) async throws {
-        try store.reserveUltra(turnId: turnId, companyId: companyId, itemId: itemId, run: plan.run, now: clock())
+        try store.reserveUltra(turnId: turnId, companyId: companyId, itemId: itemId, run: plan.run, caps: plan.caps, now: clock())
         await occupySlots(companyId: companyId, extra: max(0, plan.caps.slots - 1))
     }
 
@@ -124,6 +128,20 @@ extension Orchestrator {
     }
 
     func companyRunning(_ companyId: String) -> Int { runningByCompany[companyId] ?? 0 }
+
+    /// Gate 9's free slots, counted as the scheduler counts them (fix round 1, I4): the company's usage-mode cap under the
+    /// engine's hard cap (`SchedulerConfig.modeCap`), and the engine-wide room (`Scheduler.freeSlots`: the hard and safety caps,
+    /// memory pressure, checks and merges in flight), whichever is smaller. `includingAsking`: the asking turn already holds one
+    /// slot of each, which is not counted against it.
+    func ultraFreeSlots(company: Company, includingAsking: Bool) -> Int {
+        var cfg = config
+        cfg.planTier = store.planTier()
+        let own = includingAsking ? 1 : 0
+        let companyFree = cfg.modeCap(company.usageMode) - max(0, companyRunning(company.id) - own)
+        let globalFree = Scheduler.freeSlots(config: cfg, running: max(0, runningCount() - own), otherChildren: otherChildren,
+                                             pressure: memory.current)
+        return min(companyFree, globalFree)
+    }
 
     func occupySlots(companyId: String, extra: Int) {
         let n = (runningByCompany[companyId] ?? 0) + extra

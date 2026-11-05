@@ -111,7 +111,8 @@ extension Store {
             let texts = try String.fetchAll(db, sql: """
                 SELECT text FROM workItemEvent WHERE itemId = ? AND kind = 'modeEscalated' AND actorId = 'system' AND createdAt >= ?
                 """, arguments: [itemId, since ?? .distantPast])
-            let ultra = try Ask.filter(Column("itemId") == itemId && Column("kind") == AskKind.boost
+            // Only the engine's own failure-path proposal counts (fix round 1, M6): an agent's Ultra request never suppresses it.
+            let ultra = try Ask.filter(Column("itemId") == itemId && Column("kind") == AskKind.boost && Column("requesterId") == "system"
                                        && Column("createdAt") >= (since ?? .distantPast)).fetchCount(db) > 0
             return (texts.contains { $0.hasPrefix(Self.failureEscalationPrefix) },
                     texts.contains { $0.hasPrefix(Self.rejectionEscalationPrefix) }, ultra)

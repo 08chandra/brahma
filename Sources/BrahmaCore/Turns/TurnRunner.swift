@@ -149,7 +149,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         let ids = Set(messages.compactMap { $0.objectValue?["request_id"]?.stringValue })
         let claude = claudePath
         let env = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment, engineClaudeVars: profile.environment,
-                                        purpose: .claude)
+                                        purpose: .claude, allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
         return await Task.detached { () -> ControlTranscript? in
             let process = Process()
@@ -239,7 +239,8 @@ public struct ClaudeProcessRunner: TurnRunning {
             argv = ["env", claudePath] + leadingArguments + args
         }
         let environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
-                                                engineClaudeVars: profile.environment, purpose: .claude, secrets: request.secrets)
+                                                engineClaudeVars: profile.environment, purpose: .claude, secrets: request.secrets,
+                                                allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)
 
         // The parent's ends are close-on-exec, so no other child ever holds them; the child's ends are dup'ed onto 0, 1, 2.
         func makePipe() throws -> (read: Int32, write: Int32) {

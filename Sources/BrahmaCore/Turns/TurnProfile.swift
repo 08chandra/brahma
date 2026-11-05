@@ -61,6 +61,8 @@ public struct TurnProfile: Equatable, Sendable {
     public var permissionPrompts: String? = nil
     /// `--plugin-dir`, one per mounted extension part (Task 5a).
     public var pluginDirs: [String] = []
+    /// `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS=1` is emitted and admitted (F7-agents passed, a fan-out turn; Task 14u).
+    public var builtinAgentsDisabled = false
 
     public init(model: String, session: Session, mcpConfigPath: String, permission: PermissionProfile,
                 workingDirectory: String, addDirs: [String] = []) {
@@ -162,13 +164,24 @@ public enum TurnProfileCompiler {
         } else if r.kind == .plan {
             p.tools = BuiltinTools.plan
         } else if p.workflow != nil {
-            // An admitted Ultra turn (14u): the sandboxed tools plus Task and Workflow (the second of Workflow's three locks).
-            p.tools = BuiltinTools.ultra
+            // An admitted Ultra turn (14u): Workflow is the second of its three locks. Task and the web tools only once F7-agents
+            // passed (`taskWebTools`, fix round 1, I1).
+            p.tools = r.taskWebTools ? BuiltinTools.ultra : BuiltinTools.ultraBeforeF7
+            if !r.taskWebTools {
+                p.allowedTools.removeAll { subagentTools.contains($0) }
+                for name in subagentTools where !p.disallowedTools.contains(name) { p.disallowedTools.append(name) }
+            }
         } else if p.subagents != .off {
             // Only once the sub-agent gate passed (14u); no web tools until F7-agents passed (`taskWebTools`).
             p.tools = r.taskWebTools ? BuiltinTools.withTask : BuiltinTools.taskTurn
         } else {
             p.tools = BuiltinTools.sandboxed
+        }
+        // F7 (Task 10b/14u): once only Brahma's worker agent types are proven to load, a fan-out turn turns the CLI's built-in
+        // agents off. Never emitted before F7-agents passed; `ChildEnvironment` drops the variable unless the profile says so.
+        if r.taskWebTools, !r.kind.isReview, r.kind != .plan, p.subagents != .off || p.workflow != nil {
+            p.builtinAgentsDisabled = true
+            p.environment[ChildEnvironment.builtinAgentsSwitch] = "1"
         }
         if let scope = r.sandbox {
             p.workingDirectory = scope.cwd.path
@@ -404,9 +417,13 @@ public enum ChildEnvironment {
     /// would otherwise remove them (their names contain KEY, TOKEN or SECRET). A name `SecretName.isInjectable` refuses is
     /// silently dropped, so a row written by other means can never set `GIT_SSH_COMMAND`, `LD_PRELOAD`, `PATH` and the
     /// like; the caller logs `droppedSecretNames(_:)`.
+    /// The built-in agents switch (F7): dropped like every other unlisted variable, admitted only with `allowBuiltinAgentsSwitch`
+    /// (the compiled profile's `builtinAgentsDisabled`, set only once F7-agents passed).
+    public static let builtinAgentsSwitch = "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"
+
     public static func make(base: [String: String], extra: [String: String] = [:],
                             engineClaudeVars: [String: String] = [:], purpose: Purpose = .general,
-                            secrets: [String: String] = [:]) -> [String: String] {
+                            secrets: [String: String] = [:], allowBuiltinAgentsSwitch: Bool = false) -> [String: String] {
         var env: [String: String] = [:]
         for (name, value) in base where (allowed.contains(name) || name.hasPrefix("LC_")) && !isSecretName(name) {
             env[name] = value
@@ -420,6 +437,7 @@ public enum ChildEnvironment {
         }
         if purpose == .claude {
             for (name, value) in engineClaudeVars where Self.engineClaudeVars.contains(name) { env[name] = value }
+            if allowBuiltinAgentsSwitch, engineClaudeVars[builtinAgentsSwitch] == "1" { env[builtinAgentsSwitch] = "1" }
         }
         for (name, value) in secrets where SecretName.isInjectable(name) { env[name] = value }
         return env

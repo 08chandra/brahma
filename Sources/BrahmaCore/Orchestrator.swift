@@ -885,7 +885,8 @@ public actor Orchestrator {
                                     itemBudget: review == nil && itemBudget, sessionModel: fixedModel, sessionTokens: sessionTokens)
             // Task 14u: the item's approved Ultra run is admitted (eligible, every hard gate, a fresh get_usage) or refused.
             let ultra = await ultraPreflight(kind: review != nil ? .review : audit != nil ? .audit : kind, itemBudget: review == nil && itemBudget,
-                                             facts: facts, inputs: inputs, agent: agent, company: company, profile: profile)
+                                             facts: facts, inputs: inputs, agent: agent, company: company, profile: profile,
+                                             relayedTaint: ctx?.relayedTaint != nil)
             inputs.ultraTrigger = ultra.trigger
             inputs.ultra = ultra.plan?.admission
             inputs.ultraRefusal = ultra.refusal
@@ -909,6 +910,25 @@ public actor Orchestrator {
                 if let old = slotModel, old != model { changes.append("model \(old) -> \(model)") }
                 if let old = slotTools, old != toolsKey { changes.append("tools changed") }
                 if !changes.isEmpty { cacheBreak = changes.joined(separator: "; ") }
+            }
+            /// Task 14u: the turn re-selects without a fan-out shape it may not use after all (its canary key, a refused
+            /// reservation, taint found at launch); everything chosen from the decision follows it.
+            func adopt(_ i: ModeInputs) throws {
+                inputs = i
+                mode = ModePolicy.select(inputs)
+                if !mode.launch, review == nil { throw ModeNotLaunched(reason: mode.reason, overBudgetItem: scope.itemId) }
+                model = mode.model
+                sent.model = model
+                usedModel = model
+                modeDecision = mode
+                keepModel = scope.itemId != nil && agent.model == "auto" && !mode.cacheBreak
+            }
+            func dropUltra(_ why: String) throws {
+                ultraPlan = nil
+                var i = inputs
+                i.ultra = nil
+                i.ultraRefusal = why
+                try adopt(i)
             }
 
             // The turn's request; `mcpConfigPath` is the one string not known before the gate (the shape ignores strings).
@@ -955,15 +975,8 @@ public actor Orchestrator {
                     guard let launch = CanaryShape.launch(mode) else { break }
                     let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
                     if await fanOutVerified(gate: gate, settings: settings, launch: launch, company: company) { break }
-                    inputs = Self.withoutFanOut(inputs, launch: launch)
                     if mode.workflow != nil { ultraPlan = nil }
-                    mode = ModePolicy.select(inputs)
-                    if !mode.launch, review == nil { throw ModeNotLaunched(reason: mode.reason, overBudgetItem: scope.itemId) }
-                    model = mode.model
-                    sent.model = model
-                    usedModel = model
-                    modeDecision = mode
-                    keepModel = scope.itemId != nil && agent.model == "auto" && !mode.cacheBreak
+                    try adopt(Self.withoutFanOut(inputs, launch: launch))
                 }
             }
             var gatedShape: String?
@@ -990,12 +1003,36 @@ public actor Orchestrator {
             }
             // Task 14u: the admitted Ultra run is reserved now (its approval consumed, the item's budget raised by its cap once,
             // its extra slots held), and its digest line names who approved it.
+            // The count gates are judged again in the reserving transaction (S28): a run that lost a race runs the computed rung.
+            let promptBeforeUltra = turnPrompt
             if let plan = ultraPlan, mode.workflow != nil, let itemId = scope.itemId {
-                try await reserveUltraRun(plan, turnId: turn.id, companyId: company.id, itemId: itemId)
-                ultraReserved = true
-                if let w = mode.workflow { turnPrompt += "\n\n" + UltraDigest.line(w) }
+                do {
+                    try await reserveUltraRun(plan, turnId: turn.id, companyId: company.id, itemId: itemId)
+                    ultraReserved = true
+                    if let w = mode.workflow { turnPrompt += "\n\n" + UltraDigest.line(w) }
+                } catch let refusal as UltraRefusal {
+                    try dropUltra(refusal.reason)
+                }
             } else {
                 ultraPlan = nil
+            }
+            // Fix round 1, I2: gate 10 again, right before anything of the launch is created. The taint this turn takes at launch
+            // (what a tainted session wrote, the fan-out pre-taint while V-1 is unproven) or the session already has refuses the
+            // run: its reservation is released uncharged (the approval kept) and the computed rung runs; its shape is gated again
+            // by the backstop below.
+            if ultraReserved, let plan = ultraPlan {
+                let probe = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder))
+                var fanOut = Set(probe.tools ?? probe.allowedTools)
+                fanOut.insert("Workflow")
+                let preTainted = TaintPolicy.preTaint(tools: fanOut, network: sandboxed?.scope.network, hookVerified: await postToolGateVerified())
+                let flagged = TaintFlag.url(home: paths.home, agentId: agent.id).map(TaintFlag.exists) ?? true
+                let stored = ((try? store.agent(id: agent.id)) ?? nil)?.sessionTainted ?? true
+                if ctx?.relayedTaint != nil || preTainted || flagged || stored {
+                    await endUltraRun(plan, turnId: turn.id, companyId: company.id, launched: false)
+                    ultraReserved = false
+                    turnPrompt = promptBeforeUltra
+                    try dropUltra("the session read outside content")
+                }
             }
             // The session change decided above, now that the turn launches.
             switch sessionChange {
