@@ -197,7 +197,10 @@ private struct RefusingVault: SecretVault {
         #expect(v.smokeBase(Self.settings(.vercel, productionURL: "https://acme.com"), deployURL: deployed)?.absoluteString == "https://acme.com")
         // Rollback: the previous deploy URL, from an empty releaseDir/rollback, with the same env.
         let back = try v.rollbackPlan(Self.input(s, adapter: v, release: 2, previousDeployURL: "https://acme-k3j4h5g6f-acme-team.vercel.app"))
-        #expect(back.steps.map(\.argv) == [[bin, "rollback", "https://acme-k3j4h5g6f-acme-team.vercel.app", "--yes"]])
+        // The target is confirmed with the token first (Task 8), then rolled back to.
+        #expect(back.steps.map(\.argv) == [[bin, "inspect", "https://acme-k3j4h5g6f-acme-team.vercel.app"],
+                                            [bin, "rollback", "https://acme-k3j4h5g6f-acme-team.vercel.app", "--yes"]])
+        #expect(back.steps.map(\.label) == [DeployStep.verifyLabel, "rollback"])
         #expect(back.cwdPath == Self.layout.releaseDir(2).appending(path: "rollback").path)
         #expect(back.env == plan.env)
         #expect(Self.message { _ = try v.rollbackPlan(Self.input(s, adapter: v, previousDeployURL: "https://evil.example.com")) } != nil)
