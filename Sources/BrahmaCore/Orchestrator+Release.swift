@@ -72,18 +72,22 @@ extension Orchestrator {
     /// a requested rollback, and none in progress, gets one tracked detached task (`releaseTasks`, counted in `otherChildren` and `isIdle`) that runs
     /// `ReleaseExecutor.advance(companyId:now:)`; the release's own smoke on main runs inside it. Starts are gated like
     /// smokes: nothing under a hold (the owner's stop included; the executor's claim also refuses while it holds) or critical
-    /// memory pressure, only into a free slot, never in a paused company.
+    /// memory pressure, only into a free slot. A paused company is admitted only for a requested rollback, and then
+    /// rollback-only (`advance(rollbackOnly: true)`): a deploy never starts in a paused company (Task 8 fix I1).
     func releaseTick(now: Date, config: SchedulerConfig, held: Bool, pressure: MemoryPressure, companies: [Company]) {
         guard !held, pressure != .critical else { return }
         let waiting = (try? store.companiesWithReleaseWork()) ?? []
         guard !waiting.isEmpty else { return }
-        for company in companies where waiting.contains(company.id) && company.status == .running && releaseTasks[company.id] == nil {
+        let rollbacks = (try? store.companiesWithRequestedRollback()) ?? []
+        for company in companies where waiting.contains(company.id) && releaseTasks[company.id] == nil {
+            let rollbackOnly = company.status != .running
+            if rollbackOnly && !rollbacks.contains(company.id) { continue }
             let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
                                             pressure: pressure, held: held)
             guard slots > 0 else { return }
             let (executor, clock, companyId) = (releaseExecutor, self.clock, company.id)
             releaseTasks[companyId] = Task.detached { [self] in
-                await asEngine { await executor.advance(companyId: companyId, now: clock()) }
+                await asEngine { await executor.advance(companyId: companyId, now: clock(), rollbackOnly: rollbackOnly) }
                 await releaseEnded(companyId: companyId)
             }
         }
