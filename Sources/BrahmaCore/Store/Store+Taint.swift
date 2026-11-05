@@ -200,6 +200,18 @@ extension Store {
         }
     }
 
+    /// Every recorded lab commit of the agent and whether it is tainted (S25: `propose_extension` reads the records before it
+    /// looks at the lab, and records nothing itself).
+    public func labCommitStates(agentId: String) throws -> [String: Bool] {
+        try writer.read { db in
+            var out: [String: Bool] = [:]
+            for row in try Row.fetchAll(db, sql: "SELECT sha, tainted FROM labCommit WHERE agentId = ?", arguments: [agentId]) {
+                out[row["sha"]] = row["tainted"]
+            }
+            return out
+        }
+    }
+
     /// The commit recorded last.
     public func lastLabCommit(agentId: String) throws -> String? {
         try writer.read { db in
@@ -225,47 +237,62 @@ public enum LabProvenance {
     /// Blocking (git).
     public static func record(store: Store, workspace: URL, handle: String, companyId: String, agentId: String, turnId: String?,
                               tainted: Bool, now: Date, limit: Int = 100_000, maxOutput: Int = 16 << 20) -> Outcome {
+        switch inspect(workspace: workspace, handle: handle) {
+        case .missing: return .none
+        case .refused(let why): return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: why, now: now)
+        case .ok(let lab):
+            let git = store.gitWorkspace(root: lab, companyId: companyId)
+            do {
+                let shas = try git.labCommits(limit: limit, maxOutput: maxOutput)
+                return .recorded(try store.recordLabCommits(agentId: agentId, turnId: turnId, shas: shas, tainted: tainted, now: now))
+            } catch {
+                return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "\(error)", now: now)
+            }
+        }
+    }
+
+    /// What `inspect` found: no lab repository, one the engine refuses to read (why), or a real one (its resolved root).
+    enum Inspection: Equatable { case missing, refused(String), ok(URL) }
+
+    /// The lab's `.git` checks (I3-b, F2, S24), with no git run: a real directory reached through no link, no link anywhere
+    /// under it, no alternates, grafts, shallow, commondir or replace refs. Blocking. `propose_extension` (10b, S25) runs it
+    /// again right before its archive.
+    static func inspect(workspace: URL, handle: String) -> Inspection {
         let root = workspace.resolvedForSandbox.path
         let lab = URL(fileURLWithPath: root).appending(path: ".brahma/labs/\(handle)", directoryHint: .isDirectory)
         let gitDir = lab.appending(path: ".git", directoryHint: .isDirectory)
         // The lab and its `.git` must be real directories down from the workspace (an agent could plant links there).
-        if SandboxPath.linkedComponent(gitDir.path, under: root) != nil {
-            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's .git is reached through a link", now: now)
-        }
+        if SandboxPath.linkedComponent(gitDir.path, under: root) != nil { return .refused("the lab's .git is reached through a link") }
         switch SandboxPath.kind(gitDir.path) {
-        case .missing: return .none
+        case .missing: return .missing
         case .directory: break
-        default:
-            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's .git is not a directory", now: now)
+        default: return .refused("the lab's .git is not a directory")
         }
         // Object stores and history the lab borrows or rewrites are refused (I3-b): alternates, grafts, a shallow file, replace refs.
         // F2: a link anywhere under `.git` (it could steer git at another repository's objects or refs) is refused.
-        if let link = firstLink(under: gitDir) {
-            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's .git holds a link (\(link))", now: now)
-        }
+        if let link = firstLink(under: gitDir) { return .refused("the lab's .git holds a link (\(link))") }
         for rel in ["objects/info/alternates", "objects/info/http-alternates", "info/grafts", "shallow", "commondir"]
         where SandboxPath.kind(gitDir.appending(path: rel).path) != .missing {
-            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab has \(rel)", now: now)
+            return .refused("the lab has \(rel)")
         }
         let replace = gitDir.appending(path: "refs/replace").path
-        // Read without following a link (EngineFiles); a packed-refs that cannot be read whole is refused below.
+        // Read without following a link (EngineFiles); a packed-refs that cannot be read whole is refused.
         let packedData = try? EngineFiles.read(workspace: URL(fileURLWithPath: root), dir: ".brahma/labs/\(handle)/.git", name: "packed-refs",
                                                limit: 8 << 20)
         if packedData == nil, SandboxPath.kind(gitDir.appending(path: "packed-refs").path) != .missing {
-            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's packed-refs cannot be read", now: now)
+            return .refused("the lab's packed-refs cannot be read")
         }
         let packed = packedData.flatMap { $0 }.map { String(decoding: $0, as: UTF8.self) } ?? ""
         if SandboxPath.kind(replace) != .missing, !((try? FileManager.default.contentsOfDirectory(atPath: replace)) ?? ["?"]).isEmpty
             || packed.contains("refs/replace/") {
-            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab has replace refs", now: now)
+            return .refused("the lab has replace refs")
         }
-        let git = store.gitWorkspace(root: lab, companyId: companyId)
-        do {
-            let shas = try git.labCommits(limit: limit, maxOutput: maxOutput)
-            return .recorded(try store.recordLabCommits(agentId: agentId, turnId: turnId, shas: shas, tainted: tainted, now: now))
-        } catch {
-            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "\(error)", now: now)
-        }
+        return .ok(lab)
+    }
+
+    /// A refused lab, handled as `record` handles one: the session is marked tainted and the owner alerted.
+    static func refused(store: Store, companyId: String, agentId: String, handle: String, why: String, now: Date) {
+        _ = refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: why, now: now)
     }
 
     /// The first symbolic link under `dir` (relative path), never following one. An unreadable entry counts as a link.

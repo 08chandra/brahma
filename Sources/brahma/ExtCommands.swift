@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import Dispatch
 import BrahmaCore
 
 // `brahma ext` (Task 5a): the SDK part agents may run in their lab (`new`, `lint`) and the owner's lifecycle commands, every one
@@ -310,10 +311,26 @@ struct ExtTry: AsyncParsableCommand {
         let orchestrator = Orchestrator(store: store, runner: ClaudeProcessRunner(), paths: paths, mcpExecutable: executable,
                                         vault: try cliSecretVault(interactive: false),
                                         transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()))
+        // M2: Ctrl-C, a closed Terminal or SIGTERM cancels the trial, which ends its process and removes its places (a kill
+        // that leaves them is swept by the next trial or engine start).
+        signal(SIGPIPE, SIG_IGN)
+        let (folder, companyId, role, prompt) = (URL(fileURLWithPath: path, isDirectory: true), c.id, self.role, self.prompt)
+        let trial = Task {
+            try await ExtensionTry.run(path: folder, companyId: companyId, role: role, prompt: prompt, orchestrator: orchestrator)
+        }
+        let sources = [SIGINT, SIGTERM, SIGHUP].map { sig in
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+            source.setEventHandler { trial.cancel() }
+            source.resume()
+            return source
+        }
+        defer { sources.forEach { $0.cancel() } }
         do {
-            let result = try await ExtensionTry.run(path: URL(fileURLWithPath: path, isDirectory: true), companyId: c.id, role: role,
-                                                    prompt: prompt, orchestrator: orchestrator)
+            let result = try await trial.value
             print(safe(ExtensionTry.summary(result)))
+        } catch is CancellationError {
+            throw fail("interrupted; the trial was stopped and cleaned up")
         } catch let e as ExtensionError {
             throw fail(e.issues.isEmpty ? e.message : "refused (lint errors):\n" + e.message)
         } catch let e as WorkError {

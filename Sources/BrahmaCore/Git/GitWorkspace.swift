@@ -3274,6 +3274,52 @@ extension GitWorkspace {
         }
     }
 
+    /// The object ids of the folder at `<commit>:<path>`: its own tree and every tree and blob below it (S25: the proposal's
+    /// provenance is decided by content). A listing that was cut throws. Blocking.
+    public func labFolderObjects(commit: String, path: String, maxOutput: Int = 4 << 20) throws -> Set<String> {
+        try Self.validCommit(commit)
+        guard Self.isLabFolderPath(path) else { throw GitError.failed(command: "ls-tree", status: -1, stderr: "invalid lab path") }
+        let tree = try main.run(["rev-parse", "--verify", "--quiet", "\(commit):\(path)"], allowFailure: true)
+        let kind = try main.run(["cat-file", "-t", "\(commit):\(path)"], allowFailure: true)
+        guard tree.status == 0, kind.status == 0, kind.text == "tree" else {
+            throw GitError.failed(command: "ls-tree", status: -1, stderr: "\(path) is not a folder in the lab's last commit")
+        }
+        let out = try main.run(["ls-tree", "-r", "-t", "-z", "\(commit):\(path)"], maxOutput: maxOutput)
+        guard !out.cut else { throw GitError.failed(command: "ls-tree", status: -1, stderr: "the folder listing was cut at \(maxOutput) bytes") }
+        var ids: Set<String> = [tree.text]
+        for raw in out.stdout.split(separator: 0) {
+            let entry = String(decoding: raw, as: UTF8.self)
+            let fields = entry.prefix { $0 != "\t" }.split(separator: " ")
+            if fields.count == 3 { ids.insert(String(fields[2])) }
+        }
+        return ids
+    }
+
+    /// Per commit, the tree and blob ids it introduced: the new side of its raw diff against each parent (a root commit against
+    /// the empty tree), recursing into trees (S25). Renames and copies need no detection here: a moved or copied file keeps its
+    /// blob id, so it is matched by content wherever it lands. A merge's diffs against every parent are unioned (more, never
+    /// less). Commits go on stdin, never argv. A listing that was cut throws. Blocking.
+    public func labIntroducedObjects(commits: [String], maxOutput: Int = 64 << 20) throws -> [String: Set<String>] {
+        guard !commits.isEmpty else { return [:] }
+        for c in commits { try Self.validCommit(c) }
+        let input = Data((commits.joined(separator: "\n") + "\n").utf8)
+        let out = try main.run(["log", "--no-walk=unsorted", "--stdin", "--no-color", "--no-show-signature", "--no-renames", "--raw", "-r", "-t",
+                                "--root", "-m", "--no-abbrev", "--format=commit %H"], maxOutput: maxOutput, stdin: .data(input))
+        guard !out.cut else { throw GitError.failed(command: "log --raw", status: -1, stderr: "the history listing was cut at \(maxOutput) bytes") }
+        var result: [String: Set<String>] = [:]
+        var current: String?
+        for line in out.text.split(separator: "\n") {
+            if line.hasPrefix("commit ") { current = String(line.dropFirst(7)); continue }
+            guard line.hasPrefix(":"), let current else { continue }
+            let fields = line.prefix { $0 != "\t" }.split(separator: " ")
+            guard fields.count >= 5 else { continue }
+            let dst = String(fields[3])
+            guard dst.contains(where: { $0 != "0" }) else { continue }
+            result[current, default: []].insert(dst)
+        }
+        return result
+    }
+
     /// Writes `<commit>:<path>` (a tree: the folder as committed, nothing uncommitted) as a tar file at `tar` with `git archive`
     /// (the engine's attributes: nothing left out or substituted), then unpacks it into `into` with `untar` (relative names only,
     /// `-k`, from the directory's descriptor). Blocking.

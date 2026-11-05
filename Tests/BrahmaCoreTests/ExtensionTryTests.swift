@@ -188,6 +188,59 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(a.contains("--restricted"))
     }
 
+    /// M2: the emergency stop refuses a trial before it starts, and stops one that runs: its process ends and its places go.
+    @Test func tryHonoursTheEmergencyStop() async throws {
+        let w = try TryWorld()
+        w.script()
+        try w.store.emergencyStop(note: nil, by: "owner", now: w.world.clock.now)
+        #expect(await w.refusal(try PluginFixture()) == ExtensionTry.stoppedRefusal)
+        #expect(w.world.fake.requests.isEmpty)
+        try await w.store.writer.write { db in try db.execute(sql: "DELETE FROM engineStop") }
+
+        let hold = Gate(), started = Gate()
+        w.world.fake.defaultScript = FakeTurnRunner.Script(gate: hold)
+        let seen = TryWorld.Seen()
+        w.world.fake.onRun = { r in seen.note(dir: r.agent.name, mode: nil); started.open() }
+        let fixture = try PluginFixture()
+        let trial = Task { await w.refusal(fixture) }
+        await started.wait()
+        await w.world.stopPoll.waiting()
+        let handle = try #require(seen.devDir)
+        #expect(SandboxPath.kind(w.ws.appending(path: ".brahma/labs/\(handle)").path) == .directory, "running")
+        try w.store.emergencyStop(note: nil, by: "owner", now: w.world.clock.now)
+        w.world.stopPoll.step()
+        #expect(await trial.value == ExtensionTry.stoppedRefusal)
+        hold.open()
+        for place in [".brahma/home/\(handle)", ".brahma/labs/\(handle)", ".brahma/notes/agents/\(handle).md", ".brahma/bin/shell-\(handle).sh"] {
+            #expect(SandboxPath.kind(w.ws.appending(path: place).path) == .missing, "\(place)")
+        }
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: w.ws.appending(path: ".brahma/ext-try").path)) ?? []).isEmpty)
+        #expect(try w.store.extensionEvents(companyId: w.company.id).filter { $0.kind == "try" }.isEmpty, "a stopped trial is not recorded")
+    }
+
+    /// M2: what a killed trial left is swept (by the next trial and at engine start), and only once it is stale.
+    @Test func staleTrialPlacesAreSwept() throws {
+        let w = try TryWorld()
+        let paths = w.world.paths
+        let id = "try-" + UUID().uuidString.lowercased()
+        let leftovers = [w.ws.appending(path: ".brahma/ext-try/\(UUID().uuidString.lowercased())/plugin/x.md"),
+                         w.ws.appending(path: ".brahma/home/try-abcdef12/x"), w.ws.appending(path: ".brahma/labs/try-abcdef12/x"),
+                         w.ws.appending(path: ".brahma/notes/agents/try-abcdef12.md"), w.ws.appending(path: ".brahma/bin/shell-try-abcdef12.sh"),
+                         paths.runDir.appending(path: "\(id).settings.json"), paths.runDir.appending(path: "\(id).mcp.json"),
+                         paths.runDir.appending(path: "taint/\(id)")]
+        let kept = [w.ws.appending(path: ".brahma/home/eng-1/x"), paths.runDir.appending(path: "eng.settings.json")]
+        for url in leftovers + kept {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("x".utf8).write(to: url)
+        }
+        let workspace = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
+        #expect(ExtensionTry.sweepStale(paths: paths, workspace: workspace, now: Date()).isEmpty, "a trial running now keeps its places")
+        let removed = ExtensionTry.sweepStale(paths: paths, workspace: workspace, now: Date().addingTimeInterval(7200))
+        #expect(removed.count == leftovers.count, "\(removed)")
+        for url in leftovers { #expect(!FileManager.default.fileExists(atPath: url.path), "\(url.path)") }
+        for url in kept { #expect(FileManager.default.fileExists(atPath: url.path), "\(url.path)") }
+    }
+
     /// The CLI: owner-only, lint errors refuse before any turn, and `company create` writes the built-ins.
     @Test func cliTryIsOwnerOnlyAndLinted() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }

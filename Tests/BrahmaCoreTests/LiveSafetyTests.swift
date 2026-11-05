@@ -39,8 +39,8 @@ struct LiveSafetyTests {
         #expect(try store.agent(id: ceo.id)?.sessionId != before, "the next turn's session differs")
     }
 
-    /// Task 10b end to end: an engineer builds a skill in its lab with `brahma ext new` and `ext lint --json`, commits it and
-    /// calls `propose_extension`; the CTO approves internally, the owner approves through `ExtensionLibrary.approve`, and the
+    /// Task 10b end to end: an engineer builds a skill in its lab with `brahma ext new` and `ext lint --json` and commits it; in
+    /// its next turn it calls `propose_extension`; the CTO approves internally, the owner approves through `ExtensionLibrary.approve`, and the
     /// engineer's next turn's init `skills` holds `brand-voice:brand-voice`. Workspace profile (no canary wait), haiku.
     @Test(.timeLimit(.minutes(10)))
     func labSkillEndToEnd() async throws {
@@ -65,8 +65,13 @@ struct LiveSafetyTests {
         _ = try MessageRouter(store: store).sendDM(companyId: company.id, from: .owner, to: eng.name, text: """
             In \(lab) run each of these Bash commands on its own: `\(exe.path) ext new skill brand-voice --dir \(lab)/brand-voice`, \
             then `\(exe.path) ext lint --json --no-claude \(lab)/brand-voice` (it must print []), then `git -C \(lab) add brand-voice`, \
-            then `git -C \(lab) commit -m brand-voice`. Then call propose_extension with path brand-voice, summary "House tone", \
-            roles ["engineer"]. Then stop.
+            then `git -C \(lab) commit -m brand-voice`. Then stop.
+            """)
+        await orchestrator.tick()
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
+        // S25: the commit is recorded (clean) at that turn's end; the proposal comes in the next turn.
+        _ = try MessageRouter(store: store).sendDM(companyId: company.id, from: .owner, to: eng.name, text: """
+            Call propose_extension with path brand-voice, summary "House tone", roles ["engineer"]. Then stop.
             """)
         await orchestrator.tick()
         try await orchestrator.waitUntilIdle(timeout: .seconds(300))

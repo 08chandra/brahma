@@ -84,12 +84,26 @@ extension Orchestrator {
     }
 
     /// What a Workspace turn's settings deny reading and editing: the data home, the owner's protected paths and every other
-    /// company's workspace, each as given and resolved. A company list that cannot be read fails the turn (M6).
-    nonisolated func workspaceDeniedPaths(company: Company) throws -> [URL] {
+    /// company's workspace, each as given and resolved. A company list that cannot be read fails the turn (M6). Task 10b
+    /// (B-M9): the owner's `ext try` copies, and every extension review page that is not one `agent` pre-checks (the whole
+    /// `ext-review` directory when it reviews none: a deny always beats an allow, so its own pages are never carved out of
+    /// one). Workspace Bash is unsandboxed, so these are rules for Claude's file tools, not a wall.
+    nonisolated func workspaceDeniedPaths(company: Company, agent: Agent) throws -> [URL] {
         let others = try store.companies().filter { $0.id != company.id }
             .map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) }
+        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: false)
+        var extensionPlaces = [workspace.appending(path: ".brahma/ext-try")]
+        let reviewDir = workspace.appending(path: ExtensionLibrary.reviewDir)
+        let own = Set(try store.extensionReviewPages(reviewerId: agent.id))
+        if own.isEmpty {
+            extensionPlaces.append(reviewDir)
+        } else {
+            for name in SandboxPath.entries(reviewDir.resolvedForSandbox.path) where !own.contains("\(ExtensionLibrary.reviewDir)/\(name)") {
+                extensionPlaces.append(reviewDir.appending(path: name))
+            }
+        }
         var seen = Set<String>()
-        return ([paths.home] + ProtectedPaths.defaults(userHome: sandboxEnvironment.userHome) + others)
+        return ([paths.home] + ProtectedPaths.defaults(userHome: sandboxEnvironment.userHome) + others + extensionPlaces)
             .flatMap { [$0, $0.resolvedForSandbox] }
             .filter { seen.insert(SandboxPath.key($0.path)).inserted }
     }

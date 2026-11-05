@@ -27,7 +27,43 @@ public struct ExtensionTryResult: Equatable, Sendable {
 public enum ExtensionTry {
     public static let profileRefusal = "ext try runs only on the Sandboxed profile; this company runs the role on another profile"
     public static let model = "haiku"
+    public static let stoppedRefusal = "Brahma is stopped (emergency stop); resume it before trying an extension"
     static let dir = ".brahma/ext-try"
+
+    /// What a trial that was killed left (M2): `ext-try/*`, the `try-*` home, lab, trash, notes and shell prefix, and its
+    /// settings, MCP and taint files, each older than `olderThan` seconds (a trial running now keeps its own), removed by
+    /// descriptor without following a link. Run at each `ext try` and at engine start. Blocking. Returns what it removed.
+    @discardableResult
+    public static func sweepStale(paths: BrahmaPaths, workspace: URL, olderThan: TimeInterval = 3600, now: Date) -> [String] {
+        let ws = workspace.resolvedForSandbox
+        let handle = "^try-[0-9a-f]{8}", agentId = "^try-[0-9a-f-]{36}"
+        let places: [(dir: URL, root: URL, pattern: String)] = [
+            (ws.appending(path: dir), ws, "^[0-9a-f-]{36}$"),
+            (ws.appending(path: ".brahma/home"), ws, handle + "$"), (ws.appending(path: ".brahma/labs"), ws, handle + "$"),
+            (ws.appending(path: ".brahma/trash"), ws, handle + "$"), (ws.appending(path: ".brahma/notes/agents"), ws, handle + "\\.md$"),
+            (ws.appending(path: ".brahma/bin"), ws, "^shell-try-[0-9a-f]{8}\\.sh$"),
+            (paths.runDir, paths.runDir, agentId + "\\.(settings|mcp)\\.json$"),
+            (paths.runDir.appending(path: "taint"), paths.runDir, agentId + "$"),
+        ]
+        var removed: [String] = []
+        for place in places {
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: place.dir.path)) ?? []
+            where name.range(of: place.pattern, options: .regularExpression) != nil {
+                let url = place.dir.appending(path: name)
+                var st = stat()
+                guard lstat(url.path, &st) == 0 else { continue }
+                #if canImport(Darwin)
+                let modified = Double(st.st_mtimespec.tv_sec)
+                #else
+                let modified = Double(st.st_mtim.tv_sec)
+                #endif
+                guard now.timeIntervalSince1970 - modified > olderThan else { continue }
+                ExtensionLibrary.makeWritable(url)
+                if case .removed? = try? EngineFiles.removeNoFollow(url, under: place.root) { removed.append(url.path) }
+            }
+        }
+        return removed
+    }
 
     /// Lints `path`, mounts its plugin parts for one throwaway Quick turn of `role` in the company, records the run and removes
     /// what it made. Refused (`ExtensionError`) on lint errors or when the role does not run Sandboxed.
@@ -40,6 +76,9 @@ public enum ExtensionTry {
         }
         guard orchestrator.turnProfile(role: role, company: company) == .sandboxed else { throw ExtensionError.message(profileRefusal) }
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WorkError.invalid("the prompt is empty") }
+        // M2: the owner's emergency stop holds trials too; what an interrupted trial left is swept first.
+        if try store.engineStopped() != nil { throw ExtensionError.message(stoppedRefusal) }
+        sweepStale(paths: paths, workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), now: now)
 
         // 1. Lint a staged copy (never the folder itself), under the data home's tmp: errors refuse, warnings do not.
         let scratch = try paths.ensureTmpDir().appending(path: "ext-try-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -70,8 +109,8 @@ public enum ExtensionTry {
         let devPlugin = resolved.appending(path: relative, directoryHint: .notDirectory)
 
         // 3. The turn, then 4. its record (never an ask).
-        let result = try await orchestrator.devRun(company: company, role: role, prompt: prompt, devPlugin: devPlugin, devId: manifest.name,
-                                                   now: now)
+        let result = try await orchestrator.devRunUnlessStopped(company: company, role: role, prompt: prompt, devPlugin: devPlugin,
+                                                                devId: manifest.name, now: now)
         try store.recordExtensionEvent(companyId: company.id, extId: manifest.name, kind: "try", detail: eventDetail(result), now: now)
         return result
     }
@@ -101,6 +140,24 @@ extension Orchestrator {
     nonisolated func turnProfile(role: String, company: Company) -> PermissionProfile {
         let chosen = company.profile(forRole: role)
         return profileCeiling.map { PermissionProfile.narrower(chosen, $0) } ?? chosen
+    }
+
+    /// `devRun` raced against the owner's emergency stop (M2), as engine turns are: a stop cancels the trial (its process ends,
+    /// its places are removed) and the trial is refused. Cancelling the caller (the CLI's Ctrl-C) cleans up the same way.
+    nonisolated func devRunUnlessStopped(company: Company, role: String, prompt: String, devPlugin: URL, devId: String,
+                                         now: Date) async throws -> ExtensionTryResult {
+        let outcome: ExtensionTryResult?? = try await withThrowingTaskGroup(of: ExtensionTryResult?.self) { group in
+            group.addTask { try await self.devRun(company: company, role: role, prompt: prompt, devPlugin: devPlugin, devId: devId, now: now) }
+            group.addTask { await self.waitForStop(); return nil }
+            let first = try await group.next()
+            group.cancelAll()
+            // Every child ends (and the trial's clean-up runs) before the group returns.
+            while (try? await group.next()) != nil {}
+            return first
+        }
+        if Task.isCancelled { throw CancellationError() }
+        guard let finished = outcome, let result = finished else { throw ExtensionError.message(ExtensionTry.stoppedRefusal) }
+        return result
     }
 
     /// A dev-run turn (`ext try`, 10b): one itemless Quick turn of a throwaway handle on the Sandboxed profile, with the role's

@@ -194,16 +194,94 @@ private struct LabWorld {
         #expect(!p.taintedCommits!.contains(second))
         let page = try String(contentsOf: w.ws.appending(path: ".brahma/ext-review/\(ask.ref).md"), encoding: .utf8)
         #expect(page.contains("tainted commits: \(first)"), "\(page)")
-        // A commit with no record at all (made outside any recorded turn) counts as tainted.
+        // S25: a commit with no record (made in this very turn, say) is tainted for the proposal, and proposing records nothing:
+        // it is still unrecorded afterwards.
         let other = try LabWorld()
         let unrecorded = try other.commitPlugin()
         try other.store.writer.write { db in try db.execute(sql: "DELETE FROM labCommit") }
-        // The tool records the lab first (as this clean session); a commit it cannot record stays tainted.
-        _ = try other.propose(LabWorld.args("brand-voice"))
+        let reply = try other.propose(LabWorld.args("brand-voice"))
+        #expect(reply.contains("goes straight to the owner"), "\(reply)")
         let otherAsk = try #require(try other.extensionAsks().first)
         let recorded = try #require(ExtensionAskPayload.read(otherAsk))
-        #expect(recorded.taintedCommits == [], "recorded as this clean session's own commit: \(unrecorded)")
-        #expect(try other.store.labCommitTainted(agentId: other.eng.id, sha: String(repeating: "b", count: 40)))
+        #expect(recorded.taintedCommits == [unrecorded])
+        #expect(recorded.sourceType == "lab-tainted")
+        #expect(try other.store.labCommits(agentId: other.eng.id).isEmpty, "proposing records nothing")
+        #expect(try other.store.labCommitTainted(agentId: other.eng.id, sha: unrecorded))
+    }
+
+    /// S25: provenance follows content. A file a tainted session committed elsewhere, renamed or copied into the folder by a
+    /// clean commit, keeps its blob id: the proposal is tainted and names the tainted commit.
+    @Test(arguments: ["rename", "copy"])
+    func contentFromTaintedCommitIsTainted(_ how: String) throws {
+        let w = try LabWorld()
+        try FileManager.default.createDirectory(at: w.lab.appending(path: "drafts"), withIntermediateDirectories: true)
+        try "Write in a calm, plain voice.\n".write(to: w.lab.appending(path: "drafts/tone.md"), atomically: true, encoding: .utf8)
+        try GitFixture.plainGit(["add", "-A"], in: w.lab); try GitFixture.plainGit(["commit", "-qm", "draft"], in: w.lab)
+        let tainted = try GitFixture.plainGit(["rev-parse", "HEAD"], in: w.lab)
+        w.recordLab(tainted: true)
+        _ = try PluginFixture(id: "brand-voice", under: w.lab)
+        let target = "brand-voice/skills/brand-voice/reference/tone.md"
+        try FileManager.default.createDirectory(at: w.lab.appending(path: "brand-voice/skills/brand-voice/reference"), withIntermediateDirectories: true)
+        if how == "rename" {
+            try GitFixture.plainGit(["mv", "drafts/tone.md", target], in: w.lab)
+        } else {
+            try FileManager.default.copyItem(at: w.lab.appending(path: "drafts/tone.md"), to: w.lab.appending(path: target))
+        }
+        try GitFixture.plainGit(["add", "-A"], in: w.lab); try GitFixture.plainGit(["commit", "-qm", "skill"], in: w.lab)
+        let clean = try GitFixture.plainGit(["rev-parse", "HEAD"], in: w.lab)
+        w.recordLab(tainted: false)
+        #expect(!(try w.store.labCommitTainted(agentId: w.eng.id, sha: clean)), "the folder's own commits are all clean")
+        _ = try w.propose(LabWorld.args("brand-voice"))
+        let ask = try #require(try w.extensionAsks().first)
+        let p = try #require(ExtensionAskPayload.read(ask))
+        #expect(p.taintedCommits == [tainted], "\(how)")
+        #expect(p.sourceType == "lab-tainted")
+    }
+
+    /// I1: a tainted proposal goes straight to the owner; no agent's turn may read its review page.
+    @Test func taintedProposalIsOwnerOnly() throws {
+        let w = try LabWorld()
+        try w.commitPlugin()
+        w.recordLab(tainted: true)
+        let reply = try w.propose(LabWorld.args("brand-voice"))
+        let ask = try #require(try w.extensionAsks().first)
+        #expect(reply == "Proposed \(ask.ref) (brand-voice). Its content comes in part from lab commits made by a session that read outside "
+                + "content, or not yet recorded (a commit is recorded when the turn that made it ends), so it goes straight to the owner. "
+                + "Drafts are never mounted before approval.")
+        #expect(ask.status == .pendingOwner); #expect(ask.internalApproverId == nil)
+        for a in [w.cto, w.eng] { #expect(try w.store.extensionReviewPages(reviewerId: a.id).isEmpty) }
+        #expect(!(try w.store.pendingInbox(agentId: w.cto.id)).contains { $0.1.text.contains(ask.ref) }, "the cto is not asked")
+        let page = w.ws.appending(path: ".brahma/ext-review/\(ask.ref).md")
+        #expect(SandboxPath.kind(page.path) == .file, "the owner's page is written")
+        let ctoScope = try scope(w, w.cto, pages: try w.store.extensionReviewPages(reviewerId: w.cto.id).map { w.ws.appending(path: $0) })
+        #expect(!ctoScope.readable.contains { $0.path.contains("ext-review") })
+    }
+
+    /// B-M9 on Workspace: Claude's file tools are denied `ext-try` and every review page that is not this agent's.
+    @Test func workspaceTurnsDenyOtherReviewPages() async throws {
+        let w = try LabWorld(profile: .workspace)
+        try w.commitPlugin()
+        w.recordLab(tainted: false)
+        _ = try w.propose(LabWorld.args("brand-voice"))           // A-1: the cto pre-checks it
+        try w.commitPlugin(id: "tone-two")
+        _ = try w.propose(LabWorld.args("tone-two"))              // A-2: unrecorded, so owner-only
+        let asks = try w.extensionAsks()
+        let mine = try #require(asks.first { $0.internalApproverId == w.cto.id })
+        let ownerOnly = try #require(asks.first { $0.internalApproverId == nil })
+        func denied(_ a: Agent) async throws -> [String] {
+            try w.world.dm(w.company, a)
+            try await w.world.cycle()
+            let r = try #require(w.world.fake.requests.last { $0.agent.id == a.id })
+            #expect(r.profile == .workspace)
+            return r.deniedPaths.map(\.path)
+        }
+        let cto = try await denied(w.cto)
+        #expect(cto.contains { $0.hasSuffix("/.brahma/ext-try") })
+        #expect(cto.contains { $0.hasSuffix("/.brahma/ext-review/\(ownerOnly.ref).md") })
+        #expect(!cto.contains { $0.hasSuffix("/.brahma/ext-review/\(mine.ref).md") }, "its own page stays readable")
+        #expect(!cto.contains { $0.hasSuffix("/.brahma/ext-review") }, "no directory deny over its own page")
+        let eng = try await denied(w.eng)
+        #expect(eng.contains { $0.hasSuffix("/.brahma/ext-review") }); #expect(eng.contains { $0.hasSuffix("/.brahma/ext-try") })
     }
 
     @Test func taintedProvenanceTreatedThirdParty() async throws {

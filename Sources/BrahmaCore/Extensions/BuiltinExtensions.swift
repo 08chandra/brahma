@@ -100,17 +100,19 @@ public enum BuiltinExtensions {
                 3. Run `brahma ext lint --json <id>` and fix every entry it lists. `brahma ext lint --fix <id>` applies the mechanical
                    fixes. Repeat until the list is `[]`.
                 4. Commit the folder in your lab with plain git (`git add <id>` then `git commit -m "<id>"`, each on its own).
+                5. End your turn. A commit is recorded when the turn that made it ends; propose in a later turn.
 
                 ## The hand-off
 
                 Call `propose_extension` with `path` (the folder in your lab), a one-line `summary`, the `roles` it suits, and the
-                `item` it came from if there is one. Brahma snapshots the folder at your lab's last commit, lints it again, records
-                which of your lab commits touched it, and files an ask: your technical lead pre-checks it, then the owner decides.
+                `item` it came from if there is one. Brahma snapshots the folder at your lab's last commit, lints it again, checks
+                where its content came from, and files an ask: your technical lead pre-checks it, then the owner decides. Content
+                from a session that read outside content, or from a commit not recorded yet, goes straight to the owner instead.
                 Only committed work is proposed, so commit first. If lint is not clean you get the list back and no ask is filed.
 
                 """,
         ],
-        pinnedHash: "94b70a24b3986252d780d00e80ad464a5043e68465b3968054502b74fe0ca0e0")
+        pinnedHash: "2f4705aa08f36f1172fe5aead0ac7bf317245d41779806772c2a46f459626305")
 
     // MARK: brahma-workers (F7)
 

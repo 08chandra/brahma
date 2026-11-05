@@ -227,8 +227,9 @@ public actor Orchestrator {
             }) { log("could not install the pre-commit hook: \(failure)") }
             // Brahma's built-in extensions (Task 10b), materialized read-only into every workspace; a refusal is logged.
             for failure in await blocking.run({ companies.compactMap { company -> String? in
-                do { try BuiltinExtensions.materialize(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true)); return nil }
-                catch { return "\(company.name): \(error)" }
+                let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+                ExtensionTry.sweepStale(paths: paths, workspace: workspace, now: now)
+                do { try BuiltinExtensions.materialize(workspace: workspace); return nil } catch { return "\(company.name): \(error)" }
             } }) { log("could not materialize the built-in extensions: \(failure)") }
             try SystemTimers.ensure(store: store, now: now, digestTime: store.ownerPrefs().digestHourMinute)
             ensuredTimerCompanies = Set(try store.companies().map(\.id))
@@ -966,7 +967,7 @@ public actor Orchestrator {
                     request.shellPrefix = sandboxed.shellPrefix.path
                     request.containmentMarker = sandboxed.marker
                 } else if profile == .workspace {
-                    request.deniedPaths = try workspaceDeniedPaths(company: company)
+                    request.deniedPaths = try workspaceDeniedPaths(company: company, agent: agent)
                 }
                 return request
             }

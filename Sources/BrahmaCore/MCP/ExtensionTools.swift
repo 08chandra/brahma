@@ -2,9 +2,10 @@ import Foundation
 
 /// `propose_extension` (Task 10b): an agent hands an extension it built in its lab to the company. High risk (refused while
 /// tainted, `TaintPolicy.reviewedHighRisk`) and counted by `AskQuota`. Only a folder in the caller's own lab, only as committed
-/// (`HEAD`), only with a clean lint; the provenance of every lab commit that touched it rides on the ask. It files one reserved
-/// `extension` ask that the pack's internal reviewer pre-checks and the owner decides. A draft is never mounted on any turn
-/// before the owner approves it.
+/// (`HEAD`), only with a clean lint. Its provenance is decided by content (S25): the tainted or unrecorded lab commits that
+/// introduced any of its trees or blobs, or touched its path, ride on the ask. A clean one files a reserved `extension` ask the
+/// pack's internal reviewer pre-checks and the owner decides; a tainted one goes straight to the owner (I1), so no teammate
+/// reads it. A draft is never mounted on any turn before the owner approves it.
 extension CompanyTools {
     static let proposeOutsideLab = "propose_extension takes a folder in your lab"
 
@@ -82,40 +83,59 @@ extension CompanyTools {
         let relative = try Self.labRelative(raw, labs: [workspace, resolved].map { $0.appending(path: ".brahma/labs/\(me.name)").path })
         let lab = resolved.appending(path: ".brahma/labs/\(me.name)", directoryHint: .isDirectory)
 
-        // Provenance: the lab's commits not recorded yet are recorded first, with this session's taint state, exactly as the
-        // turn's end would (it is clean here: the taint gate refused the call otherwise). A commit an earlier tainted session
-        // made was recorded tainted at that turn's end, before its taint could be cleared; a commit with no record counts as
-        // tainted. A lab that cannot be read is refused (and the session tainted, the owner alerted).
-        let tainted = me.sessionTainted || (taintFlag.map(TaintFlag.exists) ?? false)
-        switch LabProvenance.record(store: store, workspace: workspace, handle: me.name, companyId: companyId, agentId: agentId,
-                                    turnId: quotaTurnId, tainted: tainted, now: Store.now()) {
-        case .none: throw ToolError(message: "your lab has no repository yet; nothing was proposed")
-        case .refused(let why): throw ToolError(message: "your lab could not be read for provenance (\(Store.flat(why, max: 200))); nothing was proposed")
-        case .recorded: break
+        // Provenance (S25). Nothing is recorded here: the turn's end records the lab as always. The order: the lab's `.git`
+        // checks, HEAD resolved once to a sha, the records read and the lab's commits listed (every commit with no record is
+        // unrecorded, so tainted, for this proposal), then the verdict by CONTENT: the folder is tainted when any of its trees or
+        // blobs (object ids) was introduced by a tainted or unrecorded commit, wherever it was then (a rename or copy keeps the
+        // id), or such a commit touched the folder's path. The checks run again right before the archive.
+        let now = Store.now()
+        let refused: (String) -> ToolError = { why in
+            LabProvenance.refused(store: store, companyId: companyId, agentId: agentId, handle: me.name, why: why, now: now)
+            return ToolError(message: "your lab could not be read for provenance (\(Store.flat(why, max: 200))); nothing was proposed")
+        }
+        switch LabProvenance.inspect(workspace: workspace, handle: me.name) {
+        case .missing: throw ToolError(message: "your lab has no repository yet; nothing was proposed")
+        case .refused(let why): throw refused(why)
+        case .ok: break
         }
         let git = store.gitWorkspace(root: lab, companyId: companyId)
         guard let head = try git.labHead() else { throw ToolError(message: "your lab has no commit yet: commit the folder first") }
+        let states = try store.labCommitStates(agentId: agentId)
+        let all: [String]
+        do { all = try git.labCommits() } catch { throw refused("\(error)") }
+        let suspect = Set(all.filter { states[$0] != false } + (states[head] == false ? [] : [head]))
         let touching = try git.labPathCommits(commit: head, path: relative)
         guard !touching.isEmpty else { throw ToolError(message: "\(relative) is not in your lab's last commit: commit it first") }
-        let taintedCommits = try touching.filter { try store.labCommitTainted(agentId: agentId, sha: $0) }
+        let folder = try git.labFolderObjects(commit: head, path: relative)
+        let introduced = try git.labIntroducedObjects(commits: suspect.sorted())
+        let byContent = introduced.filter { !$0.value.isDisjoint(with: folder) }.map(\.key)
+        let taintedCommits = Array(Set(byContent + touching.filter(suspect.contains))).sorted()
 
         // The snapshot of HEAD:<path>, staged under the data home; the company is its publisher (never the lab or the package).
         let facts = ExtensionSourceFacts(publisher: ExtensionPublisher.company(company.slug),
                                          sourceType: taintedCommits.isEmpty ? ExtensionSourceKind.lab : ExtensionSourceKind.labTainted,
                                          sourceUrl: "labs/\(me.name)/\(relative)", sourceSha: head)
         let validation = ValidationOptions(installedBins: try store.installedBins(companyId: companyId, paths: paths))
+        let handle = me.name
         let staged = try ExtensionImporter.stageLab(paths: paths, facts: facts, requireClean: true, options: validation) { tar, place in
+            if case .refused(let why) = LabProvenance.inspect(workspace: workspace, handle: handle) { throw refused(why) }
             try git.labArchive(commit: head, path: relative, tar: tar, into: place)
         }
+        // I1: tainted (or unrecorded) content goes straight to the owner: no teammate's turn reads its review page.
         let ask: Ask
         do {
             ask = try ExtensionLibrary.proposeSync(staged: staged, store: store, paths: paths, companyId: companyId, requester: .agent(agentId),
                                                    roles: roles, options: ExtensionLibrary.ProposalOptions(
-                                                       viaOwner: false, summary: summary, itemId: itemId, taintedCommits: taintedCommits,
-                                                       requireClean: true))
+                                                       viaOwner: !taintedCommits.isEmpty, summary: summary, itemId: itemId,
+                                                       taintedCommits: taintedCommits, requireClean: true))
         } catch {
             try? FileManager.default.removeItem(at: staged.dir)
             throw error
+        }
+        if !taintedCommits.isEmpty {
+            return "Proposed \(ask.ref) (\(staged.id)). Its content comes in part from lab commits made by a session that read outside "
+                + "content, or not yet recorded (a commit is recorded when the turn that made it ends), so it goes straight to the owner. "
+                + "Drafts are never mounted before approval."
         }
         let reviewer = try ask.internalApproverId.flatMap { try store.agent(id: $0) }?.name
         let who = reviewer.map { "@\($0) reviews it, then the owner decides." } ?? "No internal reviewer is available, so the owner decides."
