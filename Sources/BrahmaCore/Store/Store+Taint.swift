@@ -182,16 +182,24 @@ extension Store {
 
     /// Records lab commits not seen before with the turn's taint state; returns how many were new.
     @discardableResult
-    public func recordLabCommits(agentId: String, turnId: String?, shas: [String], tainted: Bool, now: Date = Store.now()) throws -> Int {
+    /// `commitTimes`: each commit's commit time (seconds since 1970). S32: while the machine-wide mark stands no commit is
+    /// recorded clean; after the owner's machine-wide clear, a commit authored before it, or whose time is not known, is not
+    /// either (fail closed).
+    public func recordLabCommits(agentId: String, turnId: String?, shas: [String], tainted: Bool, commitTimes: [String: Int]? = nil,
+                                 now: Date = Store.now()) throws -> Int {
         guard !shas.isEmpty else { return 0 }
         return try writer.write { db in
-            // S31: while a tainted Full-profile session has run since the owner last cleared it (it could write any lab on this
-            // Mac), no lab commit of any company is recorded clean.
-            let fullMark = (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM companyTaint WHERE profile = ?",
-                                             arguments: [PermissionProfile.full.rawValue]) ?? 0) > 0
-            let tainted = tainted || fullMark
+            let machine = try Row.fetchOne(db, sql: "SELECT source, clearedAt FROM machineTaint WHERE id = 1")
+            let machineSource: String? = machine?["source"]
+            let machineMarked = machineSource != nil
+            let clearedAt: Date? = machine?["clearedAt"]
             var added = 0
             for sha in shas where sha.range(of: "^[0-9a-f]{40,64}$", options: .regularExpression) != nil {
+                var tainted = tainted || machineMarked
+                if !tainted, let clearedAt {
+                    // Unknown time, or authored before the owner's machine-wide clear: never clean.
+                    if let time = commitTimes?[sha] { tainted = Double(time) < clearedAt.timeIntervalSince1970 } else { tainted = true }
+                }
                 try db.execute(sql: """
                     INSERT OR IGNORE INTO labCommit (agentId, sha, turnId, tainted, recordedAt) VALUES (?, ?, ?, ?, ?)
                     """, arguments: [agentId, sha, turnId, tainted, now])
@@ -233,6 +241,42 @@ extension Store {
             INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, ?, ?, ?)
             ON CONFLICT(companyId) DO UPDATE SET profile = excluded.profile WHERE excluded.profile = 'full'
             """, arguments: [company.id, shown, profile.rawValue, now])
+        // S32: a Full session could write any company's labs: the machine-wide mark (kept with its first source).
+        if profile == .full {
+            try db.execute(sql: """
+                INSERT INTO machineTaint (id, source, markedAt) VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET source = excluded.source, markedAt = excluded.markedAt WHERE machineTaint.source IS NULL
+                """, arguments: [Store.flat("\(company.name): \(shown)", max: 200), now])
+        }
+    }
+
+    /// The machine-wide mark (S32), or nil when none stands; `clearedAt` is the owner's last machine-wide clear.
+    public func machineLabTaint() throws -> (source: String?, markedAt: Date?, clearedAt: Date?)? {
+        try writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT source, markedAt, clearedAt FROM machineTaint WHERE id = 1")
+                .map { (source: $0["source"], markedAt: $0["markedAt"], clearedAt: $0["clearedAt"]) }
+        }
+    }
+
+    /// The owner's machine-wide clear (`brahma lab clear-taint --machine-wide`, owner shell only; no company tool): the mark goes,
+    /// the clear time is kept (commits authored before it are never recorded clean), and every company logs it. Per-company
+    /// clears never touch it. Returns whether a mark stood.
+    @discardableResult
+    public func clearMachineLabTaint(now: Date = Store.now()) throws -> Bool {
+        try writer.write { db in
+            let source: String? = try Row.fetchOne(db, sql: "SELECT source FROM machineTaint WHERE id = 1")?["source"]
+            try db.execute(sql: """
+                INSERT INTO machineTaint (id, source, markedAt, clearedAt) VALUES (1, NULL, NULL, ?)
+                ON CONFLICT(id) DO UPDATE SET source = NULL, markedAt = NULL, clearedAt = excluded.clearedAt
+                """, arguments: [now])
+            guard let source else { return false }
+            for company in try Company.fetchAll(db) {
+                try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .approval,
+                                  text: "The owner cleared the machine-wide lab mark (set by: \(Store.flat(source, max: 120))); lab commits "
+                                    + "authored before this stay unrecordable as clean", createdAt: now).insert(db)
+            }
+            return true
+        }
     }
 
     /// The session's taint at a turn's end (10b, I2): the agent row OR the flag file in `home` (the post-tool hook's mark when
@@ -272,9 +316,15 @@ extension Store {
             if let own = try Row.fetchOne(db, sql: "SELECT source, markedAt FROM labTaint WHERE agentId = ?", arguments: [agentId]) {
                 return (source: own["source"], markedAt: own["markedAt"])
             }
-            return try Row.fetchOne(db, sql: """
+            if let company = try Row.fetchOne(db, sql: """
                 SELECT c.source, c.markedAt FROM companyTaint c JOIN agent a ON a.companyId = c.companyId WHERE a.id = ?
-                """, arguments: [agentId]).map { (source: "company: \($0["source"] as String)", markedAt: $0["markedAt"]) }
+                """, arguments: [agentId]) {
+                return (source: "company: \(company["source"] as String)", markedAt: company["markedAt"])
+            }
+            // S32: the machine-wide mark counts for every agent of every company.
+            guard let machine = try Row.fetchOne(db, sql: "SELECT source, markedAt FROM machineTaint WHERE id = 1 AND source IS NOT NULL")
+            else { return nil }
+            return (source: "machine-wide: \(machine["source"] as String)", markedAt: machine["markedAt"])
         }
     }
 
@@ -366,7 +416,14 @@ public enum LabProvenance {
             let git = store.gitWorkspace(root: lab, companyId: companyId)
             do {
                 let shas = try git.labCommits(limit: limit, maxOutput: maxOutput)
-                return .recorded(try store.recordLabCommits(agentId: agentId, turnId: turnId, shas: shas, tainted: tainted, now: now))
+                // S32: commit times, read only when a machine-wide clear happened (a commit authored before it stays unrecordable;
+                // one whose time cannot be read is too).
+                let known = try store.labCommitStates(agentId: agentId)
+                let fresh = shas.filter { known[$0] == nil }
+                let cleared = try store.machineLabTaint()?.clearedAt != nil
+                let times = !tainted && !fresh.isEmpty && cleared ? (try? git.labCommitTimes(fresh)) : nil
+                return .recorded(try store.recordLabCommits(agentId: agentId, turnId: turnId, shas: shas, tainted: tainted,
+                                                            commitTimes: times, now: now))
             } catch {
                 return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "\(error)", now: now)
             }
@@ -410,6 +467,18 @@ public enum LabProvenance {
             return .refused("the lab has replace refs")
         }
         return .ok(lab)
+    }
+
+    /// Before the owner's machine-wide clear (S32): every lab of every company is recorded as it is now, its unrecorded commits
+    /// tainted, so nothing a Full session left can be recorded clean afterwards whatever its commit time says. Blocking (git).
+    public static func recordEveryLabTainted(store: Store, now: Date) throws {
+        for company in try store.companies() {
+            let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+            for agent in try store.agents(companyId: company.id) {
+                _ = record(store: store, workspace: workspace, handle: agent.name, companyId: company.id, agentId: agent.id, turnId: nil,
+                           tainted: true, now: now)
+            }
+        }
     }
 
     /// A refused lab, handled as `record` handles one: the session is marked tainted and the owner alerted.

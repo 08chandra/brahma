@@ -278,28 +278,52 @@ public final class Store: Sendable {
         }
     }
 
-    /// Task 10b (round 2c): a hire never adopts a lab that is already there. Without a sandbox (Workspace, Full) any agent can
-    /// create `.brahma/labs/<handle>` before that handle is hired; whatever is there is moved, unread and without following a
-    /// link, into `.brahma/trash/<handle>/`, the owner is alerted, and the new agent gets an empty lab. Only for a valid handle
-    /// no agent of the company holds yet (an existing agent's lab is never touched). A lab that cannot be moved aside refuses
-    /// the hire. Blocking (file moves); call it outside a write transaction.
+    /// Task 10b (round 2c): a hire never adopts a per-agent place that is already there. Without a sandbox (Workspace, Full)
+    /// any agent can create another handle's places before that handle is hired. Each one found (`.brahma/labs/<h>`,
+    /// `.brahma/home/<h>`, `.brahma/notes/agents/<h>.md`, `.brahma/bin/shell-<h>.sh`) is moved, unread and without following a
+    /// link, into `.brahma/trash/<h>/<stamp>-<id>-<kind>`; one owner alert lists what was moved; the lab, home and notes file
+    /// are created fresh and empty (the shell prefix is written at the agent's first sandboxed turn). Only for a valid handle
+    /// no agent of the company holds yet: an existing agent's places are never touched. A place that cannot be moved aside
+    /// refuses the hire. Blocking (file moves); call it outside a write transaction.
     func retirePreexistingLab(companyId: String, handle raw: String, now: Date = Store.now()) throws {
         let handle = raw.lowercased()
         guard handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil,
               let company = try company(id: companyId), try agent(companyId: companyId, name: handle) == nil else { return }
         let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true).resolvedForSandbox
-        let lab = ws.appending(path: ".brahma/labs/\(handle)")
-        guard SandboxPath.kind(lab.path) != .missing else { return }
+        let places: [(kind: String, relative: String)] = [
+            ("lab", ".brahma/labs/\(handle)"), ("home", ".brahma/home/\(handle)"),
+            ("notes", ".brahma/notes/agents/\(handle).md"), ("bin", ".brahma/bin/shell-\(handle).sh"),
+        ]
         let stamp = ISO8601DateFormatter().string(from: now).replacingOccurrences(of: ":", with: "")
-        let name = "\(stamp)-\(UUID().uuidString.prefix(8))-lab"
-        guard case .removed? = try? EngineFiles.moveNoFollow(lab, under: ws, toDirectory: ".brahma/trash/\(handle)", name: name) else {
-            throw WorkError.conflict("a lab for @\(handle) already exists and could not be moved aside; nothing was hired")
+        let batch = String(UUID().uuidString.prefix(8))
+        var moved: [String] = []
+        var failed: String?
+        for place in places {
+            let url = ws.appending(path: place.relative)
+            guard SandboxPath.kind(url.path) != .missing else { continue }
+            let name = "\(stamp)-\(batch)-\(place.kind)"
+            if case .removed? = try? EngineFiles.moveNoFollow(url, under: ws, toDirectory: ".brahma/trash/\(handle)", name: name) {
+                moved.append("\(place.relative) → .brahma/trash/\(handle)/\(name)")
+            } else {
+                failed = place.relative
+                break
+            }
         }
-        try? EngineAlerts.raise(store: self, text: "Before @\(handle) was hired in \(company.name), something had already created its lab "
-                                + "(.brahma/labs/\(handle)). Brahma moved it, unread, to .brahma/trash/\(handle)/\(name) and gives the new agent an "
-                                + "empty lab. Check what put it there: on the Workspace and Full profiles any agent can write another's lab.",
-                                now: now, reason: "pre-hire-lab:\(company.id):\(handle)", companyId: company.id)
+        if !moved.isEmpty || failed != nil {
+            let what = moved.isEmpty ? "" : " Brahma moved, unread: " + moved.joined(separator: "; ") + "."
+            let refusal = failed.map { " \($0) could not be moved aside, so @\(handle) was not hired." } ?? " The new agent gets fresh, empty places."
+            try? EngineAlerts.raise(store: self, text: "Before @\(handle) was hired in \(company.name), something had already created its "
+                                    + "places.\(what)\(refusal) Check what put them there: on the Workspace and Full profiles any agent can "
+                                    + "write another's places.", now: now, reason: "pre-hire-places:\(company.id):\(handle):\(batch)",
+                                    companyId: company.id)
+        }
+        if let failed { throw WorkError.conflict("\(failed) already exists and could not be moved aside; nothing was hired") }
+        guard !moved.isEmpty else { return }
         _ = try EngineFiles.directory(workspace: ws, ".brahma/labs/\(handle)", mode: 0o700)
+        _ = try EngineFiles.directory(workspace: ws, ".brahma/home/\(handle)", mode: 0o700)
+        if case .missing = try EngineFiles.entry(workspace: ws, dir: ".brahma/notes/agents", name: "\(handle).md") {
+            _ = try EngineFiles.create(Data(), workspace: ws, dir: ".brahma/notes/agents", name: "\(handle).md", mode: 0o600)
+        }
     }
 
     /// `reserved` lets `applyOrg` and `fillVacancy` hire into a handle an open vacancy holds; everyone else is refused.

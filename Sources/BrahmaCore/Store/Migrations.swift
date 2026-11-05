@@ -1010,13 +1010,21 @@ enum Migrations {
         }
         m.registerMigration("v5-taint-7") { db in
             // Task 10b, S31: the company-level lab mark. A tainted session without a sandbox (Workspace or Full) could write any
-            // lab of its company, later hires' included: every lab check reads this too, until the owner clears it. `profile`
-            // full: such a session could write anywhere, so no lab commit of any company is recorded clean meanwhile.
+            // lab of its company, later hires' included: every lab check reads this too, until the owner clears it.
             try db.create(table: "companyTaint") { t in
                 t.primaryKey("companyId", .text).references("company", onDelete: .cascade)
                 t.column("source", .text).notNull()
                 t.column("profile", .text).notNull()
                 t.column("markedAt", .datetime).notNull()
+            }
+            // S32: the machine-wide mark (one row). A tainted Full-profile session could write any company's labs: every lab check
+            // in every company reads it, no lab commit is recorded clean while it stands, and only the owner's machine-wide clear
+            // ends it (`clearedAt`: a commit authored before that clear is never recorded clean).
+            try db.create(table: "machineTaint") { t in
+                t.column("id", .integer).primaryKey().check { $0 == 1 }
+                t.column("source", .text)
+                t.column("markedAt", .datetime)
+                t.column("clearedAt", .datetime)
             }
         }
         m.registerMigration("v5-transcripts") { db in

@@ -3240,6 +3240,21 @@ extension GitWorkspace {
 
     // MARK: Lab proposals (Task 10b)
 
+    /// The commit time (seconds since 1970) of each of `commits`, read with `git log --no-walk --stdin` (S32). Blocking.
+    public func labCommitTimes(_ commits: [String]) throws -> [String: Int] {
+        guard !commits.isEmpty else { return [:] }
+        for c in commits { try Self.validCommit(c) }
+        let out = try main.run(["log", "--no-walk=unsorted", "--stdin", "--no-show-signature", "--format=%H %ct"],
+                               stdin: .data(Data((commits.joined(separator: "\n") + "\n").utf8)))
+        guard !out.cut else { throw GitError.failed(command: "log", status: -1, stderr: "the commit-time listing was cut") }
+        var times: [String: Int] = [:]
+        for line in out.text.split(separator: "\n") {
+            let parts = line.split(separator: " ")
+            if parts.count == 2, let t = Int(parts[1]) { times[String(parts[0])] = t }
+        }
+        return times
+    }
+
     /// A folder path inside a lab as `propose_extension` takes it: 1–8 components of `[A-Za-z0-9][A-Za-z0-9._-]*` (at most 64
     /// characters each), none `.git`. No pathspec magic, no `..`, nothing git or a shell could read two ways.
     public static func isLabFolderPath(_ path: String) -> Bool {
