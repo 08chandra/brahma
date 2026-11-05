@@ -45,6 +45,8 @@ public struct WorkSnapshot: Equatable, Sendable {
     public var pace: Pace?
     /// $LE by work mode over the last 7 days.
     public var costByMode: [String: Double] = [:]
+    /// The Budget view's Advanced row (Task 14u): `Ultra allowance <share>% of share · used <u>%`.
+    public var ultraAllowance: String?
     /// Set when the CLI reports a plan other than the configured one (the owner is asked to confirm).
     public var planMismatch: String?
     /// The owner's time zone for every calendar-facing string.
@@ -90,11 +92,20 @@ public struct WorkSnapshot: Equatable, Sendable {
         let info = try store.latestRateLimit()
         w.pace = UsageGate.pace(info, reserve: company.ownerReserve ?? (1 - store.weeklyShare()), now: now)
         w.costByMode = try store.costByMode(companyId: companyId, since: now.addingTimeInterval(-7 * 86_400))
+        w.ultraAllowance = UltraAllowanceText.line(share: company.ultraShare, allowance: try store.ultraAllowance(companyId: companyId, now: now))
         if let reported = try store.latestProbe()?.reportedSubscription, let tier = PlanTier(reportedSubscription: reported),
            tier != store.planTier() {
             w.planMismatch = PlanTierText.mismatch(reported: tier, configured: store.planTier())
         }
         return w
+    }
+}
+
+public enum UltraAllowanceText {
+    /// `Ultra allowance 15% of share · used 40%` (`used —` until the calibration knows the share in $LE).
+    public static func line(share: Double, allowance: (totalLE: Double, usedLE: Double, leftLE: Double)?) -> String {
+        let used = allowance.map { $0.totalLE > 0 ? "\(Int((min(1, $0.usedLE / $0.totalLE) * 100).rounded()))%" : "100%" } ?? "—"
+        return "Ultra allowance \(Int((share * 100).rounded()))% of share · used \(used)"
     }
 }
 

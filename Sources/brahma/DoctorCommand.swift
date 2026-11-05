@@ -24,6 +24,12 @@ struct Doctor: AsyncParsableCommand {
         if let item = BrahmaCore.Doctor.planTierItem(configured: store.planTier(), reported: report.reportedSubscription) {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
         }
+        // F9 (Task 14u): why Ultra cannot run, per running company (informational; never fails the doctor).
+        let fingerprint = try? CLIFingerprint.of(claudePath: ExtLint.claudePath() ?? "claude").key
+        for company in (try? store.companies()) ?? [] where company.status == .running {
+            let reasons = store.ultraStatus(companyId: company.id, fingerprint: fingerprint)
+            if !reasons.isEmpty { print("INFO  ultra  \(safe(company.slug)): \(safe(reasons.joined(separator: "; ")))") }
+        }
         for item in await BrahmaCore.Doctor.backupItems(store: store) {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
         }

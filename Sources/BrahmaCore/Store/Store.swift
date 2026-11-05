@@ -257,6 +257,7 @@ public final class Store: Sendable {
                 kept.webDomains = stored.webDomains
                 kept.allowLocalBinding = stored.allowLocalBinding
                 kept.toolchainReadPaths = stored.toolchainReadPaths
+                kept.ultraShare = stored.ultraShare
             }
             try kept.update(db)
         }

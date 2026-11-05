@@ -79,8 +79,9 @@ extension CompanyTools {
                                          required: ["ask", "approve", "note"])),
             ToolSpec(name: "request_mode", description: """
                 Ask for more thinking on an item you are assigned to. Deep raises it to R2 from your next turn, never this one. \
-                One request per item per three turns.
-                """, inputSchema: schema(["key": prop("string", "Work item key"), "mode": prop("string", "deep or ultra"),
+                One request per item per three turns. ultra_small or ultra asks for one multi-agent run (approved by the owner or by \
+                policy; a manager above the item may ask for it too); the engine runs it only when its limits allow.
+                """, inputSchema: schema(["key": prop("string", "Work item key"), "mode": prop("string", "deep, ultra_small or ultra"),
                                           "reason": prop("string", "Why the current mode is not enough"),
                                           "request_id": prop("string", "Your own id; repeating it changes nothing")],
                                          required: ["key", "mode", "reason", "request_id"])),

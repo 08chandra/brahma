@@ -59,7 +59,8 @@ public enum BudgetText {
 
 extension Store {
     /// Turns, counted tokens and cost recorded against the item. Review turns, infrastructure failures and session
-    /// resets are not part of it; an interrupted or usage-limited turn adds its tokens and cost but is not a turn.
+    /// resets are not part of it; an interrupted or usage-limited turn adds its tokens and cost but is not a turn. An Ultra
+    /// turn's tokens are left out of the tier token cap (its $LE cap governs it, Task 14u); it still counts as one turn.
     public func itemUsage(itemId: String) throws -> ItemUsage {
         try writer.read { db in try Store.itemUsage(db: db, itemId: itemId) }
     }
@@ -67,7 +68,7 @@ extension Store {
     static func itemUsage(db: Database, itemId: String) throws -> ItemUsage {
         let row = try Row.fetchOne(db, sql: """
             SELECT COALESCE(SUM(CASE WHEN outcome IN ('succeeded', 'failed') THEN 1 ELSE 0 END), 0) AS turns,
-                   COALESCE(SUM(inputTokens + outputTokens + cacheCreationTokens), 0) AS tokens,
+                   COALESCE(SUM(CASE WHEN mode = 'ultra' THEN 0 ELSE inputTokens + outputTokens + cacheCreationTokens END), 0) AS tokens,
                    COALESCE(SUM(costLE), 0) AS cost
             FROM turn
             WHERE itemId = ? AND kind = 'work' AND infra = 0 AND sessionResetReason IS NULL

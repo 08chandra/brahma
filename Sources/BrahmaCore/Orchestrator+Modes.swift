@@ -32,7 +32,16 @@ extension Orchestrator {
         }
         i.opusScarce = (try? store.opusScarce(now: now)) ?? false
         i.calibration = (try? store.modeCalibration()) ?? ModeCalibration()
-        i.subagentGate = SubagentGate.passed(profile: turnProfile(agent: agent, company: company))
+        // The sub-agent gate (Task 14u): the sandboxed profile, and L-2, V-2 or V-8, V-3 and V-5 passed for this CLI build and the
+        // sandboxed-Task shape. Review and audit turns never fan out before V-1 passed: Task 10's pre-taint would refuse every
+        // verdict (they get no Task either way: `TurnProfileCompiler.restricted`).
+        let gateProfile = turnProfile(agent: agent, company: company)
+        let fingerprint = probeFingerprint()
+        let taskGates = passedProbeGates(.sandboxedTask, fingerprint: fingerprint)
+        i.subagentGate = SubagentGate.passed(profile: gateProfile, gates: taskGates)
+        if kind.isReview, !taskGates.contains(TaintPolicy.postToolGate) { i.subagentGate = false }
+        // Plan-first on the sandboxed profile compiles only once V-4 passed under the sandboxed argv; elsewhere 3a's gate.
+        if gateProfile == .sandboxed { i.planFirstGate = passedProbeGates(.sandboxedPlan, fingerprint: fingerprint).contains("V-4") }
         i.trust = agent.trustLevel
         if let f = facts {
             i.tier = f.tier
@@ -44,6 +53,8 @@ extension Orchestrator {
             i.planWritten = f.planWritten
             i.replanRequested = f.replanRequested
             i.p2OnlyFix = f.p2OnlyFix
+            // Ultra eligibility reads the item's type only from a trusted spec (Task 14u).
+            if EffectiveSpec.trusted(confirmedBy: f.item.specConfirmedBy, holderId: agent.id) { i.itemType = f.item.type.rawValue }
             if kind == .work || kind == .plan, itemBudget { i.budgetLeftLE = f.budgetLeftLE }
             if kind.isReview { i.reviewSpendCapped = (try? store.reviewSpendCapped(item: f.item)) ?? false }
         }

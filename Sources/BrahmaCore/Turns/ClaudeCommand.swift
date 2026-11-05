@@ -68,8 +68,9 @@ public struct TurnRequest: Sendable {
     public var containmentMarker: String? = nil
     /// Where the runner records the turn's leader (`<runDir>/turns`), so a restarted engine can still kill what is left.
     public var turnRecordDirectory: URL? = nil
-    /// Ultra's workflow policy (Task 14u; nil until then).
-    public var workflow: WorkflowPolicy? = nil
+    /// A sub-agent (Task) turn keeps `WebFetch`/`WebSearch` (Task 14u): only once probe F7-agents passed for this CLI build
+    /// (only Brahma's worker agent types load, Task 10b). Until then a turn is Task without web tools or web tools without Task.
+    public var taskWebTools = false
     /// The runner yields every stdout line as `.raw` too (the sandbox canary reads tool results the parser only digests).
     public var emitRawLines = false
 

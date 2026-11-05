@@ -16,6 +16,11 @@ struct TurnTelemetry: Sendable, Equatable {
     /// The model and effort the work mode ran with, for the rung-cost calibration (`modeCalibration`).
     var modeModel: String? = nil
     var modeEffort: Effort? = nil
+    /// Ultra (Task 14u): why the engine stopped the turn (`agentCap`), the least it is charged (its cap when killed), and
+    /// whether it holds a reservation to release down to what it was charged.
+    var stopReason: String? = nil
+    var chargeAtLeastLE: Double? = nil
+    var releasesUltra = false
 }
 
 /// One turn's accounting, worked out inside the turn-end transaction.
@@ -82,16 +87,21 @@ extension Store {
         case .capped(let r, _): turn.stopReason = r.stopReason
         default: break
         }
+        if let stop = t.stopReason { turn.stopReason = stop }
         if resetSession { turn.stopReason = TurnStop.sessionReset }
+        // A killed Ultra turn is charged at least its cap (design §3.8.3): it may have left workflow agents' spend unreported.
+        if let floor = t.chargeAtLeastLE { turn.costLE = max(a.cost ?? 0, floor) }
         try turn.update(db)
+        if t.releasesUltra { try Store.releaseUltra(db: db, turnId: turnId, actualLE: turn.costLE ?? 0, now: turn.endedAt ?? Date()) }
         // A completed work turn teaches the rung-cost EMA what its (model, effort) costs.
         var completed = false
         switch end {
         case .succeeded, .capped: completed = true
         default: break
         }
-        if completed, !resetSession, !turn.infra, turn.kind == .work, let model = t.modeModel, let effort = t.modeEffort,
-           let cost = a.cost {
+        // An Ultra turn's cost says nothing about a rung's (it is not on the ladder).
+        if completed, !resetSession, !turn.infra, turn.kind == .work, turn.mode != WorkMode.ultra.rawValue,
+           let model = t.modeModel, let effort = t.modeEffort, let cost = a.cost {
             try recordModeCost(db: db, model: model, effort: effort, costLE: cost)
         }
     }

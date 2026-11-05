@@ -220,6 +220,11 @@ private struct CompanySettingsPopover: View {
             CapsLabel("Budget by mode")
             Text(verbatim: model.modeBreakdownLine ?? "No spend recorded this week.")
                 .font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).fixedSize(horizontal: false, vertical: true)
+            if let ultra = model.ultraAllowanceLine {
+                CapsLabel("Advanced")
+                Text(verbatim: ultra)
+                    .font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2).fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(BrahmaTheme.spaceM)
         .frame(width: 340, alignment: .leading)

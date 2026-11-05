@@ -73,10 +73,14 @@ public struct TurnProfile: Equatable, Sendable {
     }
 }
 
-/// Ultra's workflow settings (Plan 5-lite, design §2.3). Declared so the profile has the slot; nothing in 3a sets it.
+/// Ultra's workflow settings (Plan 5-lite, design §2.3), set by `apply` on an admitted Ultra turn of the sandboxed profile.
 public struct WorkflowPolicy: Equatable, Sendable {
     public var sizeGuideline: String
     public var maxConcurrentAgents: Int
+
+    public init(sizeGuideline: String, maxConcurrentAgents: Int) {
+        self.sizeGuideline = sizeGuideline; self.maxConcurrentAgents = maxConcurrentAgents
+    }
 }
 
 public enum TurnProfileError: Error, Equatable, CustomStringConvertible {
@@ -120,6 +124,19 @@ public enum TurnProfileCompiler {
             if let dir = r.planDirectory { p.addDirs = [dir] }
         }
         if let d = r.mode { apply(d, to: &p, hookExecutable: r.hookExecutable, kind: r.kind, taint: taintArguments(r)) }
+        // Sub-agents and workflows only on the sandboxed profile (14u): on Workspace and Full the agent's Bash is unsandboxed,
+        // so a nested `claude` could escape every cap. Whatever the decision said.
+        if r.profile != .sandboxed, p.subagents != .off || p.workflow != nil {
+            p.workflow = nil
+            p.subagents = .off
+            p.environment = p.environment.filter { !ultraOnlyVars.contains($0.key) && !subagentVars.contains($0.key) }
+            p.environment["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
+            p.allowedTools.removeAll { subagentTools.contains($0) }
+            for name in subagentTools + ["Workflow"] where !p.disallowedTools.contains(name) { p.disallowedTools.append(name) }
+            if let exe = p.hookExecutable, let mode = p.mode {
+                p.preToolHook = preToolHook(executable: exe, mode: mode == .ultra ? .deep : mode, subagents: false, taint: taintArguments(r))
+            }
+        }
         p = restricted(p, for: r.kind)
         // F10: `--disable-slash-commands` stays unless extension parts mount (then the Skill denies replace it).
         p.disableSlashCommands = r.mounts.isEmpty
@@ -129,7 +146,7 @@ public enum TurnProfileCompiler {
         p.settings = ClaudeSettingsCompiler.compile(
             scope: r.profile == .sandboxed ? r.sandbox : nil, profile: r.profile, mode: r.mode, mounts: r.mounts,
             postToolHook: r.postToolHook, preToolHook: p.preToolHook, kind: r.kind, plansDirectory: r.planDirectory,
-            deniedPaths: r.profile == .workspace ? r.deniedPaths : [], workflow: r.workflow,
+            deniedPaths: r.profile == .workspace ? r.deniedPaths : [], workflow: r.profile == .sandboxed ? p.workflow : nil,
             machMarker: r.profile == .sandboxed ? r.containmentMarker : nil)
         return p
     }
@@ -144,9 +161,12 @@ public enum TurnProfileCompiler {
             p.tools = BuiltinTools.review
         } else if r.kind == .plan {
             p.tools = BuiltinTools.plan
+        } else if p.workflow != nil {
+            // An admitted Ultra turn (14u): the sandboxed tools plus Task and Workflow (the second of Workflow's three locks).
+            p.tools = BuiltinTools.ultra
         } else if p.subagents != .off {
-            // Only once the sub-agent gate passed (14u); no web tools until F7.
-            p.tools = BuiltinTools.taskTurn
+            // Only once the sub-agent gate passed (14u); no web tools until F7-agents passed (`taskWebTools`).
+            p.tools = r.taskWebTools ? BuiltinTools.withTask : BuiltinTools.taskTurn
         } else {
             p.tools = BuiltinTools.sandboxed
         }
@@ -176,13 +196,25 @@ public enum TurnProfileCompiler {
         p.quotas = d.quotas
         p.hookExecutable = hookExecutable
         p.subagents = kind.isReview || kind == .plan ? .off : d.subagents
+        // Ultra (14u): only a work turn, and only with its workflow policy; the settings compiler opens the other two locks.
+        let ultra = d.mode == .ultra && kind == .work ? d.workflow : nil
+        if let ultra {
+            p.workflow = WorkflowPolicy(sizeGuideline: ultra.variant.sizeGuideline, maxConcurrentAgents: ultra.maxConcurrentAgents)
+        }
         // The settings keys (`availableModels`, `fastMode`, the workflow kill switches, `maxEffortLevel`) are compiled from the
         // decision by `ClaudeSettingsCompiler`; the pre-tool hook block is built here and merged in unchanged.
         if let hookExecutable {
             p.preToolHook = preToolHook(executable: hookExecutable, mode: d.mode, subagents: p.subagents != .off, taint: taint)
         }
         p.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] = "1"
-        p.environment["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
+        if let ultra {
+            // The Workflow tool is on the harness deny list of every other turn; an Ultra turn's `--tools` names it instead.
+            p.disallowedTools.removeAll { $0 == "Workflow" }
+            p.environment["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] = "\(ultra.maxConcurrentAgents)"
+            p.environment["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "\(UltraVariant.bgCeilingMilliseconds)"
+        } else {
+            p.environment["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
+        }
         if case .forced(let model, let depth, let concurrent) = p.subagents {
             p.disallowedTools.removeAll { subagentTools.contains($0) }
             if !p.allowedTools.contains("Task") { p.allowedTools.append("Task") }
@@ -198,12 +230,25 @@ public enum TurnProfileCompiler {
 
     /// What the engine asserts about the session of a mode turn: no `Task`/`Agent` when sub-agents are off, never `Workflow`
     /// (Ultra is 5-lite's), the init `agents` list equal to the doctor-recorded built-ins, and the forced worker allowed to bill.
+    /// An admitted Ultra turn (14u) must be offered `Workflow`, and may bill its forced Sonnet worker.
     public static func expectations(for d: ModeDecision, agents: Set<String>?) -> TurnExpectations {
         var forbidden: Set<String> = ["Workflow"]
+        var required: Set<String> = []
         var extra: Set<String> = []
+        if d.mode == .ultra, d.workflow != nil {
+            forbidden = []
+            required = ["Workflow"]
+            extra.insert(UltraVariant.workerModel)
+        }
         if case .forced(let model, _, _) = d.subagents { extra.insert(model) } else { forbidden.formUnion(subagentTools) }
-        return TurnExpectations(agents: agents, forbiddenTools: forbidden, extraModels: extra)
+        return TurnExpectations(agents: agents, forbiddenTools: forbidden, requiredTools: required, extraModels: extra)
     }
+
+    /// The `CLAUDE_CODE_*` variables only an Ultra turn carries, and those only a forced sub-agent turn carries.
+    static let ultraOnlyVars: Set<String> = ["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS", "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"]
+    static let subagentVars: Set<String> = ["CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
+                                            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS",
+                                            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"]
 
     /// 3a's PreToolUse block in exec form: `<executable> hook pre-tool --mode <mode> [--subagents]`, blocking when it cannot
     /// run (fix round 1, C1).

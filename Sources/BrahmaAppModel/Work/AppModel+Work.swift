@@ -61,6 +61,9 @@ extension AppModel {
 
     public var modeBreakdownLine: String? { ModeBreakdown.line(work.costByMode) }
 
+    /// The Budget view's Advanced row: the company's Ultra allowance and how much of it this week used (Task 14u).
+    public var ultraAllowanceLine: String? { work.ultraAllowance }
+
     public func item(key: String) -> WorkItem? {
         let k = key.uppercased()
         return work.items.first { $0.key == k }

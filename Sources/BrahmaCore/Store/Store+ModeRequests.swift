@@ -20,7 +20,11 @@ public struct ModeRequestRecord: Codable, Equatable, Sendable, FetchableRecord, 
 }
 
 public struct ModeRequestResult: Equatable, Sendable {
-    public enum Kind: Equatable, Sendable { case raised, alreadyThere, duplicate, ultraUnavailable, coolingDown }
+    public enum Kind: Equatable, Sendable {
+        case raised, alreadyThere, duplicate, ultraUnavailable, coolingDown
+        /// Task 14u: an owner `boost` ask was filed (or one is already open), or Brahma policy approved the run.
+        case ultraAsked, ultraApproved
+    }
     public var kind: Kind
     /// Text for the agent.
     public var message: String
@@ -29,13 +33,17 @@ public struct ModeRequestResult: Equatable, Sendable {
 extension Store {
     /// An assignee may raise its own item to R2 (Deep) at most. The change is stored as the item's `rungFloor` and is read when
     /// the next turn starts, so it never alters the turn that asked. Limits: one request per item per three of the agent's
-    /// turns, three per agent per active day, and a repeated `requestId` is answered with the first outcome. Ultra is not
-    /// available until the sandbox lands (5-lite); the engine's failure-path Ultra goes through `fileFailurePathBoost`.
+    /// turns, three per agent per active day, and a repeated `requestId` is answered with the first outcome. An Ultra request
+    /// (`ultra` or `ultra_small`, Task 14u) is routed by the approval table (`UltraApproval.route`): from the assignee or a
+    /// manager or executive in the item's chain, only on the sandboxed profile; the engine's failure-path Ultra goes through
+    /// `fileFailurePathBoost`. Either way the run is admitted only when the engine's hard gates hold at the next turn.
     public static let modeRequestTurnGap = 3
     public static let modeRequestsPerDay = 3
     public static let requestableFloor = 2
     /// A denied (Ultra) request is not repeated on the same item within this many company-active seconds.
     public static let ultraCooldown: Double = 86_400
+    /// The recorded modes of Ultra requests (they have their own cooldown and do not use up the Deep limits).
+    static let ultraModes = UltraVariant.allCases.map(\.rawValue)
 
     @discardableResult
     public func requestMode(companyId: String, by agentId: String, itemKey: String, mode: String, reason: String,
@@ -48,9 +56,16 @@ extension Store {
             guard let item = try WorkItem.filter(Column("companyId") == companyId && Column("key") == itemKey.uppercased()).fetchOne(db) else {
                 throw WorkError.notFound("no work item \(itemKey.uppercased())")
             }
-            guard item.ownerId == agentId else { throw WorkError.forbidden("only the item's assignee can request a mode") }
-            let m = mode.trimmingCharacters(in: .whitespaces).lowercased()
-            guard m == "deep" || m == "ultra" else { throw WorkError.invalid("mode must be deep or ultra") }
+            let m = mode.trimmingCharacters(in: .whitespaces).lowercased().replacingOccurrences(of: "-", with: "_")
+            let variant = UltraVariant(requested: m)
+            guard m == "deep" || variant != nil else { throw WorkError.invalid("mode must be deep, ultra_small or ultra") }
+            let company = try requireCompany(db, companyId)
+            let inChain = try Store.inItemChain(db: db, agent: agent, item: item, catalog: catalog, company: company)
+            let lead = variant != nil && item.ownerId != agentId && inChain
+            guard item.ownerId == agentId || lead else {
+                throw WorkError.forbidden(variant == nil ? "only the item's assignee can request a mode"
+                                          : "only the item's assignee or a manager above it can request Ultra")
+            }
             let why = try redact(reason).components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !why.isEmpty else { throw WorkError.invalid("a reason is required") }
             guard why.count <= 1000 else { throw WorkError.invalid("the reason is longer than 1000 characters") }
@@ -60,10 +75,9 @@ extension Store {
                 return ModeRequestResult(kind: .duplicate, message: "Request \(rid) was already recorded for \(item.key); nothing changed.")
             }
             let active = try Store.activeNow(db: db, companyId: companyId)
-            if m == "ultra" {
-                // Recorded and answered: Ultra arrives with the sandbox. A repeat on the same item within an active day is the
-                // denied-request cooldown, unless a new failed check has come in since.
-                if let last = try ModeRequestRecord.filter(Column("itemId") == item.id && Column("mode") == "ultra")
+            if let variant {
+                // A repeat on the same item within an active day is the cooldown, unless a new failed check has come in since.
+                if let last = try ModeRequestRecord.filter(Column("itemId") == item.id && Store.ultraModes.contains(Column("mode")))
                     .order(Column("id").desc).fetchOne(db), active - last.createdActive < Store.ultraCooldown {
                     let failedSince = try VerificationRun.filter(Column("itemId") == item.id && Column("createdAt") > last.createdAt
                                                                  && ["failed", "timedOut"].contains(Column("status"))).fetchCount(db)
@@ -73,19 +87,40 @@ extension Store {
                     }
                 }
                 var record = ModeRequestRecord(id: nil, companyId: companyId, itemId: item.id, agentId: agentId,
-                                               requestId: rid.flatMap { $0.isEmpty ? nil : $0 }, mode: m, turnId: nil,
+                                               requestId: rid.flatMap { $0.isEmpty ? nil : $0 }, mode: variant.rawValue, turnId: nil,
                                                createdActive: active, createdAt: now)
                 try record.insert(db)
-                return ModeRequestResult(kind: .ultraUnavailable, message: "Ultra arrives with the sandbox (5-lite)")
+                // Ultra exists only on the sandboxed profile, and only while the company keeps an Ultra allowance.
+                let assignee = try item.ownerId.flatMap { try Agent.fetchOne(db, key: $0) } ?? agent
+                guard company.profile(forRole: assignee.role) == .sandboxed else {
+                    return ModeRequestResult(kind: .ultraUnavailable, message: "Ultra runs only on the sandboxed profile; \(item.key) keeps its mode.")
+                }
+                guard company.ultraShare > 0 else {
+                    return ModeRequestResult(kind: .ultraUnavailable, message: "Ultra is off for this company (its Ultra share is 0).")
+                }
+                let routed = try routeUltra(db: db, company: company, item: item, by: .agent(agentId), variant: variant,
+                                            origin: lead ? .lead : .assignee, reason: "@\(agent.name): \(why)", now: now)
+                switch routed.route {
+                case .ownerAsk:
+                    return ModeRequestResult(kind: .ultraAsked, message: routed.existing
+                        ? "\(routed.ask.ref) already asks the owner for an Ultra run on \(item.key); nothing changed."
+                        : "Asked the owner for one \(variant.title) run on \(item.key) (\(routed.ask.ref)). If approved, it runs from a later "
+                            + "turn once the engine's limits allow; this turn is unchanged.")
+                case .policy, .ownerApproved:
+                    return ModeRequestResult(kind: .ultraApproved, message: routed.existing
+                        ? "An approved Ultra run on \(item.key) is already waiting (\(routed.ask.ref)); nothing changed."
+                        : "One \(variant.title) run on \(item.key) was approved by Brahma policy (\(routed.ask.ref); the owner is told). It runs "
+                            + "from a later turn once the engine's limits allow; this turn is unchanged.")
+                }
             }
             // Ultra requests have their own cooldown and do not use up the Deep request limits.
             let today = try ModeRequestRecord.filter(Column("agentId") == agentId && Column("createdActive") > active - 86_400
-                                                     && Column("mode") != "ultra").fetchCount(db)
+                                                     && !Store.ultraModes.contains(Column("mode"))).fetchCount(db)
             guard today < Store.modeRequestsPerDay else {
                 throw WorkError.conflict("you have made \(Store.modeRequestsPerDay) mode requests today; ask your manager instead")
             }
             if let last = try ModeRequestRecord.filter(Column("itemId") == item.id && Column("agentId") == agentId
-                                                       && Column("mode") != "ultra")
+                                                       && !Store.ultraModes.contains(Column("mode")))
                 .order(Column("id").desc).fetchOne(db) {
                 let since: Int
                 if let turnId = last.turnId {

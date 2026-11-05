@@ -1023,5 +1023,36 @@ enum Migrations {
             try db.execute(sql: "ALTER TABLE ownerPrefs ADD COLUMN backupTargets TEXT NOT NULL DEFAULT '[]'")
             try db.execute(sql: "ALTER TABLE ownerPrefs ADD COLUMN walShipping TEXT")
         }
+        m.registerMigration("v5-modes") { db in
+            // Task 14u. The probe gates passed (or failed) per CLI build and probe shape: Task, Ultra and Plan-first on the
+            // sandboxed profile compile only once theirs passed.
+            try db.create(table: "probeGate") { t in
+                t.column("cliFingerprint", .text).notNull()
+                t.column("shape", .text).notNull()
+                t.column("gate", .text).notNull()
+                t.column("passed", .boolean).notNull()
+                t.column("detail", .text)
+                t.column("checkedAt", .datetime).notNull()
+                t.primaryKey(["cliFingerprint", "shape", "gate"])
+            }
+            // One row per admitted Ultra run: its cap is reserved at admission (allowance, 7-day projection and every other
+            // turn's 5-hour check) and released down to what it was charged. `askId`: the approval it used (nil for the owner's
+            // Ultra intensity).
+            try db.create(table: "ultraReservation") { t in
+                t.primaryKey("turnId", .text)
+                t.column("companyId", .text).notNull()
+                t.column("itemId", .text)
+                t.column("variant", .text).notNull()
+                t.column("capLE", .double).notNull()
+                t.column("approvedBy", .text).notNull()
+                t.column("askId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("releasedAt", .datetime)
+                t.column("actualLE", .double)
+            }
+            try db.create(index: "ultraReservation_company", on: "ultraReservation", columns: ["companyId", "createdAt"])
+            try db.create(index: "ultraReservation_ask", on: "ultraReservation", columns: ["askId"])
+            try db.alter(table: "company") { t in t.add(column: "ultraShare", .double).notNull().defaults(to: 0.15) }
+        }
     }
 }

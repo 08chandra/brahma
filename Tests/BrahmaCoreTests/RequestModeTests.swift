@@ -48,12 +48,12 @@ import Testing
         let items = try (0..<4).map { try r.item("Item \($0)") }
         for i in 0..<3 { #expect(try r.ask(items[i], "deep", "d\(i)").kind == .raised) }
         #expect(throws: WorkError.self) { try r.ask(items[3], "deep", "d3") }
-        // An Ultra request is recorded and answered (the sandbox is not there yet); asking again on the same item within an
-        // active day hits the cooldown.
+        // An Ultra request is recorded and routed (Task 14u: an owner boost ask under `important`); asking again on the same
+        // item within an active day hits the cooldown.
         let r2 = try R()
         let u = try r2.item()
         let first = try r2.ask(u, "ultra", "u1")
-        #expect(first.kind == .ultraUnavailable); #expect(first.message == "Ultra arrives with the sandbox (5-lite)")
+        #expect(first.kind == .ultraAsked); #expect(first.message.hasPrefix("Asked the owner for one Ultra run on \(u.key)"))
         #expect(try r2.store.modeRequests(itemId: u.id).map(\.mode) == ["ultra"])
         let again = try r2.ask(u, "ultra", "u2")
         #expect(again.kind == .coolingDown); #expect(again.message.contains("cooldown"))

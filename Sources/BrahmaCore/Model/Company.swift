@@ -51,6 +51,9 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var allowLocalBinding: Bool = true
     /// Extra read-only toolchain paths (absolute or `~/…`), readable on every turn when they exist.
     public var toolchainReadPaths: [String] = []
+    /// The share of the company's weekly share (in $LE) its Ultra runs may use (`"v5-modes"`, Task 14u). Changed only by
+    /// `Store.setUltraShare` (the owner's `brahma settings ultra-share`); `updateCompany` keeps the stored value.
+    public var ultraShare: Double = UltraCaps.max5x.share
 
     /// The profile a turn of an agent with this role runs under: the role's override, else the company's.
     public func profile(forRole role: String) -> PermissionProfile { roleProfiles[role] ?? permissionProfile }

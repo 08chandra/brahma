@@ -156,6 +156,12 @@ public enum ClaudeSettingsCompiler {
     /// Prefix rules (defense in depth; the canary probes the real effect).
     public static let sandboxedBashDenies = ["Bash(launchctl *)", "Bash(security *)", "Bash(osascript *)", "Bash(open *)",
                                              "Bash(crontab *)", "Bash(at *)", "Bash(sudo *)", "Bash(screencapture *)"]
+    /// Ultra (Task 14u, design §2.2): the high-authority company tools a workflow could otherwise call many times as the parent,
+    /// denied outright rather than counted, and the bundled skills that would start their own fan-out.
+    public static let ultraMCPDenies = ["decide", "propose_decision", "escalate_decision", "request_from_owner", "request_access",
+                                       "request_secret", "plan_sprint", "close_sprint", "propose_extension", "request_mode"]
+        .map { "mcp__company__\($0)" }
+    public static let ultraSkillDenies = ["Skill(deep-research)", "Skill(ultrareview)"]
     /// The Task 10 PostToolUse hook's matcher.
     public static let postToolMatcher = "WebFetch|WebSearch|Bash|mcp__.*|Skill|Task|Agent"
 
@@ -219,10 +225,12 @@ public enum ClaudeSettingsCompiler {
         s.fastMode = false
         s.workflowKeywordTriggerEnabled = false
         if let mode { s.maxEffortLevel = mode.maxEffortLevel.rawValue }
-        if profile == .sandboxed, mode?.mode == .ultra, let workflow {
+        if profile == .sandboxed, mode?.mode == .ultra, kind == .work, let workflow {
             s.enableWorkflows = true
             s.workflowSizeGuideline = workflow.sizeGuideline
+            s.maxEffortLevel = Effort.high.rawValue
             allow.append("Workflow")
+            deny += ultraMCPDenies + ultraSkillDenies
         } else {
             s.disableWorkflows = true
         }

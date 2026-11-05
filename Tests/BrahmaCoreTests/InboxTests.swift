@@ -749,10 +749,11 @@ import GRDB
             try w.tools(w.cto).call(name: "request_mode", arguments: ["key": .string(item.key), "mode": .string("deep"), "reason": .string("x"), "request_id": .string("a")])
         }
         #expect(try w.store.workItem(id: item.id)?.rungFloor == 0)
-        // Ultra is not available yet, and never changes the floor or files an ask.
+        // Ultra (Task 14u) never changes the floor: under `important` it files one owner boost ask.
         let u = try w.tools(w.eng).call(name: "request_mode", arguments: ["key": .string(item.key), "mode": .string("ultra"), "reason": .string("x"), "request_id": .string("b")])
-        #expect(u == "Ultra arrives with the sandbox (5-lite)")
-        #expect(try w.store.workItem(id: item.id)?.rungFloor == 0); #expect(try w.store.asks(companyId: w.company.id).isEmpty)
+        #expect(u.hasPrefix("Asked the owner for one Ultra run"))
+        #expect(try w.store.workItem(id: item.id)?.rungFloor == 0)
+        #expect(try w.store.asks(companyId: w.company.id).map(\.kind) == [.boost])
         #expect(throws: ToolError.self) {
             try w.tools(w.eng).call(name: "request_mode", arguments: ["key": .string(item.key), "mode": .string("max"), "reason": .string("x"), "request_id": .string("c")])
         }

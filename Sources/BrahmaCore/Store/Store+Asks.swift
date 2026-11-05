@@ -432,10 +432,9 @@ extension Store {
             if let open = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.boost && Column("itemId") == itemId
                                          && [AskStatus.pendingInternal, .pendingOwner].map(\.rawValue).contains(Column("status")))
                 .fetchOne(db) { return open }
-            return try propose(db: db, companyId: companyId, by: .system, kind: .boost, risk: .high, category: nil,
-                               title: "Ultra for \(item.key) after repeated failures", summary: reason,
-                               payload: AskPayload(question: "Allow one Ultra run on \(item.key)?", details: reason), document: nil, itemId: itemId,
-                               subjectId: itemId, supersedes: nil, requestId: nil, decisionClass: .taste, viaOwner: true, now: now)
+            // Task 14u: the boost card (its text, three options, one active day), always the owner's under every preset.
+            return try routeUltra(db: db, company: try requireCompany(db, companyId), item: item, by: .system, variant: .full,
+                                  origin: .failurePath, reason: reason, now: now).ask
         }
     }
 

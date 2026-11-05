@@ -48,10 +48,17 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
         var gate: Gate?
         /// The result text of the default success (`events == nil`); "done" when nil.
         var text: String?
+        /// Held until the test opens it after this many events were yielded (a turn already running, Task 14u).
+        var pauseAfter: Int?
+        var pauseGate: Gate?
+        /// Builds the events from the request the runner was given (its session id, say); used instead of `events` when set.
+        var make: (@Sendable (TurnRequest) -> [StreamEvent])?
 
         init(events: [StreamEvent]? = nil, sideEffect: (@Sendable (TurnRequest) throws -> Void)? = nil,
-             error: (any Error)? = nil, delay: Duration? = nil, gate: Gate? = nil, text: String? = nil) {
+             error: (any Error)? = nil, delay: Duration? = nil, gate: Gate? = nil, text: String? = nil,
+             pauseAfter: Int? = nil, pauseGate: Gate? = nil, make: (@Sendable (TurnRequest) -> [StreamEvent])? = nil) {
             self.events = events; self.sideEffect = sideEffect; self.error = error; self.delay = delay; self.gate = gate; self.text = text
+            self.pauseAfter = pauseAfter; self.pauseGate = pauseGate; self.make = make
         }
     }
 
@@ -101,6 +108,20 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
                             apiErrorStatus: nil, sessionId: r.agent.sessionId))]
     }
 
+    /// Answers `control` sessions (the zero-inference control probe, Task 14u); nil: none (the default, as 3a's fakes).
+    var controlResponder: (@Sendable (TurnRequest, [JSONValue]) -> ControlTranscript?)? {
+        get { lock.withLock { _controlResponder } } set { lock.withLock { _controlResponder = newValue } }
+    }
+    private var _controlResponder: (@Sendable (TurnRequest, [JSONValue]) -> ControlTranscript?)?
+    private var _controlRequests = 0
+    var controlRequests: Int { lock.withLock { _controlRequests } }
+
+    func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? {
+        guard let responder = controlResponder else { return nil }
+        lock.withLock { _controlRequests += 1 }
+        return responder(request, messages)
+    }
+
     /// Called as each turn reaches the runner (a test opens a `Gate` here to know the turn is in flight).
     var onRun: (@Sendable (TurnRequest) -> Void)? { get { lock.withLock { _onRun } } set { lock.withLock { _onRun = newValue } } }
     private var _onRun: (@Sendable (TurnRequest) -> Void)?
@@ -127,8 +148,9 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
                 do {
                     if let delay = script.delay { try await Task.sleep(for: delay) }
                     if let gate = script.gate { await gate.wait() }
-                    let events = script.events ?? Self.success(request, text: script.text ?? "done")
+                    let events = script.make?(request) ?? script.events ?? Self.success(request, text: script.text ?? "done")
                     for (i, e) in events.enumerated() {
+                        if i == script.pauseAfter, let pause = script.pauseGate { await pause.wait(); try Task.checkCancellation() }
                         if i == events.count - 1 { try script.sideEffect?(request) }
                         continuation.yield(self.cumulative(e))
                     }

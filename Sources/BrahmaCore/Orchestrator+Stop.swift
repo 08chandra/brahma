@@ -3,7 +3,9 @@ import Foundation
 extension Orchestrator {
     /// First step of every tick (Task 7c). While the owner's stop holds: every running turn is cancelled (its process group
     /// gets SIGTERM, then SIGKILL after `ClaudeProcessRunner.killGrace`) and recorded `interrupted`, as at quit; every running
-    /// check is cancelled (its group is killed) and put back in the queue as it was, no attempt counted (`checkCancelled`);
+    /// check is cancelled (its group is killed) and put back in the queue as it was, no attempt counted (`checkCancelled`); an
+    /// Ultra turn's process group goes with it, its workflow agents included, and the run is charged its full cap (F6, Task
+    /// 14u: `UltraAccounting.charge`, released through its reservation when the turn is recorded);
     /// every merge and every git task is cancelled, and each re-reads the stop before it changes anything (a merge right
     /// before each ref it moves: `Store.performMerge`); the observers run once per stop. Admission is held by the caller
     /// (`held`; the restore-marker step and lease git wait too), and active time stands still (`accrueActiveTime`).

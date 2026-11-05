@@ -25,9 +25,10 @@ private func decision(_ edit: (inout ModeInputs) -> Void) -> ModeDecision {
     return ModePolicy.select(i)
 }
 
-private func request(_ d: ModeDecision?, kind: TurnKind = .work, prompt: String = "P", started: Bool = false) -> TurnRequest {
+private func request(_ d: ModeDecision?, kind: TurnKind = .work, prompt: String = "P", started: Bool = false,
+                     profile: PermissionProfile = .workspace) -> TurnRequest {
     var r = TurnRequest(agent: agent(started: started), company: company, prompt: prompt, appendSystemPrompt: "ROLE PROMPT",
-                        mcpConfigPath: "/tmp/run/a1.mcp.json", workingDirectory: "/tmp/ws/acme", profile: .workspace,
+                        mcpConfigPath: "/tmp/run/a1.mcp.json", workingDirectory: "/tmp/ws/acme", profile: profile,
                         environment: ["BRAHMA_AGENT_ID": "a1"])
     r.mode = d
     r.kind = kind
@@ -101,10 +102,10 @@ private let allModes = [quick, standard, deep, deepOpus]
     }
 
     @Test func standardForcesHaikuWorkersDepth1() throws {
-        // Only once the sub-agent gate passes (never on the 3a workspace profile).
+        // Only once the sub-agent gate passes, and only on the sandboxed profile (14u: never on Workspace, whatever the decision).
         var d = standard
         d.subagents = .forced(model: "haiku", depth: 1, concurrent: 2)
-        let p = TurnProfileCompiler.profile(for: request(d))
+        let p = TurnProfileCompiler.profile(for: request(d, profile: .sandboxed))
         let a = TurnProfileCompiler.arguments(p)
         let denied = value(a, "--disallowed-tools")!.split(separator: ",").map(String.init)
         #expect(!denied.contains("Task")); #expect(!denied.contains("Agent")); #expect(denied.contains("Workflow"))
@@ -123,7 +124,7 @@ private let allModes = [quick, standard, deep, deepOpus]
     @Test func deepForcesSonnetWorkers() {
         var d = deep
         d.subagents = .forced(model: "sonnet", depth: 1, concurrent: 3)
-        let p = TurnProfileCompiler.profile(for: request(d))
+        let p = TurnProfileCompiler.profile(for: request(d, profile: .sandboxed))
         #expect(p.environment["CLAUDE_CODE_SUBAGENT_MODEL"] == "sonnet")
         #expect(p.environment["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "3")
         #expect(value(TurnProfileCompiler.arguments(p), "--effort") == "high")
@@ -248,7 +249,7 @@ private let allModes = [quick, standard, deep, deepOpus]
         #expect(ChildEnvironment.engineClaudeVars.count == 11, "1b fix round 1 adds CLAUDE_CODE_TMPDIR")
         // Everything the compiler emits is on the list.
         var d = standard; d.subagents = .forced(model: "haiku", depth: 1, concurrent: 2)
-        for name in TurnProfileCompiler.profile(for: request(d)).environment.keys where name.hasPrefix("CLAUDE_CODE_") {
+        for name in TurnProfileCompiler.profile(for: request(d, profile: .sandboxed)).environment.keys where name.hasPrefix("CLAUDE_CODE_") {
             #expect(ChildEnvironment.engineClaudeVars.contains(name), "\(name)")
         }
     }

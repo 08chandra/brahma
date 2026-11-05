@@ -30,9 +30,10 @@ public enum Effort: String, Codable, CaseIterable, Sendable, Comparable {
     public func lowered(by steps: Int) -> Effort { Effort.allCases[Swift.max(0, index - Swift.max(0, steps))] }
 }
 
-/// A rung is a (model, effort) pair. `opusLow` is used when an Opus-required turn is clamped.
+/// A rung is a (model, effort) pair. `opusLow` is used when an Opus-required turn is clamped. `r5` is Ultra (5-lite, Task
+/// 14u): the session model at effort high with the Workflow tool; only an admitted Ultra run reaches it, never the ladder.
 public enum ModeRung: String, Codable, CaseIterable, Sendable {
-    case r0, r1, r2, r3, r4, opusLow
+    case r0, r1, r2, r3, r4, opusLow, r5
 
     /// Stored on the turn (`turn.rung`); opus-low is stored as 3 with effort `low`.
     public var level: Int {
@@ -42,6 +43,7 @@ public enum ModeRung: String, Codable, CaseIterable, Sendable {
         case .r2: 2
         case .r3, .opusLow: 3
         case .r4: 4
+        case .r5: 5
         }
     }
 
@@ -51,7 +53,7 @@ public enum ModeRung: String, Codable, CaseIterable, Sendable {
         switch self {
         case .r0, .opusLow: .low
         case .r1, .r3: .medium
-        case .r2, .r4: .high
+        case .r2, .r4, .r5: .high
         }
     }
 
@@ -66,6 +68,7 @@ public enum ModeRung: String, Codable, CaseIterable, Sendable {
         case .opusLow: 1.9
         case .r3: 3.7
         case .r4: 5.1
+        case .r5: 15
         }
     }
 
@@ -85,7 +88,7 @@ public enum ModeRung: String, Codable, CaseIterable, Sendable {
         case .r0: .r1
         case .r1: .r2
         case .r2, .opusLow: .r3
-        case .r3, .r4: .r4
+        case .r3, .r4, .r5: .r4
         }
     }
 
@@ -98,6 +101,7 @@ public enum ModeRung: String, Codable, CaseIterable, Sendable {
         case .opusLow: .r2
         case .r3: .opusLow
         case .r4: .r3
+        case .r5: .r4
         }
     }
 
@@ -106,6 +110,7 @@ public enum ModeRung: String, Codable, CaseIterable, Sendable {
         case .r0: .quick
         case .r1: .standard
         case .r2, .r3, .r4, .opusLow: .deep
+        case .r5: .ultra
         }
     }
 }
@@ -171,23 +176,6 @@ public struct ModeCaps: Equatable, Sendable {
     public func budgetLE(opus: Bool) -> Double { opus ? budgetOpusLE : budgetSonnetLE }
 }
 
-/// The Ultra caps per plan tier (design §3.6). Data only: Ultra arrives with the sandbox (5-lite).
-public struct UltraCaps: Equatable, Sendable {
-    public var share: Double
-    public var perCompanyDay: Int
-    public var concurrent: Int
-    public var workflowAgents: Int
-    public var slots: Int
-
-    public static func of(_ tier: PlanTier) -> UltraCaps {
-        switch tier {
-        case .max5x: UltraCaps(share: 0.15, perCompanyDay: 2, concurrent: 1, workflowAgents: 2, slots: 3)
-        case .max20x: UltraCaps(share: 0.15, perCompanyDay: 6, concurrent: 2, workflowAgents: 4, slots: 5)
-        case .pro: UltraCaps(share: 0, perCompanyDay: 0, concurrent: 0, workflowAgents: 0, slots: 0)
-        }
-    }
-}
-
 /// The models a Brahma turn may name, owner pins included (design §4.1).
 public enum ModelAllowlist {
     public static let models: Set<String> = ["haiku", "sonnet", "opus", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
@@ -214,10 +202,17 @@ public enum ModeGates {
     public static let perModeCaps = true
 }
 
-/// The sub-agent gate (design §3.9): `Task` compiles on only when L-2, V-2/V-8, V-3 and V-5 pass, and on the workspace profile
-/// also V-9, which cannot pass while agent Bash is unsandboxed. So it is always off in 3a.
+/// The sub-agent gate (design §3.9): `Task` compiles on only on the sandboxed profile, and only when L-2, V-2 (or V-8 live),
+/// V-3 and V-5 passed for this CLI fingerprint and the sandboxed-Task shape (Task 14u, `ProbeGates`). On the workspace and
+/// full profiles it never passes: their Bash is unsandboxed, so V-9 (nested `claude` fails) cannot hold.
 public enum SubagentGate {
-    public static func passed(profile: PermissionProfile) -> Bool { false }
+    /// The gates of the sandboxed-Task shape (`passed` reads them; `V-2` may be replaced by a live `V-8`).
+    public static let requiredGates: [String] = ["L-2", "V-3", "V-5"]
+
+    public static func passed(profile: PermissionProfile, gates: Set<String> = []) -> Bool {
+        guard profile == .sandboxed else { return false }
+        return requiredGates.allSatisfy(gates.contains) && (gates.contains("V-2") || gates.contains("V-8"))
+    }
 
     public static let workspaceDetail = "off on the workspace profile: sub-agents arrive with the sandbox (5-lite)"
 }
@@ -304,6 +299,15 @@ public struct ModeInputs: Equatable, Sendable {
     public var reviewSpendCapped = false
     /// The last review requested changes and every finding was P2.
     public var p2OnlyFix = false
+    // Ultra (Task 14u).
+    /// The item's type as its confirmed spec names it (nil when the spec is not trusted): Ultra eligibility reads it.
+    public var itemType: String? = nil
+    /// The R4 escalation trigger (design §3.3): the approved run came from the failure path.
+    public var ultraTrigger = false
+    /// An Ultra run the engine admitted for this turn (eligible, approved, every hard gate passed): `select` compiles R5.
+    public var ultra: UltraAdmission? = nil
+    /// Why an approved Ultra run was not admitted: recorded on the turn, which runs the computed non-Ultra rung.
+    public var ultraRefusal: String? = nil
 
     public init() {}
 }
@@ -331,6 +335,8 @@ public struct ModeDecision: Equatable, Sendable {
     public var refusal: String? = nil
     /// The model differs from the session's: an explicit escalation to Opus, recorded as a cache break.
     public var cacheBreak = false
+    /// Ultra's run (Task 14u): set only on an admitted Ultra turn (`mode == .ultra`).
+    public var workflow: UltraWorkflow? = nil
 
     /// `Deep R2 · tier M with risk tags · held by pace`.
     public var reason: String { reasons.joined(separator: "; ") }
@@ -609,7 +615,26 @@ public enum ModePolicy {
         d.cacheBreak = cacheBreak
         if subagents != .off { d.quotas.highRisk = 1 }
         if !launch { d.launch = false }
+        // R5 (Task 14u): an admitted Ultra run replaces the computed rung; a refused one is recorded and the rung runs.
+        if let u = i.ultra, i.turnKind == .work, i.hasItem { return ultra(u, computed: d, i: i, sessionModel: session) }
+        if let why = i.ultraRefusal { d.reasons.append("Ultra not admitted: \(why)") }
         return d
+    }
+
+    /// The Ultra turn (design §2.2–§2.3): the session's model (Ultra never changes it), effort high, 100 turns, the variant's
+    /// cap as `--max-budget-usd` (the approval added it to the item's budget once), 45 minutes, forced Sonnet workers at
+    /// depth 1 with 3 at once, and the workflow policy. High-risk company tools are denied in its settings, not counted.
+    static func ultra(_ u: UltraAdmission, computed d: ModeDecision, i: ModeInputs, sessionModel: String?) -> ModeDecision {
+        let caps = ModeCaps.ultra
+        let model = i.agentModel != "auto" ? i.agentModel : (sessionModel ?? (ModelAllowlist.family(d.model) == "opus" ? "opus" : "sonnet"))
+        var out = ModeDecision(mode: .ultra, rung: .r5, model: model, effort: .high, maxEffortLevel: .high,
+                               maxBudgetUSD: u.variant.capLE, maxTurns: UltraVariant.maxTurns, wallClock: UltraVariant.wallClock,
+                               quotas: caps.quotas,
+                               reasons: d.reasons + ["\(u.variant.title) (R5) approved by \(u.approver.digestName): \(u.basis)"])
+        out.subagents = .forced(model: UltraVariant.workerModel, depth: 1, concurrent: UltraVariant.maxConcurrentSubagents)
+        out.workflow = UltraWorkflow(variant: u.variant, approver: u.approver, maxConcurrentAgents: u.workflowAgents)
+        out.cacheBreak = false
+        return out
     }
 
     /// Review and audit turns: Standard, or Deep at R3 for an effective tier L or a flagged or sensitive item; never Task or

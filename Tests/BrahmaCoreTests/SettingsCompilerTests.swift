@@ -285,12 +285,12 @@ private func pretty(_ settings: ClaudeSettings) throws -> String {
         let w = try CompileWorld()
         var ultra = standard
         ultra.mode = .ultra
+        ultra.workflow = UltraWorkflow(variant: .small, approver: .policy, maxConcurrentAgents: 2)
         for mode in allModes + [ultra, nil] as [ModeDecision?] {
             for profile in PermissionProfile.allCases {
                 for kind in [TurnKind.work, .review, .plan] {
                     let scope = profile == .sandboxed ? try w.scope(kind) : nil
-                    var r = w.request(scope, kind: kind, mode: mode, profile: profile)
-                    r.workflow = WorkflowPolicy(sizeGuideline: "small", maxConcurrentAgents: 2)
+                    let r = w.request(scope, kind: kind, mode: mode, profile: profile)
                     let text = json(r)
                     #expect(!text.contains("ultracode"), "\(profile) \(kind)")
                     #expect(settings(r).ultracode == nil)
@@ -315,19 +315,17 @@ private func pretty(_ settings: ClaudeSettings) throws -> String {
                 if let mode { #expect(s.maxEffortLevel == mode.maxEffortLevel.rawValue) } else { #expect(s.maxEffortLevel == nil) }
             }
         }
-        // Ultra (Task 14u) only with a workflow policy, only sandboxed.
+        // Ultra (Task 14u) only with a workflow policy (an admitted run), only sandboxed.
         var ultra = standard
         ultra.mode = .ultra
-        var r = w.request(try w.scope(.work), mode: ultra)
-        r.workflow = WorkflowPolicy(sizeGuideline: "small", maxConcurrentAgents: 2)
-        let s = settings(r)
+        ultra.workflow = UltraWorkflow(variant: .small, approver: .policy, maxConcurrentAgents: 2)
+        let s = settings(w.request(try w.scope(.work), mode: ultra))
         #expect(s.enableWorkflows == true); #expect(s.disableWorkflows == nil); #expect(s.workflowSizeGuideline == "small")
         #expect(s.permissions?.allow?.contains("Workflow") == true)
-        r.workflow = nil
-        #expect(settings(r).disableWorkflows == true, "no policy: no workflows")
-        var ws = w.request(nil, mode: ultra, profile: .workspace)
-        ws.workflow = WorkflowPolicy(sizeGuideline: "small", maxConcurrentAgents: 2)
-        #expect(settings(ws).disableWorkflows == true, "never on the workspace profile")
+        var noPolicy = ultra
+        noPolicy.workflow = nil
+        #expect(settings(w.request(try w.scope(.work), mode: noPolicy)).disableWorkflows == true, "no policy: no workflows")
+        #expect(settings(w.request(nil, mode: ultra, profile: .workspace)).disableWorkflows == true, "never on the workspace profile")
     }
 
     @Test func nestedClaudeDeniedAllProfiles() throws {

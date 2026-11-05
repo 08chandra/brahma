@@ -170,8 +170,11 @@ extension Store {
         try saveCalibration(db, cal)
     }
 
-    /// $LE reserved by admitted-but-unfinished work (long-running modes reserve their cap; none exist in 3a).
-    public func openReservationLE() -> Double { 0 }
+    /// $LE reserved by admitted-but-unfinished work: the unspent cap of every open Ultra reservation (Task 14u). Counted in
+    /// every other turn's 5-hour check (`UsageGate.evaluateParts`) and in Ultra's own 7-day projection.
+    public func openReservationLE() -> Double {
+        (try? writer.read { db in try Store.openUltraReservationLE(db: db) }) ?? 0
+    }
 
     func recordSpend(_ usd: Double) throws { try writer.write { db in try Store.recordSpend(db, usd) } }
 

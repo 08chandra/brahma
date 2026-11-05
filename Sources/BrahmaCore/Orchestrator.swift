@@ -59,7 +59,7 @@ public actor Orchestrator {
     var fingerprintCache: (value: CLIFingerprint, at: Double)?
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
-    private var runningByCompany: [String: Int] = [:]
+    var runningByCompany: [String: Int] = [:]
     /// Agent id → its turn task.
     var tasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Health work that must never block a tick (doctor re-probe, `claude --version`, HTTPS probe, disk checks).
@@ -395,6 +395,8 @@ public actor Orchestrator {
         // Turns, checks and merges in flight keep the Mac awake (and for a minute after the last one), if the owner allows it.
         sleepGuard.update(running: runningCount() + otherChildren, enabled: (try? store.ownerPrefs().preventSleep) ?? false, now: now)
         let calibration = try store.usageCalibration()
+        // Ultra reservations a dead engine left open are released, charged in full (Task 14u), before they are counted.
+        attempt { try store.releaseOrphanUltraReservations(now: now) }
         let reservedLE = store.openReservationLE()
 
         // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
@@ -667,6 +669,12 @@ public actor Orchestrator {
         var taintMarked = false
         var recordedSources: Set<String> = []
         var labWorkspace: URL?
+        // Task 14u: the Ultra run this turn was admitted for (reserved once it passed the sandbox gate), the watchdog's
+        // agent-count kill, and the turn's leader (for its SIGINT).
+        var ultraPlan: UltraPlan?
+        var ultraReserved = false
+        var agentCapped = false
+        var leaderPid: Int32?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
             labWorkspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -872,10 +880,17 @@ public actor Orchestrator {
 
             // The model of an (agent, item) session is fixed after its first work turn; the effort may vary.
             let fixedModel = wasResume && scope.itemId != nil && review == nil ? slotModel : nil
-            let inputs = modeInputs(kind: review != nil ? .review : audit != nil ? .audit : kind, agent: agent, company: company, template: template,
+            var inputs = modeInputs(kind: review != nil ? .review : audit != nil ? .audit : kind, agent: agent, company: company, template: template,
                                     deciding: deciding, facts: facts, hasItem: review != nil || scope.itemId != nil,
                                     itemBudget: review == nil && itemBudget, sessionModel: fixedModel, sessionTokens: sessionTokens)
-            let mode = ModePolicy.select(inputs)
+            // Task 14u: the item's approved Ultra run is admitted (eligible, every hard gate, a fresh get_usage) or refused.
+            let ultra = await ultraPreflight(kind: review != nil ? .review : audit != nil ? .audit : kind, itemBudget: review == nil && itemBudget,
+                                             facts: facts, inputs: inputs, agent: agent, company: company, profile: profile)
+            inputs.ultraTrigger = ultra.trigger
+            inputs.ultra = ultra.plan?.admission
+            inputs.ultraRefusal = ultra.refusal
+            ultraPlan = ultra.plan
+            var mode = ModePolicy.select(inputs)
             if review != nil, inputs.reviewSpendCapped, let f = facts {
                 attempt { try store.noteReviewSpendCap(item: f.item, now: clock()) }
             }
@@ -883,7 +898,7 @@ public actor Orchestrator {
             if !mode.launch, review == nil {
                 throw ModeNotLaunched(reason: mode.reason, overBudgetItem: scope.itemId)
             }
-            let model = mode.model
+            var model = mode.model
             sent.model = model
             usedModel = model
             modeDecision = mode
@@ -919,6 +934,8 @@ public actor Orchestrator {
                 request.postToolHook = TaintPolicy.postToolHook(executable: mcpExecutable, database: paths.database.path, agentId: agent.id)
                 request.taintFlagFile = TaintFlag.url(home: paths.home, agentId: agent.id)?.path
                 request.taintDatabase = paths.database.path
+                // Task 14u: a Task turn keeps its web tools only once F7-agents passed for this CLI build.
+                request.taskWebTools = passedProbeGates(.sandboxedTask, fingerprint: probeFingerprint()).contains("F7-agents")
                 if let sandboxed {
                     request.sandbox = sandboxed.scope
                     request.shellPrefix = sandboxed.shellPrefix.path
@@ -931,11 +948,29 @@ public actor Orchestrator {
             // The per-launch sandbox gate (Task 3, I2), before anything of the turn is consumed or created: no one-use grant
             // spent, no session reset, no credential, no MCP file. The shape is the one this turn would run with.
             let gate = profile == .sandboxed ? sandboxCanary : nil
+            // Task 14u: a fan-out shape (Task, Ultra) runs only once its own canary key passed. Until then this turn falls back
+            // to the computed rung without it (the shape's canary is asked for in the background); the agent never waits on it.
+            if let gate {
+                for _ in 0..<2 {
+                    guard let launch = CanaryShape.launch(mode) else { break }
+                    let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
+                    if await fanOutVerified(gate: gate, settings: settings, launch: launch, company: company) { break }
+                    inputs = Self.withoutFanOut(inputs, launch: launch)
+                    if mode.workflow != nil { ultraPlan = nil }
+                    mode = ModePolicy.select(inputs)
+                    if !mode.launch, review == nil { throw ModeNotLaunched(reason: mode.reason, overBudgetItem: scope.itemId) }
+                    model = mode.model
+                    sent.model = model
+                    usedModel = model
+                    modeDecision = mode
+                    keepModel = scope.itemId != nil && agent.model == "auto" && !mode.cacheBreak
+                }
+            }
             var gatedShape: String?
             if let gate {
                 let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
-                try await requireSandboxVerified(gate: gate, settings: settings, agent: agent, company: company)
-                gatedShape = settings.shape()
+                try await requireSandboxVerified(gate: gate, settings: settings, agent: agent, company: company, launch: CanaryShape.launch(mode))
+                gatedShape = CanaryShape.key(settings, launch: CanaryShape.launch(mode))
             }
             // The turn launches: its one-use grants are spent now, never by a turn that does not run. A turn that does not
             // launch after all gives them back (`spentGrants`, below).
@@ -948,9 +983,19 @@ public actor Orchestrator {
                 // A grant lost meanwhile rebuilt the scope: its shape is gated again before anything else is created.
                 if prepared.grants.count != asked, let gate {
                     let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
-                    try await requireSandboxVerified(gate: gate, settings: settings, agent: agent, company: company)
-                    gatedShape = settings.shape()
+                    try await requireSandboxVerified(gate: gate, settings: settings, agent: agent, company: company,
+                                                     launch: CanaryShape.launch(mode))
+                    gatedShape = CanaryShape.key(settings, launch: CanaryShape.launch(mode))
                 }
+            }
+            // Task 14u: the admitted Ultra run is reserved now (its approval consumed, the item's budget raised by its cap once,
+            // its extra slots held), and its digest line names who approved it.
+            if let plan = ultraPlan, mode.workflow != nil, let itemId = scope.itemId {
+                try await reserveUltraRun(plan, turnId: turn.id, companyId: company.id, itemId: itemId)
+                ultraReserved = true
+                if let w = mode.workflow { turnPrompt += "\n\n" + UltraDigest.line(w) }
+            } else {
+                ultraPlan = nil
             }
             // The session change decided above, now that the turn launches.
             switch sessionChange {
@@ -998,8 +1043,9 @@ public actor Orchestrator {
             }
             let compiled = TurnProfileCompiler.profile(for: request)
             // Backstop: the shape that runs is the shape that was gated (they differ only if a string-free field changed).
-            if let gate, compiled.settings.shape() != gatedShape {
-                try await requireSandboxVerified(gate: gate, settings: compiled.settings, agent: agent, company: company)
+            if let gate, CanaryShape.key(compiled.settings, launch: CanaryShape.launch(mode)) != gatedShape {
+                try await requireSandboxVerified(gate: gate, settings: compiled.settings, agent: agent, company: company,
+                                                 launch: CanaryShape.launch(mode))
             }
             // Pre-taint (Task 10, F4): a turn that can fan out is tainted at launch until this CLI build passed V-1 (PostToolUse
             // fires for sub-agent and workflow calls), unless it has no network and no web tools.
@@ -1056,7 +1102,16 @@ public actor Orchestrator {
                         lastInfo = info
                         try store.saveRateLimit(info)
                     case .spawned(let pid):
+                        leaderPid = pid
                         try store.setTurnPid(turnId: turn.id, pid: pid)
+                    case .taskProgress:
+                        // Task 14u, the watchdog's agent-count kill: past the variant's distinct workflow agents the turn is
+                        // stopped (SIGINT to its leader, then its whole group as the stream is dropped) and charged its cap.
+                        if let w = mode.workflow, state.workflowAgentIds.count > w.variant.agentKill {
+                            agentCapped = true
+                            Self.interruptLeader(leaderPid)
+                            break events
+                        }
                     case .sandboxNote(let text):
                         try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
                                                             kind: .error, text: text, createdAt: clock()))
@@ -1166,6 +1221,8 @@ public actor Orchestrator {
             end = .interrupted(partial: result)
         } else if abortReason != nil {
             end = .interrupted()
+        } else if agentCapped {
+            end = .interrupted(partial: result)
         } else if case .interrupted? = runnerError as? TurnError {
             // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
             end = .interrupted(partial: result)
@@ -1235,7 +1292,11 @@ public actor Orchestrator {
             subagentsSpawned: state.subagentsSpawned,
             modeNote: state.effortCapRequested.map { "effort '\($0)' exceeded the org cap and was lowered" },
             observation: state.observation,
-            modeModel: modeDecision?.model, modeEffort: modeDecision?.effort)
+            modeModel: modeDecision?.model, modeEffort: modeDecision?.effort,
+            stopReason: agentCapped ? UltraAccounting.agentCapStop : nil,
+            chargeAtLeastLE: ultraReserved && launched
+                ? Self.ultraChargeFloor(ultraPlan, end: end, runnerError: runnerError, agentCapped: agentCapped) : nil,
+            releasesUltra: ultraReserved && launched)
         attempt {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
@@ -1280,6 +1341,9 @@ public actor Orchestrator {
                     text: "@\(agent.name) asked for effort '\(requested)', which exceeds the org cap; the turn ran at the cap",
                     createdAt: now))
             }
+        }
+        if ultraReserved, let plan = ultraPlan {
+            await endUltraRun(plan, turnId: turn.id, companyId: agent.companyId, launched: launched)
         }
         let outcome = end.outcome
         await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)

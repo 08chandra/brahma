@@ -67,6 +67,13 @@ extension Store {
             if let oldest = long.max(by: { $0.1 < $1.1 }) { input.oldestBlockedKey = oldest.0.key; input.oldestBlockedAge = oldest.1 }
             return input
         }
-        return StallExplainer.explain(input, timeZone: ownerTimeZone(), now: now)
+        var report = StallExplainer.explain(input, timeZone: ownerTimeZone(), now: now)
+        // Task 14u (F9): an approved Ultra run that has not started says why.
+        let waiting = (try? writer.read { db in try itemsWaitingForUltra(db: db, companyId: companyId) }) ?? []
+        if !waiting.isEmpty {
+            let why = ultraStatus(companyId: companyId, fingerprint: nil, now: now)
+            if !why.isEmpty { report.reasons.append("Ultra for \(waiting.joined(separator: ", ")) waits: \(why.joined(separator: "; "))") }
+        }
+        return report
     }
 }

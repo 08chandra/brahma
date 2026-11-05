@@ -54,10 +54,12 @@ extension Orchestrator {
     /// Before a sandboxed turn launches (before anything of it is consumed or created): its key must have passed the canary.
     /// Otherwise the agent waits (`canaryWaiting`, filtered out before `Scheduler.select`), a canary run is scheduled for the
     /// key with `settings`, the wait is logged once per key, and `SandboxNotVerified` is thrown. A CLI that cannot be
-    /// fingerprinted fails the turn (`SandboxRefusal`), never launches it.
-    nonisolated func requireSandboxVerified(gate: SandboxCanaryGate, settings: ClaudeSettings, agent: Agent, company: Company) async throws {
+    /// fingerprinted fails the turn (`SandboxRefusal`), never launches it. `launch`: the turn's fan-out shape (Task 14u,
+    /// `CanaryShape.launch`), which has a key of its own.
+    nonisolated func requireSandboxVerified(gate: SandboxCanaryGate, settings: ClaudeSettings, agent: Agent, company: Company,
+                                            launch: String? = nil) async throws {
         let key: SandboxCanaryKey
-        do { key = try await canaryKey(gate: gate, shape: settings.shape()) } catch {
+        do { key = try await canaryKey(gate: gate, shape: CanaryShape.key(settings, launch: launch)) } catch {
             throw SandboxRefusal(reason: "\(error)")
         }
         if try store.sandboxVerified(key) { return }
