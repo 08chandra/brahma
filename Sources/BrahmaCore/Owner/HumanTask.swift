@@ -92,6 +92,14 @@ public enum HumanTaskPolicy {
     public static let asciiLinkMessage = "link addresses must be plain ASCII (punycode for international domains)"
     /// A link title or field label is at most this long (longer ones are cut).
     public static let maxLabel = 100
+    /// An agent's (custom) link, or a URL the owner or an agent types, is at most this long.
+    public static let maxLink = 2048
+    /// A link the engine builds from a template: a 3000-character post percent-encodes to at most 12 characters each (a
+    /// 4-byte character), plus the url and the fixed prefix (fix round 1, I3).
+    public static let maxEngineLink = maxPost * 12 + maxLink + 200
+    public static let linkLengthMessage = "a link is longer than 2048 characters"
+    /// What a human task's JSON (its `AskPayload.details`) may take: a full launch post and its three engine links.
+    public static let maxDetails = 200_000
 
     /// The tainted-session rule's refusal (chief review L4).
     public static let taintedRefusal = "This session has read outside content, so request_human_task can only file a template without links; your next turn starts a fresh session where custom tasks work again."
@@ -274,7 +282,12 @@ public enum HumanTasks {
         for link in task.links {
             guard link.url.lowercased().hasPrefix("https://") else { throw WorkError.invalid(HumanTaskPolicy.linksMessage) }
             guard link.url.unicodeScalars.allSatisfy(\.isASCII) else { throw WorkError.invalid(HumanTaskPolicy.asciiLinkMessage) }
-            guard isValidLink(link.url) else { throw WorkError.invalid(HumanTaskPolicy.linksMessage) }
+            // Engine links (a template's) carry an encoded post and get their own cap; an agent's keep the usual one.
+            let cap = custom ? HumanTaskPolicy.maxLink : HumanTaskPolicy.maxEngineLink
+            guard link.url.count <= cap else {
+                throw WorkError.invalid(custom ? HumanTaskPolicy.linkLengthMessage : "a link is longer than \(cap) characters")
+            }
+            guard isValidLink(link.url, maxLength: cap) else { throw WorkError.invalid(HumanTaskPolicy.linksMessage) }
             guard !link.title.isEmpty else { throw WorkError.invalid("a link needs a title") }
         }
         if custom, task.fields.contains(where: { $0.kind != .url }) { throw WorkError.invalid(HumanTaskPolicy.customFieldsMessage) }
@@ -303,8 +316,12 @@ public enum HumanTasks {
     }
 
     /// `https://<host>…`, plain ASCII, with a host and no user or password, no spaces or control characters.
-    public static func isValidLink(_ s: String) -> Bool {
-        s.unicodeScalars.allSatisfy(\.isASCII) && HostingSettings.isValidProductionURL(s)
+    public static func isValidLink(_ s: String, maxLength: Int = HumanTaskPolicy.maxLink) -> Bool {
+        guard s.count <= maxLength, s.unicodeScalars.allSatisfy(\.isASCII), s.lowercased().hasPrefix("https://"),
+              !s.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) || CharacterSet.whitespaces.contains($0) }),
+              let c = URLComponents(string: s), c.scheme?.lowercased() == "https", let host = c.host, !host.isEmpty,
+              c.user == nil, c.password == nil else { return false }
+        return true
     }
 
     /// `UPPER_SNAKE` (a key's name, `SecretName`-shaped) or `lower_snake`.

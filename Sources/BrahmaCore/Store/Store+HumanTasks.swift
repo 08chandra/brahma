@@ -14,6 +14,11 @@ extension Store {
 
     public static func alreadyRequestedText(_ ask: Ask) -> String { "Already requested as \(ask.ref)." }
 
+    /// The requester's @system DM when the owner did the task: refs only.
+    public static func humanTaskDoneDM(_ ask: Ask, itemKey: String?) -> String {
+        itemKey.map { "\(ask.ref) is done (\($0)). See the Inbox." } ?? "\(ask.ref) is done. See the Inbox."
+    }
+
     static func humanTaskConflict(_ ask: Ask) -> WorkError {
         .conflict("\(ask.ref) is a human task; mark it done or decline it")
     }
@@ -28,7 +33,7 @@ extension Store {
     @discardableResult
     public func requestHumanTask(companyId: String, by agentId: String, template: HumanTaskTemplate?, args: [String: String] = [:],
                                  title: String? = nil, steps: [String] = [], links: [HumanTaskLink] = [], fields: [HumanTaskField] = [],
-                                 itemId: String? = nil, reason: String, now: Date = Store.now()) throws -> (ask: Ask, deduped: Bool) {
+                                 itemId: String? = nil, reason: String?, now: Date = Store.now()) throws -> (ask: Ask, deduped: Bool) {
         let args = try args.mapValues { try redact($0) }
         let title = try redact(title)
         let steps = try steps.map { try redact($0) }
@@ -41,10 +46,14 @@ extension Store {
         let custom: HumanTask? = try template == nil
             ? HumanTasks.custom(title: title ?? "", steps: steps, links: links, fields: fields) : nil
         return try writer.write { db in
-            try fileHumanTask(db, companyId: companyId, requester: .agent(agentId), build: { company, hosting in
+            // No reason (a tainted session's call): the template's own.
+            let why = try reason ?? template.map {
+                HumanTasks.defaultReason($0, provider: try HostingSettings.fetchOne(db, key: companyId)?.provider ?? .default)
+            } ?? custom?.title ?? ""
+            return try fileHumanTask(db, companyId: companyId, requester: .agent(agentId), build: { company, hosting in
                 if let custom { return custom }
                 return try HumanTasks.render(template!, company: company, hosting: hosting, args: args)
-            }, reason: reason, itemId: itemId, now: now)
+            }, reason: why, itemId: itemId, now: now)
         }
     }
 
@@ -168,11 +177,9 @@ extension Store {
                 ask.ownerAnswer = answerJSON
                 ask.ownerDecidedAt = now
                 try settle(db, ask: &ask, status: .answered, decidedBy: "owner", tellRequesterToo: false, now: now)
-                var lines = ["\(ask.ref) is done: \(ask.title)."]
-                let saved = secrets.map(\.name)
-                if !saved.isEmpty { lines.append("Saved to the vault: \(saved.joined(separator: ", ")) (agents never see engine-held keys).") }
-                for f in task.fields where !f.isSecret { if let v = values[f.name] { lines.append("\(f.name): \(v)") } }
-                try tellRequester(db, ask, text: try redact(lines.joined(separator: "\n")), now: now)
+                // An @system DM carries refs only (no agent title, no owner-entered value): the answer stays on the ask.
+                let key = try ask.itemId.flatMap { try WorkItem.fetchOne(db, key: $0)?.key }
+                try tellRequester(db, ask, text: Self.humanTaskDoneDM(ask, itemKey: key), now: now)
                 // The vault last: only the completion that won the pending -> answered transition writes it.
                 for f in secrets {
                     priors.append((f.name, try vault.value(companyId: companyId, name: f.name)))
@@ -272,9 +279,11 @@ extension Store {
                                         && Column("status") == WorkItemStatus.blocked.rawValue).fetchAll(db)
         for var item in items {
             let holder = try Self.leaseHolderId(db: db, itemId: item.id)
-            var to = item.statusBeforeBlock ?? .ready
-            if ![.backlog, .ready, .inProgress].contains(to) { to = .ready }
-            if to == .inProgress, holder == nil { to = .ready }
+            // A live lease means in progress (a claim always is); otherwise the recorded backlog or ready, else ready.
+            let to: WorkItemStatus
+            if holder != nil { to = .inProgress }
+            else if let before = item.statusBeforeBlock, before == .backlog || before == .ready { to = before }
+            else { to = .ready }
             item.status = to
             item.blockedReason = nil; item.blockedSinceActive = nil; item.blockedAskId = nil; item.blockedAskBy = nil
             item.statusBeforeBlock = nil
