@@ -3218,15 +3218,22 @@ extension GitWorkspace {
     /// reachable from any ref or from none: a tag, a note, a detached HEAD or a bare `commit-tree` included), at most `limit`.
     /// The repository is this workspace's root (an agent's lab), read through `GitCommand` (its config scanned, programs off).
     /// Blocking.
-    public func labCommits(limit: Int = 100_000) throws -> [String] {
+    /// A listing that did not cover every object (git's output cut, or `limit` commits reached) throws: recording part of it
+    /// could later record a buried tainted commit as clean (fix round 2, I3-a).
+    public func labCommits(limit: Int = 100_000, maxOutput: Int = 16 << 20) throws -> [String] {
         let out = try main.run(["cat-file", "--batch-all-objects", "--unordered", "--batch-check=%(objectname) %(objecttype)"],
-                               maxOutput: 16 << 20)
+                               maxOutput: maxOutput)
+        guard !out.cut else {
+            throw GitError.failed(command: "cat-file --batch-all-objects", status: -1, stderr: "the object listing was cut at \(maxOutput) bytes")
+        }
         var shas: [String] = []
         for line in out.text.split(separator: "\n") {
             let parts = line.split(separator: " ")
             guard parts.count == 2, parts[1] == "commit" else { continue }
             shas.append(String(parts[0]))
-            if shas.count >= limit { break }
+            guard shas.count < limit else {
+                throw GitError.failed(command: "cat-file --batch-all-objects", status: -1, stderr: "more than \(limit) commits")
+            }
         }
         return shas
     }

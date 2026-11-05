@@ -981,6 +981,11 @@ enum Migrations {
             try db.alter(table: "workItemEvent") { t in t.add(column: "taintedOrigin", .boolean).notNull().defaults(to: false) }
             try db.alter(table: "handoff") { t in t.add(column: "taintedOrigin", .boolean).notNull().defaults(to: false) }
         }
+        m.registerMigration("v5-taint-3") { db in
+            // Task 10 fix round 2 (S18, worktree files): a work item a tainted session created, edited or worked on. Sticky until
+            // the item is done: no later clean edit clears it.
+            try db.alter(table: "workItem") { t in t.add(column: "taintedOrigin", .boolean).notNull().defaults(to: false) }
+        }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
             // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).

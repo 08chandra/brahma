@@ -157,7 +157,7 @@ extension Store {
 
         let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM workItem WHERE companyId = ?",
                                        arguments: [companyId])) ?? 1
-        let item = WorkItem(
+        var item = WorkItem(
             id: UUID().uuidString, companyId: companyId, number: number, key: "\(Self.keyPrefix(slug: company.slug))-\(number)",
             type: draft.type, title: title, description: description, acceptanceCriteria: criteria, checkSpec: checkSpec,
             status: draft.status, priority: priority, points: points, tier: draft.tier, authorId: actor.id,
@@ -174,6 +174,7 @@ extension Store {
            let d = WorkPolicy.denial(.spec, item: item, actor: actor.id, actorKind: actor.kind, leaseHolderId: nil) {
             throw WorkError.forbidden(d)
         }
+        item.taintedOrigin = try writesTainted(db: db, actorId: actor.id)
         try item.insert(db)
         var text = "created \(item.type.rawValue) \"\(title)\""
         if let o = item.ownerId, let h = try Agent.fetchOne(db, key: o)?.name { text += ", assigned to @\(h)" }
@@ -389,6 +390,8 @@ extension Store {
             item.specConfirmedBy = actor.privileged || actor.isLead ? actor.label : nil
         }
         item.updatedAt = now
+        // S18: last written by a tainted session stays marked; a clean edit never clears it.
+        if try writesTainted(db: db, actorId: actor.id) { item.taintedOrigin = true }
         try item.update(db)
 
         let handles = try Self.handles(db, Set([assignment?.old, assignment?.new].compactMap { $0 }))

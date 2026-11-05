@@ -88,7 +88,7 @@ public enum TaintPolicy {
     }
 
     public static func reachesNetwork(_ command: String) -> Bool {
-        bashPatterns.contains { command.range(of: $0, options: .regularExpression) != nil }
+        bashPatterns.contains { command.range(of: $0, options: .regularExpression) != nil } || GitClassifier.reachesNetwork(command)
     }
 
     /// `<id>` of a namespaced name `<id>:<name>` (a leading `/` dropped); nil for a plain name (a built-in).
@@ -123,6 +123,134 @@ public enum TaintPolicy {
 
     static func flat(_ text: String) -> String {
         String(String.UnicodeScalarView(text.unicodeScalars.map { CharacterSet.newlines.union(.controlCharacters).contains($0) ? " " : $0 }))
+    }
+}
+
+/// The deny-by-default git classifier (Task 10 fix round 2, S17). The command is split into simple commands and words the way
+/// a shell would (single and double quotes, backslash escapes, `;`, `&&`, `||`, `|`, `&`, newlines, parentheses); leading
+/// `NAME=value` words and the wrappers `env`, `command`, `exec`, `nohup`, `time`, `xargs` are skipped; `sh|bash|zsh -c <text>`
+/// is classified again. A `git` (any path ending in `/git`) whose subcommand is a network one, or cannot be determined (a word
+/// with `$`, a backtick or a glob, an unknown subcommand such as an alias), reaches the network. Advisory: the sandbox's network
+/// allowlist stays the wall.
+public enum GitClassifier {
+    /// Subcommands that never reach a remote (anything else counts as network).
+    public static let local: Set<String> = [
+        "add", "am", "annotate", "apply", "bisect", "blame", "branch", "bundle", "cat-file", "check-attr", "check-ignore",
+        "check-mailmap", "check-ref-format", "checkout", "checkout-index", "cherry", "cherry-pick", "clean", "column", "commit",
+        "commit-graph", "commit-tree", "config", "count-objects", "describe", "diff", "diff-files", "diff-index", "diff-tree",
+        "difftool", "for-each-ref", "format-patch", "fsck", "gc", "grep", "hash-object", "help", "init", "interpret-trailers",
+        "log", "ls-files", "ls-tree", "mailinfo", "maintenance", "merge", "merge-base", "merge-file", "merge-tree", "mktag",
+        "mktree", "mv", "name-rev", "notes", "prune", "range-diff", "read-tree", "rebase", "reflog", "repack", "rerere", "reset",
+        "restore", "rev-list", "rev-parse", "revert", "rm", "shortlog", "show", "show-branch", "show-ref", "sparse-checkout",
+        "stash", "status", "stripspace", "switch", "symbolic-ref", "tag", "update-index", "update-ref", "var", "verify-commit",
+        "verify-tag", "version", "whatchanged", "worktree", "write-tree",
+    ]
+    /// Global options that take the next word as their value.
+    static let optionsWithValue: Set<String> = ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env",
+                                                "--super-prefix", "--exec-path", "--list-cmds", "--attr-source"]
+    static let wrappers: Set<String> = ["env", "command", "exec", "nohup", "time", "xargs", "builtin", "nice", "sudo", "doas"]
+    static let shells: Set<String> = ["sh", "bash", "zsh", "dash", "ksh"]
+
+    /// `dynamic`: holds an expansion (or an unquoted glob). `splits`: one of them is unquoted, so it may become several words.
+    struct Word: Equatable { var text: String; var dynamic: Bool; var splits: Bool = false }
+    /// Wrapper options that take the next word.
+    static let wrapperValueOptions: Set<String> = ["-u", "-C", "-S", "-n", "-I", "-L", "-P", "-s", "-E", "-d"]
+
+    public static func reachesNetwork(_ command: String, depth: Int = 0) -> Bool {
+        guard depth < 4 else { return true }
+        for simple in split(command) where network(simple, depth: depth) { return true }
+        return false
+    }
+
+    static func network(_ words: [Word], depth: Int) -> Bool {
+        var i = 0
+        // Assignments and wrappers (with their options) before the command.
+        while i < words.count {
+            let w = words[i]
+            if !w.dynamic, w.text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil { i += 1; continue }
+            if wrappers.contains(base(w.text)) {
+                i += 1
+                while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic {
+                    if wrapperValueOptions.contains(words[i].text) { i += 1 }
+                    i += 1
+                }
+                continue
+            }
+            break
+        }
+        guard i < words.count else { return false }
+        let cmd = words[i]
+        if shells.contains(base(cmd.text)), let c = words[(i + 1)...].firstIndex(where: { $0.text == "-c" }), c + 1 < words.count {
+            let inner = words[c + 1]
+            return reachesNetwork(inner.text, depth: depth + 1) || (inner.dynamic && inner.text.contains("git"))
+        }
+        if cmd.text == "eval" { return words[(i + 1)...].contains { $0.dynamic } || reachesNetwork(words[(i + 1)...].map(\.text).joined(separator: " "), depth: depth + 1) }
+        guard base(cmd.text) == "git" || cmd.dynamic && cmd.text.contains("git") else { return false }
+        if cmd.dynamic { return true }
+        var j = i + 1
+        while j < words.count {
+            let w = words[j]
+            // An option word that may split into several (`git $OPTS fetch`) hides the subcommand.
+            if w.splits { return true }
+            guard w.text.hasPrefix("-") else { break }
+            let name = w.text.split(separator: "=", maxSplits: 1).first.map(String.init) ?? w.text
+            if optionsWithValue.contains(name), !w.text.contains("=") {
+                j += 1
+                // A quoted value (`-C "$WT"`) stays one word; an unquoted expansion may not.
+                if j < words.count, words[j].splits { return true }
+            }
+            j += 1
+        }
+        // `git` alone, or only options (`git --version`): local.
+        guard j < words.count else { return false }
+        let sub = words[j].text
+        guard local.contains(sub) else { return true }
+        let rest = words[(j + 1)...]
+        if rest.contains(where: \.dynamic) && ["remote", "submodule", "archive"].contains(sub) { return true }
+        return false
+    }
+
+    /// The basename of a command word (`/usr/bin/git` → `git`).
+    static func base(_ word: String) -> String { word.split(separator: "/").last.map(String.init) ?? word }
+
+    /// Simple commands as words, with shell-like quoting.
+    static func split(_ command: String) -> [[Word]] {
+        var commands: [[Word]] = [], words: [Word] = []
+        var cur = "", dynamic = false, splits = false, inWord = false
+        var quote: Character? = nil
+        var chars = Array(command)
+        var k = 0
+        func endWord() {
+            if inWord { words.append(Word(text: cur, dynamic: dynamic, splits: splits)) }
+            cur = ""; dynamic = false; splits = false; inWord = false
+        }
+        func endCommand() { endWord(); if !words.isEmpty { commands.append(words) }; words = [] }
+        while k < chars.count {
+            let ch = chars[k]
+            if let q = quote {
+                if ch == q { quote = nil }
+                else if q == "\"", ch == "\\", k + 1 < chars.count { k += 1; cur.append(chars[k]) }
+                else { if q == "\"", ch == "$" || ch == "`" { dynamic = true }; cur.append(ch) }
+                k += 1; continue
+            }
+            switch ch {
+            case "'", "\"": quote = ch; inWord = true
+            case "\\":
+                if k + 1 < chars.count { k += 1; if chars[k] != "\n" { cur.append(chars[k]); inWord = true } }
+            case " ", "\t": endWord()
+            case "\n", ";", "&", "|", "(", ")", "{", "}": endCommand()
+            case "$", "`", "*", "?", "[":
+                dynamic = true; splits = true; inWord = true; cur.append(ch)
+            default:
+                inWord = true; cur.append(ch)
+            }
+            k += 1
+        }
+        // An unclosed quote: the rest is one undeterminable word.
+        if quote != nil { dynamic = true; splits = true }
+        endCommand()
+        chars.removeAll()
+        return commands
     }
 }
 
@@ -264,15 +392,20 @@ public enum OwnerImpersonation {
 
     /// Matched case-insensitively on `normalized(text)`, the form the recipient reads (I1).
     public static let patterns: [String] = [
-        #"\b(i am|i'm|im|this is|it's|its|here is|speaking as|acting as)\s+(the\s+)?(company\s+)?owner\b"#,
+        #"\b(i am|i'm|im|this is|it's|here is|speaking as|acting as)\s+(the\s+)?(company\s+)?owner\b"#,
+        #"\bper\s+(the\s+)?owner\b"#,
+        #"\[\s*owner\s*\]"#,
         #"\bon behalf of\s+(the\s+)?owner\b"#,
         #"\b(message|messages|instructions?|note|orders?|word|directive|request)\s+from\s+(the\s+)?owner\b"#,
         #"\bowner\s+((has|had|have)\s+)?(says|said|wants|wanted|approved|approves|asked|told|authori[sz]ed|authori[sz]es|confirmed|signed off|decided|ordered|instructed)\b"#,
         #"\b(approved|authori[sz]ed|confirmed|signed off)\s+by\s+(the\s+)?owner\b"#,
         #"\b(the\s+)?(brahma\s+)?engine\s+((has|had)\s+)?(approved|authori[sz]ed|says|said)\b"#,
-        // An engine line marker anywhere in the text: `owner:`, `@owner:`, `@system:` (a forged digest line mid-text).
-        #"(^|[^a-z0-9_])@?owner\s*:"#,
+        // Engine line markers: `@owner:` / `@system:` anywhere; a bare `owner:` only where a line or a digest-shaped line
+        // (`- `, `- DM `, `- #channel `) starts, so "code owner: team-a" is ordinary text.
+        #"@owner\s*:"#,
         #"@system\s*:"#,
+        #"^\s*owner\s*:"#,
+        #"(^|\s)-\s+((dm|mention in dm|#[a-z0-9_-]+)\s+)?owner\s*:"#,
     ]
 
     /// What the recipient reads, folded for matching: Cc/Cf characters (zero-width, bidi, format) and line breaks as spaces
@@ -281,15 +414,23 @@ public enum OwnerImpersonation {
     public static func normalized(_ text: String) -> [String] {
         let blocked = CharacterSet.newlines.union(.controlCharacters).union(.illegalCharacters)
         func fold(_ s: String) -> String {
-            let nfkc = s.precomposedStringWithCompatibilityMapping.replacingOccurrences(of: "\u{2019}", with: "'")
+            // NFKD with combining marks dropped (`ówner`, `o̶wner`), then lookalikes and digits-for-letters folded.
+            let nfkd = s.decomposedStringWithCompatibilityMapping.replacingOccurrences(of: "\u{2019}", with: "'")
                 .replacingOccurrences(of: "\u{2018}", with: "'").replacingOccurrences(of: "\u{02BC}", with: "'")
-            let mapped = String(String.UnicodeScalarView(nfkc.unicodeScalars.map { confusables[$0] ?? $0 }))
+            let marks: Set<Unicode.GeneralCategory> = [.nonspacingMark, .enclosingMark, .spacingMark]
+            let mapped = String(String.UnicodeScalarView(nfkd.unicodeScalars.filter { !marks.contains($0.properties.generalCategory) }
+                .map { confusables[$0] ?? $0 }))
             return mapped.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         }
         let spaced = String(String.UnicodeScalarView(text.unicodeScalars.map { blocked.contains($0) ? " " : $0 }))
         let dropped = String(String.UnicodeScalarView(text.unicodeScalars.filter { $0.properties.generalCategory != .format }
             .map { blocked.contains($0) ? " " : $0 }))
-        return Array(Set([fold(spaced), fold(dropped)]))
+        // Each line on its own too, so a line-start marker on a later line is seen.
+        let lines = text.components(separatedBy: CharacterSet.newlines).map { line in
+            String(String.UnicodeScalarView(line.unicodeScalars.filter { $0.properties.generalCategory != .format }
+                .map { blocked.contains($0) ? " " : $0 }))
+        }
+        return Array(Set([fold(spaced), fold(dropped)] + lines.map(fold)))
     }
 
     /// Cyrillic and Greek letters that render like Latin ones (the confusables skeleton for the letters of the patterns).
@@ -302,6 +443,10 @@ public enum OwnerImpersonation {
             ("ο", "o"), ("α", "a"), ("ε", "e"), ("ρ", "p"), ("ν", "v"), ("τ", "t"), ("κ", "k"), ("ι", "i"), ("υ", "u"), ("ω", "w"),
             ("η", "n"), ("Ο", "O"), ("Α", "A"), ("Ε", "E"), ("Ρ", "P"), ("Τ", "T"), ("Κ", "K"), ("Ι", "I"), ("Ν", "N"), ("Ω", "W"),
             ("Η", "H"), ("Χ", "X"), ("Υ", "Y"), ("Β", "B"), ("Μ", "M"), ("Ζ", "Z"),
+            // Armenian and Latin small capitals.
+            ("օ", "o"), ("ո", "n"), ("ս", "u"), ("հ", "h"), ("ᴏ", "o"), ("ᴡ", "w"), ("ɴ", "n"), ("ᴇ", "e"), ("ʀ", "r"),
+            // Digits for letters ("0wner", "own3r").
+            ("0", "o"), ("3", "e"), ("1", "l"),
         ]
         var out: [Unicode.Scalar: Unicode.Scalar] = [:]
         for (a, b) in pairs { out[a.unicodeScalars.first!] = b.unicodeScalars.first! }

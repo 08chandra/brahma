@@ -771,7 +771,10 @@ public actor Orchestrator {
                 // leaseholder's updates are its work, so its turns stay work turns.
                 if c.onlyNotices, c.lease == nil { kind = .notice }
                 scope = kind == .notice ? .base : c.scope
-                if scope != c.scope { c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: scope)) ?? [] }
+                if scope != c.scope {
+                    c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: scope)) ?? []
+                    c.summariesTainted = (try? store.recentTurnSummariesTainted(agentId: agent.id, scope: scope)) ?? true
+                }
                 if let itemId = scope.itemId {
                     // A leaseholder's failed checks and review rejections may raise the item's floor before this turn picks
                     // its rung (design §3.3), so the fix turn already runs at it.
@@ -1231,6 +1234,8 @@ public actor Orchestrator {
         }
         // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
         // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.
+        // A tainted holder turn marks its item (fix round 2: its worktree files came from a tainted session).
+        if launched, leaseHead != nil { attempt { try store.markHeldItemsIfTainted(agentId: agent.id) } }
         if launched, let labWorkspace {
             let (store, handle, turnId, ended) = (self.store, agent.name, turn.id, now)
             let tainted = ((try? store.agent(id: agent.id)) ?? nil)?.sessionTainted ?? true

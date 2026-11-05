@@ -49,11 +49,32 @@ extension Store {
             try db.execute(sql: """
                 UPDATE turn SET taintedAt = ?, taintSource = ? WHERE agentId = ? AND outcome = ? AND taintedAt IS NULL
                 """, arguments: [now, shown, agentId, TurnOutcome.inProgress.rawValue])
+            // The item the agent holds is now worked on by a tainted session (its worktree files, fix round 2).
+            try Store.markHeldItemsTainted(db: db, agentId: agentId)
             guard !agent.sessionTainted else { return }
             try db.execute(sql: "UPDATE agent SET sessionTainted = 1 WHERE id = ?", arguments: [agentId])
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: nil, kind: .error,
                               text: "@\(agent.name) read outside content (\(shown)); its high-risk tools are off until a fresh session",
                               createdAt: now).insert(db)
+        }
+    }
+
+    /// Marks every item the agent holds a lease on (worktree files written by a tainted session); done items are left alone.
+    static func markHeldItemsTainted(db: Database, agentId: String) throws {
+        try db.execute(sql: """
+            UPDATE workItem SET taintedOrigin = 1 WHERE status <> 'done'
+              AND id IN (SELECT itemId FROM \(WorkLease.databaseTableName) WHERE agentId = ?)
+            """, arguments: [agentId])
+    }
+
+    /// At a holder turn's end (fix round 2): a session that is tainted now marks the items it holds, even when the taint came
+    /// from an earlier turn of the same session.
+    public func markHeldItemsIfTainted(agentId: String) throws {
+        try writer.write { db in
+            guard let agent = try Agent.fetchOne(db, key: agentId) else { return }
+            var tainted = agent.sessionTainted
+            if !tainted, let home = dataHome, let flag = TaintFlag.url(home: home, agentId: agentId) { tainted = TaintFlag.exists(flag) }
+            if tainted { try Store.markHeldItemsTainted(db: db, agentId: agentId) }
         }
     }
 
@@ -170,7 +191,7 @@ public enum LabProvenance {
 
     /// Blocking (git).
     public static func record(store: Store, workspace: URL, handle: String, companyId: String, agentId: String, turnId: String?,
-                              tainted: Bool, now: Date) -> Outcome {
+                              tainted: Bool, now: Date, limit: Int = 100_000, maxOutput: Int = 16 << 20) -> Outcome {
         let root = workspace.resolvedForSandbox.path
         let lab = URL(fileURLWithPath: root).appending(path: ".brahma/labs/\(handle)", directoryHint: .isDirectory)
         let gitDir = lab.appending(path: ".git", directoryHint: .isDirectory)
@@ -184,9 +205,26 @@ public enum LabProvenance {
         default:
             return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's .git is not a directory", now: now)
         }
+        // Object stores and history the lab borrows or rewrites are refused (I3-b): alternates, grafts, a shallow file, replace refs.
+        for rel in ["objects/info/alternates", "objects/info/http-alternates", "info/grafts", "shallow"]
+        where SandboxPath.kind(gitDir.appending(path: rel).path) != .missing {
+            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab has \(rel)", now: now)
+        }
+        let replace = gitDir.appending(path: "refs/replace").path
+        // Read without following a link (EngineFiles); a packed-refs that cannot be read whole is refused below.
+        let packedData = try? EngineFiles.read(workspace: URL(fileURLWithPath: root), dir: ".brahma/labs/\(handle)/.git", name: "packed-refs",
+                                               limit: 8 << 20)
+        if packedData == nil, SandboxPath.kind(gitDir.appending(path: "packed-refs").path) != .missing {
+            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's packed-refs cannot be read", now: now)
+        }
+        let packed = packedData.flatMap { $0 }.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        if SandboxPath.kind(replace) != .missing, !((try? FileManager.default.contentsOfDirectory(atPath: replace)) ?? ["?"]).isEmpty
+            || packed.contains("refs/replace/") {
+            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab has replace refs", now: now)
+        }
         let git = store.gitWorkspace(root: lab, companyId: companyId)
         do {
-            let shas = try git.labCommits()
+            let shas = try git.labCommits(limit: limit, maxOutput: maxOutput)
             return .recorded(try store.recordLabCommits(agentId: agentId, turnId: turnId, shas: shas, tainted: tainted, now: now))
         } catch {
             return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "\(error)", now: now)

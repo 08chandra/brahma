@@ -263,6 +263,9 @@ public struct CompanyTools: Sendable {
     /// Marks this agent's session tainted because it is about to read what a tainted session wrote (I2). A mark that cannot be
     /// written refuses the read.
     func relayTaint(_ source: String) throws {
+        // A review or audit turn is never relay-tainted (its `review`/`audit` would be refused: a deadlock); the digest and the
+        // `untrusted` fields frame the content, and a marked item is never auto-approved.
+        guard reviewItemId == nil, auditTurnId == nil else { return }
         do { try store.markTainted(agentId: agentId, source: source) } catch {
             diagnostics("brahma mcp: could not mark @\(agentId) tainted: \(error)")
             throw ToolError(message: "this content could not be shown safely right now; try again next turn")

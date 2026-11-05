@@ -38,9 +38,12 @@ extension Orchestrator {
             diff = ("(the diff could not be produced: \(String(describing: error).prefix(200)))", false)
         }
         let run = try store.passingVerification(itemId: item.id, commit: commit)
+        // A marked item, or a submission a tainted session wrote, is framed as untrusted; the review turn is not tainted by it.
+        let submitted = try store.itemEvents(itemId: item.id, limit: 200).last(where: { $0.kind == .submitted })
         let digest = ReviewDigest.render(item: item, run: run, nameStatus: names, diff: diff,
                                          dependencies: try store.dependencies(itemId: item.id),
-                                         worktree: git.worktreePath(key: item.key).path, timeZone: store.ownerTimeZone())
+                                         worktree: git.worktreePath(key: item.key).path, timeZone: store.ownerTimeZone(),
+                                         untrusted: item.taintedOrigin || submitted?.taintedOrigin == true)
         return ReviewTurnContext(item: item, worktree: git.worktreePath(key: item.key), digest: digest,
                                  deep: item.tier == .l || !item.reviewFlags.isEmpty)
     }

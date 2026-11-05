@@ -183,7 +183,9 @@ extension Store {
     /// non-implementer (`autoMergeProvenanceHolds`); the first review round with no review flag and no earlier change request;
     /// no merge pending; a recorded base; and neither the assignee, the lease holder nor the submitter on full review.
     func autoMergeCandidate(db: Database, item: WorkItem, run: VerificationRun) throws -> Bool {
-        guard item.tier == .s, item.checkSpec != nil, item.reviewFlags.isEmpty, item.status == .inReview, item.mergeState == .none,
+        // A marked item (a tainted session wrote its spec or code) always gets a real review (Task 10 fix round 2).
+        guard !item.taintedOrigin, !(try writesTainted(db: db, actorId: run.requestedBy ?? "")),
+              item.tier == .s, item.checkSpec != nil, item.reviewFlags.isEmpty, item.status == .inReview, item.mergeState == .none,
               item.reviewRound == 1, item.reviewedRound == 0, item.baseCommit != nil, run.purpose == .submit, !run.flaky,
               let company = try Company.fetchOne(db, key: item.companyId),
               company.autoMergeSmall, try Self.ownerAutoMerge(db: db), catalog.pack(company.packId)?.autoMerge == true

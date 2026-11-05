@@ -182,6 +182,9 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     /// Who held the lease when `branchMoved` was set (nil when nobody did): re-adopting is refused to that agent and needs
     /// its direct manager, an executive or the owner, whoever holds the item since. Cleared only with the flag.
     public var branchMovedHolderId: String? = nil
+    /// A session that had read outside content created, edited or worked on the item (Task 10 fix round 2, S18): its readers
+    /// are tainted, its review frames it as untrusted and it is never auto-approved. Sticky until the item is done.
+    public var taintedOrigin: Bool = false
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

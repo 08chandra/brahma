@@ -2056,6 +2056,24 @@ extension ReviewTests {
         try r.store.reviewAudits(companyId: r.company.id).first { $0.itemId == itemId }
     }
 
+    /// Task 10 fix round 2: a holder whose session read outside content marks its item; the item is never auto-approved, and
+    /// its review frames it as untrusted while the reviewer keeps `review`.
+    @Test func taintedHolderItemIsReviewedNotAutoMerged() async throws {
+        let r = try R()
+        let i = try await submitted(r, by: r.eng, files: ["src/small.txt": lines(20)], edit: { _ in
+            try r.store.markTainted(agentId: r.eng.id, source: "WebFetch")
+        })
+        #expect(try r.fresh(i).taintedOrigin, "the held item is marked")
+        try keptForReview(r, i, "a marked item")
+        let context = try #require(try Orchestrator.prepareReview(store: r.store, agent: r.rev, company: r.company))
+        #expect(context.digest.contains(ReviewDigest.untrustedNotice))
+        #expect(context.digest.contains("- " + ReviewDigest.untrustedFlag))
+        // The review turn is not relay-tainted: show_work_item on its own item works, and so does review.
+        let tools = CompanyTools(store: r.store, companyId: r.company.id, agentId: r.rev.id, reviewItemId: i.id)
+        _ = try tools.call(name: "show_work_item", arguments: ["key": .string(i.key)])
+        #expect(!(try #require(try r.store.agent(id: r.rev.id)).sessionTainted))
+    }
+
     @Test func smallTierSAutoMerges() async throws {
         let r = try R()
         let i = try await submitted(r, by: r.eng, files: ["src/small.txt": lines(20)])

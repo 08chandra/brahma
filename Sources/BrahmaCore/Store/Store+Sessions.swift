@@ -210,6 +210,22 @@ extension Store {
         }
     }
 
+    /// Whether one of `recentTurnSummaries` comes from a turn that read outside content (fix round 2).
+    func recentTurnSummariesTainted(agentId: String, scope: SessionScope, limit: Int = 3) throws -> Bool {
+        try writer.read { db in
+            let itemClause = scope.itemId == nil ? "itemId IS NULL" : "itemId = ?"
+            var args: [DatabaseValueConvertible] = [agentId]
+            if let id = scope.itemId { args.append(id) }
+            args.append(limit)
+            let rows = try Bool.fetchAll(db, sql: """
+                SELECT taintedAt IS NOT NULL FROM turn WHERE agentId = ? AND \(itemClause) AND outcome = 'succeeded'
+                AND kind IN ('work', 'plan', 'notice') AND sessionResetReason IS NULL AND summary IS NOT NULL AND summary <> ''
+                ORDER BY startedAt DESC, rowid DESC LIMIT ?
+                """, arguments: StatementArguments(args))
+            return rows.contains(true)
+        }
+    }
+
     // MARK: Plan turns
 
     /// A plan turn's plan: an item event (`planWritten`), quoted into the next orientation and the Continuity block. The
