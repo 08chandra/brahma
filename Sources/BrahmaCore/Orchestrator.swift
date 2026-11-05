@@ -114,7 +114,7 @@ public actor Orchestrator {
     nonisolated let pushDispatcher: PushDispatcher
     var pushTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// The owner's emergency stop (Task 7c): what else a stop reaches (previews, deploys, merge queues, browsers, connectors).
-    /// The release executor is always one of them (Plan L Task 7).
+    /// The release executor (Plan L Task 7) and the preview runner (L-5lite-A) are always among them.
     nonisolated let stopObservers: [any EmergencyStopObserver]
     /// How a running turn's supervision waits between its reads of the stop (awake time; tests inject their own).
     nonisolated let stopPollSleep: @Sendable (Duration) async throws -> Void
@@ -183,13 +183,15 @@ public actor Orchestrator {
             adapters: releaseDeps.adapters, sleep: releaseDeps.sleep, clock: clock, blocking: engineBlocking,
             environment: releaseDeps.environment ?? checkBaseEnvironment)
         self.releaseExecutor = executor
-        self.stopObservers = stopObservers + [executor]
         // Previews (Plan L): the platform sandbox with the checks' baseline by default (`defaultPreviewDependencies`).
         let previewDeps = previewDeps ?? Orchestrator.defaultPreviewDependencies(store: store, paths: paths)
-        self.previewRunner = PreviewRunner(store: store, paths: paths, deps: previewDeps,
-                                           sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
-                                           timeouts: PreviewTimeouts(), memory: { memory.current != .normal }, clock: clock,
-                                           blocking: engineBlocking, environment: checkBaseEnvironment)
+        let previews = PreviewRunner(store: store, paths: paths, deps: previewDeps,
+                                     sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
+                                     timeouts: PreviewTimeouts(), memory: { memory.current != .normal }, clock: clock,
+                                     blocking: engineBlocking, environment: checkBaseEnvironment)
+        self.previewRunner = previews
+        // The owner's stop reaches the release executor (its steps and smokes) and every preview (L-5lite-A) too.
+        self.stopObservers = stopObservers + [executor, previews]
         self.backupTools = backupTools; self.walSleeper = walSleeper; self.sleepGuard = sleepGuard
         // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
         let vault = vault.nonInteractive()

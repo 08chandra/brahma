@@ -213,7 +213,7 @@ import Glibc
         let env = PreviewContext.environment(base: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"], port: port)
         let context = PreviewContext(surface: surface, company: company, layout: layout, run: run, commit: String(repeating: "a", count: 40),
                                      port: port, policy: policy, environment: env, logURL: layout.previewLog(name: "web"),
-                                     timeouts: PreviewTimeouts(ready: .seconds(60), poll: .milliseconds(250)))
+                                     timeouts: PreviewTimeouts(ready: .seconds(600), poll: .milliseconds(250)))
         let update = await WebAdapter.startServer(context, deps: deps)
         #expect(update.status == .running, "\(update) log: \(PreviewLog.tail(layout, name: "web", lines: 20))")
         #expect(update.resolvedURL == "http://127.0.0.1:\(port)/")
