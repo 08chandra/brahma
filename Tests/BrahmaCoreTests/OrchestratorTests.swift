@@ -526,7 +526,7 @@ import GRDB
         #expect(try w.agent(c).blocker == .usageLimit(until: t.addingTimeInterval(3600)))
 
         bobGate.open()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(try w.turns(b).map(\.outcome) == [.succeeded])
         #expect(try w.pending(b) == 0, "bob's items are delivered")
         #expect(try w.agent(b).state == .sleeping)
@@ -709,7 +709,7 @@ import GRDB
             #expect(await w.orchestrator.runningCount() <= 3)
             try await Task.sleep(for: .milliseconds(20))
         }
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(w.fake.maxConcurrent == 3)
         #expect(w.fake.requests.count == 10)
         for a in agents { #expect(try w.turns(a).map(\.outcome) == [.succeeded]) }
@@ -724,7 +724,7 @@ import GRDB
         #expect(await w.orchestrator.runningCount() == 1)
         await #expect(throws: OrchestratorError.self) { try await w.orchestrator.waitUntilIdle(timeout: .milliseconds(50)) }
         gate.open()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(await w.orchestrator.runningCount() == 0)
     }
 
@@ -757,7 +757,7 @@ import GRDB
         awake.advance(by: .seconds(60))
         await #expect(throws: OrchestratorError.self) { try await timingOut.value }
         stuck.open()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
 
         // The default clock is the suspending one (it stands still while the Mac sleeps), not the continuous one.
         #expect(Orchestrator.idleBackstopClock is SuspendingClock)

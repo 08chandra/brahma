@@ -255,15 +255,37 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
 }
 
 @Suite(.scratch, .serialized) struct DoctorExecTests {
+    /// Asserts the kill and the throw, not how long they took (a wall-clock bound failed under parallel load at 60.2 s): the
+    /// hung process writes its pid, then becomes a 600 s sleep; once the exec has thrown its timeout, that process is gone.
+    /// Only a kill can explain that, since nothing else ends a 600 s sleep before the test does. A run whose timeout fired
+    /// before the shell wrote its pid proves nothing, so it is repeated with a doubled timeout (bounded: 0.3 s … 38.4 s).
     @Test func aHangingProcessIsKilledAtTheTimeoutAndThrows() async throws {
-        let started = AwakeTime.uptime()
-        do {
-            _ = try await Doctor.execProcess(executable: "/bin/sleep", arguments: ["120"], timeout: 0.3, blocking: Blocking())
-            Issue.record("expected a timeout")
-        } catch let e as Doctor.ExecTimedOut {
-            #expect(e.description.contains("did not finish within"), "\(e)")
+        let dir = try tempDir()
+        var timeout: TimeInterval = 0.3
+        for attempt in 0..<8 {
+            let file = dir.appending(path: "hung-\(attempt).pid")
+            do {
+                _ = try await Doctor.execProcess(executable: "/bin/sh", arguments: ["-c", "echo $$ > '\(file.path)'; exec /bin/sleep 600"],
+                                                 timeout: timeout, blocking: Blocking())
+                Issue.record("expected a timeout")
+                return
+            } catch let e as Doctor.ExecTimedOut {
+                #expect(e.description.contains("did not finish within"), "\(e)")
+            }
+            if let pid = Self.pidLine(file) {
+                // Gone, or a zombie (dead, not yet reaped): either way it no longer runs.
+                let gone: Bool
+                switch ProcessTable.lookup(pid) {
+                case .found(let e): gone = e.isZombie
+                case .absent: gone = true
+                case .unreadable: gone = false                                // fail closed
+                }
+                #expect(gone, "the hung process outlived its timeout")
+                return
+            }
+            timeout *= 2
         }
-        #expect(AwakeTime.uptime() - started < 60, "killed long before the 120 s sleep ends")
+        Issue.record("the shell never wrote its pid, even with a 38 s timeout")
     }
 
     /// The engine's bounded tool runs (doctor, rclone, zstd/gzip, lsof) all go through `GroupExec`: a hung tool's children

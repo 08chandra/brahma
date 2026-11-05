@@ -105,9 +105,9 @@ private let open: @Sendable (Company) -> UsageDecision = { _ in .open }
         let o = Orchestrator(store: store, runner: fake, paths: BrahmaPaths(home: root.appending(path: "h"), workspaces: root.appending(path: "ws")),
                              mcpExecutable: "/x", clock: clock.function, memory: memory)
         _ = try MessageRouter(store: store).sendDM(companyId: c.id, from: .owner, to: "ceo", text: "go", now: clock.now)
-        await o.tick(); try await o.waitUntilIdle(timeout: .seconds(60))
+        await o.tick(); try await o.waitUntilIdle(timeout: .seconds(300))
         #expect(fake.requests.isEmpty)
-        memory.set(.normal); await o.tick(); try await o.waitUntilIdle(timeout: .seconds(60))
+        memory.set(.normal); await o.tick(); try await o.waitUntilIdle(timeout: .seconds(300))
         #expect(fake.requests.count == 1)
         _ = ceo
     }

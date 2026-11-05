@@ -43,7 +43,7 @@ private struct TimerWorld {
 
     func cycle() async throws {
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(5))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
     }
 
     func timer(_ name: String, in companyId: String?) throws -> EngineTimer {
@@ -233,10 +233,10 @@ private struct TimerWorld {
         await w.orchestrator.tick()                // due again, but the first run is still going
         #expect(await counter.started == 1)
         await gate.open()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         await w.orchestrator.tick()                // now it may run again
         while await counter.started < 2 { try await Task.sleep(for: .milliseconds(5)) }
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(5))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(await counter.started == 2)
     }
 

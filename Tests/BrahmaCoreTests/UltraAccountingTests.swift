@@ -150,7 +150,7 @@ enum BrahmaToolsForUltra {
         #expect(u.store.openReservationLE() == 15, "reserved while it runs")
         try u.store.emergencyStop(note: nil, by: "owner", now: u.world.clock.now)
         u.world.stopPoll.step()
-        try await u.world.orchestrator.waitUntilIdle(timeout: .seconds(30))
+        try await u.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         pause.open()
         let t = try u.lastTurn()
         #expect(t.mode == "ultra"); #expect(t.outcome == .interrupted)

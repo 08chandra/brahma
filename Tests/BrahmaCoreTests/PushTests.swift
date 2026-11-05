@@ -440,7 +440,7 @@ final class RecordingTransport: PushTransport, @unchecked Sendable {
                              paths: BrahmaPaths(home: root.appending(path: "h"), workspaces: root.appending(path: "ws")),
                              mcpExecutable: "/x", pushChannel: channel)
         await o.tick()
-        try await o.waitUntilIdle(timeout: .seconds(20))
+        try await o.waitUntilIdle(timeout: .seconds(300))
         #expect(channel.sent.map(\.body) == ["Brahma: 1 thing needs you"])
         #expect(try store.duePushNotices().isEmpty)
     }

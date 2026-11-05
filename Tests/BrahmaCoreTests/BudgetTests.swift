@@ -445,7 +445,7 @@ import GRDB
                                               Self.result(session: "s")]))
         try w.dm(c, eng)
         await orch.tick()
-        try await orch.waitUntilIdle(timeout: .seconds(60))
+        try await orch.waitUntilIdle(timeout: .seconds(300))
         let turn = try #require(try w.turns(eng).first)
         #expect(turn.outcome == .interrupted, "the turn was stopped at its init line")
         #expect(turn.costUSD == nil)

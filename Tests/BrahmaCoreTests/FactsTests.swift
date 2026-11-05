@@ -27,7 +27,7 @@ import GRDB
         func fresh(_ i: WorkItem) throws -> WorkItem { try #require(try store.workItem(id: i.id)) }
         func cycle() async throws {
             await world.orchestrator.tick()
-            try await world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+            try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         }
 
         @discardableResult

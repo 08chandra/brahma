@@ -394,6 +394,27 @@ import Glibc
         let c = try await pool.proxy(for: ["c.example.com"])
         #expect(a === b); #expect(a !== c); #expect(a.port != c.port)
         await pool.stopAll()
-        #expect(throws: (any Error).self) { try Self.ask(a.port, "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n") }
+        // Stopped: nothing answers on its port any more. A port freed by the stop is free for every process on the machine;
+        // under a concurrent `swift test` another process took it once and answered. So a connection that gets through is
+        // checked for whose listener it reached: none in this process may still listen on the port (ours is closed).
+        do {
+            _ = try Self.ask(a.port, "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n")
+            #expect(!Self.listensHere(on: a.port), "the stopped proxy still listens on \(a.port)")
+        } catch {}                                                             // refused: the expected case
+        #expect(!Self.listensHere(on: a.port), "the stopped proxy still listens on \(a.port)")
+    }
+
+    /// Whether this process holds a listening IPv4 socket on `port` (every open descriptor is looked at).
+    private static func listensHere(on port: UInt16) -> Bool {
+        for fd in 0..<Int32(getdtablesize()) {
+            var st = stat()
+            guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFSOCK else { continue }
+            var listening: Int32 = 0, size = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &listening, &size) == 0, listening != 0 else { continue }
+            var addr = sockaddr_in(), len = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let named = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) } }
+            if named == 0, addr.sin_family == sa_family_t(AF_INET), UInt16(bigEndian: addr.sin_port) == port { return true }
+        }
+        return false
     }
 }

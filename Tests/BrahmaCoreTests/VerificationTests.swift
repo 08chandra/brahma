@@ -42,7 +42,7 @@ import GRDB
         /// One tick, then every turn and check it started (git and processes are slow when the suite runs in parallel).
         func cycle() async throws {
             await world.orchestrator.tick()
-            try await world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+            try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         }
         func failure(_ body: () throws -> String) -> String {
             do { _ = try body(); return "no error" } catch let e as ToolError { return e.message } catch { return "\(error)" }
@@ -1009,7 +1009,7 @@ import GRDB
         await v.world.orchestrator.tick()
         #expect(v.world.fake.requests.isEmpty, "two checks fill a cap of two: no turn starts")
         v.checks.gate(false)
-        try await v.world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await v.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         try await v.cycle()
         #expect(v.world.fake.requests.count == 1, "the turn runs once the checks are done")
     }

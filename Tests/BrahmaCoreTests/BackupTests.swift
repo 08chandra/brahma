@@ -122,7 +122,7 @@ import GRDB
         try await orchestrator.start()
         clock.advance(3601)
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(30))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
         let snapshots = BackupService(paths: env.paths).list().filter { $0.reason == .hourly }
         #expect(snapshots.count == 1)
         #expect(try env.companyNames(in: try #require(snapshots.first).url) == ["Acme"])
@@ -140,7 +140,7 @@ import GRDB
         try await orchestrator.start()
         clock.advance(3601)
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(30))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
         let errors = try env.store.events(afterId: 0, limit: 100).filter { $0.companyId == acme.id && $0.kind == .error }
         #expect(errors.contains { $0.text.contains("backup.hourly") && $0.text.contains("database backup failed") })
         #expect(try env.store.allNotices().contains { $0.title == "Backup failed" })

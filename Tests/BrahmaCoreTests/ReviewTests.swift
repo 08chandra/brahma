@@ -46,7 +46,7 @@ import GRDB
         }
         func cycle() async throws {
             await world.orchestrator.tick()
-            try await world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+            try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         }
         func failure(_ body: () throws -> String) -> String {
             do { _ = try body(); return "no error" } catch let e as ToolError { return e.message } catch let e as WorkError { return e.message } catch { return "\(error)" }

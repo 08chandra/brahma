@@ -162,7 +162,7 @@ private struct GateWorld {
         await #expect(throws: SandboxNotVerified.self) {
             try await g.world.orchestrator.requireSandboxVerified(gate: gate, settings: hooked, agent: g.eng, company: g.sandboxed)
         }
-        try await g.world.orchestrator.waitUntilIdle(timeout: .seconds(30))
+        try await g.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(g.canary.shapes == [hooked.shape()])
         #expect(g.canary.settingsShapes == [hooked.shape()], "the canary is given the asking turn's settings (I3)")
     }

@@ -163,7 +163,7 @@ private final class AwakeClock: @unchecked Sendable {
         await w.orchestrator.stopSleepPrevention()
         #expect(!guardian.isActive)
         gate.open()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
     }
 }
 

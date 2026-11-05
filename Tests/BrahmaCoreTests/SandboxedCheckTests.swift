@@ -93,7 +93,7 @@ import GRDB
 
         func cycle() async throws {
             await world.orchestrator.tick()
-            try await world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+            try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         }
     }
 

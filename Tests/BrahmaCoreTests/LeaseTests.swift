@@ -536,7 +536,7 @@ import GRDB
         l.world.clock.advance(10)
         await l.world.orchestrator.tick()
         #expect(try l.allLeases().count == 2)
-        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         // Their turns are over (the agents sleep, holding their leases); the next pass hands out two more.
         l.world.clock.advance(10)
         try await l.world.cycle()
@@ -603,7 +603,7 @@ import GRDB
         l.world.clock.advance(10)
         await l.world.orchestrator.tick()
         gate.open()
-        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await l.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(try l.allLeases().isEmpty)
     }
 

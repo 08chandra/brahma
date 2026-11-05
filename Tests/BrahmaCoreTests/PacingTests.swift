@@ -309,7 +309,7 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
                              mcpExecutable: "/x", clock: clock.function, memory: NormalMemoryPressure(),
                              connectivity: AlwaysOnline(), disk: PlentyOfDisk(), exec: { _, _ in nil })
         }
-        func cycle() async throws { await o.tick(); try await o.waitUntilIdle(timeout: .seconds(60)) }
+        func cycle() async throws { await o.tick(); try await o.waitUntilIdle(timeout: .seconds(300)) }
     }
 
     private func usage(_ w: W, util: Double, fiveHour: Double = 0.1) throws {
@@ -407,14 +407,14 @@ private func reset(_ i: RateLimitInfo) -> Date { i.sevenDayResetsAt! }
         await w.o.tick()
         #expect(await w.o.runningCount() == 1, "max5x low mode allows one turn")
         first.open()
-        try await w.o.waitUntilIdle(timeout: .seconds(60))
+        try await w.o.waitUntilIdle(timeout: .seconds(300))
         try w.store.setPlanTier(.max20x)
         let second = Gate()
         w.fake.defaultScript = .init(gate: second)
         await w.o.tick()
         #expect(await w.o.runningCount() == 2, "max20x low mode allows two; the third waits")
         second.open()
-        try await w.o.waitUntilIdle(timeout: .seconds(60))
+        try await w.o.waitUntilIdle(timeout: .seconds(300))
     }
 }
 

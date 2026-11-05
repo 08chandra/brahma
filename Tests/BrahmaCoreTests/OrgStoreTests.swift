@@ -138,10 +138,10 @@ import GRDB
         let router = MessageRouter(store: s)
         for a in [designer, eng] { _ = try router.sendDM(companyId: c.id, from: .owner, to: a.name, text: "go") }
         await o.tick()
-        try await o.waitUntilIdle(timeout: .seconds(60))
+        try await o.waitUntilIdle(timeout: .seconds(300))
         _ = try router.sendDM(companyId: c.id, from: .owner, to: fixed.name, text: "go")
         await o.tick()
-        try await o.waitUntilIdle(timeout: .seconds(60))
+        try await o.waitUntilIdle(timeout: .seconds(300))
         let models = Dictionary(uniqueKeysWithValues: fake.requests.map { ($0.agent.name, $0.agent.model) })
         #expect(models == ["design-1": "haiku", "eng-1": "sonnet", "eng-2": "opus"])
         #expect(try s.agent(id: eng.id)?.model == "auto")

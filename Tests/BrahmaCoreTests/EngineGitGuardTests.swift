@@ -128,9 +128,9 @@ import Foundation
         let w = try World()
         let f = try GitFixture(files: ["a.txt": "one"])
         let ws = f.ws
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         await EngineGitGuard.$engine.withValue(w.orchestrator.engineId) { _ = try? ws.head(of: GitWorkspace.mainRef) }
-        await #expect(throws: OrchestratorError.self) { try await w.orchestrator.waitUntilIdle(timeout: .seconds(60)) }
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        await #expect(throws: OrchestratorError.self) { try await w.orchestrator.waitUntilIdle(timeout: .seconds(300)) }
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
     }
 }

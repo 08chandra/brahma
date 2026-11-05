@@ -136,6 +136,6 @@ struct World {
     /// One tick, then wait for every turn it started.
     func cycle() async throws {
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
     }
 }

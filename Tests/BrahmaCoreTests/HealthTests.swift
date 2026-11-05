@@ -80,7 +80,7 @@ private struct HWorld {
     }
     func cycle() async throws {
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
     }
     func alerts() throws -> [Message] {
         guard let ch = try store.channel(companyId: company.id, name: "dm:owner:system") else { return [] }
@@ -130,7 +130,7 @@ private struct HWorld {
         w.probe.online = true
         w.clock.advance(60); try await w.cycle(); try await w.cycle()
         #expect(try w.hold() == nil)
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(w.fake.requests.count == 6)
         #expect(try w.events(.usage).contains("engine resumed"))
         for a in agents { #expect(try w.turns(a).map(\.outcome) == [.failed, .succeeded]) }
@@ -399,7 +399,7 @@ private struct HWorld {
         await w.orchestrator.tick()
         #expect(try w.hold()?.reason == .network)
         inFlight.open()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         await w.orchestrator.tick()
         #expect(try w.hold()?.reason == .account)
         #expect(try w.alerts().count == 1)

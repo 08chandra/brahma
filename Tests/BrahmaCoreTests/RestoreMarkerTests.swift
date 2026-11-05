@@ -77,7 +77,7 @@ import GRDB
 
     private func tick(_ orchestrator: Orchestrator) async throws {
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(30))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
     }
 
     private func activity(_ store: Store, _ company: Company) throws -> [String] {

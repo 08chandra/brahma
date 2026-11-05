@@ -79,7 +79,7 @@ private final class GroupEvents: @unchecked Sendable {
 
         try w.store.emergencyStop(note: "panic", by: "owner", now: w.clock.now)
         await w.orchestrator.tick()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
         hold.open()
 
         #expect(try w.turns(ceo).map(\.outcome) == [.interrupted])
@@ -107,7 +107,7 @@ private final class GroupEvents: @unchecked Sendable {
 
         try w.store.emergencyStop(note: nil, by: "owner", now: w.clock.now)
         await w.orchestrator.tick()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
 
         let runs = try runsOf(w, item)
         #expect(runs.map(\.status) == [.queued], "the same run back in the queue: no attempt recorded, never failed (I1)")
@@ -167,7 +167,7 @@ private final class GroupEvents: @unchecked Sendable {
         #expect(await w.orchestrator.runningCount() == 1)
         try w.store.emergencyStop(note: nil, by: "cli", now: w.clock.now)
         w.stopPoll.step()
-        try await w.orchestrator.waitUntilIdle(timeout: .seconds(60))   // no tick in between
+        try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))   // no tick in between
         hold.open()
         #expect(try w.turns(ceo).map(\.outcome) == [.interrupted])
         #expect(try w.agent(ceo).state == .ready)

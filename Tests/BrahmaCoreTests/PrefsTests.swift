@@ -109,7 +109,7 @@ private func brahma(_ args: [String], home: URL) throws -> (status: Int32, stdou
         // A company added later gets its digest from the tick's re-ensure, at the preferred time.
         let b = try store.createCompany(name: "Beta", goal: "g", workspacesRoot: try tempDir())
         await orchestrator.tick()
-        try await orchestrator.waitUntilIdle(timeout: .seconds(5))
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
         #expect(try digest(b.id).schedule == .daily(hour: 6, minute: 45))
     }
 

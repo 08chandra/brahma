@@ -56,7 +56,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         }
         func cycle() async throws {
             await world.orchestrator.tick()
-            try await world.orchestrator.waitUntilIdle(timeout: .seconds(60))
+            try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         }
         /// A synchronous store write (the async overload of `writer.write` would be picked inside an async test).
         func db(_ body: @escaping (Database) throws -> Void) throws { try store.writer.write(body) }

@@ -133,7 +133,7 @@ private let subagentGates = ["L-2", "V-2", "V-3", "V-5"]
         let fallback = try #require(g.requests().last)
         #expect(!(TurnProfileCompiler.profile(for: fallback).tools ?? []).contains("Task"))
         #expect(try g.store.events(afterId: 0, companyId: g.company.id).contains { $0.text.hasPrefix("sandbox not verified for the task shape") })
-        try await g.world.orchestrator.waitUntilIdle(timeout: .seconds(30))
+        try await g.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
         let fp = try g.fingerprint(), os = ProcessInfo.processInfo.operatingSystemVersionString
         // Now the Task shape is verified: the next turn has Task and no web tools.
         try await g.runUntilTurn()

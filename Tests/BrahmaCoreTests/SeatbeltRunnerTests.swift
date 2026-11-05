@@ -577,8 +577,11 @@ struct SeatbeltRunnerTests {
     }
 
     /// Uses the "find" pasteboard (not the general one) and puts its previous text back, so the owner's clipboard is never
-    /// clobbered.
+    /// clobbered. The pasteboard is one per login session, shared by every test process: two `swift test` runs at once
+    /// clobbered each other's marker (and restore), so the whole test holds a cross-process lock first (`PasteboardLock`).
     @Test func pbpasteDenied() async throws {
+        let lock = try await PasteboardLock.acquire()
+        defer { lock.release() }
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
         let saved = try Self.outside("/usr/bin/pbpaste", ["-pboard", "find"]).output
@@ -1126,4 +1129,28 @@ struct SeatbeltRunnerTests {
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         return connect(fd, first.pointee.ai_addr, first.pointee.ai_addrlen) == 0
     }
+}
+
+/// An exclusive advisory lock (`flock`) on `/usr/bin/pbcopy`, opened read-only: every Brahma test process that uses the
+/// session's "find" pasteboard takes it first, so concurrent test runs take turns. Nothing is written; the lock goes with the
+/// descriptor. Acquiring is bounded (awake time), never a fixed sleep.
+final class PasteboardLock {
+    private let fd: Int32
+    private init(fd: Int32) { self.fd = fd }
+
+    static func acquire(bound: Duration = .seconds(300)) async throws -> PasteboardLock {
+        let fd = open("/usr/bin/pbcopy", O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let deadline = AwakeTime.deadline(after: bound)
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            guard errno == EWOULDBLOCK || errno == EINTR, AwakeTime.now < deadline else {
+                let e = errno; close(fd)
+                throw POSIXError(POSIXErrorCode(rawValue: e) ?? .ETIMEDOUT)
+            }
+            try await AwakeTime.sleep(for: .milliseconds(20))
+        }
+        return PasteboardLock(fd: fd)
+    }
+
+    func release() { close(fd) }
 }
