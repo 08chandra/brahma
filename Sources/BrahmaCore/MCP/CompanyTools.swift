@@ -96,8 +96,8 @@ public struct CompanyTools: Sendable {
     static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item"]
     /// High-authority company tools (design §2.2): one call per turn when sub-agents are on, none on a plan turn, denied under
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
-    /// Plan L's ops tools (`CompanyToolNames.ops`) are high risk too (PR-35 part 2t: this is the built gate until 5-lite's
-    /// `TaintPolicy` lands).
+    /// Plan L's ops tools (`CompanyToolNames.ops`) count as high risk too; under taint they are refused by `TaintPolicy`
+    /// (`reviewedHighRisk`, L-5lite 2t), which this set stays a subset of.
     public static let highRiskTools: Set<String> = Set(["decide", "propose_decision", "escalate_decision", "request_from_owner",
                                                         "request_mode", "plan_sprint", "close_sprint", "confirm_spec",
                                                         "request_access", "request_secret", "readopt_branch", "propose_extension"]).union(CompanyToolNames.ops)
