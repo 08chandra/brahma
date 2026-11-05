@@ -71,10 +71,17 @@ public struct VercelAdapter: HostingAdapter {
 
     /// `vercel inspect <previous deploy URL>` (the target confirmed to be this project's with the token, before anything is
     /// rolled back to it: `DeployStep.verifyLabel`, the Task 7 check), then `vercel rollback <that URL> --yes`, both from an
-    /// empty `releaseDir/rollback`; else the placeholder deployed.
+    /// empty `releaseDir/rollback`; else, when there is no previous release at all, the placeholder deployed. A previous
+    /// release with no recorded deploy URL (`previousUpload` set: `Store.rollbackInput` sets it whenever there is one) never
+    /// falls back to the placeholder (Task 8 fix M1): the plan has no steps, which `requestRollback` and the executor refuse
+    /// ("roll back from the provider dashboard"), and the deploy ask says so.
     public func rollbackPlan(_ i: DeployInput) throws -> DeployPlan {
         try validate(i.settings)
         try i.validate()
+        if i.previousDeployURL == nil, i.previousUpload != nil {
+            return try DeployPlan(steps: [], stageFrom: [], cwdPath: i.inRelease("rollback"), network: network, tokenSecret: tokenSecret,
+                                  env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
+        }
         if let previous = i.previousDeployURL {
             guard Self.isDeployURL(previous, project: i.settings.project) else { throw WorkError.invalid("the previous deploy URL is not a vercel.app URL") }
             return try DeployPlan(steps: [DeployStep(label: DeployStep.verifyLabel, argv: [i.bin("vercel"), "inspect", previous]),
