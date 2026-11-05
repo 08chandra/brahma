@@ -290,6 +290,138 @@ import Glibc
         #expect(FileManager.default.fileExists(atPath: fx.hostRoot.appending(path: "rollback-R-2/dist/index.html").path))
     }
 
+    // MARK: Fix round 1
+
+    func pause(_ fx: Fx, _ paused: Bool) throws {
+        try fx.store.writer.write { db in
+            try db.execute(sql: "UPDATE company SET status = ? WHERE id = ?", arguments: [paused ? "paused" : "running", fx.company.id])
+        }
+    }
+
+    @Test func pausedCompanyRollsBackButNeverDeploys() async throws {
+        // I1: a paused company's requested rollback runs (rollback-only); an approved deploy in it waits for the resume.
+        let fx = try Fx()
+        let r1 = try fx.proposeAndApprove()
+        await fx.advance()
+        #expect(try fx.reload(r1).status == .deployed)
+        try pause(fx, true)
+        _ = try request(fx, "R-1")
+        try await fx.w.cycle()
+        let back = try fx.reload(r1)
+        #expect(back.status == .rolledBack, "\(back.rollbackOutputTail ?? "")")
+        #expect(Self.rollbackCalls(fx).count == 1)
+        // Still paused: an approved release is never started.
+        try fx.merge(["page.txt": "two\n"])
+        try fx.passMain()
+        let r2 = try fx.proposeAndApprove("0.2.0")
+        try await fx.w.cycle()
+        await fx.advance()
+        #expect(try fx.reload(r2).status == .approved)
+        #expect(try fx.releaseSmokes().filter { $0.releaseId == r2.id }.isEmpty)
+        try pause(fx, false)
+        try await fx.w.cycle()
+        #expect(try fx.reload(r2).status == .deployed)
+    }
+
+    @Test func onlyTheLiveReleaseRollsBack() async throws {
+        // I2a: only the newest deployed-or-failed release, and never while a release is open.
+        let fx = try Fx()
+        _ = try await Self.twoDeployed(fx)
+        #expect(Self.message { _ = try request(fx, "R-1") } == "R-1 is not the live release; roll back R-2")
+        try fx.merge(["page.txt": "three\n"])
+        try fx.passMain()
+        _ = try fx.propose("0.3.0")
+        #expect(Self.message { _ = try request(fx, "R-2") } == "R-3 is still proposed; roll back after it finishes")
+        #expect(try fx.store.release(companyId: fx.company.id, ref: "R-2")?.rollbackStatus == nil)
+    }
+
+    @Test func pendingRollbackHoldsDeploysAndProposals() async throws {
+        // I2b: while a rollback is requested or running, nothing is proposed, and an approved deploy is not claimed: it runs
+        // after the rollback finishes.
+        let fx = try Fx()
+        let r1 = try fx.proposeAndApprove()
+        await fx.advance()
+        _ = try request(fx, "R-1")
+        try fx.merge(["page.txt": "two\n"])
+        try fx.passMain()
+        #expect(Self.message { _ = try fx.propose("0.2.0") } == "R-1's rollback is requested")
+        await fx.advance()
+        #expect(try fx.reload(r1).status == .rolledBack)
+        // An approved release and a rollback requested behind it (written straight into the database: the API refuses it).
+        let fresh = try Fx()
+        let first = try fresh.proposeAndApprove()
+        await fresh.advance()
+        try fresh.merge(["page.txt": "two\n"])
+        try fresh.passMain()
+        let second = try fresh.proposeAndApprove("0.2.0")
+        try setRow(fresh, first, "rollbackStatus = 'requested', rollbackRequestedAt = CURRENT_TIMESTAMP")
+        #expect(try fresh.store.claimRelease(companyId: fresh.company.id, now: fresh.w.clock.now) == nil)
+        await fresh.advance()
+        #expect(try fresh.reload(first).status == .rolledBack)
+        #expect(try fresh.reload(second).status == .approved)
+        #expect(try fresh.deploySteps().count == 1)
+        await fresh.advance()
+        let done = try fresh.reload(second)
+        #expect(done.status == .deployed, "\(done.failedReason ?? "")")
+    }
+
+    @Test func oneRollbackAtATime() async throws {
+        // I2c: two concurrent requests: one wins; another release's request while one is pending is refused.
+        let fx = try Fx()
+        let (r1, _) = try await Self.twoDeployed(fx)
+        let (store, companyId) = (fx.store, fx.company.id)
+        let results = await withTaskGroup(of: String?.self) { group -> [String?] in
+            for _ in 0..<2 {
+                group.addTask { Self.message { _ = try store.requestRollback(companyId: companyId, releaseRef: "R-2", by: .owner) } }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
+        }
+        #expect(results.filter { $0 == nil }.count == 1)
+        #expect(results.contains("R-2 is already rolling back"))
+        // A rollback pending on another release (written straight into the database) refuses a new request.
+        try setRow(fx, r1, "rollbackStatus = 'running'")
+        try await fx.store.writer.write { db in try db.execute(sql: #"UPDATE "release" SET rollbackStatus = NULL WHERE number = 2"#) }
+        #expect(Self.message { _ = try request(fx, "R-2") } == "R-1's rollback is running")
+    }
+
+    @Test func vercelPreviousWithoutURLNeverDeploysPlaceholder() async throws {
+        // M1: a previous release with no recorded deploy URL records no rollback commands (never the placeholder); the ask
+        // says so, and a rollback request is refused.
+        let v = VercelAdapter()
+        let layout = ReleaseLayout(root: try tempDir().appending(path: "releases/c1"))
+        let s = HostingSettings(companyId: "c1", provider: .vercel, project: "acme", accountId: "team_1", outputDir: "dist", updatedAt: Date())
+        let previous = Release(companyId: "c1", number: 1, version: "0.1.0", status: .deployed, provider: .vercel, project: "acme",
+                               commit: String(repeating: "a", count: 40), build: nil, outputDir: "dist",
+                               plan: try v.deployPlan(DeployInput(settings: s, commit: String(repeating: "a", count: 40), version: "0.1.0",
+                                                                  layout: layout, release: 1, cli: v.cli)),
+                               rollbackPlan: try v.rollbackPlan(DeployInput(settings: s, commit: String(repeating: "a", count: 40),
+                                                                            version: "0.1.0", layout: layout, release: 1, cli: v.cli)),
+                               proposedById: "a1", createdAt: Date())
+        #expect(previous.deployURL == nil)
+        let input = Store.rollbackInput(settings: s, release: 2, commit: String(repeating: "b", count: 40), version: "0.2.0",
+                                        previous: previous, layout: layout, cli: v.cli)
+        let none = try v.rollbackPlan(input)
+        #expect(none.steps.isEmpty)
+        #expect(none.cwdPath != layout.placeholderDir.path)
+        // No previous release at all: the placeholder, as before.
+        #expect(try v.rollbackPlan(Store.rollbackInput(settings: s, release: 1, commit: previous.commit, version: "0.1.0", previous: nil,
+                                                       layout: layout, cli: v.cli)).cwdPath == layout.placeholderDir.path)
+        let plan = try v.deployPlan(DeployInput(settings: s, commit: String(repeating: "b", count: 40), version: "0.2.0", layout: layout,
+                                                release: 2, cli: v.cli))
+        let text = Store.deployProposal(settings: s, adapter: v, smokeCheck: CheckSpec(command: "true"), sha7: "bbbbbbb", plan: plan,
+                                        rollback: none)
+        #expect(text.contains("Rollback recorded now:\nnone: the previous release has no recorded deploy URL; roll back from the provider dashboard"),
+                "\(text)")
+        // A release recorded so is refused at request time; nothing runs.
+        let fx = try Fx()
+        let r1 = try fx.proposeAndApprove()
+        await fx.advance()
+        let json = String(decoding: try JSONEncoder().encode(none), as: UTF8.self)
+        try setRow(fx, r1, "rollbackPlan = '\(json.replacingOccurrences(of: "'", with: "''"))'")
+        #expect(Self.message { _ = try request(fx, "R-1") } == "R-1 has no recorded rollback; roll back from the provider dashboard")
+        #expect(Self.rollbackCalls(fx).isEmpty)
+    }
+
     // MARK: Crash recovery
 
     func setRow(_ fx: Fx, _ r: Release, _ sql: String) throws {
