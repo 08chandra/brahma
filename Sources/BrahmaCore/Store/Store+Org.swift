@@ -63,6 +63,7 @@ extension Store {
         guard issues.isEmpty else { throw OrgError.invalidPlan(issues) }
 
         let now = Store.now()
+        for a in plan.agents { try retirePreexistingLab(companyId: companyId, handle: a.handle, now: now) }
         do {
             return try writer.write { db in
                 var hired: [String: Agent] = [:]
@@ -130,6 +131,7 @@ extension Store {
         let key = handle.lowercased()
         guard let company = try company(id: companyId) else { throw StoreError.notFound }
         let pack = pack(for: company)
+        try retirePreexistingLab(companyId: companyId, handle: key, now: now)
         do {
             return try writer.write { db in
                 guard var v = try OrgVacancy.filter(Column("companyId") == companyId && Column("handle") == key

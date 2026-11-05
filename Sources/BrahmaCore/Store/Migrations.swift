@@ -1008,6 +1008,17 @@ enum Migrations {
                 t.column("markedAt", .datetime).notNull()
             }
         }
+        m.registerMigration("v5-taint-7") { db in
+            // Task 10b, S31: the company-level lab mark. A tainted session without a sandbox (Workspace or Full) could write any
+            // lab of its company, later hires' included: every lab check reads this too, until the owner clears it. `profile`
+            // full: such a session could write anywhere, so no lab commit of any company is recorded clean meanwhile.
+            try db.create(table: "companyTaint") { t in
+                t.primaryKey("companyId", .text).references("company", onDelete: .cascade)
+                t.column("source", .text).notNull()
+                t.column("profile", .text).notNull()
+                t.column("markedAt", .datetime).notNull()
+            }
+        }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
             // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).

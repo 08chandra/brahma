@@ -313,6 +313,16 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(cleared.status == 0, "\(cleared.stderr)"); #expect(cleared.stdout.contains("cleared @eng's lab mark"))
         #expect(try store.labTaint(agentId: eng.id) == nil)
         #expect(try brahma(["lab", "clear-taint", "Acme", "eng"], home: home).stdout.contains("carries no mark"))
+        // S31: the company form, owner only too.
+        try store.writer.write { db in
+            try db.execute(sql: "INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, 'x', 'workspace', ?)",
+                           arguments: [company.id, Date()])
+        }
+        #expect(try brahma(["lab", "clear-taint", "Acme"], home: home, env: ["BRAHMA_AGENT_ID": eng.id]).status != 0)
+        #expect(try store.companyLabTaint(companyId: company.id) != nil)
+        let companyCleared = try brahma(["lab", "clear-taint", "Acme"], home: home)
+        #expect(companyCleared.status == 0, "\(companyCleared.stderr)"); #expect(companyCleared.stdout.contains("lab marks"))
+        #expect(try store.companyLabTaint(companyId: company.id) == nil)
     }
 
     /// The CLI: owner-only, lint errors refuse before any turn, and `company create` writes the built-ins.

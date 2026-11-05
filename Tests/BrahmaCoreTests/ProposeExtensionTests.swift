@@ -371,6 +371,92 @@ private struct LabWorld {
         #expect(try sandboxed.store.labTaint(agentId: sandboxed.cto.id) == nil)
     }
 
+    /// S31: the unsandboxed mark is the company's, so an agent hired after it starts marked; its proposal goes to the owner
+    /// until the owner clears the company mark, and then routes normally.
+    @Test func companyMarkTaintsLaterHires() throws {
+        let w = try LabWorld(profile: .workspace)
+        try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
+        #expect(try w.store.companyLabTaint(companyId: w.company.id)?.profile == "workspace")
+        let late = try w.store.hire(companyId: w.company.id, name: "eng-2", role: "engineer", model: "sonnet")
+        #expect(try w.store.labTaint(agentId: late.id)?.source.hasPrefix("company: @eng-1 on the workspace profile") == true)
+        try SandboxLayout(paths: w.paths, company: w.company, agentHandle: late.name).ensure()
+        let lab = w.ws.appending(path: ".brahma/labs/\(late.name)")
+        func propose(_ id: String) throws -> Ask {
+            _ = try PluginFixture(id: id, under: lab)
+            try GitFixture.plainGit(["add", "-A"], in: lab); try GitFixture.plainGit(["commit", "-qm", id], in: lab)
+            _ = LabProvenance.record(store: w.store, workspace: w.ws, handle: late.name, companyId: w.company.id, agentId: late.id,
+                                     turnId: nil, tainted: false, now: w.world.clock.now)
+            _ = try CompanyTools(store: w.store, companyId: w.company.id, agentId: late.id, paths: w.paths)
+                .call(name: "propose_extension", arguments: LabWorld.args(id))
+            return try #require(try w.extensionAsks().first { ExtensionAskPayload.read($0)?.extId == id })
+        }
+        let first = try propose("late-one")
+        #expect(first.status == .pendingOwner); #expect(first.internalApproverId == nil)
+        #expect(ExtensionAskPayload.read(first)?.labMark?.contains("company:") == true)
+        // Clearing only the agent's own row leaves the company mark in force.
+        _ = try w.store.clearLabTaint(companyId: w.company.id, agentId: late.id)
+        #expect(try w.store.labTaint(agentId: late.id) != nil)
+        // The owner clears the company: every mark there goes, recorded; the next clean proposal reaches the cto.
+        #expect(try w.store.clearCompanyLabTaint(companyId: w.company.id))
+        #expect(try w.store.companyLabTaint(companyId: w.company.id) == nil)
+        for a in [w.eng, w.cto, late] { #expect(try w.store.labTaint(agentId: a.id) == nil, "\(a.name)") }
+        #expect(try w.store.events(afterId: 0, companyId: w.company.id).contains { $0.text.contains("cleared the company's lab mark") })
+        let second = try propose("late-two")
+        #expect(second.internalApproverId == w.cto.id); #expect(second.status == .pendingInternal)
+    }
+
+    /// S31: while a tainted Full-profile session has run since the last owner clear, no lab commit of any company is recorded
+    /// clean; once the owner clears it, clean records resume.
+    @Test func fullProfileTaintRefusesCleanRecords() throws {
+        let w = try LabWorld(profile: .full)
+        let other = try w.world.company("Beta", profile: .sandboxed)
+        let bee = try w.store.hire(companyId: other.id, name: "bee", role: "engineer", model: "sonnet")
+        try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
+        #expect(try w.store.companyLabTaint(companyId: w.company.id)?.profile == "full")
+        let sha = { (c: Character) in String(repeating: c, count: 40) }
+        _ = try w.store.recordLabCommits(agentId: bee.id, turnId: nil, shas: [sha("a")], tainted: false)
+        _ = try w.store.recordLabCommits(agentId: w.cto.id, turnId: nil, shas: [sha("b")], tainted: false)
+        #expect(try w.store.labCommitTainted(agentId: bee.id, sha: sha("a")), "another company's lab too")
+        #expect(try w.store.labCommitTainted(agentId: w.cto.id, sha: sha("b")))
+        #expect(try w.store.clearCompanyLabTaint(companyId: w.company.id))
+        _ = try w.store.recordLabCommits(agentId: bee.id, turnId: nil, shas: [sha("c")], tainted: false)
+        #expect(!(try w.store.labCommitTainted(agentId: bee.id, sha: sha("c"))))
+        // A Workspace mark does not refuse other companies' clean records.
+        let ws = try LabWorld(profile: .workspace)
+        try ws.store.markTainted(agentId: ws.eng.id, source: "WebFetch", now: ws.world.clock.now)
+        _ = try ws.store.recordLabCommits(agentId: ws.cto.id, turnId: nil, shas: [sha("d")], tainted: false)
+        #expect(!(try ws.store.labCommitTainted(agentId: ws.cto.id, sha: sha("d"))))
+    }
+
+    /// Round 2c: a hire never adopts a lab that is already there; it goes to trash unread, the owner is alerted, the new agent
+    /// gets an empty lab. An existing agent's lab is never touched.
+    @Test func preexistingLabIsNotAdopted() throws {
+        let w = try LabWorld(profile: .workspace)
+        let lab = w.ws.appending(path: ".brahma/labs/eng-9")
+        try FileManager.default.createDirectory(at: lab.appending(path: "skills"), withIntermediateDirectories: true)
+        try "planted\n".write(to: lab.appending(path: "skills/planted.md"), atomically: true, encoding: .utf8)
+        _ = try w.store.hire(companyId: w.company.id, name: "eng-9", role: "engineer", model: "sonnet")
+        #expect(SandboxPath.kind(lab.path) == .directory)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: lab.path).isEmpty, "a fresh, empty lab")
+        let trash = w.ws.appending(path: ".brahma/trash/eng-9")
+        let moved = try #require(try FileManager.default.contentsOfDirectory(atPath: trash.path).first)
+        #expect(moved.hasSuffix("-lab"))
+        #expect(FileManager.default.fileExists(atPath: trash.appending(path: "\(moved)/skills/planted.md").path))
+        let alerts = try w.store.asks(companyId: w.company.id).filter { $0.kind == .engineAlert }
+        #expect(alerts.contains { $0.title.contains("eng-9") || $0.summary.contains("eng-9") }, "\(alerts.map(\.summary))")
+        // An existing agent's lab stays as it is (a duplicate hire is refused before anything moves).
+        try "mine\n".write(to: w.lab.appending(path: "mine.md"), atomically: true, encoding: .utf8)
+        #expect(throws: (any Error).self) { try w.store.hire(companyId: w.company.id, name: "eng-1", role: "engineer", model: "sonnet") }
+        #expect(FileManager.default.fileExists(atPath: w.lab.appending(path: "mine.md").path))
+        // A link planted as a lab is moved aside itself, never followed.
+        let outside = try tempDir().appending(path: "outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: w.ws.appending(path: ".brahma/labs/eng-8"), withDestinationURL: outside)
+        _ = try w.store.hire(companyId: w.company.id, name: "eng-8", role: "engineer", model: "sonnet")
+        #expect(SandboxPath.kind(w.ws.appending(path: ".brahma/labs/eng-8").path) == .directory)
+        #expect(FileManager.default.fileExists(atPath: outside.path))
+    }
+
     /// M8: an empty file carries no content; a tainted commit that added one elsewhere does not taint the folder.
     @Test func emptyBlobsDoNotDecideProvenance() throws {
         let w = try LabWorld()

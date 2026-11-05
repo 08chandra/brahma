@@ -185,6 +185,11 @@ extension Store {
     public func recordLabCommits(agentId: String, turnId: String?, shas: [String], tainted: Bool, now: Date = Store.now()) throws -> Int {
         guard !shas.isEmpty else { return 0 }
         return try writer.write { db in
+            // S31: while a tainted Full-profile session has run since the owner last cleared it (it could write any lab on this
+            // Mac), no lab commit of any company is recorded clean.
+            let fullMark = (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM companyTaint WHERE profile = ?",
+                                             arguments: [PermissionProfile.full.rawValue]) ?? 0) > 0
+            let tainted = tainted || fullMark
             var added = 0
             for sha in shas where sha.range(of: "^[0-9a-f]{40,64}$", options: .regularExpression) != nil {
                 try db.execute(sql: """
@@ -219,9 +224,15 @@ extension Store {
         guard let agent = try Agent.fetchOne(db, key: agentId), let company = try Company.fetchOne(db, key: agent.companyId) else { return }
         let profile = company.profile(forRole: agent.role)
         guard profile != .sandboxed else { return }
+        let shown = Store.flat("@\(agent.name) on the \(profile.rawValue) profile: \(source)", max: 200)
         try db.execute(sql: """
             INSERT OR IGNORE INTO labTaint (agentId, source, markedAt) SELECT id, ?, ? FROM agent WHERE companyId = ? AND id <> ?
-            """, arguments: [Store.flat("@\(agent.name) on the \(profile.rawValue) profile: \(source)", max: 200), now, company.id, agentId])
+            """, arguments: [shown, now, company.id, agentId])
+        // S31: the company itself carries the mark, so a lab of an agent hired later is marked too; a Full session upgrades it.
+        try db.execute(sql: """
+            INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, ?, ?, ?)
+            ON CONFLICT(companyId) DO UPDATE SET profile = excluded.profile WHERE excluded.profile = 'full'
+            """, arguments: [company.id, shown, profile.rawValue, now])
     }
 
     /// The session's taint at a turn's end (10b, I2): the agent row OR the flag file in `home` (the post-tool hook's mark when
@@ -254,11 +265,42 @@ extension Store {
         }
     }
 
-    /// The agent's lab mark: since when and the first taint source, or nil when its lab carries none.
+    /// The agent's lab mark: since when and the first taint source, or nil when its lab carries none. The company's mark (S31)
+    /// counts for every agent of the company, hired before it or after.
     public func labTaint(agentId: String) throws -> (source: String, markedAt: Date)? {
         try writer.read { db in
-            try Row.fetchOne(db, sql: "SELECT source, markedAt FROM labTaint WHERE agentId = ?", arguments: [agentId])
-                .map { (source: $0["source"], markedAt: $0["markedAt"]) }
+            if let own = try Row.fetchOne(db, sql: "SELECT source, markedAt FROM labTaint WHERE agentId = ?", arguments: [agentId]) {
+                return (source: own["source"], markedAt: own["markedAt"])
+            }
+            return try Row.fetchOne(db, sql: """
+                SELECT c.source, c.markedAt FROM companyTaint c JOIN agent a ON a.companyId = c.companyId WHERE a.id = ?
+                """, arguments: [agentId]).map { (source: "company: \($0["source"] as String)", markedAt: $0["markedAt"]) }
+        }
+    }
+
+    /// The company's own lab mark (S31), or nil.
+    public func companyLabTaint(companyId: String) throws -> (source: String, profile: String, markedAt: Date)? {
+        try writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT source, profile, markedAt FROM companyTaint WHERE companyId = ?", arguments: [companyId])
+                .map { (source: $0["source"], profile: $0["profile"], markedAt: $0["markedAt"]) }
+        }
+    }
+
+    /// The owner clears the company's lab mark and every lab mark of its agents (`brahma lab clear-taint <company>`, owner shell
+    /// only; never a company tool), recorded as an activity event. Returns whether anything was marked.
+    @discardableResult
+    public func clearCompanyLabTaint(companyId: String, now: Date = Store.now()) throws -> Bool {
+        try writer.write { db in
+            guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+            try db.execute(sql: "DELETE FROM companyTaint WHERE companyId = ?", arguments: [companyId])
+            let company = db.changesCount
+            try db.execute(sql: "DELETE FROM labTaint WHERE agentId IN (SELECT id FROM agent WHERE companyId = ?)", arguments: [companyId])
+            let agents = db.changesCount
+            guard company + agents > 0 else { return false }
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .approval,
+                              text: "The owner cleared the company's lab mark\(company > 0 ? "" : " (none)") and \(agents) agent lab mark(s); "
+                                + "extension proposals are checked by their commits again", createdAt: now).insert(db)
+            return true
         }
     }
 
