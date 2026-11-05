@@ -68,14 +68,14 @@ extension Orchestrator {
         }
     }
 
-    /// The tick's "release" step (Plan L Task 7, PR-6), after the main smoke: each company with an approved release and none
-    /// in progress gets one tracked detached task (`releaseTasks`, counted in `otherChildren` and `isIdle`) that runs
+    /// The tick's "release" step (Plan L Tasks 7 and 8, PR-6), after the main smoke: each company with an approved release or
+    /// a requested rollback, and none in progress, gets one tracked detached task (`releaseTasks`, counted in `otherChildren` and `isIdle`) that runs
     /// `ReleaseExecutor.advance(companyId:now:)`; the release's own smoke on main runs inside it. Starts are gated like
     /// smokes: nothing under a hold (the owner's stop included; the executor's claim also refuses while it holds) or critical
     /// memory pressure, only into a free slot, never in a paused company.
     func releaseTick(now: Date, config: SchedulerConfig, held: Bool, pressure: MemoryPressure, companies: [Company]) {
         guard !held, pressure != .critical else { return }
-        let waiting = (try? store.companiesWithApprovedRelease()) ?? []
+        let waiting = (try? store.companiesWithReleaseWork()) ?? []
         guard !waiting.isEmpty else { return }
         for company in companies where waiting.contains(company.id) && company.status == .running && releaseTasks[company.id] == nil {
             let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
