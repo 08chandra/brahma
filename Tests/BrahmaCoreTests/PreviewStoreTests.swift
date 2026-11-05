@@ -272,6 +272,35 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         }
     }
 
+    // MARK: The taint rule (L-5lite 2t)
+
+    @Test func liveToolsTaintClassified() {
+        for tool in CompanyToolNames.ops {
+            #expect(TaintPolicy.reviewedHighRisk.contains(tool), "\(tool)")
+            #expect(TaintPolicy.isHighRisk(tool), "\(tool)")
+        }
+        #expect(TaintPolicy.taintSafeTools.contains("request_human_task"), "its handler enforces the tainted-session rule")
+        #expect(!TaintPolicy.reviewedHighRisk.contains("request_human_task"))
+        // TaintTests.everyToolClassified, restated: every company tool is in exactly one set, and the quota's set is high risk.
+        #expect(Set(CompanyToolNames.all).subtracting(TaintPolicy.taintSafeTools) == TaintPolicy.reviewedHighRisk)
+        #expect(CompanyTools.highRiskTools.isSubset(of: TaintPolicy.reviewedHighRisk))
+    }
+
+    @Test func taintedSessionCannotSetPreview() throws {
+        let t = try T()
+        try t.store.markTainted(agentId: t.devops.id, source: "WebFetch")
+        let refused = t.set(t.devops, "web")
+        #expect(!refused.ok)
+        #expect(refused.text == TaintPolicy.refusal(tool: "set_preview_command", source: "outside content"))
+        #expect(try t.store.previewSurfaces(companyId: t.acme.id).isEmpty)
+        #expect(try #require(try t.store.agent(id: t.devops.id)).freshSessionRequested)
+        for tool in ["set_smoke_check", "set_deploy_config", "propose_deploy"] {
+            #expect(t.call(t.devops, tool, [:]).text == TaintPolicy.refusal(tool: tool, source: "outside content"), "\(tool)")
+        }
+        // An untainted ops agent still sets it.
+        #expect(t.set(t.cto, "web").ok)
+    }
+
     @Test func planTurnHasNoOpsTools() throws {
         let t = try T()
         let plan = CompanyTools(store: t.store, companyId: t.acme.id, agentId: t.devops.id, planTurn: true)
