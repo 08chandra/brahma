@@ -3024,6 +3024,40 @@ public struct GitWorkspace: Sendable {
         return try main.run(["merge-base", "--is-ancestor", ancestor, descendant], allowFailure: true).status == 0
     }
 
+    /// The engine's backup ref (Plan L): before each deploy it names the release commit, "the last known-good main".
+    public static let mainBackupRef = "refs/brahma/main-backup"
+
+    /// `refs/brahma/releases/<version>` (PR-29: an engine-managed namespace the plan barrier leaves alone, never a
+    /// `refs/tags/release/*` tag). Throws for a version that cannot be one ref component.
+    public static func releaseRef(version: String) throws -> String {
+        guard version.range(of: "^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$", options: .regularExpression) != nil,
+              !version.contains(".."), !version.hasSuffix("."), !version.lowercased().hasSuffix(".lock") else {
+            throw GitError.failed(command: "release ref", status: -1, stderr: "invalid release version")
+        }
+        return "refs/brahma/releases/\(version)"
+    }
+
+    /// Before a deploy (Plan L Task 7): `update-ref refs/brahma/main-backup <commit>`, then `refs/brahma/releases/<version>`
+    /// = `commit`, created only when absent (`update-ref <ref> <commit> ""`). Already there at `commit`: kept (returns false).
+    /// There at another commit: throws, nothing is moved (a release ref is never rewritten). Both refs are written in the
+    /// workspace's repository through the hardened `GitCommand`, from engine records only (never a build's `.git`).
+    @discardableResult
+    public func writeReleaseRefs(version: String, commit: String) throws -> Bool {
+        try Self.validCommit(commit)
+        let release = try Self.releaseRef(version: version)
+        let existing = try main.run(["rev-parse", "--verify", "--quiet", "\(release)^{commit}"], allowFailure: true)
+        let full = try main.run(["rev-parse", "--verify", "\(commit)^{commit}"]).text
+        if existing.status == 0 {
+            guard existing.text == full else {
+                throw GitError.failed(command: "update-ref", status: -1, stderr: "\(release) already names another commit")
+            }
+        }
+        try main.run(["update-ref", "-m", "brahma: release \(version)", Self.mainBackupRef, full])
+        if existing.status == 0 { return false }
+        try main.run(["update-ref", "-m", "brahma: release \(version)", release, full, ""])
+        return true
+    }
+
     /// Changed paths between two commits, at most `limit`.
     public func nameStatus(base: String, head: String, limit: Int = 2000) throws -> (entries: [GitChange], truncated: Bool) {
         try Self.validRef(base); try Self.validRef(head)

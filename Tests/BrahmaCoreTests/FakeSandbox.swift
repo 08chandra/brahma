@@ -28,7 +28,35 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
 
     private var spawned: [Int32] = []
 
+    /// Callers of `waitForSpawn` still waiting, with what they wait for.
+    private var spawnWaiters: [(matches: @Sendable (Call) -> Bool, continuation: CheckedContinuation<Void, Never>)] = []
+
     var calls: [Call] { lock.withLock { recorded } }
+
+    /// Returns once `spawn` has started a process for a call that `matches` (at once when one already has): an event, never
+    /// a timer, so a test can act on a running step under any load.
+    func waitForSpawn(_ matches: @escaping @Sendable (Call) -> Bool) async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let now = lock.withLock { () -> Bool in
+                if startedCalls.contains(where: matches) { return true }
+                spawnWaiters.append((matches, c))
+                return false
+            }
+            if now { c.resume() }
+        }
+    }
+
+    private var startedCalls: [Call] = []
+
+    private func started(_ call: Call) {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            startedCalls.append(call)
+            let (hit, rest) = (spawnWaiters.filter { $0.matches(call) }, spawnWaiters.filter { !$0.matches(call) })
+            spawnWaiters = rest
+            return hit.map(\.continuation)
+        }
+        for c in ready { c.resume() }
+    }
     /// The pid (process group) of every process `spawn` started, in order.
     var spawnedPids: [Int32] { lock.withLock { spawned } }
     var lastSpawnedPid: Int32? { spawnedPids.last }
@@ -60,7 +88,9 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
         let child = try ProcessGroupChild.spawn(executable: "/bin/sh", arguments: ["/bin/sh", "-c", command], environment: environment,
                                                 workingDirectory: cwd, output: file)
         lock.withLock { spawned.append(child.pid) }
-        return FakeSandboxProcess(child: child)
+        let process = FakeSandboxProcess(child: child)
+        started(Call(kind: .spawn, command: command, cwd: cwd, environment: environment, policy: policy, output: logURL))
+        return process
     }
 }
 
