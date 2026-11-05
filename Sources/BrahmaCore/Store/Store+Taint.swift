@@ -127,6 +127,11 @@ extension Store {
     public func clearTaintIfRequested(agentId: String, scope: SessionScope, now: Date = Store.now()) throws -> Bool {
         let cleared = try writer.write { db -> Bool in
             guard let agent = try Agent.fetchOne(db, key: agentId), agent.freshSessionRequested else { return false }
+            // I2 (10b), S30: the flag is read inside the transaction that marks the lab; the file is removed only after it commits.
+            let flagged = dataHome.flatMap { TaintFlag.url(home: $0, agentId: agentId) }.map(TaintFlag.exists) ?? false
+            if flagged || agent.sessionTainted {
+                try Store.markLabTainted(db, agentId: agentId, source: flagged ? TaintPolicy.hookErrorSource : "tainted session", now: now)
+            }
             try Store.forceFreshSession(db: db, agentId: agentId, itemId: scope.itemId, reason: "tainted", now: now)
             try db.execute(sql: "DELETE FROM agentSession WHERE agentId = ?", arguments: [agentId])
             if scope.itemId != nil { try Store.resetSession(db: db, agentId: agentId, scope: .base) }
@@ -206,9 +211,47 @@ extension Store {
 
     /// The sticky lab mark: set the first time a session of the agent is tainted (kept, with that first source); cleared only by
     /// the owner (`clearLabTaint`).
+    /// Without a sandbox (the role runs Workspace or Full in its company; an engine ceiling only narrows that, so this can only
+    /// over-mark), the session's Bash could write any lab of the company: every lab there is marked (fail closed).
     static func markLabTainted(_ db: Database, agentId: String, source: String, now: Date) throws {
         try db.execute(sql: "INSERT OR IGNORE INTO labTaint (agentId, source, markedAt) VALUES (?, ?, ?)",
                        arguments: [agentId, Store.flat(source, max: 200), now])
+        guard let agent = try Agent.fetchOne(db, key: agentId), let company = try Company.fetchOne(db, key: agent.companyId) else { return }
+        let profile = company.profile(forRole: agent.role)
+        guard profile != .sandboxed else { return }
+        try db.execute(sql: """
+            INSERT OR IGNORE INTO labTaint (agentId, source, markedAt) SELECT id, ?, ? FROM agent WHERE companyId = ? AND id <> ?
+            """, arguments: [Store.flat("@\(agent.name) on the \(profile.rawValue) profile: \(source)", max: 200), now, company.id, agentId])
+    }
+
+    /// The session's taint at a turn's end (10b, I2): the agent row OR the flag file in `home` (the post-tool hook's mark when
+    /// the database write failed); a missing row counts as tainted. When tainted, the lab mark is set in the same transaction
+    /// that read the row and the flag. Returns it. Throws when the row or the mark could not be read or written (S30): the
+    /// caller then keeps the session's taint and the flag file (no `clearTaintIfRequested`), so the next turn is still tainted.
+    public func turnEndTaint(agentId: String, home: URL, now: Date = Store.now()) throws -> Bool {
+        try writer.write { db in
+            let flagged = TaintFlag.url(home: home, agentId: agentId).map(TaintFlag.exists) ?? true
+            let row = try Agent.fetchOne(db, key: agentId)
+            let tainted = flagged || (row?.sessionTainted ?? true)
+            if tainted {
+                let source = row?.taintSources.split(separator: "\n").first.map(String.init)
+                    ?? (flagged ? TaintPolicy.hookErrorSource : "tainted session")
+                try Store.markLabTainted(db, agentId: agentId, source: source, now: now)
+            }
+            return tainted
+        }
+    }
+
+    /// Engine start (10b, I2): a flag file a crash left marks its agent's lab.
+    public func markLabsForTaintFlags(home: URL, now: Date = Store.now()) throws {
+        let dir = home.appending(path: "run/taint", directoryHint: .isDirectory)
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter(TaintFlag.isSafeId)
+        guard !names.isEmpty else { return }
+        try writer.write { db in
+            for id in names where try Agent.fetchOne(db, key: id) != nil {
+                try Store.markLabTainted(db, agentId: id, source: TaintPolicy.hookErrorSource, now: now)
+            }
+        }
     }
 
     /// The agent's lab mark: since when and the first taint source, or nil when its lab carries none.

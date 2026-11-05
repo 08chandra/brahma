@@ -298,6 +298,79 @@ private struct LabWorld {
         #expect(throws: WorkError.self) { try w.store.clearLabTaint(companyId: "other", agentId: w.eng.id) }
     }
 
+    /// Taint held only in the flag file (the database write failed, Task 10 M2): at the turn's end the lab is marked and the
+    /// turn's commits are recorded tainted, never clean; a flag a crash left marks the lab at engine start.
+    @Test func flagFileOnlyTaintMarksTheLab() async throws {
+        let w = try LabWorld()
+        let home = w.paths.home
+        let agentId = w.eng.id
+        w.world.fake.script(w.eng.name, FakeTurnRunner.Script(sideEffect: { r in
+            // The hook could not reach the database: only its flag file says the session is tainted.
+            TaintFlag.write(home: home, agentId: agentId, source: TaintPolicy.hookErrorSource)
+            let lab = URL(fileURLWithPath: r.workingDirectory)
+            try "planted\n".write(to: lab.appending(path: "planted.md"), atomically: true, encoding: .utf8)
+            try GitFixture.plainGit(["add", "-A"], in: lab); try GitFixture.plainGit(["commit", "-qm", "planted"], in: lab)
+        }))
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        #expect(!(try #require(try w.store.agent(id: w.eng.id)).sessionTainted), "the row never heard of it")
+        let head = try GitFixture.plainGit(["rev-parse", "HEAD"], in: w.lab)
+        let rows = try w.store.labCommits(agentId: w.eng.id)
+        #expect(rows.first { $0.sha == head }?.tainted == true, "recorded tainted, never clean")
+        #expect(try w.store.labTaint(agentId: w.eng.id)?.source == TaintPolicy.hookErrorSource)
+        // Engine start: a flag left behind (a crash) marks its agent's lab.
+        let other = try LabWorld()
+        TaintFlag.write(home: other.paths.home, agentId: other.eng.id, source: TaintPolicy.hookErrorSource)
+        #expect(try other.store.labTaint(agentId: other.eng.id) == nil)
+        try await other.world.orchestrator.start()
+        #expect(try other.store.labTaint(agentId: other.eng.id) != nil)
+        #expect(try other.store.labTaint(agentId: other.cto.id) == nil, "sandboxed: only its own lab")
+    }
+
+    /// S30: when the turn end cannot write the lab mark (an injected write failure), the taint is not cleared: the flag file
+    /// stays and the next turn is still tainted.
+    @Test func unwrittenLabMarkKeepsTheTaint() async throws {
+        let w = try LabWorld()
+        let (home, agentId, store) = (w.paths.home, w.eng.id, w.store)
+        w.world.fake.script(w.eng.name, FakeTurnRunner.Script(sideEffect: { _ in
+            // A refused high-risk call asked for a fresh session; then the hook could only write its flag file.
+            try store.markTainted(agentId: agentId, source: "WebFetch")
+            try store.requestFreshSession(agentId: agentId)
+            TaintFlag.write(home: home, agentId: agentId, source: TaintPolicy.hookErrorSource)
+            // The injected failure: every lab-mark write from here on fails.
+            try store.writer.write { db in try db.execute(sql: "DROP TABLE labTaint") }
+        }))
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        let flag = try #require(TaintFlag.url(home: home, agentId: agentId))
+        #expect(TaintFlag.exists(flag), "the flag file stays")
+        let after = try #require(try w.store.agent(id: agentId))
+        #expect(after.sessionTainted, "the next turn is still tainted"); #expect(after.freshSessionRequested)
+        #expect(throws: (any Error).self) { _ = try w.store.turnEndTaint(agentId: agentId, home: home) }
+        // The next turn runs tainted: its high-risk call is refused, and its end keeps the flag again.
+        try w.world.dm(w.company, w.eng, "again")
+        w.world.clock.advance(3600)
+        try await w.world.cycle()
+        #expect(TaintFlag.exists(flag))
+        #expect(try #require(try w.store.agent(id: agentId)).sessionTainted)
+        #expect(w.refusal(LabWorld.args("brand-voice"))?.hasPrefix("This session has read outside content") == true)
+    }
+
+    /// Residual 2, as ruled: without a sandbox a tainted session's Bash can write any lab of the company, so every lab there is
+    /// marked (fail closed). On Sandboxed only its own lab is.
+    @Test func taintWithoutSandboxMarksEveryLab() throws {
+        let w = try LabWorld(profile: .workspace)
+        let qa = try w.store.hire(companyId: w.company.id, name: "qa-1", role: "qa", model: "sonnet")
+        try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
+        for a in [w.eng, w.cto, qa] { #expect(try w.store.labTaint(agentId: a.id) != nil, "\(a.name)") }
+        #expect(try w.store.labTaint(agentId: qa.id)?.source.contains("@eng-1 on the workspace profile") == true)
+        // A clean proposal by another agent of that company now goes to the owner.
+        let sandboxed = try LabWorld()
+        try sandboxed.store.markTainted(agentId: sandboxed.eng.id, source: "WebFetch", now: sandboxed.world.clock.now)
+        #expect(try sandboxed.store.labTaint(agentId: sandboxed.eng.id) != nil)
+        #expect(try sandboxed.store.labTaint(agentId: sandboxed.cto.id) == nil)
+    }
+
     /// M8: an empty file carries no content; a tainted commit that added one elsewhere does not taint the folder.
     @Test func emptyBlobsDoNotDecideProvenance() throws {
         let w = try LabWorld()

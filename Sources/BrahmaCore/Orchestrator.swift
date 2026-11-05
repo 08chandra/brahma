@@ -225,6 +225,10 @@ public actor Orchestrator {
                     } catch { return "\(company.name): \(error)" }
                 }
             }) { log("could not install the pre-commit hook: \(failure)") }
+            // A taint flag file a crash left marks its agent's lab (Task 10b, I2).
+            if let failure = await blocking.run({ () -> String? in
+                do { try store.markLabsForTaintFlags(home: paths.home, now: now); return nil } catch { return "\(error)" }
+            }) { log("could not mark the labs of leftover taint flags: \(failure)") }
             // Brahma's built-in extensions (Task 10b), materialized read-only into every workspace; a refusal is logged.
             for failure in await blocking.run({ companies.compactMap { company -> String? in
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -675,6 +679,8 @@ public actor Orchestrator {
         var taintMarked = false
         var recordedSources: Set<String> = []
         var labWorkspace: URL?
+        // S30 (10b): the turn end could not write the lab mark: the session keeps its taint and its flag file.
+        var labMarkUnwritten = false
         // Task 14u: the Ultra run this turn was admitted for (reserved once it passed the sandbox gate), the watchdog's
         // agent-count kill, and the turn's leader (for its SIGINT).
         var ultraPlan: UltraPlan?
@@ -1358,14 +1364,21 @@ public actor Orchestrator {
         if launched, !isReview { attempt { try store.markHeldItemsIfTainted(agentId: agent.id) } }
         if launched, let labWorkspace {
             let (store, handle, turnId, ended) = (self.store, agent.name, turn.id, now)
-            let tainted = ((try? store.agent(id: agent.id)) ?? nil)?.sessionTainted ?? true
+            // The row OR the flag file (10b, I2); a tainted turn's lab is marked here, before the flag can be cleared below. S30: when
+            // that could not be written, the session keeps its taint and its flag file (no clear below): fail closed.
+            let tainted: Bool
+            do { tainted = try store.turnEndTaint(agentId: agent.id, home: paths.home, now: ended) } catch {
+                tainted = true
+                labMarkUnwritten = true
+                log("@\(agent.name)'s lab mark could not be written (\(error)); its session stays tainted")
+            }
             let outcome = await blocking.run {
                 LabProvenance.record(store: store, workspace: labWorkspace, handle: handle, companyId: agent.companyId,
                                      agentId: agent.id, turnId: turnId, tainted: tainted, now: ended)
             }
             if case .refused(let why) = outcome { log("@\(agent.name)'s lab commits were not recorded (tainted instead): \(why)") }
         }
-        attempt { try store.clearTaintIfRequested(agentId: agent.id, scope: scope, now: now) }
+        if !labMarkUnwritten { attempt { try store.clearTaintIfRequested(agentId: agent.id, scope: scope, now: now) } }
         // S19: a review or audit runs in a throwaway session. Taint it took there is recorded on the turn and on what it wrote;
         // it does not outlive the session when the agent's own session was clean before.
         if isReview, !agent.sessionTainted { attempt { try store.endThrowawaySessionTaint(agentId: agent.id) } }
