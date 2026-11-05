@@ -5,7 +5,7 @@ import Foundation
 /// as a hard link of the shared FakeTools script, never a new executable): `fake deploy <R-n>` copies the upload into
 /// `$FAKE_HOST_ROOT/<R-n>` and prints `https://fake-<r-n>.local` on stdout; `fake inspect <url>` prints `project <name>`.
 /// Its fixed environment (in the plan, and so in the hash) carries what a test asks of it: echo the token, exit with a
-/// code, print a URL on stderr, sleep before deploying. `smokeBase` is `server`. Never contacts anything. Injected through
+/// code, print a URL on stderr, sleep (or wait for a file, `FAKE_WAIT_FOR`) before deploying. `smokeBase` is `server`. Never contacts anything. Injected through
 /// the adapter lookup (PR-25), never a shared registry.
 struct FakeHostingAdapter: HostingAdapter {
     var id: HostingProviderID = .cloudflarePages
@@ -25,12 +25,16 @@ struct FakeHostingAdapter: HostingAdapter {
     var stderrLine: String?
     /// Seconds `fake deploy` sleeps before it copies anything (the stop test).
     var sleepSeconds: Int?
+    /// A file `fake deploy` waits for before it prints or copies anything (a test acts while the step runs, by event).
+    var waitFor: String?
     /// Plans carry a verify step (`fake inspect <deploy URL>`), as Vercel's do.
     var verify = false
     /// The project `fake inspect` reports (nil: the configured one).
     var inspectProject: String?
     /// What the plan stages (nil: the output folder); `["."]` stages the whole export, as Vercel's plans do.
     var stageFrom: [String]?
+    /// Added to the rollback plan's environment only (Task 8: a rollback that fails, waits or echoes while the deploy did not).
+    var rollbackEnv: [String: String] = [:]
 
     static let installIsNoOp = false
 
@@ -43,6 +47,7 @@ struct FakeHostingAdapter: HostingAdapter {
         if let exitCode { e["FAKE_EXIT"] = String(exitCode) }
         if let stderrLine { e["FAKE_STDERR"] = stderrLine }
         if let sleepSeconds { e["FAKE_SLEEP"] = String(sleepSeconds) }
+        if let waitFor { e["FAKE_WAIT_FOR"] = waitFor }
         return e
     }
 
@@ -58,10 +63,17 @@ struct FakeHostingAdapter: HostingAdapter {
                               verify: verify ? [i.bin("fake"), "inspect", DeployPlan.deployURLPlaceholder] : nil)
     }
 
+    /// `fake deploy rollback-R-<n>` from the restored release's upload (else the placeholder), so what it deploys lands in its
+    /// own host folder. With `verify` and a previous deploy URL, `fake inspect <that URL>` runs first (as Vercel's rollback).
     func rollbackPlan(_ i: DeployInput) throws -> DeployPlan {
         try validate(i.settings)
-        return try DeployPlan(steps: [step(i)], stageFrom: [], cwdPath: (i.previousUpload ?? i.placeholderDir).path,
-                              network: network, tokenSecret: tokenSecret, env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
+        var steps = [DeployStep(label: "deploy", argv: [i.bin("fake"), "deploy", "rollback-\(i.releaseDir.lastPathComponent)"])]
+        if verify, let previous = i.previousDeployURL {
+            steps.insert(DeployStep(label: DeployStep.verifyLabel, argv: [i.bin("fake"), "inspect", previous]), at: 0)
+        }
+        return try DeployPlan(steps: steps, stageFrom: [], cwdPath: (i.previousUpload ?? i.placeholderDir).path,
+                              network: network, tokenSecret: tokenSecret, env: env(i).merging(rollbackEnv) { _, new in new },
+                              build: i.settings.build, outputDir: i.settings.outputDir)
     }
 
     func deployURL(fromOutput: String, settings: HostingSettings) -> URL? {
@@ -81,6 +93,7 @@ struct FakeHostingAdapter: HostingAdapter {
         deploy)
           n="$1"
           if [ -n "$FAKE_SLEEP" ]; then sleep "$FAKE_SLEEP"; fi
+          if [ -n "$FAKE_WAIT_FOR" ]; then while [ ! -e "$FAKE_WAIT_FOR" ]; do sleep 0.05; done; fi
           mkdir -p "$FAKE_HOST_ROOT/$n" && cp -R . "$FAKE_HOST_ROOT/$n/" || exit 9
           if [ -n "$FAKE_ECHO" ]; then echo "using token $(printenv "$FAKE_ECHO")"; fi
           echo "https://fake-$(printf '%s' "$n" | tr 'A-Z' 'a-z').local"

@@ -18,11 +18,15 @@ final class FakeHTTPProbe: HTTPProbing, @unchecked Sendable {
     }
     static let refused: Response = (nil, nil, Data(), "connection refused")
 
+    /// Called with every request before it is answered (a test acts at that moment, e.g. the owner's stop mid-smoke).
+    var onSend: (@Sendable (Request) -> Void)?
+
     var requests: [Request] { lock.withLock { recorded } }
     func answer(_ more: [Response]) { lock.withLock { responses.append(contentsOf: more) } }
 
     func send(method: String, url: URL, body: Data?, timeout: Duration) async -> Response {
-        lock.withLock {
+        onSend?(Request(method: method, url: url, body: body))
+        return lock.withLock {
             recorded.append(Request(method: method, url: url, body: body))
             guard !responses.isEmpty else { return Self.refused }
             return responses.count == 1 ? responses[0] : responses.removeFirst()
