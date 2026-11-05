@@ -500,7 +500,21 @@ extension Store {
             .order(Column("number")).fetchOne(db) {
             throw WorkError.conflict("\(open.ref) is still \(open.status.rawValue)")
         }
+        // Task 8 fix I2b: nothing is proposed while a rollback is pending or running.
+        if let rolling = try pendingRollback(db, companyId: companyId) {
+            throw WorkError.conflict("\(rolling.ref)'s rollback is \(rolling.rollbackStatus?.rawValue ?? "pending")")
+        }
     }
+
+    /// The company's release whose rollback is `requested` or `running`, if any (at most one: `requestRollback`).
+    static func pendingRollback(_ db: Database, companyId: String) throws -> Release? {
+        try Release.filter(Column("companyId") == companyId
+                           && [RollbackStatus.requested.rawValue, RollbackStatus.running.rawValue].contains(Column("rollbackStatus")))
+            .order(Column("number")).fetchOne(db)
+    }
+
+    /// Shown when the recorded rollback has no commands (fix M1: a Vercel previous release with no recorded deploy URL).
+    static let noRecordedRollback = "the previous release has no recorded deploy URL; roll back from the provider dashboard"
 
     /// The deploy ask's `proposal`: exactly what the engine will do. Agent-written fields (the build, the smoke command, smoke
     /// paths and the expected text) are flattened to one line each; `propose` redacts the whole text before it is stored.
@@ -519,7 +533,7 @@ extension Store {
             Deploy (engine, token $\(plan.tokenSecret) from Keychain), in order:
             \(plan.display)
             Rollback recorded now:
-            \(rollback.display)
+            \(rollback.steps.isEmpty ? "none: \(Self.noRecordedRollback)" : rollback.display)
             Smoke after deploy: \(base) \(lines)\(expecting)
             """
     }
@@ -602,6 +616,8 @@ extension Store {
     func claimRelease(companyId: String, now: Date) throws -> Release? {
         try writer.write { db in
             if try Self.engineStopped(db) != nil { return nil }
+            // Task 8 fix I2b: an approved deploy waits while a rollback is pending or running (it runs after).
+            if try Self.pendingRollback(db, companyId: companyId) != nil { return nil }
             guard let oldest = try Release.filter(Column("companyId") == companyId && Column("status") == ReleaseStatus.approved.rawValue)
                 .order(Column("approvedAt"), Column("number")).fetchOne(db) else { return nil }
             try db.execute(sql: "UPDATE release SET status = ?, startedAt = ? WHERE id = ? AND status = ?",
@@ -717,6 +733,7 @@ enum RollbackEnd: Equatable, Sendable {
 
 extension Store {
     static let rollbackOwnerOnly = "only the owner can roll back a release"
+    static let dashboardRollback = "roll back from the provider dashboard"
 
     /// What a rollback plan is composed from (`HostingAdapter.rollbackPlan`), at propose time and when the executor renders
     /// it again: for release `number` (its folder, e.g. Vercel's empty `rollback/`), the release it restores — `previous`, the
@@ -752,6 +769,24 @@ extension Store {
                 throw WorkError.invalid("\(r.ref) is \(r.status.rawValue); only deployed or failed releases roll back")
             }
             if r.rollbackStatus == .requested || r.rollbackStatus == .running { throw WorkError.conflict("\(r.ref) is already rolling back") }
+            // Fix I2: one rollback at a time; never while a release is open; only the release that is live now (the newest
+            // deployed or failed one), so the records always say what is live.
+            if let other = try Self.pendingRollback(db, companyId: companyId) {
+                throw WorkError.conflict("\(other.ref)'s rollback is \(other.rollbackStatus?.rawValue ?? "pending")")
+            }
+            if let open = try Release.filter(Column("companyId") == companyId && ReleaseStatus.openRawValues.contains(Column("status")))
+                .order(Column("number")).fetchOne(db) {
+                throw WorkError.conflict("\(open.ref) is still \(open.status.rawValue); roll back after it finishes")
+            }
+            if let newest = try Release.filter(Column("companyId") == companyId
+                                               && [ReleaseStatus.deployed.rawValue, ReleaseStatus.failed.rawValue].contains(Column("status")))
+                .order(Column("number").desc).fetchOne(db), newest.id != r.id {
+                throw WorkError.invalid("\(r.ref) is not the live release; roll back \(newest.ref)")
+            }
+            // Fix M1: a release recorded with no rollback commands is rolled back in the provider's dashboard.
+            guard !r.rollbackPlan.steps.isEmpty else {
+                throw WorkError.invalid("\(r.ref) has no recorded rollback; \(Self.dashboardRollback)")
+            }
             r.rollbackStatus = .requested
             r.rollbackRequestedAt = now
             r.rollbackStartedAt = nil
@@ -759,6 +794,14 @@ extension Store {
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .release,
                               text: "owner requested a rollback of \(r.ref) (release \(r.version))", createdAt: now).insert(db)
             return r
+        }
+    }
+
+    /// The companies with a requested rollback (a paused company is admitted for these only, fix I1).
+    func companiesWithRequestedRollback() throws -> Set<String> {
+        try writer.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT DISTINCT companyId FROM release WHERE rollbackStatus = ?",
+                                    arguments: [RollbackStatus.requested.rawValue]))
         }
     }
 
