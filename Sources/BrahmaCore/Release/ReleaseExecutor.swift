@@ -118,9 +118,11 @@ public actor ReleaseExecutor: EmergencyStopObserver {
 
     /// Every company with an approved release or a requested rollback, one after the other (the tick runs
     /// `advance(companyId:now:)` per company).
+    /// A paused company only rolls back (fix I1), as in the tick.
     public func advance(now: Date) async {
         for companyId in ((try? store.companiesWithReleaseWork()) ?? []).sorted() {
-            await advance(companyId: companyId, now: now)
+            let paused = (try? store.company(id: companyId))??.status != .running
+            await advance(companyId: companyId, now: now, rollbackOnly: paused)
         }
     }
 
@@ -128,12 +130,13 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     /// and insert, then the deploy claim (the first database transaction, conditional on `approved`), then — when there was
     /// none — the rollback claim (one transaction, conditional on `requested`); nothing while the owner's stop holds, and no
     /// await before either (builder-checks 3 and 5, PR-9). One company runs one release or rollback at a time.
-    public func advance(companyId: String, now: Date) async {
+    /// `rollbackOnly` (a paused company, fix I1): the deploy claim is skipped, so only a requested rollback can start.
+    public func advance(companyId: String, now: Date, rollbackOnly: Bool = false) async {
         guard inFlight.insert(companyId).inserted else { return }
         defer { inFlight.remove(companyId) }
         let claimed: Release?, rollback: Release?
         do {
-            claimed = try store.claimRelease(companyId: companyId, now: now)
+            claimed = rollbackOnly ? nil : try store.claimRelease(companyId: companyId, now: now)
             rollback = claimed == nil ? try store.claimRollback(companyId: companyId, now: now) : nil
         } catch {
             log("could not claim a release or rollback of \(companyId): \(error)")
@@ -549,6 +552,10 @@ public actor ReleaseExecutor: EmergencyStopObserver {
             throw Self.rollbackMismatch
         }
         guard plan.hashIsCurrent, rendered == plan, rendered.hash == plan.hash else { throw Self.rollbackMismatch }
+        // No recorded commands (fix M1): nothing is composed in their place.
+        guard !plan.steps.isEmpty else {
+            throw Failure(stage: "rollback", detail: "no commands", reason: "\(r.ref) has no recorded rollback; \(Store.dashboardRollback)")
+        }
         guard let settings = try store.hosting(companyId: r.companyId) else { throw Self.rollbackMismatch }
         let previous = try r.previousReleaseId.flatMap { id in try store.writer.read { try Release.fetchOne($0, key: id) } }
 
