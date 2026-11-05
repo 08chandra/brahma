@@ -36,7 +36,8 @@ import Glibc
         init(build: String? = ReleaseExecutorTests.build, smoke: String = "true", profile: PermissionProfile = .workspace,
              deploySandbox: (any SandboxedRunner)? = nil,
              http: FakeHTTPProbe = FakeHTTPProbe([FakeHTTPProbe.ok(200, body: "<html><title>Lumen</title></html>")]),
-             files: [String: String] = ["README.md": "Lumen\n"], configure: (inout FakeHostingAdapter) -> Void = { _ in }) throws {
+             files: [String: String] = ["README.md": "Lumen\n"], sleep: (@Sendable (Duration) async -> Void)? = nil,
+             configure: (inout FakeHostingAdapter) -> Void = { _ in }) throws {
             root = try tempDir()
             let data = root.appending(path: "data", directoryHint: .isDirectory)
             hostRoot = root.appending(path: "host", directoryHint: .isDirectory)
@@ -50,6 +51,7 @@ import Glibc
             vault = MemoryVault()
             var deps = ReleaseDependencies.fake(sandbox: sandbox, unsandboxed: unsandboxed, http: http, adapter: fake)
             if let deploySandbox { deps.sandbox = deploySandbox }
+            if let sleep { deps.sleep = sleep }
             w = try World(store: store, vault: vault, smokeSandbox: smokeSandbox, releaseDeps: deps)
             company = try w.company("Lumen", profile: profile)
             devops = try w.hire(company, "devops-1", role: "devops")
@@ -765,6 +767,50 @@ import Glibc
         #expect(try fx.notices().contains { $0.title == "Release 0.1.0 was stopped" && $0.body == "Nothing was deployed." })
     }
 
+    /// Task 7 M5 (L-5lite-A): the owner's stop during the release's own smoke on main ends that smoke at once (its group
+    /// killed, the run recorded with no result) and the release `failed` with the stop's text: not a "smoke on main"
+    /// failure, and no bug.
+    @Test func emergencyStopDuringReleaseSmokeOnMain() async throws {
+        let fx = try Fx(smoke: "sleep 300")
+        let approved = try fx.proposeAndApprove()
+        let running = Task { await fx.executor.advance(now: fx.w.clock.now) }
+        await fx.smokeSandbox.waitForRun { $0.command == "sleep 300" }
+        let cwd = try #require(fx.smokeSandbox.calls.first?.cwd)
+        try fx.store.emergencyStop(note: "test", by: "owner", now: fx.w.clock.now)
+        await fx.executor.stopAll(reason: "stopped by the owner: test")
+        await running.value
+        let r = try fx.reload(approved)
+        #expect(r.status == .failed)
+        #expect(r.failedReason == "stopped by the owner during smoke on main")
+        let smoke = try #require(try fx.releaseSmokes().first)
+        #expect(smoke.status == .error && smoke.outputTail == ReleasePolicy.engineStopped, "\(smoke)")
+        #expect(!FileManager.default.fileExists(atPath: cwd.path))
+        #expect(try fx.bugs().isEmpty)
+        #expect(try fx.notices().contains { $0.title == "Release 0.1.0 was stopped" && $0.body == "Nothing was deployed." })
+        #expect(fx.sandbox.calls.isEmpty, "no build, tools or deploy step")
+    }
+
+    /// Task 7 M5 (L-5lite-A): the owner's stop while the deployed site is smoked ends `DeploySmoke` at its wait between
+    /// attempts (cancelled, not waited out): no further attempt, the release `failed` with the stop's text, no bug.
+    @Test func emergencyStopEndsTheDeploySmoke() async throws {
+        let gate = SleepGate()
+        let fx = try Fx(http: FakeHTTPProbe([FakeHTTPProbe.ok(503)]), sleep: { _ in await gate.sleep() })
+        let approved = try fx.proposeAndApprove()
+        let running = Task { await fx.executor.advance(now: fx.w.clock.now) }
+        await gate.waitUntilSleeping()
+        #expect(fx.http.requests.count == 1)
+        try fx.store.emergencyStop(note: nil, by: "owner", now: fx.w.clock.now)
+        await fx.executor.stopAll(reason: "stopped by the owner")
+        gate.release()   // were the stop not to reach the smoke, it would go on with its other attempts now
+        await running.value
+        let r = try fx.reload(approved)
+        #expect(gate.wasCancelled)
+        #expect(fx.http.requests.count == 1, "no attempt after the stop")
+        #expect(r.status == .failed)
+        #expect(r.failedReason == "stopped by the owner during smoke")
+        #expect(try fx.bugs().isEmpty)
+    }
+
     @Test func advanceWhileStoppedClaimsNothing() async throws {
         let fx = try Fx()
         let approved = try fx.proposeAndApprove()
@@ -776,5 +822,58 @@ import Glibc
         try fx.store.resumeAfterStop(now: fx.w.clock.now)
         await fx.advance()
         #expect(try fx.reload(approved).status == .deployed)
+    }
+}
+
+/// `DeploySmoke`'s wait between attempts, held (an event: `waitUntilSleeping`) until the waiting task is cancelled or the test
+/// calls `release`; every later wait returns at once. Records whether it ended by cancellation.
+final class SleepGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sleeping = false, released = false, cancelled = false, used = false
+    private var held: CheckedContinuation<Void, Never>?
+    private var sleepWaiters: [CheckedContinuation<Void, Never>] = []
+
+    var wasCancelled: Bool { lock.withLock { cancelled } }
+
+    func sleep() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                let (now, waiters) = lock.withLock { () -> (Bool, [CheckedContinuation<Void, Never>]) in
+                    if used || released || cancelled { return (true, []) }
+                    used = true; sleeping = true; held = c
+                    defer { sleepWaiters = [] }
+                    return (false, sleepWaiters)
+                }
+                for w in waiters { w.resume() }
+                if now { c.resume() }
+            }
+        } onCancel: {
+            let c = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+                cancelled = true
+                defer { held = nil }
+                return held
+            }
+            c?.resume()
+        }
+    }
+
+    func release() {
+        let c = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            defer { held = nil }
+            return held
+        }
+        c?.resume()
+    }
+
+    func waitUntilSleeping() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let now = lock.withLock { () -> Bool in
+                if sleeping { return true }
+                sleepWaiters.append(c)
+                return false
+            }
+            if now { c.resume() }
+        }
     }
 }

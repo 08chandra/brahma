@@ -48,6 +48,33 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
 
     private var startedCalls: [Call] = []
 
+    /// `run` calls made so far, and callers of `waitForRun` still waiting (kept apart from `spawn`'s).
+    private var runCalls: [Call] = []
+    private var runWaiters: [(matches: @Sendable (Call) -> Bool, continuation: CheckedContinuation<Void, Never>)] = []
+
+    /// Returns once `run` has been called for a call that `matches` (at once when it already has): an event, never a timer.
+    /// The command is starting then (`GroupRun` spawns it next); cancelling the caller kills its group either way.
+    func waitForRun(_ matches: @escaping @Sendable (Call) -> Bool) async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let now = lock.withLock { () -> Bool in
+                if runCalls.contains(where: matches) { return true }
+                runWaiters.append((matches, c))
+                return false
+            }
+            if now { c.resume() }
+        }
+    }
+
+    private func ranCall(_ call: Call) {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            runCalls.append(call)
+            let (hit, rest) = (runWaiters.filter { $0.matches(call) }, runWaiters.filter { !$0.matches(call) })
+            runWaiters = rest
+            return hit.map(\.continuation)
+        }
+        for c in ready { c.resume() }
+    }
+
     private func started(_ call: Call) {
         let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
             startedCalls.append(call)
@@ -64,7 +91,9 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
              policy: SandboxPolicy) async -> CheckOutcome {
-        record(Call(kind: .run, command: command, cwd: cwd, environment: environment, policy: policy, output: outputURL))
+        let call = Call(kind: .run, command: command, cwd: cwd, environment: environment, policy: policy, output: outputURL)
+        record(call)
+        ranCall(call)
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
         let cancel = GroupRun.CancelFlag()
         return await withTaskCancellationHandler {
