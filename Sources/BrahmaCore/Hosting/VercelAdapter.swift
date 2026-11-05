@@ -44,12 +44,29 @@ public struct VercelAdapter: HostingAdapter {
         DeployStep(label: "deploy", argv: [i.bin("vercel"), "deploy", "--prod", "--yes"])
     }
 
-    /// The whole export (`["."]`, through the stager's dotfile rules) is uploaded from `releaseDir/upload`.
+    /// The whole export (`["."]`, through the stager's dotfile rules) is uploaded from `releaseDir/upload`. The deploy URL the
+    /// CLI prints is confirmed with the deploy's own token before the engine stores it (`vercel inspect <url>`, the Task 7
+    /// ruling): a URL alone cannot tell this project from a foreign one named `<project>-<9 letters or digits>`.
     public func deployPlan(_ i: DeployInput) throws -> DeployPlan {
         try validate(i.settings)
         try i.validate()
         return try DeployPlan(steps: [deployStep(i)], stageFrom: ["."], cwdPath: i.inRelease("upload"), network: network,
-                              tokenSecret: tokenSecret, env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
+                              tokenSecret: tokenSecret, env: env(i), build: i.settings.build, outputDir: i.settings.outputDir,
+                              verify: [i.bin("vercel"), "inspect", DeployPlan.deployURLPlaceholder])
+    }
+
+    /// `vercel inspect` names the deployment's project on a `name <project>` line of its General section; the deployment is
+    /// this project's only when that line names exactly `settings.project` (also the `VERCEL_PROJECT_ID` the deploy used).
+    ///
+    /// UNVERIFIED until the owner's provider probe (PR-14): the line layout was read from the vercel 65.9.0 package, not seen
+    /// against a real deployment. Anything else (no such line, another name, two different names) fails closed.
+    public func verifiesDeployment(output: String, settings: HostingSettings) -> Bool {
+        let names = output.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            let words = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard words.count == 2, words[0] == "name" else { return nil }
+            return String(words[1])
+        }
+        return !names.isEmpty && names.allSatisfy { $0 == settings.project }
     }
 
     /// `vercel rollback <previous deploy URL> --yes` from an empty `releaseDir/rollback`, else the placeholder deployed.
