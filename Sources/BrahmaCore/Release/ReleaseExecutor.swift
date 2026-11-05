@@ -48,7 +48,8 @@ public struct ReleaseDependencies: Sendable {
 ///
 /// Every build, tools and deploy step is killable (`runStep`: spawned, recorded, polled, its group terminated on a timeout
 /// or the owner's stop). Raw output stays under the data home (`ReleaseLayout`); only the redacted copy of `deploy.log` (and
-/// `build.log`) goes to `<ws>/.brahma/releases/R-<n>/` (PR-7). The owner's stop (`stopAll`) ends the running step: a release
+/// `build.log`) goes to `<ws>/.brahma/releases/R-<n>/` (PR-7). The owner's stop (`stopAll`) ends the running step, and the
+/// release's smoke in flight (its smoke on main, or the deployed site's `DeploySmoke`, cancelled: Task 7 M5): a release
 /// that was `deploying` is `interrupted` and never runs again; one `building` or `smoking` is `failed` (`"stopped by the
 /// owner during <step>"`).
 ///
@@ -91,6 +92,9 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     private var tails: [String: String] = [:]
     /// Release id → the process of its running step.
     private var running: [String: any SandboxedProcess] = [:]
+    /// Release id → how to cancel its smoke in flight (the smoke on main, the deployed site's `DeploySmoke`): what the
+    /// owner's stop ends at once (Task 7 M5, L-5lite-A).
+    private var smokes: [String: @Sendable () -> Void] = [:]
 
     public init(store: Store, paths: BrahmaPaths, sandbox: any SandboxedRunner, unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner(),
                 vault: any SecretVault, http: any HTTPProbing, smoke: @escaping Smoke,
@@ -153,7 +157,19 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     /// too while the stop holds (`Store.claimRelease`, `Store.claimRollback`).
     public func stopAll(reason: String) async {
         for id in active.keys { stops.insert(id) }
+        for cancel in smokes.values { cancel() }
         for process in running.values { await process.terminate(grace: .seconds(EmergencyStop.grace)) }
+    }
+
+    /// Runs one of the release's smokes as a task the owner's stop cancels (`stopAll`), and the engine's shutdown too (the
+    /// caller's cancellation is passed on). A stop that came first cancels it at once. The caller's `checkStop` then names
+    /// the stop.
+    private func stoppable<T: Sendable>(_ r: Release, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+        let task = Task { try await body() }
+        smokes[r.id] = { task.cancel() }
+        defer { smokes[r.id] = nil }
+        if stops.contains(r.id) { task.cancel() }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
 
     /// Who stops a release: the owner (`stopAll`, or the stop row, which the observers may not have seen yet) or the engine
@@ -218,6 +234,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         active[id] = nil
         stops.remove(id)
         running[id] = nil
+        smokes[id] = nil
         stages[id] = nil
         tails[id] = nil
     }
@@ -260,7 +277,10 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         guard onMain else { throw Failure(stage: "smoke on main", detail: "not on main", reason: "\(r.ref)'s commit is no longer on main") }
         try checkStop(r)
         let run: MainSmokeRun
-        do { run = try await smoke(r.companyId, r.commit, .release, r.id, main) } catch {
+        let (smoke, companyId, releaseId) = (self.smoke, r.companyId, r.id)
+        do { run = try await stoppable(r) { try await smoke(companyId, commit, .release, releaseId, main) } } catch {
+            // A smoke the owner's stop (or the engine's shutdown) ended is the stop, never a "smoke on main" failure.
+            try checkStop(r)
             throw Failure(stage: "smoke on main", detail: "did not run",
                           reason: "the smoke check could not run at \(r.sha7) just before deploying (\(Self.text(error)))")
         }
@@ -412,7 +432,10 @@ public actor ReleaseExecutor: EmergencyStopObserver {
                           reason: "no deploy URL was found in the deploy output and no production URL is set")
         }
         try checkStop(r)
-        let smoked = await DeploySmoke.run(base: base, requests: settings.smoke, expectText: settings.expectText, http: http, sleep: sleep)
+        let (http, sleep, requests, expectText) = (self.http, self.sleep, settings.smoke, settings.expectText)
+        let smoked = try await stoppable(r) {
+            await DeploySmoke.run(base: base, requests: requests, expectText: expectText, http: http, sleep: sleep)
+        }
         try checkStop(r)
         var results = smoked.results
         // The custom domain is recorded, never gating: DNS may still be on its way.
@@ -638,7 +661,8 @@ public actor ReleaseExecutor: EmergencyStopObserver {
             throw Failure(stage: "rollback", detail: "no URL", reason: "no deploy URL was found in the rollback output and no production URL is set")
         }
         try checkStop(r)
-        let smoked = await DeploySmoke.run(base: base, requests: settings.smoke, expectText: nil, http: http, sleep: sleep)
+        let (http, sleep, requests) = (self.http, self.sleep, settings.smoke)
+        let smoked = try await stoppable(r) { await DeploySmoke.run(base: base, requests: requests, expectText: nil, http: http, sleep: sleep) }
         try checkStop(r)
         guard smoked.ok else {
             let first = smoked.results.first { !$0.ok }
