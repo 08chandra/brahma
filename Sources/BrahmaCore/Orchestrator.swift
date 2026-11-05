@@ -109,6 +109,7 @@ public actor Orchestrator {
     nonisolated let pushDispatcher: PushDispatcher
     var pushTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// The owner's emergency stop (Task 7c): what else a stop reaches (previews, deploys, merge queues, browsers, connectors).
+    /// The release executor is always one of them (Plan L Task 7).
     nonisolated let stopObservers: [any EmergencyStopObserver]
     /// How a running turn's supervision waits between its reads of the stop (awake time; tests inject their own).
     nonisolated let stopPollSleep: @Sendable (Duration) async throws -> Void
@@ -122,10 +123,14 @@ public actor Orchestrator {
     /// Plan L main smokes (`smokeTick`): what they run through, one slot per company shared with a release's smoke (PR-36),
     /// and the run in flight per company.
     nonisolated let smokeChecks: SmokeChecks
-    public nonisolated let smokeSlots = SmokeSlots()
+    public nonisolated let smokeSlots: SmokeSlots
     var smokeTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Company id → when its merge smoke, re-queued after the engine's own failure (an export), may start again.
     var smokeBackoff: [String: Date] = [:]
+    /// Plan L releases (`releaseTick`): the one executor that carries out approved deploys (a stop observer too), and the
+    /// release in progress per company. A release's own smoke on main runs inside its task, so it is tracked with it.
+    public nonisolated let releaseExecutor: ReleaseExecutor
+    var releaseTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -152,10 +157,28 @@ public actor Orchestrator {
                 stopObservers: [any EmergencyStopObserver] = [],
                 stopPollSleep: @escaping @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) },
                 previewDeps: PreviewDependencies? = nil,
-                smokeChecks: SmokeChecks? = nil) {
-        self.stopObservers = stopObservers; self.stopPollSleep = stopPollSleep
+                smokeChecks: SmokeChecks? = nil,
+                releaseDeps: ReleaseDependencies? = nil) {
+        self.stopPollSleep = stopPollSleep
         let engineBlocking = Blocking()
         self.blocking = engineBlocking
+        let engineId = UUID().uuidString
+        self.engineId = engineId
+        let slots = SmokeSlots()
+        self.smokeSlots = slots
+        // Releases (Plan L): the executor runs its release smoke through the same entry as `runSmoke` (this engine's slot,
+        // Blocking and clock), its steps through the platform sandbox by default (`defaultReleaseDependencies`).
+        let smokes = smokeChecks ?? Orchestrator.defaultSmokeChecks(store: store, paths: paths, environment: checkBaseEnvironment)
+        self.smokeChecks = smokes
+        let releaseDeps = releaseDeps ?? Orchestrator.defaultReleaseDependencies(store: store, paths: paths)
+        let executor = ReleaseExecutor(
+            store: store, paths: paths, sandbox: releaseDeps.sandbox, unsandboxed: releaseDeps.unsandboxed, vault: vault, http: releaseDeps.http,
+            smoke: Orchestrator.smokeEntry(store: store, checks: smokes, slots: slots, blocking: engineBlocking, clock: clock,
+                                           engineId: engineId),
+            adapters: releaseDeps.adapters, sleep: releaseDeps.sleep, clock: clock, blocking: engineBlocking,
+            environment: releaseDeps.environment ?? checkBaseEnvironment)
+        self.releaseExecutor = executor
+        self.stopObservers = stopObservers + [executor]
         // Previews (Plan L): the platform sandbox with the checks' baseline by default (`defaultPreviewDependencies`).
         let previewDeps = previewDeps ?? Orchestrator.defaultPreviewDependencies(store: store, paths: paths)
         self.previewRunner = PreviewRunner(store: store, paths: paths, deps: previewDeps,
@@ -184,7 +207,6 @@ public actor Orchestrator {
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths)
         self.checkBaseEnvironment = checkBaseEnvironment
-        self.smokeChecks = smokeChecks ?? Orchestrator.defaultSmokeChecks(store: store, paths: paths, environment: checkBaseEnvironment)
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -304,8 +326,9 @@ public actor Orchestrator {
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
 
-    /// Child processes that are not turns: engine-run checks, merges and main smokes. They count against the same caps as turns.
-    var otherChildren: Int { checkTasks.count + mergeTasks.count + smokeTasks.count }
+    /// Child processes that are not turns: engine-run checks, merges, main smokes and releases in progress (a deploy's build,
+    /// tools and provider CLI steps). They count against the same caps as turns.
+    var otherChildren: Int { checkTasks.count + mergeTasks.count + smokeTasks.count + releaseTasks.count }
 
     /// Previews' child processes (running servers and starts in flight): against the safety cap only, never the plan tier's
     /// hard cap (`Scheduler.freeSlots(safetyOnly:)`, Task 3 fix I1).
@@ -323,7 +346,7 @@ public actor Orchestrator {
     /// This engine's limit on concurrently running blocking (git) bodies.
     let blocking: Blocking
     /// Marks this engine's tasks for `EngineGitGuard`.
-    nonisolated let engineId = UUID().uuidString
+    nonisolated let engineId: String
 
     /// Runs `body` as one of this engine's tasks (`EngineGitGuard.engine`); for the detached ones, which inherit no task-local.
     nonisolated func asEngine<T: Sendable>(_ body: @Sendable () async throws -> T) async rethrows -> T {
@@ -337,6 +360,7 @@ public actor Orchestrator {
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
             && secretsTask == nil && pushTask == nil && stopObserverTask == nil && previewTask == nil && smokeTasks.isEmpty
+            && releaseTasks.isEmpty
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -346,7 +370,7 @@ public actor Orchestrator {
     }
 
     private func busyDescription() -> String {
-        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted()) previews=\(previewTask == nil ? "idle" : "reconciling") smokes=\(smokeTasks.keys.sorted()) secrets=\(secretsTask == nil ? "idle" : "reloading")"
+        "turns=\(tasks.keys.sorted()) health=\(healthTasks.keys.sorted()) git=\(gitTasks.keys.sorted()) checks=\(checkTasks.keys.sorted()) merges=\(mergeTasks.keys.sorted()) timers=\(timerTasks.keys.sorted()) previews=\(previewTask == nil ? "idle" : "reconciling") smokes=\(smokeTasks.keys.sorted()) releases=\(releaseTasks.keys.sorted()) secrets=\(secretsTask == nil ? "idle" : "reloading")"
     }
 
     private func idleWaiterTimedOut(_ id: Int) {
@@ -396,7 +420,7 @@ public actor Orchestrator {
         stopWALShipping()
         await stopSleepPrevention()
         let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
-            + Array(smokeTasks.values)
+            + Array(smokeTasks.values) + Array(releaseTasks.values)
             + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? []) + (stopObserverTask.map { [$0] } ?? []) + (previewTask.map { [$0] } ?? [])
         for t in inFlight { t.cancel() }
         for t in inFlight { await t.value }
@@ -569,6 +593,8 @@ public actor Orchestrator {
         previewTick(held: held)
         // 5c. The smoke check on main (Plan L): queue a run for a new main, run queued ones one at a time per company.
         smokeTick(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+        // 5d. Releases (Plan L): an approved deploy is carried out once, after the main smoke step.
+        releaseTick(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
 
         infraCooldown = infraCooldown.filter { $0.value > now }
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
