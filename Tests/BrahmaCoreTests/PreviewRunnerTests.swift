@@ -488,17 +488,143 @@ import Glibc
         await x.pass()
         let pids = [try x.state("web").pid, try x.state("api").pid]
         #expect(pids.allSatisfy { Self.alive($0) })
-        await x.runner.stopAll(reason: "stopped by the owner")
-        #expect(await Self.waitUntil { pids.allSatisfy { !Self.alive($0) } }, "no pids alive")
+        await x.runner.stopAll()
+        #expect(await Self.waitUntil(.seconds(600)) { pids.allSatisfy { !Self.alive($0) } }, "no pids alive")
         for name in ["web", "api"] {
             let s = try x.state(name)
-            #expect(s.status == .stopped && s.message == "stopped by the owner" && s.pid == nil)
+            #expect(s.status == .stopped && s.message == "engine stopped" && s.pid == nil)
         }
         #expect(x.deps.processes.count == 0)
     }
 
-    // L-5lite: emergencyStopStopsPreviews (EmergencyStopObserver / Store.engineStopped are not built yet, PR-35 3s);
-    // `stopAll(reason:)` is covered by stopAllOnShutdown.
+    /// L-5lite-A (PR-35 3s): the owner's stop reaches every preview (the observer's `stopAll(reason:)`, whatever note the
+    /// owner gave), nothing starts or restarts while it holds, and the pass after the resume starts them as on engine start.
+    @Test func emergencyStopStopsPreviews() async throws {
+        let x = try Fx()
+        try x.set("api")
+        await x.pass()
+        await x.pass()
+        let pids = [try x.state("web").pid, try x.state("api").pid]
+        #expect(pids.allSatisfy { Self.alive($0) })
+        let spawned = x.spawns.count
+        #expect(spawned == 2)
+        try x.store.emergencyStop(note: "test", by: "owner", now: x.now)
+        await x.runner.stopAll(reason: "stopped by the owner: test")
+        // Hang bound only: stopAll returns once every group is reaped.
+        #expect(await Self.waitUntil(.seconds(600)) { pids.allSatisfy { !Self.alive($0) } }, "no pids alive")
+        for name in ["web", "api"] {
+            let s = try x.state(name)
+            #expect(s.status == .stopped && s.message == "stopped by the owner" && s.pid == nil, "\(s)")
+        }
+        #expect(x.deps.processes.count == 0)
+        // While stopped: nothing starts, not the stopped surfaces, not after a merge past the debounce, not a flagged one.
+        await x.pass()
+        let moved = try x.merge(["index.html": "two"])
+        await x.pass()
+        x.w.clock.advance(PreviewRunner.debounce + 1)
+        try x.store.requestPreviewRestart(surfaceId: try x.surface("web").id, by: .owner, now: x.now)
+        await x.pass()
+        #expect(x.spawns.count == spawned, "nothing spawned while stopped")
+        for name in ["web", "api"] { #expect(try x.state(name).message == "stopped by the owner") }
+        // Resumed: the next passes start them again (one start at a time), after the debounce for the moved main, as an
+        // engine start would.
+        try x.store.resumeAfterStop(now: x.now)
+        await x.pass()
+        x.w.clock.advance(PreviewRunner.debounce + 1)
+        await x.pass()
+        await x.pass()
+        for name in ["web", "api"] {
+            let s = try x.state(name)
+            #expect(s.status == .running && s.commit == moved && Self.alive(s.pid), "\(s)")
+        }
+        #expect(x.spawns.count == spawned + 2)
+        await x.stop()
+    }
+
+    /// L-5lite-A: `brahma stop` (and the app's STOP EVERYTHING) signal the recorded groups themselves, so a wedged engine
+    /// cannot keep a preview up: a running preview's group is among them, a record whose pid does not match its times is not.
+    @Test func recordedGroupsIncludePreviews() async throws {
+        let x = try Fx()
+        await x.pass()
+        let state = try x.state()
+        let pid = try #require(state.pid)
+        #expect(state.status == .running && Self.alive(pid))
+        #if canImport(Darwin)
+        // The record's times bracket the real process start whatever the load (the test clock is not wall time).
+        var record = state
+        record.startedAt = Date().addingTimeInterval(-3600)
+        record.updatedAt = Date().addingTimeInterval(3600)
+        try x.store.savePreviewState(record)
+        #expect(EmergencyStop.recordedGroups(store: x.store).contains(pid))
+        record.startedAt = Date().addingTimeInterval(1800)
+        try x.store.savePreviewState(record)
+        #expect(!EmergencyStop.recordedGroups(store: x.store).contains(pid), "a recycled pid is never signalled")
+        #endif
+        await x.stop()
+    }
+
+    /// L-5lite-A: the preview runner is one of the engine's stop observers, and the engine's own stop path reaches it.
+    @Test func emergencyStopReachesPreviewsThroughTheEngine() async throws {
+        let x = try Fx()
+        let o = x.w.orchestrator
+        let runner = await o.previewRunner
+        #expect(o.stopObservers.contains { ($0 as? PreviewRunner) === runner })
+        try await x.w.cycle()
+        await o.previewRunner.waitForStarts()
+        let pid = try x.state().pid
+        #expect(try x.state().status == .running && Self.alive(pid))
+        try x.store.emergencyStop(note: nil, by: "owner", now: x.now)
+        try await x.w.cycle()
+        #expect(await Self.waitUntil(.seconds(600)) { !Self.alive(pid) })
+        let s = try x.state()
+        #expect(s.status == .stopped && s.message == "stopped by the owner" && s.pid == nil, "\(s)")
+        try await x.w.cycle()
+        await o.previewRunner.waitForStarts()
+        #expect(x.spawns.count == 1, "nothing restarted while stopped")
+        try x.store.resumeAfterStop(now: x.now)
+        try await x.w.cycle()
+        await o.previewRunner.waitForStarts()
+        #expect(try x.state().status == .running)
+        #expect(x.spawns.count == 2)
+        await o.previewRunner.stopAll()
+    }
+
+    /// Task 3 M1 (L-5lite-A): a pass in flight when `stopAll` runs brings nothing up after it returns. The pass is held
+    /// inside its exit notice for a server that looks dead (an event, `ExitGate`), `stopAll` runs and returns, then the pass
+    /// goes on: the flagged surface after it is not started, and the late exit notice writes nothing over the stop.
+    @Test func stopAllFencesAPassInFlight() async throws {
+        let x = try Fx(run: "sleep 301")
+        try x.set("api")
+        let gated = GatedSandbox(marker: "sleep 301")
+        let deps = PreviewDependencies(sandbox: gated, http: x.http, listen: x.listen, processes: SpawnedProcesses(),
+                                       unsandboxed: FakeSandbox())
+        let paths = x.w.paths
+        let runner = PreviewRunner(store: x.store, paths: paths, deps: deps,
+                                   sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
+                                   timeouts: Fx.fast, memory: { false }, clock: x.w.clock.function)
+        for _ in 0..<2 {
+            await runner.reconcile(now: x.now)
+            await runner.waitForStarts()
+        }
+        let pids = [try x.state("web").pid, try x.state("api").pid]
+        #expect(pids.allSatisfy { Self.alive($0) })
+        let spawned = gated.inner.calls.filter { $0.kind == .spawn }.count
+        try x.store.requestPreviewRestart(surfaceId: try x.surface("api").id, by: .owner, now: x.now)
+        gated.gate.playDead()
+        let pass = Task { await runner.reconcile(now: x.now) }
+        await gated.gate.waitUntilHeld()
+        await runner.stopAll()
+        gated.gate.release()
+        await pass.value
+        await runner.waitForStarts()
+        #expect(gated.inner.calls.filter { $0.kind == .spawn }.count == spawned, "nothing came up after stopAll returned")
+        #expect(await Self.waitUntil(.seconds(600)) { pids.allSatisfy { !Self.alive($0) } }, "no pids alive")
+        for name in ["web", "api"] {
+            let s = try x.state(name)
+            #expect(s.status == .stopped && s.message == "engine stopped" && s.pid == nil, "\(s)")
+        }
+        #expect(deps.processes.count == 0)
+    }
 
     @Test func digestPreviewLine() {
         let now = Date()
@@ -512,5 +638,88 @@ import Glibc
         #expect(TurnDigest.previewLine([]) == nil)
         let many = Array(repeating: (surface, Optional(state)), count: 20)
         #expect((TurnDigest.previewLine(many)?.count ?? 0) <= 400)
+    }
+}
+
+/// Holds a reconcile pass inside its exit notice (Task 3 M1 test): once `playDead`, the gated servers look dead with exit 0,
+/// and the first `terminate` of one (the notice's own stop) waits for `release`, after telling `waitUntilHeld`. Every other
+/// `terminate` (the runner's `stopAll`) goes straight to the real process. Events only, no timers.
+final class ExitGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var dead = false, released = false, held = false
+    private var heldWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func playDead() { lock.withLock { dead = true } }
+    var looksDead: Bool { lock.withLock { dead && !released } }
+
+    func release() {
+        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            released = true
+            defer { releaseWaiters = [] }
+            return releaseWaiters
+        }
+        for c in waiters { c.resume() }
+    }
+
+    func waitUntilHeld() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let now = lock.withLock { () -> Bool in
+                if held { return true }
+                heldWaiters.append(c)
+                return false
+            }
+            if now { c.resume() }
+        }
+    }
+
+    /// The first terminate while dead waits for `release`; returns once it may go on.
+    func holdFirstTerminate() async {
+        let first = lock.withLock { () -> (Bool, [CheckedContinuation<Void, Never>]) in
+            guard dead, !released, !held else { return (false, []) }
+            held = true
+            defer { heldWaiters = [] }
+            return (true, heldWaiters)
+        }
+        guard first.0 else { return }
+        for c in first.1 { c.resume() }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let go = lock.withLock { () -> Bool in
+                if released { return true }
+                releaseWaiters.append(c)
+                return false
+            }
+            if go { c.resume() }
+        }
+    }
+}
+
+/// A FakeSandbox whose servers with `marker` in their command go through `ExitGate`.
+final class GatedSandbox: SandboxedRunner, @unchecked Sendable {
+    let inner = FakeSandbox()
+    let gate = ExitGate()
+    let marker: String
+    init(marker: String) { self.marker = marker }
+
+    func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+             policy: SandboxPolicy) async -> CheckOutcome {
+        await inner.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy)
+    }
+
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+        let process = try inner.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: policy)
+        return command.contains(marker) ? GatedProcess(inner: process, gate: gate) : process
+    }
+}
+
+struct GatedProcess: SandboxedProcess {
+    let inner: any SandboxedProcess
+    let gate: ExitGate
+    var pid: Int32 { inner.pid }
+    func isAlive() -> Bool { gate.looksDead ? false : inner.isAlive() }
+    func exitStatus() -> Int32? { gate.looksDead ? 0 : inner.exitStatus() }
+    func terminate(grace: Duration) async {
+        await gate.holdFirstTerminate()
+        await inner.terminate(grace: grace)
     }
 }
