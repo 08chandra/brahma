@@ -193,6 +193,11 @@ extension Store {
         let returned = try WorkItemEvent.filter(Column("itemId") == item.id && Column("kind") == WorkEventKind.changesRequested.rawValue)
             .fetchCount(db)
         guard returned == 0 else { return false }
+        // S21: any event of the round (round 1: the item's whole history) a tainted session wrote rules auto-merge out; so does
+        // a mark set since this item value was read.
+        let taintedEvents = try WorkItemEvent.filter(Column("itemId") == item.id && Column("taintedOrigin") == true).fetchCount(db)
+        let marked = try Bool.fetchOne(db, sql: "SELECT taintedOrigin FROM workItem WHERE id = ?", arguments: [item.id]) ?? true
+        guard taintedEvents == 0, !marked else { return false }
         let current = Set([item.ownerId, try Self.leaseHolderId(db: db, itemId: item.id), run.requestedBy].compactMap { $0 })
         for id in current {
             if let agent = try Agent.fetchOne(db, key: id), agent.fullReview { return false }

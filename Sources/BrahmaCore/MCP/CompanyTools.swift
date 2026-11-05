@@ -250,6 +250,9 @@ public struct CompanyTools: Sendable {
     /// the flag file) is refused, and the turn's end starts a fresh session.
     private func refuseUnderTaint(_ name: String, _ me: Agent) throws {
         guard TaintPolicy.isHighRisk(name) else { return }
+        // S19: the verdict of a review or audit turn is the only high-risk call a tainted session keeps (refusing it would
+        // deadlock the review); everything else the turn writes carries the taint.
+        if name == "review" || name == "audit", try verdictTurn(name) { return }
         let flagged = taintFlag.map(TaintFlag.exists) ?? false
         guard me.sessionTainted || flagged else { return }
         do { try store.requestFreshSession(agentId: agentId) } catch {
@@ -260,12 +263,21 @@ public struct CompanyTools: Sendable {
         throw ToolError(message: TaintPolicy.refusal(tool: name, source: source ?? "outside content"))
     }
 
+    /// Whether this server belongs to the turn kind whose verdict `name` is (S19): `review` on a review turn, `audit` on an audit
+    /// turn, by the turn's own recorded kind as well as the server's credential. Without a turn (in-process tools) the
+    /// server's binding alone decides.
+    func verdictTurn(_ name: String) throws -> Bool {
+        let bound = name == "review" ? reviewItemId != nil : auditTurnId != nil
+        guard bound else { return false }
+        guard let turnId = quotaTurnId else { return true }
+        let kind = try store.writer.read { db in try String.fetchOne(db, sql: "SELECT kind FROM turn WHERE id = ?", arguments: [turnId]) }
+        return kind == (name == "review" ? TurnKind.review.rawValue : TurnKind.audit.rawValue)
+    }
+
     /// Marks this agent's session tainted because it is about to read what a tainted session wrote (I2). A mark that cannot be
     /// written refuses the read.
     func relayTaint(_ source: String) throws {
-        // A review or audit turn is never relay-tainted (its `review`/`audit` would be refused: a deadlock); the digest and the
-        // `untrusted` fields frame the content, and a marked item is never auto-approved.
-        guard reviewItemId == nil, auditTurnId == nil else { return }
+        // A review or audit turn is tainted like any other (S19); only its verdict tool is exempt from the gate.
         do { try store.markTainted(agentId: agentId, source: source) } catch {
             diagnostics("brahma mcp: could not mark @\(agentId) tainted: \(error)")
             throw ToolError(message: "this content could not be shown safely right now; try again next turn")

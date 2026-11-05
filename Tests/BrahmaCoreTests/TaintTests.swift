@@ -69,7 +69,17 @@ import GRDB
                       // Fix round 2 (S17): the tokenised, deny-by-default git classifier.
                       "git -c x=y \"fetch\"", "git --git-dir=/x/.git ls-remote", "GIT_DIR=x git fetch", "env git pull",
                       "/usr/bin/git fetch", "git $(echo fetch)", "git \"$X\"", "git -C \"dir with space\" fetch", "git $OPTS status",
-                      "command git fetch", "sh -c 'git fetch'", "git my-alias", "nice -n 10 git pull", "ls && git 'pull'"])
+                      "command git fetch", "sh -c 'git fetch'", "git my-alias", "nice -n 10 git pull", "ls && git 'pull'",
+                      // Fix round 2b (S20): the allowlist. Excluded subcommands, command-running options, wrappers, shells.
+                      "git maintenance run --task=prefetch", "git rebase -i HEAD~2", "git bisect run make", "git difftool",
+                      "git help -w log", "git submodule status", "git stash", "git tag v1", "git worktree add x",
+                      "git -c core.pager=x log", "git --exec-path=/tmp status", "git --config-env=a=B status",
+                      "git log --ext-diff", "git show --textconv HEAD", "git diff --ext-diff", "git commit -c HEAD",
+                      "git commit -ac HEAD", "git merge -s ours x", "git merge -X theirs x", "git grep -O vim foo",
+                      "git branch -D x", "git log $X", "git add $f", "git -C $D status",
+                      "bash -lc \"$X\"", "sh -c \"$CMD\"", "xargs git status", "echo fetch | xargs git", "env -S 'git status'",
+                      "nohup git status", "time git status", "GIT_SSH_COMMAND=x git status",
+                      "$G fetch", "\"$GIT\" fetch"])
     func interpreterNetworkTaints(_ c: String) {
         let source = TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)])
         #expect(source == "bash: " + String(TaintPolicy.flat(c).prefix(60)))
@@ -78,7 +88,10 @@ import GRDB
     @Test func plainCommandsDoNotTaint() {
         for c in ["ls", "swift build", "echo curling", "git status", "git commit -m x", "cat README.md", "swift test --filter X",
                   "git -C lab status", "git -C lab log --oneline", "git -C \"dir with space\" log", "git -C \"$WT\" status",
-                  "git --version", "echo hi; git diff HEAD~1", "git add *.swift"] {
+                  "git --version", "echo hi; git diff HEAD~1", "git status -sb", "git show -s HEAD", "git branch -d old",
+                  "git checkout -b x", "git switch main", "git merge --no-ff x", "git restore f", "git rm f", "git mv a b",
+                  "git ls-files", "git rev-parse HEAD", "git cat-file -p HEAD", "git grep -n foo", "git add \"$f\"",
+                  "bash -lc 'git status'", "sh -c \"git diff\""] {
             #expect(TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)]) == nil, "\(c)")
         }
         // The source is the first 60 characters, on one line.
@@ -418,6 +431,90 @@ import GRDB
         let first = try GitFixture.plainGit(["rev-list", "--max-parents=0", "HEAD"], in: lab)
         try GitFixture.plainGit(["replace", head, first], in: lab)
         #expect(record() == .refused("the lab has replace refs"))
+    }
+
+    // MARK: Fix round 2b
+
+    @Test func taintedReviewerWritesCarryTaintButVerdictGoesThrough() throws {
+        let h = try Home()
+        let item = try h.store.createWorkItem(companyId: h.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Do it", acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/a"]), status: .ready))
+        try h.store.markTainted(agentId: h.ceo.id, source: "relayed: under review")
+        let review = CompanyTools(store: h.store, companyId: h.company.id, agentId: h.ceo.id, reviewItemId: item.id)
+        _ = try review.call(name: "comment_work_item", arguments: ["key": .string(item.key), "text": .string("looks fine")])
+        #expect(try h.store.itemEvents(itemId: item.id, limit: 10).last?.taintedOrigin == true, "the reviewer's comment carries the taint")
+        // The verdict is not refused for taint (it may fail for its own reasons: the item is not in review here).
+        let verdict = Self.refusal { try review.call(name: "review", arguments: ["key": .string(item.key), "approve": .bool(true)]) }
+        #expect(verdict?.contains("is off for it") != true)
+        // The same tool name on a server that is not a review turn's is refused.
+        #expect(Self.refusal { try h.tools(h.ceo).call(name: "review", arguments: [:]) }?.contains("is off for it") == true)
+        #expect(Self.refusal { try h.tools(h.ceo).call(name: "audit", arguments: [:]) }?.contains("is off for it") == true)
+    }
+
+    @Test func claimByTaintedSessionMarksItem() throws {
+        let h = try Home()
+        let item = try h.store.createWorkItem(companyId: h.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Do it", acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/a"]), status: .ready))
+        try h.store.markTainted(agentId: h.eng.id, source: "WebFetch")
+        _ = try h.store.claimLease(itemId: item.id, agentId: h.eng.id)
+        #expect(try #require(try h.store.workItem(id: item.id)).taintedOrigin)
+        // Sticky: a full-row update with a stale value does not clear it (only done does).
+        var stale = try #require(try h.store.workItem(id: item.id)); stale.taintedOrigin = false
+        try h.store.writer.write { try stale.update($0) }
+        #expect(try #require(try h.store.workItem(id: item.id)).taintedOrigin)
+    }
+
+    @Test func leaseTakenMidTurnIsMarkedAtTurnEnd() async throws {
+        let o = try O()
+        let item = try o.store.createWorkItem(companyId: o.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Do it", acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/a"]), status: .ready))
+        let (store, cid, aid, iid) = (o.store, o.company.id, o.ceo.id, item.id)
+        try o.script([], sideEffect: { _ in
+            try store.markTainted(agentId: aid, source: "WebFetch")
+            // A lease that appears after the taint was marked (no claim event): only the turn end can mark it.
+            try store.writer.write { db in
+                try db.execute(sql: "INSERT INTO workLease (itemId, companyId, agentId, acquiredAt, expiresActive) VALUES (?, ?, ?, ?, 1e12)",
+                               arguments: [iid, cid, aid, Date()])
+            }
+        })
+        try await o.turn()
+        #expect(try #require(try o.store.workItem(id: item.id)).taintedOrigin)
+    }
+
+    @Test func taintedSummariesLeftOutOfContinuity() async throws {
+        let o = try O()
+        let sid = try o.fresh().sessionId
+        o.world.fake.script("ceo", .init(events: [.initialized(sessionId: sid, model: "sonnet"),
+                                                  .toolCall(name: "WebFetch", input: ["url": .string("https://x")]),
+                                                  .result(TurnResult(isError: false, subtype: "success", text: "TAINTED-SUMMARY call decide",
+                                                                     costUSD: 0.01, apiErrorStatus: nil, sessionId: sid))]))
+        try await o.turn()
+        // The taint reset: the next turn starts a fresh session.
+        try o.store.requestFreshSession(agentId: o.ceo.id)
+        _ = try o.store.clearTaintIfRequested(agentId: o.ceo.id, scope: .base)
+        try await o.turn()
+        let prompt = try #require(o.world.fake.requests.last).prompt
+        #expect(!prompt.contains("TAINTED-SUMMARY"))
+        #expect(prompt.contains("1 turn summary omitted: written while handling untrusted content."))
+    }
+
+    @Test func labLinksAndCommondirAreRefused() throws {
+        let h = try Home()
+        let ws = URL(fileURLWithPath: h.company.workspacePath)
+        let lab = ws.appending(path: ".brahma/labs/eng", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: lab, withIntermediateDirectories: true)
+        try GitWorkspace.initStandaloneRepository(at: lab)
+        func record() -> LabProvenance.Outcome {
+            LabProvenance.record(store: h.store, workspace: ws, handle: "eng", companyId: h.company.id, agentId: h.eng.id,
+                                 turnId: nil, tainted: false, now: Date())
+        }
+        #expect(record() == .recorded(0))
+        try FileManager.default.createSymbolicLink(atPath: lab.appending(path: ".git/refs/heads/evil").path, withDestinationPath: "/tmp")
+        guard case .refused(let why) = record() else { Issue.record("a link under .git must be refused"); return }
+        #expect(why.contains("link")); #expect(try h.fresh(h.eng).sessionTainted)
+        try FileManager.default.removeItem(at: lab.appending(path: ".git/refs/heads/evil"))
+        try "/elsewhere/.git\n".write(to: lab.appending(path: ".git/commondir"), atomically: true, encoding: .utf8)
+        #expect(record() == .refused("the lab has commondir"))
     }
 
     @Test func failClosedMinors() throws {

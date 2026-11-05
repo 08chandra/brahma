@@ -642,6 +642,10 @@ extension Store {
                                   createdAt: now, createdActive: active, taintedOrigin: try writesTainted(db: db, actorId: actor))
         try event.insert(db)
         guard let eventId = event.id else { throw StoreError.notFound }
+        // S21: a claim or a submission by a tainted session marks the item (its worktree is the tainted session's work).
+        if event.taintedOrigin, [.leaseClaimed, .submitted].contains(kind) {
+            try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE id = ? AND status <> 'done'", arguments: [item.id])
+        }
 
         var order: [String] = []
         var roles: [String: Set<NoticeRecipientRole>] = [:]

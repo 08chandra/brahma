@@ -126,35 +126,41 @@ public enum TaintPolicy {
     }
 }
 
-/// The deny-by-default git classifier (Task 10 fix round 2, S17). The command is split into simple commands and words the way
-/// a shell would (single and double quotes, backslash escapes, `;`, `&&`, `||`, `|`, `&`, newlines, parentheses); leading
-/// `NAME=value` words and the wrappers `env`, `command`, `exec`, `nohup`, `time`, `xargs` are skipped; `sh|bash|zsh -c <text>`
-/// is classified again. A `git` (any path ending in `/git`) whose subcommand is a network one, or cannot be determined (a word
-/// with `$`, a backtick or a glob, an unknown subcommand such as an alias), reaches the network. Advisory: the sandbox's network
-/// allowlist stays the wall.
+/// The git classifier (Task 10 fix round 2, S17's tokeniser; fix round 2b, S20's allowlist). The command is split into simple
+/// commands and words the way a shell would (single and double quotes, backslash escapes, `;`, `&&`, `||`, `|`, `&`, newlines,
+/// parentheses, braces). A `git` (any path ending in `/git`) is local only when its global options are plain ones, its
+/// subcommand is in `local`, and no word carries an option that runs a program or reaches out; anything else (aliases,
+/// maintenance, rebase, bisect, difftool, submodule, unknown subcommands, `-c`, a word an expansion may split) is network.
+/// `git` under any wrapper (`env`, `xargs`, `nice`, `nohup`, `time`, ...) or after a `GIT_*=` assignment is network.
+/// `sh|bash|zsh -c` (any combined short flag holding `c`) is classified again when its text is literal, else network.
+/// Advisory: the sandbox's network allowlist stays the wall.
 public enum GitClassifier {
-    /// Subcommands that never reach a remote (anything else counts as network).
+    /// The only subcommands that count as local.
     public static let local: Set<String> = [
-        "add", "am", "annotate", "apply", "bisect", "blame", "branch", "bundle", "cat-file", "check-attr", "check-ignore",
-        "check-mailmap", "check-ref-format", "checkout", "checkout-index", "cherry", "cherry-pick", "clean", "column", "commit",
-        "commit-graph", "commit-tree", "config", "count-objects", "describe", "diff", "diff-files", "diff-index", "diff-tree",
-        "difftool", "for-each-ref", "format-patch", "fsck", "gc", "grep", "hash-object", "help", "init", "interpret-trailers",
-        "log", "ls-files", "ls-tree", "mailinfo", "maintenance", "merge", "merge-base", "merge-file", "merge-tree", "mktag",
-        "mktree", "mv", "name-rev", "notes", "prune", "range-diff", "read-tree", "rebase", "reflog", "repack", "rerere", "reset",
-        "restore", "rev-list", "rev-parse", "revert", "rm", "shortlog", "show", "show-branch", "show-ref", "sparse-checkout",
-        "stash", "status", "stripspace", "switch", "symbolic-ref", "tag", "update-index", "update-ref", "var", "verify-commit",
-        "verify-tag", "version", "whatchanged", "worktree", "write-tree",
+        "status", "log", "diff", "show", "add", "commit", "branch", "checkout", "switch", "merge", "restore", "rm", "mv",
+        "ls-files", "rev-parse", "cat-file", "grep",
     ]
-    /// Global options that take the next word as their value.
-    static let optionsWithValue: Set<String> = ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env",
-                                                "--super-prefix", "--exec-path", "--list-cmds", "--attr-source"]
-    static let wrappers: Set<String> = ["env", "command", "exec", "nohup", "time", "xargs", "builtin", "nice", "sudo", "doas"]
+    /// Global options that keep a call local, and those of them that take the next word.
+    static let plainGlobals: Set<String> = ["-C", "--git-dir", "--work-tree", "--no-pager", "-P", "--paginate", "-p",
+                                            "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
+                                            "--icase-pathspecs", "--no-optional-locks", "--bare", "--namespace"]
+    static let globalsWithValue: Set<String> = ["-C", "--git-dir", "--work-tree", "--namespace"]
+    /// Option names (before any `=`) that run a program or reach out, wherever they stand.
+    static let commandOptions: Set<String> = ["-c", "--exec", "--exec-path", "--upload-pack", "--receive-pack",
+                                              "--extcmd", "--ext-diff", "--textconv", "--config-env", "--open-files-in-pager",
+                                              "--tool", "--gpg-sign"]
+    /// Per subcommand: options that pick an external program (a merge strategy or driver, a pager command, a signing key).
+    static let subcommandOptions: [String: Set<String>] = [
+        "merge": ["-s", "-X", "--strategy", "--strategy-option", "-S"],
+        "commit": ["-S"],
+        "grep": ["-O"],
+    ]
+    static let wrappers: Set<String> = ["env", "command", "exec", "nohup", "time", "xargs", "builtin", "nice", "sudo", "doas",
+                                        "stdbuf", "timeout", "caffeinate", "script", "watch", "parallel", "find"]
     static let shells: Set<String> = ["sh", "bash", "zsh", "dash", "ksh"]
 
     /// `dynamic`: holds an expansion (or an unquoted glob). `splits`: one of them is unquoted, so it may become several words.
     struct Word: Equatable { var text: String; var dynamic: Bool; var splits: Bool = false }
-    /// Wrapper options that take the next word.
-    static let wrapperValueOptions: Set<String> = ["-u", "-C", "-S", "-n", "-I", "-L", "-P", "-s", "-E", "-d"]
 
     public static func reachesNetwork(_ command: String, depth: Int = 0) -> Bool {
         guard depth < 4 else { return true }
@@ -162,51 +168,65 @@ public enum GitClassifier {
         return false
     }
 
+    static func mentionsGit(_ words: ArraySlice<Word>) -> Bool { words.contains { $0.text.contains("git") || $0.dynamic } }
+
     static func network(_ words: [Word], depth: Int) -> Bool {
         var i = 0
-        // Assignments and wrappers (with their options) before the command.
         while i < words.count {
             let w = words[i]
-            if !w.dynamic, w.text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil { i += 1; continue }
-            if wrappers.contains(base(w.text)) {
-                i += 1
-                while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic {
-                    if wrapperValueOptions.contains(words[i].text) { i += 1 }
-                    i += 1
-                }
-                continue
-            }
-            break
+            guard !w.dynamic, w.text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil else { break }
+            // A `GIT_*` assignment can point git at another config, program or remote.
+            if w.text.hasPrefix("GIT_") { return mentionsGit(words[(i + 1)...]) }
+            i += 1
         }
         guard i < words.count else { return false }
         let cmd = words[i]
-        if shells.contains(base(cmd.text)), let c = words[(i + 1)...].firstIndex(where: { $0.text == "-c" }), c + 1 < words.count {
+        let rest = words[(i + 1)...]
+        // Under a wrapper, git's arguments cannot be told apart from the wrapper's: network.
+        if wrappers.contains(base(cmd.text)) { return mentionsGit(rest) }
+        if shells.contains(base(cmd.text)),
+           let c = rest.firstIndex(where: { $0.text.range(of: "^-[A-Za-z]*c[A-Za-z]*$", options: .regularExpression) != nil }) {
+            guard c + 1 < words.count else { return false }
             let inner = words[c + 1]
-            return reachesNetwork(inner.text, depth: depth + 1) || (inner.dynamic && inner.text.contains("git"))
+            return inner.dynamic || reachesNetwork(inner.text, depth: depth + 1)
         }
-        if cmd.text == "eval" { return words[(i + 1)...].contains { $0.dynamic } || reachesNetwork(words[(i + 1)...].map(\.text).joined(separator: " "), depth: depth + 1) }
-        guard base(cmd.text) == "git" || cmd.dynamic && cmd.text.contains("git") else { return false }
+        if cmd.text == "eval" { return rest.contains { $0.dynamic } || reachesNetwork(rest.map(\.text).joined(separator: " "), depth: depth + 1) }
+        // A command word an expansion names (`$G fetch`, `"$GIT" fetch`) could be git: network.
         if cmd.dynamic { return true }
+        guard base(cmd.text) == "git" else { return false }
         var j = i + 1
         while j < words.count {
             let w = words[j]
-            // An option word that may split into several (`git $OPTS fetch`) hides the subcommand.
             if w.splits { return true }
             guard w.text.hasPrefix("-") else { break }
             let name = w.text.split(separator: "=", maxSplits: 1).first.map(String.init) ?? w.text
-            if optionsWithValue.contains(name), !w.text.contains("=") {
+            if name == "--version", j + 1 == words.count { return false }
+            guard plainGlobals.contains(name) else { return true }
+            if globalsWithValue.contains(name), !w.text.contains("=") {
                 j += 1
-                // A quoted value (`-C "$WT"`) stays one word; an unquoted expansion may not.
                 if j < words.count, words[j].splits { return true }
             }
             j += 1
         }
-        // `git` alone, or only options (`git --version`): local.
-        guard j < words.count else { return false }
-        let sub = words[j].text
-        guard local.contains(sub) else { return true }
-        let rest = words[(j + 1)...]
-        if rest.contains(where: \.dynamic) && ["remote", "submodule", "archive"].contains(sub) { return true }
+        guard j < words.count else {
+            // `git` alone or `git --version`: local; any other option alone is not on the list.
+            return false
+        }
+        let sub = words[j]
+        guard !sub.dynamic, local.contains(sub.text) else { return true }
+        for w in words[(j + 1)...] {
+            if w.splits { return true }
+            guard !w.dynamic, w.text.hasPrefix("-"), w.text != "-", w.text != "--" else { continue }
+            let name = w.text.split(separator: "=", maxSplits: 1).first.map(String.init) ?? w.text
+            if commandOptions.contains(name) || name.hasPrefix("--exec") { return true }
+            let picks = subcommandOptions[sub.text] ?? []
+            if picks.contains(name) || picks.contains(where: { $0.count == 2 && name.hasPrefix($0) && !name.hasPrefix("--") }) { return true }
+            // A combined short flag holding `c` (`-ac`) counts as `-c`.
+            if !name.hasPrefix("--"), name.count > 2, name.dropFirst().allSatisfy(\.isLetter), name.dropFirst().contains("c") { return true }
+            if name.hasPrefix("--config") || name.hasPrefix("--core.") { return true }
+        }
+        // `branch -D`/`--delete --force` and `merge -s/-X` (an external driver) are refused above or here.
+        if sub.text == "branch", words[(j + 1)...].contains(where: { $0.text == "-D" || $0.text == "--force" || $0.text == "-f" }) { return true }
         return false
     }
 
@@ -393,7 +413,9 @@ public enum OwnerImpersonation {
     /// Matched case-insensitively on `normalized(text)`, the form the recipient reads (I1).
     public static let patterns: [String] = [
         #"\b(i am|i'm|im|this is|it's|here is|speaking as|acting as)\s+(the\s+)?(company\s+)?owner\b"#,
-        #"\bper\s+(the\s+)?owner\b"#,
+        #"\bper\s+(the\s+)?owner(?![-_0-9a-z])"#,
+        #"\bowner('s)?\s+(approval|authori[sz]ation|sign-?off|go-ahead|consent|permission)\s+(is\s+|was\s+|has been\s+)?(granted|given|received|obtained|confirmed)\b"#,
+        #"\b(approval|authori[sz]ation|sign-?off|go-ahead|consent|permission)\s+(from|by)\s+(the\s+)?owner\b"#,
         #"\[\s*owner\s*\]"#,
         #"\bon behalf of\s+(the\s+)?owner\b"#,
         #"\b(message|messages|instructions?|note|orders?|word|directive|request)\s+from\s+(the\s+)?owner\b"#,
@@ -444,7 +466,7 @@ public enum OwnerImpersonation {
             ("η", "n"), ("Ο", "O"), ("Α", "A"), ("Ε", "E"), ("Ρ", "P"), ("Τ", "T"), ("Κ", "K"), ("Ι", "I"), ("Ν", "N"), ("Ω", "W"),
             ("Η", "H"), ("Χ", "X"), ("Υ", "Y"), ("Β", "B"), ("Μ", "M"), ("Ζ", "Z"),
             // Armenian and Latin small capitals.
-            ("օ", "o"), ("ո", "n"), ("ս", "u"), ("հ", "h"), ("ᴏ", "o"), ("ᴡ", "w"), ("ɴ", "n"), ("ᴇ", "e"), ("ʀ", "r"),
+            ("ѡ", "w"), ("օ", "o"), ("ո", "n"), ("ս", "u"), ("հ", "h"), ("ᴏ", "o"), ("ᴡ", "w"), ("ɴ", "n"), ("ᴇ", "e"), ("ʀ", "r"),
             // Digits for letters ("0wner", "own3r").
             ("0", "o"), ("3", "e"), ("1", "l"),
         ]

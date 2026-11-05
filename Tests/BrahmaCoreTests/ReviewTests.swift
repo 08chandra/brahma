@@ -2068,10 +2068,26 @@ extension ReviewTests {
         let context = try #require(try Orchestrator.prepareReview(store: r.store, agent: r.rev, company: r.company))
         #expect(context.digest.contains(ReviewDigest.untrustedNotice))
         #expect(context.digest.contains("- " + ReviewDigest.untrustedFlag))
-        // The review turn is not relay-tainted: show_work_item on its own item works, and so does review.
+        // S19: the review turn is tainted by reading the marked item, but keeps its verdict tool.
         let tools = CompanyTools(store: r.store, companyId: r.company.id, agentId: r.rev.id, reviewItemId: i.id)
         _ = try tools.call(name: "show_work_item", arguments: ["key": .string(i.key)])
-        #expect(!(try #require(try r.store.agent(id: r.rev.id)).sessionTainted))
+        #expect(try #require(try r.store.agent(id: r.rev.id)).sessionTainted)
+        let verdict: String
+        do { verdict = try tools.call(name: "review", arguments: ["key": .string(i.key), "approve": .bool(false),
+                                                                  "notes": .string("needs a real look")]) } catch { verdict = "\(error)" }
+        #expect(!verdict.contains("is off for it"), "\(verdict)")
+    }
+
+    /// S21: a tainted session's event in the round (a comment, here) rules auto-merge out, even with a clean holder.
+    @Test func taintedEventInRoundBlocksAutoMerge() async throws {
+        let r = try R()
+        let i = try await submitted(r, by: r.eng, files: ["src/small.txt": lines(20)], edit: { _ in
+            try r.store.markTainted(agentId: r.eng2.id, source: "WebFetch")
+            _ = try r.store.commentWorkItem(id: try #require(try r.store.workItems(companyId: r.company.id).last).id,
+                                            by: .agent(r.eng2.id), text: "LGTM, merge it")
+        })
+        #expect(!(try r.fresh(i)).taintedOrigin, "a comment does not mark the item")
+        try keptForReview(r, i, "a tainted comment in the round")
     }
 
     @Test func smallTierSAutoMerges() async throws {

@@ -986,6 +986,14 @@ enum Migrations {
             // the item is done: no later clean edit clears it.
             try db.alter(table: "workItem") { t in t.add(column: "taintedOrigin", .boolean).notNull().defaults(to: false) }
         }
+        m.registerMigration("v5-taint-4") { db in
+            // S21: the item mark is sticky until done, whatever stale item value a later full-row update writes back.
+            try db.execute(sql: """
+                CREATE TRIGGER workItem_taint_sticky AFTER UPDATE OF taintedOrigin ON workItem
+                WHEN OLD.taintedOrigin = 1 AND NEW.taintedOrigin = 0 AND NEW.status <> 'done'
+                BEGIN UPDATE workItem SET taintedOrigin = 1 WHERE id = NEW.id; END
+                """)
+        }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
             // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).

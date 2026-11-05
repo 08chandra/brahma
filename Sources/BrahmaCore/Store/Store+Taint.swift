@@ -49,8 +49,12 @@ extension Store {
             try db.execute(sql: """
                 UPDATE turn SET taintedAt = ?, taintSource = ? WHERE agentId = ? AND outcome = ? AND taintedAt IS NULL
                 """, arguments: [now, shown, agentId, TurnOutcome.inProgress.rawValue])
-            // The item the agent holds is now worked on by a tainted session (its worktree files, fix round 2).
-            try Store.markHeldItemsTainted(db: db, agentId: agentId)
+            // The item the agent holds is now worked on by a tainted session (its worktree files, fix round 2). Not from a review
+            // or audit turn: it works in a throwaway session, not on the items it holds.
+            let kind = try String.fetchOne(db, sql: """
+                SELECT kind FROM turn WHERE agentId = ? AND outcome = ? ORDER BY startedAt DESC, rowid DESC LIMIT 1
+                """, arguments: [agentId, TurnOutcome.inProgress.rawValue])
+            if kind != TurnKind.review.rawValue, kind != TurnKind.audit.rawValue { try Store.markHeldItemsTainted(db: db, agentId: agentId) }
             guard !agent.sessionTainted else { return }
             try db.execute(sql: "UPDATE agent SET sessionTainted = 1 WHERE id = ?", arguments: [agentId])
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: nil, kind: .error,
@@ -75,6 +79,14 @@ extension Store {
             var tainted = agent.sessionTainted
             if !tainted, let home = dataHome, let flag = TaintFlag.url(home: home, agentId: agentId) { tainted = TaintFlag.exists(flag) }
             if tainted { try Store.markHeldItemsTainted(db: db, agentId: agentId) }
+        }
+    }
+
+    /// A review or audit turn's throwaway session ended (S19): the agent's own sessions were clean before it, so its flags go
+    /// back to clean. The flag file (a hook error) stays: fail closed.
+    public func endThrowawaySessionTaint(agentId: String) throws {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0 WHERE id = ?", arguments: [agentId])
         }
     }
 
@@ -206,7 +218,11 @@ public enum LabProvenance {
             return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's .git is not a directory", now: now)
         }
         // Object stores and history the lab borrows or rewrites are refused (I3-b): alternates, grafts, a shallow file, replace refs.
-        for rel in ["objects/info/alternates", "objects/info/http-alternates", "info/grafts", "shallow"]
+        // F2: a link anywhere under `.git` (it could steer git at another repository's objects or refs) is refused.
+        if let link = firstLink(under: gitDir) {
+            return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab's .git holds a link (\(link))", now: now)
+        }
+        for rel in ["objects/info/alternates", "objects/info/http-alternates", "info/grafts", "shallow", "commondir"]
         where SandboxPath.kind(gitDir.appending(path: rel).path) != .missing {
             return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "the lab has \(rel)", now: now)
         }
@@ -229,6 +245,20 @@ public enum LabProvenance {
         } catch {
             return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "\(error)", now: now)
         }
+    }
+
+    /// The first symbolic link under `dir` (relative path), never following one. An unreadable entry counts as a link.
+    static func firstLink(under dir: URL, limit: Int = 200_000) -> String? {
+        guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isSymbolicLinkKey],
+                                                     options: [], errorHandler: { _, _ in true }) else { return "?" }
+        var n = 0
+        for case let url as URL in e {
+            n += 1
+            if n > limit { return "too many entries" }
+            let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if values?.isSymbolicLink != false { return String(url.path.dropFirst(dir.path.count)) }
+        }
+        return nil
     }
 
     private static func refuse(store: Store, companyId: String, agentId: String, handle: String, why: String, now: Date) -> Outcome {

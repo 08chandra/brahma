@@ -201,17 +201,18 @@ extension Store {
             var args: [DatabaseValueConvertible] = [agentId]
             if let id = scope.itemId { args.append(id) }
             args.append(limit)
-            let rows = try String.fetchAll(db, sql: """
-                SELECT COALESCE(summary, '') FROM turn WHERE agentId = ? AND \(itemClause) AND outcome = 'succeeded'
-                AND kind IN ('work', 'plan', 'notice') AND sessionResetReason IS NULL AND summary IS NOT NULL AND summary <> ''
-                ORDER BY startedAt DESC, rowid DESC LIMIT ?
+            // F1: a summary a tainted turn wrote is left out (`recentTurnSummariesTainted` counts them for the engine's line).
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT COALESCE(summary, '') AS summary, taintedAt IS NOT NULL AS tainted FROM turn WHERE agentId = ? AND \(itemClause)
+                AND outcome = 'succeeded' AND kind IN ('work', 'plan', 'notice') AND sessionResetReason IS NULL AND summary IS NOT NULL
+                AND summary <> '' ORDER BY startedAt DESC, rowid DESC LIMIT ?
                 """, arguments: StatementArguments(args))
-            return rows.reversed()
+            return rows.filter { !($0["tainted"] as Bool? ?? true) }.map { $0["summary"] as String }.reversed()
         }
     }
 
-    /// Whether one of `recentTurnSummaries` comes from a turn that read outside content (fix round 2).
-    func recentTurnSummariesTainted(agentId: String, scope: SessionScope, limit: Int = 3) throws -> Bool {
+    /// How many of the newest `limit` summaries `recentTurnSummaries` left out: written by turns that read outside content.
+    func recentTurnSummariesTainted(agentId: String, scope: SessionScope, limit: Int = 3) throws -> Int {
         try writer.read { db in
             let itemClause = scope.itemId == nil ? "itemId IS NULL" : "itemId = ?"
             var args: [DatabaseValueConvertible] = [agentId]
@@ -222,7 +223,7 @@ extension Store {
                 AND kind IN ('work', 'plan', 'notice') AND sessionResetReason IS NULL AND summary IS NOT NULL AND summary <> ''
                 ORDER BY startedAt DESC, rowid DESC LIMIT ?
                 """, arguments: StatementArguments(args))
-            return rows.contains(true)
+            return rows.filter { $0 }.count
         }
     }
 

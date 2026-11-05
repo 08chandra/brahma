@@ -8,6 +8,8 @@ struct ReviewTurnContext {
     var digest: String
     /// Tier L or flagged: the strongest model.
     var deep: Bool
+    /// The item is marked, or its submission came from a tainted session (S19: the review turn is tainted at launch).
+    var untrusted = false
 }
 
 extension Orchestrator {
@@ -44,8 +46,10 @@ extension Orchestrator {
                                          dependencies: try store.dependencies(itemId: item.id),
                                          worktree: git.worktreePath(key: item.key).path, timeZone: store.ownerTimeZone(),
                                          untrusted: item.taintedOrigin || submitted?.taintedOrigin == true)
-        return ReviewTurnContext(item: item, worktree: git.worktreePath(key: item.key), digest: digest,
-                                 deep: item.tier == .l || !item.reviewFlags.isEmpty)
+        var context = ReviewTurnContext(item: item, worktree: git.worktreePath(key: item.key), digest: digest,
+                                        deep: item.tier == .l || !item.reviewFlags.isEmpty)
+        context.untrusted = item.taintedOrigin || submitted?.taintedOrigin == true
+        return context
     }
 }
 
@@ -64,6 +68,8 @@ extension Store {
 struct AuditTurnContext {
     var itemIds: [String]
     var digest: String
+    /// One of the audited items is marked (S19).
+    var untrusted = false
 }
 
 extension Orchestrator {
@@ -88,6 +94,7 @@ extension Orchestrator {
         }
         try store.deferAudits(itemIds: deferred, agentId: agent.id)
         guard !entries.isEmpty else { return nil }
-        return AuditTurnContext(itemIds: entries.map(\.item.id), digest: AuditDigest.render(entries: entries))
+        return AuditTurnContext(itemIds: entries.map(\.item.id), digest: AuditDigest.render(entries: entries),
+                                untrusted: entries.contains { $0.item.taintedOrigin })
     }
 }

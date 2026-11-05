@@ -773,7 +773,7 @@ public actor Orchestrator {
                 scope = kind == .notice ? .base : c.scope
                 if scope != c.scope {
                     c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: scope)) ?? []
-                    c.summariesTainted = (try? store.recentTurnSummariesTainted(agentId: agent.id, scope: scope)) ?? true
+                    c.summariesOmitted = (try? store.recentTurnSummariesTainted(agentId: agent.id, scope: scope)) ?? 0
                 }
                 if let itemId = scope.itemId {
                     // A leaseholder's failed checks and review rejections may raise the item's floor before this turn picks
@@ -1016,6 +1016,15 @@ public actor Orchestrator {
                 try markTaintedOrFlag(agent: agent, source: relayed)
                 taintMarked = true
             }
+            // S19: a review or audit of marked work is tainted at launch too (its verdict tool stays exempt).
+            if !taintMarked, let review, review.untrusted {
+                try markTaintedOrFlag(agent: agent, source: "relayed: \(review.item.key) under review")
+                taintMarked = true
+            }
+            if !taintMarked, let audit, audit.untrusted {
+                try markTaintedOrFlag(agent: agent, source: "relayed: audited items written by a session that read outside content")
+                taintMarked = true
+            }
             let settingsText = try TurnProfileCompiler.settingsJSON(compiled)
             try await blocking.tryRun { try SettingsFile.write(settingsText, to: settingsFile) }
             // A review session is never recorded as the agent's own.
@@ -1234,8 +1243,8 @@ public actor Orchestrator {
         }
         // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
         // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.
-        // A tainted holder turn marks its item (fix round 2: its worktree files came from a tainted session).
-        if launched, leaseHead != nil { attempt { try store.markHeldItemsIfTainted(agentId: agent.id) } }
+        // A tainted session marks every item it holds at turn end, leases taken mid-turn included (S21).
+        if launched, !isReview { attempt { try store.markHeldItemsIfTainted(agentId: agent.id) } }
         if launched, let labWorkspace {
             let (store, handle, turnId, ended) = (self.store, agent.name, turn.id, now)
             let tainted = ((try? store.agent(id: agent.id)) ?? nil)?.sessionTainted ?? true
@@ -1246,6 +1255,9 @@ public actor Orchestrator {
             if case .refused(let why) = outcome { log("@\(agent.name)'s lab commits were not recorded (tainted instead): \(why)") }
         }
         attempt { try store.clearTaintIfRequested(agentId: agent.id, scope: scope, now: now) }
+        // S19: a review or audit runs in a throwaway session. Taint it took there is recorded on the turn and on what it wrote;
+        // it does not outlive the session when the agent's own session was clean before.
+        if isReview, !agent.sessionTainted { attempt { try store.endThrowawaySessionTaint(agentId: agent.id) } }
         // Task 13a: the turn's slice of the Claude session transcript, redacted and stored. Never fails the turn.
         if let transcripts, let sessionId = state.result?.sessionId ?? state.inits.last?.sessionId ?? (sawInit ? sentRequest?.agent.sessionId : nil) {
             let (store, turn, ended) = (self.store, turn, now)
