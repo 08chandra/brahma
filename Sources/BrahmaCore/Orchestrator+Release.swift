@@ -9,8 +9,10 @@ extension Orchestrator {
     ///   file work of a run happens inside this engine's `Blocking`.
     /// Starts are gated like checks and merges (fix I2): nothing starts under a hold or critical memory pressure, only into a
     /// slot `Scheduler.freeSlots` has free, never in a paused company, and not while a company's re-queued run backs off.
+    /// While the owner's stop holds (this tick's read, `engineStoppedNow`) the step is skipped entirely: nothing is queued or
+    /// started (PR-35 5s); a run in flight was cancelled by `enforceStop`.
     func smokeTick(now: Date, config: SchedulerConfig, held: Bool, pressure: MemoryPressure, companies: [Company]) {
-        // L-5lite: skip while engineStopped (EmergencyStopObserver, PR-35 part 5s).
+        guard !engineStoppedNow else { return }
         smokeBackoff = smokeBackoff.filter { $0.value > now }
         for company in companies {
             attempt { try self.store.queueMergeSmokeIfNeeded(companyId: company.id, now: now) }

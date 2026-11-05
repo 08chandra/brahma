@@ -267,6 +267,43 @@ import GRDB
         #expect(try fx.current().redBugItemId == nil)
     }
 
+    /// L-5lite-A (Task 5, PR-35 5s): the owner's stop ends a running merge smoke, which goes back to the queue in place as on
+    /// the restart path (no result, no red bug, no backoff); while the stop holds the smoke step is skipped entirely (nothing
+    /// starts, a new main is not even queued); after the resume the newest main is smoked.
+    @Test func emergencyStopRequeuesRunningMergeSmoke() async throws {
+        let fx = try Fx()
+        try fx.setSmoke("sleep 300")
+        let head = try fx.merge(["a.txt": "x"])
+        let engine = fx.w.orchestrator
+        await engine.tick()
+        await fx.sandbox.waitForRun { $0.command == "sleep 300" }
+        let cwd = try #require(fx.sandbox.calls.first?.cwd)
+        try fx.store.emergencyStop(note: nil, by: "owner", now: fx.w.clock.now)
+        await engine.tick()
+        // Hang bound only: the stop cancels the run, whose group is killed at once.
+        try await engine.waitUntilIdle(timeout: .seconds(600))
+        let run = try #require(try fx.runs().first)
+        #expect(try fx.runs().count == 1)
+        #expect(run.status == .queued && run.startedAt == nil && run.commit == head, "\(run)")
+        #expect(try fx.current().redBugItemId == nil)
+        #expect(!FileManager.default.fileExists(atPath: cwd.path))
+        #expect(await engine.smokeBackoff.isEmpty, "a stopped run is no failure of the engine's: no backoff")
+        // While stopped: nothing runs, and a new main is not queued either.
+        let moved = try fx.merge(["b.txt": "y"])
+        try await fx.w.cycle()
+        try await fx.w.cycle()
+        #expect(fx.sandbox.calls.count == 1)
+        #expect(try fx.runs().map(\.commit) == [head])
+        // Resumed: the newest main is smoked (green), and no red bug was ever filed.
+        try fx.setSmoke("true")
+        try fx.store.resumeAfterStop(now: fx.w.clock.now)
+        try await fx.w.cycle()
+        let after = try fx.runs()
+        #expect(after.first { $0.commit == moved }?.status == .passed, "\(after)")
+        #expect(try fx.current().redBugItemId == nil)
+        #expect(try fx.store.workItems(companyId: fx.company.id).filter { $0.title.hasPrefix("Main is red") }.isEmpty)
+    }
+
     @Test func orchestratorStartRecoversRunningSmoke() async throws {
         let fx = try Fx()
         try fx.setSmoke("test -f a.txt")
