@@ -42,6 +42,8 @@ public enum WakePolicy {
         switch kind {
         case .verificationPassed: recipientRole == .reviewer
         case .changesRequested, .verificationFailed, .mergeConflict, .mergeFailed: recipientRole == .owner || recipientRole == .holder
+        // Plan L Task 9: the human task the item waited on is done or declined; its assignee (or holder) carries on.
+        case .humanTaskDone, .humanTaskDeclined: recipientRole == .owner || recipientRole == .holder
         case .dependencyDone: recipientRole == .waiter
         case .commented: recipientRole == .mentioned
         case .handoffWritten: recipientRole == .recipient
