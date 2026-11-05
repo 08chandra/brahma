@@ -88,7 +88,9 @@ import GRDB
                       // A shell without a literal -c text, or with a late one.
                       "bash", "bash script.sh", "sh -s", "bash <<< 'ls'", "bash -c -- 'ls'", "sh -c -e 'ls'", "bash -c \"$X\"",
                       // Bash's own sockets.
-                      "exec 3<>/dev/tcp/example.com/80", "cat </dev/udp/1.2.3.4/53"])
+                      "exec 3<>/dev/tcp/example.com/80", "cat </dev/udp/1.2.3.4/53",
+                      // Fix round 2d: dequoted words.
+                      "gi\"t\" fetch", "cat </dev/t\"cp\"/example.com/80", "git-upload-pack x", "echo \"$HOME\""])
     func interpreterNetworkTaints(_ c: String) {
         let source = TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)])
         #expect(source == "bash: " + String(TaintPolicy.flat(c).prefix(60)))
@@ -577,6 +579,31 @@ import GRDB
                                        turnId: nil, tainted: false, now: Date())
         guard case .refused = out else { Issue.record("an unreadable .git entry must be refused, got \(out)"); return }
         #expect(try h.fresh(h.eng).sessionTainted)
+    }
+
+    // MARK: Fix round 2d
+
+    @Test func relayTaintedReviewStillRecordsAnUnhookedWebFetch() async throws {
+        let o = try O()
+        let item = try o.store.createWorkItem(companyId: o.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Do it", acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/a"]), status: .ready))
+        // The relay a review of marked work starts with.
+        try await o.store.writer.write { try $0.execute(sql: "UPDATE agent SET sessionTainted = 1, taintSources = ? WHERE id = ?",
+                                                         arguments: ["relayed: \(item.key) under review", o.ceo.id]) }
+        // The turn is relay-tainted at launch (a tainted teammate's DM), so the backup has already marked once...
+        let eng = try o.world.hire(o.company, "eng", role: "engineer")
+        try o.store.markTainted(agentId: eng.id, source: "WebFetch")
+        _ = try o.world.router.sendDM(companyId: o.company.id, from: .agent(eng.id), to: o.ceo.name, text: "fyi", now: o.world.clock.now)
+        // ...and the stream then shows a WebFetch the hook never recorded (a killed or failed call).
+        try o.script([.toolCall(name: "WebFetch", input: ["url": .string("https://x")])])
+        try await o.world.cycle()
+        #expect(try o.fresh().taintSources.contains("relayed: message from @eng"))
+        #expect(try o.fresh().taintSources.contains("WebFetch"), "the backup records the direct read after the relay")
+        let verdict = Self.refusal {
+            try CompanyTools(store: o.store, companyId: o.company.id, agentId: o.ceo.id, reviewItemId: item.id)
+                .call(name: "review", arguments: ["key": .string(item.key), "approve": .bool(true)])
+        }
+        #expect(verdict?.contains("is off for it") == true)
     }
 
     @Test func failClosedMinors() throws {

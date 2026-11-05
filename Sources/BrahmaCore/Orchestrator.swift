@@ -665,6 +665,7 @@ public actor Orchestrator {
         var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool)?
         // Task 10: the turn's taint (marked once, from the stream's backup path) and the workspace whose lab is recorded at the end.
         var taintMarked = false
+        var recordedSources: Set<String> = []
         var labWorkspace: URL?
         do {
             guard let company = try store.company(id: agent.companyId) else { throw StoreError.notFound }
@@ -1060,12 +1061,12 @@ public actor Orchestrator {
                         try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
                                                             kind: .error, text: text, createdAt: clock()))
                     case .toolCall(let name, let input):
-                        // The backup taint path (Task 10): every tool call, the sub-agents' and workflow agents' included.
-                        guard !taintMarked else { continue }
+                        // The backup taint path (Task 10): every tool call, the sub-agents' and workflow agents' included. Every
+                        // source is recorded, not only the first (2d): a verdict's exemption depends on all of them.
                         let companyId = agent.companyId
                         if let source = TaintPolicy.source(toolName: name, toolInput: input, publisher: { id in
                             (try? store.extensionPublisher(companyId: companyId, extId: id)) ?? nil
-                        }) {
+                        }), recordedSources.insert(source).inserted {
                             try markTaintedOrFlag(agent: agent, source: source)
                             taintMarked = true
                         }

@@ -92,8 +92,14 @@ public enum TaintPolicy {
 
     public static func reachesNetwork(_ command: String) -> Bool {
         // Bash's own sockets (`exec 3<>/dev/tcp/host/80`, `cat </dev/tcp/…`) need no program at all.
-        command.contains("/dev/tcp/") || command.contains("/dev/udp/")
+        devSocket(command)
             || bashPatterns.contains { command.range(of: $0, options: .regularExpression) != nil } || GitClassifier.reachesNetwork(command)
+    }
+
+    /// A `/dev/tcp/` or `/dev/udp/` path, in the raw text or in a dequoted word (`/dev/t"cp"/host/80`).
+    static func devSocket(_ command: String) -> Bool {
+        let words = [command] + GitClassifier.split(command).flatMap { $0.map(\.text) }
+        return words.contains { $0.contains("/dev/tcp/") || $0.contains("/dev/udp/") }
     }
 
     /// `<id>` of a namespaced name `<id>:<name>` (a leading `/` dropped); nil for a plain name (a built-in).
@@ -188,7 +194,12 @@ public enum GitClassifier {
 
     /// `git` as a word anywhere in the raw text (`/usr/bin/git`, `"git"`, `xargs git`; not `.gitignore` or `github`).
     static func mentionsGit(_ command: String) -> Bool {
-        command.range(of: "(^|[^A-Za-z0-9_.-])git([^A-Za-z0-9_-]|$)", options: .regularExpression) != nil
+        if command.range(of: "(^|[^A-Za-z0-9_.-])git([^A-Za-z0-9_-]|$)", options: .regularExpression) != nil { return true }
+        // Dequoted words too (`gi"t" fetch`): a word named `git` or `git-*`, or any word an expansion fills.
+        return split(command).joined().contains { w in
+            let name = base(w.text.trimmingCharacters(in: CharacterSet(charactersIn: "<>")))
+            return w.dynamic || name == "git" || name.hasPrefix("git-")
+        }
     }
 
     /// Any shell syntax outside single quotes: separators, pipes, subshells, braces, input redirection, newlines, backticks
