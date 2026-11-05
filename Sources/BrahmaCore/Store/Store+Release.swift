@@ -164,19 +164,22 @@ extension Store {
     /// The one path that executes a smoke run outside the tick (Task 7 calls it with reason `release`, through
     /// `Orchestrator.runSmoke`, which holds the company's smoke slot and passes the engine's `Blocking` and clock):
     /// 1. in one write: `commit` must be the engine-accepted main (`company.mainCommit`, else `"<sha7> is not the
-    ///    engine-accepted main"`); then the row is inserted or reused, and claimed `running` in that same write, so a queued
+    ///    engine-accepted main"`) — or, for a `release` run only, `acceptedMain` must still be the engine-accepted main: the
+    ///    executor passes the main it checked `commit` is an ancestor of (`main` moved on after the release was proposed;
+    ///    the release still deploys, and smokes, its own commit). Then the row is inserted or reused, and claimed `running` in that same write, so a queued
     ///    run's superseding can never touch it (fix I3a). A `merge` run at `commit` is reused (PR-12) and claimed if queued;
     ///    a `release` run is reused by `releaseId`; a `manual` run is always a new row. A reused run that is not queued is
     ///    returned as it is;
     /// 2. `EngineExport` the commit into a fresh `.git`-free tree under the data home (`smoke-<id>`);
     /// 3. run the company's smoke check there through `checks` (PR-5);
     /// 4. record the outcome (and the red-main rule).
-    func runSmoke(companyId: String, commit: String, reason: MainSmokeReason, releaseId: String?, checks: SmokeChecks,
-                  blocking: Blocking, clock: @escaping @Sendable () -> Date) async throws -> MainSmokeRun {
+    func runSmoke(companyId: String, commit: String, reason: MainSmokeReason, releaseId: String?, acceptedMain: String? = nil,
+                  checks: SmokeChecks, blocking: Blocking, clock: @escaping @Sendable () -> Date) async throws -> MainSmokeRun {
         let now = clock()
         let claimed: (MainSmokeRun, Company, Bool) = try await writer.write { db in
             guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
-            guard company.mainCommit == commit else { throw WorkError.invalid(Self.notMain(commit)) }
+            let descends = reason == .release && acceptedMain != nil && company.mainCommit == acceptedMain
+            guard company.mainCommit == commit || descends else { throw WorkError.invalid(Self.notMain(commit)) }
             var existing: MainSmokeRun?
             switch reason {
             case .merge:
@@ -567,5 +570,141 @@ extension Store {
     private func deployRelease(_ db: Database, ask: Ask) throws -> Release? {
         guard ask.kind == .deploy else { return nil }
         return try Release.filter(Column("companyId") == ask.companyId && Column("askId") == ask.id).fetchOne(db)
+    }
+}
+
+// MARK: - The release executor's records (Task 7)
+
+/// How a release the executor was carrying out ended (`Store.finishRelease`).
+enum ReleaseEnd: Equatable, Sendable {
+    /// The smoke after the deploy passed.
+    case deployed(productionURL: String, results: [SmokeResult])
+    /// A step failed. `stage` is the bug's word (`smoke on main`, `integrity`, `backup`, `build`, `stage`, `tools`, `deploy`,
+    /// `smoke`), `detail` its parenthesis, `reason` the release's `failedReason`.
+    case failed(stage: String, detail: String, reason: String, results: [SmokeResult]?)
+    /// The owner's stop (or the engine shutting down) cut it short: `interrupted` while deploying (it is never run again),
+    /// `failed` while building or smoking.
+    case stopped(reason: String)
+}
+
+extension Store {
+    /// The rollback hint of a release that changed (or may have changed) what is live.
+    static func rollbackHint(company: String, release: Release) -> String {
+        "Run brahma release rollback \(flat(company, max: 100)) \(release.ref) or use Roll back in Releases."
+    }
+
+    /// The companies with an approved release waiting for the executor (the tick's "release" step).
+    func companiesWithApprovedRelease() throws -> Set<String> {
+        try writer.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT DISTINCT companyId FROM release WHERE status = ?",
+                                    arguments: [ReleaseStatus.approved.rawValue]))
+        }
+    }
+
+    /// The executor's claim (builder-check 3, PR-9), one write transaction: nothing while the owner's stop holds; otherwise
+    /// the company's oldest approved release moves `approved` → `building` (with `startedAt`) by
+    /// `UPDATE release SET status = 'building' … WHERE id = ? AND status = 'approved'`, and is returned; nil when there was
+    /// none or another caller claimed it first.
+    func claimRelease(companyId: String, now: Date) throws -> Release? {
+        try writer.write { db in
+            if try Self.engineStopped(db) != nil { return nil }
+            guard let oldest = try Release.filter(Column("companyId") == companyId && Column("status") == ReleaseStatus.approved.rawValue)
+                .order(Column("approvedAt"), Column("number")).fetchOne(db) else { return nil }
+            try db.execute(sql: "UPDATE release SET status = ?, startedAt = ? WHERE id = ? AND status = ?",
+                           arguments: [ReleaseStatus.building.rawValue, now, oldest.id, ReleaseStatus.approved.rawValue])
+            guard db.changesCount == 1, let claimed = try Release.fetchOne(db, key: oldest.id) else { return nil }
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .release,
+                              text: "started \(claimed.ref): release \(claimed.version) at \(claimed.sha7)", createdAt: now).insert(db)
+            return claimed
+        }
+    }
+
+    /// One step of a release in progress, in its own write (committed before the executor's next side effect): the release
+    /// must still be `from`; it becomes `to` with `change` applied. Throws `WorkError.conflict` when it is no longer `from`.
+    @discardableResult
+    func advanceRelease(id: String, from: ReleaseStatus, to: ReleaseStatus, now: Date,
+                        _ change: @escaping @Sendable (inout Release) -> Void = { _ in }) throws -> Release {
+        try writer.write { db in
+            guard var release = try Release.fetchOne(db, key: id) else { throw WorkError.notFound("no such release") }
+            guard release.status == from else { throw WorkError.conflict("\(release.ref) is \(release.status.rawValue), not \(from.rawValue)") }
+            change(&release)
+            release.status = to
+            if let tail = release.outputTail { release.outputTail = try redact(tail) }
+            try release.update(db)
+            if from != to {
+                try ActivityEvent(companyId: release.companyId, agentId: nil, turnId: nil, kind: .release,
+                                  text: "\(release.ref) (release \(release.version)): \(to.title.lowercased())", createdAt: now).insert(db)
+            }
+            return release
+        }
+    }
+
+    /// Records how a release in progress (`building`, `deploying` or `smoking`) ended, in one write: its row, an activity
+    /// line, the owner's notice and, for a failure, a P1 bug filed by the engine (`Release <v> failed: <stage> (<detail>)`,
+    /// type `bug`, no check). A release no longer in progress is returned as it is. Every agent-controlled part (the failure,
+    /// the smoke results) is redacted.
+    @discardableResult
+    func finishRelease(id: String, end: ReleaseEnd, now: Date) throws -> Release {
+        try writer.write { db in
+            guard var release = try Release.fetchOne(db, key: id) else { throw WorkError.notFound("no such release") }
+            let inProgress: [ReleaseStatus] = [.building, .deploying, .smoking]
+            guard inProgress.contains(release.status) else { return release }
+            let companyName = try Company.fetchOne(db, key: release.companyId)?.name ?? "the company"
+            let deployStarted = release.status != .building
+            let v = release.version
+            func redacted(_ results: [SmokeResult]) throws -> [SmokeResult] {
+                try results.map { r in
+                    var r = r
+                    r.url = try redact(r.url); r.bodyPrefix = try redact(r.bodyPrefix); r.error = try redact(r.error)
+                    return r
+                }
+            }
+            let activity: String
+            let notice: (title: String, body: String)
+            release.finishedAt = now
+            switch end {
+            case .deployed(let url, let results):
+                release.status = .deployed
+                release.deployedAt = now
+                release.productionURL = url
+                release.smokeStatus = "passed"
+                release.smokeResults = try redacted(results)
+                activity = "Release \(v) is live at \(url)"
+                notice = ("\(companyName) is live", "\(url) (release \(v))")
+            case .failed(let stage, let detail, let reason, let results):
+                let reason = try redact(reason)
+                release.status = .failed
+                release.failedReason = reason
+                if let results {
+                    release.smokeStatus = "failed"
+                    release.smokeResults = try redacted(results)
+                }
+                let title = Self.flat("Release \(v) failed: \(stage) (\(try redact(detail)))", max: Self.maxTitle - 1)
+                let draft = WorkItemDraft(type: WorkItemType("bug"), title: title, description: Self.flat(reason, max: 2000),
+                                          checkSpec: nil, priority: 1, status: .ready)
+                _ = try createWorkItem(db: db, companyId: release.companyId, by: .system, draft: draft, now: now)
+                activity = "\(release.ref) (release \(v)) failed: \(Self.flat(reason, max: 300))"
+                notice = ("Release \(v) failed", deployStarted ? Self.rollbackHint(company: companyName, release: release)
+                                                               : "Nothing was deployed: \(Self.flat(reason, max: 300))")
+            case .stopped(let reason):
+                release.failedReason = try redact(reason)
+                if release.status == .deploying {
+                    release.status = .interrupted
+                    activity = "\(release.ref) (release \(v)) was interrupted while deploying: \(Self.flat(reason, max: 300))"
+                    notice = ("Release \(v) was interrupted", "It may be partly live. " + Self.rollbackHint(company: companyName, release: release))
+                } else {
+                    release.status = .failed
+                    activity = "\(release.ref) (release \(v)) was stopped: \(Self.flat(reason, max: 300))"
+                    notice = ("Release \(v) was stopped", deployStarted ? Self.rollbackHint(company: companyName, release: release)
+                                                                     : "Nothing was deployed.")
+                }
+            }
+            try release.update(db)
+            try ActivityEvent(companyId: release.companyId, agentId: nil, turnId: nil, kind: .release, text: try redact(activity),
+                              createdAt: now).insert(db)
+            try notifyOwner(db: db, companyId: release.companyId, kind: .system, urgency: .normal, title: notice.title,
+                            body: notice.body, now: now)
+            return release
+        }
     }
 }

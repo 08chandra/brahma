@@ -140,31 +140,48 @@ public struct DeployPlan: Codable, Equatable, Sendable {
     public var outputDir: String?
     /// One line per step (`ShellQuote.joinArgv`); the token would appear only as `"$NAME"`.
     public var display: String
+    /// The token-holding step that confirms a deploy URL belongs to the configured project before the engine stores it (the
+    /// Task 7 ruling for Vercel): its argv with `deployURLPlaceholder` as the one element the URL replaces. Nil: the URL the
+    /// adapter read from the deploy's stdout is trusted as it is. Shown as the last line of `display`.
+    public var verify: [String]?
     /// `StableHash` of display, stageFrom, cwdPath, build and outputDir (builder-checks 5, 6), and also of the steps themselves
-    /// (their `okIfOutputContains` decides success), the network, the token's name and the fixed env, so no part of a stored
-    /// plan can change without the hash changing.
+    /// (their `okIfOutputContains` decides success), the network, the token's name, the fixed env and the verify step, so no
+    /// part of a stored plan can change without the hash changing.
     public var hash: String
 
+    /// The element of `verify` the deploy URL replaces.
+    public static let deployURLPlaceholder = "{deploy-url}"
+
     public init(steps: [DeployStep], stageFrom: [String], cwdPath: String, network: [String], tokenSecret: String,
-                env: [String: String] = [:], build: String?, outputDir: String?) throws {
+                env: [String: String] = [:], build: String?, outputDir: String?, verify: [String]? = nil) throws {
         guard cwdPath.hasPrefix("/") else { throw WorkError.invalid("a deploy step must run in an absolute directory") }
+        if let verify { guard verify.filter({ $0 == Self.deployURLPlaceholder }).count == 1 else {
+            throw WorkError.invalid("a verify step names the deploy URL exactly once")
+        } }
         self.steps = steps; self.stageFrom = stageFrom; self.cwdPath = cwdPath; self.network = network
-        self.tokenSecret = tokenSecret; self.env = env; self.build = build; self.outputDir = outputDir
-        display = steps.map { ShellQuote.joinArgv($0.argv, rawRefs: [tokenSecret]) }.joined(separator: "\n")
+        self.tokenSecret = tokenSecret; self.env = env; self.build = build; self.outputDir = outputDir; self.verify = verify
+        display = (steps.map(\.argv) + (verify.map { [$0] } ?? [])).map { ShellQuote.joinArgv($0, rawRefs: [tokenSecret]) }
+            .joined(separator: "\n")
         hash = ""
         hash = computedHash
     }
 
+    /// The verify step's argv for `url`, or nil when the plan has none.
+    public func verifyArgv(url: URL) -> [String]? {
+        verify?.map { $0 == Self.deployURLPlaceholder ? url.absoluteString : $0 }
+    }
+
     /// The hash of every part but `hash`, JSON-encoded with sorted keys so no two different plans can join into the same text.
+    /// A plan without a verify step hashes as it did before the step existed (the key is left out when nil).
     public var computedHash: String {
         struct Parts: Encodable {
             let steps: [DeployStep], display: String, stageFrom: [String], cwdPath: String, network: [String], tokenSecret: String
-            let env: [String: String], build: String?, outputDir: String?
+            let env: [String: String], build: String?, outputDir: String?, verify: [String]?
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let parts = Parts(steps: steps, display: display, stageFrom: stageFrom, cwdPath: cwdPath, network: network,
-                          tokenSecret: tokenSecret, env: env, build: build, outputDir: outputDir)
+                          tokenSecret: tokenSecret, env: env, build: build, outputDir: outputDir, verify: verify)
         // Encoding plain strings and arrays cannot fail; were it to, the hash would still differ from any real plan's.
         let data = (try? encoder.encode(parts)) ?? Data("unencodable".utf8)
         return StableHash.fnv1a64(data)
@@ -326,9 +343,22 @@ public protocol HostingAdapter: Sendable {
     /// The provider config files `ProviderConfigCheck` refuses in or above a deploy folder, up to the file system root
     /// (`.git` and `.vercel` are always refused up to the release root).
     var providerConfigNames: [String] { get }
+    /// Whether the output of the plan's verify step (`DeployPlan.verify`) says the deployment belongs to `settings.project`.
+    /// Only asked when the plan has a verify step; fail closed (false) on anything it cannot read.
+    func verifiesDeployment(output: String, settings: HostingSettings) -> Bool
 }
 
 extension HostingAdapter {
+    /// No verify step: nothing to confirm.
+    public func verifiesDeployment(output: String, settings: HostingSettings) -> Bool { false }
+
+    /// The executable `cli` installs into `node_modules/.bin`: the package name without its version (and scope).
+    public var cliBin: String {
+        var name = cli
+        if let at = name.lastIndex(of: "@"), at != name.startIndex { name = String(name[..<at]) }
+        return name.split(separator: "/").last.map(String.init) ?? name
+    }
+
     /// `ProviderConfigCheck` for a plan of this adapter: what the executor calls before every step (Task 7).
     public func refuseProviderConfig(_ plan: DeployPlan, releaseRoot: URL) throws {
         try ProviderConfigCheck.check(cwd: plan.cwdPath, boundary: releaseRoot, names: providerConfigNames)
