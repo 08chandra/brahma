@@ -120,6 +120,9 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     /// by the store). Set only with `blocked` and cleared whenever the item leaves it; owner-notice urgency counts it.
     public var blockedAskId: String? = nil
     public var blockedAskBy: String? = nil
+    /// The status a human task (Plan L Task 9) blocked the item from; restored when the task is done or declined (an
+    /// `inProgress` item only while its lease still exists, else `ready`). Meaningful only while `blockedAskId` is the task.
+    public var statusBeforeBlock: WorkItemStatus? = nil
     /// 0 is most urgent; the default is 2.
     public var priority: Int = 2
     public var points: Int? = nil
@@ -304,6 +307,8 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     case mergeFailed
     // Work modes (W3).
     case planWritten, planTurnWrote, modeEscalated, specConfirmed
+    // Human tasks (Plan L Task 9): the owner did or declined the task the item was blocked on. Both wake the assignee.
+    case humanTaskDone, humanTaskDeclined
 
     /// Events that count as an agent making progress (the watchdog resets on them).
     public static let progress: Set<WorkEventKind> = [
@@ -314,7 +319,7 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     /// Kinds that also appear in the company activity feed.
     static let feed: Set<WorkEventKind> = [
         .statusChanged, .submitted, .verificationPassed, .verificationFailed, .reviewApproved, .merged, .mergeConflict,
-        .mergeFailed, .budgetExceeded, .watchdog, .leaseExpired, .aging,
+        .mergeFailed, .budgetExceeded, .watchdog, .leaseExpired, .aging, .humanTaskDone, .humanTaskDeclined,
     ]
 }
 
