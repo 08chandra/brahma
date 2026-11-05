@@ -15,6 +15,8 @@ public enum TaintPolicy {
         "post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked",
         "list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency", "comment_work_item",
         "claim_lease", "release_lease", "submit_for_review", "write_handoff",
+        // Plan L (chief review L4): the handler enforces its own tainted-session rule (a template without links only).
+        "request_human_task",
     ]
 
     /// The company tools reviewed as high risk (`everyToolClassified` pins `CompanyToolNames.all` against both sets). A task
@@ -22,6 +24,9 @@ public enum TaintPolicy {
     public static let reviewedHighRisk: Set<String> = [
         "propose_decision", "request_from_owner", "escalate_decision", "plan_sprint", "close_sprint", "decide", "review", "audit",
         "request_access", "request_secret", "use_secret", "request_mode", "confirm_spec", "readopt_branch", "propose_extension",
+        // Plan L's ops tools (`CompanyToolNames.ops`): what a preview runs, what a smoke check fetches, how a release builds,
+        // and a deploy proposal.
+        "set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy",
     ]
 
     public static func isHighRisk(_ tool: String) -> Bool { !taintSafeTools.contains(tool) }
