@@ -349,11 +349,13 @@ extension Store {
                 item.blockedSinceActive = try Self.activeNow(db: db, companyId: item.companyId)
                 item.blockedAskId = askLink
                 item.blockedAskBy = askLink == nil ? nil : actor.id
+                // Blocked on an ask: the status a settled human task restores (`applyHumanTaskEffects`).
+                item.statusBeforeBlock = askLink == nil ? nil : item.status
             } else if item.status == .blocked {
                 item.blockedReason = nil
                 item.blockedSinceActive = nil
                 item.stopReason = nil
-                item.blockedAskId = nil; item.blockedAskBy = nil
+                item.blockedAskId = nil; item.blockedAskBy = nil; item.statusBeforeBlock = nil
             }
             if item.status == .done { item.doneAt = nil }
             item.status = to
@@ -573,7 +575,10 @@ extension Store {
         let from = item.status
         guard from != to else { return item }
         item.status = to
-        if from == .blocked { item.blockedReason = nil; item.blockedSinceActive = nil; item.blockedAskId = nil; item.blockedAskBy = nil }
+        if from == .blocked {
+            item.blockedReason = nil; item.blockedSinceActive = nil; item.blockedAskId = nil; item.blockedAskBy = nil
+            item.statusBeforeBlock = nil
+        }
         if from == .done { item.doneAt = nil }
         if to == .inProgress { item.everStarted = true }
         if to == .done { item.doneAt = now }
