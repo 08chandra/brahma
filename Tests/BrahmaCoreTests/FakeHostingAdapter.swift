@@ -1,10 +1,12 @@
 import Foundation
 @testable import BrahmaCore
 
-/// A hosting provider for tests: "deploys" by copying the upload into `$FAKE_HOST_ROOT/<R-n>` and printing a fake URL; the
-/// test serves `FAKE_HOST_ROOT` with a loopback static server, and `smokeBase` is that server. Never contacts anything. Its
-/// install step is a no-op (`cli` is `fake@1`, nothing to install). Injected through the adapter lookup (PR-25), never a
-/// shared registry.
+/// A hosting provider for tests. Its CLI is `fake` (`cli` `fake@1`, installed by the fake `npm` of `FakeHostingAdapter.tools`
+/// as a hard link of the shared FakeTools script, never a new executable): `fake deploy <R-n>` copies the upload into
+/// `$FAKE_HOST_ROOT/<R-n>` and prints `https://fake-<r-n>.local` on stdout; `fake inspect <url>` prints `project <name>`.
+/// Its fixed environment (in the plan, and so in the hash) carries what a test asks of it: echo the token, exit with a
+/// code, print a URL on stderr, sleep before deploying. `smokeBase` is `server`. Never contacts anything. Injected through
+/// the adapter lookup (PR-25), never a shared registry.
 struct FakeHostingAdapter: HostingAdapter {
     var id: HostingProviderID = .cloudflarePages
     var tokenSecret = "FAKE_HOST_TOKEN"
@@ -12,28 +14,52 @@ struct FakeHostingAdapter: HostingAdapter {
     var toolNetwork: [String] = []
     var network: [String] = []
     var providerConfigNames: [String] = []
-    /// The loopback server over `FAKE_HOST_ROOT`.
+    /// What the smoke probes (a fake HTTP probe answers it).
     var server: URL?
+    /// Where `fake deploy` copies the upload.
+    var hostRoot: URL?
+    /// `fake deploy` prints the token's value (the redaction test).
+    var echoToken = false
+    var exitCode: Int?
+    /// Printed on stderr after the deploy URL (stdout-only parsing).
+    var stderrLine: String?
+    /// Seconds `fake deploy` sleeps before it copies anything (the stop test).
+    var sleepSeconds: Int?
+    /// Plans carry a verify step (`fake inspect <deploy URL>`), as Vercel's do.
+    var verify = false
+    /// The project `fake inspect` reports (nil: the configured one).
+    var inspectProject: String?
 
-    static let installIsNoOp = true
+    static let installIsNoOp = false
 
     func validate(_ s: HostingSettings) throws { try HostingAdapters.validateForDeploy(s) }
 
+    func env(_ i: DeployInput) -> [String: String] {
+        var e = ["FAKE_HOST_ROOT": hostRoot?.path ?? "/nonexistent", "FAKE_ACCOUNT": i.settings.accountId ?? "",
+                 "FAKE_INSPECT_PROJECT": inspectProject ?? i.settings.project]
+        if echoToken { e["FAKE_ECHO"] = tokenSecret }
+        if let exitCode { e["FAKE_EXIT"] = String(exitCode) }
+        if let stderrLine { e["FAKE_STDERR"] = stderrLine }
+        if let sleepSeconds { e["FAKE_SLEEP"] = String(sleepSeconds) }
+        return e
+    }
+
     func step(_ i: DeployInput) -> DeployStep {
-        let n = i.releaseDir.lastPathComponent
-        return DeployStep(label: "deploy", argv: ["/bin/sh", "-c", "cp -R . \"$FAKE_HOST_ROOT/\(n)\" && echo https://fake-\(n.lowercased()).local"])
+        DeployStep(label: "deploy", argv: [i.bin("fake"), "deploy", i.releaseDir.lastPathComponent])
     }
 
     func deployPlan(_ i: DeployInput) throws -> DeployPlan {
         try validate(i.settings)
         return try DeployPlan(steps: [step(i)], stageFrom: [i.settings.outputDir ?? ""], cwdPath: i.inRelease("upload"),
-                              network: network, tokenSecret: tokenSecret, build: i.settings.build, outputDir: i.settings.outputDir)
+                              network: network, tokenSecret: tokenSecret, env: env(i), build: i.settings.build,
+                              outputDir: i.settings.outputDir,
+                              verify: verify ? [i.bin("fake"), "inspect", DeployPlan.deployURLPlaceholder] : nil)
     }
 
     func rollbackPlan(_ i: DeployInput) throws -> DeployPlan {
         try validate(i.settings)
         return try DeployPlan(steps: [step(i)], stageFrom: [], cwdPath: (i.previousUpload ?? i.placeholderDir).path,
-                              network: network, tokenSecret: tokenSecret, build: i.settings.build, outputDir: i.settings.outputDir)
+                              network: network, tokenSecret: tokenSecret, env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
     }
 
     func deployURL(fromOutput: String, settings: HostingSettings) -> URL? {
@@ -41,4 +67,62 @@ struct FakeHostingAdapter: HostingAdapter {
     }
 
     func smokeBase(_ s: HostingSettings, deployURL: URL?) -> URL? { server }
+
+    func verifiesDeployment(output: String, settings: HostingSettings) -> Bool {
+        output.split(whereSeparator: \.isNewline).contains { $0 == "project \(settings.project)" }
+    }
+
+    /// The fake provider CLI.
+    static let cliScript = """
+        cmd="$1"; shift
+        case "$cmd" in
+        deploy)
+          n="$1"
+          if [ -n "$FAKE_SLEEP" ]; then sleep "$FAKE_SLEEP"; fi
+          mkdir -p "$FAKE_HOST_ROOT/$n" && cp -R . "$FAKE_HOST_ROOT/$n/" || exit 9
+          if [ -n "$FAKE_ECHO" ]; then echo "using token $(printenv "$FAKE_ECHO")"; fi
+          echo "https://fake-$(printf '%s' "$n" | tr 'A-Z' 'a-z').local"
+          if [ -n "$FAKE_STDERR" ]; then echo "$FAKE_STDERR" >&2; fi
+          exit "${FAKE_EXIT:-0}"
+          ;;
+        inspect)
+          echo "project $FAKE_INSPECT_PROJECT"
+          ;;
+        *)
+          echo "unknown command $cmd" >&2
+          exit 2
+          ;;
+        esac
+        """
+
+    /// A fake `npm install --prefix <dir> … <pkg>@<version>`: hard-links the shared `fake` script (its sibling in the same
+    /// FakeTools directory) as `<dir>/node_modules/.bin/<pkg>`.
+    static let npmScript = """
+        prefix=""; pkg=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --prefix) prefix="$2"; shift 2 ;;
+            --*) shift ;;
+            install) shift ;;
+            *) pkg="$1"; shift ;;
+          esac
+        done
+        name="${pkg%@*}"
+        mkdir -p "$prefix/node_modules/.bin" && ln "$(dirname "$0")/fake" "$prefix/node_modules/.bin/$name"
+        """
+
+    /// The PATH directory holding the fake `npm` and `fake`.
+    static func tools() throws -> URL { try FakeTools.bin(["npm": npmScript, "fake": cliScript]) }
+}
+
+extension ReleaseDependencies {
+    /// Fakes for every release dependency: recorded sandboxes (real processes), a scripted HTTP probe, the fake adapter,
+    /// no wait between smoke rounds, and a PATH with the fake `npm` and CLI. Never the real sandbox, network or providers.
+    static func fake(sandbox: FakeSandbox = FakeSandbox(), unsandboxed: FakeSandbox = FakeSandbox(),
+                     http: FakeHTTPProbe = FakeHTTPProbe([FakeHTTPProbe.ok()]), adapter: FakeHostingAdapter = FakeHostingAdapter(),
+                     environment: [String: String]? = nil) -> ReleaseDependencies {
+        let path = ((try? FakeHostingAdapter.tools().path).map { $0 + ":" } ?? "") + "/usr/bin:/bin"
+        return ReleaseDependencies(sandbox: sandbox, unsandboxed: unsandboxed, http: http, adapters: { _ in adapter }, sleep: { _ in },
+                                   environment: environment ?? ["PATH": path, "LANG": "C"])
+    }
 }

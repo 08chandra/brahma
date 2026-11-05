@@ -45,15 +45,63 @@ extension Orchestrator {
     }
 
     /// A smoke run of the company's engine-accepted main outside the tick (Task 7's release smoke): holds the company's smoke
-    /// slot (PR-36) and runs with this engine's `Blocking` and clock (`Store.runSmoke`).
-    public func runSmoke(companyId: String, commit: String, reason: MainSmokeReason, releaseId: String? = nil) async throws -> MainSmokeRun {
-        let (engineStore, checks, slots, blocking, clock) = (self.store, smokeChecks, smokeSlots, self.blocking, self.clock)
-        return try await asEngine {
-            try await slots.withSlot(companyId) {
-                try await engineStore.runSmoke(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId,
-                                               checks: checks, blocking: blocking, clock: clock)
+    /// slot (PR-36) and runs with this engine's `Blocking` and clock (`Store.runSmoke`). `acceptedMain` (release runs only):
+    /// the engine-accepted main the caller checked `commit` is an ancestor of.
+    public func runSmoke(companyId: String, commit: String, reason: MainSmokeReason, releaseId: String? = nil,
+                         acceptedMain: String? = nil) async throws -> MainSmokeRun {
+        try await Self.smokeEntry(store: store, checks: smokeChecks, slots: smokeSlots, blocking: blocking, clock: clock,
+                                  engineId: engineId)(companyId, commit, reason, releaseId, acceptedMain)
+    }
+
+    /// `runSmoke` as a value, built from this engine's parts only (no reference to the orchestrator): what the release
+    /// executor runs its release smoke through (carried-forward ruling 1), so both share one path, slot, `Blocking` and clock.
+    static func smokeEntry(store: Store, checks: SmokeChecks, slots: SmokeSlots, blocking: Blocking,
+                           clock: @escaping @Sendable () -> Date, engineId: String)
+        -> @Sendable (String, String, MainSmokeReason, String?, String?) async throws -> MainSmokeRun {
+        { companyId, commit, reason, releaseId, acceptedMain in
+            try await EngineGitGuard.$engine.withValue(engineId) {
+                try await slots.withSlot(companyId) {
+                    try await store.runSmoke(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId,
+                                             acceptedMain: acceptedMain, checks: checks, blocking: blocking, clock: clock)
+                }
             }
         }
+    }
+
+    /// The tick's "release" step (Plan L Task 7, PR-6), after the main smoke: each company with an approved release and none
+    /// in progress gets one tracked detached task (`releaseTasks`, counted in `otherChildren` and `isIdle`) that runs
+    /// `ReleaseExecutor.advance(companyId:now:)`; the release's own smoke on main runs inside it. Starts are gated like
+    /// smokes: nothing under a hold (the owner's stop included; the executor's claim also refuses while it holds) or critical
+    /// memory pressure, only into a free slot, never in a paused company.
+    func releaseTick(now: Date, config: SchedulerConfig, held: Bool, pressure: MemoryPressure, companies: [Company]) {
+        guard !held, pressure != .critical else { return }
+        let waiting = (try? store.companiesWithApprovedRelease()) ?? []
+        guard !waiting.isEmpty else { return }
+        for company in companies where waiting.contains(company.id) && company.status == .running && releaseTasks[company.id] == nil {
+            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
+                                            pressure: pressure, held: held)
+            guard slots > 0 else { return }
+            let (executor, clock, companyId) = (releaseExecutor, self.clock, company.id)
+            releaseTasks[companyId] = Task.detached { [self] in
+                await asEngine { await executor.advance(companyId: companyId, now: clock()) }
+                await releaseEnded(companyId: companyId)
+            }
+        }
+    }
+
+    func releaseEnded(companyId: String) { releaseTasks[companyId] = nil }
+
+    /// The default release runners: the platform sandbox (Seatbelt on macOS, else fail closed) with the checks' baseline for
+    /// every step a release runs sandboxed (always the tools install and the provider CLI), the plain group runner for a Full
+    /// company's build (as its checks run, PR-5), the real HTTP probe (no redirects) and the production adapters.
+    static func defaultReleaseDependencies(store: Store, paths: BrahmaPaths) -> ReleaseDependencies {
+        let baseline: @Sendable () -> SandboxBaseline = { checkBaseline(store: store, paths: paths) }
+        let sandbox = SandboxRunners.platformDefault(baseline: baseline, proxies: EgressProxyPool(), onStraggler: { report in
+            let pids = (report.killed + report.survivors).map(String.init).joined(separator: ", ")
+            FileHandle.standardError.write(Data("brahma orchestrator: a release step left processes outside its group (pid \(pids))\n".utf8))
+        })
+        return ReleaseDependencies(sandbox: sandbox, unsandboxed: UnsandboxedPreviewRunner(), http: URLSessionHTTPProbe(),
+                                   adapters: HostingAdapters.production)
     }
 
     /// Start-up (fix I1): runs an earlier engine left running are re-queued (merge runs at main) or recorded `error`
