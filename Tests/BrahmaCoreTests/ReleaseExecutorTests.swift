@@ -736,7 +736,7 @@ import Glibc
         await running.value
         let r = try fx.reload(approved)
         #expect(r.status == .interrupted)
-        #expect(r.failedReason == "stopped by the owner: test")
+        #expect(r.failedReason == "stopped by the owner during deploy")
         #expect(fx.executor.processes.count == 0)
         #expect(kill(pid, 0) != 0)
         #expect(!FileManager.default.fileExists(atPath: fx.hostRoot.appending(path: "R-1").path))
@@ -760,7 +760,7 @@ import Glibc
         await running.value
         let r = try fx.reload(approved)
         #expect(r.status == .failed)
-        #expect(r.failedReason == "stopped by the owner")
+        #expect(r.failedReason == "stopped by the owner during build")
         #expect(try fx.deploySteps().isEmpty)
         #expect(try fx.notices().contains { $0.title == "Release 0.1.0 was stopped" && $0.body == "Nothing was deployed." })
     }

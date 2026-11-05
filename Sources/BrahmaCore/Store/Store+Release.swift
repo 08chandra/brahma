@@ -56,8 +56,8 @@ extension Store {
         }
     }
 
-    /// The latest result (`passed` or `failed`; `error` is none) at `commit` (`ReleasePolicy.mainIsGreen`).
-    func latestResult(companyId: String, commit: String) throws -> MainSmokeRun? {
+    /// The latest result (`passed` or `failed`; `error` is none) at `commit` (`ReleasePolicy.mainIsGreen`, `brahma release`).
+    public func latestResult(companyId: String, commit: String) throws -> MainSmokeRun? {
         try writer.read { db in
             try MainSmokeRun.filter(Column("companyId") == companyId && Column("commit") == commit
                                     && [MainSmokeStatus.passed.rawValue, MainSmokeStatus.failed.rawValue].contains(Column("status")))
@@ -455,7 +455,9 @@ extension Store {
                                 previousUpload: previous.map { layout.releaseDir($0.number).appending(path: "upload", directoryHint: .isDirectory) },
                                 previousDeployURL: previous?.deployURL, functionsInCommit: functions)
         let plan = try adapter.deployPlan(input)
-        let rollback = try adapter.rollbackPlan(input)
+        // The rollback restores `previous` with its own build, output folder, commit and version (Task 8, Task 4 M3).
+        let rollback = try adapter.rollbackPlan(Self.rollbackInput(settings: settings, release: number, commit: commit, version: version,
+                                                                   previous: previous, layout: layout, cli: adapter.cli))
         let sha7 = String(commit.prefix(7))
         let proposal = Self.deployProposal(settings: settings, adapter: adapter, smokeCheck: smokeCheck, sha7: sha7, plan: plan,
                                            rollback: rollback)
@@ -593,14 +595,6 @@ extension Store {
         "Run brahma release rollback \(flat(company, max: 100)) \(release.ref) or use Roll back in Releases."
     }
 
-    /// The companies with an approved release waiting for the executor (the tick's "release" step).
-    func companiesWithApprovedRelease() throws -> Set<String> {
-        try writer.read { db in
-            Set(try String.fetchAll(db, sql: "SELECT DISTINCT companyId FROM release WHERE status = ?",
-                                    arguments: [ReleaseStatus.approved.rawValue]))
-        }
-    }
-
     /// The executor's claim (builder-check 3, PR-9), one write transaction: nothing while the owner's stop holds; otherwise
     /// the company's oldest approved release moves `approved` → `building` (with `startedAt`) by
     /// `UPDATE release SET status = 'building' … WHERE id = ? AND status = 'approved'`, and is returned; nil when there was
@@ -706,5 +700,170 @@ extension Store {
                             body: notice.body, now: now)
             return release
         }
+    }
+}
+
+// MARK: - Rollbacks and crash recovery (Task 8)
+
+/// How a rollback the executor was carrying out ended (`Store.finishRollback`). `tail` is the redacted end of its log.
+enum RollbackEnd: Equatable, Sendable {
+    /// Every recorded step ran and the site passed its smoke check.
+    case succeeded(tail: String)
+    /// A step or the smoke failed, or the rollback was refused before any step (never retried by the engine).
+    case failed(reason: String, tail: String?)
+    /// The owner's stop or the engine stopping cut it short (never run again by itself).
+    case stopped(reason: String, tail: String?)
+}
+
+extension Store {
+    static let rollbackOwnerOnly = "only the owner can roll back a release"
+
+    /// What a rollback plan is composed from (`HostingAdapter.rollbackPlan`), at propose time and when the executor renders
+    /// it again: for release `number` (its folder, e.g. Vercel's empty `rollback/`), the release it restores — `previous`, the
+    /// company's last deployed release when it was proposed — with that release's own build, output folder, commit, version,
+    /// upload and deploy URL (Task 4 M3: never the current settings' output folder). With no previous release (the placeholder)
+    /// the proposed release's own values. `settings` are the hosting settings with the proposed release's build and output.
+    public static func rollbackInput(settings: HostingSettings, release number: Int, commit: String, version: String,
+                                     previous: Release?, layout: ReleaseLayout, cli: String) -> DeployInput {
+        var s = settings
+        if let previous {
+            s.build = previous.build
+            s.outputDir = previous.outputDir
+        }
+        return DeployInput(settings: s, commit: previous?.commit ?? commit, version: previous?.version ?? version, layout: layout,
+                           release: number, cli: cli,
+                           previousUpload: previous.map { layout.releaseDir($0.number).appending(path: "upload", directoryHint: .isDirectory) },
+                           previousDeployURL: previous?.deployURL, functionsInCommit: false)
+    }
+
+    /// The owner asks the engine to roll back release `releaseRef` (`R-<n>`) by running its recorded `rollbackPlan`, the one
+    /// shown in the deploy ask. Owner only (`"only the owner can roll back a release"`); only a `deployed` or `failed` release
+    /// whose rollback is not `requested` or `running`. The refusals are exactly `"R-<n> is <status>; only deployed or failed
+    /// releases roll back"` and `"R-<n> is already rolling back"`. Sets `rollbackStatus requested` and `rollbackRequestedAt`
+    /// in one write; the executor claims it (`claimRollback`).
+    @discardableResult
+    public func requestRollback(companyId: String, releaseRef: String, by sender: Sender, now: Date = Store.now()) throws -> Release {
+        guard sender == .owner else { throw WorkError.forbidden(Self.rollbackOwnerOnly) }
+        let notFound = WorkError.notFound("no release \(Self.flat(releaseRef, max: 40))")
+        guard let found = try release(companyId: companyId, ref: releaseRef) else { throw notFound }
+        return try writer.write { db in
+            guard var r = try Release.fetchOne(db, key: found.id), r.companyId == companyId else { throw notFound }
+            guard r.status == .deployed || r.status == .failed else {
+                throw WorkError.invalid("\(r.ref) is \(r.status.rawValue); only deployed or failed releases roll back")
+            }
+            if r.rollbackStatus == .requested || r.rollbackStatus == .running { throw WorkError.conflict("\(r.ref) is already rolling back") }
+            r.rollbackStatus = .requested
+            r.rollbackRequestedAt = now
+            r.rollbackStartedAt = nil
+            try r.update(db)
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .release,
+                              text: "owner requested a rollback of \(r.ref) (release \(r.version))", createdAt: now).insert(db)
+            return r
+        }
+    }
+
+    /// The companies with an approved release or a requested rollback (the tick's "release" step).
+    func companiesWithReleaseWork() throws -> Set<String> {
+        try writer.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT DISTINCT companyId FROM release WHERE status = ? OR rollbackStatus = ?",
+                                    arguments: [ReleaseStatus.approved.rawValue, RollbackStatus.requested.rawValue]))
+        }
+    }
+
+    /// The executor's rollback claim (builder-check 5), one write transaction: nothing while the owner's stop holds or while
+    /// one of the company's releases is in progress; otherwise its oldest requested rollback moves `requested` → `running`,
+    /// with `rollbackStartedAt` set and `rollbackRequestedAt` cleared in the same conditional `UPDATE`, and is returned; nil
+    /// when there was none or another caller claimed it first.
+    func claimRollback(companyId: String, now: Date) throws -> Release? {
+        try writer.write { db in
+            if try Self.engineStopped(db) != nil { return nil }
+            let inProgress = [ReleaseStatus.building, .deploying, .smoking].map(\.rawValue)
+            if try Release.filter(Column("companyId") == companyId && inProgress.contains(Column("status"))).fetchCount(db) > 0 {
+                return nil
+            }
+            guard let oldest = try Release.filter(Column("companyId") == companyId
+                                                  && Column("rollbackStatus") == RollbackStatus.requested.rawValue)
+                .order(Column("rollbackRequestedAt"), Column("number")).fetchOne(db) else { return nil }
+            try db.execute(sql: """
+                UPDATE release SET rollbackStatus = ?, rollbackStartedAt = ?, rollbackRequestedAt = NULL
+                WHERE id = ? AND rollbackStatus = ? AND status IN (?, ?)
+                """, arguments: [RollbackStatus.running.rawValue, now, oldest.id, RollbackStatus.requested.rawValue,
+                                 ReleaseStatus.deployed.rawValue, ReleaseStatus.failed.rawValue])
+            guard db.changesCount == 1, let claimed = try Release.fetchOne(db, key: oldest.id) else { return nil }
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .release,
+                              text: "started the rollback of \(claimed.ref) (release \(claimed.version))", createdAt: now).insert(db)
+            return claimed
+        }
+    }
+
+    /// Records how a `running` rollback ended, in one write (a rollback no longer running is returned as it is):
+    /// - succeeded: `rollbackStatus succeeded`, status `rolledBack`, `rolledBackAt`, the tail;
+    /// - failed: `rollbackStatus failed`, the tail, the owner told (the engine never retries; the owner may ask again);
+    /// - stopped: `rollbackStatus interrupted`, the tail, the owner told `"Rollback of R-<n> was interrupted"`, `"Check
+    ///   <provider title>; you can request the rollback again."`.
+    /// Rollback never touches `main`. Agent-controlled text (the tail, the reason) is redacted.
+    @discardableResult
+    func finishRollback(id: String, end: RollbackEnd, now: Date) throws -> Release {
+        try writer.write { db in
+            guard var r = try Release.fetchOne(db, key: id) else { throw WorkError.notFound("no such release") }
+            guard r.rollbackStatus == .running else { return r }
+            let activity: String
+            var notice: (title: String, body: String)?
+            switch end {
+            case .succeeded(let tail):
+                r.rollbackStatus = .succeeded
+                r.status = .rolledBack
+                r.rolledBackAt = now
+                r.rollbackOutputTail = try redact(tail)
+                activity = "\(r.ref) (release \(r.version)) was rolled back"
+            case .failed(let reason, let tail):
+                let reason = try redact(reason)
+                r.rollbackStatus = .failed
+                r.rollbackOutputTail = try redact(tail)
+                activity = "the rollback of \(r.ref) (release \(r.version)) failed: \(Self.flat(reason, max: 300))"
+                notice = ("Rollback of \(r.ref) failed", Self.flat(reason, max: 300))
+            case .stopped(let reason, let tail):
+                let reason = try redact(reason)
+                r.rollbackStatus = .interrupted
+                r.rollbackOutputTail = try redact(tail)
+                activity = "the rollback of \(r.ref) (release \(r.version)) was interrupted: \(Self.flat(reason, max: 300))"
+                notice = ("Rollback of \(r.ref) was interrupted", "Check \(r.provider.title); you can request the rollback again.")
+            }
+            try r.update(db)
+            try ActivityEvent(companyId: r.companyId, agentId: nil, turnId: nil, kind: .release, text: activity, createdAt: now).insert(db)
+            if let notice {
+                try notifyOwner(db: db, companyId: r.companyId, kind: .system, urgency: .normal, title: notice.title, body: notice.body, now: now)
+            }
+            return r
+        }
+    }
+
+    /// Engine start (builder-check 5): nothing an earlier engine left in progress ever runs again.
+    /// - `building` or `smoking` → `failed`, `"the engine stopped during <build|smoke>; propose again"`;
+    /// - `deploying` → `interrupted`, `"the engine stopped during the deploy; check <provider title>, then propose again"`;
+    /// - a `running` rollback → `interrupted` (`finishRollback`).
+    /// Each with the owner's notice (`finishRelease`, `finishRollback`). Returns the rows as they were, for the clean-up.
+    func recoverReleases(now: Date) throws -> [Release] {
+        let left = try writer.read { db in
+            let inProgress = [ReleaseStatus.building, .deploying, .smoking].map(\.rawValue)
+            return try Release.filter(inProgress.contains(Column("status")) || Column("rollbackStatus") == RollbackStatus.running.rawValue)
+                .order(Column("companyId"), Column("number")).fetchAll(db)
+        }
+        for r in left {
+            switch r.status {
+            case .deploying:
+                try finishRelease(id: r.id, end: .stopped(reason: "the engine stopped during the deploy; check \(r.provider.title), then propose again"),
+                                  now: now)
+            case .building, .smoking:
+                let step = r.status == .building ? "build" : "smoke"
+                try finishRelease(id: r.id, end: .stopped(reason: "the engine stopped during \(step); propose again"), now: now)
+            default:
+                break
+            }
+            if r.rollbackStatus == .running {
+                try finishRollback(id: r.id, end: .stopped(reason: "the engine stopped during the rollback", tail: nil), now: now)
+            }
+        }
+        return left
     }
 }
