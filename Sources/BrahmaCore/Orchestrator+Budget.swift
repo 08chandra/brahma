@@ -149,7 +149,7 @@ extension Store {
         let from = item.status
         item.status = .blocked
         item.blockedReason = String("over budget: \(parts)".prefix(500))
-        item.blockedAskId = nil; item.blockedAskBy = nil
+        item.blockedAskId = nil; item.blockedAskBy = nil; item.statusBeforeBlock = nil
         item.blockedSinceActive = try Store.activeNow(db: db, companyId: item.companyId)
         item.stopReason = "budget"
         item.updatedAt = now

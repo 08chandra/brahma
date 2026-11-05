@@ -306,7 +306,8 @@ extension Store {
             // Only the agent that filed an ask can replace it; nobody supersedes another requester's (or the owner's) ask.
             guard old.requesterId == requester.id else { throw WorkError.forbidden("only the requester of \(old.ref) can supersede it") }
         }
-        let (body, hash) = try prepare(payload, document: document)
+        let (body, hash) = try prepare(payload, document: document,
+                                       detailsLimit: kind == .humanTask ? HumanTaskPolicy.maxDetails : Store.maxAskText)
 
         let active = try Store.activeNow(db: db, companyId: companyId)
         let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM ask WHERE companyId = ?", arguments: [companyId])) ?? 1
@@ -335,11 +336,12 @@ extension Store {
     }
 
     /// Checks the brief and resolves the document: returns the payload to store and the document hash.
-    private func prepare(_ payload: AskPayload?, document: PreparedDocument?) throws -> (AskPayload?, String?) {
+    private func prepare(_ payload: AskPayload?, document: PreparedDocument?,
+                         detailsLimit: Int = Store.maxAskText) throws -> (AskPayload?, String?) {
         guard var p = payload else { return (nil, nil) }
         guard p.options.count <= AskPayload.maxOptions else { throw WorkError.invalid("an ask carries at most \(AskPayload.maxOptions) options") }
         p.question = try Store.limitedText(p.question, Store.maxAskField, "the question")
-        p.details = try Store.limitedText(p.details, Store.maxAskText, "the details")
+        p.details = try Store.limitedText(p.details, detailsLimit, "the details")
         p.recommendation = try Store.limitedText(p.recommendation, Store.maxAskField, "the recommendation")
         p.stakes = try Store.limitedText(p.stakes, Store.maxAskField, "the stakes")
         p.proposal = try Store.limitedText(p.proposal, Store.maxAskField, "the proposal")
