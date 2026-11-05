@@ -169,8 +169,8 @@ public enum GitClassifier {
     static let wrappers: Set<String> = ["env", "command", "exec", "nohup", "time", "xargs", "builtin", "nice", "sudo", "doas",
                                         "stdbuf", "timeout", "caffeinate", "script", "watch", "parallel", "find"]
     static let shells: Set<String> = ["sh", "bash", "zsh", "dash", "ksh"]
-    /// Wrapper options that take the next word.
-    static let wrapperValueOptions: Set<String> = ["-u", "-C", "-S", "-n", "-I", "-L", "-P", "-s", "-E", "-d", "-k"]
+    /// Programs that only print or test (no program of their own runs): the only ones a dynamic argument leaves local.
+    public static let inert: Set<String> = ["echo", "printf", "cat", "ls", "wc", "head", "tail", "test", "[", "true", "false"]
 
     /// `dynamic`: holds an expansion (or an unquoted glob). `splits`: one of them is unquoted, so it may become several words.
     struct Word: Equatable { var text: String; var dynamic: Bool; var splits: Bool = false }
@@ -185,6 +185,13 @@ public enum GitClassifier {
     public static func reachesNetwork(_ command: String, depth: Int = 0) -> Bool {
         guard depth < 4 else { return true }
         let commands = split(command)
+        // Fail closed (regression fix after 305694c): any dynamic word is network, except as an argument of ONE inert literal
+        // program (`inert`) with no shell syntax, wrapper, assignment, shell or eval around it. A plain allowlisted git call with a
+        // dynamic word is network too (an accepted false positive).
+        if commands.joined().contains(where: \.dynamic) {
+            guard commands.count == 1, !hasShellSyntax(command), let first = commands[0].first, !first.dynamic,
+                  inert.contains(first.text) else { return true }
+        }
         if mentionsGit(command) {
             guard depth == 0, !hasShellSyntax(command), commands.count == 1, let words = commands.first,
                   words.first?.text == "git", !words.contains(where: \.dynamic) else { return true }
@@ -233,11 +240,7 @@ public enum GitClassifier {
               words[i].text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil { i += 1 }
         while i < words.count, wrappers.contains(base(words[i].text)) {
             i += 1
-            while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic {
-                // A wrapper option that takes the next word (`nice -n 5`, `env -u NAME`).
-                if wrapperValueOptions.contains(words[i].text) { i += 1 }
-                i += 1
-            }
+            while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic { i += 1 }
         }
         guard i < words.count else { return false }
         let cmd = words[i]
