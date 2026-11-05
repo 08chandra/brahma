@@ -184,7 +184,7 @@ extension Store {
         ask.statusSinceActive = try Store.activeNow(db: db, companyId: company.id)
         ask.remindCount = 0
         ask.notifiedAt = nil
-        let verb = ask.kind == .info ? "answer" : "approve"
+        let verb = ask.kind == .info ? "answer" : ask.kind == .humanTask ? "task show" : "approve"
         let text = "Owner approval needed: \(ask.ref) \(try Store.displayTitle(db, ask)): \(ask.title) (brahma \(verb) \(company.slug) \(ask.ref))"
         try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .approval, text: text, createdAt: now).insert(db)
         try MessageRouter(store: self).sendDM(db: db, companyId: company.id, from: .system, to: "owner", text: text, now: now)
@@ -226,6 +226,7 @@ extension Store {
         if ask.status == .rejected { try actingCEODeclined(db, ask: ask, now: now) }
         if ask.kind == .sprintPlan { try applySprintPlanEffects(db, ask: ask, now: now) }
         if ask.kind == .deploy { try applyDeployEffects(db, ask: ask, now: now) }
+        if ask.kind == .humanTask { try applyHumanTaskEffects(db, ask: ask, now: now) }
         guard ask.status == .approved, let oldId = ask.supersedesId, var old = try Ask.fetchOne(db, key: oldId),
               old.companyId == ask.companyId else { return }
         guard ![AskStatus.rejected, .expired, .rescinded, .superseded].contains(old.status) else { return }
@@ -541,6 +542,8 @@ extension Store {
                      grant: GrantApproval?, decidedBy: String = "owner", extensionApproved: Bool = false,
                      providingSecret: Bool = false, now: Date) throws -> Ask {
         var ask = try requireAsk(db, askId)
+        // A human task is answered only by doing it (`completeHumanTask`, values to the vault) or declining it (Task 9).
+        if ask.kind == .humanTask { throw Self.humanTaskConflict(ask) }
         // A secret request is approved only by providing the secret (`Store.provideSecret`): a bare approve has no value to give.
         if approve, ask.kind == .request, SecretRequests.requested(ask) != nil, !providingSecret {
             let slug = try Company.fetchOne(db, key: ask.companyId)?.slug ?? "<co>"
@@ -579,6 +582,7 @@ extension Store {
     public func ownerReplan(askId: String, text: String, now: Date = Store.now()) throws -> Ask {
         try writer.write { db in
             var ask = try requireAsk(db, askId)
+            if ask.kind == .humanTask { throw Self.humanTaskConflict(ask) }
             guard ask.kind.isDecision else { throw WorkError.invalid("\(ask.ref) is not a decision") }
             guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
             guard let answer = try Store.limitedText(text, Store.maxAskField, "the new plan") else { throw WorkError.invalid("the new plan is empty") }

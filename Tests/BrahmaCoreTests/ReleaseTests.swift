@@ -199,15 +199,17 @@ import GRDB
             try #require(asks.count == 1)
             let task = asks[0]
             #expect(first == "The hosting token is missing; I asked the owner (\(task.ref)). Propose again when it is done.")
-            // The stub (PR-28): an info ask from the engine with the hosting-account title, no quota charged to the agent.
-            #expect(task.kind == .info); #expect(task.requesterId == "system"); #expect(task.status == .pendingOwner)
+            // Task 9 (PR-28): the hosting-account human task, filed by the engine, no quota charged to the agent.
+            #expect(task.kind == .humanTask); #expect(task.requesterId == "system"); #expect(task.status == .pendingOwner)
+            #expect(HumanTask.from(task)?.template == .hostingAccount)
+            #expect(HumanTask.from(task)?.fields.map(\.name) == ["CLOUDFLARE_API_TOKEN", "account_id"])
             #expect(task.title == "Create a Cloudflare account and an API token")
             // Deduped: a second propose names the same ask.
             #expect(fx.message("0.1.0") == first)
             #expect(try fx.store.asks(companyId: fx.company.id).count == 1)
             #expect(try fx.store.releases(companyId: fx.company.id).isEmpty)
         }
-        #expect(StubHumanTaskFiling.hostingAccountTitle(.vercel) == "Create a Vercel account and a token")
+        #expect(HumanTasks.hostingAccount(.vercel).title == "Create a Vercel account and a token")
     }
 
     @Test func releaseKindRedirected() throws {

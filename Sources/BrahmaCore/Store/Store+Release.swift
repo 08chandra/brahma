@@ -330,35 +330,10 @@ extension Store {
 // MARK: - Releases (Task 6)
 
 /// Files the hosting-account human task when a deploy is proposed without the provider token or the account ID (refusal 7
-/// of `Store.proposeDeploy`). Returns the open ask, filing it only when none is open (deduped). Task 9 replaces the stub.
+/// of `Store.proposeDeploy`). Returns the open ask, filing it only when none is open (deduped). Task 9's
+/// `EngineHumanTaskFiling` (Store+HumanTasks) is the real one.
 public protocol HumanTaskFiling: Sendable {
     func fileHostingAccount(store: Store, companyId: String, provider: HostingProviderID, now: Date) throws -> Ask
-}
-
-/// Until Task 9: an `info` ask with the hosting-account task's title, filed by the engine (`.system`, PR-28: no agent quota
-/// is charged), at most one open per company.
-public struct StubHumanTaskFiling: HumanTaskFiling {
-    public init() {}
-
-    public static func hostingAccountTitle(_ provider: HostingProviderID) -> String {
-        switch provider {
-        case .cloudflarePages: "Create a Cloudflare account and an API token"
-        case .vercel: "Create a Vercel account and a token"
-        }
-    }
-
-    public func fileHostingAccount(store: Store, companyId: String, provider: HostingProviderID, now: Date) throws -> Ask {
-        let title = Self.hostingAccountTitle(provider)
-        if let open = try store.asks(companyId: companyId, statuses: [.pendingOwner, .pendingInternal])
-            .first(where: { $0.kind == .info && $0.requesterId == "system" && $0.title == title }) {
-            return open
-        }
-        let token = HostingAdapters.adapter(provider).tokenSecret
-        return try store.requestFromOwner(companyId: companyId, by: .system, title: title, question: """
-            Deploys to \(provider.title) need an account and an API token. Create them, store the token as the company \
-            secret \(token) and set the account ID in hosting settings, then answer here.
-            """, now: now)
-    }
 }
 
 extension Store {
@@ -404,7 +379,7 @@ extension Store {
     public func proposeDeploy(companyId: String, by agentId: String, version rawVersion: String, notes: String?,
                               now: Date = Store.now(), vault: (any SecretVault)? = nil,
                               adapters: HostingAdapters.Lookup = HostingAdapters.production, layout: ReleaseLayout? = nil,
-                              npmPresent: Bool? = nil, humanTasks: any HumanTaskFiling = StubHumanTaskFiling()) throws -> (Release, Ask) {
+                              npmPresent: Bool? = nil, humanTasks: any HumanTaskFiling = EngineHumanTaskFiling()) throws -> (Release, Ask) {
         let version = rawVersion.trimmingCharacters(in: .whitespaces)
         let notes = try Store.limitedText(try redact(notes), Store.maxAskText, "the notes")
         // Who and the cheap refusals (1–5), read in one snapshot.
