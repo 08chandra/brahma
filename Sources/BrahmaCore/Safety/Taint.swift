@@ -192,12 +192,10 @@ public enum GitClassifier {
             guard commands.count == 1, !hasShellSyntax(command), let first = commands[0].first, !first.dynamic,
                   inert.contains(first.text) else { return true }
         }
-        if mentionsGit(command) {
-            guard depth == 0, !hasShellSyntax(command), commands.count == 1, let words = commands.first,
-                  words.first?.text == "git", !words.contains(where: \.dynamic) else { return true }
-            return network(words, depth: depth)
-        }
-        for simple in commands where shellNetwork(simple, depth: depth) { return true }
+        // S23: a command that mentions git is one simple command with no shell syntax, at the top level.
+        let git = mentionsGit(command)
+        if git, depth > 0 || hasShellSyntax(command) || commands.count != 1 { return true }
+        for simple in commands where simpleNetwork(simple, depth: depth, mentionsGit: git) { return true }
         return false
     }
 
@@ -234,18 +232,76 @@ public enum GitClassifier {
 
     /// A simple command without git: a shell needs a literal `-c` text (classified again), `eval` a literal one; a command
     /// word an expansion names is network.
-    static func shellNetwork(_ words: [Word], depth: Int) -> Bool {
+    /// Wrappers and the options each may carry (true: the option takes the next word, or an attached value). An option not in
+    /// its wrapper's table is network (fail closed). `env -S` and `timeout`'s duration are handled on their own; `parallel` is
+    /// always network; `find` launches through `-exec`/`-execdir`/`-ok`/`-okdir`.
+    static let wrapperOptions: [String: [String: Bool]] = [
+        "nice": ["-n": true],
+        "env": ["-u": true, "-C": true],
+        "sudo": ["-u": true, "-g": true, "-C": true, "-h": true, "-p": true],
+        "doas": ["-u": true, "-g": true, "-C": true, "-h": true, "-p": true],
+        "timeout": ["-s": true, "-k": true],
+        "xargs": ["-I": true, "-L": true, "-n": true, "-P": true, "-s": true, "-E": true, "-d": true],
+        "stdbuf": ["-i": true, "-o": true, "-e": true],
+        "watch": ["-n": true, "-d": false],
+        "nohup": [:], "time": [:], "command": [:], "exec": [:], "builtin": [:], "caffeinate": [:], "script": [:],
+    ]
+    /// Wrappers under which a plain allowlisted git call stays local (they change only priority, time or buffering).
+    static let gitTransparent: Set<String> = ["nice", "timeout", "stdbuf"]
+
+    /// One simple command: assignments and wrappers (by `wrapperOptions`) are skipped, then the program is classified: a shell by
+    /// its literal `-c` text, `find` by what it launches, `eval` by its text, git by the allowlist (only bare or under a
+    /// transparent wrapper); a command that mentions git anywhere else is network.
+    static func simpleNetwork(_ words: [Word], depth: Int, mentionsGit git: Bool) -> Bool {
         var i = 0
-        while i < words.count, !words[i].dynamic,
-              words[i].text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil { i += 1 }
-        while i < words.count, wrappers.contains(base(words[i].text)) {
+        while i < words.count, !words[i].dynamic, words[i].text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil {
+            // An assignment before git (`GIT_DIR=x git …`) can redirect it.
+            if git { return true }
             i += 1
-            while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic { i += 1 }
+        }
+        var transparent = true
+        while i < words.count, !words[i].dynamic {
+            let name = base(words[i].text)
+            if name == "parallel" { return true }
+            guard let table = wrapperOptions[name] else { break }
+            if !gitTransparent.contains(name) { transparent = false }
+            i += 1
+            while i < words.count, words[i].text.hasPrefix("-"), words[i].text != "-" {
+                let w = words[i]
+                if w.dynamic { return true }
+                if w.text == "--" { i += 1; break }
+                if name == "env", w.text == "-S" || w.text == "--split-string" || w.text.hasPrefix("--split-string=") || w.text.hasPrefix("-S") {
+                    // env -S: its text is the command (with the rest as its arguments).
+                    let value: String?
+                    if w.text == "-S" || w.text == "--split-string" { value = i + 1 < words.count && !words[i + 1].dynamic ? words[i + 1].text : nil; i += 2 }
+                    else if w.text.hasPrefix("--split-string=") { value = String(w.text.dropFirst("--split-string=".count)); i += 1 }
+                    else { value = String(w.text.dropFirst(2)); i += 1 }
+                    guard let value else { return true }
+                    let rest = i < words.count ? words[i...].map(\.text).joined(separator: " ") : ""
+                    return reachesNetwork(value + (rest.isEmpty ? "" : " " + rest), depth: depth + 1)
+                }
+                if let takesValue = table[w.text] { i += takesValue ? 2 : 1; continue }
+                // An attached value (`-n10`, `-I{}`, `-oL`).
+                if !w.text.hasPrefix("--"), w.text.count > 2, table[String(w.text.prefix(2))] == true { i += 1; continue }
+                return true
+            }
+            if name == "env" {
+                while i < words.count, !words[i].dynamic, words[i].text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil {
+                    if git { return true }
+                    i += 1
+                }
+            }
+            if name == "timeout" {
+                // Its first positional is the duration.
+                guard i < words.count, !words[i].dynamic, words[i].text.range(of: "^[0-9.]+[smhd]?$", options: .regularExpression) != nil else { return true }
+                i += 1
+            }
         }
         guard i < words.count else { return false }
         let cmd = words[i]
         if cmd.dynamic { return true }
-        if shells.contains(base(cmd.text)) {
+        let name = base(cmd.text)
+        if shells.contains(name) {
             var j = i + 1
             while j < words.count, words[j].text.hasPrefix("-"), !words[j].dynamic {
                 if words[j].text.range(of: "^-[A-Za-z]*c[A-Za-z]*$", options: .regularExpression) != nil {
@@ -258,11 +314,31 @@ public enum GitClassifier {
             // No literal `-c`: stdin, `-s`, a here-string or a script file.
             return true
         }
+        if name == "find" {
+            // What -exec/-execdir/-ok/-okdir launch, up to `;` or `+`, is classified as a command of its own.
+            var k = i + 1
+            while k < words.count {
+                if ["-exec", "-execdir", "-ok", "-okdir"].contains(words[k].text) {
+                    var end = k + 1
+                    while end < words.count, words[end].text != ";", words[end].text != "+" { end += 1 }
+                    let launched = words[(k + 1)..<end].map(\.text).joined(separator: " ")
+                    if launched.isEmpty || reachesNetwork(launched, depth: depth + 1) { return true }
+                    k = end
+                }
+                k += 1
+            }
+            return git
+        }
         if cmd.text == "eval" {
             let rest = words[(i + 1)...]
             return rest.contains { $0.dynamic } || reachesNetwork(rest.map(\.text).joined(separator: " "), depth: depth + 1)
         }
-        return false
+        if name == "git" {
+            guard cmd.text == "git", transparent else { return true }
+            return network(Array(words[i...]), depth: depth)
+        }
+        // Git named anywhere else on the line (`echo git`, `/usr/bin/git`).
+        return git
     }
 
     static func mentionsGit(_ words: ArraySlice<Word>) -> Bool { words.contains { $0.text.contains("git") || $0.dynamic } }

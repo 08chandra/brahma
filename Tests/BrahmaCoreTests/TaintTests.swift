@@ -95,7 +95,11 @@ import GRDB
                       "\"$TOOL\" x", "env \"$X\" y", "A=1 $CMD run", "nice -n 5 \"$P\"",
                       // Fail closed again: any dynamic word outside one inert program.
                       "timeout 5 $X", "env -S \"$X\"", "xargs -I{} $X", "git log $BRANCH", "find . -exec $X {} \\;",
-                      "echo $X | sh", "swift test --filter \"$T\"", "A=1 echo $X", "echo $X; ls"])
+                      "echo $X | sh", "swift test --filter \"$T\"", "A=1 echo $X", "echo $X; ls",
+                      // Wrapper option tables.
+                      "nice -n 10 sh -c 'git fetch'", "timeout 5 git fetch", "env -u X git ls-remote", "sudo -u bob git pull",
+                      "xargs -n1 git fetch", "find . -exec git fetch \\;", "nice -z 5 ls", "timeout --foreground 5 ls",
+                      "parallel echo ::: a", "env -S 'git fetch'", "find . -exec"])
     func interpreterNetworkTaints(_ c: String) {
         let source = TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)])
         #expect(source == "bash: " + String(TaintPolicy.flat(c).prefix(60)))
@@ -110,7 +114,10 @@ import GRDB
                   // S23: no git, a literal shell text: classified again.
                   "sh -c 'echo hi'", "bash -lc \"ls -la\"", "cat .gitignore", "ls .github",
                   // A dynamic word in an ordinary argument of a non-git command does not taint.
-                  "echo \"$HOME\"", "echo $X", "cat \"$F\"", "ls $DIR", "printf '%s' \"$Y\" > out.txt"] {
+                  "echo \"$HOME\"", "echo $X", "cat \"$F\"", "ls $DIR", "printf '%s' \"$Y\" > out.txt",
+                  // Wrappers parsed by their option tables.
+                  "timeout 300 swift test", "nice -n 5 git status", "nice -n10 swift build", "stdbuf -oL swift test",
+                  "find . -name '*.swift' -exec wc -l {} +", "env -u FOO swift build", "env -S 'swift build'"] {
             #expect(TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)]) == nil, "\(c)")
         }
         // The source is the first 60 characters, on one line.
