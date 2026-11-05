@@ -252,7 +252,13 @@ public struct CompanyTools: Sendable {
         guard TaintPolicy.isHighRisk(name) else { return }
         // S19: the verdict of a review or audit turn is the only high-risk call a tainted session keeps (refusing it would
         // deadlock the review); everything else the turn writes carries the taint.
-        if name == "review" || name == "audit", try verdictTurn(name) { return }
+        if name == "review" || name == "audit", try verdictTurn(name) {
+            // S22: the verdict is exempt only when the session's every taint source is the relay of the work under this review
+            // or audit; a flag file, a direct read or any other relay refuses it.
+            let flagged = taintFlag.map(TaintFlag.exists) ?? false
+            let relayOnly = me.sessionTainted ? try verdictRelayOnly(name, me) : true
+            if !flagged, relayOnly { return }
+        }
         let flagged = taintFlag.map(TaintFlag.exists) ?? false
         guard me.sessionTainted || flagged else { return }
         do { try store.requestFreshSession(agentId: agentId) } catch {
@@ -272,6 +278,19 @@ public struct CompanyTools: Sendable {
         guard let turnId = quotaTurnId else { return true }
         let kind = try store.writer.read { db in try String.fetchOne(db, sql: "SELECT kind FROM turn WHERE id = ?", arguments: [turnId]) }
         return kind == (name == "review" ? TurnKind.review.rawValue : TurnKind.audit.rawValue)
+    }
+
+    /// Whether every taint source of the session is a relay of the item(s) this verdict is about (S22).
+    func verdictRelayOnly(_ name: String, _ me: Agent) throws -> Bool {
+        let sources = me.taintSources.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        guard !sources.isEmpty else { return false }
+        var keys: [String] = []
+        if name == "review", let id = reviewItemId, let key = try store.workItem(id: id)?.key { keys = [key] }
+        if name == "audit", let turnId = auditTurnId { keys = try store.auditTurnKeys(turnId: turnId) }
+        guard !keys.isEmpty else { return false }
+        return sources.allSatisfy { s in
+            s == TaintPolicy.auditRelaySource && name == "audit" || keys.contains { s.hasPrefix("relayed: \($0) ") }
+        }
     }
 
     /// Marks this agent's session tainted because it is about to read what a tainted session wrote (I2). A mark that cannot be

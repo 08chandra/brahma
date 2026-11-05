@@ -62,6 +62,8 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var sessionTainted: Bool = false
     /// A high-risk call was refused under taint: the turn's end starts a fresh session (`Store.clearTaintIfRequested`).
     public var freshSessionRequested: Bool = false
+    /// Every taint source of the current session, one per line (S22).
+    public var taintSources: String = ""
 }
 
 /// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and

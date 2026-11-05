@@ -79,7 +79,16 @@ import GRDB
                       "git branch -D x", "git log $X", "git add $f", "git -C $D status",
                       "bash -lc \"$X\"", "sh -c \"$CMD\"", "xargs git status", "echo fetch | xargs git", "env -S 'git status'",
                       "nohup git status", "time git status", "GIT_SSH_COMMAND=x git status",
-                      "$G fetch", "\"$GIT\" fetch"])
+                      "$G fetch", "\"$GIT\" fetch",
+                      // Fix round 2c (S23): the coarse rule. Shell syntax, a shell, a wrapper or a dynamic word around git.
+                      "git status; ls", "ls; git status", "git status && echo ok", "git status | cat", "git status &",
+                      "(git status)", "{ git status; }", "echo `git status`", "echo $(git status)", "git status\nls",
+                      "git -C \"$WT\" status", "git add \"$f\"", "bash -lc 'git status'", "sh -c \"git diff\"",
+                      "env git status", "/usr/bin/git status", "git status < in.txt",
+                      // A shell without a literal -c text, or with a late one.
+                      "bash", "bash script.sh", "sh -s", "bash <<< 'ls'", "bash -c -- 'ls'", "sh -c -e 'ls'", "bash -c \"$X\"",
+                      // Bash's own sockets.
+                      "exec 3<>/dev/tcp/example.com/80", "cat </dev/udp/1.2.3.4/53"])
     func interpreterNetworkTaints(_ c: String) {
         let source = TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)])
         #expect(source == "bash: " + String(TaintPolicy.flat(c).prefix(60)))
@@ -87,11 +96,12 @@ import GRDB
 
     @Test func plainCommandsDoNotTaint() {
         for c in ["ls", "swift build", "echo curling", "git status", "git commit -m x", "cat README.md", "swift test --filter X",
-                  "git -C lab status", "git -C lab log --oneline", "git -C \"dir with space\" log", "git -C \"$WT\" status",
-                  "git --version", "echo hi; git diff HEAD~1", "git status -sb", "git show -s HEAD", "git branch -d old",
+                  "git -C lab status", "git -C lab log --oneline", "git -C \"dir with space\" log",
+                  "git --version", "git status -sb", "git show -s HEAD", "git branch -d old",
                   "git checkout -b x", "git switch main", "git merge --no-ff x", "git restore f", "git rm f", "git mv a b",
-                  "git ls-files", "git rev-parse HEAD", "git cat-file -p HEAD", "git grep -n foo", "git add \"$f\"",
-                  "bash -lc 'git status'", "sh -c \"git diff\""] {
+                  "git ls-files", "git rev-parse HEAD", "git cat-file -p HEAD", "git grep -n foo", "git diff > patch.diff",
+                  // S23: no git, a literal shell text: classified again.
+                  "sh -c 'echo hi'", "bash -lc \"ls -la\"", "cat .gitignore", "ls .github"] {
             #expect(TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)]) == nil, "\(c)")
         }
         // The source is the first 60 characters, on one line.
@@ -439,7 +449,7 @@ import GRDB
         let h = try Home()
         let item = try h.store.createWorkItem(companyId: h.company.id, by: .owner, draft: WorkItemDraft(
             type: .task, title: "Do it", acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/a"]), status: .ready))
-        try h.store.markTainted(agentId: h.ceo.id, source: "relayed: under review")
+        try h.store.markTainted(agentId: h.ceo.id, source: "relayed: \(item.key) under review")
         let review = CompanyTools(store: h.store, companyId: h.company.id, agentId: h.ceo.id, reviewItemId: item.id)
         _ = try review.call(name: "comment_work_item", arguments: ["key": .string(item.key), "text": .string("looks fine")])
         #expect(try h.store.itemEvents(itemId: item.id, limit: 10).last?.taintedOrigin == true, "the reviewer's comment carries the taint")
@@ -515,6 +525,58 @@ import GRDB
         try FileManager.default.removeItem(at: lab.appending(path: ".git/refs/heads/evil"))
         try "/elsewhere/.git\n".write(to: lab.appending(path: ".git/commondir"), atomically: true, encoding: .utf8)
         #expect(record() == .refused("the lab has commondir"))
+    }
+
+    // MARK: Fix round 2c
+
+    @Test func verdictExemptOnlyForTheReviewedItemsRelay() throws {
+        let h = try Home()
+        func item(_ t: String) throws -> WorkItem {
+            try h.store.createWorkItem(companyId: h.company.id, by: .owner, draft: WorkItemDraft(
+                type: .task, title: t, acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/\(t)"]), status: .ready))
+        }
+        let reviewed = try item("a"), other = try item("b")
+        let review = CompanyTools(store: h.store, companyId: h.company.id, agentId: h.ceo.id, reviewItemId: reviewed.id)
+        func verdict() -> String? { Self.refusal { try review.call(name: "review", arguments: ["key": .string(reviewed.key), "approve": .bool(true)]) } }
+        // Relay of the reviewed item only: allowed (it may fail for its own reasons, never for taint).
+        try h.store.markTainted(agentId: h.ceo.id, source: "relayed: \(reviewed.key) under review")
+        try h.store.markTainted(agentId: h.ceo.id, source: "relayed: \(reviewed.key) commented by @eng")
+        #expect(verdict()?.contains("is off for it") != true)
+        // Plus a direct read: refused.
+        try h.store.markTainted(agentId: h.ceo.id, source: "WebFetch")
+        #expect(verdict()?.contains("is off for it") == true)
+        // Another item's relay alone: refused.
+        try h.store.writer.write { try $0.execute(sql: "UPDATE agent SET taintSources = ? WHERE id = ?",
+                                                   arguments: ["relayed: \(other.key) under review", h.ceo.id]) }
+        #expect(verdict()?.contains("is off for it") == true)
+        // A DM relay: refused.
+        try h.store.writer.write { try $0.execute(sql: "UPDATE agent SET taintSources = ? WHERE id = ?",
+                                                   arguments: ["relayed: message from @eng", h.ceo.id]) }
+        #expect(verdict()?.contains("is off for it") == true)
+        // The flag file, even with relay-only sources: refused.
+        try h.store.writer.write { try $0.execute(sql: "UPDATE agent SET taintSources = ? WHERE id = ?",
+                                                   arguments: ["relayed: \(reviewed.key) under review", h.ceo.id]) }
+        #expect(verdict()?.contains("is off for it") != true)
+        TaintFlag.write(home: h.dir, agentId: h.ceo.id, source: "hook-error")
+        #expect(verdict()?.contains("is off for it") == true)
+    }
+
+    @Test func linkCheckFailsClosedOnUnreadableDirectory() throws {
+        let h = try Home()
+        let ws = URL(fileURLWithPath: h.company.workspacePath)
+        let lab = ws.appending(path: ".brahma/labs/eng", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: lab, withIntermediateDirectories: true)
+        try GitWorkspace.initStandaloneRepository(at: lab)
+        let locked = lab.appending(path: ".git/refs/locked", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try "x".write(to: locked.appending(path: "f"), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path) }   // exec-bit fixture: a directory mode
+        #expect(LabProvenance.firstLink(under: lab.appending(path: ".git"))?.hasPrefix("unreadable") == true)
+        let out = LabProvenance.record(store: h.store, workspace: ws, handle: "eng", companyId: h.company.id, agentId: h.eng.id,
+                                       turnId: nil, tainted: false, now: Date())
+        guard case .refused = out else { Issue.record("an unreadable .git entry must be refused, got \(out)"); return }
+        #expect(try h.fresh(h.eng).sessionTainted)
     }
 
     @Test func failClosedMinors() throws {

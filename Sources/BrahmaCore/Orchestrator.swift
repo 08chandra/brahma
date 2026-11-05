@@ -1022,7 +1022,7 @@ public actor Orchestrator {
                 taintMarked = true
             }
             if !taintMarked, let audit, audit.untrusted {
-                try markTaintedOrFlag(agent: agent, source: "relayed: audited items written by a session that read outside content")
+                try markTaintedOrFlag(agent: agent, source: TaintPolicy.auditRelaySource)
                 taintMarked = true
             }
             let settingsText = try TurnProfileCompiler.settingsJSON(compiled)

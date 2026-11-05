@@ -59,6 +59,9 @@ public enum TaintPolicy {
             + "\(tool) works again."
     }
 
+    /// The launch source of an audit of marked items (S22: a relay its verdict may carry).
+    public static let auditRelaySource = "relayed: audited items written by a session that read outside content"
+
     /// The digest's prefix for an item a tainted session wrote (I2).
     public static let relayedPrefix = "[from a session that read outside content] "
 
@@ -88,7 +91,9 @@ public enum TaintPolicy {
     }
 
     public static func reachesNetwork(_ command: String) -> Bool {
-        bashPatterns.contains { command.range(of: $0, options: .regularExpression) != nil } || GitClassifier.reachesNetwork(command)
+        // Bash's own sockets (`exec 3<>/dev/tcp/host/80`, `cat </dev/tcp/…`) need no program at all.
+        command.contains("/dev/tcp/") || command.contains("/dev/udp/")
+            || bashPatterns.contains { command.range(of: $0, options: .regularExpression) != nil } || GitClassifier.reachesNetwork(command)
     }
 
     /// `<id>` of a namespaced name `<id>:<name>` (a leading `/` dropped); nil for a plain name (a built-in).
@@ -162,9 +167,79 @@ public enum GitClassifier {
     /// `dynamic`: holds an expansion (or an unquoted glob). `splits`: one of them is unquoted, so it may become several words.
     struct Word: Equatable { var text: String; var dynamic: Bool; var splits: Bool = false }
 
+    /// S23, final and frozen: a command line that mentions `git` is local only as ONE plain `git` invocation (the first word
+    /// literally `git`) from the allowlist, with no shell syntax at all (pipes, `;`, `&&`, `||`, `&`, subshells, braces,
+    /// input redirection, backticks, `$(…)`, newlines), no wrapper, no shell and no dynamic word. Anything else that mentions
+    /// git is network. Without git: a shell started without a literal `-c` text (stdin, `-s`, a here-string, a script file,
+    /// or a `-c` whose argument is an option) is network, a literal one is classified again (and is network if it mentions
+    /// git); a command word an expansion names is network. Further classifier-only findings are advisory: the sandbox's network
+    /// allowlist is the wall.
     public static func reachesNetwork(_ command: String, depth: Int = 0) -> Bool {
         guard depth < 4 else { return true }
-        for simple in split(command) where network(simple, depth: depth) { return true }
+        let commands = split(command)
+        if mentionsGit(command) {
+            guard depth == 0, !hasShellSyntax(command), commands.count == 1, let words = commands.first,
+                  words.first?.text == "git", !words.contains(where: \.dynamic) else { return true }
+            return network(words, depth: depth)
+        }
+        for simple in commands where shellNetwork(simple, depth: depth) { return true }
+        return false
+    }
+
+    /// `git` as a word anywhere in the raw text (`/usr/bin/git`, `"git"`, `xargs git`; not `.gitignore` or `github`).
+    static func mentionsGit(_ command: String) -> Bool {
+        command.range(of: "(^|[^A-Za-z0-9_.-])git([^A-Za-z0-9_-]|$)", options: .regularExpression) != nil
+    }
+
+    /// Any shell syntax outside single quotes: separators, pipes, subshells, braces, input redirection, newlines, backticks
+    /// and `$(` (also inside double quotes).
+    static func hasShellSyntax(_ command: String) -> Bool {
+        var quote: Character? = nil
+        let chars = Array(command)
+        var k = 0
+        while k < chars.count {
+            let ch = chars[k]
+            if quote == "'" { if ch == "'" { quote = nil }; k += 1; continue }
+            if ch == "\\" { k += 2; continue }
+            if ch == "`" || ch == "$" && k + 1 < chars.count && chars[k + 1] == "(" { return true }
+            if quote == "\"" { if ch == "\"" { quote = nil }; k += 1; continue }
+            if ch == "'" || ch == "\"" { quote = ch; k += 1; continue }
+            if ";|&(){}<\n\r".contains(ch) { return true }
+            k += 1
+        }
+        return quote != nil
+    }
+
+    /// A simple command without git: a shell needs a literal `-c` text (classified again), `eval` a literal one; a command
+    /// word an expansion names is network.
+    static func shellNetwork(_ words: [Word], depth: Int) -> Bool {
+        var i = 0
+        while i < words.count, !words[i].dynamic,
+              words[i].text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil { i += 1 }
+        while i < words.count, wrappers.contains(base(words[i].text)) {
+            i += 1
+            while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic { i += 1 }
+        }
+        guard i < words.count else { return false }
+        let cmd = words[i]
+        if cmd.dynamic { return true }
+        if shells.contains(base(cmd.text)) {
+            var j = i + 1
+            while j < words.count, words[j].text.hasPrefix("-"), !words[j].dynamic {
+                if words[j].text.range(of: "^-[A-Za-z]*c[A-Za-z]*$", options: .regularExpression) != nil {
+                    // The text must be the very next word, literal, and not an option.
+                    guard j + 1 < words.count, !words[j + 1].dynamic, !words[j + 1].text.hasPrefix("-") else { return true }
+                    return reachesNetwork(words[j + 1].text, depth: depth + 1)
+                }
+                j += 1
+            }
+            // No literal `-c`: stdin, `-s`, a here-string or a script file.
+            return true
+        }
+        if cmd.text == "eval" {
+            let rest = words[(i + 1)...]
+            return rest.contains { $0.dynamic } || reachesNetwork(rest.map(\.text).joined(separator: " "), depth: depth + 1)
+        }
         return false
     }
 

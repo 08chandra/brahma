@@ -17,6 +17,8 @@ extension Store {
 
     // MARK: Taint
 
+    static let maxTaintSources = 50
+
     /// Whether what `actorId` writes now carries a tainted origin (I2): an agent whose session is tainted (row or flag file). An
     /// agent row that cannot be read counts as tainted; the owner and the engine never are.
     func writesTainted(db: Database, actorId: String) throws -> Bool {
@@ -55,6 +57,16 @@ extension Store {
                 SELECT kind FROM turn WHERE agentId = ? AND outcome = ? ORDER BY startedAt DESC, rowid DESC LIMIT 1
                 """, arguments: [agentId, TurnOutcome.inProgress.rawValue])
             if kind != TurnKind.review.rawValue, kind != TurnKind.audit.rawValue { try Store.markHeldItemsTainted(db: db, agentId: agentId) }
+            // S22: every source is kept for the session (a verdict is exempt only when all are the reviewed item's relay).
+            var sources = agent.taintSources.split(separator: "\n").map(String.init)
+            if !sources.contains(shown), sources.count < Store.maxTaintSources {
+                sources.append(shown)
+                try db.execute(sql: "UPDATE agent SET taintSources = ? WHERE id = ?", arguments: [sources.joined(separator: "\n"), agentId])
+            } else if !sources.contains(shown) {
+                // Too many to keep: a marker no verdict exemption accepts.
+                try db.execute(sql: "UPDATE agent SET taintSources = taintSources || ? WHERE id = ? AND taintSources NOT LIKE '%(more sources)%'",
+                               arguments: ["\n(more sources)", agentId])
+            }
             guard !agent.sessionTainted else { return }
             try db.execute(sql: "UPDATE agent SET sessionTainted = 1 WHERE id = ?", arguments: [agentId])
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: nil, kind: .error,
@@ -86,7 +98,8 @@ extension Store {
     /// back to clean. The flag file (a hook error) stays: fail closed.
     public func endThrowawaySessionTaint(agentId: String) throws {
         try writer.write { db in
-            try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0 WHERE id = ?", arguments: [agentId])
+            try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0, taintSources = '' WHERE id = ?",
+                           arguments: [agentId])
         }
     }
 
@@ -115,7 +128,8 @@ extension Store {
             try Store.forceFreshSession(db: db, agentId: agentId, itemId: scope.itemId, reason: "tainted", now: now)
             try db.execute(sql: "DELETE FROM agentSession WHERE agentId = ?", arguments: [agentId])
             if scope.itemId != nil { try Store.resetSession(db: db, agentId: agentId, scope: .base) }
-            try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0 WHERE id = ?", arguments: [agentId])
+            try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0, taintSources = '' WHERE id = ?",
+                           arguments: [agentId])
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: nil, kind: .stateChanged,
                               text: "@\(agent.name)'s next turn starts a fresh session (tainted)", createdAt: now).insert(db)
             return true
@@ -248,16 +262,21 @@ public enum LabProvenance {
     }
 
     /// The first symbolic link under `dir` (relative path), never following one. An unreadable entry counts as a link.
+    /// Fails closed (S24): any error while walking (an unreadable directory, say) returns a marker.
     static func firstLink(under dir: URL, limit: Int = 200_000) -> String? {
-        guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isSymbolicLinkKey],
-                                                     options: [], errorHandler: { _, _ in true }) else { return "?" }
+        final class Failed: @unchecked Sendable { var path: String? }
+        let failed = Failed()
+        guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isSymbolicLinkKey], options: [],
+                                                     errorHandler: { url, _ in failed.path = url.path; return false }) else { return "?" }
         var n = 0
         for case let url as URL in e {
             n += 1
             if n > limit { return "too many entries" }
             let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
             if values?.isSymbolicLink != false { return String(url.path.dropFirst(dir.path.count)) }
+            if failed.path != nil { break }
         }
+        if let path = failed.path { return "unreadable: " + String(path.dropFirst(dir.path.count)) }
         return nil
     }
 

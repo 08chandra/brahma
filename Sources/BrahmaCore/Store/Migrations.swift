@@ -994,6 +994,11 @@ enum Migrations {
                 BEGIN UPDATE workItem SET taintedOrigin = 1 WHERE id = NEW.id; END
                 """)
         }
+        m.registerMigration("v5-taint-5") { db in
+            // S22: every taint source of the agent's session (newline-separated), so a verdict can tell a relay of the reviewed
+            // item from any other outside content.
+            try db.alter(table: "agent") { t in t.add(column: "taintSources", .text).notNull().defaults(to: "") }
+        }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
             // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).
