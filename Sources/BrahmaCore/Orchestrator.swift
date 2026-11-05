@@ -258,6 +258,8 @@ public actor Orchestrator {
             try await recoverChecks(now: now)
             // Main smokes an earlier engine left running: merge runs at main queued again, the rest `error` (fix I1).
             try await recoverSmokes(now: now)
+            // Releases and rollbacks an earlier engine left in progress end without running again (Task 8, builder-check 5).
+            try await releaseExecutor.recover(now: now)
             try await recoverMerges()
             // The engine-owned pre-commit hook of every company workspace (Task 5a); a refusal is logged, never fatal.
             let companies = try store.companies()
