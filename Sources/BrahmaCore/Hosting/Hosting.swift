@@ -111,6 +111,11 @@ public struct HostingSettings: Codable, Equatable, Sendable, FetchableRecord, Pe
 /// One engine-composed command of a deploy or rollback. `okIfOutputContains`: a non-zero exit still counts as success when
 /// the output contains this text (creating a project that already exists).
 public struct DeployStep: Codable, Equatable, Sendable {
+    /// A rollback step labelled so confirms its target with the token before any later step runs (Vercel's `vercel inspect
+    /// <previous deploy URL>`, Task 8): the executor requires exit 0 and `HostingAdapter.verifiesDeployment`, else it fails
+    /// closed with nothing rolled back.
+    public static let verifyLabel = "verify"
+
     public var label: String
     public var argv: [String]
     public var okIfOutputContains: String?
