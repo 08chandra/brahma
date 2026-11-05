@@ -105,6 +105,7 @@ extension Store {
         item.everStarted = true
         if item.firstClaimedAt == nil { item.firstClaimedAt = now; item.firstClaimedActive = active }
         item.blockedReason = nil; item.blockedSinceActive = nil; item.blockedAskId = nil; item.blockedAskBy = nil
+        item.statusBeforeBlock = nil
         item.stopReason = nil
         item.failedChecksSinceClaim = 0
         item.updatedAt = now
