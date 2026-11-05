@@ -770,6 +770,10 @@ enum Migrations {
                 t.uniqueKey(["companyId", "version"])
             }
         }
+        m.registerMigration("vL-human-tasks") { db in
+            // Human tasks (Task 9) reuse 5-lite's `blockedAskId`/`blockedAskBy` (PR-30); only the status to restore is new.
+            try db.alter(table: "workItem") { t in t.add(column: "statusBeforeBlock", .text) }
+        }
     }
 
     /// Task 12 fix 1 (`v5-restore`): one row per restore (`nonce`, also in the restore marker; `consumedAt` once the engine has
