@@ -999,6 +999,15 @@ enum Migrations {
             // item from any other outside content.
             try db.alter(table: "agent") { t in t.add(column: "taintSources", .text).notNull().defaults(to: "") }
         }
+        m.registerMigration("v5-taint-6") { db in
+            // Task 10b, I2: the sticky lab mark. Once a tainted session has worked in an agent's lab, every extension proposed from
+            // it goes to the owner and mounts as third-party, until the owner clears the mark (`brahma lab clear-taint`).
+            try db.create(table: "labTaint") { t in
+                t.primaryKey("agentId", .text).references("agent", onDelete: .cascade)
+                t.column("source", .text).notNull()
+                t.column("markedAt", .datetime).notNull()
+            }
+        }
         m.registerMigration("v5-transcripts") { db in
             // One row per captured turn: where its redacted, compressed slice of the Claude session transcript is, and which
             // bytes of the source file it covers (the next turn of that session continues from `byteEnd`).

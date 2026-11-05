@@ -67,6 +67,8 @@ extension Store {
                 try db.execute(sql: "UPDATE agent SET taintSources = taintSources || ? WHERE id = ? AND taintSources NOT LIKE '%(more sources)%'",
                                arguments: ["\n(more sources)", agentId])
             }
+            // I2 (10b): the agent's lab is writable on every turn, so a tainted session has worked in it: the sticky lab mark.
+            try Store.markLabTainted(db, agentId: agentId, source: shown, now: now)
             guard !agent.sessionTainted else { return }
             try db.execute(sql: "UPDATE agent SET sessionTainted = 1 WHERE id = ?", arguments: [agentId])
             try ActivityEvent(companyId: agent.companyId, agentId: agentId, turnId: nil, kind: .error,
@@ -197,6 +199,41 @@ extension Store {
     public func labCommitTainted(agentId: String, sha: String) throws -> Bool {
         try writer.read { db in
             try Bool.fetchOne(db, sql: "SELECT tainted FROM labCommit WHERE agentId = ? AND sha = ?", arguments: [agentId, sha]) ?? true
+        }
+    }
+
+    // MARK: Lab mark (10b, I2)
+
+    /// The sticky lab mark: set the first time a session of the agent is tainted (kept, with that first source); cleared only by
+    /// the owner (`clearLabTaint`).
+    static func markLabTainted(_ db: Database, agentId: String, source: String, now: Date) throws {
+        try db.execute(sql: "INSERT OR IGNORE INTO labTaint (agentId, source, markedAt) VALUES (?, ?, ?)",
+                       arguments: [agentId, Store.flat(source, max: 200), now])
+    }
+
+    /// The agent's lab mark: since when and the first taint source, or nil when its lab carries none.
+    public func labTaint(agentId: String) throws -> (source: String, markedAt: Date)? {
+        try writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT source, markedAt FROM labTaint WHERE agentId = ?", arguments: [agentId])
+                .map { (source: $0["source"], markedAt: $0["markedAt"]) }
+        }
+    }
+
+    /// The owner clears an agent's lab mark (`brahma lab clear-taint`, owner shell only; never a company tool). Recorded as an
+    /// activity event. Returns whether there was a mark.
+    @discardableResult
+    public func clearLabTaint(companyId: String, agentId: String, now: Date = Store.now()) throws -> Bool {
+        try writer.write { db in
+            guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId else {
+                throw WorkError.forbidden("not in your company")
+            }
+            guard let row = try Row.fetchOne(db, sql: "SELECT source FROM labTaint WHERE agentId = ?", arguments: [agentId]) else { return false }
+            try db.execute(sql: "DELETE FROM labTaint WHERE agentId = ?", arguments: [agentId])
+            let source: String = row["source"]
+            try ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .approval,
+                              text: "The owner cleared @\(agent.name)'s lab mark (set by: \(Store.flat(source, max: 120))); its next "
+                                + "extension proposals are checked by their commits again", createdAt: now).insert(db)
+            return true
         }
     }
 

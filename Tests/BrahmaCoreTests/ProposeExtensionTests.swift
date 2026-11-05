@@ -257,6 +257,66 @@ private struct LabWorld {
         #expect(!ctoScope.readable.contains { $0.path.contains("ext-review") })
     }
 
+    /// I2: once a tainted session has worked in the lab (the sticky mark), every proposal from it goes to the owner and mounts
+    /// as third-party, even content a clean session committed (the uncommitted hand-off); only the owner clears the mark.
+    @Test func labMarkSendsProposalsToTheOwner() throws {
+        let w = try LabWorld()
+        // A tainted session writes the skill and leaves it uncommitted.
+        try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
+        _ = try PluginFixture(id: "brand-voice", under: w.lab)
+        #expect(try w.store.labTaint(agentId: w.eng.id) != nil, "the mark is set")
+        // A later clean session commits it; its commit is recorded clean.
+        try w.store.writer.write { db in try db.execute(sql: "UPDATE agent SET sessionTainted = 0, taintSources = '' WHERE id = ?", arguments: [w.eng.id]) }
+        try GitFixture.plainGit(["add", "-A"], in: w.lab); try GitFixture.plainGit(["commit", "-qm", "skill"], in: w.lab)
+        w.recordLab(tainted: false)
+        let reply = try w.propose(LabWorld.args("brand-voice"))
+        #expect(reply.contains("has worked in your lab"), "\(reply)")
+        let ask = try #require(try w.extensionAsks().first)
+        #expect(ask.status == .pendingOwner); #expect(ask.internalApproverId == nil)
+        let p = try #require(ExtensionAskPayload.read(ask))
+        #expect(p.sourceType == "lab-tainted"); #expect(p.taintedCommits == []); #expect(p.labMark?.contains("WebFetch") == true)
+        let page = try String(contentsOf: w.ws.appending(path: ".brahma/ext-review/\(ask.ref).md"), encoding: .utf8)
+        #expect(page.contains("a session that read outside content has worked in this lab"), "\(page)")
+        // The mark is sticky: a fresh session, a review's throwaway reset and the turn end leave it.
+        try w.store.endThrowawaySessionTaint(agentId: w.eng.id)
+        #expect(try w.store.labTaint(agentId: w.eng.id) != nil)
+        // No company tool can clear it; the owner can, and it is recorded.
+        #expect(!CompanyToolNames.all.contains { $0.contains("taint") || $0.contains("lab") })
+        #expect(try w.store.clearLabTaint(companyId: w.company.id, agentId: w.eng.id))
+        #expect(try w.store.labTaint(agentId: w.eng.id) == nil)
+        #expect(try w.store.events(afterId: 0, companyId: w.company.id).contains { $0.text.contains("cleared @eng-1's lab mark") })
+        // The next clean proposal routes to the reviewer again, with the exact provenance line.
+        try w.commitPlugin(id: "tone-two")
+        w.recordLab(tainted: false)
+        let next = try w.propose(LabWorld.args("tone-two"))
+        #expect(next.contains("@cto reviews it"), "\(next)")
+        let second = try #require(try w.extensionAsks().first { ExtensionAskPayload.read($0)?.extId == "tone-two" })
+        let secondPage = try String(contentsOf: w.ws.appending(path: ".brahma/ext-review/\(second.ref).md"), encoding: .utf8)
+        #expect(secondPage.contains("no tainted session has worked in this lab since the owner last cleared it"))
+        #expect(secondPage.contains("commit content is not traced beyond object ids"))
+        // Another company's owner path cannot clear it.
+        #expect(throws: WorkError.self) { try w.store.clearLabTaint(companyId: "other", agentId: w.eng.id) }
+    }
+
+    /// M8: an empty file carries no content; a tainted commit that added one elsewhere does not taint the folder.
+    @Test func emptyBlobsDoNotDecideProvenance() throws {
+        let w = try LabWorld()
+        try FileManager.default.createDirectory(at: w.lab.appending(path: "drafts"), withIntermediateDirectories: true)
+        try Data().write(to: w.lab.appending(path: "drafts/empty.txt"))
+        try GitFixture.plainGit(["add", "-A"], in: w.lab); try GitFixture.plainGit(["commit", "-qm", "draft"], in: w.lab)
+        w.recordLab(tainted: true)
+        let fixture = try PluginFixture(id: "brand-voice", under: w.lab)
+        try FileManager.default.createDirectory(at: fixture.root.appending(path: "assets"), withIntermediateDirectories: true)
+        // A different name: a subtree holding only `empty.txt` would be the same tree as `drafts/` (identical content).
+        try Data().write(to: fixture.root.appending(path: "assets/blank.txt"))
+        try GitFixture.plainGit(["add", "-A"], in: w.lab); try GitFixture.plainGit(["commit", "-qm", "skill"], in: w.lab)
+        w.recordLab(tainted: false)
+        _ = try w.propose(LabWorld.args("brand-voice"))
+        let ask = try #require(try w.extensionAsks().first)
+        let p = try #require(ExtensionAskPayload.read(ask))
+        #expect(p.taintedCommits == []); #expect(p.sourceType == "lab"); #expect(ask.internalApproverId == w.cto.id)
+    }
+
     /// B-M9 on Workspace: Claude's file tools are denied `ext-try` and every review page that is not this agent's.
     @Test func workspaceTurnsDenyOtherReviewPages() async throws {
         let w = try LabWorld(profile: .workspace)

@@ -4,8 +4,8 @@ import Foundation
 /// tainted, `TaintPolicy.reviewedHighRisk`) and counted by `AskQuota`. Only a folder in the caller's own lab, only as committed
 /// (`HEAD`), only with a clean lint. Its provenance is decided by content (S25): the tainted or unrecorded lab commits that
 /// introduced any of its trees or blobs, or touched its path, ride on the ask. A clean one files a reserved `extension` ask the
-/// pack's internal reviewer pre-checks and the owner decides; a tainted one goes straight to the owner (I1), so no teammate
-/// reads it. A draft is never mounted on any turn before the owner approves it.
+/// pack's internal reviewer pre-checks and the owner decides; a tainted one, or any from a lab with the sticky mark (I2: a
+/// tainted session has worked in it since the owner last cleared it), goes straight to the owner (I1), so no teammate reads it. A draft is never mounted on any turn before the owner approves it.
 extension CompanyTools {
     static let proposeOutsideLab = "propose_extension takes a folder in your lab"
 
@@ -110,10 +110,17 @@ extension CompanyTools {
         let introduced = try git.labIntroducedObjects(commits: suspect.sorted())
         let byContent = introduced.filter { !$0.value.isDisjoint(with: folder) }.map(\.key)
         let taintedCommits = Array(Set(byContent + touching.filter(suspect.contains))).sorted()
+        // I2: the sticky lab mark (a tainted session has worked in this lab since the owner last cleared it) decides on its own;
+        // the commits above stay as attribution.
+        let mark = try store.labTaint(agentId: agentId).map { m -> String in
+            let iso = ISO8601DateFormatter()
+            return "first: \(m.source), \(iso.string(from: m.markedAt))"
+        }
+        let tainted = mark != nil || !taintedCommits.isEmpty
 
         // The snapshot of HEAD:<path>, staged under the data home; the company is its publisher (never the lab or the package).
         let facts = ExtensionSourceFacts(publisher: ExtensionPublisher.company(company.slug),
-                                         sourceType: taintedCommits.isEmpty ? ExtensionSourceKind.lab : ExtensionSourceKind.labTainted,
+                                         sourceType: tainted ? ExtensionSourceKind.labTainted : ExtensionSourceKind.lab,
                                          sourceUrl: "labs/\(me.name)/\(relative)", sourceSha: head)
         let validation = ValidationOptions(installedBins: try store.installedBins(companyId: companyId, paths: paths))
         let handle = me.name
@@ -126,11 +133,15 @@ extension CompanyTools {
         do {
             ask = try ExtensionLibrary.proposeSync(staged: staged, store: store, paths: paths, companyId: companyId, requester: .agent(agentId),
                                                    roles: roles, options: ExtensionLibrary.ProposalOptions(
-                                                       viaOwner: !taintedCommits.isEmpty, summary: summary, itemId: itemId,
-                                                       taintedCommits: taintedCommits, requireClean: true))
+                                                       viaOwner: tainted, summary: summary, itemId: itemId,
+                                                       taintedCommits: taintedCommits, labMark: mark, requireClean: true))
         } catch {
             try? FileManager.default.removeItem(at: staged.dir)
             throw error
+        }
+        if mark != nil {
+            return "Proposed \(ask.ref) (\(staged.id)). A session that read outside content has worked in your lab, so everything "
+                + "proposed from it goes straight to the owner until the owner clears that. Drafts are never mounted before approval."
         }
         if !taintedCommits.isEmpty {
             return "Proposed \(ask.ref) (\(staged.id)). Its content comes in part from lab commits made by a session that read outside "

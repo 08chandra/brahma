@@ -174,7 +174,7 @@ extension Orchestrator {
     /// is removed (never followed) so its next turn can start, and the owner is told the path either way.
     /// `extraDomains`: the egress the turn's mounted extensions declare (`ExtensionLibrary.agentNetwork`, Task 5a), joined to the grants'.
     nonisolated func prepareSandbox(agent: Agent, company: Company, kind: TurnKind, item: WorkItem?, turnId: String,
-                                    extraDomains: [String] = []) async throws -> SandboxedTurn {
+                                    extraDomains: [String] = [], trialRoot: String? = nil) async throws -> SandboxedTurn {
         // The containment of a sandboxed turn finds its processes by their sandbox; blind, it could not (B-I2).
         let env = sandboxEnvironment
         guard await blocking.run({ env.canSeeSandboxes() }) else {
@@ -188,7 +188,7 @@ extension Orchestrator {
         }
         let store = self.store, paths = self.paths, mcp = mcpExecutable
         let others = try store.companies().filter { $0.id != company.id }.map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) }
-        let layout = SandboxLayout(paths: paths, company: company, agentHandle: agent.name)
+        let layout = SandboxLayout(paths: paths, company: company, agentHandle: agent.name, trialRoot: trialRoot)
         let now = clock()
         func event(_ text: String) {
             attempt {
@@ -314,8 +314,7 @@ extension Orchestrator {
     /// a link (never followed) or else moved into the engine-only `.brahma/trash/<h>/` (nothing is lost), and the places are
     /// recreated. Returns whether it did. Blocking.
     nonisolated static func repairOwnPlace(_ path: String, layout: SandboxLayout, item: WorkItem?, plan: Bool = false) -> Bool {
-        let h = layout.handle
-        var own = [".brahma/home/\(h)", ".brahma/labs/\(h)", ".brahma/notes/agents/\(h).md"]
+        var own = [layout.homeRelative, layout.labRelative, layout.notesRelative]
         if let key = item?.key {
             own.append(".brahma/progress/\(key).md")
             if plan { own.append(".brahma/plans/\(key)") }
@@ -338,7 +337,7 @@ extension Orchestrator {
         default:
             let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
             let name = "\(stamp)-\(UUID().uuidString.prefix(8))-\(target.lastPathComponent)"
-            removal = try? EngineFiles.moveNoFollow(target, under: ws, toDirectory: ".brahma/trash/\(h)", name: name)
+            removal = try? EngineFiles.moveNoFollow(target, under: ws, toDirectory: layout.trashRelative, name: name)
         }
         guard case .removed? = removal else { return false }
         try? layout.ensure()

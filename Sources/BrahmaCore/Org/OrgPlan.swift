@@ -91,6 +91,10 @@ public struct OrgPlan: Equatable, Sendable {
         for a in agents {
             let valid = a.handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
             if !valid || a.handle == "owner" || a.handle == "system" { issues.append(OrgIssue(handle: a.handle, message: "invalid handle")) }
+            // 10b, S29: `try-` names the owner's extension trials.
+            if ExtensionTry.isReservedHandle(a.handle) {
+                issues.append(OrgIssue(handle: a.handle, message: "reserved handle (try- is for extension trials)"))
+            }
             if !seen.insert(a.handle).inserted { issues.append(OrgIssue(handle: a.handle, message: "duplicate handle")) }
             if pack.role(a.role) == nil { issues.append(OrgIssue(handle: a.handle, message: "unknown role \(a.role)")) }
             if let m = a.managerHandle {

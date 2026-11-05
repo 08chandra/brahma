@@ -30,18 +30,26 @@ public enum ExtensionTry {
     public static let stoppedRefusal = "Brahma is stopped (emergency stop); resume it before trying an extension"
     static let dir = ".brahma/ext-try"
 
-    /// What a trial that was killed left (M2): `ext-try/*`, the `try-*` home, lab, trash, notes and shell prefix, and its
-    /// settings, MCP and taint files, each older than `olderThan` seconds (a trial running now keeps its own), removed by
-    /// descriptor without following a link. Run at each `ext try` and at engine start. Blocking. Returns what it removed.
+    /// The handle prefix of a trial (`try-<uuid8>`), reserved (S29): `Store.hire` and `OrgPlan` refuse any handle that starts
+    /// with it (case-insensitive, after NFC).
+    public static let handlePrefix = "try-"
+
+    public static func isReservedHandle(_ handle: String) -> Bool {
+        handle.precomposedStringWithCanonicalMapping.lowercased().hasPrefix(handlePrefix)
+    }
+
+    /// What a trial that was killed left (M2, S29): its own root `.brahma/ext-try/<id>` (its plugin copy, home, lab, notes and
+    /// shell prefix all live there, never in the per-agent directories) and its `try-<uuid>` settings, MCP and taint files,
+    /// each older than `olderThan` seconds (a trial running now keeps its own), removed by descriptor without following a link.
+    /// A name that is an existing agent's id or handle is never removed (`existing`). Run at each `ext try` and at engine
+    /// start. Blocking. Returns what it removed.
     @discardableResult
-    public static func sweepStale(paths: BrahmaPaths, workspace: URL, olderThan: TimeInterval = 3600, now: Date) -> [String] {
+    public static func sweepStale(paths: BrahmaPaths, workspace: URL, existing: Set<String>, olderThan: TimeInterval = 3600,
+                                  now: Date) -> [String] {
         let ws = workspace.resolvedForSandbox
-        let handle = "^try-[0-9a-f]{8}", agentId = "^try-[0-9a-f-]{36}"
+        let agentId = "^try-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
         let places: [(dir: URL, root: URL, pattern: String)] = [
-            (ws.appending(path: dir), ws, "^[0-9a-f-]{36}$"),
-            (ws.appending(path: ".brahma/home"), ws, handle + "$"), (ws.appending(path: ".brahma/labs"), ws, handle + "$"),
-            (ws.appending(path: ".brahma/trash"), ws, handle + "$"), (ws.appending(path: ".brahma/notes/agents"), ws, handle + "\\.md$"),
-            (ws.appending(path: ".brahma/bin"), ws, "^shell-try-[0-9a-f]{8}\\.sh$"),
+            (ws.appending(path: dir), ws, "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
             (paths.runDir, paths.runDir, agentId + "\\.(settings|mcp)\\.json$"),
             (paths.runDir.appending(path: "taint"), paths.runDir, agentId + "$"),
         ]
@@ -49,6 +57,8 @@ public enum ExtensionTry {
         for place in places {
             for name in (try? FileManager.default.contentsOfDirectory(atPath: place.dir.path)) ?? []
             where name.range(of: place.pattern, options: .regularExpression) != nil {
+                let base = name.replacingOccurrences(of: "\\.(settings|mcp)\\.json$", with: "", options: .regularExpression)
+                guard !existing.contains(base), !existing.contains(name) else { continue }
                 let url = place.dir.appending(path: name)
                 var st = stat()
                 guard lstat(url.path, &st) == 0 else { continue }
@@ -58,11 +68,17 @@ public enum ExtensionTry {
                 let modified = Double(st.st_mtim.tv_sec)
                 #endif
                 guard now.timeIntervalSince1970 - modified > olderThan else { continue }
-                ExtensionLibrary.makeWritable(url)
+                if st.st_mode & S_IFMT == S_IFDIR { ExtensionLibrary.makeWritable(url) }
                 if case .removed? = try? EngineFiles.removeNoFollow(url, under: place.root) { removed.append(url.path) }
             }
         }
         return removed
+    }
+
+    /// Every agent id and handle in the store (what `sweepStale` never removes).
+    static func existingNames(_ store: Store) -> Set<String> {
+        let agents = ((try? store.companies()) ?? []).flatMap { (try? store.agents(companyId: $0.id)) ?? [] }
+        return Set(agents.flatMap { [$0.id, $0.name] })
     }
 
     /// Lints `path`, mounts its plugin parts for one throwaway Quick turn of `role` in the company, records the run and removes
@@ -78,7 +94,8 @@ public enum ExtensionTry {
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WorkError.invalid("the prompt is empty") }
         // M2: the owner's emergency stop holds trials too; what an interrupted trial left is swept first.
         if try store.engineStopped() != nil { throw ExtensionError.message(stoppedRefusal) }
-        sweepStale(paths: paths, workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), now: now)
+        sweepStale(paths: paths, workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), existing: existingNames(store),
+                   now: now)
 
         // 1. Lint a staged copy (never the folder itself), under the data home's tmp: errors refuse, warnings do not.
         let scratch = try paths.ensureTmpDir().appending(path: "ext-try-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -110,7 +127,7 @@ public enum ExtensionTry {
 
         // 3. The turn, then 4. its record (never an ask).
         let result = try await orchestrator.devRunUnlessStopped(company: company, role: role, prompt: prompt, devPlugin: devPlugin,
-                                                                devId: manifest.name, now: now)
+                                                                devId: manifest.name, trialRoot: "\(dir)/\(uuid)", now: now)
         try store.recordExtensionEvent(companyId: company.id, extId: manifest.name, kind: "try", detail: eventDetail(result), now: now)
         return result
     }
@@ -145,9 +162,12 @@ extension Orchestrator {
     /// `devRun` raced against the owner's emergency stop (M2), as engine turns are: a stop cancels the trial (its process ends,
     /// its places are removed) and the trial is refused. Cancelling the caller (the CLI's Ctrl-C) cleans up the same way.
     nonisolated func devRunUnlessStopped(company: Company, role: String, prompt: String, devPlugin: URL, devId: String,
-                                         now: Date) async throws -> ExtensionTryResult {
+                                         trialRoot: String, now: Date) async throws -> ExtensionTryResult {
         let outcome: ExtensionTryResult?? = try await withThrowingTaskGroup(of: ExtensionTryResult?.self) { group in
-            group.addTask { try await self.devRun(company: company, role: role, prompt: prompt, devPlugin: devPlugin, devId: devId, now: now) }
+            group.addTask {
+                try await self.devRun(company: company, role: role, prompt: prompt, devPlugin: devPlugin, devId: devId,
+                                      trialRoot: trialRoot, now: now)
+            }
             group.addTask { await self.waitForStop(); return nil }
             let first = try await group.next()
             group.cancelAll()
@@ -162,16 +182,16 @@ extension Orchestrator {
 
     /// A dev-run turn (`ext try`, 10b): one itemless Quick turn of a throwaway handle on the Sandboxed profile, with the role's
     /// template, a fresh session, no company tools and no grants, the role's normal mounts plus `devPlugin` (readable and
-    /// read-only on this turn only). It passes the same sandbox gate as any sandboxed turn and writes no agent or turn row;
-    /// every place it made (home, lab, notes, shell prefix, settings, MCP config, taint flag, temp dir) is removed afterwards.
-    nonisolated func devRun(company: Company, role: String, prompt: String, devPlugin: URL, devId: String,
+    /// read-only on this turn only). It passes the same sandbox gate as any sandboxed turn and writes no agent or turn row. Its
+    /// home, lab, notes and shell prefix live under `trialRoot` (`.brahma/ext-try/<id>`, S29), which the caller removes whole;
+    /// its settings, MCP config, taint flag and temp dir are removed here.
+    nonisolated func devRun(company: Company, role: String, prompt: String, devPlugin: URL, devId: String, trialRoot: String,
                             now: Date) async throws -> ExtensionTryResult {
         let paths = self.paths
         let handle = "try-" + String(UUID().uuidString.lowercased().filter { $0 != "-" }.prefix(8))
         let agent = Agent(id: "try-\(UUID().uuidString.lowercased())", companyId: company.id, name: handle, role: role,
                           model: ExtensionTry.model, sessionId: UUID().uuidString.lowercased(), sessionStarted: false, state: .running,
                           blocker: nil, requestedBlocker: nil, paused: false, readySince: nil, createdAt: now)
-        let resolved = URL(fileURLWithPath: company.workspacePath, isDirectory: true).resolvedForSandbox
         let settingsFile = SettingsFile.path(paths: paths, agentId: agent.id)
         let mcpConfig = paths.runDir.appending(path: "\(agent.id).mcp.json")
         let places = DevRunPlaces()
@@ -180,12 +200,6 @@ extension Orchestrator {
             _ = try? await runner.waitForTurnProcesses(agentId: agent.id, records: records)
             let tmp = places.claudeTmp
             await blocking.run {
-                for place in [".brahma/home/\(handle)", ".brahma/labs/\(handle)", ".brahma/notes/agents/\(handle).md",
-                              ".brahma/bin/shell-\(handle).sh", ".brahma/trash/\(handle)"] {
-                    let url = resolved.appending(path: place)
-                    guard SandboxPath.kind(url.path) != .missing else { continue }
-                    _ = try? EngineFiles.removeNoFollow(url, under: resolved)
-                }
                 for url in [settingsFile, mcpConfig] { _ = try? EngineFiles.removeNoFollow(url, under: paths.runDir) }
                 if let tmp { _ = try? EngineFiles.removeNoFollow(tmp, under: tmp.deletingLastPathComponent()) }
                 TaintFlag.remove(home: paths.home, agentId: agent.id)
@@ -193,7 +207,8 @@ extension Orchestrator {
         }
         do {
             let result = try await devRunTurn(agent: agent, company: company, prompt: prompt, devPlugin: devPlugin, devId: devId,
-                                              settingsFile: settingsFile, mcpConfig: mcpConfig, places: places, now: now)
+                                              trialRoot: trialRoot, settingsFile: settingsFile, mcpConfig: mcpConfig, places: places,
+                                              now: now)
             await cleanUp()
             return result
         } catch {
@@ -202,8 +217,8 @@ extension Orchestrator {
         }
     }
 
-    private nonisolated func devRunTurn(agent: Agent, company: Company, prompt: String, devPlugin: URL, devId: String, settingsFile: URL,
-                                        mcpConfig: URL, places: DevRunPlaces, now: Date) async throws -> ExtensionTryResult {
+    private nonisolated func devRunTurn(agent: Agent, company: Company, prompt: String, devPlugin: URL, devId: String, trialRoot: String,
+                                        settingsFile: URL, mcpConfig: URL, places: DevRunPlaces, now: Date) async throws -> ExtensionTryResult {
         let store = self.store, paths = self.paths
         let template = store.catalog.template(role: agent.role, pack: company.packId)
         // The role's normal mounts (no grants: a throwaway holds none), then the dev copy as `<id>@dev`.
@@ -212,7 +227,7 @@ extension Orchestrator {
                                         kind: .work, itemScoped: false, store: store, paths: paths, now: now)
         }.filter { $0.id != devId }
         var prepared = try await prepareSandbox(agent: agent, company: company, kind: .work, item: nil, turnId: agent.id,
-                                                extraDomains: ExtensionLibrary.agentNetwork(mounts))
+                                                extraDomains: ExtensionLibrary.agentNetwork(mounts), trialRoot: trialRoot)
         places.claudeTmp = prepared.scope.claudeTmp
         if !prepared.grants.isEmpty, let rebuild = prepared.rebuild {
             prepared.scope = try await blocking.tryRun { try rebuild(GrantInputs()) }

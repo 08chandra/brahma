@@ -282,7 +282,9 @@ public final class Store: Sendable {
                      team: String?, now: Date, honoringVacancy: Bool = false) throws -> Agent {
         let handle = name.lowercased()
         guard handle != "owner", handle != "system", handle != "here", handle != "team",
-              handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil
+              handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil,
+              // `try-` names the owner's extension trials (10b, S29), never a team member.
+              !ExtensionTry.isReservedHandle(name)
         else { throw StoreError.invalidName }
         if !honoringVacancy,
            try OrgVacancy.filter(Column("companyId") == companyId && Column("handle") == handle && Column("filledAt") == nil)

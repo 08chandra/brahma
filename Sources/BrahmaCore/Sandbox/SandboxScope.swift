@@ -305,20 +305,36 @@ public struct SandboxLayout: Equatable, Sendable {
     public let notes: URL
     /// `<ws>/.git`: the common git dir.
     public let gitDir: URL
+    /// An `ext try` turn's own root (Task 10b, S29: `.brahma/ext-try/<id>`): its home, lab, notes and shell prefix live there,
+    /// never in the per-agent directories, so a trial's clean-up and sweep can never touch a real agent's places. Nil for agents.
+    public let trialRoot: String?
 
-    public init(paths: BrahmaPaths, company: Company, agentHandle: String) {
+    /// Workspace-relative places: `.brahma/home/<h>`, `.brahma/labs/<h>`, `.brahma/notes/agents/<h>.md`,
+    /// `.brahma/bin/shell-<h>.sh` and `.brahma/trash/<h>`; for a trial `<root>/home`, `<root>/lab`, `<root>/notes/<h>.md`,
+    /// `<root>/bin/shell-<h>.sh` and `<root>/trash`.
+    public var homeRelative: String { trialRoot.map { "\($0)/home" } ?? ".brahma/home/\(handle)" }
+    public var labRelative: String { trialRoot.map { "\($0)/lab" } ?? ".brahma/labs/\(handle)" }
+    public var notesDirRelative: String { trialRoot.map { "\($0)/notes" } ?? ".brahma/notes/agents" }
+    public var notesRelative: String { "\(notesDirRelative)/\(handle).md" }
+    public var binDirRelative: String { trialRoot.map { "\($0)/bin" } ?? ".brahma/bin" }
+    public var shellPrefixRelative: String { "\(binDirRelative)/shell-\(handle).sh" }
+    public var trashRelative: String { trialRoot.map { "\($0)/trash" } ?? ".brahma/trash/\(handle)" }
+
+    public init(paths: BrahmaPaths, company: Company, agentHandle: String, trialRoot: String? = nil) {
         handle = agentHandle
         companySlug = company.slug
+        self.trialRoot = trialRoot
         workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: false)
         dotBrahma = workspace.appending(path: ".brahma")
-        agentHome = dotBrahma.appending(path: "home/\(agentHandle)")
-        lab = dotBrahma.appending(path: "labs/\(agentHandle)")
+        let root = trialRoot
+        agentHome = workspace.appending(path: root.map { "\($0)/home" } ?? ".brahma/home/\(agentHandle)")
+        lab = workspace.appending(path: root.map { "\($0)/lab" } ?? ".brahma/labs/\(agentHandle)")
         agentCache = agentHome.appending(path: "cache")
         sharedCache = dotBrahma.appending(path: "cache/shared")
         extLib = dotBrahma.appending(path: "ext")
         hooksDir = dotBrahma.appending(path: "hooks")
-        shellPrefix = dotBrahma.appending(path: "bin/shell-\(agentHandle).sh")
-        notes = dotBrahma.appending(path: "notes/agents/\(agentHandle).md")
+        shellPrefix = workspace.appending(path: (root.map { "\($0)/bin" } ?? ".brahma/bin") + "/shell-\(agentHandle).sh")
+        notes = workspace.appending(path: (root.map { "\($0)/notes" } ?? ".brahma/notes/agents") + "/\(agentHandle).md")
         gitDir = workspace.appending(path: ".git")
     }
 
@@ -346,16 +362,17 @@ public struct SandboxLayout: Equatable, Sendable {
             throw UnsafeEngineFile(path: gitDir.path, problem: "is not a real directory (the workspace has no repository)")
         }
         let ws = workspace
-        try EngineFiles.directory(workspace: ws, ".brahma/home/\(handle)", mode: 0o700)
-        try EngineFiles.directory(workspace: ws, ".brahma/home/\(handle)/cache", mode: 0o700)
-        try EngineFiles.directory(workspace: ws, ".brahma/labs/\(handle)", mode: 0o700)
+        try EngineFiles.directory(workspace: ws, homeRelative, mode: 0o700)
+        try EngineFiles.directory(workspace: ws, "\(homeRelative)/cache", mode: 0o700)
+        try EngineFiles.directory(workspace: ws, labRelative, mode: 0o700)
         let gitconfig = "[user]\n\tname = \(handle)\n\temail = \(handle)@\(companySlug).brahma.local\n"
-        try EngineFiles.replace(Data(gitconfig.utf8), workspace: ws, dir: ".brahma/home/\(handle)", name: ".gitconfig", mode: 0o600)
+        try EngineFiles.replace(Data(gitconfig.utf8), workspace: ws, dir: homeRelative, name: ".gitconfig", mode: 0o600)
         try EngineFiles.directory(workspace: ws, ".git/refs/heads/item")
         try EngineFiles.directory(workspace: ws, ".git/logs/refs/heads/item")
-        switch try EngineFiles.entry(workspace: ws, dir: ".brahma/notes/agents", name: "\(handle).md") {
+        if trialRoot != nil { _ = try EngineFiles.directory(workspace: ws, notesDirRelative, mode: 0o700) }
+        switch try EngineFiles.entry(workspace: ws, dir: notesDirRelative, name: "\(handle).md") {
         case .regular: break
-        case .missing: _ = try EngineFiles.create(Data(), workspace: ws, dir: ".brahma/notes/agents", name: "\(handle).md", mode: 0o600)
+        case .missing: _ = try EngineFiles.create(Data(), workspace: ws, dir: notesDirRelative, name: "\(handle).md", mode: 0o600)
         case .unsafe(let problem): throw problem
         }
         try ensureLabRepository()
@@ -668,10 +685,11 @@ public struct SandboxScope: Equatable, Sendable {
         let h = layout.handle
         let dot = l(".brahma")
         let git = l(".git")
-        let home = try own(".brahma/home/\(h)")
-        let lab = try own(".brahma/labs/\(h)")
-        let notes = try own(".brahma/notes/agents/\(h).md")
-        let shellPrefix = try own(".brahma/bin/shell-\(h).sh")
+        let home = try own(layout.homeRelative)
+        let lab = try own(layout.labRelative)
+        let notes = try own(layout.notesRelative)
+        let shellPrefix = try own(layout.shellPrefixRelative)
+        let cache = try own("\(layout.homeRelative)/cache")
         // 3a's item worktree (`GitWorkspace.worktreePath`: `<ws>/.brahma/wt/<KEY>`).
         func worktree(_ key: String) throws -> URL { try own(".brahma/wt/\(key)") }
 
@@ -689,12 +707,12 @@ public struct SandboxScope: Equatable, Sendable {
         switch shape {
         case .item(let key):
             cwd = try worktree(key)
-            writable = [home, lab, try own(".brahma/home/\(h)/cache"), try own(".git/objects"), try own(".git/worktrees/\(key)"),
+            writable = [home, lab, cache, try own(".git/objects"), try own(".git/worktrees/\(key)"),
                         try own(".git/refs/heads/item/\(key)"), try own(".git/refs/heads/item/\(key).lock"),
                         try own(".git/logs/refs/heads/item/\(key)"), try checked(ProgressFile.path(workspace: ws, key: key)), notes]
         case .itemless:
             cwd = lab
-            writable = [home, lab, try own(".brahma/home/\(h)/cache"), notes]
+            writable = [home, lab, cache, notes]
         case .review(let key):
             cwd = lab
             writable = [home, lab]
@@ -786,7 +804,14 @@ public struct SandboxScope: Equatable, Sendable {
         var denyWrite = protected
         denyWrite += [cwd.appending(path: ".claude"), cwd.appending(path: ".mcp.json"), lab.appending(path: ".claude"),
                       lab.appending(path: ".mcp.json")].flatMap(both)
-        denyWrite += engineOnlyDotBrahma.map { l(".brahma/\($0)") }.flatMap(both)
+        // A trial (S29) writes its own `.brahma/ext-try/<id>/{home,lab,notes}`: every other trial, and its own plugin copy and
+        // shell prefix, stay write-denied.
+        let trialId = layout.trialRoot.map { URL(fileURLWithPath: $0).lastPathComponent }
+        denyWrite += engineOnlyDotBrahma.filter { trialId == nil || $0 != "ext-try" }.map { l(".brahma/\($0)") }.flatMap(both)
+        if let root = layout.trialRoot, let trialId {
+            try denyEntries(of: l(".brahma/ext-try"), keeping: [trialId], carveOut: true)
+            denyWrite += [l("\(root)/plugin"), l(layout.binDirRelative)].flatMap(both)
+        }
         var ownKey: String?
         if case .item(let key) = shape { ownKey = key }
         // Every existing entry of `dir` but the turn's own, plus the whole directory when the turn has no carve-out there. A
@@ -804,11 +829,12 @@ public struct SandboxScope: Equatable, Sendable {
         func denySiblings(_ relative: String, keeping own: String?) throws {
             try denyEntries(of: l(".brahma/\(relative)"), keeping: own.map { [$0] } ?? [], carveOut: own != nil)
         }
-        let writesNotes = writable.contains(notes)
+        let writesNotes = writable.contains(notes) && layout.trialRoot == nil
+        let agentPlaces = layout.trialRoot == nil
         try denySiblings("notes", keeping: writesNotes ? "agents" : nil)
         try denySiblings("notes/agents", keeping: writesNotes ? "\(h).md" : nil)
-        try denySiblings("home", keeping: h)
-        try denySiblings("labs", keeping: h)
+        try denySiblings("home", keeping: agentPlaces ? h : nil)
+        try denySiblings("labs", keeping: agentPlaces ? h : nil)
         try denySiblings("progress", keeping: ownKey.map { "\($0).md" })
         try denySiblings("wt", keeping: ownKey)
         if case .plan(let key) = shape { try denySiblings("plans", keeping: key) } else { try denySiblings("plans", keeping: nil) }

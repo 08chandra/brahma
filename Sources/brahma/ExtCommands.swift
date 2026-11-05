@@ -321,7 +321,12 @@ struct ExtTry: AsyncParsableCommand {
         let sources = [SIGINT, SIGTERM, SIGHUP].map { sig in
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
-            source.setEventHandler { trial.cancel() }
+            // M7: the first signal cancels (the clean-up runs); the default disposition is back, so a second one ends the CLI
+            // (the stale sweep removes what is left).
+            source.setEventHandler {
+                trial.cancel()
+                for s in [SIGINT, SIGTERM, SIGHUP] { signal(s, SIG_DFL) }
+            }
             source.resume()
             return source
         }

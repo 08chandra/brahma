@@ -200,13 +200,16 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let hold = Gate(), started = Gate()
         w.world.fake.defaultScript = FakeTurnRunner.Script(gate: hold)
         let seen = TryWorld.Seen()
-        w.world.fake.onRun = { r in seen.note(dir: r.agent.name, mode: nil); started.open() }
+        let cwd = TryWorld.Seen()
+        w.world.fake.onRun = { r in seen.note(dir: r.agent.name, mode: nil); cwd.note(dir: r.workingDirectory, mode: nil); started.open() }
         let fixture = try PluginFixture()
         let trial = Task { await w.refusal(fixture) }
         await started.wait()
         await w.world.stopPoll.waiting()
         let handle = try #require(seen.devDir)
-        #expect(SandboxPath.kind(w.ws.appending(path: ".brahma/labs/\(handle)").path) == .directory, "running")
+        let lab = try #require(cwd.devDir)
+        #expect(lab.hasPrefix(w.ws.appending(path: ".brahma/ext-try/").path) && lab.hasSuffix("/lab"), "\(lab)")
+        #expect(SandboxPath.kind(lab) == .directory, "running")
         try w.store.emergencyStop(note: nil, by: "owner", now: w.world.clock.now)
         w.world.stopPoll.step()
         #expect(await trial.value == ExtensionTry.stoppedRefusal)
@@ -218,27 +221,98 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try w.store.extensionEvents(companyId: w.company.id).filter { $0.kind == "try" }.isEmpty, "a stopped trial is not recorded")
     }
 
-    /// M2: what a killed trial left is swept (by the next trial and at engine start), and only once it is stale.
+    /// M2, S29: what a killed trial left is swept (by the next trial and at engine start), only once it is stale, only under the
+    /// trial root and its own run files, never a real agent's places, never through a link.
     @Test func staleTrialPlacesAreSwept() throws {
         let w = try TryWorld()
         let paths = w.world.paths
         let id = "try-" + UUID().uuidString.lowercased()
-        let leftovers = [w.ws.appending(path: ".brahma/ext-try/\(UUID().uuidString.lowercased())/plugin/x.md"),
-                         w.ws.appending(path: ".brahma/home/try-abcdef12/x"), w.ws.appending(path: ".brahma/labs/try-abcdef12/x"),
-                         w.ws.appending(path: ".brahma/notes/agents/try-abcdef12.md"), w.ws.appending(path: ".brahma/bin/shell-try-abcdef12.sh"),
+        let leftovers = [w.ws.appending(path: ".brahma/ext-try/\(UUID().uuidString.lowercased())/home/x"),
                          paths.runDir.appending(path: "\(id).settings.json"), paths.runDir.appending(path: "\(id).mcp.json"),
                          paths.runDir.appending(path: "taint/\(id)")]
-        let kept = [w.ws.appending(path: ".brahma/home/eng-1/x"), paths.runDir.appending(path: "eng.settings.json")]
+        // Places named like a trial's in the per-agent directories (a real agent's), and an existing agent's run file.
+        let agentNamed = "try-" + UUID().uuidString.lowercased()
+        let kept = [w.ws.appending(path: ".brahma/home/try-1a2b3c4d/x"), w.ws.appending(path: ".brahma/labs/try-1a2b3c4d/x"),
+                    w.ws.appending(path: ".brahma/notes/agents/try-1a2b3c4d.md"), w.ws.appending(path: ".brahma/bin/shell-try-1a2b3c4d.sh"),
+                    paths.runDir.appending(path: "\(agentNamed).settings.json"), paths.runDir.appending(path: "eng.settings.json")]
         for url in leftovers + kept {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("x".utf8).write(to: url)
         }
+        // A link where a trial root would be: removed itself, never followed.
+        let outside = try tempDir().appending(path: "outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: outside.appending(path: "f"))
+        let link = w.ws.appending(path: ".brahma/ext-try/\(UUID().uuidString.lowercased())")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
         let workspace = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
-        #expect(ExtensionTry.sweepStale(paths: paths, workspace: workspace, now: Date()).isEmpty, "a trial running now keeps its places")
-        let removed = ExtensionTry.sweepStale(paths: paths, workspace: workspace, now: Date().addingTimeInterval(7200))
-        #expect(removed.count == leftovers.count, "\(removed)")
+        #expect(ExtensionTry.sweepStale(paths: paths, workspace: workspace, existing: [agentNamed], now: Date()).isEmpty,
+                "a trial running now keeps its places")
+        let removed = ExtensionTry.sweepStale(paths: paths, workspace: workspace, existing: [agentNamed], now: Date().addingTimeInterval(7200))
+        #expect(removed.count == leftovers.count + 1, "\(removed)")
         for url in leftovers { #expect(!FileManager.default.fileExists(atPath: url.path), "\(url.path)") }
         for url in kept { #expect(FileManager.default.fileExists(atPath: url.path), "\(url.path)") }
+        #expect(SandboxPath.kind(link.path) == .missing); #expect(FileManager.default.fileExists(atPath: outside.appending(path: "f").path))
+    }
+
+    /// S29: a trial's places live under its own `.brahma/ext-try/<id>`; its scope writes only there (never another trial's), and
+    /// its clean-up removes only that root.
+    @Test func trialPlacesStayUnderItsOwnRoot() async throws {
+        let w = try TryWorld()
+        let other = w.ws.appending(path: ".brahma/ext-try/\(UUID().uuidString.lowercased())")
+        try FileManager.default.createDirectory(at: other.appending(path: "lab"), withIntermediateDirectories: true)
+        w.script()
+        _ = try await w.run(try PluginFixture())
+        let r = try #require(w.world.fake.requests.first)
+        let scope = try #require(r.sandbox)
+        let root = scope.cwd.deletingLastPathComponent()
+        #expect(root.deletingLastPathComponent().path == w.ws.appending(path: ".brahma/ext-try").path, "\(scope.cwd.path)")
+        #expect(scope.cwd.lastPathComponent == "lab")
+        for w2 in scope.writable { #expect(w2.path.hasPrefix(root.path + "/"), "\(w2.path)") }
+        let deny = Set(scope.denyWrite.map(\.path))
+        #expect(deny.contains(other.path), "another trial's root")
+        #expect(deny.contains(root.appending(path: "plugin").path)); #expect(deny.contains(root.appending(path: "bin").path))
+        #expect(!deny.contains(w.ws.appending(path: ".brahma/ext-try").path), "its own root stays writable below")
+        #expect(r.shellPrefix?.hasSuffix("/.brahma/ext-try/\(root.lastPathComponent)/bin/shell-\(r.agent.name).sh") == true, "\(r.shellPrefix ?? "")")
+        for place in [".brahma/home/\(r.agent.name)", ".brahma/labs/\(r.agent.name)", ".brahma/notes/agents/\(r.agent.name).md",
+                      ".brahma/bin/shell-\(r.agent.name).sh"] {
+            #expect(SandboxPath.kind(w.ws.appending(path: place).path) == .missing, "never created: \(place)")
+        }
+        #expect(SandboxPath.kind(root.path) == .missing, "its own root is removed")
+        #expect(SandboxPath.kind(other.appending(path: "lab").path) == .directory, "another trial's root is left alone")
+    }
+
+    /// S29: `try-` is reserved: no hire and no org plan may take it.
+    @Test func trialHandlesAreReserved() throws {
+        let w = try TryWorld()
+        for name in ["try-1a2b3c4d", "TRY-1a2b3c4d", "try-x"] {
+            #expect(throws: StoreError.self) { try w.store.hire(companyId: w.company.id, name: name, role: "engineer", model: "sonnet") }
+        }
+        #expect(ExtensionTry.isReservedHandle("T\u{0052}Y-abc".lowercased()))
+        _ = try w.store.hire(companyId: w.company.id, name: "tryhard", role: "engineer", model: "sonnet")
+        var plan = OrgPlan(goal: "g", agents: [])
+        plan.add(role: "ceo-cpo", handle: "ceo", manager: nil, team: nil)
+        plan.add(role: "engineer", handle: "try-1a2b3c4d", manager: "ceo", team: nil)
+        let pack = try #require(w.store.catalog.pack("software"))
+        #expect(plan.validate(pack: pack).contains { $0.handle == "try-1a2b3c4d" && $0.message.contains("reserved") })
+    }
+
+    /// I2: only the owner's shell clears a lab mark; an agent's process is refused and the mark stays.
+    @Test func cliLabClearTaintIsOwnerOnly() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        let created = try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home)
+        try #require(created.status == 0, "\(created.stderr)")
+        let store = try Store(path: home.appending(path: "home/brahma.sqlite").path)
+        let company = try #require(try store.companies().first)
+        let eng = try store.hire(companyId: company.id, name: "eng", role: "engineer", model: "sonnet")
+        try store.markTainted(agentId: eng.id, source: "WebFetch")
+        let agent = try brahma(["lab", "clear-taint", "Acme", "eng"], home: home, env: ["BRAHMA_AGENT_ID": eng.id])
+        #expect(agent.status != 0); #expect(try store.labTaint(agentId: eng.id) != nil)
+        let cleared = try brahma(["lab", "clear-taint", "Acme", "eng"], home: home)
+        #expect(cleared.status == 0, "\(cleared.stderr)"); #expect(cleared.stdout.contains("cleared @eng's lab mark"))
+        #expect(try store.labTaint(agentId: eng.id) == nil)
+        #expect(try brahma(["lab", "clear-taint", "Acme", "eng"], home: home).stdout.contains("carries no mark"))
     }
 
     /// The CLI: owner-only, lint errors refuse before any turn, and `company create` writes the built-ins.

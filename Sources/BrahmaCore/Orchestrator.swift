@@ -228,7 +228,7 @@ public actor Orchestrator {
             // Brahma's built-in extensions (Task 10b), materialized read-only into every workspace; a refusal is logged.
             for failure in await blocking.run({ companies.compactMap { company -> String? in
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-                ExtensionTry.sweepStale(paths: paths, workspace: workspace, now: now)
+                ExtensionTry.sweepStale(paths: paths, workspace: workspace, existing: ExtensionTry.existingNames(store), now: now)
                 do { try BuiltinExtensions.materialize(workspace: workspace); return nil } catch { return "\(company.name): \(error)" }
             } }) { log("could not materialize the built-in extensions: \(failure)") }
             try SystemTimers.ensure(store: store, now: now, digestTime: store.ownerPrefs().digestHourMinute)

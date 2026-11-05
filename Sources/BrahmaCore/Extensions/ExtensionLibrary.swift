@@ -27,13 +27,17 @@ public struct ExtensionAskPayload: Codable, Equatable, Sendable {
     /// A lab proposal (10b): the lab commits that touched the folder and are recorded tainted, or not recorded at all. Any
     /// makes the installed extension third-party for taint and profile purposes (`sourceType` `lab-tainted`).
     public var taintedCommits: [String]? = nil
+    /// A lab proposal from a lab with the sticky mark (10b, I2): the mark's first source and date, as shown on the card.
+    public var labMark: String? = nil
 
     public init(action: String, extId: String, hash: String, publisher: String, roles: [String], notices: [String], lintSummary: [String],
                 executes: LintFacts.Executes, alwaysOnTokens: Int?, stagedPath: String?, role: String? = nil,
-                sourceType: String? = nil, sourceUrl: String? = nil, sourceSha: String? = nil, taintedCommits: [String]? = nil) {
+                sourceType: String? = nil, sourceUrl: String? = nil, sourceSha: String? = nil, taintedCommits: [String]? = nil,
+                labMark: String? = nil) {
         self.action = action; self.extId = extId; self.hash = hash; self.publisher = publisher; self.roles = roles; self.notices = notices
         self.lintSummary = lintSummary; self.executes = executes; self.alwaysOnTokens = alwaysOnTokens; self.stagedPath = stagedPath; self.role = role
         self.sourceType = sourceType; self.sourceUrl = sourceUrl; self.sourceSha = sourceSha; self.taintedCommits = taintedCommits
+        self.labMark = labMark
     }
 
     public static func read(_ ask: Ask) -> ExtensionAskPayload? {
@@ -70,13 +74,15 @@ public enum ExtensionLibrary {
         public var summary: String?
         public var itemId: String?
         public var taintedCommits: [String]?
+        /// The lab's sticky mark, when it has one (I2).
+        public var labMark: String?
         /// Any lint issue refuses, warnings included (an agent's proposal: `ext lint` must print `[]`).
         public var requireClean: Bool
 
         public init(viaOwner: Bool = true, summary: String? = nil, itemId: String? = nil, taintedCommits: [String]? = nil,
-                    requireClean: Bool = false) {
+                    labMark: String? = nil, requireClean: Bool = false) {
             self.viaOwner = viaOwner; self.summary = summary; self.itemId = itemId; self.taintedCommits = taintedCommits
-            self.requireClean = requireClean
+            self.labMark = labMark; self.requireClean = requireClean
         }
     }
 
@@ -173,7 +179,7 @@ public enum ExtensionLibrary {
                                           notices: staged.notices, lintSummary: result.warnings.map { "\($0.code) \($0.path): \($0.message)" },
                                           executes: facts.executes, alwaysOnTokens: alwaysOn, stagedPath: staged.dir.path,
                                           sourceType: staged.source.sourceType, sourceUrl: staged.source.sourceUrl, sourceSha: staged.source.sourceSha,
-                                          taintedCommits: options.taintedCommits)
+                                          taintedCommits: options.taintedCommits, labMark: options.labMark)
         let page = try reviewPage(staged: staged, manifest: manifest, result: result, payload: payload)
         let sender: Sender = { if case .owner = requester { return .system } else { return requester } }()
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -216,11 +222,20 @@ public enum ExtensionLibrary {
         out += "- source: \(staged.source.sourceType) \(staged.source.sourceUrl ?? "")\n"
         out += "- tree hash: \(payload.hash)\n"
         if let tainted = payload.taintedCommits {
-            // 10b: a lab proposal says which of its commits a session that read outside content made (or nobody recorded).
-            out += tainted.isEmpty
-                ? "- lab provenance: every commit touching the folder was made by a clean session\n"
-                : "- tainted commits: \(tainted.map { Store.flat($0, max: 64) }.joined(separator: ", ")) (made by a session that read outside "
-                  + "content, or never recorded): if approved it is treated as third-party (Sandboxed only; its skills taint)\n"
+            // 10b: a lab proposal says exactly what was checked (I2): the lab's sticky mark, then the commits that introduced its
+            // files or touched its folder.
+            if let mark = payload.labMark {
+                out += "- lab provenance: a session that read outside content has worked in this lab (\(Store.flat(mark, max: 200))); until "
+                    + "the owner clears the mark, everything proposed from it is treated as third-party (Sandboxed only; its skills taint)\n"
+            } else if tainted.isEmpty {
+                out += "- lab provenance: no tainted session has worked in this lab since the owner last cleared it, and no tainted or "
+                    + "unrecorded commit introduced its files or touched its folder (commit content is not traced beyond object ids)\n"
+            }
+            if !tainted.isEmpty {
+                out += "- tainted commits: \(tainted.map { Store.flat($0, max: 64) }.joined(separator: ", ")) (tainted or unrecorded commits "
+                    + "that introduced its files or touched its folder): if approved it is treated as third-party (Sandboxed only; its "
+                    + "skills taint)\n"
+            }
         }
         out += "- roles: \(payload.roles.isEmpty ? "(none)" : payload.roles.joined(separator: ", "))\n"
         out += "- description: \(Store.flat(manifest.description, max: ExtensionLimits.maxDescription))\n"

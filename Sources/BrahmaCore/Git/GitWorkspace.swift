@@ -3274,6 +3274,13 @@ extension GitWorkspace {
         }
     }
 
+    /// The empty blob and the empty tree (SHA-1 and SHA-256): they carry no content, so they never decide provenance (M8).
+    static let emptyObjectIds: Set<String> = [
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+        "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+    ]
+
     /// The object ids of the folder at `<commit>:<path>`: its own tree and every tree and blob below it (S25: the proposal's
     /// provenance is decided by content). A listing that was cut throws. Blocking.
     public func labFolderObjects(commit: String, path: String, maxOutput: Int = 4 << 20) throws -> Set<String> {
@@ -3292,7 +3299,7 @@ extension GitWorkspace {
             let fields = entry.prefix { $0 != "\t" }.split(separator: " ")
             if fields.count == 3 { ids.insert(String(fields[2])) }
         }
-        return ids
+        return ids.subtracting(Self.emptyObjectIds)
     }
 
     /// Per commit, the tree and blob ids it introduced: the new side of its raw diff against each parent (a root commit against
@@ -3314,7 +3321,7 @@ extension GitWorkspace {
             let fields = line.prefix { $0 != "\t" }.split(separator: " ")
             guard fields.count >= 5 else { continue }
             let dst = String(fields[3])
-            guard dst.contains(where: { $0 != "0" }) else { continue }
+            guard dst.contains(where: { $0 != "0" }), !Self.emptyObjectIds.contains(dst) else { continue }
             result[current, default: []].insert(dst)
         }
         return result

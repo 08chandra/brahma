@@ -368,8 +368,8 @@ public enum ShellPrefix {
                               mcpServer: MCPServer? = nil) throws -> String {
         // The agent's places as the turn's scope names them: built under the resolved workspace.
         let ws = layout.workspace.resolvedForSandbox
-        let home = ws.appending(path: ".brahma/home/\(layout.handle)").path
-        let cache = ws.appending(path: ".brahma/home/\(layout.handle)/cache").path
+        let home = ws.appending(path: layout.homeRelative).path
+        let cache = ws.appending(path: "\(layout.homeRelative)/cache").path
         let sentinel = paths.sentinel.path
         let serverPaths = mcpServer.map { [$0.executable, $0.database, $0.ownerHome, paths.home.path, paths.workspaces.path] } ?? []
         for value in [home, cache, sentinel, shell] + serverPaths
@@ -425,17 +425,17 @@ public enum ShellPrefix {
                              mcpServer: MCPServer? = nil) throws -> URL {
         try SandboxLayout.validate(handle: layout.handle)
         // Claude Code splits `CLAUDE_CODE_SHELL_PREFIX` at whitespace (M7): the prefix's own path holds none.
-        let prefixPath = layout.workspace.resolvedForSandbox.appending(path: ".brahma/bin/\(layout.shellPrefix.lastPathComponent)").path
+        let prefixPath = layout.workspace.resolvedForSandbox.appending(path: layout.shellPrefixRelative).path
         for path in [prefixPath, layout.shellPrefix.path] where path.contains(where: \.isWhitespace) {
             throw SandboxError.unsafePathCharacter(path)
         }
         let text = try script(layout: layout, paths: paths, shell: shell, keepNames: keepNames, mcpServer: mcpServer)
         let data = Data(text.utf8)
         let name = layout.shellPrefix.lastPathComponent
-        let existing = try? EngineFiles.read(workspace: layout.workspace, dir: ".brahma/bin", name: name, limit: 64 * 1024)
+        let existing = try? EngineFiles.read(workspace: layout.workspace, dir: layout.binDirRelative, name: name, limit: 64 * 1024)
         if existing != data || !isExecutable(layout.shellPrefix) {
             // Created 0755 (less whatever the owner's umask removes; the owner's own execute bit always stays).
-            try EngineFiles.replace(data, workspace: layout.workspace, dir: ".brahma/bin", name: name, mode: 0o755)
+            try EngineFiles.replace(data, workspace: layout.workspace, dir: layout.binDirRelative, name: name, mode: 0o755)
         }
         return layout.shellPrefix
     }
