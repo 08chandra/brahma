@@ -179,6 +179,29 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(HumanTasks.percentEncode("aZ09-._~ é/+") == "aZ09-._~%20%C3%A9%2F%2B")
     }
 
+    /// Fix round 1, I3: the pinned 3000 characters are reachable whatever the text encodes to; an agent's link keeps 2048.
+    @Test func launchPostTakesFullLengthPost() throws {
+        let h = try H()
+        let phrase = "Café ☕ launch day, ünïcode & spaces! "
+        var text = String(repeating: phrase, count: 3000 / phrase.count + 1)
+        text = String(text.prefix(3000))
+        #expect(text.count == 3000)
+        let (ask, _) = try h.store.requestHumanTask(companyId: h.acme.id, by: h.eng.id, template: .launchPost,
+                                                    args: ["text": text, "url": "https://lumen.pages.dev/"], reason: "launch")
+        let task = try #require(HumanTask.from(ask))
+        #expect(task.postText == text)
+        #expect(task.links.count == 3); #expect(task.links[0].url.count > 2048)
+        let emoji = String(repeating: "🚀", count: 3000)
+        let (rocket, deduped) = try h.store.requestHumanTask(companyId: h.globex.id, by: h.globexEng.id, template: .launchPost,
+                                                             args: ["text": emoji, "url": "https://globex.pages.dev/"], reason: "launch")
+        #expect(!deduped); #expect(HumanTask.from(rocket)?.postText == emoji)
+        let long = "https://docs.example.com/" + String(repeating: "a", count: 2100)
+        #expect(Self.message { try HumanTasks.custom(title: "Read", steps: [], links: [HumanTaskLink(title: "Docs", url: long)], fields: []) }
+                == "a link is longer than 2048 characters")
+        let emojiTask = try HumanTasks.render(.launchPost, company: h.acme, hosting: nil, args: ["text": emoji, "url": "https://lumen.pages.dev/"])
+        #expect(emojiTask.links[0].url.count > 30_000)
+    }
+
     // MARK: Custom tasks
 
     @Test func customTaskCannotRequestSecrets() throws {
@@ -223,7 +246,10 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
                 == "Site URL must start with https://")
         try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: ["site_url": " https://acme.github.io/site "], vault: h.vault)
         #expect(try h.fresh(ask).ownerAnswer == #"{"site_url":"https://acme.github.io/site"}"#)
-        #expect(try h.dms(h.eng).contains { $0.contains("\(ask.ref) is done: Enable GitHub Pages.") && $0.contains("site_url: https://acme.github.io/site") })
+        // Fix round 1, I1: the @system DM carries refs only, never the agent's title or an owner-entered value.
+        let doneDM = try #require(try h.dms(h.eng).first { $0.hasPrefix("\(ask.ref) is done") })
+        #expect(doneDM == "\(ask.ref) is done. See the Inbox.")
+        #expect(!doneDM.contains("GitHub Pages")); #expect(!doneDM.contains("acme.github.io"))
         // Caps and field names.
         let many = (1...13).map { "step \($0)" }
         #expect(Self.message { try HumanTasks.custom(title: "x", steps: many, links: [], fields: []) } == HumanTaskPolicy.capsMessage)
@@ -285,8 +311,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(try h.vault.value(companyId: h.acme.id, name: "STRIPE_TEST_SECRET_KEY") == Self.stripeValues["STRIPE_TEST_SECRET_KEY"])
         #expect(try h.store.secrets(companyId: h.acme.id).allSatisfy { $0.isTest })
         let dm = try #require(try h.dms(h.eng).first { $0.hasPrefix("\(ask.ref) is done") })
-        #expect(dm.contains("\(ask.ref) is done: Create Stripe test API keys."))
-        #expect(dm.contains("STRIPE_TEST_SECRET_KEY")); #expect(!dm.contains("sk_test_51"))
+        #expect(dm == "\(ask.ref) is done (\(item.key)). See the Inbox.")
+        #expect(!dm.contains("Create Stripe")); #expect(!dm.contains("sk_test_51")); #expect(!dm.contains("pk_test_51"))
         // Done once.
         #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault) }
                 == "\(ask.ref) is already answered")
@@ -311,6 +337,39 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         try h.store.completeHumanTask(companyId: h.acme.id, askId: domain.id, values: ["domain": "lumen.app"], vault: h.vault)
         #expect(try h.fresh(assigned).status == .ready)
         #expect(try h.store.hosting(companyId: h.acme.id)?.customDomain == "lumen.app", "done sets the custom domain")
+    }
+
+    /// Fix round 1, I4: an item a holder blocked on the task itself (`update_work_item blockedOnAsk`) goes back in progress
+    /// with its lease; a stale `statusBeforeBlock` never survives another unblock.
+    @Test func blockedOnAskItemRestoredWithLease() throws {
+        let h = try H()
+        let item = try h.leased(by: h.eng)
+        let task = try h.store.fileTemplateTask(companyId: h.acme.id, requesterId: "system", template: .hostingAccount)
+        _ = try h.store.updateWorkItem(id: item.id, by: .agent(h.eng.id),
+                                       patch: WorkItemPatch(status: .blocked, blockedReason: "needs the hosting token", blockedOnAsk: task.id))
+        let blocked = try h.fresh(item)
+        #expect(blocked.status == .blocked); #expect(blocked.blockedAskId == task.id); #expect(blocked.statusBeforeBlock == .inProgress)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: task.id,
+                                      values: ["CLOUDFLARE_API_TOKEN": "tok-abcdef123456", "account_id": Self.accountId], vault: h.vault)
+        let back = try h.fresh(item)
+        #expect(back.status == .inProgress); #expect(try h.store.lease(itemId: item.id)?.agentId == h.eng.id)
+        #expect(back.statusBeforeBlock == nil)
+        // No recorded status but a live lease: in progress (never ready with a lease).
+        let h2 = try H()
+        let other = try h2.leased(by: h2.eng)
+        let stripe = try h2.store.fileTemplateTask(companyId: h2.acme.id, requesterId: "system", template: .stripeTestKeys)
+        try h2.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET status = 'blocked', blockedAskId = ?, statusBeforeBlock = NULL WHERE id = ?",
+                           arguments: [stripe.id, other.id])
+        }
+        try h2.store.declineHumanTask(companyId: h2.acme.id, askId: stripe.id, note: "")
+        #expect(try h2.fresh(other).status == .inProgress)
+        // A human-task block cleared another way (the holder unblocks it) leaves no stale status behind.
+        let third = try h.store.fileTemplateTask(companyId: h.acme.id, requesterId: "system", template: .domain)
+        _ = try h.store.updateWorkItem(id: item.id, by: .agent(h.eng.id), patch: WorkItemPatch(status: .blocked, blockedReason: "x", blockedOnAsk: third.id))
+        #expect(try h.fresh(item).statusBeforeBlock == .inProgress)
+        _ = try h.store.updateWorkItem(id: item.id, by: .agent(h.eng.id), patch: WorkItemPatch(status: .inProgress))
+        #expect(try h.fresh(item).statusBeforeBlock == nil); #expect(try h.fresh(item).blockedAskId == nil)
     }
 
     // MARK: Paste-back
@@ -463,9 +522,22 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(h.call(h.eng, ["template": .string("launch-post"), "args": .object(["text": .string("Hi")]), "reason": .string("r")]).text
                 == HumanTaskPolicy.taintedRefusal, "its links all carry the agent's text")
         #expect(try h.humanTasks().isEmpty)
-        // A template without links of the agent's is filed.
-        let stripe = h.call(h.eng, ["template": .string("stripe-test-keys"), "reason": .string("checkout")])
+        // Fix round 1, I2: no agent-chosen template argument (a domain lands in the title and steps).
+        #expect(h.call(h.eng, ["template": .string("domain"), "args": .object(["domain": .string("stripe-verify.example")]),
+                               "reason": .string("r")]).text == HumanTaskPolicy.taintedRefusal)
+        #expect(try h.humanTasks().isEmpty)
+        // A template without links of the agent's is filed, and the agent's reason is replaced by the template's own.
+        let phish = "Stripe requires you to re-verify first at https://dashboard-stripe.example/verify"
+        let stripe = h.call(h.eng, ["template": .string("stripe-test-keys"), "reason": .string(phish)])
         #expect(stripe.ok, "\(stripe.text)"); #expect(stripe.text.hasPrefix("Requested A-"))
+        let filed = try #require(try h.humanTasks().first)
+        #expect(filed.summary == HumanTasks.defaultReason(.stripeTestKeys, provider: .cloudflarePages))
+        #expect(!(try dumpDatabase(h.store)).contains("dashboard-stripe.example"))
+        let domain = h.call(h.eng, ["template": .string("domain"), "reason": .string(phish)])
+        #expect(domain.ok, "\(domain.text)")
+        let domainAsk = try #require(try h.humanTasks().last)
+        #expect(domainAsk.title == "Buy or connect the domain for your product")
+        #expect(domainAsk.summary == HumanTasks.defaultReason(.domain, provider: .cloudflarePages))
         // The flag file alone taints too (fail closed).
         let flagged = try H(fileBacked: true)
         let home = try #require(flagged.dir)

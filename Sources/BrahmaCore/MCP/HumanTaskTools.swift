@@ -62,18 +62,22 @@ extension CompanyTools {
             return t
         }
         let templateArgs = try stringMap(args, "args")
-        // 0. The tainted-session rule (chief review L4): a template only, with nothing of the agent's that the owner would open.
-        //    launch-post is refused whole: every link it builds carries the agent's post text.
-        if try sessionIsTainted() {
+        // 0. The tainted-session rule (chief review L4): a template only, carrying nothing of the agent's that the owner reads or
+        //    opens. No title, steps, links, fields or template arguments (a `domain` would go into the title and steps; a
+        //    `url` into links), launch-post refused whole (every link it builds carries the agent's text), and the agent's
+        //    `reason` is replaced by the template's own (fix round 1, I2).
+        let tainted = try sessionIsTainted()
+        if tainted {
             let carries = ["links", "steps", "fields", "title"].contains { args[$0] != nil && args[$0] != .null }
-            if template == nil || carries || templateArgs["url"] != nil || template == .launchPost {
+            if template == nil || carries || !templateArgs.isEmpty || template == .launchPost {
                 do { try store.requestFreshSession(agentId: agentId) } catch {
                     diagnostics("brahma mcp: could not request a fresh session for \(agentId): \(error)")
                 }
                 throw ToolError(message: HumanTaskPolicy.taintedRefusal)
             }
         }
-        let reason = try string(args, "reason")
+        let agentReason = try string(args, "reason")
+        let reason: String? = tainted ? nil : agentReason
         // 1. The item is looked up in the acting agent's company only (another company's key is not found).
         let item = try optionalString(args, "item").map { try self.item(key: $0) }
         let steps: [String] = (args["steps"] == nil || args["steps"] == .null) ? [] : try stringArray(args, "steps")
