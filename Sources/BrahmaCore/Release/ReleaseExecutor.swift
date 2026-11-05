@@ -335,8 +335,9 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         }
         try checkStop(r)
 
-        // 7. Deploy: `deploying` is committed before any step runs.
-        try store.advanceRelease(id: r.id, from: .building, to: .deploying, now: clock())
+        // 7. Deploy. The token is read, and shown to be redactable, before `deploying` is committed (fix I1): nothing a
+        // token step prints reaches a log or the database unless the redactor demonstrably replaces this exact value (no
+        // secrets reload pending, none failed, the value long enough to be redacted). Otherwise nothing is deployed.
         let (companyId, secret) = (r.companyId, plan.tokenSecret)
         let vault = self.vault
         let token: String? = await blocking.run { try? vault.value(companyId: companyId, name: secret) }
@@ -346,6 +347,12 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         guard ChildEnvironment.droppedSecretNames([secret: token]).isEmpty else {
             throw Failure(stage: "deploy", detail: "token name", reason: "the provider token \(secret) cannot be passed to a deploy step")
         }
+        guard Self.redacts(store: store, token: token) else {
+            throw Failure(stage: "deploy", detail: "token not loaded for redaction",
+                          reason: "the hosting token \(secret) isn't loaded for redaction yet; propose again")
+        }
+        // `deploying` is committed before any step runs.
+        try store.advanceRelease(id: r.id, from: .building, to: .deploying, now: clock())
         let deployStep = plan.steps.lastIndex { $0.label == "deploy" } ?? (plan.steps.count - 1)
         var deployStdout = ""
         var tail = ""
@@ -523,6 +530,16 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     }
 
     // MARK: Helpers
+
+    /// Whether every place a token step's output can land would have `token` replaced (fix I1): the redactor is loaded with
+    /// no secret failed (`secretsHeld`), no reload is pending (it knows the stored secrets' current version; a read error
+    /// counts as pending), and it demonstrably redacts this exact value (a rotated value it has not loaded, or one too short
+    /// to redact, comes back unchanged).
+    static func redacts(store: Store, token: String) -> Bool {
+        guard !store.secretsHeld, (try? store.secretsReloadNeeded()) == false else { return false }
+        let redacted = store.redactor.apply(token)
+        return redacted != token && !redacted.contains(token)
+    }
 
     static func exists(_ url: URL) -> Bool {
         var st = stat()

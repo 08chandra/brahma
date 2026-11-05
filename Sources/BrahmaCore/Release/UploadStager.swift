@@ -26,6 +26,7 @@ public enum ReleaseError: Error, Equatable, CustomStringConvertible {
 /// - Every dot entry is skipped except `.well-known` (a `.git`, `.vercel`, `.wrangler`, `.DS_Store` never reaches the upload).
 /// - Before that rule (PR-10), any `.env` or `.env.*` entry anywhere refuses the whole stage: an env file is a mistake, never
 ///   silently dropped.
+/// - `node_modules` is never staged, at any depth (the Task 7 stager ruling; checked after the env-file refusal).
 /// - A symbolic link refuses it (the engine never follows one, here or later), and so does a file with a second hard link (a
 ///   sandboxed build could link a file it cannot read into its output and have the engine copy it, S7), one another user
 ///   owns, or anything that is not a file or a directory.
@@ -90,6 +91,9 @@ public enum UploadStager {
         return n == ".env" || n.hasPrefix(".env.")
     }
 
+    /// `node_modules` (any case: APFS is case-insensitive).
+    static func isDependencyTree(_ name: String) -> Bool { name.lowercased() == "node_modules" }
+
     static func envRefusal(_ rel: String) -> ReleaseError {
         .stage("output contains \(rel); env files are never deployed")
     }
@@ -99,9 +103,13 @@ public enum UploadStager {
         let names = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
         for name in names {
             let path = rel.isEmpty ? name : rel + "/" + name
-            // PR-10: env files are refused before the dot-entry rule could skip them.
+            // PR-10: env files are refused before the dot-entry rule (or the node_modules rule) could skip them.
             if isEnvFile(name) { throw envRefusal(path) }
             if name.hasPrefix("."), name != keptDotEntry { continue }
+            // The Task 7 stager ruling: a dependency tree is never staged, at any depth and whatever it is (npm's `.bin` links
+            // would otherwise refuse every Vercel "." stage); the provider builds or serves from the output, and the engine's
+            // own tools never come from the repo.
+            if isDependencyTree(name) { continue }
             var st = stat()
             guard lstat(export.appending(path: path).path, &st) == 0 else {
                 throw ReleaseError.stage("output changed while it was staged: \(path)")
