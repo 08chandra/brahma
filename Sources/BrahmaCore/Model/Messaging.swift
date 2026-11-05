@@ -48,6 +48,8 @@ public struct Message: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var createdAt: Date
     /// Set by the router (Task 10): `impersonation` when an agent's text claims to be the owner (`OwnerImpersonation`).
     public var flag: String? = nil
+    /// Written by a session that had read outside content (Task 10 fix round 1, I2): shown as untrusted, and it taints its reader.
+    public var taintedOrigin: Bool = false
 }
 
 public struct InboxItem: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {

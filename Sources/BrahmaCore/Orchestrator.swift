@@ -1004,9 +1004,14 @@ public actor Orchestrator {
             if !builtins.isDisjoint(with: ["Task", "Agent", "Workflow"]) {
                 let verified = await postToolGateVerified()
                 if TaintPolicy.preTaint(tools: builtins, network: sandboxed?.scope.network, hookVerified: verified) {
-                    try store.markTainted(agentId: agent.id, source: TaintPolicy.preTaintSource, now: clock())
+                    try markTaintedOrFlag(agent: agent, source: TaintPolicy.preTaintSource)
                     taintMarked = true
                 }
+            }
+            // I2: the turn reads what a tainted session wrote (a message, a work notice, the item's hand-off or review notes).
+            if !taintMarked, let relayed = ctx?.relayedTaint {
+                try markTaintedOrFlag(agent: agent, source: relayed)
+                taintMarked = true
             }
             let settingsText = try TurnProfileCompiler.settingsJSON(compiled)
             try await blocking.tryRun { try SettingsFile.write(settingsText, to: settingsFile) }
@@ -1049,7 +1054,7 @@ public actor Orchestrator {
                         if let source = TaintPolicy.source(toolName: name, toolInput: input, publisher: { id in
                             (try? store.extensionPublisher(companyId: companyId, extId: id)) ?? nil
                         }) {
-                            try store.markTainted(agentId: agent.id, source: source, now: clock())
+                            try markTaintedOrFlag(agent: agent, source: source)
                             taintMarked = true
                         }
                     case .toolUse(let name, _):
@@ -1260,6 +1265,14 @@ public actor Orchestrator {
         }
         let outcome = end.outcome
         await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)
+    }
+
+    /// `markTainted`, and when that write fails the flag file (fail closed, M2) before the error ends the turn.
+    nonisolated func markTaintedOrFlag(agent: Agent, source: String) throws {
+        do { try store.markTainted(agentId: agent.id, source: source, now: clock()) } catch {
+            TaintFlag.write(home: paths.home, agentId: agent.id, source: TaintPolicy.hookErrorSource)
+            throw error
+        }
     }
 
     /// The write barrier of a plan turn: the worktree must be clean and `HEAD` where it was. Otherwise the engine resets it,

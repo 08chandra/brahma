@@ -34,6 +34,8 @@ struct LiveSafetyTests {
         let dump = try store.events(afterId: 0).map(\.text).joined(separator: "\n")
         #expect(try store.ask(id: ask.id)?.status == .pendingInternal, "events:\n\(dump)")
         #expect(dump.contains("read outside content"), "events:\n\(dump)")
+        // M6: decide was attempted and refused (the refusal is what asks for the fresh session).
+        #expect(dump.contains("next turn starts a fresh session (tainted)"), "events:\n\(dump)")
         #expect(try store.agent(id: ceo.id)?.sessionId != before, "the next turn's session differs")
     }
 }

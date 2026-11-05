@@ -30,13 +30,14 @@ public enum TaintPolicy {
 
     /// Shell commands that reach the network or run code fetched from it (ERE, matched anywhere in the command).
     public static let bashPatterns: [String] = [
-        "(^|[^A-Za-z0-9_])(curl|wget|nc|ncat|telnet|ssh|scp|sftp|rsync|ftp)([^A-Za-z0-9_]|$)",
+        "(^|[^A-Za-z0-9_])(curl|wget|nc|ncat|telnet|ssh|scp|sftp|rsync|ftp|nscurl|aria2c|socat)([^A-Za-z0-9_]|$)",
         "openssl[[:space:]]+s_client",
         "(python3?|node|deno|bun|ruby|perl|php)[[:space:]]+(-c|-e|eval)",
         "(^|[^A-Za-z0-9_])(npm|npx|pnpm|yarn|pip3?|uv|cargo|gem|brew)[[:space:]]",
         "go[[:space:]]+(get|mod|install|run)",
         "swift[[:space:]]+package",
-        "git[[:space:]]+(clone|fetch|pull|submodule|ls-remote|archive[[:space:]]+--remote)",
+        // Global options may stand before the subcommand (`git -C lab fetch`, `git -c k=v pull`; I4).
+        "git([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+(clone|fetch|pull|submodule|ls-remote|remote[[:space:]]+update|archive[[:space:]]+--remote)([^A-Za-z0-9_]|$)",
         "(^|[^A-Za-z0-9_])gh[[:space:]]",
     ]
 
@@ -51,11 +52,15 @@ public enum TaintPolicy {
     /// The pre-tool hook's reason for `Agent`, `Task` and `Workflow` on a tainted session.
     public static let fanOutDenied = "This session read outside content; sub-agents and workflows are off until a fresh session."
 
-    /// The tool result a refused high-risk call returns.
+    /// The tool result a refused high-risk call returns. It suggests no hand-off or note (I2: what a tainted session writes
+    /// carries its taint to the reader).
     public static func refusal(tool: String, source: String) -> String {
-        "This session has read outside content (\(source)), so \(tool) is off for it. Note what you need in your progress file "
-            + "or a hand-off; your next turn starts a fresh session where \(tool) works again."
+        "This session has read outside content (\(source)), so \(tool) is off for it. Your next turn starts a fresh session where "
+            + "\(tool) works again."
     }
+
+    /// The digest's prefix for an item a tainted session wrote (I2).
+    public static let relayedPrefix = "[from a session that read outside content] "
 
     /// What one tool call read from outside the company, or nil. `publisher` names the installed publisher of an extension id
     /// (nil: not installed, which taints).
@@ -131,9 +136,10 @@ public enum TaintFlag {
 
     static func isSafeId(_ id: String) -> Bool { id.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil }
 
+    /// Present, or not provably absent: any `lstat` error but ENOENT reads as tainted (M4, fail closed).
     public static func exists(_ url: URL) -> Bool {
         var st = stat()
-        return lstat(url.path, &st) == 0
+        return lstat(url.path, &st) == 0 || errno != ENOENT
     }
 
     /// The source written into the flag, if it can be read (never through a link).
@@ -182,9 +188,19 @@ public enum PostToolHook {
         case failedClosed(String)
     }
 
+    /// Attempts at the database before failing closed (a busy or locked database is retried, M3), and the backoff between them.
+    public static let attempts = 3
+    public static let backoff: [Double] = [0.25, 0.75]
+
+    /// Waits `seconds` of awake time (`DispatchTime` counts no sleep), the hook being a short synchronous process.
+    public static func awakePause(_ seconds: Double) {
+        _ = DispatchSemaphore(value: 0).wait(timeout: .now() + seconds)
+    }
+
     public static func handle(stdin: Data, database: String, agentId: String, environment: [String: String],
                               now: Date = Store.now(),
-                              open: (String) throws -> Store = { try Store(path: $0) }) -> Outcome {
+                              open: (String) throws -> Store = { try Store(path: $0) },
+                              pause: (Double) -> Void = PostToolHook.awakePause) -> Outcome {
         guard TaintFlag.isSafeId(agentId) else { return .refused("--agent is not an agent id") }
         if let turnAgent = environment["BRAHMA_AGENT_ID"], turnAgent != agentId {
             return .refused("--agent does not match this turn's agent")
@@ -201,19 +217,26 @@ public enum PostToolHook {
               let tool = input["tool_name"]?.stringValue else {
             return failClosed("the hook input could not be read", nil)
         }
-        let store: Store
-        do { store = try open(database) } catch { return failClosed("the database could not be opened: \(error)", nil) }
-        let companyId: String?
-        do { companyId = try store.agent(id: agentId)?.companyId } catch { return failClosed("the agent could not be read: \(error)", store) }
-        guard let companyId else { return failClosed("no such agent", store) }
-        let source = TaintPolicy.source(toolName: tool, toolInput: input["tool_input"]?.objectValue ?? [:]) { id in
-            (try? store.extensionPublisher(companyId: companyId, extId: id)) ?? nil
+        let toolInput = input["tool_input"]?.objectValue ?? [:]
+        // A call whose source needs no extension lookup is classified without the database: a clean call (most company tools)
+        // never fails closed on a busy database (M3).
+        let needsLookup = ["Skill", "Task", "Agent"].contains(tool)
+        if !needsLookup, TaintPolicy.source(toolName: tool, toolInput: toolInput) == nil { return .clean }
+        var lastError: (any Error)?
+        for attempt in 0..<attempts {
+            if attempt > 0 { pause(backoff[min(attempt - 1, backoff.count - 1)]) }
+            do {
+                let store = try open(database)
+                guard let companyId = try store.agent(id: agentId)?.companyId else { return failClosed("no such agent", store) }
+                let source = TaintPolicy.source(toolName: tool, toolInput: toolInput) { id in
+                    (try? store.extensionPublisher(companyId: companyId, extId: id)) ?? nil
+                }
+                guard let source else { return .clean }
+                try store.markTainted(agentId: agentId, source: source, now: now)
+                return .tainted(source)
+            } catch { lastError = error }
         }
-        guard let source else { return .clean }
-        do { try store.markTainted(agentId: agentId, source: source, now: now) } catch {
-            return failClosed("the taint could not be recorded: \(error)", store)
-        }
-        return .tainted(source)
+        return failClosed("the taint could not be recorded: \(lastError.map { "\($0)" } ?? "unknown")", nil)
     }
 }
 
@@ -239,21 +262,59 @@ public enum OwnerImpersonation {
     public static let flag = "impersonation"
     public static let digestPrefix = "[unverified: claims to be the owner] "
 
+    /// Matched case-insensitively on `normalized(text)`, the form the recipient reads (I1).
     public static let patterns: [String] = [
-        #"\b(i am|i'm|this is|it's)\s+(the\s+)?owner\b"#,
+        #"\b(i am|i'm|im|this is|it's|its|here is|speaking as|acting as)\s+(the\s+)?(company\s+)?owner\b"#,
         #"\bon behalf of\s+(the\s+)?owner\b"#,
-        #"\b(message|instructions?|note|orders?)\s+from\s+(the\s+)?owner\b"#,
-        #"\bowner\s+(says|said|wants|approved|asked|told)\b"#,
-        #"(?m)^\s*@?owner\s*:"#,
+        #"\b(message|messages|instructions?|note|orders?|word|directive|request)\s+from\s+(the\s+)?owner\b"#,
+        #"\bowner\s+((has|had|have)\s+)?(says|said|wants|wanted|approved|approves|asked|told|authori[sz]ed|authori[sz]es|confirmed|signed off|decided|ordered|instructed)\b"#,
+        #"\b(approved|authori[sz]ed|confirmed|signed off)\s+by\s+(the\s+)?owner\b"#,
+        #"\b(the\s+)?(brahma\s+)?engine\s+((has|had)\s+)?(approved|authori[sz]ed|says|said)\b"#,
+        // An engine line marker anywhere in the text: `owner:`, `@owner:`, `@system:` (a forged digest line mid-text).
+        #"(^|[^a-z0-9_])@?owner\s*:"#,
+        #"@system\s*:"#,
     ]
+
+    /// What the recipient reads, folded for matching: Cc/Cf characters (zero-width, bidi, format) and line breaks as spaces
+    /// (as the digest renders them) and also dropped (a word split by a zero-width character reads whole), NFKC (fullwidth and
+    /// compatibility forms), Cyrillic and Greek lookalikes as Latin, whitespace collapsed.
+    public static func normalized(_ text: String) -> [String] {
+        let blocked = CharacterSet.newlines.union(.controlCharacters).union(.illegalCharacters)
+        func fold(_ s: String) -> String {
+            let nfkc = s.precomposedStringWithCompatibilityMapping.replacingOccurrences(of: "\u{2019}", with: "'")
+                .replacingOccurrences(of: "\u{2018}", with: "'").replacingOccurrences(of: "\u{02BC}", with: "'")
+            let mapped = String(String.UnicodeScalarView(nfkc.unicodeScalars.map { confusables[$0] ?? $0 }))
+            return mapped.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+        let spaced = String(String.UnicodeScalarView(text.unicodeScalars.map { blocked.contains($0) ? " " : $0 }))
+        let dropped = String(String.UnicodeScalarView(text.unicodeScalars.filter { $0.properties.generalCategory != .format }
+            .map { blocked.contains($0) ? " " : $0 }))
+        return Array(Set([fold(spaced), fold(dropped)]))
+    }
+
+    /// Cyrillic and Greek letters that render like Latin ones (the confusables skeleton for the letters of the patterns).
+    static let confusables: [Unicode.Scalar: Unicode.Scalar] = {
+        let pairs: [(String, String)] = [
+            ("а", "a"), ("е", "e"), ("о", "o"), ("р", "p"), ("с", "c"), ("х", "x"), ("у", "y"), ("і", "i"), ("ј", "j"), ("ѕ", "s"),
+            ("ԁ", "d"), ("һ", "h"), ("ԝ", "w"), ("ո", "n"), ("ѵ", "v"), ("к", "k"), ("м", "m"), ("т", "t"), ("н", "h"), ("в", "b"),
+            ("А", "A"), ("В", "B"), ("Е", "E"), ("К", "K"), ("М", "M"), ("Н", "H"), ("О", "O"), ("Р", "P"), ("С", "C"), ("Т", "T"),
+            ("Х", "X"), ("У", "Y"), ("І", "I"), ("Ѕ", "S"), ("Ԝ", "W"),
+            ("ο", "o"), ("α", "a"), ("ε", "e"), ("ρ", "p"), ("ν", "v"), ("τ", "t"), ("κ", "k"), ("ι", "i"), ("υ", "u"), ("ω", "w"),
+            ("η", "n"), ("Ο", "O"), ("Α", "A"), ("Ε", "E"), ("Ρ", "P"), ("Τ", "T"), ("Κ", "K"), ("Ι", "I"), ("Ν", "N"), ("Ω", "W"),
+            ("Η", "H"), ("Χ", "X"), ("Υ", "Y"), ("Β", "B"), ("Μ", "M"), ("Ζ", "Z"),
+        ]
+        var out: [Unicode.Scalar: Unicode.Scalar] = [:]
+        for (a, b) in pairs { out[a.unicodeScalars.first!] = b.unicodeScalars.first! }
+        return out
+    }()
 
     public static func flags(text: String, sender: Sender) -> Bool {
         switch sender {
         case .owner, .system: return false
         case .agent:
-            // Curly apostrophes count as straight ones ("I’m the owner").
-            let t = text.replacingOccurrences(of: "\u{2019}", with: "'")
-            return patterns.contains { t.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }
+            return normalized(text).contains { t in
+                patterns.contains { t.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }
+            }
         }
     }
 }

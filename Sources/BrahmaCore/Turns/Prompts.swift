@@ -96,7 +96,13 @@ public enum InboxDigest {
             }
             // The engine's prefix, never the text's (Task 10): the sender claimed to be the owner.
             let unverified = message.flag == OwnerImpersonation.flag ? OwnerImpersonation.digestPrefix : ""
-            out += "\n- \(unverified)\(source) @\(handle): \(text)"
+            if message.taintedOrigin {
+                // I2: written by a session that read outside content: framed as untrusted data, never as one of the engine's lines.
+                out += "\n- \(unverified)\(TaintPolicy.relayedPrefix)\(source) @\(handle):\n"
+                    + UntrustedBlock.render(source: "@\(handle), a session that read outside content", text: text, maxLines: 1)
+            } else {
+                out += "\n- \(unverified)\(source) @\(handle): \(text)"
+            }
         }
         return out + unreadLine
     }
@@ -119,7 +125,12 @@ public enum WorkNoticeDigest {
             }
             let flat = String(String.UnicodeScalarView(n.event.text.unicodeScalars.map { blockedInline.contains($0) ? " " : $0 }))
             let text = flat.count > maxText ? String(flat.prefix(maxText)) + "…" : flat
-            out += "\n- \(n.itemKey) \(n.event.kind.rawValue) by @\(actor): \(text)"
+            if n.event.taintedOrigin {
+                out += "\n- \(TaintPolicy.relayedPrefix)\(n.itemKey) \(n.event.kind.rawValue) by @\(actor):\n"
+                    + UntrustedBlock.render(source: "@\(actor), a session that read outside content", text: text, maxLines: 1)
+            } else {
+                out += "\n- \(n.itemKey) \(n.event.kind.rawValue) by @\(actor): \(text)"
+            }
         }
         if collapsed > 0 { out += "\n- … and \(collapsed) more (use list_work)" }
         return out

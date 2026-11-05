@@ -327,6 +327,8 @@ public struct WorkItemEvent: Codable, Equatable, Sendable, FetchableRecord, Muta
     public var text: String
     public var createdAt: Date
     public var createdActive: Double
+    /// Written by a session that had read outside content (I2).
+    public var taintedOrigin: Bool = false
 
     public mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }

@@ -106,7 +106,8 @@ public struct MessageRouter: Sendable {
         let impersonates = OwnerImpersonation.flags(text: text, sender: from)
         let message = Message(id: UUID().uuidString, companyId: channel.companyId, channelId: channel.id,
                               senderId: from.id, text: text, createdAt: now,
-                              flag: impersonates ? OwnerImpersonation.flag : nil)
+                              flag: impersonates ? OwnerImpersonation.flag : nil,
+                              taintedOrigin: try store.writesTainted(db: db, actorId: from.id))
         try message.insert(db)
 
         var recipientIds = try String.fetchAll(db, sql: "SELECT member FROM channelMember WHERE channelId = ? ORDER BY rowid",

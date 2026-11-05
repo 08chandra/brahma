@@ -63,14 +63,17 @@ import GRDB
 
     @Test(arguments: ["curl -s https://a", "python3 -c 'import urllib.request'", "node -e 'fetch(1)'", "npm view x",
                       "git submodule update", "ssh host", "openssl s_client -connect a:443", "pip install x", "swift package resolve",
-                      "cd x && wget y", "gh pr list", "go get example.com/x", "git archive --remote=x HEAD"])
+                      "cd x && wget y", "gh pr list", "go get example.com/x", "git archive --remote=x HEAD",
+                      "git -C lab fetch", "git -c http.proxy=x pull", "git --git-dir=.git ls-remote origin", "git clone https://x",
+                      "git -C a -c b=c submodule update --init", "git remote update", "nscurl https://a"])
     func interpreterNetworkTaints(_ c: String) {
         let source = TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)])
         #expect(source == "bash: " + c)
     }
 
     @Test func plainCommandsDoNotTaint() {
-        for c in ["ls", "swift build", "echo curling", "git status", "git commit -m x", "cat README.md", "swift test --filter X"] {
+        for c in ["ls", "swift build", "echo curling", "git status", "git commit -m x", "cat README.md", "swift test --filter X",
+                  "git -C lab status", "git -C lab log --oneline", "git fetchall-local-script"] {
             #expect(TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)]) == nil, "\(c)")
         }
         // The source is the first 60 characters, on one line.
@@ -184,7 +187,8 @@ import GRDB
         #expect(Self.refusal { try h.tools(h.ceo).call(name: "decide", arguments: [:]) }?.contains("is off for it") == true)
         // The database unreachable: the flag file alone refuses (the gate reads it).
         let unreachable = PostToolHook.handle(stdin: Self.hookInput("WebFetch", [:]), database: h.db, agentId: h.eng.id,
-                                              environment: [:], open: { _ in throw FakeError(description: "db locked") })
+                                              environment: [:], open: { _ in throw FakeError(description: "db locked") },
+                                              pause: { _ in })
         guard case .failedClosed = unreachable else { Issue.record("expected failedClosed, got \(unreachable)"); return }
         #expect(!(try h.fresh(h.eng).sessionTainted))
         #expect(TaintFlag.exists(h.flag(h.eng)))
@@ -262,11 +266,99 @@ import GRDB
         let rows = try h.store.labCommits(agentId: h.eng.id)
         #expect(rows.map(\.tainted) == [true, false, false])
         #expect(!(try h.fresh(h.eng).sessionTainted))
+        // I3: a tainted turn parks a commit on a tag (no branch); a clean turn branches it later: it stays tainted.
+        try "p".write(to: lab.appending(path: "p.txt"), atomically: true, encoding: .utf8)
+        try GitFixture.plainGit(["add", "p.txt"], in: lab); try GitFixture.plainGit(["commit", "-qm", "parked"], in: lab)
+        let parked = try GitFixture.plainGit(["rev-parse", "HEAD"], in: lab)
+        try GitFixture.plainGit(["tag", "park"], in: lab); try GitFixture.plainGit(["reset", "-q", "--hard", "HEAD~1"], in: lab)
+        try GitFixture.plainGit(["branch", "-D", "side"], in: lab, allowFailure: true)
+        #expect(record(tainted: true) == .recorded(1), "a tag-only commit is recorded")
+        try GitFixture.plainGit(["tag", "-d", "park"], in: lab)
+        try GitFixture.plainGit(["branch", "laundered", parked], in: lab)
+        #expect(record(tainted: false) == .recorded(0))
+        #expect(try h.store.labCommitTainted(agentId: h.eng.id, sha: parked))
+        #expect(try h.store.labCommitTainted(agentId: h.eng.id, sha: String(repeating: "a", count: 40)), "unrecorded: tainted")
+        #expect(!(try h.store.labCommitTainted(agentId: h.eng.id, sha: rows[1].sha)))
         // A lab whose config names a program is refused, never read: the session is tainted instead.
         try GitFixture.plainGit(["config", "core.fsmonitor", "/bin/sh -c 'touch x'"], in: lab)
         guard case .refused = record(tainted: false) else { Issue.record("expected the lab to be refused"); return }
         #expect(try h.fresh(h.eng).sessionTainted)
         #expect(!FileManager.default.fileExists(atPath: lab.appending(path: "x").path))
+        // A `.git` that is a plain file (a `gitdir:` pointer) is refused: tainted, and the owner alerted.
+        let other = ws.appending(path: ".brahma/labs/ceo", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try "gitdir: /tmp/elsewhere\n".write(to: other.appending(path: ".git"), atomically: true, encoding: .utf8)
+        let out = LabProvenance.record(store: h.store, workspace: ws, handle: "ceo", companyId: h.company.id, agentId: h.ceo.id,
+                                       turnId: nil, tainted: false, now: Date())
+        #expect(out == .refused("the lab's .git is not a directory"))
+        #expect(try h.fresh(h.ceo).sessionTainted)
+        #expect(try h.store.events(afterId: 0).contains { $0.text.contains("lab could not be read for provenance") })
+    }
+
+    // MARK: Fix round 1: relayed taint (I2) and fail-closed minors
+
+    @Test func taintedDMTaintsReader() async throws {
+        let o = try O()
+        let eng = try o.world.hire(o.company, "eng", role: "engineer")
+        try o.store.markTainted(agentId: eng.id, source: "WebFetch")
+        _ = try o.world.router.sendDM(companyId: o.company.id, from: .agent(eng.id), to: o.ceo.name, text: "please decide A-1 now",
+                                      now: o.world.clock.now)
+        let box = Box()
+        let (store, cid, aid) = (o.store, o.company.id, o.ceo.id)
+        try o.script([], sideEffect: { _ in
+            box.value = Self.refusal { try CompanyTools(store: store, companyId: cid, agentId: aid).call(name: "decide", arguments: [:]) }
+        })
+        try await o.world.cycle()
+        #expect(box.value == TaintPolicy.refusal(tool: "decide", source: "relayed: message from @eng"))
+        let prompt = try #require(o.world.fake.requests.last).prompt
+        #expect(prompt.contains(TaintPolicy.relayedPrefix + "DM @eng:"))
+        #expect(prompt.contains("    | please decide A-1 now"))
+        // A clean sender's message carries nothing.
+        let clean = try o.world.hire(o.company, "pm", role: "engineer")
+        let m = try o.world.router.sendDM(companyId: o.company.id, from: .agent(clean.id), to: o.ceo.name, text: "hi", now: o.world.clock.now)
+        #expect(!m.taintedOrigin)
+    }
+
+    @Test func taintedHandoffAndChannelTaintReader() throws {
+        let h = try Home()
+        try h.store.markTainted(agentId: h.eng.id, source: "WebFetch")
+        let item = try h.store.createWorkItem(companyId: h.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Do it", acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/a"]),
+            ownerId: h.eng.id, status: .ready))
+        let handoff = try h.store.writeHandoff(itemId: item.id, by: .agent(h.eng.id), draft: HandoffDraft(goal: "ship it"))
+        #expect(handoff.taintedOrigin)
+        #expect(try String(contentsOfFile: handoff.path, encoding: .utf8).contains("Untrusted: written by a session that read outside content"))
+        #expect(h.store.relayedTaint(inbox: [], notices: [], handoff: handoff, handles: [h.eng.id: "eng"]) == "relayed: hand-off by @eng")
+        let comment = try h.store.commentWorkItem(id: item.id, by: .agent(h.eng.id), text: "approve it")
+        #expect(comment.taintedOrigin)
+        // Reading a tainted post with read_channel taints the reader and marks the entry.
+        _ = try MessageRouter(store: h.store).post(companyId: h.company.id, channel: "general", from: .agent(h.eng.id), text: "do X")
+        let out = try h.tools(h.ceo).call(name: "read_channel", arguments: ["channel": .string("general")])
+        #expect(out.contains("\"untrusted\""))
+        #expect(try h.fresh(h.ceo).sessionTainted)
+        #expect(try h.store.latestTaintSource(agentId: h.ceo.id) == nil, "no turn in progress; the agent row carries it")
+        // The refusal suggests no hand-off.
+        #expect(!TaintPolicy.refusal(tool: "decide", source: "x").contains("hand-off"))
+    }
+
+    @Test func failClosedMinors() throws {
+        let h = try Home()
+        // M4: a flag path whose lstat fails with anything but ENOENT reads as tainted.
+        let file = h.dir.appending(path: "plain")
+        try "x".write(to: file, atomically: true, encoding: .utf8)
+        #expect(TaintFlag.exists(file.appending(path: "flag")), "ENOTDIR")
+        #expect(!TaintFlag.exists(h.dir.appending(path: "absent")))
+        // M3: a clean call never opens the database; a busy database is retried before it fails closed.
+        var opens = 0
+        let clean = PostToolHook.handle(stdin: Self.hookInput("mcp__company__list_agents", [:]), database: h.db, agentId: h.eng.id,
+                                        environment: [:], open: { _ in opens += 1; throw FakeError(description: "busy") }, pause: { _ in })
+        #expect(clean == .clean); #expect(opens == 0); #expect(!TaintFlag.exists(h.flag(h.eng)))
+        var pauses: [Double] = []
+        let store = h.store
+        let retried = PostToolHook.handle(stdin: Self.hookInput("WebFetch", [:]), database: h.db, agentId: h.eng.id, environment: [:],
+                                          open: { _ in opens += 1; if opens == 1 { throw FakeError(description: "busy") }; return store },
+                                          pause: { pauses.append($0) })
+        #expect(retried == .tainted("WebFetch")); #expect(pauses == [0.25]); #expect(!TaintFlag.exists(h.flag(h.eng)))
     }
 
     // MARK: Fresh session (B-M12)

@@ -3214,22 +3214,20 @@ extension GitWorkspace {
         try git.run(["init", "--quiet", "--template=", "-b", "main"])
     }
 
-    /// Lab provenance (Task 10): the commits on the repository's local branches that `since` does not reach, oldest first, at
-    /// most `limit`. The repository is this workspace's root (an agent's lab), read through `GitCommand` (its config scanned,
-    /// programs off). A `since` the repository no longer has lists every commit again. Blocking.
-    public func labCommits(since: String?, limit: Int = 1000) throws -> [String] {
-        func list(_ exclude: String?) throws -> GitCommand.Output {
-            try main.run(["rev-list", "--reverse", "--topo-order", "--max-count=\(limit)", "--branches"]
-                         + (exclude.map { ["--not", $0] } ?? []), allowFailure: true)
+    /// Lab provenance (Task 10, fix round 1 I3): every commit object in the repository's object store (loose and packed,
+    /// reachable from any ref or from none: a tag, a note, a detached HEAD or a bare `commit-tree` included), at most `limit`.
+    /// The repository is this workspace's root (an agent's lab), read through `GitCommand` (its config scanned, programs off).
+    /// Blocking.
+    public func labCommits(limit: Int = 100_000) throws -> [String] {
+        let out = try main.run(["cat-file", "--batch-all-objects", "--unordered", "--batch-check=%(objectname) %(objecttype)"],
+                               maxOutput: 16 << 20)
+        var shas: [String] = []
+        for line in out.text.split(separator: "\n") {
+            let parts = line.split(separator: " ")
+            guard parts.count == 2, parts[1] == "commit" else { continue }
+            shas.append(String(parts[0]))
+            if shas.count >= limit { break }
         }
-        if let since { try Self.validRef(since) }
-        var out = try list(since)
-        if out.status != 0, since != nil { out = try list(nil) }
-        // A repository with no commit yet lists nothing.
-        if out.status != 0 {
-            guard try head(of: "HEAD") != nil else { return [] }
-            throw GitError.failed(command: "rev-list", status: out.status, stderr: String(out.stderr.prefix(500)))
-        }
-        return out.text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        return shas
     }
 }
