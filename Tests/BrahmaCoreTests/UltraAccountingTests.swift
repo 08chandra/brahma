@@ -251,6 +251,71 @@ enum BrahmaToolsForUltra {
         #expect(!(u.g.requests().last?.prompt.contains("multi-agent orchestration") ?? true), "no Ultra digest line")
     }
 
+    /// Rivals appear between admission and reservation (on the fresh-usage probe, which comes after the count gates): two open
+    /// reservations fill max20x's concurrent cap of 2.
+    private func rivalsOnNextProbe(_ u: UltraWorld) {
+        let store = u.store, companyId = u.company.id, now = u.world.clock.now
+        let usage = #"{"type":"control_response","response":{"subtype":"success","request_id":"cu","response":{"subscription_type":"max","rate_limits":{"five_hour":{"utilization":30},"seven_day":{"utilization":20},"extra_usage":{"is_enabled":false}}}}}"#
+        let inserted = OnceFlag()
+        u.world.fake.controlResponder = { _, _ in
+            if !inserted.isSet {
+                inserted.set()
+                try? store.writer.write { db in
+                    for n in 1...2 {
+                        try UltraReservation(turnId: "rival-\(n)", companyId: companyId, itemId: nil, variant: .small, capLE: 0.01,
+                                             approvedBy: "owner", askId: nil, createdAt: now, releasedAt: nil, actualLE: nil).insert(db)
+                    }
+                }
+            }
+            return ControlTranscript(exitStatus: nil, lines: [usage])
+        }
+    }
+
+    /// Fix round 2, N3: the S28 fallback in the engine. The reservation loses its race: the turn runs the computed rung with the
+    /// reason, no digest line, nothing consumed, no slots held, the approval still waiting.
+    @Test func lostReservationRaceRunsTheComputedRung() async throws {
+        let u = try UltraWorld(tag: "lostReservationRaceRunsTheComputedRung")
+        try u.approveRun()
+        u.scriptUltraSuccess(cost: 1)
+        try await u.runToUltraTurn()                                        // both canary keys pass on a first run
+        #expect(try u.lastTurn().mode == "ultra")
+        try u.approveRun()
+        rivalsOnNextProbe(u)
+        u.world.fake.script(u.eng.name, FakeTurnRunner.Script())
+        try await u.runToUltraTurn()
+        let t = try u.lastTurn()
+        #expect(t.mode != "ultra")
+        #expect(t.modeReason?.contains("Ultra not admitted: another Ultra turn is running (at most 2 at once)") == true, "\(t.modeReason ?? "")")
+        #expect(!(u.g.requests().last?.prompt.contains("multi-agent orchestration") ?? true))
+        #expect(try u.store.ultraReservation(turnId: t.id) == nil)
+        #expect(try u.store.workItem(id: u.item.id)?.budgetBoostLE == 15, "only the first run's boost")
+        #expect(await u.world.orchestrator.companyRunning(u.company.id) == 0)
+        #expect(try u.store.pendingUltraRun(itemId: u.item.id) != nil, "the approval waits")
+    }
+
+    /// Fix round 2, N1: after a late Ultra drop the computed rung fans out (sub-agents) on a shape whose canary has not passed:
+    /// the turn falls back to no sub-agents and runs, the agent does not wait on that canary.
+    @Test func lateUltraDropFallsBackOnAnUnverifiedTaskShape() async throws {
+        let u = try UltraWorld(tag: "lateUltraDropFallsBackOnTaskShape")
+        try u.approveRun()
+        u.scriptUltraSuccess(cost: 1)
+        try await u.runToUltraTurn()
+        #expect(try u.lastTurn().mode == "ultra")
+        // Now the sub-agent gate passes (the Task shape's own canary key has not), and the next Ultra run loses its race.
+        try u.g.record(["L-2", "V-2", "V-3", "V-5"], .sandboxedTask)
+        try u.approveRun()
+        rivalsOnNextProbe(u)
+        u.world.fake.script(u.eng.name, FakeTurnRunner.Script())
+        let before = u.g.requests().count
+        try u.world.dm(u.company, u.eng, "go")
+        try await u.world.cycle()
+        #expect(u.g.requests().count == before + 1, "the turn ran: it did not wait on the Task shape's canary")
+        let r = try #require(u.g.requests().last)
+        #expect(r.mode?.mode != .ultra); #expect(r.mode?.subagents == .off)
+        #expect(!(TurnProfileCompiler.profile(for: r).tools ?? []).contains("Task"))
+        #expect(try u.store.events(afterId: 0, companyId: u.company.id).contains { $0.text.hasPrefix("sandbox not verified for the task shape") })
+    }
+
     @Test func refusedUltraRunsTheComputedRungAndKeepsTheApproval() async throws {
         // Five-hour use above 60% in the fresh reading: the turn runs Deep and records why; the approval waits.
         let u = try UltraWorld(tag: "refusedUltraRunsTheComputedRung", fiveHour: 0.65)
@@ -263,4 +328,12 @@ enum BrahmaToolsForUltra {
         #expect(try u.store.ultraReservations(companyId: u.company.id).isEmpty)
         #expect(try u.store.workItem(id: u.item.id)?.budgetBoostLE == 0)
     }
+}
+
+/// Set once, read from any thread.
+private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
 }

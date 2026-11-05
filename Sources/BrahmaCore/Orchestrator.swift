@@ -970,7 +970,9 @@ public actor Orchestrator {
             let gate = profile == .sandboxed ? sandboxCanary : nil
             // Task 14u: a fan-out shape (Task, Ultra) runs only once its own canary key passed. Until then this turn falls back
             // to the computed rung without it (the shape's canary is asked for in the background); the agent never waits on it.
-            if let gate {
+            // Run again after any later re-selection (fix round 2, N1): a computed rung that fans out falls back the same way.
+            func settleFanOut() async throws {
+                guard let gate else { return }
                 for _ in 0..<2 {
                     guard let launch = CanaryShape.launch(mode) else { break }
                     let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
@@ -979,6 +981,7 @@ public actor Orchestrator {
                     try adopt(Self.withoutFanOut(inputs, launch: launch))
                 }
             }
+            try await settleFanOut()
             var gatedShape: String?
             if let gate {
                 let settings = TurnProfileCompiler.profile(for: try turnRequest(mcpConfigPath: Self.gateMCPPlaceholder)).settings
@@ -1007,11 +1010,12 @@ public actor Orchestrator {
             let promptBeforeUltra = turnPrompt
             if let plan = ultraPlan, mode.workflow != nil, let itemId = scope.itemId {
                 do {
-                    try await reserveUltraRun(plan, turnId: turn.id, companyId: company.id, itemId: itemId)
+                    try await reserveUltraRun(plan, turnId: turn.id, company: company, itemId: itemId)
                     ultraReserved = true
                     if let w = mode.workflow { turnPrompt += "\n\n" + UltraDigest.line(w) }
                 } catch let refusal as UltraRefusal {
                     try dropUltra(refusal.reason)
+                    try await settleFanOut()
                 }
             } else {
                 ultraPlan = nil
@@ -1032,6 +1036,7 @@ public actor Orchestrator {
                     ultraReserved = false
                     turnPrompt = promptBeforeUltra
                     try dropUltra("the session read outside content")
+                    try await settleFanOut()
                 }
             }
             // The session change decided above, now that the turn launches.
@@ -1075,7 +1080,8 @@ public actor Orchestrator {
             // The test keys the holder took with `use_secret` (Task 4-wire): only a work turn on the leased item, applied by the
             // runner after `ChildEnvironment`'s drop step; a plan, review, audit or notice turn gets none. Read after the sandbox
             // gate (a read, nothing consumed), never part of the gated shape.
-            if kind == .work, let leased = leaseHead?.item {
+            // Never on an Ultra turn (fix round 2, N5): its workflow agents share the parent's environment and MCP server.
+            if kind == .work, mode.workflow == nil, let leased = leaseHead?.item {
                 request.secrets = try store.injectableSecrets(agentId: agent.id, itemId: leased.id)
             }
             let compiled = TurnProfileCompiler.profile(for: request)

@@ -115,10 +115,26 @@ extension Orchestrator {
 
     // MARK: Reservation and slots
 
-    /// Reserves the admitted run's cap (and consumes its approval), and holds the extra slots its workflow agents take.
-    nonisolated func reserveUltraRun(_ plan: UltraPlan, turnId: String, companyId: String, itemId: String) async throws {
-        try store.reserveUltra(turnId: turnId, companyId: companyId, itemId: itemId, run: plan.run, caps: plan.caps, now: clock())
-        await occupySlots(companyId: companyId, extra: max(0, plan.caps.slots - 1))
+    /// Reserves the admitted run's cap (and consumes its approval), and holds the extra slots its workflow agents take. Gate 9
+    /// is judged again and its slots taken in one actor step (fix round 2, N4: two companies' Ultra turns cannot both pass on
+    /// the slots left), then the count gates in the reserving transaction (S28); a refusal of either gives the slots back.
+    nonisolated func reserveUltraRun(_ plan: UltraPlan, turnId: String, company: Company, itemId: String) async throws {
+        try await claimUltraSlots(company: company, caps: plan.caps)
+        do {
+            try store.reserveUltra(turnId: turnId, companyId: company.id, itemId: itemId, run: plan.run, caps: plan.caps, now: clock())
+        } catch {
+            await occupySlots(companyId: company.id, extra: -max(0, plan.caps.slots - 1))
+            throw error
+        }
+    }
+
+    /// Gate 9 and the slot claim, atomic on the actor.
+    func claimUltraSlots(company: Company, caps: UltraCaps) throws {
+        let free = ultraFreeSlots(company: company, includingAsking: true)
+        guard free >= caps.slots + 1 else {
+            throw UltraRefusal(gate: 9, reason: "no free slots (\(max(0, free)) free, Ultra needs \(caps.slots + 1))")
+        }
+        occupySlots(companyId: company.id, extra: max(0, caps.slots - 1))
     }
 
     /// After an Ultra turn: its extra slots are free again; a run that never launched gives its approval back.

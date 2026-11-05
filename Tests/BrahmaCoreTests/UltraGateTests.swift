@@ -512,6 +512,24 @@ private struct ApprovalWorld {
         }
     }
 
+    /// Fix round 2, N4: gate 9 is judged again, and the slots taken, in one actor step at reservation: two companies' Ultra
+    /// turns on max20x cannot both pass on the slots left.
+    @Test func gate9RecheckedAtomicallyAcrossCompanies() async throws {
+        let w = try World(config: World.config(hardCap: 10))
+        let a = try w.company("Alpha", mode: .max, profile: .sandboxed)
+        let b = try w.company("Beta", mode: .max, profile: .sandboxed)
+        // Each company has its asking Ultra turn running (one slot each).
+        await w.orchestrator.occupySlots(companyId: a.id, extra: 1)
+        await w.orchestrator.occupySlots(companyId: b.id, extra: 1)
+        #expect(await w.orchestrator.ultraFreeSlots(company: a, includingAsking: true) >= UltraCaps.max20x.slots + 1)
+        #expect(await w.orchestrator.ultraFreeSlots(company: b, includingAsking: true) >= UltraCaps.max20x.slots + 1,
+                "at preflight both would pass")
+        try await w.orchestrator.claimUltraSlots(company: a, caps: .max20x)
+        await #expect(throws: UltraRefusal.self) { try await w.orchestrator.claimUltraSlots(company: b, caps: .max20x) }
+        #expect(await w.orchestrator.companyRunning(a.id) == 1 + UltraCaps.max20x.slots - 1)
+        #expect(await w.orchestrator.companyRunning(b.id) == 1, "the refused claim took nothing")
+    }
+
     /// I4: gate 9 counts slots as the scheduler does (the engine's hard cap and its engine-wide room).
     @Test func gate9UsesTheSchedulersEffectiveCap() async throws {
         let w = try World(config: World.config(hardCap: 2))

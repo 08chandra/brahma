@@ -165,7 +165,8 @@ public enum ClaudeSettingsCompiler {
     public static var ultraMCPDenies: [String] {
         CompanyTools.highRiskTools.union(ultraExtraMCPDenies).sorted().map { "mcp__company__\($0)" }
     }
-    static let ultraExtraMCPDenies: Set<String> = ["propose_extension"]
+    /// `use_secret` too (fix round 2, N5): no test key reaches an Ultra turn, whose workflow agents all share its MCP server.
+    static let ultraExtraMCPDenies: Set<String> = ["propose_extension", "use_secret"]
     public static let ultraSkillDenies = ["Skill(deep-research)", "Skill(ultrareview)"]
     /// The Task 10 PostToolUse hook's matcher.
     public static let postToolMatcher = "WebFetch|WebSearch|Bash|mcp__.*|Skill|Task|Agent"

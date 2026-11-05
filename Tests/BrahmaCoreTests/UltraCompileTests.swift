@@ -177,6 +177,10 @@ private func compiled(_ r: TurnRequest) -> TurnProfile { TurnProfileCompiler.pro
         let deny = Set(compiled(try w.request(d)).settings.permissions?.deny ?? [])
         for tool in CompanyTools.highRiskTools { #expect(deny.contains("mcp__company__\(tool)"), "\(tool)") }
         #expect(deny.contains("mcp__company__confirm_spec")); #expect(deny.contains("mcp__company__readopt_branch"))
+        // Fix round 2, N5: no test key reaches an Ultra turn.
+        #expect(deny.contains("mcp__company__use_secret"))
+        let standard = ModePolicy.select({ var i = eligibleUltraInputs(); i.tier = .s; return i }())
+        #expect(!(compiled(try w.request(standard)).settings.permissions?.deny ?? []).contains("mcp__company__use_secret"))
         #expect(d.quotas.highRisk == 0)
         let tools = CompanyTools(store: w.store, companyId: w.company.id, agentId: w.eng.id, quotas: d.quotas)
         #expect {
