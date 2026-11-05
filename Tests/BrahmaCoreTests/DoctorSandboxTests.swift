@@ -12,7 +12,10 @@ private final class FakeCanary: SandboxCanaryRunning, @unchecked Sendable {
     private var _shapes: [String] = []
     private var _settingsShapes: [String?] = []
     private var _verifiedShape: String?
+    private var _hold: (@Sendable () async -> Void)?
     init(passes: Bool) { _passes = passes }
+    /// Awaited before each run reports: lets a test hold the canary until the agents it is about are all waiting for it.
+    var hold: (@Sendable () async -> Void)? { get { lock.withLock { _hold } } set { lock.withLock { _hold = newValue } } }
     var passes: Bool { get { lock.withLock { _passes } } set { lock.withLock { _passes = newValue } } }
     var verifiedShape: String? { get { lock.withLock { _verifiedShape } } set { lock.withLock { _verifiedShape = newValue } } }
     var shapes: [String] { lock.withLock { _shapes } }
@@ -24,6 +27,7 @@ private final class FakeCanary: SandboxCanaryRunning, @unchecked Sendable {
             _shapes.append(key.shape); _settingsShapes.append(settings?.shape())
             return (_passes, _verifiedShape)
         }
+        if let hold { await hold() }
         var verified = key
         if let other { verified.shape = other }
         return CanaryRun(items: [DoctorItem(name: "sandbox-backend", status: .pass, detail: "fake"),
@@ -308,14 +312,23 @@ private struct GateWorld {
     @Test func twoAgentsOfOneKeyRunOneCanary() async throws {
         let g = try GateWorld(passes: true)
         let eng2 = try g.world.store.hire(companyId: g.sandboxed.id, name: "eng-2", role: "engineer", model: "sonnet")
+        // The two turns' gates run concurrently: the canary is held until BOTH agents wait for its key (an event on the
+        // engine, not a timing guess), so neither gate can see the pass early, whichever of them asked first. The hold is
+        // bounded: past the backstop the canary reports anyway and the assertions below fail.
+        let orchestrator = g.world.orchestrator
+        g.canary.hold = {
+            let deadline = AwakeTime.deadline(after: .seconds(120))
+            while await orchestrator.canaryWaiting.count < 2, AwakeTime.now < deadline { try? await AwakeTime.sleep(for: .milliseconds(10)) }
+        }
         try g.world.dm(g.sandboxed, eng2, "go")
         try await g.turnOnce()
         #expect(g.canary.shapes.count == 1)
         #expect(Set(g.canary.shapes).count == 1)
+        #expect(g.requests(g.eng).isEmpty && g.requests(eng2).isEmpty, "both agents waited for the one canary")
+        g.canary.hold = nil
         try g.world.dm(g.sandboxed, eng2, "go on")
         try await g.turnOnce()
-        // eng-2's first gate may already have seen the pass (the two turns run concurrently): it ran once or twice.
-        #expect(g.requests(g.eng).count == 1); #expect(g.requests(eng2).count >= 1)
+        #expect(g.requests(g.eng).count == 1); #expect(g.requests(eng2).count == 1)
         #expect(g.canary.shapes.count == 1, "both agents ran on the one pass")
     }
 

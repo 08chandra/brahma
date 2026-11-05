@@ -279,14 +279,17 @@ import GRDB
         let dir = try tempDir(), runs = dir.appending(path: "runs.log")
         let (_, tools) = try fakeBin(["litestream": "echo \"$@\" >> \"$TMPDIR/runs.log\"\nexit 1"], env: ["TMPDIR": dir.path])
         let delays = Delays()
+        // A run's length is measured on an injected clock (one awake second per reading): however long a fake launch takes
+        // under load, no run counts as healthy (`ShipperBackoff.healthyRun`), so the backoff never resets mid-test.
+        let ticks = Ticks()
         let shipper = WALShipper(executable: try #require(tools.litestream), paths: env.paths, tools: tools, sleeper: { d in
             delays.add(d)
             if delays.count >= 4 { throw CancellationError() }
-        })
+        }, awakeUptime: { ticks.next() })
         shipper.start()
         // The supervisor loop runs real fake-script launches; under full-suite load they can take far longer than a quick
         // deadline, so wait on the condition (4 backoffs seen, which means 4 starts) with a generous awake-time bound.
-        let deadline = AwakeTime.deadline(after: .seconds(120))
+        let deadline = AwakeTime.deadline(after: .seconds(300))
         while delays.count < 4, AwakeTime.now < deadline { try await AwakeTime.sleep(for: .milliseconds(20)) }
         shipper.stop()
         #expect(delays.all == [5, 10, 20, 40].map { Duration.seconds($0) })
@@ -366,18 +369,19 @@ import GRDB
 
     private func pidAlive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 }
 
-    /// A fake long-running litestream that still ends by itself (about 20 s), so a failing test never leaves a child behind
-    /// forever.
-    static let boundedLoop = "i=0\nwhile [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done"
+    /// A fake long-running litestream: it outlives any test under load (a process whose being alive is asserted must not end
+    /// by itself mid-test) and the test kills it, yet it still ends by itself after about 10 min, so a crashed test never
+    /// leaves a child behind forever.
+    static let longLoop = "i=0\nwhile [ $i -lt 6000 ]; do sleep 0.1; i=$((i+1)); done"
 
-    /// A child the test starts itself: no inherited stdout/stderr (a leftover child must never hold the test runner's pipes).
-    static func quiet(_ p: Process) {
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+    /// The pid a script wrote as one whole line to `file` (`echo $! > file`), or nil while the line is not complete yet.
+    static func pidLine(_ file: URL) -> Int32? {
+        guard let text = try? String(contentsOf: file, encoding: .utf8), text.hasSuffix("\n") else { return nil }
+        return Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    private func waitUntil(_ seconds: Int = 20, _ condition: () -> Bool) async throws {
+    /// Waits on `condition`, bounded by a generous awake-time deadline (full-suite load can slow fake launches a lot).
+    private func waitUntil(_ seconds: Int = 120, _ condition: () -> Bool) async throws {
         let deadline = AwakeTime.deadline(after: .seconds(seconds))
         while !condition(), AwakeTime.now < deadline { try await AwakeTime.sleep(for: .milliseconds(20)) }
     }
@@ -672,7 +676,7 @@ import GRDB
 
     @Test func litestreamChildDiesOnStop() async throws {
         let env = try BackupEnv()
-        let (_, tools) = try fakeBin(["litestream": "exec sleep 30"])
+        let (_, tools) = try fakeBin(["litestream": "exec sleep 600"])     // alive until stopped, however slow the suite runs
         let shipper = WALShipper(executable: try #require(tools.litestream), paths: env.paths, tools: tools)
         shipper.start()
         try await waitUntil { recordedPID(env.paths) != nil }
@@ -690,69 +694,75 @@ import GRDB
     @Test(arguments: [false, true]) func stopKillsTheProcessGroup(ignoreTerm: Bool) async throws {
         let env = try BackupEnv()
         let childFile = try tempDir().appending(path: "grandchild.pid")
-        let body = (ignoreTerm ? "trap '' TERM\n" : "") + "sleep 30 &\necho $! > '\(childFile.path)'\nwait"
+        // The pid line is written after the trap is set: once it reads whole, the trap is in place (no fixed sleep). The
+        // grandchild lives until it is killed, however slow the suite runs.
+        let body = (ignoreTerm ? "trap '' TERM\n" : "") + "sleep 600 &\necho $! > '\(childFile.path)'\nwait"
         let (_, tools) = try fakeBin(["litestream": body])
         let shipper = WALShipper(executable: try #require(tools.litestream), paths: env.paths, tools: tools, grace: 0.3)
         shipper.start()
-        try await waitUntil { recordedPID(env.paths) != nil && FileManager.default.fileExists(atPath: childFile.path) }
-        try await AwakeTime.sleep(for: .milliseconds(200))
+        try await waitUntil { recordedPID(env.paths) != nil && Self.pidLine(childFile) != nil }
         let leader = try #require(recordedPID(env.paths))
-        let grandchild = try #require(Int32((try String(contentsOf: childFile, encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines)))
+        let grandchild = try #require(Self.pidLine(childFile))
+        defer { if pidAlive(grandchild) { kill(grandchild, SIGKILL) } }
         #expect(pidAlive(leader) && pidAlive(grandchild))
         shipper.stop()
         #expect(!pidAlive(leader))
-        try await waitUntil(5) { !pidAlive(grandchild) }
+        try await waitUntil { !pidAlive(grandchild) }
         #expect(!pidAlive(grandchild), "the litestream child outlived the shipper")
     }
 
     @Test func stopEscalatesToKill() async throws {
         let env = try BackupEnv()
-        let (_, tools) = try fakeBin(["litestream": "trap '' TERM\n" + Self.boundedLoop])
+        let dir = try tempDir(), trapped = dir.appending(path: "trapped")
+        // The script says when its trap is set (a file event, no fixed sleep): the stop below has to escalate to KILL.
+        let (_, tools) = try fakeBin(["litestream": "trap '' TERM\necho $$ > \"$TMPDIR/trapped\"\n" + Self.longLoop], env: ["TMPDIR": dir.path])
         let shipper = WALShipper(executable: try #require(tools.litestream), paths: env.paths, tools: tools, grace: 0.3)
         shipper.start()
-        try await waitUntil { recordedPID(env.paths) != nil }
+        try await waitUntil { recordedPID(env.paths) != nil && Self.pidLine(trapped) != nil }
         let pid = try #require(recordedPID(env.paths))
-        try await AwakeTime.sleep(for: .milliseconds(200))                   // the trap is set
+        #expect(Self.pidLine(trapped) == pid)
         shipper.stop()
         #expect(!pidAlive(pid))
     }
 
     @Test func stalePidHandled() async throws {
         let env = try BackupEnv()
-        let (_, tools) = try fakeBin(["litestream": Self.boundedLoop])
+        // Both children must stay alive until the test itself ends them, however slow the suite runs (a child that ended by
+        // itself would make "killed" and "never killed" pass or fail by timing).
+        let (_, tools) = try fakeBin(["litestream": Self.longLoop])
         let litestream = try #require(tools.litestream)
         try BrahmaPaths.ensurePrivateDirectory(env.paths.runDir)
         func writePID(_ pid: Int32) throws {
             try Data("\(pid)\n\(WALShipping.configURL(paths: env.paths).path)\n".utf8).write(to: WALShipper.pidFile(paths: env.paths))
         }
-        // A litestream for this config left behind by a crashed engine: killed before a new one starts.
-        let stale = Process()
-        stale.executableURL = URL(fileURLWithPath: litestream)
-        stale.arguments = WALShipping.replicateArguments(paths: env.paths)
-        Self.quiet(stale)
-        try stale.run()
-        defer { if stale.isRunning { kill(stale.processIdentifier, SIGKILL) } }
-        try writePID(stale.processIdentifier)
+        // A litestream for this config left behind by a crashed engine: killed before a new one starts. Both children are
+        // `OutsideChild`ren, watched by pid: Foundation's `Process.isRunning` reported a long-dead child as running here.
+        let stale = try OutsideChild(executable: litestream, arguments: WALShipping.replicateArguments(paths: env.paths))
+        defer { stale.end() }
+        // The scenario needs a stale process that IS litestream for this config by the time the shipper looks: wait on that
+        // event (its argv), not on time.
+        let config = WALShipping.configURL(paths: env.paths).path
+        try await waitUntil { ProcessArguments.of(stale.pid).map { WALShipper.isLitestream($0, config: config) } ?? false }
+        try #require(ProcessArguments.of(stale.pid).map { WALShipper.isLitestream($0, config: config) } == true)
+        try writePID(stale.pid)
         // An unrelated process whose pid sits in the file is never killed.
-        let unrelated = Process()
-        unrelated.executableURL = URL(fileURLWithPath: "/bin/sleep")
-        unrelated.arguments = ["30"]
-        Self.quiet(unrelated)
-        try unrelated.run()
-        defer { if unrelated.isRunning { kill(unrelated.processIdentifier, SIGKILL) } }
+        let unrelated = try OutsideChild(executable: "/bin/sleep", arguments: ["600"])
+        defer { unrelated.end() }
 
         let first = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5)
         first.start()
         try await waitUntil { !stale.isRunning }
-        #expect(!stale.isRunning)
-        try await waitUntil { recordedPID(env.paths).map { $0 != stale.processIdentifier } ?? false }
+        try #require(!stale.isRunning, "the stale litestream was left running")
+        #expect(stale.endedBySignal == true, "the stale litestream was stopped, it did not just end")
+        try await waitUntil { recordedPID(env.paths).map { $0 != stale.pid } ?? false }
         first.stop()
 
-        try writePID(unrelated.processIdentifier)
+        try await waitUntil { ProcessArguments.of(unrelated.pid)?.first == "/bin/sleep" }
+        try writePID(unrelated.pid)
         let second = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5)
         second.start()
-        try await waitUntil { recordedPID(env.paths).map { $0 != unrelated.processIdentifier } ?? false }
-        #expect(unrelated.isRunning && pidAlive(unrelated.processIdentifier))
+        try await waitUntil { recordedPID(env.paths).map { $0 != unrelated.pid } ?? false }
+        #expect(unrelated.isRunning && pidAlive(unrelated.pid))
         second.stop()
     }
 
@@ -789,6 +799,13 @@ import GRDB
 
 private final class ShipperBox: @unchecked Sendable {
     weak var value: WALShipper?
+}
+
+/// An awake-seconds clock that moves one second per reading.
+private final class Ticks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var t: TimeInterval = 1000
+    func next() -> TimeInterval { lock.withLock { t += 1; return t } }
 }
 
 private final class Delays: @unchecked Sendable {

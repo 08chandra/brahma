@@ -124,3 +124,34 @@ final class OwnedFD: @unchecked Sendable {
     }
     deinit { close() }
 }
+
+/// A child process a test starts and ends itself: its own process group, no inherited stdio, watched by pid (`waitid`), ended
+/// by SIGKILL to its group, then a bounded awake-time wait, then reaped. Not Foundation's `Process`: it reports the child's
+/// exit through the run loop of the thread that launched it, so in an async test that resumed on another Swift-concurrency
+/// worker after an `await`, `waitUntilExit` can wait forever (`cannotInspectOtherProcessesOpenFiles` hung so) and `isRunning`
+/// can stay true for a child that is long gone (`stalePidHandled` failed so).
+final class OutsideChild {
+    private let child: ProcessGroupChild
+    var pid: Int32 { child.pid }
+
+    /// `/bin/sh -c script`.
+    convenience init(_ script: String) throws { try self.init(executable: "/bin/sh", arguments: ["-c", script]) }
+
+    init(executable: String, arguments: [String]) throws {
+        child = try ProcessGroupChild.spawn(executable: executable, arguments: [executable] + arguments, environment: ["PATH": "/usr/bin:/bin"],
+                                            workingDirectory: URL(fileURLWithPath: "/", isDirectory: true), output: -1)
+    }
+
+    var isRunning: Bool { !child.hasExited() }
+
+    /// Once it has exited: whether a signal ended it (reaps it).
+    var endedBySignal: Bool? { child.hasExited() ? child.finish() & 0x7f != 0 : nil }
+
+    /// Kills its group and reaps it; gives up (leaving it unreaped, never signalled again) after `bound` awake seconds.
+    func end(bound: TimeInterval = 60) {
+        _ = child.signalGroup(SIGKILL)
+        let until = AwakeTime.uptime() + bound
+        while !child.hasExited(), AwakeTime.uptime() < until { Thread.sleep(forTimeInterval: 0.01) }
+        if child.hasExited() { child.finish() }
+    }
+}

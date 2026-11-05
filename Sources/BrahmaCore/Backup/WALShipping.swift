@@ -272,6 +272,8 @@ public final class WALShipper: @unchecked Sendable {
     private let sleeper: Sleeper
     private let note: @Sendable (String) -> Void
     private let launchProbe: (@Sendable () -> Void)?
+    /// Awake seconds, for how long one run lasted (`ShipperBackoff.healthyRun`); a test seam.
+    private let awakeUptime: @Sendable () -> TimeInterval
     private let lock = NSLock()
     private var task: Task<Void, Never>?
     private var process: ProcessGroupChild?
@@ -279,11 +281,13 @@ public final class WALShipper: @unchecked Sendable {
 
     public static func pidFile(paths: BrahmaPaths) -> URL { paths.runDir.appending(path: "litestream.pid") }
 
-    /// `launchProbe`: tests only, called just before each launch.
+    /// `launchProbe`: tests only, called just before each launch. `awakeUptime`: tests only, the clock a run's length is
+    /// measured on (awake time).
     public init(executable: String, paths: BrahmaPaths, tools: BackupTools = .system, grace: TimeInterval = WALShipper.stopGrace,
                 launchProbe: (@Sendable () -> Void)? = nil,
                 sleeper: @escaping Sleeper = { try await AwakeTime.sleep(for: $0) },
-                note: @escaping @Sendable (String) -> Void = { _ in }) {
+                note: @escaping @Sendable (String) -> Void = { _ in },
+                awakeUptime: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }) {
         self.executable = executable
         self.arguments = WALShipping.replicateArguments(paths: paths)
         self.environment = tools.litestreamEnvironment
@@ -292,6 +296,7 @@ public final class WALShipper: @unchecked Sendable {
         self.launchProbe = launchProbe
         self.sleeper = sleeper
         self.note = note
+        self.awakeUptime = awakeUptime
     }
 
     /// How many times litestream has been started.
@@ -321,10 +326,10 @@ public final class WALShipper: @unchecked Sendable {
     private func supervise() async {
         var backoff = ShipperBackoff()
         while !Task.isCancelled {
-            let began = AwakeTime.uptime()
+            let began = awakeUptime()
             let status = await runOnce()
             if Task.isCancelled || status == -2 { return }
-            if AwakeTime.uptime() - began >= ShipperBackoff.healthyRun { backoff.reset() }
+            if awakeUptime() - began >= ShipperBackoff.healthyRun { backoff.reset() }
             let delay = backoff.take()
             note("litestream exited (\(status)); restarting in \(delay)")
             do { try await sleeper(delay) } catch { return }

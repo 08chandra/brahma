@@ -43,7 +43,7 @@ private final class AwakeClock: @unchecked Sendable {
     }
 
     private func settle(_ condition: () -> Bool) async throws {
-        let deadline = AwakeTime.deadline(after: .seconds(5))
+        let deadline = AwakeTime.deadline(after: .seconds(60))
         while !condition(), AwakeTime.now < deadline { try await AwakeTime.sleep(for: .milliseconds(10)) }
     }
 
@@ -173,9 +173,16 @@ private final class AwakeClock: @unchecked Sendable {
 
     private func alive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 }
 
+    /// Waits on `condition`, bounded by a generous awake-time deadline (full-suite load can slow a fake launch a lot).
     private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = AwakeTime.deadline(after: .seconds(10))
+        let deadline = AwakeTime.deadline(after: .seconds(120))
         while !condition(), AwakeTime.now < deadline { try await AwakeTime.sleep(for: .milliseconds(20)) }
+    }
+
+    /// The pid a script wrote as one whole line (`echo $! > file`), or nil while the line is not complete yet.
+    static func pidLine(_ file: URL) -> Int32? {
+        guard let text = try? String(contentsOf: file, encoding: .utf8), text.hasSuffix("\n") else { return nil }
+        return Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     @Test func missingBinaryIsUnavailable() {
@@ -185,13 +192,15 @@ private final class AwakeClock: @unchecked Sendable {
     @Test func runsWithTheEnginePidAndTakesItsWholeGroupDown() async throws {
         let dir = try tempDir()
         let argsFile = dir.appending(path: "args"), childFile = dir.appending(path: "child")
-        // Ignores TERM and has a child of its own: only a group KILL ends both.
-        let exe = try script("trap '' TERM\necho \"$@\" > '\(argsFile.path)'\nsleep 30 &\necho $! > '\(childFile.path)'\nwait")
+        // Ignores TERM and has a child of its own: only a group KILL ends both. Both live until killed, however slow the suite
+        // runs (a child that ended by itself would fail "alive" below by timing). The child's pid line is written last, after
+        // the trap and the args: once it reads whole, everything below is in place (a file event, no fixed sleep).
+        let exe = try script("trap '' TERM\necho \"$@\" > '\(argsFile.path)'\nsleep 600 &\necho $! > '\(childFile.path)'\nwait")
         let process = try #require(CaffeinateProcess.launch(enginePid: 777, executable: exe.path))
-        try await waitUntil { FileManager.default.fileExists(atPath: childFile.path) }
-        try await AwakeTime.sleep(for: .milliseconds(150))
+        defer { if process.isAlive() { _ = process.child.signalGroup(SIGKILL) } }
+        try await waitUntil { Self.pidLine(childFile) != nil }
         #expect(try String(contentsOf: argsFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) == "-i -w 777")
-        let child = try #require(Int32(try String(contentsOf: childFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        let child = try #require(Self.pidLine(childFile))
         #expect(process.isAlive() && alive(child))
         #expect(getpgid(process.pid) == process.pid, "its own process group")
         await process.terminate(grace: .milliseconds(200))
@@ -202,7 +211,7 @@ private final class AwakeClock: @unchecked Sendable {
     }
 
     @Test func terminatingTwiceIsHarmless() async throws {
-        let exe = try script("exec sleep 30")
+        let exe = try script("exec sleep 600")
         let process = try #require(CaffeinateProcess.launch(enginePid: 1, executable: exe.path))
         await process.terminate(grace: .milliseconds(200))
         await process.terminate(grace: .milliseconds(200))

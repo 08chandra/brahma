@@ -271,19 +271,37 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
     @Test func aHungToolsChildrenAreKilledWithItsGroup() async throws {
         // Two pid files: the doctor's run and the external tool's run are each asserted (INT-M3).
         let dir = try tempDir()
-        let doctorPid = dir.appending(path: "doctor.pid"), toolPid = dir.appending(path: "tool.pid")
-        func script(_ f: URL) -> String { "/bin/sleep 300 & echo $! > '\(f.path)'; wait" }
-        _ = try? await Doctor.execProcess(executable: "/bin/sh", arguments: ["-c", script(doctorPid)], timeout: 0.5, blocking: Blocking())
-        let r = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", script(toolPid) + "; echo never"], environment: [:], timeout: 0.5)
-        #expect(r.timedOut && r.launched)
-        for file in [doctorPid, toolPid] {
-            let pid = try #require(Int32(try String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
-            let until = AwakeTime.uptime() + 5
-            while kill(pid, 0) == 0, AwakeTime.uptime() < until { try await Task.sleep(nanoseconds: 20_000_000) }
-            #expect(kill(pid, 0) != 0, "\(file.lastPathComponent): the tool's background child outlived the timeout")
+        func script(_ f: URL) -> String { "/bin/sleep 600 & echo $! > '\(f.path)'; wait" }
+        // The timeout is what is under test, so it starts short. Under load the shell may not have started its child (and
+        // written its pid line) before the timeout fires: such a run proves nothing, so it is repeated with a doubled
+        // timeout until one did (bounded: 0.5 s … 64 s). Every run must still end as a timeout.
+        var doctorChild: Int32?, toolChild: Int32?
+        var timeout: TimeInterval = 0.5
+        for attempt in 0..<8 where doctorChild == nil || toolChild == nil {
+            if doctorChild == nil {
+                let file = dir.appending(path: "doctor-\(attempt).pid")
+                do {
+                    _ = try await Doctor.execProcess(executable: "/bin/sh", arguments: ["-c", script(file)], timeout: timeout, blocking: Blocking())
+                    Issue.record("a hung doctor exec must time out")
+                } catch is Doctor.ExecTimedOut {}
+                doctorChild = Self.pidLine(file)
+            }
+            if toolChild == nil {
+                let file = dir.appending(path: "tool-\(attempt).pid")
+                let r = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", script(file) + "; echo never"], environment: [:], timeout: timeout)
+                #expect(r.timedOut && r.launched)
+                toolChild = Self.pidLine(file)
+            }
+            timeout *= 2
+        }
+        for (name, child) in [("doctor", doctorChild), ("tool", toolChild)] {
+            let pid = try #require(child, "\(name): the shell never started its child, even with a 64 s timeout")
+            let until = AwakeTime.uptime() + 120
+            while kill(pid, 0) == 0, AwakeTime.uptime() < until { try await AwakeTime.sleep(for: .milliseconds(20)) }
+            #expect(kill(pid, 0) != 0, "\(name): the tool's background child outlived the timeout")
         }
         // A normal run still captures stdout and stderr and returns the exit code.
-        let ok = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", "echo out; echo err >&2; exit 3"], environment: [:], timeout: 10)
+        let ok = ExternalTool.run(executable: "/bin/sh", arguments: ["-c", "echo out; echo err >&2; exit 3"], environment: [:], timeout: 120)
         #expect(ok.status == 3 && ok.output == "out\nerr\n" && !ok.timedOut, "\(ok)")
     }
 
@@ -291,25 +309,36 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
     /// the wait after SIGKILL is bounded by default.
     @Test func groupExecNeverReportsALostChildAsSuccess() throws {
         #expect(GroupExec.defaultAbandonAfter > 0)
-        let cwd = GroupExec.run(executable: "/bin/pwd", arguments: [], environment: [:], output: .capture(cap: 1024, stderr: false), timeout: 10)
+        let cwd = GroupExec.run(executable: "/bin/pwd", arguments: [], environment: [:], output: .capture(cap: 1024, stderr: false), timeout: 120)
         #expect(cwd.status == 0); #expect(String(decoding: cwd.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == "/")
         // A leader given up on right after SIGKILL (abandonAfter 0) is reported as a failure with a reason, never status 0.
-        let abandoned = GroupExec.run(executable: "/bin/sh", arguments: ["-c", "trap '' TERM; sleep 30"], environment: [:],
-                                      output: .capture(cap: 1024, stderr: false), timeout: 0.2, killGrace: 0.1, abandonAfter: 0)
+        // Its clock is injected: it stands still until the shell says its TERM trap is set (a file event), then moves one
+        // second per reading, so the timeout, TERM (ignored) and KILL come in that order however slow the shell starts.
+        let ready = try tempDir().appending(path: "trapped")
+        let began = AwakeTime.uptime()
+        var t: TimeInterval = 0
+        let abandoned = GroupExec.run(executable: "/bin/sh", arguments: ["-c", "trap '' TERM; : > '\(ready.path)'; sleep 600"], environment: [:],
+                                      output: .capture(cap: 1024, stderr: false), timeout: 0.2, killGrace: 0.1, abandonAfter: 0,
+                                      clock: {
+                                          // Backstop: a shell that never gets there still ends the run (and fails below).
+                                          if FileManager.default.fileExists(atPath: ready.path) || AwakeTime.uptime() - began > 120 { t += 1 }
+                                          return t
+                                      })
+        #expect(FileManager.default.fileExists(atPath: ready.path), "the shell never set its trap")
         #expect(abandoned.status == -1 && abandoned.error != nil, "an abandoned leader must not read as success: \(abandoned)")
         // A child reaped out from under GroupExec (its exit status lost) is a failure with a reason, never status 0, even
         // though it really exited 0 (N4).
         let lost = GroupExec.run(executable: "/bin/sh", arguments: ["-c", "exit 0"], environment: [:],
-                                 output: .capture(cap: 1024, stderr: false), timeout: 10,
+                                 output: .capture(cap: 1024, stderr: false), timeout: 120,
                                  spawned: { pid in var st: Int32 = 0; while waitpid(pid, &st, 0) < 0 && errno == EINTR {} })
         #expect(lost.status == -1, "\(lost)")
         #expect(lost.error?.contains("lost track") == true, "\(lost)")
     }
 
     @Test func aFastProcessReturnsItsOutputAndAFailingOneNil() async throws {
-        let ok = try await Doctor.execProcess(executable: "/bin/echo", arguments: ["2.1.304 (Claude Code)"], timeout: 10)
+        let ok = try await Doctor.execProcess(executable: "/bin/echo", arguments: ["2.1.304 (Claude Code)"], timeout: 120)
         #expect(ok == "2.1.304 (Claude Code)\n")
-        let bad = try await Doctor.execProcess(executable: "/usr/bin/false", arguments: [], timeout: 10)
+        let bad = try await Doctor.execProcess(executable: "/usr/bin/false", arguments: [], timeout: 120)
         #expect(bad == nil)
     }
 
@@ -325,20 +354,60 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         #expect(item(r2, "flags")?.detail.contains("did not finish") == true, "\(r2.items)")
     }
 
-    /// Many doctor execs at once must not take the cooperative workers: an unrelated async task still runs promptly.
+    /// Many doctor execs at once must not take the cooperative workers: an unrelated async task still runs while they hang.
+    /// Event-ordered, no timing: every exec blocks until a gate file appears; a watcher thread (outside the cooperative pool)
+    /// opens the gate only once the pool's slots are all held by hung execs AND the unrelated task has finished, or after a
+    /// generous backstop. Execs that took cooperative workers would keep the unrelated task from ever running.
     @Test func manyConcurrentExecsDoNotStarveTheCooperativePool() async throws {
         let n = max(ProcessInfo.processInfo.activeProcessorCount * 3, 24)
         let pool = Blocking()
-        let probe = Task { () -> TimeInterval in
-            let t = AwakeTime.uptime()
+        let dir = try tempDir(), gate = dir.appending(path: "gate"), started = try Self.mkdir(dir.appending(path: "started"))
+        let hung = "/usr/bin/touch \"$1/started/$$\"; while [ ! -e \"$1/gate\" ]; do /bin/sleep 0.05; done"
+        let watch = StarvationWatch()
+        let probe = Task {
             try? await AwakeTime.sleep(for: .milliseconds(50))
-            return AwakeTime.uptime() - t
+            watch.probeDone()
         }
+        let watcher = Thread {
+            let until = AwakeTime.uptime() + 300
+            let slots = min(n, Blocking.maxConcurrent)
+            func hungCount() -> Int { ((try? FileManager.default.contentsOfDirectory(atPath: started.path)) ?? []).count }
+            while !(watch.isProbeDone && hungCount() >= slots), AwakeTime.uptime() < until { Thread.sleep(forTimeInterval: 0.02) }
+            watch.gateOpening(hung: hungCount())
+            FileManager.default.createFile(atPath: gate.path, contents: nil)
+        }
+        watcher.start()
         await withTaskGroup(of: Void.self) { g in
-            for _ in 0..<n { g.addTask { _ = try? await Doctor.execProcess(executable: "/bin/sleep", arguments: ["0.2"], timeout: 10, blocking: pool) } }
-            let elapsed = await probe.value
-            #expect(elapsed < 0.6, "the unrelated task took \(elapsed) s")
+            for _ in 0..<n {
+                g.addTask { _ = try? await Doctor.execProcess(executable: "/bin/sh", arguments: ["-c", hung, "sh", dir.path], timeout: 600, blocking: pool) }
+            }
             await g.waitForAll()
         }
+        await probe.value
+        let (probeFirst, hungAtGate) = watch.verdict
+        #expect(probeFirst, "the unrelated task did not run while the execs hung (\(hungAtGate) of them held the pool)")
+        #expect(hungAtGate >= min(n, Blocking.maxConcurrent), "the execs did not all hang at once: \(hungAtGate)")
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: started.path)) ?? []).count == n, "every exec ran")
     }
+
+    private static func mkdir(_ url: URL) throws -> URL {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    /// The pid a script wrote as one whole line (`echo $! > file`), or nil while the line is not complete yet.
+    private static func pidLine(_ file: URL) -> Int32? {
+        guard let text = try? String(contentsOf: file, encoding: .utf8), text.hasSuffix("\n") else { return nil }
+        return Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+/// What the starvation test's watcher saw when it opened the gate.
+private final class StarvationWatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false, doneBeforeGate = false, hung = 0
+    func probeDone() { lock.withLock { done = true } }
+    var isProbeDone: Bool { lock.withLock { done } }
+    func gateOpening(hung count: Int) { lock.withLock { doneBeforeGate = done; hung = count } }
+    var verdict: (Bool, Int) { lock.withLock { (doneBeforeGate, hung) } }
 }

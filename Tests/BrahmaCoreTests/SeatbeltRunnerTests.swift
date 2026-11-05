@@ -542,21 +542,26 @@ struct SeatbeltRunnerTests {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
         guard FileManager.default.isExecutableFile(atPath: "/usr/sbin/lsof") else { return }
-        // A long-lived process outside the sandbox with an open file whose name a check must not learn.
-        let victim = Process()
-        victim.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // A process outside the sandbox with an open file whose name a check must not learn. It lives until the test ends it
+        // (however slow the suite runs) and is waited on by pid with a bound (`OutsideChild`), never by Foundation's
+        // `waitUntilExit`, which hung here under a concurrent `swift test`. lsof gets -n -P: no DNS or service lookups.
         let marker = "NSIRD-\(UUID().uuidString)"
-        victim.arguments = ["-c", "exec 9>'\(w.path)/\(marker)'; sleep 30"]
-        try victim.run()
-        defer { victim.terminate(); victim.waitUntilExit() }
-        try await Task.sleep(for: .milliseconds(200))
-        let (outcome, text) = try await Self.run("/usr/sbin/lsof -p \(victim.processIdentifier) 2>&1 || true; echo DONE", Self.policy(writable: [w]))
+        let open = w.appending(path: marker)
+        let victim = try OutsideChild("exec 9>'\(open.path)'; exec /bin/sleep 600")
+        defer { victim.end() }
+        try await Self.waitUntil { FileManager.default.fileExists(atPath: open.path) }   // the file is open: a file event, no fixed sleep
+        try #require(victim.isRunning)
+        // Control: outside the sandbox, lsof does list it, so the negative result below is the sandbox, not timing.
+        let seen = ExternalTool.run(executable: "/usr/sbin/lsof", arguments: ["-n", "-P", "-p", "\(victim.pid)"], environment: Self.env, timeout: 120)
+        try #require(seen.output.contains(marker), "lsof outside the sandbox did not list the victim's open file: \(seen.output.suffix(400))")
+        let (outcome, text) = try await Self.run("/usr/sbin/lsof -n -P -p \(victim.pid) 2>&1 || true; echo DONE", Self.policy(writable: [w]))
         #expect(outcome.exitCode == 0)
+        #expect(victim.isRunning, "the victim was gone during the sandboxed lsof, so the result proves nothing")
         #expect(!text.contains(marker), "lsof revealed another process's open file: \(text.suffix(400))")
         // Positive control (N7): inside the same sandbox, lsof still works on the shell's own process, which holds its own
         // marker file open — so the negative result above is the sandbox, not lsof failing.
         let own = "OWN-\(UUID().uuidString)"
-        let (control, controlText) = try await Self.run("exec 9>'\(own)'; /usr/sbin/lsof -p $$ 2>&1; echo DONE", Self.policy(writable: [w]))
+        let (control, controlText) = try await Self.run("exec 9>'\(own)'; /usr/sbin/lsof -n -P -p $$ 2>&1; echo DONE", Self.policy(writable: [w]))
         #expect(control.exitCode == 0)
         #expect(controlText.contains(own), "lsof could not list the sandboxed shell's own open file: \(controlText.suffix(400))")
     }
@@ -591,12 +596,10 @@ struct SeatbeltRunnerTests {
         let w = try Self.mkdir(h.appending(path: "w"))
         let (parent, _) = try await Self.run("kill -0 \(getpid())", Self.policy(writable: [w]))
         #expect(parent.exitCode != 0)
-        // An unrelated process outside the sandbox survives a TERM from inside.
-        let victim = Process()
-        victim.executableURL = URL(fileURLWithPath: "/bin/sleep"); victim.arguments = ["30"]
-        try victim.run()
-        defer { victim.terminate(); victim.waitUntilExit() }
-        let (term, _) = try await Self.run("kill -TERM \(victim.processIdentifier)", Self.policy(writable: [w]))
+        // An unrelated process outside the sandbox survives a TERM from inside (it lives until the test ends it).
+        let victim = try OutsideChild("exec /bin/sleep 600")
+        defer { victim.end() }
+        let (term, _) = try await Self.run("kill -TERM \(victim.pid)", Self.policy(writable: [w]))
         #expect(term.exitCode != 0); #expect(victim.isRunning)
         // Its own children it may signal.
         let (own, _) = try await Self.run("sleep 30 & kill $!; wait $!; test $? -ne 0", Self.policy(writable: [w]))
@@ -651,19 +654,42 @@ struct SeatbeltRunnerTests {
         #expect(proxy.deniedHosts.contains("www.wikipedia.org"))
     }
 
+    /// The run may listen on its own port and on no other. Load-tolerant without weakening: ports come from the kernel (bound
+    /// to port 0) but anything on the machine can take one between that probe and nc's bind, so an attempt where nc reports
+    /// the address taken or unavailable (not a sandbox denial) is retried with a fresh pair, a bounded number of times. No
+    /// fixed sleeps: the client retries until the listener is up (bounded), and the other-port listener is waited on until it
+    /// exits (bounded; one still listening at the bound did bind).
     @Test func loopbackListenOnlyOwnPorts() async throws {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
-        let port = try Self.freePortPair()
-        let p = Self.policy(writable: [w], network: .loopbackListen(allow: [], ports: [port]))
-        let command = """
-        nc -l 127.0.0.1 \(port) > got.txt & S=$!; sleep 1; echo hello | nc -w 3 127.0.0.1 \(port); wait $S; cat got.txt
-        nc -l 127.0.0.1 \(port + 1) & N=$!; sleep 1; if kill -0 $N 2>/dev/null; then kill $N; echo BOUND-OTHER; fi
-        """
-        let (outcome, text) = try await Self.run(command, p, timeout: .seconds(30))
-        #expect(outcome.exitCode == 0, "\(text)")
-        #expect(text.contains("hello"), "own port not usable: \(text)")
-        #expect(!text.contains("BOUND-OTHER"), "bound a port it was not given")
+        let raced = ["Address already in use", "Can't assign requested address"]
+        var last = ""
+        for _ in 0..<20 {
+            let port = try Self.freePortPair()
+            let p = Self.policy(writable: [w], network: .loopbackListen(allow: [], ports: [port]))
+            let command = """
+            rm -f got.txt own.err other.err
+            nc -l 127.0.0.1 \(port) > got.txt 2> own.err & S=$!
+            i=0; until echo hello | nc -w 3 127.0.0.1 \(port) 2>/dev/null; do
+              i=$((i+1)); if [ $i -ge 600 ] || ! kill -0 $S 2>/dev/null; then echo OWN-NOT-REACHED; break; fi; sleep 0.1
+            done
+            wait $S; echo "own-exit=$?"; cat got.txt; cat own.err
+            nc -l 127.0.0.1 \(port + 1) 2> other.err & N=$!
+            i=0; while kill -0 $N 2>/dev/null && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.1; done
+            if kill -0 $N 2>/dev/null; then kill $N; echo BOUND-OTHER; else wait $N; echo "other-exit=$?"; fi
+            cat other.err
+            """
+            let (outcome, text) = try await Self.run(command, p, timeout: .seconds(300))
+            last = text
+            if raced.contains(where: { text.contains($0) }) { continue }       // a port taken from outside: a fresh pair
+            #expect(outcome.exitCode == 0, "\(text)")
+            #expect(text.contains("hello") && text.contains("own-exit=0"), "own port not usable: \(text)")
+            #expect(!text.contains("BOUND-OTHER"), "bound a port it was not given: \(text)")
+            #expect(text.contains("other-exit=") && !text.contains("other-exit=0") && text.contains("Operation not permitted"),
+                    "the other port's bind was not refused by the sandbox: \(text)")
+            return
+        }
+        Issue.record("every port pair was taken from outside the sandbox: \(last)")
     }
 
     // MARK: Toolchain
@@ -1027,6 +1053,12 @@ struct SeatbeltRunnerTests {
         return (p.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
+    /// Waits on `condition`, bounded by a generous awake-time deadline.
+    static func waitUntil(_ seconds: Int = 120, _ condition: () -> Bool) async throws {
+        let deadline = AwakeTime.deadline(after: .seconds(seconds))
+        while !condition(), AwakeTime.now < deadline { try await AwakeTime.sleep(for: .milliseconds(20)) }
+    }
+
     static func gone(_ pid: Int32) async -> Bool {
         for _ in 0..<200 {
             if kill(pid, 0) != 0 { return true }
@@ -1035,8 +1067,20 @@ struct SeatbeltRunnerTests {
         return false
     }
 
-    /// A listening loopback socket and its port.
+    /// A listening loopback socket on a port the kernel picks. Under load the ephemeral range can run short for a moment
+    /// (EADDRNOTAVAIL) or a pick can race (EADDRINUSE): retried, bounded.
     static func listenSocket() throws -> (Int32, UInt16) {
+        var failure: (any Error)?
+        for _ in 0..<500 {
+            do { return try listenSocketOnce() } catch let e as POSIXError where e.code == .EADDRNOTAVAIL || e.code == .EADDRINUSE {
+                failure = e
+                usleep(10_000)
+            }
+        }
+        throw failure ?? POSIXError(.EADDRNOTAVAIL)
+    }
+
+    private static func listenSocketOnce() throws -> (Int32, UInt16) {
         let fd = socket(AF_INET, Int32(SOCK_STREAM), 0)
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
@@ -1051,9 +1095,9 @@ struct SeatbeltRunnerTests {
         return (fd, UInt16(bigEndian: addr.sin_port))
     }
 
-    /// A port `p` with `p` and `p + 1` both free just now.
+    /// A port `p` with `p` and `p + 1` both free just now (bounded tries; under load `p + 1` is often taken).
     static func freePortPair() throws -> UInt16 {
-        for _ in 0..<50 {
+        for _ in 0..<2000 {
             let (fd, p) = try listenSocket()
             close(fd)
             guard p < 65000 else { continue }
