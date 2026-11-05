@@ -6,8 +6,10 @@ extension Orchestrator {
     /// check is cancelled (its group is killed) and put back in the queue as it was, no attempt counted (`checkCancelled`); an
     /// Ultra turn's process group goes with it, its workflow agents included, and the run is charged its full cap (F6, Task
     /// 14u: `UltraAccounting.charge`, released through its reservation when the turn is recorded);
+    /// every main smoke the tick started is cancelled (its group killed; a merge run is re-queued in place, L-5lite-A);
     /// every merge and every git task is cancelled, and each re-reads the stop before it changes anything (a merge right
-    /// before each ref it moves: `Store.performMerge`); the observers run once per stop. Admission is held by the caller
+    /// before each ref it moves: `Store.performMerge`); the observers run once per stop (the release executor and the
+    /// preview runner among them). Admission is held by the caller
     /// (`held`; the restore-marker step and lease git wait too), and active time stands still (`accrueActiveTime`).
     func enforceStop(_ stop: EngineStopRow?, now: Date) {
         guard let stop else {
@@ -21,6 +23,9 @@ extension Orchestrator {
         for t in tasks.values { t.cancel() }
         for t in checkTasks.values { t.cancel() }
         for t in mergeTasks.values { t.cancel() }
+        // Every main smoke (L-5lite-A, PR-35 5s): its group is killed and a merge run goes back to the queue in place, as on
+        // the restart path (`Store.requeueOrError`): no result, never a red bug, no backoff.
+        for t in smokeTasks.values { t.cancel() }
         // Every git task changes state (worktrees and their auto-commits, a dispatch's branch, a restore's re-adoption).
         for t in gitTasks.values { t.cancel() }
         guard stopObserved != stop.since, stopObserverTask == nil else { return }

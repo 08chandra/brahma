@@ -27,7 +27,11 @@ import Glibc
 /// group is killed when the recorded pid is still that group's leader with a start time inside the record (3a's
 /// `ProcessTable`, PR-4), the surface becomes `stopped` and is started again from a fresh export (the engine's startup sweep
 /// deleted every export).
-public actor PreviewRunner {
+///
+/// The owner's emergency stop (5-lite 7c, L-5lite-A): the runner is one of the engine's stop observers. `stopAll(reason:)`
+/// stops every surface of every company (`"stopped by the owner"`); while `store.engineStopped()` holds (or cannot be read)
+/// `reconcile` starts and restarts nothing; the first pass after the resume starts them again as on engine start.
+public actor PreviewRunner: EmergencyStopObserver {
     public static let debounce: TimeInterval = 5
     public static let crashWindow: TimeInterval = 300
     public static let crashLimit = 3
@@ -39,6 +43,8 @@ public actor PreviewRunner {
     static let pausedMessage = "company paused"
     static let engineRestartedMessage = "engine restarted"
     public static let shutdownMessage = "engine stopped"
+    /// What every surface the owner's stop reached records (the owner's note stays in the stop's own activity line).
+    public static let ownerStopMessage = "stopped by the owner"
 
     let store: Store
     let paths: BrahmaPaths
@@ -64,6 +70,9 @@ public actor PreviewRunner {
     private var recovered = false
     /// While `stopAll` runs, `reconcile` does nothing.
     private var stopping = 0
+    /// Bumped by every `stopAll` (Task 3 M1): a pass that began before it brings nothing up after it (`launch` and the
+    /// pass's own writes check that the epoch they started in is still current).
+    private var stopEpoch = 0
 
     struct Run: Sendable {
         var company: Company
@@ -93,11 +102,14 @@ public actor PreviewRunner {
 
     public func reconcile(now: Date) async {
         guard stopping == 0 else { return }
+        let epoch = stopEpoch
         if !recovered {
             recovered = true
             await recover(now: now)
         }
-        // L-5lite: while `store.engineStopped()` is non-nil nothing starts or restarts here (EmergencyStopObserver, PR-35 3s).
+        // The owner's stop (PR-35 3s): while it holds nothing starts or restarts. Fail closed: a stop that cannot be read
+        // is taken as one.
+        guard stopping == 0, epoch == stopEpoch, !ownerStopHolds else { return }
         guard let companies = try? store.companies() else { return }
         let pressured = memory()
         var present = Set<String>()
@@ -109,6 +121,7 @@ public actor PreviewRunner {
                 for surface in surfaces where starts[surface.id] != nil || runs[surface.id] != nil
                     || [.building, .starting, .running].contains(states[surface.id]?.status ?? .idle) {
                     await stopSurface(surface.id, message: Self.pausedMessage, now: now)
+                    guard epoch == stopEpoch else { return }
                 }
                 continue
             }
@@ -117,7 +130,10 @@ public actor PreviewRunner {
             let mainSettled = now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
             for surface in surfaces where starts[surface.id] == nil && surface.previewKind == .web {
                 let state = states[surface.id] ?? PreviewState(surfaceId: surface.id, companyId: company.id, updatedAt: now)
-                if await noticeExit(surface: surface, company: company, state: state, now: now) { continue }
+                if await noticeExit(surface: surface, company: company, state: state, epoch: epoch, now: now) {
+                    guard epoch == stopEpoch else { return }
+                    continue
+                }
                 guard let fresh = wantsStart(surface: surface, state: state, main: main, mainSettled: mainSettled, now: now) else { continue }
                 if pressured {
                     if state.message != Self.pressureMessage {
@@ -126,11 +142,19 @@ public actor PreviewRunner {
                     continue
                 }
                 guard starts.count < Self.maxConcurrentBuilds else { continue }
-                launch(company: company, surface: surface, commit: main, fresh: fresh, now: now)
+                launch(company: company, surface: surface, commit: main, fresh: fresh, epoch: epoch, now: now)
             }
         }
-        for id in Array(runs.keys) where !present.contains(id) && starts[id] == nil { await stopRun(id) }
+        for id in Array(runs.keys) where !present.contains(id) && starts[id] == nil {
+            await stopRun(id)
+            guard epoch == stopEpoch else { return }
+        }
         restartAt = restartAt.filter { present.contains($0.key) }
+    }
+
+    /// Whether the owner's stop holds now; a database error reads as stopped (nothing starts by mistake).
+    private var ownerStopHolds: Bool {
+        do { return try store.engineStopped() != nil } catch { return true }
     }
 
     /// Nil: leave it. Otherwise start it; `true` when the start is a new one (main moved, changed or flagged, never started),
@@ -158,10 +182,12 @@ public actor PreviewRunner {
 
     /// A server of ours that ended on its own: its exit is recorded, then it restarts after the backoff or, at the crash
     /// limit, fails. Returns whether it handled one.
-    private func noticeExit(surface: PreviewSurface, company: Company, state: PreviewState, now: Date) async -> Bool {
+    /// A `stopAll` meanwhile (`epoch` no longer current) leaves its record as the stop wrote it.
+    private func noticeExit(surface: PreviewSurface, company: Company, state: PreviewState, epoch: Int, now: Date) async -> Bool {
         guard let run = runs[surface.id], let pid = run.pid, let process = deps.processes.process(pid), !process.isAlive() else { return false }
         let code = await WebAdapter.exitCode(process)
         await stopRun(surface.id)
+        guard epoch == stopEpoch else { return true }
         let exits = (state.exits + [now]).filter { now.timeIntervalSince($0) < Self.crashWindow }
         if exits.count >= Self.crashLimit {
             restartAt[surface.id] = nil
@@ -182,7 +208,10 @@ public actor PreviewRunner {
 
     // MARK: Starts
 
-    private func launch(company: Company, surface: PreviewSurface, commit: String, fresh: Bool, now: Date) {
+    /// Nothing is launched by a pass that a `stopAll` overtook (`epoch`), while one runs, or while the owner's stop holds
+    /// (Task 3 M1).
+    private func launch(company: Company, surface: PreviewSurface, commit: String, fresh: Bool, epoch: Int, now: Date) {
+        guard epoch == stopEpoch, stopping == 0, !ownerStopHolds else { return }
         startCounter += 1
         let n = startCounter
         restartAt[surface.id] = nil
@@ -340,22 +369,37 @@ public actor PreviewRunner {
         try? store.markPreviewStopped(surfaceId: id, message: message, now: now)
     }
 
-    public func stopAll() async { await stopAll(reason: Self.shutdownMessage) }
+    /// The engine shutting down: every surface stopped, recorded `"engine stopped"` (the next engine starts them again).
+    public func stopAll() async { await stop(message: Self.shutdownMessage) }
 
-    /// Stops every surface of every company: starts cancelled, process groups terminated, exports deleted, and every
-    /// building, starting or running record `stopped` with `reason` (`"stopped by the owner"` for the emergency stop, once
-    /// 5-lite's `EmergencyStopObserver` exists: L-5lite). Nothing starts while it runs; a later `reconcile` starts them again.
-    public func stopAll(reason: String) async {
+    /// The owner's emergency stop (`EmergencyStopObserver`; the engine runs it once per stop): every surface of every company
+    /// stopped, recorded exactly `"stopped by the owner"` whatever note `reason` carries. While the stop holds `reconcile`
+    /// starts nothing; the first pass after the resume starts them again.
+    public func stopAll(reason: String) async { await stop(message: Self.ownerStopMessage) }
+
+    /// Stops every surface of every company: starts cancelled (again, until none is left: Task 3 M1), process groups
+    /// terminated (every run's, then anything still in the process registry), exports deleted, and every building, starting
+    /// or running record `stopped` with `message`. Nothing starts while it runs, and a pass that began before it starts
+    /// nothing after it (`stopEpoch`); a later `reconcile` starts them again.
+    private func stop(message: String) async {
         stopping += 1
+        stopEpoch += 1
         defer { stopping -= 1 }
-        for task in starts.values { task.cancel() }
-        await waitForStarts()
+        while !starts.isEmpty {
+            for task in starts.values { task.cancel() }
+            await waitForStarts()
+        }
         for id in Array(runs.keys) { await stopRun(id) }
+        // A server whose run a pass in flight is stopping right now (its exit notice) is no longer in `runs`.
+        for process in deps.processes.all {
+            await process.terminate(grace: WebAdapter.stopGrace)
+            deps.processes.remove(process.pid)
+        }
         restartAt = [:]
         let now = clock()
         for company in (try? store.companies()) ?? [] {
             for id in ((try? store.previewStates(companyId: company.id)) ?? [:]).keys {
-                try? store.markPreviewStopped(surfaceId: id, message: reason, now: now)
+                try? store.markPreviewStopped(surfaceId: id, message: message, now: now)
             }
         }
     }
