@@ -159,12 +159,29 @@ public enum EmergencyStop {
 
     /// The groups of every turn the database records as in progress (`Store.runningTurnPids`; each turn's `claude` leads its
     /// own session and group), and of every check and merge child the engine recorded at spawn (`ChildGroups`, under the
-    /// data home's `run/children`; only leaders whose start time still matches). Preview processes join here when previews
-    /// exist (Plan L's `previewState`).
+    /// data home's `run/children`; only leaders whose start time still matches), and of every preview server Plan L's
+    /// `previewState` records (`previewGroups`, L-5lite-A).
     public static func recordedGroups(store: Store) -> Set<Int32> {
         var groups = (try? store.runningTurnPids()) ?? []
         if let home = store.dataHome {
             groups.formUnion(ChildGroups.liveLeaders(in: ChildGroups.directory(runDir: home.appending(path: "run", directoryHint: .isDirectory))))
+        }
+        groups.formUnion(previewGroups(store: store))
+        return groups
+    }
+
+    /// The groups of the preview servers recorded `building`, `starting` or `running`, each only while its pid still leads
+    /// its own group of ours with a start time inside the record (`PreviewRunner.orphanGroup`, PR-4): a recycled pid is never
+    /// signalled. What reaches previews when the engine itself cannot (`brahma stop`, the app's STOP EVERYTHING).
+    static func previewGroups(store: Store) -> Set<Int32> {
+        var groups = Set<Int32>()
+        for company in (try? store.companies()) ?? [] {
+            for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values
+            where [.building, .starting, .running].contains(state.status) {
+                if let pid = state.pid, PreviewRunner.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
+                    groups.insert(pid)
+                }
+            }
         }
         return groups
     }
