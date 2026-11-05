@@ -598,13 +598,15 @@ public struct SandboxScope: Equatable, Sendable {
 
     /// The `.brahma` children every turn may read when they exist (5L-1). `hooks` and the shell prefix must be readable for
     /// git and Bash to start; `ext` holds mounted extension parts whose scripts run in Bash; `cache/shared` is the read-only
-    /// layer checks write.
+    /// layer checks write. `ext-review` is not one (10b, B-M9): a proposed extension's review page quotes unapproved skill
+    /// text, so only the turns of its internal reviewer read it (`reviewPages`), and the owner in the app. `ext-try` (the owner's
+    /// `ext try` copies) is readable only by that one throwaway turn.
     static let readableDotBrahma = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext",
-                                    "ext-review", "hooks", "cache/shared"]
+                                    "hooks", "cache/shared"]
 
     /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist.
     static let engineOnlyDotBrahma = ["trash", "cache", "resources", "checks", "wt-check", "handoffs", "releases", "artifacts",
-                                      "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "hooks", "bin", "kb"]
+                                      "wt/.preview", "wt/.release", "wt/.merge", "ext", "ext-review", "ext-try", "hooks", "bin", "kb"]
 
     /// Common-git-dir internals no turn writes (3a "GitCommand hardening I2": config or attributes flipped between the
     /// engine's scan and its run), listed even before they exist.
@@ -619,7 +621,9 @@ public struct SandboxScope: Equatable, Sendable {
 
     /// The scope of one turn of the agent `layout` describes. `otherWorkspaces` is every other company's workspace;
     /// `backupTargets` the owner's backup folders and WAL replica (`BackupTargets.protectedFolders`); `darwinUserTemp` the xcrun temp dir.
-    /// `userHome` is the owner's home (the process's by default; tests pass a temp dir).
+    /// `userHome` is the owner's home (the process's by default; tests pass a temp dir). `reviewPages` are the extension review
+    /// pages (`<ws>/.brahma/ext-review/A-<n>.md`) this agent is the internal reviewer of (10b, B-M9): each is readable on this
+    /// turn only when it is a real file below the workspace; no other turn reads `ext-review`.
     ///
     /// - Item turn (`work`/`notice` with an item): cwd = the item worktree; writes to the agent's home, lab and cache, the
     ///   common git dir's objects, the item's admin dir, ref, ref lock and reflog, its progress file and the agent's notes.
@@ -630,7 +634,7 @@ public struct SandboxScope: Equatable, Sendable {
     public static func forTurn(layout: SandboxLayout, paths: BrahmaPaths, otherWorkspaces: [URL], backupTargets: [URL],
                                kind: TurnKind, item: WorkItem?, company: Company, grants: GrantInputs, darwinUserTemp: URL?,
                                userHome: URL = FileManager.default.homeDirectoryForCurrentUser,
-                               claudeTmpRoot: URL? = nil) throws -> SandboxScope {
+                               claudeTmpRoot: URL? = nil, reviewPages: [URL] = []) throws -> SandboxScope {
         try SandboxLayout.validate(handle: layout.handle)
         if let key = item?.key, key.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) == nil {
             throw SandboxError.invalidPath(key)
@@ -752,6 +756,14 @@ public struct SandboxScope: Equatable, Sendable {
             return url
         }
         readable += readableDotBrahma.compactMap(engineChild)
+        // The review pages of the asks this agent pre-checks (B-M9): exactly those files, real and unlinked, never the directory.
+        for page in reviewPages {
+            let parts = page.pathComponents.suffix(3)
+            guard parts.count == 3, Array(parts.prefix(2)) == [".brahma", "ext-review"],
+                  let name = parts.last, name.range(of: "^A-[0-9]{1,9}\\.md$", options: .regularExpression) != nil,
+                  let url = engineChild("ext-review/\(name)"), SandboxPath.kind(url.path) == .file else { continue }
+            readable.append(url)
+        }
         readable += [home, lab, notes, shellPrefix]
         readable += existingExtra
         if let darwinUserDir {

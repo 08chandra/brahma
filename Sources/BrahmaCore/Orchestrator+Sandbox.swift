@@ -212,13 +212,17 @@ extension Orchestrator {
                     if state == .changed { try store.revokeChangedPathGrant(g, now: now) }
                 }
                 grants.removeAll { g in dropped.contains { $0.ref == g.ref } }
+                // B-M9 (10b): the review pages of the extension asks this agent pre-checks; no other turn reads `ext-review`.
+                let resolved = layout.workspace.resolvedForSandbox
+                let reviewPages = kind == .work || kind == .notice || kind == .plan
+                    ? try store.extensionReviewPages(reviewerId: agent.id).map { resolved.appending(path: $0) } : []
                 let rebuild: @Sendable (GrantInputs) throws -> SandboxScope = { inputs in
                     var inputs = inputs
                     inputs.domains = Array(Set(inputs.domains + extraDomains)).sorted()
                     return try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
                                                     kind: kind, item: item, company: company, grants: inputs,
                                                     darwinUserTemp: env.darwinUserTemp, userHome: env.userHome,
-                                                    claudeTmpRoot: env.claudeTmpRoot)
+                                                    claudeTmpRoot: env.claudeTmpRoot, reviewPages: reviewPages)
                 }
                 let scope = try rebuild(GrantResolver.inputs(grants))
                 if let tmp = scope.claudeTmp { try ClaudeTmp.ensure(tmp) }

@@ -12,7 +12,7 @@ struct ExtGroup: ParsableCommand {
         abstract: "Extensions: skill-only Claude Code plugin folders, validated and mounted per role.",
         discussion: "Mutating commands file a pending ask; approve it in the app. `new` and `lint` need no owner key (agents run them in their lab).",
         subcommands: [ExtNew.self, ExtLint.self, ExtAdd.self, ExtImportClaude.self, ExtAddSkill.self, ExtList.self, ExtShow.self,
-                      ExtBind.self, ExtUnbind.self, ExtRemove.self, ExtRollback.self])
+                      ExtBind.self, ExtUnbind.self, ExtRemove.self, ExtRollback.self, ExtTry.self])
 }
 
 /// `brahma ext new skill <id> [--dir <path>] [--bin]`: the embedded template, written straight to the directory.
@@ -92,11 +92,7 @@ struct ExtLint: AsyncParsableCommand {
             FileHandle.standardError.write(Data("note: claude not found on PATH; Claude's own plugin checks were skipped\n".utf8))
         }
         if json {
-            let rows: [[String: Any]] = result.issues.map {
-                ["code": $0.code, "path": $0.path, "line": $0.line as Any? ?? NSNull(), "message": $0.message, "fix": $0.fix as Any? ?? NSNull()]
-            }
-            let data = try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-            print(rows.isEmpty ? "[]" : String(decoding: data, as: UTF8.self))
+            print(ExtensionValidator.lintJSON(result.issues))
         } else {
             for i in result.issues {
                 let where_ = i.path + (i.line.map { ":\($0)" } ?? "")
@@ -293,4 +289,35 @@ struct ExtRollback: ParsableCommand {
     @Argument(help: "Company name or slug.") var company: String
     @Argument(help: "Extension id.") var id: String
     func run() throws { try proposeAction("rollback", company: company, id: id) }
+}
+
+/// `brahma ext try <path> --company <co> --role <r> --prompt <text>` (Task 10b): one throwaway Quick turn (haiku) of the role
+/// with the folder mounted as `<id>@dev`, on the Sandboxed profile only. No ask is filed and nobody joins the team; the run is
+/// recorded in the extension log and everything it made is removed.
+struct ExtTry: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "try",
+                                                    abstract: "Try an extension folder in one throwaway Quick turn (Sandboxed only; files no ask).")
+    @Argument(help: "The extension folder.") var path: String
+    @Option(help: "Company name or slug.") var company: String
+    @Option(help: "The role whose template the turn runs with.") var role: String
+    @Option(help: "What to ask the turn to do.") var prompt: String
+
+    func run() async throws {
+        try requireOwnerShell()
+        let (store, paths) = try openStore(lazySecrets: false)
+        let c = try resolveCompany(store, company)
+        let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let orchestrator = Orchestrator(store: store, runner: ClaudeProcessRunner(), paths: paths, mcpExecutable: executable,
+                                        vault: try cliSecretVault(interactive: false),
+                                        transcripts: TranscriptCapture(paths: paths, source: .fromEnvironment()))
+        do {
+            let result = try await ExtensionTry.run(path: URL(fileURLWithPath: path, isDirectory: true), companyId: c.id, role: role,
+                                                    prompt: prompt, orchestrator: orchestrator)
+            print(safe(ExtensionTry.summary(result)))
+        } catch let e as ExtensionError {
+            throw fail(e.issues.isEmpty ? e.message : "refused (lint errors):\n" + e.message)
+        } catch let e as WorkError {
+            throw fail(e.message)
+        }
+    }
 }

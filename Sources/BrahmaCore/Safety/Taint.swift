@@ -18,10 +18,10 @@ public enum TaintPolicy {
     ]
 
     /// The company tools reviewed as high risk (`everyToolClassified` pins `CompanyToolNames.all` against both sets). A task
-    /// that adds a tool adds it to one of the two in the same commit (10b: `propose_extension`).
+    /// that adds a tool adds it to one of the two in the same commit (10b: `propose_extension`, refused while tainted).
     public static let reviewedHighRisk: Set<String> = [
         "propose_decision", "request_from_owner", "escalate_decision", "plan_sprint", "close_sprint", "decide", "review", "audit",
-        "request_access", "request_secret", "use_secret", "request_mode", "confirm_spec", "readopt_branch",
+        "request_access", "request_secret", "use_secret", "request_mode", "confirm_spec", "readopt_branch", "propose_extension",
     ]
 
     public static func isHighRisk(_ tool: String) -> Bool { !taintSafeTools.contains(tool) }
@@ -111,8 +111,9 @@ public enum TaintPolicy {
         return id.isEmpty ? nil : id
     }
 
-    /// `brahma` and `company:` extensions never taint (10b adds the tainted-provenance rule for `company:`); `third-party:*`,
-    /// `local` and anything not installed do.
+    /// `brahma` and `company:` extensions never taint; `third-party:*`, `local` and anything not installed do. A `company:`
+    /// extension whose lab history is tainted (10b) is reported by `Store.extensionPublisher` as `third-party:lab-tainted`, so it
+    /// taints like a third-party one.
     static func extensionTaints(id: String, publisher: (String) -> String?) -> Bool {
         if id == ExtensionPublisher.brahma { return false }
         guard let p = publisher(id) else { return true }

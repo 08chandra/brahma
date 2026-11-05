@@ -54,6 +54,19 @@ public struct CompanyExtension: Codable, Equatable, Sendable, FetchableRecord, P
     public var sourceType: String = ""
     public var sourceUrl: String? = nil
     public var sourceSha: String? = nil
+
+    /// A `company:` extension built in a lab whose history holds a tainted (or unrecorded) commit (10b, extensions §4.5): it
+    /// keeps the company publisher, but mounts only on Sandboxed and its skills and agents taint, as a third-party one's do.
+    public var provenanceTainted: Bool { sourceType == ExtensionSourceKind.labTainted }
+}
+
+/// `sourceType` values the installer writes for an agent's lab (Task 10b).
+public enum ExtensionSourceKind {
+    public static let lab = "lab"
+    /// A lab snapshot with a tainted or unrecorded commit in the folder's history.
+    public static let labTainted = "lab-tainted"
+    /// What `Store.extensionPublisher` reports for such an extension: the taint rule treats it as third-party.
+    public static let taintedPublisher = "third-party:lab-tainted"
 }
 
 /// A company override: `add` or `remove` of an extension for a role (`scope role`, `target <role>` or `*` for every role)
@@ -115,6 +128,18 @@ extension Store {
     static func recordExtensionEvent(_ db: Database, companyId: String, extId: String, kind: String, detail: String?, now: Date) throws {
         var e = ExtensionEvent(companyId: companyId, extId: extId, kind: kind, detail: detail.map { Store.flat($0, max: 1000) }, createdAt: now)
         try e.insert(db)
+    }
+
+    /// The review pages (workspace-relative `.brahma/ext-review/A-<n>.md`) of the extension asks `reviewerId` is the internal
+    /// reviewer of and that still wait for that decision (10b, B-M9): what that agent's turns may read of `ext-review`.
+    public func extensionReviewPages(reviewerId: String) throws -> [String] {
+        try writer.read { db in
+            try Ask.filter(Column("kind") == AskKind.extension.rawValue && Column("status") == AskStatus.pendingInternal.rawValue
+                           && Column("internalApproverId") == reviewerId)
+                .order(Column("number")).fetchAll(db)
+                .compactMap { $0.payload?.documentPath }
+                .filter { $0.hasPrefix(ExtensionLibrary.reviewDir + "/") && !$0.dropFirst(ExtensionLibrary.reviewDir.count + 1).contains("/") }
+        }
     }
 
     /// The `bin/` names of a company's installed extensions (name → extension id), for the collision check.

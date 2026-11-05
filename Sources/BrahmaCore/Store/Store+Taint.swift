@@ -156,12 +156,19 @@ extension Store {
 
     // MARK: Extensions
 
-    /// The publisher this company installed `extId` from; nil when it is not installed.
+    /// The publisher the taint rule sees for `extId` in this company: the one it was installed from; for a `company:`
+    /// extension whose lab history is tainted (10b), `third-party:lab-tainted`; for a Brahma built-in that is not installed
+    /// under that id, `brahma`; nil when it is not installed (which taints).
     public func extensionPublisher(companyId: String, extId: String) throws -> String? {
-        try writer.read { db in
-            try String.fetchOne(db, sql: "SELECT publisher FROM companyExtension WHERE companyId = ? AND id = ?",
-                                arguments: [companyId, extId])
-        }.flatMap { $0.isEmpty ? nil : $0 }
+        let row = try writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT publisher, sourceType FROM companyExtension WHERE companyId = ? AND id = ?",
+                             arguments: [companyId, extId])
+        }
+        guard let row else { return BuiltinExtensions.ids.contains(extId) ? ExtensionPublisher.brahma : nil }
+        let publisher: String = row["publisher"] ?? ""
+        let sourceType: String = row["sourceType"] ?? ""
+        guard !publisher.isEmpty else { return nil }
+        return sourceType == ExtensionSourceKind.labTainted ? ExtensionSourceKind.taintedPublisher : publisher
     }
 
     // MARK: Lab provenance

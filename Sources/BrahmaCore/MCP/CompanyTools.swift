@@ -66,20 +66,24 @@ public struct CompanyTools: Sendable {
     let planTurn: Bool
     /// The session's taint flag file (`<home>/run/taint/<agent>`, Task 10): present means tainted. Nil: the store's data home's.
     let taintFlag: URL?
+    /// The data home's places (`propose_extension` stages there, 10b); nil: derived from the store's database path.
+    let paths: BrahmaPaths?
     let counter = TurnQuotaCounter()
 
     public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
-                quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil) {
+                quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
+                paths: BrahmaPaths? = nil) {
         self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, auditTurnId: auditTurnId,
-                  quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, taintFlag: taintFlag, diagnostics: { line in
+                  quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, taintFlag: taintFlag, paths: paths, diagnostics: { line in
             FileHandle.standardError.write(Data((line + "\n").utf8))
         })
     }
 
     init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
          quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
-         diagnostics: @escaping @Sendable (String) -> Void) {
+         paths: BrahmaPaths? = nil, diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
+        self.paths = paths
         self.reviewItemId = reviewItemId
         self.auditTurnId = reviewItemId == nil ? auditTurnId : nil
         self.quotas = quotas; self.quotaTurnId = quotaTurnId; self.planTurn = planTurn
@@ -94,7 +98,7 @@ public struct CompanyTools: Sendable {
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
     public static let highRiskTools: Set<String> = ["decide", "propose_decision", "escalate_decision", "request_from_owner",
                                                     "request_mode", "plan_sprint", "close_sprint", "confirm_spec",
-                                                    "request_access", "request_secret", "readopt_branch"]
+                                                    "request_access", "request_secret", "readopt_branch", "propose_extension"]
     /// What a plan turn's server leaves out: everything that changes work, leases, decisions, channels or a turn's environment.
     static let planTurnExcluded: Set<String> = Set(["claim_lease", "release_lease", "submit_for_review", "update_work_item",
                                                     "create_work_item", "link_dependency", "write_handoff", "create_channel",
@@ -162,7 +166,7 @@ public struct CompanyTools: Sendable {
 
     /// The same list for every role (a stable prompt prefix); `call` enforces what the caller's role may use.
     public func specs() -> [ToolSpec] {
-        let all = Self.baseSpecs() + Self.workSpecs() + Self.inboxToolSpecs() + Self.safetyToolSpecs()
+        let all = Self.baseSpecs() + Self.workSpecs() + Self.inboxToolSpecs() + Self.safetyToolSpecs() + Self.extensionToolSpecs()
         // An audit turn sees the audit tool only (`audit` is listed only here).
         if auditTurnId != nil { return [Self.auditSpec()] }
         if planTurn, reviewItemId == nil { return all.filter { !Self.planTurnExcluded.contains($0.name) } }
@@ -171,7 +175,8 @@ public struct CompanyTools: Sendable {
         return all.filter { CompanyToolNames.review.contains($0.name) } + [Self.reviewSpec()]
     }
 
-    private static let implemented: Set<String> = Set((baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs()).map(\.name))
+    private static let implemented: Set<String> = Set((baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs()
+                                                       + extensionToolSpecs()).map(\.name))
 
     private static func baseSpecs() -> [ToolSpec] {
         let s = Self.self
@@ -366,6 +371,7 @@ public struct CompanyTools: Sendable {
                 if let result = try callWork(name, args) { return result }
                 if let result = try dispatchInbox(name, args) { return result }
                 if let result = try dispatchSafety(name, args) { return result }
+                if let result = try dispatchExtension(name, args) { return result }
                 throw ToolError(message: "unknown tool: \(name)")
             }
         } catch let e as ToolError {

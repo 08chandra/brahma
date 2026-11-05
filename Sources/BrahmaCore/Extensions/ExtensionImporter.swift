@@ -129,7 +129,7 @@ public enum ExtensionImporter {
             facts = ExtensionSourceFacts(publisher: ExtensionPublisher.claudeCode(marketplace: marketplace), sourceType: "claudeCode",
                                          sourceUrl: "\(marketplace)/\(plugin)@\(version)", sourceSha: nil)
         case .lab(let agentId, let path, let commit):
-            guard let labArchive else { throw ExtensionError.message("lab sources arrive with Task 10b") }
+            guard let labArchive else { throw ExtensionError.message("a lab is staged by propose_extension (stageLab), not here") }
             let archived = dir.appending(path: ".archive", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: false)
             try labArchive(agentId, path, commit, archived)
@@ -139,6 +139,46 @@ public enum ExtensionImporter {
         }
         let id = try decompose(dir, bare: bare, notices: &notices)
         return StagedExtension(dir: dir, id: id, notices: notices, source: facts)
+    }
+
+    /// Stages a snapshot of an agent's lab (Task 10b, synchronous: `propose_extension`): `archive` writes the committed folder
+    /// into the directory it is given (`GitWorkspace.labArchive`), which is copied under the limits as it is (every top-level
+    /// entry, so the validator sees what `ext lint` sees in the lab). With `requireClean` any lint issue refuses before the
+    /// decompose step could drop or fill anything. `facts` are the installer's (publisher `company:<slug>`, never the lab's).
+    static func stageLab(paths: BrahmaPaths, facts: ExtensionSourceFacts, requireClean: Bool,
+                                options: ValidationOptions = ValidationOptions(),
+                                archive: (_ tar: URL, _ into: EngineFiles.OpenDirectory) throws -> Void) throws -> StagedExtension {
+        let staging = paths.extensionsDir.staging
+        try BrahmaPaths.ensurePrivateDirectory(paths.extensionsDir.root)
+        try BrahmaPaths.ensurePrivateDirectory(staging)
+        let dir = staging.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        do {
+            let archived = dir.appending(path: ".archive", directoryHint: .isDirectory)
+            let place = try EngineFiles.openWalked(workspace: dir, ".archive")
+            do { try archive(dir.appending(path: ".archive.tar"), place) } catch let e as UnexportableTree {
+                throw ExtensionError.message("the folder could not be unpacked: \(e.reason)")
+            }
+            try? FileManager.default.removeItem(at: dir.appending(path: ".archive.tar"))
+            let package = dir.appending(path: "package", directoryHint: .isDirectory)
+            try copyTree(from: archived, to: package)
+            try FileManager.default.removeItem(at: archived)
+            if requireClean {
+                let lint = ExtensionValidator.validate(staged: package, options: options)
+                guard lint.issues.isEmpty else { throw ExtensionError(issues: lint.issues) }
+            }
+            // The staged tree is the package itself (what was linted), moved into the staging dir's place.
+            for name in try FileManager.default.contentsOfDirectory(atPath: package.path) {
+                try FileManager.default.moveItem(at: package.appending(path: name), to: dir.appending(path: name))
+            }
+            try FileManager.default.removeItem(at: package)
+            var notices: [String] = []
+            let id = try decompose(dir, bare: false, notices: &notices)
+            return StagedExtension(dir: dir, id: id, notices: notices, source: facts)
+        } catch {
+            try? FileManager.default.removeItem(at: dir)
+            throw error
+        }
     }
 
     /// Which top-level entries of a plugin source are copied: the allowlisted ones and those decompose notices; `node_modules`

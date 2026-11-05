@@ -42,6 +42,8 @@ public enum LintCode: String, CaseIterable, Sendable {
     case claudeValidate = "EXT026"
     case claudeDetails = "EXT027"
     case namespace = "EXT028"
+    /// A part that reads `${CLAUDE_PLUGIN_ROOT}/assets`: `assets/` is not mounted in this release (10b, B-M14).
+    case assetsUnmounted = "EXT029"
 
     public var name: String {
         switch self {
@@ -73,6 +75,7 @@ public enum LintCode: String, CaseIterable, Sendable {
         case .claudeValidate: "claude-validate"
         case .claudeDetails: "claude-details"
         case .namespace: "namespace"
+        case .assetsUnmounted: "assets-unmounted"
         }
     }
 }
@@ -203,6 +206,19 @@ public enum ExtensionValidator {
         case .other: return name == "assets"
         default: return false
         }
+    }
+
+    /// `brahma ext lint --json`: the issues as a sorted array of `{code, path, line, message, fix}` (pretty, keys sorted), `[]`
+    /// when clean. `propose_extension` returns the same list (10b).
+    public static func lintJSON(_ issues: [LintIssue]) -> String {
+        guard !issues.isEmpty else { return "[]" }
+        let rows: [[String: Any]] = issues.sorted().map {
+            ["code": $0.code, "path": $0.path, "line": $0.line as Any? ?? NSNull(), "message": $0.message, "fix": $0.fix as Any? ?? NSNull()]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else {
+            return "[]"
+        }
+        return String(decoding: data, as: UTF8.self)
     }
 
     /// Whether a relative path is a plugin-part Markdown file (skills, commands, agents; `.md` matched case-insensitively).
@@ -464,6 +480,12 @@ public enum ExtensionValidator {
                 if let line = Scans.firstLine(regex, in: text) { issue(.secret, f.relative, line: line, "a value that looks like a secret (\(label))") }
             }
             for h in Scans.hosts(in: text) { hosts.insert(h) }
+            // B-M14 (10b): only the plugin parts are mounted, never `assets/`; a part that reads it would break at run time.
+            if isPluginPartMarkdown(f.relative) || f.relative.hasPrefix("bin/"), let line = Scans.firstLine(Scans.assetsReference, in: text) {
+                issue(.assetsUnmounted, f.relative, line: line,
+                      "reads ${CLAUDE_PLUGIN_ROOT}/assets, which is not mounted in this release; put what the skill reads under skills/<name>/",
+                      severity: .warning)
+            }
         }
         r.lintFacts.hosts = hosts.sorted()
 
@@ -1351,6 +1373,8 @@ enum Scans {
     static let secrets: [(String, NSRegularExpression)] = SecretScan.patterns.compactMap { p in
         (try? NSRegularExpression(pattern: p.ere)).map { (p.label, $0) }
     }
+
+    static let assetsReference = regex(#"\$\{?CLAUDE_PLUGIN_ROOT\}?/assets(/|\b)"#)
 
     static let url = regex(#"https?://([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?::\d+)?(?:[/?#]|\b)"#)
 

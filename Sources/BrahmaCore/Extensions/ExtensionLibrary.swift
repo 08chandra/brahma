@@ -24,13 +24,16 @@ public struct ExtensionAskPayload: Codable, Equatable, Sendable {
     public var sourceType: String? = nil
     public var sourceUrl: String? = nil
     public var sourceSha: String? = nil
+    /// A lab proposal (10b): the lab commits that touched the folder and are recorded tainted, or not recorded at all. Any
+    /// makes the installed extension third-party for taint and profile purposes (`sourceType` `lab-tainted`).
+    public var taintedCommits: [String]? = nil
 
     public init(action: String, extId: String, hash: String, publisher: String, roles: [String], notices: [String], lintSummary: [String],
                 executes: LintFacts.Executes, alwaysOnTokens: Int?, stagedPath: String?, role: String? = nil,
-                sourceType: String? = nil, sourceUrl: String? = nil, sourceSha: String? = nil) {
+                sourceType: String? = nil, sourceUrl: String? = nil, sourceSha: String? = nil, taintedCommits: [String]? = nil) {
         self.action = action; self.extId = extId; self.hash = hash; self.publisher = publisher; self.roles = roles; self.notices = notices
         self.lintSummary = lintSummary; self.executes = executes; self.alwaysOnTokens = alwaysOnTokens; self.stagedPath = stagedPath; self.role = role
-        self.sourceType = sourceType; self.sourceUrl = sourceUrl; self.sourceSha = sourceSha
+        self.sourceType = sourceType; self.sourceUrl = sourceUrl; self.sourceSha = sourceSha; self.taintedCommits = taintedCommits
     }
 
     public static func read(_ ask: Ask) -> ExtensionAskPayload? {
@@ -58,15 +61,73 @@ public enum ExtensionLibrary {
 
     // MARK: Propose
 
+    /// How a proposal is filed (10b): the owner's CLI files straight to the owner; an agent's lab proposal goes to the pack's
+    /// internal reviewer first, carries the agent's summary and item, lists its tainted commits, and needs a clean lint.
+    public struct ProposalOptions: Sendable {
+        /// Skip the internal step (the owner's own CLI and the app).
+        public var viaOwner: Bool
+        /// The ask's summary (nil: the manifest description).
+        public var summary: String?
+        public var itemId: String?
+        public var taintedCommits: [String]?
+        /// Any lint issue refuses, warnings included (an agent's proposal: `ext lint` must print `[]`).
+        public var requireClean: Bool
+
+        public init(viaOwner: Bool = true, summary: String? = nil, itemId: String? = nil, taintedCommits: [String]? = nil,
+                    requireClean: Bool = false) {
+            self.viaOwner = viaOwner; self.summary = summary; self.itemId = itemId; self.taintedCommits = taintedCommits
+            self.requireClean = requireClean
+        }
+    }
+
     /// Validates the staged package (Claude's own checks included when `claude` is given) and files ONE pending ask the owner
     /// decides in the app. Errors refuse with the lint list; nothing is installed or mounted before approval.
     @discardableResult
     public static func propose(staged: StagedExtension, store: Store, paths: BrahmaPaths, companyId: String, requester: Sender,
-                               roles: [String], claude: ClaudeCheck? = nil, now: Date = Store.now()) async throws -> Ask {
+                               roles: [String], claude: ClaudeCheck? = nil, options: ProposalOptions = ProposalOptions(),
+                               now: Date = Store.now()) async throws -> Ask {
+        var prepared = try prepare(staged: staged, store: store, paths: paths, companyId: companyId, options: options)
+        if let claude {
+            // I1: Claude's own checks run only on a package the validator passed.
+            let checks = await ExtensionValidator.claudeChecks(staged: staged.dir, check: claude)
+            prepared.result.issues += checks.issues
+            prepared.result.issues.sort()
+            prepared.alwaysOn = checks.alwaysOnTokens
+            guard prepared.result.errors.isEmpty else { throw ExtensionError(issues: prepared.result.errors) }
+            if options.requireClean, !prepared.result.issues.isEmpty { throw ExtensionError(issues: prepared.result.issues) }
+        }
+        return try file(prepared, staged: staged, store: store, companyId: companyId, requester: requester, roles: roles,
+                        options: options, now: now)
+    }
+
+    /// The same without Claude's own checks, synchronously: an agent's `propose_extension` (its MCP server is synchronous).
+    @discardableResult
+    public static func proposeSync(staged: StagedExtension, store: Store, paths: BrahmaPaths, companyId: String, requester: Sender,
+                                   roles: [String], options: ProposalOptions, now: Date = Store.now()) throws -> Ask {
+        let prepared = try prepare(staged: staged, store: store, paths: paths, companyId: companyId, options: options)
+        return try file(prepared, staged: staged, store: store, companyId: companyId, requester: requester, roles: roles,
+                        options: options, now: now)
+    }
+
+    struct Prepared {
+        var company: Company
+        var result: ValidationResult
+        var manifest: ExtensionManifest
+        var alwaysOn: Int?
+    }
+
+    /// Validation, the canonical rewrite (S9) and validation again.
+    static func prepare(staged: StagedExtension, store: Store, paths: BrahmaPaths, companyId: String,
+                        options: ProposalOptions) throws -> Prepared {
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
-        let options = ValidationOptions(installedBins: try store.installedBins(companyId: companyId, paths: paths))
-        let first = ExtensionValidator.validate(staged: staged.dir, options: options)
+        let validation = ValidationOptions(installedBins: try store.installedBins(companyId: companyId, paths: paths))
+        let first = ExtensionValidator.validate(staged: staged.dir, options: validation)
         guard first.errors.isEmpty, first.manifest != nil else { throw ExtensionError(issues: first.errors) }
+        if options.requireClean, !first.issues.isEmpty { throw ExtensionError(issues: first.issues) }
+        // Brahma's own ids are never anyone else's (10b).
+        if let id = first.manifest?.name, BuiltinExtensions.ids.contains(id) {
+            throw ExtensionError.message("'\(id)' is Brahma's own extension id; choose another")
+        }
         // S9: every plugin-part Markdown file is rewritten in canonical form (allowlisted keys only, LF, no BOM) BEFORE hashing,
         // so the lock, the hash, the review page and the mounted copy all describe exactly what Claude Code will read.
         // A lock the first validation verified describes the source bytes; after the engine's own rewrite it is regenerated so
@@ -75,17 +136,15 @@ public enum ExtensionLibrary {
            FileManager.default.fileExists(atPath: staged.dir.appending(path: ExtensionLock.path).path) {
             try ExtensionValidator.writeLock(root: staged.dir)
         }
-        var result = ExtensionValidator.validate(staged: staged.dir, options: options)
+        let result = ExtensionValidator.validate(staged: staged.dir, options: validation)
         guard result.errors.isEmpty, let manifest = result.manifest else { throw ExtensionError(issues: result.errors) }
-        var alwaysOn: Int?
-        if let claude {
-            // I1: Claude's own checks run only on a package the validator passed.
-            let checks = await ExtensionValidator.claudeChecks(staged: staged.dir, check: claude)
-            result.issues += checks.issues
-            result.issues.sort()
-            alwaysOn = checks.alwaysOnTokens
-            guard result.errors.isEmpty else { throw ExtensionError(issues: result.errors) }
-        }
+        return Prepared(company: company, result: result, manifest: manifest, alwaysOn: nil)
+    }
+
+    /// Records the package, writes the review page and files the ask (one write).
+    static func file(_ prepared: Prepared, staged: StagedExtension, store: Store, companyId: String, requester: Sender, roles: [String],
+                     options: ProposalOptions, now: Date) throws -> Ask {
+        let (company, result, manifest, alwaysOn) = (prepared.company, prepared.result, prepared.manifest, prepared.alwaysOn)
         let id = manifest.name
         for role in roles where role.range(of: "^[a-z][a-z0-9-]{0,31}$", options: .regularExpression) == nil {
             throw ExtensionError.message("'\(Store.flat(role, max: 40))' is not a role id")
@@ -113,7 +172,8 @@ public enum ExtensionLibrary {
         let payload = ExtensionAskPayload(action: "install", extId: id, hash: treeHash, publisher: staged.source.publisher, roles: roles,
                                           notices: staged.notices, lintSummary: result.warnings.map { "\($0.code) \($0.path): \($0.message)" },
                                           executes: facts.executes, alwaysOnTokens: alwaysOn, stagedPath: staged.dir.path,
-                                          sourceType: staged.source.sourceType, sourceUrl: staged.source.sourceUrl, sourceSha: staged.source.sourceSha)
+                                          sourceType: staged.source.sourceType, sourceUrl: staged.source.sourceUrl, sourceSha: staged.source.sourceSha,
+                                          taintedCommits: options.taintedCommits)
         let page = try reviewPage(staged: staged, manifest: manifest, result: result, payload: payload)
         let sender: Sender = { if case .owner = requester { return .system } else { return requester } }()
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -128,11 +188,11 @@ public enum ExtensionLibrary {
             let document = try Store.readDocument("\(reviewDir)/A-\(number).md", workspace: company.workspacePath)
             let ask = try store.propose(db: db, companyId: companyId, by: sender, kind: .extension, risk: .high, category: "prompt-change",
                                         title: "Install extension \(id) \(manifest.version)",
-                                        summary: Store.flat(manifest.description, max: Store.maxAskText),
+                                        summary: Store.flat(options.summary ?? manifest.description, max: Store.maxAskText),
                                         payload: AskPayload(documentPath: "\(reviewDir)/A-\(number).md", details: payload.json(),
                                                             proposal: "install \(id)@\(treeHash.prefix(12)) for \(roles.isEmpty ? "no role yet" : roles.joined(separator: ", "))"),
-                                        document: document, itemId: nil, subjectId: "ext:\(id)", supersedes: nil, requestId: nil,
-                                        decisionClass: .goalChanging, viaOwner: true, now: now)
+                                        document: document, itemId: options.itemId, subjectId: "ext:\(id)", supersedes: nil, requestId: nil,
+                                        decisionClass: .goalChanging, viaOwner: options.viaOwner, now: now)
             guard ask.number == number else { throw WorkError.conflict("another ask was filed meanwhile; try again") }
             try Store.recordExtensionEvent(db, companyId: companyId, extId: id, kind: "staged", detail: "\(ask.ref) \(treeHash.prefix(12)) from \(staged.source.sourceType)", now: now)
             return ask
@@ -155,6 +215,13 @@ public enum ExtensionLibrary {
         out += "- publisher: \(staged.source.publisher) (set by Brahma from the source, never by the package)\n"
         out += "- source: \(staged.source.sourceType) \(staged.source.sourceUrl ?? "")\n"
         out += "- tree hash: \(payload.hash)\n"
+        if let tainted = payload.taintedCommits {
+            // 10b: a lab proposal says which of its commits a session that read outside content made (or nobody recorded).
+            out += tainted.isEmpty
+                ? "- lab provenance: every commit touching the folder was made by a clean session\n"
+                : "- tainted commits: \(tainted.map { Store.flat($0, max: 64) }.joined(separator: ", ")) (made by a session that read outside "
+                  + "content, or never recorded): if approved it is treated as third-party (Sandboxed only; its skills taint)\n"
+        }
         out += "- roles: \(payload.roles.isEmpty ? "(none)" : payload.roles.joined(separator: ", "))\n"
         out += "- description: \(Store.flat(manifest.description, max: ExtensionLimits.maxDescription))\n"
         out += "- executes: bin \(payload.executes.bin), scripts \(payload.executes.scripts), ! injection \(payload.executes.bangInjection)\n"
@@ -292,19 +359,25 @@ public enum ExtensionLibrary {
             makeWritable(pluginDir)
             _ = try EngineFiles.removeNoFollow(pluginDir, under: workspace)
         }
+        try writePluginParts(from: staged, workspace: workspace, relative: relative)
+        guard try ExtensionLock.treeHash(root: pluginDir) == pluginHash else {
+            makeWritable(pluginDir)
+            _ = try? EngineFiles.removeNoFollow(pluginDir, under: workspace)
+            throw ExtensionError.message("the materialized plugin parts do not hash as recorded; nothing was installed")
+        }
+    }
+
+    /// Copies the plugin parts of `staged` (`workspaceParts`) to `<workspace>/<relative>` read-only (0444, `bin/` 0555), every
+    /// write through `EngineFiles` (no link is ever followed). Also the owner's `ext try` copy (10b).
+    static func writePluginParts(from staged: URL, workspace: URL, relative: String) throws {
         _ = try EngineFiles.directory(workspace: workspace, relative)
         for f in try PackageWalk.files(root: staged) where f.kind == .regular {
             let parts = f.relative.split(separator: "/").map(String.init)
             guard let top = parts.first, workspaceParts.contains(top) else { continue }
             let dir = relative + (parts.count > 1 ? "/" + parts.dropLast().joined(separator: "/") : "")
             _ = try EngineFiles.directory(workspace: workspace, dir)
-            guard let data = fm.contents(atPath: f.url.path) else { throw ExtensionError.message("cannot read \(f.relative)") }
+            guard let data = FileManager.default.contents(atPath: f.url.path) else { throw ExtensionError.message("cannot read \(f.relative)") }
             _ = try EngineFiles.replace(data, workspace: workspace, dir: dir, name: parts.last!, mode: top == "bin" ? 0o555 : 0o444)
-        }
-        guard try ExtensionLock.treeHash(root: pluginDir) == pluginHash else {
-            makeWritable(pluginDir)
-            _ = try? EngineFiles.removeNoFollow(pluginDir, under: workspace)
-            throw ExtensionError.message("the materialized plugin parts do not hash as recorded; nothing was installed")
         }
     }
 
@@ -380,8 +453,17 @@ public enum ExtensionLibrary {
         }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         try materialize(staged: storeDir, id: id, hash: previous, pluginHash: package.pluginTreeSha256, workspace: workspace, paths: paths)
+        // The earlier version's own source facts (10b): those of the approved install of that hash. Without one, an extension
+        // from a lab is rolled back as tainted provenance (fail closed).
+        let origin = try store.asks(companyId: companyId, statuses: [.approved]).compactMap(ExtensionAskPayload.read)
+            .last { $0.action == "install" && $0.extId == id && $0.hash == previous }
+        var sourceType = origin?.sourceType ?? current.sourceType
+        if origin == nil, sourceType == ExtensionSourceKind.lab { sourceType = ExtensionSourceKind.labTainted }
         try store.writer.write { db in
-            try db.execute(sql: "UPDATE companyExtension SET hash = ?, installedAt = ? WHERE companyId = ? AND id = ?", arguments: [previous, now, companyId, id])
+            try db.execute(sql: "UPDATE companyExtension SET hash = ?, installedAt = ?, publisher = ?, sourceType = ?, sourceUrl = ?, sourceSha = ? "
+                           + "WHERE companyId = ? AND id = ?",
+                           arguments: [previous, now, origin?.publisher ?? current.publisher, sourceType, origin?.sourceUrl ?? current.sourceUrl,
+                                       origin?.sourceSha ?? current.sourceSha, companyId, id])
             try Store.recordExtensionEvent(db, companyId: companyId, extId: id, kind: "rollback", detail: "\(previous) from \(current.hash.prefix(12))", now: now)
             if let ask {
                 _ = try store.ownerDecide(db: db, askId: ask.id, approve: true, note: "", acknowledgeChange: true, currentHash: nil, grant: nil,
@@ -395,17 +477,31 @@ public enum ExtensionLibrary {
     /// The plugin dirs one turn mounts, sorted by id: `RoleBundle.effective` over the pack, the company's overrides and the
     /// grants, kept to what is installed, enabled, allowed on the profile and present with its recorded hash. Review and
     /// audit turns mount none. A tree that does not hash as recorded is blocked (`extensionEvent tamper`, an engine alert);
-    /// a missing host tool leaves the extension out with an owner notice "<id> needs <tool>". Blocking (it hashes files).
+    /// a missing host tool leaves the extension out with an owner notice "<id> needs <tool>". Brahma's built-in
+    /// `extension-authoring` joins on itemless turns (`BuiltinExtensions.mounts`). `itemScoped` nil: as the turn's session scope
+    /// is chosen (`TurnContext`): a notice turn is itemless; a work turn is item-scoped when the agent holds a lease or has a
+    /// current item. Blocking (it hashes files).
     public static func mounts(company: Company, role: String, agent: Agent, grants: GrantInputs, profile: PermissionProfile, kind: TurnKind,
-                              store: Store, paths: BrahmaPaths, now: Date = Store.now()) throws -> [ExtensionMount] {
+                              itemScoped: Bool? = nil, store: Store, paths: BrahmaPaths, now: Date = Store.now()) throws -> [ExtensionMount] {
         if kind == .review || kind == .audit { return [] }
-        let installed = try store.installedExtensions(companyId: company.id)
+        let scoped = try itemScoped ?? (kind == .plan || kind == .work
+            && (try store.lease(agentId: agent.id) != nil || store.currentItemWithoutLease(agentId: agent.id) != nil))
+        let builtins = BuiltinExtensions.mounts(company: company, role: role, kind: kind, itemScoped: scoped, store: store)
+        return (builtins + (try installedMounts(company: company, role: role, agent: agent, grants: grants, profile: profile, store: store,
+                                                now: now))).sorted { $0.id < $1.id }
+    }
+
+    static func installedMounts(company: Company, role: String, agent: Agent, grants: GrantInputs, profile: PermissionProfile,
+                                store: Store, now: Date) throws -> [ExtensionMount] {
+        // A built-in's id is never mounted from a company row (none can be filed; a stale one is ignored).
+        let installed = try store.installedExtensions(companyId: company.id).filter { !BuiltinExtensions.ids.contains($0.id) }
         guard !installed.isEmpty else { return [] }
         var packages: [String: ExtensionPackage] = [:]
         for e in installed { if let p = try store.extensionPackage(hash: e.hash) { packages[e.id] = p } }
         // The publisher is the company's own (set at approve), never the shared package row's (B-I1).
         let have = installed.filter { packages[$0.id] != nil && !$0.publisher.isEmpty }
-            .map { RoleBundle.Installed(id: $0.id, publisher: $0.publisher, hash: $0.hash, enabled: $0.enabled) }
+            .map { RoleBundle.Installed(id: $0.id, publisher: $0.publisher, hash: $0.hash, enabled: $0.enabled,
+                                        provenanceTainted: $0.provenanceTainted) }
         let template = store.catalog.pack(company.packId)?.role(role)
         let chosen = RoleBundle.effective(packRefs: template?.extensions ?? [], bindings: try store.extensionBindings(companyId: company.id),
                                           grants: grants.extensions, installed: have, role: role, agentId: agent.id, profile: profile)

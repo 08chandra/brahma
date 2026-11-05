@@ -121,9 +121,11 @@ public struct InitInfo: Equatable, Sendable {
     public var model: String
     public var tools: [String]
     public var agents: [String]
+    /// The init line's `skills` (namespaced `<plugin>:<skill>` for mounted extensions; 10b records them for `ext try`).
+    public var skills: [String] = []
 
-    public init(sessionId: String, model: String, tools: [String], agents: [String]) {
-        self.sessionId = sessionId; self.model = model; self.tools = tools; self.agents = agents
+    public init(sessionId: String, model: String, tools: [String], agents: [String], skills: [String] = []) {
+        self.sessionId = sessionId; self.model = model; self.tools = tools; self.agents = agents; self.skills = skills
     }
 }
 
@@ -211,7 +213,8 @@ public enum StreamParser {
             guard let sessionId = object["session_id"] as? String, let model = object["model"] as? String else { return other }
             let info = InitInfo(sessionId: sessionId, model: model,
                                 tools: (object["tools"] as? [Any])?.compactMap { $0 as? String } ?? [],
-                                agents: (object["agents"] as? [Any])?.compactMap { $0 as? String } ?? [])
+                                agents: (object["agents"] as? [Any])?.compactMap { $0 as? String } ?? [],
+                                skills: (object["skills"] as? [Any])?.compactMap { $0 as? String } ?? [])
             return [.initialized(sessionId: sessionId, model: model), .initInfo(info)]
         case "task_started":
             guard let id = object["task_id"] as? String else { return other }

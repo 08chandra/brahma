@@ -103,6 +103,22 @@ public struct TranscriptCapture: Sendable {
         }
     }
 
+    /// A dev run (`ext try`, Task 10b): the session's transcript, redacted and compressed like a turn's, at
+    /// `transcripts/<companyId>/dev-runs/<label>.jsonl.<ext>` (0600). No row: a dev run is never a team member's turn. Returns
+    /// the path relative to the data home, or nil (secrets not loaded yet, no transcript, a write that failed). Blocking.
+    public func captureDevRun(sessionId: String, companyId: String, label: String, store: Store) -> String? {
+        guard !store.secretsHeld, Self.isSessionId(sessionId), Self.isSessionId(companyId), Self.isSessionId(label),
+              let file = newestFile(sessionId: sessionId), file.size > 0,
+              var slice = try? Self.read(file.url, from: 0, upTo: min(Int64(file.size), Int64(Self.maxChunk))),
+              let lastNewline = slice.lastIndex(of: 0x0A) else { return nil }
+        slice = slice.prefix(through: lastNewline)
+        let redacted = redact(slice, with: store.redactor)
+        guard let packed = try? compressor.compress(redacted, workDir: paths.tmpDir) else { return nil }
+        let relative = "transcripts/\(companyId)/dev-runs/\(label).jsonl.\(compressor.fileExtension)"
+        guard (try? Self.writePrivate(packed, to: paths.home.appending(path: relative))) != nil else { return nil }
+        return relative
+    }
+
     /// The decompressed, verified content of a captured turn.
     public func read(_ row: TurnTranscript) throws -> Data {
         let url = paths.home.appending(path: row.path)

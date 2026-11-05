@@ -3237,4 +3237,79 @@ extension GitWorkspace {
         }
         return shas
     }
+
+    // MARK: Lab proposals (Task 10b)
+
+    /// A folder path inside a lab as `propose_extension` takes it: 1–8 components of `[A-Za-z0-9][A-Za-z0-9._-]*` (at most 64
+    /// characters each), none `.git`. No pathspec magic, no `..`, nothing git or a shell could read two ways.
+    public static func isLabFolderPath(_ path: String) -> Bool {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard (1...8).contains(parts.count) else { return false }
+        return parts.allSatisfy { p in
+            p.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", options: .regularExpression) != nil && p.lowercased() != ".git"
+                && !p.hasSuffix(".") && !p.contains("..")
+        }
+    }
+
+    /// The lab's `HEAD` commit, or nil when it has none yet. The repository is this workspace's root (an agent's lab), read
+    /// through `GitCommand` (its config scanned, programs off). Blocking.
+    public func labHead() throws -> String? {
+        let out = try main.run(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], allowFailure: true)
+        guard out.status == 0, !out.text.isEmpty else { return nil }
+        try Self.validCommit(out.text)
+        return out.text
+    }
+
+    /// Every commit reachable from `commit` that touched `path` (full history: no merge side is pruned), newest first. These are
+    /// the commits since the folder first appeared whose provenance a proposal reports. A listing that was cut throws. Blocking.
+    public func labPathCommits(commit: String, path: String, maxOutput: Int = 4 << 20) throws -> [String] {
+        try Self.validCommit(commit)
+        guard Self.isLabFolderPath(path) else { throw GitError.failed(command: "rev-list", status: -1, stderr: "invalid lab path") }
+        let out = try main.run(["rev-list", "--full-history", commit, "--", path], maxOutput: maxOutput)
+        guard !out.cut else { throw GitError.failed(command: "rev-list", status: -1, stderr: "the commit listing was cut at \(maxOutput) bytes") }
+        return try out.text.split(separator: "\n").map { line in
+            let sha = String(line)
+            try Self.validCommit(sha)
+            return sha
+        }
+    }
+
+    /// Writes `<commit>:<path>` (a tree: the folder as committed, nothing uncommitted) as a tar file at `tar` with `git archive`
+    /// (the engine's attributes: nothing left out or substituted), then unpacks it into `into` with `untar` (relative names only,
+    /// `-k`, from the directory's descriptor). Blocking.
+    func labArchive(commit: String, path: String, tar: URL, into: EngineFiles.OpenDirectory) throws {
+        try Self.validCommit(commit)
+        guard Self.isLabFolderPath(path) else { throw GitError.failed(command: "archive", status: -1, stderr: "invalid lab path") }
+        let kind = try main.run(["cat-file", "-t", "\(commit):\(path)"], allowFailure: true)
+        guard kind.status == 0, kind.text == "tree" else {
+            throw GitError.failed(command: "archive", status: -1, stderr: "\(path) is not a folder in the lab's last commit")
+        }
+        // The extension limits before anything is written: the file count and the bytes the tree declares (no submodules).
+        let listing = try main.run(["ls-tree", "-r", "-l", "-z", "\(commit):\(path)"], allowFailure: true, maxOutput: 1 << 20)
+        guard listing.status == 0, !listing.cut else {
+            throw GitError.failed(command: "archive", status: -1, stderr: "the folder could not be listed within the limits")
+        }
+        var files = 0
+        var bytes: Int64 = 0
+        for raw in listing.stdout.split(separator: 0) {
+            let entry = String(decoding: raw, as: UTF8.self)
+            let fields = entry.prefix { $0 != "\t" }.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count == 4 else { continue }
+            guard fields[1] == "blob" else {
+                throw GitError.failed(command: "archive", status: -1, stderr: "the folder holds a \(fields[1]) entry; only files and folders")
+            }
+            files += 1
+            bytes += Int64(fields[3]) ?? Int64(ExtensionLimits.maxBytes)
+            guard files <= ExtensionLimits.maxFiles, bytes <= Int64(ExtensionLimits.maxBytes) else {
+                throw GitError.failed(command: "archive", status: -1,
+                                      stderr: "the folder is over the extension limits (\(ExtensionLimits.maxFiles) files, \(ExtensionLimits.maxBytes) bytes)")
+            }
+        }
+        let out = try main.run(["archive", "--format=tar", "--output=\(tar.path)", "\(commit):\(path)"], allowFailure: true)
+        guard out.status == 0 else { throw GitError.failed(command: "archive", status: out.status, stderr: Self.oneLine(out.stderr)) }
+        let fd = open(tar.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw GitError.failed(command: "archive", status: -1, stderr: "could not open the archive") }
+        defer { close(fd) }
+        try Self.untar(fd, into: into)
+    }
 }

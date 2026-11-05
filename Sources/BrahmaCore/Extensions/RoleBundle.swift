@@ -9,8 +9,10 @@ public enum RoleBundle {
         public var publisher: String
         public var hash: String
         public var enabled: Bool
-        public init(id: String, publisher: String, hash: String, enabled: Bool) {
-            self.id = id; self.publisher = publisher; self.hash = hash; self.enabled = enabled
+        /// A `company:` extension with a tainted lab history (10b): first-party by name, third-party for the profile rule.
+        public var provenanceTainted: Bool
+        public init(id: String, publisher: String, hash: String, enabled: Bool, provenanceTainted: Bool = false) {
+            self.id = id; self.publisher = publisher; self.hash = hash; self.enabled = enabled; self.provenanceTainted = provenanceTainted
         }
         var ref: ExtensionRef { ExtensionRef(publisher: publisher, id: id) }
     }
@@ -38,7 +40,7 @@ public enum RoleBundle {
         for b in bindings where b.op == "remove" && applies(b) { chosen.remove(b.id) }
         return chosen.sorted().compactMap { id in
             guard let have = byId[id], have.enabled else { return nil }
-            if profile != .sandboxed, !ExtensionPublisher.isFirstParty(have.publisher) { return nil }
+            if profile != .sandboxed, !ExtensionPublisher.isFirstParty(have.publisher) || have.provenanceTainted { return nil }
             return have
         }
     }

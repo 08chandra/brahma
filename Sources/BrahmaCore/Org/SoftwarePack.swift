@@ -516,6 +516,9 @@ public enum SoftwarePack {
             "architecture": ["cto", "cto-architect", "ceo", "ceo-cpo"],
             "sprintPlan": ["cpo", "ceo-cpo", "ceo"],
             "release": ["cto", "cto-architect", "ceo", "ceo-cpo"],
+            // Task 10b: an agent's proposed extension is pre-checked by the technical lead; `prompt-change` is reserved, so an
+            // internal approval always moves it on to the owner.
+            "extension": ["cto", "cto-architect", "ceo", "ceo-cpo"],
             "other": ["ceo", "ceo-cpo"],
         ],
         reservedCategories: [],

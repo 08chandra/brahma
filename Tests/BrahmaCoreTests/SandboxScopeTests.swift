@@ -660,15 +660,19 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
 
     @Test func allowlistedDotBrahmaChildrenReadableWhenTheyExist() throws {
         let w = try SandboxWorld()
-        let children = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext", "ext-review",
+        let children = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext",
                         "hooks", "cache/shared"]
+        // B-M9 (10b): `ext-review` and `ext-try` are not among them (the reviewer's pages and the owner's try turn only).
+        for reviewerOnly in ["ext-review", "ext-try"] {
+            try FileManager.default.createDirectory(atPath: w.p(".brahma/\(reviewerOnly)"), withIntermediateDirectories: true)
+        }
         for child in children { try FileManager.default.createDirectory(atPath: w.p(".brahma/\(child)"), withIntermediateDirectories: true) }
         for engineOnly in ["checks", "wt-check", "plans/X-9", "resources/secret", "cache/other"] {
             try FileManager.default.createDirectory(atPath: w.p(".brahma/\(engineOnly)"), withIntermediateDirectories: true)
         }
         let s = try w.scope(.work)
         for child in children { #expect(s.readable.paths.contains(w.p(".brahma/\(child)")), "\(child)") }
-        for engineOnly in ["checks", "wt-check", "plans", "resources", "cache", "resources/secret", "cache/other"] {
+        for engineOnly in ["checks", "wt-check", "plans", "resources", "cache", "resources/secret", "cache/other", "ext-review", "ext-try"] {
             #expect(!s.readable.paths.contains(w.p(".brahma/\(engineOnly)")), "\(engineOnly)")
         }
         #expect(s.readOnlyDirs.paths.contains(w.p(".brahma/resources/company")))

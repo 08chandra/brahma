@@ -46,6 +46,10 @@ struct CompanyGroup: ParsableCommand {
                 let layout = SandboxLayout(paths: paths2, company: c, agentHandle: "engine")
                 try CompanyHooks.install(layout: layout, git: GitWorkspace(root: layout.workspace, exportHome: paths2.home))
             } catch { FileHandle.standardError.write(Data("brahma: could not install the pre-commit hook: \(safe("\(error)"))\n".utf8)) }
+            // Brahma's built-in extensions (Task 10b); the engine also writes them at start.
+            do { try BuiltinExtensions.materialize(workspace: URL(fileURLWithPath: c.workspacePath, isDirectory: true)) } catch {
+                FileHandle.standardError.write(Data("brahma: could not write the built-in extensions: \(safe("\(error)"))\n".utf8))
+            }
             print("\(c.id)  \(c.workspacePath)")
             if let staffed {
                 let hired = try store.applyOrg(companyId: c.id, plan: staffed.seated, pack: industry, vacancies: staffed.vacancies)
