@@ -76,7 +76,11 @@ struct ReleaseGroup: ParsableCommand {
             if let url = r.deployURL { print("deploy URL: \(safe(url))") }
             print("build: \(safe(r.build.map { HostingCommand.oneLine($0, max: 300) } ?? "none")) → \(safe(r.outputDir ?? "-"))")
             print("deploy (engine, token $\(r.plan.tokenSecret), in order):\n\(ReleaseGroup.block(r.plan.display))")
-            print("rollback (recorded):\n\(ReleaseGroup.block(r.rollbackPlan.display))")
+            if r.rollbackPlan.steps.isEmpty {
+                print("rollback (recorded): none; roll back from the provider dashboard")
+            } else {
+                print("rollback (recorded):\n\(ReleaseGroup.block(r.rollbackPlan.display))")
+            }
             var rollback = "rollback: \(r.rollbackStatus?.rawValue ?? "none")"
             if let at = r.rollbackRequestedAt { rollback += ", requested \(clock(at))" }
             if let at = r.rollbackStartedAt { rollback += ", started \(clock(at))" }
