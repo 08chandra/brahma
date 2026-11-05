@@ -23,12 +23,15 @@ struct LabClearTaint: ParsableCommand {
 
     func run() throws {
         try requireOwnerShell()
-        let (store, _) = try openStore()
+        let (store, paths) = try openStore()
         if machineWide {
             guard company == nil, agent == nil else { throw fail("--machine-wide takes no company or agent") }
-            // Every lab is recorded as it is now (unrecorded commits tainted) before the mark goes.
-            try LabProvenance.recordEveryLabTainted(store: store, now: Store.now())
-            let cleared = try store.clearMachineLabTaint()
+            // One critical section under the engine lock: refused while a tainted session is active; every lab-like repository
+            // of every workspace is snapshotted tainted before the mark goes.
+            let cleared: Bool
+            do { cleared = try LabProvenance.clearMachineMark(store: store, paths: paths) } catch let e as LabProvenance.ClearRefused {
+                throw fail("refused: \(e.message)")
+            }
             print(safe(cleared
                 ? "cleared the machine-wide lab mark. A Full-profile session that read outside content could write ANY company's "
                   + "labs: review every company's labs before trusting what they propose; their commits from before now stay tainted."
@@ -39,7 +42,9 @@ struct LabClearTaint: ParsableCommand {
         let c = try resolveCompany(store, company)
         guard let agent else {
             let cleared: Bool
-            do { cleared = try store.clearCompanyLabTaint(companyId: c.id) } catch let e as WorkError { throw fail(e.message) }
+            do { cleared = try LabProvenance.clearCompanyMark(store: store, paths: paths, companyId: c.id) }
+            catch let e as LabProvenance.ClearRefused { throw fail("refused: \(e.message)") }
+            catch let e as WorkError { throw fail(e.message) }
             print(safe(cleared ? "cleared \(c.name)'s lab marks" : "\(c.name) carries no lab mark"))
             if try store.machineLabTaint()?.source != nil {
                 print("the machine-wide mark still applies to every lab: brahma lab clear-taint --machine-wide")

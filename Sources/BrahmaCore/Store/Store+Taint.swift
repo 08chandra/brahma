@@ -182,24 +182,30 @@ extension Store {
 
     /// Records lab commits not seen before with the turn's taint state; returns how many were new.
     @discardableResult
-    /// `commitTimes`: each commit's commit time (seconds since 1970). S32: while the machine-wide mark stands no commit is
-    /// recorded clean; after the owner's machine-wide clear, a commit authored before it, or whose time is not known, is not
-    /// either (fail closed).
-    public func recordLabCommits(agentId: String, turnId: String?, shas: [String], tainted: Bool, commitTimes: [String: Int]? = nil,
+    /// Nothing records clean while the machine-wide mark (S32) or the agent's company mark (N1) stands, nor a commit the
+    /// owner's clear snapshot found (`taintedLabCommit`). After a company or machine-wide clear (S33), a commit records clean
+    /// only when it is in `observed`: what the engine saw made during this clean turn (the lab's commits now, minus those at
+    /// the turn's start). Committer time is never provenance.
+    public func recordLabCommits(agentId: String, turnId: String?, shas: [String], tainted: Bool, observed: Set<String>? = nil,
                                  now: Date = Store.now()) throws -> Int {
         guard !shas.isEmpty else { return 0 }
         return try writer.write { db in
             let machine = try Row.fetchOne(db, sql: "SELECT source, clearedAt FROM machineTaint WHERE id = 1")
             let machineSource: String? = machine?["source"]
-            let machineMarked = machineSource != nil
-            let clearedAt: Date? = machine?["clearedAt"]
+            let companyRow = try Row.fetchOne(db, sql: """
+                SELECT c.source, c.clearedAt FROM companyTaint c JOIN agent a ON a.companyId = c.companyId WHERE a.id = ?
+                """, arguments: [agentId])
+            let companySource: String? = companyRow?["source"]
+            let machineCleared: Date? = machine?["clearedAt"], companyCleared: Date? = companyRow?["clearedAt"]
+            let marked = machineSource != nil || companySource != nil
+            let observedOnly = machineCleared != nil || companyCleared != nil
             var added = 0
             for sha in shas where sha.range(of: "^[0-9a-f]{40,64}$", options: .regularExpression) != nil {
-                var tainted = tainted || machineMarked
-                if !tainted, let clearedAt {
-                    // Unknown time, or authored before the owner's machine-wide clear: never clean.
-                    if let time = commitTimes?[sha] { tainted = Double(time) < clearedAt.timeIntervalSince1970 } else { tainted = true }
+                var tainted = tainted || marked
+                if !tainted, try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM taintedLabCommit WHERE sha = ?", arguments: [sha]) ?? 0 > 0 {
+                    tainted = true
                 }
+                if !tainted, observedOnly, !(observed?.contains(sha) ?? false) { tainted = true }
                 try db.execute(sql: """
                     INSERT OR IGNORE INTO labCommit (agentId, sha, turnId, tainted, recordedAt) VALUES (?, ?, ?, ?, ?)
                     """, arguments: [agentId, sha, turnId, tainted, now])
@@ -222,6 +228,16 @@ extension Store {
 
     // MARK: Lab mark (10b, I2)
 
+    /// Commits a clear's snapshot found (S33): never recorded clean in any lab.
+    public func recordTaintedLabCommits(_ shas: [String], now: Date = Store.now()) throws {
+        guard !shas.isEmpty else { return }
+        try writer.write { db in
+            for sha in shas where sha.range(of: "^[0-9a-f]{40,64}$", options: .regularExpression) != nil {
+                try db.execute(sql: "INSERT OR IGNORE INTO taintedLabCommit (sha, recordedAt) VALUES (?, ?)", arguments: [sha, now])
+            }
+        }
+    }
+
     /// The sticky lab mark: set the first time a session of the agent is tainted (kept, with that first source); cleared only by
     /// the owner (`clearLabTaint`).
     /// Without a sandbox (the role runs Workspace or Full in its company; an engine ceiling only narrows that, so this can only
@@ -239,7 +255,9 @@ extension Store {
         // S31: the company itself carries the mark, so a lab of an agent hired later is marked too; a Full session upgrades it.
         try db.execute(sql: """
             INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, ?, ?, ?)
-            ON CONFLICT(companyId) DO UPDATE SET profile = excluded.profile WHERE excluded.profile = 'full'
+            ON CONFLICT(companyId) DO UPDATE SET
+              source = COALESCE(companyTaint.source, excluded.source), markedAt = COALESCE(companyTaint.markedAt, excluded.markedAt),
+              profile = CASE WHEN companyTaint.profile IS NULL OR excluded.profile = 'full' THEN excluded.profile ELSE companyTaint.profile END
             """, arguments: [company.id, shown, profile.rawValue, now])
         // S32: a Full session could write any company's labs: the machine-wide mark (kept with its first source).
         if profile == .full {
@@ -317,7 +335,8 @@ extension Store {
                 return (source: own["source"], markedAt: own["markedAt"])
             }
             if let company = try Row.fetchOne(db, sql: """
-                SELECT c.source, c.markedAt FROM companyTaint c JOIN agent a ON a.companyId = c.companyId WHERE a.id = ?
+                SELECT c.source, c.markedAt FROM companyTaint c JOIN agent a ON a.companyId = c.companyId
+                WHERE a.id = ? AND c.source IS NOT NULL
                 """, arguments: [agentId]) {
                 return (source: "company: \(company["source"] as String)", markedAt: company["markedAt"])
             }
@@ -331,19 +350,26 @@ extension Store {
     /// The company's own lab mark (S31), or nil.
     public func companyLabTaint(companyId: String) throws -> (source: String, profile: String, markedAt: Date)? {
         try writer.read { db in
-            try Row.fetchOne(db, sql: "SELECT source, profile, markedAt FROM companyTaint WHERE companyId = ?", arguments: [companyId])
+            try Row.fetchOne(db, sql: "SELECT source, profile, markedAt FROM companyTaint WHERE companyId = ? AND source IS NOT NULL",
+                             arguments: [companyId])
                 .map { (source: $0["source"], profile: $0["profile"], markedAt: $0["markedAt"]) }
         }
     }
 
-    /// The owner clears the company's lab mark and every lab mark of its agents (`brahma lab clear-taint <company>`, owner shell
-    /// only; never a company tool), recorded as an activity event. Returns whether anything was marked.
+    /// The owner clears the company's lab mark and every lab mark of its agents, recorded as an activity event; the clear time
+    /// is kept (S33: from then on only commits the engine saw made in a clean turn record clean in that company). The database
+    /// half of `LabProvenance.clearCompanyMark`, which runs it in the owner's critical section. Returns whether anything was
+    /// marked.
     @discardableResult
     public func clearCompanyLabTaint(companyId: String, now: Date = Store.now()) throws -> Bool {
         try writer.write { db in
             guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
-            try db.execute(sql: "DELETE FROM companyTaint WHERE companyId = ?", arguments: [companyId])
-            let company = db.changesCount
+            let company = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM companyTaint WHERE companyId = ? AND source IS NOT NULL",
+                                           arguments: [companyId]) ?? 0
+            try db.execute(sql: """
+                INSERT INTO companyTaint (companyId, source, profile, markedAt, clearedAt) VALUES (?, NULL, NULL, NULL, ?)
+                ON CONFLICT(companyId) DO UPDATE SET source = NULL, profile = NULL, markedAt = NULL, clearedAt = excluded.clearedAt
+                """, arguments: [companyId, now])
             try db.execute(sql: "DELETE FROM labTaint WHERE agentId IN (SELECT id FROM agent WHERE companyId = ?)", arguments: [companyId])
             let agents = db.changesCount
             guard company + agents > 0 else { return false }
@@ -407,8 +433,11 @@ public enum LabProvenance {
     public static let alertReason = "lab-provenance"
 
     /// Blocking (git).
+    /// `startCommits`: the lab's commits when the turn started (`commitSet`), so its own new commits are the ones the engine saw
+    /// made (S33); nil: none were seen.
     public static func record(store: Store, workspace: URL, handle: String, companyId: String, agentId: String, turnId: String?,
-                              tainted: Bool, now: Date, limit: Int = 100_000, maxOutput: Int = 16 << 20) -> Outcome {
+                              tainted: Bool, now: Date, startCommits: Set<String>? = nil, limit: Int = 100_000,
+                              maxOutput: Int = 16 << 20) -> Outcome {
         switch inspect(workspace: workspace, handle: handle) {
         case .missing: return .none
         case .refused(let why): return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: why, now: now)
@@ -416,14 +445,9 @@ public enum LabProvenance {
             let git = store.gitWorkspace(root: lab, companyId: companyId)
             do {
                 let shas = try git.labCommits(limit: limit, maxOutput: maxOutput)
-                // S32: commit times, read only when a machine-wide clear happened (a commit authored before it stays unrecordable;
-                // one whose time cannot be read is too).
-                let known = try store.labCommitStates(agentId: agentId)
-                let fresh = shas.filter { known[$0] == nil }
-                let cleared = try store.machineLabTaint()?.clearedAt != nil
-                let times = !tainted && !fresh.isEmpty && cleared ? (try? git.labCommitTimes(fresh)) : nil
+                let observed = startCommits.map { Set(shas).subtracting($0) }
                 return .recorded(try store.recordLabCommits(agentId: agentId, turnId: turnId, shas: shas, tainted: tainted,
-                                                            commitTimes: times, now: now))
+                                                            observed: observed, now: now))
             } catch {
                 return refuse(store: store, companyId: companyId, agentId: agentId, handle: handle, why: "\(error)", now: now)
             }
@@ -436,9 +460,12 @@ public enum LabProvenance {
     /// The lab's `.git` checks (I3-b, F2, S24), with no git run: a real directory reached through no link, no link anywhere
     /// under it, no alternates, grafts, shallow, commondir or replace refs. Blocking. `propose_extension` (10b, S25) runs it
     /// again right before its archive.
-    static func inspect(workspace: URL, handle: String) -> Inspection {
+    static func inspect(workspace: URL, handle: String) -> Inspection { inspect(workspace: workspace, relative: ".brahma/labs/\(handle)") }
+
+    /// `inspect` for any lab-like repository below the workspace (`relative`, e.g. `.brahma/ext-try/<id>/lab`).
+    static func inspect(workspace: URL, relative: String) -> Inspection {
         let root = workspace.resolvedForSandbox.path
-        let lab = URL(fileURLWithPath: root).appending(path: ".brahma/labs/\(handle)", directoryHint: .isDirectory)
+        let lab = URL(fileURLWithPath: root).appending(path: relative, directoryHint: .isDirectory)
         let gitDir = lab.appending(path: ".git", directoryHint: .isDirectory)
         // The lab and its `.git` must be real directories down from the workspace (an agent could plant links there).
         if SandboxPath.linkedComponent(gitDir.path, under: root) != nil { return .refused("the lab's .git is reached through a link") }
@@ -456,7 +483,7 @@ public enum LabProvenance {
         }
         let replace = gitDir.appending(path: "refs/replace").path
         // Read without following a link (EngineFiles); a packed-refs that cannot be read whole is refused.
-        let packedData = try? EngineFiles.read(workspace: URL(fileURLWithPath: root), dir: ".brahma/labs/\(handle)/.git", name: "packed-refs",
+        let packedData = try? EngineFiles.read(workspace: URL(fileURLWithPath: root), dir: "\(relative)/.git", name: "packed-refs",
                                                limit: 8 << 20)
         if packedData == nil, SandboxPath.kind(gitDir.appending(path: "packed-refs").path) != .missing {
             return .refused("the lab's packed-refs cannot be read")
@@ -469,14 +496,98 @@ public enum LabProvenance {
         return .ok(lab)
     }
 
-    /// Before the owner's machine-wide clear (S32): every lab of every company is recorded as it is now, its unrecorded commits
-    /// tainted, so nothing a Full session left can be recorded clean afterwards whatever its commit time says. Blocking (git).
-    public static func recordEveryLabTainted(store: Store, now: Date) throws {
-        for company in try store.companies() {
-            let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-            for agent in try store.agents(companyId: company.id) {
-                _ = record(store: store, workspace: workspace, handle: agent.name, companyId: company.id, agentId: agent.id, turnId: nil,
-                           tainted: true, now: now)
+    /// The lab's commits now (S33: taken when a turn starts, so its end can tell what the engine saw made), or nil when it has
+    /// no repository or cannot be read. Blocking (git).
+    public static func commitSet(store: Store, workspace: URL, handle: String, companyId: String) -> Set<String>? {
+        guard case .ok(let lab) = inspect(workspace: workspace, handle: handle) else { return nil }
+        return (try? store.gitWorkspace(root: lab, companyId: companyId).labCommits()).map(Set.init)
+    }
+
+    /// Why an owner's clear did not run.
+    public struct ClearRefused: Error, CustomStringConvertible {
+        public let message: String
+        public var description: String { message }
+    }
+
+    /// Every lab-like repository of a workspace (S33): `.brahma/labs/*` and `.brahma/ext-try/*/lab` holding a `.git`, whoever
+    /// left them (current agents, fired ones, trials, planted ones).
+    static func labLikeRepos(workspace: URL) -> [String] {
+        let ws = workspace.resolvedForSandbox
+        var out: [String] = []
+        for name in SandboxPath.entries(ws.appending(path: ".brahma/labs").path) where !SandboxPath.isUnsafe(name) {
+            out.append(".brahma/labs/\(name)")
+        }
+        for name in SandboxPath.entries(ws.appending(path: ".brahma/ext-try").path) where !SandboxPath.isUnsafe(name) {
+            out.append(".brahma/ext-try/\(name)/lab")
+        }
+        return out.filter { SandboxPath.kind(ws.appending(path: "\($0)/.git").path) != .missing }
+    }
+
+    /// The owner's clear of a company's lab mark (N1), one critical section under the engine lock: refused while the engine
+    /// runs or any tainted session of the company is active; every lab-like repository of its workspace is snapshotted and
+    /// its commits marked tainted first; then the mark goes, its clear time kept. Blocking (git).
+    @discardableResult
+    public static func clearCompanyMark(store: Store, paths: BrahmaPaths, companyId: String, now: Date = Store.now()) throws -> Bool {
+        guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
+        let lock = try engineLock(paths)
+        defer { withExtendedLifetime(lock) {} }
+        try refuseActiveSessions(store: store, paths: paths, companies: [company])
+        try snapshotTainted(store: store, company: company, now: now)
+        return try store.clearCompanyLabTaint(companyId: companyId, now: now)
+    }
+
+    /// The owner's machine-wide clear (S32, S33), the same critical section over every company.
+    @discardableResult
+    public static func clearMachineMark(store: Store, paths: BrahmaPaths, now: Date = Store.now()) throws -> Bool {
+        let lock = try engineLock(paths)
+        defer { withExtendedLifetime(lock) {} }
+        let companies = try store.companies()
+        try refuseActiveSessions(store: store, paths: paths, companies: companies)
+        for company in companies { try snapshotTainted(store: store, company: company, now: now) }
+        return try store.clearMachineLabTaint(now: now)
+    }
+
+    static func engineLock(_ paths: BrahmaPaths) throws -> OrchestratorLock {
+        do { return try OrchestratorLock.acquire(paths: paths) } catch OrchestratorLockError.alreadyRunning {
+            throw ClearRefused(message: "the engine is running (the Brahma app or brahma run): stop it, then clear the mark")
+        }
+    }
+
+    /// No clear while a session that read outside content is active, a taint flag stands, or a turn is in progress.
+    static func refuseActiveSessions(store: Store, paths: BrahmaPaths, companies: [Company]) throws {
+        for company in companies {
+            for agent in try store.agents(companyId: company.id) where agent.state != .killed {
+                let flagged = TaintFlag.url(home: paths.home, agentId: agent.id).map(TaintFlag.exists) ?? true
+                if agent.sessionTainted || flagged {
+                    throw ClearRefused(message: "@\(agent.name) in \(company.name) has a session that read outside content: clear the "
+                                       + "mark once its next turn has started a fresh session")
+                }
+            }
+            let running = try store.writer.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM turn WHERE companyId = ? AND outcome = ?",
+                                 arguments: [company.id, TurnOutcome.inProgress.rawValue]) ?? 0
+            }
+            if running > 0 { throw ClearRefused(message: "a turn in \(company.name) is still recorded as running: let the engine recover it first") }
+        }
+    }
+
+    /// Every lab-like repository of the company's workspace, its commits recorded tainted (`taintedLabCommit`, and on the
+    /// owning agent's records); one that cannot be read refuses the clear.
+    static func snapshotTainted(store: Store, company: Company, now: Date) throws {
+        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        let agents = try store.agents(companyId: company.id)
+        for relative in labLikeRepos(workspace: workspace) {
+            guard case .ok(let root) = inspect(workspace: workspace, relative: relative) else {
+                throw ClearRefused(message: "\(relative) in \(company.name) cannot be read safely; move it aside, then clear the mark")
+            }
+            let shas: [String]
+            do { shas = try store.gitWorkspace(root: root, companyId: company.id).labCommits() } catch {
+                throw ClearRefused(message: "\(relative) in \(company.name) could not be listed (\(Store.flat("\(error)", max: 200))); "
+                                   + "nothing was cleared")
+            }
+            try store.recordTaintedLabCommits(shas, now: now)
+            if relative.hasPrefix(".brahma/labs/"), let owner = agents.first(where: { ".brahma/labs/\($0.name)" == relative }) {
+                _ = try store.recordLabCommits(agentId: owner.id, turnId: nil, shas: shas, tainted: true, now: now)
             }
         }
     }

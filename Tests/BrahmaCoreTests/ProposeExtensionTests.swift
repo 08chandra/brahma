@@ -62,6 +62,14 @@ private struct LabWorld {
     }
 
     func extensionAsks() throws -> [Ask] { try store.asks(companyId: company.id).filter { $0.kind == .extension } }
+
+    /// The fresh session a tainted agent's next turn starts (its marks stay).
+    func freshSession(_ a: Agent) throws {
+        try store.writer.write { db in
+            try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0, taintSources = '' WHERE id = ?",
+                           arguments: [a.id])
+        }
+    }
 }
 
 @Suite(.scratch) struct ProposeExtensionTests {
@@ -382,10 +390,12 @@ private struct LabWorld {
         try SandboxLayout(paths: w.paths, company: w.company, agentHandle: late.name).ensure()
         let lab = w.ws.appending(path: ".brahma/labs/\(late.name)")
         func propose(_ id: String) throws -> Ask {
+            // A clean turn: the commits at its start, its own commit, its end's record.
+            let start = LabProvenance.commitSet(store: w.store, workspace: w.ws, handle: late.name, companyId: w.company.id)
             _ = try PluginFixture(id: id, under: lab)
             try GitFixture.plainGit(["add", "-A"], in: lab); try GitFixture.plainGit(["commit", "-qm", id], in: lab)
             _ = LabProvenance.record(store: w.store, workspace: w.ws, handle: late.name, companyId: w.company.id, agentId: late.id,
-                                     turnId: nil, tainted: false, now: w.world.clock.now)
+                                     turnId: nil, tainted: false, now: w.world.clock.now, startCommits: start)
             _ = try CompanyTools(store: w.store, companyId: w.company.id, agentId: late.id, paths: w.paths)
                 .call(name: "propose_extension", arguments: LabWorld.args(id))
             return try #require(try w.extensionAsks().first { ExtensionAskPayload.read($0)?.extId == id })
@@ -396,8 +406,13 @@ private struct LabWorld {
         // Clearing only the agent's own row leaves the company mark in force.
         _ = try w.store.clearLabTaint(companyId: w.company.id, agentId: late.id)
         #expect(try w.store.labTaint(agentId: late.id) != nil)
-        // The owner clears the company: every mark there goes, recorded; the next clean proposal reaches the cto.
-        #expect(try w.store.clearCompanyLabTaint(companyId: w.company.id))
+        // The owner clears the company (one critical section; refused while eng's tainted session is active): every mark there
+        // goes, recorded; the next clean proposal reaches the cto.
+        #expect(throws: LabProvenance.ClearRefused.self) {
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id)
+        }
+        try w.freshSession(w.eng)
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
         #expect(try w.store.companyLabTaint(companyId: w.company.id) == nil)
         for a in [w.eng, w.cto, late] { #expect(try w.store.labTaint(agentId: a.id) == nil, "\(a.name)") }
         #expect(try w.store.events(afterId: 0, companyId: w.company.id).contains { $0.text.contains("cleared the company's lab mark") })
@@ -405,9 +420,11 @@ private struct LabWorld {
         #expect(second.internalApproverId == w.cto.id); #expect(second.status == .pendingInternal)
     }
 
-    /// S32: a tainted Full-profile session in company A leaves a machine-wide mark: company B's labs read as tainted and record
-    /// nothing clean; A's own clear leaves it; only the machine-wide clear ends it, and a commit authored before that clear (or
-    /// one whose time cannot be read) still never records clean.
+    /// S32 + S33: a tainted Full-profile session in company A leaves a machine-wide mark: company B's labs read as tainted and
+    /// record nothing clean; A's own clear leaves it; only the machine-wide clear ends it (one critical section, refused while
+    /// a tainted session is active, every lab-like repo snapshotted tainted first). Afterwards only commits the engine saw made
+    /// in a clean turn record clean: committer dates, future or past, are never provenance; a fired agent's leftover lab stays
+    /// tainted wherever its commits go.
     @Test func machineMarkSpansCompanies() throws {
         let w = try LabWorld(profile: .full)
         let beta = try w.world.company("Beta", profile: .sandboxed)
@@ -416,41 +433,99 @@ private struct LabWorld {
         let betaWs = URL(fileURLWithPath: beta.workspacePath).resolvedForSandbox
         let lab = betaWs.appending(path: ".brahma/labs/bee")
         @discardableResult
-        func commit(_ name: String, date: String? = nil) throws -> String {
-            try "\(name)\n".write(to: lab.appending(path: "\(name).md"), atomically: true, encoding: .utf8)
-            try GitFixture.plainGit(["add", "-A"], in: lab)
-            try GitFixture.plainGit(["commit", "-qm", name], in: lab,
+        func commit(_ name: String, date: String? = nil, in dir: URL? = nil) throws -> String {
+            let dir = dir ?? lab
+            try "\(name)\n".write(to: dir.appending(path: "\(name).md"), atomically: true, encoding: .utf8)
+            try GitFixture.plainGit(["add", "-A"], in: dir)
+            try GitFixture.plainGit(["commit", "-qm", name], in: dir,
                                     env: date.map { ["GIT_COMMITTER_DATE": $0, "GIT_AUTHOR_DATE": $0] } ?? [:])
-            return try GitFixture.plainGit(["rev-parse", "HEAD"], in: lab)
+            return try GitFixture.plainGit(["rev-parse", "HEAD"], in: dir)
         }
-        func record() {
+        func start() -> Set<String>? { LabProvenance.commitSet(store: w.store, workspace: betaWs, handle: bee.name, companyId: beta.id) }
+        func record(_ start: Set<String>?) {
             _ = LabProvenance.record(store: w.store, workspace: betaWs, handle: bee.name, companyId: beta.id, agentId: bee.id,
-                                     turnId: nil, tainted: false, now: w.world.clock.now)
+                                     turnId: nil, tainted: false, now: w.world.clock.now, startCommits: start)
         }
         try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
         #expect(try w.store.machineLabTaint()?.source != nil)
         #expect(try w.store.labTaint(agentId: bee.id)?.source.hasPrefix("machine-wide: ") == true, "company B's lab is tainted")
-        let during = try commit("during"); record()
+        let s0 = start(); let during = try commit("during"); record(s0)
         #expect(try w.store.labCommitTainted(agentId: bee.id, sha: during), "nothing records clean meanwhile")
+        // Refused while a tainted session is active.
+        #expect(throws: LabProvenance.ClearRefused.self) { try LabProvenance.clearMachineMark(store: w.store, paths: w.paths) }
+        try w.freshSession(w.eng)
         // Company A's own clear leaves the machine-wide mark.
-        #expect(try w.store.clearCompanyLabTaint(companyId: w.company.id))
-        #expect(try w.store.machineLabTaint()?.source != nil)
-        #expect(try w.store.labTaint(agentId: bee.id) != nil)
-        // A commit made (and left unrecorded) before the clear, dated in the future: the clear's snapshot records it tainted.
-        let forged = try commit("forged", date: "2099-01-01T00:00:00")
-        try LabProvenance.recordEveryLabTainted(store: w.store, now: w.world.clock.now)
-        #expect(try w.store.clearMachineLabTaint(now: w.world.clock.now.addingTimeInterval(-60)))
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
+        #expect(try w.store.machineLabTaint()?.source != nil); #expect(try w.store.labTaint(agentId: bee.id) != nil)
+        // Left before the clear, unrecorded, with forged dates; and a fired agent's leftover lab.
+        let future = try commit("future", date: "2099-01-01T00:00:00")
+        let past = try commit("past", date: "2001-01-01T00:00:00")
+        let leftover = betaWs.appending(path: ".brahma/labs/old-1")
+        try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "-q", "-b", "main"], in: leftover)
+        let fired = try commit("fired", in: leftover)
+        #expect(try LabProvenance.clearMachineMark(store: w.store, paths: w.paths))
         #expect(try w.store.machineLabTaint()?.source == nil); #expect(try w.store.labTaint(agentId: bee.id) == nil)
-        #expect(try w.store.labCommitTainted(agentId: bee.id, sha: forged))
-        // After the clear: a commit authored before it is still unrecordable as clean; one authored after records clean.
-        let old = try commit("old", date: "2001-01-01T00:00:00"); record()
-        #expect(try w.store.labCommitTainted(agentId: bee.id, sha: old))
-        let fresh = try commit("fresh"); record()
-        #expect(!(try w.store.labCommitTainted(agentId: bee.id, sha: fresh)))
-        // A commit whose time cannot be read: fail closed.
-        _ = try w.store.recordLabCommits(agentId: bee.id, turnId: nil, shas: [String(repeating: "e", count: 40)], tainted: false)
-        #expect(try w.store.labCommitTainted(agentId: bee.id, sha: String(repeating: "e", count: 40)))
+        for sha in [future, past] { #expect(try w.store.labCommitTainted(agentId: bee.id, sha: sha)) }
+        // Afterwards: forged dates made between turns are never clean; the leftover lab's commit fetched in a clean turn is not
+        // either; a commit the engine saw made in a clean turn is.
+        let laterFuture = try commit("later-future", date: "2099-06-01T00:00:00")
+        let laterPast = try commit("later-past", date: "2001-06-01T00:00:00")
+        let s1 = start()
+        try GitFixture.plainGit(["fetch", "-q", leftover.path, "main"], in: lab)
+        let fresh = try commit("fresh")
+        record(s1)
+        for sha in [laterFuture, laterPast, fired] { #expect(try w.store.labCommitTainted(agentId: bee.id, sha: sha), "\(sha)") }
+        #expect(!(try w.store.labCommitTainted(agentId: bee.id, sha: fresh)), "seen made in a clean turn")
         #expect(try w.store.events(afterId: 0, companyId: beta.id).contains { $0.text.contains("cleared the machine-wide lab mark") })
+    }
+
+    /// N1: while the company mark stands, no lab commit there records clean, a direct commit into another agent's lab included;
+    /// the company clear is refused while a tainted session of the company is active; after it, a clean turn's commit records
+    /// clean and one the engine did not see does not.
+    @Test func companyMarkRefusesCleanRecords() throws {
+        let w = try LabWorld(profile: .workspace)
+        try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
+        // A Workspace agent (the cto) commits straight into eng's lab; eng's clean turn would record it.
+        try "x\n".write(to: w.lab.appending(path: "x.md"), atomically: true, encoding: .utf8)
+        try GitFixture.plainGit(["add", "-A"], in: w.lab); try GitFixture.plainGit(["commit", "-qm", "x"], in: w.lab)
+        let direct = try GitFixture.plainGit(["rev-parse", "HEAD"], in: w.lab)
+        try w.freshSession(w.eng)
+        _ = LabProvenance.record(store: w.store, workspace: w.ws, handle: w.eng.name, companyId: w.company.id, agentId: w.eng.id,
+                                 turnId: nil, tainted: false, now: w.world.clock.now, startCommits: [])
+        #expect(try w.store.labCommitTainted(agentId: w.eng.id, sha: direct), "the company mark stands")
+        try w.store.markTainted(agentId: w.cto.id, source: "WebSearch", now: w.world.clock.now)
+        #expect(throws: LabProvenance.ClearRefused.self) {
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id)
+        }
+        try w.freshSession(w.cto)
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
+        let between = try w.commitPlugin(message: "between")
+        let start = LabProvenance.commitSet(store: w.store, workspace: w.ws, handle: w.eng.name, companyId: w.company.id)
+        let clean = try w.commitPlugin(id: "tone-two", message: "clean")
+        _ = LabProvenance.record(store: w.store, workspace: w.ws, handle: w.eng.name, companyId: w.company.id, agentId: w.eng.id,
+                                 turnId: nil, tainted: false, now: w.world.clock.now, startCommits: start)
+        #expect(try w.store.labCommitTainted(agentId: w.eng.id, sha: between), "not seen made in a turn")
+        #expect(!(try w.store.labCommitTainted(agentId: w.eng.id, sha: clean)))
+    }
+
+    /// S33 through the engine: after a clear, a commit a clean turn makes records clean at its end; one made before the turn
+    /// started (between turns) does not.
+    @Test func cleanTurnCommitRecordsCleanAfterAClear() async throws {
+        let w = try LabWorld()
+        #expect(!(try w.store.clearMachineLabTaint(now: w.world.clock.now)), "no mark: only the clear time is kept")
+        let before = try w.commitPlugin(message: "between turns")
+        w.world.fake.script(w.eng.name, FakeTurnRunner.Script(sideEffect: { r in
+            let lab = URL(fileURLWithPath: r.workingDirectory)
+            try "made in the turn\n".write(to: lab.appending(path: "turn.md"), atomically: true, encoding: .utf8)
+            try GitFixture.plainGit(["add", "-A"], in: lab); try GitFixture.plainGit(["commit", "-qm", "turn"], in: lab)
+        }))
+        try w.world.dm(w.company, w.eng)
+        try await w.world.cycle()
+        let made = try GitFixture.plainGit(["rev-parse", "HEAD"], in: w.lab)
+        #expect(made != before)
+        #expect(!(try w.store.labCommitTainted(agentId: w.eng.id, sha: made)), "seen made in a clean turn")
+        #expect(try w.store.labCommitTainted(agentId: w.eng.id, sha: before), "made between turns")
     }
 
     /// Round 2c: a hire never adopts a lab that is already there; it goes to trash unread, the owner is alerted, the new agent

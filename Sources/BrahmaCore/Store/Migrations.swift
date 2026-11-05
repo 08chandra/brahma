@@ -1010,16 +1010,25 @@ enum Migrations {
         }
         m.registerMigration("v5-taint-7") { db in
             // Task 10b, S31: the company-level lab mark. A tainted session without a sandbox (Workspace or Full) could write any
-            // lab of its company, later hires' included: every lab check reads this too, until the owner clears it.
+            // lab of its company, later hires' included: every lab check reads this too, and no lab commit there is recorded clean
+            // (N1), until the owner clears it. `source` NULL: no mark stands; `clearedAt`: the owner's last clear (S33: after it,
+            // only commits the engine saw made in a clean turn are recorded clean).
             try db.create(table: "companyTaint") { t in
                 t.primaryKey("companyId", .text).references("company", onDelete: .cascade)
-                t.column("source", .text).notNull()
-                t.column("profile", .text).notNull()
-                t.column("markedAt", .datetime).notNull()
+                t.column("source", .text)
+                t.column("profile", .text)
+                t.column("markedAt", .datetime)
+                t.column("clearedAt", .datetime)
+            }
+            // S33: commits found in any lab-like repository when the owner cleared a mark (fired agents' labs, trial labs,
+            // planted ones included): never recorded clean in any lab.
+            try db.create(table: "taintedLabCommit") { t in
+                t.primaryKey("sha", .text)
+                t.column("recordedAt", .datetime).notNull()
             }
             // S32: the machine-wide mark (one row). A tainted Full-profile session could write any company's labs: every lab check
             // in every company reads it, no lab commit is recorded clean while it stands, and only the owner's machine-wide clear
-            // ends it (`clearedAt`: a commit authored before that clear is never recorded clean).
+            // ends it (`clearedAt`: after it, only commits the engine saw made in a clean turn are recorded clean, S33).
             try db.create(table: "machineTaint") { t in
                 t.column("id", .integer).primaryKey().check { $0 == 1 }
                 t.column("source", .text)

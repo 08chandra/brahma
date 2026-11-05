@@ -681,6 +681,8 @@ public actor Orchestrator {
         var labWorkspace: URL?
         // S30 (10b): the turn end could not write the lab mark: the session keeps its taint and its flag file.
         var labMarkUnwritten = false
+        // S33 (10b): the lab's commits as the turn launches; its end records clean (after an owner's clear) only what is new.
+        var labAtStart: Set<String>?
         // Task 14u: the Ultra run this turn was admitted for (reserved once it passed the sandbox gate), the watchdog's
         // agent-count kill, and the turn's leader (for its SIGINT).
         var ultraPlan: UltraPlan?
@@ -1132,6 +1134,12 @@ public actor Orchestrator {
             // A review session is never recorded as the agent's own.
             var sessionMarked = wasResume || review != nil || audit != nil
             sentRequest = request
+            if let labWorkspace {
+                let (store, handle, companyId) = (self.store, agent.name, agent.companyId)
+                labAtStart = await blocking.run {
+                    LabProvenance.commitSet(store: store, workspace: labWorkspace, handle: handle, companyId: companyId)
+                }
+            }
             // Leaving the loop early (`break`) drops the stream, which terminates the child process.
             do {
                 events: for try await event in runner.run(request) {
@@ -1363,7 +1371,7 @@ public actor Orchestrator {
         // A tainted session marks every item it holds at turn end, leases taken mid-turn included (S21).
         if launched, !isReview { attempt { try store.markHeldItemsIfTainted(agentId: agent.id) } }
         if launched, let labWorkspace {
-            let (store, handle, turnId, ended) = (self.store, agent.name, turn.id, now)
+            let (store, handle, turnId, ended, start) = (self.store, agent.name, turn.id, now, labAtStart)
             // The row OR the flag file (10b, I2); a tainted turn's lab is marked here, before the flag can be cleared below. S30: when
             // that could not be written, the session keeps its taint and its flag file (no clear below): fail closed.
             let tainted: Bool
@@ -1374,7 +1382,7 @@ public actor Orchestrator {
             }
             let outcome = await blocking.run {
                 LabProvenance.record(store: store, workspace: labWorkspace, handle: handle, companyId: agent.companyId,
-                                     agentId: agent.id, turnId: turnId, tainted: tainted, now: ended)
+                                     agentId: agent.id, turnId: turnId, tainted: tainted, now: ended, startCommits: start)
             }
             if case .refused(let why) = outcome { log("@\(agent.name)'s lab commits were not recorded (tainted instead): \(why)") }
         }

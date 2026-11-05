@@ -313,7 +313,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(cleared.status == 0, "\(cleared.stderr)"); #expect(cleared.stdout.contains("cleared @eng's lab mark"))
         #expect(try store.labTaint(agentId: eng.id) == nil)
         #expect(try brahma(["lab", "clear-taint", "Acme", "eng"], home: home).stdout.contains("carries no mark"))
-        // S31: the company form, owner only too.
+        // S31: the company form, owner only too (and, S33, only once eng's tainted session has given way to a fresh one).
+        try store.writer.write { db in try db.execute(sql: "UPDATE agent SET sessionTainted = 0 WHERE id = ?", arguments: [eng.id]) }
         try store.writer.write { db in
             try db.execute(sql: "INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, 'x', 'workspace', ?)",
                            arguments: [company.id, Date()])
