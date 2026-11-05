@@ -29,6 +29,8 @@ struct FakeHostingAdapter: HostingAdapter {
     var verify = false
     /// The project `fake inspect` reports (nil: the configured one).
     var inspectProject: String?
+    /// What the plan stages (nil: the output folder); `["."]` stages the whole export, as Vercel's plans do.
+    var stageFrom: [String]?
 
     static let installIsNoOp = false
 
@@ -50,7 +52,7 @@ struct FakeHostingAdapter: HostingAdapter {
 
     func deployPlan(_ i: DeployInput) throws -> DeployPlan {
         try validate(i.settings)
-        return try DeployPlan(steps: [step(i)], stageFrom: [i.settings.outputDir ?? ""], cwdPath: i.inRelease("upload"),
+        return try DeployPlan(steps: [step(i)], stageFrom: stageFrom ?? [i.settings.outputDir ?? ""], cwdPath: i.inRelease("upload"),
                               network: network, tokenSecret: tokenSecret, env: env(i), build: i.settings.build,
                               outputDir: i.settings.outputDir,
                               verify: verify ? [i.bin("fake"), "inspect", DeployPlan.deployURLPlaceholder] : nil)

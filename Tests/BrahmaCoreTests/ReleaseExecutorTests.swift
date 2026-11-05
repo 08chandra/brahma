@@ -397,6 +397,82 @@ import Glibc
         }
     }
 
+    @Test func tokenTheRedactorDoesNotKnowRefused() async throws {
+        // Fix I1: the value read for the deploy must be one the redactor demonstrably redacts, checked before `deploying`.
+        // The vault's value changed behind the redactor (a rotation it never loaded): refused, nothing deployed.
+        let fx = try Fx(configure: { $0.echoToken = true })
+        let approved = try fx.proposeAndApprove()
+        let rotated = "cf-rotated-token-fedcba9876543210"
+        try fx.vault.set(companyId: fx.company.id, name: "CLOUDFLARE_API_TOKEN", value: rotated)
+        await fx.advance()
+        let r = try fx.reload(approved)
+        #expect(r.status == .failed)
+        #expect(r.failedReason == "the hosting token CLOUDFLARE_API_TOKEN isn't loaded for redaction yet; propose again")
+        #expect(try fx.deploySteps().isEmpty)
+        #expect(!(try fx.activity().contains { $0.contains(": deploying") }))
+        for call in fx.sandbox.calls { #expect(!call.environment.values.contains { $0.contains(rotated) || $0.contains(Self.token) }) }
+        #expect(try fx.notices().contains { $0.title == "Release 0.1.0 failed" && $0.body.hasPrefix("Nothing was deployed:") })
+
+        // A new value stored but not yet reloaded (a reload pending): refused the same way.
+        let pending = try Fx()
+        let second = try pending.proposeAndApprove()
+        pending.w.clock.advance(1)     // a later write: the stored secrets' version moves on
+        try pending.store.setSecret(companyId: pending.company.id, name: "CLOUDFLARE_API_TOKEN", value: rotated, isTest: false,
+                                    vault: pending.vault, now: pending.w.clock.now)
+        #expect(try pending.store.secretsReloadNeeded())
+        await pending.advance()
+        #expect(try pending.reload(second).failedReason == "the hosting token CLOUDFLARE_API_TOKEN isn't loaded for redaction yet; propose again")
+        #expect(try pending.deploySteps().isEmpty)
+        // Once the redactor has loaded it, a new release deploys and the printed value is redacted.
+        try pending.store.reloadRedactorIfNeeded(vault: pending.vault)
+        #expect(ReleaseExecutor.redacts(store: pending.store, token: rotated))
+        #expect(!ReleaseExecutor.redacts(store: pending.store, token: "short"))
+        let third = try pending.proposeAndApprove("0.2.0")
+        await pending.advance()
+        #expect(try pending.reload(third).status == .deployed)
+    }
+
+    @Test func nodeModulesNeverStaged() async throws {
+        // Fix I2 (the Task 7 stager ruling): a Vercel-style "." stage after a build that installed dependencies stages fine
+        // and leaves every node_modules out, at any depth; a link anywhere else is still refused.
+        let fx = try Fx(build: "mkdir -p dist node_modules/.bin node_modules/pkg web/node_modules/.bin && echo '<title>Lumen</title>' > dist/index.html "
+                        + "&& echo x > node_modules/pkg/index.js && ln -s ../pkg/index.js node_modules/.bin/pkg "
+                        + "&& ln -s ../../x web/node_modules/.bin/y && echo w > web/page.html",
+                        configure: { $0.stageFrom = ["."] })
+        let approved = try fx.proposeAndApprove()
+        await fx.advance()
+        let r = try fx.reload(approved)
+        #expect(r.status == .deployed, "\(r.failedReason ?? "")")
+        let staged = FileManager.default.subpaths(atPath: try fx.upload().path) ?? []
+        #expect(!staged.contains { $0.lowercased().split(separator: "/").contains("node_modules") }, "\(staged)")
+        #expect(staged.contains("dist/index.html")); #expect(staged.contains("web/page.html"))
+
+        let base = try tempDir()
+        let export = base.appending(path: "export", directoryHint: .isDirectory)
+        for (path, text) in ["dist/index.html": "x", "node_modules/pkg/index.js": "p", "dist/Node_Modules/a.js": "a"] {
+            let url = export.appending(path: path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: url)
+        }
+        try FileManager.default.createDirectory(at: export.appending(path: "node_modules/.bin"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: export.appending(path: "node_modules/.bin/pkg").path, withDestinationPath: "../pkg/index.js")
+        let upload = base.appending(path: "upload", directoryHint: .isDirectory)
+        try UploadStager.stage(from: export, dirs: ["."], into: upload)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: upload.path) == ["dist"])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: upload.appending(path: "dist").path) == ["index.html"])
+        // A link outside node_modules still refuses the stage.
+        try FileManager.default.createSymbolicLink(atPath: export.appending(path: "dist/key").path, withDestinationPath: "/nonexistent/.ssh/x")
+        #expect(throws: ReleaseError.stage("output contains a symlink: dist/key")) {
+            try UploadStager.stage(from: export, dirs: ["."], into: base.appending(path: "upload-2", directoryHint: .isDirectory))
+        }
+        // The env-file refusal comes first: `.env` beside node_modules is still refused.
+        try FileManager.default.removeItem(at: export.appending(path: "dist/key"))
+        try Data("A=1".utf8).write(to: export.appending(path: ".env"))
+        #expect(throws: ReleaseError.stage("output contains .env; env files are never deployed")) {
+            try UploadStager.stage(from: export, dirs: ["."], into: base.appending(path: "upload-3", directoryHint: .isDirectory))
+        }
+    }
+
     @Test func approvalAfterRedDoesNotDeploy() async throws {
         let fx = try Fx(smoke: "exit 1")
         let approved = try fx.proposeAndApprove()
