@@ -16,6 +16,54 @@ private final class Counter: @unchecked Sendable {
     func next() -> Int { lock.withLock { n += 1; return n } }
 }
 
+/// What a `ChildGroups` observer was told, in order. Waits for an exact event, bounded by awake time (`DispatchTime` does not
+/// count sleep), on a thread of its own so no cooperative thread is blocked.
+private final class GroupEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var log: [ChildGroups.Event] = []
+    private let changed = DispatchSemaphore(value: 0)
+
+    var all: [ChildGroups.Event] { lock.withLock { log } }
+
+    func observe(_ e: ChildGroups.Event) {
+        lock.withLock { log.append(e) }
+        changed.signal()
+    }
+
+    /// The first leader recorded.
+    func firstRecorded(within seconds: Int = 60) async throws -> pid_t {
+        try await wait(seconds) { log in
+            log.lazy.compactMap { if case .recorded(let p) = $0 { p } else { nil } }.first
+        }
+    }
+
+    /// Returns once `pid`'s record was removed (that event, no other).
+    func forgotten(_ pid: pid_t, within seconds: Int = 60) async throws {
+        try await wait(seconds) { $0.contains(.forgotten(pid)) ? () : nil }
+    }
+
+    private struct TimedOut: Error, CustomStringConvertible {
+        let log: [ChildGroups.Event]
+        var description: String { "timed out; events so far: \(log)" }
+    }
+
+    private func wait<T: Sendable>(_ seconds: Int, _ found: @escaping @Sendable ([ChildGroups.Event]) -> T?) async throws -> T {
+        let deadline = DispatchTime.now() + .seconds(seconds)
+        let result: Result<T, TimedOut> = await withCheckedContinuation { c in
+            Thread {
+                while true {
+                    let log = self.all
+                    if let value = found(log) { c.resume(returning: .success(value)); return }
+                    if self.changed.wait(timeout: deadline) == .timedOut, found(self.all) == nil {
+                        c.resume(returning: .failure(TimedOut(log: self.all))); return
+                    }
+                }
+            }.start()
+        }
+        return try result.get()
+    }
+}
+
 @Suite(.scratch, .serialized) struct EmergencyStopTests {
     // MARK: Engine
 
@@ -131,9 +179,9 @@ private final class Counter: @unchecked Sendable {
     /// way `brahma stop` does, with no engine involved, ends it, and its record goes.
     @Test func recordedCheckGroupIsKilledByStop() async throws {
         let dir = try tempDir()
-        let recorded = Gate(), forgotten = Gate()
+        let events = GroupEvents()
         var made = ChildGroups(dir: dir.appending(path: "children"), kind: "check")
-        made.observer = { e in if case .recorded = e { recorded.open() } else { forgotten.open() } }
+        made.observer = { events.observe($0) }
         let groups = made
         let sleeper = try FakeTools.script("check-sleeper", "sleep 300 & wait")
         let runner = ProcessCheckRunner()
@@ -144,14 +192,16 @@ private final class Counter: @unchecked Sendable {
                                  outputURL: output, environment: ["PATH": "/usr/bin:/bin"])
             }
         }
-        await recorded.wait()
+        let leader = try await events.firstRecorded()
         let leaders = ChildGroups.liveLeaders(in: groups.dir)
         #expect(leaders.count == 1)
+        #expect(leaders == [leader], "the recorded leader, still live: \(events.all)")
         let signalled = EmergencyStop.signalGroups(leaders)
         #expect(signalled.terminated == leaders.sorted())
         let outcome = await run.value
-        await forgotten.wait()
+        try await events.forgotten(leader)
         #expect(outcome.exitCode != 0, "\(outcome)")
+        #expect(events.all == [.recorded(leader), .forgotten(leader)])
         #expect(ChildGroups.liveLeaders(in: groups.dir).isEmpty)
         #expect(try FileManager.default.contentsOfDirectory(atPath: groups.dir.path).filter { $0.hasSuffix(".group") }.isEmpty)
     }
@@ -161,13 +211,16 @@ private final class Counter: @unchecked Sendable {
     @Test func recordedMergeGitGroupIsKilledByStop() async throws {
         let repo = try tempDir()
         _ = try GitFixture.plainGit(["init", "-q", "-b", "main"], in: repo)
-        let recorded = Gate(), forgotten = Gate()
+        let events = GroupEvents()
         var made = ChildGroups(dir: try tempDir().appending(path: "children"), kind: "merge")
-        made.observer = { e in if case .recorded = e { recorded.open() } else { forgotten.open() } }
+        made.observer = { events.observe($0) }
         let groups = made
         var git = GitCommand(gitDir: repo.appending(path: ".git"), workTree: repo, commonDir: nil)
         git.tempRoot = try tempDir()
         git.childGroups = groups
+        // The config scan before a command runs `git config --list` under the same group, recorded and forgotten first; that
+        // short git is not the one under test (killing it, or missing it once it exited, made this pass or fail by timing).
+        git.skipsRepositoryCheck = true
         let release = DispatchSemaphore(value: 0)
         let command = git
         let run = Task.detached { () -> String in   // scope-escape: runs one git, no scratch dirs
@@ -178,16 +231,18 @@ private final class Counter: @unchecked Sendable {
             do { return "status \(try command.run(["hash-object", "--stdin"], allowFailure: true, stdin: feed).status)" }
             catch { return "threw \(error)" }
         }
-        await recorded.wait()
+        let leader = try await events.firstRecorded()
         let leaders = ChildGroups.liveLeaders(in: groups.dir)
         #expect(leaders.count == 1)
+        #expect(leaders == [leader], "the recorded git, still live: \(events.all)")
         #expect(!leaders.contains(getpgrp()), "its own group, never the engine's")
         #expect(EmergencyStop.signalGroups(leaders).terminated == leaders.sorted())
-        await forgotten.wait()
+        try await events.forgotten(leader)
         release.signal()
         let status = await run.value
         #expect(status != "status 0", "the killed git is not a success: \(status)")
         #expect(ChildGroups.liveLeaders(in: groups.dir).isEmpty)
+        #expect(events.all == [.recorded(leader), .forgotten(leader)], "one git, recorded then forgotten")
     }
 
     @Test func nothingAdmittedWhileStopped() async throws {
