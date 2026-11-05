@@ -204,7 +204,7 @@ extension Store {
                     item.status = .ready
                     item.blockedReason = nil
                     item.blockedSinceActive = nil
-                    item.blockedAskId = nil; item.blockedAskBy = nil
+                    item.blockedAskId = nil; item.blockedAskBy = nil; item.statusBeforeBlock = nil
                 }
                 item.stopReason = stopReason
             }
