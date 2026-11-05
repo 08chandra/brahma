@@ -90,7 +90,9 @@ import GRDB
                       // Bash's own sockets.
                       "exec 3<>/dev/tcp/example.com/80", "cat </dev/udp/1.2.3.4/53",
                       // Fix round 2d: dequoted words.
-                      "gi\"t\" fetch", "cat </dev/t\"cp\"/example.com/80", "git-upload-pack x", "echo \"$HOME\""])
+                      "gi\"t\" fetch", "cat </dev/t\"cp\"/example.com/80", "git-upload-pack x",
+                      // A dynamic word where it can name the program.
+                      "\"$TOOL\" x", "env \"$X\" y", "A=1 $CMD run", "nice -n 5 \"$P\""])
     func interpreterNetworkTaints(_ c: String) {
         let source = TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)])
         #expect(source == "bash: " + String(TaintPolicy.flat(c).prefix(60)))
@@ -103,7 +105,9 @@ import GRDB
                   "git checkout -b x", "git switch main", "git merge --no-ff x", "git restore f", "git rm f", "git mv a b",
                   "git ls-files", "git rev-parse HEAD", "git cat-file -p HEAD", "git grep -n foo", "git diff > patch.diff",
                   // S23: no git, a literal shell text: classified again.
-                  "sh -c 'echo hi'", "bash -lc \"ls -la\"", "cat .gitignore", "ls .github"] {
+                  "sh -c 'echo hi'", "bash -lc \"ls -la\"", "cat .gitignore", "ls .github",
+                  // A dynamic word in an ordinary argument of a non-git command does not taint.
+                  "echo \"$HOME\"", "cat \"$F\"", "ls $DIR", "swift test --filter \"$T\""] {
             #expect(TaintPolicy.source(toolName: "Bash", toolInput: ["command": .string(c)]) == nil, "\(c)")
         }
         // The source is the first 60 characters, on one line.

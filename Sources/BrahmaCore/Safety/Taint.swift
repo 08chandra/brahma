@@ -169,6 +169,8 @@ public enum GitClassifier {
     static let wrappers: Set<String> = ["env", "command", "exec", "nohup", "time", "xargs", "builtin", "nice", "sudo", "doas",
                                         "stdbuf", "timeout", "caffeinate", "script", "watch", "parallel", "find"]
     static let shells: Set<String> = ["sh", "bash", "zsh", "dash", "ksh"]
+    /// Wrapper options that take the next word.
+    static let wrapperValueOptions: Set<String> = ["-u", "-C", "-S", "-n", "-I", "-L", "-P", "-s", "-E", "-d", "-k"]
 
     /// `dynamic`: holds an expansion (or an unquoted glob). `splits`: one of them is unquoted, so it may become several words.
     struct Word: Equatable { var text: String; var dynamic: Bool; var splits: Bool = false }
@@ -195,10 +197,12 @@ public enum GitClassifier {
     /// `git` as a word anywhere in the raw text (`/usr/bin/git`, `"git"`, `xargs git`; not `.gitignore` or `github`).
     static func mentionsGit(_ command: String) -> Bool {
         if command.range(of: "(^|[^A-Za-z0-9_.-])git([^A-Za-z0-9_-]|$)", options: .regularExpression) != nil { return true }
-        // Dequoted words too (`gi"t" fetch`): a word named `git` or `git-*`, or any word an expansion fills.
+        // Dequoted words too (`gi"t" fetch`): a word named `git` or `git-*`. A dynamic word counts only where it can name the
+        // program (command position, after an assignment or a wrapper) or a shell's `-c` text: `shellNetwork` decides those;
+        // in an ordinary argument (`echo "$HOME"`) it does not taint.
         return split(command).joined().contains { w in
             let name = base(w.text.trimmingCharacters(in: CharacterSet(charactersIn: "<>")))
-            return w.dynamic || name == "git" || name.hasPrefix("git-")
+            return name == "git" || name.hasPrefix("git-")
         }
     }
 
@@ -229,7 +233,11 @@ public enum GitClassifier {
               words[i].text.range(of: "^[A-Za-z_][A-Za-z0-9_]*=", options: .regularExpression) != nil { i += 1 }
         while i < words.count, wrappers.contains(base(words[i].text)) {
             i += 1
-            while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic { i += 1 }
+            while i < words.count, words[i].text.hasPrefix("-") || words[i].text.contains("=") && !words[i].dynamic {
+                // A wrapper option that takes the next word (`nice -n 5`, `env -u NAME`).
+                if wrapperValueOptions.contains(words[i].text) { i += 1 }
+                i += 1
+            }
         }
         guard i < words.count else { return false }
         let cmd = words[i]
