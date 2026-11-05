@@ -69,13 +69,16 @@ public struct VercelAdapter: HostingAdapter {
         return !names.isEmpty && names.allSatisfy { $0 == settings.project }
     }
 
-    /// `vercel rollback <previous deploy URL> --yes` from an empty `releaseDir/rollback`, else the placeholder deployed.
+    /// `vercel inspect <previous deploy URL>` (the target confirmed to be this project's with the token, before anything is
+    /// rolled back to it: `DeployStep.verifyLabel`, the Task 7 check), then `vercel rollback <that URL> --yes`, both from an
+    /// empty `releaseDir/rollback`; else the placeholder deployed.
     public func rollbackPlan(_ i: DeployInput) throws -> DeployPlan {
         try validate(i.settings)
         try i.validate()
         if let previous = i.previousDeployURL {
             guard Self.isDeployURL(previous, project: i.settings.project) else { throw WorkError.invalid("the previous deploy URL is not a vercel.app URL") }
-            return try DeployPlan(steps: [DeployStep(label: "rollback", argv: [i.bin("vercel"), "rollback", previous, "--yes"])],
+            return try DeployPlan(steps: [DeployStep(label: DeployStep.verifyLabel, argv: [i.bin("vercel"), "inspect", previous]),
+                                          DeployStep(label: "rollback", argv: [i.bin("vercel"), "rollback", previous, "--yes"])],
                                   stageFrom: [], cwdPath: i.inRelease("rollback"), network: network, tokenSecret: tokenSecret,
                                   env: env(i), build: i.settings.build, outputDir: i.settings.outputDir)
         }
