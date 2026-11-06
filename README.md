@@ -223,29 +223,134 @@ queue is where it gets reworked.
 
 ## Safety
 
-Agents run with `--profile workspace` by default: a fixed tool allow-list (shell, file tools, company tools),
-started in the company workspace. **This is a tool allow-list, NOT a sandbox.** The allow-list includes Bash, so
-an agent can run any shell command as your user: it can read and write files anywhere you can, including the
-brahma database (and so impersonate other agents or alter their state) and other companies' workspaces. Only
-the Sandboxed profile (Plan 5) confines agents. Every turn ignores your personal Claude settings, plugins, MCP
-servers and `CLAUDE.md` files (`--setting-sources ""`), and a `CLAUDE.md` in the workspace is not loaded either.
+**Profiles.** Every agent turn runs under its company's profile, set with
+`brahma company profile <company> sandboxed|workspace|full [--role <id>]` (`--role` sets it for one role's agents).
+`brahma run --profile` is only a ceiling: it can narrow a company's profile, never widen it.
 
-**`--profile full` gives agents your whole Mac** (all permission checks bypassed). Only use it for
-companies and prompts you trust completely.
+- **Sandboxed** (the default) confines each turn with macOS Seatbelt to its own places in the company workspace.
+- **Workspace** is a tool allow-list (shell, file tools, company tools) started in the workspace. **It is NOT a sandbox.**
+  The agent's Bash runs as your user and can read and write anything you can, including the Brahma database (and so
+  impersonate other agents or alter their state) and other companies' workspaces.
+- **Full gives agents your whole Mac** (every permission check bypassed). Only use it for companies and prompts you trust
+  completely.
+
+Switching a company back to Sandboxed does not rule out a process an earlier Workspace or Full turn left running; check
+`ps` for strays. Every turn ignores your personal Claude settings, plugins, MCP servers and `CLAUDE.md` files
+(`--setting-sources ""`), and a `CLAUDE.md` in the workspace is not loaded either.
+
+**What Sandboxed blocks.** A sandboxed turn cannot:
+
+- read your home folder, apart from the toolchain's read-only places and paths you grant;
+- read Brahma's data home (the database, MCP configs, owner key, backups);
+- read credentials and private app data, even under a granted path: `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`,
+  `~/.netrc`, `~/.docker`, `~/.kube`, `~/.claude`, `~/.gitconfig`, shell histories, the Keychains, cookies, Mail, Messages,
+  Safari, browser and other app profiles (Chrome, Firefox, Arc, Claude, Slack, 1Password, VS Code, ...);
+- read or write other companies' workspaces;
+- read `/Volumes`;
+- read or delete your backup targets and the WAL replica folder;
+- write outside its own places in the workspace: the item turn's worktree, or the agent's lab, plus its home (with its
+  own cache inside) and its notes file. `.brahma/cache` and the other engine-owned parts of `.brahma`, and git's
+  config, hooks, `info/` and `main` ref, are write-denied;
+- reach the network except through Brahma's egress proxy: Bash gets HTTPS (port 443) to the allowlisted hosts only, and
+  only at public addresses (loopback, private ranges and cloud metadata are refused). WebFetch has its own list. Anthropic's
+  domains are never allowed. Listening on loopback is off unless you turn it on;
+- use helper programs that act outside the sandbox: the Keychain, the pasteboard, screen capture, `open` (LaunchServices),
+  `osascript` (Apple events), accessibility, privacy (TCC) services, preference writes (cfprefsd) and disk mounting
+  (DiskArbitration and `mount_*`).
+
+Engine-run checks run under the same kind of sandbox (a Full company's checks run unconfined).
+
+**Network allowlist.** The default Bash list is the package registries (npm, Yarn, PyPI, crates.io, Go, RubyGems, Maven,
+GitHub); WebFetch also gets a few docs sites (Apple, Swift, MDN, Node, Python, docs.rs, pkg.go.dev).
+
+```
+brahma network <company>                          the effective lists (defaults marked)
+brahma network <company> add|rm <domain> [--web]  a Bash egress domain (--web: a WebFetch domain)
+brahma network <company> local on|off             whether agents may listen on loopback
+brahma network <company> toolchain add|rm <path>  an extra read-only toolchain path
+```
+
+**Sandbox checks.** `brahma doctor` reports `sandbox-backend`, `sandbox-canary` and `sandbox-helpers`. Before a sandboxed
+turn starts, its CLI build and turn shape must have passed the sandbox canary; until then the agent waits and you get a
+sandbox-check alert. The canary's probe content is not written yet (see the residual risks), so sandboxed companies stay
+blocked for now; Workspace and Full companies run.
+
+**Grants and presets.** An agent that needs more asks with `request_access` (a Bash domain, a WebFetch domain or a
+directory to read). You decide; a grant takes effect from the agent's next turn.
+
+```
+brahma access <company>                              open access requests, and recently refused ones
+brahma access approve <company> A-<n> --scope once|item|agent|role|company --duration turn|sprint|always
+brahma approve <company> A-<n> --reject              reject one
+brahma grants <company> [--all]                      the grant ledger
+brahma grants revoke <company> G-<n>                 gone from the next turn
+brahma presets <company> [enable|disable <preset>]   both off by default
+```
+
+`readonly-web-engineers` lets engineers, QA, DevOps, security and architects read well-known docs sites (exact hosts);
+`auto-low-risk` approves low-risk web reads for the sprint under the `auto` autonomy preset. Neither ever approves a
+medium or high risk or a reserved matter.
+
+**The taint rule.** Once a session has read outside content, it is tainted until the agent's next fresh session. Outside
+content is a WebFetch or WebSearch result, another MCP server's output, a Bash command that reaches the network or runs
+fetched code (`curl`, `ssh`, `npm`, `pip`, `git fetch`, `/dev/tcp`, ...), or a third-party or not-installed skill or
+sub-agent. A tainted session keeps talking, reading and ordinary item work (messages, channels, items, leases,
+`submit_for_review`, hand-offs). Every other company tool is refused: proposing or deciding asks, reviews and audits,
+sprint planning, asking for access or secrets, `use_secret`, mode requests, re-adopting branches and proposing extensions.
+It also cannot start sub-agents or workflows. What it writes reaches readers marked as coming from a session that read
+outside content, and its items lose auto-approval. Fan-out turns count as tainted from launch until the installed CLI
+passes the V-1 hook gate. Text that claims to come from the owner is flagged and never changes an ask; only you, as the
+owner, approve anything.
+
+Deciding which shell commands reach the network is done by a command classifier, and **the classifier is advisory**: it
+errs towards tainting, but it is not the wall. On the Sandboxed profile the network allowlist is the real wall: a command
+the classifier misses still reaches only the allowlisted hosts.
+
+**Lab marks.** Each agent has a lab, a scratch repository it builds extensions in. Once a tainted session has worked in a
+lab, the lab carries a sticky mark: every extension proposed from it goes to you and mounts as third-party. A tainted turn
+on the Workspace or Full profile marks every lab in its company (a company mark, which new hires also inherit), and on Full
+it also leaves a machine-wide mark, since it could write any company's labs. Only you clear marks, after checking what
+is in the labs:
+
+```
+brahma lab clear-taint <company> <handle>   one agent's lab
+brahma lab clear-taint <company>            the company mark and every agent's lab mark in it
+brahma lab clear-taint --machine-wide       the mark a Full-profile session left
+```
+
+A clear is refused while a tainted session or turn is still in scope, and commits made before the clear stay recorded as
+tainted.
+
+**Agent-built extensions.** An agent proposes an extension from its own lab with `propose_extension` (lint-clean, as
+committed). Brahma decides its provenance from the lab commits that introduced its content. A clean one goes to the
+company's internal reviewer and then to you. One whose provenance is tainted or unrecorded, or that comes from a marked lab,
+goes straight to you and no teammate reads it. Nothing is mounted on any turn before you approve it. To try a folder
+yourself, `brahma ext try <folder> --company <company> --role <role> --prompt <text>` runs one throwaway Quick turn on the
+Sandboxed profile with the folder mounted; it files no ask, and everything it made is removed.
+
+**Ultra mode is gated.** Ultra (an approved run of Claude's workflow engine on the Sandboxed profile, under a budget cap,
+a wall clock and an agent-count kill) stays off until every one of its probe gates passes for the installed CLI build.
+Sub-agents on the Sandboxed profile have gates of their own. `brahma mode gates` lists every gate per shape (`--run` runs
+the missing live ones, on haiku); `brahma mode ultra-status <company>` says why Ultra cannot run for a company; `brahma
+settings ultra-share <company> <0-50>` sets the share of the company's weekly share Ultra may use (0 turns it off).
+
+**Emergency stop.** `brahma stop [--note <why>]`, or STOP EVERYTHING in the app's top bar, stops every agent, check,
+preview and deploy in all companies at once. The command signals each recorded turn's process group itself (SIGTERM, then
+SIGKILL), so a wedged engine cannot keep agents running. Nothing runs until `brahma resume` (or Resume in the app).
 
 **Agent environment.** Every turn gets an allowlisted environment (`PATH, HOME, LANG, LC_*, TERM, USER, LOGNAME,
 SHELL, DEVELOPER_DIR, TMPDIR`, minus anything named like a token, secret or key), plus `BRAHMA_AGENT_ID`; never
 `BRAHMA_DEV`. `claude` itself also receives `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when you set them
-(keychain login needs neither), and an agent's Bash inherits those from the `claude` process until the 5-lite
-shell prefix unsets them. `brahma mcp` refuses a foreign `--agent`, and owner-write commands refuse to run inside
-an agent turn; as above, neither is tamper-proof until the sandbox lands.
+(keychain login needs neither). On the Sandboxed profile the agent's shell prefix unsets those and every other variable
+named like a token, secret or key before each Bash command; on Workspace and Full an agent's Bash can inherit them. `brahma mcp` refuses a foreign `--agent`, and owner-write commands refuse to run inside an agent turn;
+on the Workspace and Full profiles neither is tamper-proof.
 
 **Engine git.** Every git command the engine runs forces off what a repository could make git run (hooks, fsmonitor,
 gpg, credential helpers, askpass, ssh, editors, submodule recursion, external diff), reads attributes from the empty tree,
 ignores replace refs and grafts, and is refused (with one owner alert) when the workspace's git config holds anything
-beyond a short allowlist. Filters and diff/merge drivers are kept out by the engine's own `.git/info/attributes` plus that
-config check, which an agent rewriting both files between the check and the command could still race: the 5-lite
-sandbox must deny agent writes to `.git/config`, `config.worktree` and `.git/info/`.
+beyond a short allowlist. On the Sandboxed profile agents cannot write `.git/config`, `config.worktree` or `.git/info/`.
+When the engine commits an agent's work it leaves out, and reports, any symbolic link whose target has a `..` part or
+points outside the checkout: repositories that use such links need them rewritten.
 
 `brahma doctor` checks the installed Claude Code CLI (version, required flags, a real haiku probe turn, and that
 `--resume` keeps the role prompt). `brahma run` and the app require a passing probe, reused for 24 h per CLI version.
@@ -256,9 +361,107 @@ the data-home path; on Linux a 0600 hash file under `~/.config/brahma`, which is
 the key: the Mac app does at launch, or you run `brahma owner init` in Terminal (it needs an interactive terminal;
 `--rotate` replaces a key and needs the current key to be valid; a lost or invalid key can only be replaced from the app after a user-presence check). The hash is keyed on the canonical (symlink-resolved) data home, and owner commands refuse a database that is a symlink or lies outside it. Each turn's `brahma mcp` only starts with a per-turn token (only its SHA-256 is stored)
 that is valid while that turn is in progress, delivered in the 0600 per-turn MCP config. Both are a deterrent, not a
-security boundary: until 5-lite's sandbox read-denies the data home and Keychain services to agents, an agent shell
-can still read the key, the hash and the MCP configs, or fake a TTY with `script`.
+security boundary on their own: the Sandboxed profile denies agents the data home and the Keychain, but on the Workspace
+and Full profiles an agent shell can still read the key, the hash and the MCP configs, or fake a TTY with `script`.
 
 For temp or demo data homes only, `BRAHMA_OWNER_KEY_STORE=file` keeps the owner-key hash in a 0600 file `<data home>/owner/keyhash` instead of the Keychain (a rebuilt dev binary re-prompts for the login password on every Keychain access); the CLI and app refuse it for the default data home and for any other value, and print a warning when it is used.
 
 **Secrets.** `brahma secret set <company> NAME [--test]` stores the value in the Keychain (service `dev.brahma.secrets`); the database holds only names and flags. Each item trusts only the running Brahma binary and its sibling (the app and its bundled `brahma`), so other programs, `/usr/bin/security` included, get the system prompt instead of the value. Residual risk: Keychain asks once per item per binary build to allow access (a rebuilt or re-signed binary is a new application to macOS, and only the binaries trusted by the build that last wrote an item can read it). Background reads (the engine, `brahma mcp`, other CLI commands, app launch) never show a prompt: a read that needs your permission fails, is retried with backoff (5 s doubling to 5 min) and pauses agents, and Brahma posts one notice; run `brahma secret load` (or press Load secrets in the app) to allow access. Values are redacted from everything the engine stores; until every secret has loaded, the engine starts no turns, checks or merges, `brahma mcp` refuses tool calls ("secrets are not loaded yet; try again shortly") and text writes fail instead of storing unredacted text. Read-only CLI commands never read secrets. A test key (`--test`) needs a name containing `KEY`, `TOKEN` or `SECRET` that is not a variable that changes how programs run (`GIT_*`, `SSH_*`, `DYLD_*`, `LD_*`, `NODE_*`, `PYTHON*`, `*PATH`, `*_OPTIONS`, ...). For temp or demo data homes only, `BRAHMA_SECRET_STORE=file` keeps values in a 0600 file `<data home>/secrets/vault.json` (`memory` is for in-process tests and the CLI and app refuse it); like the owner-key switch it is refused for the default data home and for any other value.
+
+A test key (`--test`) can be put in an agent's environment, and its checks', for an item it holds (`use_secret`), from its
+next turn until it releases the item or the item is done. Every other secret is engine-held: no agent is ever given it.
+
+**Residual risks.**
+
+- Claude Code keeps its own unredacted copy of each session transcript in ~/.claude/projects; Brahma's captured copy is redacted.
+- Workspace profile Bash is not sandboxed.
+- Resource scopes and lab privacy are enforced only by Brahma's tools on the Workspace and Full profiles; an agent's shell can read them.
+- Extensions run inside the agent's sandbox. Brahma refuses hooks, MCP servers, LSP servers, monitors, plugin settings and install scripts in any extension.
+- The git pre-commit hook is advisory; the engine's submit- and merge-time scans are the real check.
+- Agent turns can write files in your user temp folder, because xcrun needs its cache file there.
+- Keychain asks once per app build to allow access.
+- **The sandbox canary's probe content is pending the owner.** Sandboxed companies stay blocked until the owner writes it.
+  Ultra's V-9 gate is pending for the same reason.
+- **Other Seatbelt mount routes** beyond the known DiskArbitration and `mount_*` routes (both denied and tested) have not
+  been exhaustively reviewed. This is a human-review item.
+- **Checks can't attach or mount disk images.**
+- **Workspace-profile Bash can clear or forge taint flags,** by removing or writing the flag files or editing the
+  database. The Sandboxed profile blocks this.
+- **A marked work item still merges after a normal reviewer approval.** Its taint mark clears only when the item is done.
+- **The command classifier is advisory.** Ordinary local commands such as `git stash`, `cd x && git status`, or variables
+  in commands taint a session.
+- A lab mark covers the whole agent, not one session. There is no command yet that lists lab marks.
+- On the Workspace and Full profiles, an untainted agent writing into another agent's lab is not detected, and the folders
+  of extension reviews and `ext try` stay readable to agents.
+- Checks cannot read your SwiftPM cache, so a check that has to resolve packages through it fails.
+- **Dev homes built from earlier pre-release lane builds must be recreated,** because of in-place migration changes.
+- **Live tests have not been run.**
+
+## Backups
+
+Backups live under `<data home>/backups/` and are made by the engine (the app, or `brahma run`) while it runs:
+
+| What | When | Kept |
+| --- | --- | --- |
+| Database snapshot (`VACUUM INTO`, integrity-checked) | every hour | 48 |
+| Repository bundle per company (`git bundle --all`, verified; skipped when no ref moved) | daily at 03:30 | 14 per company |
+| Data-home snapshot (hard-linked against the previous one) | daily at 04:00 | 30 |
+| Copy to every off-machine target | daily at 04:30 | |
+| Database snapshot before a migration | when a migration runs | 10 |
+| Manual database snapshot (`brahma backup now`) | when you ask | 20 |
+| Database snapshot before a restore | when you restore | 5 |
+
+A snapshot that fails its check is deleted and nothing is pruned. A failed backup posts a "Backup failed" notice.
+
+**What is included.** The data-home snapshot holds everything under the data home (archives, transcripts, role cards,
+company files) except `run/`, `backups/`, `tmp/`, `cache/`, `owner/` and `secrets/`, SQLite `-wal`, `-shm` and `-journal`
+files, `*.lock` files and the live `brahma.sqlite` (which has its own snapshots). SQLite files in it are integrity-checked
+copies. Links are never followed. Secrets and the owner key are never backed up. Workspaces are backed up only as their
+git history (the bundles): uncommitted files in a workspace are not.
+
+**Restore.** Quit the app and `brahma run` first.
+
+```
+brahma restore --list                  the database snapshots, newest first (also: brahma backup list)
+brahma restore --latest                the newest snapshot that passes its integrity check
+brahma restore --at <ISO-8601 time>    the newest snapshot at or before that time
+brahma restore <snapshot file>
+  --with-files                         also put the data home's files back, from the newest data-home snapshot at or
+                                       before the database snapshot (it may be up to a day older)
+  --dry-run                            check the snapshot and show what would happen; change nothing
+```
+
+The current database is kept next to it as `brahma.sqlite.pre-restore-<time>`, and with `--with-files` whatever the files
+replaced is kept in `<data home>/.pre-restore-<time>`. Git repositories are never touched: when Brahma next starts it
+re-adopts each company's `main` as the snapshot recorded it. Commits made after the snapshot are kept, but Brahma alerts
+you and holds that company until you review `main` and accept it (`brahma main accept`).
+
+**Export.** `brahma export <company> --to <new directory> [--no-workspace]` writes a self-contained copy of one company:
+its database rows, its repository as a bundle (left out with `--no-workspace`), its files, transcripts, archive and roles.
+Machine-specific records (turn tokens, restore records, the stop, the canary) are left out.
+
+**Off-machine targets.** `rclone` and `litestream` are not bundled; without them those features read "unavailable".
+
+```
+brahma backup target add folder <path>   mirror the backups to <path>/<hostname>/ (an external drive, a NAS mount)
+brahma backup target add rclone <remote> upload through an rclone remote, which must be of type crypt
+brahma backup targets                    list them
+brahma backup target rm <n>
+brahma backup now [--targets]            a database snapshot now, then (with --targets) a copy to every target
+```
+
+A folder must exist, be writable and lie outside the data home and every workspace; it is checked again on every copy.
+A drive that is not connected is skipped, with one notice a day. Agents and checks can neither read nor delete a target.
+
+**WAL shipping (optional).** `brahma backup wal enable <replica>` ships the database's write-ahead log with Litestream to a
+folder (with a folder target's checks) or a URL Litestream understands (`s3://bucket/path`); `brahma backup wal disable`
+stops it. Both take effect when the engine next starts. Credentials go in the engine's environment (`AWS_*`,
+`LITESTREAM_*`, `SSH_AUTH_SOCK`), never in the URL. With it on, `brahma restore --at` first has Litestream rebuild that
+moment (checked before it is used) and falls back to the newest snapshot if that fails. `brahma doctor` reports
+`wal-shipping` and `backup-targets`.
+
+**In the app.** Settings › Backups shows the last hourly snapshot, the last data-home snapshot and the last target copy,
+lists the targets (add and remove), has the WAL switch (disabled with "Install litestream to enable" when Litestream is
+missing) and Back up now.
+
+Include ~/Library/Application Support/Brahma and ~/Brahma in Time Machine; Brahma's own backups live inside the first.
