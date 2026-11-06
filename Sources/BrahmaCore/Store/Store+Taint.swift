@@ -509,41 +509,92 @@ public enum LabProvenance {
         public var description: String { message }
     }
 
+    /// What `labLikeRepos` walks at most (S34): a workspace with more entries refuses the clear rather than being half-checked.
+    public static let workspaceWalkLimit = 200_000
+
     /// Every lab-like repository of a workspace (S33): `.brahma/labs/*` and `.brahma/ext-try/*/lab` holding a `.git`, whoever
-    /// left them (current agents, fired ones, trials, planted ones).
-    static func labLikeRepos(workspace: URL) -> [String] {
+    /// left them (current agents, fired ones, trials, planted ones). Fails closed (M11, S34) with the reason the owner sees:
+    /// an entry there whose name Brahma cannot handle safely; `.brahma`, `.brahma/labs` or `.brahma/ext-try` that is not a real
+    /// directory; or a repository anywhere else in the workspace (a `.git` directory or file, or a bare repository) outside the
+    /// known layout (the main checkout's `.git`, its item worktrees' `.git` pointer files under `.brahma/wt`, the labs and the
+    /// trial labs). The workspace is walked with `lstat` (no link is ever followed), at most `walkLimit` entries; a walk cut at
+    /// the limit refuses. Blocking.
+    static func labLikeRepos(workspace: URL, walkLimit: Int = workspaceWalkLimit) throws -> [String] {
         let ws = workspace.resolvedForSandbox
+        func refuse(_ why: String) -> ClearRefused { ClearRefused(message: "\(why); move it aside, then clear the mark") }
+        for dir in [".brahma", ".brahma/labs", ".brahma/ext-try"] {
+            switch SandboxPath.kind(ws.appending(path: dir).path) {
+            case .missing, .directory: continue
+            default: throw refuse("\(dir) is not a real directory (a link or a file)")
+            }
+        }
         var out: [String] = []
-        for name in SandboxPath.entries(ws.appending(path: ".brahma/labs").path) where !SandboxPath.isUnsafe(name) {
-            out.append(".brahma/labs/\(name)")
+        for (dir, suffix) in [(".brahma/labs", ""), (".brahma/ext-try", "/lab")] {
+            for name in SandboxPath.entries(ws.appending(path: dir).path) {
+                guard !SandboxPath.isUnsafe(name) else {
+                    throw refuse("\(dir)/\(Store.flat(name.debugDescription, max: 120)) has a name Brahma cannot handle safely")
+                }
+                out.append("\(dir)/\(name)\(suffix)")
+            }
         }
-        for name in SandboxPath.entries(ws.appending(path: ".brahma/ext-try").path) where !SandboxPath.isUnsafe(name) {
-            out.append(".brahma/ext-try/\(name)/lab")
+        let repos = out.filter { SandboxPath.kind(ws.appending(path: "\($0)/.git").path) != .missing }
+        // The known `.git` places: walked past, never into.
+        let knownGitDirs = Set([".git"] + repos.map { "\($0)/.git" })
+        var stack = [""]
+        var seen = 0
+        while let rel = stack.popLast() {
+            let url = rel.isEmpty ? ws : ws.appending(path: rel)
+            let names = SandboxPath.entries(url.path)
+            // A bare repository: HEAD, objects and refs side by side (the known `.git` dirs are never entered).
+            if names.contains("HEAD"), names.contains("objects"), names.contains("refs"), !rel.isEmpty {
+                throw refuse("\(Store.flat(rel, max: 200)) is a git repository outside the known layout")
+            }
+            for name in names {
+                seen += 1
+                guard seen <= walkLimit else {
+                    throw ClearRefused(message: "the workspace has more than \(walkLimit) entries, so it could not be checked whole for "
+                                       + "stray repositories; nothing was cleared")
+                }
+                let child = rel.isEmpty ? name : "\(rel)/\(name)"
+                let kind = SandboxPath.kind(ws.appending(path: child).path)
+                if name == ".git" {
+                    if knownGitDirs.contains(child), kind == .directory { continue }
+                    // An item worktree's `.git` is a pointer file to the main repository's own worktree record.
+                    let parts = child.split(separator: "/")
+                    if kind == .file, parts.count == 4, parts[0] == ".brahma", parts[1] == "wt" { continue }
+                    throw refuse("\(Store.flat(child, max: 200)) is a git repository outside the known layout")
+                }
+                if kind == .directory { stack.append(child) }
+            }
         }
-        return out.filter { SandboxPath.kind(ws.appending(path: "\($0)/.git").path) != .missing }
+        return repos
     }
 
     /// The owner's clear of a company's lab mark (N1), one critical section under the engine lock: refused while the engine
     /// runs or any tainted session of the company is active; every lab-like repository of its workspace is snapshotted and
     /// its commits marked tainted first; then the mark goes, its clear time kept. Blocking (git).
     @discardableResult
-    public static func clearCompanyMark(store: Store, paths: BrahmaPaths, companyId: String, now: Date = Store.now()) throws -> Bool {
+    public static func clearCompanyMark(store: Store, paths: BrahmaPaths, companyId: String, now: Date = Store.now(),
+                                        walkLimit: Int = workspaceWalkLimit) throws -> Bool {
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         let lock = try engineLock(paths)
         defer { withExtendedLifetime(lock) {} }
         try refuseActiveSessions(store: store, paths: paths, companies: [company])
-        try snapshotTainted(store: store, company: company, now: now)
+        try snapshotTainted(store: store, company: company, now: now, walkLimit: walkLimit)
         return try store.clearCompanyLabTaint(companyId: companyId, now: now)
     }
 
     /// The owner's machine-wide clear (S32, S33), the same critical section over every company.
     @discardableResult
-    public static func clearMachineMark(store: Store, paths: BrahmaPaths, now: Date = Store.now()) throws -> Bool {
+    public static func clearMachineMark(store: Store, paths: BrahmaPaths, now: Date = Store.now(),
+                                        walkLimit: Int = workspaceWalkLimit) throws -> Bool {
         let lock = try engineLock(paths)
         defer { withExtendedLifetime(lock) {} }
         let companies = try store.companies()
         try refuseActiveSessions(store: store, paths: paths, companies: companies)
-        for company in companies { try snapshotTainted(store: store, company: company, now: now) }
+        // Every workspace is checked whole before any snapshot is written.
+        for company in companies { _ = try labLikeRepos(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), walkLimit: walkLimit) }
+        for company in companies { try snapshotTainted(store: store, company: company, now: now, walkLimit: walkLimit) }
         return try store.clearMachineLabTaint(now: now)
     }
 
@@ -573,10 +624,10 @@ public enum LabProvenance {
 
     /// Every lab-like repository of the company's workspace, its commits recorded tainted (`taintedLabCommit`, and on the
     /// owning agent's records); one that cannot be read refuses the clear.
-    static func snapshotTainted(store: Store, company: Company, now: Date) throws {
+    static func snapshotTainted(store: Store, company: Company, now: Date, walkLimit: Int = workspaceWalkLimit) throws {
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let agents = try store.agents(companyId: company.id)
-        for relative in labLikeRepos(workspace: workspace) {
+        for relative in try labLikeRepos(workspace: workspace, walkLimit: walkLimit) {
             guard case .ok(let root) = inspect(workspace: workspace, relative: relative) else {
                 throw ClearRefused(message: "\(relative) in \(company.name) cannot be read safely; move it aside, then clear the mark")
             }

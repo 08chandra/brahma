@@ -509,6 +509,75 @@ private struct LabWorld {
         #expect(!(try w.store.labCommitTainted(agentId: w.eng.id, sha: clean)))
     }
 
+    /// M11: a lab-like entry whose name Brahma cannot handle safely refuses the clear (with its path); it is never skipped.
+    @Test func unsafeLabNameRefusesTheClear() throws {
+        let w = try LabWorld(profile: .workspace)
+        try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
+        try w.freshSession(w.eng)
+        let odd = w.ws.appending(path: ".brahma/labs/odd\"lab")
+        try FileManager.default.createDirectory(at: odd, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "-q", "-b", "main"], in: odd)
+        do {
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id)
+            Issue.record("the clear ran")
+        } catch let e as LabProvenance.ClearRefused {
+            #expect(e.message.contains(".brahma/labs/") && e.message.contains("odd"), "\(e.message)")
+        }
+        #expect(try w.store.companyLabTaint(companyId: w.company.id) != nil, "the mark stands")
+        #expect(throws: LabProvenance.ClearRefused.self) { try LabProvenance.clearMachineMark(store: w.store, paths: w.paths) }
+        // Moved aside, the clear runs.
+        try FileManager.default.removeItem(at: odd)
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
+    }
+
+    /// S34: the clear fails closed, with the reason, on a layout it cannot vouch for: a linked `.brahma/labs`, a stray repo
+    /// (a `.git` directory, or a bare repository) outside the known places, a workspace too large to walk whole. An item
+    /// worktree's `.git` pointer file is known layout.
+    @Test(arguments: ["linked-labs", "stray-git", "stray-bare", "walk-limit"])
+    func clearRefusesAnUnknownLayout(_ shape: String) throws {
+        let w = try LabWorld(profile: .workspace)
+        try w.store.markTainted(agentId: w.eng.id, source: "WebFetch", now: w.world.clock.now)
+        try w.freshSession(w.eng)
+        // Known layout, in every case: an item worktree's `.git` pointer file.
+        let wt = w.ws.appending(path: ".brahma/wt/ACME-1")
+        try FileManager.default.createDirectory(at: wt, withIntermediateDirectories: true)
+        try "gitdir: ../../../.git/worktrees/ACME-1\n".write(to: wt.appending(path: ".git"), atomically: true, encoding: .utf8)
+        var limit = LabProvenance.workspaceWalkLimit
+        var expected = ""
+        switch shape {
+        case "linked-labs":
+            let elsewhere = try tempDir().appending(path: "labs")
+            try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+            let labs = w.ws.appending(path: ".brahma/labs")
+            try FileManager.default.moveItem(at: labs, to: elsewhere.appending(path: "moved"))
+            try FileManager.default.createSymbolicLink(at: labs, withDestinationURL: elsewhere)
+            expected = ".brahma/labs is not a real directory"
+        case "stray-git":
+            let stray = w.ws.appending(path: "src/vendor/thing")
+            try FileManager.default.createDirectory(at: stray, withIntermediateDirectories: true)
+            try GitFixture.plainGit(["init", "-q", "--template="], in: stray)
+            expected = "src/vendor/thing/.git is a git repository outside the known layout"
+        case "stray-bare":
+            let bare = w.ws.appending(path: "docs/hidden.git")
+            try FileManager.default.createDirectory(at: bare, withIntermediateDirectories: true)
+            try GitFixture.plainGit(["init", "-q", "--bare", "--template="], in: bare)
+            expected = "docs/hidden.git is a git repository outside the known layout"
+        default:
+            limit = 5
+            expected = "more than 5 entries"
+        }
+        do {
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, walkLimit: limit)
+            Issue.record("\(shape): the clear ran")
+        } catch let e as LabProvenance.ClearRefused {
+            #expect(e.message.contains(expected), "\(shape): \(e.message)")
+        }
+        #expect(try w.store.companyLabTaint(companyId: w.company.id) != nil, "\(shape): the mark stands")
+        #expect(throws: LabProvenance.ClearRefused.self) {
+            try LabProvenance.clearMachineMark(store: w.store, paths: w.paths, walkLimit: limit)
+        }
+    }
+
     /// S33 through the engine: after a clear, a commit a clean turn makes records clean at its end; one made before the turn
     /// started (between turns) does not.
     @Test func cleanTurnCommitRecordsCleanAfterAClear() async throws {
