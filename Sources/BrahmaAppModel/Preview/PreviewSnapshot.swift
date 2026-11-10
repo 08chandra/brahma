@@ -12,7 +12,7 @@ public struct PreviewSnapshot: Equatable, Sendable {
     public var liveRef: String?
     /// Surface id → the handle of whoever set it ("owner" for the owner).
     public var setBy: [String: String] = [:]
-    /// Log path → its last `PreviewBodies.logLines` lines (agent-controlled text).
+    /// A state's `logPath` → the last `PreviewBodies.logLines` lines of that surface's log (agent-controlled text).
     public var logTails: [String: [String]] = [:]
 
     public static let empty = PreviewSnapshot(surfaces: [], states: [:], live: nil, liveRef: nil)
@@ -28,28 +28,12 @@ public struct PreviewSnapshot: Equatable, Sendable {
             p.live = url
             p.liveRef = latest.ref
         }
-        for state in p.states.values where [.building, .starting, .failed].contains(state.status) {
-            if let path = state.logPath { p.logTails[path] = LogTail.read(URL(fileURLWithPath: path), lines: PreviewBodies.logLines) }
+        // Read through the core's hardened reader (`PreviewLog.tail`: EngineFiles, no links, no hard links), by surface name.
+        let layout = EngineLayout(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+        for s in p.surfaces {
+            guard let state = p.states[s.id], [.building, .starting, .failed].contains(state.status), let path = state.logPath else { continue }
+            p.logTails[path] = PreviewLog.tail(layout, name: s.name, lines: PreviewBodies.logLines)
         }
         return p
-    }
-}
-
-/// The last lines of a preview log: only its last 64 KB are read, and a missing or unreadable file is no lines. A symlink
-/// is not followed.
-enum LogTail {
-    static let maxBytes: off_t = 64 * 1024
-
-    static func read(_ url: URL, lines: Int) -> [String] {
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
-        guard fd >= 0 else { return [] }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        guard let end = try? handle.seekToEnd() else { return [] }
-        let start = end > UInt64(maxBytes) ? end - UInt64(maxBytes) : 0
-        guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.readToEnd() else { return [] }
-        var all = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        if start > 0, !all.isEmpty { all.removeFirst() }  // a partial first line
-        if all.last == "" { all.removeLast() }
-        return Array(all.suffix(lines))
     }
 }
