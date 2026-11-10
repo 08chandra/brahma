@@ -44,6 +44,31 @@ import BrahmaCore
         #expect(w.model.errorMessage == "production URL must start with https://")
     }
 
+    @Test func snapshotLoadsLogTailThroughCore() async throws {
+        let w = try await WorkWorld.make()
+        let surface = try Self.webSurface(w)
+        let layout = EngineLayout(workspace: URL(fileURLWithPath: w.company.workspacePath, isDirectory: true))
+        try FileManager.default.createDirectory(at: layout.previewLogs, withIntermediateDirectories: true)
+        let lines = (1...50).map { "build line \($0)" }
+        try (lines.joined(separator: "\n") + "\n").write(to: layout.previewLog(name: "web"), atomically: true, encoding: .utf8)
+        let state = PreviewState(surfaceId: surface.id, companyId: w.company.id, status: .building, commit: "abcdef1234567",
+                                 logPath: layout.previewLog(name: "web").path, updatedAt: Date())
+        try w.store.savePreviewState(state)
+        await w.refresh()
+        #expect(w.model.previewBody(forTab: PreviewTabID.surface(surface.id))
+                == .status(title: "BUILDING WEB AT abcdef1", detail: nil, logTail: Array(lines.suffix(40))))
+
+        // A symlinked logs directory is refused by the core reader: no tail.
+        let elsewhere = try tempDir()
+        try FileManager.default.copyItem(at: layout.previewLog(name: "web"), to: elsewhere.appending(path: "web.log"))
+        try FileManager.default.removeItem(at: layout.previewLogs)
+        try FileManager.default.createSymbolicLink(at: layout.previewLogs, withDestinationURL: elsewhere)
+        await w.refresh()
+        #expect(w.model.snapshot.preview.logTails[state.logPath!] == [])
+        #expect(w.model.previewBody(forTab: PreviewTabID.surface(surface.id))
+                == .status(title: "BUILDING WEB AT abcdef1", detail: nil, logTail: []))
+    }
+
     @Test func approveDeployFromApp() async throws {
         let w = try await WorkWorld.make()
         let ask = try w.store.propose(companyId: w.company.id, by: .agent(w.eng.id), kind: .deploy, risk: .high, title: "Deploy 0.1.0",
