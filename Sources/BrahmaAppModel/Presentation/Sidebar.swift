@@ -4,6 +4,8 @@ import BrahmaCore
 public enum SidebarItem: Hashable, Sendable {
     case missionControl, activity, agents
     case backlog, board, inbox
+    /// Work › Releases (symbol `shippingbox`; mono chip = open releases).
+    case releases
     /// Inbox › Grants (the ledger and presets) and Inbox › Digest.
     case inboxGrants, inboxDigest
     case settingsBackups
