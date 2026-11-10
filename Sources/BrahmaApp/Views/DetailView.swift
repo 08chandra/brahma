@@ -43,7 +43,7 @@ struct DetailView: View {
                 case .settingsBackups:
                     BackupsView(model: model.backups)
                 case .releases:
-                    ContentUnavailableView("Releases", systemImage: "shippingbox")
+                    ReleasesView(model: model)
                 case .companySettings:
                     CompanySettingsView(model: model)
                 case .channel, .dm:
