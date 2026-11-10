@@ -36,6 +36,12 @@ public struct Snapshot: Equatable, Sendable {
     public var stop: EngineStopRow?
     /// The owner's time zone (`Store.ownerTimeZone`): the stop's time is shown in it, as `brahma status` and the stall reason do.
     public var ownerTimeZone: TimeZone = .current
+    /// Selected company's preview surfaces, states and live site (Plan L).
+    public var preview = PreviewSnapshot.empty
+    /// Selected company's Work › Releases.
+    public var releases = ReleasesSnapshot.empty
+    /// Pending `deploy` ask id → its release (the deploy cards).
+    public var deployReleases: [String: Release] = [:]
 
     public static let empty = Snapshot(companies: [], agents: [], channels: [], unreadByChannel: [:], lastTurns: [:], usage: nil)
 
@@ -67,6 +73,14 @@ public struct Snapshot: Equatable, Sendable {
             snap.channels = try store.channels(companyId: id)
             snap.unreadByChannel = try store.unreadCounts(companyId: id)
             snap.work = try WorkSnapshot.load(store: store, companyId: id)
+            if let company = summaries.first(where: { $0.id == id })?.company {
+                snap.preview = try PreviewSnapshot.load(store: store, company: company)
+                snap.releases = try ReleasesSnapshot.load(store: store, companyId: id)
+                let deployAsks = Set(snap.work.inbox.filter { $0.kind == .deploy }.map(\.id))
+                if !deployAsks.isEmpty {
+                    for r in try store.releases(companyId: id) { if let a = r.askId, deployAsks.contains(a) { snap.deployReleases[a] = r } }
+                }
+            }
             for a in snap.agents {
                 if let t = try store.lastTurn(agentId: a.id) { snap.lastTurns[a.id] = t }
             }

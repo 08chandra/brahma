@@ -7,6 +7,10 @@ public enum SelectTarget: Equatable, Sendable {
     case backups
     /// Inbox › Grants, Inbox › Digest, Company › Settings.
     case grants, digest, companySettings
+    /// Work › Releases.
+    case releases
+    /// `preview:<name>` (a surface, lowercased) or `preview:live`: Mission Control's preview pane on that tab.
+    case preview(name: String)
     case item(key: String)
     /// `ask:<id>`: the Inbox, with that ask called out.
     case ask(id: String)
@@ -28,6 +32,7 @@ public enum SelectTarget: Equatable, Sendable {
         case "grants": self = .grants
         case "digest": self = .digest
         case "settings": self = .companySettings
+        case "releases": self = .releases
         case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)
@@ -43,6 +48,7 @@ public enum SelectTarget: Equatable, Sendable {
             case "channel": self = .channel(name: value.lowercased())
             case "dm": self = .dm(handle: value.lowercased())
             case "search": self = .search(value)
+            case "preview": self = .preview(name: value.lowercased())
             default: return nil
             }
         }

@@ -50,6 +50,11 @@ public final class AppModel {
     public private(set) var digest: DigestModel
     /// The message to scroll to and tint after opening a search hit; the chat view clears it after 2 s.
     public var highlightedMessageId: String?
+    /// The preview pane's tab (a `PreviewTabID`); nil or an unknown id shows the default tab.
+    public var selectedPreviewTab: String?
+    /// The agent whose turn stream some view observes (`observeTurnStream`); loaded off-main per tick only while set.
+    public internal(set) var turnStreamAgentId: String?
+    var turnStreamCache: TurnStreamCache?
     /// The ask a notification banner pointed at (set by `ask:<id>`); the Inbox calls it out.
     public var highlightedAskId: String?
 
@@ -247,6 +252,7 @@ public final class AppModel {
             if forceSnapshot || !events.isEmpty || ticksSinceSnapshot >= 4 {
                 try await refreshSnapshot()
             }
+            if turnStreamAgentId != nil { await refreshTurnStream() }
             lastDBError = nil
             ticksSinceDelivery += 1
             if ticksSinceDelivery >= Self.deliveryEvery {
@@ -286,6 +292,8 @@ public final class AppModel {
         chat = nil
         selectedAgentId = nil
         selectedItemKey = nil
+        selectedPreviewTab = nil
+        stopObservingTurnStream()
         boardSprintId = nil
         activity = []
         search.query = ""
@@ -324,6 +332,16 @@ public final class AppModel {
         case .grants: select(.inboxGrants)
         case .digest: select(.inboxDigest)
         case .companySettings: select(.companySettings)
+        case .releases: select(.releases)
+        case .preview(let name):
+            select(.missionControl)
+            if name == PreviewTabID.live {
+                selectedPreviewTab = PreviewTabID.live
+            } else if let s = snapshot.preview.surfaces.first(where: { $0.name.lowercased() == name }) {
+                selectedPreviewTab = PreviewTabID.surface(s.id)
+            } else {
+                errorMessage = "No preview \(name)"
+            }
         case .ask(let id):
             select(.inbox)
             highlightedAskId = id

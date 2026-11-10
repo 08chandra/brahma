@@ -211,7 +211,7 @@ extension Store {
     }
 
     /// The values to save, trimmed, by field name (empty optional fields left out). Throws the first rule broken.
-    static func checkedValues(_ task: HumanTask, _ raw: [String: String]) throws -> [String: String] {
+    public static func checkedValues(_ task: HumanTask, _ raw: [String: String]) throws -> [String: String] {
         let names = Set(task.fields.map(\.name))
         if let unknown = raw.keys.sorted().first(where: { !names.contains($0) }) {
             throw WorkError.invalid("\(Store.flat(unknown, max: 64)) is not a field of this task")
