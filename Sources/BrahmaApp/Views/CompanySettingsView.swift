@@ -4,7 +4,8 @@ import BrahmaAppModel
 
 /// Company › SETTINGS: PERMISSIONS (the profile chooser with the Full confirmation and role overrides), NETWORK (Bash egress
 /// and WebFetch domains, local binding, toolchain read paths), SECRETS (names and flags; values go to the vault through the
-/// secret sheet) and NOTIFICATIONS (banners, quiet hours, digest time, phone alerts with `Send test`).
+/// secret sheet), HOSTING (Plan L: provider, project, account, production URL) and NOTIFICATIONS (banners, quiet hours,
+/// digest time, phone alerts with `Send test`).
 struct CompanySettingsView: View {
     let model: AppModel
 
@@ -16,6 +17,7 @@ struct CompanySettingsView: View {
                 PermissionsPanel(settings: settings)
                 NetworkPanel(settings: settings)
                 SecretsPanel(settings: settings)
+                HostingPanel(model: model).id(model.selectedCompanyId)
                 NotificationsPanel(settings: settings)
             }
             .padding(BrahmaTheme.spaceS)

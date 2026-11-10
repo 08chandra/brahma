@@ -39,6 +39,10 @@ struct InboxView: View {
             ForEach(mine) { row in
                 if row.section == .pending, row.kind == .grant, let card = model.accessCard(askId: row.id) {
                     AccessCardView(model: model, card: card).id(card.id)
+                } else if row.section == .pending, row.kind == .deploy, let card = model.deployCard(for: row.id) {
+                    DeployCardView(model: model, card: card).id(card.askId)
+                } else if row.section == .pending, row.kind == .humanTask, let card = model.humanTaskCard(for: row.id) {
+                    HumanTaskCardView(model: model, card: card).id(card.askId)
                 } else if row.section == .pending, row.kind == .request {
                     SecretRequestCard(model: model, row: row)
                 } else {

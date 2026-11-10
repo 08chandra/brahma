@@ -171,6 +171,9 @@ private struct AgentInspector: View {
                             .textSelection(.enabled)
                     }
                     Hairline()
+                    TurnStreamView(stream: model.turnStream(agentId: a.id))
+                        .frame(minHeight: 80, maxHeight: 220)
+                    Hairline()
                     if a.state == .killed {
                         Text(verbatim: "Killed — history kept.").font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2)
                     }
@@ -188,6 +191,8 @@ private struct AgentInspector: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .task(id: a.id) { model.observeTurnStream(agentId: a.id) }
+        .onDisappear { model.stopObservingTurnStream() }
         .confirmationDialog(Text(verbatim: "Kill @\(a.name)?"), isPresented: $confirmKill, titleVisibility: .visible) {
             Button(role: .destructive) { Task { await model.kill(agentId: a.id) } } label: {
                 Text(verbatim: "Kill @\(a.name)")

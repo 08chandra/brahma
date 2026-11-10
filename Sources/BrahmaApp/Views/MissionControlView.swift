@@ -14,7 +14,7 @@ struct MissionControlView: View {
             let maxPreview = max(200, geo.size.width - 300)
             VStack(spacing: 0) {
                 HStack(spacing: 0) {
-                    PreviewPlaceholder()
+                    PreviewPane(model: model)
                         .frame(width: min(previewWidth, maxPreview))
                     SplitDivider(width: $previewWidth, range: 200...maxPreview, axis: .vertical)
                     AgentMapPlaceholder(model: model)
@@ -28,23 +28,6 @@ struct MissionControlView: View {
             }
         }
         .background(BrahmaTheme.bg0)
-    }
-}
-
-struct PreviewPlaceholder: View {
-    var body: some View {
-        Panel(title: "Preview", accessory: {
-            MonoChip(text: "PLACEHOLDER", color: BrahmaTheme.text1, fill: BrahmaTheme.bg4)
-        }, content: {
-            Text(verbatim: "No preview yet. When the company has a running product or design artifacts, they appear here.")
-                .font(BrahmaTheme.monoSmall)
-                .foregroundStyle(BrahmaTheme.text2)
-                .multilineTextAlignment(.center)
-                .padding(BrahmaTheme.spaceL)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radiusLarge)
-                    .strokeBorder(BrahmaTheme.lineStrong, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
-        })
     }
 }
 
