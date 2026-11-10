@@ -264,6 +264,7 @@ private let allModes = [quick, standard, deep, deepOpus]
         """)
         var r = request(quick)
         r.workingDirectory = dir.path
+        r.agent.id = "a1-\(UUID().uuidString)"                         // its own slot in the process-wide turn registry
         let runner = ClaudeProcessRunner(claudePath: script.path, baseEnvironment: ["PATH": "/usr/bin:/bin", "CLAUDE_CODE_EFFORT_LEVEL": "max"])
         for try await _ in runner.run(r) {}
         let text = try String(contentsOf: dump, encoding: .utf8)
@@ -280,6 +281,7 @@ private let allModes = [quick, standard, deep, deepOpus]
         let script = try FakeTools.script("claude", "cat > /dev/null\ncat '\(fixture.path)'\nexit 1")
         var r = request(quick)
         r.workingDirectory = dir.path
+        r.agent.id = "a1-\(UUID().uuidString)"                         // its own slot in the process-wide turn registry
         var result: TurnResult?
         for try await e in ClaudeProcessRunner(claudePath: script.path, baseEnvironment: ["PATH": "/usr/bin:/bin"]).run(r) {
             if case .result(let x) = e { result = x }

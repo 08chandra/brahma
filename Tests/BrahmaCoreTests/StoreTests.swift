@@ -6,7 +6,7 @@ import GRDB
 @Test(.scratch) func walModeAndBusyTimeout() throws {
     let dir = try tempDir(); let s = try Store(path: dir.appending(path: "t.sqlite").path)
     #expect(try s.pragma("journal_mode") == "wal")
-    #expect(try s.pragma("busy_timeout") == "5000")
+    #expect(try s.pragma("busy_timeout") == "30000")
 }
 
 @Test(.scratch) func createCompanyMakesWorkspaceAndDefaults() throws {

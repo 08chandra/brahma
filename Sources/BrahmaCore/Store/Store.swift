@@ -48,6 +48,12 @@ public final class Store: Sendable {
     /// redacting write throws (`secretsHeld`, `SecretError.secretsNotLoaded`).
     public let redactor = Redactor()
 
+    /// How long a write waits for another connection's write lock (the engine, every agent's `brahma mcp`, the CLI and the app
+    /// share one database) before it fails with "database is locked". SQLite's busy handler is not first-come-first-served:
+    /// under heavy machine load one writer can lose many rounds in a row, and 5 s ran out (`concurrentWritersDoNotLock`, at a
+    /// load average of ~88, where 400 writes took 62 s). WAL readers never wait on it.
+    public static let busyTimeout: TimeInterval = 30
+
     public init(path: String, catalog: PackCatalog = .builtin, lifecycleObservers: [any AgentLifecycleObserver] = [],
                 observers: [any WorkItemObserver] = [], backupsDir: URL? = nil) throws {
         self.catalog = catalog
@@ -55,9 +61,9 @@ public final class Store: Sendable {
         self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
         dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
-        config.busyMode = .timeout(5)
+        config.busyMode = .timeout(Self.busyTimeout)
         config.prepareDatabase { db in
-            try db.execute(sql: "PRAGMA busy_timeout = 5000")
+            try db.execute(sql: "PRAGMA busy_timeout = \(Int(Self.busyTimeout * 1000))")
         }
         let pool = try DatabasePool(path: path, configuration: config)
         writer = pool

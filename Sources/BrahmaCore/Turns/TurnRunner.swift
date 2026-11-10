@@ -43,8 +43,12 @@ public enum TurnError: Error, Equatable {
     /// after a SIGTERM, or it was killed with background work (`pendingTasks`) still running, even if an early `result`
     /// had been printed. Never counted against the agent. The engine's own wall-clock kill is `timedOut`.
     case interrupted(pendingTasks: Int)
-    /// Processes of an earlier turn of the agent could not be killed: no new turn of it starts.
+    /// Processes of an earlier turn of the agent could not be killed: no new turn of it starts. Empty `pids`: the runner cannot
+    /// account for its turns' processes at all (fails closed, M11).
     case earlierTurnStillRunning(pids: [Int32])
+    /// An earlier turn of the agent was still in flight in this process (its slot in the turn registry still held) after
+    /// `waitedSeconds` of awake time: no new turn of it starts. No pid is involved: the earlier turn has not ended yet.
+    case earlierTurnInFlight(waitedSeconds: Int)
     /// The turn's leader could not be recorded under the run directory right after the spawn (M8): the owner-command ancestry
     /// check would not know it, so the turn is stopped (fail closed) and the reason logged.
     case leaderNotRecorded(reason: String)
@@ -56,8 +60,12 @@ extension TurnError: CustomStringConvertible {
         case .exitedWithoutResult(let code, let tail): "exitedWithoutResult(code: \(code), stderrTail: \(tail.debugDescription))"
         case .timedOut: "timedOut"
         case .interrupted(let n): "interrupted(pendingTasks: \(n))"
+        case .earlierTurnStillRunning(let pids) where pids.isEmpty:
+            "sandbox scope: the processes of an earlier turn could not be accounted for by this runner"
         case .earlierTurnStillRunning(let pids):
             "sandbox scope: processes of an earlier turn are still running (pid \(pids.map(String.init).joined(separator: ", ")))"
+        case .earlierTurnInFlight(let seconds):
+            "an earlier turn of this agent was still in flight after \(seconds) s; this turn did not start"
         case .leaderNotRecorded(let reason): "the turn's leader could not be recorded (\(reason)); the turn was stopped"
         }
     }

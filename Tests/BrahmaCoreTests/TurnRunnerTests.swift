@@ -8,7 +8,9 @@ private func fakeClaude(_ body: String) throws -> (script: URL, dir: URL) {
 }
 
 private func request(in dir: URL) -> TurnRequest {
-    let agent = Agent(id: "a1", companyId: "c1", name: "ceo", role: "ceo", model: "sonnet", sessionId: "s1",
+    // Its own agent id per request: the runner's turn registry is process-wide and keyed by agent id, so parallel suites
+    // that shared "a1" queued behind each other's turns (and failed past the 60 s slot deadline under load).
+    let agent = Agent(id: "a1-\(UUID().uuidString)", companyId: "c1", name: "ceo", role: "ceo", model: "sonnet", sessionId: "s1",
                       sessionStarted: false, state: .running, blocker: nil, requestedBlocker: nil, paused: false,
                       readySince: nil, createdAt: Date(timeIntervalSince1970: 0))
     let company = Company(id: "c1", name: "Acme", slug: "acme", goal: "g", workspacePath: dir.path, status: .running,

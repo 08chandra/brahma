@@ -503,7 +503,7 @@ final class TurnRegistry: @unchecked Sendable {
     private var survivors: [String: [ProcessEntry]] = [:]
 
     /// Waits (on an awake-time deadline, and never past a cancellation) until no turn of the agent is in flight, then marks
-    /// one in flight. Throws `TurnError.earlierTurnStillRunning` on the deadline, `CancellationError` when cancelled.
+    /// one in flight. Throws `TurnError.earlierTurnInFlight` on the deadline, `CancellationError` when cancelled.
     func claim(_ agentId: String, deadline: Duration) async throws {
         let end = AwakeTime.deadline(after: deadline)
         while true {
@@ -521,7 +521,10 @@ final class TurnRegistry: @unchecked Sendable {
 
     private func pause(until end: SuspendingClock.Instant) async throws {
         try Task.checkCancellation()
-        guard AwakeTime.now < end else { throw TurnError.earlierTurnStillRunning(pids: []) }
+        // The earlier turn's slot is still held: it has not ended, so there is no pid to name (it reported "(pid )" before).
+        guard AwakeTime.now < end else {
+            throw TurnError.earlierTurnInFlight(waitedSeconds: Int(ClaudeProcessRunner.turnWaitDeadline.components.seconds))
+        }
         try await Task.sleep(for: .milliseconds(20))
     }
 
