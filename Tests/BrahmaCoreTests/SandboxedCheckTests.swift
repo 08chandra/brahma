@@ -151,6 +151,35 @@ import GRDB
         #expect(t.sandbox.calls.count == 1); #expect(t.fallback.calls.isEmpty)
     }
 
+    /// Final review I4: the engine's ceiling (`brahma run --profile`) narrows a check exactly as it narrows a turn: under a
+    /// Sandboxed or Workspace ceiling, a Full company's check runs sandboxed; only a Full ceiling (or none) leaves it unconfined.
+    @Test func profileCeilingReachesChecks() async throws {
+        let s = try S(profile: .full)
+        let item = try s.submitted()
+        let run = try s.latest(item)
+        let checkout = s.git.checkoutPath(runId: run.id)
+        try FileManager.default.createDirectory(at: checkout, withIntermediateDirectories: true)
+        try await s.store.writer.write { db in
+            try db.execute(sql: "UPDATE verificationRun SET status = 'running', workingDirectory = ? WHERE id = ?",
+                           arguments: [checkout.path, run.id])
+        }
+        func route(_ ceiling: PermissionProfile?) -> CheckRoute { Orchestrator.checkRoute(store: s.store, ceiling: ceiling)(checkout.path) }
+        for ceiling in [nil, PermissionProfile.full] {
+            guard case .unsandboxed = route(ceiling) else { Issue.record("a Full company's check was not unconfined under \(String(describing: ceiling))"); return }
+        }
+        for ceiling in [PermissionProfile.sandboxed, .workspace] {
+            guard case .sandboxed(let policy) = route(ceiling) else { Issue.record("the \(ceiling) ceiling did not reach the check"); return }
+            #expect(policy.writable == [Self.resolved(checkout)]); #expect(policy.readable == [Self.resolved(s.root)])
+        }
+        // The engine's own check runner takes the ceiling the engine was started with.
+        let engine = Orchestrator(store: s.store, runner: FakeTurnRunner(), paths: s.world.paths, mcpExecutable: "/x/brahma", profile: .sandboxed)
+        let runner = try #require(await engine.checkRunner as? SandboxedCheckRunner)
+        guard case .sandboxed = runner.route(checkout.path) else { Issue.record("brahma run --profile sandboxed left checks unconfined"); return }
+        let plain = Orchestrator(store: s.store, runner: FakeTurnRunner(), paths: s.world.paths, mcpExecutable: "/x/brahma")
+        let plainRunner = try #require(await plain.checkRunner as? SandboxedCheckRunner)
+        guard case .unsandboxed = plainRunner.route(checkout.path) else { Issue.record("without a ceiling a Full company's check is sandboxed"); return }
+    }
+
     // MARK: Straggler sweep (B-I4, fix round 3)
 
     private static func entry(_ pid: pid_t, start: Double = 2e9) -> ProcessEntry {

@@ -225,7 +225,8 @@ struct RestoreCommand: ParsableCommand {
             if let kept = outcome.filesPreRestore {
                 print(safe("what the files replaced is kept in \(kept.path)"))
             }
-            print(safe("restored \(snapshot.lastPathComponent); Brahma re-adopts the repositories when it next starts"))
+            print(safe("restored \(snapshot.lastPathComponent); Brahma starts stopped: check grants and lab marks "
+                + "(the machine-wide lab mark is set), then 'brahma resume'; it re-adopts the repositories after the resume"))
         } catch { throw fail("\(error)") }
     }
 }

@@ -735,14 +735,18 @@ public struct SandboxScope: Equatable, Sendable {
         // The per-user Darwin folder (`/private/var/folders/<a>/<b>`, which holds T, C and 0: every app's temporary files) is
         // unreadable like the home, except the toolchain's own entries below (the turn-side twin of Task 2 A-I1).
         let darwinUserDir = darwinUserTemp.flatMap { $0.lastPathComponent == "T" ? r($0).deletingLastPathComponent() : nil }
-        let deniedRoots = dedupe(both(userHome) + both(paths.home) + both(URL(fileURLWithPath: "/Volumes", isDirectory: false))
-                                 + both(dot) + (darwinUserDir.map(both) ?? []))
         // Claude Code's shared temp places: the owner's own sessions' outputs live there (same uid).
         let claudeShared = ["claude-\(getuid())", "claude-tool-results"].flatMap { name in
             ["/private/tmp/\(name)", "/tmp/\(name)"].map { URL(fileURLWithPath: $0, isDirectory: false) }
         }
         let tmpRoot = claudeTmpRoot.map(r)
-        let denyRead = dedupe(deniedRoots + protected + claudeShared + (tmpRoot.map(both) ?? []))
+        // Final review I2: the Claude temp places and every agent's private temp root (the default one whatever this scope's
+        // is) are denied roots too, so no grant or toolchain read path may equal or contain them (a read allowance would
+        // otherwise win over their read deny).
+        let deniedRoots = dedupe(both(userHome) + both(paths.home) + both(URL(fileURLWithPath: "/Volumes", isDirectory: false))
+                                 + both(dot) + (darwinUserDir.map(both) ?? []) + claudeShared + (tmpRoot.map(both) ?? [])
+                                 + both(SandboxEnvironment.defaultClaudeTmpRoot))
+        let denyRead = dedupe(deniedRoots + protected)
 
         // Read paths the owner or a grant added are checked whether or not they exist yet; only existing ones are mounted.
         // None may reach into `.brahma` (other agents' labs, homes and notes, the engine's files).
@@ -751,8 +755,11 @@ public struct SandboxScope: Equatable, Sendable {
         // never followed and never a reason to refuse the turn.
         let grantReads = grants.readPaths.filter { SandboxPath.isPinnedDirectory($0.path) }
         let extraReads = toolchain.map(r) + grantReads
+        // Nor into the Claude temp places or any agent's private temp directory (final review I2): inside them, not only
+        // equal to or containing them.
+        let claudeTemps = claudeShared + (tmpRoot.map(both) ?? []) + both(SandboxEnvironment.defaultClaudeTmpRoot)
         for path in extraReads {
-            try checkAllowed(path, protected: protected + both(dot), deniedRoots: deniedRoots)
+            try checkAllowed(path, protected: protected + both(dot) + claudeTemps, deniedRoots: deniedRoots)
         }
         let existingExtra = extraReads.filter { SandboxPath.kind($0.path) != .missing }
 

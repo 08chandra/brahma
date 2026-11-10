@@ -66,9 +66,13 @@ extension Store {
                                              installedExtensions: try grantableExtensions(companyId: companyId))
         } catch {
             let detail = (error as? WorkError)?.message ?? "\(error)"
+            // Agent-supplied text, kept in a database that is backed up, exported and shipped: redacted like every other
+            // agent text (final review M3); withheld when the redactor cannot run.
+            let withheld = "(withheld: secrets are not loaded)"
             try writer.write { db in
-                var row = AccessRefusal(companyId: companyId, agentId: agentId, kind: kind.rawValue, value: Store.flat(value, max: 500),
-                                        detail: Store.flat(detail, max: 1000),
+                var row = AccessRefusal(companyId: companyId, agentId: agentId, kind: kind.rawValue,
+                                        value: Store.flat((try? redact(value)) ?? withheld, max: 500),
+                                        detail: Store.flat((try? redact(detail)) ?? withheld, max: 1000),
                                         createdActive: try Store.activeNow(db: db, companyId: companyId), createdAt: now)
                 try row.insert(db)
             }

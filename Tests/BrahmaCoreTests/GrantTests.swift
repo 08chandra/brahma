@@ -360,6 +360,47 @@ func refusal(_ body: () throws -> Any) -> String? {
         }
     }
 
+    /// Final review I2: the agents' private temp root (`/private/tmp/b-<uid>`, or the environment's own root) and anything under
+    /// it or containing it is never a grantable read path, nor an owner toolchain read path; a neighbouring directory in /tmp is.
+    @Test func agentTempRootIsNeverGranted() throws {
+        let g = try GrantWorld()
+        let fm = FileManager.default
+        let root = "/private/tmp/b-\(getuid())"
+        let createdRoot = !fm.fileExists(atPath: root)
+        if createdRoot { try fm.createDirectory(atPath: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }   // exec-bit fixture: a directory mode
+        let child = URL(fileURLWithPath: root).appending(path: "bt\(String(UUID().uuidString.prefix(4)).lowercased())")
+        try fm.createDirectory(at: child.appending(path: "deeper"), withIntermediateDirectories: true)
+        let custom = URL(fileURLWithPath: "/private/tmp/brahma-agents-test-\(UUID().uuidString)")
+        try fm.createDirectory(at: custom.appending(path: "abc123"), withIntermediateDirectories: true)
+        let neighbour = URL(fileURLWithPath: "/private/tmp/brahma-grant-ok-\(UUID().uuidString)")
+        try fm.createDirectory(at: neighbour, withIntermediateDirectories: true)
+        defer {
+            try? fm.removeItem(at: child); try? fm.removeItem(at: custom); try? fm.removeItem(at: neighbour)
+            if createdRoot { try? fm.removeItem(atPath: root) }
+        }
+        let home = try tempDir().resolvedForSandbox
+        func validate(_ value: String, root claudeTmpRoot: URL?) throws {
+            let env = SandboxEnvironment(userHome: home, darwinUserTemp: nil, shell: "/bin/zsh", claudeTmpRoot: claudeTmpRoot)
+            _ = try Grants.validate(kind: .readPath, value: value, company: g.company, paths: g.world.paths, environment: env)
+        }
+        for claudeTmpRoot in [nil, URL(fileURLWithPath: root)] {
+            for bad in [root, "/tmp/b-\(getuid())", child.path, child.path + "/deeper", "/tmp/b-\(getuid())/" + child.lastPathComponent] {
+                #expect(throws: (any Error).self, "\(bad) was grantable") { try validate(bad, root: claudeTmpRoot) }
+            }
+        }
+        // An environment with its own root: that root and its children are refused, by identity.
+        for bad in [custom.path, custom.path + "/abc123"] {
+            #expect(throws: (any Error).self, "\(bad) was grantable") { try validate(bad, root: custom) }
+        }
+        #expect(Grants.inClaudeTemp(custom.path + "/abc123", claudeTmpRoot: custom))
+        // A neighbouring directory in /tmp stays grantable: the refusal is about the agents' temp places only.
+        #expect(throws: Never.self) { try validate(neighbour.path, root: URL(fileURLWithPath: root)) }
+        // The turn's own check (`SandboxScope.forTurn`, which every grant and toolchain path goes through) refuses them too.
+        #expect(throws: (any Error).self) {
+            try g.store.updateSandbox(companyId: g.company.id, SandboxPatch(toolchainReadPaths: [child.path]), userHome: home)
+        }
+    }
+
     @Test func lostOneUseGrantRebuildsTheScope() async throws {
         let g = try GrantWorld()
         let once = try g.grant("network_domain", "once.example.com", scope: .once, duration: .always)

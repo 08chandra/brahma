@@ -308,6 +308,55 @@ private struct GateWorld {
         #expect(g.requests(g.eng).count == 1)
     }
 
+    /// Final review M1: no canary starts while the owner's stop holds (a failing key is retried every tick here, retryAfter 0);
+    /// after the resume it runs again.
+    @Test func noCanaryStartsWhileStopped() async throws {
+        let g = try GateWorld(passes: false)
+        try await g.turnOnce()
+        #expect(g.canary.shapes.count == 1)
+        try g.world.store.emergencyStop(note: nil, by: "owner", now: g.world.clock.now)
+        try await g.world.cycle(); try await g.world.cycle(); try await g.world.cycle()
+        #expect(g.canary.shapes.count == 1, "a canary ran while stopped")
+        try g.world.store.resumeAfterStop(now: g.world.clock.now)
+        try await g.world.cycle()
+        #expect(g.canary.shapes.count == 2, "the waiting agent's canary runs again after the resume")
+    }
+
+    /// Final review M1: a canary running when the owner presses stop is cancelled by the next tick; it is recorded neither as
+    /// a pass nor as a failure (no alert), and runs again after the resume.
+    @Test func stopCancelsARunningCanary() async throws {
+        let g = try GateWorld(passes: true)
+        let store = g.world.store, now = g.world.clock.now
+        let cancelled = CallCounter()
+        g.canary.hold = {
+            // The owner presses stop while the canary runs; it then runs until it is cancelled (bounded).
+            try? store.emergencyStop(note: nil, by: "owner", now: now)
+            let deadline = AwakeTime.deadline(after: .seconds(120))
+            while !Task.isCancelled, AwakeTime.now < deadline { try? await AwakeTime.sleep(for: .milliseconds(10)) }
+            if Task.isCancelled { cancelled.mark() }
+        }
+        try g.world.dm(g.sandboxed, g.eng, "go")
+        let orchestrator = g.world.orchestrator
+        await orchestrator.tick()
+        let deadline = AwakeTime.deadline(after: .seconds(120))
+        while try store.engineStopped() == nil, AwakeTime.now < deadline { try await AwakeTime.sleep(for: .milliseconds(10)) }
+        await orchestrator.tick()
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(cancelled.isSet, "the stop did not cancel the running canary")
+        #expect(try g.rows() == 0, "a canary cut short by the stop was recorded")
+        let alerts = try store.asks(companyId: g.sandboxed.id).filter {
+            $0.kind == .engineAlert && $0.subjectId == EngineAlerts.askSubject(reason: EngineAlerts.sandboxCheckReason)
+        }
+        #expect(alerts.isEmpty, "a canary cut short by the stop raised the sandbox-check alert")
+        // After the resume it runs to the end and the agent starts.
+        g.canary.hold = nil
+        try store.resumeAfterStop(now: g.world.clock.now)
+        try await g.turnOnce()
+        try await g.turnOnce()
+        #expect(try g.rows() == 1)
+        #expect(g.requests(g.eng).count == 1)
+    }
+
     /// M7: two agents waiting for the same key cause one canary run.
     @Test func twoAgentsOfOneKeyRunOneCanary() async throws {
         let g = try GateWorld(passes: true)

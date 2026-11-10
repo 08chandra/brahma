@@ -173,6 +173,148 @@ import GRDB
     // `markerReadoptsRepos` planted a bare marker and expected main's current head adopted: that was the review bypass fixed in
     // Task 12 fix round 1. Its coverage lives in RestoreMarkerTests (happyPathAdoptsRecordedMain and the refusals).
 
+    // MARK: Final review I3: what a restore must not roll back
+
+    /// A data home with one company, two agents and two approved grants (one of them one-use), snapshotted.
+    private struct Forward {
+        let env: BackupEnv
+        let service: BackupService
+        let acme: Company
+        let eng: Agent, other: Agent
+        let always: Grant, once: Grant
+        let snapshot: URL
+
+        init() throws {
+            let env = try BackupEnv()
+            let acme = try env.company("Acme")
+            let eng = try env.store.hire(companyId: acme.id, name: "eng-1", role: "engineer", model: "sonnet")
+            self.env = env; self.acme = acme; self.eng = eng
+            service = env.service()
+            other = try env.store.hire(companyId: acme.id, name: "eng-2", role: "engineer", model: "sonnet")
+            always = try Self.approve(env, acme, eng, "always.example.com", .agent)
+            once = try Self.approve(env, acme, eng, "once.example.com", .once)
+            snapshot = try service.snapshot(reason: .manual)
+        }
+
+        /// `request_access` by `eng`, approved the owner's way.
+        static func approve(_ env: BackupEnv, _ acme: Company, _ eng: Agent, _ domain: String, _ scope: GrantScope) throws -> Grant {
+            _ = try CompanyTools(store: env.store, companyId: acme.id, agentId: eng.id).call(name: "request_access", arguments: [
+                "kind": .string("network_domain"), "value": .string(domain), "reason": .string("I need it")])
+            let ask = try #require(try env.store.asks(companyId: acme.id).last { $0.kind == .grant })
+            let grantEnv = SandboxEnvironment(userHome: try tempDir(), darwinUserTemp: nil, shell: "/bin/zsh")
+            return try env.store.approveAccess(askId: ask.id, scope: scope, duration: .always, note: "ok", environment: grantEnv)
+        }
+
+        /// Restores the snapshot (the live store closed first) and opens the restored database as the engine would.
+        func restore() throws -> (Store, RestoreOutcome) {
+            try env.store.close()
+            let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+            return (try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir), outcome)
+        }
+
+        func grant(_ store: Store, _ g: Grant) throws -> Grant {
+            try #require(try store.grants(companyId: acme.id, includeInactive: true).first { $0.id == g.id })
+        }
+    }
+
+    /// The engine comes back stopped, whatever the snapshot said: the owner resumes it.
+    @Test func restoreComesBackStopped() async throws {
+        let f = try Forward()
+        #expect(try f.env.store.engineStopped() == nil, "neither the snapshot nor the live database was stopped")
+        let (restored, _) = try f.restore()
+        let stop = try #require(try restored.engineStopped())
+        #expect(stop.by == "restore"); #expect(stop.note?.contains(f.snapshot.lastPathComponent) == true)
+        // An engine on the restored database admits nothing until the owner resumes it.
+        let paths = f.env.paths
+        let fake = FakeTurnRunner()
+        let orchestrator = Orchestrator(store: restored, runner: fake, paths: paths, mcpExecutable: "/usr/local/bin/brahma",
+                                        clock: TestClock().function, vault: MemoryVault())
+        try onWorkspaceProfile(restored, f.acme)
+        _ = try MessageRouter(store: restored).sendDM(companyId: f.acme.id, from: .owner, to: f.eng.name, text: "go", now: Date())
+        await orchestrator.tick()
+        try await orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(fake.requests.isEmpty, "a restored engine ran a turn before the owner resumed it")
+        #expect(try restored.resumeAfterStop(now: Date()))
+    }
+
+    /// Grants revoked (or used up) after the snapshot stay revoked (used up): carried from the live database.
+    @Test func restoreKeepsRevocations() throws {
+        let f = try Forward()
+        let revoked = try f.env.store.revokeGrant(companyId: f.acme.id, number: f.always.number, now: Date())
+        #expect(revoked.revokedAt != nil)
+        #expect(try f.env.store.consumeGrants(ids: [f.once.id], turnId: "t-1", now: Date()).isEmpty, "the use was counted")
+        let usesAfter = try f.grant(f.env.store, f.once).usesLeft
+        let (restored, _) = try f.restore()
+        let always = try f.grant(restored, f.always)
+        #expect(always.revokedAt != nil, "a grant revoked after the snapshot is active again")
+        #expect(always.revokedBy == revoked.revokedBy)
+        #expect(try f.grant(restored, f.once).usesLeft == usesAfter, "a one-use grant used after the snapshot is usable again")
+        #expect(try restored.grants(companyId: f.acme.id).isEmpty, "no grant is live after the restore")
+    }
+
+    /// Every taint mark made after the snapshot survives the restore (agent, company, machine-wide, never-clean commits, the
+    /// session and item flags), and the machine-wide mark is set by the restore itself.
+    @Test func restoreKeepsTaintMarks() throws {
+        let f = try Forward()
+        try f.env.store.markTainted(agentId: f.eng.id, source: "web: evil.example", now: Date())
+        let neverClean = String(repeating: "c", count: 40)
+        try f.env.store.recordTaintedLabCommits([neverClean])
+        try f.env.store.writer.write { db in
+            try db.execute(sql: "INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, 'full session', 'full', ?)",
+                           arguments: [f.acme.id, Date()])
+        }
+        let (restored, outcome) = try f.restore()
+        #expect(outcome.warnings.isEmpty, "\(outcome.warnings)")
+        let own = try restored.writer.read { db in try String.fetchOne(db, sql: "SELECT source FROM labTaint WHERE agentId = ?", arguments: [f.eng.id]) }
+        #expect(own?.contains("evil.example") == true, "the agent's lab mark was lost")
+        let agent = try #require(try restored.agent(id: f.eng.id))
+        #expect(agent.sessionTainted, "the agent's tainted session reads clean again")
+        #expect(agent.taintSources.contains("evil.example"))
+        #expect(try restored.companyLabTaint(companyId: f.acme.id)?.profile == "full")
+        #expect(try restored.writer.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM taintedLabCommit WHERE sha = ?", arguments: [neverClean]) } == 1)
+        let machine = try #require(try restored.machineLabTaint())
+        #expect(machine.source?.contains(f.snapshot.lastPathComponent) == true, "the restore did not set the machine-wide mark")
+        // Every lab reads as marked until the owner clears it.
+        #expect(try restored.labTaint(agentId: f.other.id) != nil)
+    }
+
+    /// Lab commits made after the snapshot are never recorded clean: one recorded tainted before the restore stays tainted, and
+    /// one never recorded at all is recorded tainted under the restore's machine-wide mark, and still not clean after the
+    /// owner's clear unless the engine saw it made in a clean turn.
+    @Test func restoreNeverRecordsPostSnapshotLabCommitsClean() throws {
+        let f = try Forward()
+        let taintedAfter = String(repeating: "a", count: 40), unrecorded = String(repeating: "b", count: 40)
+        #expect(try f.env.store.recordLabCommits(agentId: f.eng.id, turnId: nil, shas: [taintedAfter], tainted: true) == 1)
+        let (restored, _) = try f.restore()
+        // The next clean turn of the agent records the lab's commits.
+        _ = try restored.recordLabCommits(agentId: f.eng.id, turnId: nil, shas: [taintedAfter, unrecorded], tainted: false)
+        #expect(try restored.labCommitTainted(agentId: f.eng.id, sha: taintedAfter))
+        #expect(try restored.labCommitTainted(agentId: f.eng.id, sha: unrecorded))
+        // After the owner's machine-wide clear, a commit the engine did not see made in a clean turn still is not clean.
+        try restored.clearMachineLabTaint(now: Date())
+        let later = String(repeating: "d", count: 40)
+        _ = try restored.recordLabCommits(agentId: f.other.id, turnId: nil, shas: [later, taintedAfter], tainted: false)
+        #expect(try restored.labCommitTainted(agentId: f.other.id, sha: later))
+        #expect(try restored.labCommitTainted(agentId: f.other.id, sha: taintedAfter), "a commit tainted in one lab is clean in another")
+    }
+
+    /// When the live database cannot be read, nothing it held can be carried: the restore fails closed (every grant revoked,
+    /// every session and open item marked), and still comes back stopped with the machine-wide mark.
+    @Test func unreadableLiveDatabaseFailsClosed() throws {
+        let f = try Forward()
+        try f.env.store.close()
+        for suffix in ["-wal", "-shm"] { try? FileManager.default.removeItem(atPath: f.env.paths.database.path + suffix) }
+        try Data(repeating: 0x5a, count: 8192).write(to: f.env.paths.database)
+        let outcome = try f.service.restore(try f.service.planRestore(snapshot: f.snapshot))
+        #expect(outcome.warnings.contains { $0.contains("could not be read") }, "\(outcome.warnings)")
+        let restored = try Store(path: f.env.paths.database.path, backupsDir: f.env.paths.backupsDir)
+        #expect(try restored.engineStopped() != nil)
+        #expect(try restored.grants(companyId: f.acme.id).isEmpty, "a grant stayed live")
+        #expect(try f.grant(restored, f.always).revokedBy == "restore")
+        #expect(try restored.agent(id: f.eng.id)?.sessionTainted == true)
+        #expect(try restored.machineLabTaint()?.source != nil)
+    }
+
     @Test func cliRestoreOwnerOnly() throws {
         let home = try OwnerTestHome(initOwner: false)
         // No owner key in this data home: refused.

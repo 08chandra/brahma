@@ -23,6 +23,8 @@ extension Orchestrator {
         for t in mergeTasks.values { t.cancel() }
         // Every git task changes state (worktrees and their auto-commits, a dispatch's branch, a restore's re-adoption).
         for t in gitTasks.values { t.cancel() }
+        // A sandbox canary runs `claude` (final review M1); none starts again until the resume (`scheduleCanary`).
+        cancelCanaries()
         guard stopObserved != stop.since, stopObserverTask == nil else { return }
         stopObserved = stop.since
         let observers = stopObservers

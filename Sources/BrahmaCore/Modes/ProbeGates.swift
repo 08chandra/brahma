@@ -78,13 +78,24 @@ public enum ProbeGates {
         return result
     }
 
-    /// `brahma mode gates --run`: every gate of every shape that has not passed for `fingerprint`, in catalog order.
+    public static let stoppedRefusal = "Brahma is stopped (emergency stop); resume it before running the probe gates"
+
+    /// `brahma mode gates --run`: every gate of every shape that has not passed for `fingerprint`, in catalog order. A live gate
+    /// runs `claude`, so none starts while the owner's stop holds (final review M1): the stop is read before each gate (a
+    /// database error reads as stopped) and the run ends with `stoppedRefusal`.
     public static func runMissing(runner: any ProbeGateRunning, store: Store, fingerprint: String,
-                                  now: @Sendable () -> Date = { Store.now() }) async -> [GateResult] {
+                                  now: @Sendable () -> Date = { Store.now() }) async throws -> [GateResult] {
+        func refuseWhileStopped() throws {
+            let stopped: Bool
+            do { stopped = try store.engineStopped() != nil } catch { stopped = true }
+            if stopped { throw WorkError.forbidden(stoppedRefusal) }
+        }
+        try refuseWhileStopped()
         var out: [GateResult] = []
         for shape in ProbeShape.allCases {
             let passed = (try? store.passedProbeGates(fingerprint: fingerprint, shape: shape)) ?? []
             for gate in catalog(shape) where !passed.contains(gate) {
+                try refuseWhileStopped()
                 out.append(await run(gate: gate, shape: shape, runner: runner, store: store, fingerprint: fingerprint, now: now()))
             }
         }

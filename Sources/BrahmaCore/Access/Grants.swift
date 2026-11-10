@@ -154,14 +154,15 @@ public enum Grants {
             if let hit = SandboxPath.IdentityRoots(writable).overlapping(resolved.path) {
                 throw SandboxError.overlapsProtected(path: resolved.path, protected: hit)
             }
-            if inClaudeTemp(resolved.path) {
-                throw SandboxError.overlapsProtected(path: resolved.path, protected: "/private/tmp/claude*")
+            if inClaudeTemp(resolved.path, claudeTmpRoot: environment.claudeTmpRoot) {
+                throw SandboxError.overlapsProtected(path: resolved.path, protected: "/private/tmp/claude* or /private/tmp/b-\(getuid())")
             }
             // The scope a turn of this company would get with only this grant: its checks are the turn's own.
             let layout = SandboxLayout(paths: paths, company: company, agentHandle: "grant-check")
             _ = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: otherWorkspaces, backupTargets: backupTargets,
                                          kind: .audit, item: nil, company: company, grants: GrantInputs(readPaths: [resolved]),
-                                         darwinUserTemp: environment.darwinUserTemp, userHome: environment.userHome)
+                                         darwinUserTemp: environment.darwinUserTemp, userHome: environment.userHome,
+                                         claudeTmpRoot: environment.claudeTmpRoot ?? SandboxEnvironment.defaultClaudeTmpRoot)
             return resolved.path
         }
     }
@@ -180,14 +181,19 @@ public enum Grants {
     }
 
     /// The path is `/private/tmp` (or contains it), or lies in a `claude…` directory directly under it (Claude Code writes
-    /// `/tmp/claude`, `/tmp/claude-<uid>`, `/tmp/claude-tool-results`): compared by identity, so `/tmp` and alias spellings match.
-    static func inClaudeTemp(_ path: String) -> Bool {
+    /// `/tmp/claude`, `/tmp/claude-<uid>`, `/tmp/claude-tool-results`), or equals, contains or lies in the agents' private temp
+    /// root (`/private/tmp/b-<uid>`, or `claudeTmpRoot`; final review I2): compared by identity, so `/tmp` and alias spellings
+    /// match.
+    static func inClaudeTemp(_ path: String, claudeTmpRoot: URL? = nil) -> Bool {
         guard let tmp = SandboxPath.identity("/private/tmp") else { return false }
         if let id = SandboxPath.identity(path), SandboxPath.lineage("/private/tmp").contains(id) { return true }
+        let roots = [SandboxEnvironment.defaultClaudeTmpRoot] + (claudeTmpRoot.map { [$0] } ?? [])
+        if SandboxPath.IdentityRoots(roots).overlapping(path) != nil { return true }
+        let agentRootName = SandboxEnvironment.defaultClaudeTmpRoot.lastPathComponent
         var current = ""
         var parentIsTmp = SandboxPath.identity("/") == tmp
         for part in path.split(separator: "/") {
-            if parentIsTmp, part.lowercased().hasPrefix("claude") { return true }
+            if parentIsTmp, part.lowercased().hasPrefix("claude") || part == agentRootName { return true }
             current += "/" + part
             parentIsTmp = SandboxPath.identity(current) == tmp
         }

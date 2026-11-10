@@ -29,7 +29,7 @@ struct ModeGroup: AsyncParsableCommand {
                 let hook = Bundle.main.executablePath ?? CommandLine.arguments[0]
                 let runner = LiveProbeGates(paths: paths, environment: .owner, runner: ClaudeProcessRunner(claudePath: path),
                                             hookExecutable: hook)
-                for r in await ProbeGates.runMissing(runner: runner, store: store, fingerprint: key) {
+                for r in try await ProbeGates.runMissing(runner: runner, store: store, fingerprint: key) {
                     print("ran  \(r.shape.rawValue)  \(r.gate)  \(r.passed ? "PASS" : "FAIL")  \(safe(r.detail))")
                 }
             }

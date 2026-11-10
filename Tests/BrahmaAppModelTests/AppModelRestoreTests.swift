@@ -22,6 +22,8 @@ import BrahmaCore
         #expect(throws: (any Error).self) { try store.companies() }
         #expect(try model.store.companies().map(\.name).sorted() == ["Acme", "Globex"])
         #expect(model.loaded)
+        // The restored database comes back stopped (final review I3): an engine restarted on it runs nothing until the resume.
+        #expect(try model.store.engineStopped()?.by == "restore")
         // The activity cursor was re-seeded from the restored database: nothing is replayed.
         #expect(model.activity.allSatisfy { $0.text != "after" })
         model.stopPolling()

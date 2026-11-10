@@ -258,6 +258,26 @@ private final class GroupEvents: @unchecked Sendable {
         #expect(Scheduler.freeSlots(config: World.config(), running: 0, held: true) == 0)
     }
 
+    /// Final review M1: `brahma mode gates --run` (`ProbeGates.runMissing`) runs no live gate while the owner's stop holds, and
+    /// a stop pressed during the run ends it before the next gate.
+    @Test func probeGatesRefuseWhileStopped() async throws {
+        let store = try Store.inMemory()
+        try store.emergencyStop(note: nil, by: "cli", now: Date())
+        let idle = RecordingGates()
+        await #expect(throws: WorkError.forbidden(ProbeGates.stoppedRefusal)) {
+            _ = try await ProbeGates.runMissing(runner: idle, store: store, fingerprint: "fp")
+        }
+        #expect(idle.asked.isEmpty, "a gate ran while stopped")
+        #expect(try store.probeGateRows(fingerprint: "fp").isEmpty)
+
+        try store.resumeAfterStop(now: Date())
+        let stopping = StoppingGates(store: store)
+        await #expect(throws: WorkError.forbidden(ProbeGates.stoppedRefusal)) {
+            _ = try await ProbeGates.runMissing(runner: stopping, store: store, fingerprint: "fp")
+        }
+        #expect(stopping.asked.count == 1, "gates kept running after the stop: \(stopping.asked)")
+    }
+
     @Test func observersCalledOncePerStop() async throws {
         let observer = CountingObserver()
         let w = try World(stopObservers: [observer])
@@ -478,5 +498,19 @@ private final class GroupEvents: @unchecked Sendable {
         let o = out.fileHandleForReading.readDataToEndOfFile(), e = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: e, as: UTF8.self))
+    }
+}
+
+/// A live-gate stand-in whose first gate is when the owner presses stop.
+private final class StoppingGates: ProbeGateRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _asked: [String] = []
+    let store: Store
+    init(store: Store) { self.store = store }
+    var asked: [String] { lock.withLock { _asked } }
+    func run(gate: String, shape: ProbeShape) async -> GateResult {
+        lock.withLock { _asked.append("\(shape.rawValue)/\(gate)") }
+        try? store.emergencyStop(note: nil, by: "owner", now: Date())
+        return GateResult(gate: gate, shape: shape, passed: false, detail: "fake")
     }
 }

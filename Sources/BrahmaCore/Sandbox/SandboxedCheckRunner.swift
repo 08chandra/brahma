@@ -76,7 +76,10 @@ extension Orchestrator {
     ///   (no shared cache, B-I3). Nothing else of the data home is in the policy, so the rest of it (the database, other
     ///   runs, the merge repository) stays unreadable and unwritable. A `.brahma/cache/shared` a check turned into a link is
     ///   removed (without following it) and recreated; a refusal carries a precise reason (B-I2).
-    public static func checkRoute(store: Store) -> @Sendable (String) -> CheckRoute {
+    ///
+    /// `ceiling` is the engine's (`brahma run --profile`, final review I4): it narrows the company's and the role's profile
+    /// exactly as it does for turns (`turnProfile`), so a check runs unsandboxed only when the narrowed profile is still Full.
+    public static func checkRoute(store: Store, ceiling: PermissionProfile? = nil) -> @Sendable (String) -> CheckRoute {
         { cwd in
             let dir = URL(fileURLWithPath: cwd, isDirectory: true)
             let runId = dir.lastPathComponent
@@ -100,10 +103,11 @@ extension Orchestrator {
             guard same(place.path, cwd) else { return .refused("\(cwd) is not run \(runId)'s \(run.purpose.rawValue) place") }
             guard same(run.workingDirectory, cwd) else { return .refused("run \(runId) did not record \(cwd) as its directory") }
 
-            if company.permissionProfile == .full {
+            func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
+            if narrowed(company.permissionProfile) == .full {
                 let holder = (try? store.lease(itemId: run.itemId))?.agentId ?? run.requestedBy
                 let role = holder.flatMap { try? store.agent(id: $0) }?.role
-                if role.map({ company.profile(forRole: $0) == .full }) ?? true { return .unsandboxed }
+                if role.map({ narrowed(company.profile(forRole: $0)) == .full }) ?? true { return .unsandboxed }
             }
 
             // The workspace may sit behind a link the owner chose; everything under it is built logically and must be real.
@@ -126,12 +130,12 @@ extension Orchestrator {
     /// `checkRoute`. The baseline is the owner's (`SandboxBaseline.current`) with the data home (and the store's, if
     /// different) as engine homes, every company's workspace listed, and the owner's backup folders and WAL replica
     /// protected (`checkBaseline`).
-    static func defaultCheckRunner(store: Store, paths: BrahmaPaths) -> any CheckRunning {
+    static func defaultCheckRunner(store: Store, paths: BrahmaPaths, ceiling: PermissionProfile? = nil) -> any CheckRunning {
         let baseline: @Sendable () -> SandboxBaseline = { checkBaseline(store: store, paths: paths) }
         let onStraggler: @Sendable (StragglerReport) -> Void = { report in reportStragglers(report, store: store) }
         return SandboxedCheckRunner(sandbox: SandboxRunners.platformDefault(baseline: baseline, proxies: EgressProxyPool(),
                                                                             onStraggler: onStraggler),
-                                    route: checkRoute(store: store))
+                                    route: checkRoute(store: store, ceiling: ceiling))
     }
 
     /// What a sandboxed check left behind, as an owner-visible activity line on its item's company (and the engine log):

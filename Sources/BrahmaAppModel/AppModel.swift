@@ -166,7 +166,8 @@ public final class AppModel {
     }
 
     /// Restores the database from `snapshot`: stops the engine, closes the store, restores, reopens the store and restarts
-    /// the engine. The store is reopened even when the restore fails.
+    /// the engine. The store is reopened even when the restore fails. A restored database always carries the owner's stop
+    /// (`RestoreCarry`, final review I3), so the restarted engine runs nothing until the owner resumes it.
     @discardableResult
     public func restore(from snapshot: URL) async throws -> RestoreOutcome {
         await engine?.stop(timeout: .seconds(15))

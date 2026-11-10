@@ -42,9 +42,11 @@ public struct SandboxEnvironment: Sendable {
         let temp: URL? = nil
         #endif
         return SandboxEnvironment(userHome: FileManager.default.homeDirectoryForCurrentUser, darwinUserTemp: temp,
-                                  shell: ShellPrefix.shell(),
-                                  claudeTmpRoot: URL(fileURLWithPath: "/private/tmp/b-\(getuid())", isDirectory: false))
+                                  shell: ShellPrefix.shell(), claudeTmpRoot: defaultClaudeTmpRoot)
     }
+
+    /// `/private/tmp/b-<uid>`: the root of every sandboxed agent's private Claude temp directory, in every company.
+    public static var defaultClaudeTmpRoot: URL { URL(fileURLWithPath: "/private/tmp/b-\(getuid())", isDirectory: false) }
 }
 
 /// A sandboxed turn's prepared places.
@@ -102,8 +104,10 @@ extension Orchestrator {
                 extensionPlaces.append(reviewDir.appending(path: name))
             }
         }
+        // Final review M4: the owner's backup folders and WAL replica too (a database error fails the turn).
+        let backups = try BackupTargets.requiredProtectedFolders(store: store)
         var seen = Set<String>()
-        return ([paths.home] + ProtectedPaths.defaults(userHome: sandboxEnvironment.userHome) + others + extensionPlaces)
+        return ([paths.home] + ProtectedPaths.defaults(userHome: sandboxEnvironment.userHome) + others + extensionPlaces + backups)
             .flatMap { [$0, $0.resolvedForSandbox] }
             .filter { seen.insert(SandboxPath.key($0.path)).inserted }
     }

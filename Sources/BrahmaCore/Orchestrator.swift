@@ -162,7 +162,7 @@ public actor Orchestrator {
                                 runner: runner, claudePath: claudePath)
             : nil)
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
-        self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths)
+        self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
         self.checkBaseEnvironment = checkBaseEnvironment
     }
 

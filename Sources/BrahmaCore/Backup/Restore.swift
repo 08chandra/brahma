@@ -311,7 +311,9 @@ extension BackupService {
     ///
     /// 1. checkpoint (`TRUNCATE`) the live database and snapshot it (`.preRestore`), then close it;
     /// 2. keep a byte copy as `brahma.sqlite.pre-restore-<stamp>` (with the `-wal`/`-shm` beside it when the checkpoint failed);
-    /// 3. copy the snapshot to `brahma.sqlite.restoring` and fsync it;
+    /// 3. copy the snapshot to `brahma.sqlite.restoring`, migrate it and write into it what must not roll back
+    ///    (`RestoreCarry`, final review I3: the owner's stop, so the engine comes back stopped; the live database's grant
+    ///    revocations and used-up uses; every taint mark; the machine-wide lab mark), then fsync it;
     /// 4. `rename(2)` it over `brahma.sqlite`: there is never a moment without a database;
     /// 5. remove the stale `-wal` and `-shm`;
     /// 6. record the restore in the restored database (`restoreEvent` with a random nonce, and each company's recorded
@@ -348,6 +350,8 @@ extension BackupService {
         let sibling = database.deletingLastPathComponent()
         let previous = sibling.appending(path: database.lastPathComponent + ".pre-restore-\(stamp)")
         let hadDatabase = fm.fileExists(atPath: database.path)
+        // What the live database holds that a restore must not roll back (I3): read before anything changes.
+        var carried: RestoreCarry.Live = hadDatabase ? .unreadable("the database could not be opened") : .none
 
         // 1.
         if hadDatabase {
@@ -360,6 +364,7 @@ extension BackupService {
                     let busy: Int = row?[0] ?? 1
                     checkpointProblem = busy == 0 ? nil : "it was busy"
                 } catch { checkpointProblem = "\(error)" }
+                do { carried = .read(try live.read { db in try RestoreCarry.read(db) }) } catch { carried = .unreadable("\(error)") }
                 var service = self
                 service.writer = live
                 do { preSnapshot = try service.snapshot(reason: .preRestore) } catch {
@@ -395,8 +400,17 @@ extension BackupService {
         do {
             if !alreadyStaged { try fm.copyItem(at: plan.snapshot, to: staging) }
             chmod(staging.path, 0o600)
-            try Self.syncFile(staging)
         } catch { throw RestoreError.failed("could not stage the snapshot: \(error)") }
+        // 3b. The staged copy is brought to this schema and given what must not roll back (I3): the owner's stop, the live
+        // database's grant ends and taint marks, the machine-wide lab mark. Done before the rename, so the database at the live
+        // path never lacks them; a failure here changes nothing.
+        do {
+            warnings += try Self.carryForward(carried, into: staging, snapshot: plan.snapshot.lastPathComponent, now: now())
+            try Self.syncFile(staging)
+        } catch {
+            if !alreadyStaged { try? fm.removeItem(at: staging) }
+            throw RestoreError.failed("could not prepare the snapshot (\(error)); nothing was changed")
+        }
 
         // 4. and 5. The old log is empty after the checkpoint (or kept beside the byte copy); removing it first means the
         // renamed file never meets a stale one.
@@ -460,6 +474,23 @@ extension BackupService {
             }
         }
         return outcome
+    }
+
+    /// Migrates the staged snapshot and writes `RestoreCarry.apply` into it in one transaction, then empties its log and closes
+    /// it, so the file renamed into place holds everything. Returns the notes for the owner.
+    static func carryForward(_ live: RestoreCarry.Live, into staged: URL, snapshot: String, now: Date) throws -> [String] {
+        let queue = try DatabaseQueue(path: staged.path)
+        var closed = false
+        defer { if !closed { try? queue.close() } }
+        try Migrations.migrator().migrate(queue)
+        let notes = try queue.write { db in try RestoreCarry.apply(live, to: db, snapshot: snapshot, now: now) }
+        let row = try queue.writeWithoutTransaction { db in try Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)") }
+        let busy: Int = row?[0] ?? 0
+        guard busy == 0 else { throw RestoreError.failed("the staged snapshot's log could not be emptied") }
+        try queue.close()
+        closed = true
+        for suffix in ["-wal", "-shm"] { try? FileManager.default.removeItem(atPath: staged.path + suffix) }
+        return notes
     }
 
     /// Records a restore in the (restored) database: one `restoreEvent` row with a fresh nonce, the `notes` (warnings, logged as

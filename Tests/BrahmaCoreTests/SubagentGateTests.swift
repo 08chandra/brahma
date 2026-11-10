@@ -246,7 +246,7 @@ private let subagentGates = ["L-2", "V-2", "V-3", "V-5"]
         let store = try Store.inMemory()
         try store.recordProbeGate(GateResult(gate: "V-3", shape: .sandboxedTask, passed: true, detail: "ok"), fingerprint: "fp")
         let runner = RecordingGates(passing: ["L-2"])
-        let results = await ProbeGates.runMissing(runner: runner, store: store, fingerprint: "fp")
+        let results = try await ProbeGates.runMissing(runner: runner, store: store, fingerprint: "fp")
         #expect(!runner.asked.contains("sandboxed-task/V-3"), "a passed gate is not run again")
         #expect(!runner.asked.contains { $0.hasSuffix("/V-9") }, "V-9 is pending the owner: nothing runs")
         #expect(results.contains { $0.gate == "V-9" && !$0.passed })

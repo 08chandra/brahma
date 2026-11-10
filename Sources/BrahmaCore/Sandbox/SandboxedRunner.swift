@@ -103,7 +103,8 @@ public struct SandboxBaseline: Equatable, Sendable {
     public static func current(paths: BrahmaPaths, otherWorkspaces: [URL], backupTargets: [URL]) -> SandboxBaseline {
         let home = FileManager.default.homeDirectoryForCurrentUser
         func both(_ url: URL) -> [URL] { [url, url.resolvedForSandbox] }
-        let protected = dedupe((ProtectedPaths.defaults(userHome: home) + otherWorkspaces + backupTargets).flatMap(both))
+        let protected = dedupe((ProtectedPaths.defaults(userHome: home) + otherWorkspaces + backupTargets).flatMap(both)
+                               + claudeTempPlaces)
         #if canImport(Darwin)
         let temp = darwinDirectory(_CS_DARWIN_USER_TEMP_DIR), cache = darwinDirectory(_CS_DARWIN_USER_CACHE_DIR)
         let user = darwinDirectory(_CS_DARWIN_USER_DIR)?.deletingLastPathComponent()
@@ -133,6 +134,15 @@ public struct SandboxBaseline: Equatable, Sendable {
     static func dedupe(_ urls: [URL]) -> [URL] {
         var seen: Set<String> = []
         return urls.filter { seen.insert($0.path).inserted }
+    }
+
+    /// Claude Code's temp places under `/tmp`, in both spellings (final review I1): the owner's own sessions
+    /// (`claude-<uid>`: edit diffs of the owner's files, background task output), `claude-tool-results`, `claude`, and the
+    /// root of every sandboxed agent's private temp directory in every company (`b-<uid>`, `SandboxEnvironment`). No
+    /// sandboxed command reads them, as no sandboxed turn does (`SandboxScope.forTurn`).
+    static var claudeTempPlaces: [URL] {
+        let names = ["claude-\(getuid())", "claude-tool-results", "claude", SandboxEnvironment.defaultClaudeTmpRoot.lastPathComponent]
+        return names.flatMap { name in ["/private/tmp/\(name)", "/tmp/\(name)"].map { URL(fileURLWithPath: $0, isDirectory: false) } }
     }
 }
 

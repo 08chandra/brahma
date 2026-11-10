@@ -1023,6 +1023,111 @@ struct SeatbeltRunnerTests {
         #expect(list.exitCode != 0, "other runs' checkouts can be listed")
     }
 
+    // MARK: Final review I1: a check reads no more than a sandboxed turn
+
+    /// A secret file in a fresh directory under `root` (`/private/tmp/...`), created when missing; the returned closure removes
+    /// what this test made (the directory, and `root` itself only when the test created it).
+    static func tmpSecret(root: String, _ text: String) throws -> (file: URL, cleanup: () -> Void) {
+        let fm = FileManager.default
+        let createdRoot = !fm.fileExists(atPath: root)
+        if createdRoot { try fm.createDirectory(atPath: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }   // exec-bit fixture: a directory mode
+        let dir = URL(fileURLWithPath: root).appending(path: "brahma-test-\(UUID().uuidString.prefix(8))")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])   // exec-bit fixture: a directory mode
+        let file = dir.appending(path: "s")
+        try text.write(to: file, atomically: false, encoding: .utf8)
+        return (file, { try? fm.removeItem(at: dir); if createdRoot { try? fm.removeItem(atPath: root) } })
+    }
+
+    /// The check shape for real: the company workspace readable, the run's checkout under the data home writable, the toolchain
+    /// on, the workspace listed in the baseline (as `checkBaseline` lists every company's). The check cannot read another
+    /// agent's temp folder (`/private/tmp/b-<uid>/*`), the owner's Claude Code sessions (`/private/tmp/claude-<uid>`), or the
+    /// private parts of `.brahma` (other agents' homes, labs and notes, review pages, trial copies), by `cat`, `ls` or a clone;
+    /// the workspace's sources and the turn-readable `.brahma` places stay readable, and a git check in the checkout works.
+    @Test func checkCannotReadAgentTempsOwnerSessionsOrPrivateDotBrahma() async throws {
+        let ws = try Self.homeDir(); defer { Self.remove(ws) }
+        let home = try tempDir().resolvedForSandbox.appending(path: "home")
+        let checkout = home.appending(path: "run/checkouts/r1")
+        try FileManager.default.createDirectory(at: checkout.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.file(ws.appending(path: "src/f"), "src-ok")
+        _ = try GitFixture.plainGit(["init", "-q", "-b", "main"], in: ws)
+        _ = try GitFixture.plainGit(["add", "src"], in: ws)
+        _ = try GitFixture.plainGit(["commit", "-q", "-m", "base commit"], in: ws)
+        _ = try GitFixture.plainGit(["worktree", "add", "--quiet", "--detach", checkout.path, "HEAD"], in: ws)
+        try Self.file(ws.appending(path: ".brahma/wt/K/f"), "wt-ok")
+        let privates = ["home/other/s": "home-secret", "labs/other/s": "lab-secret", "notes/agents/other.md": "notes-secret",
+                        "ext-review/A-1.md": "review-secret", "ext-try/t1/f": "try-secret", "trash/x": "trash-secret",
+                        "plans/K/p.md": "plan-secret", "resources/private/r": "resource-secret"]
+        for (path, text) in privates { try Self.file(ws.appending(path: ".brahma/\(path)"), text) }
+        let agentTemp = try Self.tmpSecret(root: "/private/tmp/b-\(getuid())", "agent-temp-secret")
+        defer { agentTemp.cleanup() }
+        let ownerSession = try Self.tmpSecret(root: "/private/tmp/claude-\(getuid())", "owner-session-secret")
+        defer { ownerSession.cleanup() }
+
+        var b = Self.baseline(engineHomes: [home])
+        b.companyWorkspaces = [ws]
+        let r = Self.runner(b)
+        var env = Self.env
+        env["DEVELOPER_DIR"] = Toolchain.developerDir
+        let p = Self.policy(writable: [checkout], readable: [ws], toolchain: true)
+
+        var secrets = privates.map { (ws.appending(path: ".brahma/\($0.key)").path, $0.value) }
+        secrets += [(agentTemp.file.path, "agent-temp-secret"), (ownerSession.file.path, "owner-session-secret"),
+                    ("/tmp/" + agentTemp.file.path.dropFirst("/private/tmp/".count), "agent-temp-secret")]
+        for (path, text) in secrets {
+            let (read, readText) = try await Self.run("cat '\(path)'", p, runner: r, env: env)
+            #expect(read.exitCode != 0, "\(path) was readable"); #expect(!readText.contains(text), "\(path) leaked")
+            let (clone, _) = try await Self.run("cp -c '\(path)' cloned && cat cloned", p, runner: r, env: env)
+            #expect(clone.exitCode != 0, "\(path) could be cloned")
+        }
+        for dir in [ws.appending(path: ".brahma").path, ws.appending(path: ".brahma/labs").path, "/private/tmp/b-\(getuid())",
+                    "/private/tmp/claude-\(getuid())", agentTemp.file.deletingLastPathComponent().path] {
+            let (list, listText) = try await Self.run("ls '\(dir)'", p, runner: r, env: env)
+            #expect(list.exitCode != 0, "\(dir) could be listed: \(listText)")
+        }
+        // What a turn reads stays readable, and a git check in the checkout works (it reads the workspace's `.git`).
+        let (ok, okText) = try await Self.run("cat '\(ws.path)/src/f' '\(ws.path)/.brahma/wt/K/f' && cat src/f && "
+                                              + "git log -1 --format=%s && git status --porcelain --untracked-files=no && echo git-ok",
+                                              p, runner: r, env: env)
+        #expect(ok.exitCode == 0, "\(okText)")
+        #expect(okText.contains("src-ok") && okText.contains("wt-ok") && okText.contains("base commit") && okText.contains("git-ok"), "\(okText)")
+        // The profile names what it hides and re-allows.
+        let profile = SeatbeltProfile.render(policy: p, baseline: b, proxyPort: nil)
+        #expect(profile.contains("(deny file-read* file-read-data (subpath \"\(ws.path)/.brahma\"))"), "\(profile)")
+        #expect(profile.contains("(subpath \"/private/tmp/b-\(getuid())\")"))
+        #expect(profile.contains("(subpath \"/private/tmp/claude-\(getuid())\")"))
+    }
+
+    /// I1: a normal Swift package builds in a check's checkout under the new read scope (the workspace listed, `.brahma`
+    /// hidden, the Claude temp places denied).
+    @Test(.timeLimit(.minutes(6)), .enabled(if: Toolchain.xcodeAvailable))
+    func swiftBuildChecksStillWorkUnderTheCheckReadScope() async throws {
+        let ws = try Self.homeDir(); defer { Self.remove(ws) }
+        let home = try tempDir().resolvedForSandbox.appending(path: "home")
+        let checkout = home.appending(path: "run/checkouts/r1")
+        try FileManager.default.createDirectory(at: checkout.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.file(ws.appending(path: "Package.swift"), """
+        // swift-tools-version: 5.9
+        import PackageDescription
+        let package = Package(name: "Hello", platforms: [.macOS(.v13)], targets: [.executableTarget(name: "Hello")])
+        """)
+        try Self.file(ws.appending(path: "Sources/Hello/main.swift"), "print(\"hello from the check\")\n")
+        try Self.file(ws.appending(path: ".brahma/labs/other/s"), "lab-secret")
+        _ = try GitFixture.plainGit(["init", "-q", "-b", "main"], in: ws)
+        _ = try GitFixture.plainGit(["add", "Package.swift", "Sources"], in: ws)
+        _ = try GitFixture.plainGit(["commit", "-q", "-m", "package"], in: ws)
+        _ = try GitFixture.plainGit(["worktree", "add", "--quiet", "--detach", checkout.path, "HEAD"], in: ws)
+        var b = Self.baseline(engineHomes: [home])
+        b.companyWorkspaces = [ws]
+        var env = Self.env
+        env["DEVELOPER_DIR"] = Toolchain.developerDir
+        let p = Self.policy(writable: [checkout], readable: [ws], toolchain: true)
+        ScratchScope.current?.allowExecutable(named: "Hello")   // the product of the build under test
+        let (build, text) = try await Self.run("swift build --disable-sandbox --cache-path .build/cache > build.log 2>&1; s=$?; tail -40 build.log; "
+                                               + "[ $s -eq 0 ] && .build/debug/Hello; exit $s", p, runner: Self.runner(b), timeout: .seconds(240), env: env)
+        #expect(build.exitCode == 0, "swift build failed under the check read scope:\n\(text.suffix(3000))")
+        #expect(text.contains("hello from the check"))
+    }
+
     // MARK: Helpers
 
     final class SignalLog: @unchecked Sendable {

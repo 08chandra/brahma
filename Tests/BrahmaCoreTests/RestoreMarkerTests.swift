@@ -47,6 +47,9 @@ import GRDB
         try env.store.close()
         _ = try service.restore(try service.planRestore(snapshot: snapshot))
         let store = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        // A restore leaves the engine stopped (final review I3) and the re-adoption waits for the resume: the owner resumes.
+        #expect(try store.engineStopped()?.by == "restore")
+        try store.resumeAfterStop(now: Date())
         let hooks = RestoreHooks()
         let events = RestoreEvents()
         hooks.register { event in events.add(event) }

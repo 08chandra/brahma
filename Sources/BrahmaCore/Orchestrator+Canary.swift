@@ -104,16 +104,28 @@ extension Orchestrator {
     }
 
     /// One canary run at a time engine-wide (M5), detached; a key that did not pass is retried after `retryAfter`; the other
-    /// keys wait for later ticks.
+    /// keys wait for later ticks. Nothing starts while the owner's stop holds (final review M1): the canary runs `claude`;
+    /// waiting agents stay waiting and their canary runs after the resume.
     func scheduleCanary(_ key: SandboxCanaryKey) {
-        guard let gate = sandboxCanary else { return }
+        guard let gate = sandboxCanary, !engineStoppedNow else { return }
         guard !healthTasks.keys.contains(where: { $0.hasPrefix(Self.canaryTaskPrefix) }) else { return }
         if let failed = canaryFailedAt[key.text], AwakeTime.uptime() - failed < gate.retryAfter { return }
         let paths = self.paths, settings = canarySettings[key.text]
         healthTasks[Self.canaryTaskName(key)] = Task.detached { [self] in
             let run = await gate.canary.run(paths: paths, claudePath: gate.claudePath, runner: gate.runner, key: key, settings: settings)
-            await canaryFinished(key, run: run)
+            // Cut short by the owner's stop (`enforceStop` cancels it): neither a pass nor a failure, it runs again after the resume.
+            if Task.isCancelled { await canaryStopped(key) } else { await canaryFinished(key, run: run) }
         }
+    }
+
+    func canaryStopped(_ key: SandboxCanaryKey) {
+        healthTasks[Self.canaryTaskName(key)] = nil
+        log("sandbox canary cut short by the owner's stop; it runs again after the resume")
+    }
+
+    /// The owner's stop (final review M1): every running canary is cancelled.
+    func cancelCanaries() {
+        for (name, task) in healthTasks where name.hasPrefix(Self.canaryTaskPrefix) { task.cancel() }
     }
 
     static let canaryTaskPrefix = "sandbox-canary:"
