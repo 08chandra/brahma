@@ -141,7 +141,9 @@ public struct SandboxBaseline: Equatable, Sendable {
     /// root of every sandboxed agent's private temp directory in every company (`b-<uid>`, `SandboxEnvironment`). No
     /// sandboxed command reads them, as no sandboxed turn does (`SandboxScope.forTurn`).
     static var claudeTempPlaces: [URL] {
-        let names = ["claude-\(getuid())", "claude-tool-results", "claude", SandboxEnvironment.defaultClaudeTmpRoot.lastPathComponent]
+        // Fix-wave F4: Claude Code's daemon-control and pty socket folders too.
+        let names = ["claude-\(getuid())", "claude-tool-results", "claude", SandboxEnvironment.defaultClaudeTmpRoot.lastPathComponent,
+                     "cc-daemon-\(getuid())", "cc-socks"]
         return names.flatMap { name in ["/private/tmp/\(name)", "/tmp/\(name)"].map { URL(fileURLWithPath: $0, isDirectory: false) } }
     }
 }

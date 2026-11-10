@@ -197,12 +197,13 @@ import GRDB
         }
 
         /// `request_access` by `eng`, approved the owner's way.
-        static func approve(_ env: BackupEnv, _ acme: Company, _ eng: Agent, _ domain: String, _ scope: GrantScope) throws -> Grant {
+        static func approve(_ env: BackupEnv, _ acme: Company, _ eng: Agent, _ domain: String, _ scope: GrantScope,
+                            duration: GrantDuration = .always) throws -> Grant {
             _ = try CompanyTools(store: env.store, companyId: acme.id, agentId: eng.id).call(name: "request_access", arguments: [
                 "kind": .string("network_domain"), "value": .string(domain), "reason": .string("I need it")])
             let ask = try #require(try env.store.asks(companyId: acme.id).last { $0.kind == .grant })
             let grantEnv = SandboxEnvironment(userHome: try tempDir(), darwinUserTemp: nil, shell: "/bin/zsh")
-            return try env.store.approveAccess(askId: ask.id, scope: scope, duration: .always, note: "ok", environment: grantEnv)
+            return try env.store.approveAccess(askId: ask.id, scope: scope, duration: duration, note: "ok", environment: grantEnv)
         }
 
         /// Restores the snapshot (the live store closed first) and opens the restored database as the engine would.
@@ -224,6 +225,7 @@ import GRDB
         let (restored, _) = try f.restore()
         let stop = try #require(try restored.engineStopped())
         #expect(stop.by == "restore"); #expect(stop.note?.contains(f.snapshot.lastPathComponent) == true)
+        #expect(stop.note?.contains("nothing you had turned off was rolled back") == true, "\(stop.note ?? "")")
         // An engine on the restored database admits nothing until the owner resumes it.
         let paths = f.env.paths
         let fake = FakeTurnRunner()
@@ -296,6 +298,71 @@ import GRDB
         _ = try restored.recordLabCommits(agentId: f.other.id, turnId: nil, shas: [later, taintedAfter], tainted: false)
         #expect(try restored.labCommitTainted(agentId: f.other.id, sha: later))
         #expect(try restored.labCommitTainted(agentId: f.other.id, sha: taintedAfter), "a commit tainted in one lab is clean in another")
+    }
+
+    /// Fix-wave F1: a grant that ended on company-active time, or with its sprint, after the snapshot stays ended. Both clocks
+    /// are in the database and roll back with it; the restore revokes every grant the live database no longer counts.
+    @Test func restoreKeepsExpiredGrantsExpired() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        let eng = try env.store.hire(companyId: acme.id, name: "eng-1", role: "engineer", model: "sonnet")
+        // No sprint yet: seven active days.
+        let timed = try Forward.approve(env, acme, eng, "timed.example.com", .agent, duration: .sprint)
+        #expect(timed.expiresActive != nil && timed.sprintId == nil)
+        let sprint = Sprint(id: UUID().uuidString, companyId: acme.id, number: 1, team: nil, goal: "g", cadence: .sprint,
+                            status: .active, createdAt: Date())
+        try env.store.writer.write { db in try sprint.insert(db) }
+        let sprintBound = try Forward.approve(env, acme, eng, "sprint.example.com", .agent, duration: .sprint)
+        #expect(sprintBound.sprintId == sprint.id)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        #expect(try env.store.grants(companyId: acme.id).count == 2, "both live at the snapshot")
+        // After the snapshot: the active week runs out, and the sprint ends.
+        try env.store.advanceActive(companyId: acme.id, by: GrantResolver.noSprintTTL + 60)
+        try env.store.writer.write { db in
+            try db.execute(sql: "UPDATE sprint SET status = ? WHERE id = ?", arguments: [SprintStatus.closed.rawValue, sprint.id])
+        }
+        #expect(try env.store.grants(companyId: acme.id).isEmpty)
+        try env.store.close()
+        _ = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        // The restored database's own clocks say both are live again; the restore revoked them.
+        #expect(try restored.grants(companyId: acme.id).isEmpty, "a grant that ended after the snapshot is live again")
+        for g in [timed, sprintBound] {
+            let row = try #require(try restored.grants(companyId: acme.id, includeInactive: true).first { $0.id == g.id })
+            #expect(row.revokedAt != nil && row.revokedBy == "restore", "\(g.value)")
+        }
+    }
+
+    /// Fix-wave F2: what the owner turned off after the snapshot and the restore turns back on is listed in the restore's
+    /// warnings, its stop note and its alert, so the owner reviews it before resuming.
+    @Test func restoreListsWhatItRolledBack() throws {
+        let f = try Forward()
+        // After the snapshot the owner removes eng-2.
+        try f.env.store.writer.write { db in try db.execute(sql: "UPDATE agent SET state = 'killed' WHERE id = ?", arguments: [f.other.id]) }
+        let (restored, outcome) = try f.restore()
+        let removed = "@eng-2 (Acme), removed after the snapshot, is back"
+        #expect(outcome.warnings.contains { $0.contains(removed) }, "\(outcome.warnings)")
+        #expect(!outcome.warnings.contains { $0.contains("@eng-1") })
+        let stop = try #require(try restored.engineStopped())
+        #expect(stop.note?.contains(removed) == true, "\(stop.note ?? "")")
+        let alert = try #require(try restored.asks(companyId: f.acme.id).first {
+            $0.kind == .engineAlert && $0.subjectId == Store.engineAlertKey(RestoreCarry.restoreAlertReason) && $0.status == .pendingOwner
+        })
+        #expect(alert.summary.contains(removed) && alert.summary.contains("stopped"), "\(alert.summary)")
+    }
+
+    /// A company profile narrowed after the snapshot is listed too.
+    @Test func restoreListsANarrowedProfile() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        try env.store.updateSandbox(companyId: acme.id, SandboxPatch(profile: .full), userHome: try tempDir())
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.updateSandbox(companyId: acme.id, SandboxPatch(profile: .sandboxed), userHome: try tempDir())
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        #expect(outcome.warnings.contains { $0.contains("Acme: profile full again (it was sandboxed)") }, "\(outcome.warnings)")
     }
 
     /// When the live database cannot be read, nothing it held can be carried: the restore fails closed (every grant revoked,

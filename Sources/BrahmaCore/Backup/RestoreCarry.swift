@@ -12,6 +12,11 @@ import GRDB
 /// When the live database cannot be read, nothing about it can be trusted, so the restore fails closed instead: every grant
 /// is revoked (the owner approves again what is still wanted) and every session is treated as tainted.
 ///
+/// Grants the live database no longer counts for any reason (expired on company-active time, sprint ended, used up) are
+/// revoked in the restored one (fix-wave F1): both clocks roll back with the database, so carrying `revokedAt` alone is not
+/// enough. Other settings the owner turned off are not carried (fix-wave F2): every one the restore turns back on is listed in
+/// the stop note, the restore's warnings and an engine alert in every company, so the owner reviews them before resuming.
+///
 /// Whatever was read, the restored engine comes back stopped (the owner resumes it) and the machine-wide lab mark is set:
 /// a lab commit made after the snapshot is never recorded clean, and the owner's machine-wide clear (which snapshots every
 /// lab's commits as never-clean, S33) is the only way back.
@@ -24,6 +29,13 @@ struct RestoreCarry {
     struct AgentTaint { var id: String; var sources: String; var fresh: Bool }
 
     var grants: [GrantEnd] = []
+    /// Grants not live in the live database at restore time for any reason `GrantResolver.isLive` knows (revoked, used up,
+    /// expired on company-active time, sprint ended): fix-wave F1. Both clocks live in the database and roll back with it,
+    /// so these are revoked in the restored one rather than carrying the clocks.
+    var notLiveGrants: [String] = []
+    /// What the owner can turn off, as the live database has it (fix-wave F2): compared with the restored database so the
+    /// restore's stop note and alert name every setting it rolled back.
+    var settings = Settings()
     var labMarks: [LabMark] = []
     var companyMarks: [CompanyMark] = []
     var machineMark: MachineMark?
@@ -49,6 +61,16 @@ struct RestoreCarry {
                 SELECT id, revokedAt, revokedBy, usesLeft FROM "grant" WHERE revokedAt IS NOT NULL OR usesLeft IS NOT NULL
                 """).map { GrantEnd(id: $0["id"], revokedAt: $0["revokedAt"], revokedBy: $0["revokedBy"], usesLeft: $0["usesLeft"]) }
         }
+        if try has("grant") {
+            var active: [String: Double] = [:], sprints: [String: Set<String>] = [:]
+            for g in try Grant.fetchAll(db) where g.revokedAt == nil {
+                if active[g.companyId] == nil { active[g.companyId] = try Store.activeNow(db: db, companyId: g.companyId) }
+                if sprints[g.companyId] == nil { sprints[g.companyId] = try Store.activeSprintIds(db, companyId: g.companyId) }
+                let live = GrantResolver.isLive(g, activeNow: active[g.companyId] ?? 0, sprintActive: { sprints[g.companyId]?.contains($0) ?? false })
+                if !live { c.notLiveGrants.append(g.id) }
+            }
+        }
+        c.settings = try Settings.read(db)
         if try has("labTaint") {
             c.labMarks = try Row.fetchAll(db, sql: "SELECT agentId, source, markedAt FROM labTaint")
                 .map { LabMark(agentId: $0["agentId"], source: $0["source"], markedAt: $0["markedAt"]) }
@@ -86,15 +108,29 @@ struct RestoreCarry {
     /// notes the owner should see.
     static func apply(_ live: Live, to db: Database, snapshot: String, now: Date) throws -> [String] {
         var notes: [String] = []
+        // What the restore rolled back of what the owner had turned off (F2), read before anything is written.
+        let rolledBack: [String]
+        switch live {
+        case .none: rolledBack = []
+        case .read(let c): rolledBack = Settings.rolledBack(live: c.settings, restored: try Settings.read(db))
+        case .unreadable:
+            rolledBack = ["the previous database could not be read, so what this restore rolled back is unknown: review every "
+                + "company's agents, profiles, network and access settings, extensions, auto-merge and secrets"]
+        }
+        let summary = rolledBack.isEmpty
+            ? "nothing you had turned off was rolled back"
+            : "rolled back (review before resuming): " + rolledBack.joined(separator: "; ")
         // The owner's stop, whatever the snapshot or the live database said: nothing runs until `brahma resume`.
         try db.execute(sql: #"INSERT OR REPLACE INTO engineStop (id, since, "by", note) VALUES (1, ?, 'restore', ?)"#,
-                       arguments: [now, "restored from \(Store.flat(snapshot, max: 120)): check grants, lab marks and main, then resume"])
+                       arguments: [now, Store.flat("restored from \(snapshot): check grants, lab marks and main, then resume; " + summary, max: 4000)])
+        notes += rolledBack.map { "rolled back by the restore: \($0)" }
+        try raiseRestoreAlert(db, snapshot: snapshot, summary: summary, now: now)
 
         switch live {
         case .none:
             break
         case .read(let c):
-            try carry(c, into: db)
+            try carry(c, into: db, now: now)
         case .unreadable(let why):
             try db.execute(sql: #"UPDATE "grant" SET revokedAt = ?, revokedBy = 'restore' WHERE revokedAt IS NULL"#, arguments: [now])
             try db.execute(sql: """
@@ -116,7 +152,28 @@ struct RestoreCarry {
         return notes
     }
 
-    private static func carry(_ c: RestoreCarry, into db: Database) throws {
+    /// The restore's owner alert in every company of the restored database (an engine alert in the Inbox and an activity line):
+    /// it is stopped, and what it rolled back.
+    static let restoreAlertReason = "restore"
+
+    static func raiseRestoreAlert(_ db: Database, snapshot: String, summary: String, now: Date) throws {
+        let text = "Brahma was restored from \(snapshot) and is stopped. It \(summary). Grants revoked after the snapshot and every "
+            + "lab mark were kept; the machine-wide lab mark is set. Review, then resume (brahma resume)."
+        for company in try Company.fetchAll(db) {
+            try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .error, text: Store.flat(text, max: 4000),
+                              createdAt: now).insert(db)
+            // An earlier restore's alert still open in the snapshot says this one instead.
+            _ = try Ask.filter(Column("companyId") == company.id && Column("kind") == AskKind.engineAlert
+                               && Column("status") == AskStatus.pendingOwner.rawValue
+                               && Column("subjectId") == Store.engineAlertKey(restoreAlertReason))
+                .updateAll(db, Column("title").set(to: Store.flat(text, max: Store.maxAskTitle)),
+                           Column("summary").set(to: Store.stripControls(text, keepNewlines: true)), Column("updatedAt").set(to: now))
+            try Store.fileEngineAlert(db, company: company, reason: restoreAlertReason, text: text, now: now)
+        }
+    }
+
+    private static func carry(_ c: RestoreCarry, into db: Database, now: Date) throws {
+        // Revocations first (their own time and author), then every other grant the live database no longer counts (F1).
         for g in c.grants {
             if let revokedAt = g.revokedAt {
                 try db.execute(sql: #"UPDATE "grant" SET revokedAt = ?, revokedBy = ? WHERE id = ? AND revokedAt IS NULL"#,
@@ -126,6 +183,10 @@ struct RestoreCarry {
                 try db.execute(sql: #"UPDATE "grant" SET usesLeft = ? WHERE id = ? AND (usesLeft IS NULL OR usesLeft > ?)"#,
                                arguments: [uses, g.id, uses])
             }
+        }
+        for id in c.notLiveGrants {
+            try db.execute(sql: #"UPDATE "grant" SET revokedAt = ?, revokedBy = 'restore' WHERE id = ? AND revokedAt IS NULL"#,
+                           arguments: [now, id])
         }
         for m in c.labMarks {
             try db.execute(sql: """
@@ -175,6 +236,97 @@ struct RestoreCarry {
         }
         for id in c.taintedItems {
             try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE id = ?", arguments: [id])
+        }
+    }
+}
+
+extension RestoreCarry {
+    /// The settings the owner turns off to make Brahma safer (fix-wave F2), read from one database. Tables an older schema
+    /// lacks read as empty.
+    struct Settings {
+        var companies: [String: Company] = [:]
+        var agents: [String: (name: String, companyId: String, killed: Bool)] = [:]
+        /// `companyId|extension id` → enabled.
+        var extensions: [String: Bool] = [:]
+        /// `companyId|preset id` of every enabled access preset.
+        var presets: Set<String> = []
+        /// `companyId|secret name`.
+        var secrets: Set<String> = []
+        var ownerAutoMerge: Bool?
+
+        static func read(_ db: Database) throws -> Settings {
+            var s = Settings()
+            for c in try Company.fetchAll(db) { s.companies[c.id] = c }
+            for row in try Row.fetchAll(db, sql: "SELECT id, name, companyId, state FROM agent") {
+                s.agents[row["id"]] = (row["name"], row["companyId"], (row["state"] as String) == AgentState.killed.rawValue)
+            }
+            if try db.tableExists("companyExtension") {
+                for row in try Row.fetchAll(db, sql: "SELECT companyId, id, enabled FROM companyExtension") {
+                    s.extensions["\(row["companyId"] as String)|\(row["id"] as String)"] = row["enabled"]
+                }
+            }
+            if try db.tableExists("accessPreset") {
+                s.presets = Set(try Row.fetchAll(db, sql: "SELECT companyId, presetId FROM accessPreset WHERE enabled = 1")
+                    .map { "\($0["companyId"] as String)|\($0["presetId"] as String)" })
+            }
+            if try db.tableExists("secret") {
+                s.secrets = Set(try Row.fetchAll(db, sql: "SELECT companyId, name FROM secret").map { "\($0["companyId"] as String)|\($0["name"] as String)" })
+            }
+            if try db.tableExists("ownerSettings"), try db.columns(in: "ownerSettings").contains(where: { $0.name == "autoMerge" }) {
+                s.ownerAutoMerge = try Bool.fetchOne(db, sql: "SELECT autoMerge FROM ownerSettings WHERE id = 1")
+            }
+            return s
+        }
+
+        /// Every setting the owner had turned off (or narrowed, or removed) in `live` that `restored` has on again, in words.
+        static func rolledBack(live: Settings, restored: Settings) -> [String] {
+            var out: [String] = []
+            func companyName(_ id: String) -> String { restored.companies[id]?.name ?? live.companies[id]?.name ?? id }
+            func split(_ key: String) -> (String, String) {
+                let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+                return (parts.first ?? key, parts.count > 1 ? parts[1] : "")
+            }
+            for (id, c) in restored.companies.sorted(by: { $0.value.name < $1.value.name }) {
+                guard let now = live.companies[id] else { out.append("company \(c.name), removed after the snapshot, is back"); continue }
+                if c.permissionProfile.breadth > now.permissionProfile.breadth {
+                    out.append("\(c.name): profile \(c.permissionProfile.rawValue) again (it was \(now.permissionProfile.rawValue))")
+                }
+                for role in Set(c.roleProfiles.keys).union(now.roleProfiles.keys).sorted()
+                where c.profile(forRole: role).breadth > now.profile(forRole: role).breadth {
+                    out.append("\(c.name): role \(role) on \(c.profile(forRole: role).rawValue) again (it was \(now.profile(forRole: role).rawValue))")
+                }
+                for (what, back) in [("network domains", Set(c.allowedDomains).subtracting(now.allowedDomains)),
+                                     ("web domains", Set(c.webDomains).subtracting(now.webDomains)),
+                                     ("toolchain read paths", Set(c.toolchainReadPaths).subtracting(now.toolchainReadPaths))]
+                where !back.isEmpty {
+                    out.append("\(c.name): \(what) back: \(back.sorted().joined(separator: ", "))")
+                }
+                if c.allowLocalBinding, !now.allowLocalBinding { out.append("\(c.name): local listening allowed again") }
+                if c.autoMergeSmall, !now.autoMergeSmall { out.append("\(c.name): auto-merge on again") }
+            }
+            for (id, a) in restored.agents.sorted(by: { $0.value.name < $1.value.name }) where !a.killed {
+                if live.agents[id]?.killed ?? true {
+                    out.append("@\(a.name) (\(companyName(a.companyId))), removed after the snapshot, is back")
+                }
+            }
+            for (key, enabled) in restored.extensions.sorted(by: { $0.key < $1.key }) where enabled {
+                let (company, ext) = split(key)
+                switch live.extensions[key] {
+                case false?: out.append("\(companyName(company)): extension \(ext) enabled again")
+                case nil: out.append("\(companyName(company)): extension \(ext), removed after the snapshot, is back")
+                default: break
+                }
+            }
+            for key in restored.presets.subtracting(live.presets).sorted() {
+                let (company, preset) = split(key)
+                out.append("\(companyName(company)): access preset \(preset) on again")
+            }
+            for key in restored.secrets.subtracting(live.secrets).sorted() {
+                let (company, name) = split(key)
+                out.append("\(companyName(company)): secret \(name), removed after the snapshot, is listed again (its value is not)")
+            }
+            if restored.ownerAutoMerge == true, live.ownerAutoMerge == false { out.append("auto-merge on again (owner-wide)") }
+            return out
         }
     }
 }

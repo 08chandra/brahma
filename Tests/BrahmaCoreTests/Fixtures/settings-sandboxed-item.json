@@ -582,6 +582,12 @@
         "/Volumes",
         "$WS/.brahma",
         "$DARWIN",
+        "/private/tmp/claude-$UID",
+        "/tmp/claude-$UID",
+        "/private/tmp/claude-tool-results",
+        "/tmp/claude-tool-results",
+        "/private/tmp/b-test",
+        "/private/tmp/b-$UID",
         "$USERHOME/.ssh",
         "$USERHOME/.aws",
         "$USERHOME/.config/gh",
@@ -617,12 +623,7 @@
         "$USERHOME/Library/Application Support/Claude",
         "$USERHOME/Library/Application Support/Slack",
         "$USERHOME/Library/Application Support/1Password",
-        "$USERHOME/Library/Application Support/Code",
-        "/private/tmp/claude-$UID",
-        "/tmp/claude-$UID",
-        "/private/tmp/claude-tool-results",
-        "/tmp/claude-tool-results",
-        "/private/tmp/b-test"
+        "$USERHOME/Library/Application Support/Code"
       ],
       "denyWrite" : [
         "$USERHOME/.ssh",

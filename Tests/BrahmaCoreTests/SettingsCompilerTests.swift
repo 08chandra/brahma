@@ -52,6 +52,7 @@ private struct CompileWorld {
             .replacingOccurrences(of: userTemp.path, with: "$TMP")
             .replacingOccurrences(of: userTemp.deletingLastPathComponent().path, with: "$DARWIN")
             .replacingOccurrences(of: "claude-\(getuid())", with: "claude-$UID")
+            .replacingOccurrences(of: "/private/tmp/b-\(getuid())", with: "/private/tmp/b-$UID")
             .replacingOccurrences(of: "/private/tmp/b-test/[0-9a-f]{6}", with: "$AGENTTMP", options: .regularExpression)
             .replacingOccurrences(of: item.key, with: "$KEY")
     }

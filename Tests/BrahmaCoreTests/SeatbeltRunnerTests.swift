@@ -1095,6 +1095,8 @@ struct SeatbeltRunnerTests {
         #expect(profile.contains("(deny file-read* file-read-data (subpath \"\(ws.path)/.brahma\"))"), "\(profile)")
         #expect(profile.contains("(subpath \"/private/tmp/b-\(getuid())\")"))
         #expect(profile.contains("(subpath \"/private/tmp/claude-\(getuid())\")"))
+        // Fix-wave F4: Claude Code's daemon-control and pty socket folders too.
+        #expect(profile.contains("(subpath \"/private/tmp/cc-daemon-\(getuid())\")")); #expect(profile.contains("(subpath \"/private/tmp/cc-socks\")"))
     }
 
     /// I1: a normal Swift package builds in a check's checkout under the new read scope (the workspace listed, `.brahma`

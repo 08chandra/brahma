@@ -271,6 +271,11 @@ extension Store {
     /// Files one unresolved `engineAlert` ask per reason in the company (a repeat changes nothing). Runs in the caller's transaction
     /// and sends no DM of its own (`EngineAlerts.raise` has).
     func fileEngineAlert(_ db: Database, company: Company, reason: String, text: String, now: Date) throws {
+        try Store.fileEngineAlert(db, company: company, reason: reason, text: text, now: now)
+    }
+
+    /// `fileEngineAlert` without a store (a restore writes into a database no store has open yet).
+    static func fileEngineAlert(_ db: Database, company: Company, reason: String, text: String, now: Date) throws {
         let key = Store.engineAlertKey(reason)
         let open = try Ask.filter(Column("companyId") == company.id && Column("kind") == AskKind.engineAlert
                                   && Column("status") == AskStatus.pendingOwner.rawValue && Column("subjectId") == key).fetchCount(db)
