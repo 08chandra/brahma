@@ -69,3 +69,17 @@ BRAHMA_DEV=1 "$B" dev access Initech --by devops-1 --kind network_domain --value
 "$B" grants revoke Initech G-2 >/dev/null
 printf 'sk_test_51SeedOnlyNotARealKey0000\n' | "$B" secret set Initech STRIPE_TEST_KEY --test >/dev/null
 BRAHMA_DEV=1 "$B" dev digest Initech >/dev/null
+
+# Plan L: a web preview (python's http.server on the engine's port), a committed page on main, and hosting. The page is
+# committed with the engine identity and then accepted through the engine (`main accept` records mainCommit, PR-31): a
+# plain commit on main would otherwise trip the main guard.
+"$B" preview set Initech web --run "python3 -m http.server {port} --bind 127.0.0.1" --url "http://127.0.0.1:{port}/" >/dev/null
+cat >"$W/index.html" <<'HTML'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Habit tracker</title></head>
+<body><h1>Habit tracker</h1><p>Daily streaks, reminders and a weekly summary.</p></body></html>
+HTML
+git -C "$W" add index.html
+git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgsign=false commit -q -m "Habit tracker landing page" >/dev/null
+"$B" main accept Initech >/dev/null
+"$B" hosting set Initech --provider cloudflare-pages --project initech-demo --account-id 0123456789abcdef0123456789abcdef >/dev/null

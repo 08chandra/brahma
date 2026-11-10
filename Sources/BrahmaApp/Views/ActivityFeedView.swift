@@ -73,7 +73,7 @@ struct ActivityFeedView: View {
     }
 }
 
-private struct ActivityRow: View {
+struct ActivityRow: View {
     let event: ActivityEvent
     let handles: [String: String]
     let flashing: Bool

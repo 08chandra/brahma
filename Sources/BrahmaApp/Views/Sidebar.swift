@@ -18,6 +18,7 @@ struct Sidebar: View {
                 SectionHeader(title: "Work")
                 NavRow(title: "Backlog", icon: "list.bullet.indent", item: .backlog, model: model)
                 NavRow(title: "Board", icon: "rectangle.split.3x1", item: .board, model: model)
+                NavRow(title: "Releases", icon: "shippingbox", item: .releases, model: model, count: model.openReleaseCount)
                 NavRow(title: "Inbox", icon: "tray", item: .inbox, model: model, count: model.inboxCount)
                 NavRow(title: "Grants", icon: "key", item: .inboxGrants, model: model, indent: true)
                 NavRow(title: "Digest", icon: "doc.text", item: .inboxDigest, model: model, indent: true)
