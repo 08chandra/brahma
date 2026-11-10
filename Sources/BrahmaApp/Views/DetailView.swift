@@ -42,6 +42,8 @@ struct DetailView: View {
                     DigestView(model: model.digest)
                 case .settingsBackups:
                     BackupsView(model: model.backups)
+                case .releases:
+                    ContentUnavailableView("Releases", systemImage: "shippingbox")
                 case .companySettings:
                     CompanySettingsView(model: model)
                 case .channel, .dm:
