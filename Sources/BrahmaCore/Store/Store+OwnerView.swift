@@ -43,6 +43,14 @@ extension Store {
         }
     }
 
+    /// The newest `limit` events of one agent's turn, of the given kinds, oldest first (the app's turn stream).
+    public func turnEvents(agentId: String, turnId: String, kinds: Set<ActivityKind>, limit: Int) throws -> [ActivityEvent] {
+        try writer.read { db in
+            try ActivityEvent.filter(Column("turnId") == turnId && Column("agentId") == agentId && kinds.map(\.rawValue).contains(Column("kind")))
+                .order(Column("id").desc).limit(limit).fetchAll(db).reversed()
+        }
+    }
+
     /// The newest `limit` events for the company, oldest first.
     public func recentEvents(companyId: String, limit: Int) throws -> [ActivityEvent] {
         try writer.read { db in

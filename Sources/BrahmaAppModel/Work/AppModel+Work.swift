@@ -247,7 +247,7 @@ extension AppModel {
 
     /// Runs one owner write off the main actor, then refreshes. A refused write puts its reason in `errorMessage`.
     @discardableResult
-    private func ownerWrite<T: Sendable>(_ what: String, _ body: @escaping @Sendable (Store) throws -> T) async -> T? {
+    func ownerWrite<T: Sendable>(_ what: String, _ body: @escaping @Sendable (Store) throws -> T) async -> T? {
         let store = self.store
         do {
             let value = try await Task.detached { try body(store) }.value
