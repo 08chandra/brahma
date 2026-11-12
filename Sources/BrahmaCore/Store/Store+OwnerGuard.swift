@@ -79,6 +79,11 @@ extension Store {
         }
     }
 
+    /// Answers the open sandbox-check alert (a waiting key passed outside the engine and no other waited-on key is failing).
+    public func resolveSandboxCheckAlert(now: Date = Store.now()) throws {
+        try writer.write { db in try resolveEngineAlerts(db, reasons: [EngineAlerts.sandboxCheckReason], now: now) }
+    }
+
     /// Gives back one use of each grant (I2): a turn that consumed them and then did not launch. A grant revoked since stays
     /// revoked; only its counts go back.
     func restoreGrants(ids: [String], now: Date = Store.now()) throws {

@@ -185,12 +185,24 @@ extension Orchestrator {
     // MARK: Fan-out shapes (per-shape canary gating)
 
     /// Whether the sandbox canary passed for this fan-out shape's own key. If not, its canary is asked for in the background
-    /// (never holding the agent: the turn falls back to the computed non-fan-out rung) and false is returned.
+    /// (never holding the agent: the turn falls back to the computed non-fan-out rung) and false is returned. A launch the
+    /// canary cannot build (`SandboxCanaryRunning.verifies`: the production canary builds no fan-out shape yet) is never
+    /// asked for, run, alerted on or failed: those turns fall back silently, logged once per key.
     nonisolated func fanOutVerified(gate: SandboxCanaryGate, settings: ClaudeSettings, launch: String, company: Company) async -> Bool {
         guard let key = try? await canaryKey(gate: gate, shape: CanaryShape.key(settings, launch: launch)) else { return false }
         if (try? store.sandboxVerified(key)) == true { return true }
-        await requestCanary(key, settings: settings, company: company, launch: launch)
+        if gate.canary.verifies(launch: launch) {
+            await requestCanary(key, settings: settings, company: company, launch: launch)
+        } else {
+            await noteUnverifiableFanOut(key, launch: launch)
+        }
         return false
+    }
+
+    /// Logs once per key that the canary cannot verify this fan-out shape (no event, no alert).
+    func noteUnverifiableFanOut(_ key: SandboxCanaryKey, launch: String) {
+        guard canaryLogged.insert(key.text).inserted else { return }
+        log("the sandbox canary does not verify the \(launch) shape yet; those turns run without fan-out")
     }
 
     /// Schedules a canary run for a key no agent waits on (a fan-out shape's), logged once per key.

@@ -61,7 +61,11 @@ struct CanaryGroup: ParsableCommand {
             var seen = Set<String>()
             for company in (try? store.companies()) ?? [] where company.status == .running && company.permissionProfile == .sandboxed {
                 let spec = SandboxCanary.TurnSpec(company: company)
-                let shapeKey = "\(spec.allowedDomains?.isEmpty ?? false)|\(spec.webDomains?.isEmpty ?? false)|\(spec.allowLocalBinding ?? false)"
+                // Tied to `ClaudeSettings.shape()`, which keeps only an array's first element and turns every string into "s":
+                // of a company's network, only whether the Bash domain list is empty and the local-binding flag change the
+                // compiled shape (the WebFetch domains join `permissions.allow` after "Bash", so they never do; listed anyway).
+                // `canaryRunShapeKeyMatchesShape` checks this against the compiled shapes.
+                let shapeKey = SandboxCanary.TurnSpec.shapeKey(spec)
                 if seen.insert(shapeKey).inserted { specs.append((company.name, spec)) }
             }
             if specs.isEmpty { specs = [("the default sandboxed company", .standard)] }
@@ -78,9 +82,9 @@ struct CanaryGroup: ParsableCommand {
                 if var key = run.verified, run.passes(key) {
                     key.cliVersion = version
                     passed.append(key)
-                    // M2: the sandbox-check alert is answered only once every shape run here passed.
-                    let last = index == specs.count - 1
-                    do { try store.recordCanary(key, detail: run.detail, resolveAlert: last && failed == 0) } catch {
+                    // M2: this command cannot see which keys the engine is still failing, so it never answers the
+                    // sandbox-check alert itself; the engine does, once its waiting agents' keys have all passed.
+                    do { try store.recordCanary(key, detail: run.detail, resolveAlert: false) } catch {
                         throw fail("could not record the pass: \(error)")
                     }
                 } else {

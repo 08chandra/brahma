@@ -134,6 +134,13 @@ public struct CanaryRun: Sendable {
 public protocol SandboxCanaryRunning: Sendable {
     func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey,
              settings: ClaudeSettings?) async -> CanaryRun
+    /// Whether this canary can verify a key of this fan-out launch (`CanaryShape.launch`; nil: a plain turn) at all. The gate
+    /// never asks for one it cannot.
+    func verifies(launch: String?) -> Bool
+}
+
+extension SandboxCanaryRunning {
+    public func verifies(launch: String?) -> Bool { true }
 }
 
 /// How the planted token could show in output: raw, percent-encoded and JSON-escaped (the Redactor's forms), its bare UUID
@@ -235,8 +242,21 @@ public struct SandboxCanary: SandboxCanaryRunning {
     /// and proves nothing about the sandbox.
     static let notFoundStatus: Int32 = 127
 
-    /// Whether an exit-127 output is the sandbox refusing the exec (a denial) rather than a command that could not be found.
-    static func execRefused(_ output: String) -> Bool { output.lowercased().contains("operation not permitted") }
+    /// Whether an exit-127 output is the sandbox refusing the exec (a denial) rather than a command that could not be found:
+    /// only the shell's own exec-failure line naming the command ("zsh:1: operation not permitted: /bin/launchctl", "sh:
+    /// /bin/launchctl: Operation not permitted"), and never when the output also says "command not found" or "no such file
+    /// or directory".
+    static func execRefused(_ output: String, command: String) -> Bool {
+        let lower = output.lowercased()
+        guard !lower.contains("command not found"), !lower.contains("no such file or directory") else { return false }
+        let first = command.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? command
+        let name = URL(fileURLWithPath: first.trimmingCharacters(in: CharacterSet(charactersIn: "'\""))).lastPathComponent.lowercased()
+        guard !name.isEmpty else { return false }
+        return lower.split(separator: "\n").contains { $0.contains("operation not permitted") && $0.contains(name) }
+    }
+
+    /// What the agent's shell prefix prints when it can read the sentinel: no sandbox around it. Such a run proves nothing.
+    static let prefixRefusal = "brahma: sandbox is not active"
     /// The fan-out launches (`CanaryShape.launch`) whose keys the canary does not build yet.
     static let fanOutLaunches = ["task", "ultra-small", "ultra"]
 
@@ -262,6 +282,14 @@ public struct SandboxCanary: SandboxCanaryRunning {
         public init(company: Company) {
             let n = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: [])
             self.init(allowedDomains: n.allowedDomains, webDomains: n.webDomains, allowLocalBinding: n.allowLocalBinding)
+        }
+
+        /// What of a spec changes the compiled settings' shape (`ClaudeSettings.shape()` keeps an array's first element and
+        /// turns strings into "s"): whether the Bash domain list is empty, whether the WebFetch list is (it follows "Bash" in
+        /// `permissions.allow`, so in practice never), the local-binding flag and plan-ness. `brahma canary run` runs one
+        /// canary per distinct value.
+        public static func shapeKey(_ spec: TurnSpec) -> String {
+            "\(spec.allowedDomains?.isEmpty ?? false)|\(spec.webDomains?.isEmpty ?? false)|\(spec.allowLocalBinding ?? false)|\(spec.plan)"
         }
 
         /// The spec of an asking turn, read from its compiled settings.
@@ -340,9 +368,12 @@ public struct SandboxCanary: SandboxCanaryRunning {
         let agentId = "canary-\(id)"
         let otherHandle = "canary-other"
         let settingsFile = SettingsFile.path(paths: paths, agentId: agentId)
-        let taintDatabase = runDir.appending(path: "taint.sqlite")
+        // The engine's own files of the run (the throwaway taint database, the empty MCP config, the turn records) live in a
+        // sibling of the planted data-home place, so the planted places hold nothing but what was planted.
+        let engineDir = paths.runDir.appending(path: "canary-\(id)-engine", directoryHint: .isDirectory)
+        let taintDatabase = engineDir.appending(path: "taint.sqlite")
         var removals: [(url: URL, root: URL)] = [(ws, paths.workspaces), (other, paths.workspaces), (homeDir, environment.userHome),
-                                                  (runDir, paths.runDir), (settingsFile, paths.runDir)]
+                                                  (runDir, paths.runDir), (engineDir, paths.runDir), (settingsFile, paths.runDir)]
         if let flag = TaintFlag.url(home: paths.home, agentId: agentId) { removals.append((flag, paths.runDir)) }
         do {
             for dir in [ws, other, homeDir] {
@@ -350,6 +381,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             }
             try BrahmaPaths.ensurePrivateDirectory(runDir)
+            try BrahmaPaths.ensurePrivateDirectory(engineDir)
             func plant(_ dir: URL) throws -> URL {
                 let url = dir.appending(path: "token")
                 try SettingsFile.writePrivate(Data(token.utf8), to: url)
@@ -386,7 +418,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
                 try ClaudeTmp.ensure(tmp)
                 removals.append((tmp, tmp.deletingLastPathComponent()))
             }
-            let mcpConfig = runDir.appending(path: "empty.mcp.json")
+            let mcpConfig = engineDir.appending(path: "empty.mcp.json")
             try SettingsFile.writePrivate(Data("{\"mcpServers\":{}}".utf8), to: mcpConfig)
             var request = TurnRequest(agent: agent, company: company, prompt: "", appendSystemPrompt: nil,
                                       mcpConfigPath: mcpConfig.path, workingDirectory: scope.cwd.path, profile: .sandboxed,
@@ -397,7 +429,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
             request.shellPrefix = prefix.path
             request.containmentMarker = TurnProfileCompiler.containmentMarkerPrefix + UUID().uuidString.lowercased()
             request.settingsFilePath = settingsFile.path
-            request.turnRecordDirectory = runDir.appending(path: "turns", directoryHint: .isDirectory)
+            request.turnRecordDirectory = engineDir.appending(path: "turns", directoryHint: .isDirectory)
             request.mode = ModeCanary.shapes().first?.1
             request.hookExecutable = hookExecutable
             // As every sandboxed turn (`Orchestrator`): the PostToolUse taint hook, here against the canary's own throwaway
@@ -486,6 +518,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
         return "the canary's turn would not have the asking turn's settings shape, so no pass could be recorded for it (no model call)"
     }
+
+    /// Only plain turns: no fan-out (Task, Ultra) shape is built yet (`fanOutLaunches`).
+    public func verifies(launch: String?) -> Bool { launch == nil }
 
     public func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey,
                     settings: ClaudeSettings?) async -> CanaryRun {
@@ -577,18 +612,14 @@ public struct SandboxCanary: SandboxCanaryRunning {
 
     // MARK: Planted places (I1)
 
-    /// Every entry under the four planted places (relative path → type, size, modification time, inode, mode), never
-    /// following a link; the engine's own files in the canary's run directory (`turns`, the empty MCP config, the throwaway
-    /// taint database) are left out. Blocking.
+    /// Every entry under the four planted places (relative path → type, size, modification and status-change times, inode,
+    /// mode), never following a link. Nothing is left out: the engine's own files live elsewhere. Blocking.
     static func snapshot(_ p: Prepared) -> [String: String] {
-        let engineOwned: Set<String> = ["turns", "empty.mcp.json", "taint.sqlite", "taint.sqlite-wal", "taint.sqlite-shm",
-                                        "taint.sqlite-journal"]
         var out: [String: String] = [:]
         var budget = 500
-        func walk(_ dir: URL, _ shown: String, depth: Int, top: Bool) {
+        func walk(_ dir: URL, _ shown: String, depth: Int) {
             guard depth < 6, let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
             for name in names.sorted() where budget > 0 {
-                if top, shown.hasPrefix("the data home"), engineOwned.contains(name) { continue }
                 budget -= 1
                 let url = dir.appending(path: name)
                 var st = stat()
@@ -596,19 +627,21 @@ public struct SandboxCanary: SandboxCanaryRunning {
                 let type = st.st_mode & S_IFMT
                 #if canImport(Darwin)
                 let mtime = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
+                let ctime = Int64(st.st_ctimespec.tv_sec) * 1_000_000_000 + Int64(st.st_ctimespec.tv_nsec)
                 #else
                 let mtime = Int64(st.st_mtim.tv_sec) * 1_000_000_000 + Int64(st.st_mtim.tv_nsec)
+                let ctime = Int64(st.st_ctim.tv_sec) * 1_000_000_000 + Int64(st.st_ctim.tv_nsec)
                 #endif
                 let key = "\(shown)/\(name)"
                 if type == S_IFDIR {
                     out[key] = "dir \(st.st_ino) \(st.st_mode & 0o7777)"
-                    walk(url, key, depth: depth + 1, top: false)
+                    walk(url, key, depth: depth + 1)
                 } else {
-                    out[key] = "\(type) \(st.st_size) \(mtime) \(st.st_ino) \(st.st_mode & 0o7777)"
+                    out[key] = "\(type) \(st.st_size) \(mtime) \(ctime) \(st.st_ino) \(st.st_mode & 0o7777)"
                 }
             }
         }
-        for (name, url) in p.plantedPlaces { walk(url, name, depth: 0, top: true) }
+        for (name, url) in p.plantedPlaces { walk(url, name, depth: 0) }
         return out
     }
 
@@ -725,7 +758,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
 
         let control = await runOne(controlCommand, 0)
-        guard control.outcome.exitCode == 0, control.output.contains(p.controlText) else {
+        guard control.outcome.exitCode == 0, control.output.contains(p.controlText), !control.output.contains(prefixRefusal) else {
             return fail("the positive control (`\(controlCommand)` in the agent's own lab) did not succeed "
                         + "(exit \(control.outcome.exitCode.map(String.init) ?? "none")): the sandboxed runner ran nothing, so no probe counts")
         }
@@ -734,12 +767,14 @@ public struct SandboxCanary: SandboxCanaryRunning {
             let r = await runOne(probe.text, n + 1)
             let leaked = leak.found(in: r.output)
             let killed = r.outcome.timedOut
-            let notFound = r.outcome.exitCode == notFoundStatus && !execRefused(r.output)
-            let ran = (r.outcome.exitCode != nil || killed) && !notFound
+            let notFound = r.outcome.exitCode == notFoundStatus && !execRefused(r.output, command: probe.text)
+            let unsandboxed = r.output.contains(prefixRefusal)
+            let ran = (r.outcome.exitCode != nil || killed) && !notFound && !unsandboxed
             let denied = killed || (r.outcome.exitCode.map { $0 != 0 } ?? false)
             var result = CanaryProbeResult(layer: .local, probe: probe, ran: ran, exitStatus: r.outcome.exitCode, denied: denied,
                                            killed: killed, leaked: leaked, output: leak.redact(r.output),
-                                           note: notFound ? "command not found (exit 127): not run" : (ran ? nil : "could not run"))
+                                           note: unsandboxed ? "the shell prefix found no sandbox around it (\(prefixRefusal))"
+                                               : notFound ? "command not found (exit 127): not run" : (ran ? nil : "could not run"))
             if let planted, let change = plantedChange(planted, snapshot(p)) {
                 result.changedPlanted = true
                 result.note = "it changed a planted place: \(change)"
@@ -848,6 +883,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
         return (box.lines, box.error)
     }
 
+    /// The one bundled plugin left on (`ClaudeSettingsCompiler.bundledPluginNames`): the managed-settings security layer.
+    static let allowedPlugins: Set<String> = ["cc-plugin-sec-default@builtin"]
+
     /// The bundled skills `disableBundledSkills` leaves (`ClaudeSettingsCompiler.skillDenies`): all a canary turn may list.
     static var expectedSkills: Set<String> {
         Set(ClaudeSettingsCompiler.skillDenies.map { String($0.dropFirst("Skill(".count).dropLast()) })
@@ -867,7 +905,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
     static func judgeTurn(lines: [String], probes: [CanaryProbe], controlText: String, leak: CanaryLeakMatcher,
                           expectedTools: Set<String>, runError: String?, extra given: [String] = [])
         -> (item: DoctorItem, results: [CanaryProbeResult]) {
-        struct Use { var id: String; var name: String; var command: String? }
+        struct Use { var id: String; var name: String; var command: String?; var unsandboxed: Bool }
         var initLine: [String: Any]?
         var uses: [Use] = []
         var toolResults: [String: (isError: Bool, text: String)] = [:]
@@ -889,7 +927,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
             case "assistant":
                 for b in blocks(o) where b["type"] as? String == "tool_use" {
                     guard let id = b["id"] as? String, let name = b["name"] as? String else { continue }
-                    uses.append(Use(id: id, name: name, command: (b["input"] as? [String: Any])?["command"] as? String))
+                    let input = b["input"] as? [String: Any]
+                    uses.append(Use(id: id, name: name, command: input?["command"] as? String,
+                                    unsandboxed: (input?["dangerouslyDisableSandbox"] as? Bool) == true))
                 }
             case "user":
                 for b in blocks(o) where b["type"] as? String == "tool_result" {
@@ -897,9 +937,10 @@ public struct SandboxCanary: SandboxCanaryRunning {
                     toolResults[id] = ((b["is_error"] as? Bool) ?? false, text(b["content"]))
                 }
             case "result":
+                // Every result line's denials count (a stream may carry more than one).
                 let list = (o["permission_denials"] as? [[String: Any]]) ?? []
-                denials = list.compactMap { $0["tool_name"] as? String }
-                deniedUseIds = Set(list.compactMap { $0["tool_use_id"] as? String })
+                denials = (denials ?? []) + list.compactMap { $0["tool_name"] as? String }
+                deniedUseIds.formUnion(list.compactMap { $0["tool_use_id"] as? String })
             default:
                 break
             }
@@ -918,10 +959,12 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
         var extra: [String] = []
         if leakedLines > 0 { extra.append("a canary token appeared in \(leakedLines) stream line(s) (leak)") }
+        let outside = uses.filter { $0.name == "Bash" && $0.unsandboxed }.count
+        if outside > 0 { extra.append("\(outside) Bash call(s) asked to run outside the sandbox (dangerouslyDisableSandbox)") }
         extra += given
         // The positive control first: without it a stream in which nothing ran could look like a denial of everything.
         if let use = take(controlCommand), let r = toolResults[use.id], !deniedUseIds.contains(use.id) {
-            if r.isError || !r.text.contains(controlText) {
+            if r.isError || !r.text.contains(controlText) || r.text.contains(prefixRefusal) {
                 extra.append("the positive control (`\(controlCommand)` in the agent's own lab) did not succeed in the turn")
             }
         } else {
@@ -939,14 +982,25 @@ public struct SandboxCanary: SandboxCanaryRunning {
                 continue
             }
             guard let r = toolResults[use.id] else { notRun("no tool result came back"); continue }
-            let code = exitCode(r.text) ?? (r.isError ? nil : 0)
-            if code == notFoundStatus, !execRefused(r.text) {
+            if r.text.contains(prefixRefusal) { notRun("the shell prefix found no sandbox around it (\(prefixRefusal))"); continue }
+            // A failed result counts as run only with an exit status or an explicit timeout; an exit code is read only from a
+            // failed result (a successful one exited 0, whatever its text says).
+            let code: Int32?
+            var timedOut = false
+            if r.isError {
+                code = exitCode(r.text)
+                timedOut = r.text.range(of: "Command timed out", options: .caseInsensitive) != nil
+                if code == nil, !timedOut { notRun("the tool failed without an exit status (unverified)"); continue }
+            } else {
+                code = 0
+            }
+            if code == notFoundStatus, !execRefused(r.text, command: probe.text) {
                 results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: false, exitStatus: code, denied: true, leaked: leak.found(in: r.text),
                                                  output: leak.redact(r.text), note: "command not found (exit 127): not run"))
                 continue
             }
-            let denied = r.isError || (code.map { $0 != 0 } ?? false)
-            results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: true, exitStatus: code, denied: denied,
+            let denied = r.isError && (timedOut || (code.map { $0 != 0 } ?? false))
+            results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: true, exitStatus: code, denied: denied, killed: timedOut,
                                              leaked: leak.found(in: r.text), output: leak.redact(r.text)))
         }
         switch denials {
@@ -959,10 +1013,16 @@ public struct SandboxCanary: SandboxCanaryRunning {
         // capability and fails; an expected entry it lacks (2.1.322 omits `Skill` when no skill loads) is only noted.
         var notes: [String] = []
         if let o = initLine {
+            // A plugin is named by its `source` (`<name>@builtin`) when the line gives one, so only Claude Code's own bundled
+            // security layer is allowed, never a same-named plugin from elsewhere.
             func names(_ key: String) -> Set<String> {
-                Set(((o[key] as? [Any]) ?? []).compactMap { ($0 as? String) ?? (($0 as? [String: Any])?["name"] as? String) })
+                Set(((o[key] as? [Any]) ?? []).compactMap { entry -> String? in
+                    if let s = entry as? String { return s }
+                    guard let d = entry as? [String: Any] else { return nil }
+                    return key == "plugins" ? ((d["source"] as? String) ?? (d["name"] as? String)) : (d["name"] as? String)
+                })
             }
-            for (key, label, allowed) in [("tools", "tools", expectedTools), ("plugins", "plugins", Set<String>()),
+            for (key, label, allowed) in [("tools", "tools", expectedTools), ("plugins", "plugins", Self.allowedPlugins),
                                           ("skills", "skills", expectedSkills), ("mcp_servers", "MCP servers", Set<String>())] {
                 let got = names(key)
                 let more = got.subtracting(allowed).sorted(), less = allowed.subtracting(got).sorted()

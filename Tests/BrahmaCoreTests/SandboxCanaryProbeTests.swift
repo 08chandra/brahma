@@ -61,6 +61,21 @@ private final class AskedShapes: SandboxCanaryRunning, @unchecked Sendable {
     }
 }
 
+/// A canary that passes every key it is asked about, recording the shapes, and builds no fan-out shape (as the production one).
+private final class PlainOnlyCanary: SandboxCanaryRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _shapes: [String] = []
+    private var _passes: Bool
+    init(passes: Bool = true) { _passes = passes }
+    var shapes: [String] { lock.withLock { _shapes } }
+    var passes: Bool { get { lock.withLock { _passes } } set { lock.withLock { _passes = newValue } } }
+    func verifies(launch: String?) -> Bool { launch == nil }
+    func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey, settings: ClaudeSettings?) async -> CanaryRun {
+        let ok = lock.withLock { _shapes.append(key.shape); return _passes }
+        return CanaryRun(items: [DoctorItem(name: "sandbox-canary", status: ok ? .pass : .fail, detail: "fake")], verified: key)
+    }
+}
+
 /// How the fake model's turn goes: which commands it skips, what each tool result says, the init tools, whether Read is denied.
 private struct TurnPlay: Sendable {
     var skip: Set<String> = []
@@ -734,7 +749,210 @@ private let deniedProbes = """
             ["plugins": [["name": "cc-plugin-something-new", "path": "builtin", "source": "cc-plugin-something-new@builtin"]]]
         })))
         #expect(!run.passes(try #require(run.verified)))
-        #expect(try w.item(run, "sandbox-canary").detail.hasPrefix("the init plugins hold entries the shape does not allow (extra: cc-plugin-something-new)"))
+        #expect(try w.item(run, "sandbox-canary").detail.hasPrefix("the init plugins hold entries the shape does not allow (extra: cc-plugin-something-new@builtin)"))
+    }
+
+    // MARK: Final review round
+
+    /// I-A and minor 2: a failed result counts as run only with an exit status or an explicit timeout; a successful one exited 0.
+    @Test func aFailedResultWithoutAnExitStatusIsNotRun() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let noStatus = TurnPlay(result: { command, request in
+            command == "cat \"$CANARY_DATA_FILE\"" ? (true, "Error: something went wrong") : TurnPlay.denied(command, request)
+        })
+        let a = await w.run(w.canary(), runner: canaryRunner(noStatus))
+        #expect(try w.item(a, "sandbox-canary").detail.hasPrefix("probe line 4 was not run (unverified): the tool failed without an exit status"))
+        let timeout = TurnPlay(result: { command, request in
+            command == "cat \"$CANARY_DATA_FILE\"" ? (true, "Command timed out after 2m 0.0s") : TurnPlay.denied(command, request)
+        })
+        let b = await w.run(w.canary(), runner: canaryRunner(timeout))
+        #expect(b.passes(try #require(b.verified)), "\(b.items)")
+        #expect(b.probes.first { $0.layer == .turn && $0.line == 4 }?.killed == true)
+        let successText = TurnPlay(result: { command, request in
+            command == "cat \"$CANARY_DATA_FILE\"" ? (false, "Exit code 1\nnot really") : TurnPlay.denied(command, request)
+        })
+        let c = await w.run(w.canary(), runner: canaryRunner(successText))
+        #expect(try w.item(c, "sandbox-canary").detail.hasPrefix("probe line 4 failed (it was not denied: exit 0)"))
+    }
+
+    /// Minor 1: "operation not permitted" is a refused exec only as the shell's line naming the command, and never next to
+    /// "command not found" / "no such file or directory".
+    @Test func onlyTheShellsOwnExecRefusalCountsAsDenied() {
+        #expect(SandboxCanary.execRefused("zsh:1: operation not permitted: /bin/launchctl", command: "/bin/launchctl list"))
+        #expect(SandboxCanary.execRefused("sh: /usr/bin/security: Operation not permitted", command: "/usr/bin/security find-generic-password"))
+        #expect(!SandboxCanary.execRefused("cat: x: Operation not permitted", command: "/bin/launchctl list"), "not naming the command")
+        #expect(!SandboxCanary.execRefused("zsh:1: operation not permitted: launchctl\nzsh:1: no such file or directory: launchctl",
+                                           command: "launchctl list"))
+        #expect(!SandboxCanary.execRefused("zsh:1: command not found: x; operation not permitted: x", command: "x"))
+    }
+
+    /// Minor 3: a run the shell prefix refused (no sandbox around it) proves nothing and fails; so does any Bash call that
+    /// asked to run outside the sandbox.
+    @Test func unsandboxedRunsFail() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let local = FakeSandbox { probe, env, cwd in
+            probe == "cat \"$CANARY_DATA_FILE\"" ? CheckOutcome(exitCode: 126, timedOut: false, tail: "brahma: sandbox is not active; command refused")
+                : FakeSandbox.denyAll(probe, env, cwd)
+        }
+        let a = await w.run(w.canary(local: local))
+        #expect(try w.item(a, "sandbox-canary-local").detail.hasPrefix("probe line 4 was not run (unverified): the shell prefix found no sandbox"))
+        let dangerous = TurnPlay(extraLines: { _ in
+            [json(["type": "assistant", "message": ["content": [["type": "tool_use", "id": "toolu_x", "name": "Bash",
+                                                                 "input": ["command": "true", "dangerouslyDisableSandbox": true]]]]])]
+        })
+        let b = await w.run(w.canary(), runner: canaryRunner(dangerous))
+        #expect(!b.passes(try #require(b.verified)))
+        #expect(try w.item(b, "sandbox-canary").detail.hasPrefix("1 Bash call(s) asked to run outside the sandbox"))
+        let refusedInTurn = TurnPlay(result: { command, request in
+            command == "cat \"$CANARY_DATA_FILE\"" ? (true, "Exit code 126\nbrahma: sandbox is not active; command refused") : TurnPlay.denied(command, request)
+        })
+        let c = await w.run(w.canary(), runner: canaryRunner(refusedInTurn))
+        #expect(try w.item(c, "sandbox-canary").detail.hasPrefix("probe line 4 was not run (unverified): the shell prefix found no sandbox"))
+    }
+
+    /// Minor 4: the planted data-home place holds only its token; the engine's files of the run live in a sibling.
+    @Test func plantedPlacesHoldOnlyWhatWasPlanted() throws {
+        let w = try CanaryWorld()
+        let p = try SandboxCanary.prepare(paths: w.paths, environment: w.env, hookExecutable: "/usr/local/bin/brahma")
+        defer { p.cleanup() }
+        let dataPlace = p.dataHomeToken.deletingLastPathComponent()
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dataPlace.path) == ["token"])
+        for path in [p.request.mcpConfigPath, p.request.taintDatabase ?? "", p.request.turnRecordDirectory?.path ?? ""] {
+            #expect(!path.hasPrefix(dataPlace.path + "/"), "\(path)"); #expect(path.contains("-engine/"), "\(path)")
+        }
+        let snap = SandboxCanary.snapshot(p)
+        #expect(Set(snap.keys) == ["the owner's home/token", "the data home/token", "another company's workspace/token", "another agent's lab/token"])
+        #expect(snap.values.allSatisfy { $0.split(separator: " ").count == 6 }, "type, size, mtime, ctime, inode, mode")
+        // A change of status alone (chmod) is a change.
+        #expect(chmod(p.otherAgentToken.path, 0o400) == 0)
+        #expect(SandboxCanary.plantedChange(snap, SandboxCanary.snapshot(p)) == "another agent's lab/token")
+    }
+
+    /// Minor 5 and 6: denials of every result line count; exactly the bundled security plugin is allowed.
+    @Test func resultLinesUnionAndTheSecurityPlugin() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let twoResults = TurnPlay(readDenied: false, extraLines: { _ in
+            [json(["type": "result", "subtype": "success", "permission_denials": [["tool_name": "Read", "tool_use_id": "toolu_read"]]])]
+        })
+        let a = await w.run(w.canary(), runner: canaryRunner(twoResults))
+        #expect(a.passes(try #require(a.verified)), "\(a.items)")
+        let sec = TurnPlay(initExtras: { ["plugins": [["name": "cc-plugin-sec-default", "path": "builtin", "source": "cc-plugin-sec-default@builtin"]]] })
+        let b = await w.run(w.canary(), runner: canaryRunner(sec))
+        #expect(b.passes(try #require(b.verified)), "\(b.items)")
+        let impostor = TurnPlay(initExtras: { ["plugins": [["name": "cc-plugin-sec-default", "path": "/x", "source": "cc-plugin-sec-default@market"]]] })
+        let c = await w.run(w.canary(), runner: canaryRunner(impostor))
+        #expect(try w.item(c, "sandbox-canary").detail.hasPrefix("the init plugins hold entries the shape does not allow (extra: cc-plugin-sec-default@market)"))
+    }
+
+    /// Minor 7: `brahma canary run`'s dedupe key changes exactly when the compiled shape does.
+    @Test func canaryRunShapeKeyMatchesShape() throws {
+        let w = try CanaryWorld()
+        let specs: [SandboxCanary.TurnSpec] = [
+            .standard,
+            SandboxCanary.TurnSpec(allowedDomains: ["github.com"], webDomains: [], allowLocalBinding: false),
+            SandboxCanary.TurnSpec(allowedDomains: ["pypi.org", "crates.io"], webDomains: ["docs.rs"], allowLocalBinding: false),
+            SandboxCanary.TurnSpec(allowedDomains: [], webDomains: [], allowLocalBinding: false),
+            SandboxCanary.TurnSpec(allowedDomains: ["github.com"], webDomains: [], allowLocalBinding: true),
+            SandboxCanary.TurnSpec(allowedDomains: [], webDomains: ["docs.rs"], allowLocalBinding: true),
+        ]
+        var shapes: [String] = []
+        var keys: [String] = []
+        for spec in specs {
+            let p = try SandboxCanary.prepare(paths: w.paths, environment: w.env, hookExecutable: "/usr/local/bin/brahma", spec: spec)
+            shapes.append(p.settings.shape())
+            // `.standard` leaves the network to the company's defaults: key it by what those are (as `TurnSpec(company:)` does).
+            keys.append(SandboxCanary.TurnSpec.shapeKey(spec.allowedDomains == nil ? SandboxCanary.TurnSpec(settings: p.settings) : spec))
+            p.cleanup()
+        }
+        for i in specs.indices { for j in specs.indices {
+            let sameShape = shapes[i] == shapes[j]
+            let sameKey = keys[i].split(separator: "|").enumerated().filter { $0.offset != 1 }.map(\.element)
+                == keys[j].split(separator: "|").enumerated().filter { $0.offset != 1 }.map(\.element)
+            #expect(sameShape == sameKey, "\(i) vs \(j): \(shapes[i]) \(shapes[j]) \(keys[i]) \(keys[j])")
+        } }
+    }
+
+    /// I-B: a pass recorded outside the engine (`brahma canary run`) for a key in back-off frees its agents at the next tick,
+    /// with no new canary run, and the alert is answered.
+    @Test func aPassRecordedOutsideTheEngineFreesWaitingAgents() async throws {
+        let claude = try FakeTools.script("claude", "# SandboxCanaryProbeTests outside-pass fixture\nexit 0")
+        let canary = PlainOnlyCanary(passes: false)
+        var gate = SandboxCanaryGate(canary: canary, runner: FakeTurnRunner(), claudePath: claude.path, retryAfter: 3600)
+        gate.fingerprintCacheSeconds = 0
+        let world = try World(sandboxCanary: gate)
+        let company = try world.company("Vault", profile: .sandboxed)
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        try world.dm(company, eng, "go")
+        try await world.cycle()
+        try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(canary.shapes.count == 1)
+        let waiting = try #require(await world.orchestrator.canaryWaiting[eng.id])
+        #expect(await world.orchestrator.canaryFailedAt[waiting.text] != nil, "the key is in back-off")
+        try world.store.recordCanary(waiting, detail: "brahma canary run", resolveAlert: false)
+        try world.dm(company, eng, "go on")
+        try await world.cycle()
+        try await world.cycle()
+        #expect(world.fake.requests.contains { $0.agent.id == eng.id }, "the agent launched on the outside pass")
+        #expect(canary.shapes.count == 1, "no new canary run")
+        #expect(await world.orchestrator.canaryFailedAt.isEmpty)
+        let open = try world.store.asks(companyId: company.id).filter {
+            $0.kind == .engineAlert && $0.subjectId == EngineAlerts.askSubject(reason: EngineAlerts.sandboxCheckReason) && $0.status == .pendingOwner
+        }
+        #expect(open.isEmpty, "the alert was answered")
+    }
+
+    /// I-C: failure state is dropped with a key's last waiter (here its company leaves the Sandboxed profile).
+    @Test func failureStateGoesWithTheLastWaiter() async throws {
+        let claude = try FakeTools.script("claude", "# SandboxCanaryProbeTests prune fixture\nexit 0")
+        let canary = PlainOnlyCanary(passes: false)
+        var gate = SandboxCanaryGate(canary: canary, runner: FakeTurnRunner(), claudePath: claude.path, retryAfter: 3600)
+        gate.fingerprintCacheSeconds = 0
+        let world = try World(sandboxCanary: gate)
+        let company = try world.company("Vault", profile: .sandboxed)
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        try world.dm(company, eng, "go")
+        try await world.cycle()
+        try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(await !world.orchestrator.canaryFailedAt.isEmpty)
+        try world.store.updateSandbox(companyId: company.id, SandboxPatch(profile: .workspace), userHome: world.userHome)
+        try world.dm(company, eng, "go on")
+        try await world.cycle()
+        #expect(await world.orchestrator.canaryFailedAt.isEmpty)
+        #expect(await world.orchestrator.canaryFailures.isEmpty)
+    }
+
+    /// I-C: a fan-out shape the canary cannot build is never asked for, run or alerted on: the turn runs without fan-out.
+    @Test func fanOutShapesTheCanaryCannotBuildAreNeverAskedFor() async throws {
+        let claude = try FakeTools.script("claude", "# SandboxCanaryProbeTests fan-out fixture\nexit 0")
+        let canary = PlainOnlyCanary()
+        var gate = SandboxCanaryGate(canary: canary, runner: FakeTurnRunner(), claudePath: claude.path, retryAfter: 0)
+        gate.fingerprintCacheSeconds = 0
+        let world = try World(sandboxCanary: gate)
+        let company = try world.company("Acme", mode: .max, profile: .sandboxed)
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        let item = try world.store.createWorkItem(companyId: company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "T", acceptanceCriteria: "ok", checkSpec: CheckSpec(command: "true", paths: ["src/a"]), status: .ready),
+            now: world.clock.now)
+        _ = try CompanyTools(store: world.store, companyId: company.id, agentId: eng.id).call(name: "claim_lease", arguments: ["key": .string(item.key)])
+        let fp = try CLIFingerprint.of(claudePath: claude.path).key
+        for g in ["L-2", "V-2", "V-3", "V-5"] {
+            try world.store.recordProbeGate(GateResult(gate: g, shape: .sandboxedTask, passed: true, detail: "test"), fingerprint: fp, now: world.clock.now)
+        }
+        func requests() -> [TurnRequest] { world.fake.requests.filter { $0.agent.id == eng.id } }
+        for _ in 0..<6 where requests().count < 2 {
+            try world.dm(company, eng, "go")
+            try await world.cycle()
+            try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        }
+        #expect(requests().count >= 2)
+        for r in requests() { #expect(!(TurnProfileCompiler.profile(for: r).tools ?? []).contains("Task")) }
+        #expect(Set(canary.shapes).count == 1, "only the plain shape was asked for: \(canary.shapes)")
+        #expect(!(try world.store.events(afterId: 0, companyId: company.id)).contains { $0.text.hasPrefix("sandbox not verified for the task shape") })
+        let alerts = try world.store.asks(companyId: company.id).filter { $0.kind == .engineAlert }
+        #expect(alerts.isEmpty)
     }
 
     /// The gate's retry delay doubles with each failure of a key, capped.

@@ -94,15 +94,39 @@ extension Orchestrator {
         scheduleCanary(key)
     }
 
-    /// Each tick, before `Scheduler.select` (I1): drops waits whose agent no longer runs sandboxed, starts the next due canary,
-    /// and returns the agents still waiting, which get no slot. From memory only: no I/O per tick.
+    /// Each tick, before `Scheduler.select` (I1): drops waits whose agent no longer runs sandboxed, frees the agents of a key in
+    /// back-off that passed meanwhile (`brahma canary run` records passes outside the engine: one query per such key), starts
+    /// the next due canary, and returns the agents still waiting, which get no slot. Otherwise from memory only.
     func canaryTick(ready: [Agent], companies: [String: Company]) -> Set<String> {
         guard !canaryWaiting.isEmpty else { return [] }
         for a in ready where canaryWaiting[a.id] != nil {
             if let c = companies[a.companyId], turnProfile(agent: a, company: c) != .sandboxed { canaryWaiting[a.id] = nil }
         }
+        var freed = false
+        for key in Set(canaryWaiting.values) where canaryFailedAt[key.text] != nil {
+            guard (try? store.sandboxVerified(key)) == true else { continue }
+            canaryWaiting = canaryWaiting.filter { $0.value != key }
+            canaryFailedAt[key.text] = nil
+            canaryFailures[key.text] = nil
+            freed = true
+            log("sandbox canary pass found for a waiting key (recorded outside the engine); its agents start")
+        }
+        pruneCanaryFailures()
+        // The pinned alert is answered once no key that agents still wait on is failing (M2).
+        if freed, canaryFailedAt.isEmpty {
+            let now = clock()
+            attempt { try store.resolveSandboxCheckAlert(now: now) }
+        }
         for key in Set(canaryWaiting.values).sorted(by: { $0.text < $1.text }) { scheduleCanary(key) }
         return Set(canaryWaiting.keys)
+    }
+
+    /// Forgets the failure state (time and count) of every key no agent waits on any more, so a stale failing key never holds
+    /// back answering the sandbox-check alert and a key asked for again starts its back-off over.
+    func pruneCanaryFailures() {
+        let live = Set(canaryWaiting.values.map(\.text))
+        canaryFailedAt = canaryFailedAt.filter { live.contains($0.key) }
+        canaryFailures = canaryFailures.filter { live.contains($0.key) }
     }
 
     /// Whether `agent` still waits for a canary (the backstop in `launch`): until its key passed, or its company no longer runs
@@ -112,6 +136,7 @@ extension Orchestrator {
         let stillSandboxed = (try? store.company(id: agent.companyId)).flatMap { $0 }.map { turnProfile(agent: agent, company: $0) == .sandboxed } ?? false
         if !stillSandboxed || (try? store.sandboxVerified(key)) == true {
             canaryWaiting[agent.id] = nil
+            pruneCanaryFailures()
             return false
         }
         return true
@@ -162,11 +187,13 @@ extension Orchestrator {
             canaryFailedAt[key.text] = nil
             canaryFailures[key.text] = nil
             canarySettings[key.text] = nil
+            canaryWaiting = canaryWaiting.filter { $0.value != key }
+            pruneCanaryFailures()
+            // M2: answered only when no key that agents still wait on is failing.
             let resolve = canaryFailedAt.isEmpty
             attempt {
                 try store.recordCanary(key, detail: run.detail, now: now, resolveAlert: resolve)
             }
-            canaryWaiting = canaryWaiting.filter { $0.value != key }
             log("sandbox canary passed (claude \(key.cliVersion ?? "?"))")
             return
         }
@@ -177,6 +204,7 @@ extension Orchestrator {
         if let verified = run.verified, verified.fingerprint != key.fingerprint || verified.osVersion != key.osVersion {
             canaryWaiting = canaryWaiting.filter { $0.value != key }
             canarySettings[key.text] = nil
+            pruneCanaryFailures()
         }
         var bad = run.items.filter { $0.status != .pass }.map { "\($0.name): \($0.detail)" }
         if run.verified != key, !run.items.isEmpty { bad.append("canary shape differs from the turn's (nothing recorded)") }
