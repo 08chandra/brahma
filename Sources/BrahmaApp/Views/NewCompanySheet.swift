@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import BrahmaAppModel
 
@@ -6,14 +7,29 @@ struct NewCompanySheet: View {
     @State private var form = CompanyForm()
     @State private var submitError: String?
     @State private var submitting = false
+    @State private var start: Start = .new
+    @State private var repoText = ""
     @FocusState private var focus: Field?
 
-    private enum Field { case name, goal }
+    private enum Field { case name, goal, repo }
+    /// Plan L Task 14: a new empty workspace, or an existing repo the engine clones into it.
+    private enum Start: Hashable { case new, repo }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             PanelHeader(title: "New company")
             VStack(alignment: .leading, spacing: BrahmaTheme.spaceM) {
+                VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
+                    CapsLabel("Start")
+                    Picker("Start", selection: $start) {
+                        Text(verbatim: "NEW").tag(Start.new)
+                        Text(verbatim: "EXISTING REPO").tag(Start.repo)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                }
+                if start == .repo { repoField }
                 VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
                     CapsLabel("Name")
                     TextField("Name", text: $form.name, prompt: Text(verbatim: "Company name"))
@@ -65,6 +81,9 @@ struct NewCompanySheet: View {
                 if let message = submitError ?? form.validate() {
                     Text(verbatim: message).foregroundStyle(BrahmaTheme.danger).font(BrahmaTheme.monoSmall)
                 }
+                if submitting, start == .repo {
+                    Text(verbatim: "Cloning and checking the repo…").font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2)
+                }
             }
             .padding(BrahmaTheme.spaceL)
             Hairline()
@@ -84,6 +103,40 @@ struct NewCompanySheet: View {
         .frame(width: 480)
         .background(BrahmaTheme.bg1)
         .onAppear { focus = .name }
+        .onChange(of: start) { syncSource() }
+        .onChange(of: repoText) { syncSource() }
+    }
+
+    /// EXISTING REPO: a folder or an https URL, typed or chosen.
+    private var repoField: some View {
+        VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
+            CapsLabel("Repository")
+            HStack(spacing: BrahmaTheme.spaceS) {
+                TextField("Repository", text: $repoText, prompt: Text(verbatim: "/path/to/folder or https://host/owner/repo"))
+                    .font(BrahmaTheme.mono)
+                    .focused($focus, equals: .repo)
+                    .brahmaField(focused: focus == .repo)
+                Button("Choose Folder…") { chooseFolder() }
+                    .buttonStyle(.brahma)
+            }
+            Text(verbatim: "Brahma clones it into the company workspace. Your original is never changed or pushed to.")
+                .font(BrahmaTheme.monoSmall)
+                .foregroundStyle(BrahmaTheme.text2)
+        }
+    }
+
+    private func syncSource() {
+        form.source = start == .new ? .greenfield : .repo(repoText)
+        submitError = nil
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url { repoText = url.path }
     }
 
     private func create() {

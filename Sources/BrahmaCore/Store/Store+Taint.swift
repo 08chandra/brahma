@@ -347,6 +347,55 @@ extension Store {
         }
     }
 
+    // MARK: Import mark (Plan L Task 14)
+
+    /// An imported company's mark (owner ruling 2026-11-12: everything imported is outside content): the company lab mark (S31)
+    /// with source `import: <host>`. While it stands every work turn of the company is tainted at launch with that source
+    /// (`TurnContext.relayedTaint`), and no lab commit there records clean. The owner ends it like any company mark
+    /// (`brahma lab clear-taint <company>`, `clearCompanyLabTaint`).
+    static func markImported(_ db: Database, companyId: String, source: String, now: Date) throws {
+        try db.execute(sql: """
+            INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, ?, NULL, ?)
+            ON CONFLICT(companyId) DO UPDATE SET source = excluded.source, markedAt = excluded.markedAt
+            """, arguments: [companyId, Store.flat(source, max: 200), now])
+    }
+
+    /// The owner trusts an imported repo (`brahma company trust-import`, owner shell only; never a company tool): work turns are
+    /// no longer tainted at launch. The company mark stays as an ordinary lab mark (labs were worked in by tainted sessions
+    /// while the import mark stood; `brahma lab clear-taint` is the separate decision), and every session of the company's
+    /// agents that the mark tainted is ended in the same transaction (what it read stays out of every later turn), recorded
+    /// as an activity event. Returns the import mark's source, or nil when none stood. The caller holds the engine lock with no
+    /// turn in progress (`RepoImport.trust`).
+    @discardableResult
+    public func trustImport(companyId: String, now: Date = Store.now()) throws -> String? {
+        try writer.write { db in
+            guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+            guard let source = try String.fetchOne(db, sql: "SELECT source FROM companyTaint WHERE companyId = ? AND source LIKE 'import: %'",
+                                                    arguments: [companyId]) else { return nil }
+            try db.execute(sql: "UPDATE companyTaint SET source = ? WHERE companyId = ?",
+                           arguments: [Store.flat("labs worked in while the import mark stood (\(source))", max: 200), companyId])
+            for agent in try Agent.filter(Column("companyId") == companyId).fetchAll(db) where agent.sessionTainted || agent.freshSessionRequested {
+                try Store.markLabTainted(db, agentId: agent.id, source: agent.taintSources.split(separator: "\n").first.map(String.init) ?? source, now: now)
+                try Store.forceFreshSession(db: db, agentId: agent.id, itemId: nil, reason: "tainted", now: now)
+                try db.execute(sql: "DELETE FROM agentSession WHERE agentId = ?", arguments: [agent.id])
+                try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0, taintSources = '' WHERE id = ?",
+                               arguments: [agent.id])
+            }
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .approval,
+                              text: "The owner trusted the imported repo (\(source)): work turns are no longer tainted at launch and every "
+                                + "agent starts a fresh session; labs stay marked until brahma lab clear-taint", createdAt: now).insert(db)
+            return source
+        }
+    }
+
+    /// The import mark's source (`import: <host>`) while it stands, else nil.
+    public func importTaint(companyId: String) throws -> String? {
+        try writer.read { db in
+            try String.fetchOne(db, sql: "SELECT source FROM companyTaint WHERE companyId = ? AND source LIKE 'import: %'",
+                                arguments: [companyId])
+        }
+    }
+
     /// The company's own lab mark (S31), or nil.
     public func companyLabTaint(companyId: String) throws -> (source: String, profile: String, markedAt: Date)? {
         try writer.read { db in

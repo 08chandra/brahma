@@ -396,15 +396,22 @@ public final class AppModel {
         let goal = form.goal.trimmingCharacters(in: .whitespacesAndNewlines)
         let store = self.store, root = paths.workspaces
         let count = form.agentCount, packId = form.packId, mode = form.usageMode
+        let source: RepoSource?
+        if case .repo(let text) = form.source { source = try RepoSource.parse(text) } else { source = nil }
+        let paths = self.paths
         let company = try await Task.detached { () -> Company in
             // The seat budget follows the plan tier (`Store.seatBudget()`); the rest of the shape waits as vacancies.
             let seats = store.seatBudget()
-            var company = try store.createCompany(name: name, goal: goal, workspacesRoot: root, packId: packId)
+            // Task 14: the engine's own fetch, refused (size, file count, LFS) before the company exists.
+            let staged = try source.map { try RepoImport.stage($0, paths: paths) }
+            defer { staged?.discard() }
+            var company = try store.createCompany(name: name, goal: goal, workspacesRoot: root, packId: packId, importing: staged)
             if count > 0, let pack = store.catalog.pack(packId) {
                 let plan = try OrgGenerator.generate(goal: goal, count: count, pack: pack)
                 let staffed = OrgGenerator.staff(plan: plan, pack: pack, readyWidth: 0, seatBudget: seats)
                 try store.applyOrg(companyId: company.id, plan: staffed.seated, pack: pack, vacancies: staffed.vacancies)
             }
+            if let staged { _ = try RepoImport.onboard(store: store, company: company, staged: staged) }
             if mode != company.usageMode { company = try store.updateCompany(id: company.id) { $0.usageMode = mode } }
             return company
         }.value

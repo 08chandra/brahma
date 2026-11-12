@@ -774,6 +774,14 @@ enum Migrations {
             // Human tasks (Task 9) reuse 5-lite's `blockedAskId`/`blockedAskBy` (PR-30); only the status to restore is new.
             try db.alter(table: "workItem") { t in t.add(column: "statusBeforeBlock", .text) }
         }
+        m.registerMigration("vL-import") { db in
+            // Task 14: where an imported company's workspace came from (the folder, or the https URL without userinfo) and
+            // `main` as the import left it.
+            try db.alter(table: "company") { t in
+                t.add(column: "importedFrom", .text)
+                t.add(column: "importedCommit", .text)
+            }
+        }
     }
 
     /// Task 12 fix 1 (`v5-restore`): one row per restore (`nonce`, also in the restore marker; `consumedAt` once the engine has

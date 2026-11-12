@@ -6,7 +6,7 @@ struct CompanyGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "company", abstract: "Create and manage companies.",
         subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self, Autonomy.self, Auto.self,
-                      SetSetting.self, CompanyProfile.self])
+                      SetSetting.self, CompanyProfile.self, TrustImport.self])
 
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String
@@ -16,12 +16,16 @@ struct CompanyGroup: ParsableCommand {
         @Flag(help: "Print the org that would be created and change nothing.") var dryRun = false
         @Option(help: "A demo company. live: a four-agent org, hosting on the default provider, the hosting-account task and the owner's kickoff for a one-page waitlist site.")
         var demo: Demo?
+        @Option(name: .customLong("from-repo"),
+                help: "Start from an existing repo: a local folder or an https:// URL. Brahma clones it into the company workspace; the original is never changed or pushed to.")
+        var fromRepo: String?
 
         enum Demo: String, ExpressibleByArgument { case live }
 
         func run() throws {
             try requireOwnerShell()
             if let demo {
+                guard fromRepo == nil else { throw fail("--demo \(demo.rawValue) can't be combined with --from-repo") }
                 // The demo builds its own org; a dry run of it would still create a company and post the kickoff.
                 guard !dryRun, agents == nil, pack == nil else {
                     throw fail("--demo \(demo.rawValue) can't be combined with --dry-run, --agents or --pack")
@@ -38,6 +42,9 @@ struct CompanyGroup: ParsableCommand {
                 return
             }
             guard let goal else { throw fail("--goal is required (or use --demo live)") }
+            // Checked before anything is planned or fetched (Task 14).
+            let source: RepoSource?
+            do { source = try fromRepo.map(RepoSource.parse) } catch { throw fail(safe(error.localizedDescription)) }
             let agents = agents ?? 6
             let pack = pack ?? "software"
             guard agents == 0 || OrgGenerator.range.contains(agents) else {
@@ -58,12 +65,17 @@ struct CompanyGroup: ParsableCommand {
                 staffed = OrgGenerator.staff(plan: plan, pack: industry, readyWidth: 0, seatBudget: seats)
             }
             if dryRun {
+                if let source { print(safe("Would import \(source.importedFrom) (nothing is fetched in a dry run).")) }
                 guard let full, let staffed else { print("(empty company)"); return }
                 for line in full.treeLines(vacant: Set(staffed.vacancies.map(\.handle))) { print(safe(line)) }
                 return
             }
             let (store, paths2) = try openStore()
-            let c = try store.createCompany(name: name, goal: goal, workspacesRoot: paths2.workspaces, packId: pack)
+            // The engine's own fetch (never an agent turn), refused before the company exists: size, file count, Git LFS.
+            let staged: RepoImport.Staged?
+            do { staged = try source.map { try RepoImport.stage($0, paths: paths2) } } catch { throw fail(safe(error.localizedDescription)) }
+            defer { staged?.discard() }
+            let c = try store.createCompany(name: name, goal: goal, workspacesRoot: paths2.workspaces, packId: pack, importing: staged)
             // The engine-owned pre-commit hook (Task 5a); a refusal is reported, the company stands.
             do {
                 let layout = SandboxLayout(paths: paths2, company: c, agentHandle: "engine")
@@ -78,6 +90,37 @@ struct CompanyGroup: ParsableCommand {
                 let hired = try store.applyOrg(companyId: c.id, plan: staffed.seated, pack: industry, vacancies: staffed.vacancies)
                 print("hired \(hired.count) of \(agents); \(staffed.vacancies.count) seats vacant")
             }
+            if let staged {
+                let done = try RepoImport.onboard(store: store, company: try store.company(id: c.id) ?? c, staged: staged)
+                let commits = "\(done.commits) commit\(done.commits == 1 ? "" : "s")" + (staged.shallow ? ", shallow" : "")
+                let survey = done.assignee.map { "\(done.spike.key) asks @\($0.name) to survey it." }
+                    ?? "\(done.spike.key) waits for someone to survey it."
+                print(safe("Imported \(staged.source.importedFrom) at \(staged.head.prefix(7)) (\(commits)); \(survey)"))
+                if let ask = done.scanAsk { print("Secret scan: \(done.findings) findings, see Inbox \(ask.ref).") }
+                print(safe("Everything imported is outside content: every work turn here runs with its high-risk tools off until you "
+                           + "have read the survey and trust the repo (brahma company trust-import \(c.slug))."))
+            }
+        }
+    }
+
+    struct TrustImport: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "trust-import",
+            abstract: "Trust an imported repo (owner only), after you have read it or its survey.",
+            discussion: "Until then every work turn of the company is tainted at launch (its high-risk tools are off: decisions, "
+                + "owner requests, sprint plans, preview, smoke and deploy config, deploy proposals). Trusting ends every tainted "
+                + "session; agents' labs stay marked until 'brahma lab clear-taint'. Stop the engine first.")
+        @Argument(help: "Company name or slug.") var company: String
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let source: String?
+            do { source = try RepoImport.trust(store: store, paths: paths, companyId: c.id) }
+            catch let e as LabProvenance.ClearRefused { throw fail("refused: \(e.message)") }
+            print(safe(source.map { "\(c.name): trusted the imported repo (\($0)); every agent starts a fresh session" }
+                       ?? "\(c.name) carries no import mark"))
         }
     }
 

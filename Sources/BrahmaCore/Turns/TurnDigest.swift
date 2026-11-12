@@ -117,6 +117,8 @@ public struct TurnContext: Sendable {
         if FileManager.default.fileExists(atPath: notes.path) { c.notesPath = notes.path }
 
         c.relayedTaint = store.relayedTaint(inbox: inbox, notices: batch.shown, handoff: nil, handles: handles)
+        // Plan L Task 14: an imported company's files are outside content; every work turn there reads them.
+        if c.relayedTaint == nil, let imported = try store.importTaint(companyId: company.id) { c.relayedTaint = imported }
         guard let item else { return c }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let git = store.gitWorkspace(root: workspace, companyId: company.id)

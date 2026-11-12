@@ -192,8 +192,12 @@ public final class Store: Sendable {
         return out
     }
 
+    /// `importing`: a repository `RepoImport.stage` fetched and inspected (Plan L Task 14). It is renamed into place as the
+    /// workspace (the staging area is on the same volume), `ensureRepo` adopts its `main`, the company records where it came
+    /// from, and the import taint mark (`import: <host>`) is set in the same transaction, so no turn of the company ever runs
+    /// without it. A workspace folder already at the company's path refuses the import (nothing is merged into one).
     public func createCompany(name: String, goal: String, workspacesRoot: URL, packId: String = "software",
-                              packVersion: Int? = nil) throws -> Company {
+                              packVersion: Int? = nil, importing staged: RepoImport.Staged? = nil) throws -> Company {
         guard let pack = catalog.pack(packId) else { throw OrgError.unknownPack }
         let base = Store.slug(for: name).isEmpty ? "company" : Store.slug(for: name)
         let createdAt = Store.now()
@@ -210,10 +214,23 @@ public final class Store: Sendable {
                 status: .running, usageMode: .balanced, priorityWeight: 1, createdAt: createdAt,
                 packId: packId, packVersion: packVersion ?? pack.version)
             company.cadence = CadenceKind(rawValue: pack.defaultCadence) ?? .sprint
+            if let staged {
+                company.importedFrom = staged.source.importedFrom
+                company.importedCommit = staged.head
+            }
             try company.insert(db)
             // Directory is created only after the row is in; a failure here rolls the insert back.
-            let existed = FileManager.default.fileExists(atPath: dir.path)
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            var st = stat()
+            let existed = lstat(dir.path, &st) == 0
+            if let staged {
+                guard !existed else {
+                    throw RepoImportError(message: "the workspace folder \(dir.path) already exists; move it away or pick another name")
+                }
+                try FileManager.default.createDirectory(at: workspacesRoot, withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: staged.directory, to: dir)
+            } else {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
             do {
                 // The engine's git output for this init goes under the data home (A-I1b), never the shared per-user temp dir.
                 let git = GitWorkspace(root: dir, exportHome: dataHome)
@@ -224,12 +241,19 @@ public final class Store: Sendable {
                     company.mainCommit = head
                 }
             } catch {
-                if !existed { try? FileManager.default.removeItem(at: dir) }
+                if !existed { RepoImport.remove(dir) }
                 let detail: String
                 if case GitError.failed(_, _, let stderr) = error { detail = stderr } else { detail = "\(error)" }
                 throw StoreError.gitRequired(detail)
             }
-            try Store.insertChannel(db, companyId: company.id, name: "general", kind: .channel, members: ["owner"], now: createdAt)
+            do {
+                if let staged { try Store.markImported(db, companyId: company.id, source: staged.source.taintSource, now: createdAt) }
+                try Store.insertChannel(db, companyId: company.id, name: "general", kind: .channel, members: ["owner"], now: createdAt)
+            } catch {
+                // The insert rolls back; an adopted import does not stay behind as a workspace no company owns.
+                if staged != nil { RepoImport.remove(dir) }
+                throw error
+            }
             return company
         }
     }
@@ -268,6 +292,9 @@ public final class Store: Sendable {
                 kept.smokeCheck = stored.smokeCheck
                 kept.smokeCheckSetById = stored.smokeCheckSetById
                 kept.redBugItemId = stored.redBugItemId
+                // Set once at creation (Task 14).
+                kept.importedFrom = stored.importedFrom
+                kept.importedCommit = stored.importedCommit
             }
             try kept.update(db)
         }

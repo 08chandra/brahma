@@ -27,7 +27,16 @@ public struct CompanyForm: Equatable, Sendable {
     public var agentCount = 6
     public var packId = "software"
     public var usageMode: UsageMode = .balanced
+    /// Where the code comes from (Plan L Task 14): a new empty workspace, or an existing repo (a folder or an https URL) the
+    /// engine clones into the company workspace.
+    public var source: Source = .greenfield
 
+    public enum Source: Equatable, Sendable {
+        case greenfield
+        case repo(String)
+    }
+
+    public static let repoRequiredMessage = "Choose a folder or enter an https:// URL"
     public static let agentCountMessage = "Agents must be 0 (add them later) or 5–500"
     public static let experimentalThreshold = 50
     public static let experimentalWarning = "Org sizes over 50 are experimental."
@@ -45,6 +54,10 @@ public struct CompanyForm: Equatable, Sendable {
         if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Name is required" }
         if goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Goal is required" }
         if agentCount != 0, !OrgGenerator.range.contains(agentCount) { return Self.agentCountMessage }
+        if case .repo(let text) = source {
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return Self.repoRequiredMessage }
+            do { _ = try RepoSource.parse(text) } catch { return error.localizedDescription }
+        }
         return nil
     }
 

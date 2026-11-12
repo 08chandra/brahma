@@ -25,6 +25,26 @@ import BrahmaCore
         #expect(form.validate() == "Name is required")
     }
 
+    /// Plan L Task 14: the EXISTING REPO option validates its field with `RepoSource.parse`'s messages.
+    @Test func importSourceValidation() throws {
+        var form = CompanyForm(name: "Acme", goal: "Ship")
+        #expect(form.source == .greenfield && form.validate() == nil)
+        form.source = .repo("  ")
+        #expect(form.validate() == "Choose a folder or enter an https:// URL")
+        form.source = .repo("ssh://git@github.com/a/b.git")
+        #expect(form.validate() == RepoImport.sourceMessage)
+        form.source = .repo("https://u:p@github.com/a/b")
+        #expect(form.validate() == RepoImport.credentialsMessage)
+        form.source = .repo("https://github.com/acme/site.git")
+        #expect(form.validate() == nil)
+        let repo = try tempDir()
+        try FileManager.default.createDirectory(at: repo.appending(path: ".git"), withIntermediateDirectories: true)
+        form.source = .repo(repo.path)
+        #expect(form.validate() == nil)
+        form.name = ""
+        #expect(form.validate() == "Name is required")
+    }
+
     @Test func previewMatchesGenerator() throws {
         let catalog = PackCatalog.builtin
         let pack = try #require(catalog.pack("software"))

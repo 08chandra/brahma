@@ -74,6 +74,8 @@ public enum CompanySecurity {
         // plus a passing run at the release commit; the red-main bug id is engine bookkeeping.
         "smokeCheck": "agent-set check command, not an owner switch; deploys still need the owner and a passing run",
         "smokeCheckSetById": "who set the smoke check", "redBugItemId": "engine bookkeeping for the red-main bug",
+        // Plan L (Task 14): provenance, set once at creation; the import's taint mark lives in `companyTaint`, carried on its own.
+        "importedFrom": "provenance of an imported workspace", "importedCommit": "provenance of an imported workspace",
     ]
 
     /// The restored company with every security-relevant field at the stricter of the two, and what that changed.

@@ -37,6 +37,8 @@ A native SwiftUI app (dark ops-console look) over the same engine.
 
 ```
 brahma company create <name> --goal <text>      prints id + workspace path
+brahma company create <name> --goal <text> --from-repo <folder|https-url>   start from an existing repo
+brahma company trust-import <name>              lift an imported repo's taint (owner only, engine stopped)
 brahma company list
 brahma company pause|resume <name>
 brahma company mode <name> low|balanced|max     concurrency: 2 / 6 / hard cap
@@ -507,6 +509,27 @@ or in the Inbox; decline it with `brahma task decline`. A work item an agent blo
 the `hosting-account` task already in your Inbox, and the owner's kickoff in #general. Do the hosting task, then approve the
 brief and the deploy when they arrive. The default goal is a one-page waitlist site. `brahma dev release-scenario` (with
 `BRAHMA_DEV=1`) populates a dev home's Releases and Inbox against a loopback dev host; it never contacts a provider.
+
+**Start from an existing repo.** `brahma company create <name> --goal … --from-repo <folder|https-url>` (or EXISTING REPO
+in the app's New company sheet) clones an existing repository into the new company's workspace. The source is a local folder
+holding a git repository, or an `https://` URL. Nothing else: ssh, `git@…`, `git://`, `http://` and hand-typed `file://` are
+refused, and so is a URL with credentials or a query (put credentials in a human task, not in the URL; for a private repo,
+clone it yourself and pass the folder). The engine fetches it itself, never an agent turn, through its hardened git: an
+empty template (no hooks), one fetch by URL and refspec (no remote is ever configured, so the original is never pushed to
+and is never changed), fsck on every object, no tags, no submodules, no LFS smudge, no filters, hooks or fsmonitor, TLS
+verified, a redirect followed only to https, no credential helper or prompt, and a 600 s limit per step. A folder's own
+git config is checked first: one that names a program (a hook path, fsmonitor command, filter, pager, include, credential
+helper and the like) refuses the import; import a fresh `git clone` of it instead. History: from a folder, the current
+branch's full history comes over and becomes `main`; from https only the tip comes over (`--depth 1`), as one root commit
+whose message names the upstream commit. Before the company exists the import is refused, and nothing is kept, when the
+repo is over 2 GB (working tree plus `.git`, also enforced while the fetch runs) or 100 000 files, or uses Git LFS. The
+repo's `.claude/`, `.mcp.json`, `CLAUDE.md` and `AGENTS.md` stay plain files that no turn loads. Everything imported is
+scanned for secrets; findings (names and files, never values) become one Inbox question, and the import goes ahead. The
+CTO (or the CEO) gets a ready spike to survey the repo and propose its check, preview and deploy config. Everything
+imported is outside content: until you trust it with `brahma company trust-import <co>` (with the engine stopped, after
+reading the repo or the survey), every work turn of the company is tainted at launch (`import: <host>`, `import: local`
+for a folder), so decisions, owner requests, sprint plans, preview, smoke and deploy config and deploy proposals are off,
+and agents' labs stay marked until `brahma lab clear-taint <co>`.
 
 ```
 brahma preview <co>                                            previews: name, kind, status, url, commit

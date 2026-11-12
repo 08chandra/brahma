@@ -35,6 +35,29 @@ public enum EngineFiles {
         case unsafe(UnsafeEngineFile)
     }
 
+    // MARK: Sizes
+
+    /// The bytes of every entry under `root` (`lstat` sizes; a link counts as itself and is never followed, nothing is opened
+    /// or read), summed until the total passes `stopAbove`. A directory that vanishes or cannot be read counts as what was
+    /// seen of it. For the import's size cap (Plan L Task 14): the engine's own fresh repository, while git fills it.
+    public static func treeBytes(_ root: URL, stopAbove: Int64 = .max) -> Int64 {
+        var total: Int64 = 0
+        var pending = [root.path]
+        while let dir = pending.popLast() {
+            var st = stat()
+            guard lstat(dir, &st) == 0 else { continue }
+            total += Int64(st.st_size)
+            guard st.st_mode & S_IFMT == S_IFDIR, let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
+            for name in names {
+                let path = dir + "/" + name
+                guard lstat(path, &st) == 0 else { continue }
+                if st.st_mode & S_IFMT == S_IFDIR { pending.append(path) } else { total += Int64(st.st_size) }
+                if total > stopAbove { return total }
+            }
+        }
+        return total
+    }
+
     // MARK: Directories
 
     /// `<workspace>/<relative>` (such as `.brahma/notes`) as a real directory; missing parts are created. Throws

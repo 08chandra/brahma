@@ -64,6 +64,12 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// The open system bug filed when main went red (`"Main is red at <sha7>: smoke check failed"`), until a green run.
     public var redBugItemId: String? = nil
 
+    // Start from an existing repo (Plan L Task 14, `"vL-import"`). Set once, at creation; `updateCompany` keeps the stored values.
+    /// The folder or https URL the workspace was imported from (any userinfo stripped); nil for a greenfield company.
+    public var importedFrom: String? = nil
+    /// `main` as the import left it.
+    public var importedCommit: String? = nil
+
     /// The profile a turn of an agent with this role runs under: the role's override, else the company's.
     public func profile(forRole role: String) -> PermissionProfile { roleProfiles[role] ?? permissionProfile }
 }
