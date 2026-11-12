@@ -460,12 +460,17 @@ writes into the restored one what must not roll back:
 - every taint mark: agent sessions, items, lab and company marks, the machine-wide mark, and lab commits recorded tainted.
 
 It also always sets the machine-wide lab mark, so no lab commit made after the snapshot is recorded clean; clear it with
-`brahma lab clear-taint --machine-wide` once you have checked the labs. Other settings are not carried: the restored
-database has the snapshot's values. The restore lists every setting you had turned off, narrowed or removed that it
-brought back: removed companies and agents, a wider company or role profile, network and web domains, toolchain read
-paths, local listening, auto-merge (per company and owner-wide), disabled or removed extensions, access presets, and
-removed secret entries (their values are not restored). The list is printed by the CLI, put in the stop note and raised
-as an engine alert in every company. Review it before you resume. If the current database cannot be read, every grant is
+`brahma lab clear-taint --machine-wide` once you have checked the labs.
+
+For each security-relevant company setting, the restore keeps the stricter of the current and the snapshot's value:
+autonomy, the company and role profiles, toolchain read paths, network and web domains (only entries both allow are
+kept), local listening, auto-merge, and the pause. Owner-wide, auto-merge stays off if it is off now, and the
+auto-merge folder list is the narrower of the two. Where auto-merge is kept off, auto-approvals in the snapshot that
+have not landed go back to a normal review, as when you switch it off. Other rows are not carried, only reported:
+companies and agents removed after the snapshot come back, and so do disabled or removed extensions, access presets
+and removed secret entries (their values are not restored). The restore lists each setting it kept stricter and each
+row it brought back. The list is printed by the CLI, put in the stop note and raised as an engine alert in every
+company. Review it before you resume. If the current database cannot be read, every grant is
 revoked, every agent session and open item is marked, and the list says that what was rolled back is unknown. Ultra
 approvals used after the snapshot become usable again, and messages, hand-offs and events made after it are gone.
 
