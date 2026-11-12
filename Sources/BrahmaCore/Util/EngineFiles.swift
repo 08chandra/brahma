@@ -82,7 +82,10 @@ public enum EngineFiles {
     /// At most `limit` bytes of `name`; nil when it does not exist. Throws `UnsafeEngineFile` when it is a link, or fails
     /// `copyProblem` (not a regular file, another hard link, another owner) on the opened descriptor, or a read fails part-way
     /// (never a truncated result).
-    public static func read(workspace: URL, dir relative: String, name: String, limit: Int = defaultReadLimit) throws -> Data? {
+    /// `problem` replaces `copyProblem` as the check on the opened descriptor (a stricter one, such as the canary probe file's
+    /// exact mode).
+    public static func read(workspace: URL, dir relative: String, name: String, limit: Int = defaultReadLimit,
+                            problem: (stat) -> String? = copyProblem) throws -> Data? {
         let dfd = try openDirectory(workspace: workspace, relative)
         defer { close(dfd) }
         let shown = logical(workspace, relative).appending(path: name).path
@@ -97,7 +100,7 @@ public enum EngineFiles {
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else { throw UnsafeEngineFile(path: shown, problem: "cannot be read") }
-        if let problem = copyProblem(st) { throw UnsafeEngineFile(path: shown, problem: problem) }
+        if let found = problem(st) { throw UnsafeEngineFile(path: shown, problem: found) }
         return try readAll(fd: fd, limit: limit, shown: shown)
     }
 
