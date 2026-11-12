@@ -148,9 +148,19 @@ public enum BuiltinTools {
 }
 
 public enum ClaudeSettingsCompiler {
-    /// The bundled plugins `disableBundledSkills` leaves on; both are turned off by name.
-    public static let disabledBuiltinPlugins: [String: Bool] = ["cc-plugin-agents-md@builtin": false,
-                                                                "cc-plugin-plugin-authoring@builtin": false]
+    /// The plugins Claude Code bundles (`cc-plugin-*@builtin`; 2.1.322 registers fourteen), each turned off by name on every
+    /// turn: `disableBundledSkills` leaves them on, and the init line of a 2.1.322 `-p` turn listed `cc-plugin-privacy` and
+    /// `cc-plugin-telemetry` (sandbox canary, live run). The sandbox canary judges the init `plugins` by the subset rule, so a
+    /// bundled plugin a later CLI adds keeps the canary failing until it is reviewed and added here. `cc-plugin-sec-default`
+    /// is left alone: it is the managed-settings security layer for Team and Enterprise organizations, adds no policy of its
+    /// own, and is not ours to switch off.
+    public static let bundledPluginNames = [
+        "cc-plugin-agents-md", "cc-plugin-claude-platform", "cc-plugin-claude-test", "cc-plugin-diff", "cc-plugin-easel",
+        "cc-plugin-mermaid", "cc-plugin-mods-guide", "cc-plugin-plugin-authoring", "cc-plugin-privacy", "cc-plugin-responsive-mode",
+        "cc-plugin-telemetry", "cc-plugin-tips", "cc-plugin-you-should-know",
+    ]
+    public static let disabledBuiltinPlugins: [String: Bool] =
+        Dictionary(uniqueKeysWithValues: bundledPluginNames.map { ("\($0)@builtin", false) })
     /// Nested `claude` (F1), on every profile: a turn never starts another session of its own.
     public static let nestedClaudeDenies = ["Bash(claude *)", "Bash(*/claude *)"]
     /// The bundled skills left after `disableBundledSkills`, denied when `--disable-slash-commands` must go (F10).

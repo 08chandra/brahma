@@ -711,6 +711,32 @@ private let deniedProbes = """
         #expect(p.settings.shape() == shape)
     }
 
+    /// Every bundled `cc-plugin-*` (2.1.322's, but the managed-settings security layer) is off by name in the compiled
+    /// settings of every sandboxed turn, the canary's included; the canary's subset rule still fails a bundled plugin a later
+    /// CLI adds.
+    @Test func theCompiledSettingsDisableTheBundledPlugins() async throws {
+        let w = try CanaryWorld()
+        let p = try SandboxCanary.prepare(paths: w.paths, environment: w.env, hookExecutable: "/usr/local/bin/brahma")
+        defer { p.cleanup() }
+        let plugins = try #require(p.settings.enabledPlugins)
+        for name in ["cc-plugin-privacy", "cc-plugin-telemetry", "cc-plugin-agents-md", "cc-plugin-plugin-authoring", "cc-plugin-diff",
+                     "cc-plugin-mermaid", "cc-plugin-easel", "cc-plugin-claude-platform", "cc-plugin-claude-test", "cc-plugin-mods-guide",
+                     "cc-plugin-responsive-mode", "cc-plugin-tips", "cc-plugin-you-should-know"] {
+            #expect(plugins["\(name)@builtin"] == false, "\(name)")
+        }
+        #expect(plugins["cc-plugin-sec-default@builtin"] == nil, "the managed security layer is not switched off")
+        #expect(plugins.values.allSatisfy { $0 == false })
+        let written = try JSONDecoder().decode(ClaudeSettings.self, from: Data(contentsOf: URL(fileURLWithPath: try #require(p.request.settingsFilePath))))
+        #expect(written.enabledPlugins == plugins)
+        // A bundled plugin a later CLI adds still fails the canary until it is reviewed.
+        try w.writeProbes(deniedProbes)
+        let run = await w.run(w.canary(), runner: canaryRunner(TurnPlay(initExtras: {
+            ["plugins": [["name": "cc-plugin-something-new", "path": "builtin", "source": "cc-plugin-something-new@builtin"]]]
+        })))
+        #expect(!run.passes(try #require(run.verified)))
+        #expect(try w.item(run, "sandbox-canary").detail.hasPrefix("the init plugins hold entries the shape does not allow (extra: cc-plugin-something-new)"))
+    }
+
     /// The gate's retry delay doubles with each failure of a key, capped.
     @Test func canaryRetryBacksOff() {
         #expect(Orchestrator.canaryRetryDelay(retryAfter: 600, failures: 1) == 600)

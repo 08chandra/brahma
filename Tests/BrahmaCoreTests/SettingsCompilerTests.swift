@@ -400,7 +400,7 @@ private func pretty(_ settings: ClaudeSettings) throws -> String {
         for profile in PermissionProfile.allCases {
             let s = settings(w.request(profile == .sandboxed ? try w.scope(.work) : nil, profile: profile))
             #expect(s.disableBundledSkills == true)
-            #expect(s.enabledPlugins == ["cc-plugin-agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false])
+            #expect(s.enabledPlugins == ClaudeSettingsCompiler.disabledBuiltinPlugins)
         }
         // Full: no sandbox and no path denies.
         let full = settings(w.request(nil, profile: .full))

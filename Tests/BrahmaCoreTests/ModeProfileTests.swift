@@ -67,8 +67,8 @@ private let allModes = [quick, standard, deep, deepOpus]
         // 3a's keys plus 5-lite's (Task 1b): disableBundledSkills, disableSkillShellExecution, the two builtin plugins off, and
         // the nested-claude denies.
         let settingsJSON = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disableBundledSkills\":true,"
-            + "\"disableSkillShellExecution\":true,\"disableWorkflows\":true,\"enabledPlugins\":{\"cc-plugin-agents-md@builtin\":false,"
-            + "\"cc-plugin-plugin-authoring@builtin\":false},"
+            + "\"disableSkillShellExecution\":true,\"disableWorkflows\":true,\"enabledPlugins\":{"
+            + "\"cc-plugin-agents-md@builtin\":false,\"cc-plugin-claude-platform@builtin\":false,\"cc-plugin-claude-test@builtin\":false,\"cc-plugin-diff@builtin\":false,\"cc-plugin-easel@builtin\":false,\"cc-plugin-mermaid@builtin\":false,\"cc-plugin-mods-guide@builtin\":false,\"cc-plugin-plugin-authoring@builtin\":false,\"cc-plugin-privacy@builtin\":false,\"cc-plugin-responsive-mode@builtin\":false,\"cc-plugin-telemetry@builtin\":false,\"cc-plugin-tips@builtin\":false,\"cc-plugin-you-should-know@builtin\":false},"
             // 1b fix round 1 (C1): the pre-tool hook in exec form, blocking when it cannot run.
             + "\"fastMode\":false,\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"args\":[\"hook\",\"pre-tool\",\"--mode\",\"quick\"],"
             + "\"command\":\"\(hookExe)\",\"onFailure\":\"block\",\"type\":\"command\"}],\"matcher\":\"Agent|Task|Workflow\"}]},\"maxEffortLevel\":\"low\","
