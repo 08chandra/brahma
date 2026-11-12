@@ -627,7 +627,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
     ///   if that result is an error or reports a non-zero exit; a probe never run (or with no result) fails as unverified;
     /// - the positive control's result must be a success printing the control text;
     /// - the result line's `permission_denials` must name `Read`;
-    /// - the init line's `tools` must equal `expectedTools`.
+    /// - the init line's `tools` may hold no tool beyond `expectedTools` (an expected tool it lacks is only noted).
     static func judgeTurn(lines: [String], probes: [CanaryProbe], controlText: String, tokenForms: [String],
                           expectedTools: Set<String>, runError: String?) -> (item: DoctorItem, results: [CanaryProbeResult]) {
         struct Use { var id: String; var name: String; var command: String? }
@@ -712,13 +712,14 @@ public struct SandboxCanary: SandboxCanaryRunning {
             extra.append("Read was not denied (permission_denials: \(names.isEmpty ? "none" : names.joined(separator: ", ")))")
         default: break
         }
+        // Subset rule (owner ruling, live run on 2.1.322): a tool the session has beyond the shape's list is an extra capability
+        // and fails; an expected tool it lacks (2.1.322 omits `Skill` when no skill loads) is only noted.
+        var absentNote: String?
         if let tools = initTools {
             let got = Set(tools)
-            if got != expectedTools {
-                let more = got.subtracting(expectedTools).sorted(), less = expectedTools.subtracting(got).sorted()
-                extra.append("the init tools differ from the shape's" + (more.isEmpty ? "" : " (extra: \(more.joined(separator: ", ")))")
-                             + (less.isEmpty ? "" : " (missing: \(less.joined(separator: ", ")))"))
-            }
+            let more = got.subtracting(expectedTools).sorted(), less = expectedTools.subtracting(got).sorted()
+            if !more.isEmpty { extra.append("the init tools hold tools the shape does not allow (extra: \(more.joined(separator: ", ")))") }
+            if !less.isEmpty { absentNote = "info: expected tools absent from the init list: \(less.joined(separator: ", "))" }
         } else {
             extra.append("the turn has no init line")
         }
@@ -726,8 +727,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
                                + "stream lines", results: results, extra: extra)
         if item.status == .pass {
             item.detail = item.detail.replacingOccurrences(of: " probe(s) denied (", with: " probe(s) denied, the positive control ran, "
-                                                           + "Read was denied, the init tools match, no token streamed (")
+                                                           + "Read was denied, no init tool beyond the shape's, no token streamed (")
         }
+        if let absentNote { item.detail += "; " + absentNote }
         return (item, results)
     }
 

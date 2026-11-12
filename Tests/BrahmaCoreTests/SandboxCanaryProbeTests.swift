@@ -379,13 +379,25 @@ private let deniedProbes = """
         #expect(try w.item(run, "sandbox-canary").detail.hasPrefix("Read was not denied"))
     }
 
-    @Test func initToolsMismatchBlocks() async throws {
+    /// The init tools are judged by the subset rule: a tool beyond the shape's list (an extra capability) blocks.
+    @Test func anExtraInitToolBlocks() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes)
         let run = await w.run(w.canary(), runner: canaryRunner(TurnPlay(tools: BuiltinTools.sandboxed + ["Task"])))
         #expect(!run.passes(try #require(run.verified)))
         let detail = try w.item(run, "sandbox-canary").detail
-        #expect(detail.hasPrefix("the init tools differ"), "\(detail)"); #expect(detail.contains("extra: Task"))
+        #expect(detail.hasPrefix("the init tools hold tools the shape does not allow (extra: Task)"), "\(detail)")
+    }
+
+    /// An expected tool the session lacks (2.1.322 lists no `Skill` when no skill loads) is noted, never a failure.
+    @Test func aMissingExpectedInitToolPassesWithANote() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let run = await w.run(w.canary(), runner: canaryRunner(TurnPlay(tools: BuiltinTools.sandboxed.filter { $0 != "Skill" })))
+        let item = try w.item(run, "sandbox-canary")
+        #expect(item.status == .pass, "\(item.detail)")
+        #expect(item.detail.contains("info: expected tools absent from the init list: Skill"))
+        #expect(run.passes(try #require(run.verified)))
     }
 
     @Test func aTokenAnywhereInTheStreamBlocks() async throws {

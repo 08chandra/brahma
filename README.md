@@ -298,7 +298,7 @@ spliced into the command). Every probe runs twice: model-free, through a throwaw
 Seatbelt sandbox (10 s each, after a positive control that must succeed), then in one small haiku turn under the real
 compiled settings (budget- and time-capped), judged only from its raw stream: each probe's tool result must be an
 error or a non-zero exit, a probe the model did not run fails, no stream line may contain the token, the Read of the
-home token must be a permission denial, and the session's tools must be the expected ones. A probe passes only if it
+home token must be a permission denial, and the session may have no tool beyond the expected ones. A probe passes only if it
 was denied and printed no token. A line ending in `# helper` is warn-only (`sandbox-helpers`). The file's SHA-256 is
 part of the canary key, so any edit needs a new pass: `brahma canary run` runs both layers now, prints each line's
 verdict, exit status and redacted output, and records the pass; the engine also runs it when a sandboxed agent waits.
