@@ -160,20 +160,22 @@ turns, tokens, cost); they are only recorded, never used to schedule or judge: `
 nothing runs.
 
 **Work modes.** The engine picks Quick, Standard or Deep per turn. Plan-first is off on this CLI version (probe V-4);
-sub-agents (Task/Agent/Workflow) are off until the sandbox (5-lite). The plan tier is a setting (`brahma settings plan`,
-default max5x).
+sub-agents (Task/Agent/Workflow) never run on Workspace or Full companies. On Sandboxed companies they stay off until
+their probe gates pass for the installed CLI build: L-2, V-3 and V-5, plus V-2 or V-8 (`brahma mode gates`; see
+[Safety](#safety)). The plan tier is a setting (`brahma settings plan`, default max5x).
 
 **Engine git safety.** Engine git ignores repository filters, drivers, hooks and replace objects, and allowlists
-repository config. Workspaces whose repo config has `remote.*` (clones), LFS, `core.autocrlf`, aliases or submodules
-are refused until 5-lite. Merges run in an engine-owned repo under the data home and land only the verified SHA.
+repository config. A workspace whose repo config sets any key outside that short allowlist is refused, with an owner
+alert; that includes `remote.*` (clones), LFS filters, `core.autocrlf`, aliases and submodules. Merges run in an engine-owned repo under the data home and land only the verified SHA.
 Uncommitted changes found on `main` are quarantined under `refs/brahma/quarantine/*` and merges wait for you:
 approving Brahma's ask (or `brahma main accept <company> <ref>`) merges exactly the recorded commit; rejecting it
 leaves `main` as it is and keeps the ref. "main changed outside Brahma" needs `brahma main accept <company>`. Git state
 planted in the workspace repo that would hold merges (stale lock files, `shallow`, `info/grafts`, deleted history
 objects) is repaired and reported to you.
 
-**Owner key.** `brahma owner init` (in an interactive terminal) or the Mac app creates it. It is a deterrent until
-5-lite, not a boundary; `BRAHMA_OWNER_KEY_STORE=file` is only for temp or demo homes.
+**Owner key.** `brahma owner init` (in an interactive terminal) or the Mac app creates it. On Sandboxed
+companies the sandbox enforces it, because agents cannot read the data home or the Keychain; on Workspace and Full
+companies it is still only a deterrent. `BRAHMA_OWNER_KEY_STORE=file` is only for temp or demo homes.
 
 **Commands.**
 
@@ -199,16 +201,19 @@ brahma doctor                                               probe the installed 
 
 Workspace profile only: an agent's Bash is not sandboxed. The engine refuses owner commands from inside a turn, but a determined process can escape that check; use Sandboxed (the default).
 
-**Checks and merges run as your user.** Each item's check runs in that item's git worktree with `/bin/sh`.
-Verification, merges and owner approvals are engine-owned for every agent tool, but under the workspace profile an
-agent's shell can still edit the database or the git repository directly, or run the brahma CLI. Brahma refuses owner
-commands when `BRAHMA_AGENT_ID` is set and strips `BRAHMA_DEV` from agent turns, but an agent can unset variables. Only
-the sandbox (Plan 5-lite) makes verification and approvals tamper-proof.
+**Checks and merges.** Each item's check runs with `/bin/sh` in an engine-made checkout under the data home. A
+Workspace company's checks are sandboxed like a Sandboxed company's (see [Safety](#safety)); only Full-profile checks run
+unconfined as your user. Verification, merges and owner approvals are engine-owned for every agent tool, but under the
+workspace profile an agent's shell can still edit the database or the git repository directly, or run the brahma CLI.
+Brahma refuses owner commands when `BRAHMA_AGENT_ID` is set and strips `BRAHMA_DEV` from agent turns, but an agent can
+unset variables. So on Workspace and Full companies, verification and approvals are not tamper-proof; on Sandboxed
+companies agents cannot read or write the data home (which holds the database) or git's config, hooks and `main` ref.
 
 A nested `claude` launched from an agent's Bash can load your settings (`fastMode`, `enableWorkflows`) and Keychain
-auth. Brahma sets environment defusers, but an agent can unset them, which is why sub-agents and Ultra wait for the
-sandbox. Other 5-lite residuals: the race between the git-config scan and the command that follows it, agent worktrees
-under `.brahma/wt`, and the database and MCP configs staying readable by agent shells.
+auth. Brahma sets environment defusers, but an agent can unset them, which is why sub-agents and Ultra run only on
+Sandboxed companies, and only once their probe gates pass. Also open on Workspace and Full companies, and closed by the
+Sandboxed profile's write and read denies: the race between the git-config scan and the command that follows it, agent
+worktrees under `.brahma/wt`, and the database and MCP configs staying readable by agent shells.
 
 **Large repositories.** Each landing into `main` fetches the history it needs into a fresh engine-owned repository, so on a
 very large repository a merge costs a full-history fetch. This is acceptable for the workspaces Brahma creates; the 4a merge
@@ -251,14 +256,22 @@ Switching a company back to Sandboxed does not rule out a process an earlier Wor
 - write outside its own places in the workspace: the item turn's worktree, or the agent's lab, plus its home (with its
   own cache inside) and its notes file. `.brahma/cache` and the other engine-owned parts of `.brahma`, and git's
   config, hooks, `info/` and `main` ref, are write-denied;
-- reach the network except through Brahma's egress proxy: Bash gets HTTPS (port 443) to the allowlisted hosts only, and
-  only at public addresses (loopback, private ranges and cloud metadata are refused). WebFetch has its own list. Anthropic's
-  domains are never allowed. Listening on loopback is off unless you turn it on;
+- reach hosts outside its allowlist: Bash's network is limited by Claude Code's own sandbox network allowlist
+  (`sandbox.network.allowedDomains`), set from the company's Bash list plus the agent's granted domains. Turns do not go
+  through Brahma's egress proxy. WebFetch has its own list. Anthropic's domains are never allowed. Listening on loopback
+  is off unless you turn it on;
 - use helper programs that act outside the sandbox: the Keychain, the pasteboard, screen capture, `open` (LaunchServices),
   `osascript` (Apple events), accessibility, privacy (TCC) services, preference writes (cfprefsd) and disk mounting
   (DiskArbitration and `mount_*`).
 
-Engine-run checks run under the same kind of sandbox (a Full company's checks run unconfined).
+**Engine-run checks** run under Brahma's own Seatbelt policy, not a turn's. A check writes only its own checkout under
+the data home. It reads the company's workspace except the private parts of `.brahma` (agents' homes, labs and notes,
+extension review pages, `ext try` copies, trash and plans), and it cannot read Claude's temp folders. Its network goes
+only through Brahma's egress proxy: HTTPS (port 443) to the company's Bash allowlist (grants are not included), and only
+at public addresses (loopback, private ranges and cloud metadata are refused). `brahma run --profile` narrows checks
+as it narrows turns: a check runs unconfined as your user only when its company's profile, and the profile of the
+item holder's role when there is one, are still Full after that ceiling. The egress proxy is used only by commands Brahma itself runs under
+Seatbelt (checks, and the owner-side runner the doctor, the sandbox canary and the `ext` commands use).
 
 **Network allowlist.** The default Bash list is the package registries (npm, Yarn, PyPI, crates.io, Go, RubyGems, Maven,
 GitHub); WebFetch also gets a few docs sites (Apple, Swift, MDN, Node, Python, docs.rs, pkg.go.dev).
@@ -334,9 +347,13 @@ Sub-agents on the Sandboxed profile have gates of their own. `brahma mode gates`
 the missing live ones, on haiku); `brahma mode ultra-status <company>` says why Ultra cannot run for a company; `brahma
 settings ultra-share <company> <0-50>` sets the share of the company's weekly share Ultra may use (0 turns it off).
 
-**Emergency stop.** `brahma stop [--note <why>]`, or STOP EVERYTHING in the app's top bar, stops every agent, check,
-preview and deploy in all companies at once. The command signals each recorded turn's process group itself (SIGTERM, then
-SIGKILL), so a wedged engine cannot keep agents running. Nothing runs until `brahma resume` (or Resume in the app).
+**Emergency stop.** `brahma stop [--note <why>]`, or STOP EVERYTHING in the app's top bar, holds every company at once.
+The running engine cancels every turn (Ultra included), check, merge, git task and sandbox canary, and starts nothing new
+until `brahma resume` (or Resume in the app); a restore also comes back stopped. The command itself signals the process
+group of every turn the database records as running and of every check and merge child the engine recorded (SIGTERM, then
+SIGKILL), so a wedged engine cannot keep agents running. Probe-gate, canary and `ext try` processes are not in that
+record, so `brahma stop` with no engine running does not signal them; a probe gate already running when you press stop
+finishes that gate. `brahma mode gates --run` and `brahma ext try` refuse to start while stopped.
 
 **Agent environment.** Every turn gets an allowlisted environment (`PATH, HOME, LANG, LC_*, TERM, USER, LOGNAME,
 SHELL, DEVELOPER_DIR, TMPDIR`, minus anything named like a token, secret or key), plus `BRAHMA_AGENT_ID`; never
@@ -417,7 +434,8 @@ A snapshot that fails its check is deleted and nothing is pruned. A failed backu
 company files) except `run/`, `backups/`, `tmp/`, `cache/`, `owner/` and `secrets/`, SQLite `-wal`, `-shm` and `-journal`
 files, `*.lock` files and the live `brahma.sqlite` (which has its own snapshots). SQLite files in it are integrity-checked
 copies. Links are never followed. Secrets and the owner key are never backed up. Workspaces are backed up only as their
-git history (the bundles): uncommitted files in a workspace are not.
+git history (the bundles): uncommitted files in a workspace are not, and neither are agent labs (separate repositories
+under `.brahma/labs`) or other `.brahma` state outside the workspace's git history.
 
 **Restore.** Quit the app and `brahma run` first.
 
@@ -432,9 +450,28 @@ brahma restore <snapshot file>
 ```
 
 The current database is kept next to it as `brahma.sqlite.pre-restore-<time>`, and with `--with-files` whatever the files
-replaced is kept in `<data home>/.pre-restore-<time>`. Git repositories are never touched: when Brahma next starts it
-re-adopts each company's `main` as the snapshot recorded it. Commits made after the snapshot are kept, but Brahma alerts
-you and holds that company until you review `main` and accept it (`brahma main accept`).
+replaced is kept in `<data home>/.pre-restore-<time>`.
+
+A restore comes back stopped: nothing runs until `brahma resume`. Before the swap it reads the current database and
+writes into the restored one what must not roll back:
+
+- grant revocations and used-up uses, and a revocation of every grant that had already ended in the current database
+  (revoked, used up, expired on company-active time, or its sprint ended);
+- every taint mark: agent sessions, items, lab and company marks, the machine-wide mark, and lab commits recorded tainted.
+
+It also always sets the machine-wide lab mark, so no lab commit made after the snapshot is recorded clean; clear it with
+`brahma lab clear-taint --machine-wide` once you have checked the labs. Other settings are not carried: the restored
+database has the snapshot's values. The restore lists every setting you had turned off, narrowed or removed that it
+brought back: removed companies and agents, a wider company or role profile, network and web domains, toolchain read
+paths, local listening, auto-merge (per company and owner-wide), disabled or removed extensions, access presets, and
+removed secret entries (their values are not restored). The list is printed by the CLI, put in the stop note and raised
+as an engine alert in every company. Review it before you resume. If the current database cannot be read, every grant is
+revoked, every agent session and open item is marked, and the list says that what was rolled back is unknown. Ultra
+approvals used after the snapshot become usable again, and messages, hand-offs and events made after it are gone.
+
+Git repositories are never touched: after you resume, Brahma re-adopts each company's `main` as the snapshot recorded
+it. Commits made after the snapshot are kept, but Brahma alerts you and holds that company until you review `main` and
+accept it (`brahma main accept`).
 
 **Export.** `brahma export <company> --to <new directory> [--no-workspace]` writes a self-contained copy of one company:
 its database rows, its repository as a bundle (left out with `--no-workspace`), its files, transcripts, archive and roles.
@@ -451,7 +488,10 @@ brahma backup now [--targets]            a database snapshot now, then (with --t
 ```
 
 A folder must exist, be writable and lie outside the data home and every workspace; it is checked again on every copy.
-A drive that is not connected is skipped, with one notice a day. Agents and checks can neither read nor delete a target.
+A drive that is not connected is skipped, with one notice a day. Sandboxed turns and
+sandboxed checks can neither read nor delete a folder target or the WAL replica folder. On the Workspace profile
+Claude's file tools are denied them too, but the agent's Bash is not sandboxed and can reach them; Full-profile turns
+and checks can reach them.
 
 **WAL shipping (optional).** `brahma backup wal enable <replica>` ships the database's write-ahead log with Litestream to a
 folder (with a folder target's checks) or a URL Litestream understands (`s3://bucket/path`); `brahma backup wal disable`
