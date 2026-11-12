@@ -638,6 +638,11 @@ extension Orchestrator {
     /// The sandboxed runner the owner's CLI and the doctor run Claude's own plugin checks under: the check baseline (the owner's
     /// home, data home, every workspace and the backup folders protected), Seatbelt where available.
     public static func ownerSandboxRunner(store: Store, paths: BrahmaPaths) -> any SandboxedRunner {
-        SandboxRunners.platformDefault(baseline: { checkBaseline(store: store, paths: paths) }, proxies: EgressProxyPool())
+        SandboxRunners.platformDefault(baseline: ownerSandboxBaseline(store: store, paths: paths), proxies: EgressProxyPool())
+    }
+
+    /// That runner's baseline, taken at each run: the sandbox canary's model-free layer starts from it (`SandboxCanary.baseline`).
+    public static func ownerSandboxBaseline(store: Store, paths: BrahmaPaths) -> @Sendable () -> SandboxBaseline {
+        { checkBaseline(store: store, paths: paths) }
     }
 }

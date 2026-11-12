@@ -15,7 +15,8 @@ struct Doctor: AsyncParsableCommand {
         let sandbox = Orchestrator.ownerSandboxRunner(store: store, paths: paths)
         let report = await BrahmaCore.Doctor.run(claudePath: ExtLint.claudePath() ?? "claude", runner: ClaudeProcessRunner(),
                                                  hookExecutable: hook, sandbox: sandbox,
-                                                 canary: SandboxCanary(environment: .owner, sandbox: sandbox, hookExecutable: hook),
+                                                 canary: SandboxCanary(environment: .owner, sandbox: sandbox, hookExecutable: hook,
+                                                                       baseline: Orchestrator.ownerSandboxBaseline(store: store, paths: paths)),
                                                  canaryPaths: paths)
         try? store.saveProbe(report)
         for item in report.items {

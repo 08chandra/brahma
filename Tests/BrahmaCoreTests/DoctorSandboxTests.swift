@@ -144,6 +144,54 @@ private struct GateWorld {
         #expect(try g.rows() == 2)
     }
 
+    /// The owner's probe file is part of the key: editing it needs a new canary pass before sandboxed agents run again.
+    @Test func probeFileEditRequiresNewCanary() async throws {
+        let g = try GateWorld(passes: true)
+        let probes = CanaryProbes.url(paths: g.world.paths)
+        try BrahmaPaths.ensurePrivateDirectory(probes.deletingLastPathComponent())
+        try Data("cat \"$CANARY_HOME_FILE\"\n".utf8).write(to: probes)
+        #expect(chmod(probes.path, 0o600) == 0)
+        try await g.turnOnce()
+        try await g.turnOnce()
+        #expect(g.requests(g.eng).count == 1)
+        #expect(g.canary.shapes.count == 1)
+        // The owner edits the file (same place, same mode): a new key.
+        try Data("cat \"$CANARY_DATA_FILE\"\n".utf8).write(to: probes)
+        try await g.turnOnce()
+        #expect(g.requests(g.eng).count == 1, "blocked until the edited probe file passed")
+        #expect(g.canary.shapes.count == 2)
+        try await g.turnOnce()
+        #expect(g.requests(g.eng).count == 2)
+        #expect(try g.rows() == 2)
+    }
+
+    /// The production canary in the per-launch gate without a probe file: the agent never starts, nothing is recorded, and the
+    /// pinned sandbox-check alert names the reason.
+    @Test func missingProbeFileBlocksAndTheAlertSaysWhy() async throws {
+        let claude = try fakeClaude()
+        let userHome = try tempDir()
+        let canary = SandboxCanary(environment: SandboxEnvironment(userHome: userHome, darwinUserTemp: nil, shell: "/bin/zsh"),
+                                   hookExecutable: "/usr/local/bin/brahma")
+        let turns = FakeTurnRunner()
+        var gate = SandboxCanaryGate(canary: canary, runner: turns, claudePath: claude.path, retryAfter: 0)
+        gate.fingerprintCacheSeconds = 0
+        let world = try World(sandboxCanary: gate)
+        let company = try world.company("Vault", profile: .sandboxed)
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        try world.dm(company, eng, "go")
+        try await world.cycle()
+        try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(world.fake.requests.filter { $0.agent.id == eng.id }.isEmpty)
+        #expect(turns.requests.isEmpty, "no canary turn without a probe file")
+        #expect(try await world.store.writer.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sandboxCanary") ?? 0 } == 0)
+        let alerts = try world.store.asks(companyId: company.id).filter {
+            $0.kind == .engineAlert && $0.subjectId == EngineAlerts.askSubject(reason: EngineAlerts.sandboxCheckReason)
+        }
+        #expect(alerts.count == 1)
+        let events = try world.store.events(afterId: 0, companyId: company.id).map(\.text)
+        #expect(events.contains { $0.hasPrefix("Sandbox check failed") && $0.contains("missing probe file") }, "\(events)")
+    }
+
     @Test func newSettingsShapeRequiresCanary() async throws {
         let g = try GateWorld(passes: true)
         var plain = ClaudeSettings()
@@ -153,9 +201,11 @@ private struct GateWorld {
         #expect(plain.shape() != hooked.shape(), "a hook added is a new shape")
         let fp = try CLIFingerprint.of(claudePath: g.claude.path)
         let os = ProcessInfo.processInfo.operatingSystemVersionString
-        try g.world.store.recordCanary(SandboxCanaryKey(fingerprint: fp.key, shape: plain.shape(), osVersion: os), detail: "test")
-        #expect(try g.world.store.sandboxVerified(fingerprint: fp.key, shape: plain.shape(), osVersion: os))
-        #expect(try !g.world.store.sandboxVerified(fingerprint: fp.key, shape: hooked.shape(), osVersion: os))
+        // The gate's key: the CLI build and the probe file (absent here), as `CanaryProbes.keyFingerprint` folds them.
+        let keyed = CanaryProbes.keyFingerprint(cli: fp.key, probes: CanaryProbes.digest(paths: g.world.paths))
+        try g.world.store.recordCanary(SandboxCanaryKey(fingerprint: keyed, shape: plain.shape(), osVersion: os), detail: "test")
+        #expect(try g.world.store.sandboxVerified(fingerprint: keyed, shape: plain.shape(), osVersion: os))
+        #expect(try !g.world.store.sandboxVerified(fingerprint: keyed, shape: hooked.shape(), osVersion: os))
         var gate = SandboxCanaryGate(canary: g.canary, runner: FakeTurnRunner(), claudePath: g.claude.path, retryAfter: 0)
         gate.fingerprintCacheSeconds = 0
         try await g.world.orchestrator.requireSandboxVerified(gate: gate, settings: plain, agent: g.eng, company: g.sandboxed)
@@ -197,8 +247,9 @@ private struct GateWorld {
         #expect(!FileManager.default.fileExists(atPath: p.request.company.workspacePath))
     }
 
-    /// Until the owner's ruling is built, the production canary never passes, so nothing is recorded and the gate stays shut.
-    @Test func productionCanaryIsPendingOwner() async throws {
+    /// Without the owner's probe file the production canary never passes (fail closed), so nothing is recorded and the gate
+    /// stays shut; no model turn runs.
+    @Test func productionCanaryWithoutProbeFileStaysBlocked() async throws {
         let root = try tempDir()
         let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
         let userHome = root.appending(path: "user")
@@ -208,13 +259,16 @@ private struct GateWorld {
         let claude = try fakeClaude().path
         let key = SandboxCanaryKey(fingerprint: try CLIFingerprint.of(claudePath: claude).key, shape: "s",
                                    osVersion: ProcessInfo.processInfo.operatingSystemVersionString)
-        let run = await canary.run(paths: paths, claudePath: claude, runner: FakeTurnRunner(), key: key, settings: nil)
+        let runner = FakeTurnRunner()
+        let run = await canary.run(paths: paths, claudePath: claude, runner: runner, key: key, settings: nil)
         #expect(!run.passes(key))
+        #expect(run.verified.map { !run.passes($0) } ?? true)
         let items = run.items
-        #expect(Set(items.map(\.name)) == ["sandbox-backend", "sandbox-canary", "sandbox-helpers"])
+        #expect(Set(items.map(\.name)) == ["sandbox-backend", "sandbox-canary-local", "sandbox-canary", "sandbox-helpers"])
         #expect(!items.allSatisfy { $0.status == .pass })
         let item = try #require(items.first { $0.name == "sandbox-canary" })
-        #expect(item.status == .warn); #expect(item.detail.contains(SandboxCanary.pendingOwnerDecision))
+        #expect(item.status == .warn); #expect(item.detail.hasPrefix("missing probe file"))
+        #expect(runner.requests.isEmpty)
         let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: paths.workspaces.path)) ?? []
         #expect(leftovers.isEmpty, "\(leftovers)")
     }

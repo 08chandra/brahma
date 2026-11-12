@@ -57,6 +57,8 @@ public actor Orchestrator {
     var canarySettings: [String: ClaudeSettings] = [:]
     /// The CLI fingerprint, re-read at most every `SandboxCanaryGate.fingerprintCacheSeconds`.
     var fingerprintCache: (value: CLIFingerprint, at: Double)?
+    /// The canary probe file's digest (`CanaryProbes.digest`), re-read as often as the fingerprint.
+    var probesDigestCache: (value: String, at: Double)?
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     var runningByCompany: [String: Int] = [:]
@@ -158,7 +160,8 @@ public actor Orchestrator {
         self.sandboxCanary = sandboxCanary ?? (runner is ClaudeProcessRunner
             ? SandboxCanaryGate(canary: SandboxCanary(environment: sandboxEnvironment,
                                                       sandbox: Orchestrator.ownerSandboxRunner(store: store, paths: paths),
-                                                      hookExecutable: mcpExecutable),
+                                                      hookExecutable: mcpExecutable,
+                                                      baseline: Orchestrator.ownerSandboxBaseline(store: store, paths: paths)),
                                 runner: runner, claudePath: claudePath)
             : nil)
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).

@@ -142,7 +142,8 @@ private let subagentGates = ["L-2", "V-2", "V-3", "V-5"]
         #expect(tools.contains("Task")); #expect(!tools.contains("WebFetch")); #expect(!tools.contains("WebSearch"))
         #expect(!second.taskWebTools)
         let settings = TurnProfileCompiler.profile(for: second).settings
-        #expect(try g.store.sandboxVerified(SandboxCanaryKey(fingerprint: fp, shape: CanaryShape.key(settings, launch: "task"), osVersion: os)))
+        let keyed = CanaryProbes.keyFingerprint(cli: fp, probes: CanaryProbes.digest(paths: g.world.paths))
+        #expect(try g.store.sandboxVerified(SandboxCanaryKey(fingerprint: keyed, shape: CanaryShape.key(settings, launch: "task"), osVersion: os)))
         // Pre-tainted at launch: V-1 has not passed for this build.
         #expect(try g.store.agent(id: g.eng.id)?.taintSources.contains(TaintPolicy.preTaintSource) == true)
         // Once F7-agents passed, a Task turn keeps its web tools.

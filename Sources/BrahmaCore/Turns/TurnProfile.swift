@@ -436,6 +436,9 @@ public enum ChildEnvironment {
             env[name] = value
         }
         if purpose == .claude {
+            // The sandbox canary's four probe variables (paths of the dummy tokens it planted, `CanaryProbes.variables`): only
+            // the canary's own request carries them.
+            for name in CanaryProbes.variables { if let value = extra[name] { env[name] = value } }
             for (name, value) in engineClaudeVars where Self.engineClaudeVars.contains(name) { env[name] = value }
             if allowBuiltinAgentsSwitch, engineClaudeVars[builtinAgentsSwitch] == "1" { env[builtinAgentsSwitch] = "1" }
         }

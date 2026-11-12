@@ -91,11 +91,14 @@ public enum Doctor {
         items.append(toolsItem(probe.tools))
         items.append(sideloadItem(path: managedSettingsPath, preferences: managedPreferencesPath.map { [$0] } ?? managedPreferencePaths()))
         if let sandbox { items.append(await pluginDetailsItem(claudePath: claudePath, sandbox: sandbox)) }
-        // The sandbox canary (Task 3): `sandbox-backend`, `sandbox-canary`, `sandbox-helpers`. The doctor only reports them; the
+        // The sandbox canary (Task 3): `sandbox-backend`, `sandbox-canary-local`, `sandbox-canary`, `sandbox-helpers`. The doctor only reports them; the
         // engine's per-launch gate records a pass for the shapes its turns use.
         if let canary, let canaryPaths {
-            // The doctor asks about no turn's shape (it records nothing): the key names this CLI build and macOS only.
-            let key = SandboxCanaryKey(fingerprint: (try? CLIFingerprint.of(claudePath: claudePath))?.key ?? "unavailable",
+            // The doctor asks about no turn's shape (it records nothing): the key names this CLI build, the probe file and
+            // macOS only, computed as the gate computes it.
+            let digest = await execBlocking.run { CanaryProbes.digest(paths: canaryPaths) }
+            let cli = (try? CLIFingerprint.of(claudePath: claudePath))?.key ?? "unavailable"
+            let key = SandboxCanaryKey(fingerprint: CanaryProbes.keyFingerprint(cli: cli, probes: digest),
                                        shape: "doctor", osVersion: ProcessInfo.processInfo.operatingSystemVersionString)
             items += await canary.run(paths: canaryPaths, claudePath: claudePath, runner: runner, key: key, settings: nil).items
         }

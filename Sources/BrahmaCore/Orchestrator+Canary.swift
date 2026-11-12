@@ -10,8 +10,10 @@ public struct SandboxCanaryGate: Sendable {
     public var retryAfter: TimeInterval
     public var fingerprint: @Sendable (String) throws -> CLIFingerprint
     public var osVersion: @Sendable () -> String
-    /// The fingerprint is a `stat`, cached this many awake seconds.
+    /// The fingerprint is a `stat`, cached this many awake seconds (the probe file's digest too).
     public var fingerprintCacheSeconds: Double = 5
+    /// The owner's canary probe file's digest (`CanaryProbes.digest`): part of every canary key, so an edit needs a new pass.
+    public var probesDigest: @Sendable (BrahmaPaths) -> String = { CanaryProbes.digest(paths: $0) }
 
     public init(canary: any SandboxCanaryRunning, runner: any TurnRunning, claudePath: String, retryAfter: TimeInterval = 600,
                 fingerprint: @escaping @Sendable (String) throws -> CLIFingerprint = { try CLIFingerprint.of(claudePath: $0) },
@@ -31,24 +33,36 @@ extension Orchestrator {
     /// Whether the running CLI build passed Task 10's `V-1` hook gate. Without a canary gate (no CLI to fingerprint) or a
     /// fingerprint, it has not (fail closed: fan-out turns are pre-tainted).
     func postToolGateVerified() -> Bool {
-        guard let gate = sandboxCanary, let key = try? canaryKey(gate: gate, shape: "") else { return false }
-        return (try? store.hookGatePassed(TaintPolicy.postToolGate, fingerprint: key.fingerprint)) ?? false
+        guard let gate = sandboxCanary, let fp = try? cliFingerprint(gate: gate) else { return false }
+        return (try? store.hookGatePassed(TaintPolicy.postToolGate, fingerprint: fp.key)) ?? false
     }
 
     static func canaryTaskName(_ key: SandboxCanaryKey) -> String { canaryTaskPrefix + key.text }
 
-    /// The canary key of a sandboxed turn of this shape (the fingerprint cached for 5 s of awake time).
-    func canaryKey(gate: SandboxCanaryGate, shape: String) throws -> SandboxCanaryKey {
+    /// The running CLI's fingerprint (a `stat`, cached for 5 s of awake time).
+    func cliFingerprint(gate: SandboxCanaryGate) throws -> CLIFingerprint {
         let now = AwakeTime.uptime()
-        let fp: CLIFingerprint
-        if let cached = fingerprintCache, now - cached.at < gate.fingerprintCacheSeconds {
-            fp = cached.value
+        if let cached = fingerprintCache, now - cached.at < gate.fingerprintCacheSeconds { return cached.value }
+        let fp = try gate.fingerprint(gate.claudePath)
+        fingerprintCache = (fp, now)
+        return fp
+    }
+
+    /// The canary key of a sandboxed turn of this shape: the CLI build and the owner's probe file
+    /// (`CanaryProbes.keyFingerprint`, both cached for 5 s of awake time), the shape, this macOS. A missing or invalid probe
+    /// file has a digest no canary row ever carries, so the turn stays blocked (fail closed).
+    func canaryKey(gate: SandboxCanaryGate, shape: String) throws -> SandboxCanaryKey {
+        let fp = try cliFingerprint(gate: gate)
+        let now = AwakeTime.uptime()
+        let digest: String
+        if let cached = probesDigestCache, now - cached.at < gate.fingerprintCacheSeconds {
+            digest = cached.value
         } else {
-            fp = try gate.fingerprint(gate.claudePath)
-            fingerprintCache = (fp, now)
+            digest = gate.probesDigest(paths)
+            probesDigestCache = (digest, now)
         }
-        return SandboxCanaryKey(fingerprint: fp.key, shape: shape, osVersion: gate.osVersion(),
-                                cliVersion: (try? store.latestProbe())?.cliVersion)
+        return SandboxCanaryKey(fingerprint: CanaryProbes.keyFingerprint(cli: fp.key, probes: digest), shape: shape,
+                                osVersion: gate.osVersion(), cliVersion: (try? store.latestProbe())?.cliVersion)
     }
 
     /// Before a sandboxed turn launches (before anything of it is consumed or created): its key must have passed the canary.
@@ -141,8 +155,7 @@ extension Orchestrator {
             canarySettings[key.text] = nil
             let resolve = canaryFailedAt.isEmpty
             attempt {
-                try store.recordCanary(key, detail: run.items.map { "\($0.name): \($0.detail)" }.joined(separator: "; "), now: now,
-                                       resolveAlert: resolve)
+                try store.recordCanary(key, detail: run.detail, now: now, resolveAlert: resolve)
             }
             canaryWaiting = canaryWaiting.filter { $0.value != key }
             log("sandbox canary passed (claude \(key.cliVersion ?? "?"))")
