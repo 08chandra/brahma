@@ -424,7 +424,8 @@ private let deniedProbes = """
         let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
         let userHome = root.appending(path: "user")
         for dir in [paths.home, paths.workspaces, userHome] { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
-        let env = SandboxEnvironment(userHome: userHome, darwinUserTemp: nil, shell: "/bin/zsh")
+        // As the owner's environment has it: the per-user Darwin temp dir (the scope then reads its toolchain entries).
+        let env = SandboxEnvironment(userHome: userHome, darwinUserTemp: SandboxEnvironment.current.darwinUserTemp, shell: "/bin/zsh")
         let p = try SandboxCanary.prepare(paths: paths, environment: env, hookExecutable: "/usr/local/bin/brahma")
         defer { p.cleanup() }
         let places = SandboxCanary.LocalPlaces(paths: paths, workspace: URL(fileURLWithPath: p.request.company.workspacePath),
