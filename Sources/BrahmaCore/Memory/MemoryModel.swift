@@ -94,7 +94,8 @@ enum MemoryRefs {
     /// Canonicalizes `ref` and names the source its form implies (nil: no known form):
     /// `ask:<n>`/`A-<n>` → ask `A-<n>`; `AR-<n>` → artifact; `F-<n>` → resource; `mem:<n>` → memory; `kb:` → kb;
     /// `msg:` → message; `handoff:` → handoff; `sprint:` → retro; `decision:` → decision; `item:<KEY>` and any other
-    /// `<KEY>-<n>` → item. An item whose key prefix is `A`, `AR` or `F` is cited and recalled as `item:<KEY>`.
+    /// `<KEY>-<n>` → item. An item whose key prefix is `A`, `AR` or `F` is cited and recalled as `item:<KEY>` (its canonical
+    /// ref, `canonicalItemRef`); any other item's canonical ref is the bare `<KEY>`, whichever form was given.
     static func implied(_ ref: String) -> (source: MemorySource?, canonical: String) {
         let raw = ref.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = raw.lowercased()
@@ -110,8 +111,8 @@ enum MemoryRefs {
         if lower.hasPrefix("sprint:") { return (.retro, "sprint:" + rest("sprint:")) }
         if lower.hasPrefix("decision:") { return (.decision, "decision:" + rest("decision:")) }
         if lower.hasPrefix("item:") {
-            let key = rest("item:")
-            return (.item, itemKey(key) ?? key.uppercased())
+            let key = itemKey(rest("item:")) ?? rest("item:").uppercased()
+            return (.item, canonicalItemRef(key))
         }
         if let key = itemKey(raw) {
             let prefix = key.prefix { $0 != "-" }
@@ -123,6 +124,13 @@ enum MemoryRefs {
             }
         }
         return (nil, raw)
+    }
+
+    /// The canonical ref of an item: `item:<KEY>` when the key's prefix (before the first `-`) collides with another bare ref
+    /// form (`A`, `AR`, `F`), else the bare `<KEY>`. Both `item:ENG-7` and `ENG-7` give `ENG-7`; `item:F-1` stays `item:F-1`.
+    static func canonicalItemRef(_ key: String) -> String {
+        let prefix = key.prefix { $0 != "-" }
+        return ["A", "AR", "F"].contains(prefix) ? "item:\(key)" : key
     }
 
     /// `<KEY>-<n>` uppercased, or nil.
