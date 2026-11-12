@@ -12,6 +12,8 @@ public enum SelectTarget: Equatable, Sendable {
     /// `preview:<name>` (a surface, lowercased) or `preview:live`: Mission Control's preview pane on that tab.
     case preview(name: String)
     case item(key: String)
+    /// `release:<ref>`: Work › Releases with that release (`R-<n>`) selected in the inspector.
+    case release(ref: String)
     /// `ask:<id>`: the Inbox, with that ask called out.
     case ask(id: String)
     case agent(handle: String)
@@ -44,6 +46,7 @@ public enum SelectTarget: Equatable, Sendable {
             switch key {
             case "agent": self = .agent(handle: value.lowercased())
             case "item": self = .item(key: value.uppercased())
+            case "release": self = .release(ref: value.uppercased())
             case "ask": self = .ask(id: value)
             case "channel": self = .channel(name: value.lowercased())
             case "dm": self = .dm(handle: value.lowercased())

@@ -57,6 +57,8 @@ public final class AppModel {
     var turnStreamCache: TurnStreamCache?
     /// The ask a notification banner pointed at (set by `ask:<id>`); the Inbox calls it out.
     public var highlightedAskId: String?
+    /// The release a launch target selected (`release:<ref>`); Work › Releases opens its inspector until the owner picks a row.
+    public var selectedReleaseRef: String?
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
@@ -333,6 +335,9 @@ public final class AppModel {
         case .digest: select(.inboxDigest)
         case .companySettings: select(.companySettings)
         case .releases: select(.releases)
+        case .release(let ref):
+            select(.releases)
+            selectedReleaseRef = ref
         case .preview(let name):
             select(.missionControl)
             if name == PreviewTabID.live {
