@@ -5,7 +5,7 @@ import BrahmaCore
 struct OrgGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "org", abstract: "Show and change the org chart.",
-        subcommands: [Show.self, Move.self, Vacancies.self, Fill.self, Acting.self], defaultSubcommand: Show.self)
+        subcommands: [Show.self, Move.self, Vacancies.self, Vacancy.self, Fill.self, Acting.self], defaultSubcommand: Show.self)
 
     struct Acting: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Name the acting CEO (owner only).")
@@ -75,7 +75,58 @@ struct OrgGroup: ParsableCommand {
             let open = try store.vacancies(companyId: c.id)
             if open.isEmpty { print("(no vacancies)") }
             for v in open {
-                print(safe("\(v.handle)  \(v.role)  manager: \(v.managerHandle ?? "none")  team: \(v.team ?? "none")"))
+                let note = v.note.isEmpty ? "" : "  note: \(v.note)"
+                print(safe("\(v.handle)  \(v.role)  manager: \(v.managerHandle ?? "none")  team: \(v.team ?? "none")\(note)"))
+            }
+        }
+    }
+
+    /// Plan 4b: the owner adds and removes open seats. Both writes; the note is owner-only text, redacted by the store.
+    struct Vacancy: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Add or remove an open seat (owner only).",
+                                                        subcommands: [Add.self, Remove.self])
+
+        struct Add: ParsableCommand {
+            static let configuration = CommandConfiguration(abstract: "Open a seat for a role; its handle is picked for you.")
+            @Argument var company: String
+            @Option(help: "A role of the company's pack, e.g. engineer.") var role: String
+            @Option(help: "The seated agent the hire will report to (default: the board).") var manager: String?
+            @Option(help: "Team name: lowercase letters, digits, - and _.") var team: String?
+            @Option(help: "Owner-only note, at most \(Store.vacancyNoteLimit) characters.") var note: String = ""
+
+            func run() throws {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                let c = try resolveCompany(store, company)
+                do {
+                    let v = try store.addVacancy(companyId: c.id, role: role, managerHandle: manager, team: team, note: note)
+                    print(safe("Vacancy @\(v.handle) for \(v.role) under @\(v.managerHandle ?? "board")"))
+                } catch let e as WorkError {
+                    throw fail(e.message)
+                } catch StoreError.notFound {
+                    throw fail("no company named '\(company)'")
+                }
+            }
+        }
+
+        struct Remove: ParsableCommand {
+            static let configuration = CommandConfiguration(abstract: "Take an open seat back (its handle stays reserved).")
+            @Argument var company: String
+            @Argument var handle: String
+
+            func run() throws {
+                try requireOwnerShell()
+                let (store, _) = try openStore()
+                let c = try resolveCompany(store, company)
+                let h = Store.normalizedHandle(handle)
+                do {
+                    try store.removeVacancy(companyId: c.id, handle: h)
+                    print(safe("removed vacancy @\(h)"))
+                } catch let e as WorkError {
+                    throw fail(e.message)
+                } catch StoreError.notFound {
+                    throw fail("no open vacancy @\(h) in \(c.name)")
+                }
             }
         }
     }

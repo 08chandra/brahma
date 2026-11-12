@@ -1091,5 +1091,28 @@ enum Migrations {
             try db.create(index: "ultraReservation_ask", on: "ultraReservation", columns: ["askId"])
             try db.alter(table: "company") { t in t.add(column: "ultraShare", .double).notNull().defaults(to: 0.15) }
         }
+        m.registerMigration("v4b-vacancy-note") { db in
+            // Plan 4b, Task 1b: the owner's vacancy edits. `note` is owner-only text (redacted before it is stored); `removedAt`
+            // marks a seat the owner took back (never deleted: its handle stays reserved for `nextHandle`, `hire` and `applyOrg`).
+            try db.alter(table: "orgVacancy") { t in
+                t.add(column: "note", .text).notNull().defaults(to: "")
+                t.add(column: "removedAt", .datetime)
+            }
+            // One row per handle per company, enforced from here on. A database that already holds two rows for one handle
+            // fails closed (the whole migration is rolled back, so the columns above are not added either) rather than lose a row.
+            let duplicates = try Row.fetchAll(db, sql: """
+                SELECT companyId, handle FROM orgVacancy GROUP BY companyId, handle HAVING COUNT(*) > 1 ORDER BY companyId, handle
+                """).map { "\($0["companyId"] as String)/\($0["handle"] as String)" }
+            guard duplicates.isEmpty else {
+                throw MigrationRefused("orgVacancy has duplicate handles: " + duplicates.joined(separator: ", "))
+            }
+            try db.create(index: "orgVacancy_company_handle", on: "orgVacancy", columns: ["companyId", "handle"], unique: true)
+        }
     }
+}
+
+/// A migration that refuses to run on the data it found. GRDB rolls the migration back; `Store.init` reports it.
+struct MigrationRefused: Error, CustomStringConvertible {
+    let description: String
+    init(_ description: String) { self.description = description }
 }
