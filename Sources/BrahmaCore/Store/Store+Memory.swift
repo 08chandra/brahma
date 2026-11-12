@@ -15,8 +15,10 @@ extension Store {
     /// loaded); the title is flattened to one line of at most `MemoryPolicy.maxTitleChars`, the body capped at
     /// `MemoryPolicy.maxBodyChars`. The write is `INSERT … ON CONFLICT(companyId, source, sourceId) DO UPDATE`, never
     /// `INSERT OR REPLACE` (a replace deletes without firing `memoryDoc_ad`, orphaning the old text in `memoryFts`). When every
-    /// stored column is already equal nothing is written at all. A removed doc stays removed: `removedAt` is never cleared
-    /// here, so a re-ingest (a reset cursor after a restore) cannot bring back what the owner deleted.
+    /// stored column is already equal nothing is written at all. A live re-ingest clears `removedAt`: an upsert means the
+    /// source object exists again (a kb section deleted and later restored is searchable again). Sources that must stay gone
+    /// (owner-deleted memory entries, purged resources) are gated by their own source rows and never re-ingested;
+    /// `removeMemoryDoc` is the one removal path.
     @discardableResult
     func ingest(db: Database, _ doc: MemoryIngestDoc, now: Date) throws -> Int64 {
         let title = String(Self.flattened(try redact(doc.title)).prefix(MemoryPolicy.maxTitleChars))
@@ -28,6 +30,8 @@ extension Store {
             "readerSet": readerSet, "futureHolders": doc.futureHolders, "sensitivity": doc.sensitivity.rawValue,
             "restrictions": restrictions, "provenance": doc.provenance.raw, "tainted": doc.tainted, "taintReason": doc.taintReason,
             "weight": doc.weight, "authorId": doc.authorId, "itemId": doc.itemId, "expiresActive": doc.expiresActive,
+            // A removed doc is never "unchanged": the re-ingest brings it back.
+            "removedAt": nil,
         ]
         let columns = values.keys.sorted()
 

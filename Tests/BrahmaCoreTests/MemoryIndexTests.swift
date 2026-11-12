@@ -161,9 +161,12 @@ import GRDB
         #expect(try w.store.removeMemoryDoc(companyId: w.company.id, source: .message, sourceId: "1", now: w.now))
         #expect(try w.search(.owner, "narwhal").isEmpty)
         #expect(try w.index.document(companyId: w.company.id, scope: .owner, ref: "msg:1", now: w.now) == nil)
-        // A later re-ingest of the same source row does not bring it back.
-        try w.ingest(w.doc("1", body: "the narwhal decision, edited"))
-        #expect(try w.search(.owner, "narwhal").isEmpty)
+        // A second removal changes nothing.
+        #expect(try !w.store.removeMemoryDoc(companyId: w.company.id, source: .message, sourceId: "1", now: w.now))
+        // A live re-ingest means the object exists again: it is visible again, even with unchanged text.
+        try w.ingest(w.doc("1", body: "the narwhal decision"))
+        #expect(try w.search(.owner, "narwhal").map(\.ref) == ["msg:1"])
+        #expect(try w.index.document(companyId: w.company.id, scope: .owner, ref: "msg:1", now: w.now) != nil)
     }
 
     @Test func upsertReplacesBodyWithoutOrphans() throws {
@@ -230,7 +233,9 @@ import GRDB
     @Test func refsResolveByImpliedSource() throws {
         let w = try W(name: "F")
         #expect(Store.keyPrefix(slug: w.company.slug) == "F")
-        let item = try w.ingest(w.doc("item-1", title: "Item F-1", body: "an item", source: .item, ref: "F-1"))
+        // A colliding item is stored (as Task 2 stores it) under its canonical `item:<KEY>` ref; others under the bare key.
+        let item = try w.ingest(w.doc("item-1", title: "Item F-1", body: "an item", source: .item, ref: "item:F-1"))
+        let eng = try w.ingest(w.doc("item-7", title: "Item ENG-7", body: "another item", source: .item, ref: "ENG-7"))
         let resource = try w.ingest(w.doc("res-1", title: "Resource F-1", body: "a file", source: .resource, ref: "F-1"))
         let ask = try w.ingest(w.doc("ask-4", title: "Ask A-4", body: "a question", source: .ask, ref: "A-4"))
         func doc(_ ref: String) throws -> Int64? {
@@ -238,6 +243,16 @@ import GRDB
         }
         #expect(try doc("F-1") == resource)
         #expect(try doc("item:F-1") == item)
+        #expect(try doc("item:f-1") == item)
+        #expect(try doc("ENG-7") == eng)
+        #expect(try doc("item:ENG-7") == eng)
+        #expect(try doc("item:eng-7") == eng)
+        #expect(MemoryRefs.implied("item:F-1").source == .item && MemoryRefs.implied("item:F-1").canonical == "item:F-1")
+        #expect(MemoryRefs.implied("item:AR-3").canonical == "item:AR-3")
+        #expect(MemoryRefs.implied("item:A-4").canonical == "item:A-4")
+        #expect(MemoryRefs.implied("F-1").source == .resource && MemoryRefs.implied("F-1").canonical == "F-1")
+        #expect(MemoryRefs.implied("item:ENG-7").canonical == "ENG-7")
+        #expect(MemoryRefs.implied("item:FOO-7").canonical == "FOO-7")
         #expect(try doc("ask:4") == ask)
         #expect(try doc("A-4") == ask)
         #expect(try doc("a-4") == ask)
