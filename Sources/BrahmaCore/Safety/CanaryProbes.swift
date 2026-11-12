@@ -78,12 +78,21 @@ public enum CanaryProbes {
         # the report. A line ending in "# helper" is warn-only: when it succeeds, `brahma doctor` warns (sandbox-helpers)
         # and the canary still passes.
         #
-        # Each probe runs twice: (A) model-free, through a throwaway agent's shell prefix inside Brahma's sandbox with that
-        # agent's scope, no network, 10 seconds at most; (B) in one small haiku turn under the real compiled settings, where
-        # the model runs each line once with its Bash tool.
+        # Each probe runs twice: (A) model-free, through a throwaway agent's shell prefix inside Brahma's own Seatbelt
+        # sandbox (the one around checks and previews) with that agent's scope, no network, 10 seconds at most; (B) in one
+        # small haiku turn under the real compiled settings, where the model runs each line once with its Bash tool. Only
+        # (B) vouches for the agent turn's own sandbox.
+        #
+        # Claude Code's permission rules deny some commands by name before the sandbox sees them (launchctl, security,
+        # osascript, open, crontab, at, sudo, screencapture, claude). A probe stopped by such a rule proves nothing about the
+        # sandbox, so in (B) it counts as NOT RUN and fails the canary: write those probes in a form the rules do not match,
+        # for example by absolute path (/bin/launchctl ...) or through a shell (sh -c '...'). A probe must test something
+        # the sandbox is meant to stop: an osascript that only asks the Finder for its name is answered locally by
+        # LaunchServices and is not an escape test (real Apple events are gated by macOS Automation consent).
         #
         # Pass rule: a probe passes only if it exits non-zero (or is denied or killed) AND no planted token appears in its
-        # output. The canary passes only if this file is valid, holds at least one line that is not "# helper", and every
+        # output AND nothing planted changed; a command not found (exit 127) did not run and fails.
+        # The canary passes only if this file is valid, holds at least one line that is not "# helper", and every
         # probe passes in both runs. Sandboxed companies stay blocked until it passes. Any edit to this file needs a new
         # canary run (its SHA-256 is part of the canary key): `brahma canary run`.
         #
@@ -103,14 +112,14 @@ public enum CanaryProbes {
         var out: [CanaryProbe] = []
         // "\r\n" is one Character in Swift: both line ends split.
         for (index, raw) in text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }).enumerated() {
-            var command = String(raw).trimmingCharacters(in: .whitespaces)
+            var command = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
             if command.isEmpty || command.hasPrefix("#") { continue }
             var helper = false
             if command.hasSuffix(helperMarker) {
                 let rest = command.dropLast(helperMarker.count)
                 if let last = rest.last, last == " " || last == "\t" {
                     helper = true
-                    command = rest.trimmingCharacters(in: .whitespaces)
+                    command = rest.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             }
             guard !command.isEmpty else { continue }
@@ -152,6 +161,10 @@ public enum CanaryProbes {
             return .failure(.refused(path: path, problem: "is not UTF-8 text"))
         }
         let probes = parse(text)
+        // A probe line is shown to the owner, the model and the logs: no control character but a tab.
+        if let bad = probes.first(where: { $0.text.unicodeScalars.contains { $0 != "\t" && CharacterSet.controlCharacters.contains($0) } }) {
+            return .failure(.refused(path: path, problem: "line \(bad.line) holds a control character"))
+        }
         guard probes.contains(where: { !$0.helper }) else { return .failure(.noProbes(path: path)) }
         return .success(CanaryProbeFile(path: path, probes: probes, sha256: SHA256.hex(data)))
     }

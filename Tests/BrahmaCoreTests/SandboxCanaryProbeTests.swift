@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import GRDB
 @testable import BrahmaCore
 
 // The owner-written canary probe file and the two canary layers. Every probe line here is a benign fake that lives only in
@@ -49,6 +50,17 @@ private final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
     }
 }
 
+/// A canary that only records the shapes it was asked for (and never passes).
+private final class AskedShapes: SandboxCanaryRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _shapes: [String] = []
+    var shapes: [String] { lock.withLock { _shapes } }
+    func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey, settings: ClaudeSettings?) async -> CanaryRun {
+        lock.withLock { _shapes.append(key.shape) }
+        return CanaryRun(items: [DoctorItem(name: "sandbox-canary", status: .fail, detail: "fake")], verified: nil)
+    }
+}
+
 /// How the fake model's turn goes: which commands it skips, what each tool result says, the init tools, whether Read is denied.
 private struct TurnPlay: Sendable {
     var skip: Set<String> = []
@@ -56,6 +68,12 @@ private struct TurnPlay: Sendable {
     var tools: [String]? = nil
     var readDenied = true
     var extraLines: @Sendable (TurnRequest) -> [String] = { _ in [] }
+    /// More fields of the init line (plugins, skills, mcp_servers).
+    var initExtras: @Sendable () -> [String: Any] = { [:] }
+    /// Commands a Claude Code permission rule stops: their tool_use ids go into `permission_denials`.
+    var ruleDenied: Set<String> = []
+    /// Runs as the turn runs (a probe that changes a planted place).
+    var during: (@Sendable (TurnRequest) -> Void)? = nil
 
     static let denied: @Sendable (String, TurnRequest) -> (isError: Bool, text: String) = { command, request in
         if command == SandboxCanary.controlCommand {
@@ -74,7 +92,11 @@ private func json(_ object: Any) -> String {
 /// command of the prompt, the Read of the home token, the result with its permission denials.
 private func streamLines(_ request: TurnRequest, _ play: TurnPlay) -> [String] {
     let tools = play.tools ?? (TurnProfileCompiler.profile(for: request).tools ?? [])
-    var lines = [json(["type": "system", "subtype": "init", "session_id": request.agent.sessionId, "model": "haiku", "tools": tools])]
+    var initLine: [String: Any] = ["type": "system", "subtype": "init", "session_id": request.agent.sessionId, "model": "haiku", "tools": tools]
+    initLine.merge(play.initExtras()) { _, new in new }
+    var lines = [json(initLine)]
+    var ruleDenials: [[String: Any]] = []
+    play.during?(request)
     let commands = request.prompt.split(separator: "\n").compactMap { line -> String? in
         guard let r = line.range(of: "^[0-9]+\\. ", options: .regularExpression) else { return nil }
         return String(line[r.upperBound...])
@@ -83,7 +105,8 @@ private func streamLines(_ request: TurnRequest, _ play: TurnPlay) -> [String] {
         let id = "toolu_\(i)"
         lines.append(json(["type": "assistant", "message": ["content": [["type": "tool_use", "id": id, "name": "Bash",
                                                                          "input": ["command": command]]]]]))
-        let r = play.result(command, request)
+        let r = play.ruleDenied.contains(command) ? (isError: true, text: "Permission to use Bash has been denied.") : play.result(command, request)
+        if play.ruleDenied.contains(command) { ruleDenials.append(["tool_name": "Bash", "tool_use_id": id]) }
         lines.append(json(["type": "user", "message": ["content": [["type": "tool_result", "tool_use_id": id, "is_error": r.isError,
                                                                     "content": r.text]]]]))
     }
@@ -93,7 +116,7 @@ private func streamLines(_ request: TurnRequest, _ play: TurnPlay) -> [String] {
     lines.append(json(["type": "user", "message": ["content": [["type": "tool_result", "tool_use_id": "toolu_read", "is_error": true,
                                                                 "content": "Permission denied"]]]]))
     lines += play.extraLines(request)
-    let denials: [[String: Any]] = play.readDenied ? [["tool_name": "Read", "tool_use_id": "toolu_read"]] : []
+    let denials: [[String: Any]] = ruleDenials + (play.readDenied ? [["tool_name": "Read", "tool_use_id": "toolu_read"]] : [])
     lines.append(json(["type": "result", "subtype": "success", "is_error": false, "result": "DONE", "session_id": request.agent.sessionId,
                        "permission_denials": denials]))
     return lines
@@ -136,7 +159,7 @@ private struct CanaryWorld {
 
     func run(_ canary: SandboxCanary, runner: FakeTurnRunner = canaryRunner()) async -> CanaryRun {
         await canary.run(paths: paths, claudePath: claude.path, runner: runner,
-                         key: SandboxCanaryKey(fingerprint: "asked", shape: "s", osVersion: "o"), settings: nil)
+                         key: SandboxCanaryKey(fingerprint: "asked", shape: SandboxCanary.anyShape, osVersion: "o"), settings: nil)
     }
 
     func item(_ run: CanaryRun, _ name: String) throws -> DoctorItem { try #require(run.items.first { $0.name == name }) }
@@ -271,9 +294,10 @@ private let deniedProbes = """
         let runner = canaryRunner()
         let run = await w.run(w.canary(), runner: runner)
         #expect(run.verified.map { !run.passes($0) } ?? true)
-        // Not written yet: a warning (the doctor stays usable), never a pass.
+        // The engine wrote the header-only template; it holds no probe yet: a warning (the doctor stays usable), never a pass.
+        #expect(try String(contentsOf: w.probesURL, encoding: .utf8) == CanaryProbes.template)
         #expect(try w.item(run, "sandbox-canary-local").status == .warn)
-        #expect(try w.item(run, "sandbox-canary-local").detail.hasPrefix("missing probe file"))
+        #expect(try w.item(run, "sandbox-canary-local").detail.hasPrefix("no probes in"))
         #expect(try w.item(run, "sandbox-canary").status == .warn)
         #expect(runner.requests.isEmpty, "no model turn without a probe file")
         #expect(w.leftovers().isEmpty)
@@ -386,7 +410,7 @@ private let deniedProbes = """
         let run = await w.run(w.canary(), runner: canaryRunner(TurnPlay(tools: BuiltinTools.sandboxed + ["Task"])))
         #expect(!run.passes(try #require(run.verified)))
         let detail = try w.item(run, "sandbox-canary").detail
-        #expect(detail.hasPrefix("the init tools hold tools the shape does not allow (extra: Task)"), "\(detail)")
+        #expect(detail.hasPrefix("the init tools hold entries the shape does not allow (extra: Task)"), "\(detail)")
     }
 
     /// An expected tool the session lacks (2.1.322 lists no `Skill` when no skill loads) is noted, never a failure.
@@ -396,7 +420,7 @@ private let deniedProbes = """
         let run = await w.run(w.canary(), runner: canaryRunner(TurnPlay(tools: BuiltinTools.sandboxed.filter { $0 != "Skill" })))
         let item = try w.item(run, "sandbox-canary")
         #expect(item.status == .pass, "\(item.detail)")
-        #expect(item.detail.contains("info: expected tools absent from the init list: Skill"))
+        #expect(item.detail.contains("info: expected tools absent from the init line: Skill"))
         #expect(run.passes(try #require(run.verified)))
     }
 
@@ -426,6 +450,252 @@ private let deniedProbes = """
         #expect(try w.item(run, "sandbox-canary-local").status == .pass)
         #expect(try w.item(run, "sandbox-canary").status == .pass)
         #expect(run.passes(try #require(run.verified)), "a helper warning never blocks the canary")
+    }
+
+    // MARK: Review fixes
+
+    /// C1: a probe a Claude Code permission rule stopped never reached the sandbox: it is unverified, so the canary fails.
+    @Test func aProbeStoppedByAPermissionRuleBlocks() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let run = await w.run(w.canary(), runner: canaryRunner(TurnPlay(ruleDenied: ["cat \"$CANARY_DATA_FILE\""])))
+        #expect(!run.passes(try #require(run.verified)))
+        let detail = try w.item(run, "sandbox-canary").detail
+        #expect(detail.hasPrefix("probe line 4 was not run (unverified): stopped by a Claude Code permission rule"), "\(detail)")
+    }
+
+    /// Minor 4: a command not found (127) did not run, in either layer.
+    @Test func aCommandNotFoundIsNotRun() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes + "\nno-such-tool\n")
+        let local = FakeSandbox { probe, env, cwd in
+            probe == "no-such-tool" ? CheckOutcome(exitCode: 127, timedOut: false, tail: "zsh: command not found") : FakeSandbox.denyAll(probe, env, cwd)
+        }
+        let run = await w.run(w.canary(local: local))
+        #expect(!run.passes(try #require(run.verified)))
+        #expect(try w.item(run, "sandbox-canary-local").detail.hasPrefix("probe line 7 was not run (unverified): command not found"))
+        let play = TurnPlay(result: { command, request in
+            command == "no-such-tool" ? (true, "Exit code 127\nzsh: command not found: no-such-tool") : TurnPlay.denied(command, request)
+        })
+        let turn = await w.run(w.canary(), runner: canaryRunner(play))
+        #expect(try w.item(turn, "sandbox-canary").detail.hasPrefix("probe line 7 was not run (unverified): command not found"))
+    }
+
+    /// I1: a probe that writes into a planted place fails even when it exits non-zero; so does a turn that changes one.
+    @Test func aChangedPlantedPlaceBlocks() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes + "\nwrite-then-fail\n")
+        let local = FakeSandbox { probe, env, cwd in
+            if probe == "write-then-fail" {
+                try? Data("x".utf8).write(to: URL(fileURLWithPath: env[CanaryProbes.outsideDirVariable] ?? "/nonexistent").appending(path: "x"))
+                return CheckOutcome(exitCode: 1, timedOut: false, tail: "")
+            }
+            return FakeSandbox.denyAll(probe, env, cwd)
+        }
+        let run = await w.run(w.canary(local: local))
+        #expect(!run.passes(try #require(run.verified)))
+        let detail = try w.item(run, "sandbox-canary-local").detail
+        #expect(detail.hasPrefix("probe line 7 changed a planted place"), "\(detail)")
+        #expect(detail.contains("line 7: FAIL, exit 1, leaked false, changed a planted place"))
+        // In the turn: the other agent's token is rewritten.
+        try w.writeProbes(deniedProbes)
+        let play = TurnPlay(during: { request in
+            let lab = URL(fileURLWithPath: request.environment[CanaryProbes.otherAgentLabVariable] ?? "/nonexistent")
+            try? Data("overwritten".utf8).write(to: lab.appending(path: "token"))
+        })
+        let turn = await w.run(w.canary(), runner: canaryRunner(play))
+        #expect(!turn.passes(try #require(turn.verified)))
+        #expect(try w.item(turn, "sandbox-canary").detail.contains("a planted place changed during the turn: another agent's lab/token"))
+    }
+
+    /// I2: plugins, skills and MCP servers follow the subset rule too: anything extra blocks; missing is only noted.
+    @Test func extraInitPluginsSkillsOrServersBlock() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let cases: [(String, @Sendable () -> [String: Any], String)] = [
+            ("plugins", { ["plugins": [["name": "evil", "path": "/x"]]] }, "the init plugins hold entries the shape does not allow (extra: evil)"),
+            ("skills", { ["skills": ["deep-research", "my-own-skill"]] }, "the init skills hold entries the shape does not allow (extra: my-own-skill)"),
+            ("mcp", { ["mcp_servers": [["name": "company", "status": "connected"]]] }, "the init MCP servers hold entries the shape does not allow (extra: company)"),
+        ]
+        for (label, extras, want) in cases {
+            let run = await w.run(w.canary(), runner: canaryRunner(TurnPlay(initExtras: extras)))
+            #expect(!run.passes(try #require(run.verified)), "\(label)")
+            let detail = try w.item(run, "sandbox-canary").detail
+            #expect(detail.hasPrefix(want), "\(label): \(detail)")
+        }
+        let fine = await w.run(w.canary(), runner: canaryRunner(TurnPlay(initExtras: { ["skills": ["deep-research"], "plugins": [], "mcp_servers": []] })))
+        #expect(fine.passes(try #require(fine.verified)))
+        #expect(try w.item(fine, "sandbox-canary").detail.contains("expected skills absent from the init line: design, doctor, ultrareview"))
+    }
+
+    /// Minor 7: the bare UUID (any case) and base64 of the token are leaks too, and are redacted.
+    @Test func bareUUIDAndBase64LeaksBlock() async throws {
+        let token = "BRAHMA-CANARY-\(UUID().uuidString)"
+        let m = CanaryLeakMatcher(token: token)
+        let uuid = String(token.dropFirst("BRAHMA-CANARY-".count))
+        #expect(m.found(in: "x \(uuid.lowercased()) y")); #expect(m.found(in: uuid))
+        for prefix in ["", "a", "ab", "abc"] {
+            let b64 = Data((prefix + token + "\n").utf8).base64EncodedString()
+            #expect(m.found(in: "out: \(b64)"), "alignment \(prefix.count)")
+            #expect(!m.redact(b64).contains(String(Data((prefix + token).utf8).base64EncodedString().dropFirst(8).prefix(20))))
+        }
+        #expect(!m.found(in: "BRAHMA-CANARY-\(UUID().uuidString) a different token"))
+        #expect(!m.redact("a \(uuid.lowercased()) b").contains(uuid.lowercased()))
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes + "\necho uuid\n")
+        let local = FakeSandbox { probe, env, cwd in
+            if probe == "echo uuid" {
+                let t = (try? String(contentsOfFile: env[CanaryProbes.dataFileVariable] ?? "", encoding: .utf8)) ?? ""
+                return CheckOutcome(exitCode: 1, timedOut: false, tail: Data(t.utf8).base64EncodedString())
+            }
+            return FakeSandbox.denyAll(probe, env, cwd)
+        }
+        let run = await w.run(w.canary(local: local))
+        #expect(try w.item(run, "sandbox-canary-local").detail.hasPrefix("probe line 7 leaked a canary token"))
+    }
+
+    /// C2: a key whose shape the canary's turn cannot have fails before any model call; fan-out and Ultra shapes likewise.
+    @Test func aShapeTheCanaryCannotBuildCostsNoTurn() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let runner = canaryRunner()
+        let mismatch = await w.canary().run(paths: w.paths, claudePath: w.claude.path, runner: runner,
+                                            key: SandboxCanaryKey(fingerprint: "f", shape: "not-a-shape", osVersion: "o"), settings: nil)
+        #expect(try w.item(mismatch, "sandbox-canary").detail.hasPrefix("not run: the canary's turn would not have the asking turn's settings shape"))
+        let p = try SandboxCanary.prepare(paths: w.paths, environment: w.env, hookExecutable: "/usr/local/bin/brahma")
+        let settings = p.settings
+        p.cleanup()
+        let fanOut = await w.canary().run(paths: w.paths, claudePath: w.claude.path, runner: runner,
+                                          key: SandboxCanaryKey(fingerprint: "f", shape: CanaryShape.key(settings, launch: "task"), osVersion: "o"),
+                                          settings: settings)
+        #expect(try w.item(fanOut, "sandbox-canary").detail.contains("fans out (task)"))
+        var ultra = settings
+        ultra.enableWorkflows = true
+        let u = await w.canary().run(paths: w.paths, claudePath: w.claude.path, runner: runner,
+                                     key: SandboxCanaryKey(fingerprint: "f", shape: ultra.shape(), osVersion: "o"), settings: ultra)
+        #expect(try w.item(u, "sandbox-canary").detail.contains("Ultra"))
+        #expect(runner.requests.isEmpty, "no model turn for a shape the canary cannot build")
+        // The asking turn's own shape runs, and its pass is for exactly that shape.
+        let same = await w.canary().run(paths: w.paths, claudePath: w.claude.path, runner: runner,
+                                        key: SandboxCanaryKey(fingerprint: "f", shape: settings.shape(), osVersion: "o"), settings: settings)
+        #expect(same.verified?.shape == settings.shape())
+        #expect(runner.requests.count == 1)
+        #expect(w.leftovers().isEmpty)
+    }
+
+    /// C2: the canary turn is built like a real sandboxed turn: both hooks, its own throwaway taint database; a plan shape's
+    /// settings carry the plans directory, and the network is the asking turn's.
+    @Test func theCanaryTurnHasTheRealTurnsParts() throws {
+        let w = try CanaryWorld()
+        let p = try SandboxCanary.prepare(paths: w.paths, environment: w.env, hookExecutable: "/usr/local/bin/brahma")
+        defer { p.cleanup() }
+        #expect(p.settings.hooks?["PostToolUse"] != nil); #expect(p.settings.hooks?["PreToolUse"] != nil)
+        let db = try #require(p.request.taintDatabase)
+        #expect(db.hasPrefix(w.paths.runDir.path + "/canary-"), "a throwaway taint database, never the engine's")
+        let plan = try SandboxCanary.prepare(paths: w.paths, environment: w.env, hookExecutable: "/usr/local/bin/brahma",
+                                             spec: SandboxCanary.TurnSpec(plan: true))
+        defer { plan.cleanup() }
+        #expect(plan.settings.plansDirectory != nil); #expect(plan.settings.shape() != p.settings.shape())
+        #expect(TurnProfileCompiler.profile(for: plan.request).tools?.contains("Bash") == true, "the probes still run with Bash")
+        let closed = try SandboxCanary.prepare(paths: w.paths, environment: w.env, hookExecutable: "/usr/local/bin/brahma",
+                                               spec: SandboxCanary.TurnSpec(allowedDomains: [], webDomains: [], allowLocalBinding: true))
+        defer { closed.cleanup() }
+        #expect(closed.settings.sandbox?.network?.allowedDomains == [])
+        #expect(closed.settings.sandbox?.network?.allowLocalBinding == true)
+        #expect(SandboxCanary.TurnSpec(settings: closed.settings) == SandboxCanary.TurnSpec(allowedDomains: [], webDomains: [], allowLocalBinding: true))
+    }
+
+    /// Minor 6: a CLI that changed during the turn leaves nothing verified.
+    @Test func aCLIChangedDuringTheTurnVerifiesNothing() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes)
+        let claude = try FakeTools.script("claude", "# SandboxCanaryProbeTests changing CLI \(UUID().uuidString)\nexit 0")
+        let play = TurnPlay(during: { _ in
+            try? FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -86_400)], ofItemAtPath: claude.path)
+        })
+        let run = await w.canary().run(paths: w.paths, claudePath: claude.path, runner: canaryRunner(play),
+                                       key: SandboxCanaryKey(fingerprint: "f", shape: SandboxCanary.anyShape, osVersion: "o"), settings: nil)
+        #expect(run.verified == nil)
+        #expect(try w.item(run, "sandbox-canary").detail.hasPrefix("the claude CLI changed during the run"))
+    }
+
+    /// Minor 3 and 9: probe lines are trimmed and refuse control characters; a pass names the file's SHA prefix and count.
+    @Test func probeLinesAndThePassDetail() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes("cat \"$CANARY_HOME_FILE\"\u{07}\n")
+        guard case .failure(.refused(_, let problem)) = CanaryProbes.load(paths: w.paths) else { Issue.record("a bell loaded"); return }
+        #expect(problem == "line 1 holds a control character")
+        #expect(CanaryProbes.parse("  cat x\t\n\u{0B}") == [CanaryProbe(line: 1, text: "cat x")])
+        try w.writeProbes(deniedProbes)
+        let run = await w.run(w.canary())
+        let sha = SHA256.hex(Data(deniedProbes.utf8))
+        #expect(try w.item(run, "sandbox-canary-local").detail.hasPrefix("probe file sha256 \(sha.prefix(12)), 4 probe(s) and 0 helper(s); "))
+        #expect(run.detail.contains(String(sha.prefix(12))))
+    }
+
+    /// C2 end to end: the production canary (its sandboxes and its model faked) behind the real per-launch gate. A sandboxed
+    /// agent waits, the canary runs for exactly the agent's turn shape and passes, the pass is recorded with the probe
+    /// file's hash in its key, and the agent then launches.
+    @Test func theProductionCanaryUnlocksASandboxedAgent() async throws {
+        let claude = try FakeTools.script("claude", "# SandboxCanaryProbeTests end-to-end fixture\nexit 0")
+        let userHome = try tempDir()
+        let turns = canaryRunner()
+        let canary = SandboxCanary(environment: SandboxEnvironment(userHome: userHome, darwinUserTemp: nil, shell: "/bin/zsh"),
+                                   sandbox: FakeSandbox(), hookExecutable: "/usr/local/bin/brahma", localRunner: { _ in FakeSandbox() })
+        var gate = SandboxCanaryGate(canary: canary, runner: turns, claudePath: claude.path, retryAfter: 0)
+        gate.fingerprintCacheSeconds = 0
+        let world = try World(sandboxCanary: gate)
+        let probes = CanaryProbes.url(paths: world.paths)
+        try BrahmaPaths.ensurePrivateDirectory(probes.deletingLastPathComponent())
+        try Data(deniedProbes.utf8).write(to: probes)
+        #expect(chmod(probes.path, 0o600) == 0)
+        let company = try world.company("Vault", profile: .sandboxed)
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        func engRequests() -> [TurnRequest] { world.fake.requests.filter { $0.agent.id == eng.id } }
+        try world.dm(company, eng, "go")
+        try await world.cycle()
+        try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(engRequests().isEmpty, "the first turn waits for its canary")
+        #expect(turns.requests.count == 1, "one canary turn ran")
+        let rows = try await world.store.writer.read { db in try Row.fetchAll(db, sql: "SELECT cliFingerprint, settingsShape, detail FROM sandboxCanary") }
+        let events = try world.store.events(afterId: 0, companyId: company.id).map(\.text)
+        #expect(rows.count == 1, "the canary passed for the agent's own shape: \(events)")
+        let cli = try CLIFingerprint.of(claudePath: claude.path).key
+        #expect(rows.first?["cliFingerprint"] == CanaryProbes.keyFingerprint(cli: cli, probes: SHA256.hex(Data(deniedProbes.utf8))))
+        try world.dm(company, eng, "go on")
+        try await world.cycle()
+        #expect(engRequests().count == 1, "after the pass the sandboxed agent launches")
+        #expect(turns.requests.count == 1, "no second canary turn")
+    }
+
+    /// C2: what `brahma canary run` verifies for a company (`TurnSpec(company:)`) has the shape of that company's real
+    /// sandboxed work turn, as the per-launch gate asks for it.
+    @Test func theCLISpecMatchesTheEnginesTurnShape() async throws {
+        let claude = try FakeTools.script("claude", "# SandboxCanaryProbeTests CLI spec fixture\nexit 0")
+        let asked = AskedShapes()
+        var gate = SandboxCanaryGate(canary: asked, runner: FakeTurnRunner(), claudePath: claude.path, retryAfter: 0)
+        gate.fingerprintCacheSeconds = 0
+        let world = try World(sandboxCanary: gate)
+        let company = try world.company("Vault", profile: .sandboxed)
+        let eng = try world.store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
+        try world.dm(company, eng, "go")
+        try await world.cycle()
+        try await world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        let shape = try #require(asked.shapes.first)
+        let env = SandboxEnvironment(userHome: world.userHome, darwinUserTemp: nil, shell: "/bin/zsh")
+        let p = try SandboxCanary.prepare(paths: world.paths, environment: env, hookExecutable: "/usr/local/bin/brahma",
+                                          spec: SandboxCanary.TurnSpec(company: try #require(try world.store.company(id: company.id))))
+        defer { p.cleanup() }
+        #expect(p.settings.shape() == shape)
+    }
+
+    /// The gate's retry delay doubles with each failure of a key, capped.
+    @Test func canaryRetryBacksOff() {
+        #expect(Orchestrator.canaryRetryDelay(retryAfter: 600, failures: 1) == 600)
+        #expect(Orchestrator.canaryRetryDelay(retryAfter: 600, failures: 2) == 1200)
+        #expect(Orchestrator.canaryRetryDelay(retryAfter: 600, failures: 4) == 4800)
+        #expect(Orchestrator.canaryRetryDelay(retryAfter: 600, failures: 30) == 6 * 3600)
+        #expect(Orchestrator.canaryRetryDelay(retryAfter: 0, failures: 5) == 0)
     }
 
     /// The model-free layer under the real Seatbelt runner: the planted places are denied through the agent's own shell

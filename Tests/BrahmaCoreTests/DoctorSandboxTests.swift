@@ -189,7 +189,7 @@ private struct GateWorld {
         }
         #expect(alerts.count == 1)
         let events = try world.store.events(afterId: 0, companyId: company.id).map(\.text)
-        #expect(events.contains { $0.hasPrefix("Sandbox check failed") && $0.contains("missing probe file") }, "\(events)")
+        #expect(events.contains { $0.hasPrefix("Sandbox check failed") && $0.contains("no probes in") }, "\(events)")
     }
 
     @Test func newSettingsShapeRequiresCanary() async throws {
@@ -267,7 +267,7 @@ private struct GateWorld {
         #expect(Set(items.map(\.name)) == ["sandbox-backend", "sandbox-canary-local", "sandbox-canary", "sandbox-helpers"])
         #expect(!items.allSatisfy { $0.status == .pass })
         let item = try #require(items.first { $0.name == "sandbox-canary" })
-        #expect(item.status == .warn); #expect(item.detail.hasPrefix("missing probe file"))
+        #expect(item.status == .warn); #expect(item.detail.hasPrefix("no probes in"), "the engine wrote the template: \(item.detail)")
         #expect(runner.requests.isEmpty)
         let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: paths.workspaces.path)) ?? []
         #expect(leftovers.isEmpty, "\(leftovers)")

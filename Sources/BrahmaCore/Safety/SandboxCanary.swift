@@ -77,8 +77,10 @@ public struct CanaryProbeResult: Equatable, Sendable {
     public var denied: Bool
     public var killed: Bool
     public var leaked: Bool
+    /// The planted places changed while it ran (a new, changed or removed entry): it fails.
+    public var changedPlanted = false
     public var output: String
-    /// Why it did not run, when it did not.
+    /// Why it did not run (or what it changed); never output.
     public var note: String?
 
     public init(layer: Layer, probe: CanaryProbe, ran: Bool, exitStatus: Int32?, denied: Bool, killed: Bool = false,
@@ -88,13 +90,14 @@ public struct CanaryProbeResult: Equatable, Sendable {
         self.note = note
     }
 
-    /// The pass rule: it ran, it was denied, and nothing of a token showed.
-    public var passed: Bool { ran && denied && !leaked }
+    /// The pass rule: it ran, it was denied, nothing of a token showed and nothing planted changed.
+    public var passed: Bool { ran && denied && !leaked && !changedPlanted }
 
     /// `line 3: pass, exit 1, leaked false`: what a canary row and a doctor item record (never the output).
     public var summary: String {
         let exit = exitStatus.map(String.init) ?? (killed ? "killed" : (ran ? "none" : "not run"))
-        return "line \(line): \(passed ? "pass" : "FAIL"), exit \(exit), leaked \(leaked)" + (helper ? ", helper" : "")
+        return "line \(line): \(passed ? "pass" : "FAIL"), exit \(exit), leaked \(leaked)" + (changedPlanted ? ", changed a planted place" : "")
+            + (helper ? ", helper" : "")
     }
 }
 
@@ -133,23 +136,68 @@ public protocol SandboxCanaryRunning: Sendable {
              settings: ClaudeSettings?) async -> CanaryRun
 }
 
+/// How the planted token could show in output: raw, percent-encoded and JSON-escaped (the Redactor's forms), its bare UUID
+/// in any case, and base64 of it at any byte alignment.
+public struct CanaryLeakMatcher: Sendable {
+    public let forms: [String]
+    let uuid: String
+    let base64: [String]
+
+    public init(token: String) {
+        forms = Redactor.forms(of: token)
+        uuid = String(token.split(separator: "-", maxSplits: 2).last ?? Substring(token)).lowercased()
+        let data = Data(token.utf8)
+        var fragments: [String] = []
+        for k in 0..<3 {
+            // The first characters depend on the k bytes before the token, the last on the bytes after it.
+            let encoded = (Data(repeating: 0, count: k) + data).base64EncodedString()
+            let head = (8 * k + 5) / 6, tail = 4
+            guard encoded.count > head + tail + 16 else { continue }
+            fragments.append(String(encoded.dropFirst(head).dropLast(tail)))
+        }
+        base64 = fragments
+    }
+
+    public func found(in text: String) -> Bool {
+        if forms.contains(where: { !$0.isEmpty && text.contains($0) }) { return true }
+        if uuid.count >= 32, text.lowercased().contains(uuid) { return true }
+        return base64.contains { text.contains($0) }
+    }
+
+    /// `text` with every form replaced by `SandboxCanary.redactedToken`, capped at `SandboxCanary.outputCap` characters.
+    public func redact(_ text: String) -> String {
+        var out = text
+        for form in (forms + base64).sorted(by: { $0.utf8.count > $1.utf8.count }) where !form.isEmpty && out.contains(form) {
+            out = out.replacingOccurrences(of: form, with: SandboxCanary.redactedToken, options: .literal)
+        }
+        if uuid.count >= 32 {
+            out = out.replacingOccurrences(of: uuid, with: SandboxCanary.redactedToken, options: [.literal, .caseInsensitive])
+        }
+        if out.count > SandboxCanary.outputCap { out = String(out.suffix(SandboxCanary.outputCap)) }
+        return out
+    }
+}
+
 /// The production canary, a defensive self-test of the sandbox: every probe is expected to be DENIED. It builds a throwaway
 /// company under `paths.workspaces/.brahma-canary-<id>/`, plants dummy `BRAHMA-CANARY-<uuid>` tokens where no turn may read
-/// (the owner's home, the data home, another company's workspace, another agent's lab), and compiles the itemless turn the
-/// real `SandboxScope.forTurn` and `ClaudeSettingsCompiler` produce (the pre-tool hook on), checking its settings deny them.
-/// The probe lines are the owner's (`CanaryProbes`, `<data home>/canary/probes.txt`); none are built in. Then:
+/// (the owner's home, the data home, another company's workspace, another agent's lab), and compiles the turn the real
+/// `SandboxScope.forTurn` and `ClaudeSettingsCompiler` produce for the asking turn's shape (`TurnSpec`: its network, a plan
+/// turn's plans directory; the pre- and post-tool hooks on, as every sandboxed turn has them), checking its settings deny
+/// them. A turn whose shape the canary cannot build is refused before any model call. The probe lines are the owner's
+/// (`CanaryProbes`, `<data home>/canary/probes.txt`); none are built in. Then:
 /// - `sandbox-backend`, model-free: the Seatbelt runner's `cat` of a token in the data home must fail;
-/// - `sandbox-canary-local`, model-free: each probe through the agent's shell prefix under Seatbelt with a policy mirroring
-///   the turn's scope (after a positive control that must succeed);
+/// - `sandbox-canary-local`, model-free: each probe through the agent's shell prefix under Brahma's own Seatbelt profile (the
+///   one around checks and previews) with a policy mirroring the turn's scope, after a positive control that must succeed. It
+///   vouches for that sandbox, not for the agent turn's;
 /// - `sandbox-canary`, only when the model-free layer passed: one small haiku turn under the compiled settings runs each
-///   probe once with its Bash tool, judged only from its raw stream;
+///   probe once with its Bash tool, judged only from its raw stream. Only this layer vouches for the agent turn's sandbox;
 /// - `sandbox-helpers`, warn-only: the probes marked `# helper` that succeeded.
-/// The gate needs both layers to pass. Everything planted is removed afterwards.
+/// Nothing planted may change during either layer. The gate needs both layers to pass. Everything planted is removed.
 public struct SandboxCanary: SandboxCanaryRunning {
     public var environment: SandboxEnvironment
     /// Runs `sandbox-backend`; without one that item is a warning (skipped).
     public var sandbox: (any SandboxedRunner)?
-    /// The `brahma` the canary turn's pre-tool hook names, as real turns do.
+    /// The `brahma` the canary turn's hooks name, as real turns do.
     public var hookExecutable: String
     /// The baseline the model-free layer's runs start from (the engine's check baseline: every company workspace, the
     /// backup folders); the canary adds its own throwaway places. Nil: `SandboxBaseline.current`.
@@ -178,6 +226,50 @@ public struct SandboxCanary: SandboxCanaryRunning {
     public static let redactedToken = "[redacted canary token]"
     /// Output kept per probe for the terminal.
     static let outputCap = 2000
+    /// A key shape that asks for no particular turn shape: `brahma canary run` (which records what the run verified) and the
+    /// doctor (which records nothing).
+    public static let anyShape = ""
+    static let placeholderShapes: Set<String> = [anyShape, "doctor"]
+    /// A command the shell could not find (127) did not run: it proves nothing about the sandbox.
+    static let notFoundStatus: Int32 = 127
+    /// The fan-out launches (`CanaryShape.launch`) whose keys the canary does not build yet.
+    static let fanOutLaunches = ["task", "ultra-small", "ultra"]
+
+    /// The parts of an asking turn's shape the canary's turn reproduces: its network (the domains' presence, local binding,
+    /// WebFetch domains) and whether it is a plan turn. An Ultra (workflow) turn is not built.
+    public struct TurnSpec: Equatable, Sendable {
+        /// Nil: the canary company's defaults (`CompanyNetwork.scope`).
+        public var allowedDomains: [String]?
+        public var webDomains: [String]?
+        public var allowLocalBinding: Bool?
+        public var plan = false
+        public var ultra = false
+
+        public init(allowedDomains: [String]? = nil, webDomains: [String]? = nil, allowLocalBinding: Bool? = nil, plan: Bool = false) {
+            self.allowedDomains = allowedDomains; self.webDomains = webDomains; self.allowLocalBinding = allowLocalBinding
+            self.plan = plan
+        }
+
+        /// The standard sandboxed work turn of a company with the default network.
+        public static let standard = TurnSpec()
+
+        /// The standard sandboxed work turn of `company` (its network without grants).
+        public init(company: Company) {
+            let n = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: [])
+            self.init(allowedDomains: n.allowedDomains, webDomains: n.webDomains, allowLocalBinding: n.allowLocalBinding)
+        }
+
+        /// The spec of an asking turn, read from its compiled settings.
+        public init(settings s: ClaudeSettings) {
+            let n = s.sandbox?.network
+            let prefix = "WebFetch(domain:"
+            self.init(allowedDomains: n?.allowedDomains ?? [],
+                      webDomains: (s.permissions?.allow ?? []).compactMap { rule in
+                          rule.hasPrefix(prefix) && rule.hasSuffix(")") ? String(rule.dropFirst(prefix.count).dropLast()) : nil },
+                      allowLocalBinding: n?.allowLocalBinding ?? false, plan: s.plansDirectory != nil)
+            ultra = s.enableWorkflows == true
+        }
+    }
 
     /// The canary's throwaway places the model-free layer's runner must deny like any company's: its own workspace (whose
     /// `.brahma` is then read like a turn reads it), the other company's workspace, and the owner's home it planted in.
@@ -191,6 +283,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
     /// The canary's prepared turn: the request (scope, settings file, prefix), its compiled settings and what was planted.
     public struct Prepared: Sendable {
         public var request: TurnRequest
+        /// The settings written to the turn's settings file: what the turn runs under, and whose shape it verifies.
         public var settings: ClaudeSettings
         public var token: String
         /// The planted token files: the owner's home, the data home, another company's workspace, another agent's lab.
@@ -198,7 +291,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
         public var dataHomeToken: URL
         public var otherCompanyToken: URL
         public var otherCompany: URL
-        /// `.brahma/labs/canary-other-<id>`: another agent's lab in the throwaway company (5L-1), holding `token`.
+        /// `.brahma/labs/canary-other`: another agent's lab in the throwaway company (5L-1), holding `token`.
         public var otherAgentLab: URL
         public var otherAgentToken: URL
         /// `own.txt` in the canary agent's own lab (its cwd): the positive control reads it.
@@ -212,16 +305,25 @@ public struct SandboxCanary: SandboxCanaryRunning {
              CanaryProbes.outsideDirVariable: otherCompany.path, CanaryProbes.otherAgentLabVariable: otherAgentLab.path]
         }
 
+        /// How a leak of the token is recognized (and redacted).
+        public var leak: CanaryLeakMatcher { CanaryLeakMatcher(token: token) }
         /// The forms of the token a leak is matched in (raw, percent-encoded, JSON-escaped: the Redactor's).
-        public var tokenForms: [String] { Redactor.forms(of: token) }
+        public var tokenForms: [String] { leak.forms }
+
+        /// The four planted places, as the snapshot names them.
+        var plantedPlaces: [(name: String, url: URL)] {
+            [("the owner's home", userHomeToken.deletingLastPathComponent()), ("the data home", dataHomeToken.deletingLastPathComponent()),
+             ("another company's workspace", otherCompany), ("another agent's lab", otherAgentLab)]
+        }
 
         /// Removes everything the canary made, by descriptor (`EngineFiles.removeNoFollow`: a link is removed, never followed).
         public func cleanup() { SandboxCanary.remove(removals) }
     }
 
-    /// Builds the throwaway company, plants the tokens and compiles the canary turn. Blocking (git, files). On a throw nothing
-    /// is left behind.
-    public static func prepare(paths: BrahmaPaths, environment: SandboxEnvironment, hookExecutable: String) throws -> Prepared {
+    /// Builds the throwaway company, plants the tokens and compiles the canary turn for `spec`. Blocking (git, files). On a
+    /// throw nothing is left behind.
+    public static func prepare(paths: BrahmaPaths, environment: SandboxEnvironment, hookExecutable: String,
+                               spec: TurnSpec = .standard) throws -> Prepared {
         let fm = FileManager.default
         let id = String(UUID().uuidString.lowercased().prefix(8))
         let token = "BRAHMA-CANARY-\(UUID().uuidString)"
@@ -233,8 +335,10 @@ public struct SandboxCanary: SandboxCanaryRunning {
         let agentId = "canary-\(id)"
         let otherHandle = "canary-other"
         let settingsFile = SettingsFile.path(paths: paths, agentId: agentId)
+        let taintDatabase = runDir.appending(path: "taint.sqlite")
         var removals: [(url: URL, root: URL)] = [(ws, paths.workspaces), (other, paths.workspaces), (homeDir, environment.userHome),
                                                   (runDir, paths.runDir), (settingsFile, paths.runDir)]
+        if let flag = TaintFlag.url(home: paths.home, agentId: agentId) { removals.append((flag, paths.runDir)) }
         do {
             for dir in [ws, other, homeDir] {
                 guard !fm.fileExists(atPath: dir.path) else { throw DataHomeError(reason: "\(dir.path) already exists") }
@@ -264,10 +368,15 @@ public struct SandboxCanary: SandboxCanaryRunning {
                   try EngineFiles.create(Data(controlText.utf8), workspace: ws, dir: layout.labRelative, name: "own.txt", mode: 0o600)
             else { throw DataHomeError(reason: "the canary's lab files already exist") }
             let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: environment.shell, keepNames: [])
-            let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [other], backupTargets: [],
+            var scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [other], backupTargets: [],
                                                  kind: .work, item: nil, company: company, grants: GrantInputs(),
                                                  darwinUserTemp: environment.darwinUserTemp, userHome: environment.userHome,
                                                  claudeTmpRoot: environment.claudeTmpRoot)
+            // The asking turn's network, so the compiled settings have its shape.
+            if let d = spec.allowedDomains { scope.network.allowedDomains = d }
+            if let d = spec.webDomains { scope.network.webDomains = d }
+            if let b = spec.allowLocalBinding { scope.network.allowLocalBinding = b }
+            try scope.validate()
             if let tmp = scope.claudeTmp {
                 try ClaudeTmp.ensure(tmp)
                 removals.append((tmp, tmp.deletingLastPathComponent()))
@@ -286,11 +395,25 @@ public struct SandboxCanary: SandboxCanaryRunning {
             request.turnRecordDirectory = runDir.appending(path: "turns", directoryHint: .isDirectory)
             request.mode = ModeCanary.shapes().first?.1
             request.hookExecutable = hookExecutable
+            // As every sandboxed turn (`Orchestrator`): the PostToolUse taint hook, here against the canary's own throwaway
+            // taint database and flag, so the settings have the real turns' shape.
+            request.postToolHook = TaintPolicy.postToolHook(executable: hookExecutable, database: taintDatabase.path, agentId: agent.id)
+            request.taintFlagFile = TaintFlag.url(home: paths.home, agentId: agent.id)?.path
+            request.taintDatabase = taintDatabase.path
             request.emitRawLines = true
             let profile = TurnProfileCompiler.profile(for: request)
             try TurnProfileCompiler.validate(profile)
-            try SettingsFile.write(try TurnProfileCompiler.settingsJSON(profile), to: settingsFile)
-            return Prepared(request: request, settings: profile.settings, token: token, userHomeToken: userHomeToken,
+            // A plan turn's settings (its plans directory) with the work turn's tools: the Bash probes run under exactly the
+            // settings a plan turn gets.
+            var written = profile
+            if spec.plan {
+                var planned = request
+                planned.kind = .plan
+                written = TurnProfileCompiler.profile(for: planned)
+                try TurnProfileCompiler.validate(written)
+            }
+            try SettingsFile.write(try TurnProfileCompiler.settingsJSON(written), to: settingsFile)
+            return Prepared(request: request, settings: written.settings, token: token, userHomeToken: userHomeToken,
                             dataHomeToken: dataHomeToken, otherCompanyToken: otherToken, otherCompany: other,
                             otherAgentLab: otherLab, otherAgentToken: otherLab.appending(path: "token"),
                             controlFile: layout.lab.appending(path: "own.txt"), controlText: controlText, removals: removals)
@@ -305,7 +428,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
     }
 
     /// The names a canary's throwaway places carry: `.brahma-canary-*` in the workspaces root and the owner's home, `canary-*`
-    /// in the run directory.
+    /// in the run directory and its taint flags.
     ///
     /// Removes throwaway places an interrupted canary left (a crash mid-run), by descriptor, never following a link. Only
     /// entries older than `olderThan` seconds go, so a canary running now (the engine's or the doctor's) keeps its own.
@@ -313,7 +436,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
     @discardableResult
     public static func sweepStale(paths: BrahmaPaths, userHome: URL, olderThan: TimeInterval = 3600, now: Date = Date()) -> [String] {
         var removed: [String] = []
-        for (root, prefix) in [(paths.workspaces, ".brahma-canary-"), (paths.runDir, "canary-"), (userHome, ".brahma-canary-")] {
+        let taint = paths.runDir.appending(path: "taint", directoryHint: .isDirectory)
+        for (root, prefix) in [(paths.workspaces, ".brahma-canary-"), (paths.runDir, "canary-"), (userHome, ".brahma-canary-"),
+                               (taint, "canary-")] {
             for name in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] where name.hasPrefix(prefix) {
                 let url = root.appending(path: name)
                 var st = stat()
@@ -339,21 +464,46 @@ public struct SandboxCanary: SandboxCanaryRunning {
     }
 
     /// The key a run verifies: the CLI build it fingerprints now and the probe file it loaded (`CanaryProbes.keyFingerprint`),
-    /// the shape of the settings it compiled (its own itemless turn, not necessarily the asking turn's: then the gate records
-    /// nothing), this macOS.
+    /// the shape of the settings it compiled, this macOS.
     static func verifiedKey(claudePath: String, probesDigest: String, settings: ClaudeSettings) -> SandboxCanaryKey? {
         guard let fp = try? CLIFingerprint.of(claudePath: claudePath) else { return nil }
         return SandboxCanaryKey(fingerprint: CanaryProbes.keyFingerprint(cli: fp.key, probes: probesDigest), shape: settings.shape(),
                                 osVersion: ProcessInfo.processInfo.operatingSystemVersionString)
     }
 
+    /// Why the canary's turn cannot verify the asked shape (nil when it can, or when no shape is asked): it is checked before
+    /// any model call, so a shape the canary cannot build never costs a turn.
+    static func shapeProblem(asked: String, settings: ClaudeSettings) -> String? {
+        guard !placeholderShapes.contains(asked), asked != settings.shape() else { return nil }
+        for launch in fanOutLaunches where CanaryShape.key(settings, launch: launch) == asked {
+            return "the asking turn fans out (\(launch)); the canary does not verify fan-out shapes yet, so those turns run without "
+                + "fan-out (no model call)"
+        }
+        return "the canary's turn would not have the asking turn's settings shape, so no pass could be recorded for it (no model call)"
+    }
+
     public func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey,
                     settings: ClaudeSettings?) async -> CanaryRun {
+        await run(paths: paths, claudePath: claudePath, runner: runner, key: key, spec: settings.map(TurnSpec.init(settings:)) ?? .standard)
+    }
+
+    /// Runs the canary for `spec` (the asking turn's shape; `.standard` from the doctor and the CLI).
+    public func run(paths: BrahmaPaths, claudePath: String, runner: any TurnRunning, key: SandboxCanaryKey, spec: TurnSpec) async -> CanaryRun {
         let env = environment, hook = hookExecutable
         await Doctor.execBlocking.run { _ = Self.sweepStale(paths: paths, userHome: env.userHome) }
-        let loaded: Result<CanaryProbeFile, CanaryProbeError> = await Doctor.execBlocking.run { CanaryProbes.load(paths: paths) }
+        // The engine creates the header-only template when the file is missing (it then holds no probe: no pass).
+        let loaded: Result<CanaryProbeFile, CanaryProbeError> = await Doctor.execBlocking.run {
+            _ = try? CanaryProbes.ensureTemplate(paths: paths)
+            return CanaryProbes.load(paths: paths)
+        }
+        if spec.ultra {
+            let why = "not run: the asking turn is an Ultra (workflow) turn, whose shape the canary does not build (no model call)"
+            return CanaryRun(items: [DoctorItem(name: "sandbox-canary-local", status: .fail, detail: why),
+                                     DoctorItem(name: "sandbox-canary", status: .fail, detail: why),
+                                     Self.helpersItem(loaded, results: [])], verified: nil)
+        }
         let prepared: Result<Prepared, any Error> = await Doctor.execBlocking.run {
-            Result { try Self.prepare(paths: paths, environment: env, hookExecutable: hook) }
+            Result { try Self.prepare(paths: paths, environment: env, hookExecutable: hook, spec: spec) }
         }
         var items: [DoctorItem] = []
         var results: [CanaryProbeResult] = []
@@ -370,7 +520,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
             items.append(await Self.backendItem(token: p.dataHomeToken, secret: p.token, sandbox: sandbox))
             switch loaded {
             case .failure(let error):
-                // Not written yet (missing, or no probe lines) is a warning, a refused file a failure; neither is ever a pass
+                // Not written yet (no probe lines) is a warning, a refused file a failure; neither is ever a pass
                 // (`CanaryRun.passes`), so sandboxed companies stay blocked either way. A warning keeps `brahma doctor`
                 // usable for an owner who runs no sandboxed company.
                 let status: DoctorItem.Status
@@ -378,10 +528,20 @@ public struct SandboxCanary: SandboxCanaryRunning {
                 items.append(DoctorItem(name: "sandbox-canary-local", status: status, detail: error.description))
                 items.append(DoctorItem(name: "sandbox-canary", status: status, detail: error.description))
             case .success(let file):
+                if let problem = Self.shapeProblem(asked: key.shape, settings: p.settings) {
+                    items.append(DoctorItem(name: "sandbox-canary-local", status: .fail, detail: "not run: \(problem)"))
+                    items.append(DoctorItem(name: "sandbox-canary", status: .fail, detail: "not run: \(problem)"))
+                    break
+                }
+                let before = await Doctor.execBlocking.run { Self.snapshot(p) }
                 let places = LocalPlaces(paths: paths, workspace: URL(fileURLWithPath: p.request.company.workspacePath),
                                          otherWorkspaces: [p.otherCompany], userHome: env.userHome)
                 let local = localRunner?(places) ?? Self.platformLocalRunner(baseline: baseline, places: places)
-                let a = await Self.localLayer(p, file: file, runner: local, timeout: probeTimeout)
+                var a = await Self.localLayer(p, file: file, runner: local, timeout: probeTimeout, planted: before)
+                if a.item.status == .pass {
+                    a.item.detail = "probe file sha256 \(file.sha256.prefix(12)), \(file.blocking.count) probe(s) and "
+                        + "\(file.helpers.count) helper(s); " + a.item.detail
+                }
                 items.append(a.item)
                 results += a.results
                 let missing = Self.missingDenies(p, paths: paths, environment: env)
@@ -392,7 +552,14 @@ public struct SandboxCanary: SandboxCanaryRunning {
                     items.append(DoctorItem(name: "sandbox-canary", status: .fail,
                                             detail: "not run: the model-free layer (sandbox-canary-local) did not pass"))
                 } else {
-                    let b = await Self.turnLayer(p, file: file, runner: runner, wallClock: turnWallClock)
+                    var b = await Self.turnLayer(p, file: file, runner: runner, wallClock: turnWallClock, planted: before)
+                    // The CLI build must still be the one fingerprinted before the turn.
+                    let after = (try? CLIFingerprint.of(claudePath: claudePath)).map { CanaryProbes.keyFingerprint(cli: $0.key, probes: digest) }
+                    if let v = verified, after != v.fingerprint {
+                        verified = nil
+                        b.item.status = .fail
+                        b.item.detail = "the claude CLI changed during the run, so nothing is verified; " + b.item.detail
+                    }
                     items.append(b.item)
                     results += b.results
                 }
@@ -401,6 +568,50 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
         items.append(Self.helpersItem(loaded, results: results))
         return CanaryRun(items: items, verified: verified, probes: results)
+    }
+
+    // MARK: Planted places (I1)
+
+    /// Every entry under the four planted places (relative path → type, size, modification time, inode, mode), never
+    /// following a link; the engine's own files in the canary's run directory (`turns`, the empty MCP config, the throwaway
+    /// taint database) are left out. Blocking.
+    static func snapshot(_ p: Prepared) -> [String: String] {
+        let engineOwned: Set<String> = ["turns", "empty.mcp.json", "taint.sqlite", "taint.sqlite-wal", "taint.sqlite-shm",
+                                        "taint.sqlite-journal"]
+        var out: [String: String] = [:]
+        var budget = 500
+        func walk(_ dir: URL, _ shown: String, depth: Int, top: Bool) {
+            guard depth < 6, let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
+            for name in names.sorted() where budget > 0 {
+                if top, shown.hasPrefix("the data home"), engineOwned.contains(name) { continue }
+                budget -= 1
+                let url = dir.appending(path: name)
+                var st = stat()
+                guard lstat(url.path, &st) == 0 else { continue }
+                let type = st.st_mode & S_IFMT
+                #if canImport(Darwin)
+                let mtime = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
+                #else
+                let mtime = Int64(st.st_mtim.tv_sec) * 1_000_000_000 + Int64(st.st_mtim.tv_nsec)
+                #endif
+                let key = "\(shown)/\(name)"
+                if type == S_IFDIR {
+                    out[key] = "dir \(st.st_ino) \(st.st_mode & 0o7777)"
+                    walk(url, key, depth: depth + 1, top: false)
+                } else {
+                    out[key] = "\(type) \(st.st_size) \(mtime) \(st.st_ino) \(st.st_mode & 0o7777)"
+                }
+            }
+        }
+        for (name, url) in p.plantedPlaces { walk(url, name, depth: 0, top: true) }
+        return out
+    }
+
+    /// What changed between two snapshots (new, changed or removed entries), shown by place and name; nil when nothing did.
+    static func plantedChange(_ before: [String: String], _ after: [String: String]) -> String? {
+        let changed = Set(before.keys).union(after.keys).filter { before[$0] != after[$0] }.sorted()
+        guard !changed.isEmpty else { return nil }
+        return changed.prefix(3).joined(separator: ", ") + (changed.count > 3 ? " and \(changed.count - 3) more" : "")
     }
 
     // MARK: sandbox-backend
@@ -432,11 +643,12 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
         let out = await sandbox.run(command: "/bin/cat '\(token.path)'", cwd: cwd, environment: environment,
                                     timeout: .seconds(30), outputURL: cwd.appending(path: "out.log"), policy: policy)
-        if out.tail.contains(secret) || out.exitCode == 0 {
+        if CanaryLeakMatcher(token: secret).found(in: out.tail) || out.exitCode == 0 {
             return DoctorItem(name: name, status: .fail, detail: "a sandboxed command read a file in the data home: the sandbox does not hold")
         }
         guard out.exitCode != nil else {
-            return DoctorItem(name: name, status: .fail, detail: "the sandboxed command could not run: \(Store.flat(out.tail, max: 200))")
+            // Never the output itself in an item (it reaches the row, the alert and the terminal).
+            return DoctorItem(name: name, status: .fail, detail: "the sandboxed command could not run (no exit status)")
         }
         return DoctorItem(name: name, status: .pass, detail: "a sandboxed cat of a file in the data home was refused")
     }
@@ -466,12 +678,12 @@ public struct SandboxCanary: SandboxCanaryRunning {
     }
 
     /// Runs the positive control, then each probe, through the agent's shell prefix (its one argument, handed over in an
-    /// environment variable) under `runner` with a policy mirroring the turn's scope: writable = a scratch `TMPDIR` first,
-    /// then the scope's writable places; readable = the scope's readable places; no network. Each run is capped at `timeout`
-    /// (awake time; the runner kills the process group and caps the output). Logs are kept outside everything the probe can
-    /// touch.
-    static func localLayer(_ p: Prepared, file: CanaryProbeFile, runner: any SandboxedRunner,
-                           timeout: Duration) async -> (item: DoctorItem, results: [CanaryProbeResult]) {
+    /// environment variable) under `runner` (Brahma's full check profile) with a policy mirroring the turn's scope: writable = a
+    /// scratch `TMPDIR` first, then the scope's writable places; readable = the scope's readable places; no network. Each run
+    /// is capped at `timeout` (awake time; the runner kills the process group and caps the output). Logs are kept outside
+    /// everything the probe can touch. After each probe the planted places must be as `planted` recorded them.
+    static func localLayer(_ p: Prepared, file: CanaryProbeFile, runner: any SandboxedRunner, timeout: Duration,
+                           planted: [String: String]? = nil) async -> (item: DoctorItem, results: [CanaryProbeResult]) {
         let name = "sandbox-canary-local"
         func fail(_ detail: String, _ results: [CanaryProbeResult] = []) -> (item: DoctorItem, results: [CanaryProbeResult]) {
             (DoctorItem(name: name, status: .fail, detail: detail), results)
@@ -495,7 +707,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
         var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         env.merge(p.variables) { _, new in new }
         let command = "exec '\(prefix)' \"$\(probeVariable)\""
-        let forms = p.tokenForms
+        let leak = p.leak
         let resolvedLogs = logs.resolvedForSandbox
         func runOne(_ text: String, _ n: Int) async -> (outcome: CheckOutcome, output: String) {
             var e = env
@@ -515,24 +727,31 @@ public struct SandboxCanary: SandboxCanaryRunning {
         var results: [CanaryProbeResult] = []
         for (n, probe) in file.probes.enumerated() {
             let r = await runOne(probe.text, n + 1)
-            let leaked = forms.contains { r.output.contains($0) }
+            let leaked = leak.found(in: r.output)
             let killed = r.outcome.timedOut
-            let ran = r.outcome.exitCode != nil || killed
+            let notFound = r.outcome.exitCode == notFoundStatus
+            let ran = (r.outcome.exitCode != nil || killed) && !notFound
             let denied = killed || (r.outcome.exitCode.map { $0 != 0 } ?? false)
-            results.append(CanaryProbeResult(layer: .local, probe: probe, ran: ran, exitStatus: r.outcome.exitCode, denied: denied,
-                                             killed: killed, leaked: leaked, output: redact(r.output, forms: forms),
-                                             note: ran ? nil : "could not run: \(Store.flat(redact(r.outcome.tail, forms: forms), max: 200))"))
+            var result = CanaryProbeResult(layer: .local, probe: probe, ran: ran, exitStatus: r.outcome.exitCode, denied: denied,
+                                           killed: killed, leaked: leaked, output: leak.redact(r.output),
+                                           note: notFound ? "command not found (exit 127): not run" : (ran ? nil : "could not run"))
+            if let planted, let change = plantedChange(planted, snapshot(p)) {
+                result.changedPlanted = true
+                result.note = "it changed a planted place: \(change)"
+            }
+            results.append(result)
         }
-        return (verdictItem(name: name, layerText: "model-free, through the agent's shell prefix under Seatbelt", results: results,
-                            extra: []), results)
+        return (verdictItem(name: name, layerText: "model-free, through the agent's shell prefix under Brahma's check sandbox",
+                            results: results, extra: []), results)
     }
 
-    /// The item of one layer: pass only when every blocking probe passed and no probe (helper or not) leaked; the first reason
-    /// leads the detail (what the sandbox-check alert names), then every probe's summary.
+    /// The item of one layer: pass only when every blocking probe passed and no probe (helper or not) leaked or changed a
+    /// planted place; the first reason leads the detail (what the sandbox-check alert names), then every probe's summary.
     static func verdictItem(name: String, layerText: String, results: [CanaryProbeResult], extra: [String]) -> DoctorItem {
         var problems: [String] = []
         for r in results where r.leaked { problems.append("probe line \(r.line) leaked a canary token") }
-        for r in results where !r.helper && !r.passed && !r.leaked {
+        for r in results where r.changedPlanted { problems.append("probe line \(r.line) changed a planted place") }
+        for r in results where !r.helper && !r.passed && !r.leaked && !r.changedPlanted {
             if !r.ran { problems.append("probe line \(r.line) was not run (unverified)" + (r.note.map { ": \($0)" } ?? "")) }
             else { problems.append("probe line \(r.line) failed (it was not denied: exit \(r.exitStatus.map(String.init) ?? "none"))") }
         }
@@ -543,15 +762,6 @@ public struct SandboxCanary: SandboxCanaryRunning {
             return DoctorItem(name: name, status: .pass, detail: "\(blocking) probe(s) denied (\(layerText)): \(summary)")
         }
         return DoctorItem(name: name, status: .fail, detail: problems.joined(separator: "; ") + " (\(layerText)): \(summary)")
-    }
-
-    static func redact(_ text: String, forms: [String]) -> String {
-        var out = text
-        for form in forms.sorted(by: { $0.utf8.count > $1.utf8.count }) where !form.isEmpty && out.contains(form) {
-            out = out.replacingOccurrences(of: form, with: redactedToken, options: .literal)
-        }
-        if out.count > outputCap { out = String(out.suffix(outputCap)) }
-        return out
     }
 
     // MARK: Layer B: sandbox-canary (one haiku turn)
@@ -573,9 +783,10 @@ public struct SandboxCanary: SandboxCanaryRunning {
     }
 
     /// Runs the canary turn: the prepared request (its real compiled settings), the four variables in its environment, the
-    /// prompt, a small budget, enough turns for every command, and a wall clock; judged only from its raw stream lines.
-    static func turnLayer(_ p: Prepared, file: CanaryProbeFile, runner: any TurnRunning,
-                          wallClock: Duration) async -> (item: DoctorItem, results: [CanaryProbeResult]) {
+    /// prompt, a small budget, enough turns for every command, and a wall clock; judged only from its raw stream lines, and
+    /// the planted places must be unchanged afterwards.
+    static func turnLayer(_ p: Prepared, file: CanaryProbeFile, runner: any TurnRunning, wallClock: Duration,
+                          planted: [String: String]? = nil) async -> (item: DoctorItem, results: [CanaryProbeResult]) {
         var request = p.request
         request.prompt = turnPrompt(probes: file.probes, readPath: p.userHomeToken.path)
         request.environment.merge(p.variables) { _, new in new }
@@ -588,8 +799,12 @@ public struct SandboxCanary: SandboxCanaryRunning {
         request.wallClock = wallClock
         let expected = Set(TurnProfileCompiler.profile(for: request).tools ?? [])
         let collected = await collectRawLines(runner: runner, request: request, timeout: wallClock + .seconds(60))
-        return judgeTurn(lines: collected.lines, probes: file.probes, controlText: p.controlText, tokenForms: p.tokenForms,
-                         expectedTools: expected, runError: collected.error)
+        var extra: [String] = []
+        if let planted, let change = await Doctor.execBlocking.run({ plantedChange(planted, snapshot(p)) }) {
+            extra.append("a planted place changed during the turn: \(change)")
+        }
+        return judgeTurn(lines: collected.lines, probes: file.probes, controlText: p.controlText, leak: p.leak,
+                         expectedTools: expected, runError: collected.error, extra: extra)
     }
 
     final class LineBox: @unchecked Sendable {
@@ -603,13 +818,20 @@ public struct SandboxCanary: SandboxCanaryRunning {
     }
 
     /// Every `.raw` line of the turn, until it ends or `timeout` (awake time) passes; then it is cancelled (the runner kills it).
+    /// The error says only what kind of end it was (never the runner's stderr tail).
     static func collectRawLines(runner: any TurnRunning, request: TurnRequest, timeout: Duration) async -> (lines: [String], error: String?) {
         let box = LineBox()
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
                 do {
                     for try await event in runner.run(request) { if case .raw(let line) = event { box.append(line) } }
-                } catch { box.fail("\(error)") }
+                } catch let e as TurnError {
+                    switch e {
+                    case .timedOut: box.fail("the turn timed out")
+                    case .exitedWithoutResult(let code, _): box.fail("the CLI exited \(code) without a result")
+                    default: box.fail("the turn ended with an error")
+                    }
+                } catch { box.fail("the turn ended with an error") }
             }
             group.addTask {
                 try? await AwakeTime.sleep(for: timeout)
@@ -621,20 +843,31 @@ public struct SandboxCanary: SandboxCanaryRunning {
         return (box.lines, box.error)
     }
 
+    /// The bundled skills `disableBundledSkills` leaves (`ClaudeSettingsCompiler.skillDenies`): all a canary turn may list.
+    static var expectedSkills: Set<String> {
+        Set(ClaudeSettingsCompiler.skillDenies.map { String($0.dropFirst("Skill(".count).dropLast()) })
+    }
+
     /// The `sandbox-canary` verdict, from the raw stream-json lines only:
-    /// - no line may contain a planted token (any form);
+    /// - no line may contain a planted token (any form: `CanaryLeakMatcher`);
     /// - each Bash `tool_use` whose `input.command` equals a probe is paired by id with its `tool_result`; a probe passes only
-    ///   if that result is an error or reports a non-zero exit; a probe never run (or with no result) fails as unverified;
+    ///   if that result is an error or reports a non-zero exit; a probe never run, with no result, not found (exit 127), or
+    ///   stopped by a Claude Code permission rule (its id in `permission_denials`: the sandbox never saw it) fails as
+    ///   unverified;
     /// - the positive control's result must be a success printing the control text;
     /// - the result line's `permission_denials` must name `Read`;
-    /// - the init line's `tools` may hold no tool beyond `expectedTools` (an expected tool it lacks is only noted).
-    static func judgeTurn(lines: [String], probes: [CanaryProbe], controlText: String, tokenForms: [String],
-                          expectedTools: Set<String>, runError: String?) -> (item: DoctorItem, results: [CanaryProbeResult]) {
+    /// - the init line's `tools`, `plugins`, `skills` and `mcp_servers` may hold nothing beyond what the shape allows (the
+    ///   shape's tools; no plugin; the bundled skills left; no MCP server: the canary's config is empty); an expected entry it
+    ///   lacks is only noted.
+    static func judgeTurn(lines: [String], probes: [CanaryProbe], controlText: String, leak: CanaryLeakMatcher,
+                          expectedTools: Set<String>, runError: String?, extra given: [String] = [])
+        -> (item: DoctorItem, results: [CanaryProbeResult]) {
         struct Use { var id: String; var name: String; var command: String? }
-        var initTools: [String]?
+        var initLine: [String: Any]?
         var uses: [Use] = []
         var toolResults: [String: (isError: Bool, text: String)] = [:]
         var denials: [String]?
+        var deniedUseIds = Set<String>()
         var leakedLines = 0
         func blocks(_ o: [String: Any]) -> [[String: Any]] { ((o["message"] as? [String: Any])?["content"] as? [[String: Any]]) ?? [] }
         func text(_ content: Any?) -> String {
@@ -643,13 +876,11 @@ public struct SandboxCanary: SandboxCanaryRunning {
             return ""
         }
         for line in lines {
-            if tokenForms.contains(where: { !$0.isEmpty && line.contains($0) }) { leakedLines += 1 }
+            if leak.found(in: line) { leakedLines += 1 }
             guard let o = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any], let type = o["type"] as? String else { continue }
             switch type {
             case "system":
-                if o["subtype"] as? String == "init", initTools == nil {
-                    initTools = (o["tools"] as? [Any])?.compactMap { $0 as? String } ?? []
-                }
+                if o["subtype"] as? String == "init", initLine == nil { initLine = o }
             case "assistant":
                 for b in blocks(o) where b["type"] as? String == "tool_use" {
                     guard let id = b["id"] as? String, let name = b["name"] as? String else { continue }
@@ -661,7 +892,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
                     toolResults[id] = ((b["is_error"] as? Bool) ?? false, text(b["content"]))
                 }
             case "result":
-                denials = ((o["permission_denials"] as? [[String: Any]]) ?? []).compactMap { $0["tool_name"] as? String }
+                let list = (o["permission_denials"] as? [[String: Any]]) ?? []
+                denials = list.compactMap { $0["tool_name"] as? String }
+                deniedUseIds = Set(list.compactMap { $0["tool_use_id"] as? String })
             default:
                 break
             }
@@ -680,8 +913,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
         var extra: [String] = []
         if leakedLines > 0 { extra.append("a canary token appeared in \(leakedLines) stream line(s) (leak)") }
+        extra += given
         // The positive control first: without it a stream in which nothing ran could look like a denial of everything.
-        if let use = take(controlCommand), let r = toolResults[use.id] {
+        if let use = take(controlCommand), let r = toolResults[use.id], !deniedUseIds.contains(use.id) {
             if r.isError || !r.text.contains(controlText) {
                 extra.append("the positive control (`\(controlCommand)` in the agent's own lab) did not succeed in the turn")
             }
@@ -690,46 +924,59 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
         var results: [CanaryProbeResult] = []
         for probe in probes {
-            guard let use = take(probe.text) else {
+            func notRun(_ why: String) {
                 results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: false, exitStatus: nil, denied: false, leaked: false,
-                                                 output: "", note: "the model did not run it"))
+                                                 output: "", note: why))
+            }
+            guard let use = take(probe.text) else { notRun("the model did not run it"); continue }
+            if deniedUseIds.contains(use.id) {
+                notRun("stopped by a Claude Code permission rule, not the sandbox (unverified); write it in a form the rules do not match")
                 continue
             }
-            guard let r = toolResults[use.id] else {
-                results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: false, exitStatus: nil, denied: false, leaked: false,
-                                                 output: "", note: "no tool result came back"))
-                continue
-            }
+            guard let r = toolResults[use.id] else { notRun("no tool result came back"); continue }
             let code = exitCode(r.text) ?? (r.isError ? nil : 0)
+            if code == notFoundStatus {
+                results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: false, exitStatus: code, denied: true, leaked: leak.found(in: r.text),
+                                                 output: leak.redact(r.text), note: "command not found (exit 127): not run"))
+                continue
+            }
             let denied = r.isError || (code.map { $0 != 0 } ?? false)
-            let leaked = tokenForms.contains { !$0.isEmpty && r.text.contains($0) }
-            results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: true, exitStatus: code, denied: denied, leaked: leaked,
-                                             output: redact(r.text, forms: tokenForms)))
+            results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: true, exitStatus: code, denied: denied,
+                                             leaked: leak.found(in: r.text), output: leak.redact(r.text)))
         }
         switch denials {
-        case nil: extra.append("the turn has no result line" + (runError.map { " (\(Store.flat($0, max: 200)))" } ?? ""))
+        case nil: extra.append("the turn has no result line" + (runError.map { " (\($0))" } ?? ""))
         case let names? where !names.contains("Read"):
             extra.append("Read was not denied (permission_denials: \(names.isEmpty ? "none" : names.joined(separator: ", ")))")
         default: break
         }
-        // Subset rule (owner ruling, live run on 2.1.322): a tool the session has beyond the shape's list is an extra capability
-        // and fails; an expected tool it lacks (2.1.322 omits `Skill` when no skill loads) is only noted.
-        var absentNote: String?
-        if let tools = initTools {
-            let got = Set(tools)
-            let more = got.subtracting(expectedTools).sorted(), less = expectedTools.subtracting(got).sorted()
-            if !more.isEmpty { extra.append("the init tools hold tools the shape does not allow (extra: \(more.joined(separator: ", ")))") }
-            if !less.isEmpty { absentNote = "info: expected tools absent from the init list: \(less.joined(separator: ", "))" }
+        // Subset rule (owner ruling, live run on 2.1.322): anything the session has beyond the shape's lists is an extra
+        // capability and fails; an expected entry it lacks (2.1.322 omits `Skill` when no skill loads) is only noted.
+        var notes: [String] = []
+        if let o = initLine {
+            func names(_ key: String) -> Set<String> {
+                Set(((o[key] as? [Any]) ?? []).compactMap { ($0 as? String) ?? (($0 as? [String: Any])?["name"] as? String) })
+            }
+            for (key, label, allowed) in [("tools", "tools", expectedTools), ("plugins", "plugins", Set<String>()),
+                                          ("skills", "skills", expectedSkills), ("mcp_servers", "MCP servers", Set<String>())] {
+                let got = names(key)
+                let more = got.subtracting(allowed).sorted(), less = allowed.subtracting(got).sorted()
+                if !more.isEmpty { extra.append("the init \(label) hold entries the shape does not allow (extra: \(more.joined(separator: ", ")))") }
+                if !less.isEmpty, key == "tools" || key == "skills" {
+                    notes.append("expected \(label) absent from the init line: \(less.joined(separator: ", "))")
+                }
+            }
         } else {
             extra.append("the turn has no init line")
         }
         var item = verdictItem(name: "sandbox-canary", layerText: "a haiku turn under the compiled settings, judged from \(lines.count) "
                                + "stream lines", results: results, extra: extra)
         if item.status == .pass {
-            item.detail = item.detail.replacingOccurrences(of: " probe(s) denied (", with: " probe(s) denied, the positive control ran, "
-                                                           + "Read was denied, no init tool beyond the shape's, no token streamed (")
+            item.detail = item.detail.replacingOccurrences(of: " probe(s) denied (", with: " probe(s) denied by the sandbox, the positive "
+                                                           + "control ran, Read was denied, nothing in the init line beyond the shape's, "
+                                                           + "no token streamed, nothing planted changed (")
         }
-        if let absentNote { item.detail += "; " + absentNote }
+        if !notes.isEmpty { item.detail += "; info: " + notes.joined(separator: "; ") }
         return (item, results)
     }
 

@@ -123,7 +123,8 @@ extension Orchestrator {
     func scheduleCanary(_ key: SandboxCanaryKey) {
         guard let gate = sandboxCanary, !engineStoppedNow else { return }
         guard !healthTasks.keys.contains(where: { $0.hasPrefix(Self.canaryTaskPrefix) }) else { return }
-        if let failed = canaryFailedAt[key.text], AwakeTime.uptime() - failed < gate.retryAfter { return }
+        if let failed = canaryFailedAt[key.text],
+           AwakeTime.uptime() - failed < Self.canaryRetryDelay(retryAfter: gate.retryAfter, failures: canaryFailures[key.text] ?? 1) { return }
         let paths = self.paths, settings = canarySettings[key.text]
         healthTasks[Self.canaryTaskName(key)] = Task.detached { [self] in
             let run = await gate.canary.run(paths: paths, claudePath: gate.claudePath, runner: gate.runner, key: key, settings: settings)
@@ -144,6 +145,13 @@ extension Orchestrator {
 
     static let canaryTaskPrefix = "sandbox-canary:"
 
+    /// The awake time before a key that failed `failures` runs in a row is tried again: `retryAfter`, doubling with each
+    /// failure, at most 6 hours (or `retryAfter` itself when that is longer).
+    nonisolated static func canaryRetryDelay(retryAfter: TimeInterval, failures: Int) -> TimeInterval {
+        let doubled = retryAfter * pow(2, Double(max(0, min(failures - 1, 16))))
+        return min(doubled, max(retryAfter, 6 * 3600))
+    }
+
     /// A pass (every item, for exactly this key: `CanaryRun.passes`) is recorded and frees the agents waiting for it; the
     /// sandbox-check alert is answered only when no other key is failing (M2). Anything else raises the pinned sandbox-check
     /// alert once while it is open, and the key is retried later.
@@ -152,6 +160,7 @@ extension Orchestrator {
         let now = clock()
         if run.passes(key) {
             canaryFailedAt[key.text] = nil
+            canaryFailures[key.text] = nil
             canarySettings[key.text] = nil
             let resolve = canaryFailedAt.isEmpty
             attempt {
@@ -162,6 +171,7 @@ extension Orchestrator {
             return
         }
         canaryFailedAt[key.text] = AwakeTime.uptime()
+        canaryFailures[key.text, default: 0] += 1
         // The CLI build or macOS changed under the wait: this key can never be verified again, so its agents go back to the
         // gate, which asks for the current key.
         if let verified = run.verified, verified.fingerprint != key.fingerprint || verified.osVersion != key.osVersion {

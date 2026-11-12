@@ -53,6 +53,9 @@ public actor Orchestrator {
     /// Keys whose wait was logged (once per key), and when each key's last canary failed (awake seconds).
     var canaryLogged = Set<String>()
     var canaryFailedAt: [String: Double] = [:]
+    /// How many canary runs in a row did not pass, per key: the retry delay doubles with each (`canaryRetryDelay`), so a key
+    /// that keeps failing does not pay for a model turn every `retryAfter`.
+    var canaryFailures: [String: Int] = [:]
     /// Key text → the compiled settings of the first turn that waited for it: what that key's canary run is given (I3).
     var canarySettings: [String: ClaudeSettings] = [:]
     /// The CLI fingerprint, re-read at most every `SandboxCanaryGate.fingerprintCacheSeconds`.
