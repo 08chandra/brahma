@@ -388,6 +388,57 @@ import GRDB
         #expect(alert.summary.contains("autonomy kept at important"), "\(alert.summary)")
     }
 
+    /// S35: where a restore keeps auto-merge off (the company's switch here, and the owner-wide one), an item the snapshot had
+    /// auto-approved and waiting to land loses that approval, as switching auto-merge off live does: it needs a review again.
+    @Test func restoreKeepingAutoMergeOffRevokesAutoApprovals() throws {
+        for ownerWide in [false, true] {
+            let env = try BackupEnv()
+            let acme = try env.company("Acme")
+            try env.store.setAutoMergeSmall(companyId: acme.id, true)
+            let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(
+                type: .task, title: "Small fix", status: .ready), now: Date())
+            try env.store.writer.write { db in
+                try db.execute(sql: "UPDATE workItem SET autoApproved = 1, status = ?, mergeState = ? WHERE id = ?",
+                               arguments: [WorkItemStatus.inReview.rawValue, MergeState.pending.rawValue, item.id])
+            }
+            let service = env.service()
+            let snapshot = try service.snapshot(reason: .manual)
+            if ownerWide { try env.store.setAutoMerge(false) } else { try env.store.setAutoMergeSmall(companyId: acme.id, false) }
+            try env.store.close()
+            let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+            let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+            let after = try #require(try restored.workItem(id: item.id))
+            #expect(!after.autoApproved, "an auto-approval from the snapshot survived (owner-wide: \(ownerWide))")
+            #expect(after.mergeState == MergeState.none)
+            let events = try restored.writer.read { db in
+                try String.fetchAll(db, sql: "SELECT text FROM workItemEvent WHERE itemId = ?", arguments: [item.id])
+            }
+            #expect(events.contains { $0.contains("auto-merge was switched off before it landed") }, "\(events)")
+            let line = ownerWide ? "owner-wide auto-merge kept off" : "Acme: auto-merge kept at off"
+            #expect(outcome.warnings.contains { $0.contains(line) }, "\(outcome.warnings)")
+        }
+    }
+
+    /// S36: the owner-wide auto-merge folder list is never widened by a restore: backup [a, b], live [a] keeps [a], reported.
+    @Test func restoreKeepsTheNarrowerAutoMergePaths() throws {
+        let env = try BackupEnv()
+        try env.store.setAutoMergePaths(["docs/**", "tests/**"])
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.setAutoMergePaths(["docs/**"])
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        let stored = try restored.writer.read { db in try String.fetchOne(db, sql: "SELECT autoMergePaths FROM ownerSettings WHERE id = 1") }
+        #expect(stored.flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } == ["docs/**"], "\(stored ?? "nil")")
+        #expect(outcome.warnings.contains { $0.contains("owner-wide auto-merge folders kept at docs/** (the snapshot had docs/**, tests/**)") },
+                "\(outcome.warnings)")
+        // The rule itself: both set, the intersection; one set, the live list.
+        #expect(RestoreCarry.Settings.narrowerAutoMergePaths(live: ["a", "c"], restored: ["a", "b"]) == ["a"])
+        #expect(RestoreCarry.Settings.narrowerAutoMergePaths(live: nil, restored: ["a"]) == nil)
+        #expect(RestoreCarry.Settings.narrowerAutoMergePaths(live: ["a"], restored: nil) == ["a"])
+    }
+
     /// The other direction: a setting the owner loosened after the snapshot goes back to the snapshot's stricter value.
     @Test func restoreNeverLoosensASetting() throws {
         let env = try BackupEnv()

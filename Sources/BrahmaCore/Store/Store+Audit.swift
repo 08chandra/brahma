@@ -77,6 +77,17 @@ extension Store {
     /// way when the switch flipped still lands; it is queued for audit like an auto-merge (`queueAudit`). `companyId` nil: every
     /// company's.
     func revokeAutoApprovals(db: Database, companyId: String?, now: Date) throws {
+        try Store.revokeAutoApprovals(db: db, companyId: companyId, now: now) { item, text in
+            _ = try recordItemEvent(db: db, item: item, actor: "system", kind: .edited, text: text, now: now)
+        }
+    }
+
+    static let autoApprovalRevokedText = "auto-merge was switched off before it landed; it needs a review"
+
+    /// The body of `revokeAutoApprovals`, with the item event written by `event` (a restore writes into a database no store
+    /// has open, so it records the event itself; fix-wave S35).
+    static func revokeAutoApprovals(db: Database, companyId: String?, now: Date,
+                                    event: (WorkItem, String) throws -> Void) throws {
         var request = WorkItem.filter(Column("autoApproved") == true && Column("status") == WorkItemStatus.inReview.rawValue
                                       && [MergeState.pending.rawValue, MergeState.verifying.rawValue].contains(Column("mergeState")))
         if let companyId { request = request.filter(Column("companyId") == companyId) }
@@ -88,8 +99,7 @@ extension Store {
             if item.mergeState == .pending { item.mergeState = .none }
             item.updatedAt = now
             try item.update(db)
-            try recordItemEvent(db: db, item: item, actor: "system", kind: .edited,
-                                text: "auto-merge was switched off before it landed; it needs a review", now: now)
+            try event(item, autoApprovalRevokedText)
             try Store.wakeReviewer(db: db, item: item, now: now)
         }
     }

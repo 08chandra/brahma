@@ -134,7 +134,7 @@ struct RestoreCarry {
             break
         case .read(let c):
             try carry(c, into: db, now: now)
-            try keepStricterSettings(c.settings, into: db)
+            try keepStricterSettings(c.settings, into: db, now: now)
         case .unreadable(let why):
             try db.execute(sql: #"UPDATE "grant" SET revokedAt = ?, revokedBy = 'restore' WHERE revokedAt IS NULL"#, arguments: [now])
             try db.execute(sql: """
@@ -178,16 +178,42 @@ struct RestoreCarry {
 
     /// S35: every security-relevant company setting (`CompanySecurity.fields`) and the owner-wide auto-merge switch keep the
     /// stricter of the live and the restored value. Rows (agents, extensions, presets, secrets) are reported only.
-    static func keepStricterSettings(_ live: Settings, into db: Database) throws {
+    ///
+    /// Where auto-merge is kept off (owner-wide, or a company's), the snapshot's auto-approvals that have not landed are taken
+    /// back exactly as switching it off live does (`Store.revokeAutoApprovals`), so none lands on a switch the owner turned off.
+    static func keepStricterSettings(_ live: Settings, into db: Database, now: Date) throws {
+        var revokeScopes: [String] = []
         for restored in try Company.fetchAll(db) {
-            guard let now = live.companies[restored.id] else { continue }
-            let (merged, lines) = CompanySecurity.stricter(live: now, restored: restored)
+            guard let current = live.companies[restored.id] else { continue }
+            let (merged, lines) = CompanySecurity.stricter(live: current, restored: restored)
             if !lines.isEmpty { try merged.update(db) }
+            if restored.autoMergeSmall, !merged.autoMergeSmall { revokeScopes.append(restored.id) }
         }
+        var keptOffOwnerWide = false
         if live.ownerAutoMerge == false, try db.tableExists("ownerSettings") {
             try Store.ensureOwnerSettings(db)
+            keptOffOwnerWide = try Store.ownerAutoMerge(db: db)   // the snapshot had it on
             try db.execute(sql: "UPDATE ownerSettings SET autoMerge = 0 WHERE id = 1")
         }
+        // S36: the narrower auto-merge folder list.
+        if try db.tableExists("ownerSettings") {
+            let restored = try Settings.read(db).ownerAutoMergePaths
+            let paths = Settings.narrowerAutoMergePaths(live: live.ownerAutoMergePaths, restored: restored)
+            if paths != restored {
+                try Store.ensureOwnerSettings(db)
+                let json = paths.map { String(decoding: (try? JSONEncoder().encode($0)) ?? Data("[]".utf8), as: UTF8.self) }
+                try db.execute(sql: "UPDATE ownerSettings SET autoMergePaths = ? WHERE id = 1", arguments: [json])
+            }
+        }
+        func revoke(_ companyId: String?) throws {
+            try Store.revokeAutoApprovals(db: db, companyId: companyId, now: now) { item, text in
+                var event = WorkItemEvent(id: nil, companyId: item.companyId, itemId: item.id, actorId: "system", kind: .edited,
+                                          text: text + " (kept off by a restore)", createdAt: now,
+                                          createdActive: try Store.activeNow(db: db, companyId: item.companyId))
+                try event.insert(db)
+            }
+        }
+        if keptOffOwnerWide { try revoke(nil) } else { for id in revokeScopes { try revoke(id) } }
     }
 
     private static func carry(_ c: RestoreCarry, into db: Database, now: Date) throws {
@@ -271,6 +297,28 @@ extension RestoreCarry {
         /// `companyId|secret name`.
         var secrets: Set<String> = []
         var ownerAutoMerge: Bool?
+        /// `ownerSettings.autoMergePaths` (S36): nil is the pack's list (else the default).
+        var ownerAutoMergePaths: [String]?
+
+        /// Every `ownerSettings` column, classified for restores (S36; `OwnerSettingsSecurityTests` fails on a new column in
+        /// neither list). Security-relevant ones keep the stricter value (`keepStricterSettings`).
+        static let ownerSecurityColumns: [String: String] = [
+            "autoMerge": "off is stricter: kept off when it is off live",
+            "autoMergePaths": "the narrower folder list: both set, their intersection; one set, the live list",
+        ]
+        static let ownerNotSecurityColumns: [String: String] = [
+            "id": "the one row", "timeZone": "calendar display", "planTier": "spend pacing", "weeklyShare": "spend pacing",
+            "pctPerDollar": "usage calibration", "pctPerDollar5h": "usage calibration", "calibUtil": "usage calibration",
+            "calibResetsAt": "usage calibration", "calibCost": "usage calibration", "calibration": "usage calibration",
+            "hotPaths": "merge serialization against conflicts; risk tags use the built-in list, not this one",
+        ]
+
+        /// S36: the narrower auto-merge folder list. Both set: their intersection (in the live order); one set: the live list.
+        static func narrowerAutoMergePaths(live: [String]?, restored: [String]?) -> [String]? {
+            guard let live, let restored else { return live }
+            let allowed = Set(restored)
+            return live.filter { allowed.contains($0) }
+        }
 
         static func read(_ db: Database) throws -> Settings {
             var s = Settings()
@@ -292,6 +340,8 @@ extension RestoreCarry {
             }
             if try db.tableExists("ownerSettings"), try db.columns(in: "ownerSettings").contains(where: { $0.name == "autoMerge" }) {
                 s.ownerAutoMerge = try Bool.fetchOne(db, sql: "SELECT autoMerge FROM ownerSettings WHERE id = 1")
+                s.ownerAutoMergePaths = try String.fetchOne(db, sql: "SELECT autoMergePaths FROM ownerSettings WHERE id = 1")
+                    .flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) }
             }
             return s
         }
@@ -333,6 +383,11 @@ extension RestoreCarry {
                 out.append("\(companyName(company)): secret \(name), removed after the snapshot, is listed again (its value is not)")
             }
             if restored.ownerAutoMerge != false, live.ownerAutoMerge == false { out.append("owner-wide auto-merge kept off (the snapshot had it on)") }
+            let paths = narrowerAutoMergePaths(live: live.ownerAutoMergePaths, restored: restored.ownerAutoMergePaths)
+            if paths != restored.ownerAutoMergePaths {
+                func show(_ p: [String]?) -> String { p.map { $0.isEmpty ? "none" : $0.joined(separator: ", ") } ?? "the pack's list" }
+                out.append("owner-wide auto-merge folders kept at \(show(paths)) (the snapshot had \(show(restored.ownerAutoMergePaths)))")
+            }
             return out
         }
     }

@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import GRDB
 @testable import BrahmaCore
 
 /// S35: every stored property of `Company` is classified for restores, either security-relevant (with a strictness order,
@@ -41,5 +42,20 @@ import Foundation
         let (_, lines) = CompanySecurity.stricter(live: strict, restored: loose)
         #expect(lines.contains("autonomy kept at everything (the snapshot had auto)"), "\(lines)")
         #expect(CompanySecurity.stricter(live: loose, restored: strict).1.isEmpty, "nothing to report when the snapshot is stricter")
+    }
+}
+
+/// S36: every `ownerSettings` column is classified for restores, like `Company`'s properties: a new owner-wide setting in
+/// neither list fails here.
+@Suite(.scratch) struct OwnerSettingsSecurityTests {
+    @Test func everyOwnerSettingsColumnIsClassified() throws {
+        let store = try Store.inMemory()
+        let columns = Set(try store.writer.read { db in try db.columns(in: "ownerSettings").map(\.name) })
+        #expect(!columns.isEmpty)
+        let secure = Set(RestoreCarry.Settings.ownerSecurityColumns.keys), other = Set(RestoreCarry.Settings.ownerNotSecurityColumns.keys)
+        #expect(secure.isDisjoint(with: other), "a column is in both lists: \(secure.intersection(other).sorted())")
+        let classified = secure.union(other)
+        #expect(columns.subtracting(classified).isEmpty, "unclassified ownerSettings columns: \(columns.subtracting(classified).sorted())")
+        #expect(classified.subtracting(columns).isEmpty, "classified names that are not columns: \(classified.subtracting(columns).sorted())")
     }
 }
