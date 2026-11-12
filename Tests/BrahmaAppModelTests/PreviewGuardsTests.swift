@@ -105,6 +105,17 @@ import BrahmaCore
         #expect(!js.contains("messageHandlers") && !js.contains("webkit."))
     }
 
+    /// Task 12 probe: a page's `<link rel=preconnect>` to another host opened TCP connections without the rule list and none
+    /// with it (real WebKit, loopback); DNS-only prefetch is not a resource load the rule list sees, so the document-start
+    /// script also turns it off (`x-dns-prefetch-control: off`), inserted before any `<link>` of the page is parsed.
+    @Test func cspScriptTurnsOffDNSPrefetch() {
+        let js = PreviewGuards.cspScript
+        #expect(js.contains("x-dns-prefetch-control"))
+        #expect(js.contains("\"off\""))
+        // Both metas go in as the first children of <head>, the prefetch control before anything the page wrote.
+        #expect(js.contains("insertBefore"))
+    }
+
     @Test func prepareFailsClosed() async {
         var compiled: [String] = []
         let ok = await PreviewGuards.prepare(origin: Self.loopback) { id, json in compiled.append(id); return json.count }

@@ -13,6 +13,7 @@ struct ReleasesView: View {
 
     var body: some View {
         let rows = model.releaseRows
+        let selectedId = self.selectedId ?? rows.first { $0.ref == model.selectedReleaseRef }?.id
         VStack(spacing: BrahmaTheme.spaceS) {
             pathToLive
             HostingSummaryPanel(model: model)
@@ -25,7 +26,7 @@ struct ReleasesView: View {
                                    detail: "DevOps proposes a deploy; you approve it in the Inbox; the engine deploys it and checks the live URL.")
                 } else {
                     HStack(spacing: 0) {
-                        table(rows)
+                        table(rows, selectedId: selectedId)
                         if let row = rows.first(where: { $0.id == selectedId }) {
                             Hairline().frame(width: 1)
                             inspector(row).frame(width: 300)
@@ -67,7 +68,7 @@ struct ReleasesView: View {
 
     // MARK: Table
 
-    private func table(_ rows: [ReleaseRow]) -> some View {
+    private func table(_ rows: [ReleaseRow], selectedId: String?) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: BrahmaTheme.spaceS) {
                 ColumnHeader("Ref").frame(width: 44, alignment: .leading)
@@ -76,8 +77,11 @@ struct ReleasesView: View {
                 ColumnHeader("Commit").frame(width: 64, alignment: .leading)
                 ColumnHeader("URL").frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
                 ColumnHeader("Smoke").frame(width: 64, alignment: .leading)
-                ColumnHeader("By").frame(width: 90, alignment: .leading)
-                ColumnHeader("When").frame(width: 112, alignment: .leading)
+                // With the inspector open (it shows both) the table drops By and When, so the two fit the pane.
+                if selectedId == nil {
+                    ColumnHeader("By").frame(width: 90, alignment: .leading)
+                    ColumnHeader("When").frame(width: 112, alignment: .leading)
+                }
             }
             .padding(.horizontal, BrahmaTheme.spaceS)
             .frame(height: BrahmaTheme.denseRowHeight)
@@ -100,12 +104,14 @@ struct ReleasesView: View {
                                 .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
                             Text(verbatim: row.smoke).font(BrahmaTheme.monoSmall).foregroundStyle(checkColor(row.smoke.lowercased()))
                                 .frame(width: 64, alignment: .leading)
-                            Text(verbatim: row.proposer).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
-                                .frame(width: 90, alignment: .leading)
-                            Text(verbatim: row.when).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2).frame(width: 112, alignment: .leading)
+                            if selectedId == nil {
+                                Text(verbatim: row.proposer).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
+                                    .frame(width: 90, alignment: .leading)
+                                Text(verbatim: row.when).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2).frame(width: 112, alignment: .leading)
+                            }
                         }
                         .tableRow(index: index, selected: row.id == selectedId)
-                        .onTapGesture { selectedId = row.id }
+                        .onTapGesture { self.selectedId = row.id }
                         .accessibilityElement(children: .combine)
                         .accessibilityAddTraits(row.id == selectedId ? .isSelected : [])
                     }
@@ -128,15 +134,18 @@ struct ReleasesView: View {
                         KeyValueRow(label: "By", value: row.proposer, mono: true),
                         KeyValueRow(label: "When", value: row.when, mono: true),
                     ] + (row.rollbackTitle.map { [KeyValueRow(label: "Rollback", value: $0, mono: true, valueColor: BrahmaTheme.warning)] } ?? []))
-                    if let url = row.openURL {
-                        Button("Open") { NSWorkspace.shared.open(url) }.buttonStyle(.brahma).help(Text(verbatim: row.urlHost))
+                    // The actions sit above the (long) rollback plan, so they stay in view in a short pane.
+                    HStack(spacing: BrahmaTheme.spaceS) {
+                        if let url = row.openURL {
+                            Button("Open") { NSWorkspace.shared.open(url) }.buttonStyle(.brahma).help(Text(verbatim: row.urlHost))
+                        }
+                        if row.canRollBack {
+                            Button("Roll Back…") { rollbackTarget = row }.buttonStyle(.brahma)
+                        }
                     }
                     Hairline()
                     CapsLabel("Rollback plan")
                     MonoBlock(text: row.rollbackDisplay.isEmpty ? "—" : row.rollbackDisplay, maxHeight: 160)
-                    if row.canRollBack {
-                        Button("Roll Back…") { rollbackTarget = row }.buttonStyle(.brahma)
-                    }
                 }
                 .padding(BrahmaTheme.spaceM)
                 .frame(maxWidth: .infinity, alignment: .leading)

@@ -3,13 +3,15 @@
 # agent DM the owner through the real MCP helper, and prints the three stream-json lines StreamParser reads.
 set -u
 
-# `brahma doctor` / the app's startup check run these two first; answer like a minimal real claude.
+# `brahma doctor` / the app's startup check run these two first; answer like a minimal real claude at the doctor's
+# minimum version (`Doctor.minimumVersion`), with every flag in `Doctor.requiredFlags` in its --help.
 case "${1:-}" in
-  --version) echo "2.1.304 (Claude Code)"; exit 0 ;;
+  --version) echo "2.1.312 (Claude Code)"; exit 0 ;;
   --help)
     for f in -p --output-format --verbose --resume --session-id --mcp-config --strict-mcp-config --model \
              --fallback-model --append-system-prompt --permission-mode --allowed-tools --disallowed-tools \
-             --add-dir --settings --setting-sources --disable-slash-commands --effort --max-budget-usd; do
+             --add-dir --settings --setting-sources --disable-slash-commands --effort --max-budget-usd \
+             --restricted --tools --plugin-dir --permission-prompts; do
       echo "  $f <value>  fake"
     done
     exit 0 ;;
@@ -50,20 +52,25 @@ esac
 SID=""
 MCP=""
 SYSTEM=""
+TOOLS_ARG=""
 prev=""
 for arg in "$@"; do
   case "$prev" in
     --session-id|--resume) SID="$arg" ;;
     --mcp-config) MCP="$arg" ;;
     --append-system-prompt) SYSTEM="$arg" ;;
+    --tools) TOOLS_ARG="$arg" ;;
   esac
   prev="$arg"
 done
 
 if [ -n "$MCP" ] && [ -f "$MCP" ] && plutil -extract mcpServers.company.command raw -o - "$MCP" >/dev/null 2>&1; then
   CMD="$(plutil -extract mcpServers.company.command raw -o - "$MCP")"
-  # The per-turn token comes from the MCP config's env entry, as claude would pass it to the server.
-  export BRAHMA_TURN_TOKEN="$(plutil -extract mcpServers.company.env.BRAHMA_TURN_TOKEN raw -o - "$MCP")"
+  # The server's environment comes from the MCP config's env entry, as claude would pass it to the server: the per-turn
+  # token, and the dev home's file secret store (without it the server cannot load the home's secrets and refuses writes).
+  for V in BRAHMA_TURN_TOKEN BRAHMA_SECRET_STORE BRAHMA_MCP_REVIEW_ITEM BRAHMA_MCP_AUDIT; do
+    if VAL="$(plutil -extract "mcpServers.company.env.$V" raw -o - "$MCP" 2>/dev/null)"; then export "$V=$VAL"; fi
+  done
   DB="$(plutil -extract mcpServers.company.args.2 raw -o - "$MCP")"
   COMPANY="$(plutil -extract mcpServers.company.args.4 raw -o - "$MCP")"
   AGENT="$(plutil -extract mcpServers.company.args.6 raw -o - "$MCP")"
@@ -93,6 +100,10 @@ case "$PROMPT" in
 esac
 
 EPOCH=$(( $(date +%s) + 10800 ))
-echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$SID\",\"model\":\"fake\",\"agents\":[\"Explore\",\"general-purpose\"],\"tools\":[]}"
+# The init event lists the session's built-in tools, as a real claude does: exactly the --tools it was given, else the
+# Sandboxed profile's set (`BuiltinTools.sandboxed`), which the doctor's tools-present item checks for.
+TOOLS='"Bash","Read","Edit","Write","NotebookEdit","Skill","ToolSearch","WebFetch","WebSearch"'
+if [ -n "$TOOLS_ARG" ]; then TOOLS="\"$(printf '%s' "$TOOLS_ARG" | sed 's/,/","/g')\""; fi
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$SID\",\"model\":\"fake\",\"agents\":[\"Explore\",\"general-purpose\"],\"tools\":[$TOOLS]}"
 echo "{\"type\":\"rate_limit_event\",\"session_id\":\"$SID\",\"rate_limit_info\":{\"status\":\"allowed\",\"resetsAt\":$EPOCH,\"rateLimitType\":\"five_hour\",\"isUsingOverage\":false,\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.38,\"resetsAt\":$EPOCH},\"seven_day\":{\"utilization\":0.12,\"resetsAt\":$EPOCH}}}}"
 echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"$RESULT\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"total_cost_usd\":0,\"api_error_status\":null,\"session_id\":\"$SID\"}"

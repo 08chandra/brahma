@@ -120,36 +120,49 @@ private struct PreviewBodyView: View {
 
     // MARK: Header
 
-    @ViewBuilder private var header: some View {
+    /// The full row when it fits the pane, else a compact one (icon-only buttons with help, the chip without its caption), so
+    /// the row never pushes the pane wider than its column.
+    private var header: some View {
+        ViewThatFits(in: .horizontal) {
+            headerRow(compact: false)
+            headerRow(compact: true)
+        }
+        .padding(.horizontal, BrahmaTheme.spaceS)
+        .padding(.vertical, BrahmaTheme.spaceXS)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(BrahmaTheme.bg2)
+    }
+
+    @ViewBuilder private func headerRow(compact: Bool) -> some View {
         HStack(spacing: BrahmaTheme.spaceS) {
             if let surfaceId {
                 Button { Task { await model.restartPreview(surfaceId: surfaceId) } } label: {
-                    Label("Restart", systemImage: "arrow.clockwise")
+                    Label("Restart", systemImage: "arrow.clockwise").labelStyle(compact ? AnyLabelStyle.iconOnly : .titleAndIcon)
                 }
                 .buttonStyle(.brahma)
+                .fixedSize()
                 .help("Restart this preview")
             }
             if case .web(let url, _, _) = body_ {
                 Button { NSWorkspace.shared.open(url) } label: {
-                    Label("Open in Browser", systemImage: "safari")
+                    Label("Open in Browser", systemImage: "safari").labelStyle(compact ? AnyLabelStyle.iconOnly : .titleAndIcon)
                 }
                 .buttonStyle(.brahma)
+                .fixedSize()
+                .help("Open in Browser")
                 TextField("Path", text: $pathDraft, prompt: Text(verbatim: "/"))
                     .font(BrahmaTheme.monoSmall)
                     .brahmaField()
-                    .frame(minWidth: 80, maxWidth: 220)
+                    .frame(minWidth: compact ? 56 : 80, maxWidth: 220)
                     .onSubmit { path = pathDraft }
                     .accessibilityLabel(Text("Preview path"))
-                viewportMenu
+                viewportMenu(compact: compact)
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, BrahmaTheme.spaceS)
-        .padding(.vertical, BrahmaTheme.spaceXS)
-        .background(BrahmaTheme.bg2)
     }
 
-    private var viewportMenu: some View {
+    private func viewportMenu(compact: Bool) -> some View {
         Menu {
             Button("Desktop") { choose(.desktop) }
             Button("iPad") { choose(.ipad) }
@@ -157,7 +170,7 @@ private struct PreviewBodyView: View {
             Divider()
             Button("Custom…") { customShown = true }
         } label: {
-            MonoChip(text: "VIEWPORT · " + viewport.title, color: BrahmaTheme.text0, fill: BrahmaTheme.bg4)
+            MonoChip(text: (compact ? "" : "VIEWPORT · ") + viewport.title, color: BrahmaTheme.text0, fill: BrahmaTheme.bg4)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
@@ -265,5 +278,16 @@ enum PreviewViewportStore {
     static func save(_ v: PreviewViewport, tabId: String?, defaults: UserDefaults = .standard) {
         guard let data = try? JSONEncoder().encode(v) else { return }
         defaults.set(data, forKey: key(tabId))
+    }
+}
+
+/// `iconOnly` or `titleAndIcon` chosen at run time (the two built-in styles are different types).
+struct AnyLabelStyle: LabelStyle {
+    let iconOnlyStyle: Bool
+    static let iconOnly = AnyLabelStyle(iconOnlyStyle: true)
+    static let titleAndIcon = AnyLabelStyle(iconOnlyStyle: false)
+
+    func makeBody(configuration: Configuration) -> some View {
+        if iconOnlyStyle { Label(configuration).labelStyle(IconOnlyLabelStyle()) } else { Label(configuration).labelStyle(TitleAndIconLabelStyle()) }
     }
 }

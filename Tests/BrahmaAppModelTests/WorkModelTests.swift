@@ -106,6 +106,11 @@ private let failing = DoctorReport(cliVersion: "2.1.306", items: [DoctorItem(nam
         #expect(w.model.sidebarSelection == .backlog)
         #expect(w.model.selectedItemKey == item.key)
         #expect(w.model.selectedItem?.title == "Find me")
+        // `release:<ref>` (Task 12 snapshots): Work › Releases with that release's inspector open.
+        #expect(SelectTarget("release:r-1") == .release(ref: "R-1"))
+        w.model.apply(.release(ref: "R-1"))
+        #expect(w.model.sidebarSelection == .releases)
+        #expect(w.model.selectedReleaseRef == "R-1")
         w.model.apply(.board); #expect(w.model.sidebarSelection == .board)
         w.model.apply(.inbox); #expect(w.model.sidebarSelection == .inbox)
         #expect(w.model.chat == nil)
