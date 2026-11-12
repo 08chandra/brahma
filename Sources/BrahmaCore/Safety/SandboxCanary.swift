@@ -230,8 +230,13 @@ public struct SandboxCanary: SandboxCanaryRunning {
     /// doctor (which records nothing).
     public static let anyShape = ""
     static let placeholderShapes: Set<String> = [anyShape, "doctor"]
-    /// A command the shell could not find (127) did not run: it proves nothing about the sandbox.
+    /// Exit 127: the shell could not run the command. Under Seatbelt an exec the sandbox refuses ends the same way (zsh:
+    /// "operation not permitted: <cmd>"), which is a denial; any other 127 (command not found, no such file) did not run
+    /// and proves nothing about the sandbox.
     static let notFoundStatus: Int32 = 127
+
+    /// Whether an exit-127 output is the sandbox refusing the exec (a denial) rather than a command that could not be found.
+    static func execRefused(_ output: String) -> Bool { output.lowercased().contains("operation not permitted") }
     /// The fan-out launches (`CanaryShape.launch`) whose keys the canary does not build yet.
     static let fanOutLaunches = ["task", "ultra-small", "ultra"]
 
@@ -729,7 +734,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
             let r = await runOne(probe.text, n + 1)
             let leaked = leak.found(in: r.output)
             let killed = r.outcome.timedOut
-            let notFound = r.outcome.exitCode == notFoundStatus
+            let notFound = r.outcome.exitCode == notFoundStatus && !execRefused(r.output)
             let ran = (r.outcome.exitCode != nil || killed) && !notFound
             let denied = killed || (r.outcome.exitCode.map { $0 != 0 } ?? false)
             var result = CanaryProbeResult(layer: .local, probe: probe, ran: ran, exitStatus: r.outcome.exitCode, denied: denied,
@@ -935,7 +940,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
             }
             guard let r = toolResults[use.id] else { notRun("no tool result came back"); continue }
             let code = exitCode(r.text) ?? (r.isError ? nil : 0)
-            if code == notFoundStatus {
+            if code == notFoundStatus, !execRefused(r.text) {
                 results.append(CanaryProbeResult(layer: .turn, probe: probe, ran: false, exitStatus: code, denied: true, leaked: leak.found(in: r.text),
                                                  output: leak.redact(r.text), note: "command not found (exit 127): not run"))
                 continue

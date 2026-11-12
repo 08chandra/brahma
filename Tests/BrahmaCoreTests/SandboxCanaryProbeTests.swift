@@ -481,6 +481,28 @@ private let deniedProbes = """
         #expect(try w.item(turn, "sandbox-canary").detail.hasPrefix("probe line 7 was not run (unverified): command not found"))
     }
 
+    /// Exit 127 with the sandbox refusing the exec ("operation not permitted", as zsh reports it under Seatbelt) is a
+    /// denial in both layers, not a probe that did not run.
+    @Test func anExecRefusedWith127IsADenial() async throws {
+        let w = try CanaryWorld()
+        try w.writeProbes(deniedProbes + "\n/bin/launchctl list\n")
+        let local = FakeSandbox { probe, env, cwd in
+            probe == "/bin/launchctl list"
+                ? CheckOutcome(exitCode: 127, timedOut: false, tail: "zsh:1: operation not permitted: /bin/launchctl")
+                : FakeSandbox.denyAll(probe, env, cwd)
+        }
+        let play = TurnPlay(result: { command, request in
+            command == "/bin/launchctl list" ? (true, "Exit code 127\n(eval):1: Operation not permitted: /bin/launchctl")
+                : TurnPlay.denied(command, request)
+        })
+        let run = await w.run(w.canary(local: local), runner: canaryRunner(play))
+        #expect(run.passes(try #require(run.verified)), "\(run.items)")
+        for layer in [CanaryProbeResult.Layer.local, .turn] {
+            let r = try #require(run.probes.first { $0.line == 7 && $0.layer == layer })
+            #expect(r.ran); #expect(r.denied); #expect(r.exitStatus == 127); #expect(r.passed)
+        }
+    }
+
     /// I1: a probe that writes into a planted place fails even when it exits non-zero; so does a turn that changes one.
     @Test func aChangedPlantedPlaceBlocks() async throws {
         let w = try CanaryWorld()
