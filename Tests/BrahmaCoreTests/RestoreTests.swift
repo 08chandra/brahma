@@ -352,8 +352,8 @@ import GRDB
         #expect(alert.summary.contains(removed) && alert.summary.contains("stopped"), "\(alert.summary)")
     }
 
-    /// A company profile narrowed after the snapshot is listed too.
-    @Test func restoreListsANarrowedProfile() throws {
+    /// S35: a company profile narrowed after the snapshot (Full in the backup, Sandboxed live) stays narrowed, and is reported.
+    @Test func restoreKeepsTheNarrowerProfile() throws {
         let env = try BackupEnv()
         let acme = try env.company("Acme")
         try env.store.updateSandbox(companyId: acme.id, SandboxPatch(profile: .full), userHome: try tempDir())
@@ -362,7 +362,45 @@ import GRDB
         try env.store.updateSandbox(companyId: acme.id, SandboxPatch(profile: .sandboxed), userHome: try tempDir())
         try env.store.close()
         let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
-        #expect(outcome.warnings.contains { $0.contains("Acme: profile full again (it was sandboxed)") }, "\(outcome.warnings)")
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.company(id: acme.id)?.permissionProfile == .sandboxed, "the restore widened the profile back to Full")
+        #expect(outcome.warnings.contains { $0.contains("Acme: profile kept at sandboxed (the snapshot had full)") }, "\(outcome.warnings)")
+        #expect(try restored.engineStopped()?.note?.contains("profile kept at sandboxed") == true)
+    }
+
+    /// S35: a backup taken under `auto`, restored while the company asks the owner what matters (`important`): it stays
+    /// `important`, and the report says so.
+    @Test func restoreKeepsTheStricterAutonomy() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        try env.store.setAutonomy(companyId: acme.id, .auto)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.setAutonomy(companyId: acme.id, .important)
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.company(id: acme.id)?.autonomy == .important, "the restore loosened autonomy back to auto")
+        #expect(outcome.warnings.contains { $0.contains("Acme: autonomy kept at important (the snapshot had auto)") }, "\(outcome.warnings)")
+        let alert = try #require(try restored.asks(companyId: acme.id).first {
+            $0.kind == .engineAlert && $0.subjectId == Store.engineAlertKey(RestoreCarry.restoreAlertReason)
+        })
+        #expect(alert.summary.contains("autonomy kept at important"), "\(alert.summary)")
+    }
+
+    /// The other direction: a setting the owner loosened after the snapshot goes back to the snapshot's stricter value.
+    @Test func restoreNeverLoosensASetting() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        try env.store.setAutonomy(companyId: acme.id, .everything)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.setAutonomy(companyId: acme.id, .auto)
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.company(id: acme.id)?.autonomy == .everything)
+        #expect(!outcome.warnings.contains { $0.contains("autonomy") }, "\(outcome.warnings)")
     }
 
     /// When the live database cannot be read, nothing it held can be carried: the restore fails closed (every grant revoked,

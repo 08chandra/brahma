@@ -12,6 +12,9 @@ import GRDB
 /// When the live database cannot be read, nothing about it can be trusted, so the restore fails closed instead: every grant
 /// is revoked (the owner approves again what is still wanted) and every session is treated as tainted.
 ///
+/// The security-relevant company settings (`CompanySecurity`, S35: autonomy, profiles, read paths, domains, local listening,
+/// auto-merge, the pause) and the owner-wide auto-merge keep the stricter of the live and the restored value.
+///
 /// Grants the live database no longer counts for any reason (expired on company-active time, sprint ended, used up) are
 /// revoked in the restored one (fix-wave F1): both clocks roll back with the database, so carrying `revokedAt` alone is not
 /// enough. Other settings the owner turned off are not carried (fix-wave F2): every one the restore turns back on is listed in
@@ -119,11 +122,11 @@ struct RestoreCarry {
         }
         let summary = rolledBack.isEmpty
             ? "nothing you had turned off was rolled back"
-            : "rolled back (review before resuming): " + rolledBack.joined(separator: "; ")
+            : "differs from the snapshot (review before resuming): " + rolledBack.joined(separator: "; ")
         // The owner's stop, whatever the snapshot or the live database said: nothing runs until `brahma resume`.
         try db.execute(sql: #"INSERT OR REPLACE INTO engineStop (id, since, "by", note) VALUES (1, ?, 'restore', ?)"#,
                        arguments: [now, Store.flat("restored from \(snapshot): check grants, lab marks and main, then resume; " + summary, max: 4000)])
-        notes += rolledBack.map { "rolled back by the restore: \($0)" }
+        notes += rolledBack.map { "after the restore: \($0)" }
         try raiseRestoreAlert(db, snapshot: snapshot, summary: summary, now: now)
 
         switch live {
@@ -131,6 +134,7 @@ struct RestoreCarry {
             break
         case .read(let c):
             try carry(c, into: db, now: now)
+            try keepStricterSettings(c.settings, into: db)
         case .unreadable(let why):
             try db.execute(sql: #"UPDATE "grant" SET revokedAt = ?, revokedBy = 'restore' WHERE revokedAt IS NULL"#, arguments: [now])
             try db.execute(sql: """
@@ -169,6 +173,20 @@ struct RestoreCarry {
                 .updateAll(db, Column("title").set(to: Store.flat(text, max: Store.maxAskTitle)),
                            Column("summary").set(to: Store.stripControls(text, keepNewlines: true)), Column("updatedAt").set(to: now))
             try Store.fileEngineAlert(db, company: company, reason: restoreAlertReason, text: text, now: now)
+        }
+    }
+
+    /// S35: every security-relevant company setting (`CompanySecurity.fields`) and the owner-wide auto-merge switch keep the
+    /// stricter of the live and the restored value. Rows (agents, extensions, presets, secrets) are reported only.
+    static func keepStricterSettings(_ live: Settings, into db: Database) throws {
+        for restored in try Company.fetchAll(db) {
+            guard let now = live.companies[restored.id] else { continue }
+            let (merged, lines) = CompanySecurity.stricter(live: now, restored: restored)
+            if !lines.isEmpty { try merged.update(db) }
+        }
+        if live.ownerAutoMerge == false, try db.tableExists("ownerSettings") {
+            try Store.ensureOwnerSettings(db)
+            try db.execute(sql: "UPDATE ownerSettings SET autoMerge = 0 WHERE id = 1")
         }
     }
 
@@ -278,7 +296,9 @@ extension RestoreCarry {
             return s
         }
 
-        /// Every setting the owner had turned off (or narrowed, or removed) in `live` that `restored` has on again, in words.
+        /// Every setting the owner had turned off (or narrowed, or removed) in `live` that `restored` has on again, in words:
+        /// the company settings and the owner-wide auto-merge the restore keeps at the stricter value (S35), and the rows it
+        /// reports only (agents and companies, extensions, access presets, secrets).
         static func rolledBack(live: Settings, restored: Settings) -> [String] {
             var out: [String] = []
             func companyName(_ id: String) -> String { restored.companies[id]?.name ?? live.companies[id]?.name ?? id }
@@ -288,21 +308,8 @@ extension RestoreCarry {
             }
             for (id, c) in restored.companies.sorted(by: { $0.value.name < $1.value.name }) {
                 guard let now = live.companies[id] else { out.append("company \(c.name), removed after the snapshot, is back"); continue }
-                if c.permissionProfile.breadth > now.permissionProfile.breadth {
-                    out.append("\(c.name): profile \(c.permissionProfile.rawValue) again (it was \(now.permissionProfile.rawValue))")
-                }
-                for role in Set(c.roleProfiles.keys).union(now.roleProfiles.keys).sorted()
-                where c.profile(forRole: role).breadth > now.profile(forRole: role).breadth {
-                    out.append("\(c.name): role \(role) on \(c.profile(forRole: role).rawValue) again (it was \(now.profile(forRole: role).rawValue))")
-                }
-                for (what, back) in [("network domains", Set(c.allowedDomains).subtracting(now.allowedDomains)),
-                                     ("web domains", Set(c.webDomains).subtracting(now.webDomains)),
-                                     ("toolchain read paths", Set(c.toolchainReadPaths).subtracting(now.toolchainReadPaths))]
-                where !back.isEmpty {
-                    out.append("\(c.name): \(what) back: \(back.sorted().joined(separator: ", "))")
-                }
-                if c.allowLocalBinding, !now.allowLocalBinding { out.append("\(c.name): local listening allowed again") }
-                if c.autoMergeSmall, !now.autoMergeSmall { out.append("\(c.name): auto-merge on again") }
+                // S35: every security-relevant company setting keeps the stricter value (`CompanySecurity`); reported here.
+                out += CompanySecurity.stricter(live: now, restored: c).1.map { "\(c.name): \($0)" }
             }
             for (id, a) in restored.agents.sorted(by: { $0.value.name < $1.value.name }) where !a.killed {
                 if live.agents[id]?.killed ?? true {
@@ -325,7 +332,7 @@ extension RestoreCarry {
                 let (company, name) = split(key)
                 out.append("\(companyName(company)): secret \(name), removed after the snapshot, is listed again (its value is not)")
             }
-            if restored.ownerAutoMerge == true, live.ownerAutoMerge == false { out.append("auto-merge on again (owner-wide)") }
+            if restored.ownerAutoMerge != false, live.ownerAutoMerge == false { out.append("owner-wide auto-merge kept off (the snapshot had it on)") }
             return out
         }
     }
