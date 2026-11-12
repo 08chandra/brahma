@@ -886,6 +886,21 @@ public struct SandboxCanary: SandboxCanaryRunning {
     /// The one bundled plugin left on (`ClaudeSettingsCompiler.bundledPluginNames`): the managed-settings security layer.
     static let allowedPlugins: Set<String> = ["cc-plugin-sec-default@builtin"]
 
+    /// How an init `plugins` entry is judged: a bundled plugin only when it is an object whose `source` is exactly
+    /// `<name>@builtin` (and whose `path`, when given, is `builtin`); then its identity is that source. Anything else (no
+    /// `source`, a mismatched one, another path, a plain string, any other value) is an unknown entry whose identity starts
+    /// with `unknown plugin entry`, which no allowlist ever holds, so it fails as extra.
+    static func pluginIdentity(_ entry: Any) -> String {
+        guard let d = entry as? [String: Any] else {
+            return "unknown plugin entry \(Store.flat((entry as? String) ?? "\(type(of: entry))", max: 80))"
+        }
+        let name = d["name"] as? String ?? "?"
+        if let source = d["source"] as? String, source == "\(name)@builtin", (d["path"] as? String).map({ $0 == "builtin" }) ?? (d["path"] == nil) {
+            return source
+        }
+        return "unknown plugin entry \(Store.flat(name, max: 80)) (source \(Store.flat(d["source"] as? String ?? "none", max: 80)))"
+    }
+
     /// The bundled skills `disableBundledSkills` leaves (`ClaudeSettingsCompiler.skillDenies`): all a canary turn may list.
     static var expectedSkills: Set<String> {
         Set(ClaudeSettingsCompiler.skillDenies.map { String($0.dropFirst("Skill(".count).dropLast()) })
@@ -1013,13 +1028,11 @@ public struct SandboxCanary: SandboxCanaryRunning {
         // capability and fails; an expected entry it lacks (2.1.322 omits `Skill` when no skill loads) is only noted.
         var notes: [String] = []
         if let o = initLine {
-            // A plugin is named by its `source` (`<name>@builtin`) when the line gives one, so only Claude Code's own bundled
-            // security layer is allowed, never a same-named plugin from elsewhere.
             func names(_ key: String) -> Set<String> {
                 Set(((o[key] as? [Any]) ?? []).compactMap { entry -> String? in
+                    if key == "plugins" { return Self.pluginIdentity(entry) }
                     if let s = entry as? String { return s }
-                    guard let d = entry as? [String: Any] else { return nil }
-                    return key == "plugins" ? ((d["source"] as? String) ?? (d["name"] as? String)) : (d["name"] as? String)
+                    return (entry as? [String: Any])?["name"] as? String
                 })
             }
             for (key, label, allowed) in [("tools", "tools", expectedTools), ("plugins", "plugins", Self.allowedPlugins),

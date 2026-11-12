@@ -550,7 +550,8 @@ private let deniedProbes = """
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes)
         let cases: [(String, @Sendable () -> [String: Any], String)] = [
-            ("plugins", { ["plugins": [["name": "evil", "path": "/x"]]] }, "the init plugins hold entries the shape does not allow (extra: evil)"),
+            ("plugins", { ["plugins": [["name": "evil", "path": "/x"]]] },
+             "the init plugins hold entries the shape does not allow (extra: unknown plugin entry evil (source none))"),
             ("skills", { ["skills": ["deep-research", "my-own-skill"]] }, "the init skills hold entries the shape does not allow (extra: my-own-skill)"),
             ("mcp", { ["mcp_servers": [["name": "company", "status": "connected"]]] }, "the init MCP servers hold entries the shape does not allow (extra: company)"),
         ]
@@ -844,7 +845,26 @@ private let deniedProbes = """
         #expect(b.passes(try #require(b.verified)), "\(b.items)")
         let impostor = TurnPlay(initExtras: { ["plugins": [["name": "cc-plugin-sec-default", "path": "/x", "source": "cc-plugin-sec-default@market"]]] })
         let c = await w.run(w.canary(), runner: canaryRunner(impostor))
-        #expect(try w.item(c, "sandbox-canary").detail.hasPrefix("the init plugins hold entries the shape does not allow (extra: cc-plugin-sec-default@market)"))
+        #expect(try w.item(c, "sandbox-canary").detail.hasPrefix(
+            "the init plugins hold entries the shape does not allow (extra: unknown plugin entry cc-plugin-sec-default (source cc-plugin-sec-default@market))"))
+        // Named like the allowed plugin but without a source, as a plain string, or with a non-builtin path: never allowed.
+        for (label, entry) in [("no source", ["name": "cc-plugin-sec-default@builtin", "path": "/x"] as Any),
+                               ("no source, builtin name", ["name": "cc-plugin-sec-default"] as Any),
+                               ("plain string", "cc-plugin-sec-default@builtin" as Any),
+                               ("other path", ["name": "cc-plugin-sec-default", "path": "/Users/x/p", "source": "cc-plugin-sec-default@builtin"] as Any)] {
+            let id = SandboxCanary.pluginIdentity(entry)
+            #expect(!SandboxCanary.allowedPlugins.contains(id), "\(label): \(id)")
+            #expect(id.hasPrefix("unknown plugin entry"), "\(label): \(id)")
+        }
+        let plain = TurnPlay(initExtras: { ["plugins": ["cc-plugin-sec-default@builtin"]] })
+        let d = await w.run(w.canary(), runner: canaryRunner(plain))
+        #expect(!d.passes(try #require(d.verified)))
+        #expect(try w.item(d, "sandbox-canary").detail.contains("unknown plugin entry cc-plugin-sec-default@builtin"))
+        let sourceless = TurnPlay(initExtras: { ["plugins": [["name": "cc-plugin-sec-default@builtin", "path": "builtin"]]] })
+        let e = await w.run(w.canary(), runner: canaryRunner(sourceless))
+        #expect(!e.passes(try #require(e.verified)))
+        #expect(SandboxCanary.pluginIdentity(["name": "cc-plugin-sec-default", "path": "builtin", "source": "cc-plugin-sec-default@builtin"])
+                == "cc-plugin-sec-default@builtin")
     }
 
     /// Minor 7: `brahma canary run`'s dedupe key changes exactly when the compiled shape does.
