@@ -62,13 +62,18 @@ public enum MapGrouping {
         }
         for t in teamNames {
             let members = teams[t]!
-            result.append(group("team:\(t)", MapText.clean(t, max: 32).uppercased(), teamDepartment(members, roleKinds),
+            result.append(group("team:\(t)", teamTitle(t), teamDepartment(members, roleKinds),
                                 members))
         }
         for d in Department.allCases {
             if let members = departments[d] { result.append(group("dept:\(d.rawValue)", d.title, d, members)) }
         }
         return result
+    }
+
+    /// Uppercased before cleaning, so a case mapping that grows the text ("ß" → "SS") cannot exceed the 32-cluster cap.
+    static func teamTitle(_ team: String) -> String {
+        MapText.clean(String(String.UnicodeScalarView(team.unicodeScalars.prefix(MapText.inputLimit))).uppercased(), max: 32)
     }
 
     /// The most common department among the team's non-manager members; ties go to enum order; managers only → engineering.

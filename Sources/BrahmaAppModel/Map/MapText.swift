@@ -59,33 +59,79 @@ public enum MapText {
             }
         }
 
-        // 5. Each cluster keeps at most 8 scalars, at most 4 of them combining marks. A cut cluster can end in a scalar
-        //    that glues onto the next one (a joiner, a Hangul leading jamo, a prepend), which would rebuild a long cluster;
-        //    a cluster that would fuse with the one before it is dropped instead.
+        // 5. Each cluster keeps at most 8 scalars, at most 4 of them combining marks.
         var capped: [Character] = []
-        for c in line {
-            var kept = String.UnicodeScalarView()
-            var marks = 0
-            for u in c.unicodeScalars {
-                if kept.count == scalarsPerCluster { break }
-                if isMark(u) {
-                    if marks == marksPerCluster { continue }
-                    marks += 1
-                }
-                kept.append(u)
-            }
-            let piece = String(kept)
-            guard let first = piece.first, piece.count == 1 else { continue }
-            if let last = capped.last, (String(last) + piece).count != 2 { continue }
-            capped.append(first)
-        }
+        for c in line { append(capCluster(c), to: &capped) }
+        trimBlank(&capped)
         if capped.isEmpty { return empty }
 
         // 6. At most `max` clusters, the last one "…" when cut.
-        guard capped.count > max else { return String(capped) }
-        var head = Array(capped.prefix(max - 1))
-        // "…" must stay its own cluster (a cut cluster ending in a prepend scalar would swallow it).
-        while let last = head.last, (String(last) + String(ellipsis)).count != 2 { head.removeLast() }
-        return String(head) + String(ellipsis)
+        var out = capped
+        if capped.count > max {
+            out = Array(capped.prefix(max - 1))
+            append(ellipsis, to: &out)
+        }
+        let result = String(out)
+        // Defence in depth: the repairs above keep every cluster within the caps; should one ever slip through, the label
+        // shows "—" rather than an oversized cluster.
+        return withinCaps(result, max: max) ? result : empty
+    }
+
+    /// The cluster's scalars up to the caps. Skipping a mark can split what is left (a virama that held a conjunct
+    /// together, say); only the first cluster of the remainder is kept, so the piece is always exactly one cluster.
+    static func capCluster(_ c: Character) -> Character {
+        var kept = String.UnicodeScalarView()
+        var marks = 0
+        for u in c.unicodeScalars {
+            if kept.count == scalarsPerCluster { break }
+            if isMark(u) {
+                if marks == marksPerCluster { continue }
+                marks += 1
+            }
+            kept.append(u)
+        }
+        return String(kept).first ?? c   // `kept` is never empty: a cluster's first scalar always fits
+    }
+
+    /// Appends `piece` so that it stays its own cluster and the cluster before it is unchanged. A cut cluster can end in a
+    /// scalar that glues onto what follows (a joiner, a prepend, a Hangul jamo, an unpaired regional indicator, a virama),
+    /// which would rebuild a long cluster or shift flag pairs; such trailing scalars are stripped from the previous
+    /// cluster, one at a time, until the two segment exactly as two clusters split at the junction.
+    static func append(_ piece: Character, to clusters: inout [Character]) {
+        while let last = clusters.last {
+            let pair = String(last) + String(piece)
+            if pair.count == 2, pair.first!.unicodeScalars.count == last.unicodeScalars.count { break }
+            clusters.removeLast()
+            var shorter = String.UnicodeScalarView(last.unicodeScalars)
+            shorter.removeLast()
+            // A prefix of a cluster is one cluster; anything else is dropped rather than trusted.
+            let rest = String(shorter)
+            if let only = rest.first, rest.count == 1 { clusters.append(only) }
+        }
+        clusters.append(piece)
+    }
+
+    /// Blank clusters (only whitespace or joiners, e.g. a space left between two pieces that step 5 shrank, or a lone
+    /// U+200C) go at both ends, and a run of spaces becomes one, so the text can never be blank or space-padded.
+    static func trimBlank(_ clusters: inout [Character]) {
+        func blank(_ c: Character) -> Bool {
+            c.unicodeScalars.allSatisfy { $0.properties.isWhitespace || $0.value == 0x200C || $0.value == 0x200D }
+        }
+        while let f = clusters.first, blank(f) { clusters.removeFirst() }
+        while let l = clusters.last, blank(l) { clusters.removeLast() }
+        var i = 1
+        while i < clusters.count {
+            if clusters[i] == " " && clusters[i - 1] == " " { clusters.remove(at: i) } else { i += 1 }
+        }
+    }
+
+    static func withinCaps(_ text: String, max: Int) -> Bool {
+        var count = 0
+        for c in text {
+            count += 1
+            if count > max || c.unicodeScalars.count > scalarsPerCluster
+                || c.unicodeScalars.filter(isMark).count > marksPerCluster { return false }
+        }
+        return true
     }
 }
