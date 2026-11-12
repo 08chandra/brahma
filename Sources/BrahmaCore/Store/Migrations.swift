@@ -1231,5 +1231,101 @@ enum Migrations {
             try db.create(index: "ultraReservation_ask", on: "ultraReservation", columns: ["askId"])
             try db.alter(table: "company") { t in t.add(column: "ultraShare", .double).notNull().defaults(to: 0.15) }
         }
+        m.registerMigration("vML-memory") { db in
+            // Plan ML Task 1: one scoped company-memory index over every source. The INTEGER key keeps the FTS rowids stable
+            // across `VACUUM` (a TEXT key's implicit rowid may be renumbered). `readerSet`: a JSON array of agent ids (NULL:
+            // follow the access class); `restrictions`: a JSON `[[role]]`, every element of which must be satisfied.
+            try db.create(table: "memoryDoc") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("source", .text).notNull()
+                t.column("sourceId", .text).notNull()
+                t.column("ref", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("accessKind", .text).notNull()
+                t.column("accessId", .text)
+                t.column("readerSet", .text)
+                t.column("futureHolders", .boolean).notNull().defaults(to: false)
+                t.column("sensitivity", .text).notNull().defaults(to: "normal")
+                t.column("restrictions", .text).notNull().defaults(to: "[]")
+                t.column("provenance", .text).notNull()
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("weight", .double).notNull().defaults(to: 1.0)
+                t.column("authorId", .text)
+                t.column("itemId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.column("lastRecalledAt", .datetime)
+                t.column("expiresActive", .double)
+                t.column("removedAt", .datetime)
+                t.uniqueKey(["companyId", "source", "sourceId"])
+            }
+            try db.create(index: "memoryDoc_access", on: "memoryDoc", columns: ["companyId", "accessKind", "accessId"])
+            try db.create(index: "memoryDoc_ref", on: "memoryDoc", columns: ["companyId", "ref"])
+            // External content: the triggers keep it current. A delete must pass the old values ('delete' form); a doc is
+            // therefore only ever upserted (`ON CONFLICT … DO UPDATE`), never `INSERT OR REPLACE`d, which skips `memoryDoc_ad`.
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE memoryFts USING fts5(title, body, content='memoryDoc', content_rowid='id',
+                    tokenize='unicode61 remove_diacritics 2')
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER memoryDoc_ai AFTER INSERT ON memoryDoc BEGIN INSERT INTO memoryFts(rowid,title,body) VALUES(new.id,new.title,new.body); END;
+                CREATE TRIGGER memoryDoc_ad AFTER DELETE ON memoryDoc BEGIN INSERT INTO memoryFts(memoryFts,rowid,title,body) VALUES('delete',old.id,old.title,old.body); END;
+                CREATE TRIGGER memoryDoc_au AFTER UPDATE OF title, body ON memoryDoc BEGIN
+                  INSERT INTO memoryFts(memoryFts,rowid,title,body) VALUES('delete',old.id,old.title,old.body);
+                  INSERT INTO memoryFts(rowid,title,body) VALUES(new.id,new.title,new.body); END;
+                """)
+            // Where each source's tick ingest left off (Task 2).
+            try db.create(table: "memoryCursor") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("source", .text).notNull()
+                t.column("position", .text).notNull()
+                t.primaryKey(["companyId", "source"])
+            }
+            // Remembered facts and episodes (Tasks 2–3), shown as `mem:<n>`.
+            try db.create(table: "memoryEntry") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("kind", .text).notNull()
+                t.column("type", .text).notNull()
+                t.column("key", .text)
+                t.column("fact", .text).notNull()
+                t.column("factHash", .text).notNull()
+                t.column("accessKind", .text).notNull()
+                t.column("accessId", .text)
+                t.column("confidence", .double).notNull().defaults(to: 0.7)
+                t.column("confirmations", .integer).notNull().defaults(to: 0)
+                t.column("authorId", .text).notNull()
+                t.column("itemId", .text)
+                t.column("turnId", .text)
+                t.column("provenance", .text).notNull()
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("contradictsId", .text)
+                t.column("contradictedById", .text)
+                t.column("inheritedFromId", .text)
+                t.column("expiresActive", .double)
+                t.column("createdAt", .datetime).notNull()
+                t.column("confirmedAt", .datetime)
+                t.column("removedAt", .datetime)
+                t.column("purgedAt", .datetime)
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "memoryEntry_access", on: "memoryEntry", columns: ["companyId", "accessKind", "accessId", "key"])
+            // Who read which doc, and how (`search|recall|kb_read`): written by Tasks 3–4, read by purge (6c).
+            try db.create(table: "memoryRead") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("docId", .integer).notNull()
+                t.column("agentId", .text).notNull()
+                t.column("turnId", .text)
+                t.column("via", .text).notNull()
+                t.column("readAt", .datetime).notNull()
+            }
+            try db.create(index: "memoryRead_doc", on: "memoryRead", columns: ["companyId", "docId"])
+        }
     }
 }
