@@ -15,8 +15,9 @@ public enum PreviewGuards {
     public static let contentSecurityPolicy = "default-src 'self'; script-src 'self' 'unsafe-inline'; "
         + "style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
 
-    /// Runs at document start in the main frame: inserts the CSP `<meta>` as the first child of `<head>` as soon as `<head>`
-    /// exists (a mutation observer, which fires before the first parser-inserted script runs). No bridge to the app.
+    /// Runs at document start in the main frame: inserts the CSP `<meta>`, and `x-dns-prefetch-control: off` (a page's
+    /// `<link rel=dns-prefetch>` is a DNS lookup, not a load the rule list sees; Task 12 probe), as the first children of
+    /// `<head>` as soon as `<head>` exists (a mutation observer, which fires before the first parser-inserted script runs). No bridge to the app.
     public static let cspScript: String = {
         let policy = contentSecurityPolicy.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         return """
@@ -29,6 +30,10 @@ public enum PreviewGuards {
                 m.setAttribute("content", policy);
                 m.setAttribute("data-brahma-csp", "");
                 head.insertBefore(m, head.firstChild);
+                var p = document.createElement("meta");
+                p.setAttribute("http-equiv", "x-dns-prefetch-control");
+                p.setAttribute("content", "off");
+                head.insertBefore(p, head.firstChild);
               }
               if (document.head) { add(document.head); return; }
               var o = new MutationObserver(function () {

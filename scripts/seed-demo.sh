@@ -83,3 +83,9 @@ git -C "$W" add index.html
 git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgsign=false commit -q -m "Habit tracker landing page" >/dev/null
 "$B" main accept Initech >/dev/null
 "$B" hosting set Initech --provider cloudflare-pages --project initech-demo --account-id 0123456789abcdef0123456789abcdef >/dev/null
+
+# Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
+# folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.
+if [ "${BRAHMA_DEV:-}" = "1" ]; then
+  "$B" dev release-scenario Initech --item INITE-2 --expect-text "Habit tracker" >/dev/null
+fi

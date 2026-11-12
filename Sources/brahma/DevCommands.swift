@@ -15,10 +15,10 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
     do { return try body() } catch let e as WorkError { throw fail(e.message) }
 }
 
-struct DevGroup: ParsableCommand {
+struct DevGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self])
+        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -48,6 +48,32 @@ struct DevGroup: ParsableCommand {
             }
             print(safe(describe(result.ask, store: store) + (result.deduped ? " (already requested)" : "")
                        + (result.grant.map { " \($0.ref) by \($0.approvedBy)" } ?? "")))
+        }
+    }
+
+    /// Plan L Task 12: R-1 deployed and R-2 proposed through the real deploy path against the dev host (a folder under the
+    /// data home served on loopback, never a provider), plus two pending human tasks. Refuses while an engine runs.
+    struct ReleaseScenario: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "release-scenario",
+                                                        abstract: "Deploy R-1 and propose R-2 against the local dev host.")
+        @Argument var company: String
+        @Option(help: "Work item key the Stripe test-keys task is linked to.") var item: String?
+        @Option(name: .customLong("expect-text"), help: "Text the deployed page's / must contain.") var expectText: String?
+
+        func run() async throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let summary: DevReleaseScenario.Summary
+            do {
+                summary = try await DevReleaseScenario.run(store: store, paths: paths, companyId: c.id,
+                                                           vault: try cliSecretVault(interactive: false), itemKey: item,
+                                                           expectText: expectText)
+            } catch let e as WorkError { throw fail(e.message) }
+            print(safe("smoke \(summary.smoke.status.rawValue) at \(summary.smoke.commit.prefix(7))"))
+            print(safe("\(summary.deployed.ref) \(summary.deployed.status.rawValue) \(summary.deployed.productionURL ?? "-")"))
+            print(safe("\(summary.proposed.ref) \(summary.proposed.status.rawValue) (\(summary.deployAsk.ref) waits on the owner)"))
+            for ask in summary.humanTasks { print(safe("\(ask.ref) human task: \(ask.title)")) }
         }
     }
 
