@@ -58,8 +58,13 @@ public enum SeatbeltProfile {
         (false, "com.apple.DiskArbitration.diskarbitrationd"),
     ]
 
+    // `tmutil` is denied (mount-escape audit, round 9): `tmutil localsnapshot` creates a system APFS local snapshot of every
+    // volume from inside the sandbox (it carries the VFS-snapshot entitlement and needs no root), an effect outside the
+    // command's writable area that the profile otherwise does not stop. Mounting such a snapshot to read a denied path is
+    // separately blocked (`mount_apfs -s` is a client-side `mount(2)`, caught by `file-mount`), so this is a side-effect /
+    // persistence concern, not a path-read escape; denying the entitled CLI closes the demonstrated route.
     static let deniedExecutables = ["/usr/bin/osascript", "/usr/bin/open", "/bin/launchctl", "/usr/bin/security", "/usr/bin/sudo",
-                                    "/usr/sbin/screencapture", "/usr/bin/crontab", "/usr/bin/at"]
+                                    "/usr/sbin/screencapture", "/usr/bin/crontab", "/usr/bin/at", "/usr/bin/tmutil"]
 
     /// What a GUI app built by a check (or previewed) needs to draw.
     static let toolchainServices = ["com.apple.windowserver.active", "com.apple.CARenderServer", "com.apple.dock.server",

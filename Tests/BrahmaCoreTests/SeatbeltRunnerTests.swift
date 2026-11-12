@@ -325,6 +325,32 @@ struct SeatbeltRunnerTests {
         return (info.contains(dir.path), mounts.filter { line in points.contains { line.contains(" on \($0.path) (") } })
     }
 
+    /// `mount(2)` (SYS_mount = 167) from inside the sandbox via Perl's `syscall`: one line per `type=dir` argument, `ok` or
+    /// `errno <n>`. The string arguments must be lvalue scalars for `syscall` to pass their pointers. `devfs` and `fdesc` are
+    /// synthetic filesystems a non-root user can mount over a directory they own with no device and no server (the positive
+    /// control below does exactly that), so they reach the real `mount(2)` the profile's `file-mount` deny must stop — the
+    /// same syscall every mount helper (mount_smbfs/nfs/webdav/afp, mount_apfs, mount_tmpfs, an FSKit mount) calls in the
+    /// mounting process.
+    static let mountPerl = #"for (@ARGV) { my ($t, $d) = split /=/, $_; my $tt = "$t"; my $dd = "$d"; $! = 0; my $r = syscall(167, $tt, $dd, 0, 0); print "$d: ", ($r == 0 ? "ok" : "errno " . ($! + 0)), "\n" }"#
+
+    /// The mount points at or under `dir` right now (from outside the sandbox), by parsing `/sbin/mount` ("<dev> on <point> (…").
+    static func mountsUnder(_ dir: URL) -> [String] {
+        guard let out = try? Self.outside("/sbin/mount", []).output else { return [] }
+        var points: [String] = []
+        for line in out.split(separator: "\n") {
+            guard let on = line.range(of: " on "), let paren = line[on.upperBound...].range(of: " (") else { continue }
+            let point = String(line[on.upperBound..<paren.lowerBound])
+            if point == dir.path || point.hasPrefix(dir.path + "/") { points.append(point) }
+        }
+        return points
+    }
+
+    /// Force-unmounts anything mounted at or under `dir` (deepest first), from outside the sandbox — test hygiene, so a run
+    /// that unexpectedly mounted leaves nothing behind.
+    static func unmountAllUnder(_ dir: URL) {
+        for point in mountsUnder(dir).sorted(by: { $0.count > $1.count }) { _ = try? Self.outside("/sbin/umount", ["-f", point]) }
+    }
+
     /// Fix round 8 (Critical): DiskArbitration mounts as root outside the sandbox, so `file-mount` alone did not stop
     /// `hdiutil makehybrid` → `attach -nomount` → `diskutil mount -mountPoint <dir>` from laying an agent-built filesystem over
     /// a data-home directory the profile denies. With its lookup denied: the sandboxed chain attaches nothing; a device the
@@ -418,6 +444,130 @@ struct SeatbeltRunnerTests {
         #expect(outcome.exitCode == 0, "\(text)")
         #expect(text.contains("public-textnested-textpublic-textnested-text"), "\(text)")
         #expect(FileManager.default.fileExists(atPath: w.appending(path: "wt2/a.txt").path), "\(text)")
+    }
+
+    // MARK: Mount escapes (follow-up to the DiskArbitration fix, round 8)
+
+    /// The core of the mount-escape audit. `mount(2)` is the one syscall every mount helper calls in the mounting process,
+    /// and on macOS none of them is setuid, so a sandboxed command's only routes to a mount are (a) that client-side
+    /// `mount(2)` — which `(deny file-mount …)` must stop — or (b) a root daemon that mounts on its behalf, of which the only
+    /// one that does so for an arbitrary target is DiskArbitration, already denied (round 8). `devfs` proves (a) with no
+    /// device, no server and no root: the positive control really mounts it over a dir this user owns, then unmounts, so the
+    /// in-sandbox refusals below are the sandbox and nothing else. Inside the sandbox `devfs`/`fdesc` are refused over a
+    /// denied data-home directory, a readable directory and the writable one; nothing is mounted and the directories are
+    /// unchanged. The non-setuid `mount_devfs` helper (same `mount(2)`) is refused too. This is the syscall-level proof for
+    /// every client-side route the brief lists: mount_smbfs/nfs/webdav/afp, mount_apfs -s, mount_tmpfs and an FSKit mount.
+    @Test func clientSideMountsOverDeniedPathsAreRefused() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        defer { Self.unmountAllUnder(h) }
+        let fm = FileManager.default
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let home = h.appending(path: "datahome")
+        let db = home.appending(path: "db")
+        try Self.file(db.appending(path: "orig"), "engine-private")
+        let pub = h.appending(path: "r/pub")
+        try Self.file(pub.appending(path: "p"), "public-text")
+        try Self.file(w.appending(path: "mount.pl"), Self.mountPerl)
+        let r = Self.runner(Self.baseline(engineHomes: [home]))
+        let p = Self.policy(writable: [w], readable: [h.appending(path: "r")])
+
+        // Positive control, outside the sandbox: devfs really does mount over a directory this user owns (so the refusals
+        // below are the sandbox, not a missing privilege or a missing server). Unmounted immediately.
+        let ctl = try Self.mkdir(h.appending(path: "ctl"))
+        let control = try Self.outside("/usr/bin/perl", ["-e", Self.mountPerl, "devfs=\(ctl.path)"])
+        #expect(control.output.contains("\(ctl.path): ok"), "devfs is not user-mountable here; the test would prove nothing: \(control.output)")
+        #expect(!Self.mountsUnder(ctl).isEmpty, "the control devfs mount did not appear: \(control.output)")
+        Self.unmountAllUnder(ctl)
+
+        // Inside the sandbox: devfs and fdesc over the denied, the readable and the writable directories.
+        let targets = [db, pub, w]
+        let args = targets.flatMap { ["devfs=\($0.path)", "fdesc=\($0.path)"] }
+        let (outcome, text) = try await Self.run("/usr/bin/perl mount.pl " + args.map { "'\($0)'" }.joined(separator: " "), p, runner: r)
+        #expect(outcome.exitCode == 0, "\(text)")
+        for t in targets {
+            #expect(text.contains("\(t.path): errno"), "a mount over \(t.path) was not refused: \(text)")
+            #expect(!text.contains("\(t.path): ok"), "a mount over \(t.path) succeeded: \(text)")
+            #expect(Self.mountsUnder(t).isEmpty, "something is mounted under \(t.path): \(Self.mountsUnder(t))")
+        }
+        #expect(Set(try fm.contentsOfDirectory(atPath: db.path)) == ["orig"], "the denied data-home dir changed")
+        #expect(Set(try fm.contentsOfDirectory(atPath: pub.path)) == ["p"], "the readable dir changed")
+
+        // The mount_devfs helper itself (not setuid; same mount(2)).
+        let (helper, helperText) = try await Self.run("/sbin/mount_devfs devfs '\(db.path)'", p, runner: r)
+        #expect(helper.exitCode != 0, "mount_devfs succeeded: \(helperText)")
+        #expect(Self.mountsUnder(db).isEmpty, "mount_devfs mounted something: \(Self.mountsUnder(db))")
+    }
+
+    /// Brief routes 1–2: the network-share mount helpers. None is setuid, so each calls the client-side `mount(2)` shown
+    /// refused above (NetFS authentication via NetAuthSysAgent returns to the client; the mount is this syscall). Run for real
+    /// at a loopback address with no server: whether they fail to connect or are stopped at the mount, nothing is ever
+    /// mounted over the denied data-home directory, which stays unchanged.
+    @Test func networkShareMountHelpersPlantNothing() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        defer { Self.unmountAllUnder(h) }
+        let fm = FileManager.default
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let home = h.appending(path: "datahome")
+        let db = home.appending(path: "db")
+        try Self.file(db.appending(path: "orig"), "engine-private")
+        let r = Self.runner(Self.baseline(engineHomes: [home]))
+        let p = Self.policy(writable: [w], readable: [h.appending(path: "r")])
+        let point = db.path
+        let attempts = [
+            "/sbin/mount_nfs -o timeo=1,retrycnt=0,soft 127.0.0.1:/nonexistent '\(point)'",
+            "/sbin/mount_webdav -i http://127.0.0.1:1/dav '\(point)'",
+            "/sbin/mount_smbfs //guest:@127.0.0.1/nonexistent '\(point)'",
+            "/sbin/mount_afp afp://guest:@127.0.0.1/nonexistent '\(point)'",
+        ]
+        for attempt in attempts {
+            let (_, text) = try await Self.run(attempt + " 2>&1; echo EXIT=$?", p, runner: r, timeout: .seconds(30))
+            #expect(!text.contains("EXIT=0"), "\(attempt) reported success: \(text)")
+            #expect(Self.mountsUnder(db).isEmpty, "\(attempt) mounted something: \(Self.mountsUnder(db))")
+        }
+        #expect(Set(try fm.contentsOfDirectory(atPath: db.path)) == ["orig"], "the denied data-home dir changed")
+    }
+
+    /// Brief route 4: APFS snapshots / Time Machine. The mount-escape audit found that `tmutil localsnapshot` was NOT stopped
+    /// — it created a system APFS local snapshot of every volume from inside the sandbox (it carries the VFS-snapshot
+    /// entitlement and needs no root), an effect outside the command's writable area. The round-9 fix denies `/usr/bin/tmutil`
+    /// (`deniedExecutables`), so the exec is refused and no snapshot is created; this test asserts that refusal. (This is a
+    /// side-effect / persistence concern, not a path read: mounting a snapshot to read a denied path is a client-side
+    /// `mount(2)`, separately blocked — `mount_apfs -s` plants nothing over the denied data-home directory, which is
+    /// unchanged.) The whole test is gated so it never runs — and so never creates a snapshot — unless the tmutil deny is in
+    /// the rendered profile.
+    @Test func apfsSnapshotAndTimeMachineMountsAreRefused() async throws {
+        // Guard: only run once the fix is present, so a pre-fix checkout does not create a stray snapshot. The rendered
+        // profile must deny tmutil.
+        try #require(SeatbeltProfile.deniedExecutables.contains("/usr/bin/tmutil"),
+                     "tmutil is not denied; skipping to avoid creating a system snapshot (apply the round-9 fix first)")
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        defer { Self.unmountAllUnder(h) }
+        let fm = FileManager.default
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let home = h.appending(path: "datahome")
+        let db = home.appending(path: "db")
+        try Self.file(db.appending(path: "orig"), "engine-private")
+        let r = Self.runner(Self.baseline(engineHomes: [home]))
+        let p = Self.policy(writable: [w], readable: [h.appending(path: "r")])
+        // tmutil is refused at exec (process-exec deny), so it creates no snapshot.
+        let (snap, snapText) = try await Self.run("/usr/bin/tmutil localsnapshot 2>&1", p, runner: r, timeout: .seconds(30))
+        #expect(snap.exitCode != 0, "tmutil localsnapshot ran: \(snapText)")
+        #expect(snapText.contains("not permitted"), "tmutil was not denied at exec: \(snapText)")
+        #expect(!snapText.contains("Created local snapshot"), "a snapshot was created: \(snapText)")
+        // mount_apfs -s is a client-side mount(2): it plants nothing over the denied directory.
+        let dev = Self.outside_device(for: db) ?? "/dev/disk3s1"
+        let (m, mText) = try await Self.run("/sbin/mount_apfs -s nonexistent.brahma.test \(dev) '\(db.path)' 2>&1; echo EXIT=$?",
+                                            p, runner: r, timeout: .seconds(30))
+        #expect(!mText.contains("EXIT=0"), "mount_apfs reported success: \(mText)")
+        #expect(Self.mountsUnder(db).isEmpty, "mount_apfs mounted something: \(Self.mountsUnder(db))")
+        _ = m
+        #expect(Set(try fm.contentsOfDirectory(atPath: db.path)) == ["orig"], "the denied data-home dir changed")
+    }
+
+    /// The device backing `url` (from outside the sandbox): the first field of `df`'s data line.
+    static func outside_device(for url: URL) -> String? {
+        guard let out = try? Self.outside("/bin/df", [url.path]).output else { return nil }
+        return out.split(separator: "\n").dropFirst().first?.split(separator: " ").first.map(String.init)
     }
 
     // MARK: Escapes
