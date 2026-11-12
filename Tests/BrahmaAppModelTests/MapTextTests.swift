@@ -80,6 +80,48 @@ import Foundation
         #expect(prepend == "…")
     }
 
+    /// Review fix 1: step 5 shrinking clusters must never leave blank, space-led or space-trailed text.
+    @Test func neverBlankOrSpacePadded() {
+        // The virama is the 5th mark: skipping it splits the conjunct; the first cluster is kept, not the whole dropped.
+        let conj = "\u{0915}" + String(repeating: "\u{093C}", count: 4) + "\u{094D}\u{0937}"
+        let kept = "\u{0915}" + String(repeating: "\u{093C}", count: 4)
+        #expect(MapText.clean(conj + " " + conj, max: 40) == kept + " " + kept)
+        // A 10-scalar kiss is cut after a joiner; the joiner is stripped so the party popper survives, no padding.
+        let kiss = "👩🏻\u{200D}❤️\u{200D}💋\u{200D}👨🏼"
+        let out = MapText.clean("a " + kiss + "🎉", max: 40)
+        #expect(out.hasPrefix("a ") && out.hasSuffix("🎉") && !out.hasSuffix(" "))
+        for c in out { #expect(c.unicodeScalars.count <= 8) }
+        // Blank-only text (joiners, spaces) is "—".
+        #expect(MapText.clean("\u{200C}", max: 40) == "—")
+        #expect(MapText.clean("\u{200C} \u{200D}\u{2028}", max: 40) == "—")
+        for input in [conj + " " + conj, "a " + kiss + "🎉", "\u{200C}x\u{200D}"] {
+            let r = MapText.clean(input, max: 40)
+            #expect(r.first != " " && r.last != " " && !r.contains("  "))
+        }
+    }
+
+    /// Review fix 2: a cut cluster ending in a regional indicator must not shift the flag pairs after it.
+    @Test func regionalIndicatorParityNeverFuses() {
+        let input = String(repeating: "\u{0600}", count: 7) + "🇺🇸🇺🇸🇺🇸"
+        let out = MapText.clean(input, max: 40)
+        #expect(out != "—")
+        for c in out { #expect(c.unicodeScalars.count <= 8) }
+        #expect(out == "🇺🇸🇺🇸")   // the prepend run glues onto anything, so it goes; the later flags pair correctly
+        // The emoji chain keeps its content (each cut family loses its dangling joiner) instead of being dropped.
+        let chain = MapText.clean(String(repeating: "👨‍👩‍👧‍👦‍👦", count: 3), max: 40)
+        #expect(chain.count == 3)
+        #expect(chain.map(\.unicodeScalars.count) == [7, 7, 8])   // the last one has nothing after it to fuse with
+    }
+
+    /// The last-resort check behind step 6 rejects too many clusters, an oversized cluster and too many marks.
+    @Test func capsCheck() {
+        #expect(MapText.withinCaps("ab", max: 2))
+        #expect(!MapText.withinCaps("abc", max: 2))
+        #expect(!MapText.withinCaps("👨‍👩‍👧‍👦‍👦", max: 2))                                          // 9 scalars
+        #expect(!MapText.withinCaps("e" + String(repeating: "\u{0301}", count: 5), max: 2))   // 5 marks
+        #expect(MapText.withinCaps("e" + String(repeating: "\u{0301}", count: 4), max: 2))
+    }
+
     @Test func outputIsBoundedForHugeInputs() {
         let mixed = String(repeating: "x\u{202E}\u{E0041}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\n", count: 10_000)
         let out = MapText.clean(mixed, max: 80)

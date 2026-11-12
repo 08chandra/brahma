@@ -91,6 +91,14 @@ import Foundation
         #expect(groups.first { $0.id == "csuite" }?.memberIds == ["a-ceo"])
     }
 
+    /// Review minor: uppercase before the cap, so "ß" → "SS" cannot double the title past 32 clusters.
+    @Test func teamTitleCappedAfterUppercasing() {
+        let agents = [agent("e", role: "engineer", team: String(repeating: "ß", count: 32), at: 0)]
+        let title = MapGrouping.make(agents: agents, roleKinds: roleKinds(software)).first?.title
+        #expect(title == String(repeating: "S", count: 31) + "…")
+        #expect(title?.count == 32)
+    }
+
     @Test func departmentTiesGoToEnumOrder() {
         let kinds = roleKinds(software)
         let agents = [agent("q", role: "qa", team: "t", at: 0), agent("d", role: "designer", team: "t", at: 1)]
