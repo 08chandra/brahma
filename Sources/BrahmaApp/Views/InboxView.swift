@@ -36,19 +36,28 @@ struct InboxView: View {
                 MonoChip(text: "\(mine.count)", color: BrahmaTheme.text1)
             }
             .padding(.top, BrahmaTheme.spaceXS)
-            ForEach(mine) { row in
-                if row.section == .pending, row.kind == .grant, let card = model.accessCard(askId: row.id) {
-                    AccessCardView(model: model, card: card).id(card.id)
-                } else if row.section == .pending, row.kind == .deploy, let card = model.deployCard(for: row.id) {
-                    DeployCardView(model: model, card: card).id(card.askId)
-                } else if row.section == .pending, row.kind == .humanTask, let card = model.humanTaskCard(for: row.id) {
-                    HumanTaskCardView(model: model, card: card).id(card.askId)
-                } else if row.section == .pending, row.kind == .request {
-                    SecretRequestCard(model: model, row: row)
-                } else {
-                    InboxCard(model: model, row: row)
-                }
-            }
+            ForEach(mine) { row in card(row) }
+        }
+    }
+
+    /// A pending deploy or human task gets its live card; without one (missing release record, unreadable payload) it gets
+    /// the read-only fallback (`LiveCardFallback`), never the generic card's Approve.
+    @ViewBuilder private func card(_ row: InboxRow) -> some View {
+        let pending = row.section == .pending
+        let deploy = pending && row.kind == .deploy ? model.deployCard(for: row.id) : nil
+        let task = pending && row.kind == .humanTask ? model.humanTaskCard(for: row.id) : nil
+        if pending, row.kind == .grant, let card = model.accessCard(askId: row.id) {
+            AccessCardView(model: model, card: card).id(card.id)
+        } else if let deploy {
+            DeployCardView(model: model, card: deploy).id(deploy.askId)
+        } else if let task {
+            HumanTaskCardView(model: model, card: task).id(task.askId)
+        } else if let fallback = LiveCardFallback.for(row: row, deployCard: deploy, humanTaskCard: task) {
+            LiveCardFallbackView(model: model, row: row, fallback: fallback).id(row.id)
+        } else if pending, row.kind == .request {
+            SecretRequestCard(model: model, row: row)
+        } else {
+            InboxCard(model: model, row: row)
         }
     }
 }
