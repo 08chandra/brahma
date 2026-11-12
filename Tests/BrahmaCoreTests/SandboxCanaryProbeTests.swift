@@ -9,13 +9,13 @@ import GRDB
 
 /// A sandboxed runner that runs nothing: it answers each command the way a sandbox would, by `behave`. The model-free layer's
 /// probe arrives in `SandboxCanary.probeVariable`; `sandbox-backend`'s `/bin/cat '<path>'` reads only its own control file.
-private final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
+private final class CanaryFakeSandbox: SandboxedRunner, @unchecked Sendable {
     typealias Behave = @Sendable (_ probe: String, _ env: [String: String], _ cwd: URL) -> CheckOutcome
     private let lock = NSLock()
     private var _probes: [String] = []
     let behave: Behave
 
-    init(behave: @escaping Behave = FakeSandbox.denyAll) { self.behave = behave }
+    init(behave: @escaping Behave = CanaryFakeSandbox.denyAll) { self.behave = behave }
     var probes: [String] { lock.withLock { _probes } }
 
     /// The positive control reads its file; every other probe is denied.
@@ -168,8 +168,8 @@ private struct CanaryWorld {
         #expect(chmod(probesURL.path, mode) == 0)
     }
 
-    func canary(local: FakeSandbox = FakeSandbox()) -> SandboxCanary {
-        SandboxCanary(environment: env, sandbox: FakeSandbox(), hookExecutable: "/usr/local/bin/brahma", localRunner: { _ in local })
+    func canary(local: CanaryFakeSandbox = CanaryFakeSandbox()) -> SandboxCanary {
+        SandboxCanary(environment: env, sandbox: CanaryFakeSandbox(), hookExecutable: "/usr/local/bin/brahma", localRunner: { _ in local })
     }
 
     func run(_ canary: SandboxCanary, runner: FakeTurnRunner = canaryRunner()) async -> CanaryRun {
@@ -265,7 +265,7 @@ private let deniedProbes = """
     @Test func allProbesDeniedInBothLayersPasses() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes)
-        let local = FakeSandbox()
+        let local = CanaryFakeSandbox()
         let runner = canaryRunner()
         let run = await w.run(w.canary(local: local), runner: runner)
         let verified = try #require(run.verified)
@@ -340,9 +340,9 @@ private let deniedProbes = """
     @Test func aSucceedingProbeBlocksNamingItsLine() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes + "\ntrue\n")
-        let local = FakeSandbox { probe, env, cwd in
+        let local = CanaryFakeSandbox { probe, env, cwd in
             if probe == "true" { return CheckOutcome(exitCode: 0, timedOut: false, tail: "") }
-            return FakeSandbox.denyAll(probe, env, cwd)
+            return CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let runner = canaryRunner()
         let run = await w.run(w.canary(local: local), runner: runner)
@@ -357,12 +357,12 @@ private let deniedProbes = """
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes + "\necho leak\n")
         // The fake sandbox "fails" to deny one probe: it prints the planted token, then exits non-zero.
-        let local = FakeSandbox { probe, env, cwd in
+        let local = CanaryFakeSandbox { probe, env, cwd in
             if probe == "echo leak" {
                 let token = (try? String(contentsOfFile: env[CanaryProbes.homeFileVariable] ?? "", encoding: .utf8)) ?? ""
                 return CheckOutcome(exitCode: 1, timedOut: false, tail: "here: \(token)")
             }
-            return FakeSandbox.denyAll(probe, env, cwd)
+            return CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let run = await w.run(w.canary(local: local))
         #expect(!run.passes(try #require(run.verified)))
@@ -383,7 +383,7 @@ private let deniedProbes = """
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes)
         // A runner that runs nothing: every command "fails", so every probe would look denied.
-        let local = FakeSandbox { _, _, _ in CheckOutcome(exitCode: 1, timedOut: false, tail: "") }
+        let local = CanaryFakeSandbox { _, _, _ in CheckOutcome(exitCode: 1, timedOut: false, tail: "") }
         let run = await w.run(w.canary(local: local))
         #expect(!run.passes(try #require(run.verified)))
         #expect(try w.item(run, "sandbox-canary-local").detail.hasPrefix("the positive control"))
@@ -454,8 +454,8 @@ private let deniedProbes = """
     @Test func aSucceedingHelperProbeWarnsButPasses() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes + "\npbpaste # helper\n")
-        let local = FakeSandbox { probe, env, cwd in
-            probe == "pbpaste" ? CheckOutcome(exitCode: 0, timedOut: false, tail: "clipboard") : FakeSandbox.denyAll(probe, env, cwd)
+        let local = CanaryFakeSandbox { probe, env, cwd in
+            probe == "pbpaste" ? CheckOutcome(exitCode: 0, timedOut: false, tail: "clipboard") : CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let play = TurnPlay(result: { command, request in command == "pbpaste" ? (false, "clipboard") : TurnPlay.denied(command, request) })
         let run = await w.run(w.canary(local: local), runner: canaryRunner(play))
@@ -483,8 +483,8 @@ private let deniedProbes = """
     @Test func aCommandNotFoundIsNotRun() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes + "\nno-such-tool\n")
-        let local = FakeSandbox { probe, env, cwd in
-            probe == "no-such-tool" ? CheckOutcome(exitCode: 127, timedOut: false, tail: "zsh: command not found") : FakeSandbox.denyAll(probe, env, cwd)
+        let local = CanaryFakeSandbox { probe, env, cwd in
+            probe == "no-such-tool" ? CheckOutcome(exitCode: 127, timedOut: false, tail: "zsh: command not found") : CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let run = await w.run(w.canary(local: local))
         #expect(!run.passes(try #require(run.verified)))
@@ -501,10 +501,10 @@ private let deniedProbes = """
     @Test func anExecRefusedWith127IsADenial() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes + "\n/bin/launchctl list\n")
-        let local = FakeSandbox { probe, env, cwd in
+        let local = CanaryFakeSandbox { probe, env, cwd in
             probe == "/bin/launchctl list"
                 ? CheckOutcome(exitCode: 127, timedOut: false, tail: "zsh:1: operation not permitted: /bin/launchctl")
-                : FakeSandbox.denyAll(probe, env, cwd)
+                : CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let play = TurnPlay(result: { command, request in
             command == "/bin/launchctl list" ? (true, "Exit code 127\n(eval):1: Operation not permitted: /bin/launchctl")
@@ -522,12 +522,12 @@ private let deniedProbes = """
     @Test func aChangedPlantedPlaceBlocks() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes + "\nwrite-then-fail\n")
-        let local = FakeSandbox { probe, env, cwd in
+        let local = CanaryFakeSandbox { probe, env, cwd in
             if probe == "write-then-fail" {
                 try? Data("x".utf8).write(to: URL(fileURLWithPath: env[CanaryProbes.outsideDirVariable] ?? "/nonexistent").appending(path: "x"))
                 return CheckOutcome(exitCode: 1, timedOut: false, tail: "")
             }
-            return FakeSandbox.denyAll(probe, env, cwd)
+            return CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let run = await w.run(w.canary(local: local))
         #expect(!run.passes(try #require(run.verified)))
@@ -581,12 +581,12 @@ private let deniedProbes = """
         #expect(!m.redact("a \(uuid.lowercased()) b").contains(uuid.lowercased()))
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes + "\necho uuid\n")
-        let local = FakeSandbox { probe, env, cwd in
+        let local = CanaryFakeSandbox { probe, env, cwd in
             if probe == "echo uuid" {
                 let t = (try? String(contentsOfFile: env[CanaryProbes.dataFileVariable] ?? "", encoding: .utf8)) ?? ""
                 return CheckOutcome(exitCode: 1, timedOut: false, tail: Data(t.utf8).base64EncodedString())
             }
-            return FakeSandbox.denyAll(probe, env, cwd)
+            return CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let run = await w.run(w.canary(local: local))
         #expect(try w.item(run, "sandbox-canary-local").detail.hasPrefix("probe line 7 leaked a canary token"))
@@ -679,7 +679,7 @@ private let deniedProbes = """
         let userHome = try tempDir()
         let turns = canaryRunner()
         let canary = SandboxCanary(environment: SandboxEnvironment(userHome: userHome, darwinUserTemp: nil, shell: "/bin/zsh"),
-                                   sandbox: FakeSandbox(), hookExecutable: "/usr/local/bin/brahma", localRunner: { _ in FakeSandbox() })
+                                   sandbox: CanaryFakeSandbox(), hookExecutable: "/usr/local/bin/brahma", localRunner: { _ in CanaryFakeSandbox() })
         var gate = SandboxCanaryGate(canary: canary, runner: turns, claudePath: claude.path, retryAfter: 0)
         gate.fingerprintCacheSeconds = 0
         let world = try World(sandboxCanary: gate)
@@ -793,9 +793,9 @@ private let deniedProbes = """
     @Test func unsandboxedRunsFail() async throws {
         let w = try CanaryWorld()
         try w.writeProbes(deniedProbes)
-        let local = FakeSandbox { probe, env, cwd in
+        let local = CanaryFakeSandbox { probe, env, cwd in
             probe == "cat \"$CANARY_DATA_FILE\"" ? CheckOutcome(exitCode: 126, timedOut: false, tail: "brahma: sandbox is not active; command refused")
-                : FakeSandbox.denyAll(probe, env, cwd)
+                : CanaryFakeSandbox.denyAll(probe, env, cwd)
         }
         let a = await w.run(w.canary(local: local))
         #expect(try w.item(a, "sandbox-canary-local").detail.hasPrefix("probe line 4 was not run (unverified): the shell prefix found no sandbox"))

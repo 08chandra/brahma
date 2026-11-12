@@ -26,8 +26,10 @@ scripts/seed-demo.sh >/dev/null
 
 APP=.build/Brahma.app/Contents/MacOS/Brahma
 CLI=.build/Brahma.app/Contents/Helpers/brahma
-# The lifecycle cases need @ceo's fake turn to run. Sandboxed agents stay paused until the owner rules on the 5-lite sandbox
-# canary's agent-turn part ("pending owner decision"), so Acme runs Workspace here: this smoke checks the app, not the sandbox.
+# The lifecycle cases need @ceo's fake turn to run. A Sandboxed turn starts only after the sandbox canary passed for the claude
+# that runs it (its fingerprint is in the canary key), and the canary's turn layer needs a real model to run the owner's
+# probes: scripts/fake-claude.sh runs none, so it can never pass and a Sandboxed Acme would never take a turn here. Acme runs
+# Workspace: this smoke checks the app; `brahma canary run` with a real claude checks the sandbox.
 "$CLI" company profile Acme workspace >/dev/null
 BIN="$TMP/bin"
 mkdir -p "$BIN"

@@ -269,6 +269,14 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let inAgent = try brahma(["company", "create", "Zed", "--demo", "live"], home: owner.url, env: ["BRAHMA_AGENT_ID": "x"])
         #expect(inAgent.status == 1 && inAgent.stderr.contains("owner commands can't run inside an agent turn"), "\(inAgent.stderr)")
         #expect(try brahma(["company", "create", "Zed"], home: owner.url).status != 0)
+        // --demo live builds its own org: --dry-run, --agents and --pack (even at their default values) are refused, and
+        // nothing is created.
+        for extra in [["--dry-run"], ["--agents", "6"], ["--agents", "0"], ["--pack", "software"], ["--pack", "foo"]] {
+            let mixed = try brahma(["company", "create", "Zed", "--demo", "live"] + extra, home: owner.url)
+            #expect(mixed.status != 0 && mixed.stderr.contains("--demo live can't be combined with --dry-run, --agents or --pack"),
+                    "\(extra): \(mixed.stderr)")
+        }
+        #expect(try store.companies().map(\.name).sorted() == ["Lumen", "Nimbus"])
     }
 
     /// The dev host serves only regular files under its folder (no `..`, links or hard links) and the scenario's sandbox
