@@ -634,25 +634,59 @@ struct SeatbeltRunnerTests {
             && FileManager.default.isExecutableFile(atPath: "/usr/bin/lipo")
     }
 
+    /// The x86_64 slice of `tool`, ad-hoc re-signed, at `out`: a copy that AMFI's launch constraints do not kill.
+    static func reSignedCopy(of tool: String, to out: URL, keepEntitlements: Bool = false) throws {
+        let env = ["DEVELOPER_DIR": Toolchain.developerDir, "PATH": "/usr/bin:/bin"]
+        let l = try Self.outside("/usr/bin/lipo", ["-thin", "x86_64", tool, "-output", out.path], environment: env)
+        try #require(l.status == 0, "lipo \(tool): \(l.output)")
+        let c = try Self.outside("/usr/bin/codesign", ["-f", "-s", "-"]
+            + (keepEntitlements ? ["--preserve-metadata=entitlements"] : []) + [out.path], environment: env)
+        try #require(c.status == 0, "codesign \(tool): \(c.output)")
+    }
+
+    /// launchd job creation (copy audit). The path deny cannot stop a re-signed `launchctl`, so the boundary is launchd's own
+    /// sandbox check, which the profile denies explicitly (`(deny job-creation)`). Control first: the same copy run OUTSIDE
+    /// the sandbox does create a job, so the in-sandbox refusal is the profile, not a broken copy. Both canary jobs (they
+    /// only run /usr/bin/true) are removed from outside the sandbox even when an expectation fails.
+    @Test(.enabled(if: rosettaAvailable, "no Rosetta"))
+    func launchdJobCreationIsRefusedEvenForAReSignedLaunchctl() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let label = "dev.brahma.canary.\(UUID().uuidString)", control = "dev.brahma.canary.\(UUID().uuidString)"
+        defer {
+            _ = try? Self.outside("/bin/launchctl", ["remove", label])
+            _ = try? Self.outside("/bin/launchctl", ["remove", control])
+        }
+        try #require(SeatbeltProfile.render(policy: Self.policy(writable: [w]), baseline: Self.baseline(), proxyPort: nil)
+            .contains("(deny job-creation)"))
+        let copy = w.appending(path: "r-launchctl")
+        try Self.reSignedCopy(of: "/bin/launchctl", to: copy)
+        let made = try Self.outside(copy.path, ["submit", "-l", control, "--", "/usr/bin/true"])
+        try #require(made.status == 0, "the re-signed launchctl cannot submit even unsandboxed: \(made.output)")
+        try #require(try Self.outside("/bin/launchctl", ["list", control]).status == 0, "control job missing")
+        _ = try Self.outside("/bin/launchctl", ["remove", control])
+
+        let (_, text) = try await Self.run("./r-launchctl submit -l \(label) -- /usr/bin/true; echo \"submit rc=$?\"",
+                                           Self.policy(writable: [w]))
+        #expect(text.contains("submit rc=") && !text.contains("submit rc=0"), "\(text)")
+        let listed = try Self.outside("/bin/launchctl", ["list", label])
+        #expect(listed.status != 0, "the sandboxed copy created a launchd job: \(listed.output)")
+    }
+
     /// The copy route that DOES run: thin a denied tool to its x86_64 slice (Rosetta) and ad-hoc re-sign it. Seatbelt
     /// cannot stop it (positive control: such a copy of `/bin/echo` runs in the writable dir), and a command could build
     /// the same code itself. What the copy loses is what the deny protects. Restricted entitlements cannot ride on an ad-hoc
     /// signature (AMFI kills a re-signed `tmutil` that keeps them), and setuid does not survive `cp` (`crontab`, `at`). The
     /// Keychain stays out of reach (`security`, mach-lookup deny).
-    /// NOT asserted here, open gaps (see the commit): a re-signed `osascript` still delivers Apple events, and a re-signed
-    /// `launchctl` still talks to launchd.
+    /// `launchctl` is covered by `launchdJobCreationIsRefusedEvenForAReSignedLaunchctl`. Apple events from a re-signed
+    /// `osascript` are not asserted: `name of application "Finder"` is answered locally by LaunchServices (no event is sent),
+    /// and a real event needs the owner's Automation (TCC) consent, which a test must not prompt for.
     @Test(.enabled(if: rosettaAvailable, "no Rosetta"))
     func reSignedCopiesOfDeniedExecutablesLoseTheirPrivilege() async throws {
         let h = try Self.homeDir(); defer { Self.remove(h) }
         let w = try Self.mkdir(h.appending(path: "w"))
-        let env = ["DEVELOPER_DIR": Toolchain.developerDir, "PATH": "/usr/bin:/bin"]
         func thin(_ tool: String, as name: String, keepEntitlements: Bool = false) throws {
-            let out = w.appending(path: name).path
-            let l = try Self.outside("/usr/bin/lipo", ["-thin", "x86_64", tool, "-output", out], environment: env)
-            try #require(l.status == 0, "lipo \(tool): \(l.output)")
-            let c = try Self.outside("/usr/bin/codesign", ["-f", "-s", "-"]
-                + (keepEntitlements ? ["--preserve-metadata=entitlements"] : []) + [out], environment: env)
-            try #require(c.status == 0, "codesign \(tool): \(c.output)")
+            try Self.reSignedCopy(of: tool, to: w.appending(path: name), keepEntitlements: keepEntitlements)
         }
         try thin("/bin/echo", as: "r-echo")
         try thin("/usr/bin/tmutil", as: "r-tmutil-ent", keepEntitlements: true)
@@ -1170,7 +1204,7 @@ struct SeatbeltRunnerTests {
                      "(deny file-mount file-unmount file-mount-update)",
                      "(deny signal (target others))", "(deny process-info* (target others))",
                      "(deny mach-lookup (global-name \"com.apple.SecurityServer\")",
-                     "(deny process-exec (literal \"/usr/bin/osascript\")", "(allow mach-lookup (global-name \"com.apple.windowserver.active\")",
+                     "(deny process-exec (literal \"/usr/bin/osascript\")", "(deny job-creation)", "(allow mach-lookup (global-name \"com.apple.windowserver.active\")",
                      "(deny mach-lookup (global-name-prefix \"dev.brahma.run.\"))",
                      "(allow mach-lookup (global-name \"dev.brahma.run.abc\"))",
                      "(deny network*)", "(allow network-outbound (remote ip \"localhost:5555\"))",

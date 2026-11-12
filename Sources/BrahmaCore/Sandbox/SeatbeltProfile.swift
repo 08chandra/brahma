@@ -24,6 +24,7 @@ import Foundation
 /// (deny mach-lookup … the brief's names … (global-name "com.apple.cfprefsd.agent") (global-name "com.apple.cfprefsd.daemon")
 ///     … (global-name "com.apple.DiskArbitration.diskarbitrationd"))                                               ; round 8
 /// (deny process-exec …)
+/// (deny job-creation)                                                          ; explicit (copy audit)
 /// (allow mach-lookup (global-name "com.apple.windowserver.active") …)          ; toolchain only
 /// (deny network*)
 /// (allow network-outbound (remote ip "localhost:<proxyPort>"))                  ; .outbound / .loopbackListen
@@ -215,6 +216,12 @@ public enum SeatbeltProfile {
         lines.append("(deny mach-lookup " + deniedServices.map { "(\($0.prefix ? "global-name-prefix" : "global-name") \(quote($0.name)))" }
             .joined(separator: " ") + ")")
         lines.append("(deny process-exec " + deniedExecutables.map { "(literal \(quote($0)))" }.joined(separator: " ") + ")")
+        // launchd asks the sandbox before it imports a job from a sandboxed caller (`launchctl submit`/`bootstrap`, or any code
+        // speaking its protocol), and `job-creation` is not part of `(allow default)`: the kernel logs `deny(1) job-creation`
+        // under a bare allow-default profile, and only an explicit `(allow job-creation)` let a submit through (probed, macOS
+        // 26.2). So job creation was already refused; this makes the refusal explicit, so no later allow or OS default
+        // change can open it. A re-signed `launchctl` copy (which the path deny above cannot stop) is refused here.
+        lines.append("(deny job-creation)")
         if policy.toolchain {
             lines.append("(allow mach-lookup " + toolchainServices.map { "(global-name \(quote($0)))" }.joined(separator: " ") + ")")
         }
