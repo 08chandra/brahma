@@ -291,17 +291,29 @@ the sandbox canary; until then the agent waits and you get a sandbox-check alert
 probes, probe line N failed, a leak). Workspace and Full companies run.
 
 The canary is a self-test whose probes are yours: `brahma canary edit` opens `<data home>/canary/probes.txt` (created
-with header comments only; a regular file you own, mode 0600, never a link), one shell command per line, each expected
-to be DENIED. Probes refer to `$CANARY_HOME_FILE`, `$CANARY_DATA_FILE`, `$CANARY_OUTSIDE_DIR` and `$OTHER_AGENT_LAB`,
-places where Brahma plants a dummy `BRAHMA-CANARY-<uuid>` token for the run (passed as environment variables, never
-spliced into the command). Every probe runs twice: model-free, through a throwaway agent's shell prefix inside Brahma's
-Seatbelt sandbox (10 s each, after a positive control that must succeed), then in one small haiku turn under the real
-compiled settings (budget- and time-capped), judged only from its raw stream: each probe's tool result must be an
-error or a non-zero exit, a probe the model did not run fails, no stream line may contain the token, the Read of the
-home token must be a permission denial, and the session may have no tool beyond the expected ones. A probe passes only if it
-was denied and printed no token. A line ending in `# helper` is warn-only (`sandbox-helpers`). The file's SHA-256 is
-part of the canary key, so any edit needs a new pass: `brahma canary run` runs both layers now, prints each line's
-verdict, exit status and redacted output, and records the pass; the engine also runs it when a sandboxed agent waits.
+with header comments only, also by the engine when it is missing; a regular file you own, mode 0600, never a link), one
+shell command per line, each expected to be DENIED. Probes refer to `$CANARY_HOME_FILE`, `$CANARY_DATA_FILE`,
+`$CANARY_OUTSIDE_DIR` and `$OTHER_AGENT_LAB`, places where Brahma plants a dummy `BRAHMA-CANARY-<uuid>` token for the run
+(passed as environment variables, never spliced into the command). Every probe runs twice. First model-free, through a
+throwaway agent's shell prefix inside Brahma's own Seatbelt profile, the one around checks and previews (10 s each,
+after a positive control that must succeed): this vouches for that sandbox, not for the agent turn's. Then in one small
+haiku turn built like a real sandboxed turn of the shape being verified (the real compiled settings, both hooks; budget-
+and time-capped), judged only from its raw stream: each probe's tool result must be an error or a non-zero exit; a probe
+the model did not run, a command not found (exit 127), or a probe stopped by one of Claude Code's permission rules (it
+never reached the sandbox) fails as unverified; no stream line may contain the token (raw, encoded, its bare UUID or
+base64); the Read of the home token must be a permission denial; and the session may have no tool, plugin, skill or
+MCP server beyond the expected ones. Only this second run vouches for the agent turn's sandbox. The planted places must
+not change during either run. A line ending in `# helper` is warn-only (`sandbox-helpers`). The file's SHA-256 is part
+of the canary key, so any edit needs a new pass: `brahma canary run` runs both layers for the turn shape of each
+running sandboxed company, prints each line's verdict, exit status and redacted output, and records the passes (with
+the file's SHA prefix and probe count); the engine also runs it when a sandboxed agent waits, backing off after
+failures, and never pays for a turn whose shape it cannot build.
+
+Writing probes: the permission rules deny `launchctl`, `security`, `osascript`, `open`, `crontab`, `at`, `sudo`,
+`screencapture` and `claude` by name, so write such probes in a form the rules do not match (an absolute path such as
+`/bin/launchctl`, or `sh -c '...'`), or the canary fails them as not run. A probe must test something the sandbox is
+meant to stop: `osascript -e 'get name of ...'` of the Finder, for one, is answered locally by LaunchServices and is not
+an escape test (real Apple events are gated by macOS Automation consent).
 
 **Grants and presets.** An agent that needs more asks with `request_access` (a Bash domain, a WebFetch domain or a
 directory to read). You decide; a grant takes effect from the agent's next turn.

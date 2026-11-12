@@ -45,7 +45,14 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let loosens = try FakeTools.script("canary-editor-chmod", "chmod 644 \"$1\"")
         let bad = try brahma(["canary", "edit"], home: owner.url, env: ["EDITOR": loosens.path])
         #expect(bad.status == 1); #expect(bad.stderr.contains("mode 644"), "\(bad.stderr)")
+        // A refused file is reported before any editor opens it.
+        let marker = owner.url.appending(path: "editor-ran")
+        let touches = try FakeTools.script("canary-editor-touch", "touch \"$CANARY_EDITOR_MARKER\"")
+        let refused = try brahma(["canary", "edit"], home: owner.url, env: ["EDITOR": touches.path, "CANARY_EDITOR_MARKER": marker.path])
+        #expect(refused.status == 1); #expect(refused.stderr.contains("mode 644"))
+        #expect(!FileManager.default.fileExists(atPath: marker.path), "the editor was started on a refused file")
         // A failing editor.
+        #expect(chmod(CanaryProbes.url(paths: ownerPaths(owner.url)).path, 0o600) == 0)
         let fails = try brahma(["canary", "edit"], home: owner.url, env: ["EDITOR": "/usr/bin/false"])
         #expect(fails.status == 1); #expect(fails.stderr.contains("the editor exited"))
     }

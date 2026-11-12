@@ -19,6 +19,8 @@ struct CanaryGroup: ParsableCommand {
             let created: (url: URL, created: Bool)
             do { created = try CanaryProbes.ensureTemplate(paths: paths) } catch { throw fail("\(error)") }
             if created.created { print(safe("created \(created.url.path) (header comments only; no probe lines)")) }
+            // Checked before the editor opens it: never hand an editor a link or a file that is not the owner's own.
+            if case .failure(let error) = CanaryProbes.load(paths: paths), case .refused = error { throw fail(error.description) }
             let editor = ProcessInfo.processInfo.environment["EDITOR"].flatMap { $0.isEmpty ? nil : $0 } ?? "vi"
             // As git runs an editor: the owner's $EDITOR through the shell, the file as its one argument (never spliced).
             let process = Process()
@@ -43,7 +45,7 @@ struct CanaryGroup: ParsableCommand {
     struct RunNow: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "run",
-            abstract: "Run the sandbox canary now: model-free, then one small haiku turn (uses a little of your plan). Records a pass.")
+            abstract: "Run the sandbox canary now for the turn shape(s) your sandboxed companies use: model-free, then one small haiku turn each (uses a little of your plan). Records each pass.")
 
         func run() async throws {
             try requireOwnerShell()
@@ -53,17 +55,44 @@ struct CanaryGroup: ParsableCommand {
             let claude = ExtLint.claudePath() ?? "claude"
             let canary = SandboxCanary(environment: .owner, sandbox: Orchestrator.ownerSandboxRunner(store: store, paths: paths),
                                        hookExecutable: hook, baseline: Orchestrator.ownerSandboxBaseline(store: store, paths: paths))
-            // The canary verifies its own key (this CLI build, the probe file, its turn's shape, this macOS); that key is recorded.
-            let asked = SandboxCanaryKey(fingerprint: "", shape: "", osVersion: "")
-            let run = await canary.run(paths: paths, claudePath: claude, runner: ClaudeProcessRunner(claudePath: claude), key: asked,
-                                       settings: nil)
-            for line in CanaryReport.lines(run, redact: { store.redactedForDisplay($0) }) { print(safe(line)) }
-            guard var key = run.verified, run.passes(key) else {
-                throw fail("the sandbox canary did not pass; sandboxed companies stay blocked")
+            // The shapes the engine asks for: each running sandboxed company's standard work turn (its network), else the
+            // default one. Companies whose turns compile to the same shape share one run.
+            var specs: [(name: String, spec: SandboxCanary.TurnSpec)] = []
+            var seen = Set<String>()
+            for company in (try? store.companies()) ?? [] where company.status == .running && company.permissionProfile == .sandboxed {
+                let spec = SandboxCanary.TurnSpec(company: company)
+                let shapeKey = "\(spec.allowedDomains?.isEmpty ?? false)|\(spec.webDomains?.isEmpty ?? false)|\(spec.allowLocalBinding ?? false)"
+                if seen.insert(shapeKey).inserted { specs.append((company.name, spec)) }
             }
-            key.cliVersion = await BrahmaCore.Doctor.cliVersion(claudePath: claude)
-            do { try store.recordCanary(key, detail: run.detail) } catch { throw fail("could not record the pass: \(error)") }
-            print("sandbox canary passed; recorded for this CLI build, probe file and settings shape")
+            if specs.isEmpty { specs = [("the default sandboxed company", .standard)] }
+            let version = await BrahmaCore.Doctor.cliVersion(claudePath: claude)
+            var passed: [SandboxCanaryKey] = []
+            var failed = 0
+            for (index, entry) in specs.enumerated() {
+                if specs.count > 1 { print(safe("== the work turn shape of \(entry.name) (\(index + 1) of \(specs.count))")) }
+                // The canary verifies its own key (this CLI build, the probe file, the turn's shape, this macOS); that key is recorded.
+                let asked = SandboxCanaryKey(fingerprint: "", shape: SandboxCanary.anyShape, osVersion: "")
+                let run = await canary.run(paths: paths, claudePath: claude, runner: ClaudeProcessRunner(claudePath: claude), key: asked,
+                                           spec: entry.spec)
+                for line in CanaryReport.lines(run, redact: { store.redactedForDisplay($0) }) { print(safe(line)) }
+                if var key = run.verified, run.passes(key) {
+                    key.cliVersion = version
+                    passed.append(key)
+                    // M2: the sandbox-check alert is answered only once every shape run here passed.
+                    let last = index == specs.count - 1
+                    do { try store.recordCanary(key, detail: run.detail, resolveAlert: last && failed == 0) } catch {
+                        throw fail("could not record the pass: \(error)")
+                    }
+                } else {
+                    failed += 1
+                }
+            }
+            let file = try? CanaryProbes.load(paths: paths).get()
+            let probes = file.map { "probe file sha256 \($0.sha256.prefix(12)), \($0.blocking.count) probe(s)" } ?? "probe file"
+            guard failed == 0 else {
+                throw fail("the sandbox canary did not pass for \(failed) of \(specs.count) shape(s); sandboxed companies stay blocked")
+            }
+            print(safe("sandbox canary passed; recorded \(passed.count) shape(s) for this CLI build and \(probes)"))
         }
     }
 }
