@@ -96,7 +96,7 @@ struct ReleasesView: View {
                             }
                             .frame(width: 150, alignment: .leading)
                             Text(verbatim: row.commit).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text1).frame(width: 64, alignment: .leading)
-                            Text(verbatim: row.url).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).lineLimit(1).truncationMode(.middle)
+                            Text(verbatim: row.urlHost).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).lineLimit(1).truncationMode(.middle)
                                 .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
                             Text(verbatim: row.smoke).font(BrahmaTheme.monoSmall).foregroundStyle(checkColor(row.smoke.lowercased()))
                                 .frame(width: 64, alignment: .leading)
@@ -123,13 +123,13 @@ struct ReleasesView: View {
                         KeyValueRow(label: "Version", value: row.version, mono: true),
                         KeyValueRow(label: "Status", value: row.statusTitle, mono: true, valueColor: Self.toneColor(ReleaseTone(row.status))),
                         KeyValueRow(label: "Commit", value: row.commit, mono: true),
-                        KeyValueRow(label: "URL", value: row.url, mono: true),
+                        KeyValueRow(label: "URL", value: row.urlHost, mono: true),
                         KeyValueRow(label: "Smoke", value: row.smoke, mono: true),
                         KeyValueRow(label: "By", value: row.proposer, mono: true),
                         KeyValueRow(label: "When", value: row.when, mono: true),
                     ] + (row.rollbackTitle.map { [KeyValueRow(label: "Rollback", value: $0, mono: true, valueColor: BrahmaTheme.warning)] } ?? []))
-                    if row.url != "—", let url = URL(string: row.url), ["http", "https"].contains(url.scheme ?? "") {
-                        Button("Open") { NSWorkspace.shared.open(url) }.buttonStyle(.brahma)
+                    if let url = row.openURL {
+                        Button("Open") { NSWorkspace.shared.open(url) }.buttonStyle(.brahma).help(Text(verbatim: row.urlHost))
                     }
                     Hairline()
                     CapsLabel("Rollback plan")

@@ -90,4 +90,57 @@ import BrahmaCore
                                              health: MainHealth(title: "NO SMOKE CHECK", tone: .idle), handles: [:]))
         #expect(d.title == Self.hostile && d.commands == Self.hostile)
     }
+
+    // MARK: Fix round 1 (I3, M1)
+
+    static func pendingRow(_ a: Ask) throws -> InboxRow {
+        var w = WorkSnapshot()
+        w.inbox = [a]
+        return try #require(InboxRows.make(w, handles: [:]).first { $0.id == a.id && $0.section == .pending })
+    }
+
+    @Test func deployWithoutReleaseRecordIsReadOnly() throws {
+        let deploy = Self.ask(.deploy, title: "Deploy 0.1.0", payload: AskPayload(proposal: "wrangler pages deploy dist"))
+        let row = try Self.pendingRow(deploy)
+        let card = try #require(DeployCard.make(ask: deploy, release: try ReleaseFixtures.release(1, .proposed),
+                                                health: MainHealth(title: "NO SMOKE CHECK", tone: .idle), handles: [:]))
+        #expect(LiveCardFallback.for(row: row, deployCard: card, humanTaskCard: nil) == nil)
+        let fallback = try #require(LiveCardFallback.for(row: row, deployCard: nil, humanTaskCard: nil))
+        #expect(fallback == .deployUnavailable)
+        #expect(fallback.title(ref: row.ref) == "DEPLOY · A-7: release record unavailable")
+        #expect(fallback.canApprove == false && fallback.canReject && !fallback.canDecline)
+    }
+
+    @Test func unreadableHumanTaskCanStillBeDeclined() throws {
+        let broken = Self.ask(.humanTask, payload: AskPayload(details: "{not json"))
+        #expect(HumanTaskCard.make(ask: broken, handles: [:], itemKeys: [:]) == nil)
+        let row = try Self.pendingRow(broken)
+        let fallback = try #require(LiveCardFallback.for(row: row, deployCard: nil, humanTaskCard: nil))
+        #expect(fallback == .humanTaskUnreadable)
+        #expect(fallback.title(ref: row.ref) == "HUMAN TASK · A-7: task details unreadable")
+        #expect(fallback.canDecline && !fallback.canApprove && !fallback.canReject)
+        let good = try #require(HumanTaskCard.make(ask: try Self.taskAsk(Self.stripe), handles: [:], itemKeys: [:]))
+        #expect(LiveCardFallback.for(row: try Self.pendingRow(try Self.taskAsk(Self.stripe)), deployCard: nil, humanTaskCard: good) == nil)
+        // Other kinds keep the generic card.
+        #expect(LiveCardFallback.for(row: try Self.pendingRow(Self.ask(.other, payload: nil)), deployCard: nil, humanTaskCard: nil) == nil)
+    }
+
+    @Test func formTakesSecretsOutOfViewState() throws {
+        let card = try #require(HumanTaskCard.make(ask: try Self.taskAsk(Self.stripe), handles: [:], itemKeys: [:]))
+        var values = ["STRIPE_TEST_SECRET_KEY": "sk_test_1", "account_id": "ab12", "blank": ""]
+        let form = HumanTaskForm.make(card, values: &values, editedPost: "ignored")
+        #expect(form.values == ["STRIPE_TEST_SECRET_KEY": "sk_test_1", "account_id": "ab12"])
+        #expect(form.editedPost == nil)  // the card has no post text
+        #expect(values["STRIPE_TEST_SECRET_KEY"] == nil)
+        #expect(values["account_id"] == "ab12")
+        // A failing form clears the secret just the same.
+        var bad = ["STRIPE_TEST_SECRET_KEY": "pk_test_1"]
+        let rejected = HumanTaskForm.make(card, values: &bad, editedPost: nil)
+        #expect(rejected.validate(card) == "Test secret key must start with sk_test_")
+        #expect(bad.isEmpty)
+        let post = HumanTask(template: nil, title: "Post it", steps: ["Post"], links: [], fields: [], postText: "hello")
+        let postCard = try #require(HumanTaskCard.make(ask: try Self.taskAsk(post), handles: [:], itemKeys: [:]))
+        var none: [String: String] = [:]
+        #expect(HumanTaskForm.make(postCard, values: &none, editedPost: "hello, edited").editedPost == "hello, edited")
+    }
 }
