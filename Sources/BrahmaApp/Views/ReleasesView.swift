@@ -52,15 +52,31 @@ struct ReleasesView: View {
 
     private var pathToLive: some View {
         let health = model.mainHealth
+        let chips = MilestoneChips.make(model.snapshot.releases.milestones)
         return Panel(title: "Path to live") {
-            HStack(spacing: BrahmaTheme.spaceS) {
-                CapsLabel("Main")
-                StatusChip(label: health.title, color: PreviewPane<EmptyView>.toneColor(health.tone), pulse: health.tone == .busy)
-                Button("Run Smoke") { Task { await model.runMainSmoke() } }
-                    .buttonStyle(.brahma)
-                    .disabled(model.snapshot.releases.smokeCheck == nil || health.tone == .busy)
-                    .help(model.snapshot.releases.smokeCheck == nil ? "No smoke check is set for this company" : "Run the smoke check on main now")
-                Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: BrahmaTheme.spaceS) {
+                HStack(spacing: BrahmaTheme.spaceS) {
+                    CapsLabel("Main")
+                    StatusChip(label: health.title, color: PreviewPane<EmptyView>.toneColor(health.tone), pulse: health.tone == .busy)
+                    Button("Run Smoke") { Task { await model.runMainSmoke() } }
+                        .buttonStyle(.brahma)
+                        .disabled(model.snapshot.releases.smokeCheck == nil || health.tone == .busy)
+                        .help(model.snapshot.releases.smokeCheck == nil ? "No smoke check is set for this company" : "Run the smoke check on main now")
+                    Spacer(minLength: 0)
+                }
+                // Task 13: the milestone chips — `GOAL 0:00 · PRD +0:52 · … · LIVE +3:10` and the totals (engine-written text).
+                if !chips.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: BrahmaTheme.spaceS) {
+                            CapsLabel("Milestones")
+                            ForEach(Array(chips.enumerated()), id: \.element.id) { index, chip in
+                                if index > 0 { Text(verbatim: "·").font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2) }
+                                MonoChip(text: chip.title, color: Self.toneColor(chip.tone), fill: BrahmaTheme.bg4)
+                                    .accessibilityLabel(Text(verbatim: chip.title))
+                            }
+                        }
+                    }
+                }
             }
         }
         .fixedSize(horizontal: false, vertical: true)

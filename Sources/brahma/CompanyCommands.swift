@@ -10,13 +10,30 @@ struct CompanyGroup: ParsableCommand {
 
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String
-        @Option(help: "What the company is for.") var goal: String
+        @Option(help: "What the company is for (optional with --demo live).") var goal: String?
         @Option(help: "Agents in the full org shape (0 for an empty company, otherwise 5 to 500).") var agents: Int = 6
         @Option(help: "Industry pack id.") var pack: String = "software"
         @Flag(help: "Print the org that would be created and change nothing.") var dryRun = false
+        @Option(help: "A demo company. live: a four-agent org, hosting on the default provider, the hosting-account task and the owner's kickoff for a one-page waitlist site.")
+        var demo: Demo?
+
+        enum Demo: String, ExpressibleByArgument { case live }
 
         func run() throws {
             try requireOwnerShell()
+            if let demo {
+                switch demo {
+                case .live:
+                    let (store, paths) = try openStore()
+                    let (c, task) = try DemoSeed.live(store: store, paths: paths, name: name, goal: goal) {
+                        FileHandle.standardError.write(Data("brahma: \(safe($0))\n".utf8))
+                    }
+                    print(safe("Created \(c.name) with \(DemoSeed.liveHires.count) agents. Do Inbox task \(task.ref) (hosting account) now; "
+                               + "approve the brief and the deploy when they arrive."))
+                }
+                return
+            }
+            guard let goal else { throw fail("--goal is required (or use --demo live)") }
             guard agents == 0 || OrgGenerator.range.contains(agents) else {
                 throw fail("--agents must be 0 or between \(OrgGenerator.range.lowerBound) and \(OrgGenerator.range.upperBound)")
             }

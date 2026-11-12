@@ -2,6 +2,23 @@ import ArgumentParser
 import Foundation
 import BrahmaCore
 
+/// `brahma milestones <company>` (Plan L Task 13): the path-to-live scorecard, read-only. One line per milestone with the
+/// phase before it (`prd           +0:52   $3.10   2 touches`), then `total $14.80, 7 owner touches`. Engine-written text only.
+struct MilestonesCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "milestones",
+        abstract: "The path to live: when the brief, first merge, first preview, live URL and launch post happened, what each stretch cost and how often you were needed.")
+    @Argument(help: "Company name or slug.") var company: String
+
+    func run() throws {
+        let (store, _) = try openStore()
+        let c = try resolveCompany(store, company)
+        let now = Date()
+        let report = try CompanyMilestones.load(store: store, companyId: c.id, now: now)
+        for line in report.lines(now: now) { print(line) }
+    }
+}
+
 /// A company's releases (Plan L Task 8). `list` and `show` are read-only; `rollback` and `smoke` are owner-write commands.
 /// Only the engine (`ReleaseExecutor`) ever runs a deploy, a rollback or a smoke run: these commands record the owner's
 /// request. Every agent-controlled field (notes, failure reasons, output tails, smoke bodies and errors) prints through `safe()`.

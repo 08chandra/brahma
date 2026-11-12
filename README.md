@@ -414,6 +414,89 @@ next turn until it releases the item or the item is done. Every other secret is 
 - **Dev homes built from earlier pre-release lane builds must be recreated,** because of in-place migration changes.
 - **Live tests have not been run.**
 
+## Live: preview, deploy and human tasks
+
+Plan L takes a company from a goal to a URL you can open. The path is the same in every software company: the brief, a
+walking skeleton (a static site whose `npm run build` writes `dist/`), a preview the engine keeps running from `main`, a smoke
+check that keeps `main` green, then a deploy you approve. Agents never deploy; they propose, and the engine does exactly what
+you approved, once.
+
+**The path to live.** The CTO, architect and DevOps role cards carry the recipe: start a walking skeleton on an item branch
+while the brief is reviewed; call `set_preview_command`, `set_smoke_check` and `set_deploy_config`; when `main` is green, call
+`propose_deploy`. Anything only a human can do (an account, a domain, keys, posting) becomes a human task in your Inbox
+(`request_human_task`).
+
+**Previews.** A preview is a web server the engine builds from `main` in a fresh sandboxed export and keeps running on a
+loopback port (`127.0.0.1`, ports 47100–47999, at most 8 per company), restarted when `main` moves. Agents and you write the
+command with `{port}` where the engine's port goes (`PORT={port} npm start`, `http://127.0.0.1:{port}/`). Every merge gives a
+fresh export: a preview never runs from an agent's working tree, and its process group is killed on restart. The app shows
+previews in a pane that loads only the loopback origin; the engine logs each preview under the data home.
+
+**Hosting.** You pick the provider and project (`brahma hosting set`, or Company › Settings › HOSTING). Cloudflare Pages is
+the default: its free plan serves static sites with no commercial-use restriction, a scoped API token is enough, and `wrangler`
+prints the deployment URL the engine checks. Vercel is the alternative (its free Hobby plan is for non-commercial use; deploys
+need the team or account ID). Both CLIs are pinned to exact versions and installed by the engine, token-free, into a folder
+agent code cannot write. Hosting tokens arrive through the `hosting-account` human task and go to your Keychain. Agents never
+receive the hosting token.
+
+**The deploy ask.** `propose_deploy` records a release (`R-<n>`, a version unique in the company, the exact `main` commit) and
+puts one ask in your Inbox showing the provider and project, the commit, the release notes, the build command and output
+folder, the smoke results on `main`, and the exact deploy and rollback commands the engine will run. Approving it is the only
+way a deploy starts; `brahma approve` and the app do it, no tool can. The engine then, in order and each step recorded before
+the next: checks the commit is still on the engine-accepted `main` and runs the smoke check at it; re-renders the plan and
+refuses if anything differs from what you approved; records `refs/brahma/main-backup` and `refs/brahma/releases/<version>`;
+builds in a clean `.git`-free export of the commit (sandboxed, no secrets, 30 minutes at most); stages only the output folder
+(at most 500 MB, 20 000 files); installs the provider CLI if missing; runs the deploy steps (15 minutes each) with the token
+only in their environment; smoke-checks the live URL (6 attempts, 10 s apart, for CDN propagation); and marks the release
+`deployed` or `failed` (a P1 bug is filed and you are told). The redacted deploy and build logs land in
+`<workspace>/.brahma/releases/R-<n>/`, which agents can read and never write.
+
+**The smoke check on `main`.** `set_smoke_check` sets the command the engine runs, sandboxed in a clean export, on every new
+`main` and before every deploy (10 minutes by default, 60 at most). While it fails `main` is red: the engine files a bug and
+deploys are blocked. A deploy needs a passing smoke run at the exact commit being deployed; `brahma release smoke` runs it on
+demand.
+
+Preview and build commands are written by agents and run in Plan 5-lite's sandbox, in fresh engine exports of main that contain no .git, in their own process group, with no secrets. Deploy and rollback commands are composed by the engine from your hosting settings, shown to you exactly in the deploy request, and run once after you approve, from a clean folder holding only the built files, using a provider CLI the engine installed where agent code cannot write, with the hosting token taken from your Keychain. Agents never receive the hosting token.
+
+**Releases, rollback and recovery.** Work › Releases lists every release with its status, commit, URL and smoke result; the
+PATH TO LIVE strip shows `main`'s health and the milestones (`GOAL 0:00 · PRD +0:52 · … · LIVE +3:10`) with what each stretch
+cost and how often you were needed. Only the live release (the newest deployed or failed one, with nothing in flight) can be
+rolled back: `brahma release rollback <co> R-<n>` or the Roll Back button runs the rollback commands recorded before that
+deploy, exactly as shown, then smoke-checks the site. A rollback never touches `main`, is never retried by the engine, and
+you can also roll back from the provider dashboard. If the engine stops mid-release (Ctrl-C, the app quitting, the emergency
+stop), the release records where it was (`interrupted` while deploying, else `failed`) and nothing runs again on restart.
+
+**Human tasks.** Agents, and the engine, ask you for things only a person can do. The templates are engine-written, with
+their links, steps and paste-back fields: `hosting-account` (the provider token into your Keychain, plus the account ID),
+`domain` (buy or connect a domain, with the DNS records to add), `stripe-test-keys` (test-mode keys only; a live key is
+refused) and `launch-post` (the text to post, with links that open the post pre-filled on X, LinkedIn and Hacker News, and a
+field for the posted URL). An agent's own custom task can only ask for https links and URL fields; whatever you type in a
+non-secret field is shown to the agent that asked, so the form says so. Secret values go to the Keychain and are recorded only
+as "saved". Do a task with `brahma task done <co> A-<n> --field name=value [--secret NAME]` (secrets read from standard input)
+or in the Inbox; decline it with `brahma task decline`. A work item an agent blocked on the task resumes when you answer.
+
+**The demo.** `brahma company create <name> --demo live [--goal …]` creates the goal-to-URL demo: a four-agent org (`ceo`,
+`cto`, `eng-1`, `devops-1`; autonomy `important`), hosting on the default provider with the project named after the company,
+the `hosting-account` task already in your Inbox, and the owner's kickoff in #general. Do the hosting task, then approve the
+brief and the deploy when they arrive. The default goal is a one-page waitlist site. `brahma dev release-scenario` (with
+`BRAHMA_DEV=1`) populates a dev home's Releases and Inbox against a loopback dev host; it never contacts a provider.
+
+```
+brahma preview <co>                                            previews: name, kind, status, url, commit
+brahma preview set <co> <name> --run <cmd> --url <url> [--build <cmd>] [--smoke "GET / 200"]
+brahma preview remove|restart <co> <name>
+brahma hosting show <co>
+brahma hosting set <co> [--provider cloudflare-pages|vercel] [--project <name>] [--account-id <id>] [--production-url <https url>]
+brahma release <co>                                            releases, newest first, then main's smoke result
+brahma release show <co> R-<n>                                 the exact deploy and rollback commands, smoke results, output
+brahma release rollback <co> R-<n>                             roll the live release back (owner only)
+brahma release smoke <co>                                      run the smoke check on main now (owner only)
+brahma task <co> | task show <co> A-<n>                        pending human tasks; one task's steps, links (with hosts) and fields
+brahma task done <co> A-<n> --field name=value [--secret NAME] mark it done (secrets from standard input)
+brahma task decline <co> A-<n> --note <text>
+brahma milestones <co>                                         the path-to-live scorecard
+```
+
 ## Backups
 
 Backups live under `<data home>/backups/` and are made by the engine (the app, or `brahma run`) while it runs:

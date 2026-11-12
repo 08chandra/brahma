@@ -104,6 +104,28 @@ enum ReleaseFixtures {
                 && loaded.productionURL == "https://shop.vercel.app")
     }
 
+    /// Task 13: the PATH TO LIVE strip's milestone chips, from the core report; nothing without a report, LIVE in success.
+    @Test func milestoneChips() {
+        #expect(MilestoneChips.make(nil).isEmpty)
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let report = MilestoneReport(
+            milestones: [Milestone(name: "goal", at: t0), Milestone(name: "prd", at: t0.addingTimeInterval(52 * 60)),
+                         Milestone(name: "firstMerge", at: t0.addingTimeInterval(2 * 3600)), Milestone(name: "live", at: t0.addingTimeInterval(3 * 3600 + 600))],
+            phases: [MilestonePhase(from: "goal", to: "prd", costLE: 3.1, ownerTouches: 2),
+                     MilestonePhase(from: "prd", to: "firstMerge", costLE: 4, ownerTouches: 0),
+                     MilestonePhase(from: "firstMerge", to: "live", costLE: 7.7, ownerTouches: 5),
+                     MilestonePhase(from: "live", to: "now", costLE: 0, ownerTouches: 0)],
+            totalLE: 14.8, totalTouches: 7)
+        let chips = MilestoneChips.make(report)
+        #expect(chips.map(\.title) == ["GOAL 0:00", "PRD +0:52", "FIRST MERGE +2:00", "LIVE +3:10", "$14.80 · 7 TOUCHES"])
+        #expect(chips.map(\.tone) == [.muted, .muted, .muted, .success, .ready])
+        #expect(chips.map(\.id) == ["goal", "prd", "firstMerge", "live", "totals"])
+        // Only a goal: the strip shows it and the totals.
+        let fresh = MilestoneReport(milestones: [Milestone(name: "goal", at: t0)], phases: [MilestonePhase(from: "goal", to: "now", costLE: 0, ownerTouches: 0)],
+                                    totalLE: 0, totalTouches: 0)
+        #expect(MilestoneChips.make(fresh).map(\.title) == ["GOAL 0:00", "$0.00 · 0 TOUCHES"])
+    }
+
     @Test func vercelNote() {
         var form = HostingForm(nil, companySlug: "acme")
         #expect(form.providerNote == nil)

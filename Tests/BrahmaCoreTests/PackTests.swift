@@ -9,7 +9,7 @@ import Foundation
 
     @Test func builtinSoftwarePackIsValid() throws {
         let p = try #require(PackCatalog.builtin.pack("software")); try p.validate()
-        #expect(p.version == 2); #expect(p.roles.count == 13)
+        #expect(p.version > 2, "Plan L bumped the pack (ops tools, then the live path)"); #expect(p.roles.count == 13)
         // Plan L: the ops tools on devops, architect and every executive (including the merged roles).
         for id in ["devops", "architect", "ceo", "cpo", "cto", "ceo-cpo", "cto-architect"] {
             #expect(Set(p.role(id)!.companyTools).isSuperset(of: CompanyToolNames.ops), "\(id)")
@@ -27,6 +27,28 @@ import Foundation
         #expect(Set(p.role("qa")!.playbooks.keys) == ["bug", "task"])
         #expect(Set(p.role("manager")!.playbooks.keys) == ["story", "epic"])
         #expect(Set(p.role("designer")!.playbooks.keys) == ["story", "spike"])
+    }
+
+    /// Plan L Task 13: the path-to-live paragraph (exact copy) sits on the roles that set previews, deploy config and deploys;
+    /// every prompt still ends with the status line and stays within `RoleTemplate.maxPrompt` (PR-33).
+    @Test func livePathInPrompts() throws {
+        let p = software
+        #expect(SoftwarePack.livePath.hasPrefix("Path to live: start a walking skeleton on an item branch while the brief is reviewed"))
+        #expect(SoftwarePack.livePath.contains("set_preview_command") && SoftwarePack.livePath.contains("set_smoke_check")
+                && SoftwarePack.livePath.contains("set_deploy_config") && SoftwarePack.livePath.contains("propose_deploy")
+                && SoftwarePack.livePath.contains("request_human_task"))
+        #expect(SoftwarePack.livePath.count <= 600)
+        for id in ["cto-architect", "cto", "devops", "architect"] {
+            let role = try #require(p.role(id))
+            #expect(role.prompt.contains(SoftwarePack.livePath), "\(id)")
+            #expect(role.prompt.count <= RoleTemplate.maxPrompt, "\(id)")
+            #expect(role.prompt.hasSuffix(SoftwarePack.statusLine), "\(id)")
+            // PR-26: releases never go through propose_decision.
+            #expect(!role.prompt.contains("release via propose_decision") && !role.prompt.contains("raise the release with propose_decision"), "\(id)")
+        }
+        for id in ["ceo", "cpo", "ceo-cpo", "director", "manager", "engineer", "designer", "qa", "security"] {
+            #expect(!p.role(id)!.prompt.contains("Path to live:"), "\(id)")
+        }
     }
 
     @Test func roleWeightsUnchangedFromPlan1() {

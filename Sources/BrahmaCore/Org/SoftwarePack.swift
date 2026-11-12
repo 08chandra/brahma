@@ -1,8 +1,13 @@
 import Foundation
 
-/// The built-in `software` industry pack, version 2 (Plan L added the ops tools). Role cards follow the Role Card v2 layout.
+/// The built-in `software` industry pack, version 3 (Plan L added the ops tools, then the path-to-live paragraph). Role cards follow the Role Card v2 layout.
 public enum SoftwarePack {
     static let statusLine = "STATUS: DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT"
+    /// Plan L Task 13: the path to live, on the roles that set previews, deploy config and deploys (cto, cto-architect, architect,
+    /// devops). Exact copy from the plan; one paragraph, under 600 characters.
+    public static let livePath = "Path to live: start a walking skeleton on an item branch while the brief is reviewed: a static site (plain HTML or Vite) where `npm run build` writes `dist/`. Then call set_preview_command (run a local server on {port}, bind 127.0.0.1), set_smoke_check, and set_deploy_config (output_dir dist, expect_text = a phrase from the page). When main is green, call propose_deploy; the owner approves and the engine deploys. Need something only a human can do (account, domain, keys, posting)? Use request_human_task."
+    /// Interpolated at the start of a line of the (indent-stripped) prompt literals, right before `## Output template`.
+    static let livePathSection = "## Path to live\n\(livePath)\n\n"
 
     /// Role id -> provenance line for the card front matter.
     static let adaptedFrom: [String: String] = [
@@ -143,7 +148,7 @@ public enum SoftwarePack {
     ## Anti-patterns
     Resume-driven technology, rewrites without a migration path, decisions in chat that are never recorded.
 
-    ## Output template
+    \(livePathSection)## Output template
     Decision, options considered, reason, reversal plan.
     \(statusLine)
     """
@@ -190,7 +195,7 @@ public enum SoftwarePack {
     ## Anti-patterns
     Diagrams without decisions, speculative generality, contracts that change without notice.
 
-    ## Output template
+    \(livePathSection)## Output template
     ADR or contract path, decision summary, consequences.
     \(statusLine)
     """
@@ -399,7 +404,7 @@ public enum SoftwarePack {
     ## Anti-patterns
     Deploying on Friday without a rollback, stale reviews, hidden environment drift.
 
-    ## Output template
+    \(livePathSection)## Output template
     What shipped, canary result, rollback command.
     \(statusLine)
     """
@@ -475,7 +480,7 @@ public enum SoftwarePack {
     }
 
     public static let pack = IndustryPack(
-        id: "software", version: 2, title: "Software company",
+        id: "software", version: 3, title: "Software company",
         roles: [
             role("ceo", "CEO", .executive, "ceo", ceoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
             role("cpo", "CPO", .executive, "cpo", cpoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
