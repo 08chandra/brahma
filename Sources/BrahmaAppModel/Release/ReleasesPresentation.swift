@@ -145,3 +145,24 @@ public struct HostingForm: Equatable, Sendable {
         provider == .vercel ? "Vercel's free Hobby plan is for non-commercial use." : nil
     }
 }
+
+/// One chip of the PATH TO LIVE strip (Task 13): a milestone with its offset from the goal, then the totals.
+public struct MilestoneChip: Equatable, Identifiable, Sendable {
+    public var id: String
+    /// `GOAL 0:00` | `PRD +0:52` | `LIVE +3:10` | `$14.80 · 7 TOUCHES`.
+    public var title: String
+    /// `success` for `live`, `ready` for the totals, `muted` for every other milestone (the color tokens).
+    public var tone: ReleaseTone
+}
+
+public enum MilestoneChips {
+    /// Nothing without a report; otherwise one chip per milestone, in time order, and the totals last.
+    public static func make(_ report: MilestoneReport?) -> [MilestoneChip] {
+        guard let report, !report.milestones.isEmpty else { return [] }
+        var chips = zip(report.milestones, report.chipTitles()).map { m, title in
+            MilestoneChip(id: m.name, title: title, tone: m.name == "live" ? .success : .muted)
+        }
+        chips.append(MilestoneChip(id: "totals", title: report.totalsTitle, tone: .ready))
+        return chips
+    }
+}

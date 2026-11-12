@@ -199,6 +199,78 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(out.contains("R-1 deployed"), "\(out)")
     }
 
+    /// `brahma milestones <co>` (Task 13): one line per milestone with the phase before it, then the totals.
+    @Test func milestonesPrintsCostAndTouches() throws {
+        let rig = try Rig()
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        func at(_ minutes: Double) -> Date { t0.addingTimeInterval(minutes * 60) }
+        var c = rig.company
+        c.createdAt = t0
+        try rig.store.updateCompany(c)
+        for (minute, usd) in [(5.0, 1.0), (20.0, 2.1), (60.0, 4.0)] {
+            let t = Turn(id: UUID().uuidString, agentId: rig.agent.id, companyId: c.id, startedAt: at(minute), endedAt: at(minute + 1),
+                         outcome: .succeeded, summary: nil, costUSD: usd)
+            try rig.store.writer.write { db in try t.insert(db) }
+        }
+        _ = try MessageRouter(store: rig.store).post(companyId: c.id, channel: "general", from: .owner, text: "go", now: at(1))
+        let prd = try rig.store.propose(companyId: c.id, by: .agent(rig.agent.id), kind: .prd, title: "Brief", summary: "s", viaOwner: true, now: at(10))
+        try rig.store.ownerDecide(askId: prd.id, approve: true, now: at(52))
+        try rig.release(1, status: .deployed) { $0.deployedAt = at(190) }
+
+        let out = try brahma(["milestones", "Acme"], home: rig.home)
+        #expect(out.status == 0, "\(out.stderr)")
+        let lines = out.stdout.split(separator: "\n").map(String.init)
+        #expect(lines.first == "goal           0:00", "\(out.stdout)")
+        #expect(lines.contains("prd           +0:52   $3.10   2 touches"), "\(out.stdout)")
+        #expect(lines.contains("live          +3:10   $4.00   0 touches"), "\(out.stdout)")
+        #expect(lines.dropLast().last?.hasPrefix("now           +") == true, "\(out.stdout)")
+        #expect(lines.last == "total $7.10, 2 owner touches", "\(out.stdout)")
+        // Reading is fine in an agent's shell; an unknown company fails.
+        #expect(try brahma(["milestones", "Acme"], home: rig.home, env: ["BRAHMA_AGENT_ID": rig.agent.id]).status == 0)
+        #expect(try brahma(["milestones", "Nope"], home: rig.home).status == 1)
+    }
+
+    /// `brahma company create <name> --demo live` (Task 13): `DemoSeed.live` hires the four-agent org with its models, creates
+    /// the hosting row, files the hosting-account task from the engine and posts the owner's kickoff. Never contacts a provider.
+    @Test func demoLiveSeeds() throws {
+        let owner = try OwnerTestHome()
+        let made = try brahma(["company", "create", "Lumen", "--demo", "live"], home: owner.url)
+        #expect(made.status == 0, "\(made.stderr)")
+        #expect(made.stdout == "Created Lumen with 4 agents. Do Inbox task A-1 (hosting account) now; approve the brief and the deploy when they arrive.\n",
+                "\(made.stdout)")
+        let store = try Store(path: ownerPaths(owner.url).database.path)
+        let company = try #require(try store.companies().first)
+        #expect(company.name == "Lumen")
+        #expect(company.goal == "A one-page waitlist site for Lumen: a headline, three benefits and an email field that thanks the visitor (no backend yet).")
+        #expect(company.autonomy == .important)
+        let agents = try store.agents(companyId: company.id)
+        let byName = Dictionary(agents.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+        #expect(agents.count == 4)
+        #expect(byName["ceo"]?.role == "ceo-cpo" && byName["ceo"]?.model == "sonnet")
+        #expect(byName["cto"]?.role == "cto-architect" && byName["cto"]?.model == "sonnet")
+        #expect(byName["eng-1"]?.role == "engineer" && byName["eng-1"]?.model == "haiku")
+        #expect(byName["devops-1"]?.role == "devops" && byName["devops-1"]?.model == "sonnet")
+        let hosting = try #require(try store.hosting(companyId: company.id))
+        #expect(hosting.provider == .default && hosting.project == company.slug && hosting.accountId == nil)
+        let pending = try store.asks(companyId: company.id).filter { $0.status.isPending }
+        #expect(pending.count == 1)
+        #expect(pending.first?.kind == .humanTask && pending.first?.requesterId == "system")
+        #expect(pending.first.flatMap(HumanTask.from)?.template == .hostingAccount)
+        let general = try #require(try store.channel(companyId: company.id, name: "general"))
+        let kickoff = try #require(try store.messages(channelId: general.id, limit: 10).first { $0.senderId == "owner" })
+        #expect(kickoff.text.hasPrefix("@ceo @cto Goal: A one-page waitlist site for Lumen"), "\(kickoff.text)")
+        #expect(kickoff.text.contains("@eng-1") && kickoff.text.contains("@devops-1"))
+        #expect(try store.releases(companyId: company.id, limit: 5).isEmpty)
+        // A custom goal; an unknown demo; the owner-write guard; a plain create still needs --goal.
+        let custom = try brahma(["company", "create", "Nimbus", "--demo", "live", "--goal", "A landing page for Nimbus"], home: owner.url)
+        #expect(custom.status == 0, "\(custom.stderr)")
+        #expect(try store.companies().first { $0.name == "Nimbus" }?.goal == "A landing page for Nimbus")
+        #expect(try brahma(["company", "create", "Zed", "--demo", "nope"], home: owner.url).status != 0)
+        let inAgent = try brahma(["company", "create", "Zed", "--demo", "live"], home: owner.url, env: ["BRAHMA_AGENT_ID": "x"])
+        #expect(inAgent.status == 1 && inAgent.stderr.contains("owner commands can't run inside an agent turn"), "\(inAgent.stderr)")
+        #expect(try brahma(["company", "create", "Zed"], home: owner.url).status != 0)
+    }
+
     /// The dev host serves only regular files under its folder (no `..`, links or hard links) and the scenario's sandbox
     /// widens nothing but the dev adapter's copy step into that folder.
     @Test func devHostServesOnlyItsFolderAndGrantsOnlyTheCopy() async throws {

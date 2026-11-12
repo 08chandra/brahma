@@ -196,6 +196,23 @@ extension Store {
         }
     }
 
+    /// The requester's own answered human tasks, newest answer first (Task 13: the agent-facing read path for the owner's
+    /// non-secret answers — `posted_url`, `site_url`, `account_id`, custom url fields; secret fields are recorded only as
+    /// `saved`). A requester of another company gets nothing: the rows are filtered on both the company and the requester.
+    public func answeredHumanTasks(companyId: String, requesterId: String, limit: Int) throws -> [Ask] {
+        try writer.read { db in
+            try Ask.filter(Column("companyId") == companyId && Column("requesterId") == requesterId
+                           && Column("kind") == AskKind.humanTask.rawValue && Column("status") == AskStatus.answered.rawValue)
+                .order(Column("ownerDecidedAt").desc, Column("number").desc).limit(limit).fetchAll(db)
+        }
+    }
+
+    /// The owner's recorded answer as `field: value` pairs (the JSON `completeHumanTask` stored), empty when it does not decode.
+    public static func humanTaskAnswer(_ ask: Ask) -> [String: String] {
+        guard let json = ask.ownerAnswer, let data = json.data(using: .utf8) else { return [:] }
+        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+    }
+
     /// The owner declines the task: `rejected` with the note; the linked item is restored and told (`humanTaskDeclined`).
     @discardableResult
     public func declineHumanTask(companyId: String, askId: String, note: String, now: Date = Store.now()) throws -> Ask {

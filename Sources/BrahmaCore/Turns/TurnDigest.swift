@@ -45,6 +45,9 @@ public struct TurnContext: Sendable {
     public var plan: String?
     /// The agent's own asks that are still open.
     public var openAsks: [Ask]
+    /// The agent's own human tasks the owner has done, newest first (at most `TurnDigest.maxAnsweredTasks`): the read path for
+    /// the owner's non-secret answers (Task 13).
+    public var answeredTasks: [Ask] = []
     /// Summaries of the last turns of this scope, oldest first, for a session that starts over.
     public var recentSummaries: [String]
     /// What the engine delivers when the turn succeeds.
@@ -101,6 +104,7 @@ public struct TurnContext: Sendable {
                 .filter { $0.requesterId == agent.id }.prefix(TurnDigest.maxAsks).map { $0 },
             recentSummaries: [], inboxItemIds: inbox.compactMap(\.0.id), quietItemIds: quiet.map(\.id), noticeIds: batch.deliveredIds)
         c.inboxOverflow = allInbox.count - inbox.count
+        c.answeredTasks = try store.answeredHumanTasks(companyId: company.id, requesterId: agent.id, limit: TurnDigest.maxAnsweredTasks)
         c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: c.scope)) ?? []
         c.summariesOmitted = (try? store.recentTurnSummariesTainted(agentId: agent.id, scope: c.scope)) ?? 0
         if let sprint = try store.currentSprint(companyId: company.id, team: agent.team) {
@@ -164,6 +168,28 @@ public enum TurnDigest {
     public static let maxInbox = 20
     static let maxReviewNotes = 8192
     public static let maxPreviewLine = 400
+    public static let maxAnsweredTasks = 5
+    public static let maxAnswerValue = 300
+
+    /// `Done human tasks (the owner's answers):` then one line per task — `- A-3 · <template or title> · field = "value" · …`.
+    /// Engine-written refs and field names; the title (agent text) and every value (owner text) are flattened, values quoted;
+    /// a secret field reads `saved (in the vault)` (its value was never stored on the ask). Nil without answered tasks.
+    public static func answeredTasksBlock(_ tasks: [Ask]) -> String? {
+        guard !tasks.isEmpty else { return nil }
+        var out = ["Done human tasks (the owner's answers):"]
+        for ask in tasks.prefix(maxAnsweredTasks) {
+            let task = HumanTask.from(ask)
+            let what = task?.template?.rawValue ?? ReviewDigest.flat(task?.title ?? ask.title, max: 100)
+            let answer = Store.humanTaskAnswer(ask)
+            var parts = ["- \(ask.ref)", what]
+            for field in task?.fields ?? [] {
+                guard let value = answer[field.name] else { continue }
+                parts.append(field.isSecret ? "\(field.name) = saved (in the vault)" : "\(field.name) = \"\(ReviewDigest.flat(value, max: maxAnswerValue))\"")
+            }
+            out.append(parts.joined(separator: " · "))
+        }
+        return out.joined(separator: "\n")
+    }
 
     /// `Previews: <name> <status>[ <url>] @<sha7> · …` (the URL while running), one flattened line of at most
     /// `maxPreviewLine` characters (a cut line ends in …); nil without surfaces.
@@ -204,6 +230,7 @@ public enum TurnDigest {
             out.append("Sprint: \(s.name) · \(s.status.rawValue) · \(c.sprintDone)/\(c.sprintTotal) done · goal: \(ReviewDigest.flat(s.goal, max: 200))")
         }
         if let path = c.notesPath { out.append("Your notes: \(path)") }
+        if let done = answeredTasksBlock(c.answeredTasks) { out.append(done) }
 
         out.append("## Current work")
         if let item = c.item {

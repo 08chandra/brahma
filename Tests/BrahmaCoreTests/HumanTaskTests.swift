@@ -568,6 +568,61 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault) } == "no such ask")
     }
 
+    /// Task 13 (controller ruling, carried from Task 9): the requester sees its own answered human tasks in the turn digest —
+    /// engine-written refs and `field = "value"` for text and url fields, `saved (in the vault)` for secret ones; never a secret
+    /// value, never another agent's or another company's tasks.
+    @Test func answeredTasksReadByRequesterOnly() throws {
+        let h = try H()
+        let paths = BrahmaPaths(home: try tempDir(), workspaces: try tempDir())
+        // eng: a custom task with a url field and a template with secret fields; pm: its own custom task; globex: a template.
+        let site = h.call(h.eng, ["title": .string("Connect the \u{1B}[31mstatus page"), "reason": .string("r"),
+                                  "fields": .array([.object(["name": .string("site_url"), "label": .string("Site URL"), "kind": .string("url")])])])
+        #expect(site.ok, "\(site.text)")
+        let stripe = h.call(h.eng, ["template": .string("stripe-test-keys"), "reason": .string("payments")])
+        #expect(stripe.ok, "\(stripe.text)")
+        let theirs = h.call(h.pm, ["title": .string("Share the deck"), "reason": .string("r"),
+                                   "fields": .array([.object(["name": .string("deck_url"), "label": .string("Deck"), "kind": .string("url")])])])
+        #expect(theirs.ok, "\(theirs.text)")
+        let globex = try h.store.fileTemplateTask(companyId: h.globex.id, requesterId: h.globexEng.id, template: .stripeTestKeys)
+        let tasks = try h.humanTasks()
+        let siteAsk = try #require(tasks.first { HumanTask.from($0)?.template == nil && $0.requesterId == h.eng.id })
+        let stripeAsk = try #require(tasks.first { HumanTask.from($0)?.template == .stripeTestKeys })
+        let deckAsk = try #require(tasks.first { $0.requesterId == h.pm.id })
+
+        // Nothing is shown while they are pending.
+        var ctx = try TurnContext.load(store: h.store, paths: paths, agent: h.eng, company: h.acme)
+        #expect(ctx.answeredTasks.isEmpty)
+        #expect(!TurnDigest.render(ctx, agent: h.eng, company: h.acme).contains("Done human tasks"))
+
+        let secret = "sk_test_51HyperSecretValue0000000000", publishable = "pk_test_51PublicValue00000000000000"
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: siteAsk.id, values: ["site_url": "https://status.acme.dev/"], vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: stripeAsk.id,
+                                      values: ["STRIPE_TEST_SECRET_KEY": secret, "STRIPE_TEST_PUBLISHABLE_KEY": publishable], vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: deckAsk.id, values: ["deck_url": "https://docs.acme.dev/deck"], vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.globex.id, askId: globex.id, values: Self.stripeValues, vault: h.vault)
+
+        ctx = try TurnContext.load(store: h.store, paths: paths, agent: h.eng, company: h.acme)
+        #expect(ctx.answeredTasks.map(\.id) == [stripeAsk.id, siteAsk.id], "the requester's own, newest first")
+        let text = TurnDigest.render(ctx, agent: h.eng, company: h.acme)
+        #expect(text.contains("Done human tasks (the owner's answers):"), "\(text)")
+        #expect(text.contains("- \(siteAsk.ref) · Connect the [31mstatus page · site_url = \"https://status.acme.dev/\""), "\(text)")
+        #expect(text.contains("- \(stripeAsk.ref) · stripe-test-keys · STRIPE_TEST_SECRET_KEY = saved (in the vault) · STRIPE_TEST_PUBLISHABLE_KEY = saved (in the vault)"), "\(text)")
+        #expect(!text.contains(secret) && !text.contains(publishable) && !text.contains("\u{1B}"))
+        #expect(!text.contains("deck_url") && !text.contains(deckAsk.ref), "another agent's task is invisible")
+        // The other agent sees only its own; the other company's agent sees only its own.
+        let pmText = TurnDigest.render(try TurnContext.load(store: h.store, paths: paths, agent: h.pm, company: h.acme), agent: h.pm, company: h.acme)
+        #expect(pmText.contains("deck_url = \"https://docs.acme.dev/deck\"") && !pmText.contains("site_url"), "\(pmText)")
+        let globexCtx = try TurnContext.load(store: h.store, paths: paths, agent: h.globexEng, company: h.globex)
+        #expect(globexCtx.answeredTasks.map(\.id) == [globex.id])
+        // A declined task is not an answer; the store query refuses another company's requester.
+        let declined = try h.store.requestHumanTask(companyId: h.acme.id, by: h.eng.id, template: .domain, reason: "r").ask
+        try h.store.declineHumanTask(companyId: h.acme.id, askId: declined.id, note: "later")
+        #expect(try h.store.answeredHumanTasks(companyId: h.acme.id, requesterId: h.eng.id, limit: 10).map(\.id) == [stripeAsk.id, siteAsk.id])
+        #expect(try h.store.answeredHumanTasks(companyId: h.acme.id, requesterId: h.globexEng.id, limit: 10).isEmpty)
+        // The secret never reached the database in clear.
+        #expect(!(try dumpDatabase(h.store)).contains(secret))
+    }
+
     // MARK: CLI
 
     @Test func taskCLI() throws {

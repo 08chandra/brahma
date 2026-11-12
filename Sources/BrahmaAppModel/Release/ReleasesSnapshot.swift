@@ -13,12 +13,14 @@ public struct ReleasesSnapshot: Equatable, Sendable {
     public var redBugKey: String?
     /// The engine-accepted head of `main`.
     public var mainHead: String?
-    // `milestones: MilestoneReport?` arrives with Task 13 (the type does not exist yet).
+    /// The path-to-live scorecard (Task 13), for the PATH TO LIVE strip; nil for an unknown company.
+    public var milestones: MilestoneReport?
 
     public static let newest = 20
     public static let empty = ReleasesSnapshot(hosting: nil, readiness: HostingReadiness(configured: false, tokenPresent: false,
                                                                                          accountPresent: false, npmPresent: false),
-                                               releases: [], smokeCheck: nil, latestMainSmoke: nil, redBugKey: nil, mainHead: nil)
+                                               releases: [], smokeCheck: nil, latestMainSmoke: nil, redBugKey: nil, mainHead: nil,
+                                               milestones: nil)
 
     /// `vault` is passed through to `hostingReadiness`, which reads only secret metadata (never the vault).
     public static func load(store: Store, companyId: String, vault: (any SecretVault)? = nil) throws -> ReleasesSnapshot {
@@ -31,6 +33,7 @@ public struct ReleasesSnapshot: Equatable, Sendable {
         r.latestMainSmoke = try store.latestMainSmoke(companyId: companyId)
         r.redBugKey = try company.redBugItemId.flatMap { try store.workItem(id: $0)?.key }
         r.mainHead = company.mainCommit
+        r.milestones = try CompanyMilestones.load(store: store, companyId: companyId, now: Date())
         return r
     }
 
