@@ -11,6 +11,10 @@ public struct OrgVacancy: Codable, Equatable, Sendable, FetchableRecord, Mutable
     public var team: String?
     public var createdAt: Date
     public var filledAt: Date?
+    /// Owner-only text (Plan 4b): shown by the map, `brahma org vacancies` and the vacancy sheet; never read by agents.
+    public var note: String = ""
+    /// Set when the owner removed the seat. The row stays: its handle is never handed out again.
+    public var removedAt: Date? = nil
 
     public mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }
@@ -30,15 +34,18 @@ extension Store {
 
     // MARK: Handles
 
-    /// `<prefix>-<max n over all agents (killed included) and open vacancies + 1>`.
+    /// `<prefix>-<max n over all agents (killed included) and every vacancy row (filled and removed included) + 1>`.
     public func nextHandle(companyId: String, prefix: String) throws -> String {
-        try writer.read { db in
-            let names = try String.fetchAll(db, sql: "SELECT name FROM agent WHERE companyId = ?", arguments: [companyId])
-                + String.fetchAll(db, sql: "SELECT handle FROM orgVacancy WHERE companyId = ?", arguments: [companyId])
-            let head = prefix + "-"
-            let maxN = names.compactMap { $0.hasPrefix(head) ? Int($0.dropFirst(head.count)) : nil }.max() ?? 0
-            return "\(head)\(maxN + 1)"
-        }
+        try writer.read { db in try Store.nextHandle(db, companyId: companyId, prefix: prefix) }
+    }
+
+    /// The same, inside a caller's transaction: `addVacancy` picks its handle in the write that inserts the row.
+    static func nextHandle(_ db: Database, companyId: String, prefix: String) throws -> String {
+        let names = try String.fetchAll(db, sql: "SELECT name FROM agent WHERE companyId = ?", arguments: [companyId])
+            + String.fetchAll(db, sql: "SELECT handle FROM orgVacancy WHERE companyId = ?", arguments: [companyId])
+        let head = prefix + "-"
+        let maxN = names.compactMap { $0.hasPrefix(head) ? Int($0.dropFirst(head.count)) : nil }.max() ?? 0
+        return "\(head)\(maxN + 1)"
     }
 
     // MARK: Applying a plan
@@ -118,9 +125,11 @@ extension Store {
 
     // MARK: Vacancies
 
+    /// Open seats (neither filled nor removed), oldest first.
     public func vacancies(companyId: String) throws -> [OrgVacancy] {
         try writer.read { db in
-            try OrgVacancy.filter(Column("companyId") == companyId && Column("filledAt") == nil).order(Column("id")).fetchAll(db)
+            try OrgVacancy.filter(Column("companyId") == companyId && Column("filledAt") == nil && Column("removedAt") == nil)
+                .order(Column("id")).fetchAll(db)
         }
     }
 
@@ -135,7 +144,7 @@ extension Store {
         do {
             return try writer.write { db in
                 guard var v = try OrgVacancy.filter(Column("companyId") == companyId && Column("handle") == key
-                                                    && Column("filledAt") == nil).fetchOne(db)
+                                                    && Column("filledAt") == nil && Column("removedAt") == nil).fetchOne(db)
                 else { throw StoreError.notFound }
                 var managerId: String?
                 var cursor = v.managerHandle
