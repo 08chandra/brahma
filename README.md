@@ -38,7 +38,7 @@ A native SwiftUI app (dark ops-console look) over the same engine.
 ```
 brahma company create <name> --goal <text>      prints id + workspace path
 brahma company create <name> --goal <text> --from-repo <folder|https-url>   start from an existing repo
-brahma company trust-import <name>              lift an imported repo's taint (owner only, engine stopped)
+brahma company trust-import <name> [--yes]      show, then (--yes) lift, an imported repo's taint (owner only, engine stopped)
 brahma company list
 brahma company pause|resume <name>
 brahma company mode <name> low|balanced|max     concurrency: 2 / 6 / hard cap
@@ -517,19 +517,25 @@ refused, and so is a URL with credentials or a query (put credentials in a human
 clone it yourself and pass the folder). The engine fetches it itself, never an agent turn, through its hardened git: an
 empty template (no hooks), one fetch by URL and refspec (no remote is ever configured, so the original is never pushed to
 and is never changed), fsck on every object, no tags, no submodules, no LFS smudge, no filters, hooks or fsmonitor, TLS
-verified, a redirect followed only to https, no credential helper or prompt, and a 600 s limit per step. A folder's own
-git config is checked first: one that names a program (a hook path, fsmonitor command, filter, pager, include, credential
-helper and the like) refuses the import; import a fresh `git clone` of it instead. History: from a folder, the current
+verified, a redirect followed only to https, no credential helper, prompt or `~/.netrc` (the fetch runs with an empty
+home), git's output capped (a server that floods it is cut off), and a 600 s limit per step. A folder is fetched from its
+own `.git`, which must be a plain repository git resolves to itself (not a linked worktree's `.git` file). Its git config
+is checked first: one that names a program (a hook path, fsmonitor command, filter, pager, include, credential helper and
+the like), a partial clone or promisor remote, or an unknown repository format refuses the import; import a fresh
+`git clone` of it instead. A repo that tracks anything under `.brahma`, `.brahma-tmp` or a `.git` (in any case), or a
+symbolic link that is absolute, has a `..` part, passes through another link or points into those names, is refused. History: from a folder, the current
 branch's full history comes over and becomes `main`; from https only the tip comes over (`--depth 1`), as one root commit
 whose message names the upstream commit. Before the company exists the import is refused, and nothing is kept, when the
 repo is over 2 GB (working tree plus `.git`, also enforced while the fetch runs) or 100 000 files, or uses Git LFS. The
 repo's `.claude/`, `.mcp.json`, `CLAUDE.md` and `AGENTS.md` stay plain files that no turn loads. Everything imported is
 scanned for secrets; findings (names and files, never values) become one Inbox question, and the import goes ahead. The
 CTO (or the CEO) gets a ready spike to survey the repo and propose its check, preview and deploy config. Everything
-imported is outside content: until you trust it with `brahma company trust-import <co>` (with the engine stopped, after
-reading the repo or the survey), every work turn of the company is tainted at launch (`import: <host>`, `import: local`
-for a folder), so decisions, owner requests, sprint plans, preview, smoke and deploy config and deploy proposals are off,
-and agents' labs stay marked until `brahma lab clear-taint <co>`.
+imported is outside content: until you trust it, every turn of the company (work, plan, review, audit) is tainted at
+launch (`import: <host>`, `import: local` for a folder), so decisions, owner requests, sprint plans, preview, smoke and
+deploy config, deploy proposals and review verdicts are off. `brahma company trust-import <co>` shows the source, the
+imported commit and the secret scan's result; with `--yes` (the engine stopped, after reading the repo or the survey) it
+lifts the mark and ends every tainted session. Agents' labs stay marked until `brahma lab clear-taint <co>`. Every new
+import is tainted again, even of a repo you trusted before.
 
 ```
 brahma preview <co>                                            previews: name, kind, status, url, commit

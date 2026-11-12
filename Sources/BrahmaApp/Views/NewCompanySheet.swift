@@ -89,9 +89,11 @@ struct NewCompanySheet: View {
             Hairline()
             HStack(spacing: BrahmaTheme.spaceS) {
                 Spacer()
+                // Not while a company is being created (an import may still be cloning): Cancel never pretends to stop it.
                 Button("Cancel") { model.presentedSheet = nil }
                     .buttonStyle(.brahma)
                     .keyboardShortcut(.cancelAction)
+                    .disabled(submitting)
                 Button("Create") { create() }
                     .buttonStyle(.brahmaPrimary)
                     .keyboardShortcut(.defaultAction)
@@ -103,6 +105,7 @@ struct NewCompanySheet: View {
         .frame(width: 480)
         .background(BrahmaTheme.bg1)
         .onAppear { focus = .name }
+        .interactiveDismissDisabled(submitting)
         .onChange(of: start) { syncSource() }
         .onChange(of: repoText) { syncSource() }
     }

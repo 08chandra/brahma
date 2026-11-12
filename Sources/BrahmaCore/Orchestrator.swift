@@ -1179,6 +1179,12 @@ public actor Orchestrator {
                 try await requireSandboxVerified(gate: gate, settings: compiled.settings, agent: agent, company: company,
                                                  launch: CanaryShape.launch(mode))
             }
+            // Plan L Task 14 (fix round 1, S1): every turn of an imported company the owner has not trusted (work, plan, review,
+            // audit) reads the imported tree, so it is tainted at launch with the import's source, wherever it was scheduled from.
+            if let imported = try store.importTaint(companyId: company.id) {
+                try markTaintedOrFlag(agent: agent, source: imported)
+                taintMarked = true
+            }
             // Pre-taint (Task 10, F4): a turn that can fan out is tainted at launch until this CLI build passed V-1 (PostToolUse
             // fires for sub-agent and workflow calls), unless it has no network and no web tools.
             var builtins = Set(compiled.tools ?? compiled.allowedTools)

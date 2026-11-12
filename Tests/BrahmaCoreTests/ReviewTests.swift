@@ -625,6 +625,20 @@ import GRDB
         #expect(r.world.fake.requests.contains { $0.agent.name == "rev" && $0.prompt.hasPrefix("Review \(i.key)") })
     }
 
+    /// Plan L Task 14 fix round 1 (S1): the import mark taints every turn kind of an imported company the owner has not
+    /// trusted, a review turn included (it reads the imported tree).
+    @Test func importMarkTaintsAReviewTurn() async throws {
+        let r = try R()
+        try await r.store.writer.write { try Store.markImported($0, companyId: r.company.id, source: "import: example.com", now: Date()) }
+        let i = try r.item("research", type: .spike, command: nil)
+        let wt = try r.claim(i, r.eng)
+        try r.write("notes.md", "found it", in: wt)
+        try r.submit(i, r.eng)
+        try await r.cycle()
+        let review = try #require(try r.world.turns(r.rev).first { $0.kind == .review }, "the review turn ran")
+        #expect(review.taintSource == "import: example.com" && review.taintedAt != nil)
+    }
+
     @Test func reviewTurnRunsWhilePaceClosed() async throws {
         let r = try R()
         var co = r.company; co.usageMode = .max; try r.store.updateCompany(co)

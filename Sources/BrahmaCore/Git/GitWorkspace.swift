@@ -107,6 +107,12 @@ struct GitCommand: Sendable {
     /// size cap refuses the repository.
     var sizeWatch: (directory: URL, limit: Int64)? = nil
     static let sizeWatchInterval: TimeInterval = 0.25
+    /// While `sizeWatch` runs, git's captured stderr may grow to this many bytes (stdout to `maxOutput` plus this) before git
+    /// is killed (`Output.flooded`): a network peer's `remote:` lines must not fill the data home (Task 14 fix round 1, I2).
+    static let maxWatchedStderr: Int64 = 1 << 20
+    /// `HOME` and `XDG_CONFIG_HOME` for this git (an empty engine directory): nothing from the owner's home, such as
+    /// `~/.netrc` credentials curl would send, reaches the import's network fetch (Task 14 fix round 1, M1).
+    var homeDirectory: URL? = nil
     /// Called between a failed attempt (git met an `index.lock`) and its retry, before the retry is scanned again. Tests change
     /// the repository there instead of racing a timer.
     var beforeRetry: (@Sendable (_ attempt: Int) -> Void)? = nil
@@ -232,6 +238,8 @@ struct GitCommand: Sendable {
         var timedOut = false
         /// `sizeWatch` killed git: the directory outgrew its limit.
         var oversize = false
+        /// `sizeWatch` killed git: its captured output outgrew `maxWatchedStderr`.
+        var flooded = false
         var text: String { String(decoding: stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 
@@ -252,6 +260,10 @@ struct GitCommand: Sendable {
         env["GIT_ASKPASS"] = "/usr/bin/false"
         env["SSH_ASKPASS"] = "/usr/bin/false"
         env["GIT_OPTIONAL_LOCKS"] = "0"
+        if let homeDirectory {
+            env["HOME"] = homeDirectory.path
+            env["XDG_CONFIG_HOME"] = homeDirectory.path
+        }
         // Never inherited (the allowlist keeps them out already); named so that no later change lets one through.
         for name in ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
                      "GIT_EXEC_PATH", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR"] { env[name] = nil }
@@ -446,13 +458,22 @@ struct GitCommand: Sendable {
         let timer = DispatchWorkItem { timedOut.mark(); if let grouped { grouped.signalGroup(SIGTERM) } else { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timer)
         // The size watch polls on a thread of its own: a busy shared dispatch pool must never let git outgrow the cap.
-        let oversize = TimeoutFlag(), watchDone = TimeoutFlag()
+        let oversize = TimeoutFlag(), flooded = TimeoutFlag(), watchDone = TimeoutFlag()
         if let sizeWatch {
             let stop = GitStopper(process: process, grouped: grouped)
+            let outputCap = Int64(maxOutput) + Self.maxWatchedStderr
+            func bytes(_ url: URL) -> Int64 {
+                var st = stat()
+                return lstat(url.path, &st) == 0 ? Int64(st.st_size) : 0
+            }
             Thread {
                 while !watchDone.cut {
                     if EngineFiles.treeBytes(sizeWatch.directory, stopAbove: sizeWatch.limit) > sizeWatch.limit {
                         oversize.mark()
+                    } else if bytes(errURL) > Self.maxWatchedStderr || bytes(outURL) > outputCap {
+                        flooded.mark()
+                    }
+                    if oversize.cut || flooded.cut {
                         if !watchDone.cut { stop.stop() }
                         return
                     }
@@ -485,14 +506,16 @@ struct GitCommand: Sendable {
         var stderr = String(decoding: read(errURL, limit: 64 * 1024).0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if timedOut.cut { stderr = "timed out after \(Int(timeoutSeconds)) s" + (stderr.isEmpty ? "" : ": \(stderr)") }
         if oversize.cut, let sizeWatch { stderr = "stopped: the repository grew past \(sizeWatch.limit) bytes" + (stderr.isEmpty ? "" : ": \(stderr)") }
+        if flooded.cut { stderr = "stopped: git's output passed \(Self.maxWatchedStderr) bytes" + (stderr.isEmpty ? "" : ": \(stderr)") }
         var status = grouped == nil ? process.terminationStatus : groupedStatus
         if let error = feed?.result.error {
             // The input ended early: whatever git made of the part it got does not count as success.
             if status == 0 { status = -1 }
             stderr = "\(error)" + (stderr.isEmpty ? "" : ": \(stderr)")
         }
-        if oversize.cut, status == 0 { status = -1 }
-        return Output(status: status, stdout: stdout, stderr: stderr, cut: cut, timedOut: timedOut.cut, oversize: oversize.cut)
+        if oversize.cut || flooded.cut, status == 0 { status = -1 }
+        return Output(status: status, stdout: stdout, stderr: stderr, cut: cut, timedOut: timedOut.cut, oversize: oversize.cut,
+                      flooded: flooded.cut)
     }
 }
 
@@ -3524,16 +3547,23 @@ extension GitWorkspace {
         try git.run(["init", "--quiet", "--template="])
         try git.run(["symbolic-ref", "HEAD", Self.mainRef])
 
+        // The network steps run with an empty engine home (no `~/.netrc`, no XDG config), and their output and `.git` are
+        // watched against the caps.
+        let home = tempRoot.appending(path: "import-home-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try fm.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? fm.removeItem(at: home) }
         var remote = git
         remote.timeoutSeconds = caps.timeout
+        remote.homeDirectory = home
+        remote.sizeWatch = (dir.appending(path: ".git", directoryHint: .isDirectory), caps.maxBytes)
         let target: String
         var transportFlags = ["-c", "protocol.version=2"]
         var options: [String] = []
         switch transport {
         case .local(let source):
-            try scanImportSource(source, shown: shown, with: git)
+            // The explicit `.git` (S2): never the folder itself, so git never probes for a repository around it.
+            target = try resolveImportSource(source, shown: shown, with: git).path
             remote.allowsLocalFetch = true
-            target = source.path
             options = ["--upload-pack=git-upload-pack"]
         case .https(let url):
             remote.allowsHTTPSFetch = true
@@ -3542,8 +3572,18 @@ extension GitWorkspace {
             if let caFile { transportFlags += ["-c", "http.sslCAInfo=\(caFile.path)"] }
         }
 
+        /// A watched network step: past the size cap it is the size refusal; flooded output or any other failure is git's.
+        func network(_ args: [String], maxOutput: Int = GitCommand.maxCapture) throws -> GitCommand.Output {
+            let out = try remote.run(args, allowFailure: true, maxOutput: maxOutput)
+            if out.oversize { throw RepoImportError(message: RepoImport.sizeMessage) }
+            guard out.status == 0, !out.flooded else {
+                throw GitError.failed(command: args.first(where: { !$0.hasPrefix("-") && !$0.contains("=") }) ?? "fetch",
+                                      status: out.status, stderr: String(out.stderr.prefix(2000)))
+            }
+            return out
+        }
         // The source's current branch: `ref: refs/heads/<b>\tHEAD` (a symref), then `<sha>\tHEAD`.
-        let listed = try remote.run(transportFlags + ["ls-remote", "--symref"] + options + [target, "HEAD"], maxOutput: 64 << 10)
+        let listed = try network(transportFlags + ["ls-remote", "--symref"] + options + [target, "HEAD"], maxOutput: 64 << 10)
         var ref = "HEAD", branch = "HEAD", sawHead = false
         for line in listed.text.split(separator: "\n") {
             let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
@@ -3559,18 +3599,12 @@ extension GitWorkspace {
         }
         guard sawHead else { throw GitError.failed(command: "ls-remote", status: -1, stderr: "the repository has no commits") }
 
-        var fetcher = remote
-        fetcher.sizeWatch = (dir.appending(path: ".git", directoryHint: .isDirectory), caps.maxBytes)
         let depth: [String]
         if case .https = transport { depth = ["--depth", "1"] } else { depth = [] }
-        let fetched = try fetcher.run(transportFlags + [
+        _ = try network(transportFlags + [
             "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true",
             "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-gc",
-        ] + depth + options + [target, "+\(ref):\(Self.importRef)"], allowFailure: true)
-        if fetched.oversize { throw RepoImportError(message: RepoImport.sizeMessage) }
-        guard fetched.status == 0 else {
-            throw GitError.failed(command: "fetch", status: fetched.status, stderr: String(fetched.stderr.prefix(2000)))
-        }
+        ] + depth + options + [target, "+\(ref):\(Self.importRef)"])
 
         let upstream = try git.run(["rev-parse", "--verify", "--quiet", "\(Self.importRef)^{commit}"]).text
         try validCommit(upstream)
@@ -3613,10 +3647,16 @@ extension GitWorkspace {
         var bytes: Int64 = 0
         var attributes: [(object: String, size: Int64)] = []
         var sizes: [String: Int64] = [:]
+        var links: [(path: String, object: String)] = []
         for raw in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) {
             guard let tab = raw.firstIndex(of: 0x09) else { continue }
             let fields = String(decoding: raw[raw.startIndex..<tab], as: UTF8.self).split(separator: " ", omittingEmptySubsequences: true)
             let path = String(decoding: raw[raw.index(after: tab)...], as: UTF8.self)
+            // Every entry, of every type (C1/S3): nothing lands in the engine's own directories or a `.git`.
+            if let problem = importEntryProblem(path: path, mode: fields.first.map(String.init) ?? "", target: nil, links: []) {
+                throw RepoImportError(message: problem)
+            }
+            if fields.count == 4, fields[0] == "120000" { links.append((path, String(fields[2]))) }
             guard fields.count == 4, fields[1] == "blob" else { continue }
             let size = Int64(fields[3]) ?? 0
             files += 1
@@ -3627,6 +3667,18 @@ extension GitWorkspace {
         if files > caps.maxFiles { throw RepoImportError(message: RepoImport.filesMessage(caps.maxFiles)) }
         let gitBytes = EngineFiles.treeBytes(dir.appending(path: ".git", directoryHint: .isDirectory), stopAbove: caps.maxBytes)
         if bytes > caps.maxBytes || gitBytes > caps.maxBytes - bytes { throw RepoImportError(message: RepoImport.sizeMessage) }
+        // Symbolic links (S3): the rules for agents' commits, on the tree (no absolute target, no `..`, nothing through a link,
+        // nothing into `.git` or the engine's directories).
+        if !links.isEmpty {
+            let targets = try importLinkTargets(git, objects: links.map(\.object))
+            let linkPaths = Set(links.map(\.path))
+            for (path, object) in links {
+                guard let target = targets[object] else { throw RepoImportError(message: RepoImport.linkMessage(path, "cannot be read")) }
+                if let problem = importEntryProblem(path: path, mode: "120000", target: target, links: linkPaths) {
+                    throw RepoImportError(message: problem)
+                }
+            }
+        }
         // LFS by its attributes: any `.gitattributes` (as stored) naming the lfs filter.
         for entry in attributes.prefix(1000) {
             let blob = try git.run(["cat-file", "blob", entry.object], maxOutput: 1 << 20)
@@ -3647,6 +3699,58 @@ extension GitWorkspace {
         } else if grep.status != 1 {
             throw GitError.failed(command: "grep", status: grep.status, stderr: Self.oneLine(grep.stderr))
         }
+    }
+
+    /// The largest symbolic-link target the import reads; a longer one is refused as odd.
+    static let importLinkTargetLimit = 4096
+
+    /// Why one tree entry of an import is refused (the message the owner reads), or nil. Any path whose first part is one of
+    /// the engine's own top-level names or whose any part is `.git`, by folded name (`isEngineName`, `foldedName`); for a
+    /// symbolic link (`120000`, with its `target`): an empty, NUL-holding or absolute target, a `..` part, a way that passes
+    /// through another link of the tree (`links`, the tree's link paths), or one that leads into `.git` or an engine name.
+    static func importEntryProblem(path: String, mode: String, target: String?, links: Set<String>) -> String? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let first = parts.first else { return RepoImport.reservedMessage(path) }
+        if isEngineName(Array(first.utf8)) { return RepoImport.reservedMessage(first) }
+        if let dotGit = parts.first(where: { foldedName(Array($0.utf8)) == ".git" }) { return RepoImport.reservedMessage(dotGit) }
+        guard mode == "120000", let target else { return nil }
+        let bytes = Array(target.utf8)
+        guard !bytes.isEmpty, !bytes.contains(0), bytes.count <= importLinkTargetLimit else {
+            return RepoImport.linkMessage(path, "has an empty or odd target")
+        }
+        if bytes.first == UInt8(ascii: "/") { return RepoImport.linkMessage(path, "has an absolute target") }
+        let targetParts = target.split(separator: "/", omittingEmptySubsequences: true).map(String.init).filter { $0 != "." }
+        if targetParts.contains("..") { return RepoImport.linkMessage(path, "has a `..` part in its target") }
+        let way = Array(parts.dropLast()) + targetParts
+        if let top = way.first, isEngineName(Array(top.utf8)) || way.contains(where: { foldedName(Array($0.utf8)) == ".git" }) {
+            return RepoImport.linkMessage(path, "points into .git or a name Brahma reserves")
+        }
+        var prefix = ""
+        for part in way.dropLast() {
+            prefix = prefix.isEmpty ? part : prefix + "/" + part
+            if links.contains(prefix) { return RepoImport.linkMessage(path, "passes through a symbolic link") }
+        }
+        return nil
+    }
+
+    /// The targets of the import's symbolic links, by object id, read in one `cat-file --batch` (bounded; more output than the
+    /// capture limit refuses the import).
+    static func importLinkTargets(_ git: GitCommand, objects: [String]) throws -> [String: String] {
+        let unique = Array(Set(objects))
+        let out = try git.run(["cat-file", "--batch"], stdin: .data(Data(unique.map { $0 + "\n" }.joined().utf8)))
+        if out.cut { throw RepoImportError(message: RepoImport.linkMessage("(many)", "are too many to check")) }
+        var targets: [String: String] = [:]
+        var data = out.stdout[...]
+        while let newline = data.firstIndex(of: 0x0A) {
+            let header = String(decoding: data[data.startIndex..<newline], as: UTF8.self).split(separator: " ")
+            data = data[data.index(after: newline)...]
+            guard header.count == 3, header[1] == "blob", let size = Int(header[2]), size >= 0, data.count >= size else { break }
+            let body = data.prefix(size)
+            targets[String(header[0])] = size <= importLinkTargetLimit ? String(decoding: body, as: UTF8.self) : nil
+            data = data.dropFirst(size)
+            if data.first == 0x0A { data = data.dropFirst() }
+        }
+        return targets
     }
 
     /// `inspectImport` for an imported workspace (`RepoImport.inspect`).
@@ -3694,12 +3798,43 @@ extension GitWorkspace {
         }
     }
 
-    /// Whether a source config key could make git (or a program it starts) run something during a fetch from it.
+    /// The source's explicit `.git` (S2), after `scanImportSource`: it must hold `HEAD`, `objects` and `refs` as a plain
+    /// repository does, and git, asked with exactly that `GIT_DIR` (`rev-parse --absolute-git-dir`, no repository check: the
+    /// owner's repository has remotes, and nothing is written into it), must name the same real directory. The fetch then
+    /// reads from that directory, never from the folder (no discovery around it).
+    static func resolveImportSource(_ source: URL, shown: String, with git: GitCommand) throws -> URL {
+        try scanImportSource(source, shown: shown, with: git)
+        let dotGit = source.appending(path: ".git", directoryHint: .isDirectory)
+        var st = stat()
+        let head = lstat(dotGit.appending(path: "HEAD").path, &st) == 0 && st.st_mode & S_IFMT == S_IFREG
+        guard head, isRealDirectory(dotGit.appending(path: "objects")), isRealDirectory(dotGit.appending(path: "refs")) else {
+            throw RepoImportError(message: RepoImport.notARepositoryMessage(shown))
+        }
+        var probe = GitCommand(gitDir: dotGit, workTree: source, commonDir: nil)
+        probe.skipsRepositoryCheck = true
+        probe.tempRoot = git.tempRoot
+        let out = try probe.run(["rev-parse", "--absolute-git-dir"], allowFailure: true, maxOutput: 64 << 10)
+        let resolved = URL(fileURLWithPath: out.text).resolvingSymlinksInPath().standardizedFileURL.path
+        guard out.status == 0, resolved == dotGit.resolvingSymlinksInPath().standardizedFileURL.path else {
+            throw RepoImportError(message: RepoImport.notARepositoryMessage(shown))
+        }
+        return dotGit
+    }
+
+    /// Whether a source config key could make git (or a program it starts) run something, or reach the network, during a
+    /// fetch from it.
     static func importSourceRuns(_ key: String, value: String) -> Bool {
         let lower = key.lowercased()
         guard let firstDot = lower.firstIndex(of: "."), let lastDot = lower.lastIndex(of: ".") else { return true }
         let section = String(lower[..<firstDot]), variable = String(lower[lower.index(after: lastDot)...])
         if ["include", "includeif", "filter", "credential", "pager"].contains(section) { return true }
+        // M6: a partial clone's upload-pack may fetch missing objects from its promisor remote on its own; a repository format
+        // git does not know is refused rather than guessed at.
+        if lower == "extensions.partialclone" { return true }
+        if section == "remote", firstDot != lastDot, ["promisor", "partialclonefilter"].contains(variable) { return true }
+        if lower == "core.repositoryformatversion" {
+            return !["0", "1"].contains(value.trimmingCharacters(in: .whitespaces))
+        }
         if lower == "core.fsmonitor" {
             return !["true", "false", "yes", "no", "on", "off", "1", "0", ""].contains(value.lowercased().trimmingCharacters(in: .whitespaces))
         }

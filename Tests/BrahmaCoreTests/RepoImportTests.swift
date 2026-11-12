@@ -72,10 +72,15 @@ private final class HTTPSFixture {
             .contains { FileManager.default.isExecutableFile(atPath: "\($0)/\(name)") }
     }
 
+    /// Arguments: root, cert, key, port file, then optional: a pack-objects hook (a chatty server: upload-pack relays its stderr
+    /// as `remote:` lines) and a file that records every Authorization header received. `/auth/<path>` answers 401 (Basic)
+    /// unless the request carries credentials. Responses stream, so a never-ending one reaches the client as it goes.
     static let server = #"""
         exec python3 -I - "$@" <<'PY'
         import http.server, ssl, subprocess, sys, os
         root, certf, keyf, portfile = sys.argv[1:5]
+        hook = sys.argv[5] if len(sys.argv) > 5 else ""
+        authlog = sys.argv[6] if len(sys.argv) > 6 else ""
         class H(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
             def log_message(self, *a): pass
@@ -83,28 +88,48 @@ private final class HTTPSFixture {
             def do_POST(self): self.cgi()
             def cgi(self):
                 path, _, query = self.path.partition("?")
+                if self.headers.get("Authorization") and authlog:
+                    with open(authlog, "a") as f: f.write(self.headers["Authorization"] + "\n")
                 if path.startswith("/redirect/"):
                     self.send_response(302)
                     self.send_header("Location", "http://127.0.0.1:%d/%s%s" % (self.server.server_address[1], path[len("/redirect/"):], ("?" + query) if query else ""))
                     self.end_headers(); return
+                if path.startswith("/auth/"):
+                    if not self.headers.get("Authorization"):
+                        self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="t"'); self.end_headers(); return
+                    path = path[len("/auth"):]
                 n = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(n) if n else b""
                 env = {"PATH": os.environ.get("PATH", ""), "GIT_PROJECT_ROOT": root, "GIT_HTTP_EXPORT_ALL": "1", "PATH_INFO": path,
                        "QUERY_STRING": query, "REQUEST_METHOD": self.command, "CONTENT_TYPE": self.headers.get("Content-Type", ""),
                        "CONTENT_LENGTH": str(len(body)), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+                if hook: env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "uploadpack.packObjectsHook", "GIT_CONFIG_VALUE_0": hook})
                 if self.headers.get("Git-Protocol"): env["GIT_PROTOCOL"] = self.headers["Git-Protocol"]
-                out = subprocess.run(["git", "http-backend"], input=body, env=env, capture_output=True).stdout
-                head, sep, rest = out.partition(b"\r\n\r\n")
-                if not sep: head, _, rest = out.partition(b"\n\n")
-                status = 200; headers = []
-                for line in head.decode("latin1").splitlines():
-                    k, _, v = line.partition(":"); v = v.strip()
-                    if k.lower() == "status": status = int(v.split()[0])
-                    elif k: headers.append((k, v))
-                self.send_response(status)
-                for k, v in headers: self.send_header(k, v)
-                self.end_headers(); self.wfile.write(rest)
+                p = subprocess.Popen(["git", "http-backend"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+                try:
+                    p.stdin.write(body); p.stdin.close()
+                    head = b""
+                    while b"\r\n\r\n" not in head and b"\n\n" not in head:
+                        c = p.stdout.read(1)
+                        if not c: break
+                        head += c
+                    status = 200; headers = []
+                    for line in head.decode("latin1").splitlines():
+                        k, _, v = line.partition(":"); v = v.strip()
+                        if k.lower() == "status": status = int(v.split()[0])
+                        elif k: headers.append((k, v))
+                    self.send_response(status)
+                    for k, v in headers: self.send_header(k, v)
+                    self.end_headers()
+                    while True:
+                        chunk = p.stdout.read1(65536)
+                        if not chunk: break
+                        self.wfile.write(chunk); self.wfile.flush()
+                except Exception: pass
+                finally:
+                    p.kill(); p.wait()
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(certf, keyf)
         srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
         open(portfile + ".tmp", "w").write(str(srv.server_address[1])); os.rename(portfile + ".tmp", portfile)
@@ -117,7 +142,7 @@ private final class HTTPSFixture {
     let port: Int
     private let process: Process
 
-    init(serving root: URL) throws {
+    init(serving root: URL, packObjectsHook: URL? = nil, authLog: URL? = nil) throws {
         self.root = root
         let dir = try tempDir()
         caFile = dir.appending(path: "cert.pem")
@@ -131,7 +156,7 @@ private final class HTTPSFixture {
         try #require(openssl.terminationStatus == 0, "openssl could not make the test certificate")
         process = Process()
         process.executableURL = try FakeTools.script("brahma-test-git-https", Self.server)
-        process.arguments = [root.path, caFile.path, key.path, portFile.path]
+        process.arguments = [root.path, caFile.path, key.path, portFile.path, packObjectsHook?.path ?? "", authLog?.path ?? ""]
         process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
         try process.run()
         var found: Int?
@@ -465,6 +490,189 @@ private final class HTTPSFixture {
                                      limits: RepoImport.Limits(maxBytes: RepoImport.maxBytes, maxFiles: 0), caFile: server.caFile)
         } == RepoImport.filesMessage(0))
         #expect(staleStaging(paths).isEmpty)
+    }
+
+    // MARK: Fix round 1
+
+    /// C1/S3: the imported tree is walked before anything is checked out. A path under the engine's own top-level names (by
+    /// folded name) or `.git`, and a symbolic link that leaves the checkout or passes through another link, refuse the import.
+    @Test func importRefusesReservedNamesAndUnsafeLinks() throws {
+        let (_, paths) = try home()
+        func refused(_ build: (SourceRepo) throws -> Void) throws -> String? {
+            let src = try SourceRepo()
+            try build(src)
+            try src.git(["add", "-A"])
+            try src.git(["commit", "--quiet", "-m", "planted"])
+            return refusal { _ = try RepoImport.stage(try RepoSource.parse(src.root.path), paths: paths) }
+        }
+        let hooks = try refused { src in
+            try FakeTools.install(at: src.root.appending(path: ".brahma/hooks/post-checkout"), "echo pwned")
+        }
+        #expect(hooks == RepoImport.reservedMessage(".brahma"), "\(hooks ?? "nil")")
+        #expect(RepoImport.reservedMessage(".brahma") == "this repo tracks .brahma, a name Brahma reserves for its own files; remove it from the repo first")
+        let folded = try refused { src in try src.write(".Brahma-TMP/x", "x\n") }
+        #expect(folded == RepoImport.reservedMessage(".Brahma-TMP"), "\(folded ?? "nil")")
+        let linkedDir = try refused { src in
+            try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: ".brahma").path, withDestinationPath: "/tmp")
+        }
+        #expect(linkedDir == RepoImport.reservedMessage(".brahma"), "\(linkedDir ?? "nil")")
+        let absolute = try refused { src in
+            try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: "passwd").path, withDestinationPath: "/etc/passwd")
+        }
+        #expect(absolute == RepoImport.linkMessage("passwd", "has an absolute target"), "\(absolute ?? "nil")")
+        let up = try refused { src in
+            try FileManager.default.createDirectory(at: src.root.appending(path: "docs"), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: "docs/up").path, withDestinationPath: "../../outside")
+        }
+        #expect(up == RepoImport.linkMessage("docs/up", "has a `..` part in its target"), "\(up ?? "nil")")
+        let through = try refused { src in
+            try src.write("real/file.txt", "x\n")
+            try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: "alias").path, withDestinationPath: "real")
+            try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: "deep").path, withDestinationPath: "alias/file.txt")
+        }
+        #expect(through == RepoImport.linkMessage("deep", "passes through a symbolic link"), "\(through ?? "nil")")
+        let intoGit = try refused { src in
+            try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: "cfg").path, withDestinationPath: ".git/config")
+        }
+        #expect(intoGit == RepoImport.linkMessage("cfg", "points into .git or a name Brahma reserves"), "\(intoGit ?? "nil")")
+        #expect(staleStaging(paths).isEmpty, "every refusal removed its workspace")
+        // The walk's rules on names git itself never lets into a tree (fsck refuses them at the fetch as well).
+        #expect(GitWorkspace.importEntryProblem(path: ".Git/config", mode: "100644", target: nil, links: []) == RepoImport.reservedMessage(".Git"))
+        #expect(GitWorkspace.importEntryProblem(path: "a/.GIT/x", mode: "100644", target: nil, links: []) == RepoImport.reservedMessage(".GIT"))
+        #expect(GitWorkspace.importEntryProblem(path: "a/b", mode: "120000", target: "c", links: ["a/b"]) == nil, "inside the tree")
+        #expect(GitWorkspace.importEntryProblem(path: "a/b", mode: "120000", target: "../c", links: ["a/b"])
+                == RepoImport.linkMessage("a/b", "has a `..` part in its target"))
+        // A plain relative link inside the checkout is fine.
+        let ok = try SourceRepo()
+        try FileManager.default.createSymbolicLink(atPath: ok.root.appending(path: "readme-link").path, withDestinationPath: "README.md")
+        try ok.git(["add", "-A"]); try ok.git(["commit", "--quiet", "-m", "link"])
+        let staged = try RepoImport.stage(try RepoSource.parse(ok.root.path), paths: paths)
+        staged.discard()
+    }
+
+    /// S2: a folder's repository is fetched from its explicit `.git`, resolved by git and required to be exactly that real
+    /// directory (HEAD, objects and refs present); M6: partial-clone and promisor settings refuse it like programs do.
+    @Test func localSourceMustBeAPlainRepository() throws {
+        let (_, paths) = try home()
+        // A gitfile (`.git` a file pointing elsewhere), as a linked worktree or submodule checkout has.
+        let real = try SourceRepo()
+        let gitfile = try tempDir()
+        try "gitdir: \(real.root.appending(path: ".git").path)\n".write(to: gitfile.appending(path: ".git"), atomically: true, encoding: .utf8)
+        #expect(refusal { _ = try RepoImport.stage(try RepoSource.parse(gitfile.path), paths: paths) }?.contains("linked worktree") == true)
+        // A `.git` directory that is not a repository on its own (no objects).
+        let odd = try SourceRepo()
+        try FileManager.default.moveItem(at: odd.root.appending(path: ".git/objects"), to: odd.root.appending(path: "objects-aside"))
+        let oddMessage = refusal { _ = try RepoImport.stage(try RepoSource.parse(odd.root.path), paths: paths) }
+        #expect(oddMessage == RepoImport.notARepositoryMessage(odd.root.standardizedFileURL.path), "\(oddMessage ?? "nil")")
+        // GIT_DIR elsewhere through a `commondir` redirect.
+        let redirected = try SourceRepo()
+        try "../../elsewhere\n".write(to: redirected.root.appending(path: ".git/commondir"), atomically: true, encoding: .utf8)
+        #expect(refusal { _ = try RepoImport.stage(try RepoSource.parse(redirected.root.path), paths: paths) }?.contains("linked worktree") == true)
+        // Partial clone and promisor remotes: upload-pack there could fetch from the network on its own.
+        let partial = try SourceRepo()
+        try partial.git(["config", "extensions.partialClone", "origin"])
+        try partial.git(["config", "remote.origin.promisor", "true"])
+        try partial.git(["config", "remote.origin.partialclonefilter", "blob:none"])
+        let partialMessage = refusal { _ = try RepoImport.stage(try RepoSource.parse(partial.root.path), paths: paths) } ?? ""
+        for key in ["extensions.partialclone", "remote.origin.promisor", "remote.origin.partialclonefilter"] {
+            #expect(partialMessage.contains(key), "\(partialMessage)")
+        }
+        #expect(GitWorkspace.importSourceRuns("core.repositoryformatversion", value: "2"))
+        #expect(!GitWorkspace.importSourceRuns("core.repositoryformatversion", value: "1"))
+        #expect(!GitWorkspace.importSourceRuns("remote.origin.url", value: "https://x"))
+        #expect(staleStaging(paths).isEmpty)
+    }
+
+    /// I1: the import's company mark carries a profile, and reading it never traps (a NULL profile from an earlier build reads
+    /// as unknown).
+    @Test func importMarkReadsWithoutTrapping() throws {
+        let src = try SourceRepo()
+        let (store, paths) = try home()
+        let (company, _, _) = try importCompany(try RepoSource.parse(src.root.path), store: store, paths: paths)
+        let mark = try #require(try store.companyLabTaint(companyId: company.id))
+        #expect(mark.source == "import: local" && mark.profile == company.permissionProfile.rawValue)
+        try store.writer.write { try $0.execute(sql: "UPDATE companyTaint SET profile = NULL WHERE companyId = ?", arguments: [company.id]) }
+        #expect(try store.companyLabTaint(companyId: company.id)?.profile == "unknown")
+        _ = try RepoImport.trust(store: store, paths: paths, companyId: company.id)
+        #expect(try store.companyLabTaint(companyId: company.id) != nil)
+    }
+
+    /// M1: the import's git never reads the owner's home (no `~/.netrc`, no XDG config): it runs with an empty engine home.
+    @Test func importGitUsesAnEmptyHome() throws {
+        let dir = try tempDir()
+        var git = GitCommand(gitDir: dir.appending(path: ".git"), workTree: dir, commonDir: nil)
+        let plainEnv = git.environment()
+        #expect(plainEnv["HOME"] == ProcessInfo.processInfo.environment["HOME"])
+        git.homeDirectory = dir.appending(path: "home")
+        let env = git.environment()
+        #expect(env["HOME"] == dir.appending(path: "home").path && env["XDG_CONFIG_HOME"] == dir.appending(path: "home").path)
+    }
+
+    @Test(.enabled(if: HTTPSFixture.available)) func httpsSendsNoCredentials() throws {
+        let src = try SourceRepo()
+        let serverRoot = try tempDir()
+        _ = try src.bare(in: serverRoot)
+        let log = try tempDir().appending(path: "auth.log")
+        let server = try HTTPSFixture(serving: serverRoot, authLog: log)
+        defer { server.stop() }
+        let (_, paths) = try home()
+        let message = refusal { _ = try RepoImport.stage(try RepoSource.parse(server.url("auth/repo.git")), paths: paths, caFile: server.caFile) }
+        #expect(message?.hasPrefix("could not clone \(server.url("auth/repo.git")): ") == true, "\(message ?? "nil")")
+        #expect(!FileManager.default.fileExists(atPath: log.path), "no credentials were sent")
+        #expect(staleStaging(paths).isEmpty)
+        // The import's own home is gone afterwards.
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: paths.home.appending(path: "tmp").path)) ?? []
+        #expect(!leftovers.contains { $0.hasPrefix("import-home-") }, "\(leftovers)")
+    }
+
+    /// I2: what git captures from a hostile server is capped: a server that streams `remote:` lines without end is cut off
+    /// long before the import's timeout.
+    @Test(.enabled(if: HTTPSFixture.available)) func httpsChattyServerIsCutOff() throws {
+        let src = try SourceRepo()
+        let serverRoot = try tempDir()
+        _ = try src.bare(in: serverRoot)
+        let hook = try FakeTools.script("brahma-test-chatty-pack", "yes 'remote spam spam spam spam spam spam' >&2")
+        let server = try HTTPSFixture(serving: serverRoot, packObjectsHook: hook)
+        defer { server.stop() }
+        let (_, paths) = try home()
+        var limits = RepoImport.Limits.standard
+        limits.timeout = 60
+        let started = Date()
+        let message = refusal { _ = try RepoImport.stage(try RepoSource.parse(server.url("repo.git")), paths: paths, limits: limits,
+                                                         caFile: server.caFile) }
+        #expect(message?.contains("output passed") == true, "\(message ?? "nil")")
+        #expect(Date().timeIntervalSince(started) < 30, "cut off by the output cap, not the timeout")
+        #expect(staleStaging(paths).isEmpty)
+    }
+
+    /// C-T: trust shows what is being trusted (the source, the imported commit, the secret scan) and acts only when confirmed;
+    /// a new import of a trusted source is tainted again.
+    @Test func trustImportShowsTheImportAndNeedsConfirmation() throws {
+        let src = try SourceRepo(files: ["README.md": "hi\n", "config.txt": "AKIAABCDEFGHIJKLMNOP\n"])
+        let owner = try OwnerTestHome()
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--from-repo", src.root.path], home: owner.url).status == 0)
+        let store = try Store(path: ownerPaths(owner.url).database.path)
+        let company = try #require(try store.companies().first)
+        let ask = try #require(try store.asks(companyId: company.id).first { $0.kind == .info })
+        let preview = try brahma(["company", "trust-import", "Acme"], home: owner.url)
+        #expect(preview.status == 0, "\(preview.stderr)")
+        #expect(preview.stdout.contains("Imported from \(src.root.standardizedFileURL.path) at \(company.importedCommit?.prefix(7) ?? "?")"), "\(preview.stdout)")
+        #expect(preview.stdout.contains("Secret scan: 1 findings (Inbox \(ask.ref))"), "\(preview.stdout)")
+        #expect(preview.stdout.contains("--yes"), "\(preview.stdout)")
+        #expect(try store.importTaint(companyId: company.id) == "import: local", "nothing changed without --yes")
+        let agent = try #require(try store.agents(companyId: company.id).first)
+        #expect(try brahma(["company", "trust-import", "Acme", "--yes"], home: owner.url, env: ["BRAHMA_AGENT_ID": agent.id]).status != 0)
+        let done = try brahma(["company", "trust-import", "Acme", "--yes"], home: owner.url)
+        #expect(done.status == 0 && done.stdout.contains("trusted the imported repo"), "\(done.stdout) \(done.stderr)")
+        #expect(try store.importTaint(companyId: company.id) == nil)
+        // Importing the same repo again: the new company carries the mark.
+        #expect(try brahma(["company", "create", "Acme Two", "--goal", "g", "--from-repo", src.root.path], home: owner.url).status == 0)
+        let second = try #require(try store.companies().first { $0.name == "Acme Two" })
+        #expect(try store.importTaint(companyId: second.id) == "import: local")
+        let clean = try SourceRepo()
+        #expect(try brahma(["company", "create", "Beta", "--goal", "g", "--from-repo", clean.root.path], home: owner.url).status == 0)
+        let beta = try brahma(["company", "trust-import", "Beta"], home: owner.url)
+        #expect(beta.stdout.contains("Secret scan: no findings"), "\(beta.stdout)")
     }
 
     // MARK: CLI

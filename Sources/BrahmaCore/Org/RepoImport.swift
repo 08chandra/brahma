@@ -90,6 +90,18 @@ public enum RepoImport {
     public static let sizeMessage = "this repo is larger than 2 GB; Brahma v1 imports smaller repos"
     public static let lfsMessage = "this repo uses Git LFS, which Brahma v1 does not support"
     public static func filesMessage(_ cap: Int) -> String { "this repo has more than \(cap) files; Brahma v1 imports smaller repos" }
+    /// A tracked path under one of the engine's own top-level names or a `.git` (fix round 1, C1/S3).
+    public static func reservedMessage(_ name: String) -> String {
+        "this repo tracks \(Store.flat(name, max: 120)), a name Brahma reserves for its own files; remove it from the repo first"
+    }
+    /// A tracked symbolic link the import will not check out (fix round 1, S3).
+    public static func linkMessage(_ path: String, _ problem: String) -> String {
+        "this repo has a symbolic link \(Store.flat(path, max: 200)) that \(problem); Brahma v1 imports no such link"
+    }
+    /// A folder whose `.git` is not a plain repository git resolves to itself (fix round 1, S2).
+    public static func notARepositoryMessage(_ shown: String) -> String {
+        "\(Store.flat(shown, max: 300)) is not a plain git repository (its .git needs HEAD, objects and refs, and git must find it there); import a fresh clone instead"
+    }
 
     public static let scanTitle = "The imported repo may contain secrets"
     public static let scanQuestion = "Rotate or remove these before deploying:"
@@ -102,6 +114,8 @@ public enum RepoImport {
     public struct Limits: Sendable, Equatable {
         public var maxBytes: Int64
         public var maxFiles: Int
+        /// Seconds per network or checkout step (`cloneTimeout`).
+        public var timeout: TimeInterval = TimeInterval(RepoImport.cloneTimeout.components.seconds)
         public init(maxBytes: Int64, maxFiles: Int) { self.maxBytes = maxBytes; self.maxFiles = maxFiles }
         public static let standard = Limits(maxBytes: RepoImport.maxBytes, maxFiles: RepoImport.maxFiles)
     }
@@ -145,8 +159,7 @@ public enum RepoImport {
     }
 
     static func clone(_ src: RepoSource, into workspace: URL, paths: BrahmaPaths, limits: Limits, caFile: URL?) throws -> ImportedRepository {
-        let caps = ImportCaps(maxBytes: limits.maxBytes, maxFiles: limits.maxFiles,
-                              timeout: TimeInterval(cloneTimeout.components.seconds))
+        let caps = ImportCaps(maxBytes: limits.maxBytes, maxFiles: limits.maxFiles, timeout: limits.timeout)
         // Never into (and so never removing) something that is already there.
         var st = stat()
         guard lstat(workspace.path, &st) != 0 else { throw RepoImportError(message: "\(workspace.path) already exists") }
@@ -235,7 +248,44 @@ public enum RepoImport {
         return Onboarding(spike: spike, assignee: assignee, scanAsk: scanAsk, findings: findings.count, commits: staged.commits)
     }
 
+    // MARK: Off the cooperative pool
+
+    /// The import's own blocking threads (fix round 1, I3): the app runs `stage`, the company's creation and `onboard` here,
+    /// never on a Swift concurrency worker (a minutes-long fetch would stall the in-process engine).
+    static let blocking = Blocking(maxConcurrent: 2)
+
+    /// Runs `body` on one of the import's blocking threads.
+    public static func offPool<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await blocking.tryRun(body)
+    }
+
     // MARK: Trust
+
+    /// What the owner is asked to trust (C-T 1): the source and imported commit, and the secret scan's result; nil when the
+    /// company carries no import mark.
+    public static func trustSummary(store: Store, companyId: String) throws -> [String]? {
+        guard let company = try store.company(id: companyId), let mark = try store.importTaint(companyId: companyId) else { return nil }
+        let commit = company.importedCommit.map { String($0.prefix(7)) } ?? "an unrecorded commit"
+        var lines = ["Imported from \(company.importedFrom ?? "an unrecorded source") at \(commit) (\(mark))."]
+        let scan = try store.asks(companyId: companyId).first { $0.requesterId == "system" && $0.requestId == "import-secret-scan" }
+        if let scan {
+            lines.append("Secret scan: \(findingCount(scan)) findings (Inbox \(scan.ref)).")
+        } else {
+            lines.append("Secret scan: no findings.")
+        }
+        lines.append("Trusting it lets every agent's high-risk tools work again on content from this repo.")
+        return lines
+    }
+
+    /// How many findings a scan ask lists (`- <finding>` lines, and `- and N more`).
+    static func findingCount(_ ask: Ask) -> Int {
+        var count = 0
+        for line in (ask.payload?.details ?? "").split(separator: "\n") where line.hasPrefix("- ") {
+            let text = line.dropFirst(2)
+            if text.hasPrefix("and "), text.hasSuffix(" more"), let n = Int(text.dropFirst(4).dropLast(5)) { count += n } else { count += 1 }
+        }
+        return count
+    }
 
     /// The owner's end of the import mark (`brahma company trust-import`): under the engine lock (the engine stopped) and with
     /// no turn of the company recorded as running, `Store.trustImport`. Returns the mark's source, or nil when none stood.

@@ -247,7 +247,10 @@ public final class Store: Sendable {
                 throw StoreError.gitRequired(detail)
             }
             do {
-                if let staged { try Store.markImported(db, companyId: company.id, source: staged.source.taintSource, now: createdAt) }
+                if let staged {
+                try Store.markImported(db, companyId: company.id, source: staged.source.taintSource,
+                                       profile: company.permissionProfile.rawValue, now: createdAt)
+            }
                 try Store.insertChannel(db, companyId: company.id, name: "general", kind: .channel, members: ["owner"], now: createdAt)
             } catch {
                 // The insert rolls back; an adopted import does not stay behind as a workspace no company owns.

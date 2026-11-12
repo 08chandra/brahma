@@ -353,11 +353,14 @@ extension Store {
     /// with source `import: <host>`. While it stands every work turn of the company is tainted at launch with that source
     /// (`TurnContext.relayedTaint`), and no lab commit there records clean. The owner ends it like any company mark
     /// (`brahma lab clear-taint <company>`, `clearCompanyLabTaint`).
-    static func markImported(_ db: Database, companyId: String, source: String, now: Date) throws {
+    /// `profile`: the company's profile when it was imported (fix round 1, I1: never NULL).
+    static func markImported(_ db: Database, companyId: String, source: String, profile: String = PermissionProfile.sandboxed.rawValue,
+                             now: Date) throws {
         try db.execute(sql: """
-            INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, ?, NULL, ?)
-            ON CONFLICT(companyId) DO UPDATE SET source = excluded.source, markedAt = excluded.markedAt
-            """, arguments: [companyId, Store.flat(source, max: 200), now])
+            INSERT INTO companyTaint (companyId, source, profile, markedAt) VALUES (?, ?, ?, ?)
+            ON CONFLICT(companyId) DO UPDATE SET source = excluded.source, markedAt = excluded.markedAt,
+              profile = COALESCE(companyTaint.profile, excluded.profile)
+            """, arguments: [companyId, Store.flat(source, max: 200), profile, now])
     }
 
     /// The owner trusts an imported repo (`brahma company trust-import`, owner shell only; never a company tool): work turns are
@@ -401,7 +404,8 @@ extension Store {
         try writer.read { db in
             try Row.fetchOne(db, sql: "SELECT source, profile, markedAt FROM companyTaint WHERE companyId = ? AND source IS NOT NULL",
                              arguments: [companyId])
-                .map { (source: $0["source"], profile: $0["profile"], markedAt: $0["markedAt"]) }
+                // A NULL profile (an import mark from before fix round 1) reads as unknown, never as a trap (I1).
+                .map { (source: $0["source"], profile: ($0["profile"] as String?) ?? "unknown", markedAt: $0["markedAt"]) }
         }
     }
 

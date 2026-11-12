@@ -45,6 +45,36 @@ import BrahmaCore
         #expect(form.validate() == "Name is required")
     }
 
+    /// Fix round 1 (I3): the model imports off the cooperative pool and onboards; a cancelled import creates nothing.
+    @Test func createCompanyImportsARepo() async throws {
+        let (store, paths) = try makeHome()
+        let model = AppModel(store: store, paths: paths)
+        await model.load()
+        let repo = try tempDir()
+        for args in [["init", "--quiet", "-b", "trunk"], ["commit", "--quiet", "--allow-empty", "-m", "one"]] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            p.arguments = ["git", "-C", repo.path, "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"] + args
+            p.environment = ProcessInfo.processInfo.environment.merging(["GIT_CONFIG_GLOBAL": "/dev/null"]) { _, n in n }
+            try p.run(); p.waitUntilExit()
+        }
+        var form = CompanyForm(name: "Acme", goal: "Ship", agentCount: 6)
+        form.source = .repo(repo.path)
+        let company = try await model.createCompany(form)
+        #expect(company.importedFrom == repo.standardizedFileURL.path && company.importedCommit != nil)
+        #expect(try store.workItems(companyId: company.id).contains { $0.title == RepoImport.surveyTitle })
+        #expect(try store.importTaint(companyId: company.id) == "import: local")
+        // Cancelled before the company exists: nothing is created and nothing is left in the staging area.
+        var other = form
+        other.name = "Cancelled"
+        let task = Task { try await model.createCompany(other) }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(try store.companies().map(\.name) == ["Acme"])
+        let staging = paths.workspaces.appending(path: RepoImport.stagingDirName)
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? []).isEmpty)
+    }
+
     @Test func previewMatchesGenerator() throws {
         let catalog = PackCatalog.builtin
         let pack = try #require(catalog.pack("software"))

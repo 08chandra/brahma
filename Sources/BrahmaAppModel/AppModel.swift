@@ -399,12 +399,16 @@ public final class AppModel {
         let source: RepoSource?
         if case .repo(let text) = form.source { source = try RepoSource.parse(text) } else { source = nil }
         let paths = self.paths
-        let company = try await Task.detached { () -> Company in
+        // Task 14: the engine's own fetch, refused (size, file count, LFS, reserved names, links) before the company exists. It
+        // and everything after it run on the import's blocking threads, never on the cooperative pool (fix round 1, I3); a
+        // task cancelled before the company is created creates nothing and leaves nothing staged.
+        try Task.checkCancellation()
+        let staged = try await RepoImport.offPool { try source.map { try RepoImport.stage($0, paths: paths) } }
+        if Task.isCancelled { staged?.discard(); throw CancellationError() }
+        let company = try await RepoImport.offPool { () -> Company in
+            defer { staged?.discard() }
             // The seat budget follows the plan tier (`Store.seatBudget()`); the rest of the shape waits as vacancies.
             let seats = store.seatBudget()
-            // Task 14: the engine's own fetch, refused (size, file count, LFS) before the company exists.
-            let staged = try source.map { try RepoImport.stage($0, paths: paths) }
-            defer { staged?.discard() }
             var company = try store.createCompany(name: name, goal: goal, workspacesRoot: root, packId: packId, importing: staged)
             if count > 0, let pack = store.catalog.pack(packId) {
                 let plan = try OrgGenerator.generate(goal: goal, count: count, pack: pack)
@@ -414,7 +418,7 @@ public final class AppModel {
             if let staged { _ = try RepoImport.onboard(store: store, company: company, staged: staged) }
             if mode != company.usageMode { company = try store.updateCompany(id: company.id) { $0.usageMode = mode } }
             return company
-        }.value
+        }
         await selectCompany(company.id)
         return company
     }

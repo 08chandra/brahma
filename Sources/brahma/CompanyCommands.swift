@@ -98,7 +98,7 @@ struct CompanyGroup: ParsableCommand {
                 print(safe("Imported \(staged.source.importedFrom) at \(staged.head.prefix(7)) (\(commits)); \(survey)"))
                 if let ask = done.scanAsk { print("Secret scan: \(done.findings) findings, see Inbox \(ask.ref).") }
                 print(safe("Everything imported is outside content: every work turn here runs with its high-risk tools off until you "
-                           + "have read the survey and trust the repo (brahma company trust-import \(c.slug))."))
+                           + "have read the survey and trust the repo (brahma company trust-import \(c.slug) --yes)."))
             }
         }
     }
@@ -107,15 +107,26 @@ struct CompanyGroup: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "trust-import",
             abstract: "Trust an imported repo (owner only), after you have read it or its survey.",
-            discussion: "Until then every work turn of the company is tainted at launch (its high-risk tools are off: decisions, "
-                + "owner requests, sprint plans, preview, smoke and deploy config, deploy proposals). Trusting ends every tainted "
-                + "session; agents' labs stay marked until 'brahma lab clear-taint'. Stop the engine first.")
+            discussion: "Until then every turn of the company is tainted at launch (its high-risk tools are off: decisions, "
+                + "owner requests, sprint plans, preview, smoke and deploy config, deploy proposals, review verdicts). Without "
+                + "--yes it shows what you would trust (the source, the imported commit, the secret scan) and changes nothing. "
+                + "Trusting ends every tainted session; agents' labs stay marked until 'brahma lab clear-taint'. Stop the engine "
+                + "first. A new import is tainted again.")
         @Argument(help: "Company name or slug.") var company: String
+        @Flag(help: "Trust it now (otherwise only show what would be trusted).") var yes = false
 
         func run() throws {
             try requireOwnerShell()
             let (store, paths) = try openStore()
             let c = try resolveCompany(store, company)
+            guard let summary = try RepoImport.trustSummary(store: store, companyId: c.id) else {
+                print(safe("\(c.name) carries no import mark")); return
+            }
+            for line in summary { print(safe(line)) }
+            guard yes else {
+                print(safe("Nothing changed. To trust it: brahma company trust-import \(c.slug) --yes"))
+                return
+            }
             let source: String?
             do { source = try RepoImport.trust(store: store, paths: paths, companyId: c.id) }
             catch let e as LabProvenance.ClearRefused { throw fail("refused: \(e.message)") }
