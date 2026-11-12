@@ -589,6 +589,93 @@ struct SeatbeltRunnerTests {
         #expect(outcome.exitCode != 0); #expect(text.contains("not permitted"), "\(text)")
     }
 
+    /// A harmless, read-only invocation of each denied executable (never one that changes system state).
+    static let harmlessArguments: [String: String] = [
+        "/usr/bin/osascript": "-e 'return 1'", "/usr/bin/open": "-h", "/bin/launchctl": "version", "/usr/bin/security": "help",
+        "/usr/bin/sudo": "-n true", "/usr/sbin/screencapture": "-h", "/usr/bin/crontab": "-l", "/usr/bin/at": "-l",
+        "/usr/bin/tmutil": "version",
+    ]
+
+    /// Copy-and-rename bypass of the path-literal exec deny (security review of b334c09). A sandboxed command copies a
+    /// denied Apple tool into its writable dir and runs the copy. Seatbelt cannot stop this: it has no filter on the exec
+    /// TARGET's code signature (`signing-identifier` on `process-exec` matches the calling process, probed). What stops it is
+    /// AMFI: every platform binary carries a launch constraint that it run from the sealed system volume, so the copy is
+    /// SIGKILLed at exec ("Launch Constraint Violation"), `/bin/echo` as much as `tmutil`. This test pins that premise: if a
+    /// macOS release drops the constraint, it fails, and the deny list needs another lever. It checks that the death is the
+    /// SIGKILL (exit 137), not an argument error, and that the original path is still refused by Seatbelt.
+    @Test func copiesOfDeniedExecutablesAreKilledAtExec() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        var script = ""
+        for path in SeatbeltProfile.deniedExecutables {
+            let args = try #require(Self.harmlessArguments[path], "no harmless invocation for \(path)")
+            let name = (path as NSString).lastPathComponent
+            script += "\(path) \(args) >/dev/null 2>&1; echo \"orig \(name) rc=$?\"\n"
+            // sudo is mode 4111 (unreadable): it cannot be copied at all.
+            if path == "/usr/bin/sudo" { script += "cp \(path) ./c-\(name) 2>/dev/null; echo \"cp \(name) rc=$?\"\n"; continue }
+            script += "cp \(path) ./c-\(name) && ./c-\(name) \(args); echo \"copy \(name) rc=$?\"\n"
+        }
+        // The marker is computed by the shell, so the "Killed: 9" line (which repeats the command) never contains it.
+        script += "cp /bin/echo ./c-echo && ./c-echo ECHO-$((40+2))-RAN; echo \"copy echo rc=$?\"\n"
+        let (_, text) = try await Self.run(script + " 2>&1", Self.policy(writable: [w]))
+        for path in SeatbeltProfile.deniedExecutables {
+            let name = (path as NSString).lastPathComponent
+            #expect(text.contains("orig \(name) rc=126"), "\(path) was not refused at exec by Seatbelt: \(text)")
+            if path == "/usr/bin/sudo" { #expect(!text.contains("cp \(name) rc=0"), "sudo could be copied: \(text)"); continue }
+            #expect(text.contains("copy \(name) rc=137"), "the copy of \(path) was not SIGKILLed at exec: \(text)")
+        }
+        #expect(text.contains("Killed: 9"), "\(text)")
+        // Not our deny: an undenied platform binary's copy dies the same way (the launch constraint).
+        #expect(text.contains("copy echo rc=137") && !text.contains("ECHO-42-RAN"), "\(text)")
+    }
+
+    static var rosettaAvailable: Bool {
+        FileManager.default.fileExists(atPath: "/Library/Apple/usr/libexec/oah/libRosettaRuntime")
+            && FileManager.default.isExecutableFile(atPath: "/usr/bin/lipo")
+    }
+
+    /// The copy route that DOES run: thin a denied tool to its x86_64 slice (Rosetta) and ad-hoc re-sign it. Seatbelt
+    /// cannot stop it (positive control: such a copy of `/bin/echo` runs in the writable dir), and a command could build
+    /// the same code itself. What the copy loses is what the deny protects. Restricted entitlements cannot ride on an ad-hoc
+    /// signature (AMFI kills a re-signed `tmutil` that keeps them), and setuid does not survive `cp` (`crontab`, `at`). The
+    /// Keychain stays out of reach (`security`, mach-lookup deny).
+    /// NOT asserted here, open gaps (see the commit): a re-signed `osascript` still delivers Apple events, and a re-signed
+    /// `launchctl` still talks to launchd.
+    @Test(.enabled(if: rosettaAvailable, "no Rosetta"))
+    func reSignedCopiesOfDeniedExecutablesLoseTheirPrivilege() async throws {
+        let h = try Self.homeDir(); defer { Self.remove(h) }
+        let w = try Self.mkdir(h.appending(path: "w"))
+        let env = ["DEVELOPER_DIR": Toolchain.developerDir, "PATH": "/usr/bin:/bin"]
+        func thin(_ tool: String, as name: String, keepEntitlements: Bool = false) throws {
+            let out = w.appending(path: name).path
+            let l = try Self.outside("/usr/bin/lipo", ["-thin", "x86_64", tool, "-output", out], environment: env)
+            try #require(l.status == 0, "lipo \(tool): \(l.output)")
+            let c = try Self.outside("/usr/bin/codesign", ["-f", "-s", "-"]
+                + (keepEntitlements ? ["--preserve-metadata=entitlements"] : []) + [out], environment: env)
+            try #require(c.status == 0, "codesign \(tool): \(c.output)")
+        }
+        try thin("/bin/echo", as: "r-echo")
+        try thin("/usr/bin/tmutil", as: "r-tmutil-ent", keepEntitlements: true)
+        try thin("/usr/bin/security", as: "r-security")
+        try thin("/usr/bin/crontab", as: "r-crontab")
+        try thin("/usr/bin/at", as: "r-at")
+        let ent = try Self.outside("/usr/bin/codesign", ["-d", "--entitlements", "-", w.appending(path: "r-tmutil-ent").path])
+        try #require(ent.output.contains("com.apple.private"), "the re-signed tmutil did not keep its entitlements: \(ent.output)")
+        let script = """
+        ./r-echo RESIGNED-$((40+2))-RAN; echo "echo rc=$?"
+        ./r-tmutil-ent version; echo "tmutil-ent rc=$?"
+        ./r-security list-keychains; echo "security rc=$?"
+        ./r-crontab -l; echo "crontab rc=$?"
+        ./r-at -l; echo "at rc=$?"
+        """
+        let (_, text) = try await Self.run(script + " 2>&1", Self.policy(writable: [w]))
+        #expect(text.contains("RESIGNED-42-RAN") && text.contains("echo rc=0"), "writable-dir exec was blocked: \(text)")
+        #expect(text.contains("tmutil-ent rc=137") && !text.contains("tmutil version 4"), "an ad-hoc tmutil kept its entitlements: \(text)")
+        #expect(!text.contains(".keychain"), "the Keychain was reachable: \(text)")
+        #expect(text.contains("crontab: seteuid: Operation not permitted") && !text.contains("crontab rc=0"), "\(text)")
+        #expect(text.contains("at: setregid failed: Operation not permitted") && !text.contains("at rc=0"), "\(text)")
+    }
+
     /// B-I3: each run gets its own HOME, CARGO_HOME and XDG_CACHE_HOME under its TMPDIR (thrown away with it), so config a
     /// check plants there cannot run in a later check; only the npm cache is shared, and only when the policy gives a shared
     /// cache. A merge check (one writable entry) gets no shared cache: its npm cache is per-run too.

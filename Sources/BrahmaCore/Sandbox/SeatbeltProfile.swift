@@ -63,6 +63,15 @@ public enum SeatbeltProfile {
     // command's writable area that the profile otherwise does not stop. Mounting such a snapshot to read a denied path is
     // separately blocked (`mount_apfs -s` is a client-side `mount(2)`, caught by `file-mount`), so this is a side-effect /
     // persistence concern, not a path-read escape; denying the entitled CLI closes the demonstrated route.
+    //
+    // Copies (security review of b334c09, probed on macOS 26.2): the deny is by path, and Seatbelt has no filter on the
+    // exec TARGET's code signature. `(signing-identifier …)` on `process-exec` compiles but matches the CALLING process (it
+    // stopped /bin/sh exec'ing bash, and never the named tool), so it is not used. A plain `cp` of any of these is still
+    // refused: AMFI launch constraints SIGKILL a platform binary run off the sealed system volume. An x86_64-thinned,
+    // ad-hoc re-signed copy does run (Rosetta), but it carries no restricted entitlement (AMFI kills it if it keeps one) and no
+    // setuid. Its capability is then the same as code the command builds itself, which only the resource rules (mach-lookup,
+    // file, network) contain. Pinned by `copiesOfDeniedExecutablesAreKilledAtExec` and
+    // `reSignedCopiesOfDeniedExecutablesLoseTheirPrivilege`.
     static let deniedExecutables = ["/usr/bin/osascript", "/usr/bin/open", "/bin/launchctl", "/usr/bin/security", "/usr/bin/sudo",
                                     "/usr/sbin/screencapture", "/usr/bin/crontab", "/usr/bin/at", "/usr/bin/tmutil"]
 
