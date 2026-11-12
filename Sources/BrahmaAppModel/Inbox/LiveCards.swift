@@ -63,9 +63,48 @@ public struct HumanTaskForm: Equatable, Sendable {
         self.values = values; self.editedPost = editedPost
     }
 
+    /// The form for `card` from the card's field values (empty ones left out; the post only when the card has one). Every
+    /// secret field's entry is removed from `values` each time, whether the form later validates or not, so a pasted key is
+    /// not kept in view state longer than the submit (constraint: secrets are not held in view state).
+    public static func make(_ card: HumanTaskCard, values: inout [String: String], editedPost: String?) -> HumanTaskForm {
+        let form = HumanTaskForm(values: values.filter { !$0.value.isEmpty }, editedPost: card.postText == nil ? nil : editedPost)
+        for field in card.fields where field.isSecret { values[field.name] = nil }
+        return form
+    }
+
     public func validate(_ card: HumanTaskCard) -> String? {
         let task = HumanTask(template: nil, title: card.title, steps: card.steps, links: card.links, fields: card.fields)
         do { _ = try Store.checkedValues(task, values) } catch let e as WorkError { return e.message } catch { return "\(error)" }
         return nil
     }
+}
+
+/// What the Inbox shows for a pending `deploy` or `humanTask` ask whose live card can't be built (I3): never the generic card,
+/// whose Approve would skip the exact commands and the main-health gate.
+public enum LiveCardFallback: Equatable, Sendable {
+    /// A deploy ask without its release record: read-only, Reject only.
+    case deployUnavailable
+    /// A human task whose payload doesn't parse: Can't do… only (the core decline does not read the payload).
+    case humanTaskUnreadable
+
+    /// nil when the row has its card, isn't pending, or is another kind (the generic card applies).
+    public static func `for`(row: InboxRow, deployCard: DeployCard?, humanTaskCard: HumanTaskCard?) -> LiveCardFallback? {
+        guard row.section == .pending else { return nil }
+        switch row.kind {
+        case .deploy: return deployCard == nil ? .deployUnavailable : nil
+        case .humanTask: return humanTaskCard == nil ? .humanTaskUnreadable : nil
+        default: return nil
+        }
+    }
+
+    public func title(ref: String) -> String {
+        switch self {
+        case .deployUnavailable: "DEPLOY · \(ref): release record unavailable"
+        case .humanTaskUnreadable: "HUMAN TASK · \(ref): task details unreadable"
+        }
+    }
+
+    public var canApprove: Bool { false }
+    public var canReject: Bool { self == .deployUnavailable }
+    public var canDecline: Bool { self == .humanTaskUnreadable }
 }

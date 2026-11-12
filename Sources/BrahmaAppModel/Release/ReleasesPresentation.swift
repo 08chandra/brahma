@@ -26,7 +26,7 @@ public struct ReleaseRow: Equatable, Identifiable, Sendable {
     public var statusTitle: String
     /// sha7.
     public var commit: String
-    /// The production URL, else the deploy URL, else "—".
+    /// The production URL, else the deploy URL, else "—" (agent-controlled: provider output).
     public var url: String
     /// The deploy smoke's status, uppercased, or "—".
     public var smoke: String
@@ -41,6 +41,10 @@ public struct ReleaseRow: Equatable, Identifiable, Sendable {
     public var canRollBack: Bool
     /// The recorded rollback commands, exactly as the owner approved them.
     public var rollbackDisplay: String
+    /// The URL's host, lowercased, or "—": what the table and inspector show (links render as host + Open).
+    public var urlHost: String = "—"
+    /// The URL when it is https with a host; nil otherwise (Open is https only).
+    public var openURL: URL?
 }
 
 public enum ReleaseRows {
@@ -59,8 +63,20 @@ public enum ReleaseRows {
                               commit: rel.sha7, url: rel.productionURL ?? rel.deployURL ?? "—",
                               smoke: rel.smokeStatus?.uppercased() ?? "—", proposer: "@" + (handles[rel.proposedById] ?? rel.proposedById),
                               when: f.string(from: rel.createdAt), rollbackTitle: rel.rollbackStatus.map(rollbackTitle),
-                              status: rel.status, canRollBack: can, rollbackDisplay: rel.rollbackPlan.display)
+                              status: rel.status, canRollBack: can, rollbackDisplay: rel.rollbackPlan.display,
+                              urlHost: host(rel.productionURL ?? rel.deployURL) ?? "—", openURL: https(rel.productionURL ?? rel.deployURL))
         }
+    }
+
+    static func host(_ s: String?) -> String? {
+        guard let s, let c = URLComponents(string: s), ["http", "https"].contains(c.scheme?.lowercased() ?? ""),
+              let host = c.host?.lowercased(), !host.isEmpty else { return nil }
+        return host
+    }
+
+    static func https(_ s: String?) -> URL? {
+        guard let s, let url = URL(string: s), url.scheme?.lowercased() == "https", host(s) != nil else { return nil }
+        return url
     }
 
     static func rollbackTitle(_ s: RollbackStatus) -> String {

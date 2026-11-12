@@ -55,6 +55,18 @@ enum ReleaseFixtures {
         #expect(rows[0].canRollBack && rows[0].rollbackTitle == "ROLLBACK FAILED")
     }
 
+    @Test func releaseURLShowsHostAndOpensHTTPSOnly() throws {
+        var snap = ReleasesSnapshot.empty
+        snap.releases = [try ReleaseFixtures.release(4, .deployed) { $0.productionURL = "https://Acme.pages.dev/x?y=1" },
+                         try ReleaseFixtures.release(3, .deployed) { $0.deployURL = "http://acme.example/" },
+                         try ReleaseFixtures.release(2, .deployed) { $0.deployURL = "javascript:alert(1)" },
+                         try ReleaseFixtures.release(1, .proposed)]
+        let rows = ReleaseRows.make(snap, handles: [:])
+        #expect(rows.map(\.urlHost) == ["acme.pages.dev", "acme.example", "—", "—"])
+        #expect(rows[0].openURL?.absoluteString == "https://Acme.pages.dev/x?y=1")
+        #expect(rows[1].openURL == nil && rows[2].openURL == nil && rows[3].openURL == nil)
+    }
+
     @Test func mainHealthTitles() throws {
         let head = "abc1234def5678"
         var snap = ReleasesSnapshot.empty
