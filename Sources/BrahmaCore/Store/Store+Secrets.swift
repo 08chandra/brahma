@@ -441,6 +441,10 @@ extension Store {
         set { redactor.lazyLoader = newValue }
     }
 
+    /// `text` with every loaded secret redacted, for the owner's terminal (`brahma canary run`); nil when the secrets cannot be
+    /// loaded (the caller withholds the text).
+    public func redactedForDisplay(_ text: String) -> String? { try? redact(text) }
+
     func redact(_ text: String?) throws -> String? {
         guard let text else { return nil }
         return try redact(text)

@@ -195,6 +195,8 @@ brahma why <company>                                        why little or nothin
 brahma perf facts <company>                                 outcome facts of finished items
 brahma main accept <company> [<ref>]                        after main changed outside Brahma, or a quarantine
 brahma doctor                                               probe the installed Claude Code CLI
+brahma canary edit                                          write the sandbox canary's probe lines ($EDITOR, default vi)
+brahma canary run                                           run the sandbox canary now; records a pass
 ```
 
 ### Workspace profile limits
@@ -283,10 +285,23 @@ brahma network <company> local on|off             whether agents may listen on l
 brahma network <company> toolchain add|rm <path>  an extra read-only toolchain path
 ```
 
-**Sandbox checks.** `brahma doctor` reports `sandbox-backend`, `sandbox-canary` and `sandbox-helpers`. Before a sandboxed
-turn starts, its CLI build and turn shape must have passed the sandbox canary; until then the agent waits and you get a
-sandbox-check alert. The canary's probe content is not written yet (see the residual risks), so sandboxed companies stay
-blocked for now; Workspace and Full companies run.
+**Sandbox checks.** `brahma doctor` reports `sandbox-backend`, `sandbox-canary-local`, `sandbox-canary` and
+`sandbox-helpers`. Before a sandboxed turn starts, its CLI build, turn shape and your canary probe file must have passed
+the sandbox canary; until then the agent waits and you get a sandbox-check alert naming the reason (missing file, no
+probes, probe line N failed, a leak). Workspace and Full companies run.
+
+The canary is a self-test whose probes are yours: `brahma canary edit` opens `<data home>/canary/probes.txt` (created
+with header comments only; a regular file you own, mode 0600, never a link), one shell command per line, each expected
+to be DENIED. Probes refer to `$CANARY_HOME_FILE`, `$CANARY_DATA_FILE`, `$CANARY_OUTSIDE_DIR` and `$OTHER_AGENT_LAB`,
+places where Brahma plants a dummy `BRAHMA-CANARY-<uuid>` token for the run (passed as environment variables, never
+spliced into the command). Every probe runs twice: model-free, through a throwaway agent's shell prefix inside Brahma's
+Seatbelt sandbox (10 s each, after a positive control that must succeed), then in one small haiku turn under the real
+compiled settings (budget- and time-capped), judged only from its raw stream: each probe's tool result must be an
+error or a non-zero exit, a probe the model did not run fails, no stream line may contain the token, the Read of the
+home token must be a permission denial, and the session's tools must be the expected ones. A probe passes only if it
+was denied and printed no token. A line ending in `# helper` is warn-only (`sandbox-helpers`). The file's SHA-256 is
+part of the canary key, so any edit needs a new pass: `brahma canary run` runs both layers now, prints each line's
+verdict, exit status and redacted output, and records the pass; the engine also runs it when a sandboxed agent waits.
 
 **Grants and presets.** An agent that needs more asks with `request_access` (a Bash domain, a WebFetch domain or a
 directory to read). You decide; a grant takes effect from the agent's next turn.
@@ -397,7 +412,7 @@ next turn until it releases the item or the item is done. Every other secret is 
 - The git pre-commit hook is advisory; the engine's submit- and merge-time scans are the real check.
 - Agent turns can write files in your user temp folder, because xcrun needs its cache file there.
 - Keychain asks once per app build to allow access.
-- **The sandbox canary's probe content is pending the owner.** Sandboxed companies stay blocked until the owner writes it.
+- **The sandbox canary checks only what your probe lines ask.** Sandboxed companies stay blocked until you write them (`brahma canary edit`) and they pass; the canary is as thorough as the probes.
   Ultra's V-9 gate is pending for the same reason.
 - **Other Seatbelt mount routes** beyond the known DiskArbitration and `mount_*` routes (both denied and tested) have not
   been exhaustively reviewed. This is a human-review item.
