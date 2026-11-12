@@ -161,7 +161,8 @@ struct HumanTaskCardView: View {
     }
 
     private func done() {
-        let form = HumanTaskForm(values: values.filter { !$0.value.isEmpty }, editedPost: card.postText == nil ? nil : editedPost)
+        // Secret entries leave `values` here, whether the form validates or not (not kept in view state).
+        let form = HumanTaskForm.make(card, values: &values, editedPost: editedPost)
         if let message = form.validate(card) {
             validation = message
             return
