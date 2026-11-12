@@ -70,6 +70,10 @@ public enum CompanySecurity {
         "ownerReserve": "spend pacing", "ultraShare": "spend cap; each Ultra run still needs the owner's approval",
         "mainCommit": "re-adopted by the restore marker (S1), which raises the main alert on any other head",
         "pendingMainCommit": "as mainCommit", "autoMergeCount": "a counter", "cadence": "sprint completion rule",
+        // Plan L (Task 5): the smoke check is agent-set (ops roles), runs sandboxed, and a deploy still needs the owner's approval
+        // plus a passing run at the release commit; the red-main bug id is engine bookkeeping.
+        "smokeCheck": "agent-set check command, not an owner switch; deploys still need the owner and a passing run",
+        "smokeCheckSetById": "who set the smoke check", "redBugItemId": "engine bookkeeping for the red-main bug",
     ]
 
     /// The restored company with every security-relevant field at the stricter of the two, and what that changed.
