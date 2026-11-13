@@ -21,8 +21,18 @@ extension Store {
     /// `removeMemoryDoc` is the one removal path.
     @discardableResult
     func ingest(db: Database, _ doc: MemoryIngestDoc, now: Date) throws -> Int64 {
-        let title = String(Self.flattened(try redact(doc.title)).prefix(MemoryPolicy.maxTitleChars))
-        let body = String(try redact(doc.body).prefix(MemoryPolicy.maxBodyChars))
+        var redacted = doc
+        redacted.title = try redact(doc.title)
+        redacted.body = try redact(doc.body)
+        return try Self.ingestRedacted(db: db, redacted, now: now)
+    }
+
+    /// `ingest(db:_:now:)` for a doc whose title and body are already redacted text (an episode built from a stored turn
+    /// summary, which `endTurn` redacted): the same flattening, caps and upsert, without the store's redactor.
+    @discardableResult
+    static func ingestRedacted(db: Database, _ doc: MemoryIngestDoc, now: Date) throws -> Int64 {
+        let title = String(Self.flattened(doc.title).prefix(MemoryPolicy.maxTitleChars))
+        let body = String(doc.body.prefix(MemoryPolicy.maxBodyChars))
         let readerSet = try doc.readerSet.map { try Self.json($0.sorted()) }
         let restrictions = try Self.json(doc.restrictions.map { $0.sorted() })
         let values: [String: (any DatabaseValueConvertible)?] = [

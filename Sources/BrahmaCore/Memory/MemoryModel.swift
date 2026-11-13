@@ -143,3 +143,63 @@ enum MemoryRefs {
 
     private static func isNumber<S: StringProtocol>(_ s: S) -> Bool { !s.isEmpty && s.allSatisfy { $0.isASCII && $0.isNumber } }
 }
+
+// MARK: Memory entries
+
+/// `semantic`: a fact an agent chose to `remember` (Task 3). `episodic`: what the engine recorded about a finished turn or item.
+public enum MemoryEntryKind: String, Codable, Sendable, DatabaseValueConvertible {
+    case semantic, episodic
+}
+
+public enum MemoryEntryType: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
+    case fact, preference, howto, person, decision, episode
+}
+
+/// One remembered fact or recorded episode (`memoryEntry`), shown as `mem:<number>` and indexed as a `memory` doc.
+public struct MemoryEntry: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "memoryEntry"
+
+    public var id: String
+    public var companyId: String
+    /// Per company, from 1.
+    public var number: Int
+    public var kind: MemoryEntryKind
+    public var type: MemoryEntryType
+    public var key: String?
+    public var fact: String
+    /// `MemoryEntry.factHash(fact)`.
+    public var factHash: String
+    public var accessKind: String
+    public var accessId: String?
+    public var confidence: Double = 0.7
+    public var confirmations: Int = 0
+    /// An agent id, `"owner"` or `"system"` (episodes).
+    public var authorId: String
+    public var itemId: String?
+    public var turnId: String?
+    /// `Provenance.raw`.
+    public var provenance: String
+    public var tainted: Bool = false
+    public var taintReason: String?
+    public var contradictsId: String?
+    public var contradictedById: String?
+    public var inheritedFromId: String?
+    public var expiresActive: Double?
+    public var createdAt: Date
+    public var confirmedAt: Date?
+    public var removedAt: Date?
+    public var purgedAt: Date?
+
+    public var ref: String { "mem:\(number)" }
+    public var access: AccessClass? { AccessClass(kind: accessKind, id: accessId) }
+
+    /// `StableHash` of the NFC-lowercased, whitespace-collapsed fact: equal facts, however spaced or cased, hash equal.
+    public static func factHash(_ fact: String) -> String {
+        StableHash.fnv1a64(Store.flattened(fact.precomposedStringWithCanonicalMapping.lowercased()))
+    }
+
+    /// The next free number in the company (in the caller's write transaction).
+    static func nextNumber(db: Database, companyId: String) throws -> Int {
+        (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM memoryEntry WHERE companyId = ?", arguments: [companyId]) ?? 0) + 1
+    }
+}

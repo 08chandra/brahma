@@ -41,7 +41,8 @@ public final class Store: Sendable {
     let planBarrierOutputLimit = GitOutputLimit()
     /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
     let lifecycleObservers: [any AgentLifecycleObserver]
-    /// Called inside the transaction that completes an item (`completeItem`). The outcome-facts observer is always first.
+    /// Called inside the transaction that completes an item (`completeItem`). The outcome-facts observer is always first, the
+    /// episode recorder (Plan ML) second.
     let observers: [any WorkItemObserver]
     /// Secret values the engine knows, redacted from any agent- or tool-produced text before it is stored. Reloaded by
     /// `reloadRedactorIfNeeded(vault:)`; until its first complete load (when the database had secrets at open) every
@@ -58,7 +59,7 @@ public final class Store: Sendable {
                 observers: [any WorkItemObserver] = [], backupsDir: URL? = nil) throws {
         self.catalog = catalog
         self.lifecycleObservers = lifecycleObservers
-        self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
+        self.observers = [OutcomeFactsObserver(catalog: catalog), EpisodeObserver(catalog: catalog)] + observers
         dataHome = URL(fileURLWithPath: path).deletingLastPathComponent()
         var config = Configuration()
         config.busyMode = .timeout(Self.busyTimeout)
@@ -99,7 +100,7 @@ public final class Store: Sendable {
                  observers: [any WorkItemObserver]) throws {
         self.catalog = catalog
         self.lifecycleObservers = lifecycleObservers
-        self.observers = [OutcomeFactsObserver(catalog: catalog)] + observers
+        self.observers = [OutcomeFactsObserver(catalog: catalog), EpisodeObserver(catalog: catalog)] + observers
         dataHome = nil
         writer = queue
         try Migrations.migrator().migrate(writer)
