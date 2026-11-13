@@ -1339,6 +1339,11 @@ enum Migrations {
             }
             try db.create(index: "memoryRead_doc", on: "memoryRead", columns: ["companyId", "docId"])
         }
+        m.registerMigration("vML-ingest") { db in
+            // Plan ML Task 2: the message cursor reads `(createdAt, id) > cursor` per company on every tick; without this index
+            // that is a scan of every message.
+            try db.create(index: "message_company_created", on: "message", columns: ["companyId", "createdAt", "id"], ifNotExists: true)
+        }
     }
 
     /// Plan 4b migrations: registered after every Plan L migration, never inside `registerPlan5` or `registerPlanL`, in landing order

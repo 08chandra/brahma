@@ -215,6 +215,8 @@ public actor Orchestrator {
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
         self.checkBaseEnvironment = checkBaseEnvironment
+        // Plan ML: a restore resets the company's memory cursors, a full idempotent re-scan on the next ticks.
+        restoreHooks.register(afterRestore: { event in try MemoryIngest.resetCursors(store: store, companyId: event.companyId) })
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -507,6 +509,12 @@ public actor Orchestrator {
             guard active - (lastLiveness[c.id] ?? -.infinity) >= Liveness.scanInterval else { continue }
             lastLiveness[c.id] = active
             attempt { try store.sweepLiveness(companyId: c.id, now: now) }
+        }
+
+        // Company memory (Plan ML): new messages, items, asks, decisions, hand-offs and retros are indexed from restore-safe
+        // cursors. Held by the owner's stop (caught up on resume) and while secrets are unloaded (ingest redacts, fail closed).
+        if stopped == nil, !store.secretsHeld {
+            for c in companies { attempt { try MemoryIngest.run(store: store, companyId: c.id, paths: paths, now: now) } }
         }
 
         // Audits of auto-merges (9c): every waiting sample is routed to an auditor (a cheap read when there is nothing to do).
@@ -1445,7 +1453,7 @@ public actor Orchestrator {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
                                       deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use,
-                                      telemetry: telemetry, now: now)
+                                      telemetry: telemetry, taintHome: paths.home, now: now)
         }
         // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
         // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.
@@ -1699,6 +1707,7 @@ extension Store {
     /// `--session-id`, the role prompt and the orientation), the turn is recorded `failed` with `sessionResetReason`, and the
     /// agent is `ready` again at once: no backoff, `consecutiveFailures` unchanged, the inbox undelivered. Budgets, the watchdog
     /// and facts ignore the turn. `sessionUse`: the session the turn ran in, noted for the next turn's warm and size rules.
+    /// `taintHome`: the data home whose taint flag files the episode's taint reads (nil: the store's own).
     ///
     /// A failure whose error text classifies as network/account is recorded `failed` with `infra = true`: the agent
     /// goes back to `ready` with no backoff, `consecutiveFailures` is unchanged and the inbox stays undelivered.
@@ -1707,7 +1716,7 @@ extension Store {
     @discardableResult
     func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], deliveredNoticeIds: [Int64] = [],
                  sessionReset: SessionScope? = nil, sessionUse: SessionUse? = nil, telemetry: TurnTelemetry = TurnTelemetry(),
-                 now: Date) throws -> InfraClass {
+                 taintHome: URL? = nil, now: Date) throws -> InfraClass {
         try writer.write { db in
             var summary: String?
             var cost: Double?
@@ -1759,6 +1768,17 @@ extension Store {
                                           model: use.model, tools: use.tools, cwd: use.cwd)
             }
             if closed, let cost { try Store.recordSpend(db, cost) }
+            // Plan ML: the turn's episode, before any fresh-session reset (the orchestrator's `clearTaintIfRequested` runs after
+            // this transaction), with the session's taint as it stands now. Never fails the turn end.
+            if closed, let ended = try? Turn.fetchOne(db, key: turn.id) {
+                let taint: String?
+                do { taint = try Store.currentTaint(db: db, agentId: agentId, home: taintHome ?? dataHome) } catch { taint = "session" }
+                // The turn's item, else the item the agent holds.
+                let itemKey = try? String.fetchOne(db, sql: """
+                    SELECT key FROM workItem WHERE id = COALESCE(?, (SELECT itemId FROM workLease WHERE agentId = ? ORDER BY acquiredAt DESC LIMIT 1))
+                    """, arguments: [ended.itemId, agentId])
+                try? EpisodeRecorder.turnEnded(db: db, turn: ended, agent: agent, itemKey: itemKey, taint: taint, now: now)
+            }
             var watchdogBlock: Blocker?
             var budgeted = completed
             if case .failed(_, _, let partial) = end, partial != nil { budgeted = true }
