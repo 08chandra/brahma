@@ -542,6 +542,60 @@ private final class HTTPSFixture {
         #expect(GitWorkspace.importEntryProblem(path: "a/b", mode: "120000", target: "c", links: ["a/b"]) == nil, "inside the tree")
         #expect(GitWorkspace.importEntryProblem(path: "a/b", mode: "120000", target: "../c", links: ["a/b"])
                 == RepoImport.linkMessage("a/b", "has a `..` part in its target"))
+    }
+
+    /// Fix round 2 (S4, S3-residual): the link checks compare paths as the volume does (case-folded, composed), and a link may
+    /// not name its own directory, the checkout root, or a directory that holds other links.
+    @Test func importLinkChecksFoldNames() throws {
+        func problem(_ path: String, _ mode: String = "120000", _ target: String?, _ links: Set<String>) -> String? {
+            GitWorkspace.importEntryProblem(path: path, mode: mode, target: target, links: links)
+        }
+        // `Docs` is a link: `docs/x` (a file under it on a case-insensitive volume) and a link through `docs/x` are refused.
+        #expect(problem("docs/x", "100644", nil, ["Docs"]) == RepoImport.underLinkMessage("docs/x"))
+        #expect(problem("deep", "120000", "docs/x", ["Docs", "deep"]) == RepoImport.linkMessage("deep", "passes through a symbolic link"))
+        // The same with composed and decomposed spellings of É.
+        #expect(problem("Cafe\u{301}/menu", "100644", nil, ["Caf\u{E9}"]) == RepoImport.underLinkMessage("Cafe\u{301}/menu"))
+        #expect(problem("deep", "120000", "CAFE\u{301}/menu", ["caf\u{E9}", "deep"])
+                == RepoImport.linkMessage("deep", "passes through a symbolic link"))
+        // `.` and the checkout root.
+        #expect(problem("self", "120000", ".", ["self"]) == RepoImport.linkMessage("self", "names its own directory or the checkout root"))
+        #expect(problem("docs/here", "120000", "./", ["docs/here"]) == RepoImport.linkMessage("docs/here", "names its own directory or the checkout root"))
+        // A directory that holds other links.
+        #expect(problem("alias", "120000", "Sub", ["alias", "sub/inner"]) == RepoImport.linkMessage("alias", "points at a directory that holds other links"))
+        // The residual case: `Alias -> .` and `deep -> alias/.brahma/hooks`.
+        #expect(problem("Alias", "120000", ".", ["Alias", "deep"]) != nil)
+        #expect(problem("deep", "120000", "alias/.brahma/hooks", ["Alias", "deep"]) != nil)
+        // A plain relative link stays fine.
+        #expect(problem("readme", "120000", "docs/README.md", ["readme"]) == nil)
+    }
+
+    /// Fix round 2 (S4) end to end: a link named `Alias` to `.` with a link through `alias/` is refused before checkout.
+    @Test func importRefusesCaseFoldedLinkTrees() throws {
+        let (_, paths) = try home()
+        let src = try SourceRepo()
+        try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: "Alias").path, withDestinationPath: ".")
+        try FileManager.default.createSymbolicLink(atPath: src.root.appending(path: "deep").path, withDestinationPath: "alias/README.md")
+        try src.git(["add", "-A"]); try src.git(["commit", "--quiet", "-m", "links"])
+        let message = refusal { _ = try RepoImport.stage(try RepoSource.parse(src.root.path), paths: paths) }
+        #expect(message?.contains("symbolic link") == true, "\(message ?? "nil")")
+        #expect(staleStaging(paths).isEmpty)
+    }
+
+    /// Fix round 2 (S2-b): a repository hidden at `<folder>/.git/.git` (a directory or a gitfile) is refused; the fetch is
+    /// strict, so git never serves a probed suffix instead of the scanned repository.
+    @Test func importRefusesANestedGitDir() throws {
+        let (_, paths) = try home()
+        let inner = try SourceRepo(files: ["secret.txt": "inner\n"])
+        let nestedDir = try SourceRepo()
+        try FileManager.default.copyItem(at: inner.root.appending(path: ".git"), to: nestedDir.root.appending(path: ".git/.git"))
+        let dirMessage = refusal { _ = try RepoImport.stage(try RepoSource.parse(nestedDir.root.path), paths: paths) }
+        #expect(dirMessage == RepoImport.notARepositoryMessage(nestedDir.root.standardizedFileURL.path), "\(dirMessage ?? "nil")")
+        let nestedFile = try SourceRepo()
+        try "gitdir: \(inner.root.appending(path: ".git").path)\n".write(to: nestedFile.root.appending(path: ".git/.git"), atomically: true, encoding: .utf8)
+        let fileMessage = refusal { _ = try RepoImport.stage(try RepoSource.parse(nestedFile.root.path), paths: paths) }
+        #expect(fileMessage == RepoImport.notARepositoryMessage(nestedFile.root.standardizedFileURL.path), "\(fileMessage ?? "nil")")
+        #expect(staleStaging(paths).isEmpty)
+        #expect(GitWorkspace.importUploadPack == "--upload-pack=git-upload-pack --strict")
         // A plain relative link inside the checkout is fine.
         let ok = try SourceRepo()
         try FileManager.default.createSymbolicLink(atPath: ok.root.appending(path: "readme-link").path, withDestinationPath: "README.md")
@@ -616,9 +670,20 @@ private final class HTTPSFixture {
         let server = try HTTPSFixture(serving: serverRoot, authLog: log)
         defer { server.stop() }
         let (_, paths) = try home()
-        let message = refusal { _ = try RepoImport.stage(try RepoSource.parse(server.url("auth/repo.git")), paths: paths, caFile: server.caFile) }
+        // A stand-in for the owner's real home with credentials for the server in `~/.netrc` (and a git credential store):
+        // the import's git must read none of it (fix round 2: this goes RED without the empty import home).
+        let ownerHome = try tempDir()
+        try "machine 127.0.0.1 login owner password hunter2\n".write(to: ownerHome.appending(path: ".netrc"), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: ownerHome.appending(path: ".netrc").path)
+        try "https://owner:hunter2@127.0.0.1\n".write(to: ownerHome.appending(path: ".git-credentials"), atomically: true, encoding: .utf8)
+        var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = ownerHome.path
+        let message = refusal {
+            _ = try RepoImport.stage(try RepoSource.parse(server.url("auth/repo.git")), paths: paths, caFile: server.caFile,
+                                     baseEnvironment: environment)
+        }
         #expect(message?.hasPrefix("could not clone \(server.url("auth/repo.git")): ") == true, "\(message ?? "nil")")
-        #expect(!FileManager.default.fileExists(atPath: log.path), "no credentials were sent")
+        #expect(!FileManager.default.fileExists(atPath: log.path), "no credentials were sent: \((try? String(contentsOf: log, encoding: .utf8)) ?? "")")
         #expect(staleStaging(paths).isEmpty)
         // The import's own home is gone afterwards.
         let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: paths.home.appending(path: "tmp").path)) ?? []

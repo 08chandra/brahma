@@ -98,6 +98,10 @@ public enum RepoImport {
     public static func linkMessage(_ path: String, _ problem: String) -> String {
         "this repo has a symbolic link \(Store.flat(path, max: 200)) that \(problem); Brahma v1 imports no such link"
     }
+    /// A tracked path under a directory that is a symbolic link of the same tree, as the volume compares names (fix round 2, S4).
+    public static func underLinkMessage(_ path: String) -> String {
+        "this repo tracks \(Store.flat(path, max: 200)) under a symbolic link; Brahma v1 imports no such tree"
+    }
     /// A folder whose `.git` is not a plain repository git resolves to itself (fix round 1, S2).
     public static func notARepositoryMessage(_ shown: String) -> String {
         "\(Store.flat(shown, max: 300)) is not a plain git repository (its .git needs HEAD, objects and refs, and git must find it there); import a fresh clone instead"
@@ -158,14 +162,16 @@ public enum RepoImport {
         return (repo.head, repo.branch)
     }
 
-    static func clone(_ src: RepoSource, into workspace: URL, paths: BrahmaPaths, limits: Limits, caFile: URL?) throws -> ImportedRepository {
+    /// `baseEnvironment`: tests only, the environment the import's git starts from (a stand-in for the owner's home).
+    static func clone(_ src: RepoSource, into workspace: URL, paths: BrahmaPaths, limits: Limits, caFile: URL?,
+                      baseEnvironment: [String: String]? = nil) throws -> ImportedRepository {
         let caps = ImportCaps(maxBytes: limits.maxBytes, maxFiles: limits.maxFiles, timeout: limits.timeout)
         // Never into (and so never removing) something that is already there.
         var st = stat()
         guard lstat(workspace.path, &st) != 0 else { throw RepoImportError(message: "\(workspace.path) already exists") }
         do {
             return try GitWorkspace.importRepository(src.transport, shown: src.importedFrom, into: workspace, caps: caps,
-                                                     tempRoot: gitTemp(paths), caFile: caFile)
+                                                     tempRoot: gitTemp(paths), caFile: caFile, baseEnvironment: baseEnvironment)
         } catch let refusal as RepoImportError {
             remove(workspace)
             throw refusal
@@ -190,11 +196,12 @@ public enum RepoImport {
     }
 
     /// `caFile`: tests only (a loopback https server's certificate).
-    static func stage(_ src: RepoSource, paths: BrahmaPaths, limits: Limits = .standard, caFile: URL?) throws -> Staged {
+    static func stage(_ src: RepoSource, paths: BrahmaPaths, limits: Limits = .standard, caFile: URL?,
+                      baseEnvironment: [String: String]? = nil) throws -> Staged {
         let area = paths.workspaces.appending(path: stagingDirName, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: area, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let dir = area.appending(path: UUID().uuidString, directoryHint: .isDirectory)
-        let repo = try clone(src, into: dir, paths: paths, limits: limits, caFile: caFile)
+        let repo = try clone(src, into: dir, paths: paths, limits: limits, caFile: caFile, baseEnvironment: baseEnvironment)
         return Staged(source: src, directory: dir, head: repo.head, branch: repo.branch, upstreamHead: repo.upstreamHead,
                       shallow: repo.shallow, commits: repo.commits)
     }

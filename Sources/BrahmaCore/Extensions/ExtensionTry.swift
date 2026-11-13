@@ -22,6 +22,8 @@ public struct ExtensionTryResult: Equatable, Sendable {
     /// The redacted transcript, relative to the data home (`TranscriptCapture.captureDevRun`); nil when none was captured.
     public var transcript: String?
     public var problem: String?
+    /// The taint source the trial ran under (Plan L Task 14 fix round 2: an imported company the owner has not trusted), or nil.
+    public var taint: String? = nil
 }
 
 public enum ExtensionTry {
@@ -146,6 +148,7 @@ public enum ExtensionTry {
                      "skills: \(r.skills.isEmpty ? "(none reported)" : r.skills.map { Store.flat($0, max: 120) }.joined(separator: ", "))",
                      "tools used: \(r.tools.isEmpty ? "(none)" : r.tools.map { Store.flat($0, max: 80) }.joined(separator: ", "))",
                      "transcript: \(r.transcript ?? "not captured")"]
+        if let t = r.taint { lines.append("taint: \(Store.flat(t, max: 120)) (the company's imported repo is not trusted yet)") }
         if let p = r.problem { lines.append("note: \(Store.flat(p, max: 400))") }
         if let t = r.text { lines.append("reply: \(Store.flat(t, max: 2000))") }
         return lines.joined(separator: "\n")
@@ -273,6 +276,13 @@ extension Orchestrator {
         }
         let settingsText = try TurnProfileCompiler.settingsJSON(compiled)
         try await blocking.tryRun { try SettingsFile.write(settingsText, to: settingsFile) }
+        // Plan L Task 14 fix round 2 (S1-ext): a trial in an imported company the owner has not trusted reads the imported tree,
+        // so it runs tainted with the import's source, through the same flag file its hooks read (removed in `cleanUp`).
+        let importTaint = try store.importTaint(companyId: company.id)
+        if let importTaint {
+            let written = await blocking.run { TaintFlag.write(home: paths.home, agentId: agent.id, source: importTaint) }
+            guard written else { throw ExtensionError.message("could not mark the trial as reading the imported repo; it did not run") }
+        }
 
         var state = TurnStreamState()
         var skills: [String] = [], tools: [String] = []
@@ -312,7 +322,8 @@ extension Orchestrator {
         else { outcome = "failed" }
         return ExtensionTryResult(extId: devId, handle: agent.name, role: agent.role, outcome: outcome, costUSD: result?.costUSD,
                                   skills: skills, tools: tools, text: result?.text, transcript: transcript,
-                                  problem: problem ?? (outcome == "failed" ? (result?.text ?? "claude exited without a result") : nil))
+                                  problem: problem ?? (outcome == "failed" ? (result?.text ?? "claude exited without a result") : nil),
+                                  taint: importTaint)
     }
 }
 

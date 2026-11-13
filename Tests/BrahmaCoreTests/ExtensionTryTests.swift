@@ -102,6 +102,33 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(ExtensionTry.summary(result).contains("demo@dev"))
     }
 
+    /// Plan L Task 14 fix round 2 (S1-ext): an owner's trial in an imported company the owner has not trusted runs tainted with
+    /// the import's source (its flag file is in place for the turn's hooks), and the result says so.
+    @Test func tryInAnImportedCompanyIsTainted() async throws {
+        let w = try TryWorld()
+        try await w.store.writer.write { try Store.markImported($0, companyId: w.company.id, source: "import: example.com", now: Date()) }
+        final class Flag: @unchecked Sendable { let lock = NSLock(); var source: String?; var path: String? }
+        let flag = Flag()
+        let session = "try-session"
+        w.world.fake.defaultScript = FakeTurnRunner.Script(events: [
+            .initialized(sessionId: session, model: "haiku"),
+            .result(TurnResult(isError: false, subtype: "success", text: "ok", costUSD: 0.01, apiErrorStatus: nil, sessionId: session)),
+        ], sideEffect: { r in
+            guard let path = r.taintFlagFile else { return }
+            flag.lock.withLock { flag.path = path; flag.source = TaintFlag.source(URL(fileURLWithPath: path)) }
+        })
+        let result = try await w.run(try PluginFixture())
+        #expect(flag.lock.withLock { flag.source } == "import: example.com")
+        #expect(result.taint == "import: example.com")
+        #expect(ExtensionTry.summary(result).contains("import: example.com"))
+        let path = try #require(flag.lock.withLock { flag.path })
+        #expect(!FileManager.default.fileExists(atPath: path), "the trial's flag is removed afterwards")
+        // A company without the mark: no taint.
+        let plain = try TryWorld()
+        plain.script()
+        #expect(try await plain.run(try PluginFixture()).taint == nil)
+    }
+
     @Test func tryMountsDevCopyReadOnly() async throws {
         let w = try TryWorld()
         // An extension the role already mounts stays mounted next to the dev copy.

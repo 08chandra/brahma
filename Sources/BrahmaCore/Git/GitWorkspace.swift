@@ -113,6 +113,8 @@ struct GitCommand: Sendable {
     /// `HOME` and `XDG_CONFIG_HOME` for this git (an empty engine directory): nothing from the owner's home, such as
     /// `~/.netrc` credentials curl would send, reaches the import's network fetch (Task 14 fix round 1, M1).
     var homeDirectory: URL? = nil
+    /// Test seam: the environment `ChildEnvironment` filters (nil: this process's).
+    var baseEnvironment: [String: String]? = nil
     /// Called between a failed attempt (git met an `index.lock`) and its retry, before the retry is scanned again. Tests change
     /// the repository there instead of racing a timer.
     var beforeRetry: (@Sendable (_ attempt: Int) -> Void)? = nil
@@ -244,7 +246,7 @@ struct GitCommand: Sendable {
     }
 
     func environment() -> [String: String] {
-        var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        var env = ChildEnvironment.make(base: baseEnvironment ?? ProcessInfo.processInfo.environment, purpose: .general)
         env["GIT_DIR"] = gitDir.path
         env["GIT_WORK_TREE"] = workTree.path
         // Always pinned: without it git follows a `commondir` file in the git dir (the workspace's own `.git` included) to
@@ -3515,6 +3517,9 @@ struct ImportCaps: Sendable {
 }
 
 extension GitWorkspace {
+    /// The import's upload-pack for a folder (fix round 2, S2-b): `--strict`, so it serves exactly the scanned `<folder>/.git`
+    /// and never probes `<path>/.git` (a repository hidden at `<folder>/.git/.git`) first.
+    static let importUploadPack = "--upload-pack=git-upload-pack --strict"
     /// Where the fetched branch lands before `main` is set from it; deleted right after.
     static let importRef = "refs/brahma/import"
     /// The largest `ls-tree` listing the import's inspection reads; a longer one is over any file cap.
@@ -3539,11 +3544,12 @@ extension GitWorkspace {
     /// from the empty tree with the engine's override (no filter, so no LFS smudge), with hooks and fsmonitor off.
     /// `caFile`: tests only, a certificate the https fetch trusts (a loopback server's).
     static func importRepository(_ transport: ImportTransport, shown: String, into dir: URL, caps: ImportCaps, tempRoot: URL,
-                                 caFile: URL? = nil) throws -> ImportedRepository {
+                                 caFile: URL? = nil, baseEnvironment: [String: String]? = nil) throws -> ImportedRepository {
         let fm = FileManager.default
         try fm.createDirectory(at: dir, withIntermediateDirectories: false)
         var git = GitCommand(gitDir: dir.appending(path: ".git", directoryHint: .isDirectory), workTree: dir, commonDir: nil)
         git.tempRoot = tempRoot
+        git.baseEnvironment = baseEnvironment
         try git.run(["init", "--quiet", "--template="])
         try git.run(["symbolic-ref", "HEAD", Self.mainRef])
 
@@ -3564,7 +3570,7 @@ extension GitWorkspace {
             // The explicit `.git` (S2): never the folder itself, so git never probes for a repository around it.
             target = try resolveImportSource(source, shown: shown, with: git).path
             remote.allowsLocalFetch = true
-            options = ["--upload-pack=git-upload-pack"]
+            options = [Self.importUploadPack]
         case .https(let url):
             remote.allowsHTTPSFetch = true
             target = url.absoluteString
@@ -3648,6 +3654,7 @@ extension GitWorkspace {
         var attributes: [(object: String, size: Int64)] = []
         var sizes: [String: Int64] = [:]
         var links: [(path: String, object: String)] = []
+        var entries: [(path: String, mode: String)] = []
         for raw in listing.stdout.split(separator: 0, omittingEmptySubsequences: true) {
             guard let tab = raw.firstIndex(of: 0x09) else { continue }
             let fields = String(decoding: raw[raw.startIndex..<tab], as: UTF8.self).split(separator: " ", omittingEmptySubsequences: true)
@@ -3657,6 +3664,7 @@ extension GitWorkspace {
                 throw RepoImportError(message: problem)
             }
             if fields.count == 4, fields[0] == "120000" { links.append((path, String(fields[2]))) }
+            entries.append((path, fields.first.map(String.init) ?? ""))
             guard fields.count == 4, fields[1] == "blob" else { continue }
             let size = Int64(fields[3]) ?? 0
             files += 1
@@ -3667,14 +3675,19 @@ extension GitWorkspace {
         if files > caps.maxFiles { throw RepoImportError(message: RepoImport.filesMessage(caps.maxFiles)) }
         let gitBytes = EngineFiles.treeBytes(dir.appending(path: ".git", directoryHint: .isDirectory), stopAbove: caps.maxBytes)
         if bytes > caps.maxBytes || gitBytes > caps.maxBytes - bytes { throw RepoImportError(message: RepoImport.sizeMessage) }
-        // Symbolic links (S3): the rules for agents' commits, on the tree (no absolute target, no `..`, nothing through a link,
-        // nothing into `.git` or the engine's directories).
+        // Symbolic links (S3, S4): the rules for agents' commits, on the tree and with names folded as the volume folds them
+        // (no absolute target, no `..`, no `.`, nothing through a link or under one, nothing into `.git` or the engine's
+        // directories, no directory above other links).
         if !links.isEmpty {
             let targets = try importLinkTargets(git, objects: links.map(\.object))
-            let linkPaths = Set(links.map(\.path))
+            let index = ImportLinkIndex(links: links.map(\.path))
+            var linkTargets: [String: String] = [:]
             for (path, object) in links {
                 guard let target = targets[object] else { throw RepoImportError(message: RepoImport.linkMessage(path, "cannot be read")) }
-                if let problem = importEntryProblem(path: path, mode: "120000", target: target, links: linkPaths) {
+                linkTargets[path] = target
+            }
+            for entry in entries {
+                if let problem = importEntryProblem(path: entry.path, mode: entry.mode, target: linkTargets[entry.path], index: index) {
                     throw RepoImportError(message: problem)
                 }
             }
@@ -3704,15 +3717,56 @@ extension GitWorkspace {
     /// The largest symbolic-link target the import reads; a longer one is refused as odd.
     static let importLinkTargetLimit = 4096
 
-    /// Why one tree entry of an import is refused (the message the owner reads), or nil. Any path whose first part is one of
-    /// the engine's own top-level names or whose any part is `.git`, by folded name (`isEngineName`, `foldedName`); for a
-    /// symbolic link (`120000`, with its `target`): an empty, NUL-holding or absolute target, a `..` part, a way that passes
-    /// through another link of the tree (`links`, the tree's link paths), or one that leads into `.git` or an engine name.
+    /// The import's symbolic links as the volume compares names (`foldedPath`), and every directory above one of them.
+    struct ImportLinkIndex {
+        let links: Set<String>
+        let ancestors: Set<String>
+        init<S: Sequence>(links raw: S) where S.Element == String {
+            var links = Set<String>(), ancestors = Set<String>()
+            for path in raw {
+                let folded = GitWorkspace.foldedPath(path)
+                links.insert(folded)
+                var prefix = ""
+                for part in folded.split(separator: "/").dropLast() {
+                    prefix = prefix.isEmpty ? String(part) : prefix + "/" + part
+                    ancestors.insert(prefix)
+                }
+            }
+            self.links = links
+            self.ancestors = ancestors
+        }
+    }
+
+    /// A tree path with every part folded (`foldedName`: case-folded, composed), as a case-insensitive, normalizing volume
+    /// compares it.
+    static func foldedPath(_ path: String) -> String {
+        path.split(separator: "/", omittingEmptySubsequences: true).map { foldedName(Array($0.utf8)) }.joined(separator: "/")
+    }
+
+    /// `importEntryProblem` with the tree's link paths (`links`) indexed here.
     static func importEntryProblem(path: String, mode: String, target: String?, links: Set<String>) -> String? {
+        importEntryProblem(path: path, mode: mode, target: target, index: ImportLinkIndex(links: links))
+    }
+
+    /// Why one tree entry of an import is refused (the message the owner reads), or nil. Names are compared folded (`foldedName`),
+    /// as the workspace's volume compares them (fix round 2, S4).
+    /// - Any path whose first part is one of the engine's own top-level names, or whose any part is `.git`.
+    /// - Any path under a directory that is itself a symbolic link of the tree (`Docs` a link, `docs/x` a file).
+    /// - For a symbolic link (`120000`, with its `target`): an empty, NUL-holding or over-long target; an absolute one; a `..`
+    ///   part; a target that names the link's own directory or the checkout root (`.`); a way into `.git` or an engine name;
+    ///   a way through another link of the tree; or a directory above other links of the tree.
+    static func importEntryProblem(path: String, mode: String, target: String?, index: ImportLinkIndex) -> String? {
         let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         guard let first = parts.first else { return RepoImport.reservedMessage(path) }
         if isEngineName(Array(first.utf8)) { return RepoImport.reservedMessage(first) }
         if let dotGit = parts.first(where: { foldedName(Array($0.utf8)) == ".git" }) { return RepoImport.reservedMessage(dotGit) }
+        if !index.links.isEmpty {
+            var prefix = ""
+            for part in parts.dropLast() {
+                prefix = prefix.isEmpty ? foldedName(Array(part.utf8)) : prefix + "/" + foldedName(Array(part.utf8))
+                if index.links.contains(prefix) { return RepoImport.underLinkMessage(path) }
+            }
+        }
         guard mode == "120000", let target else { return nil }
         let bytes = Array(target.utf8)
         guard !bytes.isEmpty, !bytes.contains(0), bytes.count <= importLinkTargetLimit else {
@@ -3721,14 +3775,18 @@ extension GitWorkspace {
         if bytes.first == UInt8(ascii: "/") { return RepoImport.linkMessage(path, "has an absolute target") }
         let targetParts = target.split(separator: "/", omittingEmptySubsequences: true).map(String.init).filter { $0 != "." }
         if targetParts.contains("..") { return RepoImport.linkMessage(path, "has a `..` part in its target") }
+        if targetParts.isEmpty { return RepoImport.linkMessage(path, "names its own directory or the checkout root") }
         let way = Array(parts.dropLast()) + targetParts
         if let top = way.first, isEngineName(Array(top.utf8)) || way.contains(where: { foldedName(Array($0.utf8)) == ".git" }) {
             return RepoImport.linkMessage(path, "points into .git or a name Brahma reserves")
         }
         var prefix = ""
         for part in way.dropLast() {
-            prefix = prefix.isEmpty ? part : prefix + "/" + part
-            if links.contains(prefix) { return RepoImport.linkMessage(path, "passes through a symbolic link") }
+            prefix = prefix.isEmpty ? foldedName(Array(part.utf8)) : prefix + "/" + foldedName(Array(part.utf8))
+            if index.links.contains(prefix) { return RepoImport.linkMessage(path, "passes through a symbolic link") }
+        }
+        if index.ancestors.contains(foldedPath(way.joined(separator: "/"))) {
+            return RepoImport.linkMessage(path, "points at a directory that holds other links")
         }
         return nil
     }
@@ -3807,7 +3865,9 @@ extension GitWorkspace {
         let dotGit = source.appending(path: ".git", directoryHint: .isDirectory)
         var st = stat()
         let head = lstat(dotGit.appending(path: "HEAD").path, &st) == 0 && st.st_mode & S_IFMT == S_IFREG
-        guard head, isRealDirectory(dotGit.appending(path: "objects")), isRealDirectory(dotGit.appending(path: "refs")) else {
+        // Nothing at `.git/.git` (S2-b): a repository or gitfile there is what a non-strict upload-pack would serve instead.
+        let nested = lstat(dotGit.appending(path: ".git").path, &st) == 0
+        guard head, !nested, isRealDirectory(dotGit.appending(path: "objects")), isRealDirectory(dotGit.appending(path: "refs")) else {
             throw RepoImportError(message: RepoImport.notARepositoryMessage(shown))
         }
         var probe = GitCommand(gitDir: dotGit, workTree: source, commonDir: nil)
