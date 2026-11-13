@@ -5,7 +5,7 @@ import BrahmaCore
 /// A company's hosting: `brahma hosting <company>` shows it; `brahma hosting set` (owner only) chooses the provider, project,
 /// account and production URL. The build, output folder and smoke checks are an ops agent's (`set_deploy_config`); the
 /// provider token is a secret (`brahma secret set <company> CLOUDFLARE_API_TOKEN` or `VERCEL_TOKEN`).
-struct HostingCommand: ParsableCommand {
+struct HostingCommand: AsyncParsableCommand {
     /// Agent text on one line, at most `max` characters (then `safe()` before printing).
     static func oneLine(_ s: String, max: Int) -> String {
         let flat = s.split(whereSeparator: \.isNewline).joined(separator: " ")
@@ -14,7 +14,7 @@ struct HostingCommand: ParsableCommand {
 
     static let configuration = CommandConfiguration(
         commandName: "hosting", abstract: "Show or set a company's hosting (Cloudflare Pages or Vercel).",
-        subcommands: [Show.self, Set.self], defaultSubcommand: Show.self)
+        subcommands: [Show.self, Set.self, Probe.self], defaultSubcommand: Show.self)
 
     struct Show: ParsableCommand {
         static let configuration = CommandConfiguration(commandName: "show", abstract: "Show a company's hosting.")
@@ -78,6 +78,30 @@ struct HostingCommand: ParsableCommand {
             }
             print("hosting for \(safe(selected.name)): \(s.provider.title) project \(safe(s.project))")
             if s.provider == .vercel { print("note: \(VercelAdapter.hobbyNote)") }
+        }
+    }
+
+    /// Plan L Task 15 (builder-check 9): the owner's live provider probe against Vercel, hidden and owner only. The owner's
+    /// explicit run is the approval; it needs the company's engine-held `VERCEL_TOKEN` (never argv, never printed) and account
+    /// ID, and refuses in an agent turn. Prints the verdict lines (redacted, the token pinned out) and the throwaway project.
+    struct Probe: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "probe",
+            abstract: "Owner only: deploy a throwaway marker page to Vercel to verify the CLI pin, hosts and output formats, then remove it.",
+            shouldDisplay: false)
+        @Argument(help: "Company name or slug (hosting provider vercel, VERCEL_TOKEN stored, account ID set).") var company: String
+
+        func run() async throws {
+            try requireOwnerShell()
+            let (store, paths) = try openStore()
+            let selected = try resolveCompany(store, company)
+            let report: ProviderProbe.Report
+            do {
+                report = try await ProviderProbe.run(store: store, paths: paths, companyId: selected.id,
+                                                     vault: try cliSecretVault(interactive: false))
+            } catch let e as WorkError { throw fail(e.message) }
+            for line in report.lines { print(safe(line)) }
+            if !report.ok { throw ExitCode.failure }
         }
     }
 }

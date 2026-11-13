@@ -289,6 +289,8 @@ import Glibc
         #expect(text.hasPrefix("HTTP/1.1 200 Connection established\r\n\r\n"), "\(text)")
         #expect(text.hasSuffix("PING-42"))
         #expect(proxy.deniedHosts.isEmpty)
+        // Task 15: a vetted, dialled host is logged (what the owner's provider probe reports as the hosts a CLI contacted).
+        #expect(proxy.allowedHosts == ["echo.example.com"])
     }
 
     /// A-M8: an IP literal never matches even when it is on the list (validation bypassed), and the host is resolved exactly

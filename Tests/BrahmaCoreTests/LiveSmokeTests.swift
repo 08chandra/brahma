@@ -278,4 +278,255 @@ struct LiveSmokeTests {
         #expect(await orchestrator.runningCount() == 0)
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
+
+    // MARK: Plan L Task 15 — goal → live URL
+
+    /// The running sum of `turn.costUSD` at which the live test stops everything and fails ("cost abort").
+    static let costAbortUSD = 20.0
+    /// The dummy hosting token the test's owner pastes into the `hosting-account` task (fake host; never a real credential).
+    static let fakeHostToken = "fake-host-token-NOT-A-REAL-SECRET-0001"
+
+    private func costs(_ store: Store, companyId: String) throws -> (total: Double, perAgent: [(name: String, usd: Double, turns: Int)], turns: [Turn]) {
+        let turns = try store.writer.read { db in
+            try Turn.filter(Column("companyId") == companyId).order(Column("startedAt")).fetchAll(db)
+        }
+        let agents = Dictionary(uniqueKeysWithValues: try store.agents(companyId: companyId).map { ($0.id, $0.name) })
+        var per: [String: (Double, Int)] = [:]
+        for t in turns {
+            let name = agents[t.agentId] ?? t.agentId
+            per[name, default: (0, 0)].0 += t.costUSD ?? 0
+            per[name, default: (0, 0)].1 += 1
+        }
+        let list = per.map { (name: $0.key, usd: $0.value.0, turns: $0.value.1) }.sorted { $0.usd > $1.usd }
+        return (turns.reduce(0) { $0 + ($1.costUSD ?? 0) }, list, turns)
+    }
+
+    /// The dogfood scorecard: every phase's $LE and owner touches, then the per-agent cost.
+    private func printScorecard(_ store: Store, companyId: String, title: String) throws {
+        let report = try CompanyMilestones.load(store: store, companyId: companyId, now: Store.now())
+        print("SCORECARD (\(title)):")
+        for line in report.lines(now: Store.now()) { print("  " + line) }
+        let c = try costs(store, companyId: companyId)
+        for a in c.perAgent { print(String(format: "  agent %@: $%.4f over %d turn(s)", a.name, a.usd, a.turns)) }
+        print(String(format: "  total turn cost $%.4f over %d turn(s)", c.total, c.turns.count))
+    }
+
+    /// Plan L Task 15: a real company goes from the goal to a live URL — `DemoSeed.live` (ceo/cto/devops on sonnet, eng on
+    /// haiku; never opus), tier max5x, Balanced, real turns, the live engine (previews, main smokes, the release executor with
+    /// the real sandbox), the test acting as the owner (gate approved, hosting task done, deploy approved, other tasks
+    /// declined, questions answered "Use your recommendation."), the cost abort at `costAbortUSD`, and the scorecard.
+    ///
+    /// FAKE HOST: the hosting "provider" is the dev host (PR-32: `LocalCopyHostingAdapter` copying the upload into a folder
+    /// under the data home, served on loopback by `DevHostServer`), reporting itself as the company's configured provider,
+    /// so every executor check runs unchanged; nothing contacts Cloudflare or Vercel. The owner-run Vercel probe
+    /// (`brahma hosting probe`, `ProviderProbe`) is what verifies a real provider.
+    @Test(.timeLimit(.minutes(60)))
+    func goalToLiveURL() async throws {
+        print("FAKE HOST: this run does not prove a Cloudflare or Vercel deploy (dev host on loopback; see `brahma hosting probe`)")
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        try store.setPlanTier(.max5x)
+        let mcp = try brahmaExecutable()
+        let runner = ClaudeProcessRunner(maxTurnDuration: .seconds(600))
+        var report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp)
+        // `tools-present` fails on Claude Code 2.1.322: a turn run with `--disable-slash-commands` (every turn without extension
+        // parts, F10) lists no `Skill` in its init tools, though the sandboxed `--tools` names it. The engine only raises an alert
+        // for a failing doctor at runtime; this test is about the path to live, so that one item is reported, not gating.
+        func gating(_ r: DoctorReport) -> [DoctorItem] { r.items.filter { $0.status == .fail && $0.name != "tools-present" } }
+        if !gating(report).isEmpty { report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp) }
+        for item in report.items where item.status != .pass { print("DOCTOR \(item.name)=\(item.status): \(item.detail)") }
+        #expect(gating(report).isEmpty, "doctor: \(report.items.map { "\($0.name)=\($0.status) \($0.detail)" })")
+        guard gating(report).isEmpty else { return }
+        try store.saveProbe(report)
+
+        // The company, as `brahma company create Lumen --demo live` makes it.
+        let (seeded, hostingTask) = try DemoSeed.live(store: store, paths: paths, name: "Lumen", goal: nil, log: { print("seed: \($0)") })
+        var company = try #require(try store.company(id: seeded.id))
+        company.usageMode = .balanced
+        company.ownerReserve = -1   // weekly pacing depends on the real account's usage; off for this test
+        try store.updateCompany(company)
+        // The temp data home has no sandbox-canary probes (`<home>/canary/probes.txt` is the owner's), so a Sandboxed turn could
+        // never start here: the turns run on the Workspace profile. Previews, smokes, builds and the deploy still run under the
+        // real Seatbelt sandbox (the engine's SandboxedRunner), which is what this test is about.
+        let userHome = root.appending(path: "user", directoryHint: .isDirectory)   // the home the sandbox patch protects: never the real one
+        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        try store.updateSandbox(companyId: company.id, SandboxPatch(profile: .workspace), userHome: userHome)
+        company = try #require(try store.company(id: company.id))
+        let companyId = company.id
+        let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+
+        // The fake host: a folder under the data home served on loopback; its adapter reports the configured provider.
+        let hosting = try #require(try store.hosting(companyId: companyId))
+        let hostRoot = paths.home.appending(path: "dev-host", directoryHint: .isDirectory)
+        try BrahmaPaths.ensurePrivateDirectory(hostRoot)
+        let hostDir = try EngineFiles.directory(workspace: hostRoot, company.slug, mode: 0o700)
+        let server = try DevHostServer(base: hostDir)
+        defer { server.stop() }
+        let tokenName = HostingAdapters.adapter(hosting.provider).tokenSecret
+        let adapter = LocalCopyHostingAdapter(id: hosting.provider, tokenSecret: tokenName, hostDir: hostDir, server: server.url)
+        let layout = try store.releaseLayout(companyId: companyId)
+        try BrahmaPaths.ensurePrivateDirectory(layout.root)
+        let bin = "tools/\(adapter.cli)/node_modules/.bin"
+        try EngineFiles.directory(workspace: layout.root, bin, mode: 0o700)
+        _ = try EngineFiles.create(Data("dev host: nothing to install (the deploy runs /bin/cp)\n".utf8), workspace: layout.root, dir: bin, name: adapter.cliBin)
+
+        // The owner does the hosting-account task with dummy values (the token goes to the in-memory vault, never a Keychain).
+        let vault = MemoryVault()
+        let accountId = hosting.provider == .cloudflarePages ? String(repeating: "0", count: 32) : "team_fake"
+        _ = try store.completeHumanTask(companyId: companyId, askId: hostingTask.id, values: [tokenName: Self.fakeHostToken, "account_id": accountId], vault: vault)
+        try store.reloadRedactorIfNeeded(vault: vault)
+        #expect(try store.hosting(companyId: companyId)?.accountId == accountId)
+
+        let proxies = EgressProxyPool()
+        let platform = SandboxRunners.platformDefault(baseline: { Orchestrator.checkBaseline(store: store, paths: paths) }, proxies: proxies)
+        let releaseDeps = ReleaseDependencies(sandbox: DevHostSandbox(base: platform, hostDir: hostDir), http: URLSessionHTTPProbe(),
+                                              adapters: { _ in adapter })
+        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps)
+        try await orchestrator.start()
+        let loop = Task { await orchestrator.runForever(interval: .seconds(2)) }
+        let started = AwakeTime.now
+        let deadline = started + .seconds(55 * 60)
+        var deployed: Release?
+        var costAbort: Double?
+        var touches: [String] = []
+        var seenAsks = Set<String>()
+        while AwakeTime.now < deadline {
+            // The owner.
+            for ask in try store.asks(companyId: companyId, statuses: [.pendingOwner]) {
+                guard seenAsks.insert(ask.id).inserted || ask.kind == .deploy || ask.kind == .prd || ask.kind == .architecture else { continue }
+                do {
+                    switch ask.kind {
+                    case .prd, .architecture, .deploy:
+                        _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+                        touches.append("approve \(ask.ref) (\(ask.kind.rawValue): \(ask.title))")
+                    case .humanTask:
+                        _ = try store.declineHumanTask(companyId: companyId, askId: ask.id, note: "not needed for this test")
+                        touches.append("decline \(ask.ref) (human task: \(ask.title))")
+                    case .info:
+                        _ = try store.ownerAnswer(askId: ask.id, text: "Use your recommendation.")
+                        touches.append("answer \(ask.ref) (\(ask.title))")
+                    default:
+                        // Anything else the owner would read and wave through (a sprint plan, a staffing or stage change).
+                        _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+                        touches.append("approve \(ask.ref) (\(ask.kind.rawValue): \(ask.title))")
+                    }
+                } catch let e as WorkError {
+                    // Settled between the read and the decision, or a kind this owner cannot settle this way: logged, never fatal.
+                    print("owner: \(ask.ref) (\(ask.kind.rawValue)) not decided: \(e.message)")
+                }
+            }
+            // The fake host serves whichever release is being deployed.
+            for release in try store.releases(companyId: companyId) where release.status.isOpen || release.status == .deployed {
+                server.serve(folder: release.ref)
+            }
+            // The cost abort (builder-check 10).
+            let total = try costs(store, companyId: companyId).total
+            if total >= Self.costAbortUSD { costAbort = total; break }
+            if let done = try store.releases(companyId: companyId).first(where: { $0.status == .deployed }) {
+                deployed = done
+                try await Task.sleep(for: .seconds(5))   // post-deploy bookkeeping and the running turn settle
+                break
+            }
+            try await Task.sleep(for: .seconds(2))
+        }
+        loop.cancel()
+        await loop.value   // cancels and awaits in-flight turns, checks, merges, smokes and releases
+        await orchestrator.previewRunner.stopAll()
+        await proxies.stopAll()
+
+        let dump = try store.events(afterId: 0).map(\.text).joined(separator: "\n")
+        print("OWNER TOUCHES (\(touches.count)):\n  " + touches.joined(separator: "\n  "))
+        if let costAbort {
+            try printScorecard(store, companyId: companyId, title: "cost abort")
+            Issue.record("cost abort at $\(String(format: "%.2f", costAbort))\nEvents:\n\(dump)")
+            return
+        }
+        guard let r1 = deployed else {
+            let stall = try store.stallReport(companyId: companyId)
+            print("STALL: running \(stall.running); reasons: \(stall.reasons.joined(separator: " | "))")
+            try printScorecard(store, companyId: companyId, title: "timed out")
+            let releases = try store.releases(companyId: companyId).map { "\($0.ref) \($0.status.rawValue) \($0.failedReason ?? "")" }
+            Issue.record("timed out after \(MilestoneReport.elapsed(Double((AwakeTime.now - started).components.seconds))) with no deployed release; releases: \(releases)\nStall: \(stall.reasons)\nEvents:\n\(dump)")
+            return
+        }
+        try printScorecard(store, companyId: companyId, title: "live")
+
+        // The gate: approved, titled "Brief & architecture" for this small company.
+        let gate = try #require(try store.asks(companyId: companyId).first { $0.kind == .prd && $0.status == .approved }, "no approved prd ask\n\(dump)")
+        #expect(try store.displayTitle(gate) == "Brief & architecture")
+
+        // At least one item merged to main.
+        let items = try store.workItems(companyId: companyId)
+        let merged = items.filter { $0.status == .done && $0.mergedCommit != nil }
+        #expect(!merged.isEmpty, "no done item with a mergedCommit\n\(dump)")
+        for item in merged {
+            _ = try GitFixture.plainGit(["merge-base", "--is-ancestor", item.mergedCommit!, "main"], in: ws)
+        }
+
+        // A web preview running, answering 200 with "Lumen".
+        let states = try store.previewStates(companyId: companyId)
+        let surfaces = try store.previewSurfaces(companyId: companyId)
+        let running = surfaces.first { $0.kind == PreviewKind.web.rawValue && states[$0.id]?.status == .running && states[$0.id]?.resolvedURL != nil }
+        #expect(running != nil, "no running web preview; surfaces: \(surfaces.map { "\($0.name) \(states[$0.id]?.status.rawValue ?? "-") \(states[$0.id]?.message ?? "")" })\n\(dump)")
+        let http = URLSessionHTTPProbe()
+        if let running, let url = states[running.id]?.resolvedURL.flatMap(URL.init(string:)) {
+            let answer = await http.send(method: "GET", url: url, body: nil, timeout: .seconds(10))
+            #expect(answer.status == 200, "preview \(url): \(answer.status.map(String.init) ?? "no status") \(answer.error ?? "")")
+            #expect(String(decoding: answer.body, as: UTF8.self).contains("Lumen"), "preview body lacks Lumen: \(String(decoding: answer.body.prefix(400), as: UTF8.self))")
+        }
+
+        // The smoke check set by an agent; a release-reason smoke run passed at R-1's commit.
+        company = try #require(try store.company(id: companyId))
+        #expect(company.smokeCheck != nil && company.smokeCheckSetById != nil, "no smoke check set by an agent")
+        let smokes = try store.mainSmokeRuns(companyId: companyId)
+        #expect(smokes.contains { $0.reason == .release && $0.status == .passed && $0.commit == r1.commit },
+                "no passed release smoke at \(r1.sha7): \(smokes.map { "\($0.reason.rawValue) \($0.status.rawValue) \($0.sha7)" })")
+
+        // R-1 deployed: on main, with a production URL, smoke passed, proposed by a devops or cto agent.
+        #expect(r1.ref == "R-1")
+        #expect(r1.status == .deployed)
+        _ = try GitFixture.plainGit(["merge-base", "--is-ancestor", r1.commit, "main"], in: ws)
+        let productionURL = try #require(r1.productionURL.flatMap(URL.init(string:)), "no productionURL")
+        #expect(r1.smokeStatus == "passed", "smokeStatus \(r1.smokeStatus ?? "nil")")
+        let proposer = try #require(try store.agent(id: r1.proposedById))
+        #expect(["devops", "cto-architect", "cto", "architect"].contains(proposer.role), "proposed by \(proposer.name) (\(proposer.role))")
+
+        // An independent GET of the production URL answers 200 with "Lumen".
+        let live = await http.send(method: "GET", url: productionURL, body: nil, timeout: .seconds(10))
+        #expect(live.status == 200, "GET \(productionURL): \(live.status.map(String.init) ?? "no status") \(live.error ?? "")")
+        #expect(String(decoding: live.body, as: UTF8.self).contains("Lumen"), "live body lacks Lumen: \(String(decoding: live.body.prefix(400), as: UTF8.self))")
+        print("LIVE URL (fake host): \(productionURL.absoluteString)")
+
+        // The backup ref and the release ref (PR-29: refs/brahma/releases/<version>, not a tag) name R-1's commit.
+        let backup = try GitFixture.plainGit(["rev-parse", GitWorkspace.mainBackupRef], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(backup == r1.commit, "main-backup \(backup) != \(r1.commit)")
+        let releaseRef = try GitFixture.plainGit(["rev-parse", try GitWorkspace.releaseRef(version: r1.version)], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(releaseRef == r1.commit, "release ref \(releaseRef) != \(r1.commit)")
+
+        // No opus turn; a cost reported; the total under the abort.
+        let c = try costs(store, companyId: companyId)
+        for agent in try store.agents(companyId: companyId) { #expect(!agent.model.contains("opus"), "\(agent.name) on \(agent.model)") }
+        #expect(!c.turns.contains { ($0.modelsUsed ?? "").lowercased().contains("opus") }, "an opus turn ran")
+        let priced = c.turns.filter { ($0.costUSD ?? 0) > 0 }
+        if priced.isEmpty {
+            let tokens = c.turns.map { "in \($0.inputTokens) out \($0.outputTokens) cacheRead \($0.cacheReadTokens) cacheCreate \($0.cacheCreationTokens)" }
+            print("TOKENS (no cost reported):\n  " + tokens.joined(separator: "\n  "))
+            Issue.record("no cost reported")
+        }
+        #expect(c.total < Self.costAbortUSD)
+
+        // The scorecard.
+        let milestones = try CompanyMilestones.load(store: store, companyId: companyId, now: Store.now())
+        let names = Set(milestones.milestones.map(\.name))
+        for name in ["goal", "prd", "architecture", "firstMerge", "firstPreview", "live"] {
+            #expect(names.contains(name), "milestone \(name) missing: \(milestones.milestones.map(\.name))")
+        }
+        #expect(milestones.totalTouches >= 2, "touches \(milestones.totalTouches)")
+
+        // Nothing of ours is left in flight.
+        #expect(await orchestrator.runningCount() == 0)
+        #expect(try !processExists(matching: root.path), "a claude/brahma/preview child process outlived the run")
+    }
 }

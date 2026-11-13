@@ -283,6 +283,8 @@ public final class EgressProxy: @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
     private var denied: [String] = []
+    /// Hosts let through so far (Plan L Task 15: what the owner's provider probe reports as the hosts a CLI contacted).
+    private var allowed: [String] = []
     private var active = 0
     private let acceptDone = DispatchSemaphore(value: 0)
 
@@ -325,6 +327,9 @@ public final class EgressProxy: @unchecked Sendable {
     /// Hosts refused so far (oldest first, at most `maxDeniedHosts`).
     public var deniedHosts: [String] { lock.withLock { denied } }
 
+    /// Hosts whose CONNECT was vetted and dialled (oldest first, at most `maxDeniedHosts`; one entry per connection).
+    public var allowedHosts: [String] { lock.withLock { allowed } }
+
     /// How many connections this proxy is serving now (tests).
     public var activeConnections: Int { lock.withLock { active } }
 
@@ -339,6 +344,14 @@ public final class EgressProxy: @unchecked Sendable {
     }
 
     private var isStopped: Bool { lock.withLock { stopped } }
+
+    private func permit(_ host: String) {
+        let shown = String(host.unicodeScalars.filter { $0.value > 0x20 && $0.value < 0x7f }.map(Character.init).prefix(255))
+        lock.withLock {
+            allowed.append(shown)
+            if allowed.count > Self.maxDeniedHosts { allowed.removeFirst(allowed.count - Self.maxDeniedHosts) }
+        }
+    }
 
     private func deny(_ host: String) {
         let shown = String(host.unicodeScalars.filter { $0.value > 0x20 && $0.value < 0x7f }.map(Character.init).prefix(255))
@@ -457,6 +470,7 @@ public final class EgressProxy: @unchecked Sendable {
             return
         }
         defer { close(upstream) }
+        permit(host)
         guard writeAll(client, Array(Self.established.utf8), idle: Self.idleTimeout) else { return }
         if !rest.isEmpty, !writeAll(upstream, rest, idle: Self.idleTimeout) { return }
         pipeBoth(client, upstream)
@@ -665,6 +679,9 @@ public actor EgressProxyPool {
 
     public func proxy(for allow: [String]) throws -> EgressProxy { try proxies.proxy(for: allow) }
 
+    /// The proxy already started for `allow`, or nil (nothing is started: a report of what ran, Task 15's probe).
+    public nonisolated func existing(for allow: [String]) -> EgressProxy? { proxies.existing(for: allow) }
+
     public func stopAll() { proxies.stopAll() }
 
     /// `proxy(for:)` for synchronous callers (`SeatbeltRunner.spawn`).
@@ -687,6 +704,11 @@ public actor EgressProxyPool {
                 proxies[key] = made
                 return made
             }
+        }
+
+        func existing(for allow: [String]) -> EgressProxy? {
+            let key = Array(Set(allow.map(DomainMatcher.normalize))).sorted().joined(separator: "\n")
+            return lock.withLock { proxies[key] }
         }
 
         func stopAll() {

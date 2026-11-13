@@ -35,6 +35,8 @@ struct FakeHostingAdapter: HostingAdapter {
     var stageFrom: [String]?
     /// Added to the rollback plan's environment only (Task 8: a rollback that fails, waits or echoes while the deploy did not).
     var rollbackEnv: [String: String] = [:]
+    /// What `fake project ls` lists (Task 15: the provider probe's leftover check).
+    var projects: [String] = []
 
     static let installIsNoOp = false
 
@@ -48,6 +50,7 @@ struct FakeHostingAdapter: HostingAdapter {
         if let stderrLine { e["FAKE_STDERR"] = stderrLine }
         if let sleepSeconds { e["FAKE_SLEEP"] = String(sleepSeconds) }
         if let waitFor { e["FAKE_WAIT_FOR"] = waitFor }
+        if !projects.isEmpty { e["FAKE_PROJECTS"] = projects.joined(separator: " ") }
         return e
     }
 
@@ -102,6 +105,15 @@ struct FakeHostingAdapter: HostingAdapter {
           ;;
         inspect)
           echo "project $FAKE_INSPECT_PROJECT"
+          ;;
+        project)
+          sub="$1"; shift
+          case "$sub" in
+            ls) for p in $FAKE_PROJECTS; do echo "  $p"; done ;;
+            add) echo "created $1" ;;
+            rm) echo "removed $1" ;;
+            *) echo "unknown project command $sub" >&2; exit 2 ;;
+          esac
           ;;
         *)
           echo "unknown command $cmd" >&2

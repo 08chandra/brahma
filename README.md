@@ -510,6 +510,20 @@ the `hosting-account` task already in your Inbox, and the owner's kickoff in #ge
 brief and the deploy when they arrive. The default goal is a one-page waitlist site. `brahma dev release-scenario` (with
 `BRAHMA_DEV=1`) populates a dev home's Releases and Inbox against a loopback dev host; it never contacts a provider.
 
+**The owner's provider probe (Vercel).** Every Vercel pin, host list and output format the engine relies on was read from the
+CLI's package, never seen against the real service, because the provider token is yours and never passes through an agent.
+`brahma hosting probe <co>` (hidden; owner only; refused in an agent turn, for any provider but `vercel`, without a stored
+`VERCEL_TOKEN` or an account ID, and while an engine runs on the data home) verifies them once with your token: it installs the
+pinned CLI token-free, stages an engine-written marker page under the releases folder, runs the real deploy plan through the
+real sandbox (token in the environment only, provider-config check, redaction gate, stdout-only URL parse, `vercel inspect`)
+against a throwaway project `brahma-probe-<6 letters or digits>`, smokes the production alias for the marker, reads the hosts
+the CLI contacted from the engine's egress proxy, removes the project and lists what is left. It prints one `PASS`/`FAIL`/
+`NOTE` line per item (CLI pin, network hosts, HTTPS_PROXY honoured, deploy URL, the 9-character URL hash, `Production:` on
+stdout, inspect, smoke, `.env` not read, `GIT_CEILING_DIRECTORIES`, project removed, leftover projects), redacted, never the
+token. The `brahma-probe-` project-name prefix is reserved for it: it deletes nothing else, and a leftover under that prefix is
+reported by name. The live test (`BRAHMA_LIVE=1 … LiveSmokeTests/goalToLiveURL`) runs the whole goal-to-URL path against a
+fake host on loopback and says so (`FAKE HOST`); only this probe proves a real provider.
+
 **Start from an existing repo.** `brahma company create <name> --goal … --from-repo <folder|https-url>` (or EXISTING REPO
 in the app's New company sheet) clones an existing repository into the new company's workspace. The source is a local folder
 holding a git repository, or an `https://` URL. Nothing else: ssh, `git@…`, `git://`, `http://` and hand-typed `file://` are
@@ -546,6 +560,7 @@ brahma preview set <co> <name> --run <cmd> --url <url> [--build <cmd>] [--smoke 
 brahma preview remove|restart <co> <name>
 brahma hosting show <co>
 brahma hosting set <co> [--provider cloudflare-pages|vercel] [--project <name>] [--account-id <id>] [--production-url <https url>]
+brahma hosting probe <co>                                      owner only, hidden: the live Vercel probe (see above)
 brahma release <co>                                            releases, newest first, then main's smoke result
 brahma release show <co> R-<n>                                 the exact deploy and rollback commands, smoke results, output
 brahma release rollback <co> R-<n>                             roll the live release back (owner only)
