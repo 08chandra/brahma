@@ -22,7 +22,9 @@ let package = Package(
         // Platform owner-key hash store (macOS Keychain); kept out of BrahmaCore so the core stays portable.
         .target(name: "BrahmaKeychain", dependencies: ["BrahmaCore"]),
         .target(name: "BrahmaAppModel", dependencies: ["BrahmaCore", "BrahmaKeychain"]),
-        .executableTarget(name: "BrahmaApp", dependencies: ["BrahmaAppModel", "BrahmaKeychain"]),
+        // SpriteKit/Metal rendering of the live map: the only place besides BrahmaApp that imports AppKit or SpriteKit.
+        .target(name: "BrahmaMapKit", dependencies: ["BrahmaAppModel"]),
+        .executableTarget(name: "BrahmaApp", dependencies: ["BrahmaAppModel", "BrahmaKeychain", "BrahmaMapKit"]),
         .executableTarget(
             name: "brahma",
             dependencies: [
@@ -36,5 +38,6 @@ let package = Package(
             resources: [.copy("Fixtures")]
         ),
         .testTarget(name: "BrahmaAppModelTests", dependencies: ["BrahmaAppModel", "BrahmaKeychain"]),
+        .testTarget(name: "BrahmaMapKitTests", dependencies: ["BrahmaMapKit"]),
     ]
 )

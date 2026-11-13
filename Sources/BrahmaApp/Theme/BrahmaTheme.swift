@@ -1,5 +1,6 @@
 import SwiftUI
 import BrahmaCore
+import BrahmaAppModel
 
 extension Color {
     /// `0xRRGGBB` in sRGB.
@@ -13,47 +14,45 @@ extension Color {
 }
 
 /// Design tokens of the ops-console look (docs/superpowers/specs/2026-10-20-visual-design.md).
-/// Views use these instead of ad-hoc colors, fonts and sizes.
+/// Views use these instead of ad-hoc colors, fonts and sizes. Every color reads `ThemeHex`, the one hex source the
+/// SpriteKit map (`MapPalette`) shares, so the two can never drift apart.
 enum BrahmaTheme {
     // MARK: Backgrounds, darkest to lightest
-    static let bg0 = Color(hex: 0x0E1217)  // window
-    static let bg1 = Color(hex: 0x141A21)  // sidebar / rail
-    static let bg2 = Color(hex: 0x1A2129)  // panels
-    static let bg3 = Color(hex: 0x212A33)  // panel headers, table header, hovered rows
-    static let bg4 = Color(hex: 0x2A3540)  // selected row
+    static let bg0 = Color(hex: ThemeHex.bg0)  // window
+    static let bg1 = Color(hex: ThemeHex.bg1)  // sidebar / rail
+    static let bg2 = Color(hex: ThemeHex.bg2)  // panels
+    static let bg3 = Color(hex: ThemeHex.bg3)  // panel headers, table header, hovered rows
+    static let bg4 = Color(hex: ThemeHex.bg4)  // selected row
     /// Alternate (odd) row of a zebra-striped table over `bg2`.
-    static let zebra = Color(hex: 0x1D252E)
+    static let zebra = Color(hex: ThemeHex.zebra)
     /// Grid lines of the map placeholder over `bg0`.
-    static let mapGrid = Color(hex: 0x18202A)
+    static let mapGrid = Color(hex: ThemeHex.mapGrid)
 
     // MARK: Borders
-    static let line = Color(hex: 0x2F3A45)
-    static let lineStrong = Color(hex: 0x3D4A57)
+    static let line = Color(hex: ThemeHex.line)
+    static let lineStrong = Color(hex: ThemeHex.lineStrong)
 
     // MARK: Text
-    static let text0 = Color(hex: 0xE6EBF0)  // primary
-    static let text1 = Color(hex: 0xA7B3BF)  // secondary
-    static let text2 = Color(hex: 0x6E7C89)  // tertiary / labels
+    static let text0 = Color(hex: ThemeHex.text0)  // primary
+    static let text1 = Color(hex: ThemeHex.text1)  // secondary
+    static let text2 = Color(hex: ThemeHex.text2)  // tertiary / labels
 
     // MARK: Accent
-    static let accent = Color(hex: 0x2D72D2)
-    static let accentDim = Color(hex: 0x1F4F91)
+    static let accent = Color(hex: ThemeHex.accent)
+    static let accentDim = Color(hex: ThemeHex.accentDim)
 
     // MARK: Status
-    static let running = Color(hex: 0x32A467)
-    static let ready = Color(hex: 0x4C90F0)
-    static let blocked = Color(hex: 0xE76A6E)
-    static let sleeping = Color(hex: 0x6E7C89)
-    static let killed = Color(hex: 0x404854)
-    static let warning = Color(hex: 0xEC9A3C)
-    static let success = Color(hex: 0x32A467)
-    static let danger = Color(hex: 0xE76A6E)
+    static let running = Color(hex: ThemeHex.running)
+    static let ready = Color(hex: ThemeHex.ready)
+    static let blocked = Color(hex: ThemeHex.blocked)
+    static let sleeping = Color(hex: ThemeHex.sleeping)
+    static let killed = Color(hex: ThemeHex.killed)
+    static let warning = Color(hex: ThemeHex.warning)
+    static let success = Color(hex: ThemeHex.success)
+    static let danger = Color(hex: ThemeHex.danger)
 
     // MARK: Charts / series
-    static let series: [Color] = [
-        Color(hex: 0x4C90F0), Color(hex: 0x32A467), Color(hex: 0xEC9A3C),
-        Color(hex: 0xC774E8), Color(hex: 0x2EC4B6), Color(hex: 0xE76A6E),
-    ]
+    static let series: [Color] = ThemeHex.series.map { Color(hex: $0) }
 
     // MARK: Typography (SF Pro / SF Mono, no bundled fonts)
     static let body = Font.system(size: 12)
@@ -106,21 +105,9 @@ enum BrahmaTheme {
         }
     }
 
-    /// Avatar color by role family; unknown roles get a stable series color.
+    /// Avatar color by role family (`ThemeHex.roleSeriesIndex`); unknown roles get a stable series color.
     static func roleColor(_ role: String?) -> Color {
-        guard let role = role?.lowercased(), !role.isEmpty else { return text2 }
-        let families: [(keys: [String], color: Color)] = [
-            (["ceo", "founder", "chief", "exec", "president", "director"], series[3]),
-            (["cto", "eng", "dev", "architect", "backend", "frontend", "ops", "infra"], series[0]),
-            (["design", "ux", "ui", "brand", "art"], series[4]),
-            (["product", "pm", "manager", "lead"], series[2]),
-            (["qa", "test", "quality"], series[1]),
-            (["market", "sales", "growth", "writer", "content", "support"], series[5]),
-        ]
-        for family in families where family.keys.contains(where: { role.contains($0) }) {
-            return family.color
-        }
-        let sum = role.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
-        return series[sum % series.count]
+        guard let role, !role.isEmpty else { return text2 }
+        return series[ThemeHex.roleSeriesIndex(role)]
     }
 }
