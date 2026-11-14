@@ -10,14 +10,7 @@ import Foundation
     let software = SoftwarePack.pack
     let t0: TimeInterval = 1_000
 
-    /// The 30-agent plan with its generated team names "team-1" shortened to "1", as a `team-<t>` channel names them.
-    var base: [Agent] {
-        agentsFromPlan(plan(30, pack: software)).map { a in
-            var a = a
-            a.team = a.team.map { $0.replacingOccurrences(of: "team-", with: "") }
-            return a
-        }
-    }
+    var base: [Agent] { agentsFromPlan(plan(30, pack: software)) }
 
     func inputs(_ agents: [Agent], currentItems: [String: String] = [:], blockers: [String: String] = [:],
                 vacancies: [Vacancy] = [], meetings: [Meeting] = [], people: MapPeople = .empty) -> MapInputs {
@@ -170,7 +163,7 @@ import Foundation
         #expect(m.pending[0].to == .agent("a-mgr-1"))
 
         var team = model()
-        team.ingest([post(team: "1", from: "a-cto")], now: t0)
+        team.ingest([post(team: "team-1", from: "a-cto")], now: t0)
         #expect(kinds(team) == [.broadcast])
         #expect(team.pending[0].from == .agent("a-mgr-1"))
 
@@ -182,11 +175,11 @@ import Foundation
 
         // Mentions: one message each, the sender's broadcast only when the list is cut.
         var few = model()
-        few.ingest([post(team: "1", from: "a-cto", mentions: ["a-ceo", "a-cpo"])], now: t0)
+        few.ingest([post(team: "team-1", from: "a-cto", mentions: ["a-ceo", "a-cpo"])], now: t0)
         #expect(kinds(few) == [.message, .message])
         let others = base.map(\.id).filter { $0 != "a-ceo" }
         var storm = model()
-        storm.ingest([post(team: "1", from: "a-ceo", mentions: others)], now: t0)
+        storm.ingest([post(team: "team-1", from: "a-ceo", mentions: others)], now: t0)
         #expect(storm.pending.filter { $0.kind == .message }.count == MapModel.maxFanout)
         let b = try #require(storm.pending.first { $0.kind == .broadcast })
         #expect(b.from == .agent("a-ceo"))
@@ -333,24 +326,91 @@ import Foundation
         #expect(meter.fraction == 1)
     }
 
+    func texts(_ h: MapHoverCard) -> [String] {
+        [h.handle, h.role, h.stateLabel, h.blocker, h.department] + [h.team, h.item, h.manager].compactMap { $0 }
+            + (h.trust.map { [$0.label, $0.title] } ?? []) + h.perks + (h.meter.map { [$0.line] } ?? [])
+    }
+
     @Test func teamCardTextIsClean() throws {
         var a = base
         let mgr = try #require(a.firstIndex { $0.name == "mgr-1" })
         for i in a.indices where a[i].team == a[mgr].team { a[i].team = "a\u{202E}b" }
+        a[mgr].name = "m\u{202E}gr\n"
         let report = try #require(a.firstIndex { $0.managerId == "a-mgr-1" })
         a[report].role = "e\u{2028}ng\u{202E}"
         a[report].name = "x\u{202E}y\n"
+        let rid = a[report].id
+        var m = MapModel()
+        m.apply(inputs(a, currentItems: [rid: "K-2\u{2029}t\u{202E}" + String(repeating: "i", count: 200)],
+                       blockers: [rid: "Waiting\u{202E}\n" + String(repeating: "b", count: 200)]), now: t0)
+        let card = try #require(m.teamCard(managerId: "a-mgr-1"))
+        #expect(card.title.hasPrefix("TEAM-AB · "))
+        let manager = try #require(m.hoverCard(agentId: "a-mgr-1"))
+        let member = try #require(m.hoverCard(agentId: rid))
+        // The ids are keys, not text; every other string is scanned.
+        var strings = [card.title, card.lead] + texts(manager) + texts(member)
+        for mem in card.members { strings += [mem.handle, mem.label] }
+        #expect(strings.count > 20)
+        for s in strings { #expect(!hasForbidden(s), "\(s.debugDescription)") }
+        #expect(card.lead == "@mgr")
+        #expect(member.handle == "@xy" && member.role == "e ng" && member.manager == "@mgr")
+        #expect(member.blocker.hasPrefix("Waiting") && member.blocker.count <= 80)
+        #expect(card.members.contains { $0.handle == "@xy" && $0.label == "e ng" })
+    }
+
+    @Test func teamTitleRulesForGeneratedAndNamedTeams() throws {
+        // Generated teams are "team-<i>" and read "TEAM-1"; a pack's small-team name gets the prefix.
+        var m = model()
+        #expect(m.teamCard(managerId: "a-mgr-1")?.title == "TEAM-1 · ENGINEERING")
+        var a = base
+        let name = software.org.smallTeamName
+        for i in a.indices where a[i].team == "team-1" { a[i].team = name }
+        m.apply(inputs(a), now: t0 + 1)
+        #expect(m.teamCard(managerId: "a-mgr-1")?.title == "TEAM-\(name.uppercased()) · ENGINEERING")
+        for i in a.indices where a[i].team == name { a[i].team = "TEAMWORK" }
+        m.apply(inputs(a), now: t0 + 2)
+        #expect(m.teamCard(managerId: "a-mgr-1")?.title == "TEAMWORK · ENGINEERING")
+    }
+
+    @Test func pausedRendersLikeSleeping() throws {
+        var a = base
+        let ids = a.indices.filter { a[$0].managerId == "a-mgr-1" }
+        a[ids[0]].state = .running; a[ids[0]].paused = true
+        a[ids[1]].state = .killed; a[ids[1]].paused = true
+        a[ids[2]].state = .blocked; a[ids[2]].paused = true
         var m = MapModel()
         m.apply(inputs(a), now: t0)
         let card = try #require(m.teamCard(managerId: "a-mgr-1"))
-        #expect(card.title.hasPrefix("TEAM-AB · "))
-        let hover = try #require(m.hoverCard(agentId: "a-mgr-1"))
-        var strings = [card.title, card.lead, hover.handle, hover.role, hover.stateLabel, hover.blocker, hover.department]
-        strings += [hover.team, hover.item, hover.manager].compactMap { $0 }
-        for member in card.members { strings += [member.id, member.handle, member.label] }
-        for s in strings where s != "a-mgr-1" && !s.hasPrefix("a-") { #expect(!hasForbidden(s), "\(s.debugDescription)") }
-        #expect(card.lead == "@mgr-1")
-        #expect(card.members.contains { $0.handle == "@xy" && $0.label == "e ng" })
+        let member = try #require(card.members.first { $0.id == a[ids[0]].id })
+        #expect(member.state == .sleeping)
+        #expect(card.members.first { $0.id == a[ids[2]].id }?.state == .sleeping)
+        #expect(card.counts.running == 0)
+        #expect(card.counts.blocked == 0)
+        #expect(card.counts.sleeping == 2)
+        #expect(card.counts.killed == 0)
+        let hover = try #require(m.hoverCard(agentId: a[ids[0]].id))
+        #expect(hover.state == .sleeping)
+        #expect(hover.stateLabel == "running (pausing)")
+        // A paused killed agent stays killed.
+        #expect(m.hoverCard(agentId: a[ids[1]].id)?.state == .killed)
+        // The map agent keeps the raw state and flag for the renderer.
+        #expect(m.agents[a[ids[0]].id]?.state == .running)
+        #expect(m.agents[a[ids[0]].id]?.paused == true)
+    }
+
+    @Test func trustLabelThatCleansToNothingIsAbsent() {
+        var m = MapModel()
+        let id = base[4].id
+        func people(_ label: String) -> MapPeople { MapPeople(trust: [id: MapTrust(label: label, title: "x", tier: 1)]) }
+        m.apply(inputs(base, people: people("\u{202E}\u{200B}")), now: t0)
+        #expect(m.agents[id]?.trust == nil)
+        m.apply(inputs(base, people: people("T2")), now: t0 + 1)
+        #expect(m.pendingCount == 0)
+        m.apply(inputs(base, people: people("\u{202E}")), now: t0 + 2)
+        m.apply(inputs(base, people: people("T3")), now: t0 + 3)
+        #expect(m.pendingCount == 0)
+        m.apply(inputs(base, people: people("T4")), now: t0 + 4)
+        #expect(kinds(m) == [.promotion(from: "T3", to: "T4")])
     }
 
     @Test func teamCardCountsAndVacancies() throws {
@@ -358,7 +418,7 @@ import Foundation
         let reports = a.filter { $0.managerId == "a-mgr-1" }
         #expect(reports.count >= 2)
         var m = MapModel()
-        m.apply(inputs(a, vacancies: [vacancy("v1", manager: "a-mgr-1", team: "1"), vacancy("v2", manager: "a-cto")]), now: t0)
+        m.apply(inputs(a, vacancies: [vacancy("v1", manager: "a-mgr-1", team: "team-1"), vacancy("v2", manager: "a-cto")]), now: t0)
         let card = try #require(m.teamCard(managerId: "a-mgr-1"))
         #expect(card.title == "TEAM-1 · ENGINEERING")
         #expect(card.counts.total == reports.count)
@@ -370,7 +430,7 @@ import Foundation
         let hover = try #require(m.hoverCard(agentId: "a-mgr-1"))
         #expect(hover.reports == reports.count)
         #expect(hover.manager == "@cto")
-        #expect(hover.team == "1")
+        #expect(hover.team == "team-1")
         #expect(hover.department == "ENGINEERING")
     }
 
@@ -378,19 +438,19 @@ import Foundation
 
     @Test func meetingsFromSprints() throws {
         let a = base
-        let planning = Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 2, team: "1", status: .pendingApproval)])
+        let planning = Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 2, team: "team-1", status: .pendingApproval)])
         let meeting = try #require(planning.first)
         #expect(planning.count == 1)
         #expect(meeting.kind == .sprintPlanning)
         #expect(meeting.title == "SPRINT 2 PLANNING")
         #expect(meeting.id == "sprint:sprint-2")
         #expect(meeting.participantIds.first == "a-mgr-1")
-        #expect(Set(meeting.participantIds) == Set(a.filter { $0.team == "1" }.map(\.id)))
-        let review = Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 2, team: "1", status: .review)])
+        #expect(Set(meeting.participantIds) == Set(a.filter { $0.team == "team-1" }.map(\.id)))
+        let review = Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 2, team: "team-1", status: .review)])
         #expect(review.map(\.title) == ["SPRINT 2 REVIEW"])
         #expect(review.map(\.kind) == [.sprintReview])
         for s in [SprintStatus.active, .closed, .rejected] {
-            #expect(Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 2, team: "1", status: s)]).isEmpty)
+            #expect(Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 2, team: "team-1", status: s)]).isEmpty)
         }
 
         // A diff: meetingStart, then meetingEnd from the first participant.
@@ -409,9 +469,9 @@ import Foundation
     @Test func meetingRules() {
         var a = base
         // Killed agents never attend; a lone attendee is no meeting; a company-wide sprint seats managers and executives.
-        let team1 = a.indices.filter { a[$0].team == "1" }
+        let team1 = a.indices.filter { a[$0].team == "team-1" }
         for i in team1.dropFirst() { a[i].state = .killed }
-        #expect(Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 1, team: "1", status: .review)]).isEmpty)
+        #expect(Meetings.detect(agents: a, pack: software, sprints: [sprintFixture(number: 1, team: "team-1", status: .review)]).isEmpty)
         let wide = Meetings.detect(agents: base, pack: software, sprints: [sprintFixture(number: 3, team: nil, status: .pendingApproval)])
         let kindsSeen = Set(wide[0].participantIds.compactMap { id in base.first { $0.id == id }.flatMap { software.role($0.role)?.kind } })
         #expect(kindsSeen.isSubset(of: [.manager, .executive]))
@@ -424,7 +484,7 @@ import Foundation
             var x = lead; x.id = "x\(n)"; x.name = "x\(n)"; x.role = "engineer"; x.createdAt = mapFixtureEpoch.addingTimeInterval(100 + Double(n))
             big.append(x)
         }
-        let capped = Meetings.detect(agents: big, pack: software, sprints: [sprintFixture(number: 1, team: "1", status: .review)])
+        let capped = Meetings.detect(agents: big, pack: software, sprints: [sprintFixture(number: 1, team: "team-1", status: .review)])
         #expect(capped[0].participantIds.count == 12)
         #expect(capped[0].participantIds.first == "a-mgr-1")
     }
