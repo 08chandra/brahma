@@ -163,6 +163,12 @@ public final class MapController {
         if let world = synthetic { model.apply(Self.inputs(world), now: mapNow()) }
     }
 
+    /// The store a live controller reads (nil for synthetic): `AppModel` never hands out one bound to a store it replaced.
+    public var liveStore: Store? {
+        if case .live(let store, _) = source { return store }
+        return nil
+    }
+
     // MARK: Derived
 
     /// The subtrees drawn as stubs: the tree's default collapse, the owner's overrides, and every ancestor of the followed
@@ -276,6 +282,9 @@ public final class MapController {
                 blockers[a.id] = r
             } else if case .owner = b {
                 blockers[a.id] = "Waiting on you: \(Self.withheld)"
+            } else if case .agent(let id) = b, handles[id] == nil {
+                // `describe` falls back to the raw id, which is agent text when it names no agent.
+                blockers[a.id] = "Waiting on \(Self.withheld)"
             } else {
                 // The other blockers hold no agent text: handles, item keys and times.
                 blockers[a.id] = line
@@ -346,6 +355,8 @@ public final class MapController {
         var handoffs: [HandoffFlow] = []
         var vacancies: [OrgVacancy]?
         var people: MapPeople?
+        /// The poll's vault reload installed a new redactor load: what is on the map is re-redacted at once.
+        var reloaded = false
     }
 
     private func pollLive(store: Store, companyId: String) async {
@@ -386,7 +397,7 @@ public final class MapController {
             if replay == nil && !facts.isEmpty { model.ingest(facts, now: mapNow()) }
         }
 
-        var changed = false
+        var changed = read.reloaded
         if let rows = read.vacancies, rows != orgVacancyRows {
             orgVacancyRows = rows
             changed = true
@@ -406,7 +417,7 @@ public final class MapController {
                                      now: Date) -> LiveRead {
         var read = LiveRead()
         // The engine tick reloads the redactor only while the engine runs.
-        if let vault { _ = try? store.reloadRedactorIfNeeded(vault: vault) }
+        if let vault { read.reloaded = (try? store.reloadRedactorIfNeeded(vault: vault)) ?? false }
         read.vacancies = try? store.vacancies(companyId: companyId)
         if let people { read.people = try? people.load(store: store, companyId: companyId, now: now) }
 

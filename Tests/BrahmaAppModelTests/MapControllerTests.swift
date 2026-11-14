@@ -141,11 +141,17 @@ final class MapTestClock: @unchecked Sendable {
 
     @Test func itemAndBlockerWithheldWhileSecretsUnloaded() async throws {
         let (owner, paths) = try makeHome()
-        let (acme, _, _, eng) = try seedAcme(owner, paths)
+        let (acme, ceo, _, eng) = try seedAcme(owner, paths)
         let value = "sk-live-abcdefgh12345"
         let item = try activeItem(owner, acme.id, title: "Use \(value)", owner: eng.id)
         _ = try owner.transition(agentId: eng.id, to: .ready)
         _ = try owner.transition(agentId: eng.id, to: .blocked, blocker: .owner(reason: "paste \(value)"))
+        // An agent blocker naming no agent: `describe` would show the raw id.
+        _ = try owner.transition(agentId: ceo.id, to: .blocked, blocker: .agent(value))
+        // One naming a real agent keeps its handle.
+        let qa = try owner.hire(companyId: acme.id, name: "qa", role: "engineer", model: "sonnet")
+        _ = try owner.transition(agentId: qa.id, to: .ready)
+        _ = try owner.transition(agentId: qa.id, to: .blocked, blocker: .agent(eng.id))
         try owner.setSecret(companyId: acme.id, name: "API_KEY", value: value, isTest: false, vault: MemoryVault())
         // A new process: the database has a secret and the redactor has not loaded it.
         let store = try Store(path: paths.database.path)
@@ -156,6 +162,50 @@ final class MapTestClock: @unchecked Sendable {
         #expect(agent.item == "\(item.key) \(MapController.withheld)", "\(agent.item ?? "nil")")
         #expect(agent.blocker == "Waiting on you: \(MapController.withheld)", "\(agent.blocker)")
         #expect(!(agent.item ?? "").contains(value) && !agent.blocker.contains(value))
+        #expect(c.model.agents[ceo.id]?.blocker == "Waiting on \(MapController.withheld)")
+        #expect(c.model.agents[qa.id]?.blocker == "Waiting on @eng")
+        #expect(c.model.hoverCard(agentId: ceo.id)?.blocker.contains(value) == false)
+    }
+
+    @Test func pollReloadReappliesAtOnce() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, eng) = try seedAcme(store, paths)
+        let value = "sk-added-later-98765"
+        try activeItem(store, acme.id, title: "Use \(value)", owner: eng.id)
+        let vault = MemoryVault()
+        let c = live(store, acme.id, vault: vault)
+        c.sync(snapshot: try snapshot(store, acme.id))
+        await c.poll()   // vacancies loaded: nothing else changes on the next poll
+        try store.setSecret(companyId: acme.id, name: "API_KEY", value: value, isTest: false, vault: vault)
+        await c.poll()
+        // No refreshSnapshot ran: the poll's reload re-applied the last snapshot itself.
+        let item = try #require(c.model.agents[eng.id]?.item)
+        #expect(item.contains("[redacted API_KEY]"), "\(item)")
+        #expect(!item.contains(value))
+    }
+
+    @Test func noLiveControllerOverAClosedStore() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let app = AppModel(store: store, paths: paths)
+        await app.load()
+        let first = try #require(app.ensureMapController())
+        await app.closeStore()
+        #expect(first.isInvalidated)
+        // A view asking for the map while the store is closed gets none.
+        #expect(app.ensureMapController() == nil)
+        // One installed over the closed store anyway is dropped by the reopen.
+        let stray = live(store, acme.id)
+        app.installMapController(stray)
+        await app.reopenStore()
+        app.stopPolling()
+        #expect(stray.isInvalidated)
+        let fresh = try #require(app.ensureMapController())
+        #expect(fresh !== stray && fresh !== first)
+        #expect(fresh.liveStore === app.store)
+        #expect(fresh.messageCursor == (try app.store.maxMessageRowId(companyId: acme.id)))
+        #expect(fresh.handoffCursor == (try app.store.maxHandoffRowId(companyId: acme.id)))
+        #expect(app.ensureMapController() === fresh)
     }
 
     @Test func redactorReloadsOnPollWhileEngineStopped() async throws {

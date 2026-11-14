@@ -69,6 +69,8 @@ public final class AppModel {
     /// The non-interactive vault the engine reloads the redactor from; the map's poll reloads it too while the engine is
     /// stopped. Set by the app delegate; tests leave it nil.
     @ObservationIgnored public var mapSecretVault: (any SecretVault)? = nil
+    /// Between `closeStore()` and a successful `reopenStore()`: `store` is closed, so no live map may be built over it.
+    @ObservationIgnored private var storeClosed = false
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
@@ -157,6 +159,7 @@ public final class AppModel {
         chat = nil
         // A live map reads this store: it stops for good, and the next `ensureMapController()` after `reopenStore()` builds
         // one whose cursors start at the restored database's maxima.
+        storeClosed = true
         dropLiveMapController()
         let store = self.store
         try? await Task.detached { try store.close() }.value
@@ -169,6 +172,10 @@ public final class AppModel {
         do {
             let reopened = try await Task.detached { try Store(path: path, catalog: catalog, backupsDir: backupsDir) }.value
             store = reopened
+            // Anything built or installed over the closed store while it was away is dropped; the next ensure builds a
+            // controller over `reopened`, its cursors at the restored database's maxima.
+            storeClosed = false
+            dropLiveMapController()
             search = SearchModel(store: reopened)
             backups = BackupsModel(store: reopened, paths: paths)
             access = AccessModel(store: reopened)
@@ -392,8 +399,12 @@ public final class AppModel {
     /// The current map controller: the existing one (an installed demo included), else a new live one for the selected
     /// company over the current `store` (read now: `reopenStore()` replaces it), else nil when no company is selected.
     public func ensureMapController() -> MapController? {
-        if let mapController { return mapController }
-        guard let id = selectedCompanyId else { return nil }
+        if let mapController {
+            // A live controller over a store this model no longer uses is never handed out.
+            if mapController.isSynthetic || mapController.liveStore === store { return mapController }
+            dropLiveMapController()
+        }
+        guard !storeClosed, let id = selectedCompanyId else { return nil }
         let controller = MapController(source: .live(store: store, companyId: id), people: mapPeopleProvider,
                                        vault: mapSecretVault, clock: clock)
         controller.sync(snapshot: snapshot)
