@@ -160,10 +160,19 @@ public struct OrgTree: Equatable, Sendable {
 
     // MARK: Collapse
 
-    /// Above the threshold every manager-tier node with children starts collapsed; otherwise nothing does.
+    /// Above the threshold every manager-tier node with children starts collapsed, and so does every director whose children
+    /// are all ICs or vacancies (it acts as a manager: "collapsed below directors at scale"). Directors with a manager or
+    /// director child, executives and Board never do; below the threshold nothing collapses.
     public func defaultCollapsed(activeCount: Int) -> Set<String> {
         guard activeCount > OrgTree.collapseThreshold else { return [] }
-        return Set(nodes.values.filter { $0.tier == .manager && !$0.childIds.isEmpty }.map(\.id))
+        return Set(nodes.values.filter { node in
+            guard !node.childIds.isEmpty else { return false }
+            switch node.tier {
+            case .manager: return true
+            case .director: return node.childIds.allSatisfy { nodes[$0]?.tier == .ic }
+            default: return false
+            }
+        }.map(\.id))
     }
 
     /// `overrides` (true = expanded) win over `defaults`; then every ancestor of `focus` is expanded so the focused node

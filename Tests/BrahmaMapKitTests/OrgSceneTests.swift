@@ -126,9 +126,13 @@ import AppKit
         let collapsed = c.collapsed
         let scene = Self.scene(c.model, collapsed: collapsed)
         let tree = c.model.tree
-        let managersWithReports = tree.nodes.values.filter { $0.tier == .manager && !$0.childIds.isEmpty }.map(\.id)
-        #expect(!managersWithReports.isEmpty)
-        #expect(scene.stubIds == Set(managersWithReports))
+        // Managers with reports, and directors that lead only ICs (they act as managers).
+        let folded = tree.nodes.values.filter { node in
+            !node.childIds.isEmpty && (node.tier == .manager
+                || (node.tier == .director && node.childIds.allSatisfy { tree.nodes[$0]?.tier == .ic }))
+        }.map(\.id)
+        #expect(folded.contains { tree.nodes[$0]?.tier == .manager } && folded.contains { tree.nodes[$0]?.tier == .director })
+        #expect(scene.stubIds == Set(folded))
         #expect(scene.stubIds == collapsed)
         // No card of anything under a collapsed manager.
         for m in collapsed {

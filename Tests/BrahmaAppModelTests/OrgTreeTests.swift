@@ -209,17 +209,38 @@ import Foundation
         let sixtyOne = agentsFromPlan(plan(61, pack: software))
         let t61 = tree(sixtyOne)
         let collapsed = t61.defaultCollapsed(activeCount: 61)
+        // Every manager with reports, and every director whose children are all ICs or vacancies (it acts as a manager).
+        func leadsOnlyICs(_ id: String) -> Bool {
+            guard let node = t61.nodes[id], !node.childIds.isEmpty else { return false }
+            return node.childIds.allSatisfy { t61.nodes[$0]?.tier == .ic }
+        }
         let managersWithReports = sixtyOne.filter { a in a.role == "manager" && !(t61.nodes[a.id]?.childIds.isEmpty ?? true) }
+        let icDirectors = sixtyOne.filter { $0.role == "director" && leadsOnlyICs($0.id) }
         #expect(!managersWithReports.isEmpty)
-        #expect(collapsed == Set(managersWithReports.map(\.id)))
-        #expect(sixtyOne.contains { $0.role == "director" })
-        for a in sixtyOne where a.role == "director" || t61.nodes[a.id]?.tier == .csuite || a.role == "ceo" {
+        #expect(!icDirectors.isEmpty, "the 61-agent plan has directors that lead only ICs")
+        #expect(collapsed == Set((managersWithReports + icDirectors).map(\.id)))
+        // Directors with manager children, executives and Board never collapse.
+        let managingDirectors = sixtyOne.filter { a in
+            a.role == "director" && (t61.nodes[a.id]?.childIds.contains { t61.nodes[$0]?.tier == .manager } ?? false)
+        }
+        for a in managingDirectors { #expect(!collapsed.contains(a.id)) }
+        for a in sixtyOne where t61.nodes[a.id]?.tier == .csuite || a.role == "ceo" {
             #expect(!collapsed.contains(a.id))
         }
         #expect(!collapsed.contains("owner"))
         // A manager without reports is never collapsed.
         let lone = [agent("ceo", role: "ceo", manager: nil), agent("mgr-1", role: "manager", manager: "ceo")]
         #expect(tree(lone).defaultCollapsed(activeCount: 61).isEmpty)
+        // Hand-built: a director over a manager stays open, a director over ICs folds, an empty director does not.
+        let hand = [
+            agent("ceo", role: "ceo", manager: nil),
+            agent("dir-a", role: "director", manager: "ceo"), agent("mgr-a", role: "manager", manager: "dir-a"),
+            agent("eng-a", role: "engineer", manager: "mgr-a"),
+            agent("dir-b", role: "director", manager: "ceo"), agent("eng-b", role: "engineer", manager: "dir-b"),
+            agent("dir-c", role: "director", manager: "ceo"),
+        ]
+        let th = tree(hand)
+        #expect(th.defaultCollapsed(activeCount: 61) == Set(["a-mgr-a", "a-dir-b"]))
     }
 
     @Test func focusAndOverrides() throws {

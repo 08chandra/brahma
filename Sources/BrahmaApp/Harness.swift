@@ -165,6 +165,8 @@ enum Harness {
         init(controller: MapController) { self.controller = controller }
 
         nonisolated func update(_ currentTime: TimeInterval, for scene: SKScene) {
+            // SpriteKit calls the delegate on the main thread (`SKView` renders there), so this asserts rather than hops: a hop
+            // would delay the timestamp bookkeeping and distort the very intervals being measured. It would trap if that changed.
             MainActor.assumeIsolated {
                 defer { last = currentTime }
                 guard let last, currentTime > last else { return }
