@@ -533,7 +533,8 @@ import BrahmaKeychain
         #expect(RolePrompt.render(agent: w.eng1, company: w.company).contains(line))
         #expect(RolePrompt.render(agent: w.eng1, company: w.company).contains("search_memory, recall, remember"))
         #expect(CompanyToolNames.memory == ["search_memory", "recall", "remember"])
-        #expect(Array(CompanyToolNames.base.suffix(3)) == CompanyToolNames.memory)
+        // Task 4 appends the handbook tools after them.
+        #expect(Array(CompanyToolNames.base.suffix(6)) == CompanyToolNames.memory + CompanyToolNames.kb)
         #expect(TaintPolicy.taintSafeTools.isSuperset(of: CompanyToolNames.memory))
     }
 

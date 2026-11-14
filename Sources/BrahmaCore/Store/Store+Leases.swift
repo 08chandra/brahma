@@ -208,6 +208,7 @@ extension Store {
             }
             try lease.delete(db)
             try Store.endSecretUses(db: db, itemId: itemId, now: now)
+            try Store.releaseKBLeases(db: db, itemId: itemId)
             if item.status == .inProgress { item.status = .ready }
             if undoOwner, item.ownerId == agentId { item.ownerId = nil }
             item.updatedAt = now
@@ -255,6 +256,7 @@ extension Store {
     private func reapOne(_ db: Database, _ lease: WorkLease, now: Date) throws {
         try lease.delete(db)
         try Store.endSecretUses(db: db, itemId: lease.itemId, now: now)
+        try Store.releaseKBLeases(db: db, itemId: lease.itemId)
         guard var item = try WorkItem.fetchOne(db, key: lease.itemId) else { return }
         let holder = try Agent.fetchOne(db, key: lease.agentId)
         var text = "lease of @\(holder?.name ?? "?") expired"

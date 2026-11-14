@@ -157,11 +157,20 @@ public struct MemoryIndex: Sendable {
             let full = readable.filter { $0.level == .full }.map(\.doc)
             if let newest = full.first {
                 if wholePage {
-                    // The page's readable sections in the order they were indexed.
-                    let sections = full.sorted { $0.id < $1.id }
+                    // The page's readable sections in page order (then indexing order), under the page's title.
+                    var order: [String: Int] = [:]
+                    var pageTitle: String?
+                    if let path = try? HandbookPath.normalize(canonical),
+                       let page = try Store.kbPage(db: db, companyId: companyId, path: path) {
+                        for (i, s) in KBMarkdown.sections(page.body, page: nil).enumerated() { order[s.slug] = i }
+                        pageTitle = page.title
+                    }
+                    func position(_ doc: StoredDoc) -> Int { order[String(doc.ref.dropFirst(canonical.count + 1))] ?? Int.max }
+                    let sections = full.sorted { (position($0), $0.id) < (position($1), $1.id) }
                     let text = sections.map(\.body).joined(separator: "\n\n")
                     var hit = newest.hit(level: .full, score: 0)
                     hit.ref = canonical
+                    if let pageTitle { hit.title = pageTitle }
                     hit.tainted = sections.contains(where: \.tainted)
                     hit.taintReason = sections.first(where: \.tainted)?.taintReason
                     if hit.tainted { hit.title = "\(canonical) (untrusted)" }
