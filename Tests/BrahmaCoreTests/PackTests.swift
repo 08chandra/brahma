@@ -101,6 +101,25 @@ import Foundation
         #expect(p.org.teamSupport == nil)
     }
 
+    /// Plan ML Task 4: a pack written before the handbook decodes with the default sections; the software pack carries them,
+    /// and its spike playbooks send research to the handbook.
+    @Test func packWithoutHandbookDecodesDefault() throws {
+        #expect(software.handbook == HandbookSection.softwareDefault)
+        #expect(software.version >= 5)
+        var object = try #require(try JSONSerialization.jsonObject(with: try encoded(software)) as? [String: Any])
+        #expect(object["handbook"] != nil)
+        object["handbook"] = nil
+        let old = try JSONDecoder().decode(IndustryPack.self, from: try JSONSerialization.data(withJSONObject: object))
+        #expect(old.handbook == HandbookSection.softwareDefault)
+        #expect(try JSONDecoder().decode(IndustryPack.self, from: try encoded(software)) == software)
+        #expect(SoftwarePack.researchLine == "Write research as handbook pages under Research/ with kb_write, and list every source you used in sources.")
+        for id in ["engineer", "designer"] { #expect(software.role(id)?.playbooks["spike"]?.hasSuffix(SoftwarePack.researchLine) == true, "\(id)") }
+        // A section path that is not a handbook page name is refused.
+        var bad = software
+        bad.handbook = [HandbookSection(path: "../up", title: "Up", summary: "x")]
+        #expect(throws: PackError.self) { try bad.validate() }
+    }
+
     @Test(arguments: ["bad-model", "unknown-tool", "dangling-ratio", "dup-role", "bad-category", "bad-playbook"])
     func invalidPackRejected(kind: String) throws {
         var p = software

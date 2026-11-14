@@ -99,6 +99,8 @@ public actor Orchestrator {
     var lastSweep: [String: Date] = [:]
     /// Company-active time of each company's last deadlock/aging scan.
     var lastLiveness: [String: Double] = [:]
+    /// Companies whose handbook skeleton this engine has ensured since it started.
+    var handbookSkeletons: Set<String> = []
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
     var infraCooldown: [String: Date] = [:]
@@ -483,6 +485,8 @@ public actor Orchestrator {
         // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
         // ready items to idle individual contributors. Nothing here waits on git.
         let reaped = try store.reapLeases(now: now)
+        // Handbook page leases past their active-time expiry, or of killed holders (Plan ML).
+        attempt { try store.reapKBLeases(now: now) }
         leaseMaintenance(now: now, companies: companies, reaped: stopped == nil ? reaped : [], held: held)
         // Test-key uses whose lease or item status no longer carries them are closed (Task 4-wire; injection checks the
         // live lease and status as well).
@@ -516,6 +520,15 @@ public actor Orchestrator {
         // cursors. Held by the owner's stop (caught up on resume) and while secrets are unloaded (ingest redacts, fail closed).
         if stopped == nil, !store.secretsHeld {
             for c in companies { attempt { try MemoryIngest.run(store: store, companyId: c.id, paths: paths, now: now) } }
+        }
+        // The pack's handbook sections, once per company per engine start (companies made before Plan ML get theirs here).
+        for c in companies where !handbookSkeletons.contains(c.id) {
+            do {
+                try store.ensureHandbookSkeleton(companyId: c.id, now: now)
+                handbookSkeletons.insert(c.id)
+            } catch {
+                log("handbook skeleton for \(c.id) failed (retried next tick): \(error)")
+            }
         }
 
         // Audits of auto-merges (9c): every waiting sample is routed to an auditor (a cheap read when there is nothing to do).

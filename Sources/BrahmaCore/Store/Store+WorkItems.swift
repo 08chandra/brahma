@@ -385,6 +385,7 @@ extension Store {
             if releasedLease != nil {
                 try lease.delete(db)
                 try Store.endSecretUses(db: db, itemId: item.id, now: now)
+                try Store.releaseKBLeases(db: db, itemId: item.id)
             }
         }
         if !specChanged.isEmpty || checkChanged {
@@ -586,7 +587,10 @@ extension Store {
         if to.resetsRungFloor { item.rungFloor = 0 }
         item.updatedAt = now
         try item.update(db)
-        if to == .done { try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id]) }
+        if to == .done {
+            try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id])
+            try Store.releaseKBLeases(db: db, itemId: item.id)
+        }
         // A test key is in the holder's environment only while the item is in progress or in review (its checks).
         if to != .inProgress, to != .inReview { try Store.endSecretUses(db: db, itemId: item.id, now: now) }
         try recordItemEvent(db: db, item: item, actor: "system", kind: event,

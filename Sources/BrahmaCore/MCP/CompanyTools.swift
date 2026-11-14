@@ -97,7 +97,7 @@ public struct CompanyTools: Sendable {
 
     /// Tools that only read; they carry `readOnlyHint` and are never counted.
     static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item",
-                                             "search_memory", "recall"]
+                                             "search_memory", "recall", "search_kb", "kb_read"]
     /// High-authority company tools (design §2.2): one call per turn when sub-agents are on, none on a plan turn, denied under
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
     /// Plan L's ops tools (`CompanyToolNames.ops`) count as high risk too; under taint they are refused by `TaintPolicy`
@@ -184,7 +184,7 @@ public struct CompanyTools: Sendable {
     /// Every tool group's specs (the stable, role-independent list).
     private static func allSpecs() -> [ToolSpec] {
         baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs() + previewToolSpecs() + deployToolSpecs() + humanTaskToolSpecs()
-            + extensionToolSpecs() + memoryToolSpecs()
+            + extensionToolSpecs() + memoryToolSpecs() + handbookToolSpecs()
     }
 
     private static let implemented: Set<String> = Set(allSpecs().map(\.name))
@@ -388,6 +388,7 @@ public struct CompanyTools: Sendable {
                 if let result = try dispatchDeploy(name, args) { return result }
                 if let result = try dispatchHumanTask(name, args) { return result }
                 if let result = try dispatchMemory(name, args) { return result }
+                if let result = try dispatchHandbook(name, args) { return result }
                 throw ToolError(message: "unknown tool: \(name)")
             }
         } catch let e as ToolError {

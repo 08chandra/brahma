@@ -18,6 +18,7 @@ public enum TaintPolicy {
         // Plan L (chief review L4): the handler enforces its own tainted-session rule (a template without links only).
         "request_human_task",
     ]).union(CompanyToolNames.memory)   // Plan ML: what a tainted session remembers is stored tainted; what it reads taints first.
+        .union(CompanyToolNames.kb)     // Plan ML: a tainted session's page edit taints the page; reading a tainted revision taints first.
 
     /// The company tools reviewed as high risk (`everyToolClassified` pins `CompanyToolNames.all` against both sets). A task
     /// that adds a tool adds it to one of the two in the same commit (10b: `propose_extension`, refused while tainted).

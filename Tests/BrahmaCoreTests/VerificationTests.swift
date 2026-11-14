@@ -486,7 +486,8 @@ import GRDB
         #expect(Set(try #require(submit.inputSchema.objectValue?["properties"]?.objectValue).keys) == ["key", "summary"])
         let forbidden: Set<String> = ["verifiedRevision", "verifiedCommit", "commit", "flags", "scriptHash", "reviewFlags", "reviewRound",
                                       "exitCode", "outputTail", "status"]
-        for spec in specs where !["update_work_item", "create_work_item", "list_work"].contains(spec.name) {
+        // `kb_write`'s `status` is a handbook page's (draft or active), not a work item's.
+        for spec in specs where !["update_work_item", "create_work_item", "list_work", "kb_write"].contains(spec.name) {
             let props = Set(spec.inputSchema.objectValue?["properties"]?.objectValue?.keys.map { $0 } ?? [])
             #expect(props.isDisjoint(with: forbidden), "\(spec.name)")
         }
