@@ -462,22 +462,44 @@ fresh export: a preview never runs from an agent's working tree, and its process
 previews in a pane that loads only the loopback origin; the engine logs each preview under the data home.
 
 **Hosting.** You pick the provider and project (`brahma hosting set`, or Company › Settings › HOSTING). Cloudflare Pages is
-the default: its free plan serves static sites with no commercial-use restriction, a scoped API token is enough, and `wrangler`
-prints the deployment URL the engine checks. Vercel is the alternative (its free Hobby plan is for non-commercial use; deploys
-need the team or account ID). Both CLIs are pinned to exact versions and installed by the engine, token-free, into a folder
-agent code cannot write. Hosting tokens arrive through the `hosting-account` human task and go to your Keychain. Agents never
-receive the hosting token.
+the default: its free plan serves static sites with no commercial-use restriction and a scoped API token is enough.
+**Cloudflare deploys are unverified until a Cloudflare probe runs:** the owner's provider probe covers Vercel only, so no
+real `wrangler pages deploy` has run under the engine yet. The engine expects `wrangler` to print the deployment URL
+(`https://<8 hex>.<subdomain>.pages.dev`) on its "Deployment complete!" line; the subdomain is the project name, or the
+project name with the short suffix Pages adds when that name is taken on `pages.dev`. The site is smoked at your production
+URL, else at the address derived from that deploy URL, never one guessed from the project name; when neither is there the
+release fails and asks you to set the production URL in HOSTING. Vercel is the alternative (its free Hobby plan is for
+non-commercial use; deploys need the team or account ID). **The Vercel project must already exist:** deploys name it
+(`VERCEL_PROJECT_ID`) and never create it, so create it in the Vercel dashboard (Add New… → Project, or `vercel project add
+<name>`); the `hosting-account` task and `brahma hosting show` say so. A Vercel site is smoked at your production URL, else at
+the deploy URL the engine verified with `vercel inspect`, never a guessed `<project>.vercel.app` (that name may belong to
+someone else); a project behind Vercel's deployment protection needs the production URL set. Unverified until the probe runs
+a deploy → rollback → deploy cycle: after a `vercel rollback`, Vercel may stop assigning production to later `--prod` deploys
+until you run `vercel promote` (or promote in the dashboard), so after a Vercel rollback check that the next release really
+went live. Both CLIs are pinned to exact versions and installed by the engine, token-free, into a folder agent code cannot
+write. Hosting tokens arrive through the `hosting-account` human task and go to your Keychain. The token is never in a
+prompt, an argument, a log or the database; who else can read it while a deploy step runs depends on the company's profile
+(see "Where that paragraph (the plan's wording) is not exact" below).
 
 **The deploy ask.** `propose_deploy` records a release (`R-<n>`, a version unique in the company, the exact `main` commit) and
 puts one ask in your Inbox showing the provider and project, the commit, the release notes, the build command and output
-folder, the smoke results on `main`, and the exact deploy and rollback commands the engine will run. Approving it is the only
+folder, the smoke check that runs on `main` just before deploying (`main` must already be green at the commit to propose),
+the deployed site's smoke requests and expected text, and the exact deploy and rollback commands the engine will run. The
+smoke checks are pinned to the release: if an agent changes the smoke check or the site's smoke after you approve, the
+release is refused ("propose again") before anything runs. Approving it is the only
 way a deploy starts; `brahma approve` and the app do it, no tool can. The engine then, in order and each step recorded before
-the next: checks the commit is still on the engine-accepted `main` and runs the smoke check at it; re-renders the plan and
+the next: checks the commit is still on the engine-accepted `main` and runs the smoke check at it (when a merge lands while it
+waits for the company's smoke slot, it checks the commit against the new `main` and goes on); re-renders the plan and
 refuses if anything differs from what you approved; records `refs/brahma/main-backup` and `refs/brahma/releases/<version>`;
-builds in a clean `.git`-free export of the commit (sandboxed, no secrets, 30 minutes at most); stages only the output folder
-(at most 500 MB, 20 000 files); installs the provider CLI if missing; runs the deploy steps (15 minutes each) with the token
-only in their environment; smoke-checks the live URL (6 attempts, 10 s apart, for CDN propagation); and marks the release
-`deployed` or `failed` (a P1 bug is filed and you are told). The redacted deploy and build logs land in
+builds in a clean `.git`-free export of the commit (sandboxed, no secrets, 30 minutes at most); stages the upload (at most
+500 MB, 20 000 files; never a symlink, a hard link or an `.env` file): for Cloudflare the output folder, plus `functions/`
+when the commit has one; for Vercel the whole export of the commit after the build, source included (Vercel builds and serves
+from it), minus every dot entry but `.well-known` and every `node_modules`; installs the provider CLI if missing; runs the
+deploy steps (15 minutes each) with the token only in their environment; smoke-checks the live URL (6 attempts, 10 s apart,
+for CDN propagation); and marks the release `deployed` or `failed`. You are told either way; a P1 bug is filed for the agents
+only when they can fix the failure (the build, the staged output, the smoke check failing on `main`, the deployed site
+failing its smoke), never for your side (the approved plan changed, the token, provider config, the tools, the backup refs,
+the sandbox). The redacted deploy and build logs land in
 `<workspace>/.brahma/releases/R-<n>/`, which agents can read and never write.
 
 **The smoke check on `main`.** `set_smoke_check` sets the command the engine runs, sandboxed in a clean export, on every new
@@ -487,13 +509,26 @@ demand.
 
 Preview and build commands are written by agents and run in Plan 5-lite's sandbox, in fresh engine exports of main that contain no .git, in their own process group, with no secrets. Deploy and rollback commands are composed by the engine from your hosting settings, shown to you exactly in the deploy request, and run once after you approve, from a clean folder holding only the built files, using a provider CLI the engine installed where agent code cannot write, with the hosting token taken from your Keychain. Agents never receive the hosting token.
 
+*Where that paragraph (the plan's wording) is not exact.* "Only the built files": true for Cloudflare; Vercel's upload is the
+clean export of the commit after the build, source included (see above). "Agents never receive the hosting token": no agent is
+ever given it (it is in no prompt, argument, file or tool result), and on the **Sandboxed** profile an agent turn also cannot
+read another process's environment. On the **Workspace** and **Full** profiles agent shells run as your macOS user without
+that restriction, so while a deploy or rollback step runs, an agent process running at the same moment could read the step's
+environment, token included. That is a documented limit of those profiles: deploy from a Sandboxed company when the token
+matters, or rotate the token after a deploy you did not watch.
+
 **Releases, rollback and recovery.** Work › Releases lists every release with its status, commit, URL and smoke result; the
 PATH TO LIVE strip shows `main`'s health and the milestones (`GOAL 0:00 · PRD +0:52 · … · LIVE +3:10`) with what each stretch
-cost and how often you were needed. Only the live release (the newest deployed or failed one, with nothing in flight) can be
-rolled back: `brahma release rollback <co> R-<n>` or the Roll Back button runs the rollback commands recorded before that
-deploy, exactly as shown, then smoke-checks the site. A rollback never touches `main`, is never retried by the engine, and
-you can also roll back from the provider dashboard. If the engine stops mid-release (Ctrl-C, the app quitting, the emergency
-stop), the release records where it was (`interrupted` while deploying, else `failed`) and nothing runs again on restart.
+cost and how often you were needed. Only the live release can be rolled back: the newest one that changed, or may have
+changed, what is live (deployed; interrupted while deploying; or failed after its deploy step started; a release that
+failed before deploying changed nothing), with nothing in flight (an open proposal: reject its ask first). `brahma release
+rollback <co> R-<n>` or the Roll Back button runs the rollback commands recorded with that release, exactly as shown (they
+put the release before it back, or the placeholder page for the first one), then smoke-checks the site. A rollback never
+touches `main`, is never retried by the engine, and you can also roll back from the provider dashboard. If the engine stops
+mid-release (Ctrl-C, the app quitting, the emergency stop), the release records where it was (`interrupted` while deploying,
+else `failed`) and nothing runs again on restart; an interrupted release may be partly live, and rolling it back is the
+undo. Restoring a backup cancels every release the snapshot held approved but not yet started ("restored from backup;
+propose again"): an approval is never carried out from an old snapshot.
 
 **Human tasks.** Agents, and the engine, ask you for things only a person can do. The templates are engine-written, with
 their links, steps and paste-back fields: `hosting-account` (the provider token into your Keychain, plus the account ID),
@@ -516,12 +551,16 @@ CLI's package, never seen against the real service, because the provider token i
 `VERCEL_TOKEN` or an account ID, and while an engine runs on the data home) verifies them once with your token: it installs the
 pinned CLI token-free, stages an engine-written marker page under the releases folder, runs the real deploy plan through the
 real sandbox (token in the environment only, provider-config check, redaction gate, stdout-only URL parse, `vercel inspect`)
-against a throwaway project `brahma-probe-<6 letters or digits>`, smokes the production alias for the marker, reads the hosts
+against a throwaway project `brahma-probe-<6 letters or digits>`, smokes the site for the marker (your production URL if set,
+else the verified deploy URL), reads the hosts
 the CLI contacted from the engine's egress proxy, removes the project and lists what is left. It prints one `PASS`/`FAIL`/
 `NOTE` line per item (CLI pin, network hosts, HTTPS_PROXY honoured, deploy URL, the 9-character URL hash, `Production:` on
-stdout, inspect, smoke, `.env` not read, `GIT_CEILING_DIRECTORIES`, project removed, leftover projects) and an `INFO` line with
+stdout, inspect, smoke, `.env` not read, `GIT_CEILING_DIRECTORIES`, project exists, promotion after rollback, project removed,
+leftover projects) and an `INFO` line with
 the deploy output's tail, all redacted, never the token, then `VERDICT ok: N passed, K noted (not decided)` or `VERDICT n items failed (…)`: a NOTE is an item this run could not
-decide (`.env` is always one: the engine refuses `.env` in release uploads, so the probe plants none). The `brahma-probe-`
+decide (`.env` is always one: the engine refuses `.env` in release uploads, so the probe plants none; so are "project exists",
+because the probe creates its own project while a real release never does, and "promotion after rollback", which it does not
+exercise). The probe covers Vercel only: Cloudflare Pages, the default, stays unverified. The `brahma-probe-`
 project-name prefix is reserved for it: it deletes nothing else, and a leftover under that prefix is reported by name (the
 listing may be paginated or use the CLI's default scope, so also check the dashboard). An interrupted probe (Ctrl-C, a closed
 terminal) skips its cleanup: the throwaway project stays (the next run names it as a leftover) and so does
@@ -556,8 +595,9 @@ imported is outside content: until you trust it, every turn of the company (work
 `brahma ext try` trials there) is tainted at launch (`import: <host>`, `import: local` for a folder), so decisions, owner requests, sprint plans, preview, smoke and
 deploy config, deploy proposals and review verdicts are off. `brahma company trust-import <co>` shows the source, the
 imported commit and the secret scan's result; with `--yes` (the engine stopped, after reading the repo or the survey) it
-lifts the mark and ends every tainted session. Agents' labs stay marked until `brahma lab clear-taint <co>`. Every new
-import is tainted again, even of a repo you trusted before.
+lifts the mark and ends every tainted session. Agents' labs stay marked until `brahma lab clear-taint <co>`, which refuses
+while the import mark stands (only trust-import ends it). Every new import is tainted again, even of a repo you trusted
+before.
 
 ```
 brahma preview <co>                                            previews: name, kind, status, url, commit
