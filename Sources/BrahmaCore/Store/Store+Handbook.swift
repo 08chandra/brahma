@@ -195,6 +195,13 @@ extension Store {
                         status: KBStatus? = nil, release: Bool = false, knownValues: [(name: String, value: String)],
                         now: Date = Store.now(), paths: BrahmaPaths? = nil) throws -> (page: KBPage, revision: Int, created: Bool) {
         let path = try HandbookPath.normalize(rawPath)
+        // A path becomes file names and link targets that cannot be redacted (the mirror, the export), and refusals echo it:
+        // a path that looks like it holds a secret is refused first, whoever writes, with the body's wording.
+        for segment in path.split(separator: "/").map(String.init) {
+            if let f = SecretScan.textFindings(segment, knownValues: knownValues).first {
+                throw WorkError.invalid("that text contains what looks like a secret (\(f.label), line \(f.line)); remove it")
+            }
+        }
         let home = paths?.home ?? dataHome
         let rawText = rawBody.replacingOccurrences(of: "\r\n", with: "\n")
         return try writer.write { db in

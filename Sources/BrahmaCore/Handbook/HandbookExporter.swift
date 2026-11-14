@@ -133,20 +133,43 @@ public enum HandbookExporter {
     /// `INDEX.md`. Everything goes through `EngineFiles` (directories walked without following links, files replaced through a
     /// temporary file renamed in the same directory, stale entries removed by descriptor).
     ///
-    /// Every refresh re-reads each mirror file and compares its SHA-256 with what it should hold: when the handbook did not
-    /// change (the fingerprint of every page's id, revision, taint, vouch, status and restriction, and the redactor's version,
-    /// matches the stored one), a difference — a changed, missing or planted file — is put back, listed in `repaired` and
-    /// noted in the activity feed. A link or odd file in the way stops the mirror for this refresh, raises the engine-file
-    /// alert and removes the planted entry (the link itself, never what it points at), so the next refresh rebuilds it;
-    /// nothing outside the workspace is touched.
+    /// Every refresh first sweeps the mirror (stale, planted or wrong-kind entries go), then re-reads each mirror file and
+    /// compares its SHA-256 with what it should hold: when the handbook did not change (the fingerprint of every page's id,
+    /// revision, taint, vouch, status and restriction, and the redactor's version, matches the stored one), a difference — a
+    /// changed, missing or planted file — is put back, listed in `repaired` and noted in the activity feed.
+    ///
+    /// It fails closed: old content (perhaps a section restricted since) never stays readable.
+    /// - Any `UnsafeEngineFile` while sweeping (a link, an entry that cannot be inspected, listed or removed, one nested too
+    ///   deeply or that kept changing) is treated as planted, as is one in the way of a write: the engine-file alert, the whole
+    ///   mirror removed (by descriptor: a link is unlinked, never followed), the cursor reset, so the next refresh rebuilds it.
+    /// - Any other failure (the content cannot be built, the engine's own write fails: a full disk) also removes the mirror,
+    ///   alerts when there was one to remove, and is rethrown for the caller to trace.
     @discardableResult
     public static func mirror(store: Store, companyId: String, workspace: URL, now: Date = Store.now()) throws -> MirrorResult {
-        let content = try mirrorContent(store: store, companyId: companyId)
-        let stored = try store.writer.read { db in
-            try Store.memoryCursorPosition(db: db, companyId: companyId, source: mirrorCursor)
+        try mirror(store: store, companyId: companyId, workspace: workspace, now: now, fault: nil)
+    }
+
+    /// Where a test injects a failure: the sweep (listing, inspecting, removing) or the writes.
+    enum MirrorPhase { case sweep, write }
+
+    static func mirror(store: Store, companyId: String, workspace: URL, now: Date,
+                       fault: ((MirrorPhase, String) throws -> Void)?) throws -> MirrorResult {
+        var result = MirrorResult()
+        func flag(_ problem: UnsafeEngineFile) {
+            guard !result.unsafe.contains(problem) else { return }
+            result.unsafe.append(problem)
+            store.alertEngineFile(problem, companyId: companyId, now: now)
+        }
+        let content: (files: [String: Data], dirs: [String], fingerprint: String)
+        let stored: String
+        do {
+            content = try mirrorContent(store: store, companyId: companyId)
+            stored = try store.writer.read { db in try Store.memoryCursorPosition(db: db, companyId: companyId, source: mirrorCursor) }
+        } catch {
+            failClosed(store: store, companyId: companyId, workspace: workspace, now: now, because: error)
+            throw error
         }
         let changed = stored != content.fingerprint
-        var result = MirrorResult()
         var notes: [String] = []
         func note(_ relative: String) {
             result.repaired.append(relative)
@@ -154,38 +177,40 @@ public enum HandbookExporter {
         }
         func base(_ relative: String) -> String { relative.isEmpty ? mirrorRoot : "\(mirrorRoot)/\(relative)" }
 
-        func flag(_ problem: UnsafeEngineFile) {
-            guard !result.unsafe.contains(problem) else { return }
-            result.unsafe.append(problem)
-            store.alertEngineFile(problem, companyId: companyId, now: now)
-        }
-
         do {
-            try EngineFiles.directory(workspace: workspace, mirrorRoot)
-            // First, anything that is not an expected directory or file, or not of the expected kind (compared as the file
-            // system may: folded), goes: stale pages, planted files, a directory where a file belongs. A link is flagged.
-            let dirKeys = Set(content.dirs.map(Layout.fold)), fileKeys = Set(content.files.keys.map(Layout.fold))
-            func sweep(_ relative: String, depth: Int) throws {
-                let dir = try EngineFiles.openWalked(workspace: workspace, base(relative))
-                for name in try dir.names().sorted() {
-                    let child = relative.isEmpty ? name : "\(relative)/\(name)"
-                    let key = Layout.fold(child)
-                    let kind = dir.kind(of: name)
-                    switch kind {
-                    case .directory where dirKeys.contains(key) && depth < HandbookPath.maxSegments: try sweep(child, depth: depth + 1)
-                    case .other where fileKeys.contains(key): continue
-                    default:
-                        if kind == .link, dirKeys.contains(key) || fileKeys.contains(key) {
-                            flag(UnsafeEngineFile(path: workspace.appending(path: "\(base(relative))/\(name)").path,
-                                                  problem: "is a symbolic link"))
+            // Sweep: anything that is not an expected directory or file, or not of the expected kind (compared as the file
+            // system may: folded), goes: stale pages, planted files, a directory where a file belongs. Every problem here is
+            // treated as planted.
+            do {
+                try EngineFiles.directory(workspace: workspace, mirrorRoot)
+                let dirKeys = Set(content.dirs.map(Layout.fold)), fileKeys = Set(content.files.keys.map(Layout.fold))
+                func sweep(_ relative: String, depth: Int) throws {
+                    try fault?(.sweep, relative)
+                    let dir = try EngineFiles.openWalked(workspace: workspace, base(relative))
+                    for name in try dir.names().sorted() {
+                        let child = relative.isEmpty ? name : "\(relative)/\(name)"
+                        let key = Layout.fold(child)
+                        let kind = dir.kind(of: name)
+                        switch kind {
+                        case .directory where dirKeys.contains(key) && depth < HandbookPath.maxSegments: try sweep(child, depth: depth + 1)
+                        case .other where fileKeys.contains(key): continue
+                        default:
+                            if kind == .link, dirKeys.contains(key) || fileKeys.contains(key) {
+                                flag(UnsafeEngineFile(path: workspace.appending(path: "\(base(relative))/\(name)").path,
+                                                      problem: "is a symbolic link"))
+                            }
+                            try fault?(.sweep, child)
+                            try EngineFiles.remove(workspace: workspace, dir: base(relative), name: name)
+                            result.removed += 1
+                            if !changed { note(child) }
                         }
-                        try EngineFiles.remove(workspace: workspace, dir: base(relative), name: name)
-                        result.removed += 1
-                        if !changed { note(child) }
                     }
                 }
+                try sweep("", depth: 0)
+            } catch let problem as UnsafeEngineFile {
+                throw Planted(problem: problem)
             }
-            try sweep("", depth: 0)
+            // Writes. A link or odd file in the way is planted; the engine's own failure is not.
             for dir in content.dirs { try EngineFiles.directory(workspace: workspace, base(dir)) }
             for (relative, data) in content.files.sorted(by: { $0.key < $1.key }) {
                 let parent = relative.contains("/") ? String(relative[..<relative.lastIndex(of: "/")!]) : ""
@@ -199,24 +224,22 @@ public enum HandbookExporter {
                     current = nil
                 }
                 if let current, SHA256.hex(current) == SHA256.hex(data) { continue }
+                try fault?(.write, relative)
                 if let problem = try EngineFiles.replace(data, workspace: workspace, dir: base(parent), name: name) { flag(problem) }
                 if changed { result.written += 1 } else if !result.repaired.contains(relative) { note(relative) }
             }
+        } catch let planted as Planted {
+            flag(planted.problem)
+            removeMirror(store: store, companyId: companyId, workspace: workspace)
+            return result
         } catch let problem as UnsafeEngineFile where isPlanted(problem) {
             flag(problem)
-            // The planted entry goes (by descriptor: a link is unlinked, never followed) and the mirror is rebuilt next time.
-            do {
-                try EngineFiles.remove(workspace: workspace, dir: ".brahma", name: "kb")
-            } catch {
-                FileHandle.standardError.write(Data("brahma: could not remove the handbook mirror: \(error)\n".utf8))
-            }
-            try store.writer.write { db in
-                try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorCursor, "")
-            }
+            removeMirror(store: store, companyId: companyId, workspace: workspace)
             return result
+        } catch {
+            failClosed(store: store, companyId: companyId, workspace: workspace, now: now, because: error)
+            throw error
         }
-        // Any other failure (a name the file system refuses, a full disk) is thrown to the caller, which traces it: it is not
-        // something an agent planted, so nothing is alerted or wiped.
         try store.writer.write { db in
             for text in notes {
                 try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work, text: text, createdAt: now).insert(db)
@@ -224,6 +247,45 @@ public enum HandbookExporter {
             try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorCursor, content.fingerprint)
         }
         return result
+    }
+
+    /// A sweep problem, carried out of the sweep to the planted path.
+    private struct Planted: Error { var problem: UnsafeEngineFile }
+
+    /// The reason that keys the alert about a mirror that could not be rebuilt and was removed.
+    public static let mirrorAlertReason = "handbook-mirror"
+
+    /// The mirror is removed (by descriptor; a link is unlinked, never followed) and its cursor reset, so the next refresh
+    /// rebuilds it from scratch. Returns whether something was there. A removal that fails is reported on standard error (the
+    /// caller has raised, or raises, an alert).
+    @discardableResult
+    static func removeMirror(store: Store, companyId: String, workspace: URL) -> Bool {
+        var existed = true
+        do {
+            existed = try EngineFiles.entry(workspace: workspace, dir: ".brahma", name: "kb") != .missing
+            if existed { try EngineFiles.remove(workspace: workspace, dir: ".brahma", name: "kb") }
+        } catch {
+            FileHandle.standardError.write(Data("brahma: could not remove the handbook mirror of \(companyId): \(error)\n".utf8))
+        }
+        do {
+            try store.writer.write { db in try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorCursor, "") }
+        } catch {
+            FileHandle.standardError.write(Data("brahma: could not reset the handbook mirror cursor of \(companyId): \(error)\n".utf8))
+        }
+        return existed
+    }
+
+    /// The mirror cannot be rebuilt: its old files go (nothing stale stays readable) and, when there were any, the owner is
+    /// alerted. The caller rethrows `error` for its trace.
+    static func failClosed(store: Store, companyId: String, workspace: URL, now: Date, because error: any Error) {
+        guard removeMirror(store: store, companyId: companyId, workspace: workspace) else { return }
+        let text = "The handbook mirror in .brahma/kb could not be rebuilt (\(Store.flat("\(error)", max: 300))); its old files were "
+            + "removed so nothing stale stays readable. The next refresh tries again."
+        do {
+            try EngineAlerts.raise(store: store, text: text, now: now, reason: mirrorAlertReason, companyId: companyId)
+        } catch {
+            FileHandle.standardError.write(Data("brahma: \(text) (and the alert failed: \(error))\n".utf8))
+        }
     }
 
     /// The mirror's files (relative to `.brahma/kb`), its directories (parents first) and its fingerprint.
@@ -263,10 +325,12 @@ public enum HandbookExporter {
         return (files, layout.dirs, fingerprint)
     }
 
-    /// Whether `problem` is something found in the way (a link, a hard link, another user's or odd file, a directory moved
-    /// during the walk) rather than a failure of the engine's own write (a refused name, a full disk).
+    /// For the writes (after the sweep, where every problem counts as planted): whether `problem` is something found in the
+    /// way (a link, a hard link, another user's or odd file, a directory moved during the walk, a directory where the file
+    /// goes) rather than a failure of the engine's own write (a refused name, a full disk). Either way the mirror is removed.
     static func isPlanted(_ problem: UnsafeEngineFile) -> Bool {
-        ["symbolic link", "is not a directory", "another hard link", "owned by another user", "not a regular file", "moved"]
+        ["symbolic link", "is not a directory", "another hard link", "owned by another user", "not a regular file", "moved",
+         "is a directory, not a file"]
             .contains { problem.problem.contains($0) }
     }
 

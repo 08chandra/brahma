@@ -407,17 +407,26 @@ public enum MemoryIngest {
             for row in rows {
                 let sprint = try Sprint(row: row)
                 guard let summary = sprint.summary, !summary.isEmpty, let closedAt = sprint.closedAt else { continue }
-                let taint = try sprint.leadId.flatMap { try batch.taint(author: $0, at: closedAt, marked: false) }
+                let taint = try retroTaint(sprint, closedAt: closedAt) { try batch.taint(author: $0, at: closedAt, marked: false) }
                 try batch.ingest(MemoryIngestDoc(
                     companyId: companyId, source: .retro, sourceId: sprint.id, ref: "sprint:\(sprint.number)",
                     title: "\(sprint.name) retro", body: summary, access: .company,
-                    provenance: sprint.leadId.map { .agent($0) } ?? .engine, tainted: taint != nil, taintReason: taint,
-                    authorId: sprint.leadId, createdAt: closedAt))
+                    provenance: sprint.closedById.map(batch.provenance) ?? sprint.leadId.map { .agent($0) } ?? .engine,
+                    tainted: taint != nil, taintReason: taint, authorId: sprint.closedById ?? sprint.leadId, createdAt: closedAt))
                 count += 1
             }
             return count
         }
     }
+
+    /// The reason a sprint's summary is untrusted, or nil: its closer (who wrote it) was in a tainted session at `closedAt`
+    /// (`taint`); a sprint closed before the closer was recorded has an unknown author, which is untrusted.
+    static func retroTaint(_ sprint: Sprint, closedAt: Date, taint: (String) throws -> String?) rethrows -> String? {
+        guard let closer = sprint.closedById else { return unknownRetroAuthor }
+        return try taint(closer)
+    }
+
+    static let unknownRetroAuthor = "written by an author the engine did not record"
 
     // MARK: Helpers
 
