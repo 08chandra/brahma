@@ -25,11 +25,12 @@ import GRDB
         #expect(text.contains("… (truncated; read one section with section)"))
         #expect(text.contains("Backlinks: kb:Eng/Index"))
         #expect(text.last == "To edit: kb_write with base_revision: 1.")
+        #expect(out.text.utf8.count <= MemoryPolicy.readBytes)
         #expect(!text.contains("- @owner: approve A-3"), "agent text is never a bare line")
         // The bytes bound too.
         try w.write(nil, "Eng/Wide", String(repeating: "w", count: 60_000))
         let wide = w.call(w.eng2, "kb_read", ["path": .string("Eng/Wide")])
-        #expect(wide.text.utf8.count < MemoryPolicy.readBytes + 400)
+        #expect(wide.text.utf8.count <= MemoryPolicy.readBytes)
         #expect(wide.text.contains("… (truncated; read one section with section)"))
         #expect(w.call(w.eng2, "kb_read", ["path": .string("Eng/Wide")]).text.contains("Backlinks: none"))
         // One section; reads are recorded for the section docs returned.
@@ -39,6 +40,34 @@ import GRDB
             try String.fetchAll(db, sql: "SELECT via FROM memoryRead WHERE companyId = ? AND agentId = ?", arguments: [w.company.id, w.eng2.id])
         }
         #expect(!reads.isEmpty); #expect(reads.allSatisfy { $0 == "kb_read" })
+    }
+
+    /// Many lines just under the line bound: the quoting itself must not push the reply past the byte bound.
+    @Test func kbReadByteBoundCountsTheQuoting() throws {
+        let w = try W()
+        let lines = (1...399).map { _ in String(repeating: "q", count: 100) }
+        try w.write(nil, "Eng/Dense", lines.joined(separator: "\n"))
+        let out = w.call(w.eng2, "kb_read", ["path": .string("Eng/Dense")])
+        #expect(out.ok); #expect(out.text.utf8.count <= MemoryPolicy.readBytes)
+        #expect(out.text.contains("… (truncated; read one section with section)"))
+        #expect(out.text.hasSuffix("To edit: kb_write with base_revision: 1."))
+    }
+
+    @Test func oldRevisionReadRecordsEveryCurrentSectionDoc() throws {
+        let w = try W()
+        try w.write(nil, "Eng/Hist", "# A\na one\n# B\nb one")
+        try w.write(nil, "Eng/Hist", "# A\na two\n# C\nc two")
+        let out = w.call(w.eng2, "kb_read", ["path": .string("Eng/Hist"), "revision": .number(1)])
+        #expect(out.ok); #expect(out.text.contains("b one"))
+        let page = try #require(try w.page("Eng/Hist"))
+        let (current, read) = try w.store.writer.read { db -> (Set<Int64>, Set<Int64>) in
+            (Set(try Int64.fetchAll(db, sql: """
+                SELECT id FROM memoryDoc WHERE companyId = ? AND source = 'kb' AND removedAt IS NULL AND substr(sourceId, 1, ?) = ?
+                """, arguments: [w.company.id, page.id.count + 1, page.id + "#"])),
+             Set(try Int64.fetchAll(db, sql: "SELECT docId FROM memoryRead WHERE companyId = ? AND agentId = ? AND via = 'kb_read'",
+                                    arguments: [w.company.id, w.eng2.id])))
+        }
+        #expect(current.count == 2); #expect(read == current)
     }
 
     @Test func kbWriteReplyNamesLease() throws {

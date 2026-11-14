@@ -142,6 +142,8 @@ import BrahmaKeychain
         #expect(eng.text.contains("public plan text")); #expect(!eng.text.contains("otter")); #expect(!eng.text.contains("Comp"))
         #expect(eng.hiddenSections == 1)
         #expect(eng.text.hasSuffix("_1 restricted section(s) not shown._"))
+        // No field of the view carries the hidden section.
+        #expect(!eng.page.body.contains("otter")); #expect(eng.page.body == eng.text)
         let cfo = try #require(try w.read(w.cfo, "Company/Board"))
         #expect(cfo.text.contains("salary bands otter")); #expect(cfo.hiddenSections == 0)
         // Search filters before returning: no hit, no snippet, no count.
@@ -255,9 +257,11 @@ import BrahmaKeychain
             w.refusal { try w.write(w.eng1, "Board", "x", base: .none, noItem: true) },
             w.refusal { try w.write(w.eng1, "Board", "x", base: .n(1)) },
             w.refusal { try w.write(w.eng1, "Board", "x", section: "minutes") },
-            w.refusal { try w.write(w.eng1, "board", "x", item: w.item(w.eng2)) },
+            w.refusal { try w.write(w.eng1, "Board", "x", item: w.item(w.eng2)) },
         ]
         for r in refusals { #expect(r == .forbidden("you can't write kb:Board")) }
+        // Only the path asked for is echoed, never the stored one.
+        #expect(w.refusal { try w.write(w.eng1, "board", "x", item: w.item(w.eng2)) } == .forbidden("you can't write kb:board"))
         for r in refusals.compactMap({ $0?.message }) {
             #expect(!r.contains("rev")); #expect(!r.contains("lease")); #expect(!r.contains("@ceo")); #expect(!r.contains("edited"))
         }
@@ -346,10 +350,62 @@ import BrahmaKeychain
         let w = try W()
         try w.write(nil, "Company/Pay", "# Plan\nplan\n# Pay\nsalary walrus")
         try w.write(nil, "Company/Pay", "# Plan\nplan\n# Pay [restricted: cfo]\nsalary walrus")
-        let old = try #require(try w.read(w.eng1, "Company/Pay", revision: 1))
-        #expect(old.revision == 1); #expect(!old.text.contains("walrus")); #expect(old.hiddenSections == 1)
-        #expect(try #require(try w.read(w.cfo, "Company/Pay", revision: 1)).text.contains("walrus"))
-        #expect(w.refusal { try w.read(w.eng1, "Company/Pay", revision: 9) as Any } != nil)
+        // History is for readers of the whole current page: eng-1 gets the missing-revision answer.
+        #expect(w.refusal { try w.read(w.eng1, "Company/Pay", revision: 1) as Any } == .notFound("kb:Company/Pay has no revision 1"))
+        #expect(w.refusal { try w.read(w.eng1, "Company/Pay", revision: 9) as Any } == .notFound("kb:Company/Pay has no revision 9"))
+        #expect(w.call(w.eng1, "kb_read", ["path": .string("Company/Pay"), "revision": .number(1)])
+                == (false, "kb:Company/Pay has no revision 1"))
+        let cfoOld = try #require(try w.read(w.cfo, "Company/Pay", revision: 1))
+        #expect(cfoOld.revision == 1); #expect(cfoOld.text.contains("walrus"))
+        #expect(try w.read(nil, "Company/Pay", revision: 1)?.text.contains("walrus") == true)
+        // The current revision by number is not history.
+        #expect(try w.read(w.eng1, "Company/Pay", revision: 2)?.hiddenSections == 1)
+    }
+
+    @Test func renamedRestrictedSectionLeaksNoOldText() throws {
+        let w = try W()
+        try w.write(nil, "Company/Pay", "# Plan\nplan\n# Pay\nsalary walrus")
+        // Restricted in rev 2 under a new slug: a slug match alone would show rev 1's text.
+        try w.write(nil, "Company/Pay", "# Plan\nplan\n# Compensation [restricted: cfo]\nsalary walrus")
+        #expect(w.refusal { try w.read(w.eng1, "Company/Pay", revision: 1) as Any } == .notFound("kb:Company/Pay has no revision 1"))
+        let out = w.call(w.eng1, "kb_read", ["path": .string("Company/Pay"), "revision": .number(1)])
+        #expect(out == (false, "kb:Company/Pay has no revision 1")); #expect(!out.text.contains("walrus"))
+        #expect(try #require(try w.read(w.cfo, "Company/Pay", revision: 1)).text.contains("salary walrus"))
+    }
+
+    @Test func topSectionWriteHoldsNoHeadings() throws {
+        let w = try W()
+        try w.write(nil, "Company/Board", Self.boardBody)
+        let e = w.refusal { try w.write(w.eng1, "Company/Board", "intro\n## X [restricted: cfo]\nx", section: "top") }
+        #expect(e == .invalid("a section edit must be one section: close every code fence and don't add headings at this level or above"))
+        #expect(w.refusal { try w.write(w.eng1, "Company/Board", "intro\n###### deep", section: "top") } == e)
+        #expect(try w.page("Company/Board")?.revision == 1)
+        try w.write(w.eng1, "Company/Board", "intro\n```\n# fenced, not a heading\n```", section: "top")
+        #expect(try #require(try w.page("Company/Board")).body.hasPrefix("intro\n```\n# fenced, not a heading\n```\n# Plan"))
+    }
+
+    @Test func lookAlikeOfUnreadablePageRefusedTheSameWay() throws {
+        let w = try W()
+        try w.write(nil, "\u{C9}t\u{E9}", "summer secrets")          // "Été"
+        try w.store.writer.write { db in
+            try db.execute(sql: "UPDATE kbPage SET restriction = '[\"@executive\"]' WHERE companyId = ?", arguments: [w.company.id])
+        }
+        // Creating a look-alike (a non-ASCII case variant): refused, echoing the path asked for.
+        let created = w.refusal { try w.write(w.eng1, "\u{E9}t\u{E9}", "x") }   // "été"
+        #expect(created == .forbidden("you can't write kb:\u{E9}t\u{E9}"))
+        #expect(w.refusal { try w.write(w.eng1, "\u{C9}T\u{C9}", "x") } == .forbidden("you can't write kb:\u{C9}T\u{C9}"))
+        // An NFD spelling is the same page: the unreadable-page answer, in the same words.
+        #expect(w.refusal { try w.write(w.eng1, "E\u{301}te\u{301}", "x") } == .forbidden("you can't write kb:\u{C9}t\u{E9}"))
+        #expect(try w.page("\u{E9}t\u{E9}") == nil || (try w.page("\u{E9}t\u{E9}"))?.path == "\u{C9}t\u{E9}")
+        // An existing unreadable "été" answers byte for byte as the look-alike creation did.
+        try w.write(nil, "\u{E9}t\u{E9}", "another page")
+        try w.store.writer.write { db in
+            try db.execute(sql: "UPDATE kbPage SET restriction = '[\"@executive\"]' WHERE companyId = ?", arguments: [w.company.id])
+        }
+        let existing = w.refusal { try w.write(w.eng1, "\u{E9}t\u{E9}", "x") }
+        #expect(existing?.message.utf8.elementsEqual(try #require(created?.message).utf8) == true)
+        // A reader of the page may still create a look-alike (it sees the page it would collide with).
+        try w.write(w.ceo, "\u{C9}T\u{C9}", "ceo page")
     }
 
     @Test func oldTaintedRevisionTaintsReader() throws {

@@ -97,23 +97,35 @@ extension CompanyTools {
         let source = "kb:\(page.path)@\(view.revision)"
         var header = "kb:\(page.path) · rev \(view.revision) · \(page.status.rawValue) · owner \(labels.author(page.ownerId)) · updated \(labels.date(view.revisionDate))"
         if view.tainted { header += " · untrusted" }
-        let (text, truncated) = Self.boundedKB(view.text)
-        var lines = [header]
+        // The bound applies to what the agent receives: at most `readLines` quoted lines, and the whole reply (header,
+        // quoted block and trailer) at most `readBytes` bytes.
+        let truncationNote = "… (truncated; read one section with section)"
+        let trailer = ["Backlinks: " + (view.backlinks.isEmpty ? "none" : view.backlinks.map { "kb:\($0)" }.joined(separator: ", ")),
+                       "To edit: kb_write with base_revision: \(page.revision)."]
+        let textLines = view.text.split(separator: "\n", omittingEmptySubsequences: false)
+        var truncated = textLines.count > MemoryPolicy.readLines
+        let shown = textLines.prefix(MemoryPolicy.readLines).joined(separator: "\n")
+        var block: String
         if view.tainted {
             // Taint first: the text is shown only once this session is marked as having read it (a failed mark refuses).
             try relayTaint(source)
-            lines.append(UntrustedBlock.render(source: "\(source) (\(view.taintReason ?? "outside content"))", text: text,
-                                               maxLines: MemoryPolicy.readLines))
+            block = UntrustedBlock.render(source: "\(source) (\(view.taintReason ?? "outside content"))", text: shown,
+                                          maxLines: MemoryPolicy.readLines)
         } else {
-            for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-                lines.append("    | " + String(String.UnicodeScalarView(line.unicodeScalars.map {
+            block = shown.split(separator: "\n", omittingEmptySubsequences: false).map { line in
+                "    | " + String(String.UnicodeScalarView(line.unicodeScalars.map {
                     CharacterSet.controlCharacters.contains($0) && $0 != "\t" ? " " : $0
-                })))
-            }
+                }))
+            }.joined(separator: "\n")
         }
-        if truncated { lines.append("… (truncated; read one section with section)") }
-        lines.append("Backlinks: " + (view.backlinks.isEmpty ? "none" : view.backlinks.map { "kb:\($0)" }.joined(separator: ", ")))
-        lines.append("To edit: kb_write with base_revision: \(page.revision).")
+        // Room for the header, the trailer and the truncation note, each on its own line.
+        let budget = MemoryPolicy.readBytes - ([header, truncationNote] + trailer).joined(separator: "\n").utf8.count - 1
+        let cut = Self.cutToBytes(block, max(budget, 0))
+        block = cut.text
+        truncated = truncated || cut.truncated
+        var lines = [header, block]
+        if truncated { lines.append(truncationNote) }
+        lines += trailer
 
         let sourceIds = view.slugs.map { "\(page.id)#\($0)" }
         if !sourceIds.isEmpty {
@@ -129,28 +141,18 @@ extension CompanyTools {
         return lines.joined(separator: "\n")
     }
 
-    /// At most `MemoryPolicy.readLines` lines and `MemoryPolicy.readBytes` bytes (cut on a character boundary).
-    static func boundedKB(_ text: String) -> (text: String, truncated: Bool) {
-        var out = text
-        var truncated = false
-        let lines = out.split(separator: "\n", omittingEmptySubsequences: false)
-        if lines.count > MemoryPolicy.readLines {
-            out = lines.prefix(MemoryPolicy.readLines).joined(separator: "\n")
-            truncated = true
+    /// `text` cut to at most `bytes` UTF-8 bytes, on a character boundary.
+    static func cutToBytes(_ text: String, _ bytes: Int) -> (text: String, truncated: Bool) {
+        guard text.utf8.count > bytes else { return (text, false) }
+        var used = 0
+        var cut = text.startIndex
+        for index in text.indices {
+            let size = text[index].utf8.count
+            guard used + size <= bytes else { break }
+            used += size
+            cut = text.index(after: index)
         }
-        if out.utf8.count > MemoryPolicy.readBytes {
-            var bytes = 0
-            var cut = out.startIndex
-            for index in out.indices {
-                let size = out[index].utf8.count
-                guard bytes + size <= MemoryPolicy.readBytes else { break }
-                bytes += size
-                cut = out.index(after: index)
-            }
-            out = String(out[..<cut])
-            truncated = true
-        }
-        return (out, truncated)
+        return (String(text[..<cut]), true)
     }
 
     // MARK: kb_write

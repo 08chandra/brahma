@@ -9,8 +9,9 @@ extension Store {
 
     /// The page `path` names (an optional `kb:` prefix; a `#section` suffix stands for `section` when that is nil) as `reader`
     /// may see it, at `revision` (nil: the current one). Nil for a missing page **and** for one the reader cannot read at page
-    /// level. Sections are filtered with `KBAccess`; an old revision is also filtered by the current revision's restrictions
-    /// for every slug restricted now. `tainted` is the read revision's flag. Backlinks list only links whose source page and
+    /// level. Sections are filtered with `KBAccess`. An old revision is shown only to a reader who can read every current
+    /// section (else the missing-revision answer), and is also filtered by its own markers and by the current restrictions of
+    /// every slug restricted now. `tainted` is the read revision's flag. Backlinks list only links whose source page and
     /// section the reader can read. The text passes through the redactor. A revision the page does not have, or a section
     /// that is missing or hidden, is `WorkError.notFound` (the same answer for both).
     public func kbRead(companyId: String, reader: Reader, path: String, section: String? = nil,
@@ -22,11 +23,18 @@ extension Store {
             guard let page = try Self.kbPage(db: db, companyId: companyId, path: ref.path), KBAccess.canReadPage(page, ctx: ctx)
             else { return nil }
             let restriction = page.pageRestriction
+            let currentSections = KBMarkdown.sections(page.body, page: restriction)
             let row: KBRevision?
+            let old = revision.map { $0 != page.revision } ?? false
             if let revision {
+                // History is for readers of the whole current page: an old revision's sections cannot be matched to today's
+                // restrictions reliably (a section may have been renamed or restricted since), so anyone who cannot read
+                // every current section sees no old revision at all, with the missing-revision answer.
+                let missing = WorkError.notFound("kb:\(page.path) has no revision \(revision)")
+                if old, !currentSections.allSatisfy({ KBAccess.canRead($0, ctx: ctx) }) { throw missing }
                 guard let r = try KBRevision.filter(Column("pageId") == page.id && Column("number") == revision).fetchOne(db),
                       r.companyId == companyId
-                else { throw WorkError.notFound("kb:\(page.path) has no revision \(revision)") }
+                else { throw missing }
                 row = r
             } else {
                 row = try KBRevision.filter(Column("pageId") == page.id && Column("number") == page.revision).fetchOne(db)
@@ -34,7 +42,7 @@ extension Store {
             let body = row?.body ?? page.body
             // Every slug restricted now must be readable now too, whatever an old revision said.
             var restrictedNow: [String: KBSection] = [:]
-            for s in KBMarkdown.sections(page.body, page: restriction) where !s.restrictions.isEmpty { restrictedNow[s.slug] = s }
+            for s in currentSections where !s.restrictions.isEmpty { restrictedNow[s.slug] = s }
             let lines = KBMarkdown.lines(body)
             let located = KBMarkdown.located(body, page: restriction)
             func visible(_ loc: KBMarkdown.Located) -> Bool {
@@ -61,6 +69,8 @@ extension Store {
                 text = shown.joined(separator: "\n")
                 if hidden > 0 { text += "\n\n_\(hidden) restricted section(s) not shown._" }
             }
+            // An old revision's text is read by a whole-page reader: its reads are of every current section doc.
+            if old { slugs = currentSections.map(\.slug) }
 
             let backlinks = try Self.kbBacklinks(db: db, page: page, ctx: ctx)
             return KBView(page: page, revision: row?.number ?? page.revision, text: text, hiddenSections: hidden,
@@ -70,6 +80,8 @@ extension Store {
         }
         guard var view else { return nil }
         view.text = redactor.apply(view.text)
+        // No field of a view carries what the reader may not see: the page's body is the filtered text.
+        view.page.body = view.text
         return view
     }
 
@@ -160,8 +172,9 @@ extension Store {
     /// runs before anything is written, in one transaction; a refusal writes nothing. For an agent, in this order:
     /// 1. the path normalizes (`HandbookPath`);
     /// 2. an engine-generated page (or path) → forbidden;
-    /// 2b. an existing page the agent cannot read at page level → `forbidden("you can't write kb:<path>")`, before any item,
-    ///     lease or revision check;
+    /// 2b. an existing page the agent cannot read at page level, or a new path that differs only by case or Unicode
+    ///     normalization from one → `forbidden("you can't write kb:<requested path>")`, before any item, lease or revision
+    ///     check: one text for both, echoing only the normalized path asked for (never a stored one);
     /// 4. an item is required, and the agent must own or lease it;
     /// 5. another agent's unexpired page lease → conflict;
     /// 6. an existing page needs `baseRevision`, equal to its revision;
@@ -200,8 +213,18 @@ extension Store {
             if author != .system, existing?.autoKind != nil || Handbook.isAutoPath(path) {
                 throw WorkError.forbidden("kb:\(shownPath) is generated by the engine from live data; it updates itself")
             }
-            if case .agent = author, let existing, !KBAccess.canReadPage(existing, ctx: ctx) {
-                throw WorkError.forbidden("you can't write kb:\(shownPath)")
+            if case .agent = author {
+                let cannotWrite = WorkError.forbidden("you can't write kb:\(path)")
+                if let existing {
+                    if !KBAccess.canReadPage(existing, ctx: ctx) { throw cannotWrite }
+                } else {
+                    // A look-alike of a page the agent cannot read (`é` vs `É`, compatibility forms) is refused the same way.
+                    let key = HandbookPath.foldKey(path)
+                    for other in try KBPage.fetchAll(db, sql: "SELECT * FROM kbPage WHERE companyId = ?", arguments: [companyId])
+                    where HandbookPath.foldKey(other.path) == key && !KBAccess.canReadPage(other, ctx: ctx) {
+                        throw cannotWrite
+                    }
+                }
             }
 
             // 4, 5.
@@ -245,7 +268,10 @@ extension Store {
                 let notOneSection = WorkError.invalid("a section edit must be one section: close every code fence and don't add headings at this level or above")
                 if let target = oldSections.first(where: { $0.slug == slug }) {
                     guard KBAccess.canRead(target, ctx: ctx) else { throw WorkError.forbidden("kb:\(shownPath) \(Self.kbSectionsHidden)") }
-                    guard KBMarkdown.isSingleSectionText(supplied, belowLevel: target.level) else { throw notOneSection }
+                    // The lead holds no heading at all: through it a writer could otherwise add whole new sections.
+                    guard KBMarkdown.isSingleSectionText(supplied, belowLevel: target.heading == nil ? 6 : target.level) else {
+                        throw notOneSection
+                    }
                     newBody = KBMarkdown.replacing(section: slug, in: oldBody, with: supplied)
                 } else {
                     guard KBMarkdown.isSingleSectionText(supplied, belowLevel: 2) else { throw notOneSection }
