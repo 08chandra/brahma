@@ -249,9 +249,11 @@ public struct MapModel: Sendable {
     }
 
     static func makeAgent(_ a: Agent, kinds: [String: RoleKind], item: String?, blocker: String?, people: MapPeople) -> MapAgent {
-        let trust = people.trust[a.id].map {
-            MapTrust(label: MapText.clean($0.label, max: 8), title: MapText.clean($0.title, max: 40),
-                     tier: Swift.min(3, Swift.max(0, $0.tier)))
+        // A label that cleans to the empty marker (only stripped scalars) is no label: the trust is absent.
+        let trust = people.trust[a.id].flatMap { t -> MapTrust? in
+            let label = MapText.clean(t.label, max: 8)
+            guard label != MapText.empty else { return nil }
+            return MapTrust(label: label, title: MapText.clean(t.title, max: 40), tier: Swift.min(3, Swift.max(0, t.tier)))
         }
         let perks = (people.perks[a.id] ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .prefix(2).map { MapText.clean($0, max: 8) }
@@ -408,11 +410,18 @@ public struct MapModel: Sendable {
 
     // MARK: Cards
 
+    /// A paused agent that is not killed renders like a sleeping one.
+    static func displayState(_ state: AgentState, paused: Bool) -> AgentState {
+        paused && state != .killed ? .sleeping : state
+    }
+
+    private static func displayState(_ a: Agent) -> AgentState { displayState(a.state, paused: a.paused) }
+
     public func hoverCard(agentId: String) -> MapHoverCard? {
         guard let a = agents[agentId], let r = raw[agentId] else { return nil }
         let managerId = tree.nodes[agentId] != nil ? tree.nodes[agentId]?.parentId : r.managerId
         return MapHoverCard(handle: a.handle, role: a.role, stateLabel: AgentBadge.label(r), blocker: a.blocker,
-                            department: a.department.title, state: a.state, team: a.team, item: a.item,
+                            department: a.department.title, state: Self.displayState(a.state, paused: a.paused), team: a.team, item: a.item,
                             manager: managerId.flatMap { agents[$0]?.handle }, reports: reportIds[agentId]?.count ?? 0,
                             trust: a.trust, perks: a.perks, meter: a.meter)
     }
@@ -423,9 +432,14 @@ public struct MapModel: Sendable {
               let label = tree.teamLabel(managerId, agents: raw) else { return nil }
         let department = groups.first { $0.id == "team:\(manager.team ?? "")" }?.department ?? lead.department
         let members = (reportIds[managerId] ?? []).compactMap { agents[$0] }
-        return MapTeamCard(title: "TEAM-" + label + " · " + department.title, lead: lead.handle,
-                           counts: StateCounts(members.compactMap { raw[$0.id] }),
-                           members: members.map { MapTeamMember(id: $0.id, handle: $0.handle, label: $0.role, state: $0.state) },
+        // A generated team is already "TEAM-1"; a named one ("core") gets the prefix.
+        let name = label.hasPrefix("TEAM") ? label : "TEAM-" + label
+        return MapTeamCard(title: name + " · " + department.title, lead: lead.handle,
+                           counts: StateCounts(members.compactMap { raw[$0.id] }.map { var a = $0; a.state = Self.displayState(a); return a }),
+                           members: members.map {
+                               MapTeamMember(id: $0.id, handle: $0.handle, label: $0.role,
+                                             state: Self.displayState($0.state, paused: $0.paused))
+                           },
                            vacancies: vacancies.filter { $0.managerId == managerId }.count)
     }
 }
