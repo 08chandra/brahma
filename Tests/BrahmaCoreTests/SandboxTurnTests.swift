@@ -90,7 +90,11 @@ private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: 
         #expect(scope.cwd.path == w.ws.appending(path: ".brahma/wt/\(i.key)").path)
         #expect(r.workingDirectory == scope.cwd.path)
         #expect(scope.writable.map(\.path).contains(w.ws.appending(path: ".git/refs/heads/item/\(i.key)").path))
-        #expect(TurnProfileCompiler.profile(for: r).addDirs.isEmpty, "no extra directory: the worktree is the cwd")
+        // No extra directory but the read-only handbook mirror (Plan ML Task 5 writes `.brahma/kb` on the tick): the worktree
+        // is the cwd.
+        #expect(TurnProfileCompiler.profile(for: r).addDirs.filter { !$0.hasSuffix("/.brahma/kb") }.isEmpty,
+                "no extra directory: the worktree is the cwd")
+        #expect(scope.readOnlyDirs.map(\.path).allSatisfy { $0.hasSuffix("/.brahma/kb") })
     }
 
     @Test func companyProfilesUnderTheEngineCeiling() async throws {

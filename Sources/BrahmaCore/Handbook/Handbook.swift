@@ -10,11 +10,9 @@ public enum Handbook {
     /// `kb_write` sources: at most this many, each at most `maxSourceChars` once flattened to one line.
     public static let maxSources = 20
     public static let maxSourceChars = 300
-    /// Pages the engine generates from live data (Task 5's `AutoPageKind` raw values). Nobody else writes these paths, whether
-    /// or not the engine has made the page yet, and the skeleton leaves them to the engine.
-    public static let autoPagePaths: [String] = [
-        "Company/Org chart", "Company/Roster", "Decisions log", "Company/Release history", "Company/Sprint summaries",
-    ]
+    /// Pages the engine generates from live data (`AutoPageKind`'s raw values, so the two lists cannot drift). Nobody else
+    /// writes these paths, whether or not the engine has made the page yet, and the skeleton leaves them to the engine.
+    public static let autoPagePaths: [String] = AutoPageKind.allCases.map(\.rawValue)
 
     static func isAutoPath(_ path: String) -> Bool {
         autoPagePaths.contains { $0.lowercased() == path.lowercased() }

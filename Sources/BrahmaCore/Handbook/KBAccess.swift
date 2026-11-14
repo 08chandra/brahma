@@ -19,6 +19,14 @@ public enum KBAccess {
         canRead(restrictions: page.pageRestriction.map { [$0] } ?? [], ctx: ctx)
     }
 
+    /// A reader with no role, no team and no executive seat: what every agent of the company can read (the `.brahma/kb`
+    /// mirror, which any agent with the workspace can open, shows only this).
+    static func companyWide(companyId: String) -> ReaderContext {
+        ReaderContext(reader: .agent(companyWideId), companyId: companyId, agentId: companyWideId)
+    }
+
+    static let companyWideId = "<company-wide reader>"
+
     static func canRead(restrictions: [Restriction], ctx: ReaderContext) -> Bool {
         MemoryAccess.level(ctx, access: .company, sensitivity: .normal, readerSet: nil, restrictions: restrictions,
                            futureHolders: false) == .full
