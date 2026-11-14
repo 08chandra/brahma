@@ -108,6 +108,21 @@ import Foundation
         for r in reports { #expect(st.nodes[r.id]?.parentId == "owner") }
     }
 
+    @Test func boardRootsOrderedByTierThenHandleNotReports() throws {
+        // Two same-tier orphans under Board; the later handle has a report. Board orders them by handle alone.
+        let agents = [agent("aaa", role: "engineer", manager: nil),
+                      agent("zzz", role: "engineer", manager: nil),
+                      agent("rep", role: "engineer", manager: "zzz")]
+        let t = tree(agents)
+        #expect(try #require(t.nodes["owner"]).childIds == ["a-aaa", "a-zzz"])
+        // Any other parent still puts the manager with reports first.
+        let under = [agent("boss", role: "engineer", manager: nil),
+                     agent("aaa", role: "engineer", manager: "boss"),
+                     agent("zzz", role: "engineer", manager: "boss"),
+                     agent("rep", role: "engineer", manager: "zzz")]
+        #expect(try #require(tree(under).nodes["a-boss"]).childIds == ["a-zzz", "a-aaa"])
+    }
+
     @Test func cycleBrokenDeterministically() throws {
         let a = agent("alpha", role: "engineer", manager: "beta")
         let b = agent("beta", role: "engineer", manager: "alpha")
@@ -294,6 +309,10 @@ import Foundation
         withExtras["vacancy:eng-50"] = "eng-50"
         #expect(!t.search("owner", handles: withExtras, roles: roles).contains("owner"))
         #expect(!t.search("eng-50", handles: withExtras, roles: roles).contains("vacancy:eng-50"))
+        // An id with no node (a killed or hidden agent still present in `handles`) is never returned.
+        withExtras["a-ghost"] = "eng-ghost"
+        #expect(!t.search("eng-ghost", handles: withExtras, roles: roles).contains("a-ghost"))
+        #expect(t.search("ghost", handles: withExtras, roles: roles).isEmpty)
     }
 
     // MARK: - Layout
