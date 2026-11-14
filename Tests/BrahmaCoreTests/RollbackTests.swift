@@ -193,6 +193,29 @@ import Glibc
         #expect(Self.message { _ = try request(fx, "R-1") } == "R-1 is already rolling back")
     }
 
+    /// Final-fix2 R1 (m7 residual): a rollback requested before a backup was taken is not carried out after a restore from
+    /// that backup. The restore's carry (`RestoreCarry.apply`, what `Restore.restore` writes into the staged snapshot) is applied
+    /// to this rig's database; once the owner resumes, the engine's tick runs no provider step and the release stays deployed.
+    @Test func restoredRequestedRollbackNeverRuns() async throws {
+        let fx = try Fx()
+        let (_, r2) = try await Self.twoDeployed(fx)
+        let before = fx.sandbox.calls.count
+        #expect(try request(fx, "R-2").rollbackStatus == .requested)
+        let notes = try await fx.store.writer.write { db in
+            try RestoreCarry.apply(.none, to: db, snapshot: "brahma-test.sqlite", now: fx.w.clock.now)
+        }
+        #expect(notes.contains("Lumen: the rollback of R-2 (release 0.2.0) was requested in the snapshot and is cancelled; "
+                               + "request it again"), "\(notes)")
+        #expect(try fx.store.resumeAfterStop(now: fx.w.clock.now))
+        await fx.advance()
+        try await fx.w.cycle()
+        let back = try fx.reload(r2)
+        #expect(back.rollbackStatus == nil)
+        #expect(back.status == .deployed)
+        #expect(Self.rollbackCalls(fx).isEmpty)
+        #expect(fx.sandbox.calls.count == before, "a provider step ran after the restore")
+    }
+
     @Test func missingPreviousFilesRefused() async throws {
         let fx = try Fx()
         let (_, r2) = try await Self.twoDeployed(fx)

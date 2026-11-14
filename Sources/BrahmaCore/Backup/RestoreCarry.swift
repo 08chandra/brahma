@@ -129,6 +129,7 @@ struct RestoreCarry {
         notes += rolledBack.map { "after the restore: \($0)" }
         try raiseRestoreAlert(db, snapshot: snapshot, summary: summary, now: now)
         notes += try cancelApprovedReleases(db, now: now)
+        notes += try cancelRequestedRollbacks(db, now: now)
 
         switch live {
         case .none:
@@ -177,6 +178,33 @@ struct RestoreCarry {
                               text: "\(r.ref) (release \(r.version)) was cancelled: \(restoredRelease)", createdAt: now).insert(db)
             let name = try Company.fetchOne(db, key: r.companyId)?.name ?? r.companyId
             notes.append("\(name): \(r.ref) (release \(r.version)) was approved in the snapshot and is cancelled; propose it again")
+        }
+        return notes
+    }
+
+    /// Final-fix2 R1 (the m7 residual): what a rollback requested in the snapshot but never started records after the restore.
+    static let restoredRollback = "restored from backup; request it again"
+
+    /// Final-fix2 R1: a rollback the snapshot holds `requested` (the owner's request, not yet started) is never carried out by
+    /// the restored engine, exactly like an approved release that never started (`cancelApprovedReleases`): since the
+    /// snapshot the rollback may have run and later releases gone live, so running it again could take down what is live now.
+    /// Each is cleared (`rollbackStatus` and `rollbackRequestedAt` nil; the release keeps its status, so the owner can request
+    /// it again), with an activity line, whatever the live database said. A `running` rollback is not touched: engine start
+    /// records it `interrupted` and never runs it again. Returns the notes.
+    static func cancelRequestedRollbacks(_ db: Database, now: Date) throws -> [String] {
+        guard try db.tableExists("release") else { return [] }
+        var notes: [String] = []
+        let requested = try Release.filter(Column("rollbackStatus") == RollbackStatus.requested.rawValue)
+            .order(Column("companyId"), Column("number")).fetchAll(db)
+        for var r in requested {
+            r.rollbackStatus = nil
+            r.rollbackRequestedAt = nil
+            try r.update(db)
+            try ActivityEvent(companyId: r.companyId, agentId: nil, turnId: nil, kind: .release,
+                              text: "the rollback of \(r.ref) (release \(r.version)) was cancelled: \(restoredRollback)", createdAt: now).insert(db)
+            let name = try Company.fetchOne(db, key: r.companyId)?.name ?? r.companyId
+            notes.append("\(name): the rollback of \(r.ref) (release \(r.version)) was requested in the snapshot and is cancelled; "
+                + "request it again")
         }
         return notes
     }

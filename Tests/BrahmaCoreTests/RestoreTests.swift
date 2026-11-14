@@ -280,6 +280,52 @@ import GRDB
         #expect(try restored.claimRelease(companyId: acme.id, now: Date()) == nil)
     }
 
+    /// Final-fix2 R1 (m7 residual): a rollback the snapshot holds `requested` is the owner's action from before the snapshot;
+    /// the restored engine never carries it out. It is cleared (no rollback status), named in the restore's warnings and an
+    /// activity line, and, resumed, the engine claims nothing. The release itself stays deployed, so the owner can ask again.
+    @Test func restoreCancelsRequestedRollbacks() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        let devops = try env.store.hire(companyId: acme.id, name: "devops-1", role: "devops", model: "sonnet")
+        let plan = try DeployPlan(steps: [DeployStep(label: "deploy", argv: ["/opt/fake/bin/wrangler", "pages", "deploy", "dist"])],
+                                  stageFrom: ["dist"], cwdPath: "/tmp/brahma-restore-test/upload", network: [],
+                                  tokenSecret: "CLOUDFLARE_API_TOKEN", build: nil, outputDir: "dist")
+        let t = Date(timeIntervalSince1970: 1_781_000_000)
+        func release(_ n: Int) -> Release {
+            var r = Release(companyId: acme.id, number: n, version: "0.\(n).0", status: .deployed, provider: .cloudflarePages,
+                            project: "acme", commit: String(repeating: "\(n)", count: 40), build: nil, outputDir: "dist", plan: plan,
+                            rollbackPlan: plan, proposedById: devops.id, createdAt: t)
+            r.approvedAt = t; r.approvedBy = "owner"; r.deployedAt = t; r.deployStartedAt = t
+            return r
+        }
+        try env.store.writer.write { db in
+            try release(1).insert(db)
+            try release(2).insert(db)
+        }
+        let requested = try env.store.requestRollback(companyId: acme.id, releaseRef: "R-2", by: .owner, now: t)
+        #expect(requested.rollbackStatus == .requested)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        let r2 = try #require(try restored.release(companyId: acme.id, ref: "R-2"))
+        #expect(r2.rollbackStatus == nil, "a rollback requested in the snapshot is still \(r2.rollbackStatus?.rawValue ?? "")")
+        #expect(r2.rollbackRequestedAt == nil)
+        #expect(r2.status == .deployed)
+        #expect(outcome.warnings.contains(
+            "Acme: the rollback of R-2 (release 0.2.0) was requested in the snapshot and is cancelled; request it again"),
+            "\(outcome.warnings)")
+        let activity = try restored.writer.read { try ActivityEvent.filter(Column("companyId") == acme.id).fetchAll($0) }.map(\.text)
+        #expect(activity.contains("the rollback of R-2 (release 0.2.0) was cancelled: restored from backup; request it again"),
+                "\(activity)")
+        // Resumed, the engine finds nothing to carry out, and the owner can request it again.
+        _ = try restored.resumeAfterStop(now: Date())
+        #expect(try restored.claimRollback(companyId: acme.id, now: Date()) == nil)
+        #expect(try restored.companiesWithReleaseWork().isEmpty)
+        #expect(try restored.requestRollback(companyId: acme.id, releaseRef: "R-2", by: .owner, now: Date()).rollbackStatus == .requested)
+    }
+
     /// Grants revoked (or used up) after the snapshot stay revoked (used up): carried from the live database.
     @Test func restoreKeepsRevocations() throws {
         let f = try Forward()

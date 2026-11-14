@@ -528,7 +528,9 @@ touches `main`, is never retried by the engine, and you can also roll back from 
 mid-release (Ctrl-C, the app quitting, the emergency stop), the release records where it was (`interrupted` while deploying,
 else `failed`) and nothing runs again on restart; an interrupted release may be partly live, and rolling it back is the
 undo. Restoring a backup cancels every release the snapshot held approved but not yet started ("restored from backup;
-propose again"): an approval is never carried out from an old snapshot.
+propose again") and every rollback it held requested ("restored from backup; request it again"; the release keeps its
+status, so you can request it again): an approval or a rollback request is never carried out from an old snapshot, and the
+restore's warnings name each one.
 
 **Human tasks.** Agents, and the engine, ask you for things only a person can do. The templates are engine-written, with
 their links, steps and paste-back fields: `hosting-account` (the provider token into your Keychain, plus the account ID),
