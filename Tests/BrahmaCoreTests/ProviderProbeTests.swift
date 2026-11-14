@@ -115,8 +115,9 @@ import GRDB
         let deployed = try #require(try FileManager.default.contentsOfDirectory(atPath: fx.hostRoot.path).first)
         let page = try String(contentsOf: fx.hostRoot.appending(path: deployed).appending(path: "index.html"), encoding: .utf8)
         #expect(page.contains("\(ProviderProbe.markerPrefix)abc123"))
+        // No `.env` is planted (fix round 1, I3): the engine's own uploads never carry one (UploadStager refuses it).
         let dotenv = fx.hostRoot.appending(path: deployed).appending(path: ".env").path
-        #expect(FileManager.default.fileExists(atPath: dotenv), "the .env canary is staged with the page")
+        #expect(!FileManager.default.fileExists(atPath: dotenv), "the probe no longer stages a .env")
         for step in steps { #expect(step.cwd.path.hasPrefix(layout.root.path), Comment(rawValue: step.cwd.path)) }
         // The smoke asked the production alias for the marker.
         #expect(fx.http.requests.contains { $0.url.absoluteString.hasPrefix("https://") && $0.url.host == "brahma-probe-abc123.vercel.app" || $0.url.absoluteString.hasPrefix("https://fake-") },
@@ -158,6 +159,52 @@ import GRDB
         #expect(!report.ok)
         #expect(report.lines.contains { $0.contains("redact") }, "\(report.lines)")
         #expect(fx.tokenSteps().isEmpty)
+    }
+
+    /// Fix round 1, I3: the `.env` item is reported as a NOTE that names why it is not decidable here, never as a PASS.
+    @Test func envItemIsANoteNeverAPass() async throws {
+        let fx = try Fx(http: FakeHTTPProbe([FakeHTTPProbe.ok(200, body: "<html>\(ProviderProbe.markerPrefix)abc123 probe</html>")]))
+        let report = try await fx.run()
+        #expect(report.ok, "\(report.lines)")
+        #expect(!report.lines.contains { $0.hasPrefix("PASS") && $0.contains(".env") }, "\(report.lines)")
+        let note = try #require(report.lines.first { $0.hasPrefix("NOTE") && $0.contains(".env not read") }, "\(report.lines)")
+        #expect(note.contains("not decidable") && note.contains("UploadStager"), Comment(rawValue: note))
+        // The same NOTE when nothing was deployed.
+        var failed = try Fx()
+        failed.fake.exitCode = 7
+        let none = try await failed.run()
+        #expect(none.lines.contains { $0.hasPrefix("NOTE") && $0.contains(".env not read") && $0.contains("UploadStager") }, "\(none.lines)")
+    }
+
+    /// Fix round 1, M1: the verdict counts the passes and the notes (undecided items), never "every item passed" alone.
+    @Test func verdictCountsPassesAndNotes() async throws {
+        let fx = try Fx(http: FakeHTTPProbe([FakeHTTPProbe.ok(200, body: "<html>\(ProviderProbe.markerPrefix)abc123 probe</html>")]))
+        let report = try await fx.run()
+        let passed = report.lines.filter { $0.hasPrefix("PASS") }.count
+        let noted = report.lines.filter { $0.hasPrefix("NOTE") }.count
+        #expect(noted >= 1)
+        #expect(report.lines.last == "VERDICT ok: \(passed) passed, \(noted) noted (not decided)", "\(report.lines)")
+        var failing = try Fx()
+        failing.fake.exitCode = 7
+        let bad = try await failing.run()
+        let fails = bad.lines.filter { $0.hasPrefix("FAIL") }.count
+        let badPassed = bad.lines.filter { $0.hasPrefix("PASS") }.count, badNoted = bad.lines.filter { $0.hasPrefix("NOTE") }.count
+        #expect(bad.lines.last == "VERDICT \(fails) item\(fails == 1 ? "" : "s") failed (\(badPassed) passed, \(badNoted) noted)", "\(bad.lines)")
+    }
+
+    /// Fix round 1, M2: a last pin over every report line, whatever wrote it (a future line that bypasses the token step).
+    @Test func finalPinCoversEveryLine() {
+        let token = Self.token
+        let lines = ["PASS  a: fine", "NOTE  b: leaked \(token) here", "plan:\n  env X=\(token)"]
+        let sealed = ProviderProbe.seal(lines, token: token, redactor: Redactor())
+        #expect(sealed.count == lines.count)
+        #expect(!sealed.joined(separator: "\n").contains(token), "\(sealed)")
+        #expect(sealed[1].contains("[redacted VERCEL_TOKEN]"), "\(sealed)")
+        #expect(sealed[0] == "PASS  a: fine")
+        // No token known (refused before it was read): the store's redactor still applies.
+        let store = Redactor()
+        store.update([(name: "VERCEL_TOKEN", value: token)], version: "v")
+        #expect(!ProviderProbe.seal(lines, token: nil, redactor: store).joined().contains(token))
     }
 
     @Test func projectNames() {

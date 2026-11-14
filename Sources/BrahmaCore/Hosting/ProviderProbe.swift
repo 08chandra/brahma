@@ -10,8 +10,8 @@ import Glibc
 /// against the real service, because the provider token is the owner's and never passes through an agent. The owner's
 /// explicit run is the approval. With the company's engine-held `VERCEL_TOKEN` and account ID it:
 /// 1. installs the pinned CLI token-free into `ReleaseLayout.deployTools` (as the executor does, when missing);
-/// 2. stages an engine-written static page carrying a unique marker (and a `.env` canary) in a fresh folder under the
-///    releases root;
+/// 2. stages an engine-written static page carrying a unique marker in a fresh folder under the releases root (no `.env`:
+///    the engine's stager refuses one, so the `.env` item is a NOTE, not a verdict);
 /// 3. runs the REAL `VercelAdapter` deploy plan through the REAL sandbox (token env-only, provider-config check, the
 ///    redactor-knows-token gate, pinned redaction, stdout-only URL parse, `vercel inspect` verification) against a throwaway
 ///    project `brahma-probe-<6 random [a-z0-9]>` (a reserved prefix, documented in the README), created and removed by
@@ -42,6 +42,19 @@ public enum ProviderProbe {
         /// `brahma-probe-*` projects the final listing still shows.
         public var leftovers: [String]
     }
+
+    /// The last pin over every report line (fix round 1, M2; defence in depth): the store's redactor, then the token itself
+    /// when it was read. Every current line is already redacted where it is written; this keeps a future line that bypasses
+    /// `tokenStep` from carrying the token.
+    static func seal(_ lines: [String], token: String?, redactor: Redactor) -> [String] {
+        let pin = Redactor()
+        if let token, !token.isEmpty { pin.update([(name: "VERCEL_TOKEN", value: token)], version: "pinned") }
+        return lines.map { pin.apply(redactor.apply($0)) }
+    }
+
+    /// Why the `.env` item is a NOTE (fix round 1, I3): the probe cannot decide it, and a real release never uploads one.
+    static let envNote = "not decidable here: the engine refuses `.env` in release uploads (UploadStager), so a real deploy never "
+        + "carries one, and the probe plants none (it would be served publicly); `.vercel` is refused by the config check before any step"
 
     /// Six random `[a-z0-9]`.
     public static func randomSuffix() -> String {
@@ -108,6 +121,10 @@ public enum ProviderProbe {
         var settings: HostingSettings
         var lines: [String] = []
         var failures = 0
+        var passes = 0
+        var notes = 0
+        /// The token once read: `finish()` pins it out of every line.
+        var token: String?
         var leftovers: [String] = []
         var stepIndex = 0
 
@@ -131,9 +148,11 @@ public enum ProviderProbe {
             self.settings = s
         }
 
-        func pass(_ item: String, _ text: String) { lines.append("PASS  \(item): \(text)") }
+        func pass(_ item: String, _ text: String) { passes += 1; lines.append("PASS  \(item): \(text)") }
         func fail(_ item: String, _ text: String) { failures += 1; lines.append("FAIL  \(item): \(text)") }
-        func note(_ item: String, _ text: String) { lines.append("NOTE  \(item): \(text)") }
+        func note(_ item: String, _ text: String) { notes += 1; lines.append("NOTE  \(item): \(text)") }
+        /// Context for the owner, not a ledger item (never counted in the verdict).
+        func info(_ item: String, _ text: String) { lines.append("INFO  \(item): \(text)") }
 
         func run() async -> Report {
             lines.append("probe project \(project) (\(adapter.cli), hosts \(adapter.network.joined(separator: ", ")), install host \(adapter.toolNetwork.joined(separator: ", ")))")
@@ -160,7 +179,7 @@ public enum ProviderProbe {
             }
             lines.append("plan:\n" + plan.display.split(separator: "\n").map { "  \($0)" }.joined(separator: "\n"))
 
-            // The page (and a `.env` canary: were the CLI to read it, the deploy would go to a project that does not exist).
+            // The page (and nothing else: no `.env`, which the engine's own uploads never carry).
             do {
                 try BrahmaPaths.ensurePrivateDirectory(layout.root)
                 try EngineFiles.remove(workspace: layout.root, dir: "", name: "probe-\(suffix)")
@@ -170,8 +189,6 @@ public enum ProviderProbe {
                 let page = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Brahma provider probe</title></head>"
                     + "<body><p>\(marker)</p><p>This throwaway page was deployed by Brahma's provider probe and is removed by it.</p></body></html>\n"
                 _ = try EngineFiles.create(Data(page.utf8), workspace: layout.root, dir: "probe-\(suffix)/upload", name: "index.html")
-                _ = try EngineFiles.create(Data("VERCEL_PROJECT_ID=brahma-probe-dotenv-canary\nPROBE_DOTENV=should-not-be-read\n".utf8),
-                                           workspace: layout.root, dir: "probe-\(suffix)/upload", name: ".env")
             } catch {
                 fail("stage", "could not write the probe page (\(ReleaseExecutor.text(error)))")
                 return finish()
@@ -179,7 +196,7 @@ public enum ProviderProbe {
 
             // The token, under the executor's rule: read, passable, demonstrably redacted; else nothing runs with it.
             let token: String
-            do { token = try readToken(plan) } catch let e as WorkError {
+            do { token = try readToken(plan); self.token = token } catch let e as WorkError {
                 fail("token", e.message)
                 return finish()
             } catch {
@@ -230,7 +247,7 @@ public enum ProviderProbe {
             var deployURL: URL?
             if deployed {
                 pass("deploy", "every plan step exited 0")
-                note("deploy output", "stdout tail (redacted): \(Store.flat(String(deployStdout.suffix(300)), max: 300))")
+                info("deploy output", "stdout tail (redacted): \(Store.flat(String(deployStdout.suffix(300)), max: 300))")
                 // Which stream carried "Production:" (stdout-only parsing; the bare-URL fallback otherwise).
                 let onOut = deployStdout.contains("Production:"), onErr = deployStderr.contains("Production:")
                 switch (onOut, onErr) {
@@ -270,15 +287,13 @@ public enum ProviderProbe {
                         let first = smoked.results.first { !$0.ok }
                         fail("smoke", "GET \(base.absoluteString): \(first?.error ?? "no result") (status \(first?.status.map(String.init) ?? "none"))")
                     }
-                    // `.env` canary: a deploy that reached the configured project did not take VERCEL_PROJECT_ID from `.env`.
-                    pass(".env not read", "the deploy reached \(project) while upload/.env named brahma-probe-dotenv-canary; and `.vercel` is refused by the config check before any step")
                 } else {
                     fail("smoke", "no smoke base")
                 }
             } else {
                 note("smoke", "skipped: nothing was deployed")
-                note(".env not read", "not decided: nothing was deployed")
             }
+            note(".env not read", ProviderProbe.envNote)
             note("GIT_CEILING_DIRECTORIES", "set to \(plan.env["GIT_CEILING_DIRECTORIES"] ?? "(unset)") on every token step; a `.git` between the deploy folder and the releases root is refused by the config check; a repository above the root cannot be planted by this probe, so the ceiling itself is reported, not exercised")
 
             // 4. The hosts the CLI contacted (the egress proxy's allow and deny logs) and whether the proxy was honoured.
@@ -325,8 +340,11 @@ public enum ProviderProbe {
         }
 
         func finish() -> Report {
-            lines.append(failures == 0 ? "VERDICT ok: every item passed" : "VERDICT \(failures) item\(failures == 1 ? "" : "s") failed")
-            return Report(project: project, lines: lines, ok: failures == 0, leftovers: leftovers)
+            // NOTE lines are items this run could not decide: counted, never folded into "ok" as passes (fix round 1, M1).
+            lines.append(failures == 0 ? "VERDICT ok: \(passes) passed, \(notes) noted (not decided)"
+                                       : "VERDICT \(failures) item\(failures == 1 ? "" : "s") failed (\(passes) passed, \(notes) noted)")
+            return Report(project: project, lines: ProviderProbe.seal(lines, token: token, redactor: store.redactor), ok: failures == 0,
+                          leftovers: leftovers)
         }
 
         /// The 9-character hash segment Vercel is believed to put after the project (unverified until this probe).

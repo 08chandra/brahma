@@ -3,6 +3,46 @@ import Foundation
 import GRDB
 @testable import BrahmaCore
 
+/// The live goal-to-URL test's owner policy (Plan L Task 15; fix round 1, I2): what it does with each pending-owner ask.
+/// - Approve: the kinds the brief names (`prd`, `architecture`, `deploy`) plus an explicit benign allowlist, `sprintPlan`
+///   (a gate on the path to the first merge, low risk, not a reserved matter).
+/// - Human tasks are declined ("not needed for this test"); questions are answered "Use your recommendation.".
+/// - Everything else is DECLINED (and logged as an owner touch): mode boosts, grants and requests, extensions, spend,
+///   outbox, role, staffing and stage changes, release gates, plain decisions, engine alerts and any kind added later.
+///   Reserved matters, money, outbound messages and secrets never auto-approve (§6.24), not even in an unattended test.
+enum LiveOwnerPolicy {
+    enum Action: Equatable { case approve, declineHumanTask, answer, decline }
+
+    static let approved: Set<AskKind> = [.prd, .architecture, .deploy, .sprintPlan]
+
+    static func action(for kind: AskKind) -> Action {
+        if approved.contains(kind) { return .approve }
+        switch kind {
+        case .humanTask: return .declineHumanTask
+        case .info: return .answer
+        default: return .decline
+        }
+    }
+
+    /// Settles one pending ask the owner's way; returns the owner-touch line.
+    static func settle(_ ask: Ask, store: Store, companyId: String) throws -> String {
+        switch action(for: ask.kind) {
+        case .approve:
+            _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+            return "approve \(ask.ref) (\(ask.kind.rawValue): \(ask.title))"
+        case .declineHumanTask:
+            _ = try store.declineHumanTask(companyId: companyId, askId: ask.id, note: "not needed for this test")
+            return "decline \(ask.ref) (human task: \(ask.title))"
+        case .answer:
+            _ = try store.ownerAnswer(askId: ask.id, text: "Use your recommendation.")
+            return "answer \(ask.ref) (\(ask.title))"
+        case .decline:
+            _ = try store.ownerDecide(askId: ask.id, approve: false, note: "declined by the live test: \(ask.kind.rawValue) is not on its approve list")
+            return "decline \(ask.ref) (\(ask.kind.rawValue): \(ask.title))"
+        }
+    }
+}
+
 /// Real `claude` turns (uses subscription quota). Run with: BRAHMA_LIVE=1 swift test --filter LiveSmokeTests
 @Suite(.scratch, .enabled(if: ProcessInfo.processInfo.environment["BRAHMA_LIVE"] == "1"))
 struct LiveSmokeTests {
@@ -313,23 +353,39 @@ struct LiveSmokeTests {
 
     /// Plan L Task 15: a real company goes from the goal to a live URL — `DemoSeed.live` (ceo/cto/devops on sonnet, eng on
     /// haiku; never opus), tier max5x, Balanced, real turns, the live engine (previews, main smokes, the release executor with
-    /// the real sandbox), the test acting as the owner (gate approved, hosting task done, deploy approved, other tasks
-    /// declined, questions answered "Use your recommendation."), the cost abort at `costAbortUSD`, and the scorecard.
+    /// the real sandbox), the test acting as the owner (`LiveOwnerPolicy`: gate, architecture, sprint plan and deploy
+    /// approved, the hosting task done, other human tasks declined, questions answered "Use your recommendation.", every
+    /// other kind declined), the cost abort at `costAbortUSD`, and the scorecard.
     ///
     /// FAKE HOST: the hosting "provider" is the dev host (PR-32: `LocalCopyHostingAdapter` copying the upload into a folder
     /// under the data home, served on loopback by `DevHostServer`), reporting itself as the company's configured provider,
     /// so every executor check runs unchanged; nothing contacts Cloudflare or Vercel. The owner-run Vercel probe
     /// (`brahma hosting probe`, `ProviderProbe`) is what verifies a real provider.
+    ///
+    /// Bounded (fix round 1, I1): every deadline of this test is WALL time (`Date`, counts system sleep: an overnight run on a
+    /// sleeping Mac must not outlive its budget; the engine's own timeouts stay on `AwakeTime`). The owner loop ends at
+    /// `ownerLoopDeadline` after the test started; teardown runs on EVERY exit path (deployed, cost abort, timeout, a throw,
+    /// the time limit's cancellation, which also cancels the engine's task) and each of its waits is capped (the engine
+    /// `engineStopWait`, previews 30 s, proxies 15 s), after which the engine's recorded process groups and anything naming the
+    /// test's temp root are signalled (SIGTERM, SIGKILL). An always-on watchdog prints a heartbeat each minute (elapsed, phase,
+    /// cost, pending asks, running turns), runs the cost check itself (an emergency stop at the abort, so the engine admits
+    /// nothing more even if this loop is stuck) and, at `hardKillAt`, kills what is left. stdout is line-buffered. Run it with
+    /// `BRAHMA_LIVE=1 DEVELOPER_DIR=… timeout -k 30 3900 swift test --filter LiveSmokeTests/goalToLiveURL`.
     @Test(.timeLimit(.minutes(60)))
     func goalToLiveURL() async throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let monitor = LiveRunMonitor()
         print("FAKE HOST: this run does not prove a Cloudflare or Vercel deploy (dev host on loopback; see `brahma hosting probe`)")
         let root = try tempDir()
         let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         let store = try Store(path: paths.database.path)
+        let watchdog = Self.startWatchdog(monitor: monitor, store: store, root: root)
+        defer { watchdog.cancel() }
         try store.setPlanTier(.max5x)
         let mcp = try brahmaExecutable()
         let runner = ClaudeProcessRunner(maxTurnDuration: .seconds(600))
+        monitor.set(phase: "doctor")
         var report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp)
         // `tools-present` fails on Claude Code 2.1.322: a turn run with `--disable-slash-commands` (every turn without extension
         // parts, F10) lists no `Skill` in its init tools, though the sandboxed `--tools` names it. The engine only raises an alert
@@ -340,8 +396,10 @@ struct LiveSmokeTests {
         #expect(gating(report).isEmpty, "doctor: \(report.items.map { "\($0.name)=\($0.status) \($0.detail)" })")
         guard gating(report).isEmpty else { return }
         try store.saveProbe(report)
+        print("DOCTOR done at \(monitor.elapsedText)")
 
         // The company, as `brahma company create Lumen --demo live` makes it.
+        monitor.set(phase: "seed")
         let (seeded, hostingTask) = try DemoSeed.live(store: store, paths: paths, name: "Lumen", goal: nil, log: { print("seed: \($0)") })
         var company = try #require(try store.company(id: seeded.id))
         company.usageMode = .balanced
@@ -355,6 +413,7 @@ struct LiveSmokeTests {
         try store.updateSandbox(companyId: company.id, SandboxPatch(profile: .workspace), userHome: userHome)
         company = try #require(try store.company(id: company.id))
         let companyId = company.id
+        monitor.set(companyId: companyId)
         let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
 
         // The fake host: a folder under the data home served on loopback; its adapter reports the configured provider.
@@ -384,74 +443,59 @@ struct LiveSmokeTests {
         let releaseDeps = ReleaseDependencies(sandbox: DevHostSandbox(base: platform, hostDir: hostDir), http: URLSessionHTTPProbe(),
                                               adapters: { _ in adapter })
         let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps)
+        monitor.set(phase: "engine start")
         try await orchestrator.start()
         let loop = Task { await orchestrator.runForever(interval: .seconds(2)) }
-        let started = AwakeTime.now
-        let deadline = started + .seconds(55 * 60)
-        var deployed: Release?
-        var costAbort: Double?
-        var touches: [String] = []
-        var seenAsks = Set<String>()
-        while AwakeTime.now < deadline {
-            // The owner.
-            for ask in try store.asks(companyId: companyId, statuses: [.pendingOwner]) {
-                guard seenAsks.insert(ask.id).inserted || ask.kind == .deploy || ask.kind == .prd || ask.kind == .architecture else { continue }
-                do {
-                    switch ask.kind {
-                    case .prd, .architecture, .deploy:
-                        _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
-                        touches.append("approve \(ask.ref) (\(ask.kind.rawValue): \(ask.title))")
-                    case .humanTask:
-                        _ = try store.declineHumanTask(companyId: companyId, askId: ask.id, note: "not needed for this test")
-                        touches.append("decline \(ask.ref) (human task: \(ask.title))")
-                    case .info:
-                        _ = try store.ownerAnswer(askId: ask.id, text: "Use your recommendation.")
-                        touches.append("answer \(ask.ref) (\(ask.title))")
-                    default:
-                        // Anything else the owner would read and wave through (a sprint plan, a staffing or stage change).
-                        _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
-                        touches.append("approve \(ask.ref) (\(ask.kind.rawValue): \(ask.title))")
-                    }
-                } catch let e as WorkError {
-                    // Settled between the read and the decision, or a kind this owner cannot settle this way: logged, never fatal.
-                    print("owner: \(ask.ref) (\(ask.kind.rawValue)) not decided: \(e.message)")
-                }
+        monitor.set(phase: "owner loop")
+        print("ENGINE started at \(monitor.elapsedText); the owner loop ends by +\(Int(Self.ownerLoopDeadline / 60))m (wall) after the start")
+
+        // The owner loop. Whatever ends it (an outcome, a throw, or the time limit's cancellation), teardown runs.
+        let outcome: LiveOutcome
+        do {
+            outcome = try await withTaskCancellationHandler {
+                try await ownerLoop(store: store, companyId: companyId, server: server, monitor: monitor)
+            } onCancel: {
+                loop.cancel()   // the time limit cancels this task only; the engine's unstructured task is cancelled here
             }
-            // The fake host serves whichever release is being deployed.
-            for release in try store.releases(companyId: companyId) where release.status.isOpen || release.status == .deployed {
-                server.serve(folder: release.ref)
-            }
-            // The cost abort (builder-check 10).
-            let total = try costs(store, companyId: companyId).total
-            if total >= Self.costAbortUSD { costAbort = total; break }
-            if let done = try store.releases(companyId: companyId).first(where: { $0.status == .deployed }) {
-                deployed = done
-                try await Task.sleep(for: .seconds(5))   // post-deploy bookkeeping and the running turn settle
-                break
-            }
-            try await Task.sleep(for: .seconds(2))
+        } catch {
+            let cancelled = Task.isCancelled
+            monitor.set(phase: "teardown after \(cancelled ? "cancellation" : "a throw")")
+            print("ABORTED at \(monitor.elapsedText) (cancelled \(cancelled)): \(error)")
+            let td = await teardown(loop: loop, orchestrator: orchestrator, proxies: proxies, store: store, root: root, stopEngine: true)
+            print("TEARDOWN: \(td.summary)")
+            print("OWNER TOUCHES (\(monitor.touches.count)):\n  " + monitor.touches.joined(separator: "\n  "))
+            try? printStall(store, companyId: companyId)
+            try? printScorecard(store, companyId: companyId, title: "aborted")
+            throw error
         }
-        loop.cancel()
-        await loop.value   // cancels and awaits in-flight turns, checks, merges, smokes and releases
-        await orchestrator.previewRunner.stopAll()
-        await proxies.stopAll()
+        let deployedPath: Bool
+        if case .deployed = outcome { deployedPath = true } else { deployedPath = false }
+        monitor.set(phase: "teardown")
+        let td = await teardown(loop: loop, orchestrator: orchestrator, proxies: proxies, store: store, root: root, stopEngine: !deployedPath)
+        print("TEARDOWN at \(monitor.elapsedText): \(td.summary)")
+        monitor.set(phase: "assertions")
 
         let dump = try store.events(afterId: 0).map(\.text).joined(separator: "\n")
-        print("OWNER TOUCHES (\(touches.count)):\n  " + touches.joined(separator: "\n  "))
-        if let costAbort {
+        print("OWNER TOUCHES (\(monitor.touches.count)):\n  " + monitor.touches.joined(separator: "\n  "))
+        let r1: Release, observed: LiveObservation
+        switch outcome {
+        case .costAbort(let total):
             try printScorecard(store, companyId: companyId, title: "cost abort")
-            Issue.record("cost abort at $\(String(format: "%.2f", costAbort))\nEvents:\n\(dump)")
+            print("COST ABORT: the abort sees finished turns' costUSD only; up to the concurrency cap of in-flight turns can overshoot it")
+            Issue.record("cost abort at $\(String(format: "%.2f", total))\nEvents:\n\(dump)")
             return
-        }
-        guard let r1 = deployed else {
-            let stall = try store.stallReport(companyId: companyId)
-            print("STALL: running \(stall.running); reasons: \(stall.reasons.joined(separator: " | "))")
+        case .timedOut:
+            try printStall(store, companyId: companyId)
             try printScorecard(store, companyId: companyId, title: "timed out")
             let releases = try store.releases(companyId: companyId).map { "\($0.ref) \($0.status.rawValue) \($0.failedReason ?? "")" }
-            Issue.record("timed out after \(MilestoneReport.elapsed(Double((AwakeTime.now - started).components.seconds))) with no deployed release; releases: \(releases)\nStall: \(stall.reasons)\nEvents:\n\(dump)")
+            Issue.record("timed out after \(monitor.elapsedText) with no deployed release; releases: \(releases)\nEvents:\n\(dump)")
             return
+        case .deployed(let release, let observation):
+            r1 = release; observed = observation
         }
         try printScorecard(store, companyId: companyId, title: "live")
+        #expect(td.stalled.isEmpty, "teardown stalled: \(td.stalled)")
+        #expect(td.killed.isEmpty, "processes outlived the engine's own stop: \(td.killed)")
 
         // The gate: approved, titled "Brief & architecture" for this small company.
         let gate = try #require(try store.asks(companyId: companyId).first { $0.kind == .prd && $0.status == .approved }, "no approved prd ask\n\(dump)")
@@ -465,16 +509,11 @@ struct LiveSmokeTests {
             _ = try GitFixture.plainGit(["merge-base", "--is-ancestor", item.mergedCommit!, "main"], in: ws)
         }
 
-        // A web preview running, answering 200 with "Lumen".
-        let states = try store.previewStates(companyId: companyId)
-        let surfaces = try store.previewSurfaces(companyId: companyId)
-        let running = surfaces.first { $0.kind == PreviewKind.web.rawValue && states[$0.id]?.status == .running && states[$0.id]?.resolvedURL != nil }
-        #expect(running != nil, "no running web preview; surfaces: \(surfaces.map { "\($0.name) \(states[$0.id]?.status.rawValue ?? "-") \(states[$0.id]?.message ?? "")" })\n\(dump)")
-        let http = URLSessionHTTPProbe()
-        if let running, let url = states[running.id]?.resolvedURL.flatMap(URL.init(string:)) {
-            let answer = await http.send(method: "GET", url: url, body: nil, timeout: .seconds(10))
-            #expect(answer.status == 200, "preview \(url): \(answer.status.map(String.init) ?? "no status") \(answer.error ?? "")")
-            #expect(String(decoding: answer.body, as: UTF8.self).contains("Lumen"), "preview body lacks Lumen: \(String(decoding: answer.body.prefix(400), as: UTF8.self))")
+        // A web preview running (observed before teardown stopped it), answering 200 with "Lumen".
+        #expect(observed.preview != nil, "no running web preview; surfaces: \(observed.surfaces)\n\(dump)")
+        if let preview = observed.preview {
+            #expect(preview.status == 200, "preview \(preview.url): \(preview.status.map(String.init) ?? "no status") \(preview.error ?? "")")
+            #expect(preview.body.contains("Lumen"), "preview body lacks Lumen: \(preview.body.prefix(400))")
         }
 
         // The smoke check set by an agent; a release-reason smoke run passed at R-1's commit.
@@ -493,8 +532,8 @@ struct LiveSmokeTests {
         let proposer = try #require(try store.agent(id: r1.proposedById))
         #expect(["devops", "cto-architect", "cto", "architect"].contains(proposer.role), "proposed by \(proposer.name) (\(proposer.role))")
 
-        // An independent GET of the production URL answers 200 with "Lumen".
-        let live = await http.send(method: "GET", url: productionURL, body: nil, timeout: .seconds(10))
+        // An independent GET of the production URL answers 200 with "Lumen" (the dev host still serves: it stops at the end).
+        let live = await URLSessionHTTPProbe().send(method: "GET", url: productionURL, body: nil, timeout: .seconds(10))
         #expect(live.status == 200, "GET \(productionURL): \(live.status.map(String.init) ?? "no status") \(live.error ?? "")")
         #expect(String(decoding: live.body, as: UTF8.self).contains("Lumen"), "live body lacks Lumen: \(String(decoding: live.body.prefix(400), as: UTF8.self))")
         print("LIVE URL (fake host): \(productionURL.absoluteString)")
@@ -526,7 +565,234 @@ struct LiveSmokeTests {
         #expect(milestones.totalTouches >= 2, "touches \(milestones.totalTouches)")
 
         // Nothing of ours is left in flight.
-        #expect(await orchestrator.runningCount() == 0)
+        if td.stalled.isEmpty { #expect(await orchestrator.runningCount() == 0) }
         #expect(try !processExists(matching: root.path), "a claude/brahma/preview child process outlived the run")
+        monitor.set(phase: "done")
+    }
+
+    // MARK: Task 15 fix round 1 (I1): the owner loop, bounded teardown, watchdog
+
+    /// The owner loop ends this long (wall) after the test started; with teardown capped at `teardownCap`, the test is done
+    /// well inside its 60-minute limit.
+    static let ownerLoopDeadline: TimeInterval = 50 * 60
+    /// The longest teardown waits for the engine's own stop (in-flight turns, checks, merges, smokes, releases).
+    static let engineStopWait: TimeInterval = 120
+    /// engine 120 s + previews 30 s + proxies 15 s + signalling (5 s grace + 3 s).
+    static let teardownCap: TimeInterval = 180
+    /// The watchdog's last resort (wall, after the start): everything recorded or naming the temp root is signalled.
+    static let hardKillAt: TimeInterval = 55 * 60
+
+    /// The owner, every 2 s: settle pending asks (`LiveOwnerPolicy`), serve the open release on the fake host, run the cost
+    /// check, and stop at a deployed release (observing the preview and the live URL while they still run), the cost abort,
+    /// or the deadline.
+    private func ownerLoop(store: Store, companyId: String, server: DevHostServer, monitor: LiveRunMonitor) async throws -> LiveOutcome {
+        var seenAsks = Set<String>()
+        while monitor.elapsed < Self.ownerLoopDeadline {
+            if let total = monitor.costAbort { return .costAbort(total) }
+            for ask in try store.asks(companyId: companyId, statuses: [.pendingOwner]) {
+                // An approval is retried each tick (a gate can be re-filed); anything else is settled once.
+                guard seenAsks.insert(ask.id).inserted || LiveOwnerPolicy.action(for: ask.kind) == .approve else { continue }
+                do {
+                    let touch = try LiveOwnerPolicy.settle(ask, store: store, companyId: companyId)
+                    monitor.touch(touch)
+                    print("owner: \(touch)")
+                } catch let e as WorkError {
+                    // Settled between the read and the decision, or a kind this owner cannot settle this way: logged, never fatal.
+                    print("owner: \(ask.ref) (\(ask.kind.rawValue)) not decided: \(e.message)")
+                }
+            }
+            // The fake host serves whichever release is being deployed.
+            for release in try store.releases(companyId: companyId) where release.status.isOpen || release.status == .deployed {
+                server.serve(folder: release.ref)
+            }
+            // The cost abort (builder-check 10); the watchdog runs the same check on its own task.
+            let total = try costs(store, companyId: companyId).total
+            if total >= Self.costAbortUSD { monitor.abort(cost: total); return .costAbort(total) }
+            if let done = try store.releases(companyId: companyId).first(where: { $0.status == .deployed }) {
+                print("DEPLOYED \(done.ref) at \(monitor.elapsedText)")
+                try await Task.sleep(for: .seconds(5))   // post-deploy bookkeeping and the running turn settle
+                return .deployed(done, try await observe(store: store, companyId: companyId))
+            }
+            try await Task.sleep(for: .seconds(2))
+        }
+        print("OWNER LOOP deadline reached at \(monitor.elapsedText)")
+        return .timedOut
+    }
+
+    /// The running web preview and its answer, read while the engine still runs (teardown stops previews).
+    private func observe(store: Store, companyId: String) async throws -> LiveObservation {
+        let states = try store.previewStates(companyId: companyId)
+        let surfaces = try store.previewSurfaces(companyId: companyId)
+        let text = surfaces.map { "\($0.name) \(states[$0.id]?.status.rawValue ?? "-") \(states[$0.id]?.message ?? "")" }
+        let running = surfaces.first { $0.kind == PreviewKind.web.rawValue && states[$0.id]?.status == .running && states[$0.id]?.resolvedURL != nil }
+        guard let running, let url = states[running.id]?.resolvedURL.flatMap(URL.init(string:)) else {
+            return LiveObservation(preview: nil, surfaces: text)
+        }
+        let answer = await URLSessionHTTPProbe().send(method: "GET", url: url, body: nil, timeout: .seconds(10))
+        return LiveObservation(preview: .init(url: url.absoluteString, status: answer.status, error: answer.error,
+                                              body: String(decoding: answer.body, as: UTF8.self)), surfaces: text)
+    }
+
+    /// Teardown on every path, every wait capped: an emergency stop first when the run did not end deployed (nothing more is
+    /// admitted, running turns and checks are cancelled), then the engine's task cancelled and awaited at most
+    /// `engineStopWait`, previews and proxies stopped (capped), and finally the engine's recorded process groups and anything
+    /// naming the temp root signalled (SIGTERM, then SIGKILL).
+    private func teardown(loop: Task<Void, Never>, orchestrator: Orchestrator, proxies: EgressProxyPool, store: Store, root: URL,
+                          stopEngine: Bool) async -> LiveTeardown {
+        var td = LiveTeardown()
+        if stopEngine { _ = try? store.emergencyStop(note: "live test teardown", by: "owner", now: Store.now()) }
+        loop.cancel()
+        if !(await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value })) {
+            td.stalled.append("engine (in-flight work did not stop within \(Int(Self.engineStopWait)) s)")
+            print("TEARDOWN STALLED: the engine did not stop within \(Int(Self.engineStopWait)) s; stopping everything and signalling its groups")
+            _ = try? store.emergencyStop(note: "live test teardown stalled", by: "owner", now: Store.now())
+        }
+        if !(await LiveRunMonitor.bounded(30, { await orchestrator.previewRunner.stopAll() })) { td.stalled.append("previews (30 s)") }
+        if !(await LiveRunMonitor.bounded(15, { await proxies.stopAll() })) { td.stalled.append("proxies (15 s)") }
+        td.killed = LiveRunMonitor.killLeftovers(store: store, root: root)
+        return td
+    }
+
+    /// The always-on watchdog (its own task, wall clock): every 10 s the cost check (at the abort: an emergency stop, so the
+    /// engine stops admitting and cancels running turns even if the owner loop is stuck); every 60 s a heartbeat; at
+    /// `hardKillAt` everything left is signalled.
+    private static func startWatchdog(monitor: LiveRunMonitor, store: Store, root: URL) -> Task<Void, Never> {
+        Task.detached {   // scope-escape: the watchdog (heartbeat, cost check, hard kill); makes no scratch dirs
+            var tick = 0, killed = false
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(10)) } catch { return }   // the poll interval; deadlines read `Date`
+                tick += 1
+                let companyId = monitor.companyId
+                var cost: Double?, pending = 0, running = 0, releases = ""
+                if let companyId {
+                    let sum = try? await store.writer.read { db in
+                        try Double.fetchOne(db, sql: "SELECT COALESCE(SUM(costUSD), 0) FROM turn WHERE companyId = ?", arguments: [companyId])
+                    }
+                    cost = (sum ?? nil) ?? 0
+                    pending = (try? store.asks(companyId: companyId, statuses: [.pendingOwner]).count) ?? 0
+                    running = (try? store.runningTurnPids().count) ?? 0
+                    releases = ((try? store.releases(companyId: companyId)) ?? []).map { "\($0.ref) \($0.status.rawValue)" }.joined(separator: ", ")
+                }
+                if let cost, cost >= costAbortUSD, monitor.abort(cost: cost) {
+                    print(String(format: "WATCHDOG cost abort at $%.2f: emergency stop", cost))
+                    _ = try? store.emergencyStop(note: "live test cost abort", by: "owner", now: Store.now())
+                }
+                if tick % 6 == 0 {
+                    print("HEARTBEAT \(monitor.elapsedText) phase=\(monitor.phase) cost=\(cost.map { String(format: "$%.4f", $0) } ?? "-") "
+                          + "pendingOwnerAsks=\(pending) runningTurns=\(running) touches=\(monitor.touches.count) releases=[\(releases)]")
+                }
+                if !killed, monitor.elapsed >= hardKillAt, monitor.phase != "done" {
+                    killed = true
+                    print("WATCHDOG hard deadline (+\(Int(hardKillAt / 60))m) reached in phase \(monitor.phase): emergency stop and signalling")
+                    _ = try? store.emergencyStop(note: "live test hard deadline", by: "owner", now: Store.now())
+                    let left = LiveRunMonitor.killLeftovers(store: store, root: root)
+                    print("WATCHDOG signalled: \(left.isEmpty ? "nothing" : left.joined(separator: ", "))")
+                }
+            }
+        }
+    }
+
+    private func printStall(_ store: Store, companyId: String) throws {
+        let stall = try store.stallReport(companyId: companyId)
+        print("STALL: running \(stall.running); reasons: \(stall.reasons.joined(separator: " | "))")
+    }
+}
+
+/// How the live test's owner loop ended.
+enum LiveOutcome {
+    case deployed(Release, LiveObservation)
+    case costAbort(Double)
+    case timedOut
+}
+
+/// The running web preview as the owner loop saw it right after the deploy (before teardown stopped previews).
+struct LiveObservation {
+    struct Preview { var url: String; var status: Int?; var error: String?; var body: String }
+    var preview: Preview?
+    var surfaces: [String]
+}
+
+struct LiveTeardown {
+    var stalled: [String] = []
+    var killed: [String] = []
+    var summary: String {
+        (stalled.isEmpty ? "engine, previews and proxies stopped" : "STALLED: " + stalled.joined(separator: "; "))
+            + (killed.isEmpty ? "; nothing left to signal" : "; signalled: " + killed.joined(separator: ", "))
+    }
+}
+
+/// What the live test's owner loop and its watchdog share (lock-protected; the watchdog runs on its own task).
+final class LiveRunMonitor: @unchecked Sendable {
+    private let lock = NSLock()
+    private let started = Date()
+    private var _phase = "start"
+    private var _companyId: String?
+    private var _costAbort: Double?
+    private var _touches: [String] = []
+
+    /// Wall seconds since the test started (counts system sleep, deliberately: I1).
+    var elapsed: TimeInterval { Date().timeIntervalSince(started) }
+    var elapsedText: String { "+" + MilestoneReport.elapsed(elapsed.rounded()) }
+    var phase: String { lock.withLock { _phase } }
+    var companyId: String? { lock.withLock { _companyId } }
+    var costAbort: Double? { lock.withLock { _costAbort } }
+    var touches: [String] { lock.withLock { _touches } }
+    func set(phase: String) { lock.withLock { _phase = phase }; print("PHASE \(phase) at \(elapsedText)") }
+    func set(companyId: String) { lock.withLock { _companyId = companyId } }
+    func touch(_ line: String) { lock.withLock { _touches.append(line) } }
+    /// Records the cost abort; true the first time.
+    @discardableResult func abort(cost: Double) -> Bool {
+        lock.withLock { guard _costAbort == nil else { return false }; _costAbort = cost; return true }
+    }
+
+    /// Runs `work` on its own task and waits for it at most `limit` wall seconds; true when it finished. Neither racer is a
+    /// child of the waiter, so the waiter's own cancellation (the time limit) never turns this into an unbounded wait.
+    static func bounded(_ limit: TimeInterval, _ work: @escaping @Sendable () async -> Void) async -> Bool {
+        let once = OnceFlag()
+        let deadline = Date().addingTimeInterval(limit)
+        return await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+            Task.detached { await work(); if once.claim() { c.resume(returning: true) } }   // scope-escape: the bounded work; no scratch dirs
+            Task.detached {   // scope-escape: the deadline racer (polls wall time); no scratch dirs
+                while Date() < deadline, !once.claimed { try? await Task.sleep(for: .milliseconds(500)) }
+                if once.claim() { c.resume(returning: false) }
+            }
+        }
+    }
+
+    final class OnceFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var done = false
+        var claimed: Bool { lock.withLock { done } }
+        func claim() -> Bool { lock.withLock { if done { return false }; done = true; return true } }
+    }
+
+    /// SIGTERM then SIGKILL (5 s grace) to every process group the engine recorded (turns, checks, merges, previews), then
+    /// to any process of ours whose command line names the test's temp root. Returns what was signalled.
+    static func killLeftovers(store: Store, root: URL) -> [String] {
+        var out: [String] = []
+        let groups = EmergencyStop.recordedGroups(store: store)
+        let s = EmergencyStop.signalGroups(groups)
+        out += s.terminated.map { "group \($0) SIGTERM" } + s.killed.map { "group \($0) SIGKILL" }
+        let me = getpid()
+        func matching() -> [Int32] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            p.arguments = ["-f", root.path]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return [] }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).compactMap { Int32($0) }.filter { $0 != me }
+        }
+        let first = matching()
+        for pid in first { kill(pid, SIGTERM) }
+        if !first.isEmpty {
+            out += first.map { "pid \($0) SIGTERM" }
+            usleep(3_000_000)
+            for pid in matching() where kill(pid, SIGKILL) == 0 { out.append("pid \(pid) SIGKILL") }
+        }
+        return out
     }
 }

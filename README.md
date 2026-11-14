@@ -519,9 +519,14 @@ real sandbox (token in the environment only, provider-config check, redaction ga
 against a throwaway project `brahma-probe-<6 letters or digits>`, smokes the production alias for the marker, reads the hosts
 the CLI contacted from the engine's egress proxy, removes the project and lists what is left. It prints one `PASS`/`FAIL`/
 `NOTE` line per item (CLI pin, network hosts, HTTPS_PROXY honoured, deploy URL, the 9-character URL hash, `Production:` on
-stdout, inspect, smoke, `.env` not read, `GIT_CEILING_DIRECTORIES`, project removed, leftover projects), redacted, never the
-token. The `brahma-probe-` project-name prefix is reserved for it: it deletes nothing else, and a leftover under that prefix is
-reported by name. The live test (`BRAHMA_LIVE=1 … LiveSmokeTests/goalToLiveURL`) runs the whole goal-to-URL path against a
+stdout, inspect, smoke, `.env` not read, `GIT_CEILING_DIRECTORIES`, project removed, leftover projects) and an `INFO` line with
+the deploy output's tail, all redacted, never the token, then `VERDICT ok: N passed, K noted (not decided)` or `VERDICT n items failed (…)`: a NOTE is an item this run could not
+decide (`.env` is always one: the engine refuses `.env` in release uploads, so the probe plants none). The `brahma-probe-`
+project-name prefix is reserved for it: it deletes nothing else, and a leftover under that prefix is reported by name (the
+listing may be paginated or use the CLI's default scope, so also check the dashboard). An interrupted probe (Ctrl-C, a closed
+terminal) skips its cleanup: the throwaway project stays (the next run names it as a leftover) and so does
+`<releases>/probe-<suffix>/` with any step output not yet read; delete both. Run it on a throwaway data home
+(`BRAHMA_HOME`/`BRAHMA_WORKSPACES`), never on your real one with a development build. The live test (`BRAHMA_LIVE=1 … LiveSmokeTests/goalToLiveURL`) runs the whole goal-to-URL path against a
 fake host on loopback and says so (`FAKE HOST`); only this probe proves a real provider.
 
 **Start from an existing repo.** `brahma company create <name> --goal … --from-repo <folder|https-url>` (or EXISTING REPO
