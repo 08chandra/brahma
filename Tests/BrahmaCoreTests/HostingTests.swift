@@ -161,9 +161,34 @@ private struct RefusingVault: SecretVault {
         #expect(cf.smokeBase(s, deployURL: nil) == nil)
     }
 
+    /// Final-review I5: when `<project>.pages.dev` is taken, Pages gives the project a suffixed subdomain. The deploy URL
+    /// wrangler prints (`<8 hex>.<project>-<suffix>.pages.dev`) is still accepted, pinned to the project, and the smoke base
+    /// is derived from its host, never assumed from the project name. Nothing derivable: no smoke base (fail closed).
+    @Test func cloudflareSuffixedSubdomainDerivedFromTheDeployURL() throws {
+        let cf = CloudflarePagesAdapter()
+        let s = Self.settings()
+        let line = "✨ Deployment complete! Take a peek over at https://1a2b3c4d.acme-7xq.pages.dev"
+        let url = cf.deployURL(fromOutput: "Uploading...\n" + line + "\n", settings: s)
+        #expect(url?.absoluteString == "https://1a2b3c4d.acme-7xq.pages.dev")
+        #expect(cf.smokeBase(s, deployURL: url)?.absoluteString == "https://acme-7xq.pages.dev")
+        // The plain subdomain still derives the plain base.
+        let plain = try #require(cf.deployURL(fromOutput: "✨ Deployment complete! Take a peek over at https://1a2b3c4d.acme.pages.dev", settings: s))
+        #expect(cf.smokeBase(s, deployURL: plain)?.absoluteString == "https://acme.pages.dev")
+        // Still pinned to the project: another project's (or a longer name's) subdomain, a deeper host, another domain.
+        for foreign in ["https://1a2b3c4d.acme-other.pages.dev", "https://1a2b3c4d.acmex.pages.dev", "https://1a2b3c4d.x.acme.pages.dev",
+                        "https://1a2b3c4d.acme-7xq.pages.dev.evil.com", "https://1a2b3c4d.acme-7XQ.pages.dev", "https://1a2b3c4d.acme-.pages.dev"] {
+            #expect(cf.deployURL(fromOutput: "✨ Deployment complete! Take a peek over at \(foreign)", settings: s) == nil, "\(foreign)")
+        }
+        // A URL the adapter did not accept never derives a base (the executor only passes parsed URLs; defence in depth).
+        #expect(cf.smokeBase(s, deployURL: URL(string: "https://1a2b3c4d.evil.pages.dev")) == nil)
+        #expect(cf.smokeBase(s, deployURL: URL(string: "https://acme.pages.dev")) == nil)
+        // The owner's production URL always wins.
+        #expect(cf.smokeBase(Self.settings(productionURL: "https://www.acme.com"), deployURL: nil)?.absoluteString == "https://www.acme.com")
+    }
+
     // MARK: Vercel
 
-    @Test func vercelTokenNeverInArgvAndSmokesAlias() throws {
+    @Test func vercelTokenNeverInArgvAndSmokesVerifiedURL() throws {
         let v = VercelAdapter()
         #expect(v.tokenSecret == "VERCEL_TOKEN")
         #expect(v.cli == "vercel@65.9.0")
@@ -193,8 +218,12 @@ private struct RefusingVault: SecretVault {
                 == "https://acme-k3j4h5g6f-acme-team.vercel.app")
         #expect(v.deployURL(fromOutput: "Production: https://globex-a1-x.vercel.app\nhttps://evil-b2.vercel.app\n", settings: s) == nil)
         #expect(v.deployURL(fromOutput: "https://acme.vercel.app\n", settings: s) == nil)
-        #expect(v.smokeBase(s, deployURL: deployed)?.absoluteString == "https://acme.vercel.app")
+        // Final-review I6b: never a guessed `<project>.vercel.app` (which may be someone else's site): the owner's production
+        // URL, else the deploy URL the executor verified with `vercel inspect`, else nothing (fail closed).
+        #expect(v.smokeBase(s, deployURL: deployed)?.absoluteString == "https://acme-k3j4h5g6f-acme-team.vercel.app")
+        #expect(v.smokeBase(s, deployURL: nil) == nil)
         #expect(v.smokeBase(Self.settings(.vercel, productionURL: "https://acme.com"), deployURL: deployed)?.absoluteString == "https://acme.com")
+        #expect(v.smokeBase(Self.settings(.vercel, productionURL: "https://acme.com"), deployURL: nil)?.absoluteString == "https://acme.com")
         // Rollback: the previous deploy URL, from an empty releaseDir/rollback, with the same env.
         let back = try v.rollbackPlan(Self.input(s, adapter: v, release: 2, previousDeployURL: "https://acme-k3j4h5g6f-acme-team.vercel.app"))
         // The target is confirmed with the token first (Task 8), then rolled back to.
@@ -539,5 +568,8 @@ private struct RefusingVault: SecretVault {
         let v = try brahma(["hosting", "show", "Acme"], home: home)
         #expect(v.stdout.contains("provider: Vercel (vercel)")); #expect(v.stdout.contains("token: missing (VERCEL_TOKEN)"))
         #expect(v.stdout.contains("unverified")); #expect(v.stdout.contains("account: none"))
+        // Final-review I6a: the owner creates the Vercel project; deploys never do.
+        #expect(v.stdout.contains("note: \(VercelAdapter.projectNote(project: "acme-site"))"), "\(v.stdout)")
+        #expect(vercel.stdout.contains("note: \(VercelAdapter.projectNote(project: "acme-site"))"), "\(vercel.stdout)")
     }
 }

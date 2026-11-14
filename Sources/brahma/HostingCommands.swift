@@ -30,7 +30,8 @@ struct HostingCommand: AsyncParsableCommand {
             // The listing only: no vault read (a read-only command never touches the vault).
             let token = try store.secrets(companyId: selected.id).contains { $0.name == tokenName }
             if s == nil { print("not configured yet (defaults below)") }
-            print("provider: \(provider.title) (\(provider.rawValue)), \(adapter.cli), unverified: needs the owner's provider token")
+            print("provider: \(provider.title) (\(provider.rawValue)), \(adapter.cli), unverified: needs the owner's provider token"
+                  + (provider == .cloudflarePages ? " (the provider probe covers Vercel only)" : ""))
             print("project: \(safe(s?.project ?? selected.slug))")
             print("account: \(safe(s?.accountId ?? "none"))")
             print("production URL: \(safe(s?.productionURL ?? "none"))")
@@ -43,7 +44,10 @@ struct HostingCommand: AsyncParsableCommand {
             print("smoke: \(safe(smoke.isEmpty ? "none" : smoke.map { HostingCommand.oneLine($0, max: 200) }.joined(separator: "; ")))")
             if let expect = s?.expectText { print("expect text: \(safe(HostingCommand.oneLine(expect, max: 200)))") }
             print("token: \(token ? "present" : "missing") (\(tokenName))")
-            if provider == .vercel { print("note: \(VercelAdapter.hobbyNote)") }
+            if provider == .vercel {
+                print("note: \(VercelAdapter.hobbyNote)")
+                print(safe("note: \(VercelAdapter.projectNote(project: s?.project ?? selected.slug))"))
+            }
         }
     }
 
@@ -77,7 +81,10 @@ struct HostingCommand: AsyncParsableCommand {
                 throw fail(e.message)
             }
             print("hosting for \(safe(selected.name)): \(s.provider.title) project \(safe(s.project))")
-            if s.provider == .vercel { print("note: \(VercelAdapter.hobbyNote)") }
+            if s.provider == .vercel {
+                print("note: \(VercelAdapter.hobbyNote)")
+                print(safe("note: \(VercelAdapter.projectNote(project: s.project))"))
+            }
         }
     }
 

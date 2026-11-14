@@ -130,6 +130,6 @@ enum ReleaseFixtures {
         var form = HostingForm(nil, companySlug: "acme")
         #expect(form.providerNote == nil)
         form.provider = .vercel
-        #expect(form.providerNote == "Vercel's free Hobby plan is for non-commercial use.")
+        #expect(form.providerNote == "Vercel's free Hobby plan is for non-commercial use. " + VercelAdapter.projectNote(project: form.project))
     }
 }

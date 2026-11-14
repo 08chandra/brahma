@@ -16,7 +16,8 @@ import Glibc
 ///    redactor-knows-token gate, pinned redaction, stdout-only URL parse, `vercel inspect` verification) against a throwaway
 ///    project `brahma-probe-<6 random [a-z0-9]>` (a reserved prefix, documented in the README), created and removed by
 ///    engine-composed `vercel project add|rm` steps;
-/// 4. smokes the production alias for the marker; reads the hosts the CLI contacted from the engine's egress proxy (allowed
+/// 4. smokes the site for the marker (the production URL when set, else the inspect-verified deploy URL: never a guessed
+///    alias, final-review I6b); reads the hosts the CLI contacted from the engine's egress proxy (allowed
 ///    and denied) and whether the proxy was honoured; prints one verdict per item the ledger left unverified;
 /// 5. removes the project and lists what is left under the prefix.
 /// Never run by a test or an agent: the adapter, sandbox, HTTP probe and environment are injectable so unit tests use the fake
@@ -55,6 +56,14 @@ public enum ProviderProbe {
     /// Why the `.env` item is a NOTE (fix round 1, I3): the probe cannot decide it, and a real release never uploads one.
     static let envNote = "not decidable here: the engine refuses `.env` in release uploads (UploadStager), so a real deploy never "
         + "carries one, and the probe plants none (it would be served publicly); `.vercel` is refused by the config check before any step"
+
+    /// Final-review I6a: the probe's `project add` hides whether a deploy to a project that does not exist fails.
+    static let projectNote = "the probe created its own project (`vercel project add`); a real release never creates the project "
+        + "(VERCEL_PROJECT_ID names it), so the owner creates it first; whether a deploy to a missing project fails is not decided here"
+
+    /// Final-review I6c: not exercised by this probe.
+    static let promotionNote = "not exercised: after `vercel rollback`, Vercel may stop assigning production to later `--prod` "
+        + "deploys until `vercel promote`; only a deploy → rollback → deploy cycle would decide it"
 
     /// Six random `[a-z0-9]`.
     public static func randomSuffix() -> String {
@@ -277,7 +286,7 @@ public enum ProviderProbe {
                 }
             }
 
-            // 3. The smoke of the production alias, for the marker.
+            // 3. The smoke of the site (the production URL, else the verified deploy URL), for the marker.
             if deployed {
                 if let base = adapter.smokeBase(settings, deployURL: deployURL) {
                     let smoked = await DeploySmoke.run(base: base, requests: [], expectText: marker, http: http, sleep: sleep)
@@ -294,6 +303,9 @@ public enum ProviderProbe {
                 note("smoke", "skipped: nothing was deployed")
             }
             note(".env not read", ProviderProbe.envNote)
+            // Final-review I6a/I6c: what this run cannot show, said rather than implied by a pass.
+            note("project exists", ProviderProbe.projectNote)
+            note("promotion after rollback", ProviderProbe.promotionNote)
             note("GIT_CEILING_DIRECTORIES", "set to \(plan.env["GIT_CEILING_DIRECTORIES"] ?? "(unset)") on every token step; a `.git` between the deploy folder and the releases root is refused by the config check; a repository above the root cannot be planted by this probe, so the ceiling itself is reported, not exercised")
 
             // 4. The hosts the CLI contacted (the egress proxy's allow and deny logs) and whether the proxy was honoured.

@@ -115,6 +115,11 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(v.links.map(\.url) == ["https://vercel.com/signup", "https://vercel.com/account/settings/tokens"])
         #expect(v.fields.first == HumanTaskField(name: "VERCEL_TOKEN", label: "Vercel token", kind: .secretEngine, required: true))
         #expect(v.steps.contains("Vercel's free Hobby plan is for non-commercial use."))
+        // Final-review I6a: deploys never create the Vercel project; the owner does, with the configured name.
+        #expect(v.steps.contains("Create a Vercel project named lumen (Add New… → Project in the dashboard, or `vercel project add lumen`). Deploys use it and never create it."),
+                "\(v.steps)")
+        #expect(VercelAdapter.projectNote(project: "lumen")
+                == "Vercel deploys never create the project: create lumen first (Add New… → Project in the Vercel dashboard, or `vercel project add lumen`).")
         #expect(v.fields.map(\.name) == ["VERCEL_TOKEN", "account_id"], "deploys need VERCEL_ORG_ID (PR-15)")
 
         let stripe = try HumanTasks.render(.stripeTestKeys, company: h.acme, hosting: nil, args: [:])

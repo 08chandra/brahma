@@ -124,7 +124,7 @@ public enum HumanTasks {
         }
         let task: HumanTask
         switch t {
-        case .hostingAccount: task = hostingAccount(provider)
+        case .hostingAccount: task = hostingAccount(provider, project: project)
         case .domain: task = try domain(provider: provider, project: project, domain: args["domain"])
         case .stripeTestKeys: task = stripeTestKeys
         case .launchPost: task = try launchPost(text: args["text"], url: args["url"])
@@ -133,7 +133,7 @@ public enum HumanTasks {
         return task
     }
 
-    static func hostingAccount(_ provider: HostingProviderID) -> HumanTask {
+    static func hostingAccount(_ provider: HostingProviderID, project: String? = nil) -> HumanTask {
         let token = HostingAdapters.adapter(provider).tokenSecret
         switch provider {
         case .cloudflarePages:
@@ -157,6 +157,9 @@ public enum HumanTasks {
                 "Account Settings → Tokens → Create Token → Create.",
                 "Copy the token into the field below. It goes to your Mac's Keychain; agents never see it.",
                 "Copy your Team ID (team Settings → General), or on Hobby your Vercel ID (Account Settings → General), into the field below.",
+                // Final-review I6a: deploys name the project (VERCEL_PROJECT_ID) and never create it.
+                project.map { "Create a Vercel project named \($0) (Add New… → Project in the dashboard, or `vercel project add \($0)`). Deploys use it and never create it." }
+                    ?? "Create the Vercel project your company deploys to (Add New… → Project). Deploys use it and never create it.",
                 "Vercel's free Hobby plan is for non-commercial use.",
             ], links: [
                 HumanTaskLink(title: "Sign up", url: "https://vercel.com/signup"),

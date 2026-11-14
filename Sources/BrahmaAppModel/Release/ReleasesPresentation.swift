@@ -142,7 +142,9 @@ public struct HostingForm: Equatable, Sendable {
     }
 
     public var providerNote: String? {
-        provider == .vercel ? "Vercel's free Hobby plan is for non-commercial use." : nil
+        guard provider == .vercel else { return nil }
+        let project = self.project.trimmingCharacters(in: .whitespaces)
+        return "Vercel's free Hobby plan is for non-commercial use. " + VercelAdapter.projectNote(project: project)
     }
 }
 

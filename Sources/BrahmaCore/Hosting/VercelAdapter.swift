@@ -9,6 +9,10 @@ import Foundation
 /// UNVERIFIED (PR-14, "needs owner token"): the pin is the registry's latest at the time of writing (`npm view vercel
 /// version`); the flags and environment names were checked against that package's source only. `VERCEL_PROJECT_ID` carries
 /// the project name (the CLI resolves projects by id or name). `network` is provisional until the owner's probe.
+///
+/// Final-review I6: the deploy never creates the project (the owner does: `projectNote`, the hosting-account task); after
+/// a `vercel rollback`, Vercel may stop auto-assigning production to later `--prod` deploys until a `vercel promote`
+/// (unverified; the probe does not exercise a deploy → rollback → deploy cycle, and says so).
 public struct VercelAdapter: HostingAdapter {
     public init() {}
 
@@ -24,6 +28,13 @@ public struct VercelAdapter: HostingAdapter {
     public static let hobbyNote = "Vercel's free Hobby plan is for non-commercial use only; a commercial site needs a Pro plan."
 
     static let accountMessage = "Vercel needs the team or account ID; finish the hosting-account task"
+
+    /// Final-review I6a: a deploy never creates the project (`VERCEL_PROJECT_ID` names it; `vercel deploy` likely fails
+    /// "Project not found" without it, unverified until the probe deploys to a project it did not create). Shown with the
+    /// hosting (CLI, app) and in the hosting-account task.
+    public static func projectNote(project: String) -> String {
+        "Vercel deploys never create the project: create \(project) first (Add New… → Project in the Vercel dashboard, or `vercel project add \(project)`)."
+    }
 
     public func validate(_ s: HostingSettings) throws {
         try HostingAdapters.validateForDeploy(s)
@@ -123,9 +134,13 @@ public struct VercelAdapter: HostingAdapter {
         return nil
     }
 
-    /// Always the production alias (the stored production URL, else `https://<project>.vercel.app`), never the per-deploy
-    /// URL, which Vercel's deployment protection may put behind a login.
+    /// The owner's production URL; else the deploy URL the executor verified with the token (`vercel inspect`, the Task 7
+    /// ruling: it passes only a verified one); else nil (fail closed: "set the production URL in HOSTING"). Never a guessed
+    /// `https://<project>.vercel.app` (final-review I6b): when that name is taken Vercel gives the project another alias, and
+    /// the guess would smoke someone else's site. A per-deploy URL may sit behind Vercel's deployment protection (a 401),
+    /// so the owner sets the production URL for a protected project.
     public func smokeBase(_ s: HostingSettings, deployURL: URL?) -> URL? {
-        URL(string: s.productionURL ?? "https://\(s.project).vercel.app")
+        if let p = s.productionURL { return URL(string: p) }
+        return deployURL
     }
 }

@@ -6,6 +6,8 @@ import Foundation
 /// version`), and every flag, the `HTTPS_PROXY` support and the output lines below were checked against that package's
 /// source only. No real `pages deploy` has run under the sandbox yet, so `network` is the provisional host list; the owner's
 /// probe with a throwaway token records the hosts the egress proxy saw (`Fixtures/wrangler-hosts.txt`) and fixes it.
+/// The owner-run provider probe covers Vercel only, so the Cloudflare path (the default) stays unverified (final-review I5),
+/// including the deploy URL's form and the subdomain Pages assigns.
 public struct CloudflarePagesAdapter: HostingAdapter {
     public init() {}
 
@@ -72,12 +74,20 @@ public struct CloudflarePagesAdapter: HostingAdapter {
                               outputDir: i.settings.outputDir)
     }
 
+    /// The project's `pages.dev` subdomain as it may appear in a deploy URL (final-review I5): the project name, or, when
+    /// that name was taken on `pages.dev`, the project name with the short suffix Pages adds (`<project>-<1–4 lowercase
+    /// letters or digits>`). UNVERIFIED until a Cloudflare probe: the suffix's form is the one seen on Pages sites, not
+    /// read from wrangler (it comes from Cloudflare's API). Anything else is not this project's.
+    static func subdomainPattern(project: String) -> String {
+        NSRegularExpression.escapedPattern(for: project) + "(?:-[a-z0-9]{1,4})?"
+    }
+
     /// The deploy URL from wrangler's own last "Deployment complete!" line only, pinned to the configured project:
-    /// `https://<8 hex>.<project>.pages.dev` (M1). A URL echoed anywhere else in the output (a build log, a function's
-    /// bundling output) is ignored.
+    /// `https://<8 hex>.<subdomain>.pages.dev`, the subdomain being the project's (`subdomainPattern`; M1, I5). A URL echoed
+    /// anywhere else in the output (a build log, a function's bundling output) is ignored.
     public func deployURL(fromOutput: String, settings: HostingSettings) -> URL? {
-        let project = NSRegularExpression.escapedPattern(for: settings.project)
-        guard let pattern = try? NSRegularExpression(pattern: "https://[0-9a-f]{8}\\.\(project)\\.pages\\.dev(?![A-Za-z0-9.-])") else {
+        let sub = Self.subdomainPattern(project: settings.project)
+        guard let pattern = try? NSRegularExpression(pattern: "https://[0-9a-f]{8}\\.\(sub)\\.pages\\.dev(?![A-Za-z0-9.-])") else {
             return nil
         }
         guard let line = fromOutput.split(whereSeparator: \.isNewline).last(where: { $0.contains("Deployment complete!") }) else {
@@ -88,10 +98,15 @@ public struct CloudflarePagesAdapter: HostingAdapter {
         return URL(string: text.substring(with: m.range))
     }
 
-    /// The stored production URL, else `https://<project>.pages.dev` (the deploy URL is pinned to it).
+    /// The stored production URL; else the production address derived from the parsed deploy URL's host (final-review I5:
+    /// `<8 hex>.<subdomain>.pages.dev` → `https://<subdomain>.pages.dev`, the subdomain still pinned to the project, never
+    /// assumed from the project name, which Pages suffixes when it is taken); else nil, and the executor fails closed ("set
+    /// the production URL in HOSTING").
     public func smokeBase(_ s: HostingSettings, deployURL: URL?) -> URL? {
         if let p = s.productionURL { return URL(string: p) }
-        guard deployURL != nil else { return nil }
-        return URL(string: "https://\(s.project).pages.dev")
+        guard let host = deployURL?.host, deployURL?.scheme == "https",
+              host.range(of: "^[0-9a-f]{8}\\.\(Self.subdomainPattern(project: s.project))\\.pages\\.dev$", options: .regularExpression) != nil
+        else { return nil }
+        return URL(string: "https://" + host.split(separator: ".").dropFirst().joined(separator: "."))
     }
 }

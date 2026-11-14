@@ -87,6 +87,12 @@ import GRDB
         for line in ["CLI pin", "network hosts", "deploy URL", "Production:", "inspect", "smoke", ".env", "GIT_CEILING", "project removed", "leftover"] {
             #expect(report.lines.contains { $0.localizedCaseInsensitiveContains(line) }, "no verdict for \(line): \(report.lines)")
         }
+        // Final-review I6a/I6c: what this probe cannot show is said, as NOTEs (never folded into a pass): it created its own
+        // project (a real deploy never does), and promotion after a rollback was not exercised.
+        #expect(report.lines.contains { $0.hasPrefix("NOTE  project exists: ") && $0.contains("created its own project")
+                                         && $0.contains("never creates the project") }, "\(report.lines)")
+        #expect(report.lines.contains { $0.hasPrefix("NOTE  promotion after rollback: ") && $0.contains("vercel promote")
+                                         && $0.contains("not exercised") }, "\(report.lines)")
         // The install ran first, token-free, with the install network only; every token step carries the token in its
         // environment, never its argv, with the deploy network and the fixed env (PR-15: org + project from the env).
         let install = try #require(fx.sandbox.calls.first)
