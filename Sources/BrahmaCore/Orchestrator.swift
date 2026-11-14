@@ -215,8 +215,9 @@ public actor Orchestrator {
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
         self.checkBaseEnvironment = checkBaseEnvironment
-        // Plan ML: a restore resets the company's memory cursors, a full idempotent re-scan on the next ticks.
-        restoreHooks.register(afterRestore: { event in try MemoryIngest.resetCursors(store: store, companyId: event.companyId) })
+        // Plan ML: a restore resets every memory cursor (every company's: the whole database was swapped), a full idempotent
+        // re-scan on the next ticks.
+        restoreHooks.register(afterRestore: { _ in try MemoryIngest.resetCursors(store: store) })
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -1769,15 +1770,21 @@ extension Store {
             }
             if closed, let cost { try Store.recordSpend(db, cost) }
             // Plan ML: the turn's episode, before any fresh-session reset (the orchestrator's `clearTaintIfRequested` runs after
-            // this transaction), with the session's taint as it stands now. Never fails the turn end.
-            if closed, let ended = try? Turn.fetchOne(db, key: turn.id) {
-                let taint: String?
-                do { taint = try Store.currentTaint(db: db, agentId: agentId, home: taintHome ?? dataHome) } catch { taint = "session" }
-                // The turn's item, else the item the agent holds.
-                let itemKey = try? String.fetchOne(db, sql: """
-                    SELECT key FROM workItem WHERE id = COALESCE(?, (SELECT itemId FROM workLease WHERE agentId = ? ORDER BY acquiredAt DESC LIMIT 1))
-                    """, arguments: [ended.itemId, agentId])
-                try? EpisodeRecorder.turnEnded(db: db, turn: ended, agent: agent, itemKey: itemKey, taint: taint, now: now)
+            // this transaction), with the session's taint as it stands now. Never fails the turn end; a failure leaves an
+            // `error` activity line.
+            if closed {
+                EpisodeRecorder.nonFatal(db: db, companyId: agent.companyId, agentId: agentId,
+                                         what: "the episode of @\(agent.name)'s turn", now: now) {
+                    guard let ended = try Turn.fetchOne(db, key: turn.id) else { throw StoreError.notFound }
+                    let taint: String?
+                    // Unreadable: tainted (fail closed).
+                    do { taint = try Store.currentTaint(db: db, agentId: agentId, home: taintHome ?? dataHome) } catch { taint = "session" }
+                    // The turn's item, else the item the agent holds.
+                    let itemKey = try String.fetchOne(db, sql: """
+                        SELECT key FROM workItem WHERE id = COALESCE(?, (SELECT itemId FROM workLease WHERE agentId = ? ORDER BY acquiredAt DESC LIMIT 1))
+                        """, arguments: [ended.itemId, agentId])
+                    try EpisodeRecorder.turnEnded(db: db, turn: ended, agent: agent, itemKey: itemKey, taint: taint, now: now)
+                }
             }
             var watchdogBlock: Blocker?
             var budgeted = completed

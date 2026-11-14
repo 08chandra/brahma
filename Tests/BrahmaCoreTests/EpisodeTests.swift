@@ -170,6 +170,58 @@ import GRDB
         #expect(second.number == first.number + 1); #expect(!second.tainted)
     }
 
+    /// Fix round 1: a turn with no item of its own takes the KEY of the item the agent currently leases (`endTurn`'s COALESCE):
+    /// here the agent claims items mid-turn (a lease taken while the turn runs), the newest lease naming the episode.
+    @Test func turnEpisodeKeyFromCurrentLease() async throws {
+        let o = try O()
+        let older = try o.store.createWorkItem(companyId: o.company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Older lease"))
+        let held = try o.store.createWorkItem(companyId: o.company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Held lease"))
+        let (store, cid, aid, now) = (o.store, o.company.id, o.eng.id, o.world.clock.now)
+        try await o.turn(o.eng, .init(sideEffect: { _ in
+            try store.writer.write { db in
+                try WorkLease(itemId: older.id, companyId: cid, agentId: aid, acquiredAt: now.addingTimeInterval(-600),
+                              expiresActive: 1e12).insert(db)
+                try WorkLease(itemId: held.id, companyId: cid, agentId: aid, acquiredAt: now.addingTimeInterval(-60),
+                              expiresActive: 1e12).insert(db)
+            }
+        }, text: "Sketched the ibis importer"))
+        let turn = try #require(try o.world.turns(o.eng).last)
+        let e = try #require(try o.entries(o.eng).last)
+        #expect(e.fact == "\(held.key) · \(turn.kind.rawValue): Sketched the ibis importer", "the newest lease")
+        // The turn row had no item when the episode was written (the accounting attributes it to a held item afterwards).
+        #expect(e.itemId == nil); #expect(e.turnId == turn.id)
+        #expect(try o.doc(e)?["title"] == "Episode \(MemoryIngest.stamp(e.createdAt, zone: TimeZone(identifier: "UTC")!)) \(held.key)")
+    }
+
+    /// Fix round 1: a failed episode never fails the turn end, and never passes silently: it leaves an `error` activity line.
+    @Test func episodeFailureLeavesActivityLine() async throws {
+        let o = try O()
+        // Every memoryEntry insert fails.
+        try await o.store.writer.write { db in
+            try db.execute(sql: "CREATE TRIGGER fail_episode BEFORE INSERT ON memoryEntry BEGIN SELECT RAISE(ABORT, 'forced episode failure'); END")
+        }
+        try await o.turn(o.eng, .init(text: "Shipped the heron feed"))
+        let turn = try #require(try o.world.turns(o.eng).last)
+        #expect(turn.outcome == .succeeded, "the turn end committed")
+        #expect(try o.entries(o.eng).isEmpty)
+        let lines = try await o.store.writer.read { db in
+            try ActivityEvent.filter(Column("companyId") == o.company.id && Column("kind") == ActivityKind.error.rawValue).fetchAll(db)
+        }
+        let line = try #require(lines.first { $0.text.hasPrefix("could not record the episode of @eng-1's turn: ") })
+        #expect(line.text.contains("forced episode failure")); #expect(line.agentId == o.eng.id)
+        #expect(try await o.store.writer.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memoryDoc WHERE source = 'memory'") } == 0)
+
+        // The completion episode: the item is done, the line is left.
+        let item = try o.store.createWorkItem(companyId: o.company.id, by: .owner,
+                                              draft: WorkItemDraft(type: .task, title: "Finish me", ownerId: o.eng.id))
+        try await o.store.writer.write { db in try o.store.engineSetStatus(db: db, itemId: item.id, to: .done, now: o.world.clock.now) }
+        #expect(try o.store.workItem(id: item.id)?.status == .done)
+        #expect(try await o.store.writer.read { db in
+            try ActivityEvent.filter(Column("text").like("could not record the completion episode of \(item.key): %forced episode failure%"))
+                .fetchCount(db)
+        } == 1)
+    }
+
     @Test func itemCompletionRecordedWithoutMergedCommit() throws {
         let store = try Store.inMemory()
         let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
