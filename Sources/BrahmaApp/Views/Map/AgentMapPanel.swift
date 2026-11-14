@@ -10,12 +10,14 @@ import BrahmaMapKit
 /// controller, and a panel holding the old one would draw a dead map. It also works standalone (the pop-out window and
 /// `--map-demo` mount it with `isWindow: true`).
 struct AgentMapPanel: View {
-    /// The pop-out window's id (Task 10b declares the window).
+    /// The pop-out window's id (`BrahmaApp` declares the window; `MapWindow` hosts this panel in it).
     static let windowId = "map"
 
     let model: AppModel
     /// True in the pop-out window: no pop-out button, and the panel never shows the "open in window" placeholder.
     var isWindow = false
+    /// The pop-out window's full-screen toggle (the window passes it; the inline panel has none).
+    var onFullScreen: (() -> Void)?
 
     @Environment(\.openWindow) private var openWindow
     @State private var query = ""
@@ -24,7 +26,8 @@ struct AgentMapPanel: View {
         let controller = model.mapController
         Panel(title: "Agent map", padded: false, accessory: {
             if let controller {
-                MapHeader(model: model, controller: controller, query: $query, isWindow: isWindow, onPopOut: popOut)
+                MapHeader(model: model, controller: controller, query: $query, isWindow: isWindow, onPopOut: popOut,
+                          onFullScreen: onFullScreen)
             }
         }, content: {
             content(controller)

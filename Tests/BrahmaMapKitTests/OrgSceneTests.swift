@@ -852,6 +852,30 @@ import AppKit
         #expect((c.lastFrameTime ?? 0) > 125)
     }
 
+    /// Facts stamped while the map was unmounted carry the controller's clock, not the last frame's: a scene mounted again
+    /// starts at `mapNow()`, so those facts are not in the "future" of the first frame.
+    @Test func remountedSceneStartsAtMapNow() {
+        final class Clock: @unchecked Sendable {
+            let lock = NSLock()
+            var t = Date(timeIntervalSince1970: 1_800_000_000)
+            var now: Date { lock.lock(); defer { lock.unlock() }; return t }
+            func advance(_ s: TimeInterval) { lock.lock(); t = t.addingTimeInterval(s); lock.unlock() }
+        }
+        let clock = Clock()
+        let c = MapController(source: .synthetic(agents: 40, rate: 0, seed: 7), defaults: UserDefaults(suiteName: UUID().uuidString)!,
+                              clock: { clock.now })
+        _ = c.frame(now: 100)
+        clock.advance(30)
+        #expect(abs(c.mapNow() - 130) < 1e-6)
+        let scene = OrgScene(size: CGSize(width: 1600, height: 900))
+        scene.present(controller: c)
+        // A view's first update after a remount: its own clock is unrelated to map time.
+        scene.update(5000)
+        #expect(abs((c.lastFrameTime ?? 0) - 130) < 1e-6, "first frame at \(c.lastFrameTime ?? -1)")
+        scene.update(5000 + 1.0 / 60)
+        #expect(abs((c.lastFrameTime ?? 0) - (130 + 1.0 / 60)) < 1e-6)
+    }
+
     @Test func glowShapesStayWithTheirEdge() throws {
         let c = Self.controller(40)
         let scene = OrgScene(size: CGSize(width: 1600, height: 900))
