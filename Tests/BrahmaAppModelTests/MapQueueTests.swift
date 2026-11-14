@@ -414,7 +414,7 @@ import Foundation
         var m = MapModel()
         m.apply(MapInputs(agents: c.agents, pack: c.pack, vacancies: c.vacancies, meetings: c.meetings), now: 0)
         var traffic = SyntheticTraffic(seed: 5)
-        let clock = ContinuousClock()
+        let clock = SuspendingClock()
         var total = 0.0, worst = 0.0, lastPoll = 0.0
         let steps = 3600
         for step in 0..<steps {
