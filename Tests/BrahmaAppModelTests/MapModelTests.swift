@@ -180,10 +180,10 @@ import Foundation
         let others = base.map(\.id).filter { $0 != "a-ceo" }
         var storm = model()
         storm.ingest([post(team: "team-1", from: "a-ceo", mentions: others)], now: t0)
-        #expect(storm.pending.filter { $0.kind == .message }.count == MapModel.maxFanout)
+        #expect(storm.pending.filter { $0.kind == .message }.count == MapThrottle.standard.maxFanout)
         let b = try #require(storm.pending.first { $0.kind == .broadcast })
         #expect(b.from == .agent("a-ceo"))
-        #expect(storm.pending.count == MapModel.maxFanout + 1)
+        #expect(storm.pending.count == MapThrottle.standard.maxFanout + 1)
         #expect(storm.edges(now: t0).count == others.count)
     }
 
