@@ -285,6 +285,46 @@ import GRDB
         #expect(try w.docs(.decision).count == 1)
     }
 
+    /// Fix round 1: provenance follows the requester the line records. An agent → `.agent`; the engine (`Sender.system`, the
+    /// line has no agent) → `.engine`; an agent-less line whose engine-built head names `@owner` → `.owner`.
+    @Test func decisionProvenanceFollowsRequester() throws {
+        let w = try W()
+        try w.store.recordMechanicalDecision(companyId: w.company.id, by: .system, kind: .other, category: "process",
+                                             title: "Rotate the on-call weekly", summary: "", now: w.at(0))
+        // The shape an owner-recorded line would have (no path writes one today: the owner files no asks).
+        try w.store.appendEvent(ActivityEvent(companyId: w.company.id, agentId: nil, turnId: nil, kind: .approval,
+                                              text: "Recorded: Decision by @owner: Freeze deploys on Fridays", createdAt: w.at(1)))
+        // Agent-written text after the head cannot pass for the owner.
+        try w.store.recordMechanicalDecision(companyId: w.company.id, by: .system, kind: .other, category: "process",
+                                             title: "x by @owner: y", summary: "", now: w.at(2))
+        try w.store.recordMechanicalDecision(companyId: w.company.id, by: .agent(w.eng1.id), kind: .other, category: "process",
+                                             title: "Use squash merges", summary: "", now: w.at(3))
+        try w.run()
+        let byBody = Dictionary(uniqueKeysWithValues: try w.docs(.decision).map {
+            ($0["body"] as String, ($0["provenance"] as String, $0["authorId"] as String?))
+        })
+        #expect(byBody.count == 4)
+        #expect(byBody["Decision by @system: Rotate the on-call weekly"]! == ("engine", "system"))
+        #expect(byBody["Decision by @owner: Freeze deploys on Fridays"]! == ("owner", "owner"))
+        #expect(byBody["Decision by @system: x by @owner: y"]! == ("engine", "system"))
+        #expect(byBody["Decision by @eng-1: Use squash merges"]! == ("agent:\(w.eng1.id)", w.eng1.id))
+    }
+
+    /// The pinned item-body comment cap, `MemoryIngest.itemComments`: the newest 50 comments, the oldest dropped.
+    @Test func itemBodyKeepsNewestComments() throws {
+        #expect(MemoryIngest.itemComments == 50); #expect(MemoryIngest.maxHandoffBytes == 65_536)
+        let w = try W()
+        let item = try w.store.createWorkItem(companyId: w.company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Chatty"),
+                                              now: w.at(0))
+        for i in 0...MemoryIngest.itemComments {
+            _ = try w.store.commentWorkItem(id: item.id, by: .owner, text: "remark-\(i)-end", now: w.at(Double(i + 1)))
+        }
+        try w.run()
+        let body: String = try #require(try w.doc(.item, item.id))["body"]
+        #expect(!body.contains("remark-0-end"))
+        #expect(body.contains("remark-1-end")); #expect(body.contains("remark-\(MemoryIngest.itemComments)-end"))
+    }
+
     @Test func retroIngestedOnClose() throws {
         let w = try W()
         let sprint = Sprint(id: UUID().uuidString, companyId: w.company.id, number: 1, team: nil, goal: "ship", cadence: .sprint,
@@ -327,7 +367,7 @@ import GRDB
         #expect(try w.activity(line) == 1)
         // Re-reads (the overlap, a re-scan) skip it again without another line.
         try w.run(at: 3601)
-        try MemoryIngest.resetCursors(store: w.store, companyId: w.company.id)
+        try MemoryIngest.resetCursors(store: w.store)
         try w.run(at: 3602)
         #expect(try w.activity(line) == 1)
         #expect(try w.docs(.handoff).count == 1)
@@ -395,9 +435,9 @@ import GRDB
             #expect(c.range(of: #"=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\|.+$"#, options: .regularExpression) != nil, "\(c)")
         }
         #expect(cursors.contains { $0.range(of: #"^itemEvent=\d+$"#, options: .regularExpression) != nil })
-        // Again (inside the overlap), and after a full re-scan: nothing changes, nothing is duplicated.
+        // Again (idle: the overlap window has closed), and after a full re-scan: nothing changes, nothing is duplicated.
         try w.run(at: 3700)
-        try MemoryIngest.resetCursors(store: w.store, companyId: w.company.id)
+        try MemoryIngest.resetCursors(store: w.store)
         try w.run(at: 3800)
         #expect(try w.docs().map { "\($0["id"] as Int64)|\($0["updatedAt"] as String)" } == before)
         try w.store.writer.write { db in try db.execute(sql: "INSERT INTO memoryFts(memoryFts) VALUES('integrity-check')") }
@@ -408,11 +448,16 @@ import GRDB
         let db = dir.appending(path: "brahma.db")
         var store = try Store(path: db.path)
         var w = try W(store: store)
+        // A second company on the same database: the restore resets its cursors too.
+        let beta = try W(store: store, name: "Beta")
         for i in 0..<50 {
             _ = try w.router.post(companyId: w.company.id, channel: "general", from: .owner, text: "old message \(i)", now: w.at(Double(i)))
         }
+        _ = try beta.router.post(companyId: beta.company.id, channel: "general", from: .owner, text: "beta note", now: beta.at(0))
         try w.run()
+        try beta.run()
         #expect(try w.docs(.message).count == 50)
+        #expect(try beta.cursorPositions().contains { !$0.isEmpty })
         // A snapshot as the backups take it (VACUUM INTO renumbers a TEXT table's rowids), restored over the database.
         let snapshot = dir.appending(path: "snap.db")
         try w.vacuum(into: snapshot)
@@ -432,7 +477,12 @@ import GRDB
             try await hook(RestoreEvent(companyId: company.id, companyName: company.name, workspace: URL(fileURLWithPath: company.workspacePath),
                                         mainHead: nil, snapshotName: "snap.db"))
         }
-        #expect(try w.cursorPositions().allSatisfy(\.isEmpty))
+        // Every cursor row, the other company's included (the event names only the first).
+        let all = try await store.writer.read { db in
+            try Row.fetchAll(db, sql: "SELECT companyId, position FROM memoryCursor").map { ($0["companyId"] as String, $0["position"] as String) }
+        }
+        #expect(Set(all.map(\.0)) == [w.company.id, beta.company.id])
+        #expect(all.allSatisfy { $0.1.isEmpty })
 
         var fresh: [Message] = []
         for i in 0..<3 {
@@ -450,6 +500,80 @@ import GRDB
         try w.run(at: 9100)
         #expect(try w.ocelots() == fresh.map(\.id).sorted())
         #expect(try w.docs(.message).count == 56)
+    }
+
+    /// Fix round 1: an idle source opens no write transaction. Detection: a statement trace on the store's writer connection.
+    /// The store is a `DatabasePool`, whose reads run on reader connections, so any statement on the writer (its
+    /// `BEGIN IMMEDIATE` first) is a write access; the positive controls show the trace sees a source's write.
+    @Test func idleSourceOpensNoWriteTransaction() throws {
+        let dir = try tempDir()
+        let store = try Store(path: dir.appending(path: "brahma.db").path)
+        defer { try? store.close() }
+        let w = try W(store: store)
+        let beta = try W(store: store, name: "Beta")
+        // A row in every source.
+        _ = try w.router.post(companyId: w.company.id, channel: "general", from: .owner, text: "the first tapir", now: w.at(0))
+        let item = try w.store.createWorkItem(companyId: w.company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Tapir work"),
+                                              now: w.at(1))
+        _ = try w.store.commentWorkItem(id: item.id, by: .owner, text: "tapir note", now: w.at(2))
+        _ = try w.store.writeHandoff(itemId: item.id, by: .owner, draft: HandoffDraft(goal: "the tapir hand-off"), now: w.at(3))
+        try w.store.recordMechanicalDecision(companyId: w.company.id, by: .agent(w.eng1.id), kind: .other, category: "process",
+                                             title: "Tapir policy", summary: "", now: w.at(4))
+        _ = try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.eng1.id), title: "Tapir?", question: "Which tapir?",
+                                         now: w.at(5))
+        let sprint = Sprint(id: UUID().uuidString, companyId: w.company.id, number: 1, team: nil, goal: "ship", cadence: .sprint,
+                            status: .active, milestoneItemId: nil, askId: nil, createdAt: w.at(0), startedAt: w.at(0), closedAt: nil,
+                            summary: nil, leadId: nil)
+        try w.store.writer.write { db in try sprint.insert(db) }
+        _ = try w.store.closeSprint(sprintId: sprint.id, by: .owner, summary: "The tapir retro", lessons: "", now: w.at(6))
+        try w.run()
+        let sources = try w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT source FROM memoryCursor WHERE companyId = ? ORDER BY source", arguments: [w.company.id])
+        }
+        #expect(sources == MemoryIngest.Cursor.allCases.map(\.rawValue).sorted())
+        /// Every cursor and every doc's `updatedAt`.
+        func state() throws -> [String] {
+            try w.store.writer.read { db in
+                try String.fetchAll(db, sql: "SELECT companyId || ':' || source || '=' || position FROM memoryCursor ORDER BY companyId, source")
+                    + String.fetchAll(db, sql: "SELECT id || '|' || updatedAt FROM memoryDoc ORDER BY id")
+            }
+        }
+        let before = try state()
+        let trace = WriterTrace(store)
+
+        // Long after the overlap window closed, with nothing new: no write, nothing changes.
+        try w.run(at: 3601)
+        try w.run(at: 7200)
+        #expect(trace.take().isEmpty)
+        #expect(try state() == before)
+
+        // Rows the id sources skip (another company's, a non-decision activity line) move no cursor and open no write.
+        _ = try beta.router.post(companyId: beta.company.id, channel: "general", from: .owner, text: "beta", now: w.at(7210))
+        let betaItem = try beta.store.createWorkItem(companyId: beta.company.id, by: .owner,
+                                                     draft: WorkItemDraft(type: .task, title: "B"), now: w.at(7210))
+        _ = try beta.store.commentWorkItem(id: betaItem.id, by: .owner, text: "b", now: w.at(7210))
+        try w.store.appendEvent(ActivityEvent(companyId: w.company.id, agentId: nil, turnId: nil, kind: .approval,
+                                              text: "Approved: not a decision", createdAt: w.at(7210)))
+        _ = trace.take()
+        try w.run(at: 7300)
+        #expect(trace.take().isEmpty)
+        #expect(try state() == before)
+
+        // Positive control: a new message is a write, and opens the overlap window.
+        let second = try w.router.post(companyId: w.company.id, channel: "general", from: .owner, text: "the second tapir", now: w.at(7400))
+        _ = trace.take()
+        try w.run(at: 7400)
+        #expect(trace.take().contains { $0.hasPrefix("BEGIN") })
+        #expect(try w.doc(.message, second.id) != nil)
+        // While the window is open (now < cursor + overlap), a row stamped before the cursor that commits late is still found.
+        let late = try w.router.post(companyId: w.company.id, channel: "general", from: .owner, text: "the late tapir", now: w.at(7390))
+        _ = trace.take()
+        try w.run(at: 7430)
+        #expect(!trace.take().isEmpty)
+        #expect(try w.doc(.message, late.id) != nil)
+        // The window closed: idle again.
+        try w.run(at: 7461)
+        #expect(trace.take().isEmpty)
     }
 
     @Test func cursorsResumeAfterStop() async throws {
@@ -494,11 +618,10 @@ import GRDB
         #expect(throws: WorkError.forbidden("not in your company")) {
             try b.index.search(companyId: b.company.id, scope: .agent(a.eng1.id), query: "lemur", now: b.at(7200))
         }
-        // Resetting B's cursors leaves A's alone.
-        try MemoryIngest.resetCursors(store: a.store, companyId: b.company.id)
-        #expect(try a.store.writer.read { db in
-            try String.fetchAll(db, sql: "SELECT position FROM memoryCursor WHERE companyId = ?", arguments: [a.company.id])
-        }.allSatisfy { !$0.isEmpty })
+        // The restore reset is store-wide: every company's cursors go back to "" (a restore swaps the whole database).
+        #expect(try !a.cursorPositions().isEmpty && !b.cursorPositions().isEmpty)
+        try MemoryIngest.resetCursors(store: a.store)
+        #expect(try a.cursorPositions().allSatisfy(\.isEmpty)); #expect(try b.cursorPositions().allSatisfy(\.isEmpty))
     }
 }
 
@@ -506,5 +629,25 @@ extension MemoryIngestTests.W {
     /// The same company and agents on a reopened store.
     init(reopened store: Store, from w: MemoryIngestTests.W) {
         self.store = store; company = w.company; paths = w.paths; mgr = w.mgr; eng1 = w.eng1; eng2 = w.eng2
+    }
+}
+
+/// Every statement run on a store's writer connection from now on (a `DatabasePool`: reads use other connections).
+final class WriterTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var statements: [String] = []
+
+    init(_ store: Store) {
+        store.writer.writeWithoutTransaction { db in
+            db.trace(options: .statement) { [weak self] event in
+                guard let self else { return }
+                self.lock.withLock { self.statements.append("\(event)") }
+            }
+        }
+    }
+
+    /// The statements so far, cleared.
+    func take() -> [String] {
+        lock.withLock { defer { statements = [] }; return statements }
     }
 }
