@@ -69,4 +69,29 @@ import BrahmaCore
         model.apply(.sheet(.newCompany))
         #expect(model.presentedSheet == .newCompany)
     }
+    @Test func mapFlags() {
+        let a = LaunchOptions.parse(["/x", "--map-demo", "--map-demo-agents=120", "--map-bench=20"])
+        #expect(a.mapDemo)
+        #expect(a.mapDemoAgents == 120)
+        #expect(a.mapBench == 20)
+        let d = LaunchOptions()
+        #expect(!d.mapDemo && d.mapDemoAgents == 300 && d.mapBench == nil)
+        #expect(LaunchOptions.parse(["/x", "--map-demo-agents=9000"]).mapDemoAgents == 500)
+        #expect(LaunchOptions.parse(["/x", "--map-demo-agents=1"]).mapDemoAgents == 5)
+        #expect(LaunchOptions.parse(["/x", "--map-demo-agents=lots"]).mapDemoAgents == 300)
+        #expect(LaunchOptions.parse(["/x", "--map-bench=soon"]).mapBench == nil)
+        #expect(LaunchOptions.parse(["/x", "--select", "map"]).select == .map)
+        #expect(SelectTarget("map") == .map)
+    }
+
+    @Test func applyMapSelectsMissionControlAndEnsuresTheController() async throws {
+        let (store, paths) = try makeHome()
+        let seeded = try seedAcme(store, paths)
+        let model = AppModel(store: store, paths: paths)
+        await model.load()
+        model.apply(.agents)
+        model.apply(.map)
+        #expect(model.sidebarSelection == .missionControl)
+        #expect(model.mapController?.companyId == seeded.0.id)
+    }
 }

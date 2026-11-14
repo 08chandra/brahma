@@ -1,0 +1,543 @@
+import Foundation
+import Observation
+import BrahmaCore
+
+/// Where a map's company comes from: a live store, or the deterministic demo company (`--map-demo`).
+public enum MapSource: Sendable {
+    case live(store: Store, companyId: String)
+    case synthetic(agents: Int, rate: Double, seed: UInt64)
+}
+
+public enum CameraTarget: Equatable, Sendable {
+    case fit
+    case agent(String)
+}
+
+/// The replay scrubber's state (Task 7b drives it).
+public struct ReplayState: Equatable, Sendable {
+    public var timeline: MapTimeline
+    public var time: Date
+    public var playing: Bool
+    public var speed: Double
+
+    public init(timeline: MapTimeline, time: Date, playing: Bool, speed: Double) {
+        self.timeline = timeline; self.time = time; self.playing = playing; self.speed = speed
+    }
+}
+
+/// Feeds one company's map: snapshots in (`sync`), traffic in (`poll`), animations out (`frame`).
+///
+/// Every stored property later tasks mutate is declared here (extensions cannot add stored properties). Setters that the
+/// Task 7b extensions (separate files) need are `internal(set)` rather than `private(set)`; the public surface is the same.
+///
+/// Agent text: item titles and blocker lines pass through `Store.redactor` in `sync` (5-lite does not redact them at write
+/// time) and then through `MapText.clean` in `MapModel`. While the store's secrets are held (`Store.secretsHeld`: never
+/// loaded in this process, or the last reload left one unloaded) nothing is shown raw: an item shows its key and
+/// `withheld`, an owner blocker `"Waiting on you: " + withheld`.
+@MainActor @Observable
+public final class MapController {
+    public static let pollInterval: Duration = .milliseconds(500)
+    public static let highlightDuration: TimeInterval = 1.5
+    /// Polls between two cursor checks (the first poll after `init` and after `start()` always checks).
+    public static let cursorCheckEvery = 10
+    /// The people provider is consulted at most this often.
+    static let peopleInterval: TimeInterval = 10
+    /// Synthetic mode: one random reorg this often.
+    static let syntheticReorgEvery: TimeInterval = 30
+    /// Synthetic mode: the share of agents whose state changes per poll.
+    static let syntheticChurn = 0.02
+    /// Shown instead of agent text while the redactor cannot vouch for it.
+    public static let withheld = "[hidden until secrets load]"
+    static let redactionCacheLimit = 4096
+    nonisolated static let feedPages = 10
+
+    public static func modeKey(_ id: String) -> String { "brahma.map.mode.\(id)" }
+
+    // MARK: Setup
+
+    public let companyId: String
+    public let isSynthetic: Bool
+    @ObservationIgnored let source: MapSource
+    @ObservationIgnored let people: (any MapPeopleProviding)?
+    @ObservationIgnored let vault: (any SecretVault)?
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored let clock: @Sendable () -> Date
+    @ObservationIgnored private let createdAt: Date
+
+    // MARK: State
+
+    public internal(set) var model = MapModel()
+    public var mode: MapMode {
+        didSet { defaults.set(mode.rawValue, forKey: Self.modeKey(companyId)) }
+    }
+    public var zoom: Double = 1
+    /// Subtree id → expanded (true) or collapsed (false); wins over the default collapse.
+    public var orgOverrides: [String: Bool] = [:]
+    public var hoveredAgentId: String?
+    public var selectedManagerId: String?
+    public internal(set) var camera: CameraTarget = .fit
+    public internal(set) var follow: String?
+    public internal(set) var replay: ReplayState?
+    public internal(set) var searchHits: [String] = []
+    public internal(set) var highlightId: String? {
+        didSet { if highlightId != oldValue { highlightStartedAt = nil } }
+    }
+    public internal(set) var isRunning = false
+    public internal(set) var isInvalidated = false
+    public internal(set) var reseeds = 0
+
+    // Live feed bookkeeping.
+    /// The last live snapshot `sync` took (7b's `exitReplay` re-syncs it; `poll` re-applies it when vacancies or people change).
+    @ObservationIgnored var lastSnapshot: Snapshot?
+    @ObservationIgnored var messageCursor: Int64 = 0
+    @ObservationIgnored var handoffCursor: Int64 = 0
+    /// False when `init` could not read the maxima: the next poll seeds the cursors instead of reading flows.
+    @ObservationIgnored var cursorsSeeded = false
+    @ObservationIgnored var pollsUntilCursorCheck = 0
+    /// Bumped by `stop()`: a poll that started under another generation discards its result.
+    @ObservationIgnored var generation = 0
+    @ObservationIgnored var pollsInFlight = 0
+    @ObservationIgnored var lastPeopleLoad: Date?
+    /// 3a's open `orgVacancy` rows as last read (raw handles); nil before the first poll.
+    @ObservationIgnored var orgVacancyRows: [OrgVacancy]?
+    /// Cleaned vacancy id (what the map shows and hits name) → the raw org handle every Store call must use. Provider
+    /// vacancies are never in it.
+    @ObservationIgnored var orgVacancyHandles: [String: String] = [:]
+    /// The provider's last answer, uncleaned (cleaned when applied).
+    @ObservationIgnored var cachedPeople: MapPeople = .empty
+    @ObservationIgnored private var redactionCache: [String: String] = [:]
+    @ObservationIgnored private var redactionVersion: String?
+
+    // Frame bookkeeping.
+    @ObservationIgnored var highlightStartedAt: TimeInterval?
+    @ObservationIgnored private var lastFrameNow: TimeInterval?
+    @ObservationIgnored private var lastFrameAt: Date?
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+
+    // Synthetic world.
+    struct SyntheticWorld {
+        var agents: [Agent]
+        var pack: IndustryPack
+        var vacancies: [Vacancy]
+        var meetings: [Meeting]
+        var items: [String: String]
+        var blockers: [String: String]
+        var traffic: SyntheticTraffic
+        var rng: SplitMix64
+        var rate: Double
+        var last: Date
+        var lastReorg: Date
+    }
+    @ObservationIgnored var synthetic: SyntheticWorld?
+
+    public init(source: MapSource, people: (any MapPeopleProviding)? = nil, vault: (any SecretVault)? = nil,
+                defaults: UserDefaults = .standard, clock: @escaping @Sendable () -> Date = { .now }) {
+        self.source = source
+        self.vault = vault
+        self.defaults = defaults
+        self.clock = clock
+        let now = clock()
+        self.createdAt = now
+        switch source {
+        case .live(let store, let companyId):
+            self.companyId = companyId
+            self.isSynthetic = false
+            self.people = people
+            // Old traffic is not replayed: the cursors start at the current maxima.
+            if let m = try? store.maxMessageRowId(companyId: companyId), let h = try? store.maxHandoffRowId(companyId: companyId) {
+                messageCursor = m
+                handoffCursor = h
+                cursorsSeeded = true
+            }
+        case .synthetic(let agents, let rate, let seed):
+            self.companyId = "demo"
+            self.isSynthetic = true
+            // Synthetic mode never consults a provider.
+            self.people = nil
+            let made = SyntheticCompany.make(agents: agents, seed: seed, companyId: "demo")
+            synthetic = SyntheticWorld(agents: made.agents, pack: made.pack, vacancies: made.vacancies, meetings: made.meetings,
+                                       items: made.currentItems, blockers: made.blockers, traffic: SyntheticTraffic(seed: seed),
+                                       rng: SplitMix64(seed: seed &+ 0x5EED), rate: Swift.max(0, rate), last: now, lastReorg: now)
+        }
+        mode = defaults.string(forKey: Self.modeKey(companyId)).flatMap(MapMode.init(rawValue:)) ?? .org
+        if let world = synthetic { model.apply(Self.inputs(world), now: mapNow()) }
+    }
+
+    // MARK: Derived
+
+    /// The subtrees drawn as stubs: the tree's default collapse, the owner's overrides, and every ancestor of the followed
+    /// or highlighted agent expanded.
+    public var collapsed: Set<String> {
+        var active = 0
+        for a in model.agents.values where a.state != .killed { active += 1 }
+        return model.tree.collapsed(defaults: model.tree.defaultCollapsed(activeCount: active), overrides: orgOverrides,
+                                    focus: follow ?? highlightId)
+    }
+
+    public func toggleSubtree(_ id: String) {
+        orgOverrides[id] = collapsed.contains(id)
+    }
+
+    /// Map time (the renderer's `frame(now:)` base), extrapolated from the last frame with the clock; before any frame,
+    /// seconds since the controller was made.
+    func mapNow() -> TimeInterval {
+        let t = clock()
+        if let n = lastFrameNow, let at = lastFrameAt { return n + Swift.max(0, t.timeIntervalSince(at)) }
+        return Swift.max(0, t.timeIntervalSince(createdAt))
+    }
+
+    // MARK: Lifecycle
+
+    public func start() {
+        guard !isInvalidated, pollTask == nil else { return }
+        isRunning = true
+        pollsUntilCursorCheck = 0
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let me = self else { return }
+                await me.poll()
+                try? await AwakeTime.sleep(for: MapController.pollInterval)
+            }
+        }
+    }
+
+    public func stop() {
+        pollTask?.cancel()
+        pollTask = nil
+        generation += 1
+        isRunning = false
+    }
+
+    /// Stops for good: `sync`, `poll` and `handle` do nothing afterwards (the company changed or the store closed).
+    public func invalidate() {
+        stop()
+        isInvalidated = true
+    }
+
+    // MARK: Sync
+
+    public func sync(snapshot: Snapshot) {
+        guard case .live(let store, _) = source, !isInvalidated, replay == nil else { return }
+        // A snapshot of another company (or the empty one of a reopening store) is not this map's.
+        guard snapshot.companies.contains(where: { $0.id == companyId }),
+              snapshot.agents.allSatisfy({ $0.companyId == companyId }) else { return }
+        lastSnapshot = snapshot
+        model.apply(inputs(for: snapshot, store: store), now: mapNow())
+    }
+
+    /// `raw` through the redactor, cached per raw string until the redactor's version changes; nil while the secrets are
+    /// held (the caller shows a placeholder, never the raw text).
+    func redacted(_ raw: String, store: Store) -> String? {
+        guard !store.secretsHeld else {
+            redactionCache = [:]
+            redactionVersion = nil
+            return nil
+        }
+        let version = store.redactor.version
+        if version != redactionVersion {
+            redactionCache = [:]
+            redactionVersion = version
+        }
+        if let hit = redactionCache[raw] { return hit }
+        let out = store.redactor.apply(raw)
+        if redactionCache.count >= Self.redactionCacheLimit { redactionCache = [:] }
+        redactionCache[raw] = out
+        return out
+    }
+
+    func inputs(for snapshot: Snapshot, store: Store) -> MapInputs {
+        let company = snapshot.companies.first { $0.id == companyId }?.company
+        // Display only: vacancy writes never fall back to another pack.
+        let pack = company.flatMap { store.catalog.pack($0.packId) } ?? SoftwarePack.pack
+        let agents = snapshot.agents
+        let living = agents.filter { $0.state != .killed }
+        let livingIds = Set(living.map(\.id))
+
+        // Each owner's newest active item, as redacted "KEY title".
+        var newest: [String: WorkItem] = [:]
+        for item in snapshot.work.items where item.status == .inProgress || item.status == .inReview {
+            guard let owner = item.ownerId else { continue }
+            if let current = newest[owner],
+               (current.updatedAt, current.createdAt, current.number) >= (item.updatedAt, item.createdAt, item.number) { continue }
+            newest[owner] = item
+        }
+        var currentItems: [String: String] = [:]
+        for (owner, item) in newest {
+            currentItems[owner] = redacted("\(item.key) \(item.title)", store: store) ?? "\(item.key) \(Self.withheld)"
+        }
+
+        // Blocker lines (an owner blocker carries the agent's reason).
+        let handles = Dictionary(agents.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+        var blockers: [String: String] = [:]
+        for a in agents {
+            guard let b = a.blocker else { continue }
+            let line = BlockerText.describe(b, handles: handles, timeZone: snapshot.work.timeZone)
+            if let r = redacted(line, store: store) {
+                blockers[a.id] = r
+            } else if case .owner = b {
+                blockers[a.id] = "Waiting on you: \(Self.withheld)"
+            } else {
+                // The other blockers hold no agent text: handles, item keys and times.
+                blockers[a.id] = line
+            }
+        }
+
+        // Vacancies: the owner's seats first (raw handles kept for Store calls), then the provider's, display only.
+        let idsByHandle = Dictionary(living.map { ($0.name, $0.id) }, uniquingKeysWith: { first, _ in first })
+        var vacancies: [Vacancy] = []
+        var handleMap: [String: String] = [:]
+        let rows = orgVacancyRows ?? []
+        for row in rows {
+            let v = Vacancy(row: row, pack: pack, agentIdsByHandle: idsByHandle)
+            if handleMap[v.id] == nil { handleMap[v.id] = row.handle }
+            vacancies.append(v)
+        }
+        orgVacancyHandles = handleMap
+        let rawHandles = Set(rows.map { $0.handle.lowercased() })
+        var shown = Set(vacancies.map(\.id))
+        for var p in cachedPeople.vacancies {
+            p.source = .provider
+            guard !rawHandles.contains(p.id.lowercased()) else { continue }
+            let cleaned = p.cleaned()
+            guard shown.insert(cleaned.id).inserted else { continue }
+            vacancies.append(cleaned)
+        }
+
+        let dotted = DottedLinks.reviewers(items: snapshot.work.items, agents: livingIds)
+            + cachedPeople.dotted.filter { livingIds.contains($0.from) && livingIds.contains($0.to) }
+        let meetings = Meetings.detect(agents: agents, pack: pack, sprints: snapshot.work.openSprints)
+        return MapInputs(agents: agents, pack: pack, currentItems: currentItems, blockers: blockers, vacancies: vacancies,
+                         dotted: dotted, meetings: meetings, people: Self.cleaned(cachedPeople))
+    }
+
+    /// The provider's strings through `MapText.clean` (trust label and title, meter line, perks); vacancies travel
+    /// separately.
+    static func cleaned(_ p: MapPeople) -> MapPeople {
+        MapPeople(
+            trust: p.trust.mapValues { MapTrust(label: MapText.clean($0.label, max: 8), title: MapText.clean($0.title, max: 40),
+                                                tier: $0.tier) },
+            perks: p.perks.mapValues { perks in
+                perks.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.prefix(2).map { MapText.clean($0, max: 8) }
+            },
+            meters: p.meters.mapValues { MapMeter(line: MapText.clean($0.line, max: 40), fraction: $0.fraction) },
+            dotted: p.dotted)
+    }
+
+    static func inputs(_ w: SyntheticWorld) -> MapInputs {
+        MapInputs(agents: w.agents, pack: w.pack, currentItems: w.items, blockers: w.blockers, vacancies: w.vacancies,
+                  meetings: w.meetings, people: .empty)
+    }
+
+    // MARK: Poll
+
+    public func poll() async {
+        guard !isInvalidated else { return }
+        switch source {
+        case .synthetic: pollSynthetic()
+        case .live(let store, let companyId): await pollLive(store: store, companyId: companyId)
+        }
+    }
+
+    struct LiveRead: Sendable {
+        /// Cursors to adopt without reading flows: a first seed, or a re-seed after a cursor ran above the maximum.
+        var seedTo: (message: Int64, handoff: Int64)?
+        var isReseed = false
+        var messages: [MessageFlow] = []
+        var handoffs: [HandoffFlow] = []
+        var vacancies: [OrgVacancy]?
+        var people: MapPeople?
+    }
+
+    private func pollLive(store: Store, companyId: String) async {
+        let startedIn = generation
+        let checkCursors = !cursorsSeeded || pollsUntilCursorCheck <= 0
+        pollsUntilCursorCheck = checkCursors ? Self.cursorCheckEvery - 1 : pollsUntilCursorCheck - 1
+        let now = clock()
+        var provider: (any MapPeopleProviding)?
+        if let people, lastPeopleLoad.map({ now.timeIntervalSince($0) >= Self.peopleInterval || now < $0 }) ?? true {
+            provider = people
+            lastPeopleLoad = now
+        }
+        let (seeded, m, h, vault) = (cursorsSeeded, messageCursor, handoffCursor, vault)
+        pollsInFlight += 1
+        defer { pollsInFlight -= 1 }
+        let read = await Task.detached {
+            Self.readLive(store: store, companyId: companyId, seeded: seeded, messageCursor: m, handoffCursor: h,
+                          checkCursors: checkCursors, vault: vault, people: provider, now: now)
+        }.value
+        // `stop()` or `invalidate()` ran during the read: the result belongs to a map that is gone.
+        guard startedIn == generation, !isInvalidated else { return }
+
+        if let seed = read.seedTo {
+            messageCursor = seed.message
+            handoffCursor = seed.handoff
+            cursorsSeeded = true
+            if read.isReseed { reseeds += 1 }
+        } else {
+            // Overlapping polls read the same rows: only what is past the cursor now is new.
+            let messages = read.messages.filter { $0.rowId > messageCursor }
+            let handoffs = read.handoffs.filter { $0.rowId > handoffCursor }
+            if let last = read.messages.last?.rowId { messageCursor = Swift.max(messageCursor, last) }
+            if let last = read.handoffs.last?.rowId { handoffCursor = Swift.max(handoffCursor, last) }
+            let facts = (messages.map(MapFact.message) + handoffs.map(MapFact.handoff)).enumerated()
+                .sorted { $0.element.at != $1.element.at ? $0.element.at < $1.element.at : $0.offset < $1.offset }
+                .map(\.element)
+            // Replay shows history; live traffic that arrives meanwhile is skipped, not queued.
+            if replay == nil && !facts.isEmpty { model.ingest(facts, now: mapNow()) }
+        }
+
+        var changed = false
+        if let rows = read.vacancies, rows != orgVacancyRows {
+            orgVacancyRows = rows
+            changed = true
+        }
+        if let p = read.people, p != cachedPeople {
+            cachedPeople = p
+            changed = true
+        }
+        if changed, replay == nil, let snapshot = lastSnapshot {
+            model.apply(inputs(for: snapshot, store: store), now: mapNow())
+        }
+    }
+
+    /// The off-main half of a live poll. Read failures (a closing store) leave that part out.
+    nonisolated static func readLive(store: Store, companyId: String, seeded: Bool, messageCursor: Int64, handoffCursor: Int64,
+                                     checkCursors: Bool, vault: (any SecretVault)?, people: (any MapPeopleProviding)?,
+                                     now: Date) -> LiveRead {
+        var read = LiveRead()
+        // The engine tick reloads the redactor only while the engine runs.
+        if let vault { _ = try? store.reloadRedactorIfNeeded(vault: vault) }
+        read.vacancies = try? store.vacancies(companyId: companyId)
+        if let people { read.people = try? people.load(store: store, companyId: companyId, now: now) }
+
+        if checkCursors, let maxM = try? store.maxMessageRowId(companyId: companyId),
+           let maxH = try? store.maxHandoffRowId(companyId: companyId) {
+            if !seeded {
+                read.seedTo = (maxM, maxH)
+                return read
+            }
+            // A cursor above the maximum: the database went back (a restore). Both cursors follow it; nothing is read.
+            if maxM < messageCursor || maxH < handoffCursor {
+                read.seedTo = (maxM, maxH)
+                read.isReseed = true
+                return read
+            }
+        }
+        guard seeded else { return read }
+
+        var cursor = messageCursor
+        for _ in 0..<feedPages {
+            guard let batch = try? store.messageFlows(companyId: companyId, afterRowId: cursor), !batch.isEmpty else { break }
+            read.messages += batch
+            cursor = batch.last!.rowId
+            if batch.count < 500 { break }
+        }
+        cursor = handoffCursor
+        for _ in 0..<feedPages {
+            guard let batch = try? store.handoffFlows(companyId: companyId, afterRowId: cursor), !batch.isEmpty else { break }
+            read.handoffs += batch
+            cursor = batch.last!.rowId
+            if batch.count < 200 { break }
+        }
+        return read
+    }
+
+    /// Synthetic traffic for the time since the last poll, 2 % of the agents changing state, and a reorg every 30 s.
+    private func pollSynthetic() {
+        guard var w = synthetic else { return }
+        let now = clock()
+        let facts = now > w.last ? w.traffic.facts(from: w.last, to: now, agents: w.agents, rate: w.rate) : []
+        if now > w.last { w.last = now }
+
+        let handles = Dictionary(w.agents.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+        let states: [AgentState] = [.ready, .running, .sleeping, .blocked]
+        for i in w.agents.indices where w.agents[i].state != .killed {
+            guard Double.random(in: 0..<1, using: &w.rng) < Self.syntheticChurn else { continue }
+            let choices = states.filter { $0 != w.agents[i].state }
+            let next = choices.randomElement(using: &w.rng)!
+            w.agents[i].state = next
+            if next == .blocked {
+                let reason = SyntheticCompany.ownerReasons.randomElement(using: &w.rng)!
+                w.agents[i].blocker = .owner(reason: reason)
+                w.blockers[w.agents[i].id] = BlockerText.describe(w.agents[i].blocker, handles: handles)
+            } else {
+                w.agents[i].blocker = nil
+                w.blockers[w.agents[i].id] = nil
+            }
+        }
+
+        if now.timeIntervalSince(w.lastReorg) >= Self.syntheticReorgEvery {
+            w.lastReorg = now
+            Self.reorg(&w)
+        }
+        synthetic = w
+        guard replay == nil else { return }
+        let t = mapNow()
+        model.apply(Self.inputs(w), now: t)
+        if !facts.isEmpty { model.ingest(facts, now: t) }
+    }
+
+    /// Moves one living individual contributor under another living manager (and into that manager's team).
+    static func reorg(_ w: inout SyntheticWorld) {
+        let living = w.agents.indices.filter { w.agents[$0].state != .killed }
+        let livingIds = Set(living.map { w.agents[$0].id })
+        var reports: [String: [Int]] = [:]
+        for i in living { if let m = w.agents[i].managerId { reports[m, default: []].append(i) } }
+        let managers = living.filter { reports[w.agents[$0].id] != nil }
+        let leaves = living.filter { reports[w.agents[$0].id] == nil && w.agents[$0].managerId.map(livingIds.contains) == true }
+        guard let mover = leaves.randomElement(using: &w.rng) else { return }
+        let targets = managers.filter { w.agents[$0].id != w.agents[mover].managerId && $0 != mover }
+        guard let target = targets.randomElement(using: &w.rng) else { return }
+        let managerId = w.agents[target].id
+        w.agents[mover].managerId = managerId
+        let agents = w.agents
+        w.agents[mover].team = reports[managerId]?.lazy.compactMap { agents[$0].team }.first ?? agents[target].team
+    }
+
+    // MARK: Frame
+
+    /// One render frame: drains the queue with agents inside collapsed subtrees resolved to their visible ancestor, and
+    /// clears the highlight 1.5 s after it first showed. Task 7b adds the replay branch.
+    public func frame(now: TimeInterval, budget: Int? = nil) -> [VisualEvent] {
+        lastFrameNow = now
+        lastFrameAt = clock()
+        if highlightId != nil {
+            if let since = highlightStartedAt {
+                if now - since >= Self.highlightDuration || now < since { highlightId = nil }
+            } else {
+                highlightStartedAt = now
+            }
+        }
+        let collapsed = self.collapsed
+        let tree = model.tree
+        return model.step(now: now, resolve: { endpoint in
+            guard case .agent(let id) = endpoint else { return endpoint }
+            let visible = tree.visibleAncestor(id, collapsed: collapsed)
+            return visible == tree.rootId ? .owner : .agent(visible)
+        }, budget: budget)
+    }
+
+    // MARK: Hits
+
+    /// A click on the map. Nothing for an invalidated controller or one of a company that is no longer selected; a
+    /// synthetic (demo) controller only expands and collapses subtrees, it never touches the app's selection.
+    public func handle(_ hit: MapHit, appModel: AppModel) {
+        guard !isInvalidated else { return }
+        if isSynthetic {
+            if case .stub(let id) = hit { toggleSubtree(id) }
+            return
+        }
+        guard appModel.selectedCompanyId == companyId else { return }
+        switch hit {
+        case .agent(let id):
+            appModel.select(.agents)
+            appModel.selectedAgentId = id
+        case .stub(let id):
+            toggleSubtree(id)
+        case .team(let managerId):
+            selectedManagerId = managerId
+        case .owner, .vacancy:
+            break   // the view shows a context menu
+        }
+    }
+}

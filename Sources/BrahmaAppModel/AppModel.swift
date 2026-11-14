@@ -53,6 +53,16 @@ public final class AppModel {
     /// The ask a notification banner pointed at (set by `ask:<id>`); the Inbox calls it out.
     public var highlightedAskId: String?
 
+    /// The agent map of the selected company (live), or the installed demo (`--map-demo`); `ensureMapController()` makes it.
+    public private(set) var mapController: MapController?
+    /// The map is shown in its own window rather than in Mission Control.
+    public var mapPoppedOut = false
+    /// Optional people data for live maps (none in 4b).
+    @ObservationIgnored public var mapPeopleProvider: (any MapPeopleProviding)? = nil
+    /// The non-interactive vault the engine reloads the redactor from; the map's poll reloads it too while the engine is
+    /// stopped. Set by the app delegate; tests leave it nil.
+    @ObservationIgnored public var mapSecretVault: (any SecretVault)? = nil
+
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
     /// Runs after each tick that read the database without error.
@@ -138,6 +148,9 @@ public final class AppModel {
     public func closeStore() async {
         stopPolling()
         chat = nil
+        // A live map reads this store: it stops for good, and the next `ensureMapController()` after `reopenStore()` builds
+        // one whose cursors start at the restored database's maxima.
+        dropLiveMapController()
         let store = self.store
         try? await Task.detached { try store.close() }.value
     }
@@ -277,6 +290,7 @@ public final class AppModel {
     // MARK: Selection
 
     public func selectCompany(_ id: String) async {
+        dropLiveMapController()
         selectedCompanyId = id
         access.companyId = id
         settings.companyId = id
@@ -344,7 +358,37 @@ public final class AppModel {
             search.query = q
             Task { await runSearch() }
         case .sheet(let s): presentedSheet = s
+        case .map:
+            select(.missionControl)
+            _ = ensureMapController()
         }
+    }
+
+    // MARK: Map
+
+    /// The current map controller: the existing one (an installed demo included), else a new live one for the selected
+    /// company over the current `store` (read now: `reopenStore()` replaces it), else nil when no company is selected.
+    public func ensureMapController() -> MapController? {
+        if let mapController { return mapController }
+        guard let id = selectedCompanyId else { return nil }
+        let controller = MapController(source: .live(store: store, companyId: id), people: mapPeopleProvider,
+                                       vault: mapSecretVault, clock: clock)
+        controller.sync(snapshot: snapshot)
+        mapController = controller
+        return controller
+    }
+
+    /// Installs a controller (the `--map-demo` path), invalidating any previous one.
+    public func installMapController(_ c: MapController) {
+        if let old = mapController, old !== c { old.invalidate() }
+        mapController = c
+    }
+
+    /// A live controller belongs to one company and one store: it is invalidated and dropped. A synthetic one stays.
+    private func dropLiveMapController() {
+        guard let c = mapController, !c.isSynthetic else { return }
+        c.invalidate()
+        mapController = nil
     }
 
     // MARK: Search
@@ -430,6 +474,7 @@ public final class AppModel {
         let new = try await Task.detached { try Snapshot.load(store: store, selectedCompanyId: id) }.value
         guard id == selectedCompanyId else { return }  // selection changed mid-load: the stale snapshot is dropped
         if new != snapshot { snapshot = new }
+        if let c = mapController, c.companyId == id { c.sync(snapshot: snapshot) }
         ticksSinceSnapshot = 0
     }
 
