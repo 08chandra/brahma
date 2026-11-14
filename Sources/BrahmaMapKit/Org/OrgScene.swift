@@ -24,7 +24,8 @@ public final class OrgScene: SKScene {
     static let gridStep: CGFloat = 24
     /// Grid tile: 64 × 64 cells, so one texture covers a large area with few sprites.
     static let gridTile: CGFloat = 24 * 64
-    static let bandPadding: CGFloat = 6
+    /// Sibling bands sit `hGap` (16) apart; 3 on each side leaves 10, and each nesting level adds another 3.
+    static let bandPadding: CGFloat = 3
     static let bandHeader: CGFloat = 22
 
     // MARK: Layers
