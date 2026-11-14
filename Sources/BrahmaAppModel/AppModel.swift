@@ -306,6 +306,8 @@ public final class AppModel {
 
     public func selectCompany(_ id: String) async {
         dropLiveMapController()
+        // The map's vacancy sheets act on the company they were opened for.
+        if presentedSheet?.isCompanyBound == true { presentedSheet = nil }
         selectedCompanyId = id
         access.companyId = id
         settings.companyId = id

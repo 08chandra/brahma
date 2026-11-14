@@ -3,9 +3,31 @@ import BrahmaCore
 
 public enum FormError: Error, Equatable { case invalid(String) }
 
-public enum AppSheet: String, Identifiable, Sendable {
+/// The sheet over the main window. `id` is stable: each case that was once a `String` raw value keeps that string.
+public enum AppSheet: Identifiable, Hashable, Sendable {
     case newCompany, hire, newItem
-    public var id: String { rawValue }
+    /// The owner adds an open seat under `managerHandle`, or under the Board when nil (Plan 4b, the map's context menu).
+    case vacancy(managerHandle: String?)
+    /// The owner fills the open seat `handle` (the map's cleaned vacancy id), after the paid-agent preview.
+    case fillVacancy(handle: String)
+
+    public var id: String {
+        switch self {
+        case .newCompany: "newCompany"
+        case .hire: "hire"
+        case .newItem: "newItem"
+        case .vacancy(let managerHandle): "vacancy:\(managerHandle ?? "board")"
+        case .fillVacancy(let handle): "fill:\(handle)"
+        }
+    }
+
+    /// Bound to the company (and map) it was opened for: dismissed when the selected company changes.
+    var isCompanyBound: Bool {
+        switch self {
+        case .vacancy, .fillVacancy: true
+        case .newCompany, .hire, .newItem: false
+        }
+    }
 }
 
 /// What a new company's org would look like, before anything is created.

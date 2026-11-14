@@ -222,12 +222,14 @@ public final class MapController {
 
     // MARK: Sync
 
+    /// Applies a live snapshot. While replaying it is only recorded: `exitReplay` applies the newest one.
     public func sync(snapshot: Snapshot) {
-        guard case .live(let store, _) = source, !isInvalidated, replay == nil else { return }
+        guard case .live(let store, _) = source, !isInvalidated else { return }
         // A snapshot of another company (or the empty one of a reopening store) is not this map's.
         guard snapshot.companies.contains(where: { $0.id == companyId }),
               snapshot.agents.allSatisfy({ $0.companyId == companyId }) else { return }
         lastSnapshot = snapshot
+        guard replay == nil else { return }
         model.apply(inputs(for: snapshot, store: store), now: mapNow())
     }
 
@@ -507,11 +509,16 @@ public final class MapController {
 
     // MARK: Frame
 
-    /// One render frame: drains the queue with agents inside collapsed subtrees resolved to their visible ancestor, and
-    /// clears the highlight 1.5 s after it first showed. Task 7b adds the replay branch.
+    /// One render frame: while a replay plays, advances it by the frame's Δt·speed (`advanceReplay`); then drains the queue
+    /// with agents inside collapsed subtrees resolved to their visible ancestor, and clears the highlight 1.5 s after it
+    /// first showed.
     public func frame(now: TimeInterval, budget: Int? = nil) -> [VisualEvent] {
+        let previousFrame = lastFrameNow
         lastFrameNow = now
         lastFrameAt = clock()
+        if replay?.playing == true, !isInvalidated {
+            advanceReplay(by: previousFrame.map { now - $0 } ?? 0, now: now)
+        }
         if highlightId != nil {
             if let since = highlightStartedAt {
                 if now - since >= Self.highlightDuration || now < since { highlightId = nil }

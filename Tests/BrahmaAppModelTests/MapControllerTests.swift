@@ -458,4 +458,343 @@ final class MapTestClock: @unchecked Sendable {
         #expect(c.model.agents.count == 300)
         #expect(!c.frame(now: 1).isEmpty)
     }
+
+    // MARK: Task 7b: navigation, replay, vacancy actions
+
+    /// The seed moved two hours back (every agent's `createdAt` and every event so far), so the agents exist, in their
+    /// seeded states, at the start of a one-hour replay window.
+    private func backdateSeed(_ store: Store, _ companyId: String) throws {
+        let past = Date().addingTimeInterval(-7200)
+        try store.writer.write { db in
+            try db.execute(sql: "UPDATE agent SET createdAt = ? WHERE companyId = ?", arguments: [past, companyId])
+            try db.execute(sql: "UPDATE \(ActivityEvent.databaseTableName) SET createdAt = ? WHERE companyId = ?",
+                           arguments: [past, companyId])
+        }
+    }
+
+    @Test func jumpAndFollowExpandAncestors() throws {
+        let c = MapController(source: .synthetic(agents: 150, rate: 0, seed: 7), defaults: defaults())
+        let tree = c.model.tree
+        let collapsedBefore = c.collapsed
+        #expect(!collapsedBefore.isEmpty, "150 agents start with collapsed subtrees")
+        let ic = try #require(c.model.agents.keys.sorted().first { id in
+            (tree.nodes[id]?.childIds.isEmpty ?? false) && tree.nodes[id]?.parentId.map(collapsedBefore.contains) == true
+        })
+        let manager = try #require(tree.nodes[ic]?.parentId)
+
+        c.jump(to: ic)
+        #expect(c.highlightId == ic)
+        #expect(c.camera == .agent(ic))
+        #expect(!c.collapsed.contains(manager))
+        for a in tree.ancestors(ic) { #expect(!c.collapsed.contains(a)) }
+        // Cleared 1.5 s of frames after it first showed; the subtree folds back.
+        _ = c.frame(now: 10)
+        _ = c.frame(now: 11)
+        #expect(c.highlightId == ic)
+        _ = c.frame(now: 11.6)
+        #expect(c.highlightId == nil)
+        #expect(c.collapsed.contains(manager))
+        // An unknown id is not jumped to.
+        c.jump(to: "nobody")
+        #expect(c.highlightId == nil)
+
+        c.follow(ic)
+        #expect(c.follow == ic && c.camera == .agent(ic))
+        #expect(!c.collapsed.contains(manager))
+        c.follow(nil)
+        #expect(c.follow == nil && c.camera == .fit)
+        c.follow(ic)
+        c.zoomToFit()
+        #expect(c.camera == .fit && c.follow == nil)
+
+        let handle = try #require(c.model.agents[ic]?.handle)
+        c.search(handle.uppercased())
+        #expect(c.searchHits.contains(ic))
+        c.search("  ")
+        #expect(c.searchHits.isEmpty)
+
+        let revision = c.model.structureRevision
+        c.setShowFormer(true)
+        #expect(c.model.showFormer && c.model.structureRevision == revision + 1)
+        c.setShowFormer(false)
+        #expect(!c.model.showFormer)
+    }
+
+    @Test func replayScrubRewindsStates() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, ceo, _, _) = try seedAcme(store, paths)
+        try backdateSeed(store, acme.id)
+        _ = try store.transition(agentId: ceo.id, to: .running)
+        let c = live(store, acme.id)
+        c.sync(snapshot: try snapshot(store, acme.id))
+        #expect(c.model.agents[ceo.id]?.state == .running)
+
+        await c.enterReplay()
+        let r = try #require(c.replay)
+        #expect(r.time == r.timeline.start)
+        #expect(!r.playing && r.speed == 1)
+        #expect(c.model.agents[ceo.id]?.state == .ready)
+        #expect(c.model.pendingCount == 0, "replay applies without events")
+
+        c.scrub(to: r.timeline.end)
+        #expect(c.model.agents[ceo.id]?.state == .running)
+        c.scrub(to: r.timeline.start)
+        #expect(c.model.agents[ceo.id]?.state == .ready)
+        // Out of the window clamps.
+        c.scrub(to: r.timeline.start.addingTimeInterval(-60))
+        #expect(c.replay?.time == r.timeline.start)
+
+        // Only the timeline's speeds.
+        c.setSpeed(16)
+        #expect(c.replay?.speed == 16)
+        c.setSpeed(3)
+        #expect(c.replay?.speed == 16)
+
+        // Playing advances by Δt·speed and stops at the end.
+        c.scrub(to: r.timeline.end.addingTimeInterval(-8))
+        c.setPlaying(true)
+        _ = c.frame(now: 100)
+        _ = c.frame(now: 100.25)
+        let t = try #require(c.replay?.time)
+        #expect(abs(t.timeIntervalSince(r.timeline.end.addingTimeInterval(-4))) < 0.001, "\(t)")
+        #expect(c.replay?.playing == true)
+        _ = c.frame(now: 100.5)
+        #expect(c.replay?.time == r.timeline.end)
+        #expect(c.replay?.playing == false)
+
+        // Live sync is held while replaying; exit re-syncs the last snapshot.
+        c.sync(snapshot: try snapshot(store, acme.id))
+        c.scrub(to: r.timeline.start)
+        #expect(c.model.agents[ceo.id]?.state == .ready)
+        c.exitReplay()
+        #expect(c.replay == nil)
+        #expect(c.model.agents[ceo.id]?.state == .running)
+
+        // Synthetic and invalidated controllers have no history to replay.
+        let demo = MapController(source: .synthetic(agents: 20, rate: 0, seed: 1), defaults: defaults())
+        await demo.enterReplay()
+        #expect(demo.replay == nil)
+        let gone = live(store, acme.id)
+        gone.sync(snapshot: try snapshot(store, acme.id))
+        gone.invalidate()
+        await gone.enterReplay()
+        #expect(gone.replay == nil)
+    }
+
+    @Test func actionsPerHit() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, ceo, cto, _) = try seedAcme(store, paths)
+        let row = try store.addVacancy(companyId: acme.id, role: "engineer", managerHandle: "cto", team: nil, note: "")
+        let provider = FakePeopleProvider(MapPeople(vacancies: [
+            Vacancy(id: "x-1", role: "designer", roleTitle: "Designer", managerId: cto.id, team: nil, note: "", source: .org),
+        ]))
+        let c = live(store, acme.id, people: provider)
+        c.sync(snapshot: try snapshot(store, acme.id))
+        await c.poll()
+        #expect(c.model.vacancies.contains { $0.id == "x-1" && $0.source == .provider })
+
+        #expect(c.actions(for: .agent(cto.id)) == [.message(handle: "cto"), .follow(agentId: cto.id), .addVacancy(managerHandle: "cto")])
+        #expect(c.actions(for: .owner) == [.addVacancy(managerHandle: nil)])
+        #expect(c.actions(for: .vacancy(row.handle)) == [.fill(handle: row.handle), .removeVacancy(handle: row.handle)])
+        #expect(c.actions(for: .vacancy("x-1")).isEmpty)
+        #expect(c.actions(for: .vacancy("nobody-1")).isEmpty)
+        #expect(c.actions(for: .stub(ceo.id)).isEmpty)
+        #expect(c.actions(for: .team(cto.id)).isEmpty)
+        #expect(c.actions(for: .agent("not-an-agent")).isEmpty)
+
+        let demo = MapController(source: .synthetic(agents: 60, rate: 0, seed: 2), defaults: defaults())
+        let demoAgent = try #require(demo.model.agents.keys.sorted().first)
+        let demoVacancy = try #require(demo.model.vacancies.first?.id)
+        for hit: MapHit in [.agent(demoAgent), .owner, .vacancy(demoVacancy), .stub(demoAgent), .team(demoAgent)] {
+            #expect(demo.actions(for: hit).isEmpty, "\(hit)")
+        }
+        c.invalidate()
+        for hit: MapHit in [.agent(cto.id), .owner, .vacancy(row.handle), .stub(ceo.id), .team(cto.id)] {
+            #expect(c.actions(for: hit).isEmpty, "\(hit)")
+        }
+    }
+
+    @Test func addFillRemoveVacancies() async throws {
+        let (store, paths) = try makeHome()
+        let app = AppModel(store: store, paths: paths)
+        await app.load()
+        app.stopPolling()
+        try store.setPlanTier(.pro)
+        let company = try await app.createCompany(CompanyForm(name: "Org", goal: "Ship", agentCount: 20))
+        app.stopPolling()
+        let c = try #require(app.ensureMapController())
+        #expect(c.companyId == company.id)
+        await c.poll()
+        let initial = c.model.vacancies
+        #expect(initial.count >= 1)
+        #expect(initial.allSatisfy { $0.source == .org })
+        let pack = try #require(store.catalog.pack(company.packId))
+        let cto = try #require(try store.agents(companyId: company.id).first { pack.rolesCovering("cto").contains($0.role) })
+
+        try await c.addVacancy(role: "engineer", managerHandle: "@" + cto.name.uppercased(), team: nil, note: "needs a hand")
+        #expect(c.model.vacancies.count == initial.count + 1)
+        let added = try #require(c.model.vacancies.first { v in !initial.contains { $0.id == v.id } })
+        #expect(added.managerId == cto.id && added.role == "engineer" && added.note == "needs a hand")
+        #expect(try store.vacancies(companyId: company.id).contains { $0.handle == added.id && $0.managerHandle == cto.name })
+
+        // Fill: the seat becomes an agent with a hire event.
+        _ = c.frame(now: 1)
+        try await c.fillVacancy(handle: added.id)
+        #expect(!c.model.vacancies.contains { $0.id == added.id })
+        let hired = try #require(try store.agents(companyId: company.id).first { $0.name == added.id })
+        #expect(hired.managerId == cto.id && hired.role == "engineer")
+        #expect(c.model.agents[hired.id] != nil)
+        var events: [VisualEvent] = []
+        for t in stride(from: 2.0, through: 6.0, by: 0.5) { events += c.frame(now: t) }
+        #expect(events.contains { $0.kind == .hire }, "\(events.map(\.kind))")
+
+        // Remove another one.
+        let other = try #require(initial.first)
+        try await c.removeVacancy(handle: other.id)
+        #expect(!c.model.vacancies.contains { $0.id == other.id })
+        #expect(try !store.vacancies(companyId: company.id).contains { $0.handle == other.id })
+        #expect(try store.agents(companyId: company.id).allSatisfy { $0.name != other.id })
+
+        // Gone seats are not found again.
+        await #expect(throws: StoreError.notFound) { try await c.fillVacancy(handle: added.id) }
+        await #expect(throws: StoreError.notFound) { try await c.removeVacancy(handle: other.id) }
+    }
+
+    @Test func fillPreviewShowsRoleAndCost() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, cto, _) = try seedAcme(store, paths)
+        let row = try store.addVacancy(companyId: acme.id, role: "engineer", managerHandle: "cto", team: "core", note: "")
+        let provider = FakePeopleProvider(MapPeople(vacancies: [
+            Vacancy(id: "x-1", role: "engineer", roleTitle: "Engineer", managerId: cto.id, team: nil, note: "", source: .org),
+        ]))
+        let c = live(store, acme.id, people: provider)
+        c.sync(snapshot: try snapshot(store, acme.id))
+        await c.poll()
+        let title = try #require(store.catalog.pack(acme.packId)?.role("engineer")?.title)
+        let preview = try #require(c.fillPreview(handle: row.handle))
+        #expect(preview == FillPreview(handle: row.handle, roleTitle: title, companyName: "Acme", managerHandle: "cto", team: "core"))
+        #expect(c.fillPreview(handle: "x-1") == nil)
+        #expect(c.fillPreview(handle: "eng-99") == nil)
+        #expect(FillPreview.costLine.contains("paid agent"))
+        #expect(FillPreview.costLine == "This starts a new paid agent. It runs Claude turns, and uses your usage allowance, as soon as it has work.")
+
+        let demo = MapController(source: .synthetic(agents: 60, rate: 0, seed: 2), defaults: defaults())
+        #expect(demo.fillPreview(handle: try #require(demo.model.vacancies.first?.id)) == nil)
+        c.invalidate()
+        #expect(c.fillPreview(handle: row.handle) == nil)
+    }
+
+    @Test func providerVacancyCannotBeFilledOrRemoved() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, cto, _) = try seedAcme(store, paths)
+        let row = try store.addVacancy(companyId: acme.id, role: "engineer", managerHandle: "cto", team: nil, note: "")
+        #expect(row.handle != "eng-9")
+        let provider = FakePeopleProvider(MapPeople(vacancies: [
+            Vacancy(id: "eng-9", role: "engineer", roleTitle: "Engineer", managerId: cto.id, team: nil, note: "", source: .org),
+            Vacancy(id: row.handle.uppercased(), role: "designer", roleTitle: "Designer", managerId: nil, team: nil, note: "",
+                    source: .org),
+        ]))
+        let c = live(store, acme.id, people: provider)
+        c.sync(snapshot: try snapshot(store, acme.id))
+        await c.poll()
+        #expect(c.model.vacancies.contains { $0.id == "eng-9" && $0.source == .provider })
+        let rowsBefore = try store.vacancies(companyId: acme.id)
+        let agentsBefore = try store.agents(companyId: acme.id).count
+
+        await #expect(throws: StoreError.notFound) { try await c.fillVacancy(handle: "eng-9") }
+        await #expect(throws: StoreError.notFound) { try await c.removeVacancy(handle: "eng-9") }
+        #expect(try store.vacancies(companyId: acme.id) == rowsBefore)
+        #expect(try store.agents(companyId: acme.id).count == agentsBefore)
+
+        // A provider entry naming the owner's seat was dropped: the seat on the map is the owner's own row, untouched.
+        let seat = c.model.vacancies.filter { $0.id.lowercased() == row.handle }
+        #expect(seat.count == 1)
+        #expect(seat.first?.source == .org && seat.first?.role == "engineer")
+        #expect(c.fillPreview(handle: row.handle)?.roleTitle == store.catalog.pack(acme.packId)?.role("engineer")?.title)
+        #expect(c.fillPreview(handle: row.handle.uppercased()) == nil)
+        await #expect(throws: StoreError.notFound) { try await c.fillVacancy(handle: row.handle.uppercased()) }
+        #expect(try store.vacancies(companyId: acme.id) == rowsBefore)
+    }
+
+    @Test func syntheticWritesRefused() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, cto, _) = try seedAcme(store, paths)
+        _ = try store.addVacancy(companyId: acme.id, role: "engineer", managerHandle: "cto", team: nil, note: "")
+        let app = AppModel(store: store, paths: paths)
+        await app.load()
+        app.stopPolling()
+        app.selectedAgentId = cto.id
+        let demo = MapController(source: .synthetic(agents: 60, rate: 0, seed: 4), defaults: defaults())
+        app.installMapController(demo)
+        let vacancy = try #require(demo.model.vacancies.first?.id)
+        let rows = try store.vacancies(companyId: acme.id).count
+        let agents = try store.agents(companyId: acme.id).count
+        let demoVacancies = demo.model.vacancies
+
+        await #expect(throws: MapControllerError.demoIsReadOnly) {
+            try await demo.addVacancy(role: "engineer", managerHandle: nil, team: nil, note: "")
+        }
+        await #expect(throws: MapControllerError.demoIsReadOnly) { try await demo.removeVacancy(handle: vacancy) }
+        await #expect(throws: MapControllerError.demoIsReadOnly) { try await demo.fillVacancy(handle: vacancy) }
+        #expect(MapControllerError.demoIsReadOnly.errorDescription == "The demo map is read-only")
+        #expect(MapControllerError.stale.errorDescription == "This map belongs to another company")
+
+        #expect(try store.vacancies(companyId: acme.id).count == rows)
+        #expect(try store.agents(companyId: acme.id).count == agents)
+        #expect(demo.model.vacancies == demoVacancies)
+        #expect(app.selectedCompanyId == acme.id)
+        #expect(app.selectedAgentId == cto.id)
+    }
+
+    @Test func companySwitchRefusesWritesAndDismissesSheet() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let globex = try #require(try store.companies().first { $0.name == "Globex" })
+        let row = try store.addVacancy(companyId: acme.id, role: "engineer", managerHandle: "cto", team: nil, note: "")
+        let app = AppModel(store: store, paths: paths)
+        await app.load()
+        app.stopPolling()
+        let old = try #require(app.ensureMapController())
+        await old.poll()
+        #expect(old.fillPreview(handle: row.handle) != nil)
+
+        app.presentedSheet = .vacancy(managerHandle: nil)
+        await app.selectCompany(globex.id)
+        #expect(app.presentedSheet == nil)
+        app.presentedSheet = .fillVacancy(handle: row.handle)
+        await app.selectCompany(acme.id)
+        #expect(app.presentedSheet == nil)
+        app.presentedSheet = .hire
+        await app.selectCompany(acme.id)
+        #expect(app.presentedSheet == .hire, "only the map's sheets are company-bound")
+
+        let rows = try store.vacancies(companyId: acme.id)
+        await #expect(throws: MapControllerError.stale) {
+            try await old.addVacancy(role: "engineer", managerHandle: "cto", team: nil, note: "")
+        }
+        await #expect(throws: MapControllerError.stale) { try await old.fillVacancy(handle: row.handle) }
+        await #expect(throws: MapControllerError.stale) { try await old.removeVacancy(handle: row.handle) }
+        #expect(try store.vacancies(companyId: acme.id) == rows)
+        #expect(old.fillPreview(handle: row.handle) == nil)
+    }
+
+    @Test func vacancyFormValidation() {
+        let pack = SoftwarePack.pack
+        var form = VacancyForm()
+        #expect(form.validate(pack: pack, packId: "software") == "Pick a role")
+        form.role = "wizard"
+        #expect(form.validate(pack: pack, packId: "software") == "unknown role wizard")
+        form.role = "engineer"
+        #expect(form.validate(pack: pack, packId: "software") == nil)
+        form.team = "Bad Team!"
+        #expect(form.validate(pack: pack, packId: "software") == "Team names are lowercase letters, digits, - and _")
+        form.team = "core-2"
+        #expect(form.validate(pack: pack, packId: "software") == nil)
+        form.note = String(repeating: "n", count: 281)
+        #expect(form.validate(pack: pack, packId: "software") == "Notes are at most 280 characters")
+        form.note = String(repeating: "n", count: 280)
+        #expect(form.validate(pack: pack, packId: "software") == nil)
+        #expect(form.validate(pack: nil, packId: "retail") == "company pack retail is not installed")
+        #expect(VacancyForm().managerHandle == nil)
+    }
 }
