@@ -118,32 +118,92 @@ import GRDB
     @Test func exportRefusesNonEmptyDir() throws {
         let w = try W()
         try w.write("Engineering/Runbook", "steps")
-        let dir = w.exportDir()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try Data("old".utf8).write(to: dir.appending(path: "old.txt"))
-        // A link inside the folder is removed with --force, never followed.
-        let outside = w.root.appending(path: "outside", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
-        try Data("keep".utf8).write(to: outside.appending(path: "keep.txt"))
-        try FileManager.default.createSymbolicLink(at: dir.appending(path: "link"), withDestinationURL: outside)
+        let fm = FileManager.default
+        // A folder that is not an earlier export: refused with and without --force, and nothing in it is deleted.
+        let mine = w.exportDir("mine")
+        try fm.createDirectory(at: mine, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: mine.appending(path: "old.txt"))
+        try Data("# Notes".utf8).write(to: mine.appending(path: "INDEX.md"))
         #expect(throws: WorkError.conflict("export folder must be empty (use --force to replace it)")) {
-            try HandbookExporter.export(store: w.store, companyId: w.company.id, to: dir, force: false)
+            try HandbookExporter.export(store: w.store, companyId: w.company.id, to: mine, force: false)
         }
-        #expect(FileManager.default.fileExists(atPath: dir.appending(path: "old.txt").path))
-        let count = try HandbookExporter.export(store: w.store, companyId: w.company.id, to: dir, force: true)
-        #expect(count > 1)
-        #expect(!FileManager.default.fileExists(atPath: dir.appending(path: "old.txt").path))
+        #expect(throws: WorkError.conflict("--force only replaces an earlier handbook export (a folder with its INDEX.md); choose an empty folder")) {
+            try HandbookExporter.export(store: w.store, companyId: w.company.id, to: mine, force: true)
+        }
+        #expect(w.files(under: mine) == ["INDEX.md", "old.txt"])
+        // A link named INDEX.md does not make a folder an export.
+        let linked = w.exportDir("linked")
+        try fm.createDirectory(at: linked, withIntermediateDirectories: true)
+        let real = w.exportDir("real")
+        let count = try HandbookExporter.export(store: w.store, companyId: w.company.id, to: real, force: false)
+        try fm.createSymbolicLink(at: linked.appending(path: "INDEX.md"), withDestinationURL: real.appending(path: "INDEX.md"))
+        #expect(throws: WorkError.self) { try HandbookExporter.export(store: w.store, companyId: w.company.id, to: linked, force: true) }
+        #expect(fm.fileExists(atPath: real.appending(path: "Engineering/Runbook.md").path))
+
+        // An earlier export is replaced with --force; a link inside it is removed, never followed.
+        let outside = w.root.appending(path: "outside", directoryHint: .isDirectory)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: outside.appending(path: "keep.txt"))
+        try Data("old".utf8).write(to: real.appending(path: "old.txt"))
+        try fm.createSymbolicLink(at: real.appending(path: "link"), withDestinationURL: outside)
+        #expect(throws: WorkError.conflict("export folder must be empty (use --force to replace it)")) {
+            try HandbookExporter.export(store: w.store, companyId: w.company.id, to: real, force: false)
+        }
+        #expect(try HandbookExporter.export(store: w.store, companyId: w.company.id, to: real, force: true) == count)
+        #expect(!fm.fileExists(atPath: real.appending(path: "old.txt").path))
         #expect(w.files(under: outside) == ["keep.txt"], "the link's target is untouched")
-        #expect(FileManager.default.fileExists(atPath: dir.appending(path: "Engineering/Runbook.md").path))
-        // A missing folder is created; an empty one is used.
-        let fresh = w.exportDir("fresh/nested")
-        #expect(try HandbookExporter.export(store: w.store, companyId: w.company.id, to: fresh, force: false) == count)
+        #expect(fm.fileExists(atPath: real.appending(path: "Engineering/Runbook.md").path))
+        // A missing folder is created.
+        #expect(try HandbookExporter.export(store: w.store, companyId: w.company.id, to: w.exportDir("fresh/nested"), force: false) == count)
         // Never inside a workspace: agents can read those.
         let inside = w.workspace.appending(path: "handbook-export", directoryHint: .isDirectory)
         #expect(throws: WorkError.self) {
             try HandbookExporter.export(store: w.store, companyId: w.company.id, to: inside, force: true)
         }
-        #expect(!FileManager.default.fileExists(atPath: inside.appending(path: "INDEX.md").path))
+        #expect(!fm.fileExists(atPath: inside.appending(path: "INDEX.md").path))
+    }
+
+    @Test func agentChosenPathsCannotBreakMirrorOrExport() throws {
+        let w = try W()
+        let long = String(repeating: "\u{1D400}", count: 64)
+        try w.write("README.md/x", "readme dir page")
+        try w.write("INDEX.md/y", "index dir page")
+        try w.write("Research/\(long)", "long name page")
+        try w.write("Research/\(long)/child", "under the long name")
+        for round in 0..<2 {
+            let r = try w.mirror()
+            #expect(r.unsafe.isEmpty, "round \(round): \(r.unsafe)")
+            #expect(r.repaired.isEmpty, "round \(round): \(r.repaired)")
+            if round == 1 { #expect(r.written == 0) }
+        }
+        #expect(w.mirrored("README.md") == Self.readme)
+        let index = try #require(w.mirrored("INDEX.md"))
+        #expect(index.hasPrefix("# Handbook index\n"))
+        let files = w.files(under: w.mirrorDir)
+        #expect(files.contains("README.md (dir)/x.md"), "\(files)"); #expect(files.contains("INDEX.md (dir)/y.md"), "\(files)")
+        let longFiles = files.filter { $0.hasPrefix("Research/") && $0.contains("~") }
+        #expect(longFiles.count == 2, "\(files)")
+        for f in files {
+            for part in f.split(separator: "/") { #expect(part.utf8.count <= 128, "\(part.utf8.count) bytes") }
+        }
+        #expect(try w.activity(containing: "refused to write through").isEmpty)
+        let alerts = try w.store.writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT count(*) FROM ask WHERE companyId = ? AND kind = 'engineAlert'", arguments: [w.company.id])
+        }
+        #expect(alerts == 0)
+        // The owner's export holds every page and its own INDEX.md.
+        let dir = w.exportDir()
+        let pages = try w.store.kbPages(companyId: w.company.id, reader: .owner)
+        #expect(try HandbookExporter.export(store: w.store, companyId: w.company.id, to: dir, force: false) == pages.count + 1)
+        let exported = w.files(under: dir)
+        #expect(exported.contains("INDEX.md")); #expect(exported.contains("README.md (dir)/x.md")); #expect(exported.contains("INDEX.md (dir)/y.md"))
+        #expect(String(decoding: try Data(contentsOf: dir.appending(path: "INDEX.md")), as: UTF8.self).hasPrefix("# Handbook index\n"))
+        // A layout from an older mirror (a directory where a file now belongs) is cleared without an alert.
+        try FileManager.default.removeItem(at: w.mirrorDir.appending(path: "Research.md"))
+        try FileManager.default.createDirectory(at: w.mirrorDir.appending(path: "Research.md"), withIntermediateDirectories: true)
+        let healed = try w.mirror()
+        #expect(healed.unsafe.isEmpty)
+        #expect(w.mirrored("Research.md")?.contains("Research") == true)
     }
 
     // MARK: Mirror
