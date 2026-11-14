@@ -282,7 +282,9 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         guard onMain else { throw Failure(stage: "smoke on main", detail: "not on main", reason: "\(r.ref)'s commit is no longer on main") }
         // Final-review m2: the smoke checks the owner approved (pinned on the release), before anything runs; the smoke on
         // main checks its own pin again in the write that claims its run.
-        try Self.checkSmokePins(r, smokeCheck: company.smokeCheck, site: try store.hosting(companyId: r.companyId))
+        let site = try store.hosting(companyId: r.companyId)
+        try Self.checkSmokePins(r, smokeCheck: company.smokeCheck, site: site)
+        try Self.checkProductionURL(adapter, site)
         try checkStop(r)
         let run: MainSmokeRun
         let (smoke, companyId, releaseId) = (self.smoke, r.companyId, r.id)
@@ -317,6 +319,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         guard rendered == r.plan, rendered.hash == r.commandsHash, r.plan.hashIsCurrent, r.plan.build == r.build,
               r.plan.outputDir == r.outputDir else { throw Self.mismatch }
         try Self.checkSmokePins(r, smokeCheck: nil, site: settings)
+        try Self.checkProductionURL(adapter, settings)
         let plan = r.plan
         settings.build = r.build
         settings.outputDir = r.outputDir
@@ -481,6 +484,15 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         }
         if let site, site.smoke != r.siteSmoke || site.expectText != r.siteExpectText {
             throw Failure(stage: "integrity", detail: "site smoke changed", reason: ReleasePolicy.siteSmokeChanged)
+        }
+    }
+
+    /// Final-fix2 R2: a provider that needs the owner's production URL (Vercel: its per-deploy URLs sit behind deployment
+    /// protection) refuses a release whose production URL was cleared after approval, before any build or token step. The
+    /// owner's to fix (no bug).
+    private static func checkProductionURL(_ adapter: any HostingAdapter, _ settings: HostingSettings?) throws {
+        if let why = adapter.productionURLRequired, settings?.productionURL == nil {
+            throw Failure(stage: "integrity", detail: "no production URL", reason: why)
         }
     }
 

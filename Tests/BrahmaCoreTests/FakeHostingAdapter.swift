@@ -39,6 +39,8 @@ struct FakeHostingAdapter: HostingAdapter {
     var projects: [String] = []
     /// `smokeBase` as Vercel's (final-review I6b): the owner's production URL, else the deploy URL it is given, else nil.
     var smokesDeployURL = false
+    /// As Vercel's (final-fix2 R2): a release needs the owner's production URL (nil: it does not).
+    var productionURLRequired: String?
 
     static let installIsNoOp = false
 

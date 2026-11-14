@@ -16,9 +16,10 @@ import Glibc
 ///    redactor-knows-token gate, pinned redaction, stdout-only URL parse, `vercel inspect` verification) against a throwaway
 ///    project `brahma-probe-<6 random [a-z0-9]>` (a reserved prefix, documented in the README), created and removed by
 ///    engine-composed `vercel project add|rm` steps;
-/// 4. smokes the site for the marker (the production URL when set, else the inspect-verified deploy URL: never a guessed
-///    alias, final-review I6b); reads the hosts the CLI contacted from the engine's egress proxy (allowed
-///    and denied) and whether the proxy was honoured; prints one verdict per item the ledger left unverified;
+/// 4. smokes its own deploy URL for the marker (the per-deploy URL parsed from the deploy step's stdout, pinned to the probe
+///    project; the probe records no production URL, and never a guessed alias, final-review I6b); reads the hosts the CLI
+///    contacted from the engine's egress proxy (allowed and denied) and whether the proxy was honoured; prints one verdict
+///    per item the ledger left unverified;
 /// 5. removes the project and lists what is left under the prefix.
 /// Never run by a test or an agent: the adapter, sandbox, HTTP probe and environment are injectable so unit tests use the fake
 /// adapter and FakeSandbox with no network.
@@ -286,7 +287,7 @@ public enum ProviderProbe {
                 }
             }
 
-            // 3. The smoke of the site (the production URL, else the verified deploy URL), for the marker.
+            // 3. The smoke of the site at the probe's own deploy URL (it records no production URL), for the marker.
             if deployed {
                 if let base = adapter.smokeBase(settings, deployURL: deployURL) {
                     let smoked = await DeploySmoke.run(base: base, requests: [], expectText: marker, http: http, sleep: sleep)

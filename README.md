@@ -471,9 +471,11 @@ URL, else at the address derived from that deploy URL, never one guessed from th
 release fails and asks you to set the production URL in HOSTING. Vercel is the alternative (its free Hobby plan is for
 non-commercial use; deploys need the team or account ID). **The Vercel project must already exist:** deploys name it
 (`VERCEL_PROJECT_ID`) and never create it, so create it in the Vercel dashboard (Add New… → Project, or `vercel project add
-<name>`); the `hosting-account` task and `brahma hosting show` say so. A Vercel site is smoked at your production URL, else at
-the deploy URL the engine verified with `vercel inspect`, never a guessed `<project>.vercel.app` (that name may belong to
-someone else); a project behind Vercel's deployment protection needs the production URL set. Unverified until the probe runs
+<name>`); the `hosting-account` task and `brahma hosting show` say so. **A Vercel release needs your production URL in
+HOSTING:** Vercel's per-deploy URLs sit behind its deployment protection, so a release is smoked only at the production URL,
+never at a per-deploy URL or a guessed `<project>.vercel.app` (that name may belong to someone else). With none set, a
+proposal is refused ("set the production URL in HOSTING before deploying to Vercel …"), and an approved release whose
+production URL was cleared since fails before anything is built or deployed. Unverified until the probe runs
 a deploy → rollback → deploy cycle: after a `vercel rollback`, Vercel may stop assigning production to later `--prod` deploys
 until you run `vercel promote` (or promote in the dashboard), so after a Vercel rollback check that the next release really
 went live. Both CLIs are pinned to exact versions and installed by the engine, token-free, into a folder agent code cannot
@@ -553,8 +555,9 @@ CLI's package, never seen against the real service, because the provider token i
 `VERCEL_TOKEN` or an account ID, and while an engine runs on the data home) verifies them once with your token: it installs the
 pinned CLI token-free, stages an engine-written marker page under the releases folder, runs the real deploy plan through the
 real sandbox (token in the environment only, provider-config check, redaction gate, stdout-only URL parse, `vercel inspect`)
-against a throwaway project `brahma-probe-<6 letters or digits>`, smokes the site for the marker (your production URL if set,
-else the verified deploy URL), reads the hosts
+against a throwaway project `brahma-probe-<6 letters or digits>`, smokes its own deploy URL for the marker (the per-deploy URL
+parsed from the deploy step's stdout and pinned to the probe's project; the probe records no production URL, so your HOSTING
+production URL is never used), reads the hosts
 the CLI contacted from the engine's egress proxy, removes the project and lists what is left. It prints one `PASS`/`FAIL`/
 `NOTE` line per item (CLI pin, network hosts, HTTPS_PROXY honoured, deploy URL, the 9-character URL hash, `Production:` on
 stdout, inspect, smoke, `.env` not read, `GIT_CEILING_DIRECTORIES`, project exists, promotion after rollback, project removed,

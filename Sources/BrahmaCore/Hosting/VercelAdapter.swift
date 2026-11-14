@@ -143,4 +143,11 @@ public struct VercelAdapter: HostingAdapter {
         if let p = s.productionURL { return URL(string: p) }
         return deployURL
     }
+
+    /// Final-fix2 R2: a release is smoked only at the owner's production URL. Vercel's per-deploy URLs sit behind its
+    /// deployment protection by default (likely a 401 or a login page), so a release with none recorded is refused before
+    /// anything deploys rather than failing its smoke after the deploy. (The probe and a rollback still use `smokeBase`.)
+    public var productionURLRequired: String? {
+        "set the production URL in HOSTING before deploying to Vercel (its per-deploy URLs sit behind deployment protection)"
+    }
 }

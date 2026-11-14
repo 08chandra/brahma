@@ -770,6 +770,53 @@ import Glibc
                                                                   cli: CloudflarePagesAdapter().cli)).verify == nil)
     }
 
+    /// Final-fix2 R2 (re-review N2): Vercel's per-deploy URLs sit behind its deployment protection, so a Vercel release is
+    /// smoked only at the owner's production URL. With none recorded in HOSTING the proposal is refused before anything is
+    /// recorded; a production URL cleared after approval fails the release before any token step (owner-side, no bug).
+    @Test func vercelReleaseNeedsProductionURL() async throws {
+        #expect(VercelAdapter().productionURLRequired
+                == "set the production URL in HOSTING before deploying to Vercel (its per-deploy URLs sit behind deployment protection)")
+        #expect(CloudflarePagesAdapter().productionURLRequired == nil)
+        let vercelLike: (inout FakeHostingAdapter) -> Void = {
+            $0.verify = true; $0.smokesDeployURL = true; $0.productionURLRequired = VercelAdapter().productionURLRequired
+        }
+        // Propose time: refused, nothing recorded, nothing asked.
+        let fx = try Fx(configure: vercelLike)
+        #expect(Self.message { _ = try fx.propose() } == VercelAdapter().productionURLRequired)
+        #expect(try fx.store.releases(companyId: fx.company.id).isEmpty)
+        let deployAsks = try await fx.store.writer.read { db in try Ask.filter(Column("kind") == AskKind.deploy).fetchCount(db) }
+        #expect(deployAsks == 0)
+        // With the production URL set, the release deploys and is smoked there, never at the per-deploy URL.
+        try fx.store.setHosting(companyId: fx.company.id, by: .owner, productionURL: "https://lumen.example", now: fx.w.clock.now)
+        let deployed = try fx.proposeAndApprove()
+        await fx.advance()
+        let r1 = try fx.reload(deployed)
+        #expect(r1.status == .deployed, "\(r1.failedReason ?? "")")
+        #expect(r1.productionURL == "https://lumen.example")
+        #expect(fx.http.requests.map(\.url.absoluteString) == ["https://lumen.example/"])
+
+        // Execution: the production URL cleared after approval → refused before any token step.
+        let cleared = try Fx(configure: vercelLike)
+        try cleared.store.setHosting(companyId: cleared.company.id, by: .owner, productionURL: "https://lumen.example", now: cleared.w.clock.now)
+        let approved = try cleared.proposeAndApprove()
+        try cleared.store.setHosting(companyId: cleared.company.id, by: .owner, productionURL: "", now: cleared.w.clock.now)
+        await cleared.advance()
+        let refused = try cleared.reload(approved)
+        #expect(refused.status == .failed)
+        #expect(refused.failedReason == VercelAdapter().productionURLRequired)
+        #expect(refused.deployStartedAt == nil, "nothing was deployed")
+        #expect(!refused.isRollbackCandidate)
+        #expect(try cleared.deploySteps().isEmpty)
+        for call in cleared.sandbox.calls { #expect(call.environment["CLOUDFLARE_API_TOKEN"] == nil) }
+        #expect(cleared.http.requests.isEmpty)
+        #expect(try cleared.bugs().isEmpty, "the production URL is the owner's (m4)")
+        #expect(try cleared.notices().contains { $0.title == "Release 0.1.0 failed" && $0.body.hasPrefix("Nothing was deployed:") })
+    }
+
+    static func message(_ body: () throws -> Void) -> String? {
+        do { try body(); return nil } catch let e as WorkError { return e.message } catch { return "\(error)" }
+    }
+
     @Test func sandboxUnavailableFailsClosed() async throws {
         // PR-5: a Full company's build runs as its checks do (unsandboxed); the token-holding step never does.
         let fx = try Fx(profile: .full, deploySandbox: UnavailableSandboxRunner())

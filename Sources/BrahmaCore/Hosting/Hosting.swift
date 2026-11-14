@@ -351,9 +351,15 @@ public protocol HostingAdapter: Sendable {
     /// Whether the output of the plan's verify step (`DeployPlan.verify`) says the deployment belongs to `settings.project`.
     /// Only asked when the plan has a verify step; fail closed (false) on anything it cannot read.
     func verifiesDeployment(output: String, settings: HostingSettings) -> Bool
+    /// Why a release on this provider needs the owner's production URL in HOSTING (final-fix2 R2), or nil when it does not.
+    /// `Store.proposeDeploy` refuses with it when none is set, and the executor refuses with it again before any token step.
+    var productionURLRequired: String? { get }
 }
 
 extension HostingAdapter {
+    /// The site may be smoked at the verified deploy URL: no production URL needed.
+    public var productionURLRequired: String? { nil }
+
     /// No verify step: nothing to confirm.
     public func verifiesDeployment(output: String, settings: HostingSettings) -> Bool { false }
 

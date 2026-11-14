@@ -406,6 +406,10 @@ extension Store {
         }
         guard let settings, settings.outputDir != nil else { throw WorkError.invalid(ReleasePolicy.noOutputDir) }
         guard let smokeCheck = company.smokeCheck else { throw WorkError.invalid(ReleasePolicy.noSmokeCheck) }
+        let adapter = adapters(settings.provider)
+        // Final-fix2 R2: a provider whose per-deploy URLs are not public (Vercel's deployment protection) is smoked only at
+        // the owner's production URL; with none recorded nothing is proposed (the executor checks again before any token step).
+        if let why = adapter.productionURLRequired, settings.productionURL == nil { throw WorkError.invalid(why) }
         // 6. npm, which installs the provider CLI.
         guard npmPresent ?? HostingReadiness.npmOnPath() else {
             try notifyOwner(companyId: companyId, title: "Deploying needs Node.js",
@@ -413,7 +417,6 @@ extension Store {
             throw WorkError.invalid(ReleasePolicy.noNpm)
         }
         // 7. The token and the account (metadata only; the executor reads the token at deploy time).
-        let adapter = adapters(settings.provider)
         let tokenPresent = try secrets(companyId: companyId).contains { $0.name == adapter.tokenSecret }
         guard tokenPresent, settings.accountId != nil else {
             let task = try humanTasks.fileHostingAccount(store: self, companyId: companyId, provider: settings.provider, now: now)
