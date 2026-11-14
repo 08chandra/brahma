@@ -66,16 +66,21 @@ struct OrgGroup: ParsableCommand {
         }
     }
 
+    /// Any caller lists the open seats (3a); the owner-only note (Plan 4b) is printed only to the owner's shell, by the same
+    /// check owner commands use (`requireOwnerShell`, quietly): inside an agent turn the list is plain. The stored note is
+    /// already redacted; it is redacted again at print time for secrets set since, and withheld when they cannot be loaded.
     struct Vacancies: ParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "List open seats.")
+        static let configuration = CommandConfiguration(abstract: "List open seats (notes are shown to the owner only).")
         @Argument var company: String
         func run() throws {
+            let isOwner = (try? requireOwnerShell(quietly: true)) != nil
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let open = try store.vacancies(companyId: c.id)
             if open.isEmpty { print("(no vacancies)") }
             for v in open {
-                let note = v.note.isEmpty ? "" : "  note: \(v.note)"
+                var note = ""
+                if isOwner, !v.note.isEmpty, let shown = store.redactedForDisplay(v.note) { note = "  note: \(shown)" }
                 print(safe("\(v.handle)  \(v.role)  manager: \(v.managerHandle ?? "none")  team: \(v.team ?? "none")\(note)"))
             }
         }

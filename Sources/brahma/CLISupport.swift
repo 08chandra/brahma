@@ -126,18 +126,22 @@ func ownerKeyStore(for paths: BrahmaPaths) throws -> any OwnerKeyStore {
 /// Task 3: a turn is refused by its environment and by its ancestry: a process whose ancestor is a running turn's process
 /// (`Store.recordedTurnLeaders`: the runner's turn records, read without opening the database) is inside that turn. On the Sandboxed profile the sandbox denies the data home and the Keychain
 /// services anyway; on the Workspace profile this check is a deterrent, not a security boundary (README).
-func requireOwnerShell() throws {
+///
+/// `quietly` (Plan 4b): the same checks, but a refusal throws without printing, for a command any caller may run that only
+/// shows owner-only detail to the owner (`brahma org vacancies` and its notes). Key-store warnings and errors still print.
+func requireOwnerShell(quietly: Bool = false) throws {
+    func refuse(_ why: String) -> ExitCode { quietly ? ExitCode.failure : fail(why) }
     let paths = BrahmaPaths.fromEnvironment()
     let running = Store.recordedTurnLeaders(paths: paths)
     if let why = OwnerShellGuard.refusal(environment: ProcessInfo.processInfo.environment,
                                          ancestors: ProcessAncestry.chain(of: getpid()), runningTurnPids: running) {
-        throw fail(why)
+        throw refuse(why)
     }
     guard OwnerKey.verify(paths: paths, store: try ownerKeyStore(for: paths)) else {
-        throw fail("owner key missing or invalid; run 'brahma owner init' in Terminal or open the app")
+        throw refuse("owner key missing or invalid; run 'brahma owner init' in Terminal or open the app")
     }
     // The key is keyed on the canonical data home; the database we are about to open must really live in it.
     guard OwnerKey.databaseIsInsideHome(paths: paths) else {
-        throw fail("the database is a symlink or lies outside the data home; refusing owner command")
+        throw refuse("the database is a symlink or lies outside the data home; refusing owner command")
     }
 }
