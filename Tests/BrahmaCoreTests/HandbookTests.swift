@@ -590,6 +590,26 @@ import BrahmaKeychain
         #expect(w.refusal { try w.write(w.eng1, "Eng/Doc", "x", title: String(repeating: "t", count: Handbook.maxTitle + 1)) } != nil)
     }
 
+    /// Fix round 2 (Task 5): page paths become mirror and export file names that cannot be redacted, so a path that looks like
+    /// it holds a secret is refused at write, for agents and the owner alike, with the body's wording, and nothing is written.
+    @Test func secretInPathRefused() throws {
+        let w = try W()
+        let aws = w.refusal { try w.write(w.eng1, "Eng/Keys AKIAABCDEFGHIJKLMNOP", "notes") }
+        #expect(aws?.message.hasPrefix("that text contains what looks like a secret (") == true, "\(String(describing: aws))")
+        #expect(aws?.message.hasSuffix(", line 1); remove it") == true)
+        #expect(!(aws?.message.contains("AKIAABCDEFGHIJKLMNOP") ?? true), "the refusal never echoes the path")
+        #expect(w.refusal { try w.write(nil, "Eng/AKIAABCDEFGHIJKLMNOP/Child", "notes") } == aws)
+        #expect(w.refusal { try w.write(nil, "Eng/Notes \(Self.testToken)", "notes") }
+                == .invalid("that text contains what looks like a secret (stored secret TEST_TOKEN, line 1); remove it"))
+        #expect(w.refusal { try w.write(w.eng1, "\(Self.testToken)/Notes", "notes") } != nil)
+        let pages = try w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT path FROM kbPage WHERE companyId = ?", arguments: [w.company.id])
+        }
+        #expect(!pages.contains { $0.contains("AKIA") || $0.contains(Self.testToken) })
+        // An ordinary path is still fine.
+        #expect(w.refusal { try w.write(w.eng1, "Eng/Keys rotation", "notes") } == nil)
+    }
+
     @Test func outputsRedacted() throws {
         let w = try W()
         let value = "zebra-secret-998877"

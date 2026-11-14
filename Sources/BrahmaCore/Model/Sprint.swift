@@ -86,6 +86,9 @@ public struct Sprint: Codable, Equatable, Sendable, FetchableRecord, Persistable
     public var summary: String?
     /// Who planned it: the lead that is told when it completes or reaches its timebox.
     public var leadId: String?
+    /// Who closed it and so wrote its summary (`actor.id`: an agent id or `"owner"`); nil for sprints closed before Plan ML
+    /// recorded it (their summary's author is unknown, and treated as untrusted).
+    public var closedById: String? = nil
 
     public var name: String { "Sprint \(number)" }
     /// "core" or "company".
