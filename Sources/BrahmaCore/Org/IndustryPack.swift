@@ -3,7 +3,10 @@ import Foundation
 public enum RoleKind: String, Codable, Sendable { case executive, architect, manager, individual }
 
 public enum CompanyToolNames {
+    /// Plan ML's memory tools: every role gets them (they are part of `base`).
+    public static let memory = ["search_memory", "recall", "remember"]
     public static let base = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"]
+        + memory
     public static let work = ["list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency",
                               "comment_work_item", "claim_lease", "release_lease", "submit_for_review", "write_handoff",
                               "propose_decision", "request_from_owner", "escalate_decision", "request_mode",

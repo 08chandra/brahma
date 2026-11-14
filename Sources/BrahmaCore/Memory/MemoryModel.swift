@@ -189,6 +189,8 @@ public struct MemoryEntry: Codable, Equatable, Sendable, FetchableRecord, Persis
     public var confirmedAt: Date?
     public var removedAt: Date?
     public var purgedAt: Date?
+    /// The company-active second it was created at (`remember`'s hourly limit); nil for episodes.
+    public var createdActive: Double? = nil
 
     public var ref: String { "mem:\(number)" }
     public var access: AccessClass? { AccessClass(kind: accessKind, id: accessId) }
