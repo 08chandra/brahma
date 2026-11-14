@@ -42,6 +42,24 @@ import GRDB
         }
     }
 
+    /// Plan ML Task 5: the export carries the company's handbook as Markdown (the owner's view), and only that company's.
+    @Test func companyExportIncludesHandbook() throws {
+        let f = try Fixture()
+        try f.env.store.kbWrite(companyId: f.acme.id, by: .owner, path: "Engineering/Runbook",
+                                body: "# Runbook\nrestart the zebra queue\n## Pay [restricted: cfo]\nsalary bands", knownValues: [])
+        try f.env.store.kbWrite(companyId: f.beta.id, by: .owner, path: "Engineering/Giraffe", body: "beta only", knownValues: [])
+        let result = try f.export(f.acme)
+        #expect(result.copied.contains("handbook")); #expect(!result.skipped.contains { $0.hasPrefix("handbook") })
+        let handbook = result.directory.appending(path: "handbook", directoryHint: .isDirectory)
+        let runbook = try String(contentsOf: handbook.appending(path: "Engineering/Runbook.md"), encoding: .utf8)
+        #expect(runbook.hasPrefix("---\ntitle: \"Runbook\"\npath: \"kb:Engineering/Runbook\""))
+        #expect(runbook.contains("restart the zebra queue")); #expect(runbook.contains("salary bands"))
+        #expect(FileManager.default.fileExists(atPath: handbook.appending(path: "INDEX.md").path))
+        #expect(!FileManager.default.fileExists(atPath: handbook.appending(path: "Engineering/Giraffe.md").path))
+        let index = try String(contentsOf: handbook.appending(path: "INDEX.md"), encoding: .utf8)
+        #expect(index.contains("(Engineering/Runbook.md)")); #expect(!index.contains("Giraffe"))
+    }
+
     @Test func exportContainsOnlyThatCompany() throws {
         let f = try Fixture()
         let result = try f.export(f.acme)
@@ -125,7 +143,7 @@ import GRDB
         for unwanted in [".cache", "node_modules", "wt", ".brahma", "link", "dirlink", "secret-in-worktree"] {
             #expect(!names.contains { $0.contains(unwanted) }, "\(unwanted) must not be exported: \(names)")
         }
-        #expect(result.copied.sorted() == ["archive", "files", "roles", "transcripts"])
+        #expect(result.copied.sorted() == ["archive", "files", "handbook", "roles", "transcripts"])
         var st = stat()
         #expect(stat(result.directory.appending(path: "files/keep.txt").path, &st) == 0 && st.st_mode & 0o777 == 0o600)
     }

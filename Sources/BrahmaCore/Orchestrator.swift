@@ -101,6 +101,8 @@ public actor Orchestrator {
     var lastLiveness: [String: Double] = [:]
     /// Companies whose handbook skeleton this engine has ensured since it started.
     var handbookSkeletons: Set<String> = []
+    /// Company-active time of each company's last handbook refresh (auto pages and the `.brahma/kb` mirror).
+    var lastHandbookRefresh: [String: Double] = [:]
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
     var infraCooldown: [String: Date] = [:]
@@ -528,6 +530,18 @@ public actor Orchestrator {
                 handbookSkeletons.insert(c.id)
             } catch {
                 log("handbook skeleton for \(c.id) failed (retried next tick): \(error)")
+            }
+        }
+
+        // Handbook refresh (Plan ML): every `AutoPages.interval` company-active seconds per company, the engine-rendered pages
+        // and then the agent-readable `.brahma/kb` mirror. Held like ingest: by the owner's stop and while secrets are unloaded
+        // (both redact). A failure leaves an activity line; a link planted in the mirror raises the engine-file alert.
+        if !HandbookRefresh.isHeld(stopped: stopped != nil, secretsHeld: store.secretsHeld) {
+            for c in companies {
+                let active = store.activeNow(companyId: c.id)
+                guard HandbookRefresh.isDue(active: active, last: lastHandbookRefresh[c.id]) else { continue }
+                lastHandbookRefresh[c.id] = active
+                HandbookRefresh.run(store: store, company: c, now: now)
             }
         }
 
