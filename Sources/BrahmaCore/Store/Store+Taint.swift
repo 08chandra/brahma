@@ -351,8 +351,9 @@ extension Store {
 
     /// An imported company's mark (owner ruling 2026-11-12: everything imported is outside content): the company lab mark (S31)
     /// with source `import: <host>`. While it stands every work turn of the company is tainted at launch with that source
-    /// (`TurnContext.relayedTaint`), and no lab commit there records clean. The owner ends it like any company mark
-    /// (`brahma lab clear-taint <company>`, `clearCompanyLabTaint`).
+    /// (`TurnContext.relayedTaint`), and no lab commit there records clean. Only the owner's trust ends it (`brahma company
+    /// trust-import`, `trustImport`, which shows the source, the imported commit and the secret scan first); the generic lab
+    /// clear refuses while it stands (final-review I3, `clearCompanyLabTaint`).
     /// `profile`: the company's profile when it was imported (fix round 1, I1: never NULL).
     static func markImported(_ db: Database, companyId: String, source: String, profile: String = PermissionProfile.sandboxed.rawValue,
                              now: Date) throws {
@@ -412,11 +413,13 @@ extension Store {
     /// The owner clears the company's lab mark and every lab mark of its agents, recorded as an activity event; the clear time
     /// is kept (S33: from then on only commits the engine saw made in a clean turn record clean in that company). The database
     /// half of `LabProvenance.clearCompanyMark`, which runs it in the owner's critical section. Returns whether anything was
-    /// marked.
+    /// marked. Refused, changing nothing, while the company carries an import mark (final-review I3): that mark ends only
+    /// through `trustImport`, which the owner reaches after seeing the source, the imported commit and the secret scan.
     @discardableResult
     public func clearCompanyLabTaint(companyId: String, now: Date = Store.now()) throws -> Bool {
         try writer.write { db in
-            guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+            guard let found = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
+            try Self.refuseImportMark(db, company: found)
             let company = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM companyTaint WHERE companyId = ? AND source IS NOT NULL",
                                            arguments: [companyId]) ?? 0
             try db.execute(sql: """
@@ -431,6 +434,17 @@ extension Store {
                                 + "extension proposals are checked by their commits again", createdAt: now).insert(db)
             return true
         }
+    }
+
+    /// Final-review I3: the generic lab clear never ends an import mark.
+    static func importMarkRefusal(_ company: Company) -> String {
+        "\(company.name) carries an import mark; use brahma company trust-import \(company.slug)"
+    }
+
+    static func refuseImportMark(_ db: Database, company: Company) throws {
+        let imported = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM companyTaint WHERE companyId = ? AND source LIKE 'import: %'",
+                                        arguments: [company.id]) ?? 0
+        if imported > 0 { throw WorkError.invalid(importMarkRefusal(company)) }
     }
 
     /// The owner clears an agent's lab mark (`brahma lab clear-taint`, owner shell only; never a company tool). Recorded as an
@@ -630,6 +644,8 @@ public enum LabProvenance {
     public static func clearCompanyMark(store: Store, paths: BrahmaPaths, companyId: String, now: Date = Store.now(),
                                         walkLimit: Int = workspaceWalkLimit) throws -> Bool {
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
+        // Final-review I3: an import mark ends only through trust-import (refused before anything is snapshotted).
+        if try store.importTaint(companyId: companyId) != nil { throw WorkError.invalid(Store.importMarkRefusal(company)) }
         let lock = try engineLock(paths)
         defer { withExtendedLifetime(lock) {} }
         try refuseActiveSessions(store: store, paths: paths, companies: [company])

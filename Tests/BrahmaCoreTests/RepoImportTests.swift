@@ -346,7 +346,7 @@ private final class HTTPSFixture {
     }
 
     /// Everything imported is outside content (owner ruling 2026-11-12): every work turn of the company is tainted at launch
-    /// with `import: <host>` (`import: local` for a folder), and labs record nothing clean, until the owner clears the mark.
+    /// with `import: <host>` (`import: local` for a folder), and labs record nothing clean, until the owner trusts the import.
     @Test func importedFilesMarkReadersTainted() throws {
         let src = try SourceRepo()
         let (store, paths) = try home()
@@ -360,8 +360,11 @@ private final class HTTPSFixture {
         try store.markTainted(agentId: eng.id, source: try #require(ctx.relayedTaint))
         let marked = try #require(try store.agent(id: eng.id))
         #expect(marked.sessionTainted && marked.taintSources.contains("import: local"))
-        // The generic lab clear refuses while a session the mark tainted stands; the owner's trust ends both.
-        #expect(throws: LabProvenance.ClearRefused.self) { _ = try LabProvenance.clearCompanyMark(store: store, paths: paths, companyId: company.id) }
+        // The generic lab clear refuses while the import mark stands (final-review I3); the owner's trust ends it and the
+        // sessions it tainted.
+        #expect(throws: WorkError.invalid("\(company.name) carries an import mark; use brahma company trust-import \(company.slug)")) {
+            _ = try LabProvenance.clearCompanyMark(store: store, paths: paths, companyId: company.id)
+        }
         #expect(try RepoImport.trust(store: store, paths: paths, companyId: company.id) == "import: local")
         #expect(try store.importTaint(companyId: company.id) == nil)
         let trusted = try #require(try store.agent(id: eng.id))
@@ -369,11 +372,19 @@ private final class HTTPSFixture {
         #expect(try TurnContext.load(store: store, paths: paths, agent: eng, company: company).relayedTaint == nil)
         #expect(try store.labTaint(agentId: eng.id) != nil, "labs stay marked until brahma lab clear-taint")
         #expect(try RepoImport.trust(store: store, paths: paths, companyId: company.id) == nil, "nothing left to trust")
-        // Before any turn ran, the company lab clear ends the mark too.
+        // Final-review I3: the generic lab clear never ends an import mark (even before any turn ran): only trust-import,
+        // which shows the source, the imported commit and the secret scan first, does. Nothing changes.
         let (store2, paths2) = try home()
         let (c2, _, _) = try importCompany(try RepoSource.parse(src.root.path), store: store2, paths: paths2)
+        let refusal = "\(c2.name) carries an import mark; use brahma company trust-import \(c2.slug)"
+        #expect(throws: WorkError.invalid(refusal)) { _ = try LabProvenance.clearCompanyMark(store: store2, paths: paths2, companyId: c2.id) }
+        #expect(throws: WorkError.invalid(refusal)) { _ = try store2.clearCompanyLabTaint(companyId: c2.id) }
+        #expect(try store2.importTaint(companyId: c2.id) == "import: local")
+        #expect(try store2.companyLabTaint(companyId: c2.id)?.source == "import: local")
+        // Once trusted, the remaining (ordinary) company mark clears as any lab mark does.
+        #expect(try RepoImport.trust(store: store2, paths: paths2, companyId: c2.id) == "import: local")
         #expect(try LabProvenance.clearCompanyMark(store: store2, paths: paths2, companyId: c2.id))
-        #expect(try store2.importTaint(companyId: c2.id) == nil)
+        #expect(try store2.companyLabTaint(companyId: c2.id) == nil)
         // A greenfield company carries no mark.
         let green = try store2.createCompany(name: "Green", goal: "g", workspacesRoot: paths2.workspaces)
         #expect(try store2.importTaint(companyId: green.id) == nil && green.importedFrom == nil && green.importedCommit == nil)
