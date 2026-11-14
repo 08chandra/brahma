@@ -64,6 +64,28 @@ public struct Agent: Codable, Equatable, Sendable, FetchableRecord, PersistableR
     public var freshSessionRequested: Bool = false
     /// Every taint source of the current session, one per line (S22).
     public var taintSources: String = ""
+
+    /// Public so other modules (the synthetic company) can build agents. Lists every stored property in declaration order with
+    /// the declaration's default; a stored property added to `Agent` is added here too.
+    public init(id: String, companyId: String, name: String, role: String, model: String, sessionId: String,
+                sessionStarted: Bool, state: AgentState, blocker: Blocker? = nil, requestedBlocker: Blocker? = nil,
+                paused: Bool, readySince: Date? = nil, createdAt: Date, consecutiveFailures: Int = 0,
+                consecutiveInfraFailures: Int = 0, managerId: String? = nil, team: String? = nil, trustLevel: String = "T1",
+                lastNoticeWakeActive: Double? = nil, pausedActive: Double? = nil, sessionMeta: SessionMeta? = nil,
+                actingRole: String? = nil, fullReview: Bool = false, turnsWithoutProgress: Int = 0,
+                pendingSessionReset: String? = nil, pendingSessionResetScope: String? = nil, sessionTainted: Bool = false,
+                freshSessionRequested: Bool = false, taintSources: String = "") {
+        self.id = id; self.companyId = companyId; self.name = name; self.role = role; self.model = model
+        self.sessionId = sessionId; self.sessionStarted = sessionStarted; self.state = state; self.blocker = blocker
+        self.requestedBlocker = requestedBlocker; self.paused = paused; self.readySince = readySince
+        self.createdAt = createdAt; self.consecutiveFailures = consecutiveFailures
+        self.consecutiveInfraFailures = consecutiveInfraFailures; self.managerId = managerId; self.team = team
+        self.trustLevel = trustLevel; self.lastNoticeWakeActive = lastNoticeWakeActive; self.pausedActive = pausedActive
+        self.sessionMeta = sessionMeta; self.actingRole = actingRole; self.fullReview = fullReview
+        self.turnsWithoutProgress = turnsWithoutProgress; self.pendingSessionReset = pendingSessionReset
+        self.pendingSessionResetScope = pendingSessionResetScope; self.sessionTainted = sessionTainted
+        self.freshSessionRequested = freshSessionRequested; self.taintSources = taintSources
+    }
 }
 
 /// The facts about a session the engine compares on the next turn: where it ran, with which model and tools, and when and

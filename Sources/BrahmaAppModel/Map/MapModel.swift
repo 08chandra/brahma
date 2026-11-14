@@ -123,10 +123,10 @@ public struct MapTeamCard: Equatable, Sendable {
 // MARK: - Model
 
 /// The map's live state: who is on the chart, what changed since the last snapshot, who talked to whom, which meetings
-/// are on. Pure value code; Task 5 adds the throttled queue (`step`) over `pending`.
+/// are on. Pure value code; `step` (MapQueue.swift) drains `pending` through the throttle into `active`.
 public struct MapModel: Sendable {
-    /// Mention fan-out cap per message (Task 5 moves this into `MapThrottle.maxFanout`).
-    static let maxFanout = 12
+    /// Queue and fan-out limits; `ingest` reads `maxFanout`, `step` the rest.
+    public var throttle = MapThrottle.standard
 
     public private(set) var agents: [String: MapAgent] = [:]
     public private(set) var tree = OrgTree(nodes: ["owner": OrgNode(id: "owner", tier: .board, parentId: nil, childIds: [],
@@ -139,9 +139,11 @@ public struct MapModel: Sendable {
     public private(set) var structureRevision = 0
     public private(set) var showFormer = false
 
-    /// Events waiting for Task 5's `step`. `start` is the enqueue time and `duration` is 0 until the queue spawns them.
+    /// Events waiting for `step`. `start` is the enqueue time and `duration` is 0 until the queue spawns them.
     var pending: [VisualEvent] = []
     public var pendingCount: Int { pending.count }
+    /// Spawned events, counters and the message-fact times behind `rate` (MapQueue.swift).
+    var queue = QueueState()
 
     private var raw: [String: Agent] = [:]
     private var roleKinds: [String: RoleKind] = [:]
@@ -226,7 +228,7 @@ public struct MapModel: Sendable {
             diff(old: oldRaw, oldTrust: oldTrust, oldMeetings: oldMeetings, now: now)
         }
         hasApplied = true
-        dropUnknown()
+        dropUnknown(now: now)
     }
 
     public mutating func setShowFormer(_ on: Bool) {
@@ -300,17 +302,24 @@ public struct MapModel: Sendable {
                                now: TimeInterval) {
         pending.append(VisualEvent(id: nextEventId, kind: kind, from: from, to: to, label: label, start: now, duration: 0))
         nextEventId += 1
+        queue.ingested += 1
     }
 
-    /// The world changed under the queue: events and edges that name an agent no longer in the company are dropped.
-    private mutating func dropUnknown() {
+    /// The world changed under the queue: events and edges that name an agent no longer in the company are dropped. The
+    /// events are counted in `dropped`, so every ingested event stays accounted for.
+    private mutating func dropUnknown(now: TimeInterval) {
         func known(_ e: MapEndpoint?) -> Bool {
             switch e {
             case nil, .owner?: true
             case .agent(let id)?: agents[id] != nil
             }
         }
+        let before = pending.count
         pending.removeAll { !known($0.from) || !known($0.to) }
+        if pending.count < before {
+            queue.dropped += before - pending.count
+            queue.lastDropAt = now
+        }
         edgeStates = edgeStates.filter { known($0.key.a) && known($0.key.b) }
     }
 
@@ -319,7 +328,9 @@ public struct MapModel: Sendable {
     public mutating func ingest(_ facts: [MapFact], now: TimeInterval) {
         for fact in facts {
             switch fact {
-            case .message(let f): ingestMessage(f, now: now)
+            case .message(let f):
+                queue.recordFact(now)
+                ingestMessage(f, now: now)
             case .handoff(let h): ingestHandoff(h, now: now)
             case .stateChanged, .hired: break   // the snapshot diff covers them
             }
@@ -343,10 +354,10 @@ public struct MapModel: Sendable {
         // Every recipient named is unknown or the sender: nothing to draw.
         if !f.recipientIds.isEmpty && recipients.isEmpty { return }
         for r in recipients { bump(EdgeKey(sender, r), now: now) }
-        for r in recipients.prefix(Self.maxFanout) { emit(.message, from: sender, to: r, now: now) }
+        for r in recipients.prefix(throttle.maxFanout) { emit(.message, from: sender, to: r, now: now) }
         if recipients.isEmpty {
             emit(.broadcast, from: teamLead(f.team).map { .agent($0) } ?? sender, now: now)
-        } else if recipients.count > Self.maxFanout {
+        } else if recipients.count > throttle.maxFanout {
             emit(.broadcast, from: sender, now: now)
         }
     }
@@ -378,8 +389,14 @@ public struct MapModel: Sendable {
         edgeStates[k] = EdgeState(weight: w + 1, at: now, pulseAt: now)
     }
 
-    private mutating func pruneEdges(now: TimeInterval) {
+    mutating func pruneEdges(now: TimeInterval) {
         edgeStates = edgeStates.filter { Self.decayed($0.value, at: now) >= MapEdges.minWeight }
+    }
+
+    /// Aggregate mode: a message that is not drawn as a particle still lights its edge. An edge that does not exist is
+    /// not created.
+    mutating func pulseEdge(_ k: EdgeKey, now: TimeInterval) {
+        edgeStates[k]?.pulseAt = now
     }
 
     /// Replay: replaces every comm edge with the given weights as of `now`, without a pulse. Unknown ends and weights
