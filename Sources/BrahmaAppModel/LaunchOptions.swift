@@ -68,7 +68,8 @@ public struct LaunchOptions: Equatable, Sendable {
     public var mapDemo = false
     /// `--map-demo-agents=<n>`, clamped to `OrgGenerator.range`.
     public var mapDemoAgents = 300
-    /// `--map-bench=<seconds>`: run the map benchmark for that long.
+    /// `--map-bench=<seconds>`: run the map benchmark for that long. It implies `--map-demo` (the bench runs on the demo
+    /// company's map window), so `--map-demo` need not be given with it.
     public var mapBench: Double?
 
     public init() {}
