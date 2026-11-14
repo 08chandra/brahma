@@ -114,7 +114,9 @@ struct MCP: ParsableCommand {
                                                    auditTurnId: auditTurnId, quotas: quotas, quotaTurnId: context.turnId,
                                                    planTurn: planTurn,
                                                    // The hook's fail-closed mark: present, every high-risk call is refused.
-                                                   taintFlag: TaintFlag.url(home: secretPaths.home, agentId: me.id)), beforeCall: check)
+                                                   taintFlag: TaintFlag.url(home: secretPaths.home, agentId: me.id),
+                                                   // `remember` refuses a fact holding a stored secret's value.
+                                                   vault: vault), beforeCall: check)
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

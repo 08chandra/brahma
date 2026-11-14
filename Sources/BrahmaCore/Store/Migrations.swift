@@ -1343,5 +1343,11 @@ enum Migrations {
             // that is a scan of every message.
             try db.create(index: "message_company_created", on: "message", columns: ["companyId", "createdAt", "id"], ifNotExists: true)
         }
+        m.registerMigration("vML-remember") { db in
+            // Plan ML Task 3: `remember` is limited per agent per active hour, so each entry records the company-active second it
+            // was created at (durations use active time, never wall-clock differences).
+            try db.alter(table: "memoryEntry") { t in t.add(column: "createdActive", .double) }
+            try db.create(index: "memoryEntry_author", on: "memoryEntry", columns: ["companyId", "authorId", "createdActive"])
+        }
     }
 }
