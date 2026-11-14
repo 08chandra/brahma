@@ -279,24 +279,13 @@ public enum MemoryIngest {
                 add(ask.internalNote)
 
                 let system = ask.requesterId == "system"
-                var readers: Set<String> = [ask.requesterId]
-                if let approver = ask.internalApproverId { readers.insert(approver) }
-                if let decided = ask.decidedBy, decided.hasPrefix("@"), let id = try batch.agentId(handle: String(decided.dropFirst())) {
-                    readers.insert(id)
-                }
-                var sensitivity = Sensitivity.normal
-                var restrictions: [Restriction] = []
-                switch ask.category {
-                case "termination"?: sensitivity = .hrPerf
-                case "exec-staffing"?: sensitivity = .restricted; restrictions = [["@executive"]]
-                default: break
-                }
+                let scope = try askScope(ask) { try batch.agentId(handle: $0) }
                 let taint = system ? nil : try batch.taint(author: ask.requesterId, at: ask.createdAt, marked: false)
                 try batch.ingest(MemoryIngestDoc(
                     companyId: companyId, source: .ask, sourceId: ask.id, ref: ask.ref,
                     title: "\(ask.ref) \(ask.kind.title): \(ask.title)", body: lines.joined(separator: "\n"),
-                    access: system ? .ownerOnly : .agent(ask.requesterId), readerSet: system ? nil : readers,
-                    sensitivity: sensitivity, restrictions: restrictions, provenance: batch.provenance(ask.requesterId),
+                    access: scope.access, readerSet: scope.readerSet,
+                    sensitivity: scope.sensitivity, restrictions: scope.restrictions, provenance: batch.provenance(ask.requesterId),
                     tainted: taint != nil, taintReason: taint, authorId: ask.requesterId, itemId: ask.itemId, createdAt: ask.createdAt))
                 count += 1
 
@@ -313,6 +302,34 @@ public enum MemoryIngest {
             }
             return count
         }
+    }
+
+    /// Who may read an ask: an engine-raised ask is the owner's alone; any other is its requester's, read by the reader set of
+    /// requester, internal approver and the agent that decided it (`@<handle>`, resolved by `agentId`). `termination` is
+    /// `hr-perf`, `exec-staffing` restricted to executives. The handbook's Decisions log applies the same scope (Task 5).
+    struct AskScope: Equatable {
+        var access: AccessClass
+        var readerSet: Set<String>?
+        var sensitivity: Sensitivity
+        var restrictions: [Restriction]
+    }
+
+    static func askScope(_ ask: Ask, agentId: (String) throws -> String?) rethrows -> AskScope {
+        let system = ask.requesterId == "system"
+        var readers: Set<String> = [ask.requesterId]
+        if let approver = ask.internalApproverId { readers.insert(approver) }
+        if let decided = ask.decidedBy, decided.hasPrefix("@"), let id = try agentId(String(decided.dropFirst())) {
+            readers.insert(id)
+        }
+        var sensitivity = Sensitivity.normal
+        var restrictions: [Restriction] = []
+        switch ask.category {
+        case "termination"?: sensitivity = .hrPerf
+        case "exec-staffing"?: sensitivity = .restricted; restrictions = [["@executive"]]
+        default: break
+        }
+        return AskScope(access: system ? .ownerOnly : .agent(ask.requesterId), readerSet: system ? nil : readers,
+                        sensitivity: sensitivity, restrictions: restrictions)
     }
 
     /// Mechanical decisions: the `approval` activity lines `Recorded: …`.

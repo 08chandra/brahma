@@ -32,6 +32,8 @@ public enum HandbookExporter {
     static let mirrorRoot = ".brahma/kb"
     /// The `memoryCursor.source` holding the mirror's fingerprint.
     static let mirrorCursor = "mirror"
+    /// The first line of every `INDEX.md` the engine writes: `export --force` only empties a folder whose `INDEX.md` has it.
+    static let indexHeader = "# Handbook index"
 
     // MARK: Export
 
@@ -68,7 +70,7 @@ public enum HandbookExporter {
             }
             files.append((relative, document(fields, body: try store.redact(page.body))))
         }
-        files.append(("INDEX.md", index(pages: pages.map { ($0.id, $0.path, $0.title) }, layout: layout, redact: store.redact)))
+        files.append(("INDEX.md", try index(pages: pages.map { ($0.id, $0.path, $0.title) }, layout: layout, redact: store.redact)))
 
         let target = dir.standardizedFileURL
         let real = resolvedPath(target)
@@ -86,6 +88,11 @@ public enum HandbookExporter {
         let existing = try fm.contentsOfDirectory(atPath: target.path)
         if !existing.isEmpty {
             guard force else { throw WorkError.conflict("export folder must be empty (use --force to replace it)") }
+            // `--force` replaces an earlier handbook export, never any folder: its `INDEX.md` (a regular file, not a link)
+            // must start with the engine's header.
+            guard isEarlierExport(rootFD) else {
+                throw WorkError.conflict("--force only replaces an earlier handbook export (a folder with its INDEX.md); choose an empty folder")
+            }
             for name in existing {
                 try EngineFiles.removeEntry(dfd: rootFD, name: name, shown: target.appending(path: name).path)
             }
@@ -147,8 +154,38 @@ public enum HandbookExporter {
         }
         func base(_ relative: String) -> String { relative.isEmpty ? mirrorRoot : "\(mirrorRoot)/\(relative)" }
 
+        func flag(_ problem: UnsafeEngineFile) {
+            guard !result.unsafe.contains(problem) else { return }
+            result.unsafe.append(problem)
+            store.alertEngineFile(problem, companyId: companyId, now: now)
+        }
+
         do {
             try EngineFiles.directory(workspace: workspace, mirrorRoot)
+            // First, anything that is not an expected directory or file, or not of the expected kind (compared as the file
+            // system may: folded), goes: stale pages, planted files, a directory where a file belongs. A link is flagged.
+            let dirKeys = Set(content.dirs.map(Layout.fold)), fileKeys = Set(content.files.keys.map(Layout.fold))
+            func sweep(_ relative: String, depth: Int) throws {
+                let dir = try EngineFiles.openWalked(workspace: workspace, base(relative))
+                for name in try dir.names().sorted() {
+                    let child = relative.isEmpty ? name : "\(relative)/\(name)"
+                    let key = Layout.fold(child)
+                    let kind = dir.kind(of: name)
+                    switch kind {
+                    case .directory where dirKeys.contains(key) && depth < HandbookPath.maxSegments: try sweep(child, depth: depth + 1)
+                    case .other where fileKeys.contains(key): continue
+                    default:
+                        if kind == .link, dirKeys.contains(key) || fileKeys.contains(key) {
+                            flag(UnsafeEngineFile(path: workspace.appending(path: "\(base(relative))/\(name)").path,
+                                                  problem: "is a symbolic link"))
+                        }
+                        try EngineFiles.remove(workspace: workspace, dir: base(relative), name: name)
+                        result.removed += 1
+                        if !changed { note(child) }
+                    }
+                }
+            }
+            try sweep("", depth: 0)
             for dir in content.dirs { try EngineFiles.directory(workspace: workspace, base(dir)) }
             for (relative, data) in content.files.sorted(by: { $0.key < $1.key }) {
                 let parent = relative.contains("/") ? String(relative[..<relative.lastIndex(of: "/")!]) : ""
@@ -158,39 +195,15 @@ public enum HandbookExporter {
                 case .missing: current = nil
                 case .regular: current = try EngineFiles.read(workspace: workspace, dir: base(parent), name: name, limit: data.count + 1)
                 case .unsafe(let problem):
-                    result.unsafe.append(problem)
-                    store.alertEngineFile(problem, companyId: companyId, now: now)
+                    flag(problem)
                     current = nil
                 }
                 if let current, SHA256.hex(current) == SHA256.hex(data) { continue }
-                if let problem = try EngineFiles.replace(data, workspace: workspace, dir: base(parent), name: name),
-                   !result.unsafe.contains(problem) {
-                    result.unsafe.append(problem)
-                    store.alertEngineFile(problem, companyId: companyId, now: now)
-                }
-                if changed { result.written += 1 } else { note(relative) }
+                if let problem = try EngineFiles.replace(data, workspace: workspace, dir: base(parent), name: name) { flag(problem) }
+                if changed { result.written += 1 } else if !result.repaired.contains(relative) { note(relative) }
             }
-            // Stale entries: anything that is not an expected directory or file (compared as the file system may: folded).
-            let dirKeys = Set(content.dirs.map(Layout.fold)), fileKeys = Set(content.files.keys.map(Layout.fold))
-            func sweep(_ relative: String, depth: Int) throws {
-                let dir = try EngineFiles.openWalked(workspace: workspace, base(relative))
-                for name in try dir.names().sorted() {
-                    let child = relative.isEmpty ? name : "\(relative)/\(name)"
-                    let key = Layout.fold(child)
-                    switch dir.kind(of: name) {
-                    case .directory where dirKeys.contains(key) && depth < HandbookPath.maxSegments: try sweep(child, depth: depth + 1)
-                    case .other where fileKeys.contains(key): continue
-                    default:
-                        try EngineFiles.remove(workspace: workspace, dir: base(relative), name: name)
-                        result.removed += 1
-                        if !changed { note(child) }
-                    }
-                }
-            }
-            try sweep("", depth: 0)
-        } catch let problem as UnsafeEngineFile {
-            result.unsafe.append(problem)
-            store.alertEngineFile(problem, companyId: companyId, now: now)
+        } catch let problem as UnsafeEngineFile where isPlanted(problem) {
+            flag(problem)
             // The planted entry goes (by descriptor: a link is unlinked, never followed) and the mirror is rebuilt next time.
             do {
                 try EngineFiles.remove(workspace: workspace, dir: ".brahma", name: "kb")
@@ -202,6 +215,8 @@ public enum HandbookExporter {
             }
             return result
         }
+        // Any other failure (a name the file system refuses, a full disk) is thrown to the caller, which traces it: it is not
+        // something an agent planted, so nothing is alerted or wiped.
         try store.writer.write { db in
             for text in notes {
                 try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work, text: text, createdAt: now).insert(db)
@@ -244,28 +259,62 @@ public enum HandbookExporter {
             files[relative] = document(fields, body: try store.redact(text))
         }
         files["README.md"] = Data(mirrorReadme.utf8)
-        files["INDEX.md"] = index(pages: shown.map { ($0.id, $0.path, $0.title) }, layout: layout, redact: store.redact)
+        files["INDEX.md"] = try index(pages: shown.map { ($0.id, $0.path, $0.title) }, layout: layout, redact: store.redact)
         return (files, layout.dirs, fingerprint)
+    }
+
+    /// Whether `problem` is something found in the way (a link, a hard link, another user's or odd file, a directory moved
+    /// during the walk) rather than a failure of the engine's own write (a refused name, a full disk).
+    static func isPlanted(_ problem: UnsafeEngineFile) -> Bool {
+        ["symbolic link", "is not a directory", "another hard link", "owned by another user", "not a regular file", "moved"]
+            .contains { problem.problem.contains($0) }
     }
 
     // MARK: Layout and rendering
 
     /// Where each page's file goes. Directories are spelled as the first page that needs them spells them (paths compare
     /// case-insensitively, and so may the file system); a file name already taken, by a file or a directory, gets ` (2)`, ` (3)` ….
+    /// Every name is the engine's own and always writable: a directory never takes a name of the engine's files
+    /// (`README.md`, `INDEX.md`: it becomes `<name> (dir)`), and a part longer than `maxNameBytes` UTF-8 bytes is cut and given
+    /// a hash of the whole part, so a name with its suffix and `EngineFiles.replace`'s temporary name stays under the file
+    /// system's 255 bytes (and six levels stay well under its path limit).
     struct Layout {
         /// Page id → relative file path.
         var files: [String: String] = [:]
         /// Every directory, parents first.
         var dirs: [String] = []
 
+        static let maxNameBytes = 120
+        /// Names the engine's own files take, folded.
+        static let reserved: Set<String> = ["readme.md", "index.md"]
+
         static func fold(_ path: String) -> String { HandbookPath.foldKey(path) }
+
+        /// `part`, or (when longer than `maxNameBytes` bytes) its longest prefix that leaves room for `~<16 hex>`, plus that
+        /// hash of the whole part. Deterministic.
+        static func capped(_ part: String) -> String {
+            guard part.utf8.count > maxNameBytes else { return part }
+            let hash = "~" + StableHash.fnv1a64(part)
+            var out = ""
+            for ch in part {
+                guard out.utf8.count + String(ch).utf8.count + hash.utf8.count <= maxNameBytes else { break }
+                out.append(ch)
+            }
+            return out + hash
+        }
+
+        static func directoryName(_ part: String) -> String {
+            let name = capped(part)
+            return reserved.contains(fold(name)) ? capped(name + " (dir)") : name
+        }
 
         init(_ pages: [(id: String, path: String)]) {
             var spelled: [String: String] = [:]
             func dirPath(_ parts: ArraySlice<String>) -> String {
                 var path = ""
                 for part in parts {
-                    let candidate = path.isEmpty ? part : "\(path)/\(part)"
+                    let name = Self.directoryName(part)
+                    let candidate = path.isEmpty ? name : "\(path)/\(name)"
                     let key = Self.fold(candidate)
                     if let known = spelled[key] { path = known } else {
                         spelled[key] = candidate
@@ -277,11 +326,11 @@ public enum HandbookExporter {
             }
             let sorted = pages.sorted { $0.path.lowercased() < $1.path.lowercased() }
             for page in sorted { _ = dirPath(page.path.split(separator: "/").map(String.init).dropLast()) }
-            var taken = Set(dirs.map(Self.fold)).union(["index.md", "readme.md"])
+            var taken = Set(dirs.map(Self.fold)).union(Self.reserved)
             for page in sorted {
                 let parts = page.path.split(separator: "/").map(String.init)
                 let dir = dirPath(parts.dropLast())
-                let stem = parts.last ?? page.path
+                let stem = Self.capped(parts.last ?? page.path)
                 var n = 1
                 while true {
                     let name = n == 1 ? "\(stem).md" : "\(stem) (\(n)).md"
@@ -304,7 +353,7 @@ public enum HandbookExporter {
     }
 
     /// `INDEX.md`: the pages as a tree of links, two spaces per level; a level with no page of its own is plain text.
-    static func index(pages: [(id: String, path: String, title: String)], layout: Layout, redact: (String) throws -> String) -> Data {
+    static func index(pages: [(id: String, path: String, title: String)], layout: Layout, redact: (String) throws -> String) throws -> Data {
         final class Node {
             var name: String
             var page: (id: String, title: String)?
@@ -324,20 +373,20 @@ public enum HandbookExporter {
             }
             node.page = (p.id, p.title)
         }
-        var lines = ["# Handbook index", ""]
-        func walk(_ node: Node, depth: Int) {
+        var lines = [indexHeader, ""]
+        // Fail closed: text the redactor cannot check is never written.
+        func walk(_ node: Node, depth: Int) throws {
             for child in node.children.values.sorted(by: { $0.name.lowercased() < $1.name.lowercased() }) {
                 let indent = String(repeating: "  ", count: depth)
                 if let page = child.page, let file = layout.files[page.id] {
-                    let title = (try? redact(page.title)) ?? child.name
-                    lines.append("\(indent)- [\(MarkdownEscape.inline(title))](\(linkTarget(file)))")
+                    lines.append("\(indent)- [\(MarkdownEscape.inline(try redact(page.title)))](\(linkTarget(file)))")
                 } else {
-                    lines.append("\(indent)- \(MarkdownEscape.inline(child.name))")
+                    lines.append("\(indent)- \(MarkdownEscape.inline(try redact(child.name)))")
                 }
-                walk(child, depth: depth + 1)
+                try walk(child, depth: depth + 1)
             }
         }
-        walk(root, depth: 0)
+        try walk(root, depth: 0)
         if pages.isEmpty { lines.append("No pages yet.") }
         return Data((lines.joined(separator: "\n") + "\n").utf8)
     }
@@ -393,6 +442,20 @@ public enum HandbookExporter {
                 offset += n
             }
         }
+    }
+
+    /// Whether the folder open at `dfd` holds an `INDEX.md` the engine wrote: a regular file (opened without following a
+    /// link) whose first line is `indexHeader`.
+    static func isEarlierExport(_ dfd: Int32) -> Bool {
+        let fd = openat(dfd, "INDEX.md", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return false }
+        var buffer = [UInt8](repeating: 0, count: indexHeader.utf8.count + 1)
+        let n = read(fd, &buffer, buffer.count)
+        guard n == buffer.count else { return false }
+        return Array(buffer) == Array((indexHeader + "\n").utf8)
     }
 
     private static func realpathString(_ path: String) -> String? {

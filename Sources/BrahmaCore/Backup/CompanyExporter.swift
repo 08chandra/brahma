@@ -105,7 +105,13 @@ public enum CompanyExporter {
                                         force: true)
             copied.append("handbook")
         } catch {
-            try? fm.removeItem(at: staging.appending(path: "handbook", directoryHint: .isDirectory))
+            // A partial `handbook/` never travels: when it cannot be removed, the export fails.
+            do {
+                let partial = staging.appending(path: "handbook", directoryHint: .isDirectory)
+                if fm.fileExists(atPath: partial.path) { try fm.removeItem(at: partial) }
+            } catch let cleanup {
+                throw ExportError.failed("the handbook export failed (\(error)) and its partial folder could not be removed: \(cleanup)")
+            }
             skipped.append("handbook: \(error)")
         }
         let manifest = staging.appending(path: "MANIFEST.json")
