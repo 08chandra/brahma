@@ -149,6 +149,7 @@ public struct KBPageSummary: Equatable, Sendable {
 
 /// A page as one reader may see it (`Store.kbRead`).
 public struct KBView: Sendable {
+    /// The page's metadata; its `body` is the filtered `text`, never the stored body (no field carries a hidden section).
     public var page: KBPage
     /// The revision read.
     public var revision: Int
@@ -160,7 +161,7 @@ public struct KBView: Sendable {
     /// The read revision's taint, whatever the page's is now.
     public var tainted: Bool
     public var taintReason: String?
-    /// The slugs of the sections in `text`.
+    /// The slugs of the sections in `text`; for an old revision (whole-page readers only), every current section's.
     public var slugs: [String]
     /// When the read revision was written.
     public var revisionDate: Date
