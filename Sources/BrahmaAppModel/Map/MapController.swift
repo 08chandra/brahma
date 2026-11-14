@@ -193,8 +193,9 @@ public final class MapController {
     public var lastFrameTime: TimeInterval? { lastFrameNow }
 
     /// Map time (the renderer's `frame(now:)` base), extrapolated from the last frame with the clock; before any frame,
-    /// seconds since the controller was made.
-    func mapNow() -> TimeInterval {
+    /// seconds since the controller was made. A view that mounts again starts its time base here, not at `lastFrameTime`, so
+    /// facts stamped while the map was unmounted are not "in the future" of its first frame.
+    public func mapNow() -> TimeInterval {
         let t = clock()
         if let n = lastFrameNow, let at = lastFrameAt { return n + Swift.max(0, t.timeIntervalSince(at)) }
         return Swift.max(0, t.timeIntervalSince(createdAt))

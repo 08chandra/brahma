@@ -45,6 +45,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let options: LaunchOptions
     /// Set by `MainWindow.onAppear`; reopens the main window after the user closes it.
     var openMainWindow: (() -> Void)?
+    /// Set by `MainWindow.onAppear` too; `--map-demo` opens the map window through it.
+    var openMapWindow: (() -> Void)?
     /// SwiftUI wraps the adaptor, so `NSApp.delegate` is not this object; the harness reaches it here.
     static private(set) weak var current: AppDelegate?
     private var signalSources: [DispatchSourceSignal] = []
@@ -147,6 +149,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in
                 await model.load()
                 model.startPolling()
+                // The demo controller is installed after the load (which may have made a live one) and before any panel
+                // mounts, so `ensureMapController()` hands the demo out.
+                if options.mapDemo || options.mapBench != nil { launchMapDemo(model: model, options: options) }
                 // A Finder launch has a bare PATH; the login shell's PATH is where `claude` and the agents' tools live.
                 let env = ProcessInfo.processInfo.environment
                 let merged = await Task.detached {
@@ -167,8 +172,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func windowWillClose(_ note: Notification) {
-        guard let window = note.object as? NSWindow, (window.identifier?.rawValue ?? "").hasPrefix("main") else { return }
+        guard let window = note.object as? NSWindow else { return }
+        let id = window.identifier?.rawValue ?? ""
+        if id.hasPrefix("map") { model?.mapWindowClosed() }
+        guard id.hasPrefix("main") else { return }
         NSApp.setActivationPolicy(.accessory)
+    }
+
+    /// `--map-demo`: the deterministic synthetic company (read-only: no write actions, clicks never change the selection)
+    /// replaces the map's controller, and the map window opens as soon as the main window has registered how to open it.
+    private func launchMapDemo(model: AppModel, options: LaunchOptions) {
+        model.installMapController(MapController(source: .synthetic(agents: options.mapDemoAgents, rate: 50, seed: 42)))
+        Task { @MainActor [weak self] in
+            let deadline = AwakeTime.deadline(after: .seconds(20))
+            while self?.openMapWindow == nil, AwakeTime.now < deadline { try? await Task.sleep(for: .milliseconds(50)) }
+            guard let open = self?.openMapWindow else { return }
+            open()
+            NSApp.activate()
+        }
     }
 
     /// The emergency stop's confirmation from the menu bar extra (an NSMenu cannot host a SwiftUI alert): true to stop.

@@ -19,6 +19,8 @@ struct MapHeader: View {
     /// The pop-out window hosts the panel itself: no pop-out button.
     var isWindow = false
     var onPopOut: () -> Void = {}
+    /// The window's full-screen toggle; the button shows only in the window.
+    var onFullScreen: (() -> Void)?
 
     @FocusState private var searchFocused: Bool
     @State private var info = Info()
@@ -70,6 +72,8 @@ struct MapHeader: View {
 
             if !isWindow {
                 iconButton("arrow.up.forward.app", help: "Open the map in its own window", action: onPopOut)
+            } else if let onFullScreen {
+                iconButton("rectangle.arrowtriangle.2.outward", help: "Full screen", action: onFullScreen)
             }
         }
         .task(id: ObjectIdentifier(controller)) {

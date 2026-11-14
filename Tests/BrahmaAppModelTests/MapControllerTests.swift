@@ -379,6 +379,29 @@ final class MapTestClock: @unchecked Sendable {
         app.stopPolling()
     }
 
+    /// Closing the pop-out window clears the flag and stops the controller (nothing is mounted to poll for); a mounted
+    /// inline panel starts it again from its `mapPoppedOut` change.
+    @Test func closingTheMapWindowStopsPollingAndClearsPoppedOut() throws {
+        let (store, paths) = try makeHome()
+        let app = AppModel(store: store, paths: paths)
+        let demo = MapController(source: .synthetic(agents: 20, rate: 1, seed: 1), defaults: defaults())
+        app.installMapController(demo)
+        demo.start()
+        app.mapPoppedOut = true
+        #expect(demo.isRunning)
+        app.mapWindowClosed()
+        #expect(!app.mapPoppedOut)
+        #expect(!demo.isRunning && !demo.isInvalidated, "stopped, not invalidated: a later start works")
+        demo.start()
+        #expect(demo.isRunning)
+        demo.stop()
+        // No controller at all: just the flag.
+        let bare = AppModel(store: store, paths: paths)
+        bare.mapPoppedOut = true
+        bare.mapWindowClosed()
+        #expect(!bare.mapPoppedOut)
+    }
+
     @Test func installedControllerIsEnsured() async throws {
         let (store, paths) = try makeHome()
         let app = AppModel(store: store, paths: paths)

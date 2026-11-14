@@ -145,8 +145,9 @@ public final class OrgScene: SKScene {
         super.update(currentTime)
         // Driven by a view: one controller frame, then the scene's own. Map time starts at 0 with the first frame.
         if let controller = motion.driver {
-            // A scene mounted on a controller that has already run continues where its last frame left off.
-            let base = motion.timeBase ?? (currentTime - (controller.lastFrameTime ?? 0))
+            // A scene mounted on a controller that has already run continues at the controller's map time, which kept
+            // running (the clock) while nothing was mounted; `lastFrameTime` would be stale by the unmounted interval.
+            let base = motion.timeBase ?? (currentTime - controller.mapNow())
             motion.timeBase = base
             let now = currentTime - base
             update(controller: controller, events: controller.frame(now: now), now: now)

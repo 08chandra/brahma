@@ -17,7 +17,10 @@ struct MainWindow: View {
         .frame(minWidth: 900, minHeight: 600)
         .background(BrahmaTheme.bg0)
         .preferredColorScheme(.dark)
-        .onAppear { delegate.openMainWindow = { openWindow(id: "main") } }
+        .onAppear {
+            delegate.openMainWindow = { openWindow(id: "main") }
+            delegate.openMapWindow = { openWindow(id: AgentMapPanel.windowId) }
+        }
     }
 }
 

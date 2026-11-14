@@ -414,6 +414,13 @@ public final class AppModel {
         return controller
     }
 
+    /// The pop-out map window closed: the map is no longer shown elsewhere, so the flag clears and the controller stops
+    /// polling. An inline panel that is mounted restarts it from its `mapPoppedOut` change (`start()` is idempotent).
+    public func mapWindowClosed() {
+        mapPoppedOut = false
+        mapController?.stop()
+    }
+
     /// Installs a controller (the `--map-demo` path), invalidating any previous one.
     public func installMapController(_ c: MapController) {
         if let old = mapController, old !== c { old.invalidate() }
