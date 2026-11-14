@@ -8,7 +8,7 @@ import Metal
 
 /// Scene tests render offscreen through `MapSnapshotter`; Tasks 9a and 9b add the org-chart cases.
 @MainActor
-@Suite struct OrgSceneTests {
+@Suite(.scratch) struct OrgSceneTests {
     /// A `bg0` scene with one 100×100 `running` sprite rendered at 400×300: the sprite covers 1/12 of the image.
     /// A BGRA/RGBA mix-up in the snapshotter would make both fractions lie, which is why this test exists.
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))

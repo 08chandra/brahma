@@ -7,7 +7,7 @@ import SpriteKit
 
 /// CoreText label textures and the LRU behind them. No GPU: `SKTexture(cgImage:)` and CoreGraphics run anywhere.
 @MainActor
-@Suite struct LabelTexturesTests {
+@Suite(.scratch) struct LabelTexturesTests {
     @Test func lruEvictsLeastRecentlyUsed() {
         let cache = LRUCache<Int, String>(capacity: 3)
         cache[1] = "a"; cache[2] = "b"; cache[3] = "c"

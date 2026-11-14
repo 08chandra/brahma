@@ -38,6 +38,6 @@ let package = Package(
             resources: [.copy("Fixtures")]
         ),
         .testTarget(name: "BrahmaAppModelTests", dependencies: ["BrahmaAppModel", "BrahmaKeychain"]),
-        .testTarget(name: "BrahmaMapKitTests", dependencies: ["BrahmaMapKit"]),
+        .testTarget(name: "BrahmaMapKitTests", dependencies: ["BrahmaMapKit", "BrahmaKeychain"]),
     ]
 )

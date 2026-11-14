@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import BrahmaAppModel
 
-@Suite struct MapTextTests {
+@Suite(.scratch) struct MapTextTests {
     @Test func cleansControlBidiAndLength() {
         #expect(MapText.clean("a\nb\t c", max: 40) == "a b c")
         #expect(MapText.clean("evil\u{202E}txt.exe", max: 40) == "eviltxt.exe")

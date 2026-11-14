@@ -5,7 +5,7 @@ import Foundation
 
 /// The org tree and its chart layout: pure value code over `agentsFromPlan` and the software pack. Nothing here touches
 /// the Keychain or a store.
-@Suite struct OrgTreeTests {
+@Suite(.scratch) struct OrgTreeTests {
     let software = SoftwarePack.pack
 
     func tree(_ agents: [Agent], vacancies: [Vacancy] = [], showFormer: Bool = false) -> OrgTree {

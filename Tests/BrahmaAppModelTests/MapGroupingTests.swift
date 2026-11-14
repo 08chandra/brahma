@@ -3,7 +3,7 @@ import Foundation
 @testable import BrahmaCore
 @testable import BrahmaAppModel
 
-@Suite struct MapGroupingTests {
+@Suite(.scratch) struct MapGroupingTests {
     let software = SoftwarePack.pack
 
     @Test func departmentRules() {
