@@ -1,5 +1,4 @@
 import AppKit
-import Observation
 import SpriteKit
 import SwiftUI
 import BrahmaAppModel
@@ -66,7 +65,6 @@ public struct OrgView: NSViewRepresentable {
         fileprivate var parent: OrgView!
         fileprivate weak var scene: OrgScene?
         fileprivate private(set) weak var observed: MapController?
-        private var generation = 0
 
         fileprivate func wire(_ view: MapSKView) {
             view.onClick = { [weak self] hit, point in self?.click(hit, at: point) }
@@ -86,27 +84,10 @@ public struct OrgView: NSViewRepresentable {
             observed = controller
             view.controller = controller
             scene?.present(controller: controller)
-            observeCamera()
         }
 
         fileprivate func detach() {
-            generation += 1
             observed = nil
-        }
-
-        /// Any set of `controller.camera` (a Fit button pressed while already fitted included) asks the scene to ease again.
-        private func observeCamera() {
-            guard let controller = observed else { return }
-            let mine = generation
-            withObservationTracking {
-                _ = controller.camera
-            } onChange: { [weak self] in
-                Task { @MainActor in
-                    guard let self, self.generation == mine, self.observed === controller else { return }
-                    self.scene?.requestCamera()
-                    self.observeCamera()
-                }
-            }
         }
 
         private func click(_ hit: MapHit, at point: CGPoint) {

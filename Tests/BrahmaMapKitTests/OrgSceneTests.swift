@@ -594,6 +594,18 @@ import AppKit
         #expect(count >= 29 && count <= 31, "\(count) in a second")
     }
 
+    @Test func throttledHoverIsFlushedAtTheTrailingEdge() {
+        var throttle = HoverThrottle()
+        let first = throttle.allow(100.0)
+        #expect(first)
+        let wait = throttle.remaining(at: 100.01)
+        #expect(abs(wait - (1.0 / 30 - 0.01)) < 1e-9, "the flush is due when the interval is up: \(wait)")
+        #expect(throttle.remaining(at: 100.05) == 0)
+        throttle.record(100.0 + 1.0 / 30)
+        let early = throttle.allow(100.04)
+        #expect(!early, "the flushed event counts as the last one")
+    }
+
     @Test func eventVisualsByKind() throws {
         let c = Self.controller(40)
         let scene = OrgScene(size: CGSize(width: 1600, height: 900))
@@ -682,23 +694,51 @@ import AppKit
         #expect(abs(scene.zoom - fitZoom) < 1e-6)
     }
 
-    @Test func hireStateChangeAndPromotionPlayOnTheCard() throws {
+    /// The state and trust changes come with the model's re-apply (no structure change), and their events reach the scene
+    /// 0.1 s after the last rebuild: the card must be reconfigured first, and the next refresh must not cut the effect.
+    private static func effectFixture() throws -> (c: MapController, scene: OrgScene, id: String, node: OrgCardNode, before: OrgCardNode.Content?) {
         let c = Self.controller(40)
         let scene = OrgScene(size: CGSize(width: 1600, height: 900))
-        let id = try #require(c.synthetic!.agents.first { $0.state != .killed && $0.managerId != nil }?.id)
-        Self.reapply(c) { $0.people = MapPeople(trust: [id: MapTrust(label: "T2", title: "Trusted", tier: 2)]) }
         scene.update(controller: c, events: [], now: 0)
-        let node = try #require(scene.cardNode(id))
-        let promotion = VisualEvent(id: 1, kind: .promotion(from: "T1", to: "T2"), from: .agent(id), start: 0, duration: 1.2)
-        scene.update(controller: c, events: [promotion], now: 0.05)
-        let chip = try #require(node.childNode(withName: ".//trustChipGroup"))
+        let agent = try #require(c.synthetic!.agents.first { $0.state != .killed && $0.managerId != nil })
+        let node = try #require(scene.cardNode(agent.id))
+        let before = node.content
+        let to: AgentState = agent.state == .blocked ? .ready : .blocked
+        Self.reapply(c, now: 0.1) { inputs in
+            let i = inputs.agents.firstIndex { $0.id == agent.id }!
+            inputs.agents[i].state = to
+            inputs.people = MapPeople(trust: [agent.id: MapTrust(label: "T2", title: "Trusted", tier: 2)])
+        }
+        return (c, scene, agent.id, node, before)
+    }
+
+    private static func cardEvents(_ id: String, from: AgentState = .ready, to: AgentState = .blocked) -> [VisualEvent] {
+        [VisualEvent(id: 1, kind: .promotion(from: "T1", to: "T2"), from: .agent(id), start: 0.1, duration: 1.2),
+         VisualEvent(id: 2, kind: .stateChange(from: from, to: to), from: .agent(id), start: 0.1, duration: 0.2)]
+    }
+
+    @Test func stateChangeAndPromotionPlayOnFreshContent() throws {
+        let (c, scene, id, node, before) = try Self.effectFixture()
+        scene.update(controller: c, events: Self.cardEvents(id), now: 0.1)
+        #expect(node === scene.cardNode(id))
+        #expect(node.content != before, "the card is reconfigured before the effects play")
+        #expect(node.childNode(withName: "barFlash") != nil, "the bar flashes")
+        let chip = try #require(node.childNode(withName: ".//trustChipGroup"), "the new chip exists to be popped")
         #expect(abs(chip.xScale - 1.4) < 1e-6, "the chip pops from 1.4")
         #expect(Self.hex((node.childNode(withName: ".//trustChip") as? SKSpriteNode)?.color) == ThemeHex.success, "recolored to the new tier")
 
-        scene.update(controller: c, events: [VisualEvent(id: 2, kind: .stateChange(from: .ready, to: .running), from: .agent(id),
-                                                          start: 0.1, duration: 0.2)], now: 0.1)
-        #expect(node.childNode(withName: ".//barFlash") != nil, "the bar flashes")
+        // The 0.25 s content refresh finds nothing to change, so it leaves the in-flight flash and pop alone.
+        scene.update(controller: c, events: [], now: 0.4)
+        #expect(node.childNode(withName: "barFlash") != nil)
+        #expect(abs(try #require(node.childNode(withName: ".//trustChipGroup")).xScale - 1.4) < 1e-6)
+    }
 
+    @Test func hirePlaysOnTheCard() throws {
+        let c = Self.controller(40)
+        let scene = OrgScene(size: CGSize(width: 1600, height: 900))
+        scene.update(controller: c, events: [], now: 0)
+        let id = try #require(c.synthetic!.agents.first { $0.state != .killed && $0.managerId != nil }?.id)
+        let node = try #require(scene.cardNode(id))
         scene.update(controller: c, events: [VisualEvent(id: 3, kind: .hire, from: .agent(id), start: 0.1, duration: 0.4)], now: 0.1)
         #expect(abs(node.xScale - 0.6) < 1e-6 && node.alpha == 0, "a hire starts at 60 % and transparent")
         #expect(node.childNode(withName: ".//hireFlash") != nil, "with an accent border flash")
@@ -706,21 +746,157 @@ import AppKit
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))
     func cardEffectsSettle() throws {
-        let c = Self.controller(40)
-        let scene = OrgScene(size: CGSize(width: 1600, height: 900))
-        let id = try #require(c.synthetic!.agents.first { $0.state != .killed && $0.managerId != nil }?.id)
-        Self.reapply(c) { $0.people = MapPeople(trust: [id: MapTrust(label: "T2", title: "Trusted", tier: 2)]) }
-        scene.update(controller: c, events: [], now: 0)
-        let node = try #require(scene.cardNode(id))
-        scene.update(controller: c, events: [
-            VisualEvent(id: 1, kind: .promotion(from: "T1", to: "T2"), from: .agent(id), start: 0, duration: 1.2),
-            VisualEvent(id: 3, kind: .hire, from: .agent(id), start: 0, duration: 0.4),
-            VisualEvent(id: 2, kind: .stateChange(from: .ready, to: .running), from: .agent(id), start: 0, duration: 0.2),
-        ], now: 0.05)
+        let (c, scene, id, node, before) = try Self.effectFixture()
+        scene.update(controller: c, events: Self.cardEvents(id) + [VisualEvent(id: 3, kind: .hire, from: .agent(id), start: 0.1, duration: 0.4)],
+                     now: 0.1)
+        #expect(node.content != before)
         _ = try #require(MapSnapshotter.render(scene: scene, size: scene.size, steps: 60))
         #expect(abs(node.xScale - 1) < 1e-6 && abs(node.alpha - 1) < 1e-6, "the hire settled: \(node.xScale) \(node.alpha)")
         #expect(abs(try #require(node.childNode(withName: ".//trustChipGroup")).xScale - 1) < 1e-6)
-        #expect(node.childNode(withName: ".//barFlash") == nil && node.childNode(withName: ".//hireFlash") == nil)
+        #expect(node.childNode(withName: "barFlash") == nil && node.childNode(withName: ".//hireFlash") == nil)
+    }
+
+    @Test func fitAndFollowWorkAgainAfterTheOwnerPans() throws {
+        let c = Self.controller(40)
+        let scene = OrgScene(size: CGSize(width: 1600, height: 900))
+        scene.update(controller: c, events: [], now: 0)
+        let camera = try #require(scene.camera)
+        let fitCenter = CGPoint(x: scene.contentBounds.midX, y: scene.contentBounds.midY)
+        let fitZoom = scene.zoom
+        let id = try #require(c.synthetic!.agents.first { $0.state != .killed && $0.managerId != nil }?.id)
+        let card = try #require(scene.cardRect(id))
+
+        c.follow(id)
+        scene.update(controller: c, events: [], now: 1.0)
+        scene.update(controller: c, events: [], now: 1.4)
+        #expect(abs(camera.position.x - card.midX) < 0.5 && abs(camera.position.y - card.midY) < 0.5)
+
+        // The owner drags away and zooms out; the followed card is no longer tracked.
+        scene.userMovedCamera()
+        camera.position = CGPoint(x: card.midX + 300, y: card.midY + 120)
+        scene.zoom = 0.4
+        scene.update(controller: c, events: [], now: 2.0)
+        #expect(abs(camera.position.x - (card.midX + 300)) < 0.5)
+
+        // Following the same agent again brings the camera back (`camera` is `.agent(id)` both times).
+        c.follow(id)
+        #expect(c.camera == .agent(id))
+        scene.update(controller: c, events: [], now: 3.0)
+        scene.update(controller: c, events: [], now: 3.4)
+        #expect(abs(camera.position.x - card.midX) < 0.5 && abs(camera.position.y - card.midY) < 0.5)
+        #expect(scene.zoom >= 1 - 1e-9)
+
+        c.zoomToFit()
+        scene.update(controller: c, events: [], now: 4.0)
+        scene.update(controller: c, events: [], now: 4.4)
+        #expect(abs(camera.position.x - fitCenter.x) < 0.5)
+        scene.userMovedCamera()
+        camera.position = CGPoint(x: fitCenter.x + 250, y: fitCenter.y - 90)
+        scene.zoom = 2
+        scene.update(controller: c, events: [], now: 5.0)
+        // Fit again while already fitted: back to the whole chart.
+        c.zoomToFit()
+        #expect(c.camera == .fit)
+        scene.update(controller: c, events: [], now: 6.0)
+        scene.update(controller: c, events: [], now: 6.4)
+        #expect(abs(camera.position.x - fitCenter.x) < 0.5 && abs(camera.position.y - fitCenter.y) < 0.5)
+        #expect(abs(scene.zoom - fitZoom) < 1e-6)
+
+        // Jumping to the same agent twice does the same.
+        c.jump(to: id)
+        scene.update(controller: c, events: [], now: 7.0)
+        scene.update(controller: c, events: [], now: 7.4)
+        scene.userMovedCamera()
+        camera.position = CGPoint(x: card.midX - 400, y: card.midY)
+        c.jump(to: id)
+        scene.update(controller: c, events: [], now: 8.0)
+        scene.update(controller: c, events: [], now: 8.4)
+        #expect(abs(camera.position.x - card.midX) < 0.5)
+    }
+
+    /// A view that mounts on a controller that already ran continues its map time; restarting at 0 would leave the queue's
+    /// entries (start ≈ 100) alive forever and freeze the edges' pulse.
+    @Test func remountedSceneContinuesMapTime() throws {
+        let c = Self.controller(40)
+        c.model.throttle.aggregateEnter = .infinity
+        var traffic = SyntheticTraffic(seed: 4)
+        func burst() -> [MapFact] {
+            traffic.facts(from: Date(timeIntervalSince1970: 0), to: Date(timeIntervalSince1970: 1), agents: c.synthetic!.agents,
+                          rate: 400, burst: nil)
+        }
+        let a = OrgScene(size: CGSize(width: 1600, height: 900))
+        var frame = 0
+        Self.run(a, c, from: 98, to: 100) { now in
+            frame += 1
+            if frame % 10 == 1 { c.model.ingest(burst(), now: now) }
+        }
+        #expect(abs((c.lastFrameTime ?? 0) - 100) < 0.02)
+        #expect(!c.model.active.isEmpty)
+
+        let b = OrgScene(size: CGSize(width: 1600, height: 900))
+        b.present(controller: c)
+        c.model.ingest(burst(), now: 100)
+        var peak = 0
+        var earlyAlpha: CGFloat = 0
+        for k in 0...1800 {
+            // `SKScene.update(_:)` is what a view calls; its clock is unrelated to map time.
+            b.update(7000 + Double(k) / 60)
+            peak = Swift.max(peak, b.particlesInUse)
+            if k == 6 { earlyAlpha = b.glowEdges.map(\.alpha).max() ?? 0 }
+        }
+        #expect(peak > 0, "particles spawn on the remounted scene")
+        #expect(c.model.active.isEmpty, "entries retire: map time kept going")
+        #expect(b.particlesInUse == 0)
+        let lateAlpha = b.glowEdges.map(\.alpha).max() ?? 0
+        #expect(lateAlpha > 0 && lateAlpha < earlyAlpha, "the pulse decays: \(earlyAlpha) then \(lateAlpha)")
+        #expect((c.lastFrameTime ?? 0) > 125)
+    }
+
+    @Test func glowShapesStayWithTheirEdge() throws {
+        let c = Self.controller(40)
+        let scene = OrgScene(size: CGSize(width: 1600, height: 900))
+        let ids = c.synthetic!.agents.filter { $0.state != .killed }.map(\.id).sorted()
+        let (x, y, a, b) = (ids[0], ids[1], ids[ids.count - 2], ids[ids.count - 1])
+        func dm(_ row: Int64, _ from: String, _ to: String) -> MapFact {
+            .message(MessageFlow(rowId: row, messageId: "m\(row)", companyId: "demo", senderId: from, channelId: "c\(row)",
+                                 channelName: "dm", channelKind: .dm, kind: "text", recipientIds: [to], team: nil,
+                                 createdAt: Date(timeIntervalSince1970: 0)))
+        }
+        c.model.ingest([dm(1, a, b)], now: 0)
+        scene.update(controller: c, events: [], now: 0)
+        let key = EdgeKey(.agent(a), .agent(b))
+        let node = try #require(scene.glowShape(key))
+        #expect(!node.isHidden)
+        // Heavier edges that sort before it arrive: its stroke is still its own, not a neighbour's slot.
+        c.model.ingest((2...6).map { dm(Int64($0), x, y) }, now: 0.1)
+        scene.update(controller: c, events: [], now: 0.2)
+        #expect(scene.glowShape(EdgeKey(.agent(x), .agent(y))) != nil)
+        #expect(scene.glowShape(key) === node)
+        #expect(!node.isHidden)
+        #expect(scene.glowEdges.count == 2)
+    }
+
+    @Test func meetingHullFollowsWhateverIsVisible() throws {
+        let c = Self.controller(40)
+        let scene = OrgScene(size: CGSize(width: 1600, height: 900))
+        scene.update(controller: c, events: [], now: 0)
+        let tree = c.model.tree
+        let manager = try #require(tree.order.first { id in
+            id != "owner" && tree.nodes[id]?.tier == .manager && (tree.nodes[id]?.childIds.filter { !$0.hasPrefix("vacancy:") }.count ?? 0) >= 2
+        })
+        let members = Array(tree.nodes[manager]!.childIds.filter { !$0.hasPrefix("vacancy:") }.prefix(2))
+        Self.reapply(c) { $0.meetings = [Meeting(id: "m1", kind: .other, title: "SYNC", participantIds: members)] }
+        Self.run(scene, c, to: 0.3)
+        #expect(scene.meetingHulls["m1"] != nil)
+        // Fold the team: both members stand in as one card, and the hull goes around that card.
+        c.toggleSubtree(manager)
+        Self.run(scene, c, from: 0.3, to: 0.6)
+        let hull = try #require(scene.meetingHulls["m1"], "one visible card still gets a hull")
+        #expect(hull.rect.contains(try #require(scene.cardRect(manager))))
+        // No participant on the chart: no hull.
+        Self.reapply(c, now: 0.7) { $0.meetings = [Meeting(id: "m2", kind: .other, title: "GHOSTS", participantIds: ["nobody"])] }
+        Self.run(scene, c, from: 0.7, to: 1.0)
+        #expect(scene.meetingHulls.isEmpty)
     }
 
     /// A 50 msg/s burst for 60 frames lights the tree: more accent pixels than the static chart.

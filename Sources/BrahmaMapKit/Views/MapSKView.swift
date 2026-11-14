@@ -54,6 +54,15 @@ public struct HoverThrottle: Sendable {
 
     public init(interval: TimeInterval = 1.0 / 30) { self.interval = interval }
 
+    /// Seconds until a hover is allowed again (0 when one is allowed at `t`); the time to wait before flushing the last one.
+    public func remaining(at t: TimeInterval) -> TimeInterval {
+        guard let last, t >= last else { return 0 }
+        return Swift.max(0, interval - (t - last))
+    }
+
+    /// Counts a hover delivered at `t` (the trailing flush) as the last one.
+    public mutating func record(_ t: TimeInterval) { last = t }
+
     /// True when a hover at `t` should be handled. A clock that went backwards lets the event through.
     public mutating func allow(_ t: TimeInterval) -> Bool {
         if let last, t >= last, t - last < interval { return false }
@@ -83,6 +92,9 @@ public final class MapSKView: SKView {
     public var onRemoveVacancy: ((String) -> Void)?
 
     private var hoverThrottle = HoverThrottle()
+    /// The latest hover the throttle held back (view point, and the event time it is due at).
+    private var pendingHover: (point: CGPoint, at: TimeInterval)?
+    private var flushScheduled = false
     private var trackingArea: NSTrackingArea?
     private var drag: (start: CGPoint, camera: CGPoint, moved: Bool)?
     /// Pointer travel below this is a click, not a drag.
@@ -122,12 +134,39 @@ public final class MapSKView: SKView {
     // MARK: Mouse
 
     public override func mouseMoved(with event: NSEvent) {
-        guard hoverThrottle.allow(event.timestamp) else { return }
         let local = convert(event.locationInWindow, from: nil)
-        onHover?(hit(event)?.hit, CGPoint(x: local.x, y: bounds.height - local.y))
+        let wait = hoverThrottle.remaining(at: event.timestamp)
+        if wait <= 0, hoverThrottle.allow(event.timestamp) {
+            pendingHover = nil
+            deliverHover(at: local)
+            return
+        }
+        // Too soon: keep the latest position and deliver it when the interval is up, so the pointer's resting place is
+        // never lost to the throttle.
+        pendingHover = (local, event.timestamp + wait)
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.flushHover() }
+    }
+
+    private func flushHover() {
+        flushScheduled = false
+        guard let pending = pendingHover else { return }
+        pendingHover = nil
+        hoverThrottle.record(pending.at)
+        deliverHover(at: pending.point)
+    }
+
+    private func deliverHover(at local: CGPoint) {
+        var found: MapHit?
+        if let scene {
+            found = interactive?.hit(at: scene.convertPoint(fromView: local))
+        }
+        onHover?(found, CGPoint(x: local.x, y: bounds.height - local.y))
     }
 
     public override func mouseExited(with event: NSEvent) {
+        pendingHover = nil
         onHover?(nil, nil)
     }
 

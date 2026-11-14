@@ -6,6 +6,7 @@ import BrahmaCore
 extension MapController {
     /// Keeps `agentId` in view; nil, or an agent not on the map, goes back to the whole chart.
     public func follow(_ agentId: String?) {
+        cameraRequest += 1
         guard let agentId, model.agents[agentId] != nil else {
             self.follow = nil
             camera = .fit
@@ -17,6 +18,7 @@ extension MapController {
 
     /// The whole chart in view; stops following.
     public func zoomToFit() {
+        cameraRequest += 1
         self.follow = nil
         camera = .fit
     }
@@ -46,6 +48,7 @@ extension MapController {
     /// not on the map is ignored.
     public func jump(to agentId: String) {
         guard model.agents[agentId] != nil else { return }
+        cameraRequest += 1
         highlightId = agentId
         highlightStartedAt = nil
         camera = .agent(agentId)

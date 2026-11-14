@@ -76,6 +76,10 @@ public final class MapController {
     public var hoveredAgentId: String?
     public var selectedManagerId: String?
     public internal(set) var camera: CameraTarget = .fit
+    /// Bumped by every `follow`, `zoomToFit` and `jump(to:)`, even when `camera` ends up equal to what it was: the view eases
+    /// to the target again (after the owner panned away) when this changes. Setting an Equatable value to itself is not a
+    /// change to Observation, so `camera` alone cannot say "go there again".
+    public internal(set) var cameraRequest = 0
     public internal(set) var follow: String?
     public internal(set) var replay: ReplayState?
     public internal(set) var searchHits: [String] = []
@@ -183,6 +187,10 @@ public final class MapController {
     public func toggleSubtree(_ id: String) {
         orgOverrides[id] = collapsed.contains(id)
     }
+
+    /// The `now` of the last `frame(now:)`, or nil before the first. A view that mounts on a controller that has already been
+    /// framed continues from here, so map time never runs backwards (queue entries and edge decay live on it).
+    public var lastFrameTime: TimeInterval? { lastFrameNow }
 
     /// Map time (the renderer's `frame(now:)` base), extrapolated from the last frame with the clock; before any frame,
     /// seconds since the controller was made.
