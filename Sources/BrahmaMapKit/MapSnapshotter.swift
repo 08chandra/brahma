@@ -37,6 +37,11 @@ public enum MapSnapshotter {
         Self.queue = queue
         guard let targets = targets(width: width, height: height, device: device) else { return nil }
 
+        // `SKRenderer` treats the viewport as a 2× backing store: a `.resizeFill` scene (what a live `SKView` wants) would be
+        // resized to half the size and drawn twice as large. The scene keeps its own size and fills the target 1:1 instead.
+        let scaleMode = scene.scaleMode
+        scene.scaleMode = .aspectFill
+        defer { scene.scaleMode = scaleMode }
         let renderer = SKRenderer(device: device)
         renderer.scene = scene
         let viewport = CGRect(x: 0, y: 0, width: width, height: height)
