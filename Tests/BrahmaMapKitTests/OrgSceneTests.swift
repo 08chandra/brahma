@@ -302,6 +302,104 @@ import AppKit
         #expect(abs(node.position.y - newRect.midY) < 0.5, "y \(node.position.y) vs \(newRect.midY)")
     }
 
+    /// A live update (an item changing) reconfigures a card; it must not cancel or strand a reorg glide in flight.
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))
+    func contentChangeMidGlideStillArrives() throws {
+        let made = SyntheticCompany.make(agents: 40)
+        func model(_ agents: [Agent], items: [String: String] = [:]) -> MapModel {
+            var m = MapModel()
+            m.apply(MapInputs(agents: agents, pack: made.pack, currentItems: items, vacancies: made.vacancies), now: 0)
+            return m
+        }
+        let before = model(made.agents)
+        let scene = Self.scene(before)
+        let tree = before.tree
+        let leaf = try #require(tree.order.last { id in
+            id != "owner" && !id.hasPrefix("vacancy:") && (tree.nodes[id]?.childIds.isEmpty ?? false)
+                && before.agents[id]?.state != .killed })
+        let newManager = try #require(tree.order.first { id in
+            id != "owner" && id != tree.nodes[leaf]?.parentId && tree.nodes[id]?.tier == .manager && !(tree.nodes[id]?.childIds.isEmpty ?? true) })
+        var agents = made.agents
+        agents[try #require(agents.firstIndex { $0.id == leaf })].managerId = newManager
+
+        let node = try #require(scene.cardNode(leaf))
+        let oldRect = try #require(scene.cardRect(leaf))
+        scene.rebuild(model: model(agents), collapsed: [])
+        let newRect = try #require(scene.cardRect(leaf))
+        _ = try #require(MapSnapshotter.render(scene: scene, size: scene.size, steps: 10))
+        let mid = node.position
+        #expect(mid != CGPoint(x: oldRect.midX, y: oldRect.midY) && mid != CGPoint(x: newRect.midX, y: newRect.midY),
+                "the glide is under way")
+
+        // The same card gets a current item mid-glide: same layout, new content.
+        let contentBefore = node.content
+        scene.rebuild(model: model(agents, items: [leaf: "BRH-9 A fresh item"]), collapsed: [])
+        #expect(node.content != contentBefore, "the card was reconfigured")
+        #expect(node === scene.cardNode(leaf))
+        _ = try #require(MapSnapshotter.render(scene: scene, size: scene.size, steps: 36))
+        #expect(abs(node.position.x - newRect.midX) < 0.5, "x \(node.position.x) vs \(newRect.midX)")
+        #expect(abs(node.position.y - newRect.midY) < 0.5, "y \(node.position.y) vs \(newRect.midY)")
+    }
+
+    @Test func pulseSurvivesUnrelatedContentChange() throws {
+        var ids: [String] = []
+        func model(item: String?) -> MapModel {
+            let made = SyntheticCompany.make(agents: 12)
+            var agents = made.agents
+            ids = agents.map(\.id)
+            agents[1].state = .running; agents[1].paused = false
+            var m = MapModel()
+            m.apply(MapInputs(agents: agents, pack: made.pack, currentItems: item.map { [agents[1].id: $0] } ?? [:]), now: 0)
+            return m
+        }
+        let scene = Self.scene(model(item: nil))
+        let card = try #require(scene.cardNode(ids[1]))
+        let bar = card.statusBar
+        #expect(bar.action(forKey: OrgCardNode.pulseKey) != nil)
+        scene.rebuild(model: model(item: "BRH-1 something"), collapsed: [])
+        #expect(card.content != nil)
+        #expect(card.statusBar === bar, "the running bar and its pulse carry over")
+        #expect(bar.action(forKey: OrgCardNode.pulseKey) != nil)
+        #expect(bar.parent === card)
+    }
+
+    @Test func bandsNeverTouchEachOtherOrForeignCards() throws {
+        let model = Self.model(agents: 40)
+        let scene = Self.scene(model)
+        let bands = scene.bandRects.sorted { $0.key < $1.key }
+        #expect(bands.count >= 3)
+        for (i, a) in bands.enumerated() {
+            for b in bands[(i + 1)...] where !a.value.contains(b.value) && !b.value.contains(a.value) {
+                #expect(!a.value.insetBy(dx: -3, dy: -3).intersects(b.value), "\(a.key) and \(b.key) are less than 6 pt apart")
+            }
+            // Only the manager's own subtree may lie inside its band.
+            var subtree: Set<String> = [a.key]
+            var walk = model.tree.nodes[a.key]?.childIds ?? []
+            while let id = walk.popLast() { subtree.insert(id); walk.append(contentsOf: model.tree.nodes[id]?.childIds ?? []) }
+            for id in scene.cardIds where !subtree.contains(id) {
+                let r = try #require(scene.cardRect(id))
+                #expect(!a.value.intersects(r), "\(id) overlaps the band of \(a.key)")
+            }
+        }
+    }
+
+    @Test func vacancyTitleCentersWhileNoteIsHidden() throws {
+        let made = SyntheticCompany.make(agents: 40)
+        var vacancy = try #require(made.vacancies.first)
+        vacancy.note = "Backfill for the platform team"
+        var model = MapModel()
+        model.apply(MapInputs(agents: made.agents, pack: made.pack, vacancies: [vacancy]), now: 0)
+        let scene = Self.scene(model)
+        let card = try #require(scene.cardNode("vacancy:\(vacancy.id)"))
+        let title = try #require(card.vacancyTitle)
+        scene.zoom = 1.0
+        #expect(card.itemLine.isHidden); #expect(title.position.y == 0, "the lone title is centered")
+        scene.zoom = 1.5
+        #expect(!card.itemLine.isHidden); #expect(title.position.y == 6, "title makes room for the note")
+        scene.zoom = 0.4
+        #expect(title.position.y == 0)
+    }
+
     // MARK: - Snapshots
 
     @Test func dottedLinesDrawOneBatchedSpritePerKind() throws {

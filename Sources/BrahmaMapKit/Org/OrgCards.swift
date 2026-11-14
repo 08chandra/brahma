@@ -11,7 +11,8 @@ import BrahmaAppModel
 /// item or a vacancy's note) shows from `OrgScene.itemZoom`.
 ///
 /// Every string that reaches a texture goes through `fit`, which is `MapText.clean` with a cluster cap chosen to fit the
-/// card; the model's strings are clean already, and the fixed labels (`BOARD`, `▸ 3 REPORTS`) pass the same gate.
+/// card: handles, roles, items, notes, trust labels and perk emoji (the model cleaned them already; this is the second
+/// gate), and the fixed labels (`BOARD`, `▸ 3 REPORTS`).
 @MainActor
 final class OrgCardNode: SKNode {
     struct Segment: Equatable {
@@ -37,6 +38,11 @@ final class OrgCardNode: SKNode {
     let details = SKNode()
     let itemLine = SKNode()
     private var isBoard = false
+    /// A vacancy's title label (centered while the note is hidden).
+    private(set) var vacancyTitle: SKSpriteNode?
+    private var vacancyHasNote = false
+    /// The previous status bar of a card that stays running, carried over so its pulse keeps its phase.
+    private var reusableBar: SKSpriteNode?
 
     override init() {
         super.init()
@@ -48,10 +54,18 @@ final class OrgCardNode: SKNode {
 
     // MARK: Configure
 
-    /// Rebuilds the sprites when `content` changed; a no-op otherwise.
+    /// Rebuilds the sprites when `content` changed; a no-op otherwise. The node's own actions (a reorg glide) are left
+    /// alone: a live update must never cancel or strand one. A running agent whose card stays running keeps its status
+    /// bar, so the pulse does not restart on an unrelated change.
     func configure(_ content: Content, zoom: Double) {
         guard content != self.content else { setZoom(zoom); return }
-        reset()
+        var keptBar: SKSpriteNode?
+        if case .agent(let old, _)? = self.content, case .agent(let new, _) = content,
+           Self.displayState(old) == .running, Self.displayState(new) == .running {
+            keptBar = statusBar
+        }
+        clear()
+        reusableBar = keptBar
         self.content = content
         switch content {
         case .agent(let agent, let expanded): buildAgent(agent, expanded: expanded)
@@ -59,12 +73,18 @@ final class OrgCardNode: SKNode {
         case .vacancy(let title, let note): buildVacancy(title: title, note: note)
         case .stub(let count, let segments): buildStub(count: count, segments: segments)
         }
+        reusableBar = nil
         setZoom(zoom)
     }
 
-    /// Back to a blank node, ready for the pool.
+    /// Back to a blank node, ready for the pool: also drops the node's actions (the glide).
     func reset() {
         removeAllActions()
+        clear()
+    }
+
+    /// Drops every sprite and the content, keeping the node's actions.
+    private func clear() {
         removeAllChildren()
         details.removeAllChildren()
         itemLine.removeAllChildren()
@@ -73,6 +93,7 @@ final class OrgCardNode: SKNode {
         content = nil
         border = SKSpriteNode()
         statusBar = SKSpriteNode()
+        vacancyTitle = nil
     }
 
     /// The text level of detail and (for Board) the zoom-compensated border.
@@ -80,6 +101,8 @@ final class OrgCardNode: SKNode {
         details.isHidden = zoom < OrgScene.textZoom
         itemLine.isHidden = zoom < OrgScene.itemZoom
         if isBoard { sizeBoardBorder(zoom) }
+        // A vacancy's title sits above its note; with the note hidden it centers.
+        vacancyTitle?.position.y = vacancyHasNote && zoom >= OrgScene.itemZoom ? 6 : 0
     }
 
     // MARK: Agent
@@ -98,10 +121,11 @@ final class OrgCardNode: SKNode {
         border.name = "border"
         addChild(border)
         addChild(rect(ThemeHex.bg2, w - 2, h - 2, name: "fill"))
-        statusBar = rect(ThemeHex.status(agent.state, paused: agent.paused), 3, h - 2, at: CGPoint(x: -w / 2 + 2.5, y: 0))
+        let kept = reusableBar
+        statusBar = kept ?? rect(ThemeHex.status(agent.state, paused: agent.paused), 3, h - 2, at: CGPoint(x: -w / 2 + 2.5, y: 0))
         statusBar.name = "statusBar"
         addChild(statusBar)
-        if state == .running {
+        if state == .running, kept == nil {
             let pulse = SKAction.sequence([
                 .fadeAlpha(to: 0.6, duration: 0.5),
                 .fadeAlpha(to: 1.0, duration: 0.5),
@@ -133,7 +157,7 @@ final class OrgCardNode: SKNode {
         var roleRight = right
         var perkX = right
         for perk in agent.perks.prefix(2).reversed() {
-            let texture = LabelTextures.shared.emoji(perk, size: 10)
+            let texture = LabelTextures.shared.emoji(Self.fit(perk, width: 16, size: 10, mono: false), size: 10)
             let sprite = SKSpriteNode(texture: texture, size: Self.points(texture))
             sprite.anchorPoint = CGPoint(x: 1, y: 0.5)
             sprite.position = CGPoint(x: perkX + 1, y: -1)
@@ -234,7 +258,10 @@ final class OrgCardNode: SKNode {
         addChild(itemLine)
         let left = -w / 2 + 8
         let text = Self.fit(("OPEN · " + title).uppercased(), width: w - 16, size: 10, mono: true)
-        details.addChild(label(text, size: 10, mono: true, color: ThemeHex.text2, left: left, y: note.isEmpty ? 0 : 6))
+        let titleSprite = label(text, size: 10, mono: true, color: ThemeHex.text2, left: left, y: 0)
+        details.addChild(titleSprite)
+        vacancyTitle = titleSprite
+        vacancyHasNote = !note.isEmpty
         if !note.isEmpty {
             itemLine.addChild(label(Self.fit(note, width: w - 16, size: 9, mono: true), size: 9, mono: true,
                                     color: ThemeHex.text2, left: left, y: -7))
