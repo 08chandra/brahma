@@ -17,8 +17,10 @@ public enum MemoryIngest {
     public static let overlap: TimeInterval = 60
     /// At most this many batches per source per run, so a full re-scan never holds a tick; the rest follows next tick.
     static let maxBatchesPerRun = 20
-    /// The most of a hand-off file that is indexed.
-    static let handoffReadLimit = 65_536
+    /// The most of a hand-off file that is indexed, in bytes.
+    public static let maxHandoffBytes = 65_536
+    /// An item's body holds its newest this-many comments.
+    public static let itemComments = 50
 
     /// The `memoryCursor.source` of each cursor.
     enum Cursor: String, CaseIterable {
@@ -40,11 +42,10 @@ public enum MemoryIngest {
         return total
     }
 
-    /// After a restore (`RestoreHooks.afterRestore`): every cursor of the company back to `""`, a full idempotent re-scan.
-    public static func resetCursors(store: Store, companyId: String) throws {
-        try store.writer.write { db in
-            try db.execute(sql: "UPDATE memoryCursor SET position = '' WHERE companyId = ?", arguments: [companyId])
-        }
+    /// After a restore (`RestoreHooks.afterRestore`): every `memoryCursor` row, of every company, back to `""`, a full
+    /// idempotent re-scan. A restore swaps the whole database, so no company's cursor is kept.
+    public static func resetCursors(store: Store) throws {
+        try store.writer.write { db in try db.execute(sql: "UPDATE memoryCursor SET position = ''") }
     }
 
     /// The stored cursor, `""` when none.
@@ -86,6 +87,11 @@ public enum MemoryIngest {
     /// A `(ts, id)` source. `select` names its rows' `cursorTs` and `cursorId` and ends in a `WHERE` with `companyId = ?` as
     /// its only argument; `ts`/`id` are the column expressions behind them. The first batch of a run starts `overlap` before
     /// the cursor; later ones strictly after it.
+    ///
+    /// An idle source opens no write transaction. The check is a read: work is due when the cursor is empty or unreadable
+    /// (and the source has rows), when a row is strictly after the cursor, or while the overlap window is still open on the
+    /// engine's clock (`now < cursorTs + overlap`: a row stamped up to `overlap` before the cursor may still commit late).
+    /// Once the window has closed and nothing is newer, the tick costs one indexed read.
     static func pairSource(store: Store, companyId: String, cursor: Cursor, select: String, ts: String, id: String,
                            now: Date, process: (Batch, [Row]) throws -> Int) throws -> Int {
         func fetch(_ db: Database, overlapped: Bool, limit: Int) throws -> [Row] {
@@ -100,8 +106,16 @@ public enum MemoryIngest {
             return try Row.fetchAll(db, sql: "\(select) AND (\(ts) > ? OR (\(ts) = ? AND \(id) > ?)) ORDER BY \(ts), \(id) LIMIT ?",
                                     arguments: [companyId, at.ts, at.ts, at.id, limit])
         }
-        // Nothing to look at: no write transaction.
-        guard try !store.writer.read({ db in try fetch(db, overlapped: true, limit: 1) }).isEmpty else { return 0 }
+        func workDue(_ db: Database) throws -> Bool {
+            if let at = parsePair(try position(db: db, companyId: companyId, cursor)), let date = storedDate(at.ts),
+               now < date.addingTimeInterval(overlap) {
+                return true
+            }
+            // Strictly after the cursor (every row, for an empty or unreadable one).
+            return try !fetch(db, overlapped: false, limit: 1).isEmpty
+        }
+        // Nothing new and the overlap window closed: no write transaction.
+        guard try store.writer.read({ db in try workDue(db) }) else { return 0 }
         var total = 0
         for n in 0..<maxBatchesPerRun {
             let (count, done) = try store.writer.write { db -> (Int, Bool) in
@@ -127,6 +141,10 @@ public enum MemoryIngest {
 
     /// An INTEGER-id source: rows with `id > cursor`, up to the table's newest id when the read began (so a filtered source
     /// never rescans the rows it skipped). `select` ends in a `WHERE` with `companyId = ?` as its only argument.
+    ///
+    /// An idle source opens no write transaction. The check is a read: work is due when a row of the company's selection is
+    /// after the cursor, or when the table has moved `batch` ids past it (other companies' rows, filtered-out rows), which
+    /// moves the cursor up so the read's range stays short. Otherwise the cursor stays put and the tick costs one read.
     static func idSource(store: Store, companyId: String, cursor: Cursor, table: String, select: String, now: Date,
                          process: (Batch, [Row]) throws -> Int) throws -> Int {
         func bounds(_ db: Database) throws -> (after: Int64, upTo: Int64) {
@@ -135,7 +153,13 @@ public enum MemoryIngest {
             let upTo = try Int64.fetchOne(db, sql: "SELECT MAX(id) FROM \(table)") ?? 0
             return (after, upTo)
         }
-        guard try store.writer.read({ db in let b = try bounds(db); return b.upTo > b.after }) else { return 0 }
+        let due = try store.writer.read { db -> Bool in
+            let b = try bounds(db)
+            guard b.upTo > b.after else { return false }
+            if b.upTo - b.after >= Int64(batch) { return true }
+            return try Row.fetchOne(db, sql: "\(select) AND id > ? AND id <= ? LIMIT 1", arguments: [companyId, b.after, b.upTo]) != nil
+        }
+        guard due else { return 0 }
         var total = 0
         for _ in 0..<maxBatchesPerRun {
             let (count, done) = try store.writer.write { db -> (Int, Bool) in
@@ -207,12 +231,12 @@ public enum MemoryIngest {
         }
     }
 
-    /// One item: `<KEY> <title>`, its description, acceptance criteria, submit summary and newest 50 comments.
+    /// One item: `<KEY> <title>`, its description, acceptance criteria, submit summary and newest `itemComments` comments.
     static func ingestItem(_ batch: Batch, itemId: String) throws {
         let db = batch.db
         guard let item = try WorkItem.fetchOne(db, key: itemId), item.companyId == batch.companyId else { return }
         let events = try WorkItemEvent.filter(Column("itemId") == item.id).order(Column("id")).fetchAll(db)
-        let comments = events.filter { $0.kind == .commented }.suffix(50)
+        let comments = events.filter { $0.kind == .commented }.suffix(itemComments)
         var parts: [String] = []
         if !item.description.isEmpty { parts.append(item.description) }
         if !item.acceptanceCriteria.isEmpty { parts.append("Acceptance criteria:\n" + item.acceptanceCriteria) }
@@ -292,6 +316,11 @@ public enum MemoryIngest {
     }
 
     /// Mechanical decisions: the `approval` activity lines `Recorded: …`.
+    ///
+    /// The author (and so the provenance) is the requester `Store.recordMechanicalDecision` wrote: the line's `agentId` when
+    /// an agent recorded it. Without one, the engine-built `Recorded: <kind> by @<handle>: ` head names the requester, read
+    /// before the agent-written title: `@owner` is the owner (`.owner`), anything else the engine (`system`, `.engine`).
+    /// Today only `Sender.system` writes a line without an agent (the owner files no asks), so that is `.engine`.
     static func decisions(store: Store, companyId: String, now: Date) throws -> Int {
         let prefix = "Recorded: "
         return try idSource(store: store, companyId: companyId, cursor: .decision, table: "activityEvent", select: """
@@ -301,7 +330,7 @@ public enum MemoryIngest {
             for row in rows {
                 let id: Int64 = row["id"], text: String = row["text"], createdAt: Date = row["createdAt"]
                 let agentId: String? = row["agentId"]
-                let author = agentId ?? "system"
+                let author = agentId ?? decisionAuthor(text: text, prefix: prefix)
                 let taint = try batch.taint(author: author, at: createdAt, marked: false)
                 try batch.ingest(MemoryIngestDoc(
                     companyId: companyId, source: .decision, sourceId: String(id), ref: "decision:\(id)",
@@ -311,6 +340,13 @@ public enum MemoryIngest {
             }
             return rows.count
         }
+    }
+
+    /// The requester of an agent-less `Recorded: <kind> by @<handle>: <title>` line: `owner` or `system`.
+    static func decisionAuthor(text: String, prefix: String) -> String {
+        let head = text.dropFirst(prefix.count)
+        guard let by = head.range(of: " by @"), let colon = head[by.upperBound...].firstIndex(of: ":") else { return "system" }
+        return head[by.upperBound..<colon] == "owner" ? "owner" : "system"
     }
 
     /// Hand-off files, read only through `EngineFiles.readNoFollow` under `<ws>/.brahma/handoffs`: a link, a hard link, a file
@@ -327,7 +363,7 @@ public enum MemoryIngest {
                 let handoff = try Handoff(row: row)
                 let key: String = row["itemKey"]
                 let url = URL(fileURLWithPath: handoff.path)
-                guard let data = EngineFiles.readNoFollow(url, under: root, limit: handoffReadLimit) else {
+                guard let data = EngineFiles.readNoFollow(url, under: root, limit: maxHandoffBytes) else {
                     try batch.noteOnce("skipped hand-off \(handoff.path): not a regular single-link file inside .brahma/handoffs")
                     continue
                 }
