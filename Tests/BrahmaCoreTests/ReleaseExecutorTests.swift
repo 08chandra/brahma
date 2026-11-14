@@ -414,6 +414,7 @@ import Glibc
         #expect(!(try fx.activity().contains { $0.contains(": deploying") }))
         for call in fx.sandbox.calls { #expect(!call.environment.values.contains { $0.contains(rotated) || $0.contains(Self.token) }) }
         #expect(try fx.notices().contains { $0.title == "Release 0.1.0 failed" && $0.body.hasPrefix("Nothing was deployed:") })
+        #expect(try fx.bugs().isEmpty, "the token is the owner's (m4)")
 
         // A new value stored but not yet reloaded (a reload pending): refused the same way.
         let pending = try Fx()
@@ -482,6 +483,7 @@ import Glibc
         let r = try fx.reload(approved)
         #expect(r.status == .failed)
         #expect(r.failedReason == "the smoke check failed at \(r.sha7) just before deploying")
+        #expect(r.deployStartedAt == nil, "it never reached the deploy step (m1)")
         // Nothing built, staged or deployed; no backup refs moved.
         #expect(fx.sandbox.calls.isEmpty); #expect(fx.unsandboxed.calls.isEmpty)
         #expect(try fx.ref("refs/brahma/main-backup") == nil)
@@ -521,6 +523,62 @@ import Glibc
         #expect(r.failedReason == "R-1's commit is no longer on main")
         #expect(try fx.releaseSmokes().isEmpty)
         #expect(fx.sandbox.calls.isEmpty)
+        #expect(try fx.bugs().isEmpty, "nothing for agents to fix (m4)")
+    }
+
+    /// Final-review I1: a merge that lands while the release's smoke on main waits for the company's smoke slot (held by the
+    /// merge smoke of the newest main, the normal case right after a merge) does not fail the approved release: inside the
+    /// slot the commit is checked again against the new engine-accepted main, and the smoke runs at the release's commit.
+    @Test func mergeDuringSmokeSlotWaitStillDeploys() async throws {
+        let fx = try Fx(build: "mkdir -p dist && cp page.txt dist/index.html", files: ["page.txt": "v1 Lumen\n"])
+        let approved = try fx.proposeAndApprove()
+        let slots = fx.w.orchestrator.smokeSlots
+        let held = Gate(), release = Gate()
+        let holder = Task { await slots.withSlot(fx.company.id) { held.open(); await release.wait() } }
+        await held.wait()
+        let running = Task { await fx.executor.advance(now: fx.w.clock.now) }
+        await slots.untilWaiting(fx.company.id)
+        // The executor read main and checked the commit before it asked for the slot; main moves on now.
+        let newer = try fx.merge(["page.txt": "v2 Lumen\n"])
+        #expect(newer != approved.commit)
+        release.open()
+        await holder.value
+        await running.value
+        let r = try fx.reload(approved)
+        #expect(r.status == .deployed, "\(r.failedReason ?? "")")
+        #expect(try fx.releaseSmokes().map(\.commit) == [approved.commit])
+        #expect(try fx.releaseSmokes().map(\.status) == [.passed])
+        #expect(try String(contentsOf: fx.hostRoot.appending(path: "R-1/dist/index.html"), encoding: .utf8) == "v1 Lumen\n")
+        #expect(try fx.bugs().isEmpty)
+    }
+
+    /// Final-review m2 (§6.26): the smoke check on main and the deployed site's smoke requests and expected text are pinned
+    /// to the release when it is proposed; a change after the owner's approval refuses the release before anything runs.
+    @Test func smokeChecksChangedAfterApprovalRefused() async throws {
+        let fx = try Fx()
+        let approved = try fx.proposeAndApprove()
+        try fx.store.setSmokeCheck(companyId: fx.company.id, by: fx.devops.id, check: CheckSpec(command: "true # weaker"),
+                                   now: fx.w.clock.now)
+        await fx.advance()
+        let r = try fx.reload(approved)
+        #expect(r.status == .failed)
+        #expect(r.failedReason == "the smoke check changed after approval; propose again")
+        #expect(try fx.releaseSmokes().isEmpty, "the changed check never ran for the release")
+        #expect(fx.smokeSandbox.calls.isEmpty); #expect(fx.sandbox.calls.isEmpty)
+        #expect(try fx.bugs().isEmpty)
+        #expect(try fx.notices().contains { $0.title == "Release 0.1.0 failed" && $0.body.hasPrefix("Nothing was deployed:") })
+
+        // The deployed site's smoke: the expected text changed after approval.
+        let site = try Fx()
+        let pending = try site.proposeAndApprove()
+        try site.store.setDeployConfig(companyId: site.company.id, by: site.devops.id, build: ReleaseExecutorTests.build, outputDir: "dist",
+                                       smoke: [], expectText: nil, now: site.w.clock.now)
+        await site.advance()
+        let refused = try site.reload(pending)
+        #expect(refused.status == .failed)
+        #expect(refused.failedReason == "the deployed site's smoke check changed after approval; propose again")
+        #expect(site.sandbox.calls.isEmpty, "nothing built or deployed")
+        #expect(site.http.requests.isEmpty)
     }
 
     @Test func buildRewritingGitIgnored() async throws {
@@ -562,8 +620,9 @@ import Glibc
         #expect(refused.status == .failed)
         #expect(refused.failedReason == "the approved commands no longer match; propose again")
         #expect(edited.sandbox.calls.isEmpty)
-        #expect(try edited.bugs().map(\.title)
-                == ["Release 0.1.0 failed: integrity (the hosting settings or the stored plan changed since approval)"])
+        // An integrity refusal is the owner's (m4): told, no bug for agents.
+        #expect(try edited.bugs().isEmpty)
+        #expect(try edited.notices().contains { $0.title == "Release 0.1.0 failed" && $0.body.hasPrefix("Nothing was deployed:") })
 
         // The owner changed the account after approval: the plan renders differently, fail closed (ruling 2).
         let moved = try Fx()
@@ -601,7 +660,8 @@ import Glibc
         #expect(try ReleaseExecutor.renderPlan(store: fx.store, release: r2, adapter: cf) != r2.plan)
     }
 
-    @Test func failedDeployFilesBugAndNotifies() async throws {
+    @Test func failedDeployNotifiesOwnerOnly() async throws {
+        // Final-review m4: a failed provider step is not something agents can fix: the owner is told, no bug is filed.
         let fx = try Fx(configure: { $0.exitCode = 3 })
         let approved = try fx.proposeAndApprove()
         await fx.advance()
@@ -609,13 +669,11 @@ import Glibc
         #expect(r.status == .failed)
         #expect(r.failedReason == "the deploy step failed (exit 3)")
         #expect(r.outputTail?.contains("https://fake-r-1.local") == true)
-        let bug = try #require(try fx.bugs().first)
-        #expect(try fx.bugs().count == 1)
-        #expect(bug.title == "Release 0.1.0 failed: deploy (exit 3)")
-        #expect(bug.priority == 1); #expect(bug.checkSpec == nil); #expect(bug.status == .ready)
+        #expect(try fx.bugs().isEmpty, "\((try? fx.bugs().map(\.title)) ?? [])")
         #expect(try fx.notices().contains {
-            $0.title == "Release 0.1.0 failed" && $0.body == "Run brahma release rollback Lumen R-1 or use Roll back in Releases."
-        })
+            $0.title == "Release 0.1.0 failed" && $0.body == "Run brahma release rollback Lumen R-1 (puts the placeholder page back) or use Roll back in Releases."
+        }, "\((try? fx.notices().map(\.body)) ?? [])")
+        #expect(r.deployStartedAt != nil, "the deploy step started (m1)")
         // No smoke of the site after a failed deploy.
         #expect(fx.http.requests.isEmpty)
     }
@@ -629,7 +687,10 @@ import Glibc
         #expect(r.deployURL == "https://fake-r-1.local")
         #expect(r.smokeStatus == "failed"); #expect(r.smokeResults.first?.ok == false)
         #expect(fx.http.requests.count == DeploySmoke.attempts)
+        // The deployed site failing its smoke is the agents' to fix (m4): a P1 bug.
+        let bug = try #require(try fx.bugs().first)
         #expect(try fx.bugs().map(\.title) == ["Release 0.1.0 failed: smoke (GET /: the page does not contain the expected text)"])
+        #expect(bug.priority == 1); #expect(bug.checkSpec == nil); #expect(bug.status == .ready)
     }
 
     // MARK: Rulings
@@ -660,7 +721,8 @@ import Glibc
         #expect(reason.hasPrefix("refusing to deploy: ") && reason.hasSuffix("/.git would configure the provider CLI"), "\(reason)")
         #expect(try fx.deploySteps().isEmpty)
         for call in fx.sandbox.calls { #expect(call.environment["CLOUDFLARE_API_TOKEN"] == nil) }
-        #expect(try fx.bugs().first?.title.hasPrefix("Release 0.1.0 failed: deploy (provider config)") == true)
+        #expect(try fx.bugs().isEmpty, "provider config is the owner's (m4)")
+        #expect(try fx.notices().contains { $0.title == "Release 0.1.0 failed" })
     }
 
     @Test func deployURLVerifiedWithTheToken() async throws {
@@ -720,7 +782,7 @@ import Glibc
         #expect(fx.calls(in: fx.export(r), of: fx.unsandboxed).count == 1)
         #expect(fx.unsandboxed.calls.count == 1)
         #expect(fx.sandbox.calls.isEmpty)
-        #expect(try fx.bugs().map(\.title) == ["Release 0.1.0 failed: deploy (sandbox unavailable)"])
+        #expect(try fx.bugs().isEmpty, "the machine's sandbox is the owner's (m4)")
         #expect(!FileManager.default.fileExists(atPath: fx.hostRoot.appending(path: "R-1").path))
     }
 

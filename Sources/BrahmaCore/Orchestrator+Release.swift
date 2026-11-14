@@ -57,14 +57,40 @@ extension Orchestrator {
 
     /// `runSmoke` as a value, built from this engine's parts only (no reference to the orchestrator): what the release
     /// executor runs its release smoke through (carried-forward ruling 1), so both share one path, slot, `Blocking` and clock.
+    ///
+    /// Final-review I1: a release smoke usually waits for the slot behind the merge smoke of the newest `main`, and agents
+    /// keep merging meanwhile. Inside the slot the engine-accepted main is read again; when it moved, the release's commit
+    /// must still be its ancestor (`merge-base --is-ancestor`, else `"<sha7> is no longer on the engine-accepted main"`), and
+    /// the smoke runs with that main as `acceptedMain`. A merge landing between that read and the claiming write is retried
+    /// the same way, up to `ReleasePolicy.mainMovedAttempts` times.
     static func smokeEntry(store: Store, checks: SmokeChecks, slots: SmokeSlots, blocking: Blocking,
                            clock: @escaping @Sendable () -> Date, engineId: String)
         -> @Sendable (String, String, MainSmokeReason, String?, String?) async throws -> MainSmokeRun {
         { companyId, commit, reason, releaseId, acceptedMain in
             try await EngineGitGuard.$engine.withValue(engineId) {
                 try await slots.withSlot(companyId) {
-                    try await store.runSmoke(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId,
-                                             acceptedMain: acceptedMain, checks: checks, blocking: blocking, clock: clock)
+                    guard reason == .release, var accepted = acceptedMain else {
+                        return try await store.runSmoke(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId,
+                                                        acceptedMain: acceptedMain, checks: checks, blocking: blocking, clock: clock)
+                    }
+                    var attempt = 0
+                    while true {
+                        attempt += 1
+                        if let company = try store.company(id: companyId), let current = company.mainCommit, current != accepted {
+                            let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+                            let onMain = await blocking.run {
+                                (try? store.gitWorkspace(root: root, companyId: companyId).isAncestor(commit, of: current)) ?? false
+                            }
+                            guard onMain else { throw WorkError.invalid(Store.noLongerOnMain(commit)) }
+                            accepted = current
+                        }
+                        do {
+                            return try await store.runSmoke(companyId: companyId, commit: commit, reason: reason, releaseId: releaseId,
+                                                            acceptedMain: accepted, checks: checks, blocking: blocking, clock: clock)
+                        } catch let e as WorkError where e == .invalid(Store.notMain(commit)) && attempt < ReleasePolicy.mainMovedAttempts {
+                            continue
+                        }
+                    }
                 }
             }
         }

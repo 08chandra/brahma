@@ -37,6 +37,8 @@ struct FakeHostingAdapter: HostingAdapter {
     var rollbackEnv: [String: String] = [:]
     /// What `fake project ls` lists (Task 15: the provider probe's leftover check).
     var projects: [String] = []
+    /// `smokeBase` as Vercel's (final-review I6b): the owner's production URL, else the deploy URL it is given, else nil.
+    var smokesDeployURL = false
 
     static let installIsNoOp = false
 
@@ -83,7 +85,10 @@ struct FakeHostingAdapter: HostingAdapter {
         fromOutput.split(whereSeparator: \.isNewline).last { $0.hasPrefix("https://fake-") }.flatMap { URL(string: String($0)) }
     }
 
-    func smokeBase(_ s: HostingSettings, deployURL: URL?) -> URL? { server }
+    func smokeBase(_ s: HostingSettings, deployURL: URL?) -> URL? {
+        guard smokesDeployURL else { return server }
+        return s.productionURL.flatMap { URL(string: $0) } ?? deployURL
+    }
 
     func verifiesDeployment(output: String, settings: HostingSettings) -> Bool {
         output.split(whereSeparator: \.isNewline).contains { $0 == "project \(settings.project)" }

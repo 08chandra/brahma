@@ -99,7 +99,7 @@ import BrahmaCore
         try Self.release(w2, 1, .proposed)
         await w2.refresh()
         await w2.model.rollback(releaseRef: "R-1")
-        #expect(w2.model.errorMessage == "R-1 is proposed; only deployed or failed releases roll back")
+        #expect(w2.model.errorMessage == "R-1 is proposed; only deployed, interrupted or failed releases roll back")
     }
 
     @Test func completeHumanTaskFromApp() async throws {

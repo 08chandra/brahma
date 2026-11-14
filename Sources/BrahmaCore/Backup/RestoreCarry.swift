@@ -128,6 +128,7 @@ struct RestoreCarry {
                        arguments: [now, Store.flat("restored from \(snapshot): check grants, lab marks and main, then resume; " + summary, max: 4000)])
         notes += rolledBack.map { "after the restore: \($0)" }
         try raiseRestoreAlert(db, snapshot: snapshot, summary: summary, now: now)
+        notes += try cancelApprovedReleases(db, now: now)
 
         switch live {
         case .none:
@@ -153,6 +154,30 @@ struct RestoreCarry {
             ON CONFLICT(id) DO UPDATE SET source = COALESCE(machineTaint.source, excluded.source),
               markedAt = COALESCE(machineTaint.markedAt, excluded.markedAt)
             """, arguments: [source, now])
+        return notes
+    }
+
+    /// Final-review m7: what a release approved in the snapshot but never started records after the restore.
+    static let restoredRelease = "restored from backup; propose again"
+
+    /// Final-review m7: a release the snapshot holds `approved` (the owner's approval, not yet started) is never carried out
+    /// by the restored engine: the owner may have rolled it back, or approved something else, since. Each is `cancelled`
+    /// (`"restored from backup; propose again"`, with an activity line), whatever the live database said. Returns the notes.
+    static func cancelApprovedReleases(_ db: Database, now: Date) throws -> [String] {
+        guard try db.tableExists("release") else { return [] }
+        var notes: [String] = []
+        let approved = try Release.filter(Column("status") == ReleaseStatus.approved.rawValue)
+            .order(Column("companyId"), Column("number")).fetchAll(db)
+        for var r in approved {
+            r.status = .cancelled
+            r.finishedAt = now
+            r.failedReason = restoredRelease
+            try r.update(db)
+            try ActivityEvent(companyId: r.companyId, agentId: nil, turnId: nil, kind: .release,
+                              text: "\(r.ref) (release \(r.version)) was cancelled: \(restoredRelease)", createdAt: now).insert(db)
+            let name = try Company.fetchOne(db, key: r.companyId)?.name ?? r.companyId
+            notes.append("\(name): \(r.ref) (release \(r.version)) was approved in the snapshot and is cancelled; propose it again")
+        }
         return notes
     }
 

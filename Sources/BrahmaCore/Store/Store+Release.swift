@@ -160,13 +160,16 @@ extension Store {
     }
 
     static func notMain(_ commit: String) -> String { "\(commit.prefix(7)) is not the engine-accepted main" }
+    /// The engine-accepted main no longer descends from a release's commit (final-review I1's re-check inside the slot).
+    static func noLongerOnMain(_ commit: String) -> String { "\(commit.prefix(7)) is no longer on the engine-accepted main" }
 
     /// The one path that executes a smoke run outside the tick (Task 7 calls it with reason `release`, through
     /// `Orchestrator.runSmoke`, which holds the company's smoke slot and passes the engine's `Blocking` and clock):
     /// 1. in one write: `commit` must be the engine-accepted main (`company.mainCommit`, else `"<sha7> is not the
     ///    engine-accepted main"`) — or, for a `release` run only, `acceptedMain` must still be the engine-accepted main: the
     ///    executor passes the main it checked `commit` is an ancestor of (`main` moved on after the release was proposed;
-    ///    the release still deploys, and smokes, its own commit). Then the row is inserted or reused, and claimed `running` in that same write, so a queued
+    ///    the release still deploys, and smokes, its own commit), and the company's smoke check must still be the one pinned on
+    ///    the release (final-review m2). Then the row is inserted or reused, and claimed `running` in that same write, so a queued
     ///    run's superseding can never touch it (fix I3a). A `merge` run at `commit` is reused (PR-12) and claimed if queued;
     ///    a `release` run is reused by `releaseId`; a `manual` run is always a new row. A reused run that is not queued is
     ///    returned as it is;
@@ -180,6 +183,12 @@ extension Store {
             guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
             let descends = reason == .release && acceptedMain != nil && company.mainCommit == acceptedMain
             guard company.mainCommit == commit || descends else { throw WorkError.invalid(Self.notMain(commit)) }
+            // Final-review m2: a release's smoke runs only the check the owner approved (pinned on the release), checked in
+            // the write that claims the run, so a change after approval can never weaken the gate.
+            if reason == .release, let releaseId, let release = try Release.fetchOne(db, key: releaseId), release.companyId == companyId,
+               release.smokeCheck != company.smokeCheck {
+                throw WorkError.conflict(ReleasePolicy.smokeChanged)
+            }
             var existing: MainSmokeRun?
             switch reason {
             case .merge:
@@ -408,7 +417,10 @@ extension Store {
         let tokenPresent = try secrets(companyId: companyId).contains { $0.name == adapter.tokenSecret }
         guard tokenPresent, settings.accountId != nil else {
             let task = try humanTasks.fileHostingAccount(store: self, companyId: companyId, provider: settings.provider, now: now)
-            throw WorkError.invalid("The hosting token is missing; I asked the owner (\(task.ref)). Propose again when it is done.")
+            // Final-review m10: say what is actually missing.
+            let missing = !tokenPresent && settings.accountId == nil ? "The hosting token and account ID are missing"
+                : !tokenPresent ? "The hosting token is missing" : "The hosting account ID is missing"
+            throw WorkError.invalid("\(missing); I asked the owner (\(task.ref)). Propose again when it is done.")
         }
         // 8. Main must be green at its engine-accepted head (PR-22).
         guard let commit = company.mainCommit else { throw WorkError.invalid(Self.noMainYet) }
@@ -442,14 +454,19 @@ extension Store {
             try Self.checkReleaseSlot(db, companyId: companyId, version: version)
             let latestNumber = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM release WHERE companyId = ?",
                                                  arguments: [companyId])) ?? 1
-            let latestMain = try Company.fetchOne(db, key: companyId)?.mainCommit
-            guard latestNumber == number, latestMain == commit else {
+            let latest = try Company.fetchOne(db, key: companyId)
+            guard latestNumber == number, latest?.mainCommit == commit else {
                 throw WorkError.conflict("main or the releases changed while proposing; propose again")
+            }
+            // Final-review m2: the smoke checks the ask shows are the ones pinned to the release.
+            let hosting = try HostingSettings.fetchOne(db, key: companyId)
+            guard latest?.smokeCheck == smokeCheck, hosting?.smoke == settings.smoke, hosting?.expectText == settings.expectText else {
+                throw WorkError.conflict("the smoke check changed while proposing; propose again")
             }
             var release = Release(companyId: companyId, number: number, version: version, provider: settings.provider,
                                   project: settings.project, commit: commit, previousReleaseId: previous?.id, build: settings.build,
                                   outputDir: settings.outputDir, plan: plan, rollbackPlan: rollback, notes: notes, proposedById: agentId,
-                                  createdAt: now)
+                                  createdAt: now, smokeCheck: smokeCheck, siteSmoke: settings.smoke, siteExpectText: settings.expectText)
             let summary = notes ?? "Release \(version) of main at \(sha7)."
             let ask = try propose(db: db, companyId: companyId, by: .agent(agentId), kind: .deploy, risk: .high, category: nil,
                                   title: "Deploy \(version) to \(settings.provider.title) at \(sha7)", summary: summary,
@@ -468,8 +485,11 @@ extension Store {
     /// Refusals 1–3: the version's form, a version already used, another open release.
     static func checkReleaseSlot(_ db: Database, companyId: String, version: String) throws {
         guard ReleasePolicy.validVersion(version) else { throw WorkError.invalid(ReleasePolicy.badVersion) }
-        if try Release.filter(Column("companyId") == companyId && Column("version") == version).fetchCount(db) > 0 {
-            throw WorkError.conflict("release \(version) already exists")
+        // Final-review m3: unique ignoring case (APFS folds case in the loose refs `refs/brahma/releases/<version>`).
+        if let taken = try Release.filter(Column("companyId") == companyId && Column("version").lowercased == version.lowercased())
+            .fetchOne(db) {
+            throw WorkError.conflict(taken.version == version ? "release \(version) already exists"
+                                                                : "release \(version) already exists (as \(taken.version))")
         }
         if let open = try Release.filter(Column("companyId") == companyId && ReleaseStatus.openRawValues.contains(Column("status")))
             .order(Column("number")).fetchOne(db) {
@@ -571,17 +591,24 @@ enum ReleaseEnd: Equatable, Sendable {
     /// The smoke after the deploy passed.
     case deployed(productionURL: String, results: [SmokeResult])
     /// A step failed. `stage` is the bug's word (`smoke on main`, `integrity`, `backup`, `build`, `stage`, `tools`, `deploy`,
-    /// `smoke`), `detail` its parenthesis, `reason` the release's `failedReason`.
-    case failed(stage: String, detail: String, reason: String, results: [SmokeResult]?)
+    /// `smoke`), `detail` its parenthesis, `reason` the release's `failedReason`. `bug` (final-review m4): the failure is one
+    /// the agents can fix (the build, the staged output, the smoke check failing on main, the deployed site failing its smoke),
+    /// so a P1 bug is filed for them; an owner-side one (integrity, the token, provider config, the tools, the backup, the
+    /// folder, the sandbox, the engine) only tells the owner.
+    case failed(stage: String, detail: String, reason: String, results: [SmokeResult]?, bug: Bool = false)
     /// The owner's stop (or the engine shutting down) cut it short: `interrupted` while deploying (it is never run again),
     /// `failed` while building or smoking.
     case stopped(reason: String)
 }
 
 extension Store {
-    /// The rollback hint of a release that changed (or may have changed) what is live.
-    static func rollbackHint(company: String, release: Release) -> String {
-        "Run brahma release rollback \(flat(company, max: 100)) \(release.ref) or use Roll back in Releases."
+    /// The rollback hint of a release that changed (or may have changed) what is live (final-review I2): its own recorded
+    /// rollback, naming what that puts back (the release before it, or the placeholder page); with no recorded commands, the
+    /// provider's dashboard.
+    static func rollbackHint(_ db: Database, company: String, release: Release) throws -> String {
+        guard !release.rollbackPlan.steps.isEmpty else { return "\(release.ref) has no recorded rollback; \(dashboardRollback)." }
+        let restores = try release.previousReleaseId.flatMap { try Release.fetchOne(db, key: $0) }?.ref ?? "the placeholder page"
+        return "Run brahma release rollback \(flat(company, max: 100)) \(release.ref) (puts \(restores) back) or use Roll back in Releases."
     }
 
     /// The executor's claim (builder-check 3, PR-9), one write transaction: nothing while the owner's stop holds; otherwise
@@ -625,8 +652,8 @@ extension Store {
     }
 
     /// Records how a release in progress (`building`, `deploying` or `smoking`) ended, in one write: its row, an activity
-    /// line, the owner's notice and, for a failure, a P1 bug filed by the engine (`Release <v> failed: <stage> (<detail>)`,
-    /// type `bug`, no check). A release no longer in progress is returned as it is. Every agent-controlled part (the failure,
+    /// line, the owner's notice and, for a failure the agents can fix (`ReleaseEnd.failed`'s `bug`, final-review m4), a P1 bug
+    /// filed by the engine (`Release <v> failed: <stage> (<detail>)`, type `bug`, no check). A release no longer in progress is returned as it is. Every agent-controlled part (the failure,
     /// the smoke results) is redacted.
     @discardableResult
     func finishRelease(id: String, end: ReleaseEnd, now: Date) throws -> Release {
@@ -656,7 +683,7 @@ extension Store {
                 release.smokeResults = try redacted(results)
                 activity = "Release \(v) is live at \(url)"
                 notice = ("\(companyName) is live", "\(url) (release \(v))")
-            case .failed(let stage, let detail, let reason, let results):
+            case .failed(let stage, let detail, let reason, let results, let bug):
                 let reason = try redact(reason)
                 release.status = .failed
                 release.failedReason = reason
@@ -664,23 +691,25 @@ extension Store {
                     release.smokeStatus = "failed"
                     release.smokeResults = try redacted(results)
                 }
-                let title = Self.flat("Release \(v) failed: \(stage) (\(try redact(detail)))", max: Self.maxTitle - 1)
-                let draft = WorkItemDraft(type: WorkItemType("bug"), title: title, description: Self.flat(reason, max: 2000),
-                                          checkSpec: nil, priority: 1, status: .ready)
-                _ = try createWorkItem(db: db, companyId: release.companyId, by: .system, draft: draft, now: now)
+                if bug {
+                    let title = Self.flat("Release \(v) failed: \(stage) (\(try redact(detail)))", max: Self.maxTitle - 1)
+                    let draft = WorkItemDraft(type: WorkItemType("bug"), title: title, description: Self.flat(reason, max: 2000),
+                                              checkSpec: nil, priority: 1, status: .ready)
+                    _ = try createWorkItem(db: db, companyId: release.companyId, by: .system, draft: draft, now: now)
+                }
                 activity = "\(release.ref) (release \(v)) failed: \(Self.flat(reason, max: 300))"
-                notice = ("Release \(v) failed", deployStarted ? Self.rollbackHint(company: companyName, release: release)
+                notice = ("Release \(v) failed", deployStarted ? try Self.rollbackHint(db, company: companyName, release: release)
                                                                : "Nothing was deployed: \(Self.flat(reason, max: 300))")
             case .stopped(let reason):
                 release.failedReason = try redact(reason)
                 if release.status == .deploying {
                     release.status = .interrupted
                     activity = "\(release.ref) (release \(v)) was interrupted while deploying: \(Self.flat(reason, max: 300))"
-                    notice = ("Release \(v) was interrupted", "It may be partly live. " + Self.rollbackHint(company: companyName, release: release))
+                    notice = ("Release \(v) was interrupted", "It may be partly live. " + (try Self.rollbackHint(db, company: companyName, release: release)))
                 } else {
                     release.status = .failed
                     activity = "\(release.ref) (release \(v)) was stopped: \(Self.flat(reason, max: 300))"
-                    notice = ("Release \(v) was stopped", deployStarted ? Self.rollbackHint(company: companyName, release: release)
+                    notice = ("Release \(v) was stopped", deployStarted ? try Self.rollbackHint(db, company: companyName, release: release)
                                                                      : "Nothing was deployed.")
                 }
             }
@@ -729,10 +758,12 @@ extension Store {
     }
 
     /// The owner asks the engine to roll back release `releaseRef` (`R-<n>`) by running its recorded `rollbackPlan`, the one
-    /// shown in the deploy ask. Owner only (`"only the owner can roll back a release"`); only a `deployed` or `failed` release
-    /// whose rollback is not `requested` or `running`. The refusals are exactly `"R-<n> is <status>; only deployed or failed
-    /// releases roll back"` and `"R-<n> is already rolling back"`. Sets `rollbackStatus requested` and `rollbackRequestedAt`
-    /// in one write; the executor claims it (`claimRollback`).
+    /// shown in the deploy ask. Owner only (`"only the owner can roll back a release"`); only a release that changed, or may
+    /// have changed, what is live (`Release.isRollbackCandidate`: `deployed`, `interrupted` (final-review I2: a stop or crash
+    /// while deploying), or `failed` once its deploy step started (m1)) whose rollback is not `requested` or `running`. The
+    /// refusals include `"R-<n> is <status>; only deployed, interrupted or failed releases roll back"`, `"R-<n> failed before
+    /// deploying; nothing to roll back"` and `"R-<n> is already rolling back"`. Sets `rollbackStatus requested` and
+    /// `rollbackRequestedAt` in one write; the executor claims it (`claimRollback`).
     @discardableResult
     public func requestRollback(companyId: String, releaseRef: String, by sender: Sender, now: Date = Store.now()) throws -> Release {
         guard sender == .owner else { throw WorkError.forbidden(Self.rollbackOwnerOnly) }
@@ -740,23 +771,26 @@ extension Store {
         guard let found = try release(companyId: companyId, ref: releaseRef) else { throw notFound }
         return try writer.write { db in
             guard var r = try Release.fetchOne(db, key: found.id), r.companyId == companyId else { throw notFound }
-            guard r.status == .deployed || r.status == .failed else {
-                throw WorkError.invalid("\(r.ref) is \(r.status.rawValue); only deployed or failed releases roll back")
+            guard r.isRollbackCandidate else {
+                if r.status == .failed { throw WorkError.invalid("\(r.ref) failed before deploying; nothing to roll back") }
+                throw WorkError.invalid("\(r.ref) is \(r.status.rawValue); only deployed, interrupted or failed releases roll back")
             }
             if r.rollbackStatus == .requested || r.rollbackStatus == .running { throw WorkError.conflict("\(r.ref) is already rolling back") }
             // Fix I2: one rollback at a time; never while a release is open; only the release that is live now (the newest
-            // deployed or failed one), so the records always say what is live.
+            // rollback candidate), so the records always say what is live.
             if let other = try Self.pendingRollback(db, companyId: companyId) {
                 throw WorkError.conflict("\(other.ref)'s rollback is \(other.rollbackStatus?.rawValue ?? "pending")")
             }
             if let open = try Release.filter(Column("companyId") == companyId && ReleaseStatus.openRawValues.contains(Column("status")))
                 .order(Column("number")).fetchOne(db) {
+                // Final-review m1: a proposal waits on the owner; rejecting its ask is what frees the rollback.
+                if open.status == .proposed, let ask = try open.askId.flatMap({ try Ask.fetchOne(db, key: $0) }) {
+                    throw WorkError.conflict("\(open.ref) is still proposed; reject \(ask.ref) first")
+                }
                 throw WorkError.conflict("\(open.ref) is still \(open.status.rawValue); roll back after it finishes")
             }
-            if let newest = try Release.filter(Column("companyId") == companyId
-                                               && [ReleaseStatus.deployed.rawValue, ReleaseStatus.failed.rawValue].contains(Column("status")))
-                .order(Column("number").desc).fetchOne(db), newest.id != r.id {
-                throw WorkError.invalid("\(r.ref) is not the live release; roll back \(newest.ref)")
+            if let live = try Self.liveRelease(db, companyId: companyId), live.id != r.id {
+                throw WorkError.invalid("\(r.ref) is not the live release; roll back \(live.ref)")
             }
             // Fix M1: a release recorded with no rollback commands is rolled back in the provider's dashboard.
             guard !r.rollbackPlan.steps.isEmpty else {
@@ -770,6 +804,14 @@ extension Store {
                               text: "owner requested a rollback of \(r.ref) (release \(r.version))", createdAt: now).insert(db)
             return r
         }
+    }
+
+    /// The company's live release (final-review I2, m1): its newest `Release.isRollbackCandidate`, or nil.
+    static func liveRelease(_ db: Database, companyId: String) throws -> Release? {
+        try Release.filter(sql: """
+            companyId = ? AND (status IN (?, ?) OR (status = ? AND deployStartedAt IS NOT NULL))
+            """, arguments: [companyId, ReleaseStatus.deployed.rawValue, ReleaseStatus.interrupted.rawValue, ReleaseStatus.failed.rawValue])
+            .order(Column("number").desc).fetchOne(db)
     }
 
     /// The companies with a requested rollback (a paused company is admitted for these only, fix I1).
@@ -802,11 +844,12 @@ extension Store {
             guard let oldest = try Release.filter(Column("companyId") == companyId
                                                   && Column("rollbackStatus") == RollbackStatus.requested.rawValue)
                 .order(Column("rollbackRequestedAt"), Column("number")).fetchOne(db) else { return nil }
+            // Only a rollback candidate (`Release.isRollbackCandidate`: deployed, interrupted, failed once deploying started).
             try db.execute(sql: """
                 UPDATE release SET rollbackStatus = ?, rollbackStartedAt = ?, rollbackRequestedAt = NULL
-                WHERE id = ? AND rollbackStatus = ? AND status IN (?, ?)
+                WHERE id = ? AND rollbackStatus = ? AND (status IN (?, ?) OR (status = ? AND deployStartedAt IS NOT NULL))
                 """, arguments: [RollbackStatus.running.rawValue, now, oldest.id, RollbackStatus.requested.rawValue,
-                                 ReleaseStatus.deployed.rawValue, ReleaseStatus.failed.rawValue])
+                                 ReleaseStatus.deployed.rawValue, ReleaseStatus.interrupted.rawValue, ReleaseStatus.failed.rawValue])
             guard db.changesCount == 1, let claimed = try Release.fetchOne(db, key: oldest.id) else { return nil }
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .release,
                               text: "started the rollback of \(claimed.ref) (release \(claimed.version))", createdAt: now).insert(db)

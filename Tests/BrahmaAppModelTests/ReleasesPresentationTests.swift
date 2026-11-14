@@ -39,7 +39,15 @@ enum ReleaseFixtures {
         #expect(rows[0].rollbackDisplay == snap.releases[0].rollbackPlan.display)
         #expect(rows.map(\.canRollBack) == [true, false, false])  // only the live release
 
+        // A release that failed once its deploy step started may have changed what is live: it is the live one.
+        let started = Date(timeIntervalSince1970: 1_800_000_100)
+        snap.releases = [try ReleaseFixtures.release(2, .failed) { $0.deployStartedAt = started }, try ReleaseFixtures.release(1, .deployed)]
+        #expect(ReleaseRows.make(snap, handles: [:]).map(\.canRollBack) == [true, false])
+        // Final-review m1: one that failed before deploying changed nothing; the release before it is still live.
         snap.releases = [try ReleaseFixtures.release(2, .failed), try ReleaseFixtures.release(1, .deployed)]
+        #expect(ReleaseRows.make(snap, handles: [:]).map(\.canRollBack) == [false, true])
+        // Final-review I2: an interrupted deploy may be partly live: its own rollback is offered, never the older release's.
+        snap.releases = [try ReleaseFixtures.release(2, .interrupted), try ReleaseFixtures.release(1, .deployed)]
         #expect(ReleaseRows.make(snap, handles: [:]).map(\.canRollBack) == [true, false])
 
         snap.releases = [try ReleaseFixtures.release(2, .proposed), try ReleaseFixtures.release(1, .deployed)]

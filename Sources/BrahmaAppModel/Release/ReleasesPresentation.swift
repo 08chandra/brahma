@@ -55,9 +55,11 @@ public enum ReleaseRows {
         f.dateFormat = "yyyy-MM-dd HH:mm"
         let anyOpen = r.releases.contains { $0.status.isOpen }
         let anyRollingBack = r.releases.contains { $0.rollbackStatus == .requested || $0.rollbackStatus == .running }
-        let live = r.releases.filter { $0.status == .deployed || $0.status == .failed }.max { $0.number < $1.number }?.id
+        // The live release: the newest that changed, or may have changed, what is live (`Release.isRollbackCandidate`, the
+        // rule `Store.requestRollback` applies; final-review I2, m1).
+        let live = r.releases.filter(\.isRollbackCandidate).max { $0.number < $1.number }?.id
         return r.releases.map { rel in
-            let can = (rel.status == .deployed || rel.status == .failed) && !anyOpen && !anyRollingBack && rel.id == live
+            let can = rel.isRollbackCandidate && !anyOpen && !anyRollingBack && rel.id == live
                 && !rel.rollbackPlan.steps.isEmpty
             return ReleaseRow(id: rel.id, ref: rel.ref, version: "release \(rel.version)", statusTitle: rel.status.title.uppercased(),
                               commit: rel.sha7, url: rel.productionURL ?? rel.deployURL ?? "—",

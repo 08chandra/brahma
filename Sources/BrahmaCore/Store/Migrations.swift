@@ -646,7 +646,7 @@ enum Migrations {
     }
 
     /// Plan L migrations (PR-21): registered after every 5-lite migration, never inside `registerPlan5`, in landing order
-    /// vL-preview, vL-hosting, vL-release, vL-human-tasks, vL-import. Never edit an earlier one.
+    /// vL-preview, vL-hosting, vL-release, vL-human-tasks, vL-import, then the final review's vL-release-2. Never edit an earlier one.
     static func registerPlanL(_ m: inout DatabaseMigrator) {
         m.registerMigration("vL-preview") { db in
             // The previews a company runs from `main` (`PreviewSurface`) and the engine's record of each one's process
@@ -780,6 +780,17 @@ enum Migrations {
             try db.alter(table: "company") { t in
                 t.add(column: "importedFrom", .text)
                 t.add(column: "importedCommit", .text)
+            }
+        }
+        m.registerMigration("vL-release-2") { db in
+            // Final review m1/m2 (appended after vL-import; no earlier migration edited): when a release's deploy step started
+            // (only such a release, or an interrupted one, rolls back), and the smoke check on main and the deployed site's
+            // smoke requests and expected text as the owner approved them (the executor refuses when they changed).
+            try db.alter(table: "release") { t in
+                t.add(column: "deployStartedAt", .datetime)
+                t.add(column: "smokeCheck", .text)              // JSON CheckSpec
+                t.add(column: "siteSmoke", .text).notNull().defaults(to: "[]")
+                t.add(column: "siteExpectText", .text)
             }
         }
     }

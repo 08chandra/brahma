@@ -128,20 +128,44 @@ public struct Release: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var startedAt: Date?
     public var deployedAt: Date?
     public var finishedAt: Date?
+    /// When the executor committed `deploying` (final-review m1, `vL-release-2`): from then on the release changed, or may
+    /// have changed, what is live. Nil for a release that never reached the deploy step.
+    public var deployStartedAt: Date?
+    /// The smoke check on main as the owner approved it (final-review m2, `vL-release-2`): the release's smoke on main runs
+    /// only while the company's check is still exactly this one; otherwise it is refused ("propose again").
+    public var smokeCheck: CheckSpec?
+    /// The deployed site's smoke requests and expected text as the owner approved them (m2): the executor refuses when the
+    /// hosting's differ, and smokes with these.
+    public var siteSmoke: [SmokeRequest]
+    public var siteExpectText: String?
 
     public init(id: String = UUID().uuidString.lowercased(), companyId: String, number: Int, version: String,
                 status: ReleaseStatus = .proposed, provider: HostingProviderID, project: String, commit: String,
                 previousReleaseId: String? = nil, build: String?, outputDir: String?, plan: DeployPlan, rollbackPlan: DeployPlan,
-                notes: String? = nil, askId: String? = nil, proposedById: String, createdAt: Date) {
+                notes: String? = nil, askId: String? = nil, proposedById: String, createdAt: Date, smokeCheck: CheckSpec? = nil,
+                siteSmoke: [SmokeRequest] = [], siteExpectText: String? = nil) {
         self.id = id; self.companyId = companyId; self.number = number; self.version = version; self.status = status
         self.provider = provider; self.project = project; self.commit = commit; self.previousReleaseId = previousReleaseId
         self.build = build; self.outputDir = outputDir; self.plan = plan; self.commandsHash = plan.hash
         self.rollbackPlan = rollbackPlan; self.notes = notes; self.askId = askId; self.proposedById = proposedById
         self.smokeResults = []; self.createdAt = createdAt
+        self.smokeCheck = smokeCheck; self.siteSmoke = siteSmoke; self.siteExpectText = siteExpectText
     }
 
     public var ref: String { "R-\(number)" }
     public var sha7: String { String(commit.prefix(7)) }
+
+    /// Whether this release changed, or may have changed, what is live, so its recorded rollback is the owner's undo
+    /// (final-review I2, m1): `deployed`; `interrupted` (stopped or crashed while deploying: it may be partly live); `failed`
+    /// once the deploy step started (`deployStartedAt`). A release that failed before deploying changed nothing.
+    /// `Store.requestRollback` and the app's Roll Back button use this one rule.
+    public var isRollbackCandidate: Bool {
+        switch status {
+        case .deployed, .interrupted: true
+        case .failed: deployStartedAt != nil
+        default: false
+        }
+    }
 }
 
 /// The release rules (Plan L).
@@ -160,13 +184,21 @@ public enum ReleasePolicy {
     /// `propose_decision {kind: "release"}` is refused with this pointer (PR-26).
     public static let releaseKindRedirect = "propose releases with propose_deploy so they carry the exact deploy and rollback commands"
     static let superseded = "superseded"
+    /// Final-review m2: the release's smoke on main is refused when the company's check is no longer the approved one.
+    static let smokeChanged = "the smoke check changed after approval; propose again"
+    /// Final-review m2: the deployed site's smoke requests or expected text are no longer the approved ones.
+    static let siteSmokeChanged = "the deployed site's smoke check changed after approval; propose again"
+    /// Final-review I1: how often a release smoke re-checks the commit against a `main` that moved while it waited (the
+    /// merges landing between the read and the write); after that the smoke "did not run".
+    static let mainMovedAttempts = 3
     static let engineStopped = "engine stopped"
     static let engineRestarted = "engine restarted"
 
-    /// `^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$`.
-    public static func validVersion(_ v: String) -> Bool {
-        v.range(of: "^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$", options: .regularExpression) != nil
-    }
+    /// `^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$`, and a name git accepts as the release's ref component (final-review m3): no
+    /// `..`, no trailing `.`, no `.lock` suffix (any case). The same rule `GitWorkspace.releaseRef` applies at the backup
+    /// step, so a version accepted here never fails there. Uniqueness ignores case (`Store.checkReleaseSlot`): APFS folds
+    /// case in loose refs.
+    public static func validVersion(_ v: String) -> Bool { GitWorkspace.isValidReleaseVersion(v) }
 
     /// Whether `main` at `commit` may be deployed: only when the company has a smoke check and the latest finished
     /// (`passed` or `failed`) `merge`, `manual` or `release` run at `commit` passed. Otherwise the reason, exactly one of
@@ -229,9 +261,21 @@ public actor SmokeSlots {
         return try await body()
     }
 
+    /// Test seam (final-review I1): callers parked until someone waits for a company's slot.
+    private var watchers: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    /// Test seam: returns once a caller is waiting for `companyId`'s slot (an event, never a poll).
+    func untilWaiting(_ companyId: String) async {
+        if !(waiters[companyId]?.isEmpty ?? true) { return }
+        await withCheckedContinuation { watchers[companyId, default: []].append($0) }
+    }
+
     private func acquire(_ companyId: String) async {
         if !busy.contains(companyId) { busy.insert(companyId); return }
-        await withCheckedContinuation { waiters[companyId, default: []].append($0) }
+        await withCheckedContinuation { c in
+            waiters[companyId, default: []].append(c)
+            for w in watchers.removeValue(forKey: companyId) ?? [] { w.resume() }
+        }
     }
 
     private func release(_ companyId: String) {

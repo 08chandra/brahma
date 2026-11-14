@@ -148,6 +148,40 @@ import GRDB
         #expect(try fx.store.releases(companyId: fx.company.id).isEmpty)
     }
 
+    /// Final-review m3: a version git refuses as a ref component is refused when proposed (never later at the backup step),
+    /// and versions are unique ignoring case (APFS folds case in loose refs).
+    @Test func versionsGitRefusesOrCaseVariantsRefused() throws {
+        for bad in ["1..2", "1.", "x.lock", "1.0.LOCK", "a..b.c"] {
+            #expect(!ReleasePolicy.validVersion(bad), "\(bad)")
+            #expect(throws: (any Error).self) { _ = try GitWorkspace.releaseRef(version: bad) }
+        }
+        for good in ["1.0.0", "1.2.0-rc.1+b5", "v2", "1.0-lockdown", "lock"] {
+            #expect(ReleasePolicy.validVersion(good), "\(good)")
+            #expect(try GitWorkspace.releaseRef(version: good) == "refs/brahma/releases/\(good)")
+        }
+        let fx = try Self.fixture()
+        #expect(fx.message("1..2") == ReleasePolicy.badVersion)
+        #expect(fx.message("x.lock") == ReleasePolicy.badVersion)
+        let (r1, ask1) = try fx.propose("1.0-RC")
+        try fx.store.ownerDecide(askId: ask1.id, approve: false, note: "not yet")
+        #expect(try fx.store.release(companyId: fx.company.id, ref: r1.ref)?.status == .rejected)
+        #expect(fx.message("1.0-rc") == "release 1.0-rc already exists (as 1.0-RC)")
+        #expect(try fx.store.releases(companyId: fx.company.id).count == 1)
+    }
+
+    /// Final-review m2: the smoke check on main and the deployed site's smoke requests and expected text are pinned to the
+    /// release when it is proposed.
+    @Test func proposalPinsTheSmokeChecks() throws {
+        let fx = try Self.fixture()
+        let (r, _) = try fx.propose("0.1.0")
+        #expect(r.smokeCheck == CheckSpec(command: "npm test"))
+        #expect(r.siteSmoke == [SmokeRequest(method: "GET", path: "/", expectStatus: 200), SmokeRequest(method: "GET", path: "/health")])
+        #expect(r.siteExpectText == "Welcome")
+        let stored = try #require(try fx.store.release(companyId: fx.company.id, ref: r.ref))
+        #expect(stored.smokeCheck == r.smokeCheck && stored.siteSmoke == r.siteSmoke && stored.siteExpectText == r.siteExpectText)
+        #expect(stored.deployStartedAt == nil)
+    }
+
     @Test func redMainBlocksProposal() throws {
         let notRun = try Self.fixture(passed: false)
         let sha = String(notRun.main.prefix(7))
@@ -192,13 +226,15 @@ import GRDB
     }
 
     @Test func missingTokenFilesHostingTask() throws {
-        for (token, account) in [(false, true), (true, false)] {
+        // Final-review m10: the refusal names what is actually missing.
+        for (token, account, missing) in [(false, true, "The hosting token is missing"), (true, false, "The hosting account ID is missing"),
+                                          (false, false, "The hosting token and account ID are missing")] {
             let fx = try Self.fixture(token: token, account: account)
             let first = try #require(fx.message("0.1.0"))
             let asks = try fx.store.asks(companyId: fx.company.id).filter { $0.kind != .deploy }
             try #require(asks.count == 1)
             let task = asks[0]
-            #expect(first == "The hosting token is missing; I asked the owner (\(task.ref)). Propose again when it is done.")
+            #expect(first == "\(missing); I asked the owner (\(task.ref)). Propose again when it is done.")
             // Task 9 (PR-28): the hosting-account human task, filed by the engine, no quota charged to the agent.
             #expect(task.kind == .humanTask); #expect(task.requesterId == "system"); #expect(task.status == .pendingOwner)
             #expect(HumanTask.from(task)?.template == .hostingAccount)

@@ -43,8 +43,10 @@ public struct ReleaseDependencies: Sendable {
 /// 7. **Deploy** (`deploying`): every plan step, engine-composed argv, under the sandbox only (fail closed), the token only in
 ///    its environment, after `ProviderConfigCheck` (I3); the deploy URL from the deploy step's stdout only, confirmed by the
 ///    plan's verify step when it has one (Vercel).
-/// 8. **Smoke** (`smoking`): `DeploySmoke` against the adapter's smoke base.
-/// 9. **Finish**: `deployed` or `failed` (a P1 bug, the owner told), through `Store.finishRelease`.
+/// 8. **Smoke** (`smoking`): `DeploySmoke` against the adapter's smoke base, with the smoke requests and expected text
+///    pinned on the release (final-review m2).
+/// 9. **Finish**: `deployed` or `failed` (the owner told; a P1 bug only for what agents can fix, m4), through
+///    `Store.finishRelease`.
 ///
 /// Every build, tools and deploy step is killable (`runStep`: spawned, recorded, polled, its group terminated on a timeout
 /// or the owner's stop). Raw output stays under the data home (`ReleaseLayout`); only the redacted copy of `deploy.log` (and
@@ -205,6 +207,9 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     private struct Failure: Error {
         let stage: String, detail: String, reason: String
         var results: [SmokeResult]? = nil
+        /// The agents can fix it (final-review m4): a failing build, a refused upload, the smoke check failing on main, the
+        /// deployed site failing its smoke. Everything else is the owner's (only the owner is told; no bug is filed).
+        var bug = false
     }
 
     private func checkStop(_ release: Release) throws {
@@ -219,7 +224,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         do { end = try await deploy(release) } catch let s as Stopped {
             end = .stopped(reason: stopText(s.cause, release))
         } catch let f as Failure {
-            end = .failed(stage: f.stage, detail: f.detail, reason: f.reason, results: f.results)
+            end = .failed(stage: f.stage, detail: f.detail, reason: f.reason, results: f.results, bug: f.bug)
         } catch {
             end = .failed(stage: "release", detail: "engine error", reason: "the engine could not carry out the release: \(error)", results: nil)
         }
@@ -275,19 +280,30 @@ public actor ReleaseExecutor: EmergencyStopObserver {
             (try? store.gitWorkspace(root: ws, companyId: company.id).isAncestor(commit, of: main)) ?? false
         }
         guard onMain else { throw Failure(stage: "smoke on main", detail: "not on main", reason: "\(r.ref)'s commit is no longer on main") }
+        // Final-review m2: the smoke checks the owner approved (pinned on the release), before anything runs; the smoke on
+        // main checks its own pin again in the write that claims its run.
+        try Self.checkSmokePins(r, smokeCheck: company.smokeCheck, site: try store.hosting(companyId: r.companyId))
         try checkStop(r)
         let run: MainSmokeRun
         let (smoke, companyId, releaseId) = (self.smoke, r.companyId, r.id)
         do { run = try await stoppable(r) { try await smoke(companyId, commit, .release, releaseId, main) } } catch {
             // A smoke the owner's stop (or the engine's shutdown) ended is the stop, never a "smoke on main" failure.
             try checkStop(r)
-            throw Failure(stage: "smoke on main", detail: "did not run",
-                          reason: "the smoke check could not run at \(r.sha7) just before deploying (\(Self.text(error)))")
+            switch (error as? WorkError)?.message {
+            case ReleasePolicy.smokeChanged?:
+                throw Failure(stage: "integrity", detail: "smoke check changed", reason: ReleasePolicy.smokeChanged)
+            case Store.noLongerOnMain(commit)?:
+                throw Failure(stage: "smoke on main", detail: "not on main", reason: "\(r.ref)'s commit is no longer on main")
+            default:
+                throw Failure(stage: "smoke on main", detail: "did not run",
+                              reason: "the smoke check could not run at \(r.sha7) just before deploying (\(Self.text(error)))")
+            }
         }
         try checkStop(r)
         switch run.status {
         case .passed: break
-        case .failed: throw Failure(stage: "smoke on main", detail: run.failure, reason: "the smoke check failed at \(r.sha7) just before deploying")
+        case .failed: throw Failure(stage: "smoke on main", detail: run.failure, reason: "the smoke check failed at \(r.sha7) just before deploying",
+                                    bug: true)
         default: throw Failure(stage: "smoke on main", detail: "no result",
                                reason: "the smoke check could not run at \(r.sha7) just before deploying (\(Store.flat(run.outputTail ?? "no result", max: 200)))")
         }
@@ -300,6 +316,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         }
         guard rendered == r.plan, rendered.hash == r.commandsHash, r.plan.hashIsCurrent, r.plan.build == r.build,
               r.plan.outputDir == r.outputDir else { throw Self.mismatch }
+        try Self.checkSmokePins(r, smokeCheck: nil, site: settings)
         let plan = r.plan
         settings.build = r.build
         settings.outputDir = r.outputDir
@@ -346,7 +363,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
                 if timedOut || exit != 0 {
                     _ = try? store.advanceRelease(id: r.id, from: .building, to: .building, now: clock()) { $0.outputTail = tail }
                     let detail = timedOut ? "timed out" : "exit \(exit)"
-                    throw Failure(stage: "build", detail: detail, reason: "build failed (\(detail))")
+                    throw Failure(stage: "build", detail: detail, reason: "build failed (\(detail))", bug: true)
                 }
             }
         }
@@ -360,7 +377,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
                 try UploadStager.stage(from: export, dirs: dirs, into: upload)
             }
         } catch let e as ReleaseError {
-            throw Failure(stage: "stage", detail: e.message, reason: e.message)
+            throw Failure(stage: "stage", detail: e.message, reason: e.message, bug: true)
         } catch {
             throw Failure(stage: "stage", detail: "could not stage", reason: "could not stage the upload (\(Self.text(error)))")
         }
@@ -375,8 +392,10 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         // token step prints reaches a log or the database unless the redactor demonstrably replaces this exact value (no
         // secrets reload pending, none failed, the value long enough to be redacted). Otherwise nothing is deployed.
         let token = try await readToken(r, plan: plan, stage: "deploy", again: "propose again")
-        // `deploying` is committed before any step runs.
-        try store.advanceRelease(id: r.id, from: .building, to: .deploying, now: clock())
+        // `deploying` is committed before any step runs, with when it started (final-review m1: from now on the release
+        // changed, or may have changed, what is live).
+        let deployStarted = clock()
+        try store.advanceRelease(id: r.id, from: .building, to: .deploying, now: deployStarted) { $0.deployStartedAt = deployStarted }
         at(r, "deploy")
         let deployStep = plan.steps.lastIndex { $0.label == "deploy" } ?? (plan.steps.count - 1)
         var deployStdout = ""
@@ -428,11 +447,10 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         }
         at(r, "smoke")
         guard let base = adapter.smokeBase(settings, deployURL: deployURL) else {
-            throw Failure(stage: "smoke", detail: "no deploy URL",
-                          reason: "no deploy URL was found in the deploy output and no production URL is set")
+            throw Failure(stage: "smoke", detail: "no deploy URL", reason: Self.noSmokeBase("deploy"))
         }
         try checkStop(r)
-        let (http, sleep, requests, expectText) = (self.http, self.sleep, settings.smoke, settings.expectText)
+        let (http, sleep, requests, expectText) = (self.http, self.sleep, r.siteSmoke, r.siteExpectText)
         let smoked = try await stoppable(r) {
             await DeploySmoke.run(base: base, requests: requests, expectText: expectText, http: http, sleep: sleep)
         }
@@ -447,13 +465,29 @@ public actor ReleaseExecutor: EmergencyStopObserver {
             let path = first.flatMap { URL(string: $0.url)?.path }.map { $0.isEmpty ? "/" : $0 } ?? "/"
             let detail = first.map { "\($0.method) \(path): \($0.error ?? $0.status.map { "status \($0)" } ?? "no response")" } ?? "no result"
             throw Failure(stage: "smoke", detail: Store.flat(detail, max: 120),
-                          reason: "the deployed site failed its smoke check (\(Store.flat(detail, max: 120)))", results: results)
+                          reason: "the deployed site failed its smoke check (\(Store.flat(detail, max: 120)))", results: results, bug: true)
         }
         return .deployed(productionURL: settings.productionURL ?? base.absoluteString, results: results)
     }
 
     private static let mismatch = Failure(stage: "integrity", detail: "the hosting settings or the stored plan changed since approval",
                                   reason: "the approved commands no longer match; propose again")
+
+    /// Final-review m2: the smoke check on main (`smokeCheck`, when given) and the deployed site's smoke requests and expected
+    /// text (`site`, when given) must still be the ones pinned on the release when it was approved; else nothing runs.
+    private static func checkSmokePins(_ r: Release, smokeCheck: CheckSpec??, site: HostingSettings?) throws {
+        if let smokeCheck, smokeCheck != r.smokeCheck {
+            throw Failure(stage: "integrity", detail: "smoke check changed", reason: ReleasePolicy.smokeChanged)
+        }
+        if let site, site.smoke != r.siteSmoke || site.expectText != r.siteExpectText {
+            throw Failure(stage: "integrity", detail: "site smoke changed", reason: ReleasePolicy.siteSmokeChanged)
+        }
+    }
+
+    /// No address to smoke (final-review I5, I6b): the site's address is never guessed from the project name.
+    static func noSmokeBase(_ step: String) -> String {
+        "no verified deploy URL was found in the \(step) output and no production URL is set; set the production URL in HOSTING"
+    }
 
     // MARK: Shared steps
 
@@ -626,6 +660,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
 
         var tail = ""
         var stdout = ""
+        var verified: URL?
         for (i, step) in plan.steps.enumerated() {
             let result = try await tokenStep(r, argv: step.argv, index: i, plan: plan, adapter: adapter, token: token, layout: layout,
                                              home: home, tools: tools, logs: logs, log: "rollback.log", prefix: "rollback-step",
@@ -644,6 +679,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
                         throw Failure(stage: "rollback", detail: "unverified target",
                                       reason: "the rollback target \(step.argv.last ?? "") is not a deployment of \(settings.project)")
                     }
+                    verified = step.argv.last.flatMap { URL(string: $0) }
                     continue
                 }
                 let tolerated = step.okIfOutputContains.map { result.stdout.contains($0) || result.stderr.contains($0) } ?? false
@@ -655,10 +691,13 @@ public actor ReleaseExecutor: EmergencyStopObserver {
             }
         }
 
-        // The restored site, smoked without the expected text (it need not carry the current release's).
-        let deployURL = adapter.deployURL(fromOutput: stdout, settings: settings)
+        // The restored site, smoked without the expected text (it need not carry the current release's). Final-review I6b:
+        // for a provider whose deploy URLs are verified with the token (the release's plan has a verify step: Vercel), only
+        // the target this rollback verified counts, never a URL its output merely printed.
+        let printed = adapter.deployURL(fromOutput: stdout, settings: settings)
+        let deployURL = verified ?? (r.plan.verify == nil ? printed : nil)
         guard let base = adapter.smokeBase(settings, deployURL: deployURL) else {
-            throw Failure(stage: "rollback", detail: "no URL", reason: "no deploy URL was found in the rollback output and no production URL is set")
+            throw Failure(stage: "rollback", detail: "no URL", reason: Self.noSmokeBase("rollback"))
         }
         try checkStop(r)
         let (http, sleep, requests) = (self.http, self.sleep, settings.smoke)

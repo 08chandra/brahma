@@ -239,6 +239,47 @@ import GRDB
         #expect(try restored.resumeAfterStop(now: Date()))
     }
 
+    /// Final-review m7: a snapshot taken while a release was `approved` (not started) never carries out that deploy after the
+    /// restore without a fresh approval (the owner may have rolled it back since): the release is cancelled ("restored from
+    /// backup; propose again") and the restore's notes say so. Every other release is left as the snapshot recorded it.
+    @Test func restoreCancelsApprovedReleases() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        let devops = try env.store.hire(companyId: acme.id, name: "devops-1", role: "devops", model: "sonnet")
+        let plan = try DeployPlan(steps: [DeployStep(label: "deploy", argv: ["/opt/fake/bin/wrangler", "pages", "deploy", "dist"])],
+                                  stageFrom: ["dist"], cwdPath: "/tmp/brahma-restore-test/upload", network: [],
+                                  tokenSecret: "CLOUDFLARE_API_TOKEN", build: nil, outputDir: "dist")
+        let t = Date(timeIntervalSince1970: 1_781_000_000)
+        func release(_ n: Int, _ status: ReleaseStatus) -> Release {
+            var r = Release(companyId: acme.id, number: n, version: "0.\(n).0", status: status, provider: .cloudflarePages, project: "acme",
+                            commit: String(repeating: "\(n)", count: 40), build: nil, outputDir: "dist", plan: plan, rollbackPlan: plan,
+                            proposedById: devops.id, createdAt: t)
+            if status != .proposed { r.approvedAt = t; r.approvedBy = "owner" }
+            return r
+        }
+        try env.store.writer.write { db in
+            try release(1, .deployed).insert(db)
+            try release(2, .approved).insert(db)
+        }
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        let r2 = try #require(try restored.release(companyId: acme.id, ref: "R-2"))
+        #expect(r2.status == .cancelled)
+        #expect(r2.failedReason == "restored from backup; propose again")
+        #expect(r2.finishedAt != nil)
+        #expect(try restored.release(companyId: acme.id, ref: "R-1")?.status == .deployed)
+        #expect(outcome.warnings.contains("Acme: R-2 (release 0.2.0) was approved in the snapshot and is cancelled; propose it again"),
+                "\(outcome.warnings)")
+        let activity = try restored.writer.read { try ActivityEvent.filter(Column("companyId") == acme.id).fetchAll($0) }.map(\.text)
+        #expect(activity.contains("R-2 (release 0.2.0) was cancelled: restored from backup; propose again"), "\(activity)")
+        // Resumed, the engine finds nothing to carry out.
+        _ = try restored.resumeAfterStop(now: Date())
+        #expect(try restored.claimRelease(companyId: acme.id, now: Date()) == nil)
+    }
+
     /// Grants revoked (or used up) after the snapshot stay revoked (used up): carried from the live database.
     @Test func restoreKeepsRevocations() throws {
         let f = try Forward()

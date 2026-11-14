@@ -3096,11 +3096,18 @@ public struct GitWorkspace: Sendable {
     /// `refs/brahma/releases/<version>` (PR-29: an engine-managed namespace the plan barrier leaves alone, never a
     /// `refs/tags/release/*` tag). Throws for a version that cannot be one ref component.
     public static func releaseRef(version: String) throws -> String {
-        guard version.range(of: "^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$", options: .regularExpression) != nil,
-              !version.contains(".."), !version.hasSuffix("."), !version.lowercased().hasSuffix(".lock") else {
+        guard isValidReleaseVersion(version) else {
             throw GitError.failed(command: "release ref", status: -1, stderr: "invalid release version")
         }
         return "refs/brahma/releases/\(version)"
+    }
+
+    /// A release version that is one valid ref component under `refs/brahma/releases/` (`ReleasePolicy.validVersion` applies
+    /// this same rule at propose time, final-review m3): `^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$`, no `..`, no trailing `.`, no
+    /// `.lock` suffix in any case. Pure: runs no git.
+    public static func isValidReleaseVersion(_ version: String) -> Bool {
+        version.range(of: "^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$", options: .regularExpression) != nil
+            && !version.contains("..") && !version.hasSuffix(".") && !version.lowercased().hasSuffix(".lock")
     }
 
     /// Before a deploy (Plan L Task 7): `update-ref refs/brahma/main-backup <commit>`, then `refs/brahma/releases/<version>`

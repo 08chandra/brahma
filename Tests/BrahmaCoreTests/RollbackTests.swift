@@ -90,12 +90,12 @@ import Glibc
         #expect(try fx.activity().contains("R-2 (release 0.2.0) was rolled back"))
         // Nothing is left to claim; the release no longer rolls back.
         #expect(try fx.store.claimRollback(companyId: fx.company.id, now: fx.w.clock.now) == nil)
-        #expect(Self.message { _ = try request(fx, "R-2") } == "R-2 is rolledBack; only deployed or failed releases roll back")
+        #expect(Self.message { _ = try request(fx, "R-2") } == "R-2 is rolledBack; only deployed, interrupted or failed releases roll back")
         // A proposed release is refused, exactly.
         try fx.merge(["page.txt": "three\n"])
         try fx.passMain()
         let (r3, _) = try fx.propose("0.3.0")
-        #expect(Self.message { _ = try request(fx, r3.ref) } == "R-3 is proposed; only deployed or failed releases roll back")
+        #expect(Self.message { _ = try request(fx, r3.ref) } == "R-3 is proposed; only deployed, interrupted or failed releases roll back")
         #expect(try fx.reload(r3).rollbackStatus == nil)
         // Only the owner rolls back.
         #expect(Self.message { _ = try fx.store.requestRollback(companyId: fx.company.id, releaseRef: "R-1", by: .agent(fx.devops.id)) }
@@ -257,6 +257,36 @@ import Glibc
         #expect(order.map { $0.command.contains("inspect") } == [true, false])
     }
 
+    /// Final-review I6b: with a provider whose deploy URLs must be verified with the token (Vercel), the site is smoked at
+    /// the owner's production URL or at a URL verified in this very run, never at an unverified one: the deploy smokes its
+    /// inspected deploy URL; a rollback smokes the target its verify step confirmed, not a URL the rollback printed; a
+    /// placeholder rollback (nothing verified) fails closed and says to set the production URL.
+    @Test func smokeOnlyVerifiedURLs() async throws {
+        let fx = try Fx(configure: { $0.verify = true; $0.smokesDeployURL = true })
+        let (_, r2) = try await Self.twoDeployed(fx)
+        #expect(r2.productionURL == "https://fake-r-2.local")
+        #expect(fx.http.requests.map(\.url.absoluteString) == ["https://fake-r-1.local/", "https://fake-r-2.local/"])
+        _ = try request(fx, "R-2")
+        await fx.advance()
+        let back = try fx.reload(r2)
+        #expect(back.status == .rolledBack, "\(back.rollbackOutputTail ?? "")")
+        #expect(fx.http.requests.last?.url.absoluteString == "https://fake-r-1.local/", "the verified target, not fake-rollback-r-2")
+
+        // The first release's rollback deploys the placeholder: no URL is verified, so nothing is smoked.
+        let first = try Fx(configure: { $0.verify = true; $0.smokesDeployURL = true })
+        let r1 = try first.proposeAndApprove()
+        await first.advance()
+        _ = try request(first, "R-1")
+        let smoked = first.http.requests.count
+        await first.advance()
+        let failed = try first.reload(r1)
+        #expect(failed.rollbackStatus == .failed)
+        #expect(try first.notices().contains {
+            $0.title == "Rollback of R-1 failed" && $0.body.contains("set the production URL in HOSTING")
+        }, "\((try? first.notices().map(\.body)) ?? [])")
+        #expect(first.http.requests.count == smoked)
+    }
+
     @Test func rollbackRestoresTheRestoredReleasesOutput() async throws {
         // Task 4 M3: R-2's rollback deploys R-1's own output folder, build, commit and version, not the current settings.
         let fx = try Fx()
@@ -330,9 +360,62 @@ import Glibc
         #expect(Self.message { _ = try request(fx, "R-1") } == "R-1 is not the live release; roll back R-2")
         try fx.merge(["page.txt": "three\n"])
         try fx.passMain()
-        _ = try fx.propose("0.3.0")
-        #expect(Self.message { _ = try request(fx, "R-2") } == "R-3 is still proposed; roll back after it finishes")
+        // Final-review m1: an open proposal's refusal names the ask the owner rejects first.
+        let (_, ask3) = try fx.propose("0.3.0")
+        #expect(Self.message { _ = try request(fx, "R-2") } == "R-3 is still proposed; reject \(ask3.ref) first")
         #expect(try fx.store.release(companyId: fx.company.id, ref: "R-2")?.rollbackStatus == nil)
+        // Approved (not started yet): it runs first.
+        _ = try fx.store.ownerDecide(askId: ask3.id, approve: true, now: fx.w.clock.now)
+        #expect(Self.message { _ = try request(fx, "R-2") } == "R-3 is still approved; roll back after it finishes")
+    }
+
+    /// Final-review I2: a release interrupted while deploying (a stop or a crash) may be partly live. Its own recorded rollback
+    /// (the release before it) is the owner's undo: the notice says so, the request is accepted and runs; the older release is
+    /// not offered (rolling it back would restore the one before it, two versions back).
+    @Test func interruptedReleaseRollsBack() async throws {
+        let fx = try Fx()
+        let r1 = try fx.proposeAndApprove("0.1.0")
+        await fx.advance()
+        try fx.merge(["page.txt": "two\n"])
+        try fx.passMain()
+        let r2 = try fx.proposeAndApprove("0.2.0")
+        try setRow(fx, r2, "status = 'deploying', startedAt = CURRENT_TIMESTAMP")
+        try await fx.executor.recover(now: fx.w.clock.now)
+        #expect(try fx.reload(r2).status == .interrupted)
+        #expect(try fx.notices().contains {
+            $0.title == "Release 0.2.0 was interrupted"
+                && $0.body == "It may be partly live. Run brahma release rollback Lumen R-2 (puts R-1 back) or use Roll back in Releases."
+        }, "\((try? fx.notices().map(\.body)) ?? [])")
+        #expect(Self.message { _ = try request(fx, "R-1") } == "R-1 is not the live release; roll back R-2")
+        #expect(try request(fx, "R-2").rollbackStatus == .requested)
+        try await fx.w.cycle()
+        let back = try fx.reload(r2)
+        #expect(back.rollbackStatus == .succeeded, "\(back.rollbackOutputTail ?? "")")
+        #expect(back.status == .rolledBack)
+        // R-2's recorded plan ran: R-1's upload went live again.
+        let calls = Self.rollbackCalls(fx)
+        #expect(calls.count == 1)
+        #expect(Fx.same(try #require(calls.first).cwd, try fx.upload(1)))
+        #expect(try fx.reload(r1).status == .deployed)
+    }
+
+    /// Final-review m1: a release that failed before its deploy step changed nothing live, so it is not "the live release":
+    /// it does not roll back, and the release before it still does.
+    @Test func failedBeforeDeployingIsNotLive() async throws {
+        let fx = try Fx()
+        let r1 = try fx.proposeAndApprove("0.1.0")
+        await fx.advance()
+        #expect(try fx.reload(r1).status == .deployed)
+        #expect(try fx.reload(r1).deployStartedAt != nil)
+        try fx.store.setSmokeCheck(companyId: fx.company.id, by: fx.devops.id, check: CheckSpec(command: "exit 1"), now: fx.w.clock.now)
+        try fx.merge(["page.txt": "two\n"])
+        try fx.passMain()
+        let r2 = try fx.proposeAndApprove("0.2.0")
+        await fx.advance()
+        let failed = try fx.reload(r2)
+        #expect(failed.status == .failed); #expect(failed.deployStartedAt == nil)
+        #expect(Self.message { _ = try request(fx, "R-2") } == "R-2 failed before deploying; nothing to roll back")
+        #expect(try request(fx, "R-1").rollbackStatus == .requested)
     }
 
     @Test func pendingRollbackHoldsDeploysAndProposals() async throws {

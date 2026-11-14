@@ -117,7 +117,7 @@ struct ReleaseGroup: ParsableCommand {
 
     struct Rollback: ParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Roll a deployed or failed release back: the engine runs its recorded rollback commands (owner only).")
+            abstract: "Roll the live release back (deployed, interrupted, or failed once deploying): the engine runs its recorded rollback commands (owner only).")
         @Argument(help: "Company name or slug.") var company: String
         @Argument(help: "The release, e.g. R-2.") var ref: String
 

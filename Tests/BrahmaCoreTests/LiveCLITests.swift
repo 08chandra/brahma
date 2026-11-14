@@ -136,7 +136,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         try rig.release(2, status: .proposed)
         let proposed = try brahma(["release", "rollback", "Acme", "R-2"], home: rig.home)
         #expect(proposed.status == 1)
-        #expect(proposed.stderr.contains("R-2 is proposed; only deployed or failed releases roll back"), "\(proposed.stderr)")
+        #expect(proposed.stderr.contains("R-2 is proposed; only deployed, interrupted or failed releases roll back"), "\(proposed.stderr)")
         // The list shows the requested rollback.
         #expect(try brahma(["release", "Acme"], home: rig.home).stdout.contains("rollback requested"))
     }
