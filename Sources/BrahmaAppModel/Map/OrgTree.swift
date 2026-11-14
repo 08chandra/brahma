@@ -131,9 +131,13 @@ public struct OrgTree: Equatable, Sendable {
         }
         func handle(_ id: String) -> String { included[id]?.name ?? id }
         func children(of id: String) -> [String] {
+            // Board's roots go by tier then handle (CEO first by tier); every other parent also puts managers with
+            // reports ahead of leaves within a tier.
+            let reportsFirst = id != rootId
+            func leafRank(_ x: String) -> Int { reportsFirst && !(reports[x]?.isEmpty ?? true) ? 0 : 1 }
             let agentKids = (reports[id] ?? []).sorted { l, r in
-                let lk = (tier[l]!.rawValue, (reports[l]?.isEmpty ?? true) ? 1 : 0, handle(l), l)
-                let rk = (tier[r]!.rawValue, (reports[r]?.isEmpty ?? true) ? 1 : 0, handle(r), r)
+                let lk = (tier[l]!.rawValue, reportsFirst ? leafRank(l) : 0, handle(l), l)
+                let rk = (tier[r]!.rawValue, reportsFirst ? leafRank(r) : 0, handle(r), r)
                 return lk < rk
             }
             let seatKids = (seats[id] ?? []).map(\.id).sorted().map(vacancyNodeId)
@@ -212,12 +216,12 @@ public struct OrgTree: Equatable, Sendable {
         return MapGrouping.teamTitle(team)
     }
 
-    /// Case-insensitive: handle-prefix matches first, then handles or roles containing the query; agent ids only, at most
-    /// `searchLimit`. An empty (or blank) query gives nothing.
+    /// Case-insensitive: handle-prefix matches first, then handles or roles containing the query; agent ids with a node on the chart only
+    /// (a killed or hidden agent in `handles` is skipped), at most `searchLimit`. An empty (or blank) query gives nothing.
     public func search(_ query: String, handles: [String: String], roles: [String: String]) -> [String] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !q.isEmpty else { return [] }
-        func isAgent(_ id: String) -> Bool { id != OrgTree.boardId && !id.hasPrefix("vacancy:") }
+        func isAgent(_ id: String) -> Bool { id != OrgTree.boardId && !id.hasPrefix("vacancy:") && nodes[id] != nil }
         let candidates = handles.keys.filter(isAgent).sorted { l, r in
             let lh = handles[l]!, rh = handles[r]!
             return lh == rh ? l < r : DottedLinks.numericallyBefore(lh, rh)
