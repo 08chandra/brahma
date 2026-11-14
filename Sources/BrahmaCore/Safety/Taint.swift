@@ -11,13 +11,13 @@ import Glibc
 /// is high risk.
 public enum TaintPolicy {
     /// Company tools a tainted session keeps: talking, reading and ordinary work on items.
-    public static let taintSafeTools: Set<String> = [
+    public static let taintSafeTools: Set<String> = Set([
         "post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked",
         "list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency", "comment_work_item",
         "claim_lease", "release_lease", "submit_for_review", "write_handoff",
         // Plan L (chief review L4): the handler enforces its own tainted-session rule (a template without links only).
         "request_human_task",
-    ]
+    ]).union(CompanyToolNames.memory)   // Plan ML: what a tainted session remembers is stored tainted; what it reads taints first.
 
     /// The company tools reviewed as high risk (`everyToolClassified` pins `CompanyToolNames.all` against both sets). A task
     /// that adds a tool adds it to one of the two in the same commit (10b: `propose_extension`, refused while tainted).

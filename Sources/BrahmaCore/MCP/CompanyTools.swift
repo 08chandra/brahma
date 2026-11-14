@@ -68,22 +68,25 @@ public struct CompanyTools: Sendable {
     let taintFlag: URL?
     /// The data home's places (`propose_extension` stages there, 10b); nil: derived from the store's database path.
     let paths: BrahmaPaths?
+    /// The secret store `brahma mcp` resolved (Plan ML: `remember` refuses a fact holding a stored value). Nil: none, which
+    /// refuses `remember` whenever the company has secrets (fail closed).
+    let vault: (any SecretVault)?
     let counter = TurnQuotaCounter()
 
     public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
                 quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
-                paths: BrahmaPaths? = nil) {
+                paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil) {
         self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, auditTurnId: auditTurnId,
-                  quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, taintFlag: taintFlag, paths: paths, diagnostics: { line in
-            FileHandle.standardError.write(Data((line + "\n").utf8))
-        })
+                  quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, taintFlag: taintFlag, paths: paths, vault: vault,
+                  diagnostics: { line in FileHandle.standardError.write(Data((line + "\n").utf8)) })
     }
 
     init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
          quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
-         paths: BrahmaPaths? = nil, diagnostics: @escaping @Sendable (String) -> Void) {
+         paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil, diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
         self.paths = paths
+        self.vault = vault
         self.reviewItemId = reviewItemId
         self.auditTurnId = reviewItemId == nil ? auditTurnId : nil
         self.quotas = quotas; self.quotaTurnId = quotaTurnId; self.planTurn = planTurn
@@ -93,7 +96,8 @@ public struct CompanyTools: Sendable {
     static let turnEndedMessage = "this turn has ended; its tools no longer work"
 
     /// Tools that only read; they carry `readOnlyHint` and are never counted.
-    static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item"]
+    static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item",
+                                             "search_memory", "recall"]
     /// High-authority company tools (design §2.2): one call per turn when sub-agents are on, none on a plan turn, denied under
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
     /// Plan L's ops tools (`CompanyToolNames.ops`) count as high risk too; under taint they are refused by `TaintPolicy`
@@ -180,7 +184,7 @@ public struct CompanyTools: Sendable {
     /// Every tool group's specs (the stable, role-independent list).
     private static func allSpecs() -> [ToolSpec] {
         baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs() + previewToolSpecs() + deployToolSpecs() + humanTaskToolSpecs()
-            + extensionToolSpecs()
+            + extensionToolSpecs() + memoryToolSpecs()
     }
 
     private static let implemented: Set<String> = Set(allSpecs().map(\.name))
@@ -320,7 +324,8 @@ public struct CompanyTools: Sendable {
 
     /// While the engine merges an item, no tool may act on it (`"<KEY> is being merged"`).
     private func refuseItemsBeingMerged(_ name: String, _ arguments: [String: JSONValue]) throws {
-        guard !Self.readOnlyItemTools.contains(name) else { return }
+        // A memory key is not an item key (`remember {key: "eng-7"}` touches no item).
+        guard !Self.readOnlyItemTools.contains(name), !CompanyToolNames.memory.contains(name) else { return }
         for field in ["key", "dependsOn"] {
             guard let raw = arguments[field]?.stringValue else { continue }
             let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
@@ -382,6 +387,7 @@ public struct CompanyTools: Sendable {
                 if let result = try dispatchPreview(name, args) { return result }
                 if let result = try dispatchDeploy(name, args) { return result }
                 if let result = try dispatchHumanTask(name, args) { return result }
+                if let result = try dispatchMemory(name, args) { return result }
                 throw ToolError(message: "unknown tool: \(name)")
             }
         } catch let e as ToolError {

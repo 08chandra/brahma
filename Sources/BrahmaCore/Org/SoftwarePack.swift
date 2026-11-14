@@ -1,6 +1,7 @@
 import Foundation
 
-/// The built-in `software` industry pack, version 3 (Plan L added the ops tools, then the path-to-live paragraph). Role cards follow the Role Card v2 layout.
+/// The built-in `software` industry pack, version 4 (Plan L added the ops tools, then the path-to-live paragraph; Plan ML the
+/// memory tools). Role cards follow the Role Card v2 layout.
 public enum SoftwarePack {
     static let statusLine = "STATUS: DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT"
     /// Plan L Task 13: the path to live, on the roles that set previews, deploy config and deploys (cto, cto-architect, architect,
@@ -480,7 +481,7 @@ public enum SoftwarePack {
     }
 
     public static let pack = IndustryPack(
-        id: "software", version: 3, title: "Software company",
+        id: "software", version: 4, title: "Software company",
         roles: [
             role("ceo", "CEO", .executive, "ceo", ceoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
             role("cpo", "CPO", .executive, "cpo", cpoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
