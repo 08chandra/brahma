@@ -373,7 +373,18 @@ struct LiveSmokeTests {
     /// `BRAHMA_LIVE=1 DEVELOPER_DIR=… timeout -k 30 3900 swift test --filter LiveSmokeTests/goalToLiveURL`.
     @Test(.timeLimit(.minutes(60)))
     func goalToLiveURL() async throws {
+        // Line-buffered stdout (best effort: Swift Testing has already written to it, so the watchdog also flushes every 10 s
+        // and each phase line flushes: the first live rerun showed nothing at all until the process ended).
         setvbuf(stdout, nil, _IOLBF, 0)
+        // The turns' `brahma mcp` processes resolve their own vault for this temp home: with the file store they load the same
+        // secrets as the engine (`MCPConfig` passes `BRAHMA_SECRET_STORE=file` on). Without it they looked in the platform
+        // vault, found no value for the hosting token and refused every tool call ("secrets are not loaded yet"): the first
+        // live run stalled there. Never the Keychain; refused by the vault for the default home.
+        let previousStore = ProcessInfo.processInfo.environment[SecretStore.environmentVariable]
+        setenv(SecretStore.environmentVariable, "file", 1)
+        defer {
+            if let previousStore { setenv(SecretStore.environmentVariable, previousStore, 1) } else { unsetenv(SecretStore.environmentVariable) }
+        }
         let monitor = LiveRunMonitor()
         print("FAKE HOST: this run does not prove a Cloudflare or Vercel deploy (dev host on loopback; see `brahma hosting probe`)")
         let root = try tempDir()
@@ -431,8 +442,9 @@ struct LiveSmokeTests {
         try EngineFiles.directory(workspace: layout.root, bin, mode: 0o700)
         _ = try EngineFiles.create(Data("dev host: nothing to install (the deploy runs /bin/cp)\n".utf8), workspace: layout.root, dir: bin, name: adapter.cliBin)
 
-        // The owner does the hosting-account task with dummy values (the token goes to the in-memory vault, never a Keychain).
-        let vault = MemoryVault()
+        // The owner does the hosting-account task with dummy values (the token goes to the temp home's file vault, which the
+        // turns' MCP servers read too; never a Keychain).
+        let vault = FileVault(home: paths.home)
         let accountId = hosting.provider == .cloudflarePages ? String(repeating: "0", count: 32) : "team_fake"
         _ = try store.completeHumanTask(companyId: companyId, askId: hostingTask.id, values: [tokenName: Self.fakeHostToken, "account_id": accountId], vault: vault)
         try store.reloadRedactorIfNeeded(vault: vault)
@@ -661,6 +673,7 @@ struct LiveSmokeTests {
             var tick = 0, killed = false
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(10)) } catch { return }   // the poll interval; deadlines read `Date`
+                fflush(stdout)
                 tick += 1
                 let companyId = monitor.companyId
                 var cost: Double?, pending = 0, running = 0, releases = ""
@@ -737,7 +750,7 @@ final class LiveRunMonitor: @unchecked Sendable {
     var companyId: String? { lock.withLock { _companyId } }
     var costAbort: Double? { lock.withLock { _costAbort } }
     var touches: [String] { lock.withLock { _touches } }
-    func set(phase: String) { lock.withLock { _phase = phase }; print("PHASE \(phase) at \(elapsedText)") }
+    func set(phase: String) { lock.withLock { _phase = phase }; print("PHASE \(phase) at \(elapsedText)"); fflush(stdout) }
     func set(companyId: String) { lock.withLock { _companyId = companyId } }
     func touch(_ line: String) { lock.withLock { _touches.append(line) } }
     /// Records the cost abort; true the first time.
