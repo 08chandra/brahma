@@ -227,14 +227,14 @@ extension CompanyTools {
     // MARK: Helpers
 
     /// A string argument as given (absent or null: nil); blank is allowed so the store's own refusal answers.
-    private func rawString(_ args: [String: JSONValue], _ key: String) throws -> String? {
+    func rawString(_ args: [String: JSONValue], _ key: String) throws -> String? {
         guard let v = args[key], v != .null else { return nil }
         guard let s = v.stringValue else { throw ToolError(message: "argument \(key) must be a string") }
         return s
     }
 
     /// The turn a read belongs to: this server's turn, else the agent's running one.
-    private func runningTurnId() throws -> String? {
+    func runningTurnId() throws -> String? {
         if let quotaTurnId { return quotaTurnId }
         return try store.writer.read { [agentId] db in try Store.runningTurnId(db: db, agentId: agentId) }
     }

@@ -1,7 +1,7 @@
 import Foundation
 
-/// The built-in `software` industry pack, version 4 (Plan L added the ops tools, then the path-to-live paragraph; Plan ML the
-/// memory tools). Role cards follow the Role Card v2 layout.
+/// The built-in `software` industry pack, version 5 (Plan L added the ops tools, then the path-to-live paragraph; Plan ML the
+/// memory tools, then the handbook sections and the research line). Role cards follow the Role Card v2 layout.
 public enum SoftwarePack {
     static let statusLine = "STATUS: DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT"
     /// Plan L Task 13: the path to live, on the roles that set previews, deploy config and deploys (cto, cto-architect, architect,
@@ -9,6 +9,9 @@ public enum SoftwarePack {
     public static let livePath = "Path to live: start a walking skeleton on an item branch while the brief is reviewed: a static site (plain HTML or Vite) where `npm run build` writes `dist/`. Then call set_preview_command (run a local server on {port}, bind 127.0.0.1), set_smoke_check, and set_deploy_config (output_dir dist, expect_text = a phrase from the page). When main is green, call propose_deploy; the owner approves and the engine deploys. Need something only a human can do (account, domain, keys, posting)? Use request_human_task."
     /// Interpolated at the start of a line of the (indent-stripped) prompt literals, right before `## Output template`.
     static let livePathSection = "## Path to live\n\(livePath)\n\n"
+    /// Plan ML Task 4 (R-199), verbatim. The pack has no researcher role: research is a spike, so the line ends the spike
+    /// playbooks.
+    public static let researchLine = "Write research as handbook pages under Research/ with kb_write, and list every source you used in sources."
 
     /// Role id -> provenance line for the card front matter.
     static let adaptedFrom: [String: String] = [
@@ -456,7 +459,7 @@ public enum SoftwarePack {
     private static let engineerPlaybooks: [String: String] = [
         "task": "1. show_work_item and restate the criteria. 2. claim_lease. 3. Write the failing test. 4. Make it pass with the smallest change. 5. Run the check. 6. submit_for_review with what changed and what you verified. Never edit the check.",
         "bug": "1. Reproduce on main and note the steps. 2. Write a regression test that fails. 3. Fix the root cause, not the symptom. 4. Run the check. 5. submit_for_review with the repro, cause and fix.",
-        "spike": "1. State the question and a timebox. 2. Explore the cheapest way to answer it. 3. write_handoff with the answer, evidence, options and a recommendation. No production changes unless the item says so.",
+        "spike": "1. State the question and a timebox. 2. Explore the cheapest way to answer it. 3. write_handoff with the answer, evidence, options and a recommendation. No production changes unless the item says so. \(researchLine)",
     ]
     private static let qaPlaybooks: [String: String] = [
         "bug": "1. Reproduce and record exact steps. 2. Check for a duplicate by root cause. 3. Rate severity by user impact. 4. Attach evidence. 5. When fixed, confirm the regression fails on main and passes on the fix commit.",
@@ -468,7 +471,7 @@ public enum SoftwarePack {
     ]
     private static let designerPlaybooks: [String: String] = [
         "story": "1. Rate hierarchy, states, responsiveness, accessibility, consistency and copy from 0 to 10. 2. For each below 10, say what makes it a 10. 3. Amend the item with required states and values from DESIGN.md. 4. Attach a mockup or preview.",
-        "spike": "1. Look at three comparable products. 2. Propose a design direction with reasons (type, color, spacing, motion). 3. Attach a preview. 4. If brand-level, request_from_owner for sign-off before DESIGN.md changes.",
+        "spike": "1. Look at three comparable products. 2. Propose a design direction with reasons (type, color, spacing, motion). 3. Attach a preview. 4. If brand-level, request_from_owner for sign-off before DESIGN.md changes. \(researchLine)",
     ]
 
     // MARK: Pack
@@ -481,7 +484,7 @@ public enum SoftwarePack {
     }
 
     public static let pack = IndustryPack(
-        id: "software", version: 4, title: "Software company",
+        id: "software", version: 5, title: "Software company",
         roles: [
             role("ceo", "CEO", .executive, "ceo", ceoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
             role("cpo", "CPO", .executive, "cpo", cpoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
@@ -531,5 +534,6 @@ public enum SoftwarePack {
             "other": ["ceo", "ceo-cpo"],
         ],
         reservedCategories: [],
-        triggerRoles: IndustryPack.defaultTriggerRoles)
+        triggerRoles: IndustryPack.defaultTriggerRoles,
+        handbook: HandbookSection.softwareDefault)
 }

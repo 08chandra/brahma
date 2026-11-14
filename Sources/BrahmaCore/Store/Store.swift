@@ -250,6 +250,8 @@ public final class Store: Sendable {
             do {
                 if let staged { try Store.markImported(db, companyId: company.id, source: staged.source.taintSource, now: createdAt) }
                 try Store.insertChannel(db, companyId: company.id, name: "general", kind: .channel, members: ["owner"], now: createdAt)
+                // Plan ML: the pack's handbook sections, from the first moment the company exists.
+                try ensureHandbookSkeleton(db: db, companyId: company.id, now: createdAt)
             } catch {
                 // The insert rolls back; an adopted import does not stay behind as a workspace no company owns.
                 if staged != nil { RepoImport.remove(dir) }

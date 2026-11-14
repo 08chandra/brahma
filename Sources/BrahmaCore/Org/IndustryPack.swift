@@ -5,8 +5,10 @@ public enum RoleKind: String, Codable, Sendable { case executive, architect, man
 public enum CompanyToolNames {
     /// Plan ML's memory tools: every role gets them (they are part of `base`).
     public static let memory = ["search_memory", "recall", "remember"]
+    /// Plan ML's handbook tools: every role gets them too.
+    public static let kb = ["search_kb", "kb_read", "kb_write"]
     public static let base = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"]
-        + memory
+        + memory + kb
     public static let work = ["list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency",
                               "comment_work_item", "claim_lease", "release_lease", "submit_for_review", "write_handoff",
                               "propose_decision", "request_from_owner", "escalate_decision", "request_mode",
@@ -195,20 +197,25 @@ public struct IndustryPack: Codable, Equatable, Sendable {
     public var autoMerge: Bool = true
     /// Directories an auto-merged change may touch; nil is `ReviewPolicy.defaultAutoMergePaths`. The owner's list wins.
     public var autoMergePaths: [String]? = nil
+    /// The top-level handbook sections every company of the pack starts with (Plan ML); absent in older pack files: the
+    /// software sections.
+    public var handbook: [HandbookSection] = HandbookSection.softwareDefault
 
     public static let defaultTriggerRoles = ["qa", "designer", "security"]
 
     public init(id: String, version: Int, title: String, roles: [RoleTemplate], itemTypes: [ItemTypeDef], org: OrgShape,
                 defaultCadence: String, askApprovers: [String: [String]], reservedCategories: [String],
-                connectors: [String] = [], triggerRoles: [String] = []) {
+                connectors: [String] = [], triggerRoles: [String] = [],
+                handbook: [HandbookSection] = HandbookSection.softwareDefault) {
         self.id = id; self.version = version; self.title = title; self.roles = roles; self.itemTypes = itemTypes
         self.org = org; self.defaultCadence = defaultCadence; self.askApprovers = askApprovers
         self.reservedCategories = reservedCategories; self.connectors = connectors; self.triggerRoles = triggerRoles
+        self.handbook = handbook
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, version, title, roles, itemTypes, org, defaultCadence, askApprovers, reservedCategories, connectors, triggerRoles
-        case autoMerge, autoMergePaths
+        case autoMerge, autoMergePaths, handbook
     }
 
     public init(from d: Decoder) throws {
@@ -229,6 +236,7 @@ public struct IndustryPack: Codable, Equatable, Sendable {
             ?? Self.defaultTriggerRoles.filter { known.contains($0) }
         autoMerge = try c.decodeIfPresent(Bool.self, forKey: .autoMerge) ?? true
         autoMergePaths = try c.decodeIfPresent([String].self, forKey: .autoMergePaths)
+        handbook = try c.decodeIfPresent([HandbookSection].self, forKey: .handbook) ?? HandbookSection.softwareDefault
     }
 
     public func role(_ id: String) -> RoleTemplate? { roles.first { $0.id == id } }
@@ -278,6 +286,11 @@ public struct IndustryPack: Codable, Equatable, Sendable {
             if let u = approvers.first(where: { !known.contains($0) }) { throw fail("askApprovers[\(kind)] unknown role \(u)") }
         }
         if let t = triggerRoles.first(where: { !known.contains($0) }) { throw fail("unknown trigger role \(t)") }
+        for section in handbook {
+            do { _ = try HandbookPath.normalize(section.path) } catch let e as WorkError {
+                throw fail("handbook section \(section.path): \(e.message)")
+            }
+        }
         if let paths = autoMergePaths {
             do { try CheckSpec.validatePaths(paths, what: "auto-merge") } catch let e as WorkError { throw fail(e.message) }
         }

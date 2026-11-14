@@ -1338,5 +1338,69 @@ enum Migrations {
             try db.alter(table: "memoryEntry") { t in t.add(column: "createdActive", .double) }
             try db.create(index: "memoryEntry_author", on: "memoryEntry", columns: ["companyId", "authorId", "createdActive"])
         }
+        m.registerMigration("vML-kb") { db in
+            // Plan ML Task 4: the handbook. A page holds its current revision; revisions are appended, never changed. Paths are
+            // unique per company case-insensitively (NFC is the writer's job: `HandbookPath.normalize`). `restriction`: a
+            // page-level JSON `[role]`; `sources`: a JSON array of one-line strings.
+            try db.create(table: "kbPage") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("path", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("section", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("ownerId", .text).notNull()
+                t.column("status", .text).notNull().defaults(to: "active")
+                t.column("autoKind", .text)
+                t.column("revision", .integer).notNull()
+                t.column("lastReviewed", .datetime)
+                t.column("sources", .text).notNull().defaults(to: "[]")
+                t.column("restriction", .text)
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("vouchedAt", .datetime)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+            }
+            try db.execute(sql: "CREATE UNIQUE INDEX kbPage_path ON kbPage(companyId, path COLLATE NOCASE)")
+            try db.create(table: "kbRevision") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("pageId", .text).notNull().references("kbPage", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("title", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("status", .text).notNull()
+                t.column("authorId", .text).notNull()
+                t.column("itemId", .text)
+                t.column("turnId", .text)
+                t.column("summary", .text)
+                t.column("diffSummary", .text).notNull()
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("rollbackOf", .integer)
+                t.column("createdAt", .datetime).notNull()
+                t.uniqueKey(["pageId", "number"])
+            }
+            // `restrictions`: the linking section's JSON `[[role]]`.
+            try db.create(table: "kbLink") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("fromPageId", .text).notNull().references("kbPage", onDelete: .cascade)
+                t.column("sectionSlug", .text).notNull()
+                t.column("toPath", .text).notNull().collate(.nocase)
+                t.column("restrictions", .text).notNull().defaults(to: "[]")
+                t.primaryKey(["fromPageId", "sectionSlug", "toPath"])
+            }
+            try db.create(index: "kbLink_to", on: "kbLink", columns: ["companyId", "toPath"])
+            // One page, one writer: the agent editing it for an item, until a company-active second.
+            try db.create(table: "kbLease") { t in
+                t.primaryKey("pageId", .text).references("kbPage", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull()
+                t.column("itemId", .text).notNull()
+                t.column("expiresActive", .double).notNull()
+            }
+            try db.create(index: "kbLease_item", on: "kbLease", columns: ["itemId"])
+        }
     }
 }
