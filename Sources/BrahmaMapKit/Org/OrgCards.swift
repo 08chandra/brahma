@@ -29,6 +29,14 @@ final class OrgCardNode: SKNode {
     }
 
     static let pulseKey = "pulse"
+    static let hireKey = "hire"
+    static let chipPopKey = "chipPop"
+    /// Hire: the card grows from 60 % and fades in over this long, with an accent halo that fades with it.
+    static let hireDuration = 0.4
+    /// A state change flashes the status bar for this long.
+    static let flashDuration = 0.2
+    /// A promotion pops the trust chip from 1.4× back to 1× in this long.
+    static let chipPopDuration = 0.2
 
     private(set) var content: Content?
     private(set) var cardSize = CGSize(width: OrgLayout.card.w, height: OrgLayout.card.h)
@@ -80,6 +88,7 @@ final class OrgCardNode: SKNode {
     /// Back to a blank node, ready for the pool: also drops the node's actions (the glide).
     func reset() {
         removeAllActions()
+        setScale(1)
         clear()
     }
 
@@ -88,7 +97,8 @@ final class OrgCardNode: SKNode {
         removeAllChildren()
         details.removeAllChildren()
         itemLine.removeAllChildren()
-        alpha = 1
+        // A hire is fading the card in: a content change in the middle must not make it blink to full.
+        if action(forKey: Self.hireKey) == nil { alpha = 1 }
         isBoard = false
         content = nil
         border = SKSpriteNode()
@@ -206,15 +216,60 @@ final class OrgCardNode: SKNode {
         let size = Self.points(texture)
         let w = size.width + 4, h: CGFloat = 13
         let frame = CGRect(x: rightEdge - w, y: y - h / 2, width: w, height: h)
-        let chipBorder = rect(hex, w, h, at: CGPoint(x: frame.midX, y: y))
+        // One group per chip, centred on the chip, so a promotion can pop it as a whole.
+        let group = SKNode()
+        group.name = "trustChipGroup"
+        group.position = CGPoint(x: frame.midX, y: y)
+        let chipBorder = rect(hex, w, h)
         chipBorder.name = "trustChip"
-        details.addChild(chipBorder)
-        details.addChild(rect(ThemeHex.bg2, w - 2, h - 2, at: CGPoint(x: frame.midX, y: y)))
-        details.addChild(rect(hex, w - 2, h - 2, alpha: 0.15, at: CGPoint(x: frame.midX, y: y)))
+        group.addChild(chipBorder)
+        group.addChild(rect(ThemeHex.bg2, w - 2, h - 2))
+        group.addChild(rect(hex, w - 2, h - 2, alpha: 0.15))
         let sprite = SKSpriteNode(texture: texture, size: size)
-        sprite.position = CGPoint(x: frame.midX, y: y)
-        details.addChild(sprite)
+        group.addChild(sprite)
+        details.addChild(group)
         return frame
+    }
+
+    // MARK: Event animations
+
+    /// A state change: a `text0` overlay on the status bar that fades out over `flashDuration`. It sits on top of the bar
+    /// (which may be pulsing), so nothing has to be restored afterwards.
+    func flashStatusBar() {
+        guard case .agent? = content else { return }
+        childNode(withName: "barFlash")?.removeFromParent()
+        let flash = SKSpriteNode(color: MapPalette.color(ThemeHex.text0), size: statusBar.size)
+        flash.position = statusBar.position
+        flash.name = "barFlash"
+        addChild(flash)
+        flash.run(.sequence([.fadeOut(withDuration: Self.flashDuration), .removeFromParent()]))
+    }
+
+    /// A hire: scale 0.6 → 1 and fade in over `hireDuration`, with an accent rim (a slightly larger `accent` rect behind the
+    /// card) that fades out over the same time.
+    func playHire() {
+        removeAction(forKey: Self.hireKey)
+        childNode(withName: "hireFlash")?.removeFromParent()
+        let halo = SKSpriteNode(color: MapPalette.color(ThemeHex.accent),
+                                size: CGSize(width: cardSize.width + 4, height: cardSize.height + 4))
+        halo.name = "hireFlash"
+        insertChild(halo, at: 0)
+        halo.run(.sequence([.fadeOut(withDuration: Self.hireDuration), .removeFromParent()]))
+        setScale(0.6)
+        alpha = 0
+        let grow = SKAction.scale(to: 1, duration: Self.hireDuration)
+        grow.timingMode = .easeOut
+        run(.group([grow, .fadeIn(withDuration: Self.hireDuration)]), withKey: Self.hireKey)
+    }
+
+    /// A promotion: the chip (already showing the new label and tier color) pops from 1.4× to 1×.
+    func popTrustChip() {
+        guard let chip = details.childNode(withName: "trustChipGroup") else { return }
+        chip.removeAction(forKey: Self.chipPopKey)
+        chip.setScale(1.4)
+        let settle = SKAction.scale(to: 1, duration: Self.chipPopDuration)
+        settle.timingMode = .easeOut
+        chip.run(settle, withKey: Self.chipPopKey)
     }
 
     // MARK: Board, vacancy, stub

@@ -9,7 +9,8 @@ import BrahmaAppModel
 ///
 /// Layers, back to front: `bg0` background with a `mapGrid` lattice every 24 pt, team bands, connectors, dotted lines,
 /// cards and stubs, band labels (over the connectors that enter a band from above). The camera is an `SKCameraNode`;
-/// `zoom` is its inverse scale. Task 9b adds the live `update(controller:events:now:)`.
+/// `zoom` is its inverse scale. The live visuals (message particles, comm-edge glow, meeting hulls, the highlight ring and
+/// the card animations) are driven by `update(controller:events:now:)` (OrgParticles.swift).
 ///
 /// Rebuilding is incremental: a layout is recomputed only when the tree or the collapsed set changed, card nodes are
 /// reused by id (and pooled when a card leaves), and a card whose rect moved glides there in 0.4 s.
@@ -30,24 +31,28 @@ public final class OrgScene: SKScene {
 
     // MARK: Layers
 
-    private let cameraNode = SKCameraNode()
+    let cameraNode = SKCameraNode()
     private let gridLayer = SKNode()
     private let bandLayer = SKNode()
     private let connectorLayer = SKNode()
     private let dottedLayer = SKNode()
     private let cardLayer = SKNode()
     private let labelLayer = SKNode()
+    /// The live visuals' layers and bookkeeping (OrgParticles.swift).
+    let motion = MotionState()
     private let connectorShape = SKShapeNode()
     private var gridSprites: [SKSpriteNode] = []
     private var lastCamera: (position: CGPoint, scale: CGFloat, size: CGSize)?
 
     // MARK: State
 
-    private var layout = OrgLayout()
-    private var builtTree: OrgTree?
-    private var builtCollapsed: Set<String> = []
-    private var builtRevision = -1
-    private var cards: [String: OrgCardNode] = [:]
+    private(set) var layout = OrgLayout()
+    private(set) var builtTree: OrgTree?
+    private(set) var builtCollapsed: Set<String> = []
+    private(set) var builtRevision = -1
+    /// Bumped whenever the layout changed: cached routes and the shapes drawn from them are stale.
+    private(set) var layoutVersion = 0
+    private(set) var cards: [String: OrgCardNode] = [:]
     private var stubs: [String: OrgCardNode] = [:]
     private var targets: [String: CGPoint] = [:]
     private var pool: [OrgCardNode] = []
@@ -88,6 +93,12 @@ public final class OrgScene: SKScene {
             layer.zPosition = CGFloat(z)
             addChild(layer)
         }
+        // Between the lines and the cards: comm-edge glow and meeting hulls; above the cards: the highlight ring and the
+        // particles.
+        for (layer, z) in [(motion.glowLayer, 1.5), (motion.hullLayer, 2.5), (motion.highlightLayer, 4.5), (motion.particleLayer, 5)] {
+            layer.zPosition = CGFloat(z)
+            addChild(layer)
+        }
         connectorShape.strokeColor = MapPalette.color(ThemeHex.line)
         connectorShape.lineWidth = 1
         connectorShape.lineJoin = .miter
@@ -112,10 +123,17 @@ public final class OrgScene: SKScene {
 
     /// Centres the chart and zooms so all of `contentBounds` plus `margin` points shows (clamped to `zoomRange`).
     public func zoomToFit(margin: CGFloat = 40) {
-        guard contentBounds.width > 0, contentBounds.height > 0, size.width > 0, size.height > 0 else { return }
+        guard let goal = fitGoal(margin: margin) else { return }
+        cameraNode.position = goal.center
+        zoom = goal.zoom
+    }
+
+    /// Where the camera shows all of `contentBounds` plus `margin` points: its centre and (unclamped) zoom. Nil while the
+    /// chart or the view is empty.
+    func fitGoal(margin: CGFloat = 40) -> (center: CGPoint, zoom: Double)? {
+        guard contentBounds.width > 0, contentBounds.height > 0, size.width > 0, size.height > 0 else { return nil }
         let fit = Swift.min(size.width / (contentBounds.width + 2 * margin), size.height / (contentBounds.height + 2 * margin))
-        cameraNode.position = CGPoint(x: contentBounds.midX, y: contentBounds.midY)
-        zoom = Double(fit)
+        return (CGPoint(x: contentBounds.midX, y: contentBounds.midY), Double(fit))
     }
 
     public override func didChangeSize(_ oldSize: CGSize) {
@@ -125,13 +143,20 @@ public final class OrgScene: SKScene {
 
     public override func update(_ currentTime: TimeInterval) {
         super.update(currentTime)
+        // Driven by a view: one controller frame, then the scene's own. Map time starts at 0 with the first frame.
+        if let controller = motion.driver {
+            let base = motion.timeBase ?? currentTime
+            motion.timeBase = base
+            let now = currentTime - base
+            update(controller: controller, events: controller.frame(now: now), now: now)
+        }
         // Another owner (a pan or zoom gesture) may have moved the camera directly.
         if let last = lastCamera, last.position == cameraNode.position, last.scale == cameraNode.xScale, last.size == size { return }
         cameraMoved()
     }
 
     /// Everything that depends on the camera: text level of detail, connector width, the visible grid tiles.
-    private func cameraMoved() {
+    func cameraMoved() {
         lastCamera = (cameraNode.position, cameraNode.xScale, size)
         let z = zoom
         let level: Level = z < Self.textZoom ? .blank : z < Self.itemZoom ? .text : .items
@@ -202,6 +227,7 @@ public final class OrgScene: SKScene {
         let layoutChanged = builtTree != tree || builtCollapsed != collapsed || builtRevision != model.structureRevision
         if layoutChanged {
             layout = OrgLayout.make(tree: tree, collapsed: collapsed)
+            layoutVersion += 1
             builtTree = tree
             builtCollapsed = collapsed
             builtRevision = model.structureRevision
@@ -340,6 +366,15 @@ public final class OrgScene: SKScene {
         return nil
     }
 
+    /// True when `p` is on the `▾` of an expanded manager's card (its bottom-right corner), where a click collapses the team
+    /// instead of selecting the agent. The marker only shows from `textZoom`.
+    func isExpandMarker(_ id: String, at p: CGPoint) -> Bool {
+        guard zoom >= Self.textZoom, case .agent(_, let expanded)? = cards[id]?.content, expanded, let r = cardRect(id) else {
+            return false
+        }
+        return p.x >= r.maxX - 20 && p.y <= r.minY + 18
+    }
+
     // MARK: Bands
 
     /// One band per expanded manager: its subtree's bounding box padded (more above, for the label), and padded again around
@@ -475,5 +510,91 @@ public final class OrgScene: SKScene {
             counts[parent, default: Counts()].add(own)
         }
         return counts
+    }
+}
+
+// MARK: - Camera motion (Task 9b)
+
+extension OrgScene {
+    /// The next `update(controller:…)` rebuilds the cards whatever changed.
+    func forceRebuild() { builtRevision = -1 }
+
+    /// Eases the camera over 0.3 s to the controller's `camera` target: `.fit` shows the whole chart (and keeps showing it as
+    /// the chart grows, until the owner pans or zooms), `.agent` centres that card, at least at 100 %, and while the owner
+    /// is following it the camera tracks the card as it glides. The first frame snaps instead of easing.
+    func updateCamera(controller: MapController, now: TimeInterval) {
+        let m = motion
+        let target = controller.camera
+        if m.camera.target != target || m.camera.request {
+            let first = m.camera.target == nil
+            m.camera.target = target
+            m.camera.request = false
+            m.camera.suspended = false
+            if case .fit = target { m.camera.autoFit = true } else { m.camera.autoFit = false }
+            if first {
+                m.camera.snapNext = true
+                m.camera.ease = nil
+            } else {
+                var zoomGoal: Double?
+                if case .agent = target { zoomGoal = Swift.max(zoom, 1) }
+                m.camera.ease = .init(start: now, from: cameraNode.position, fromScale: cameraNode.xScale, zoom: zoomGoal)
+            }
+        }
+
+        let goal: (center: CGPoint, zoom: Double)?
+        switch target {
+        case .fit:
+            goal = fitGoal().map { ($0.center, Self.clampZoom($0.zoom)) }
+        case .agent(let id):
+            goal = currentCardRect(id).map { (CGPoint(x: $0.midX, y: $0.midY), m.camera.ease?.zoom ?? Swift.max(zoom, 1)) }
+        }
+        guard let goal else { return }
+
+        if case .fit = target, m.camera.autoFit {
+            let key = MotionState.CameraState.FitKey(bounds: contentBounds, size: size)
+            if key != m.camera.fitKey {
+                m.camera.fitKey = key
+                if !m.camera.snapNext && m.camera.ease == nil {
+                    m.camera.ease = .init(start: now, from: cameraNode.position, fromScale: cameraNode.xScale, zoom: nil)
+                }
+            }
+        }
+        if m.camera.snapNext {
+            cameraNode.position = goal.center
+            zoom = goal.zoom
+            m.camera.snapNext = false
+            m.camera.ease = nil
+            return
+        }
+        if let ease = m.camera.ease {
+            let p = Swift.min(1, Swift.max(0, (now - ease.start) / MotionState.cameraEase))
+            let s = CGFloat(p * p * (3 - 2 * p))
+            let toScale = 1 / CGFloat(Self.clampZoom(ease.zoom ?? goal.zoom))
+            cameraNode.position = CGPoint(x: ease.from.x + (goal.center.x - ease.from.x) * s,
+                                          y: ease.from.y + (goal.center.y - ease.from.y) * s)
+            zoom = Double(1 / (ease.fromScale + (toScale - ease.fromScale) * s))
+            if p >= 1 { m.camera.ease = nil }
+        } else if case .agent(let id) = target, controller.follow == id, !m.camera.suspended {
+            cameraNode.position = goal.center
+            cameraMoved()
+        }
+    }
+
+    /// `controller.zoom` and the camera stay one value: the scene's zoom (gestures, easing) is written to the controller;
+    /// a zoom set on the controller from outside (a control) moves the camera.
+    func syncZoom(controller: MapController) {
+        let m = motion
+        if let last = m.camera.lastControllerZoom, controller.zoom != last {
+            m.camera.ease = nil
+            m.camera.autoFit = false
+            zoom = controller.zoom
+        } else if abs(controller.zoom - zoom) > 1e-9 {
+            controller.zoom = zoom
+        }
+        m.camera.lastControllerZoom = controller.zoom
+    }
+
+    static func clampZoom(_ z: Double) -> Double {
+        Swift.min(zoomRange.upperBound, Swift.max(zoomRange.lowerBound, z.isFinite ? z : 1))
     }
 }
