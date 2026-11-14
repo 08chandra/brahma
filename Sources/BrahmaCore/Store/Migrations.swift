@@ -1413,5 +1413,11 @@ enum Migrations {
             }
             try db.create(index: "kbLease_item", on: "kbLease", columns: ["itemId"])
         }
+        m.registerMigration("vML-sprint-closer") { db in
+            // Plan ML Task 5 (fix round 2): who closed a sprint wrote its summary, so its taint follows that author. Retros are
+            // re-ingested so the ones closed before this (author unknown) are marked untrusted.
+            try db.alter(table: "sprint") { t in t.add(column: "closedById", .text) }
+            try db.execute(sql: "UPDATE memoryCursor SET position = '' WHERE source = 'retro'")
+        }
     }
 }

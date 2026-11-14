@@ -389,6 +389,7 @@ extension Store {
                 + (carried.isEmpty ? "none" : carried.map(\.key).joined(separator: ", ")) + "."
             sprint.status = .closed
             sprint.closedAt = now
+            sprint.closedById = actor.id
             sprint.summary = agentSummary.map { head + "\n" + $0 } ?? head
             try sprint.update(db)
             try releaseSprintItems(db, sprint, text: "carried over from \(sprint.name)", toBacklog: false, now: now)

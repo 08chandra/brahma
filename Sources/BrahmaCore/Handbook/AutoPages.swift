@@ -119,7 +119,7 @@ public enum AutoPages {
         var name: String
         var closedAt: Date
         var summary: String?
-        /// The lead's session taint when it closed (the retro's rule), or nil.
+        /// The closer's session taint when it closed, or the unknown-author reason (`MemoryIngest.retroTaint`), or nil.
         var taint: String?
     }
 
@@ -165,7 +165,10 @@ public enum AutoPages {
                 input.sprints = try Sprint.filter(Column("companyId") == companyId && Column("status") == SprintStatus.closed.rawValue)
                     .fetchAll(db).map {
                         let closed = $0.closedAt ?? $0.createdAt
-                        return SprintRow(name: $0.name, closedAt: closed, summary: $0.summary, taint: try taint($0.leadId, at: closed))
+                        let hasSummary = !($0.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        // The closer wrote the summary (the retro rule, `MemoryIngest.retroTaint`).
+                        let rowTaint = hasSummary ? try MemoryIngest.retroTaint($0, closedAt: closed) { try taint($0, at: closed) } : nil
+                        return SprintRow(name: $0.name, closedAt: closed, summary: $0.summary, taint: rowTaint)
                     }
                     .sorted { $0.closedAt > $1.closedAt }
             }
@@ -408,7 +411,7 @@ extension Store {
                 if let existing, existing.autoKind == kind.rawValue, stored == fingerprint { continue }
                 let body = try redact(AutoPages.render(kind, input, tz: tz))
                 if var page = existing {
-                    if page.autoKind != kind.rawValue || page.body != body || page.tainted != (taint != nil) {
+                    if page.autoKind != kind.rawValue || page.body != body || page.tainted != (taint != nil) || page.taintReason != taint {
                         page.autoKind = kind.rawValue
                         page.ownerId = KBAuthor.system.id
                         page.title = kind.title
@@ -467,6 +470,11 @@ public enum HandbookRefresh {
 
     @discardableResult
     public static func run(store: Store, company: Company, now: Date) -> Report {
+        run(store: store, company: company, now: now, mirrorFault: nil)
+    }
+
+    static func run(store: Store, company: Company, now: Date,
+                    mirrorFault: ((HandbookExporter.MirrorPhase, String) throws -> Void)?) -> Report {
         var report = Report()
         do {
             report.pages = try store.refreshAutoPages(companyId: company.id, now: now)
@@ -475,7 +483,8 @@ public enum HandbookRefresh {
         }
         do {
             report.mirror = try HandbookExporter.mirror(store: store, companyId: company.id,
-                                                        workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), now: now)
+                                                        workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), now: now,
+                                                        fault: mirrorFault)
         } catch {
             trace(store: store, companyId: company.id, "could not refresh the handbook mirror: \(error)", now: now)
         }

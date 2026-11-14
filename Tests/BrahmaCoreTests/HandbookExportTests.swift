@@ -325,6 +325,65 @@ import GRDB
         #expect(try Data(contentsOf: file) == good)
     }
 
+    /// Fix round 2: every problem met while sweeping the mirror counts as planted: the alert, and the whole mirror removed,
+    /// so a section restricted since never stays readable in an old file.
+    @Test func mirrorSweepProblemsFailClosed() throws {
+        for problem in ["cannot be removed (Operation not permitted)", "is nested too deeply to remove",
+                        "kept changing while it was removed", "cannot be inspected", "cannot be listed", "is on the way"] {
+            let w = try W()
+            try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay\nsalary otter")
+            _ = try w.mirror()
+            #expect(w.mirrored("Engineering/Board.md")?.contains("otter") == true)
+            try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay [restricted: cfo]\nsalary otter")
+            let r = try HandbookExporter.mirror(store: w.store, companyId: w.company.id, workspace: w.workspace, now: Store.now()) { phase, _ in
+                if phase == .sweep { throw UnsafeEngineFile(path: w.mirrorDir.path, problem: problem) }
+            }
+            #expect(r.unsafe.map(\.problem) == [problem])
+            #expect(!FileManager.default.fileExists(atPath: w.mirrorDir.path), "\(problem): the old mirror is gone")
+            #expect(!(try w.activity(containing: "refused to write through")).isEmpty, "\(problem)")
+            let alerts = try w.store.writer.read { db in
+                try Ask.fetchAll(db, sql: "SELECT * FROM ask WHERE companyId = ? AND kind = 'engineAlert'", arguments: [w.company.id])
+            }
+            #expect(alerts.contains { $0.subjectId == EngineAlerts.askSubject(reason: EngineAlerts.engineFileReason) })
+            // The next refresh rebuilds it, without the restricted section.
+            let next = try w.mirror()
+            #expect(next.unsafe.isEmpty)
+            let board = try #require(w.mirrored("Engineering/Board.md"))
+            #expect(board.contains("open plan")); #expect(!board.contains("otter"))
+        }
+    }
+
+    /// Fix round 2: the engine's own write failing (a full disk) is rethrown and traced, and the old mirror is removed with an
+    /// alert, so nothing stale (a section restricted since) stays behind.
+    @Test func mirrorEngineWriteFailureFailsClosed() throws {
+        let w = try W()
+        try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay\nsalary otter")
+        _ = try w.mirror()
+        try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay [restricted: cfo]\nsalary otter")
+        let full = UnsafeEngineFile(path: w.mirrorDir.appending(path: "Engineering/Board.md").path,
+                                    problem: "cannot be written (No space left on device)")
+        #expect(throws: full) {
+            try HandbookExporter.mirror(store: w.store, companyId: w.company.id, workspace: w.workspace, now: Store.now()) { phase, _ in
+                if phase == .write { throw full }
+            }
+        }
+        #expect(!FileManager.default.fileExists(atPath: w.mirrorDir.path))
+        let alerts = try w.store.writer.read { db in
+            try Ask.fetchAll(db, sql: "SELECT * FROM ask WHERE companyId = ? AND kind = 'engineAlert'", arguments: [w.company.id])
+        }
+        #expect(alerts.contains { $0.subjectId == EngineAlerts.askSubject(reason: HandbookExporter.mirrorAlertReason) })
+        // Through the tick step: traced (an activity line), never thrown; with no mirror left there is nothing to alert about.
+        let report = HandbookRefresh.run(store: w.store, company: w.company, now: Store.now()) { phase, _ in
+            if phase == .write { throw full }
+        }
+        #expect(report.mirror == nil)
+        #expect(try w.activity(containing: "could not refresh the handbook mirror").count == 1)
+        #expect(!FileManager.default.fileExists(atPath: w.mirrorDir.appending(path: "Engineering/Board.md").path))
+        // Once the disk has room the mirror is rebuilt, without the restricted section.
+        _ = try w.mirror()
+        #expect(w.mirrored("Engineering/Board.md")?.contains("otter") == false)
+    }
+
     @Test func vouchRemirrors() throws {
         let w = try W()
         try w.write("Research/Market", "market notes from the web")
