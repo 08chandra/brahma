@@ -1,4 +1,5 @@
 import Foundation
+import BrahmaCore
 
 public enum SelectTarget: Equatable, Sendable {
     case missionControl, activity, agents
@@ -21,6 +22,8 @@ public enum SelectTarget: Equatable, Sendable {
     case dm(handle: String)
     case search(String)
     case sheet(AppSheet)
+    /// Mission Control with the agent map.
+    case map
 
     public init?(_ s: String) {
         switch s {
@@ -38,6 +41,7 @@ public enum SelectTarget: Equatable, Sendable {
         case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)
+        case "map": self = .map
         default:
             guard let colon = s.firstIndex(of: ":") else { return nil }
             let key = s[..<colon]
@@ -69,6 +73,12 @@ public struct LaunchOptions: Equatable, Sendable {
     public var select: SelectTarget?
     /// Company name to select first (snapshots of the work screens use the seeded Initech).
     public var company: String?
+    /// `--map-demo`: install the synthetic map company.
+    public var mapDemo = false
+    /// `--map-demo-agents=<n>`, clamped to `OrgGenerator.range`.
+    public var mapDemoAgents = 300
+    /// `--map-bench=<seconds>`: run the map benchmark for that long.
+    public var mapBench: Double?
 
     public init() {}
 
@@ -83,6 +93,18 @@ public struct LaunchOptions: Equatable, Sendable {
                 i += 1
                 continue
             }
+            if args[i].hasPrefix("--map-demo-agents=") {
+                if let n = Int(args[i].dropFirst("--map-demo-agents=".count)) {
+                    o.mapDemoAgents = min(OrgGenerator.range.upperBound, max(OrgGenerator.range.lowerBound, n))
+                }
+                i += 1
+                continue
+            }
+            if args[i].hasPrefix("--map-bench=") {
+                if let v = Double(args[i].dropFirst("--map-bench=".count)), v.isFinite, v > 0 { o.mapBench = v }
+                i += 1
+                continue
+            }
             if args[i].hasPrefix("--smoke-release=") {
                 let path = String(args[i].dropFirst("--smoke-release=".count))
                 if !path.isEmpty { o.smokeRelease = path }
@@ -92,6 +114,7 @@ public struct LaunchOptions: Equatable, Sendable {
             switch args[i] {
             case "--smoke-test": o.smokeTest = true
             case "--smoke-close-window": o.smokeCloseWindow = true
+            case "--map-demo": o.mapDemo = true
             case "--smoke-hold":
                 if i + 1 < args.count, let v = Double(args[i + 1]) { o.smokeHold = v; i += 1 }
             case "--ui-snapshot":
