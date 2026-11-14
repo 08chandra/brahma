@@ -145,7 +145,8 @@ public final class OrgScene: SKScene {
         super.update(currentTime)
         // Driven by a view: one controller frame, then the scene's own. Map time starts at 0 with the first frame.
         if let controller = motion.driver {
-            let base = motion.timeBase ?? currentTime
+            // A scene mounted on a controller that has already run continues where its last frame left off.
+            let base = motion.timeBase ?? (currentTime - (controller.lastFrameTime ?? 0))
             motion.timeBase = base
             let now = currentTime - base
             update(controller: controller, events: controller.frame(now: now), now: now)
@@ -525,10 +526,10 @@ extension OrgScene {
     func updateCamera(controller: MapController, now: TimeInterval) {
         let m = motion
         let target = controller.camera
-        if m.camera.target != target || m.camera.request {
+        if m.camera.target != target || m.camera.requestSeen != controller.cameraRequest {
             let first = m.camera.target == nil
             m.camera.target = target
-            m.camera.request = false
+            m.camera.requestSeen = controller.cameraRequest
             m.camera.suspended = false
             if case .fit = target { m.camera.autoFit = true } else { m.camera.autoFit = false }
             if first {

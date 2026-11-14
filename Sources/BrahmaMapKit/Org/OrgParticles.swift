@@ -209,6 +209,8 @@ final class MotionState {
 
     // Comm-edge glow.
     var glow: [GlowShape] = []
+    var glowByEdge: [EdgeKey: GlowShape] = [:]
+    var glowFree: [GlowShape] = []
     var lastGlow = -Double.infinity
     var glowVersion = -1
 
@@ -239,7 +241,8 @@ final class MotionState {
         }
 
         var target: CameraTarget?
-        var request = false
+        /// The controller's `cameraRequest` this scene has acted on.
+        var requestSeen = 0
         var ease: Ease?
         /// Following the chart's bounds: a fit target the owner has not panned or zoomed away from.
         var autoFit = true
@@ -271,7 +274,11 @@ extension OrgScene {
 
         beginLeaves(events, model: model)
         advanceLeaves(now: now)
-        let due = builtRevision != model.structureRevision || builtCollapsed != collapsed
+        // A state change or a promotion does not touch the structure, so the card still shows the old content when the event
+        // arrives: refresh now, before the effect is played on it (a refresh later would replace the card's content and cut
+        // the effect short).
+        let contentEvent = events.contains { Self.isContentEvent($0) } || m.waiting.contains { Self.isContentEvent($0) }
+        let due = builtRevision != model.structureRevision || builtCollapsed != collapsed || contentEvent
             || now - m.lastRebuild >= MotionState.refreshInterval || now < m.lastRebuild
         if due && m.leaving.isEmpty {
             rebuild(model: model, collapsed: collapsed)
@@ -287,16 +294,19 @@ extension OrgScene {
         syncZoom(controller: controller)
     }
 
-    /// Makes `controller` drive this scene from `SKScene.update(_:)` (or stops driving with nil).
+    private static func isContentEvent(_ e: VisualEvent) -> Bool {
+        switch e.kind {
+        case .stateChange, .promotion: true
+        default: false
+        }
+    }
+
+    /// Makes `controller` drive this scene from `SKScene.update(_:)` (or stops driving with nil). Map time continues from the
+    /// controller's last frame, so a view that is mounted again does not send it back to 0.
     public func present(controller: MapController?) {
         motion.driver = controller
         motion.timeBase = nil
         if let controller { resetMotion(for: controller) }
-    }
-
-    /// The whole chart in view again, as with the owner's "fit" request (the controller's `camera` is already `.fit`).
-    public func requestCamera() {
-        motion.camera.request = true
     }
 
     /// The owner dragged or zoomed: stop easing, stop tracking a followed card, stop refitting.
@@ -316,6 +326,8 @@ extension OrgScene {
         m.routes = [:]
         m.routesVersion = -1
         for shape in m.glow { shape.node.isHidden = true }
+        m.glowByEdge = [:]
+        m.glowFree = m.glow
         m.lastGlow = -.infinity
         m.hullLayer.removeAllChildren()
         m.hulls = [:]
@@ -341,6 +353,7 @@ extension OrgScene {
     var leavingIds: Set<String> { Set(motion.leaving.keys) }
     var meetingHulls: [String: MeetingHull] { motion.hulls }
     var highlightRing: CGRect? { motion.ringRect }
+    func glowShape(_ key: EdgeKey) -> SKShapeNode? { motion.glowByEdge[key]?.node }
     var glowEdges: [GlowEdge] {
         motion.glow.filter { !$0.node.isHidden }.map { GlowEdge(width: $0.node.lineWidth, alpha: $0.node.alpha) }
     }
@@ -411,9 +424,11 @@ extension OrgScene {
         if m.waiting.count > 256 { m.waiting.removeFirst(m.waiting.count - 256) }
         // Card animations play on the card as it is now; one whose card is not there yet (the layout is held, or the next
         // rebuild creates it) waits a little.
+        // A state or trust effect also waits while the layout is held (a card fading out): the card's content is not current.
+        let contentCurrent = m.leaving.isEmpty
         m.waiting.removeAll { e in
             let id = Self.nodeId(e.from)
-            if cards[id] != nil { return playCardEffect(e, on: id) }
+            if cards[id] != nil, contentCurrent || !Self.isContentEvent(e) { return playCardEffect(e, on: id) }
             return now > e.start + e.duration + 0.5
         }
     }
@@ -514,18 +529,38 @@ extension OrgScene {
             edges = edges.enumerated().sorted { $0.element.weight != $1.element.weight ? $0.element.weight > $1.element.weight : $0.offset < $1.offset }
                 .prefix(MotionState.edgeLimit).map(\.element)
         }
-        var used = 0
+        // Each stroke belongs to its edge, whatever the order of `edges` is this time: a stroke keeps its path and moves on only
+        // when its edge leaves the drawn set.
+        var wanted = Set<EdgeKey>()
+        var routes: [EdgeKey: MotionRoute] = [:]
         for edge in edges {
-            let a = edge.key.a, b = edge.key.b
-            guard let route = motionRoute(Self.nodeId(a), Self.nodeId(b)), route.points.count >= 2 else { continue }
-            if used == m.glow.count {
-                let shape = GlowShape()
-                m.glowLayer.addChild(shape.node)
-                m.glow.append(shape)
+            guard let route = motionRoute(Self.nodeId(edge.key.a), Self.nodeId(edge.key.b)), route.points.count >= 2 else { continue }
+            wanted.insert(edge.key)
+            routes[edge.key] = route
+        }
+        for (key, shape) in m.glowByEdge where !wanted.contains(key) {
+            shape.node.isHidden = true
+            m.glowByEdge[key] = nil
+            m.glowFree.append(shape)
+        }
+        for edge in edges {
+            guard let route = routes[edge.key] else { continue }
+            let shape: GlowShape
+            if let own = m.glowByEdge[edge.key] {
+                shape = own
+            } else {
+                if let reused = m.glowFree.popLast() {
+                    shape = reused
+                } else {
+                    shape = GlowShape()
+                    m.glowLayer.addChild(shape.node)
+                    m.glow.append(shape)
+                }
+                shape.key = ""
+                m.glowByEdge[edge.key] = shape
             }
-            let shape = m.glow[used]
-            let key = "\(Self.nodeId(a))\u{0}\(Self.nodeId(b))\u{0}\(layoutVersion)"
-            if shape.key != key || shape.node.path == nil {
+            let key = "\(layoutVersion)"
+            if shape.key != key {
                 let path = CGMutablePath()
                 path.addLines(between: route.points)
                 shape.node.path = path
@@ -535,16 +570,14 @@ extension OrgScene {
             if abs(shape.node.lineWidth - width) > 0.02 { shape.node.lineWidth = width }
             shape.node.alpha = CGFloat(Swift.min(1, Swift.min(0.8, edge.weight / 4) + edge.pulse))
             shape.node.isHidden = false
-            used += 1
         }
-        for k in used..<m.glow.count { m.glow[k].node.isHidden = true }
     }
 
     // MARK: Meeting hulls
 
     /// A dashed `accent` hull around the visible cards of each meeting's participants (those inside a collapsed subtree
-    /// stand in as that subtree's card), with the cleaned title in mono 10 `accent`. A meeting with fewer than two visible
-    /// cards has no hull.
+    /// stand in as that subtree's card), with the cleaned title in mono 10 `accent`. One visible card (a folded team) still
+    /// gets a hull around it; a meeting with no participant on the chart has none.
     private func updateHulls(model: MapModel) {
         let m = motion
         let signature = HullSignature(version: layoutVersion, meetings: model.meetings)
@@ -561,7 +594,7 @@ extension OrgScene {
                 let visible = tree.visibleAncestor(id, collapsed: builtCollapsed)
                 if seen.insert(visible).inserted, let r = layout.cards[visible] { rects.append(Self.sceneRect(r)) }
             }
-            guard rects.count >= 2 else { continue }
+            guard !rects.isEmpty else { continue }
             var rect = rects.dropFirst().reduce(rects[0]) { $0.union($1) }.insetBy(dx: -pad, dy: -pad)
             // The title sits in a strip along the bottom edge: the top is where a team band prints its own label.
             rect.origin.y -= labelBand

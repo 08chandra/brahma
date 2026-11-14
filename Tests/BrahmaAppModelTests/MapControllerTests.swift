@@ -472,6 +472,29 @@ final class MapTestClock: @unchecked Sendable {
         }
     }
 
+    /// `camera` is Equatable, so setting it to the value it has is no change to Observation: `cameraRequest` is what tells a
+    /// view that "fit" or "follow" was asked for again.
+    @Test func cameraRequestCountsEveryAsk() throws {
+        let c = MapController(source: .synthetic(agents: 40, rate: 0, seed: 7), defaults: defaults())
+        let id = try #require(c.model.agents.keys.sorted().first)
+        #expect(c.cameraRequest == 0)
+        c.zoomToFit()
+        c.zoomToFit()
+        #expect(c.cameraRequest == 2 && c.camera == .fit)
+        c.follow(id)
+        c.follow(id)
+        #expect(c.cameraRequest == 4 && c.camera == .agent(id))
+        c.jump(to: id)
+        #expect(c.cameraRequest == 5)
+        c.jump(to: "nobody")
+        #expect(c.cameraRequest == 5, "an unknown agent is not a request")
+        c.follow(nil)
+        #expect(c.cameraRequest == 6)
+        #expect(c.lastFrameTime == nil)
+        _ = c.frame(now: 42)
+        #expect(c.lastFrameTime == 42)
+    }
+
     @Test func jumpAndFollowExpandAncestors() throws {
         let c = MapController(source: .synthetic(agents: 150, rate: 0, seed: 7), defaults: defaults())
         let tree = c.model.tree
