@@ -37,6 +37,11 @@ public enum HandbookPath {
         return (parts.joined(separator: "/"), section)
     }
 
+    /// What two paths compare as when looking for look-alikes: compatibility-normalized (NFKC) and case-folded.
+    static func foldKey(_ path: String) -> String {
+        path.precomposedStringWithCompatibilityMapping.folding(options: [.caseInsensitive], locale: nil)
+    }
+
     /// The page's section: its first part.
     public static func section(of path: String) -> String {
         String(path.split(separator: "/", omittingEmptySubsequences: false).first ?? Substring(path))
