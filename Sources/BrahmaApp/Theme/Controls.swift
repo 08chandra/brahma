@@ -174,14 +174,16 @@ extension ButtonStyle where Self == BrahmaButtonStyle {
 /// Bordered `bg2` input field (apply to a `TextField`).
 struct FieldStyle: ViewModifier {
     var focused = false
+    /// A 22 pt field for a panel header strip (mono, tighter padding).
+    var compact = false
 
     func body(content: Content) -> some View {
         content
             .textFieldStyle(.plain)
-            .font(BrahmaTheme.bodyLarge)
+            .font(compact ? BrahmaTheme.monoSmall : BrahmaTheme.bodyLarge)
             .foregroundStyle(BrahmaTheme.text0)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.horizontal, compact ? 6 : 8)
+            .padding(.vertical, compact ? 3 : 6)
             .background(RoundedRectangle(cornerRadius: BrahmaTheme.radius).fill(BrahmaTheme.bg2))
             .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius)
                 .strokeBorder(focused ? BrahmaTheme.accent : BrahmaTheme.lineStrong, lineWidth: 1))
@@ -189,7 +191,9 @@ struct FieldStyle: ViewModifier {
 }
 
 extension View {
-    func brahmaField(focused: Bool = false) -> some View { modifier(FieldStyle(focused: focused)) }
+    func brahmaField(focused: Bool = false, compact: Bool = false) -> some View {
+        modifier(FieldStyle(focused: focused, compact: compact))
+    }
 }
 
 // MARK: - Avatar and map grid

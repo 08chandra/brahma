@@ -58,8 +58,8 @@ private struct Shell: View {
                 case .newCompany: NewCompanySheet(model: model)
                 case .hire: HireSheet(model: model)
                 case .newItem: ItemEditorSheet(model: model)
-                // Task 10a replaces this with the vacancy and fill sheets.
-                default: EmptyView()
+                case .vacancy(let managerHandle): VacancySheet(model: model, managerHandle: managerHandle)
+                case .fillVacancy(let handle): FillVacancySheet(model: model, handle: handle)
                 }
             }
             .background(BrahmaTheme.bg1)
