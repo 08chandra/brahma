@@ -4,7 +4,7 @@ import GRDB
 @testable import BrahmaCore
 
 /// Runs the built `brahma` binary against a throwaway data home (file owner-key and secret stores: never the Keychain).
-private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) throws
+private func brahma(_ args: [String], home: URL, env: [String: String] = [:], stdin: String? = nil) throws
     -> (status: Int32, stdout: String, stderr: String) {
     let url = brahmaExecutableURL()
     try #require(FileManager.default.isExecutableFile(atPath: url.path), "build the brahma product first")
@@ -16,8 +16,10 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
     p.environment = e
     let out = Pipe(), err = Pipe()
     p.standardOutput = out; p.standardError = err
-    p.standardInput = FileHandle.nullDevice
+    let inp = Pipe()
+    if stdin == nil { p.standardInput = FileHandle.nullDevice } else { p.standardInput = inp }
     try p.run()
+    if let stdin { inp.fileHandleForWriting.write(Data(stdin.utf8)); try inp.fileHandleForWriting.close() }
     let o = out.fileHandleForReading.readDataToEndOfFile(), r = err.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
     return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))
@@ -266,8 +268,57 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
         let add = try brahma(["org", "vacancy", "add", "Acme", "--role", "engineer"], home: home, env: ["BRAHMA_AGENT_ID": "x"])
         #expect(add.status == 1); #expect(add.stdout.isEmpty)
+        // The refused add wrote no row: only the plan's own seat is there.
+        let file = try Store(path: ownerPaths(home).database.path)
+        let acme = try #require(try file.companies().first { $0.name == "Acme" })
+        #expect(try file.writer.read { db in try OrgVacancy.filter(Column("companyId") == acme.id).fetchCount(db) } == 1)
+        try file.close()
         let remove = try brahma(["org", "vacancy", "remove", "Acme", "qa-1"], home: home, env: ["BRAHMA_AGENT_ID": "x"])
         #expect(remove.status == 1)
         #expect(try brahma(["org", "vacancies", "Acme"], home: home).stdout.contains("qa-1"))
+    }
+
+    /// The note is owner-only: `brahma org vacancies` still lists open seats inside an agent turn, never their notes.
+    @Test func cliHidesNotesInsideAgentTurn() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let secretNote = "owner-only-zebra-7731 hire before Q3"
+        let add = try brahma(["org", "vacancy", "add", "Acme", "--role", "engineer", "--note", secretNote], home: home)
+        #expect(add.status == 0, "\(add.stderr)")
+        let handle = try #require(add.stdout.split(separator: " ").dropFirst().first.map { String($0.dropFirst()) })
+
+        let agent = try brahma(["org", "vacancies", "Acme"], home: home, env: ["BRAHMA_AGENT_ID": "x"])
+        #expect(agent.status == 0, "\(agent.stderr)")
+        #expect(agent.stdout.contains("\(handle)  engineer  manager: none  team: none\n"), "\(agent.stdout)")
+        #expect(agent.stdout.contains("qa-1"))
+        #expect(!agent.stdout.contains("zebra-7731")); #expect(!agent.stderr.contains("zebra-7731"))
+        #expect(!agent.stdout.contains("note:"))
+        // Inside a turn the listing is quiet: no refusal text on stderr for a command that succeeded.
+        #expect(agent.stderr.isEmpty, "\(agent.stderr)")
+
+        let mine = try brahma(["org", "vacancies", "Acme"], home: home)
+        #expect(mine.status == 0, "\(mine.stderr)")
+        #expect(mine.stdout.contains("\(handle)  engineer  manager: none  team: none  note: \(secretNote)"), "\(mine.stdout)")
+    }
+
+    /// The owner's listing redacts the note again at print time: a secret set after the note was stored never prints.
+    @Test func cliRedactsNotesAtPrintTime() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let add = try brahma(["org", "vacancy", "add", "Acme", "--role", "engineer", "--note", "ci token vac-secret-value-77 here"],
+                             home: home)
+        #expect(add.status == 0, "\(add.stderr)")
+        let set = try brahma(["secret", "set", "Acme", "API_KEY"], home: home, stdin: "vac-secret-value-77\n")
+        #expect(set.status == 0, "\(set.stderr)")
+
+        let mine = try brahma(["org", "vacancies", "Acme"], home: home)
+        #expect(mine.status == 0, "\(mine.stderr)")
+        #expect(mine.stdout.contains("note: ci token [redacted API_KEY] here"), "\(mine.stdout)")
+        #expect(!mine.stdout.contains("vac-secret-value-77")); #expect(!mine.stderr.contains("vac-secret-value-77"))
+        let agent = try brahma(["org", "vacancies", "Acme"], home: home, env: ["BRAHMA_AGENT_ID": "x"])
+        #expect(agent.status == 0, "\(agent.stderr)")
+        #expect(!agent.stdout.contains("vac-secret-value-77")); #expect(!agent.stdout.contains("ci token"))
     }
 }
