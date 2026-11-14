@@ -5,7 +5,7 @@ import Foundation
 
 /// `ThemeHex` is the one color source: `BrahmaTheme` (SwiftUI) and `MapPalette` (NSColor) both read it, so these
 /// values are the Plan 2 ops-console palette verbatim. Changing one here changes the app and the map together.
-@Suite struct ThemeHexTests {
+@Suite(.scratch) struct ThemeHexTests {
     @Test func backgroundTokens() {
         #expect(ThemeHex.bg0 == 0x0E1217)
         #expect(ThemeHex.bg1 == 0x141A21)

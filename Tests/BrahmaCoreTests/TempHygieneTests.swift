@@ -95,11 +95,12 @@ import Foundation
         #expect(offenders == [], "mark `// scope-escape: ...` (and make no scratch dirs there): \(offenders)")
     }
 
-    /// The two targets' copies of the scratch support are the same file.
+    /// The three targets' copies of the scratch support are the same file.
     @Test func scratchSupportTwinsAreIdentical() throws {
         let core = try Data(contentsOf: Self.tests.appending(path: "BrahmaCoreTests/TestScratch.swift"))
         let app = try Data(contentsOf: Self.tests.appending(path: "BrahmaAppModelTests/TestScratch.swift"))
-        #expect(core == app)
+        let mapKit = try Data(contentsOf: Self.tests.appending(path: "BrahmaMapKitTests/TestScratch.swift"))
+        #expect(core == app && core == mapKit)
     }
 
     private static func sources() throws -> [(String, String)] {

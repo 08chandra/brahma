@@ -6,7 +6,7 @@ import Foundation
 /// The map's live state: org diffs, comm edges, sprint meetings and the hover and team cards. Pure value code over a
 /// 30-agent plan; nothing here touches the Keychain or a store.
 @MainActor
-@Suite struct MapModelTests {
+@Suite(.scratch) struct MapModelTests {
     let software = SoftwarePack.pack
     let t0: TimeInterval = 1_000
 
