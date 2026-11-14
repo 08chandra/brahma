@@ -98,6 +98,16 @@ public enum CompanyExporter {
                          sqlite: tree.name == "archive", tmpDir: paths.tmpDir, skipped: &skipped)
             copied.append(tree.name)
         }
+        // Plan ML: the handbook as Markdown (the owner's view, redacted). Secrets that cannot be loaded leave it out, named in
+        // `skipped`; the rest of the export goes on.
+        do {
+            try HandbookExporter.export(store: store, companyId: company.id, to: staging.appending(path: "handbook", directoryHint: .isDirectory),
+                                        force: true)
+            copied.append("handbook")
+        } catch {
+            try? fm.removeItem(at: staging.appending(path: "handbook", directoryHint: .isDirectory))
+            skipped.append("handbook: \(error)")
+        }
         let manifest = staging.appending(path: "MANIFEST.json")
         if let companyDir = source(["companies", company.id]), HomeFiles.status(companyDir, "MANIFEST.json").map({ $0.st_mode & S_IFMT == S_IFREG }) == true {
             let input = try HomeFiles.openRead(companyDir, "MANIFEST.json", copySource: true)
