@@ -423,6 +423,8 @@ public enum MemoryIngest {
     /// (`taint`); a sprint closed before the closer was recorded has an unknown author, which is untrusted.
     static func retroTaint(_ sprint: Sprint, closedAt: Date, taint: (String) throws -> String?) rethrows -> String? {
         guard let closer = sprint.closedById else { return unknownRetroAuthor }
+        // The owner and the engine are never tainted.
+        guard closer != "owner", closer != "system", !closer.isEmpty else { return nil }
         return try taint(closer)
     }
 

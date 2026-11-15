@@ -158,7 +158,21 @@ public enum HandbookExporter {
         func flag(_ problem: UnsafeEngineFile) {
             guard !result.unsafe.contains(problem) else { return }
             result.unsafe.append(problem)
-            store.alertEngineFile(problem, companyId: companyId, now: now)
+            alertOnce(store: store, companyId: companyId, key: "planted \(problem.description)") { db in
+                try store.alertEngineFile(db: db, problem, companyId: companyId, now: now)
+            }
+        }
+        /// The planted path: the alert (once), the whole mirror cleared, and the truth about what is left.
+        func plantedCleared(_ problem: UnsafeEngineFile) -> MirrorResult {
+            flag(problem)
+            let outcome = removeMirror(store: store, companyId: companyId, workspace: workspace)
+            if outcome != .removed {
+                alertOnce(store: store, companyId: companyId, key: "cleared \(problem.description) \(outcome)") { db in
+                    try EngineAlerts.raise(store: store, db: db, text: clearedText(because: problem, outcome), now: now,
+                                           reason: mirrorAlertReason, companyId: companyId)
+                }
+            }
+            return result
         }
         let content: (files: [String: Data], dirs: [String], fingerprint: String)
         let stored: String
@@ -176,6 +190,21 @@ public enum HandbookExporter {
             notes.append("repaired a changed handbook mirror file \(mirrorRoot)/\(relative)")
         }
         func base(_ relative: String) -> String { relative.isEmpty ? mirrorRoot : "\(mirrorRoot)/\(relative)" }
+
+        // Leftovers of an earlier removal that failed part-way (`.brahma/.brahma-removing-*`) are cleared on every refresh.
+        var leftoversClear = true
+        do {
+            let leftover = try EngineFiles.clear(workspace: workspace, dir: ".brahma", name: nil)
+            if leftover != .removed {
+                leftoversClear = false
+                alertOnce(store: store, companyId: companyId, key: "leftover \(leftover)") { db in
+                    try EngineAlerts.raise(store: store, db: db, text: leftoverText(leftover), now: now, reason: mirrorAlertReason,
+                                           companyId: companyId)
+                }
+            }
+        } catch let problem as UnsafeEngineFile {
+            return plantedCleared(problem)
+        }
 
         do {
             // Sweep: anything that is not an expected directory or file, or not of the expected kind (compared as the file
@@ -229,13 +258,9 @@ public enum HandbookExporter {
                 if changed { result.written += 1 } else if !result.repaired.contains(relative) { note(relative) }
             }
         } catch let planted as Planted {
-            flag(planted.problem)
-            removeMirror(store: store, companyId: companyId, workspace: workspace)
-            return result
+            return plantedCleared(planted.problem)
         } catch let problem as UnsafeEngineFile where isPlanted(problem) {
-            flag(problem)
-            removeMirror(store: store, companyId: companyId, workspace: workspace)
-            return result
+            return plantedCleared(problem)
         } catch {
             failClosed(store: store, companyId: companyId, workspace: workspace, now: now, because: error)
             throw error
@@ -245,6 +270,10 @@ public enum HandbookExporter {
                 try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work, text: text, createdAt: now).insert(db)
             }
             try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorCursor, content.fingerprint)
+            // A clean refresh: the next failure, even one seen before, is news again.
+            if result.unsafe.isEmpty, leftoversClear {
+                try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorAlertCursor, "")
+            }
         }
         return result
     }
@@ -255,36 +284,80 @@ public enum HandbookExporter {
     /// The reason that keys the alert about a mirror that could not be rebuilt and was removed.
     public static let mirrorAlertReason = "handbook-mirror"
 
-    /// The mirror is removed (by descriptor; a link is unlinked, never followed) and its cursor reset, so the next refresh
-    /// rebuilds it from scratch. Returns whether something was there. A removal that fails is reported on standard error (the
-    /// caller has raised, or raises, an alert).
-    @discardableResult
-    static func removeMirror(store: Store, companyId: String, workspace: URL) -> Bool {
-        var existed = true
+    /// The `memoryCursor.source` holding the mirror alerts raised since the mirror last refreshed cleanly (one key per line):
+    /// each distinct failure alerts the owner once; repeats are traced only.
+    static let mirrorAlertCursor = "mirror-alerts"
+
+    /// Runs `raise` (in one write with the record of it) unless `key` was alerted since the last clean refresh; a repeat
+    /// goes to standard error only. Never throws: a failure is reported on standard error.
+    static func alertOnce(store: Store, companyId: String, key rawKey: String, _ raise: (Database) throws -> Void) {
+        let key = Store.flat(rawKey, max: 400)
         do {
-            existed = try EngineFiles.entry(workspace: workspace, dir: ".brahma", name: "kb") != .missing
-            if existed { try EngineFiles.remove(workspace: workspace, dir: ".brahma", name: "kb") }
+            try store.writer.write { db in
+                let seen = try Store.memoryCursorPosition(db: db, companyId: companyId, source: mirrorAlertCursor)
+                    .split(separator: "\n").map(String.init)
+                guard !seen.contains(key) else {
+                    FileHandle.standardError.write(Data("brahma: handbook mirror of \(companyId), again: \(key)\n".utf8))
+                    return
+                }
+                try raise(db)
+                try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorAlertCursor,
+                                                  (seen + [key]).suffix(50).joined(separator: "\n"))
+            }
         } catch {
-            FileHandle.standardError.write(Data("brahma: could not remove the handbook mirror of \(companyId): \(error)\n".utf8))
+            FileHandle.standardError.write(Data("brahma: could not raise the handbook mirror alert (\(key)): \(error)\n".utf8))
+        }
+    }
+
+    /// The mirror is cleared (`EngineFiles.clear`: removed by descriptor, a link unlinked and never followed; what cannot be
+    /// removed is made inert, its files emptied) and its cursor reset, so the next refresh rebuilds it from scratch. Returns
+    /// what is left.
+    @discardableResult
+    static func removeMirror(store: Store, companyId: String, workspace: URL) -> EngineFiles.Clearance {
+        var outcome: EngineFiles.Clearance
+        do {
+            outcome = try EngineFiles.clear(workspace: workspace, dir: ".brahma", name: "kb")
+        } catch {
+            outcome = .failed("\(error)")
+        }
+        if outcome != .removed {
+            FileHandle.standardError.write(Data("brahma: the handbook mirror of \(companyId) was not fully removed: \(outcome)\n".utf8))
         }
         do {
             try store.writer.write { db in try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorCursor, "") }
         } catch {
             FileHandle.standardError.write(Data("brahma: could not reset the handbook mirror cursor of \(companyId): \(error)\n".utf8))
         }
-        return existed
+        return outcome
     }
 
-    /// The mirror cannot be rebuilt: its old files go (nothing stale stays readable) and, when there were any, the owner is
-    /// alerted. The caller rethrows `error` for its trace.
+    /// What became of the old files, truthfully.
+    static func outcomeText(_ outcome: EngineFiles.Clearance) -> String {
+        switch outcome {
+        case .removed: "its old files were removed"
+        case .emptied: "its old files could not be fully removed, so their contents were emptied: nothing stale stays readable"
+        case .failed(let why):
+            "its old files could not be removed or emptied (\(Store.flat(why, max: 300))): stale handbook text may still be readable "
+                + "under .brahma in the workspace; check it"
+        }
+    }
+
+    static func clearedText(because problem: UnsafeEngineFile, _ outcome: EngineFiles.Clearance) -> String {
+        "The handbook mirror in .brahma/kb met \(Store.flat(problem.description, max: 300)); \(outcomeText(outcome))."
+    }
+
+    static func leftoverText(_ outcome: EngineFiles.Clearance) -> String {
+        "An earlier removal of the handbook mirror left files under .brahma; \(outcomeText(outcome)). The next refresh tries again."
+    }
+
+    /// The mirror cannot be rebuilt: its old files go (or are emptied), and the owner is alerted once per distinct failure
+    /// with what became of them. The caller rethrows `error` for its trace.
     static func failClosed(store: Store, companyId: String, workspace: URL, now: Date, because error: any Error) {
-        guard removeMirror(store: store, companyId: companyId, workspace: workspace) else { return }
-        let text = "The handbook mirror in .brahma/kb could not be rebuilt (\(Store.flat("\(error)", max: 300))); its old files were "
-            + "removed so nothing stale stays readable. The next refresh tries again."
-        do {
-            try EngineAlerts.raise(store: store, text: text, now: now, reason: mirrorAlertReason, companyId: companyId)
-        } catch {
-            FileHandle.standardError.write(Data("brahma: \(text) (and the alert failed: \(error))\n".utf8))
+        let outcome = removeMirror(store: store, companyId: companyId, workspace: workspace)
+        let reason = Store.flat("\(error)", max: 300)
+        let text = "The handbook mirror in .brahma/kb could not be rebuilt (\(reason)); \(outcomeText(outcome)). The next refresh tries again."
+        alertOnce(store: store, companyId: companyId, key: "failed \(reason) \(outcome)") { db in
+            try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: mirrorAlertReason, companyId: companyId)
         }
     }
 

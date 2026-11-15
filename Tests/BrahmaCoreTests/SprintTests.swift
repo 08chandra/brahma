@@ -483,6 +483,9 @@ import GRDB
         let closed = try w.fresh(sprint)
         #expect(closed.status == .closed)
         #expect(closed.summary == "cancelled: \(ask.ref) rescinded by the owner")
+        // Engine-written: a known, clean author for the retro and the handbook's Sprint summaries (Plan ML Task 5).
+        #expect(closed.closedById == "system")
+        #expect(MemoryIngest.retroTaint(closed, closedAt: try #require(closed.closedAt)) { _ in "tainted" } == nil)
         #expect(try [a, b, c].map { try w.fresh($0).sprintId } == [nil, nil, nil])
         #expect(try w.fresh(a).status == .backlog && w.fresh(b).status == .backlog)
         #expect(try w.fresh(c).status == .inProgress, "work already started is left alone")

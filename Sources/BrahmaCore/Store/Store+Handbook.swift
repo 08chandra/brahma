@@ -197,7 +197,8 @@ extension Store {
         let path = try HandbookPath.normalize(rawPath)
         // A path becomes file names and link targets that cannot be redacted (the mirror, the export), and refusals echo it:
         // a path that looks like it holds a secret is refused first, whoever writes, with the body's wording.
-        for segment in path.split(separator: "/").map(String.init) {
+        // Each part, and the whole path once (a known value holding `/` spans parts).
+        for segment in path.split(separator: "/").map(String.init) + [path] {
             if let f = SecretScan.textFindings(segment, knownValues: knownValues).first {
                 throw WorkError.invalid("that text contains what looks like a secret (\(f.label), line \(f.line)); remove it")
             }

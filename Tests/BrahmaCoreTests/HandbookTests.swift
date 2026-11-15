@@ -608,6 +608,13 @@ import BrahmaKeychain
         #expect(!pages.contains { $0.contains("AKIA") || $0.contains(Self.testToken) })
         // An ordinary path is still fine.
         #expect(w.refusal { try w.write(w.eng1, "Eng/Keys rotation", "notes") } == nil)
+        // A known value holding `/` spans two parts: the whole path is scanned too.
+        let split = w.refusal {
+            try w.store.kbWrite(companyId: w.company.id, by: .owner, path: "X/ab/cd123456", body: "notes",
+                                knownValues: [("SPLIT_KEY", "ab/cd123456")])
+        }
+        #expect(split == .invalid("that text contains what looks like a secret (stored secret SPLIT_KEY, line 1); remove it"))
+        #expect(try w.page("X/ab/cd123456") == nil)
     }
 
     @Test func outputsRedacted() throws {
