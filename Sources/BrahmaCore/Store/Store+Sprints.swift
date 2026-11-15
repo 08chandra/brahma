@@ -182,6 +182,8 @@ extension Store {
         sprint.status = .closed
         sprint.closedAt = now
         sprint.summary = "cancelled: \(ask.ref) rescinded by the owner"
+        // The engine wrote that summary: a known, clean author (never the lead's words).
+        sprint.closedById = KBAuthor.system.id
         try sprint.update(db)
         try releaseSprintItems(db, sprint, text: "removed from \(sprint.name) (\(ask.ref) rescinded)", toBacklog: true, now: now)
         try sprintPost(db, sprint, text: "\(sprint.name) was cancelled: \(ask.ref) was rescinded by the owner", now: now)

@@ -56,6 +56,37 @@ import GRDB
             return out.sorted()
         }
 
+        /// Owner DMs from the engine that contain `text`.
+        func ownerDMs(containing text: String) throws -> Int {
+            try store.writer.read { db in
+                try Int.fetchOne(db, sql: """
+                    SELECT count(*) FROM message m JOIN channel c ON c.id = m.channelId
+                    WHERE m.companyId = ? AND c.name LIKE 'dm:%owner%' AND instr(m.text, ?) > 0
+                    """, arguments: [company.id, text]) ?? 0
+            }
+        }
+
+        /// Regular files anywhere under `<ws>/.brahma` whose bytes contain `needle`.
+        func staleUnderBrahma(_ needle: String) throws -> [String] {
+            let root = workspace.appending(path: ".brahma")
+            var hits: [String] = []
+            let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            while let url = e?.nextObject() as? URL {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true,
+                      let data = FileManager.default.contents(atPath: url.path) else { continue }
+                if String(decoding: data, as: UTF8.self).contains(needle) { hits.append(url.path) }
+            }
+            return hits
+        }
+
+        /// `.brahma/.brahma-removing-*` leftovers.
+        func leftovers() throws -> [String] {
+            let root = workspace.appending(path: ".brahma")
+            guard FileManager.default.fileExists(atPath: root.path) else { return [] }
+            return try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasPrefix(".brahma-removing-") }
+        }
+
         func activity(containing text: String) throws -> [String] {
             try store.writer.read { db in
                 try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND instr(text, ?) > 0",
@@ -345,6 +376,16 @@ import GRDB
                 try Ask.fetchAll(db, sql: "SELECT * FROM ask WHERE companyId = ? AND kind = 'engineAlert'", arguments: [w.company.id])
             }
             #expect(alerts.contains { $0.subjectId == EngineAlerts.askSubject(reason: EngineAlerts.engineFileReason) })
+            // The same problem on the next two refreshes: the owner is not told again.
+            for _ in 0..<2 {
+                _ = try HandbookExporter.mirror(store: w.store, companyId: w.company.id, workspace: w.workspace, now: Store.now()) { phase, _ in
+                    if phase == .sweep { throw UnsafeEngineFile(path: w.mirrorDir.path, problem: problem) }
+                }
+            }
+            // One alert: its `.error` line (the DM's own feed line is the `#dm:` one).
+            let lines = try w.activity(containing: "refused to write through").filter { !$0.hasPrefix("#dm:") }
+            #expect(lines.count == 1, "\(problem): \(lines)")
+            #expect(try w.ownerDMs(containing: "refused to write through") == 1, "\(problem)")
             // The next refresh rebuilds it, without the restricted section.
             let next = try w.mirror()
             #expect(next.unsafe.isEmpty)
@@ -372,17 +413,85 @@ import GRDB
             try Ask.fetchAll(db, sql: "SELECT * FROM ask WHERE companyId = ? AND kind = 'engineAlert'", arguments: [w.company.id])
         }
         #expect(alerts.contains { $0.subjectId == EngineAlerts.askSubject(reason: HandbookExporter.mirrorAlertReason) })
-        // Through the tick step: traced (an activity line), never thrown; with no mirror left there is nothing to alert about.
-        let report = HandbookRefresh.run(store: w.store, company: w.company, now: Store.now()) { phase, _ in
-            if phase == .write { throw full }
+        #expect(try w.ownerDMs(containing: "could not be rebuilt") == 1)
+        #expect(try w.ownerDMs(containing: "its old files were removed. The next refresh tries again.") == 1, "the truth")
+        // Through the tick step, twice more: traced (an activity line), never thrown, and the owner is not told again.
+        for _ in 0..<2 {
+            let report = HandbookRefresh.run(store: w.store, company: w.company, now: Store.now()) { phase, _ in
+                if phase == .write { throw full }
+            }
+            #expect(report.mirror == nil)
         }
-        #expect(report.mirror == nil)
         #expect(try w.activity(containing: "could not refresh the handbook mirror").count == 1)
+        #expect(try w.ownerDMs(containing: "could not be rebuilt") == 1, "one alert for three failing refreshes")
+        #expect(try w.activity(containing: "could not be rebuilt").filter { !$0.hasPrefix("#dm:") }.count == 1)
         #expect(!FileManager.default.fileExists(atPath: w.mirrorDir.appending(path: "Engineering/Board.md").path))
         // Once the disk has room the mirror is rebuilt, without the restricted section.
         _ = try w.mirror()
         #expect(w.mirrored("Engineering/Board.md")?.contains("otter") == false)
+        // A failure after a clean refresh is news again.
+        try w.write("Engineering/Board", "# Plan\nnewer plan")
+        #expect(throws: full) {
+            try HandbookExporter.mirror(store: w.store, companyId: w.company.id, workspace: w.workspace, now: Store.now()) { phase, _ in
+                if phase == .write { throw full }
+            }
+        }
+        #expect(try w.ownerDMs(containing: "could not be rebuilt") == 2)
     }
+
+    /// Fix round 3: a removal that fails part-way (an agent made a mirror directory unwritable) leaves nothing readable: what
+    /// is left is made inert (its directories writable again, its files emptied) and removed, and the alert says so.
+    @Test func mirrorRemovalFailureLeavesNothingReadable() throws {
+        let w = try W()
+        let fm = FileManager.default
+        try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay\nsalary otter")
+        _ = try w.mirror()
+        try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay [restricted: cfo]\nsalary otter")
+        let engineering = w.mirrorDir.appending(path: "Engineering")
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: engineering.path)  // exec-bit fixture: an agent made a mirror directory unwritable
+        #expect(throws: (any Error).self) { try w.mirror() }
+        let stale = try w.staleUnderBrahma("otter")
+        #expect(stale.isEmpty, "\(stale)")
+        #expect(try w.leftovers().isEmpty)
+        #expect(try w.ownerDMs(containing: "its old files were removed") == 1)
+        // The next refresh rebuilds the mirror without the restricted section.
+        let next = try w.mirror()
+        #expect(next.unsafe.isEmpty)
+        #expect(w.mirrored("Engineering/Board.md")?.contains("open plan") == true)
+        #expect(try w.staleUnderBrahma("otter").isEmpty)
+    }
+
+    #if canImport(Darwin)
+    /// Fix round 3: when what is left cannot be removed at all (an immutable directory), its files are emptied, the alert says
+    /// so, and the leftover is cleared on a later refresh once it can be.
+    @Test func mirrorUnremovableLeftoverIsEmptiedThenSwept() throws {
+        let w = try W()
+        let fm = FileManager.default
+        try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay\nsalary otter")
+        _ = try w.mirror()
+        try w.write("Engineering/Board", "# Plan\nopen plan\n## Pay [restricted: cfo]\nsalary otter")
+        let engineering = w.mirrorDir.appending(path: "Engineering")
+        #expect(chflags(engineering.path, UInt32(UF_IMMUTABLE)) == 0)
+        var locked: [URL] = []
+        defer { for url in locked { chflags(url.path, 0) } }
+        #expect(throws: (any Error).self) { try w.mirror() }
+        // The immutable directory now sits in a leftover; unlock it again when the test ends.
+        let brahma = w.workspace.appending(path: ".brahma")
+        locked = try w.leftovers().map { brahma.appending(path: $0).appending(path: "Engineering") }
+        #expect(locked.count == 1)
+        #expect(try w.staleUnderBrahma("otter").isEmpty, "the files left were emptied")
+        #expect(try w.ownerDMs(containing: "could not be fully removed, so their contents were emptied") == 1)
+        #expect(try w.ownerDMs(containing: "its old files were removed") == 0, "never claims a removal that did not happen")
+        // Once it can be removed, the next refresh clears the leftover and rebuilds the mirror.
+        for url in locked { chflags(url.path, 0) }
+        let next = try w.mirror()
+        #expect(next.unsafe.isEmpty)
+        #expect(try w.leftovers().isEmpty)
+        #expect(w.mirrored("Engineering/Board.md")?.contains("open plan") == true)
+        #expect(try w.staleUnderBrahma("otter").isEmpty)
+        _ = fm
+    }
+    #endif
 
     @Test func vouchRemirrors() throws {
         let w = try W()
