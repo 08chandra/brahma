@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// The fixed rules for what an owner can drop as a resource (file caps live in `ArtifactPolicy`).
 public enum ResourcePolicy {
@@ -61,4 +66,93 @@ public enum ResourceError: Error, Equatable, Sendable, CustomStringConvertible {
     }
 
     public var description: String { message }
+}
+
+/// Which file an inspected drop was: device, inode, size and modification time, read from the open descriptor. 6b's vault
+/// copy requires the same identity before it copies a byte (the drop TOCTOU).
+public struct FileIdentity: Equatable, Sendable {
+    public var dev: UInt64
+    public var ino: UInt64
+    public var size: Int64
+    public var mtimeNs: Int64
+
+    public init(dev: UInt64, ino: UInt64, size: Int64, mtimeNs: Int64) {
+        self.dev = dev; self.ino = ino; self.size = size; self.mtimeNs = mtimeNs
+    }
+
+    public init(_ st: stat) {
+        dev = UInt64(truncatingIfNeeded: st.st_dev)
+        ino = UInt64(truncatingIfNeeded: st.st_ino)
+        size = Int64(st.st_size)
+        #if canImport(Darwin)
+        mtimeNs = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
+        #else
+        mtimeNs = Int64(st.st_mtim.tv_sec) * 1_000_000_000 + Int64(st.st_mtim.tv_nsec)
+        #endif
+    }
+
+    /// The same file (device and inode), whatever its size or time.
+    func sameFile(_ st: stat) -> Bool {
+        dev == UInt64(truncatingIfNeeded: st.st_dev) && ino == UInt64(truncatingIfNeeded: st.st_ino)
+    }
+}
+
+/// One file of a drop that passed every check, ready for 6b to copy into the vault.
+public struct DropItem: Equatable, Sendable {
+    /// The directory the dropped path sits in, and its identity when the drop was inspected.
+    public var root: URL
+    public var rootIdentity: FileIdentity
+    /// The path from `root` as it is on disk (raw names, `/`-separated): the dropped name, plus the path inside a folder.
+    public var relativePath: String
+    public var identity: FileIdentity
+    /// The file's own name, sanitized (`ResourceIntake.sanitizeName`).
+    public var displayName: String
+    /// The lowercased extension (`ArtifactKind.ext(of:)`).
+    public var ext: String
+    /// An `ArtifactKind` raw value, or `"archive"` for a zip.
+    public var fileKind: String
+    public var bytes: Int64
+    public var isText: Bool
+    public var provenance: Provenance
+    public var tainted: Bool
+    public var taintReason: String?
+    public var quarantined: Bool
+    public var findings: [ScanFinding]
+
+    public init(root: URL, rootIdentity: FileIdentity, relativePath: String, identity: FileIdentity, displayName: String,
+                ext: String, fileKind: String, bytes: Int64, isText: Bool, provenance: Provenance, tainted: Bool,
+                taintReason: String?, quarantined: Bool, findings: [ScanFinding]) {
+        self.root = root; self.rootIdentity = rootIdentity; self.relativePath = relativePath; self.identity = identity
+        self.displayName = displayName; self.ext = ext; self.fileKind = fileKind; self.bytes = bytes; self.isText = isText
+        self.provenance = provenance; self.tainted = tainted; self.taintReason = taintReason; self.quarantined = quarantined
+        self.findings = findings
+    }
+}
+
+/// What a drop would add: the files that passed, what was refused (with the owner-facing reason) and what was skipped.
+public struct DropPlan: Equatable, Sendable {
+    public var items: [DropItem]
+    /// The sanitized folder name when the drop is exactly one folder.
+    public var folderName: String?
+    /// The refused paths (sanitized, relative to the drop) and why.
+    public var refusals: [(name: String, reason: String)]
+    /// Paths left out without a refusal: links inside a folder, `.git`, directories deeper than `ResourcePolicy.maxDepth`,
+    /// and anything that is not a file or directory. `.DS_Store` is left out silently.
+    public var skipped: [String]
+    public var totalBytes: Int64
+    public var hasKnownValueFinding: Bool
+    public var hasPatternFinding: Bool
+
+    public init(items: [DropItem] = [], folderName: String? = nil, refusals: [(name: String, reason: String)] = [],
+                skipped: [String] = [], totalBytes: Int64 = 0, hasKnownValueFinding: Bool = false, hasPatternFinding: Bool = false) {
+        self.items = items; self.folderName = folderName; self.refusals = refusals; self.skipped = skipped
+        self.totalBytes = totalBytes; self.hasKnownValueFinding = hasKnownValueFinding; self.hasPatternFinding = hasPatternFinding
+    }
+
+    public static func == (a: DropPlan, b: DropPlan) -> Bool {
+        a.items == b.items && a.folderName == b.folderName && a.skipped == b.skipped && a.totalBytes == b.totalBytes
+            && a.hasKnownValueFinding == b.hasKnownValueFinding && a.hasPatternFinding == b.hasPatternFinding
+            && a.refusals.count == b.refusals.count
+            && zip(a.refusals, b.refusals).allSatisfy { $0.name == $1.name && $0.reason == $1.reason }
+    }
 }

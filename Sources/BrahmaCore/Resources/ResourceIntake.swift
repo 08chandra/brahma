@@ -5,95 +5,6 @@ import Darwin
 import Glibc
 #endif
 
-/// Which file an inspected drop was: device, inode, size and modification time, read from the open descriptor. 6b's vault
-/// copy requires the same identity before it copies a byte (the drop TOCTOU).
-public struct FileIdentity: Equatable, Sendable {
-    public var dev: UInt64
-    public var ino: UInt64
-    public var size: Int64
-    public var mtimeNs: Int64
-
-    public init(dev: UInt64, ino: UInt64, size: Int64, mtimeNs: Int64) {
-        self.dev = dev; self.ino = ino; self.size = size; self.mtimeNs = mtimeNs
-    }
-
-    public init(_ st: stat) {
-        dev = UInt64(truncatingIfNeeded: st.st_dev)
-        ino = UInt64(truncatingIfNeeded: st.st_ino)
-        size = Int64(st.st_size)
-        #if canImport(Darwin)
-        mtimeNs = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
-        #else
-        mtimeNs = Int64(st.st_mtim.tv_sec) * 1_000_000_000 + Int64(st.st_mtim.tv_nsec)
-        #endif
-    }
-
-    /// The same file (device and inode), whatever its size or time.
-    func sameFile(_ st: stat) -> Bool {
-        dev == UInt64(truncatingIfNeeded: st.st_dev) && ino == UInt64(truncatingIfNeeded: st.st_ino)
-    }
-}
-
-/// One file of a drop that passed every check, ready for 6b to copy into the vault.
-public struct DropItem: Equatable, Sendable {
-    /// The directory the dropped path sits in, and its identity when the drop was inspected.
-    public var root: URL
-    public var rootIdentity: FileIdentity
-    /// The path from `root` as it is on disk (raw names, `/`-separated): the dropped name, plus the path inside a folder.
-    public var relativePath: String
-    public var identity: FileIdentity
-    /// The file's own name, sanitized (`ResourceIntake.sanitizeName`).
-    public var displayName: String
-    /// The lowercased extension (`ArtifactKind.ext(of:)`).
-    public var ext: String
-    /// An `ArtifactKind` raw value, or `"archive"` for a zip.
-    public var fileKind: String
-    public var bytes: Int64
-    public var isText: Bool
-    public var provenance: Provenance
-    public var tainted: Bool
-    public var taintReason: String?
-    public var quarantined: Bool
-    public var findings: [ScanFinding]
-
-    public init(root: URL, rootIdentity: FileIdentity, relativePath: String, identity: FileIdentity, displayName: String,
-                ext: String, fileKind: String, bytes: Int64, isText: Bool, provenance: Provenance, tainted: Bool,
-                taintReason: String?, quarantined: Bool, findings: [ScanFinding]) {
-        self.root = root; self.rootIdentity = rootIdentity; self.relativePath = relativePath; self.identity = identity
-        self.displayName = displayName; self.ext = ext; self.fileKind = fileKind; self.bytes = bytes; self.isText = isText
-        self.provenance = provenance; self.tainted = tainted; self.taintReason = taintReason; self.quarantined = quarantined
-        self.findings = findings
-    }
-}
-
-/// What a drop would add: the files that passed, what was refused (with the owner-facing reason) and what was skipped.
-public struct DropPlan: Equatable, Sendable {
-    public var items: [DropItem]
-    /// The sanitized folder name when the drop is exactly one folder.
-    public var folderName: String?
-    /// The refused paths (sanitized, relative to the drop) and why.
-    public var refusals: [(name: String, reason: String)]
-    /// Paths left out without a refusal: links inside a folder, `.git`, directories deeper than `ResourcePolicy.maxDepth`,
-    /// and anything that is not a file or directory. `.DS_Store` is left out silently.
-    public var skipped: [String]
-    public var totalBytes: Int64
-    public var hasKnownValueFinding: Bool
-    public var hasPatternFinding: Bool
-
-    public init(items: [DropItem] = [], folderName: String? = nil, refusals: [(name: String, reason: String)] = [],
-                skipped: [String] = [], totalBytes: Int64 = 0, hasKnownValueFinding: Bool = false, hasPatternFinding: Bool = false) {
-        self.items = items; self.folderName = folderName; self.refusals = refusals; self.skipped = skipped
-        self.totalBytes = totalBytes; self.hasKnownValueFinding = hasKnownValueFinding; self.hasPatternFinding = hasPatternFinding
-    }
-
-    public static func == (a: DropPlan, b: DropPlan) -> Bool {
-        a.items == b.items && a.folderName == b.folderName && a.skipped == b.skipped && a.totalBytes == b.totalBytes
-            && a.hasKnownValueFinding == b.hasKnownValueFinding && a.hasPatternFinding == b.hasPatternFinding
-            && a.refusals.count == b.refusals.count
-            && zip(a.refusals, b.refusals).allSatisfy { $0.name == $1.name && $0.reason == $1.reason }
-    }
-}
-
 /// The fail-closed inspection of an owner drop (§3.5, ML-4): nothing is copied here, every file is opened without following a
 /// link, checked against the drop rules, given its default trust and secret-scanned through the descriptor its identity is
 /// read from.
@@ -109,6 +20,10 @@ public enum ResourceIntake {
     static let otherArchiveRefusal = "only .zip archives can be added"
     static let linkRefusal = "only http and https links can be added"
     static let notFileRefusal = "only files, folders and links can be added"
+    /// iWork documents saved as packages (folders): never walked, so no part of one is added.
+    static let iWorkPackageExt: Set<String> = ["numbers", "pages", "key"]
+
+    static func iWorkPackage(_ display: String) -> String { "\(display) is an iWork package; export it to PDF first" }
 
     static func unsupported(ext: String) -> String {
         let tail = "aren't supported as resources (allowed: documents, images, video, tables, 3D, text and code, .zip)"
@@ -156,6 +71,7 @@ public enum ResourceIntake {
         case S_IFDIR:
             if name == ".git" { plan.skipped.append(shown); return }
             if ResourcePolicy.refusedExt.contains(ArtifactKind.ext(of: name)) { plan.refusals.append((shown, executableRefusal)); return }
+            if iWorkPackageExt.contains(ArtifactKind.ext(of: name)) { plan.refusals.append((shown, iWorkPackage(shown))); return }
             let walked = inspectFolder(root, name, walked: st, shown: shown, knownValues: knownValues, into: &plan)
             if single && walked { plan.folderName = shown }
         default:
@@ -179,11 +95,13 @@ public enum ResourceIntake {
         var skipped: [String] = []
         var refusals: [(name: String, reason: String)] = []
         var bytes: Int64 = 0, visited = 0
-        var over = false
+        var over = false, unreadable = false
 
         func walk(_ dfd: Int32, _ components: [String], depth: Int) {
-            guard let names = listNames(dfd, limit: maxWalkEntries - visited + 1) else {
-                skipped.append(shownPath(components)); return
+            guard let names = DirectoryListing.names(fd: dfd, limit: maxWalkEntries - visited + 1) else {
+                // The dropped folder itself: refused. A folder inside it: skipped and listed.
+                if depth == 0 { unreadable = true } else { skipped.append(shownPath(components)) }
+                return
             }
             for n in names.sorted() {
                 if over { return }
@@ -204,6 +122,9 @@ public enum ResourceIntake {
                     if ResourcePolicy.refusedExt.contains(ArtifactKind.ext(of: n)) {
                         refusals.append((shownPath(path), executableRefusal)); continue
                     }
+                    if iWorkPackageExt.contains(ArtifactKind.ext(of: n)) {
+                        refusals.append((shownPath(path), iWorkPackage(sanitizeName(n)))); continue
+                    }
                     let child = openat(dfd, n, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                     guard child >= 0 else { skipped.append(shownPath(path)); continue }
                     var cst = stat()
@@ -219,6 +140,7 @@ public enum ResourceIntake {
             }
         }
         walk(fd, [name], depth: 0)
+        if unreadable { plan.refusals.append((shown, "\(shown) can't be read")); return false }
         if over { plan.refusals.append((shown, folderRefusal)); return false }
 
         plan.skipped += skipped
@@ -231,7 +153,8 @@ public enum ResourceIntake {
 
     /// Every check on one regular file, in order: refused extensions, other archives, playlists, unknown kinds, the size
     /// cap; then, on the descriptor opened without following anything (and required to be the file the walk saw):
-    /// executable magic, the sniffer (or the zip checks), quarantine, default trust and the secret scan. The identity is
+    /// executable magic, the sniffer, the archive checks (zip and zip containers), quarantine, default trust and the secret
+    /// scan. The identity is
     /// read before the reads and must be unchanged after them.
     private static func inspectFile(_ root: Root, _ components: [String], walked: stat, shown: String,
                                     knownValues: [(name: String, value: String)], into plan: inout DropPlan) {
@@ -267,13 +190,16 @@ public enum ResourceIntake {
         if ResourcePolicy.isExecutable(head: headData) { return refuse(executableRefusal) }
         if isZip {
             guard ArtifactSniffer.isZip(headData) else { return refuse(ArtifactSniffer.mismatch(ext: ext)) }
+        } else if let kind, !ArtifactSniffer.matches(kind: kind, ext: ext, head: headData) {
+            return refuse(ArtifactSniffer.mismatch(ext: ext))
+        }
+        // A .zip and every zip container (docx, xlsx, key, usdz …) get the same archive checks: a renamed bomb is refused.
+        if isZip || ArtifactKind.isZipContainer(ext: ext) {
             do {
                 if let refusal = ArchiveRatio.refusal(try ArchiveRatio.stats(fd: fd)) { return refuse(refusal.message) }
             } catch {
                 return refuse((error as? ArchiveError)?.message ?? ArchiveError.unreadable.message)
             }
-        } else if let kind, !ArtifactSniffer.matches(kind: kind, ext: ext, head: headData) {
-            return refuse(ArtifactSniffer.mismatch(ext: ext))
         }
 
         let quarantined = Quarantine.isQuarantined(fd: fd)
@@ -311,22 +237,6 @@ public enum ResourceIntake {
             current = next
         }
         return current
-    }
-
-    /// The names in the directory open at `fd` (without `.` and `..`), at most `limit`, through a fresh descriptor of it.
-    private static func listNames(_ fd: Int32, limit: Int) -> [String]? {
-        let own = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard own >= 0 else { return nil }
-        guard let dir = fdopendir(own) else { close(own); return nil }
-        defer { closedir(dir) }
-        var names: [String] = []
-        while names.count < limit, let entry = readdir(dir) {
-            let name = withUnsafePointer(to: &entry.pointee.d_name) {
-                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
-            }
-            if name != "." && name != ".." { names.append(name) }
-        }
-        return names
     }
 
     private static func shownPath(_ components: [String]) -> String { components.map(sanitizeName).joined(separator: "/") }

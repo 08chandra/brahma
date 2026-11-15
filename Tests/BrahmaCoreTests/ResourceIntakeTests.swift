@@ -353,4 +353,82 @@ import Glibc
         }
         #expect(try ResourceIntake.link("https://a.com/" + String(repeating: "a", count: 2000)).count <= ResourcePolicy.maxURL)
     }
+
+    @Test func iWorkPackageRefusedWhole() throws {
+        let dir = try tempDir()
+        let key = dir.appending(path: "Talk.key")
+        _ = try write(bytes: [0xFF, 0xD8, 0xFF, 0xE0], key.appending(path: "preview.jpg"))
+        _ = try ZipFixture.write([.init(name: "Index/Document.iwa")], to: key.appending(path: "Index.zip"))
+        let plan = try inspect(key)
+        #expect(plan.items.isEmpty)
+        #expect(plan.refusals.map(\.name) == ["Talk.key"])
+        #expect(reasons(plan) == ["Talk.key is an iWork package; export it to PDF first"])
+        #expect(plan.folderName == nil)
+
+        // Found during a walk: the package is refused, never walked; the rest of the folder is kept.
+        let folder = dir.appending(path: "proj")
+        _ = try write("<plist/>", folder.appending(path: "Budget.numbers/Index.zip"))
+        _ = try write("# notes", folder.appending(path: "notes.md"))
+        let inner = try inspect(folder)
+        #expect(inner.items.map(\.relativePath) == ["proj/notes.md"])
+        #expect(inner.refusals.map(\.name) == ["proj/Budget.numbers"])
+        #expect(reasons(inner) == ["Budget.numbers is an iWork package; export it to PDF first"])
+    }
+
+    @Test func renamedZipGetsArchiveChecks() throws {
+        let dir = try tempDir()
+        let bomb = try ZipFixture.write([.init(name: "word/document.xml", claimedUncompressed: 1_000_000_000)],
+                                        to: dir.appending(path: "Report.docx"))
+        let unsafe = try ZipFixture.write([.init(name: "../../.zshrc")], to: dir.appending(path: "model.usdz"))
+        let link = try ZipFixture.write([.init(name: "home", symlink: true)], to: dir.appending(path: "Sheet.xlsx"))
+        let hidden = try ZipFixture.write([.init(name: "ok.txt"), .init(name: "../evil")], to: dir.appending(path: "hidden.zip"),
+                                          declaredEntries: 1)
+        let plan = try inspect(bomb, unsafe, link, hidden)
+        #expect(plan.items.isEmpty)
+        #expect(reasons(plan) == ["this archive expands too much", "this archive contains unsafe paths",
+                                  "this archive contains unsafe paths", "this archive can't be read"])
+        // A real small .docx-shaped zip passes.
+        let real = dir.appending(path: "Real.docx")
+        try fm.copyItem(at: try resourceFixture("sample.docx"), to: real)
+        #expect(try inspect(real).items.map(\.fileKind) == ["document"])
+    }
+
+    @Test func unreadableDroppedFolderRefused() throws {
+        let dir = try tempDir()
+        let locked = dir.appending(path: "locked")
+        _ = try write("# hi", locked.appending(path: "a.md"))
+        #expect(chmod(locked.path, 0o000) == 0)
+        defer { _ = chmod(locked.path, 0o700) }   // exec-bit fixture: restore the directory so the scratch sweep can remove it
+        let plan = try inspect(locked)
+        #expect(plan.items.isEmpty)
+        #expect(plan.refusals.map(\.name) == ["locked"])
+        #expect(reasons(plan) == ["locked can't be read"])
+        #expect(plan.folderName == nil)
+
+        // A locked folder inside a dropped folder is skipped and listed; the drop goes on.
+        let outer = dir.appending(path: "outer")
+        _ = try write("# ok", outer.appending(path: "ok.md"))
+        _ = try write("# no", outer.appending(path: "inner/x.md"))
+        #expect(chmod(outer.appending(path: "inner").path, 0o000) == 0)
+        defer { _ = chmod(outer.appending(path: "inner").path, 0o700) }   // exec-bit fixture: restore for the scratch sweep
+        let o = try inspect(outer)
+        #expect(o.items.map(\.relativePath) == ["outer/ok.md"])
+        #expect(o.skipped == ["outer/inner"])
+        #expect(o.folderName == "outer")
+    }
+
+    @Test func quarantineFailsClosed() throws {
+        #if canImport(Darwin)
+        // An attribute that can't be read (here: a bad descriptor) counts as quarantined.
+        #expect(Quarantine.isQuarantined(fd: -1))
+        #expect(!Quarantine.interpret(rc: -1, errno: ENOATTR))
+        #expect(!Quarantine.interpret(rc: -1, errno: ENOTSUP))
+        #expect(Quarantine.interpret(rc: -1, errno: EACCES))
+        #expect(Quarantine.interpret(rc: -1, errno: EIO))
+        #expect(Quarantine.interpret(rc: 0, errno: 0))
+        #expect(DropTrust.defaultProvenance(ext: "md", bytes: 5, quarantined: true).tainted)
+        #else
+        #expect(!Quarantine.isQuarantined(fd: -1))
+        #endif
+    }
 }

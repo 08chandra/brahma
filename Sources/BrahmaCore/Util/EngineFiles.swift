@@ -867,18 +867,8 @@ public enum EngineFiles {
     /// The names in the directory open at `fd` (without `.` and `..`), at most `limit` of them, read through a fresh
     /// descriptor of it.
     private static func entryNames(fd: Int32, shown: String, limit: Int = .max) throws -> [String] {
-        let own = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard own >= 0, let dir = fdopendir(own) else {
-            if own >= 0 { close(own) }
+        guard let names = DirectoryListing.names(fd: fd, limit: limit) else {
             throw UnsafeEngineFile(path: shown, problem: "cannot be listed")
-        }
-        defer { closedir(dir) }
-        var names: [String] = []
-        while names.count < limit, let entry = readdir(dir) {
-            let name = withUnsafePointer(to: &entry.pointee.d_name) {
-                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
-            }
-            if name != "." && name != ".." { names.append(name) }
         }
         return names
     }
