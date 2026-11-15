@@ -1246,7 +1246,7 @@ enum Migrations {
     }
 
     /// Plan 4b migrations: registered after every Plan L migration, never inside `registerPlan5` or `registerPlanL`, in landing order
-    /// v4b-vacancy-note. Never edit an earlier one.
+    /// v4b-vacancy-note. Never edit an earlier one. Later plans register theirs after this one.
     static func registerPlan4b(_ m: inout DatabaseMigrator) {
         m.registerMigration("v4b-vacancy-note") { db in
             // Plan 4b, Task 1b: the owner's vacancy edits. `note` is owner-only text (redacted before it is stored); `removedAt`

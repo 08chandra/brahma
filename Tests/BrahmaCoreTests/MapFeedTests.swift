@@ -111,8 +111,9 @@ import GRDB
         let r = try f.store.messageFlows(companyId: f.acme.id, since: f.at(0), until: f.at(2))
         #expect(r.flows.map(\.messageId) == [a.id, b.id])
         #expect(!r.truncated)
+        // Over the limit the newest are kept (final review I5).
         let short = try f.store.messageFlows(companyId: f.acme.id, since: f.at(0), until: f.at(2), limit: 1)
-        #expect(short.flows.map(\.messageId) == [a.id])
+        #expect(short.flows.map(\.messageId) == [b.id])
         #expect(short.truncated)
         #expect(try f.store.messageFlows(companyId: f.acme.id, since: f.at(2), until: f.at(2)).flows.isEmpty)
         #expect(try f.store.messageFlows(companyId: f.acme.id, since: f.at(1), until: f.at(10)).flows.count == 2)
@@ -179,12 +180,30 @@ import GRDB
         try f.store.appendEvent(ActivityEvent(companyId: f.acme.id, agentId: f.ceo.id, turnId: nil, kind: .toolUse, text: "b", createdAt: f.at(101)))
         try f.store.appendEvent(ActivityEvent(companyId: f.globex.id, agentId: f.gx.id, turnId: nil, kind: .stateChanged, text: "c", createdAt: f.at(100)))
         try f.store.appendEvent(ActivityEvent(companyId: f.acme.id, agentId: f.ceo.id, turnId: nil, kind: .stateChanged, text: "d", createdAt: f.at(110)))
-        let events = try f.store.events(companyId: f.acme.id, kinds: [.stateChanged], since: since, until: f.at(110))
+        let events = try f.store.events(companyId: f.acme.id, kinds: [.stateChanged], since: since, until: f.at(110)).events
         #expect(events.map(\.text) == ["a"])
-        #expect(try f.store.events(companyId: f.acme.id, kinds: [.stateChanged, .toolUse], since: since, until: f.at(111)).map(\.text) == ["a", "b", "d"])
-        #expect(try f.store.events(companyId: f.acme.id, kinds: [.stateChanged], since: since, until: f.at(111), limit: 1).map(\.text) == ["a"])
-        #expect(try f.store.events(companyId: f.acme.id, kinds: [], since: since, until: f.at(111)).isEmpty)
-        #expect(try f.store.events(companyId: f.globex.id, kinds: [.stateChanged], since: since, until: f.at(111)).map(\.text) == ["c"])
+        #expect(try f.store.events(companyId: f.acme.id, kinds: [.stateChanged, .toolUse], since: since, until: f.at(111)).events.map(\.text) == ["a", "b", "d"])
+        // Over the limit, the newest rows are kept (ascending) and the result says it was cut.
+        let cut = try f.store.events(companyId: f.acme.id, kinds: [.stateChanged], since: since, until: f.at(111), limit: 1)
+        #expect(cut.events.map(\.text) == ["d"])
+        #expect(cut.truncated)
+        #expect(try !f.store.events(companyId: f.acme.id, kinds: [.stateChanged], since: since, until: f.at(111), limit: 2).truncated)
+        #expect(try f.store.events(companyId: f.acme.id, kinds: [], since: since, until: f.at(111)).events.isEmpty)
+        #expect(try f.store.events(companyId: f.globex.id, kinds: [.stateChanged], since: since, until: f.at(111)).events.map(\.text) == ["c"])
+    }
+
+    /// Final review I5: a range over the limit keeps its newest messages (the end of the replay window is complete), still
+    /// ascending, and says it was cut.
+    @Test func rangeMessagesKeepTheNewest() throws {
+        let f = try F()
+        for i in 0..<5 { try f.post(.agent(f.ceo.id), "m\(i)", at: f.at(Double(i))) }
+        let cut = try f.store.messageFlows(companyId: f.acme.id, since: f.at(0), until: f.at(10), limit: 3)
+        #expect(cut.truncated)
+        #expect(cut.flows.map(\.createdAt) == [f.at(2), f.at(3), f.at(4)])
+        #expect(zip(cut.flows, cut.flows.dropFirst()).allSatisfy { $0.rowId < $1.rowId })
+        let whole = try f.store.messageFlows(companyId: f.acme.id, since: f.at(0), until: f.at(10), limit: 5)
+        #expect(!whole.truncated)
+        #expect(whole.flows.count == 5)
     }
 
     @Test func feedsAreCompanyScoped() throws {

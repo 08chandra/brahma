@@ -38,7 +38,7 @@ struct MapScrubber: View {
 
                 if replay.timeline.truncated {
                     MonoChip(text: "TRUNCATED", color: BrahmaTheme.warning, fill: BrahmaTheme.bg4)
-                        .help("The history is longer than the map can replay; the start is cut.")
+                        .help("The history is longer than the map can replay; the start of the hour is cut.")
                 }
                 Button("LIVE") { controller.exitReplay() }
                     .buttonStyle(.brahmaPrimary)

@@ -111,6 +111,8 @@ import GRDB
         #expect(zip(tl.facts, tl.facts.dropFirst()).allSatisfy { $0.at <= $1.at })
     }
 
+    /// Final review I5: past the limit the newest messages are kept, the flag is set and the window starts at the first
+    /// message kept, so the end of the hour (the part the owner most likely wants) is complete.
     @Test func truncatedFlag() throws {
         let (store, _) = try makeHome()
         let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
@@ -119,14 +121,61 @@ import GRDB
         let channelId: String = try store.writer.read { db in
             try String.fetchOne(db, sql: "SELECT id FROM channel WHERE companyId = ? LIMIT 1", arguments: [company.id])!
         }
+        // 20 001 messages, one every 0.1 s, the newest 1 s before the end.
+        let first = now.addingTimeInterval(-2001)
         try store.writer.write { db in
             for i in 0..<20_001 {
                 try db.execute(sql: "INSERT INTO message (id, companyId, channelId, senderId, text, createdAt, taintedOrigin) VALUES (?, ?, ?, ?, 'x', ?, 0)",
-                               arguments: ["m\(i)", company.id, channelId, ceo.id, now.addingTimeInterval(-60)])
+                               arguments: ["m\(i)", company.id, channelId, ceo.id, first.addingTimeInterval(Double(i) / 10)])
             }
         }
         let tl = try MapHistory.load(store: store, companyId: company.id, end: now, current: [ceo])
         #expect(tl.truncated)
+        let ids = tl.facts.compactMap { fact -> String? in
+            if case .message(let m) = fact { return m.messageId }
+            return nil
+        }
+        #expect(ids.count == 20_000)
+        #expect(ids.first == "m1" && ids.last == "m20000", "the oldest is cut, the newest kept")
+        #expect(abs(tl.start.timeIntervalSince(first.addingTimeInterval(0.1))) < 0.002, "\(tl.start)")
+        #expect(tl.end == now)
+    }
+
+    /// Final review I5 (and Task 6's deferred minor): state changes past the limit keep the newest too, mark the timeline
+    /// truncated, and the window starts where the kept changes start, so every state shown in it is rewound correctly.
+    @Test func stateChangeOverflowKeepsTheNewestAndCutsTheStart() throws {
+        let (store, _) = try makeHome()
+        let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+        var eng = try store.hire(companyId: company.id, name: "eng", role: "engineer", model: "sonnet")
+        let now = Store.now()
+        eng.createdAt = now.addingTimeInterval(-7200)
+        // ready → running → blocked → sleeping → running, one a minute; the agent is running now.
+        let steps: [(AgentState, AgentState, TimeInterval)] = [
+            (.ready, .running, -600), (.running, .blocked, -540), (.blocked, .sleeping, -480), (.sleeping, .running, -420),
+        ]
+        try store.writer.write { db in
+            for (from, to, offset) in steps {
+                try ActivityEvent(companyId: company.id, agentId: eng.id, turnId: nil, kind: .stateChanged,
+                                  text: "\(from.rawValue) -> \(to.rawValue)", createdAt: now.addingTimeInterval(offset)).insert(db)
+            }
+        }
+        eng.state = .running
+        let tl = try MapHistory.load(store: store, companyId: company.id, end: now, current: [eng], limit: 2)
+        #expect(tl.truncated)
+        let kept = tl.facts.compactMap { fact -> Date? in
+            if case .stateChanged(_, _, _, let at) = fact { return at }
+            return nil
+        }
+        #expect(kept == [now.addingTimeInterval(-480), now.addingTimeInterval(-420)], "the newest two")
+        #expect(tl.start == now.addingTimeInterval(-480))
+        #expect(tl.agents(at: tl.start).first?.state == .sleeping)
+        #expect(tl.agents(at: now.addingTimeInterval(-450)).first?.state == .sleeping)
+        #expect(tl.agents(at: tl.end).first?.state == .running)
+
+        let whole = try MapHistory.load(store: store, companyId: company.id, end: now, current: [eng], limit: 4)
+        #expect(!whole.truncated)
+        #expect(whole.start == now.addingTimeInterval(-MapTimeline.window))
+        #expect(whole.agents(at: now.addingTimeInterval(-570)).first?.state == .running)
     }
 
     @Test func emptyHourIsCurrentState() {

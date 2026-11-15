@@ -75,14 +75,16 @@ extension Store {
 
     // MARK: Range feeds (half-open `[since, until)`, ascending)
 
-    /// `truncated` is set when more than `limit` rows fall in the range (the query fetches `limit + 1`).
+    /// The newest `limit` messages of the range, ascending rowid. `truncated` is set when more than `limit` rows fall in
+    /// the range (the query reads newest first and fetches `limit + 1`): the oldest are the ones cut, so the end of the
+    /// range is always complete.
     public func messageFlows(companyId: String, since: Date, until: Date, limit: Int = 20_000) throws -> (flows: [MessageFlow], truncated: Bool) {
         try writer.read { db in
             var flows = try Self.messageFlows(db, companyId: companyId, where: "m.createdAt >= ? AND m.createdAt < ?",
-                                              arguments: [since, until], limit: limit + 1)
+                                              arguments: [since, until], limit: limit + 1, newestFirst: true)
             let truncated = flows.count > limit
             if truncated { flows.removeLast(flows.count - limit) }
-            return (flows, truncated)
+            return (flows.reversed(), truncated)
         }
     }
 
@@ -93,15 +95,20 @@ extension Store {
         }
     }
 
-    /// The company's activity events of the given kinds in the range, ascending id.
-    public func events(companyId: String, kinds: Set<ActivityKind>, since: Date, until: Date, limit: Int = 20_000) throws -> [ActivityEvent] {
-        guard !kinds.isEmpty else { return [] }
+    /// The company's newest `limit` activity events of the given kinds in the range, ascending id; `truncated` as for
+    /// messages (newest first, `limit + 1`, the oldest cut).
+    public func events(companyId: String, kinds: Set<ActivityKind>, since: Date, until: Date,
+                       limit: Int = 20_000) throws -> (events: [ActivityEvent], truncated: Bool) {
+        guard !kinds.isEmpty else { return ([], false) }
         return try writer.read { db in
-            try ActivityEvent
+            var events = try ActivityEvent
                 .filter(Column("companyId") == companyId)
                 .filter(kinds.map(\.rawValue).sorted().contains(Column("kind")))
                 .filter(Column("createdAt") >= since && Column("createdAt") < until)
-                .order(Column("id")).limit(limit).fetchAll(db)
+                .order(Column("id").desc).limit(limit + 1).fetchAll(db)
+            let truncated = events.count > limit
+            if truncated { events.removeLast(events.count - limit) }
+            return (events.reversed(), truncated)
         }
     }
 
@@ -118,7 +125,7 @@ extension Store {
     /// reply resolves its recipients exactly like a post in its channel or DM. The detection becomes a no-op (always
     /// true) once the column lands; nothing else here changes.
     private static func messageFlows(_ db: Database, companyId: String, where predicate: String, arguments: StatementArguments,
-                                     limit: Int) throws -> [MessageFlow] {
+                                     limit: Int, newestFirst: Bool = false) throws -> [MessageFlow] {
         let hasKind = try db.columns(in: "message").contains { $0.name == "kind" }
         let kindSelect = hasKind ? "COALESCE(m.kind, 'text')" : "'text'"
         let kindFilter = hasKind ? " AND COALESCE(m.kind, 'text') <> 'system'" : ""
@@ -130,7 +137,7 @@ extension Store {
                    \(kindSelect) AS kind, c.name AS channelName, c.kind AS channelKind
             FROM message m JOIN channel c ON c.id = m.channelId
             WHERE m.companyId = ? AND \(predicate) AND m.senderId <> 'system'\(kindFilter)
-            ORDER BY m.rowid LIMIT ?
+            ORDER BY m.rowid \(newestFirst ? "DESC" : "ASC") LIMIT ?
             """, arguments: args)
         guard !rows.isEmpty else { return [] }
 

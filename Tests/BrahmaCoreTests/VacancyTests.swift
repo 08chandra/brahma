@@ -195,8 +195,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
     }
 
     @Test func migrationRegistersAfterEveryPlanLMigration() throws {
+        // Not `names.last`: later plans (Collab-MVP, 4a, Memory-lite) append their migrations after this one.
         let names = Migrations.migrator().migrations
-        #expect(names.last == "v4b-vacancy-note")
         let last = try #require(names.firstIndex(of: "vL-release-2"))
         let note = try #require(names.firstIndex(of: "v4b-vacancy-note"))
         #expect(note > last)

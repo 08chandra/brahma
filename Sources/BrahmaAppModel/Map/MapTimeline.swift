@@ -18,7 +18,8 @@ public struct MapTimeline: Equatable, Sendable {
     /// Ascending by `at`; equal times keep their input order.
     public var facts: [MapFact]
     public var current: [Agent]
-    /// More messages fell in the window than the loader reads.
+    /// More messages or state changes fell in the hour than the loader reads: the newest are kept and `start` moved up to
+    /// where they begin (the start of the hour is cut).
     public var truncated: Bool
 
     public static func build(current: [Agent], facts: [MapFact], start: Date, end: Date, truncated: Bool) -> MapTimeline {
@@ -78,12 +79,18 @@ public struct MapTimeline: Equatable, Sendable {
 
 public enum MapHistory {
     /// `[end − 3600, end)` in one read transaction per feed: messages, hand-offs, state changes, plus a `.hired` fact for
-    /// each agent created in the window.
-    public static func load(store: Store, companyId: String, end: Date, current: [Agent]) throws -> MapTimeline {
-        let start = end.addingTimeInterval(-MapTimeline.window)
-        let messages = try store.messageFlows(companyId: companyId, since: start, until: end)
+    /// each agent created in the window. When messages or state changes exceed `limit`, the newest are kept and the window
+    /// starts at the oldest one kept (of either feed, whichever is later): states before it could not be rewound
+    /// correctly, and the scrubber offers no stretch with missing traffic.
+    public static func load(store: Store, companyId: String, end: Date, current: [Agent],
+                            limit: Int = 20_000) throws -> MapTimeline {
+        var start = end.addingTimeInterval(-MapTimeline.window)
+        let messages = try store.messageFlows(companyId: companyId, since: start, until: end, limit: limit)
         let handoffs = try store.handoffFlows(companyId: companyId, since: start, until: end)
-        let events = try store.events(companyId: companyId, kinds: [.stateChanged], since: start, until: end)
+        let changes = try store.events(companyId: companyId, kinds: [.stateChanged], since: start, until: end, limit: limit)
+        let events = changes.events
+        if messages.truncated, let cut = messages.flows.map(\.createdAt).min() { start = max(start, cut) }
+        if changes.truncated, let cut = events.map(\.createdAt).min() { start = max(start, cut) }
 
         var facts: [MapFact] = messages.flows.map(MapFact.message)
         facts += handoffs.map(MapFact.handoff)
@@ -94,7 +101,9 @@ public enum MapHistory {
         for a in current where a.createdAt >= start && a.createdAt < end {
             facts.append(.hired(agentId: a.id, at: a.createdAt))
         }
-        return MapTimeline.build(current: current, facts: facts, start: start, end: end, truncated: messages.truncated)
+        if messages.truncated || changes.truncated { facts.removeAll { $0.at < start } }
+        return MapTimeline.build(current: current, facts: facts, start: start, end: end,
+                                 truncated: messages.truncated || changes.truncated)
     }
 
     private static let pattern = "^(ready|running|blocked|sleeping|killed) -> (ready|running|blocked|sleeping|killed)"
