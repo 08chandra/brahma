@@ -5,6 +5,9 @@ import Foundation
 /// Hand-built zip archives for the archive checks: stored entries whose central-directory records can claim any
 /// uncompressed size or carry a symlink mode, so a "bomb" is a few hundred bytes on disk and nothing is ever inflated.
 enum ZipFixture {
+    /// How an entry's data descriptor (bit 3) is written after its data.
+    enum Descriptor { case signed, unsigned, signed64, unsigned64, missing, badCRC }
+
     struct Entry {
         var name: String
         var data: Data = Data("x".utf8)
@@ -14,8 +17,9 @@ enum ZipFixture {
         var localName: String? = nil
         /// The uncompressed size written in the local header, when it should differ from the central record's.
         var localUncompressed: UInt32? = nil
-        /// Bit 3 (sizes in a data descriptor) set in both headers, with zero local sizes.
+        /// Bit 3 set in both headers, zero local sizes and CRC, and a data descriptor after the data.
         var dataDescriptor: Bool = false
+        var descriptor: Descriptor = .signed
         /// No local header of its own: the central record points at entry `n`'s (overlapping data).
         var sharesLocalWith: Int? = nil
         var method: Int = 0
@@ -25,6 +29,14 @@ enum ZipFixture {
         /// Extra fields of the central record and of the local header.
         var extra: Data = Data()
         var localExtra: Data = Data()
+        /// Bytes written right before this entry's local header (not listed anywhere).
+        var gapBefore: Data = Data()
+        /// The central record's "disk number start".
+        var diskStart: Int = 0
+        /// Local sizes as 0xFFFFFFFF with a ZIP64 field carrying both (Python's force_zip64).
+        var zip64Local: Bool = false
+        /// The central uncompressed size as 0xFFFFFFFF with a ZIP64 field carrying it (Info-ZIP's -fz).
+        var zip64Central: Bool = false
     }
 
     static func u16(_ v: Int, into d: inout Data) { var x = UInt16(truncatingIfNeeded: v).littleEndian; d.append(Data(bytes: &x, count: 2)) }
@@ -32,15 +44,22 @@ enum ZipFixture {
     static func u64(_ v: UInt64, into d: inout Data) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 8)) }
 
     /// An Info-ZIP Unicode Path extra field (0x7075) naming `path`.
-    static func unicodePathField(_ path: String) -> Data {
+    static func unicodePathField(_ path: String, version: UInt8 = 1) -> Data {
         var d = Data()
         let name = Data(path.utf8)
-        u16(0x7075, into: &d); u16(5 + name.count, into: &d); d.append(1); u32(0, into: &d); d.append(name)
+        u16(0x7075, into: &d); u16(5 + name.count, into: &d); d.append(version); u32(0, into: &d); d.append(name)
         return d
     }
 
-    /// The local headers with their data, and each entry's central record (pointing at those headers).
-    static func parts(_ entries: [Entry]) -> (locals: Data, records: [Data]) {
+    static func zip64Field(_ values: [UInt64]) -> Data {
+        var d = Data()
+        u16(0x0001, into: &d); u16(values.count * 8, into: &d)
+        for v in values { u64(v, into: &d) }
+        return d
+    }
+
+    /// The local headers with their data (offsets counted from `base`), and each entry's central record.
+    static func parts(_ entries: [Entry], base: Int = 0) -> (locals: Data, records: [Data]) {
         var out = Data()
         var offsets: [UInt32] = [], records: [Data] = []
         for e in entries {
@@ -51,26 +70,41 @@ enum ZipFixture {
             if let shared = e.sharesLocalWith {
                 offset = offsets[shared]
             } else {
-                offset = UInt32(out.count)
+                out.append(e.gapBefore)
+                offset = UInt32(base + out.count)
                 let localName = Data((e.localName ?? e.name).utf8)
+                let localU = e.localUncompressed ?? uncompressed
+                let localExtra = (e.zip64Local ? zip64Field([UInt64(localU), UInt64(e.data.count)]) : Data()) + e.localExtra
                 u32(0x0403_4b50, into: &out); u16(20, into: &out); u16(flags, into: &out); u16(e.localMethod ?? e.method, into: &out)
                 u16(0, into: &out); u16(0, into: &out); u32(e.dataDescriptor ? 0 : (e.localCRC ?? e.crc), into: &out)
-                u32(e.dataDescriptor ? 0 : UInt32(e.data.count), into: &out)
-                u32(e.dataDescriptor ? 0 : (e.localUncompressed ?? uncompressed), into: &out)
-                u16(localName.count, into: &out); u16(e.localExtra.count, into: &out)
-                out.append(localName); out.append(e.localExtra); out.append(e.data)
+                u32(e.dataDescriptor ? 0 : (e.zip64Local ? 0xFFFF_FFFF : UInt32(e.data.count)), into: &out)
+                u32(e.dataDescriptor ? 0 : (e.zip64Local ? 0xFFFF_FFFF : localU), into: &out)
+                u16(localName.count, into: &out); u16(localExtra.count, into: &out)
+                out.append(localName); out.append(localExtra); out.append(e.data)
+                if e.dataDescriptor {
+                    let c = UInt64(e.data.count), u = UInt64(uncompressed)
+                    switch e.descriptor {
+                    case .signed: u32(0x0807_4b50, into: &out); u32(e.crc, into: &out); u32(UInt32(c), into: &out); u32(UInt32(u), into: &out)
+                    case .unsigned: u32(e.crc, into: &out); u32(UInt32(c), into: &out); u32(UInt32(u), into: &out)
+                    case .signed64: u32(0x0807_4b50, into: &out); u32(e.crc, into: &out); u64(c, into: &out); u64(u, into: &out)
+                    case .unsigned64: u32(e.crc, into: &out); u64(c, into: &out); u64(u, into: &out)
+                    case .badCRC: u32(0x0807_4b50, into: &out); u32(e.crc ^ 1, into: &out); u32(UInt32(c), into: &out); u32(UInt32(u), into: &out)
+                    case .missing: break
+                    }
+                }
             }
             offsets.append(offset)
 
+            let centralExtra = (e.zip64Central ? zip64Field([UInt64(uncompressed)]) : Data()) + e.extra
             var r = Data()
             u32(0x0201_4b50, into: &r); u16(3 << 8 | 20, into: &r); u16(20, into: &r)
             u16(flags, into: &r); u16(e.method, into: &r); u16(0, into: &r); u16(0, into: &r)
             u32(e.crc, into: &r); u32(UInt32(e.data.count), into: &r)
-            u32(uncompressed, into: &r)
-            u16(name.count, into: &r); u16(e.extra.count, into: &r); u16(0, into: &r)
-            u16(0, into: &r); u16(0, into: &r)
+            u32(e.zip64Central ? 0xFFFF_FFFF : uncompressed, into: &r)
+            u16(name.count, into: &r); u16(centralExtra.count, into: &r); u16(0, into: &r)
+            u16(e.diskStart, into: &r); u16(0, into: &r)
             u32(UInt32(e.symlink ? 0o120777 : 0o100644) << 16, into: &r)
-            u32(offset, into: &r); r.append(name); r.append(e.extra)
+            u32(offset, into: &r); r.append(name); r.append(centralExtra)
             records.append(r)
         }
         return (out, records)
@@ -85,28 +119,31 @@ enum ZipFixture {
         return d
     }
 
-    /// A ZIP64 end record and its locator, for a central directory of `count` records at `cdOffset`.
-    static func zip64Tail(count: Int, cdSize: Int, cdOffset: Int, at recordOffset: Int) -> Data {
+    /// A ZIP64 end record (with `extensible` data after its fixed fields) and its locator, for a central directory of
+    /// `count` records at `cdOffset`; the record starts at `recordOffset`.
+    static func zip64Tail(count: Int, cdSize: Int, cdOffset: Int, at recordOffset: Int, extensible: Data = Data()) -> Data {
         var d = Data()
-        u32(0x0606_4b50, into: &d); u64(44, into: &d); u16(45, into: &d); u16(45, into: &d)
+        u32(0x0606_4b50, into: &d); u64(UInt64(44 + extensible.count), into: &d); u16(45, into: &d); u16(45, into: &d)
         u32(0, into: &d); u32(0, into: &d)
         u64(UInt64(count), into: &d); u64(UInt64(count), into: &d); u64(UInt64(cdSize), into: &d); u64(UInt64(cdOffset), into: &d)
+        d.append(extensible)
         u32(0x0706_4b50, into: &d); u32(0, into: &d); u64(UInt64(recordOffset), into: &d); u32(1, into: &d)
         return d
     }
 
     /// `declaredEntries` overrides the end record's count; `trailing` is appended after the end record (outside its
-    /// comment); `zip64` writes a ZIP64 end record and locator and puts the markers in the end record.
+    /// comment); `zip64` writes a ZIP64 end record and locator and puts the markers in the end record; `prefix` is
+    /// prepended with every offset adjusted for it (a self-extractor's stub).
     static func make(_ entries: [Entry], declaredEntries: Int? = nil, trailing: Data = Data(), comment: Data = Data(),
-                     disk: Int = 0, zip64: Bool = false) -> Data {
-        let (locals, records) = parts(entries)
-        var out = locals
+                     disk: Int = 0, zip64: Bool = false, zip64Extensible: Data = Data(), prefix: Data = Data()) -> Data {
+        let (locals, records) = parts(entries, base: prefix.count)
+        var out = prefix + locals
         let central = records.reduce(Data(), +)
         let cdOffset = out.count
         out.append(central)
         let count = declaredEntries ?? entries.count
         if zip64 {
-            out.append(zip64Tail(count: count, cdSize: central.count, cdOffset: cdOffset, at: out.count))
+            out.append(zip64Tail(count: count, cdSize: central.count, cdOffset: cdOffset, at: out.count, extensible: zip64Extensible))
             out.append(eocd(count: 0xFFFF, cdSize: 0xFFFF_FFFF, cdOffset: 0xFFFF_FFFF, disk: disk, comment: comment))
         } else {
             out.append(eocd(count: count, cdSize: UInt32(central.count), cdOffset: UInt32(cdOffset), disk: disk, comment: comment))
@@ -349,8 +386,7 @@ func resourceFixture(_ name: String) throws -> URL {
 
         // 3. Names, methods and CRCs.
         let upath = try file(ZipFixture.make([.init(name: "safe.txt", extra: ZipFixture.unicodePathField("../../.zshrc"))]))
-        #expect(try ArchiveRatio.stats(url: upath).hasUnsafeName)
-        #expect(throws: ArchiveError.unsafePaths) { try ArchiveRatio.check(url: upath) }
+        #expect(throws: ArchiveError.unsafePaths) { try ArchiveRatio.stats(url: upath) }
         let localUpath = try file(ZipFixture.make([.init(name: "safe.txt", localExtra: ZipFixture.unicodePathField("/etc/x"))]))
         #expect(throws: ArchiveError.unsafePaths) { try ArchiveRatio.check(url: localUpath) }
         let fineUpath = try file(ZipFixture.make([.init(name: "caf\u{E9}.txt", extra: ZipFixture.unicodePathField("caf\u{E9}.txt"))]))
@@ -364,5 +400,81 @@ func resourceFixture(_ name: String) throws -> URL {
         try unreadable(ZipFixture.make([.init(name: "a.txt", crc: 0x1234_5678, localCRC: 0x8765_4321)]), "CRC differs")
         // With a data descriptor, the local CRC may be zero.
         #expect(try ArchiveRatio.stats(url: try file(ZipFixture.make([.init(name: "a.txt", dataDescriptor: true, crc: 0x1234_5678)]))).entries == 1)
+    }
+
+    /// Round 3: the archive's layout is canonical, so a streaming reader, Python and this parser see the same entries.
+    @Test func archiveLayoutIsCanonical() throws {
+        let dir = try tempDir()
+        var n = 0
+        func file(_ data: Data) throws -> URL {
+            n += 1
+            let url = dir.appending(path: "c\(n).zip")
+            try data.write(to: url)
+            return url
+        }
+        func lists(_ data: Data, _ why: String) throws -> Int {
+            let url = try file(data)
+            do { return try ArchiveRatio.stats(url: url).entries } catch { Issue.record("\(why): \(error)"); return -1 }
+        }
+        func unreadable(_ data: Data, _ why: String) throws {
+            let url = try file(data)
+            #expect(throws: ArchiveError.unreadable, "\(why)") { try ArchiveRatio.stats(url: url) }
+        }
+        let ok: [ZipFixture.Entry] = [.init(name: "ok.txt")]
+        #expect(try lists(ZipFixture.make(ok), "a normal zip") == 1)
+
+        // 1. ZIP64: no extensible data in the end record; 0 or 1 disks in total.
+        try unreadable(ZipFixture.make(ok, zip64: true, zip64Extensible: Data(repeating: 0, count: 16)),
+                       "a ZIP64 end record with extensible data")
+        var zeroDisks = ZipFixture.make(ok, zip64: true)
+        zeroDisks[zeroDisks.count - 22 - 20 + 16] = 0
+        #expect(try lists(zeroDisks, "a ZIP64 locator saying 0 disks") == 1)
+        #expect(try lists(ZipFixture.make([.init(name: "big.txt", zip64Local: true), .init(name: "c.txt")]),
+                          "ZIP64 local sizes (Python force_zip64)") == 2)
+        #expect(try lists(ZipFixture.make([.init(name: "dir/a.txt", zip64Local: true, zip64Central: true)], zip64: true),
+                          "ZIP64 central and local fields with a ZIP64 end record (Info-ZIP -fz)") == 1)
+
+        // 2. Extra blocks and Unicode Paths fail closed.
+        try unreadable(ZipFixture.make([.init(name: "safe.txt", extra: ZipFixture.unicodePathField("safe.txt")
+                                                + ZipFixture.unicodePathField("../../.zshrc"))]), "two Unicode Path fields")
+        try unreadable(ZipFixture.make([.init(name: "safe.txt", localExtra: ZipFixture.unicodePathField("safe.txt")
+                                                + ZipFixture.unicodePathField("other.txt"))]), "two local Unicode Path fields")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", extra: Data([0x75, 0x70, 0x09, 0x00, 0x01]))]), "a truncated field")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", extra: Data([0x00, 0x00]))]), "a truncated field header")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", localExtra: Data([0x0A, 0x00, 0x04]))]), "a truncated local field")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", extra: ZipFixture.zip64Field([1]) + ZipFixture.zip64Field([1]))]),
+                       "two ZIP64 fields")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", extra: ZipFixture.unicodePathField("b.txt"))]),
+                       "a Unicode Path naming another file")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", extra: ZipFixture.unicodePathField("a.txt", version: 2))]),
+                       "a Unicode Path of an unknown version")
+        #expect(try lists(ZipFixture.make([.init(name: "Caf\u{E9}.txt", extra: ZipFixture.unicodePathField("cafe\u{301}.txt"),
+                                                  localExtra: ZipFixture.unicodePathField("caf\u{E9}.txt"))]),
+                          "Unicode Paths naming the same file") == 1)
+
+        // 3. Local entries tile the file from 0 to the central directory.
+        let hiddenHeader = ZipFixture.parts([.init(name: "../hidden")]).locals
+        try unreadable(ZipFixture.make([.init(name: "a.txt"), .init(name: "b.txt", gapBefore: hiddenHeader)]),
+                       "a gap holding a local header the central directory doesn't list")
+        try unreadable(ZipFixture.make([.init(name: "a.txt"), .init(name: "b.txt", gapBefore: Data([0, 0, 0, 0]))]), "a gap")
+        try unreadable(ZipFixture.make(ok, prefix: Data("#!/bin/sh\nexit 0\n".utf8)), "a prepended stub, offsets adjusted")
+        for form in [ZipFixture.Descriptor.signed, .unsigned, .signed64, .unsigned64] {
+            let entries: [ZipFixture.Entry] = [
+                .init(name: "s1.txt", data: Data("hello there".utf8), dataDescriptor: true, descriptor: form, method: 8, crc: 0x4579_5D56),
+                .init(name: "dir/"),
+                .init(name: "s2.txt", dataDescriptor: true, descriptor: form, crc: 0x856A_5AA8),
+            ]
+            #expect(try lists(ZipFixture.make(entries), "data descriptors, \(form)") == 3)
+        }
+        try unreadable(ZipFixture.make([.init(name: "a.txt", dataDescriptor: true, descriptor: .missing, crc: 7), .init(name: "b.txt")]),
+                       "bit 3 without a descriptor")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", dataDescriptor: true, descriptor: .badCRC, crc: 7)]),
+                       "a descriptor whose CRC is not the central record's")
+        try unreadable(ZipFixture.make([.init(name: "d.txt", diskStart: 1)]), "an entry on another disk")
+
+        // 4. Names that land on one file: case and Unicode normalisation.
+        try unreadable(ZipFixture.make([.init(name: "A.txt"), .init(name: "a.txt")]), "a case-only duplicate")
+        try unreadable(ZipFixture.make([.init(name: "caf\u{E9}.txt"), .init(name: "cafe\u{301}.txt")]), "an NFC/NFD duplicate")
+        try unreadable(ZipFixture.make([.init(name: "Dir/X.TXT"), .init(name: "dir//x.txt")]), "case plus normalisation")
     }
 }
