@@ -273,37 +273,59 @@ public enum ArchiveRatio {
         let tailLength = Int(min(size, 22 + 65_535))
         let tailStart = size - Int64(tailLength)
         let tail = try readExactly(fd, at: tailStart, count: tailLength)
-        var eocd = -1
-        var i = tail.count - 22
-        while i >= 0 {
-            if tail[i] == 0x50, tail[i + 1] == 0x4B, tail[i + 2] == 0x05, tail[i + 3] == 0x06,
-               i + 22 + Int(u16(tail, i + 20)) == tail.count {
-                eocd = i; break
-            }
-            i -= 1
+        // Exactly one end-record signature in the searched tail, and its comment ends exactly at the end of the file: no
+        // reader can pick a different end record, and none hides in the comment.
+        var signatures: [Int] = []
+        for j in 0...(tail.count - 4) where tail[j] == 0x50 && tail[j + 1] == 0x4B && tail[j + 2] == 0x05 && tail[j + 3] == 0x06 {
+            signatures.append(j)
         }
-        guard eocd >= 0 else { throw ArchiveError.unreadable }
-        var entries = UInt64(u16(tail, eocd + 10))
-        var cdSize = UInt64(u32(tail, eocd + 12))
-        var cdOffset = UInt64(u32(tail, eocd + 16))
-        if entries == 0xFFFF || cdSize == 0xFFFF_FFFF || cdOffset == 0xFFFF_FFFF {
-            // ZIP64: the locator sits right before the end record and points at the ZIP64 end record.
-            let locatorAt = tailStart + Int64(eocd) - 20
-            guard locatorAt >= 0 else { throw ArchiveError.unreadable }
-            let locator = try readExactly(fd, at: locatorAt, count: 20)
-            guard u32(locator, 0) == 0x0706_4b50 else { throw ArchiveError.unreadable }
+        guard signatures.count == 1, let eocd = signatures.first, eocd + 22 <= tail.count,
+              eocd + 22 + Int(u16(tail, eocd + 20)) == tail.count else { throw ArchiveError.unreadable }
+        let eocdAt = tailStart + Int64(eocd)
+        let disk16 = u16(tail, eocd + 4), cdDisk16 = u16(tail, eocd + 6)
+        let diskEntries16 = u16(tail, eocd + 8), entries16 = u16(tail, eocd + 10)
+        let cdSize32 = u32(tail, eocd + 12), cdOffset32 = u32(tail, eocd + 16)
+        let markers = disk16 == 0xFFFF || cdDisk16 == 0xFFFF || diskEntries16 == 0xFFFF || entries16 == 0xFFFF
+            || cdSize32 == 0xFFFF_FFFF || cdOffset32 == 0xFFFF_FFFF
+
+        // A ZIP64 locator right before the end record: some readers follow it whatever the end record says, so it must be
+        // there exactly when the end record's markers call for it.
+        let locatorAt = eocdAt - 20
+        var locator: [UInt8] = []
+        if locatorAt >= 0 { locator = try readExactly(fd, at: locatorAt, count: 20) }
+        let hasLocator = locator.count == 20 && u32(locator, 0) == 0x0706_4b50
+        guard hasLocator == markers else { throw ArchiveError.unreadable }
+
+        var entries = UInt64(entries16), cdSize = UInt64(cdSize32), cdOffset = UInt64(cdOffset32)
+        var cdMustEndAt = UInt64(eocdAt)          // the end record, or the ZIP64 end record
+        if markers {
+            // One disk only (the ZIP64 record on disk 0, one disk in total), a ZIP64 record that ends exactly at the
+            // locator, and every 32-bit field that is not a marker equal to its ZIP64 value.
+            guard u32(locator, 4) == 0, u32(locator, 16) == 1 else { throw ArchiveError.unreadable }
             let z64At = u64(locator, 8)
-            guard size >= 56, z64At <= UInt64(size - 56) else { throw ArchiveError.unreadable }
+            guard z64At <= UInt64(locatorAt), UInt64(locatorAt) - z64At >= 56 else { throw ArchiveError.unreadable }
             let z64 = try readExactly(fd, at: Int64(z64At), count: 56)
-            guard u32(z64, 0) == 0x0606_4b50 else { throw ArchiveError.unreadable }
+            guard u32(z64, 0) == 0x0606_4b50, u64(z64, 4) == UInt64(locatorAt) - z64At - 12,
+                  u32(z64, 16) == 0, u32(z64, 20) == 0, u64(z64, 24) == u64(z64, 32) else { throw ArchiveError.unreadable }
             entries = u64(z64, 32); cdSize = u64(z64, 40); cdOffset = u64(z64, 48)
+            guard disk16 == 0xFFFF || disk16 == 0, cdDisk16 == 0xFFFF || cdDisk16 == 0,
+                  diskEntries16 == 0xFFFF || UInt64(diskEntries16) == entries,
+                  entries16 == 0xFFFF || UInt64(entries16) == entries,
+                  cdSize32 == 0xFFFF_FFFF || UInt64(cdSize32) == cdSize,
+                  cdOffset32 == 0xFFFF_FFFF || UInt64(cdOffset32) == cdOffset else { throw ArchiveError.unreadable }
+            cdMustEndAt = z64At
+        } else {
+            guard disk16 == 0, cdDisk16 == 0, diskEntries16 == entries16 else { throw ArchiveError.unreadable }
         }
-        guard cdOffset <= UInt64(size), cdSize <= UInt64(size) - cdOffset else { throw ArchiveError.unreadable }
+        // The central directory ends exactly where the end record (or the ZIP64 one) starts: nothing between them, and no
+        // offset that only works once a reader adjusts for prepended bytes.
+        guard cdOffset <= cdMustEndAt, cdSize == cdMustEndAt - cdOffset else { throw ArchiveError.unreadable }
 
         let declared = entries > UInt64(Int.max) ? Int.max : Int(entries)
         var uncompressed: Int64 = 0
         var hasSymlink = false, hasUnsafe = false
         var spans: [(start: UInt64, end: UInt64)] = []
+        var seenNames = Set<[UInt8]>()
         var records = 0
         var at = Int64(cdOffset)
         let cdEnd = Int64(cdOffset + cdSize)
@@ -317,7 +339,7 @@ public enum ArchiveRatio {
             guard at + 46 <= cdEnd else { throw ArchiveError.unreadable }
             let h = try readExactly(fd, at: at, count: 46)
             guard u32(h, 0) == 0x0201_4b50 else { throw ArchiveError.unreadable }
-            let flags = u16(h, 8)
+            let flags = u16(h, 8), method = u16(h, 10), crc = u32(h, 16)
             let nameLength = Int(u16(h, 28)), extraLength = Int(u16(h, 30)), commentLength = Int(u16(h, 32))
             let variable = nameLength + extraLength
             guard at + 46 + Int64(variable + commentLength) <= cdEnd else { throw ArchiveError.unreadable }
@@ -331,14 +353,22 @@ public enum ArchiveRatio {
                 if wanted[1] { csize = values.removeFirst() }
                 if wanted[2] { local = values.removeFirst() }
             }
-            let dataEnd = try localDataEnd(fd, at: local, name: name, flags: flags, compressed: csize, uncompressed: usize,
-                                           before: cdOffset)
-            spans.append((local, dataEnd))
+            let localEntry = try localHeader(fd, at: local, name: name, flags: flags, method: method, crc: crc,
+                                             compressed: csize, uncompressed: usize, before: cdOffset)
+            spans.append((local, localEntry.dataEnd))
+            // Every name an extractor might use: the header name and any Unicode Path field (central or local). Each is
+            // checked like the header name, and no two entries may share one.
+            var names = [name]
+            if let unicodePath = unicodePath(Array(v[nameLength...])) { names.append(unicodePath) }
+            names += localEntry.unicodePaths
+            if names.contains(where: unsafe) { hasUnsafe = true }
+            let keys = Set(names.map(normalized))
+            guard seenNames.isDisjoint(with: keys) else { throw ArchiveError.unreadable }
+            seenNames.formUnion(keys)
             let (sum, overflow) = uncompressed.addingReportingOverflow(Int64(clamping: usize))
             uncompressed = overflow ? .max : sum
             let mode = (u32(h, 38) >> 16) & 0o170000
             if mode == 0o120000 { hasSymlink = true }
-            if unsafe(name) { hasUnsafe = true }
             at += 46 + Int64(variable + commentLength)
         }
         guard at == cdEnd, records == declared else { throw ArchiveError.unreadable }
@@ -347,27 +377,32 @@ public enum ArchiveRatio {
         return result(entries: declared)
     }
 
-    /// Checks the local header at `offset` against its central record and returns where the entry's data ends, which must
-    /// be at or before `limit` (the central directory's start).
-    private static func localDataEnd(_ fd: Int32, at offset: UInt64, name: [UInt8], flags: UInt16, compressed: UInt64,
-                                     uncompressed: UInt64, before limit: UInt64) throws -> UInt64 {
+    /// Checks the local header at `offset` against its central record (signature, name, data-descriptor bit, compression
+    /// method, sizes, and the CRC when bit 3 is clear) and returns where the entry's data ends, which must be at or before
+    /// `limit` (the central directory's start), with any Unicode Path names the local header carries.
+    private static func localHeader(_ fd: Int32, at offset: UInt64, name: [UInt8], flags: UInt16, method: UInt16, crc: UInt32,
+                                    compressed: UInt64, uncompressed: UInt64, before limit: UInt64)
+        throws -> (dataEnd: UInt64, unicodePaths: [[UInt8]]) {
         guard offset <= limit, limit - offset >= 30 else { throw ArchiveError.unreadable }
         let h = try readExactly(fd, at: Int64(offset), count: 30)
         guard u32(h, 0) == 0x0403_4b50 else { throw ArchiveError.unreadable }
         let localFlags = u16(h, 6)
-        guard localFlags & 0x0008 == flags & 0x0008 else { throw ArchiveError.unreadable }
+        guard localFlags & 0x0008 == flags & 0x0008, u16(h, 8) == method else { throw ArchiveError.unreadable }
+        let descriptor = localFlags & 0x0008 != 0
+        guard descriptor || u32(h, 14) == crc else { throw ArchiveError.unreadable }
         let nameLength = Int(u16(h, 26)), extraLength = Int(u16(h, 28))
         let variableEnd = offset + 30 + UInt64(nameLength + extraLength)
         guard variableEnd <= limit else { throw ArchiveError.unreadable }
         let v = try readExactly(fd, at: Int64(offset) + 30, count: nameLength + extraLength)
         guard Array(v[0..<nameLength]) == name else { throw ArchiveError.unsafePaths }
+        let extra = Array(v[nameLength...])
         var localU = UInt64(u32(h, 22)), localC = UInt64(u32(h, 18))
         if localU == 0xFFFF_FFFF || localC == 0xFFFF_FFFF {
             // A local ZIP64 field carries both sizes.
-            let values = try zip64(Array(v[nameLength...]), count: 2)
+            let values = try zip64(extra, count: 2)
             localU = values[0]; localC = values[1]
         }
-        if localFlags & 0x0008 != 0 {
+        if descriptor {
             guard (localU == 0 && localC == 0) || (localU == uncompressed && localC == compressed) else {
                 throw ArchiveError.unreadable
             }
@@ -375,7 +410,28 @@ public enum ArchiveRatio {
             guard localU == uncompressed, localC == compressed else { throw ArchiveError.unreadable }
         }
         guard compressed <= limit - variableEnd else { throw ArchiveError.unreadable }
-        return variableEnd + compressed
+        return (variableEnd + compressed, unicodePath(extra).map { [$0] } ?? [])
+    }
+
+    /// The UTF-8 name of an Info-ZIP Unicode Path extra field (id 0x7075: a version byte, the CRC-32 of the header name,
+    /// then the name), whatever its CRC says: an extractor that trusts it would write there.
+    static func unicodePath(_ extra: [UInt8]) -> [UInt8]? {
+        var i = 0
+        while i + 4 <= extra.count {
+            let id = u16(extra, i), length = Int(u16(extra, i + 2))
+            guard i + 4 + length <= extra.count else { return nil }
+            if id == 0x7075, length >= 5 { return Array(extra[(i + 9)..<(i + 4 + length)]) }
+            i += 4 + length
+        }
+        return nil
+    }
+
+    /// An entry name as the name check sees it: split on `/` and `\`, empty and `.` parts dropped, joined with `/`. Two
+    /// entries with the same normalized name would land on the same file.
+    static func normalized(_ name: [UInt8]) -> [UInt8] {
+        let parts = name.split { $0 == UInt8(ascii: "/") || $0 == UInt8(ascii: "\\") }
+            .filter { $0.count != 1 || $0.first != UInt8(ascii: ".") }
+        return Array(parts.map(Array.init).joined(separator: [UInt8(ascii: "/")]))
     }
 
     /// The first `count` 64-bit values of the ZIP64 extended-information extra field (id 0x0001): the uncompressed size,

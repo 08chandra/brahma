@@ -405,6 +405,17 @@ import Glibc
         #expect(reasons(plan) == ["locked can't be read"])
         #expect(plan.folderName == nil)
 
+        // 0400: the folder opens (readable) but can't be searched, so listing it through a descriptor fails: refused too.
+        let readOnly = dir.appending(path: "readonly")
+        _ = try write("# hi", readOnly.appending(path: "b.md"))
+        #expect(chmod(readOnly.path, 0o400) == 0)
+        defer { _ = chmod(readOnly.path, 0o700) }   // exec-bit fixture: restore the directory so the scratch sweep can remove it
+        let r = try inspect(readOnly)
+        #expect(r.items.isEmpty)
+        #expect(r.refusals.map(\.name) == ["readonly"])
+        #expect(reasons(r) == ["readonly can't be read"])
+        #expect(r.folderName == nil)
+
         // A locked folder inside a dropped folder is skipped and listed; the drop goes on.
         let outer = dir.appending(path: "outer")
         _ = try write("# ok", outer.appending(path: "ok.md"))
