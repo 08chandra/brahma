@@ -642,6 +642,7 @@ enum Migrations {
         }
         registerPlan5(&m)
         registerPlanL(&m)
+        registerPlan4b(&m)
         return m
     }
 
@@ -1242,6 +1243,11 @@ enum Migrations {
             try db.create(index: "ultraReservation_ask", on: "ultraReservation", columns: ["askId"])
             try db.alter(table: "company") { t in t.add(column: "ultraShare", .double).notNull().defaults(to: 0.15) }
         }
+    }
+
+    /// Plan 4b migrations: registered after every Plan L migration, never inside `registerPlan5` or `registerPlanL`, in landing order
+    /// v4b-vacancy-note. Never edit an earlier one.
+    static func registerPlan4b(_ m: inout DatabaseMigrator) {
         m.registerMigration("v4b-vacancy-note") { db in
             // Plan 4b, Task 1b: the owner's vacancy edits. `note` is owner-only text (redacted before it is stored); `removedAt`
             // marks a seat the owner took back (never deleted: its handle stays reserved for `nextHandle`, `hire` and `applyOrg`).

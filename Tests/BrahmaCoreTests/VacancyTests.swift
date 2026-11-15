@@ -194,6 +194,15 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(try s.members(channelId: try #require(try s.channel(companyId: c.id, name: "team-core")).id) == [a.id])
     }
 
+    @Test func migrationRegistersAfterEveryPlanLMigration() throws {
+        let names = Migrations.migrator().migrations
+        #expect(names.last == "v4b-vacancy-note")
+        let last = try #require(names.firstIndex(of: "vL-release-2"))
+        let note = try #require(names.firstIndex(of: "v4b-vacancy-note"))
+        #expect(note > last)
+        #expect(names.filter { $0.hasPrefix("vL-") }.allSatisfy { names.firstIndex(of: $0)! < note })
+    }
+
     @Test func migrationFailsClosedOnDuplicateHandles() throws {
         var config = Configuration()
         config.foreignKeysEnabled = false
@@ -213,7 +222,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         }
         #expect(!columnsBefore.contains("note")); #expect(!columnsBefore.contains("removedAt"))
         #expect(!indexesBefore.contains("orgVacancy_company_handle"))
-        #expect(completed.last == "v5-modes")
+        // The Plan L migrations ran (each its own transaction); the refused 4b migration is the first one not completed.
+        #expect(completed.last == "vL-release-2")
+        #expect(!completed.contains("v4b-vacancy-note"))
         // Without the duplicate the migration completes, with the unique index.
         try queue.write { db in try db.execute(sql: "DELETE FROM orgVacancy WHERE rowid = 2") }
         try migrator.migrate(queue)
