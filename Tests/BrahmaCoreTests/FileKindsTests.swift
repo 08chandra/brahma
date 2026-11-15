@@ -10,25 +10,45 @@ enum ZipFixture {
         var data: Data = Data("x".utf8)
         var claimedUncompressed: UInt32? = nil
         var symlink: Bool = false
+        /// The name written in the local header, when it should differ from the central record's.
+        var localName: String? = nil
+        /// The uncompressed size written in the local header, when it should differ from the central record's.
+        var localUncompressed: UInt32? = nil
+        /// Bit 3 (sizes in a data descriptor) set in both headers, with zero local sizes.
+        var dataDescriptor: Bool = false
+        /// No local header of its own: the central record points at entry `n`'s (overlapping data).
+        var sharesLocalWith: Int? = nil
     }
 
-    static func make(_ entries: [Entry]) -> Data {
+    /// `declaredEntries` overrides the end record's count; `trailing` is appended after the end record (outside its comment).
+    static func make(_ entries: [Entry], declaredEntries: Int? = nil, trailing: Data = Data()) -> Data {
         var out = Data(), central = Data()
+        var offsets: [UInt32] = []
         func u16(_ v: Int, into d: inout Data) { var x = UInt16(v).littleEndian; d.append(Data(bytes: &x, count: 2)) }
         func u32(_ v: UInt32, into d: inout Data) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 4)) }
         for e in entries {
             let name = Data(e.name.utf8)
-            let offset = UInt32(out.count)
-            u32(0x0403_4b50, into: &out); u16(20, into: &out); u16(0, into: &out); u16(0, into: &out)
-            u16(0, into: &out); u16(0, into: &out); u32(0, into: &out)
-            u32(UInt32(e.data.count), into: &out); u32(UInt32(e.data.count), into: &out)
-            u16(name.count, into: &out); u16(0, into: &out)
-            out.append(name); out.append(e.data)
+            let uncompressed = e.claimedUncompressed ?? UInt32(e.data.count)
+            let flags = e.dataDescriptor ? 0x0008 : 0
+            let offset: UInt32
+            if let shared = e.sharesLocalWith {
+                offset = offsets[shared]
+            } else {
+                offset = UInt32(out.count)
+                let localName = Data((e.localName ?? e.name).utf8)
+                u32(0x0403_4b50, into: &out); u16(20, into: &out); u16(flags, into: &out); u16(0, into: &out)
+                u16(0, into: &out); u16(0, into: &out); u32(0, into: &out)
+                u32(e.dataDescriptor ? 0 : UInt32(e.data.count), into: &out)
+                u32(e.dataDescriptor ? 0 : (e.localUncompressed ?? uncompressed), into: &out)
+                u16(localName.count, into: &out); u16(0, into: &out)
+                out.append(localName); out.append(e.data)
+            }
+            offsets.append(offset)
 
             u32(0x0201_4b50, into: &central); u16(3 << 8 | 20, into: &central); u16(20, into: &central)
-            u16(0, into: &central); u16(0, into: &central); u16(0, into: &central); u16(0, into: &central)
+            u16(flags, into: &central); u16(0, into: &central); u16(0, into: &central); u16(0, into: &central)
             u32(0, into: &central); u32(UInt32(e.data.count), into: &central)
-            u32(e.claimedUncompressed ?? UInt32(e.data.count), into: &central)
+            u32(uncompressed, into: &central)
             u16(name.count, into: &central); u16(0, into: &central); u16(0, into: &central)
             u16(0, into: &central); u16(0, into: &central)
             u32(UInt32(e.symlink ? 0o120777 : 0o100644) << 16, into: &central)
@@ -36,14 +56,16 @@ enum ZipFixture {
         }
         let cdOffset = UInt32(out.count)
         out.append(central)
+        let count = declaredEntries ?? entries.count
         u32(0x0605_4b50, into: &out); u16(0, into: &out); u16(0, into: &out)
-        u16(entries.count, into: &out); u16(entries.count, into: &out)
+        u16(count, into: &out); u16(count, into: &out)
         u32(UInt32(central.count), into: &out); u32(cdOffset, into: &out); u16(0, into: &out)
+        out.append(trailing)
         return out
     }
 
-    static func write(_ entries: [Entry], to url: URL) throws -> URL {
-        try make(entries).write(to: url)
+    static func write(_ entries: [Entry], to url: URL, declaredEntries: Int? = nil, trailing: Data = Data()) throws -> URL {
+        try make(entries, declaredEntries: declaredEntries, trailing: trailing).write(to: url)
         return url
     }
 }
@@ -175,5 +197,40 @@ func resourceFixture(_ name: String) throws -> URL {
         let st = try ArchiveRatio.stats(url: safe)
         #expect(!st.hasUnsafeName && !st.hasSymlink)
         #expect(st.entries == 2)
+    }
+
+    /// The central directory, the end record and the local headers must agree; a zip whose records disagree is refused.
+    @Test func archiveRecordsMustAgree() throws {
+        let dir = try tempDir()
+        func zip(_ name: String, _ entries: [ZipFixture.Entry], declared: Int? = nil, trailing: Data = Data()) throws -> URL {
+            try ZipFixture.write(entries, to: dir.appending(path: name), declaredEntries: declared, trailing: trailing)
+        }
+        // The end record declares one entry; the central directory hides a second, unsafe one.
+        let hidden = try zip("hidden.zip", [.init(name: "ok.txt"), .init(name: "../evil")], declared: 1)
+        #expect(throws: ArchiveError.unreadable) { try ArchiveRatio.stats(url: hidden) }
+        // Declares more than it holds.
+        let short = try zip("short.zip", [.init(name: "ok.txt")], declared: 2)
+        #expect(throws: ArchiveError.unreadable) { try ArchiveRatio.stats(url: short) }
+        // The central record names a different file than its local header (what an extractor would write).
+        let renamed = try zip("renamed.zip", [.init(name: "ok.txt", localName: "../../.zshrc")])
+        #expect(throws: ArchiveError.unsafePaths) { try ArchiveRatio.check(url: renamed) }
+        // The sizes disagree: a small central claim over a large local one.
+        let sizes = try zip("sizes.zip", [.init(name: "a.bin", localUncompressed: 1_000_000_000)])
+        #expect(throws: ArchiveError.unreadable) { try ArchiveRatio.stats(url: sizes) }
+        // Two central records over one local header (overlapping entries).
+        let overlap = try zip("overlap.zip", [.init(name: "a.txt"), .init(name: "a.txt", sharesLocalWith: 0)])
+        #expect(throws: ArchiveError.unreadable) { try ArchiveRatio.stats(url: overlap) }
+        // Bytes after the end record that its comment length does not cover: no end record ends the file.
+        let tail = try zip("tail.zip", [.init(name: "a.txt")], trailing: Data("junk".utf8))
+        #expect(throws: ArchiveError.unreadable) { try ArchiveRatio.stats(url: tail) }
+        // Data-descriptor entries (bit 3 in both headers, zero local sizes) are consistent.
+        let descriptor = try zip("dd.zip", [.init(name: "a.txt", dataDescriptor: true), .init(name: "b.txt", dataDescriptor: true)])
+        #expect(try ArchiveRatio.stats(url: descriptor).entries == 2)
+        // The real fixture (written by a zip library, deflated) passes.
+        let docx = try ArchiveRatio.stats(url: try resourceFixture("sample.docx"))
+        #expect(docx.entries == 2 && ArchiveRatio.refusal(docx) == nil)
+        #expect(ArtifactKind.isZipContainer(ext: "DOCX"))
+        #expect(Set(ArtifactKind.extensionTable.keys.filter { ArtifactKind.isZipContainer(ext: $0) }) ==
+                ["xlsx", "numbers", "docx", "pptx", "key", "pages", "usdz"])
     }
 }

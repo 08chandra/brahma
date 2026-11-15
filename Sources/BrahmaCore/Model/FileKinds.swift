@@ -42,6 +42,10 @@ public enum ArtifactKind: String, Codable, CaseIterable, Sendable {
     /// and the text 3D formats (`gltf`, `usda`, `obj`, `dae`). False for anything not in the table.
     public static func isText(ext: String) -> Bool { extensionTable[ext.lowercased()]?.isText ?? false }
 
+    /// Whether files with this extension are zip containers (docx, xlsx, pptx, key, pages, numbers, usdz). Their archive
+    /// gets every check a dropped `.zip` gets, so a renamed bomb is still a bomb.
+    public static func isZipContainer(ext: String) -> Bool { extensionTable[ext.lowercased()]?.sniff == .zip }
+
     /// How the first bytes of a file are checked against its extension (`ArtifactSniffer`).
     enum Sniff: Sendable {
         case text, svg, pdf, png, jpeg, gif, webp, heic, tiff, mp4, mov, zip, cfb, rtf, glb, usdc, extensionOnly
@@ -208,7 +212,7 @@ public enum ArchiveError: Error, Equatable, Sendable, CustomStringConvertible {
     case expandsTooMuch
     /// A symlink entry or an unsafe name.
     case unsafePaths
-    /// No end-of-central-directory record, or records that do not fit the file.
+    /// No end-of-central-directory record, or records that do not fit the file or each other.
     case unreadable
 
     public var message: String {
@@ -222,8 +226,8 @@ public enum ArchiveError: Error, Equatable, Sendable, CustomStringConvertible {
     public var description: String { message }
 }
 
-/// Zip checks that read only the end-of-central-directory record (ZIP64 included) and the central-directory records, never
-/// the entries' data, and stop after `ResourcePolicy.maxArchiveEntries` records.
+/// Zip checks that read only the end-of-central-directory record (ZIP64 included), the central-directory records and each
+/// entry's local header, never the entries' data, and stop after `ResourcePolicy.maxArchiveEntries` records.
 public enum ArchiveRatio {
     /// The ratio, when the archive passes every limit; else throws `ArchiveError`.
     @discardableResult
@@ -250,21 +254,32 @@ public enum ArchiveRatio {
         return nil
     }
 
-    /// The stats of the zip open at `fd` (read with `pread`; the descriptor's offset is untouched).
+    /// The stats of the zip open at `fd` (read with `pread`; the descriptor's offset is untouched). Throws
+    /// `ArchiveError.unreadable` for an archive whose records do not agree with each other, and `.unsafePaths` when a
+    /// central record names a different file than its local header.
+    /// - The end record is the last signature whose comment ends exactly at the end of the file.
+    /// - The central directory is walked record by record to exactly its declared end, and must hold exactly the declared
+    ///   number of records. Past `ResourcePolicy.maxArchiveEntries` records the walk stops and the stats report more entries
+    ///   than the cap (refused as too many).
+    /// - Every record's local header must carry the same name and the same sizes (a data-descriptor entry, bit 3 set in both,
+    ///   may leave its local sizes zero), its data must end before the central directory, and no two entries' data may
+    ///   overlap. Nothing is inflated.
     public static func stats(fd: Int32) throws -> ArchiveStats {
         var st = stat()
         guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { throw ArchiveError.unreadable }
         let size = Int64(st.st_size)
         guard size >= 22 else { throw ArchiveError.unreadable }
 
-        // The end record: the last signature in the final 22 + 65 535 bytes.
         let tailLength = Int(min(size, 22 + 65_535))
         let tailStart = size - Int64(tailLength)
         let tail = try readExactly(fd, at: tailStart, count: tailLength)
         var eocd = -1
         var i = tail.count - 22
         while i >= 0 {
-            if tail[i] == 0x50, tail[i + 1] == 0x4B, tail[i + 2] == 0x05, tail[i + 3] == 0x06 { eocd = i; break }
+            if tail[i] == 0x50, tail[i + 1] == 0x4B, tail[i + 2] == 0x05, tail[i + 3] == 0x06,
+               i + 22 + Int(u16(tail, i + 20)) == tail.count {
+                eocd = i; break
+            }
             i -= 1
         }
         guard eocd >= 0 else { throw ArchiveError.unreadable }
@@ -288,29 +303,95 @@ public enum ArchiveRatio {
         let declared = entries > UInt64(Int.max) ? Int.max : Int(entries)
         var uncompressed: Int64 = 0
         var hasSymlink = false, hasUnsafe = false
+        var spans: [(start: UInt64, end: UInt64)] = []
+        var records = 0
         var at = Int64(cdOffset)
         let cdEnd = Int64(cdOffset + cdSize)
-        for _ in 0..<min(declared, ResourcePolicy.maxArchiveEntries) {
+        func result(entries: Int) -> ArchiveStats {
+            ArchiveStats(ratio: Double(uncompressed) / Double(max(size, 1)), uncompressedBytes: uncompressed, entries: entries,
+                         hasSymlink: hasSymlink, hasUnsafeName: hasUnsafe)
+        }
+        while at < cdEnd {
+            if records == ResourcePolicy.maxArchiveEntries { return result(entries: max(declared, records + 1)) }
+            records += 1
             guard at + 46 <= cdEnd else { throw ArchiveError.unreadable }
             let h = try readExactly(fd, at: at, count: 46)
             guard u32(h, 0) == 0x0201_4b50 else { throw ArchiveError.unreadable }
+            let flags = u16(h, 8)
             let nameLength = Int(u16(h, 28)), extraLength = Int(u16(h, 30)), commentLength = Int(u16(h, 32))
             let variable = nameLength + extraLength
             guard at + 46 + Int64(variable + commentLength) <= cdEnd else { throw ArchiveError.unreadable }
             let v = try readExactly(fd, at: at + 46, count: variable)
             let name = Array(v[0..<nameLength])
-            var size64 = UInt64(u32(h, 24))
-            if size64 == 0xFFFF_FFFF { size64 = zip64Uncompressed(Array(v[nameLength...])) ?? size64 }
-            let (sum, overflow) = uncompressed.addingReportingOverflow(Int64(clamping: size64))
+            var usize = UInt64(u32(h, 24)), csize = UInt64(u32(h, 20)), local = UInt64(u32(h, 42))
+            let wanted = [usize == 0xFFFF_FFFF, csize == 0xFFFF_FFFF, local == 0xFFFF_FFFF]
+            if wanted.contains(true) {
+                var values = try zip64(Array(v[nameLength...]), count: wanted.filter { $0 }.count)[...]
+                if wanted[0] { usize = values.removeFirst() }
+                if wanted[1] { csize = values.removeFirst() }
+                if wanted[2] { local = values.removeFirst() }
+            }
+            let dataEnd = try localDataEnd(fd, at: local, name: name, flags: flags, compressed: csize, uncompressed: usize,
+                                           before: cdOffset)
+            spans.append((local, dataEnd))
+            let (sum, overflow) = uncompressed.addingReportingOverflow(Int64(clamping: usize))
             uncompressed = overflow ? .max : sum
             let mode = (u32(h, 38) >> 16) & 0o170000
             if mode == 0o120000 { hasSymlink = true }
             if unsafe(name) { hasUnsafe = true }
             at += 46 + Int64(variable + commentLength)
         }
-        let ratio = Double(uncompressed) / Double(max(size, 1))
-        return ArchiveStats(ratio: ratio, uncompressedBytes: uncompressed, entries: declared, hasSymlink: hasSymlink,
-                            hasUnsafeName: hasUnsafe)
+        guard at == cdEnd, records == declared else { throw ArchiveError.unreadable }
+        spans.sort { $0.start < $1.start }
+        for (a, b) in zip(spans, spans.dropFirst()) where a.end > b.start { throw ArchiveError.unreadable }
+        return result(entries: declared)
+    }
+
+    /// Checks the local header at `offset` against its central record and returns where the entry's data ends, which must
+    /// be at or before `limit` (the central directory's start).
+    private static func localDataEnd(_ fd: Int32, at offset: UInt64, name: [UInt8], flags: UInt16, compressed: UInt64,
+                                     uncompressed: UInt64, before limit: UInt64) throws -> UInt64 {
+        guard offset <= limit, limit - offset >= 30 else { throw ArchiveError.unreadable }
+        let h = try readExactly(fd, at: Int64(offset), count: 30)
+        guard u32(h, 0) == 0x0403_4b50 else { throw ArchiveError.unreadable }
+        let localFlags = u16(h, 6)
+        guard localFlags & 0x0008 == flags & 0x0008 else { throw ArchiveError.unreadable }
+        let nameLength = Int(u16(h, 26)), extraLength = Int(u16(h, 28))
+        let variableEnd = offset + 30 + UInt64(nameLength + extraLength)
+        guard variableEnd <= limit else { throw ArchiveError.unreadable }
+        let v = try readExactly(fd, at: Int64(offset) + 30, count: nameLength + extraLength)
+        guard Array(v[0..<nameLength]) == name else { throw ArchiveError.unsafePaths }
+        var localU = UInt64(u32(h, 22)), localC = UInt64(u32(h, 18))
+        if localU == 0xFFFF_FFFF || localC == 0xFFFF_FFFF {
+            // A local ZIP64 field carries both sizes.
+            let values = try zip64(Array(v[nameLength...]), count: 2)
+            localU = values[0]; localC = values[1]
+        }
+        if localFlags & 0x0008 != 0 {
+            guard (localU == 0 && localC == 0) || (localU == uncompressed && localC == compressed) else {
+                throw ArchiveError.unreadable
+            }
+        } else {
+            guard localU == uncompressed, localC == compressed else { throw ArchiveError.unreadable }
+        }
+        guard compressed <= limit - variableEnd else { throw ArchiveError.unreadable }
+        return variableEnd + compressed
+    }
+
+    /// The first `count` 64-bit values of the ZIP64 extended-information extra field (id 0x0001): the uncompressed size,
+    /// compressed size and local-header offset, each present only when its 32-bit field is 0xFFFFFFFF, in that order.
+    private static func zip64(_ extra: [UInt8], count: Int) throws -> [UInt64] {
+        var i = 0
+        while i + 4 <= extra.count {
+            let id = u16(extra, i), length = Int(u16(extra, i + 2))
+            guard i + 4 + length <= extra.count else { break }
+            if id == 0x0001 {
+                guard length >= count * 8 else { throw ArchiveError.unreadable }
+                return (0..<count).map { u64(extra, i + 4 + $0 * 8) }
+            }
+            i += 4 + length
+        }
+        throw ArchiveError.unreadable
     }
 
     /// `..` as a path component, a leading `/` or `\`, or a NUL byte.
@@ -319,18 +400,6 @@ public enum ArchiveRatio {
         if let first = name.first, first == UInt8(ascii: "/") || first == UInt8(ascii: "\\") { return true }
         let parts = name.split(omittingEmptySubsequences: false) { $0 == UInt8(ascii: "/") || $0 == UInt8(ascii: "\\") }
         return parts.contains { Array($0) == [UInt8(ascii: "."), UInt8(ascii: ".")] }
-    }
-
-    /// The uncompressed size from a ZIP64 extended-information extra field (id 0x0001), whose first field it is when the
-    /// header's own field is 0xFFFFFFFF.
-    private static func zip64Uncompressed(_ extra: [UInt8]) -> UInt64? {
-        var i = 0
-        while i + 4 <= extra.count {
-            let id = u16(extra, i), length = Int(u16(extra, i + 2))
-            if id == 0x0001, length >= 8, i + 12 <= extra.count { return u64(extra, i + 4) }
-            i += 4 + length
-        }
-        return nil
     }
 
     private static func u16(_ b: [UInt8], _ i: Int) -> UInt16 { UInt16(b[i]) | UInt16(b[i + 1]) << 8 }
