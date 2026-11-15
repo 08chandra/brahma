@@ -13,7 +13,7 @@ public struct ScanFinding: Equatable, Sendable {
 }
 
 extension SecretScan {
-    private static let textCompiled: [(label: String, regex: NSRegularExpression)] = patterns.compactMap { p in
+    static let textCompiled: [(label: String, regex: NSRegularExpression)] = patterns.compactMap { p in
         (try? NSRegularExpression(pattern: p.ere)).map { (p.label, $0) }
     }
 
