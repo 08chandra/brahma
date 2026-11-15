@@ -58,6 +58,12 @@ BRAHMA_DEV=1 "$B" dev decide Initech A-2 --by ceo --approve >/dev/null
   --check "test -f streak.txt" --path . --description "Count consecutive days" >/dev/null
 "$B" items add Initech --type bug --title "Reminder fires twice" --owner eng-1 --priority 1 >/dev/null
 
+# Agent map (Plan 4b): INITE-2 in progress with eng-1 as owner and the CTO as reviewer (a dashed reviewer line on the chart,
+# `dev claim` takes the work lease as the agent), and one open ENGINEER seat under the CTO (an `OPEN · ENGINEER` card).
+"$B" items edit Initech INITE-2 --owner eng-1 --reviewer cto --status ready >/dev/null
+BRAHMA_DEV=1 "$B" dev claim Initech INITE-2 --by eng-1 >/dev/null
+"$B" org vacancy add Initech --role engineer --manager cto --note "Backend, streaks service" >/dev/null
+
 # Access Center (Plan 5-lite): a pending web_domain ask from @eng-1 on INITE-2, one active role grant (G-1) and one revoked
 # grant (G-2), the test secret STRIPE_TEST_KEY (value in the dev file vault, BRAHMA_SECRET_STORE=file), and a stored digest.
 BRAHMA_DEV=1 "$B" dev access Initech --by eng-1 --kind web_domain --value docs.stripe.com \
