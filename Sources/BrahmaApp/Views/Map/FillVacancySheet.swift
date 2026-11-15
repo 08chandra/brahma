@@ -9,6 +9,8 @@ struct FillVacancySheet: View {
     /// The map's cleaned vacancy id.
     let handle: String
     @State private var preview: FillPreview?
+    /// The controller `preview` came from: Hire acts on it and nothing else.
+    @State private var previewSource: ObjectIdentifier?
     @State private var loaded = false
     @State private var submitError: String?
     @State private var submitting = false
@@ -42,7 +44,7 @@ struct FillVacancySheet: View {
                     Button("Hire") { hire() }
                         .buttonStyle(.brahmaPrimary)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(submitting)
+                        .disabled(submitting || replaying)
                 } else {
                     Button("Close") { model.presentedSheet = nil }
                         .buttonStyle(.brahma)
@@ -79,16 +81,22 @@ struct FillVacancySheet: View {
             Text(verbatim: FillPreview.costLine)
                 .font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.warning)
                 .fixedSize(horizontal: false, vertical: true)
-            if let submitError {
-                Text(verbatim: submitError).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.danger)
+            if let message = submitError ?? (replaying ? MapText.errorText(MapControllerError.replaying) : nil) {
+                Text(verbatim: message).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.danger)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
+    /// A replay is open on the map: hiring waits for LIVE (the controller refuses it too).
+    private var replaying: Bool { model.mapController?.isReplaying == true }
+
     private func refresh() {
-        let next = model.mapController?.fillPreview(handle: handle)
+        let controller = model.mapController
+        let next = controller?.fillPreview(handle: handle)
         if next != preview { preview = next }
+        let source = next == nil ? nil : controller.map(ObjectIdentifier.init)
+        if source != previewSource { previewSource = source }
         if !loaded { loaded = true }
     }
 
@@ -98,8 +106,12 @@ struct FillVacancySheet: View {
         submitError = nil
         Task {
             defer { submitting = false }
-            guard let controller = model.ensureMapController() else {
-                submitError = "The map is not available for this company"
+            // Only the controller whose preview the owner is looking at: never a new one built for the sheet, never one that
+            // replaced it since (another company, a restore).
+            guard let controller = model.mapController, preview != nil,
+                  ObjectIdentifier(controller) == previewSource else {
+                submitError = "The map changed; check the seat again"
+                refresh()
                 return
             }
             do {

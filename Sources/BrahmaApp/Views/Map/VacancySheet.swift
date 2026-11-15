@@ -3,9 +3,7 @@ import BrahmaCore
 import BrahmaAppModel
 
 /// Agent text shown in a sheet: Store and map errors can carry agent text (a handle, a note), so it is cleaned.
-func mapErrorText(_ error: Error) -> String {
-    MapText.clean((error as? LocalizedError)?.errorDescription ?? String(describing: error), max: 200)
-}
+func mapErrorText(_ error: Error) -> String { MapText.errorText(error) }
 
 /// The owner's add-an-open-seat sheet: role, manager, team and note. `VacancyForm.validate` says what is wrong before
 /// anything is written; the Store checks again, and what it or the controller throws is shown here.
@@ -40,9 +38,13 @@ struct VacancySheet: View {
         return nil
     }
 
+    /// A replay is open on the map this sheet writes through: adding waits for LIVE (the controller refuses it too).
+    private var replaying: Bool { model.mapController?.isReplaying == true }
+
     /// An empty role is not an error yet: the button stays off and nothing is shown until a role is picked.
     private var shownError: String? {
         if let submitError { return submitError }
+        if replaying { return MapText.errorText(MapControllerError.replaying) }
         guard let validation else { return nil }
         return form.role.isEmpty && pack != nil ? nil : MapText.clean(validation, max: 160)
     }
@@ -55,7 +57,8 @@ struct VacancySheet: View {
                     Picker("Role", selection: $form.role) {
                         Text(verbatim: "Pick a role").tag("")
                         ForEach(pack?.roles ?? [], id: \.id) { role in
-                            Text(verbatim: role.title).tag(role.id)
+                            // Pack text: packs load from the user-writable packs directory.
+                            Text(verbatim: MapText.clean(role.title, max: 40)).tag(role.id)
                         }
                     }
                     .labelsHidden()
@@ -103,7 +106,7 @@ struct VacancySheet: View {
                 Button("Add") { add() }
                     .buttonStyle(.brahmaPrimary)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(validation != nil || submitting)
+                    .disabled(validation != nil || submitting || replaying)
             }
             .padding(BrahmaTheme.spaceM)
             .background(BrahmaTheme.bg2)
@@ -126,7 +129,8 @@ struct VacancySheet: View {
         let form = self.form
         Task {
             defer { submitting = false }
-            guard let controller = model.ensureMapController() else {
+            // The map that opened this sheet; a sheet never builds one (it would never be framed, and only queue).
+            guard let controller = model.mapController else {
                 submitError = "The map is not available for this company"
                 return
             }

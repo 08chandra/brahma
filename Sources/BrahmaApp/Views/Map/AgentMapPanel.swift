@@ -44,6 +44,9 @@ struct AgentMapPanel: View {
         .onAppear(perform: startMap)
         .onChange(of: model.mapController.map(ObjectIdentifier.init)) { startMap() }
         .onChange(of: model.mapPoppedOut) { startMap() }
+        // After an in-app restore: `closeStore()` dropped the controller while no map could be built, and the reload that
+        // `reopenStore()` finishes changes nothing else this panel observes. Build and start one for the reloaded selection.
+        .onChange(of: model.loaded) { _, loaded in if loaded { startMap() } }
         .onDisappear {
             // `stop()`, not `invalidate()`: an open vacancy sheet keeps working while the panel is off screen. A popped-out
             // map keeps running for its window; the window's own panel stops it when the window closes.
@@ -120,13 +123,13 @@ private struct MapBody: View {
                     Spacer(minLength: 0)
                     MapChipsOverlay(controller: controller)
                         .padding(.horizontal, BrahmaTheme.spaceS)
-                        .padding(.bottom, controller.replay == nil ? BrahmaTheme.spaceS : 0)
+                        .padding(.bottom, controller.isReplaying ? 0 : BrahmaTheme.spaceS)
                     MapScrubber(controller: controller, timeZone: model.ownerTimeZone)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             }
         }
-        .animation(BrahmaTheme.medium, value: controller.replay != nil)
+        .animation(BrahmaTheme.medium, value: controller.isReplaying)
     }
 }
 

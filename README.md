@@ -247,8 +247,9 @@ item key, and a sprint meeting is a hull drawn around its participants. Hires, t
   `brahma org vacancy add|remove <company> ...` (4b) opens and withdraws seats; the map's context menu does the same.
   **Fill asks for confirmation** in a sheet, because it starts a paid agent. Vacancies that come from a provider
   are display-only.
-- Replay: the last hour can be scrubbed and played back at speed. Meetings and reorgs are not replayed, and a window
-  with more than 20 000 messages is shown as truncated.
+- Replay: the last hour can be scrubbed and played back at speed. Meetings and reorgs are not replayed. When the hour
+  holds more than 20 000 messages or state changes, the newest are kept, the replay starts where they start and is shown
+  as truncated (the start of the hour is cut). A replay never writes: vacancy actions wait for LIVE.
 - Pop-out window and full screen.
 
 **Bursts.** Messages between the same pair within half a second are coalesced; above 30 messages per second the map switches
@@ -256,8 +257,11 @@ to aggregate mode (no particles, the edge pulses instead, with an `AGGREGATE · 
 queue is capped at 400, oldest traffic first.
 
 **What the map shows about agents.** Item titles and blocker reasons are redacted by the store's redactor and cleaned
-(control characters, length) before they are drawn. Vacancy notes are owner-only and redacted. `system` traffic is not
-drawn. After a database restore from a backup the map starts fresh (old traffic is not replayed).
+(control characters, length) before they are drawn. Vacancy notes are owner-only and redacted (again when drawn; hidden
+while the secrets are not loaded). `system` traffic is not drawn. After a database restore from a backup the map starts
+fresh (old traffic is not replayed). While its window is closed the map keeps its chart current but queues no
+animations; reopened, it starts from the traffic of that moment. Actions taken in the map window (select an agent,
+message, add or fill a vacancy, hire) bring the main window to the front, where they open.
 
 **Demo and snapshots.**
 
@@ -277,7 +281,9 @@ the first `--flag=value` argument, so put such flags before the first `--flag=va
 **Measured numbers.** Apple M4 Pro, macOS 26.2 (build 25C56), release build. The offscreen runs drive a synthetic company through `OrgScene` and `SKRenderer`
 into a 1600×900 texture at a fixed 1/60 s step for 30 s (50 msg/s and a 200-message burst every 10 s; 120 msg/s for the
 aggregate run; 15 msg/s and no bursts for the particle run); a frame is the controller frame, scene update and GPU work (the controller's 500 ms poll, which applies the new snapshot,
-runs outside the timed window; the on-screen bench includes it). Reproduce with
+runs outside the timed window; the on-screen bench includes the synthetic poll). Live-store snapshot applies (redaction
+lookups, the vacancy, review-line and meeting rebuild and a full model apply on every app snapshot reload) are not
+measured. Reproduce with
 `BRAHMA_PERF=1 swift test -c release -Xswiftc -enable-testing --filter MapPerfTests` and `Brahma --map-bench=20`.
 
 | Measurement | Result |

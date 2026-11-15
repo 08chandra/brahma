@@ -10,8 +10,11 @@ import BrahmaAppModel
 /// is seen by `AppDelegate` (`NSWindow.willCloseNotification`), which calls `AppModel.mapWindowClosed()`: the pop-out flag
 /// clears and the controller stops polling (an inline panel, if mounted, starts it again).
 ///
-/// An agent click selects the agent in the app, so the main window comes to the front to show it. The demo's controller
-/// never changes the selection, so nothing opens there.
+/// Map actions land in the main window: an agent click selects the agent, "Message @x" opens the DM, and Add vacancy,
+/// Fill… and Hire Agent present a sheet on it. So whenever the selection, the sidebar or the presented sheet changes, the
+/// main window is opened (if it was closed into the menu bar) and brought to the front, and the paid Fill confirmation is
+/// always in front of the owner before anything can be hired. The demo's controller never changes any of them, so nothing
+/// opens there.
 struct MapWindow: View {
     let delegate: AppDelegate
 
@@ -40,7 +43,11 @@ private struct MapWindowContent: View {
     var body: some View {
         AgentMapPanel(model: model, isWindow: true, onFullScreen: { NSApp.keyWindow?.toggleFullScreen(nil) })
             .onChange(of: model.selectedAgentId) { _, id in
-                if id != nil { delegate.openMainWindow?() }
+                if id != nil { delegate.openMainWindowFromMenu() }
             }
+            .onChange(of: model.presentedSheet) { _, sheet in
+                if sheet != nil { delegate.openMainWindowFromMenu() }
+            }
+            .onChange(of: model.sidebarSelection) { delegate.openMainWindowFromMenu() }
     }
 }

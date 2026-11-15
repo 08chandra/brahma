@@ -59,15 +59,15 @@ struct MapHeader: View {
 
             formerToggle
 
-            if !controller.isSynthetic && controller.replay == nil {
+            if !controller.isSynthetic && !controller.isReplaying {
                 Button("+ VACANCY") { model.presentedSheet = .vacancy(managerHandle: nil) }
                     .buttonStyle(.brahma)
                     .help("Add an open seat under the Board")
             }
 
-            iconButton("clock.arrow.circlepath", help: controller.replay == nil ? "Replay the last hour" : "Back to live",
+            iconButton("clock.arrow.circlepath", help: controller.isReplaying ? "Back to live" : "Replay the last hour",
                        disabled: controller.isSynthetic) {
-                if controller.replay == nil { Task { await controller.enterReplay() } } else { controller.exitReplay() }
+                if controller.isReplaying { controller.exitReplay() } else { Task { await controller.enterReplay() } }
             }
 
             if !isWindow {
