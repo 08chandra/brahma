@@ -18,14 +18,31 @@ enum ZipFixture {
         var dataDescriptor: Bool = false
         /// No local header of its own: the central record points at entry `n`'s (overlapping data).
         var sharesLocalWith: Int? = nil
+        var method: Int = 0
+        var localMethod: Int? = nil
+        var crc: UInt32 = 0
+        var localCRC: UInt32? = nil
+        /// Extra fields of the central record and of the local header.
+        var extra: Data = Data()
+        var localExtra: Data = Data()
     }
 
-    /// `declaredEntries` overrides the end record's count; `trailing` is appended after the end record (outside its comment).
-    static func make(_ entries: [Entry], declaredEntries: Int? = nil, trailing: Data = Data()) -> Data {
-        var out = Data(), central = Data()
-        var offsets: [UInt32] = []
-        func u16(_ v: Int, into d: inout Data) { var x = UInt16(v).littleEndian; d.append(Data(bytes: &x, count: 2)) }
-        func u32(_ v: UInt32, into d: inout Data) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 4)) }
+    static func u16(_ v: Int, into d: inout Data) { var x = UInt16(truncatingIfNeeded: v).littleEndian; d.append(Data(bytes: &x, count: 2)) }
+    static func u32(_ v: UInt32, into d: inout Data) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 4)) }
+    static func u64(_ v: UInt64, into d: inout Data) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 8)) }
+
+    /// An Info-ZIP Unicode Path extra field (0x7075) naming `path`.
+    static func unicodePathField(_ path: String) -> Data {
+        var d = Data()
+        let name = Data(path.utf8)
+        u16(0x7075, into: &d); u16(5 + name.count, into: &d); d.append(1); u32(0, into: &d); d.append(name)
+        return d
+    }
+
+    /// The local headers with their data, and each entry's central record (pointing at those headers).
+    static func parts(_ entries: [Entry]) -> (locals: Data, records: [Data]) {
+        var out = Data()
+        var offsets: [UInt32] = [], records: [Data] = []
         for e in entries {
             let name = Data(e.name.utf8)
             let uncompressed = e.claimedUncompressed ?? UInt32(e.data.count)
@@ -36,36 +53,72 @@ enum ZipFixture {
             } else {
                 offset = UInt32(out.count)
                 let localName = Data((e.localName ?? e.name).utf8)
-                u32(0x0403_4b50, into: &out); u16(20, into: &out); u16(flags, into: &out); u16(0, into: &out)
-                u16(0, into: &out); u16(0, into: &out); u32(0, into: &out)
+                u32(0x0403_4b50, into: &out); u16(20, into: &out); u16(flags, into: &out); u16(e.localMethod ?? e.method, into: &out)
+                u16(0, into: &out); u16(0, into: &out); u32(e.dataDescriptor ? 0 : (e.localCRC ?? e.crc), into: &out)
                 u32(e.dataDescriptor ? 0 : UInt32(e.data.count), into: &out)
                 u32(e.dataDescriptor ? 0 : (e.localUncompressed ?? uncompressed), into: &out)
-                u16(localName.count, into: &out); u16(0, into: &out)
-                out.append(localName); out.append(e.data)
+                u16(localName.count, into: &out); u16(e.localExtra.count, into: &out)
+                out.append(localName); out.append(e.localExtra); out.append(e.data)
             }
             offsets.append(offset)
 
-            u32(0x0201_4b50, into: &central); u16(3 << 8 | 20, into: &central); u16(20, into: &central)
-            u16(flags, into: &central); u16(0, into: &central); u16(0, into: &central); u16(0, into: &central)
-            u32(0, into: &central); u32(UInt32(e.data.count), into: &central)
-            u32(uncompressed, into: &central)
-            u16(name.count, into: &central); u16(0, into: &central); u16(0, into: &central)
-            u16(0, into: &central); u16(0, into: &central)
-            u32(UInt32(e.symlink ? 0o120777 : 0o100644) << 16, into: &central)
-            u32(offset, into: &central); central.append(name)
+            var r = Data()
+            u32(0x0201_4b50, into: &r); u16(3 << 8 | 20, into: &r); u16(20, into: &r)
+            u16(flags, into: &r); u16(e.method, into: &r); u16(0, into: &r); u16(0, into: &r)
+            u32(e.crc, into: &r); u32(UInt32(e.data.count), into: &r)
+            u32(uncompressed, into: &r)
+            u16(name.count, into: &r); u16(e.extra.count, into: &r); u16(0, into: &r)
+            u16(0, into: &r); u16(0, into: &r)
+            u32(UInt32(e.symlink ? 0o120777 : 0o100644) << 16, into: &r)
+            u32(offset, into: &r); r.append(name); r.append(e.extra)
+            records.append(r)
         }
-        let cdOffset = UInt32(out.count)
+        return (out, records)
+    }
+
+    /// An end record: `disk` for both disk numbers, `count` entries, the central directory's size and offset.
+    static func eocd(count: Int, cdSize: UInt32, cdOffset: UInt32, disk: Int = 0, comment: Data = Data()) -> Data {
+        var d = Data()
+        u32(0x0605_4b50, into: &d); u16(disk, into: &d); u16(disk, into: &d)
+        u16(count, into: &d); u16(count, into: &d)
+        u32(cdSize, into: &d); u32(cdOffset, into: &d); u16(comment.count, into: &d); d.append(comment)
+        return d
+    }
+
+    /// A ZIP64 end record and its locator, for a central directory of `count` records at `cdOffset`.
+    static func zip64Tail(count: Int, cdSize: Int, cdOffset: Int, at recordOffset: Int) -> Data {
+        var d = Data()
+        u32(0x0606_4b50, into: &d); u64(44, into: &d); u16(45, into: &d); u16(45, into: &d)
+        u32(0, into: &d); u32(0, into: &d)
+        u64(UInt64(count), into: &d); u64(UInt64(count), into: &d); u64(UInt64(cdSize), into: &d); u64(UInt64(cdOffset), into: &d)
+        u32(0x0706_4b50, into: &d); u32(0, into: &d); u64(UInt64(recordOffset), into: &d); u32(1, into: &d)
+        return d
+    }
+
+    /// `declaredEntries` overrides the end record's count; `trailing` is appended after the end record (outside its
+    /// comment); `zip64` writes a ZIP64 end record and locator and puts the markers in the end record.
+    static func make(_ entries: [Entry], declaredEntries: Int? = nil, trailing: Data = Data(), comment: Data = Data(),
+                     disk: Int = 0, zip64: Bool = false) -> Data {
+        let (locals, records) = parts(entries)
+        var out = locals
+        let central = records.reduce(Data(), +)
+        let cdOffset = out.count
         out.append(central)
         let count = declaredEntries ?? entries.count
-        u32(0x0605_4b50, into: &out); u16(0, into: &out); u16(0, into: &out)
-        u16(count, into: &out); u16(count, into: &out)
-        u32(UInt32(central.count), into: &out); u32(cdOffset, into: &out); u16(0, into: &out)
+        if zip64 {
+            out.append(zip64Tail(count: count, cdSize: central.count, cdOffset: cdOffset, at: out.count))
+            out.append(eocd(count: 0xFFFF, cdSize: 0xFFFF_FFFF, cdOffset: 0xFFFF_FFFF, disk: disk, comment: comment))
+        } else {
+            out.append(eocd(count: count, cdSize: UInt32(central.count), cdOffset: UInt32(cdOffset), disk: disk, comment: comment))
+        }
         out.append(trailing)
         return out
     }
 
-    static func write(_ entries: [Entry], to url: URL, declaredEntries: Int? = nil, trailing: Data = Data()) throws -> URL {
-        try make(entries, declaredEntries: declaredEntries, trailing: trailing).write(to: url)
+    static func write(_ entries: [Entry], to url: URL, declaredEntries: Int? = nil, trailing: Data = Data(),
+                      comment: Data = Data(), disk: Int = 0, zip64: Bool = false) throws -> URL {
+        try make(entries, declaredEntries: declaredEntries, trailing: trailing, comment: comment, disk: disk, zip64: zip64)
+            .write(to: url)
         return url
     }
 }
@@ -232,5 +285,84 @@ func resourceFixture(_ name: String) throws -> URL {
         #expect(ArtifactKind.isZipContainer(ext: "DOCX"))
         #expect(Set(ArtifactKind.extensionTable.keys.filter { ArtifactKind.isZipContainer(ext: $0) }) ==
                 ["xlsx", "numbers", "docx", "pptx", "key", "pages", "usdz"])
+    }
+
+    /// Round 2: no reader of the archive may see a different end record, central directory or file name than this one.
+    @Test func archiveParserDifferentialsClosed() throws {
+        let dir = try tempDir()
+        var n = 0
+        func file(_ data: Data) throws -> URL {
+            n += 1
+            let url = dir.appending(path: "z\(n).zip")
+            try data.write(to: url)
+            return url
+        }
+        func unreadable(_ data: Data, _ why: String) throws {
+            let url = try file(data)
+            #expect(throws: ArchiveError.unreadable, "\(why)") { try ArchiveRatio.stats(url: url) }
+        }
+        let ok: [ZipFixture.Entry] = [.init(name: "ok.txt")]
+        // A normal zip still lists, with a comment too, and as ZIP64.
+        #expect(try ArchiveRatio.stats(url: try file(ZipFixture.make(ok))).entries == 1)
+        #expect(try ArchiveRatio.stats(url: try file(ZipFixture.make(ok, comment: Data("hello".utf8)))).entries == 1)
+        #expect(try ArchiveRatio.stats(url: try file(ZipFixture.make(ok + [.init(name: "b.txt")], zip64: true))).entries == 2)
+
+        // 1. End record: two of them; one hidden in the comment; comment not reaching the end.
+        let (locals, records) = ZipFixture.parts(ok)
+        var twice = locals + records[0]
+        twice += ZipFixture.eocd(count: 1, cdSize: UInt32(records[0].count), cdOffset: UInt32(locals.count))
+        twice += ZipFixture.eocd(count: 1, cdSize: UInt32(records[0].count), cdOffset: UInt32(locals.count))
+        try unreadable(twice, "two end records")
+        let inner = ZipFixture.eocd(count: 1, cdSize: UInt32(records[0].count), cdOffset: UInt32(locals.count))
+        try unreadable(ZipFixture.make(ok, comment: inner), "an end record inside the comment")
+        try unreadable(ZipFixture.make(ok, trailing: Data([0, 0])), "the comment does not reach the end of the file")
+
+        // 2. ZIP64 and disks. An unused locator (no markers) pointing at a ZIP64 record whose central directory hides
+        //    `../evil`: Python's zipfile would follow it.
+        let all: [ZipFixture.Entry] = [.init(name: "ok.txt"), .init(name: "../evil")]
+        let (allLocals, allRecords) = ZipFixture.parts(all)
+        var hidden = allLocals
+        let hiddenCD = allRecords.reduce(Data(), +)
+        let hiddenAt = hidden.count
+        hidden += hiddenCD
+        let z64At = hidden.count
+        let z64 = ZipFixture.zip64Tail(count: 2, cdSize: hiddenCD.count, cdOffset: hiddenAt, at: z64At)
+        hidden += z64.prefix(56)                                           // the ZIP64 end record
+        let visibleAt = hidden.count
+        hidden += allRecords[0]                                            // the visible directory: ok.txt only
+        hidden += z64.suffix(20)                                           // the locator, right before the end record
+        hidden += ZipFixture.eocd(count: 1, cdSize: UInt32(allRecords[0].count), cdOffset: UInt32(visibleAt))
+        try unreadable(hidden, "a ZIP64 locator the end record does not call for")
+        // Markers without a locator.
+        var markersOnly = locals + records[0]
+        markersOnly += ZipFixture.eocd(count: 0xFFFF, cdSize: 0xFFFF_FFFF, cdOffset: 0xFFFF_FFFF)
+        try unreadable(markersOnly, "ZIP64 markers without a locator")
+        try unreadable(ZipFixture.make(ok, disk: 1), "a multi-disk end record")
+        var multi = ZipFixture.make(ok, zip64: true)
+        let locatorAt = multi.count - 22 - 20
+        multi[locatorAt + 16] = 2                                          // total disks 2
+        try unreadable(multi, "a multi-disk ZIP64 locator")
+        // Bytes between the central directory and the end record.
+        var gap = locals + records[0] + Data([0, 0, 0, 0])
+        gap += ZipFixture.eocd(count: 1, cdSize: UInt32(records[0].count), cdOffset: UInt32(locals.count))
+        try unreadable(gap, "a gap after the central directory")
+
+        // 3. Names, methods and CRCs.
+        let upath = try file(ZipFixture.make([.init(name: "safe.txt", extra: ZipFixture.unicodePathField("../../.zshrc"))]))
+        #expect(try ArchiveRatio.stats(url: upath).hasUnsafeName)
+        #expect(throws: ArchiveError.unsafePaths) { try ArchiveRatio.check(url: upath) }
+        let localUpath = try file(ZipFixture.make([.init(name: "safe.txt", localExtra: ZipFixture.unicodePathField("/etc/x"))]))
+        #expect(throws: ArchiveError.unsafePaths) { try ArchiveRatio.check(url: localUpath) }
+        let fineUpath = try file(ZipFixture.make([.init(name: "caf\u{E9}.txt", extra: ZipFixture.unicodePathField("caf\u{E9}.txt"))]))
+        #expect(try ArchiveRatio.check(url: fineUpath) > 0)
+        try unreadable(ZipFixture.make([.init(name: "a.txt"), .init(name: "a.txt")]), "duplicate names")
+        try unreadable(ZipFixture.make([.init(name: "dir/a.txt"), .init(name: "dir//./a.txt")]), "duplicate after normalising")
+        try unreadable(ZipFixture.make([.init(name: "dir/a.txt"), .init(name: "dir\\a.txt")]), "duplicate with a backslash")
+        try unreadable(ZipFixture.make([.init(name: "a.txt"), .init(name: "b.txt", extra: ZipFixture.unicodePathField("a.txt"))]),
+                       "a Unicode Path that duplicates another entry")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", method: 8, localMethod: 0)]), "method differs")
+        try unreadable(ZipFixture.make([.init(name: "a.txt", crc: 0x1234_5678, localCRC: 0x8765_4321)]), "CRC differs")
+        // With a data descriptor, the local CRC may be zero.
+        #expect(try ArchiveRatio.stats(url: try file(ZipFixture.make([.init(name: "a.txt", dataDescriptor: true, crc: 0x1234_5678)]))).entries == 1)
     }
 }
