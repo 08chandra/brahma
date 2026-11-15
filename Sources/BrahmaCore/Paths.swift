@@ -50,6 +50,11 @@ public struct BrahmaPaths: Sendable, Equatable {
     /// Data-home snapshots (`HomeSnapshot`): `<backups>/home/home-<stamp>/{tree,MANIFEST.json}`.
     public var homeSnapshots: URL { backupsDir.appending(path: "home", directoryHint: .isDirectory) }
 
+    /// `<home>/vault`: the engine-only store of owner resources (`ContentVault`), outside every workspace. 0700.
+    public var vaultDir: URL { home.appending(path: "vault", directoryHint: .isDirectory) }
+    /// `<home>/vault/<companyId>`: one company's vault root (`resources/F-<n>.<ext>` below it). 0700.
+    public func vaultDir(companyId: String) -> URL { vaultDir.appending(path: companyId, directoryHint: .isDirectory) }
+
     /// Creates `url` (and parents) as a 0700 directory, and tightens an existing one.
     public static func ensurePrivateDirectory(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,

@@ -21,7 +21,7 @@ public enum ActivityFilter: String, CaseIterable, Sendable {
         case .messages: k == .message
         case .turns: k == .turnStarted || k == .turnFinished || k == .toolUse
         case .states: k == .stateChanged
-        case .work: k == .work || k == .approval || k == .preview || k == .release
+        case .work: k == .work || k == .approval || k == .preview || k == .release || k == .resource
         case .problems: k == .usage || k == .error
         }
     }

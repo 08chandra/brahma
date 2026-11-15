@@ -21,6 +21,22 @@ public enum ContentScan {
 
     public static func scan(fd: Int32, isText: Bool, knownValues: [(name: String, value: String)],
                             chunk: Int = chunkBytes) throws -> [ScanFinding] {
+        try scan(isText: isText, knownValues: knownValues, chunk: chunk) { offset, count in try read(fd, at: offset, count: count) }
+    }
+
+    /// The same scan over bytes already in memory (the vault scans exactly the bytes it copies): the same windows, so the same
+    /// findings as `scan(fd:…)` over a file holding them.
+    public static func scan(data: Data, isText: Bool, knownValues: [(name: String, value: String)],
+                            chunk: Int = chunkBytes) throws -> [ScanFinding] {
+        try scan(isText: isText, knownValues: knownValues, chunk: chunk) { offset, count in
+            let start = Int(min(offset, off_t(data.count))), end = min(start + count, data.count)
+            return [UInt8](data[(data.startIndex + start)..<(data.startIndex + end)])
+        }
+    }
+
+    /// The window loop: `source(offset, count)` gives up to `count` bytes at `offset`, fewer only at the end.
+    private static func scan(isText: Bool, knownValues: [(name: String, value: String)], chunk: Int,
+                             source: (off_t, Int) throws -> [UInt8]) throws -> [ScanFinding] {
         let known = knownValues.filter { $0.value.count >= Redactor.minLength }
         let needles: [(name: String, forms: [[UInt8]])] = known.map { kv in
             (kv.name, Redactor.forms(of: kv.value).map { Array($0.utf8) }.filter { !$0.isEmpty })
@@ -41,7 +57,7 @@ public enum ContentScan {
         var linesBefore = 0                  // newlines before the window's first byte
         let newline = UInt8(ascii: "\n")
         while true {
-            let fresh = try read(fd, at: offset, count: step)
+            let fresh = try source(offset, step)
             if fresh.isEmpty { break }       // the carried tail was scanned with the window before
             offset += off_t(fresh.count)
             window.append(contentsOf: fresh)

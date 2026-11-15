@@ -1420,6 +1420,53 @@ enum Migrations {
             try db.alter(table: "sprint") { t in t.add(column: "closedById", .text) }
             try db.execute(sql: "UPDATE memoryCursor SET position = '' WHERE source = 'retro'")
         }
+        m.registerMigration("vML-resources") { db in
+            // Plan ML Task 6b: owner resources, shown as `F-<number>`. The bytes live in the vault (`vaultPath`, relative to
+            // `<home>/vault/<companyId>`); `displayName` is sanitized and never used as a file name. A folder row owns its
+            // children (`parentId`). `readerSet`: a JSON array of agent ids (NULL: follow the scope). `purgeReport`: JSON
+            // `{backups:[], transcripts:[]}` (Task 6c). Collab adds its snapshot rows here.
+            try db.create(table: "resource") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("kind", .text).notNull()
+                t.column("parentId", .text)
+                t.column("displayName", .text).notNull()
+                t.column("ext", .text)
+                t.column("fileKind", .text)
+                t.column("bytes", .integer).notNull().defaults(to: 0)
+                t.column("sha256", .text)
+                t.column("vaultPath", .text)
+                t.column("mirrorPath", .text)
+                t.column("mirrorSha256", .text)
+                t.column("url", .text)
+                t.column("scopeKind", .text).notNull()
+                t.column("scopeId", .text)
+                t.column("readerSet", .text)
+                t.column("futureHolders", .boolean).notNull().defaults(to: false)
+                t.column("provenance", .text).notNull()
+                t.column("sourceDetail", .text)
+                t.column("tainted", .boolean).notNull()
+                t.column("taintReason", .text)
+                t.column("quarantined", .boolean).notNull().defaults(to: false)
+                t.column("secretScan", .text).notNull().defaults(to: "none")
+                t.column("vouchedAt", .datetime)
+                t.column("addedVia", .text).notNull()
+                t.column("channelId", .text)
+                t.column("messageId", .text)
+                t.column("askId", .text)
+                t.column("itemId", .text)
+                t.column("textIndexed", .boolean).notNull().defaults(to: false)
+                t.column("purgedAt", .datetime)
+                t.column("purgeReport", .text)
+                t.column("removedAt", .datetime)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "resource_parent", on: "resource", columns: ["companyId", "parentId"])
+            try db.create(index: "resource_created", on: "resource", columns: ["companyId", "createdAt"])
+        }
     }
 
     /// Plan 4b migrations: registered after every Plan L migration, never inside `registerPlan5` or `registerPlanL`, in landing order

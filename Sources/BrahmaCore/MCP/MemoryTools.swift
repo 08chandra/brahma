@@ -145,6 +145,7 @@ extension CompanyTools {
         }
         let raw = ref ?? ""
         let now = Store.now()
+        if let answer = try resourceRecall(raw) { return answer }
         let notFound = "No memory \(Store.flat(MemoryRefs.implied(raw).canonical, max: 80)) you can read."
         guard let doc = try MemoryIndex(store: store).document(companyId: companyId, scope: .agent(agentId), ref: raw, now: now) else {
             return notFound
@@ -173,6 +174,30 @@ extension CompanyTools {
         try store.recordRead(companyId: companyId, docIds: [doc.hit.docId], agentId: agentId, turnId: try runningTurnId(),
                              via: .recall, now: now)
         return out
+    }
+
+    /// `recall(ref: "F-<n>")` answers the engine gives without the doc text, for a resource this agent can read in full:
+    /// purged, flagged (the vault is never read), a link, a folder, or a file whose text is not indexed. Nil otherwise: the
+    /// generic path then shows the indexed text (taint first), or answers like a missing ref.
+    private func resourceRecall(_ raw: String) throws -> String? {
+        let (source, canonical) = MemoryRefs.implied(raw)
+        guard source == .resource, canonical.hasPrefix("F-"), let number = Int(canonical.dropFirst(2)), canonical == "F-\(number)",
+              let found = try store.resourceForReader(companyId: companyId, number: number, reader: .agent(agentId)),
+              found.level == .full
+        else { return nil }
+        let r = found.resource
+        if r.purgedAt != nil { return "\(r.ref) was purged by the owner." }
+        guard r.removedAt == nil else { return nil }
+        if r.secretScan == .flagged { return "\(r.ref) was flagged by the owner as containing a secret; it can't be read by agents." }
+        switch r.kind {
+        case .link:
+            return "\(r.ref) is a link to \(Store.flat(Store.linkShown(r.url ?? ""), max: 200)); it was not fetched."
+        case .folder:
+            return "\(r.ref) is a folder (\(ResourceText.size(r.bytes))). Its contents can't be read as text yet."
+        case .file:
+            guard !r.textIndexed else { return nil }
+            return "\(r.ref) is a \(Store.flat(r.fileKind ?? "file", max: 20)) (\(ResourceText.size(r.bytes))). Its contents can't be read as text yet."
+        }
     }
 
     // MARK: remember
