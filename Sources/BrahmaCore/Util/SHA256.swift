@@ -3,7 +3,7 @@ import Foundation
 /// Pure-Swift SHA-256 (FIPS 180-4), so BrahmaCore stays Linux-portable without CryptoKit.
 /// For security-relevant hashes only; `StableHash` (FNV) is for non-security ids.
 public enum SHA256 {
-    private static let k: [UInt32] = [
+    fileprivate static let k: [UInt32] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
         0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
         0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -15,16 +15,58 @@ public enum SHA256 {
     ]
 
     public static func hash(_ data: Data) -> [UInt8] {
-        var h: [UInt32] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
-        var message = [UInt8](data)
-        let bitLength = UInt64(message.count) * 8
-        message.append(0x80)
-        while message.count % 64 != 56 { message.append(0) }
-        for shift in stride(from: 56, through: 0, by: -8) { message.append(UInt8((bitLength >> UInt64(shift)) & 0xff)) }
+        var hasher = Hasher()
+        hasher.update(data)
+        return hasher.finalize()
+    }
 
-        func rotr(_ x: UInt32, _ n: UInt32) -> UInt32 { (x >> n) | (x << (32 - n)) }
-        var w = [UInt32](repeating: 0, count: 64)
-        for chunk in stride(from: 0, to: message.count, by: 64) {
+    /// The same digest fed in pieces (a large file read in chunks never sits in memory twice).
+    public struct Hasher: Sendable {
+        private var h: [UInt32] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+        private var pending: [UInt8] = []
+        private var length: UInt64 = 0
+
+        public init() {}
+
+        public mutating func update(_ data: Data) { data.withUnsafeBytes { update($0) } }
+
+        public mutating func update(_ bytes: UnsafeRawBufferPointer) {
+            guard bytes.count > 0 else { return }
+            length &+= UInt64(bytes.count)
+            var offset = 0
+            if !pending.isEmpty {
+                let take = min(64 - pending.count, bytes.count)
+                pending.append(contentsOf: bytes[0..<take])
+                offset = take
+                if pending.count == 64 {
+                    let block = pending
+                    pending.removeAll(keepingCapacity: true)
+                    block.withUnsafeBytes { compress($0, at: 0) }
+                }
+            }
+            while bytes.count - offset >= 64 {
+                compress(bytes, at: offset)
+                offset += 64
+            }
+            if offset < bytes.count { pending.append(contentsOf: bytes[offset...]) }
+        }
+
+        public mutating func finalize() -> [UInt8] {
+            let bitLength = length &* 8
+            var tail = pending
+            tail.append(0x80)
+            while tail.count % 64 != 56 { tail.append(0) }
+            for shift in stride(from: 56, through: 0, by: -8) { tail.append(UInt8((bitLength >> UInt64(shift)) & 0xff)) }
+            tail.withUnsafeBytes { raw in
+                for chunk in stride(from: 0, to: raw.count, by: 64) { compress(raw, at: chunk) }
+            }
+            pending.removeAll()
+            return h.flatMap { v in [UInt8(v >> 24), UInt8((v >> 16) & 0xff), UInt8((v >> 8) & 0xff), UInt8(v & 0xff)] }
+        }
+
+        private mutating func compress(_ message: UnsafeRawBufferPointer, at chunk: Int) {
+            func rotr(_ x: UInt32, _ n: UInt32) -> UInt32 { (x >> n) | (x << (32 - n)) }
+            var w = [UInt32](repeating: 0, count: 64)
             for i in 0..<16 {
                 let j = chunk + i * 4
                 w[i] = UInt32(message[j]) << 24 | UInt32(message[j + 1]) << 16 | UInt32(message[j + 2]) << 8 | UInt32(message[j + 3])
@@ -38,7 +80,7 @@ public enum SHA256 {
             for i in 0..<64 {
                 let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
                 let ch = (e & f) ^ (~e & g)
-                let t1 = hh &+ s1 &+ ch &+ k[i] &+ w[i]
+                let t1 = hh &+ s1 &+ ch &+ SHA256.k[i] &+ w[i]
                 let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
                 let maj = (a & b) ^ (a & c) ^ (b & c)
                 let t2 = s0 &+ maj
@@ -47,10 +89,12 @@ public enum SHA256 {
             h[0] = h[0] &+ a; h[1] = h[1] &+ b; h[2] = h[2] &+ c; h[3] = h[3] &+ d
             h[4] = h[4] &+ e; h[5] = h[5] &+ f; h[6] = h[6] &+ g; h[7] = h[7] &+ hh
         }
-        return h.flatMap { v in [UInt8(v >> 24), UInt8((v >> 16) & 0xff), UInt8((v >> 8) & 0xff), UInt8(v & 0xff)] }
     }
+
+    /// Lowercase hex of a digest.
+    public static func hex(digest: [UInt8]) -> String { digest.map { String(format: "%02x", $0) }.joined() }
 
     /// 64 lowercase hex digits.
     public static func hex(_ text: String) -> String { hex(Data(text.utf8)) }
-    public static func hex(_ data: Data) -> String { hash(data).map { String(format: "%02x", $0) }.joined() }
+    public static func hex(_ data: Data) -> String { hex(digest: hash(data)) }
 }

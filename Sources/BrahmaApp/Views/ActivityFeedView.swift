@@ -113,6 +113,7 @@ struct ActivityRow: View {
         case .approval: "checkmark.seal"
         case .preview: "play.rectangle"
         case .release: "shippingbox"
+        case .resource: "paperclip"
         }
     }
 
@@ -129,6 +130,7 @@ struct ActivityRow: View {
         case .approval: BrahmaTheme.warning
         case .preview: BrahmaTheme.running
         case .release: BrahmaTheme.success
+        case .resource: BrahmaTheme.accent
         }
     }
 }
