@@ -221,6 +221,74 @@ worktrees under `.brahma/wt`, and the database and MCP configs staying readable 
 very large repository a merge costs a full-history fetch. This is acceptable for the workspaces Brahma creates; the 4a merge
 queue is where it gets reworked.
 
+## Agent map
+
+The agent map is a live org chart of one company, drawn in SpriteKit from the same snapshot the rest of the app reads.
+It is built and reachable from the pop-out map window; the in-window Mission Control slot arrives with the Plan 4a /
+Collab-MVP layout.
+
+**What it shows.** Board at the top, then executives, directors, managers and ICs, in team bands. Each card has the
+agent's handle, role, a state (`ready`, `running`, `blocked`, `sleeping`, `killed`; paused agents look like sleeping),
+its current work item and, when blocked, the blocker. Where people data exists (3b) a card also shows the trust chip,
+perks and the usage meter. Open seats are `OPEN · <ROLE>` cards. A dashed line runs from a reviewer to the owner of
+every item that is in progress or in review.
+
+**What moves.** Messages and broadcasts travel as particles along the reporting lines, hand-offs are labelled with the
+item key, and a sprint meeting is a hull drawn around its participants. Hires, terminations, reorgs and promotions are animated.
+
+**Controls.**
+
+- Above 60 active agents managers (and directors whose reports are all ICs or vacancies) start folded into stubs
+  (`▸ N REPORTS`); click a stub or a manager's `▾` to open or fold a subtree.
+- Search and jump to an agent (it is revealed and highlighted), follow an agent, zoom to fit, show former agents.
+- Vacancies: `brahma org vacancies <company>` lists them, `brahma org fill` hires into one (3a), and
+  `brahma org vacancy add|remove <company> ...` (4b) opens and withdraws seats; the map's context menu does the same.
+  **Fill asks for confirmation** in a sheet, because it starts a paid agent. Vacancies that come from a provider
+  are display-only.
+- Replay: the last hour can be scrubbed and played back at speed. Meetings and reorgs are not replayed, and a window
+  with more than 20 000 messages is shown as truncated.
+- Pop-out window and full screen.
+
+**Bursts.** Messages between the same pair within half a second are coalesced; above 30 messages per second the map switches
+to aggregate mode (no particles, the edge pulses instead, with an `AGGREGATE · <rate> MSG/S` label) and drops back below 20; the particle
+queue is capped at 400, oldest traffic first.
+
+**What the map shows about agents.** Item titles and blocker reasons are redacted by the store's redactor and cleaned
+(control characters, length) before they are drawn. Vacancy notes are owner-only and redacted. `system` traffic is not
+drawn. After a database restore from a backup the map starts fresh (old traffic is not replayed).
+
+**Demo and snapshots.**
+
+```
+scripts/map-demo.sh [agents] [flags]             # read-only synthetic company, no write actions, temp home
+scripts/map-snapshots.sh                          # offscreen PNGs of the scenes into .superpowers/maps
+Brahma --map-demo --map-demo-agents=300           # the same demo, straight from the app binary
+Brahma --map-bench=20                             # implies --map-demo: prints one MAP BENCH line and exits
+```
+
+`--map-bench=<s>` measures the on-screen frame rate for `<s>` seconds and prints
+`MAP BENCH mode=org agents=<n> fps=… p95=…ms max=…ms dropped=… aggregate=…s`. The display must be awake. AppKit
+treats a flag followed by a separate value (for example `--ui-snapshot <path>`) as a file to open when it comes after a
+`--flag=value`, so put those before `--map-demo`; the `=` forms can go anywhere.
+
+**Measured numbers.** Apple M4 Pro, macOS 26.2 (build 25C56), release build. The offscreen runs drive a synthetic company through `OrgScene` and `SKRenderer`
+into a 1600×900 texture at a fixed 1/60 s step for 30 s (50 msg/s and a 200-message burst every 10 s; 120 msg/s for the
+aggregate run); a frame is the controller frame, scene update and GPU work. Reproduce with
+`BRAHMA_PERF=1 swift test -c release -Xswiftc -enable-testing --filter MapPerfTests` and `Brahma --map-bench=20`.
+
+| Measurement | Result |
+| --- | --- |
+| Offscreen, 300 agents, default collapse | mean 0.9 ms, p95 1.4 ms, max 3.8 ms (1080 fps), 0 frames over 16.7 ms |
+| Offscreen, 300 agents, fully expanded | mean 3.0 ms, p95 4.3 ms, max 15.0 ms (329 fps), 0 frames over 16.7 ms |
+| Offscreen, aggregate fallback (600 asked, 500 drawn: the generator maximum), 120 msg/s | mean 3.1 ms, p95 5.0 ms, max 22.0 ms (327 fps), 2 frames over 16.7 ms, aggregate mode for the whole run |
+| On screen, 300 agents, `--map-bench=20` | 60.0 fps, p95 17.1 ms (display refresh jitter), max 25.0 ms, 1 dropped frame |
+| Queue step (`MapQueueTests`, 300 agents) | mean 0.000543 ms per step |
+
+Timings vary by a factor of two or so from run to run with machine load; the 60 fps budget (16.7 ms at the 95th
+percentile) is met with a wide margin offscreen.
+
+Hive and Village arrive in Plan 4c on the same `MapModel`.
+
 ## Data locations
 
 | What | Where | Override |

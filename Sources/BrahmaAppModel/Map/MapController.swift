@@ -133,6 +133,9 @@ public final class MapController {
         var lastReorg: Date
     }
     @ObservationIgnored var synthetic: SyntheticWorld?
+    /// The synthetic company's traffic bursts: `size` extra messages at every multiple of `every` seconds. The offscreen bench
+    /// (`MapBench`) varies it; nil turns bursts off.
+    @ObservationIgnored public var syntheticBurst: (every: TimeInterval, size: Int)? = (10, 200)
 
     public init(source: MapSource, people: (any MapPeopleProviding)? = nil, vault: (any SecretVault)? = nil,
                 defaults: UserDefaults = .standard, clock: @escaping @Sendable () -> Date = { .now }) {
@@ -465,10 +468,11 @@ public final class MapController {
     }
 
     /// Synthetic traffic for the time since the last poll, 2 % of the agents changing state, and a reorg every 30 s.
-    private func pollSynthetic() {
-        guard var w = synthetic else { return }
+    /// Public so the offscreen bench can poll without suspending; a live or invalidated controller does nothing.
+    public func pollSynthetic() {
+        guard !isInvalidated, var w = synthetic else { return }
         let now = clock()
-        let facts = now > w.last ? w.traffic.facts(from: w.last, to: now, agents: w.agents, rate: w.rate) : []
+        let facts = now > w.last ? w.traffic.facts(from: w.last, to: now, agents: w.agents, rate: w.rate, burst: syntheticBurst) : []
         if now > w.last { w.last = now }
 
         let handles = Dictionary(w.agents.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })

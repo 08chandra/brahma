@@ -18,7 +18,7 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
 struct DevGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self])
+        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, Claim.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -92,6 +92,24 @@ struct DevGroup: ParsableCommand {
                                   itemId: itemId, supersedes: old, requestId: requestId, decisionClass: cls, quotaExempt: .devHook)
             }
             print(safe(describe(ask, store: store)))
+        }
+    }
+
+    /// `claim_item` as an agent would call it: takes the work lease, so a `ready` item goes `inProgress` (the seed's reviewer line).
+    struct Claim: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Claim a work item as an agent.")
+        @Argument var company: String
+        @Argument(help: "Work item key.") var key: String
+        @Option(help: "Handle of the agent claiming it.") var by: String
+
+        func run() throws {
+            try requireDev()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: by)
+            guard let item = try store.workItem(companyId: c.id, key: key) else { throw fail("no work item \(key.uppercased())") }
+            _ = try refusing { try store.claimLease(itemId: item.id, agentId: agent.id) }
+            print(safe("\(item.key) claimed by @\(agent.name)"))
         }
     }
 
