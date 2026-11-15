@@ -6,11 +6,14 @@ public enum MapControllerError: Error, Equatable, LocalizedError {
     case demoIsReadOnly
     /// The controller was invalidated: the company changed or the store closed.
     case stale
+    /// A replay is open: the map shows history, and history is never written.
+    case replaying
 
     public var errorDescription: String? {
         switch self {
         case .demoIsReadOnly: "The demo map is read-only"
         case .stale: "This map belongs to another company"
+        case .replaying: "The map is showing a replay; go back to LIVE to change the org"
         }
     }
 }
@@ -47,7 +50,8 @@ public struct FillPreview: Equatable, Sendable {
 /// can be filled or removed, and only through the raw handle `orgVacancyHandles` recorded for it: a provider-supplied id,
 /// a cleaned id that differs from its raw handle, the demo and a stale controller never reach the Store.
 extension MapController {
-    /// The context menu for `hit`, and its only source. Nothing for the demo or an invalidated controller.
+    /// The context menu for `hit`, and its only source. Nothing for the demo or an invalidated controller; no vacancy
+    /// write while a replay is open (history is never written).
     public func actions(for hit: MapHit) -> [MapAction] {
         guard !isSynthetic, !isInvalidated, liveStore != nil else { return [] }
         switch hit {
@@ -55,11 +59,12 @@ extension MapController {
             guard model.agents[id] != nil, let agent = lastSnapshot?.agents.first(where: { $0.id == id }) else { return [] }
             // A former agent (shown with "show former") can be followed, not messaged or given reports.
             guard agent.state != .killed else { return [.follow(agentId: id)] }
+            if isReplaying { return [.message(handle: agent.name), .follow(agentId: id)] }
             return [.message(handle: agent.name), .follow(agentId: id), .addVacancy(managerHandle: agent.name)]
         case .owner:
-            return [.addVacancy(managerHandle: nil)]
+            return isReplaying ? [] : [.addVacancy(managerHandle: nil)]
         case .vacancy(let id):
-            return fillPreview(handle: id) == nil ? [] : [.fill(handle: id), .removeVacancy(handle: id)]
+            return isReplaying || fillPreview(handle: id) == nil ? [] : [.fill(handle: id), .removeVacancy(handle: id)]
         case .stub, .team:
             return []
         }
@@ -111,15 +116,17 @@ extension MapController {
         if let snapshot {
             sync(snapshot: snapshot)
         } else if !isInvalidated, replay == nil, let last = lastSnapshot {
-            model.apply(inputs(for: last, store: store), now: mapNow())
+            model.apply(inputs(for: last, store: store), now: mapNow(), emitEvents: isRunning)
         }
         await poll()
     }
 
-    /// The store an owner write may use: never the demo's (it has none), never a stale controller's.
+    /// The store an owner write may use: never the demo's (it has none), never a stale controller's, never while a replay
+    /// is open.
     private func writableStore() throws -> Store {
         if isSynthetic { throw MapControllerError.demoIsReadOnly }
         guard !isInvalidated, let store = liveStore else { throw MapControllerError.stale }
+        if isReplaying { throw MapControllerError.replaying }
         return store
     }
 

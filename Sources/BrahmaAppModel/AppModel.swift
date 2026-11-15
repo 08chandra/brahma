@@ -66,8 +66,9 @@ public final class AppModel {
     public var mapPoppedOut = false
     /// Optional people data for live maps (none in 4b).
     @ObservationIgnored public var mapPeopleProvider: (any MapPeopleProviding)? = nil
-    /// The non-interactive vault the engine reloads the redactor from; the map's poll reloads it too while the engine is
-    /// stopped. Set by the app delegate; tests leave it nil.
+    /// The vault a live map's poll reloads the redactor from (the engine reloads it only while it runs). Nil, as in the app,
+    /// means the vault the embedded engine was given: the app delegate's non-interactive vault, which `restartEngine` keeps
+    /// (`mapVault`). Tests set it, or give the engine a `MemoryVault`/`FileVault`; never a Keychain-backed one.
     @ObservationIgnored public var mapSecretVault: (any SecretVault)? = nil
     /// Between `closeStore()` and a successful `reopenStore()`: `store` is closed, so no live map may be built over it.
     @ObservationIgnored private var storeClosed = false
@@ -161,6 +162,8 @@ public final class AppModel {
         // one whose cursors start at the restored database's maxima.
         storeClosed = true
         dropLiveMapController()
+        // The map's vacancy sheets act on the company and store they were opened for.
+        if presentedSheet?.isCompanyBound == true { presentedSheet = nil }
         let store = self.store
         try? await Task.detached { try store.close() }.value
     }
@@ -223,6 +226,8 @@ public final class AppModel {
                 (try store.maxEventId(), try store.companies().first?.id)
             }.value
             self.cursor = cursor
+            // A live map of another company (one built over a reopened store before this reload) is not this selection's.
+            if firstId != selectedCompanyId { dropLiveMapController() }
             selectedCompanyId = firstId
             access.companyId = firstId
             settings.companyId = firstId
@@ -402,20 +407,25 @@ public final class AppModel {
     /// company over the current `store` (read now: `reopenStore()` replaces it), else nil when no company is selected.
     public func ensureMapController() -> MapController? {
         if let mapController {
-            // A live controller over a store this model no longer uses is never handed out.
-            if mapController.isSynthetic || mapController.liveStore === store { return mapController }
+            // A live controller over a store this model no longer uses, or of a company it no longer shows, is never handed out.
+            if mapController.isSynthetic
+                || (mapController.liveStore === store && mapController.companyId == selectedCompanyId) { return mapController }
             dropLiveMapController()
         }
         guard !storeClosed, let id = selectedCompanyId else { return nil }
         let controller = MapController(source: .live(store: store, companyId: id), people: mapPeopleProvider,
-                                       vault: mapSecretVault, clock: clock)
+                                       vault: mapVault, clock: clock)
         controller.sync(snapshot: snapshot)
         mapController = controller
         return controller
     }
 
+    /// The vault a live map reloads the redactor from: `mapSecretVault`, else the embedded engine's.
+    var mapVault: (any SecretVault)? { mapSecretVault ?? engine?.secretVault }
+
     /// The pop-out map window closed: the map is no longer shown elsewhere, so the flag clears and the controller stops
-    /// polling. An inline panel that is mounted restarts it from its `mapPoppedOut` change (`start()` is idempotent).
+    /// polling and drops its queue (it keeps its model current without queuing until it starts again, at the then-current
+    /// maxima). An inline panel that is mounted restarts it from its `mapPoppedOut` change (`start()` is idempotent).
     public func mapWindowClosed() {
         mapPoppedOut = false
         mapController?.stop()

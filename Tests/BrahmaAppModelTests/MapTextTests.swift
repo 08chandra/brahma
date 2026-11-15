@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import BrahmaCore
 @testable import BrahmaAppModel
 
 @Suite(.scratch) struct MapTextTests {
@@ -10,6 +11,16 @@ import Foundation
         #expect(MapText.clean(String(repeating: "x", count: 50), max: 40).hasSuffix("…"))
         #expect(MapText.clean("   ", max: 40) == "—"); #expect(MapText.clean(nil, max: 40) == "—")
         #expect(MapText.clean("👩‍💻👩‍💻👩‍💻", max: 2) == "👩‍💻…")
+    }
+
+    /// Deferred minor 10a-1: a sheet shows a `WorkError`'s message, not its enum syntax; other errors keep their description;
+    /// every one is cleaned.
+    @Test func errorTextIsTheMessageCleaned() {
+        #expect(MapText.errorText(WorkError.invalid("unknown role x")) == "unknown role x")
+        #expect(MapText.errorText(WorkError.forbidden("not in your company")) == "not in your company")
+        #expect(MapText.errorText(WorkError.conflict("bad\u{202E}\nname")) == "bad name")
+        #expect(MapText.errorText(MapControllerError.replaying) == MapControllerError.replaying.errorDescription)
+        #expect(MapText.errorText(StoreError.notFound) == StoreError.notFound.errorDescription)
     }
 
     @Test func invisibleAndLayoutCharactersRemoved() {

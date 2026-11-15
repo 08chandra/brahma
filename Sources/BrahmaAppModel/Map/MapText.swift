@@ -32,6 +32,13 @@ public enum MapText {
     }
 
     /// Empty or nil gives "—". A caller that needs "no text" keeps its field optional or empty and does not call this.
+    /// An error as one cleaned line for a sheet: Store and map errors can carry agent text (a handle, a note). A
+    /// `WorkError` shows its message (it is not a `LocalizedError`, and its enum form means nothing to the owner).
+    public static func errorText(_ error: any Error) -> String {
+        let text = (error as? WorkError)?.message ?? (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        return clean(text, max: 200)
+    }
+
     public static func clean(_ s: String?, max: Int) -> String {
         guard let s, !s.isEmpty else { return empty }
         let max = Swift.max(1, max)

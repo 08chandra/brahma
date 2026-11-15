@@ -104,6 +104,13 @@ extension MapModel {
                  aggregate: queue.aggregate, lastDropAt: queue.lastDropAt)
     }
 
+    /// Drops every queued event: the map stopped, and nothing frames a stopped map. They count as dropped, so the counters
+    /// still add up; no drop time is recorded (the DROPPED chip is for drops the owner could have seen).
+    mutating func discardPending() {
+        queue.dropped += pending.count
+        pending.removeAll()
+    }
+
     /// Events playing now; the renderer reads `start` and `duration` against map time.
     public var active: [VisualEvent] { queue.active }
 

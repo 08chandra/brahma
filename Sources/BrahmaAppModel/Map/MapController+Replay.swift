@@ -22,6 +22,7 @@ extension MapController {
         // Invalidated, or another call entered first, while the history loaded.
         guard let timeline = loaded, !isInvalidated, replay == nil else { return }
         replay = ReplayState(timeline: timeline, time: timeline.start, playing: false, speed: MapTimeline.speeds[0])
+        isReplaying = true
         showReplay(at: timeline.start, facts: [], now: mapNow(), emitEvents: false)
     }
 
@@ -57,6 +58,7 @@ extension MapController {
     public func exitReplay() {
         guard replay != nil else { return }
         replay = nil
+        isReplaying = false
         guard case .live(let store, _) = source, !isInvalidated, let snapshot = lastSnapshot else { return }
         let now = mapNow()
         model.apply(inputs(for: snapshot, store: store), now: now, emitEvents: false)

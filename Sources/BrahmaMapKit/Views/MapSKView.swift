@@ -221,7 +221,7 @@ public final class MapSKView: SKView {
     /// else; no menu when there are no actions.
     public override func menu(for event: NSEvent) -> NSMenu? {
         guard let controller, let found = hit(event) else { return nil }
-        let entries = MapMenu.entries(for: controller.actions(for: found.hit), replaying: controller.replay != nil)
+        let entries = MapMenu.entries(for: controller.actions(for: found.hit), replaying: controller.isReplaying)
         guard !entries.isEmpty else { return nil }
         let menu = NSMenu()
         menu.autoenablesItems = false

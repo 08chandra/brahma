@@ -92,6 +92,10 @@ final class MapTestClock: @unchecked Sendable {
         let (acme, _, cto, _) = try seedAcme(store, paths)
         let c = live(store, acme.id)
         c.sync(snapshot: try snapshot(store, acme.id))
+        // Traffic is queued only for a running map (final review I3); `start()` begins at the current maxima.
+        c.start()
+        defer { c.stop() }
+        await c.poll()
         _ = try MessageRouter(store: store).sendDM(companyId: acme.id, from: .owner, to: "cto", text: "hello")
         await c.poll()
         let events = c.frame(now: 1)
@@ -311,6 +315,8 @@ final class MapTestClock: @unchecked Sendable {
         let fresh = try #require(app.ensureMapController())
         #expect(fresh !== old)
         #expect(fresh.messageCursor == (try app.store.maxMessageRowId(companyId: acme.id)))
+        fresh.start()
+        defer { fresh.stop() }
         await fresh.poll()
         #expect(fresh.model.stats.ingested == 0)
         _ = try MessageRouter(store: app.store).sendDM(companyId: acme.id, from: .owner, to: "cto", text: "now")
@@ -343,6 +349,10 @@ final class MapTestClock: @unchecked Sendable {
         #expect(c.messageCursor == (try store.maxMessageRowId(companyId: acme.id)))
         #expect(c.handoffCursor == (try store.maxHandoffRowId(companyId: acme.id)))
         #expect(c.model.stats.ingested == 0)
+        // Traffic is queued only by a running map (final review I3); `start()` seeds, which is not a re-seed.
+        c.start()
+        defer { c.stop() }
+        await c.poll()
         _ = try router.sendDM(companyId: acme.id, from: .owner, to: "cto", text: "two")
         await c.poll()
         await c.poll()
@@ -670,6 +680,9 @@ final class MapTestClock: @unchecked Sendable {
         app.stopPolling()
         let c = try #require(app.ensureMapController())
         #expect(c.companyId == company.id)
+        // Running, as a mounted map is: the fill's hire is queued as an event (final review I3).
+        c.start()
+        defer { c.stop() }
         await c.poll()
         let initial = c.model.vacancies
         #expect(initial.count >= 1)
@@ -842,5 +855,190 @@ final class MapTestClock: @unchecked Sendable {
         #expect(form.validate(pack: pack, packId: "software") == nil)
         #expect(form.validate(pack: nil, packId: "retail") == "company pack retail is not installed")
         #expect(VacancyForm().managerHandle == nil)
+    }
+
+    // MARK: Final review fixes
+
+    /// I1: the app's map reloads the redactor from the vault the embedded engine was given, so a secret added after launch
+    /// is redacted on the map even while the engine is not running (or a terminal `brahma run` owns it).
+    @Test func mapReloadsSecretsFromTheEngineVault() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, eng) = try seedAcme(store, paths)
+        // The dev/demo file vault in the scratch home: never the Keychain.
+        let vault = FileVault(home: paths.home)
+        _ = try store.reloadRedactorIfNeeded(vault: vault)
+        #expect(!store.secretsHeld)
+        let value = "sk-after-launch-424242"
+        try activeItem(store, acme.id, title: "Rotate \(value)", owner: eng.id)
+        let app = AppModel(store: store, paths: paths)
+        app.engine = EngineHost(paths: paths, store: store, ownerKeyStore: InMemoryOwnerKeyStore(), secretVault: vault)
+        await app.load()
+        app.stopPolling()
+        let c = try #require(app.ensureMapController())
+        await c.poll()
+        // Set after launch (as `brahma secret set` would): the engine is not running, so only the map's poll reloads.
+        try store.setSecret(companyId: acme.id, name: "API_KEY", value: value, isTest: false, vault: vault)
+        await c.poll()
+        let item = try #require(c.model.agents[eng.id]?.item)
+        #expect(item.contains("[redacted API_KEY]"), "\(item)")
+        #expect(!item.contains(value))
+    }
+
+    /// I2: a restore rebuilds the map for the selection the reload makes, and the map's company-bound sheets close with
+    /// the store.
+    @Test func restoreRebuildsTheMapForTheReloadedSelection() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let globex = try #require(try store.companies().first { $0.name == "Globex" })
+        let app = AppModel(store: store, paths: paths)
+        await app.load()
+        app.stopPolling()
+        await app.selectCompany(globex.id)
+        let before = try #require(app.ensureMapController())
+        #expect(before.companyId == globex.id)
+        app.presentedSheet = .fillVacancy(handle: "eng-1")
+        await app.closeStore()
+        #expect(app.presentedSheet == nil, "a company-bound sheet closes with the store")
+        app.presentedSheet = .hire
+        await app.reopenStore()
+        app.stopPolling()
+        #expect(app.presentedSheet == .hire)
+        #expect(app.selectedCompanyId == acme.id)
+        let after = try #require(app.ensureMapController())
+        #expect(after.companyId == acme.id)
+        #expect(after.liveStore === app.store)
+        #expect(before.isInvalidated)
+    }
+
+    /// I2: `load()` moves the selection to the first company. A live controller of the previous selection (one built while
+    /// a restore's reload was in flight) is dropped, never handed out for the company now shown.
+    @Test func loadDropsTheMapOfThePreviousSelection() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let globex = try #require(try store.companies().first { $0.name == "Globex" })
+        let app = AppModel(store: store, paths: paths)
+        await app.load()
+        app.stopPolling()
+        await app.selectCompany(globex.id)
+        let stale = try #require(app.ensureMapController())
+        await app.load()
+        #expect(app.selectedCompanyId == acme.id)
+        #expect(stale.isInvalidated)
+        let next = try #require(app.ensureMapController())
+        #expect(next !== stale)
+        #expect(next.companyId == acme.id)
+    }
+
+    /// I3: a map that is not running (never started, or stopped when its window closed) keeps its model current from the
+    /// snapshot reloads but queues nothing, and `start()` resumes at the current maxima: the backlog is not played as live.
+    @Test func stoppedMapQueuesNothingAndRestartsAtTheCurrentMaxima() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, ceo, _, _) = try seedAcme(store, paths)
+        let app = AppModel(store: store, paths: paths)
+        await app.load()
+        app.stopPolling()
+        let c = try #require(app.ensureMapController())
+        let router = MessageRouter(store: store)
+
+        // Never started: snapshot reloads apply without queuing, and a poll (a write's) ingests no traffic.
+        _ = try store.transition(agentId: ceo.id, to: .running)
+        await app.tick(forceSnapshot: true)
+        #expect(c.model.agents[ceo.id]?.state == .running)
+        #expect(c.model.pendingCount == 0)
+        _ = try router.sendDM(companyId: acme.id, from: .owner, to: "cto", text: "unseen")
+        await c.poll()
+        #expect(c.model.stats.ingested == 0)
+        #expect(c.model.pendingCount == 0)
+
+        // Running: a state change is queued; closing the window drops what is queued.
+        c.start()
+        _ = try store.transition(agentId: ceo.id, to: .ready)
+        await app.tick(forceSnapshot: true)
+        #expect(c.model.pendingCount > 0)
+        app.mapWindowClosed()
+        #expect(!c.isRunning)
+        #expect(c.model.pendingCount == 0)
+        let stats = c.model.stats
+        #expect(stats.ingested == stats.spawned + stats.coalesced + stats.aggregated + stats.dropped + stats.queued)
+
+        // Closed for a while: state changes and traffic.
+        _ = try store.transition(agentId: ceo.id, to: .running)
+        for i in 0..<5 { _ = try router.sendDM(companyId: acme.id, from: .owner, to: "cto", text: "backlog \(i)") }
+        await app.tick(forceSnapshot: true)
+        await app.tick(forceSnapshot: true)
+        #expect(c.model.agents[ceo.id]?.state == .running)
+        #expect(c.model.pendingCount == 0)
+        let ingested = c.model.stats.ingested
+
+        // Reopened: the backlog is not live traffic; what is sent now is.
+        c.start()
+        await c.poll()
+        await c.poll()
+        #expect(c.model.stats.ingested == ingested, "nothing from the backlog")
+        #expect(c.messageCursor == (try store.maxMessageRowId(companyId: acme.id)))
+        _ = try router.sendDM(companyId: acme.id, from: .owner, to: "cto", text: "live")
+        await c.poll()
+        try await eventually { c.model.stats.ingested == ingested + 1 }
+        c.stop()
+    }
+
+    /// Deferred minor 10a-3: replay cannot write. The controller refuses every vacancy write while a replay is open and its
+    /// actions offer none; back to live, they return.
+    @Test func replayRefusesWrites() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, cto, _) = try seedAcme(store, paths)
+        try backdateSeed(store, acme.id)
+        let row = try store.addVacancy(companyId: acme.id, role: "engineer", managerHandle: "cto", team: nil, note: "")
+        let c = live(store, acme.id)
+        c.sync(snapshot: try snapshot(store, acme.id))
+        await c.poll()
+        #expect(c.fillPreview(handle: row.handle) != nil)
+        #expect(!c.isReplaying)
+
+        await c.enterReplay()
+        #expect(c.replay != nil)
+        #expect(c.isReplaying)
+        let rows = try store.vacancies(companyId: acme.id)
+        let agents = try store.agents(companyId: acme.id).count
+        await #expect(throws: MapControllerError.replaying) {
+            try await c.addVacancy(role: "engineer", managerHandle: "cto", team: nil, note: "")
+        }
+        await #expect(throws: MapControllerError.replaying) { try await c.fillVacancy(handle: row.handle) }
+        await #expect(throws: MapControllerError.replaying) { try await c.removeVacancy(handle: row.handle) }
+        #expect(try store.vacancies(companyId: acme.id) == rows)
+        #expect(try store.agents(companyId: acme.id).count == agents)
+        #expect(c.actions(for: .vacancy(row.handle)).isEmpty)
+        #expect(c.actions(for: .owner).isEmpty)
+        #expect(c.actions(for: .agent(cto.id)) == [.message(handle: "cto"), .follow(agentId: cto.id)])
+
+        c.exitReplay()
+        #expect(!c.isReplaying)
+        #expect(c.actions(for: .vacancy(row.handle)) == [.fill(handle: row.handle), .removeVacancy(handle: row.handle)])
+        try await c.removeVacancy(handle: row.handle)
+        #expect(try store.vacancies(companyId: acme.id).isEmpty)
+    }
+
+    /// Review M1: a vacancy note is redacted again when the map draws it (a secret set after the note was written), and
+    /// withheld while the secrets are held, as the CLI does.
+    @Test func vacancyNotesRedactedWhenDrawn() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let value = "sk-note-later-777777"
+        let row = try store.addVacancy(companyId: acme.id, role: "engineer", managerHandle: "cto", team: nil, note: "uses \(value)")
+        store.redactor.update([(name: "API_KEY", value: value)], version: "later")
+        let c = live(store, acme.id)
+        c.sync(snapshot: try snapshot(store, acme.id))
+        await c.poll()
+        let note = try #require(c.model.vacancies.first { $0.id == row.handle }?.note)
+        #expect(note.contains("[redacted API_KEY]"), "\(note)")
+        #expect(!note.contains(value))
+
+        try store.setSecret(companyId: acme.id, name: "API_KEY", value: value, isTest: false, vault: MemoryVault())
+        let held = try Store(path: paths.database.path)
+        #expect(held.secretsHeld)
+        let h = live(held, acme.id)
+        h.sync(snapshot: try snapshot(held, acme.id))
+        await h.poll()
+        #expect(h.model.vacancies.first { $0.id == row.handle }?.note == MapController.withheld)
     }
 }

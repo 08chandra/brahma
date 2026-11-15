@@ -82,6 +82,9 @@ public final class MapController {
     public internal(set) var cameraRequest = 0
     public internal(set) var follow: String?
     public internal(set) var replay: ReplayState?
+    /// Whether a replay is open. Changes only on enter and exit, so a view that only needs to know (the header, the menus,
+    /// the sheets) does not re-render with every replay frame the way a read of `replay` does.
+    public internal(set) var isReplaying = false
     public internal(set) var searchHits: [String] = []
     public internal(set) var highlightId: String? {
         didSet { if highlightId != oldValue { highlightStartedAt = nil } }
@@ -98,7 +101,7 @@ public final class MapController {
     /// False when `init` could not read the maxima: the next poll seeds the cursors instead of reading flows.
     @ObservationIgnored var cursorsSeeded = false
     @ObservationIgnored var pollsUntilCursorCheck = 0
-    /// Bumped by `stop()`: a poll that started under another generation discards its result.
+    /// Bumped by `stop()` and `start()`: a poll that started under another generation discards its result.
     @ObservationIgnored var generation = 0
     @ObservationIgnored var pollsInFlight = 0
     @ObservationIgnored var lastPeopleLoad: Date?
@@ -151,7 +154,7 @@ public final class MapController {
             self.isSynthetic = false
             self.people = people
             // Old traffic is not replayed: the cursors start at the current maxima.
-            if let m = try? store.maxMessageRowId(companyId: companyId), let h = try? store.maxHandoffRowId(companyId: companyId) {
+            if let (m, h) = Self.maxima(store: store, companyId: companyId) {
                 messageCursor = m
                 handoffCursor = h
                 cursorsSeeded = true
@@ -206,9 +209,21 @@ public final class MapController {
 
     // MARK: Lifecycle
 
+    /// Starts polling. Only a running map queues events, and it starts at the current maxima: what happened while the map
+    /// was stopped (or before it was first shown) is never played as live traffic; the model itself was kept current by
+    /// `sync` meanwhile. A poll still in flight from before (a write's) is discarded.
     public func start() {
         guard !isInvalidated, pollTask == nil else { return }
         isRunning = true
+        generation += 1
+        if case .live(let store, let companyId) = source {
+            if let (m, h) = Self.maxima(store: store, companyId: companyId) {
+                (messageCursor, handoffCursor) = (m, h)
+                cursorsSeeded = true
+            } else {
+                cursorsSeeded = false   // the first poll seeds them
+            }
+        }
         pollsUntilCursorCheck = 0
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -219,11 +234,20 @@ public final class MapController {
         }
     }
 
+    /// Stops polling and drops the queued events: nothing frames a stopped map, and its queue would only grow.
     public func stop() {
         pollTask?.cancel()
         pollTask = nil
         generation += 1
         isRunning = false
+        model.discardPending()
+    }
+
+    /// The company's newest message and hand-off rowids, or nil when they cannot be read (a closing store).
+    private static func maxima(store: Store, companyId: String) -> (Int64, Int64)? {
+        guard let m = try? store.maxMessageRowId(companyId: companyId),
+              let h = try? store.maxHandoffRowId(companyId: companyId) else { return nil }
+        return (m, h)
     }
 
     /// Stops for good: `sync`, `poll` and `handle` do nothing afterwards (the company changed or the store closed).
@@ -234,7 +258,8 @@ public final class MapController {
 
     // MARK: Sync
 
-    /// Applies a live snapshot. While replaying it is only recorded: `exitReplay` applies the newest one.
+    /// Applies a live snapshot; its changes become events only while the map runs (a stopped map stays current without
+    /// queuing). While replaying it is only recorded: `exitReplay` applies the newest one.
     public func sync(snapshot: Snapshot) {
         guard case .live(let store, _) = source, !isInvalidated else { return }
         // A snapshot of another company (or the empty one of a reopening store) is not this map's.
@@ -242,7 +267,7 @@ public final class MapController {
               snapshot.agents.allSatisfy({ $0.companyId == companyId }) else { return }
         lastSnapshot = snapshot
         guard replay == nil else { return }
-        model.apply(inputs(for: snapshot, store: store), now: mapNow())
+        model.apply(inputs(for: snapshot, store: store), now: mapNow(), emitEvents: isRunning)
     }
 
     /// `raw` through the redactor, cached per raw string until the redactor's version changes; nil while the secrets are
@@ -310,7 +335,10 @@ public final class MapController {
         var vacancies: [Vacancy] = []
         var handleMap: [String: String] = [:]
         let rows = orgVacancyRows ?? []
-        for row in rows {
+        for var row in rows {
+            // Owner text, redacted at write time with the secrets known then: redacted again with today's, and withheld
+            // while they are held (as `brahma org vacancies` does).
+            if !row.note.isEmpty { row.note = redacted(row.note, store: store) ?? Self.withheld }
             let v = Vacancy(row: row, pack: pack, agentIdsByHandle: idsByHandle)
             if handleMap[v.id] == nil { handleMap[v.id] = row.handle }
             vacancies.append(v)
@@ -407,8 +435,9 @@ public final class MapController {
             let facts = (messages.map(MapFact.message) + handoffs.map(MapFact.handoff)).enumerated()
                 .sorted { $0.element.at != $1.element.at ? $0.element.at < $1.element.at : $0.offset < $1.offset }
                 .map(\.element)
-            // Replay shows history; live traffic that arrives meanwhile is skipped, not queued.
-            if replay == nil && !facts.isEmpty { model.ingest(facts, now: mapNow()) }
+            // Replay shows history; live traffic that arrives meanwhile is skipped, not queued. A stopped map (a write's
+            // poll) only moves its cursors.
+            if isRunning && replay == nil && !facts.isEmpty { model.ingest(facts, now: mapNow()) }
         }
 
         var changed = read.reloaded
@@ -421,7 +450,7 @@ public final class MapController {
             changed = true
         }
         if changed, replay == nil, let snapshot = lastSnapshot {
-            model.apply(inputs(for: snapshot, store: store), now: mapNow())
+            model.apply(inputs(for: snapshot, store: store), now: mapNow(), emitEvents: isRunning)
         }
     }
 

@@ -131,6 +131,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .success(let booted):
             let model = booted.model
             let options = self.options
+            // The live map reloads the redactor from this engine's vault too (`AppModel.mapVault`), so a secret set while the
+            // engine is not running here (a terminal `brahma run` owns it) is still redacted on the map.
             let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: booted.ownerKeyStore,
                                     secretVault: booted.secretVault)
             model.engine = engine
