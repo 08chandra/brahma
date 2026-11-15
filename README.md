@@ -226,8 +226,8 @@ queue is where it gets reworked.
 ## Agent map
 
 The agent map is a live org chart of one company, drawn in SpriteKit from the same snapshot the rest of the app reads.
-It is built and reachable from the pop-out map window; the in-window Mission Control slot arrives with the Plan 4a /
-Collab-MVP layout.
+Today it opens in its own window (menu Window → Agent Map) and in `--map-demo`; the in-window Mission Control slot
+arrives with the Plan 4a / Collab-MVP layout.
 
 **What it shows.** Board at the top, then executives, directors, managers and ICs, in team bands. Each card has the
 agent's handle, role, a state (`ready`, `running`, `blocked`, `sleeping`, `killed`; paused agents look like sleeping),
@@ -262,7 +262,7 @@ drawn. After a database restore from a backup the map starts fresh (old traffic 
 **Demo and snapshots.**
 
 ```
-scripts/map-demo.sh [agents] [flags]             # read-only synthetic company, no write actions, temp home
+scripts/map-demo.sh [agents] [--flag=value ...]  # read-only synthetic company, no write actions, temp home
 scripts/map-snapshots.sh                          # offscreen PNGs of the scenes into .superpowers/maps
 Brahma --map-demo --map-demo-agents=300           # the same demo, straight from the app binary
 Brahma --map-bench=20                             # implies --map-demo: prints one MAP BENCH line and exits
@@ -270,24 +270,28 @@ Brahma --map-bench=20                             # implies --map-demo: prints o
 
 `--map-bench=<s>` measures the on-screen frame rate for `<s>` seconds and prints
 `MAP BENCH mode=org agents=<n> fps=… p95=…ms max=…ms dropped=… aggregate=…s`. The display must be awake. AppKit
-treats a flag followed by a separate value (for example `--ui-snapshot <path>`) as a file to open when it comes after a
-`--flag=value`, so put those before `--map-demo`; the `=` forms can go anywhere.
+treats a flag followed by a separate value (for example `--ui-snapshot <path>`) as a file to open when it comes after
+the first `--flag=value` argument, so put such flags before the first `--flag=value`; the `=` forms can go anywhere.
+`scripts/map-demo.sh` appends its extra arguments after `--map-demo-agents=<n>`, so only `=`-form flags work through it.
 
 **Measured numbers.** Apple M4 Pro, macOS 26.2 (build 25C56), release build. The offscreen runs drive a synthetic company through `OrgScene` and `SKRenderer`
 into a 1600×900 texture at a fixed 1/60 s step for 30 s (50 msg/s and a 200-message burst every 10 s; 120 msg/s for the
-aggregate run); a frame is the controller frame, scene update and GPU work. Reproduce with
+aggregate run; 15 msg/s and no bursts for the particle run); a frame is the controller frame, scene update and GPU work (the controller's 500 ms poll, which applies the new snapshot,
+runs outside the timed window; the on-screen bench includes it). Reproduce with
 `BRAHMA_PERF=1 swift test -c release -Xswiftc -enable-testing --filter MapPerfTests` and `Brahma --map-bench=20`.
 
 | Measurement | Result |
 | --- | --- |
-| Offscreen, 300 agents, default collapse | mean 0.9 ms, p95 1.4 ms, max 3.8 ms (1080 fps), 0 frames over 16.7 ms |
-| Offscreen, 300 agents, fully expanded | mean 3.0 ms, p95 4.3 ms, max 15.0 ms (329 fps), 0 frames over 16.7 ms |
-| Offscreen, aggregate fallback (600 asked, 500 drawn: the generator maximum), 120 msg/s | mean 3.1 ms, p95 5.0 ms, max 22.0 ms (327 fps), 2 frames over 16.7 ms, aggregate mode for the whole run |
-| On screen, 300 agents, `--map-bench=20` | 60.0 fps, p95 17.1 ms (display refresh jitter), max 25.0 ms, 1 dropped frame |
-| Queue step (`MapQueueTests`, 300 agents) | mean 0.000543 ms per step |
+| Offscreen, 300 agents, default collapse, aggregate mode (50 msg/s) | mean 0.8 ms, p95 1.3 ms, max 3.6 ms (1245 fps), 0 frames over 16.7 ms |
+| Offscreen, 300 agents, fully expanded, aggregate mode (50 msg/s) | mean 2.2 ms, p95 3.4 ms, max 14.5 ms (461 fps), 0 frames over 16.7 ms |
+| Offscreen, 300 agents, fully expanded, particles (15 msg/s, no bursts) | mean 1.8 ms, p95 3.0 ms, max 13.3 ms (542 fps), 0 frames over 16.7 ms, no aggregate time |
+| Offscreen, aggregate fallback, 500 agents (600 asked, the generator maximum is 500), 120 msg/s | mean 1.1 ms, p95 2.2 ms, max 4.5 ms (931 fps), 0 frames over 16.7 ms |
+| On screen, 300 agents, aggregate mode (50 msg/s), `--map-bench=20` | 60.0 fps, p95 17.1 ms (display refresh jitter), max 25.0 ms, 1 dropped frame |
+| Queue step (`MapQueueTests.stepCostAt300`, 300 agents, 50 msg/s) | mean 0.00055 ms per step, release build (Task 5 recorded 0.000543 ms) |
 
-Timings vary by a factor of two or so from run to run with machine load; the 60 fps budget (16.7 ms at the 95th
-percentile) is met with a wide margin offscreen.
+"Particles" rows draw message particles (rate under the 20 msg/s exit threshold); "aggregate" rows are above the 30 msg/s
+enter threshold, so no particles are drawn and edges pulse instead. Timings vary by a factor of two or so from run to run
+with machine load; the 60 fps budget (16.7 ms at the 95th percentile) is met with a wide margin offscreen.
 
 Hive and Village arrive in Plan 4c on the same `MapModel`.
 

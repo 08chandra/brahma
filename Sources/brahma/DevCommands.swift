@@ -121,7 +121,8 @@ struct DevGroup: AsyncParsableCommand {
         }
     }
 
-    /// `claim_item` as an agent would call it: takes the work lease, so a `ready` item goes `inProgress` (the seed's reviewer line).
+    /// `claim_lease` as the agent would call it, through the same tool path as an agent's MCP server (the main-rewritten guard,
+    /// the worktree, the progress file and the check baseline all happen): the seed's in-progress item with a reviewer.
     struct Claim: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Claim a work item as an agent.")
         @Argument var company: String
@@ -133,9 +134,14 @@ struct DevGroup: AsyncParsableCommand {
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let agent = try resolveAgent(store, company: c, handle: by)
-            guard let item = try store.workItem(companyId: c.id, key: key) else { throw fail("no work item \(key.uppercased())") }
-            _ = try refusing { try store.claimLease(itemId: item.id, agentId: agent.id) }
-            print(safe("\(item.key) claimed by @\(agent.name)"))
+            let tools = CompanyTools(store: store, companyId: c.id, agentId: agent.id)
+            do {
+                print(safe(try tools.call(name: "claim_lease", arguments: ["key": .string(key)])))
+            } catch let e as ToolError {
+                throw fail(e.message)
+            } catch let e as WorkError {
+                throw fail(e.message)
+            }
         }
     }
 

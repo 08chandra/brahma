@@ -43,7 +43,7 @@ final class TurnQuotaCounter: @unchecked Sendable {
 }
 
 /// A failure the agent should see as an `isError` tool result.
-struct ToolError: Error { let message: String }
+public struct ToolError: Error { public let message: String }
 
 /// The tools one agent can call. Every call is attributed to `agentId` and writes straight to the shared store.
 public struct CompanyTools: Sendable {

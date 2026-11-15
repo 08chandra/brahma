@@ -392,6 +392,33 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try brahma(["inbox", "Acme"], home: home, env: agentEnv).status == 0)
     }
 
+    /// `dev claim` goes through the agent's own `claim_lease`: the item is in progress with a lease, and the worktree and
+    /// progress file exist. An agent turn (BRAHMA_AGENT_ID) and a missing BRAHMA_DEV are refused.
+    @Test func devClaimTakesTheAgentClaimPath() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let add = try brahma(["items", "add", "Acme", "--title", "Parser", "--check", "true", "--owner", "eng-1", "--reviewer", "cto",
+                              "--ready"], home: home)
+        #expect(add.status == 0, "\(add.stderr)")
+        #expect(try brahma(["dev", "claim", "Acme", "ACME-1", "--by", "eng-1"], home: home).stderr.contains("dev commands need BRAHMA_DEV=1"))
+        let refused = try brahma(["dev", "claim", "Acme", "ACME-1", "--by", "eng-1"], home: home,
+                                 env: ["BRAHMA_AGENT_ID": "a1", "BRAHMA_DEV": "1"])
+        #expect(refused.status != 0); #expect(refused.stderr.contains("owner commands can't run inside an agent turn"), "\(refused.stderr)")
+        let claimed = try brahma(["dev", "claim", "Acme", "ACME-1", "--by", "eng-1"], home: home, env: devEnv)
+        #expect(claimed.status == 0, "\(claimed.stderr)")
+        #expect(claimed.stdout.contains("You hold ACME-1 until"), "\(claimed.stdout)")
+        #expect(claimed.stdout.contains("Work only in your worktree:") && claimed.stdout.contains("Progress file:"), "\(claimed.stdout)")
+        let worktree = try #require(claimed.stdout.components(separatedBy: "Work only in your worktree: ").last?
+            .components(separatedBy: " (branch").first)
+        #expect(FileManager.default.fileExists(atPath: worktree), "no worktree at \(worktree)")
+        let show = try brahma(["items", "show", "Acme", "ACME-1"], home: home).stdout
+        #expect(show.contains("In progress"), "\(show)")
+        // A second claim of the same item is the tool's own refusal.
+        let again = try brahma(["dev", "claim", "Acme", "ACME-1", "--by", "eng-1"], home: home, env: devEnv)
+        #expect(again.status != 0)
+    }
+
     @Test func runRefusesWithoutPassingProbe() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url
