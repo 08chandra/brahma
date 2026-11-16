@@ -170,6 +170,32 @@ import BrahmaCore
         #expect(HandbookTree.rows(hb.tree).first { $0.node.path == "Research/Market" }?.node.chips == ["DEPRECATED"])
     }
 
+    @Test func editOfTaintedPageIsExplicitVouch() async throws {
+        let w = try world()
+        let item = try w.store.createWorkItem(companyId: w.acme.id, by: .owner,
+                                              draft: WorkItemDraft(type: .task, title: "Market notes", ownerId: w.eng.id))
+        try w.store.markTainted(agentId: w.eng.id, source: "web page example.com")
+        try w.store.kbWrite(companyId: w.acme.id, by: .agent(w.eng.id), path: "Research/Market", body: "# Market\n\nIt is big.",
+                            itemId: item.id, knownValues: [], paths: w.paths)
+        try w.write("Engineering/Notes", "# Notes")
+        let hb = try await w.handbook()
+        #expect(HandbookModel.editVouchNotice == "Saving vouches for the whole page, including agent-written text")
+        // An untainted page saves plainly.
+        await hb.select("Engineering/Notes")
+        #expect(hb.editVouches == false)
+        #expect(hb.saveTitle == "Save")
+        // A tainted page: the owner's whole-page save clears the taint, so the sheet says it vouches.
+        await hb.select("Research/Market")
+        #expect(hb.canEdit)
+        #expect(hb.editVouches)
+        #expect(hb.saveTitle == "Save and vouch")
+        let base = try #require(hb.view?.page.revision)
+        #expect(await hb.save(edit: "# Market\n\nIt is big. Typo fixed.", baseRevision: base))
+        #expect(hb.view?.page.tainted == false)
+        #expect(hb.editVouches == false)
+        #expect(hb.saveTitle == "Save")
+    }
+
     @Test func exportRefusesNonEmptyFolder() async throws {
         let w = try world()
         let hb = try await w.handbook()

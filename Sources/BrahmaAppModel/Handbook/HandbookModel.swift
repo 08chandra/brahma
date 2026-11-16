@@ -13,6 +13,8 @@ public enum HandbookTab: String, CaseIterable, Sendable {
 @MainActor @Observable
 public final class HandbookModel {
     public nonisolated static let exportNeedsEmptyFolder = "Choose an empty folder: the handbook is exported only into an empty folder."
+    /// The edit sheet's chip on a tainted page, exactly.
+    public nonisolated static let editVouchNotice = "Saving vouches for the whole page, including agent-written text"
 
     public let companyId: String
     public var tab: HandbookTab = .pages
@@ -83,6 +85,11 @@ public final class HandbookModel {
     public var canRollback: Bool { view.map { $0.page.autoKind == nil } ?? false && revision != nil && !isWorking }
     /// `I vouch for this page`: the page is tainted now.
     public var canVouch: Bool { view?.page.tainted == true && !isWorking }
+    /// An owner edit of a tainted page is an explicit vouch: the owner's whole-page write clears the page's taint (Task 4), so
+    /// the edit sheet says so (`editVouchNotice`) and its primary button is `Save and vouch`.
+    public var editVouches: Bool { view?.page.tainted == true }
+    /// The edit sheet's primary button.
+    public var saveTitle: String { editVouches ? "Save and vouch" : "Save" }
 
     // MARK: Loading
 

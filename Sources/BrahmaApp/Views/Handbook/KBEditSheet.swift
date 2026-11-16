@@ -2,7 +2,9 @@ import SwiftUI
 import BrahmaAppModel
 
 /// The owner's page editor: the whole page in a mono `TextEditor`, saved on the revision it was opened at. A conflict (the
-/// page changed meanwhile) or any refusal shows the Store's text, exactly, and the sheet stays open with the edit.
+/// page changed meanwhile) or any refusal shows the Store's text, exactly, and the sheet stays open with the edit. On a
+/// tainted page the save is an explicit vouch (the owner's whole-page write clears the taint): a `warning` chip says so and
+/// the button reads `Save and vouch`.
 struct KBEditSheet: View {
     let handbook: HandbookModel
     let path: String
@@ -26,6 +28,17 @@ struct KBEditSheet: View {
                 Text(verbatim: "kb:\(path) · REV \(baseRevision)").font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1)
                     .lineLimit(1).truncationMode(.middle)
             }
+            if handbook.editVouches {
+                // A `warning` chip with the text as written (StatusChip would upper-case it).
+                Text(verbatim: HandbookModel.editVouchNotice)
+                    .font(BrahmaTheme.label)
+                    .foregroundStyle(BrahmaTheme.warning)
+                    .padding(.horizontal, 6)
+                    .frame(height: BrahmaTheme.chipHeight)
+                    .background(RoundedRectangle(cornerRadius: BrahmaTheme.radius).fill(BrahmaTheme.warning.opacity(0.15)))
+                    .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius).strokeBorder(BrahmaTheme.warning, lineWidth: 1))
+                    .fixedSize()
+            }
             TextEditor(text: $text)
                 .font(BrahmaTheme.mono)
                 .foregroundStyle(BrahmaTheme.text0)
@@ -48,7 +61,7 @@ struct KBEditSheet: View {
                 }
                 .buttonStyle(.brahma)
                 .keyboardShortcut(.cancelAction)
-                Button("Save") {
+                Button(handbook.saveTitle) {
                     saving = true
                     Task {
                         let ok = await handbook.save(edit: text, baseRevision: baseRevision)
