@@ -133,9 +133,10 @@ public struct SecretSheetState: Equatable, Identifiable, Sendable {
 }
 
 /// The owner's drops on one composer (an owner DM, a channel, an agent's question in the Inbox, the Resources library).
-/// Inspection runs off the main actor against the company's stored secret values (`app.secretVault`); Send commits every
-/// pending drop with the owner's words in one `Store.addResources` call (links: `Store.addLink`, after it). Owner-only: the
-/// engine checks every scope and recipient again, and a refusal lands in `app.errorMessage` with nothing stored.
+/// Inspection runs off the main actor against the company's stored secret values (`app.secretVault`); one Send is one
+/// message: the pending files with the owner's words in one `Store.addResources` call, or one link alone (`Store.addLink`).
+/// Owner-only: the engine checks every scope and recipient again, and a refusal lands in `app.errorMessage` with nothing
+/// stored.
 @MainActor @Observable
 public final class ResourceDropModel {
     public static let advisoryText =
@@ -144,6 +145,8 @@ public final class ResourceDropModel {
     public static let inboxHint = "Drop a file to answer"
     /// What the trust chip says after "Mark untrusted" (the engine stores the same reason).
     nonisolated public static let untrustedReason = "marked untrusted by you"
+    /// A link pending with files or with another link: one Send is one message.
+    nonisolated public static let linkAloneRefusal = "Send a link on its own, one per message"
 
     nonisolated public static func advisoryKey(_ companyId: String) -> String { "advisoryAck.\(companyId)" }
 
@@ -159,8 +162,14 @@ public final class ResourceDropModel {
     public var secretSheet: SecretSheetState?
     /// The advisory alert is up: the first non-company-scope drop of a company on the Workspace or Full profile.
     public var advisoryPrompt = false
-    /// Inspecting or committing.
-    public private(set) var isWorking = false
+    /// Inspecting a drop (`add(urls:)`).
+    public private(set) var isInspecting = false
+    /// Writing: a commit or a store-as-secret is in flight. A second commit meanwhile is refused (nothing twice).
+    public private(set) var isCommitting = false
+    /// Inspecting or committing (the views disable their buttons).
+    public var isWorking: Bool { isInspecting || isCommitting }
+    /// Tests only: awaited on the main actor by a commit after it has taken its drops and before anything is written.
+    @ObservationIgnored var commitWillWrite: (@MainActor () async -> Void)?
 
     @ObservationIgnored private weak var app: AppModel?
     @ObservationIgnored private let defaults: UserDefaults
@@ -228,7 +237,7 @@ public final class ResourceDropModel {
     public func add(urls: [URL]) async {
         guard !urls.isEmpty, let app, let companyId else { return }
         let (store, vault) = (app.store, app.secretVault)
-        isWorking = true
+        isInspecting = true
         let inspected: Result<DropPlan, any Error> = await Task.detached {
             Result {
                 // Fail closed: a vault that can't be read means the scan can't be trusted, so nothing is added.
@@ -236,7 +245,7 @@ public final class ResourceDropModel {
                 return try ResourceIntake.inspect(urls: urls, knownValues: known)
             }
         }.value
-        isWorking = false
+        isInspecting = false
         let plan: DropPlan
         switch inspected {
         case .success(let p): plan = p
@@ -338,9 +347,9 @@ public final class ResourceDropModel {
                 secretSheet = sheet
                 return
             }
-            guard let app, let companyId else { return }
+            guard let app, let companyId, !isCommitting else { return }
             let (store, vault, paths, plan, context) = (app.store, app.secretVault, app.paths, pending[index].plan, self.context)
-            isWorking = true
+            isCommitting = true
             let stored: Result<Void, any Error> = await Task.detached {
                 Result {
                     let known = try store.knownSecretValues(companyId: companyId, vault: vault)
@@ -349,7 +358,7 @@ public final class ResourceDropModel {
                                            contentVault: ContentVault(paths: paths), secretVault: vault, knownValues: known, paths: paths)
                 }
             }.value
-            isWorking = false
+            isCommitting = false
             if case .failure(let error) = stored {
                 sheet.error = Self.message(error)
                 secretSheet = sheet
@@ -371,19 +380,26 @@ public final class ResourceDropModel {
 
     // MARK: Commit
 
-    /// Adds every pending drop with `message` (the owner's words, above the engine's lines) as one message in the drop's
-    /// context: the files in one `Store.addResources` call (`secretVault: app.secretVault`), then each link. False, with
-    /// nothing stored, when a secret finding has no answer yet (the sheet opens), when the advisory has not been acknowledged
-    /// (`advisoryPrompt`), or when the engine refuses (`app.errorMessage`). Committed drops leave `pending`.
+    /// One Send is one message: the pending files in one `Store.addResources` call (`secretVault: app.secretVault`), or one
+    /// link (`Store.addLink`), with `message` (the owner's words, above the engine's lines) in the drop's context. False, with
+    /// nothing stored, when a commit is already in flight, when a link is pending with files or with another link
+    /// (`linkAloneRefusal`), when a secret finding has no answer yet (the sheet opens), when the advisory has not been
+    /// acknowledged (`advisoryPrompt`), or when the engine refuses (`app.errorMessage`). Only a successful commit clears the
+    /// drops it took; anything added meanwhile stays pending.
     @discardableResult
     public func commit(message: String) async -> Bool {
-        guard let app, let companyId, !pending.isEmpty, !isWorking else { return false }
+        guard let app, let companyId, !pending.isEmpty, !isCommitting else { return false }
+        let files = pending.filter { $0.link == nil }
+        let links = pending.filter { $0.link != nil }
+        // Each call posts its own message (an Inbox answer can be given once): a link never rides with anything else.
+        guard links.isEmpty || (links.count == 1 && files.isEmpty) else {
+            app.errorMessage = Self.linkAloneRefusal
+            return false
+        }
         if let unresolved = pending.first(where: \.needsSecretChoice) {
             secretSheet = SecretSheetState.make(unresolved)
             return false
         }
-        let files = pending.filter { $0.link == nil }
-        let links = pending.filter { $0.link != nil }
         let merged: MergedDrop?
         do { merged = try Self.merge(files) } catch {
             app.errorMessage = Self.message(error)
@@ -393,21 +409,25 @@ public final class ResourceDropModel {
         let (store, vault, paths, context) = (app.store, app.secretVault, app.paths, self.context)
         let (scope, future) = (self.scope, self.futureHolders)
         let acked = defaults.bool(forKey: Self.advisoryKey(companyId))
-        isWorking = true
+        isCommitting = true
+        await commitWillWrite?()
         let result = await Task.detached {
             Self.commitOffMain(store: store, vault: vault, paths: paths, companyId: companyId, context: context, scope: scope,
-                               futureHolders: future, acked: acked, files: merged, fileIds: files.map(\.id), links: links,
+                               futureHolders: future, acked: acked, files: merged, fileIds: files.map(\.id), link: links.first,
                                words: words.isEmpty ? nil : words)
         }.value
-        isWorking = false
+        isCommitting = false
         if result.needsAdvisory {
             advisoryPrompt = true
             return false
         }
+        if let error = result.error {
+            app.errorMessage = error
+            return false
+        }
         for id in result.committed { remove(id) }
-        if let error = result.error { app.errorMessage = error }
-        if !result.committed.isEmpty { await app.tick(forceSnapshot: true) }
-        return result.error == nil
+        await app.tick(forceSnapshot: true)
+        return true
     }
 
     struct MergedDrop: Sendable {
@@ -462,7 +482,7 @@ public final class ResourceDropModel {
 
     nonisolated static func commitOffMain(store: Store, vault: any SecretVault, paths: BrahmaPaths, companyId: String,
                                           context: DropContext, scope: ScopeChoice, futureHolders: Bool, acked: Bool,
-                                          files: MergedDrop?, fileIds: [UUID], links: [PendingDrop], words: String?) -> CommitResult {
+                                          files: MergedDrop?, fileIds: [UUID], link: PendingDrop?, words: String?) -> CommitResult {
         var result = CommitResult()
         do {
             let resolved = try resolve(store: store, companyId: companyId, context: context, choice: scope, futureHolders: futureHolders)
@@ -472,24 +492,19 @@ public final class ResourceDropModel {
                 return result
             }
             let content = ContentVault(paths: paths)
-            // The owner's words go with the first call only: one message.
-            var words = words
             func drop(trust: TrustChoice, secret: SecretChoice) -> ResourceDrop {
                 ResourceDrop(context: context, scope: resolved.access, readerSet: resolved.readerSet,
                              futureHolders: resolved.futureHolders, trust: trust, secretChoice: secret, message: words)
             }
+            // Exactly one call, so exactly one message (`commit` lets a link through only on its own).
             if let files {
                 let known = try store.knownSecretValues(companyId: companyId, vault: vault)
                 try store.addResources(companyId: companyId, plan: files.plan, drop: drop(trust: files.trust, secret: files.secret),
                                        contentVault: content, secretVault: vault, knownValues: known, paths: paths)
-                result.committed += fileIds
-                words = nil
-            }
-            for link in links {
-                guard let url = link.link else { continue }
+                result.committed = fileIds
+            } else if let link, let url = link.link {
                 try store.addLink(companyId: companyId, url: url, drop: drop(trust: link.trust, secret: .none), contentVault: content)
-                result.committed.append(link.id)
-                words = nil
+                result.committed = [link.id]
             }
         } catch {
             result.error = message(error)

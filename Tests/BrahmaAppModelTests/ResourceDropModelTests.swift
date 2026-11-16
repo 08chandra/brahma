@@ -288,7 +288,6 @@ import BrahmaCore
         let m = w.model(.dm(handle: "eng"))
         await m.add(urls: [try w.pdf("report.pdf")])
         await m.add(urls: [try w.file("notes.md", "# notes\n")])
-        m.addLink("https://example.com/spec")
         m.setTrust(m.pending[0].id, .vouched)
         m.setTrust(m.pending[1].id, .untrusted)
         // A folder goes on its own.
@@ -296,22 +295,79 @@ import BrahmaCore
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try Data("a\n".utf8).write(to: folder.appending(path: "a.md"))
         await m.add(urls: [folder])
-        #expect(m.pending.count == 3)
+        #expect(m.pending.count == 2)
         #expect(w.app.errorMessage == "A folder is added on its own; send or remove the pending files first.")
 
-        #expect(await m.commit(message: "three things"))
+        #expect(await m.commit(message: "two files"))
         let rows = try w.rows()
-        #expect(rows.map(\.ref) == ["F-1", "F-2", "F-3"])
+        #expect(rows.map(\.ref) == ["F-1", "F-2"])
         #expect(!rows[0].tainted)
         #expect(rows[1].tainted && rows[1].taintReason == "marked untrusted by you")
-        #expect(rows[2].kind == .link && !rows[2].tainted)
-        // The owner's words go once, with the files; the link is announced by its ref.
+        // One Send, one message: the owner's words above both files' lines.
         let dm = try #require(try w.store.channel(companyId: w.company.id, name: "dm:eng:owner"))
         let texts = try w.store.messages(channelId: dm.id, limit: 10).map(\.text)
-        #expect(texts.count == 2)
-        #expect(texts[0].hasPrefix("three things\n[file F-1 · "))
-        #expect(texts[1] == "[link F-3]")
+        #expect(texts.count == 1)
+        #expect(texts.first?.hasPrefix("two files\n[file F-1 · ") == true)
+        #expect(texts.first?.contains("[file F-2 · ") == true)
         #expect(m.pending.isEmpty)
+    }
+
+    /// One Send is one message: a link goes on its own, one per message, refused before anything is written.
+    @Test func linkGoesAloneOnePerMessage() async throws {
+        let w = try await W()
+        w.ackAdvisory()
+        // An Inbox question: files plus a link would answer it twice (the second refused after the first was written).
+        let ask = try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.cto.id), title: "Data", question: "Which file?")
+        let inbox = w.model(.inbox(askId: ask.id))
+        await inbox.add(urls: [try w.file("data.csv", "a,b\n1,2\n")])
+        inbox.addLink("https://example.com/data")
+        #expect(await inbox.commit(message: "here") == false)
+        #expect(w.app.errorMessage == "Send a link on its own, one per message")
+        #expect(try w.store.ask(id: ask.id)?.status == .pendingOwner)
+        #expect(try w.rows().isEmpty)
+        #expect(inbox.pending.count == 2)
+        w.app.errorMessage = nil
+
+        // A DM with two links: refused the same way.
+        let dm = w.model(.dm(handle: "eng"))
+        dm.addLink("https://example.com/a")
+        dm.addLink("https://example.com/b")
+        #expect(await dm.commit(message: "") == false)
+        #expect(w.app.errorMessage == "Send a link on its own, one per message")
+        #expect(try w.rows().isEmpty)
+        #expect(dm.pending.count == 2)
+        w.app.errorMessage = nil
+
+        // One link alone still goes, as one message.
+        dm.remove(dm.pending[1].id)
+        #expect(await dm.commit(message: "read this"))
+        #expect(w.app.errorMessage == nil)
+        #expect(try w.rows().map(\.kind) == [.link])
+        let channel = try #require(try w.store.channel(companyId: w.company.id, name: "dm:eng:owner"))
+        #expect(try w.store.messages(channelId: channel.id, limit: 10).map(\.text) == ["read this\n[link F-1]"])
+        #expect(dm.pending.isEmpty)
+    }
+
+    /// A second commit while one is in flight (an inspection finishing meanwhile included) adds nothing twice.
+    @Test func concurrentCommitsAddOnce() async throws {
+        let w = try await W()
+        let m = w.model(.library)
+        await m.add(urls: [try w.file("notes.md", "# notes\n")])
+        let late = try w.file("late.md", "# late\n")
+        var second: Bool?
+        m.commitWillWrite = { [weak m] in
+            guard let m else { return }
+            m.commitWillWrite = nil
+            #expect(m.isCommitting)
+            await m.add(urls: [late])               // an inspection that ends while the first commit is in flight
+            second = await m.commit(message: "")
+        }
+        #expect(await m.commit(message: ""))
+        #expect(second == false)
+        #expect(try w.rows().map(\.displayName) == ["notes.md"])
+        // The drop added meanwhile is still pending, for the next Send.
+        #expect(m.pending.map(\.name) == ["late.md"])
+        #expect(!m.isCommitting)
     }
 
     @Test func inboxDropAnswersAsk() async throws {
