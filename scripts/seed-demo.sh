@@ -120,8 +120,21 @@ BRAHMA_DEV=1 "$B" dev turn Initech --by eng-1 --summary "Added the reminder sche
 BRAHMA_DEV=1 "$B" dev tool Initech comment_work_item --by eng-1 --args '{"key":"INITE-3","text":"Scheduler registers once now; checking the flaky test."}' >/dev/null
 BRAHMA_DEV=1 "$B" dev tool Initech post_message --by eng-1 --args '{"channel":"general","text":"Reminder fix is up for INITE-3."}' >/dev/null
 
+# Plan ML Task 10: a research page written after reading the web (TAINTED, via `dev tool --taint`; @cto's session is
+# tainted from here on, so it writes nothing else below), and the owner's DM drop to @eng-1 (scoped to @eng-1 alone and
+# announced in the DM, as the app's DM drop zone does; the CLI's `resource add` has no conversation, hence `dev drop`).
+BRAHMA_DEV=1 "$B" dev tool Initech kb_write --by cto --taint "web page example.com/habit-apps" --args '{"path":"Research/Competitors","item":"INITE-4","release":true,"body":"# Competitors\n\nThree habit apps lead the store: Streaks, Habitica and Loop. All three have daily streaks; none sends a weekly summary.\n"}' >/dev/null
+D="$(mktemp -d)"
+printf 'Standup notes for @eng-1\n\n- Reminder bug: the timer registers on every launch.\n- Pair with QA on the flaky test.\n' >"$D/standup-notes.txt"
+BRAHMA_DEV=1 "$B" dev drop Initech --dm eng-1 --message "Notes from this morning's standup" "$D/standup-notes.txt" >/dev/null
+rm -rf "$D"
+
 # Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
 # folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.
 if [ "${BRAHMA_DEV:-}" = "1" ]; then
   "$B" dev release-scenario Initech --item INITE-2 --expect-text "Habit tracker" >/dev/null
 fi
+
+# Plan ML Task 10: one auto-page refresh now (the engine does it every 60 active seconds), so the generated pages (roster,
+# org chart, release history, sprint summaries, decisions log) reflect everything seeded above.
+BRAHMA_DEV=1 "$B" dev autopages Initech >/dev/null

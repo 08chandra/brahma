@@ -699,6 +699,166 @@ brahma task decline <co> A-<n> --note <text>
 brahma milestones <co>                                         the path-to-live scorecard
 ```
 
+## Memory, Handbook and Resources
+
+Agents and you can find anything the company already knows. One search index covers every source, and the engine filters
+every result to what the reader may see before anything reaches an agent. Ingest, ranking, auto pages, replay and the
+storage meter are plain code: none of it runs an LLM turn.
+
+**What is indexed.** The engine indexes these on its tick (in batches; a restore re-scans everything):
+
+- messages in channels and DMs;
+- work items (description, acceptance criteria, submit summary and the newest 50 comments);
+- asks and their decisions, and mechanically recorded decisions;
+- hand-offs under `.brahma/handoffs` (regular single-link files only; anything else is skipped with an activity line);
+- sprint retros;
+- handbook pages, one entry per section;
+- resources (the text of text files up to 2 MB, first 200 000 characters; other kinds by name only);
+- remembered facts (`remember`) and episodes. At the end of each successful work, notice or review turn, the engine
+  writes an episode from the turn's summary into that agent's private memory.
+
+Agents search with `search_memory` (cited snippets) and read one entry in full with `recall(ref: …)`. Refs are `mem:12`,
+`F-3`, `ENG-7`, `kb:Path`, `A-4`, `msg:<id>`, `handoff:…`, `sprint:<n>` and `decision:<id>`. `recall(query: …)` searches the
+agent's remembered facts and past work. `remember` saves a durable fact: the same key with the same fact confirms it, and a
+different fact under the same key is kept as a contradiction (nothing is deleted). A fact that looks like a secret, or
+holds a stored secret's value, is refused.
+
+**Who can read what.** You (the owner) read everything. For an agent:
+
+| Where it came from | Who reads it |
+| --- | --- |
+| A channel or DM message | the channel's or DM's members |
+| A resource dropped in a channel or DM | the members when it was dropped (a later joiner of the channel does not get it) |
+| A company-wide source (items, decisions, hand-offs, retros, company facts, the handbook, company resources) | every agent in the company |
+| A team (a fact remembered with scope `team`, a team resource) | that team, and managers whose subtree contains it |
+| A role | agents holding that role, including a merged executive who covers it |
+| An item (a fact remembered with scope `item`, an item resource) | the item's author, owner, lease holder and reviewer, and the owner's manager |
+| An agent's private memory (`remember` with scope `mine`, episodes) | that agent in full; its managers up the chain see the title only (no snippet, and their queries match only the title) |
+| An ask | per party: the agent that filed it, its internal approver and an agent that decided it. Your answer and your notes are yours alone; the asker gets your answer as the DM it already receives, and that DM is indexed as a DM. An ask filed by the engine is yours alone |
+| HR or performance records, and anything owner-only | you alone |
+
+A restriction is a cap on top of that: a handbook section marked `[restricted]` is for executives only, and
+`[restricted: cfo, cto]` for those roles. Restrictions nest, and every enclosing one must be satisfied. A hit you cannot
+read is not returned at all: no snippet, no title and no count, and a ref you cannot read answers exactly like a missing
+one. Every query is bound to one company; another company's ref is "not found".
+
+**Session taint is data.** Once an agent's session reads outside content (a web page, an EXTERNAL resource, a tainted
+page or fact), everything it writes in that session is marked tainted: facts, handbook edits, messages and hand-offs, as
+the index picks them up. Tainted hits show without a snippet. Reading one marks the reader's session first and shows the
+text as an untrusted block. Inheriting a fact keeps its taint, and a tainted contradiction never demotes a trusted fact.
+Only you clear taint: "I vouch" on a page or resource (`brahma kb <co> vouch <path>`, `brahma resource <co> vouch F-<n>`), or
+a whole-page edit of your own. In the app, editing a tainted page is an explicit vouch: the edit sheet shows the warning
+"Saving vouches for the whole page, including agent-written text" and its button reads **Save and vouch**.
+
+**The handbook.** Pages live in SQLite, with every revision kept.
+
+- **Paths and sections.** A path is up to 6 parts (`Engineering/Environments`), with a section per top-level part
+  (Company, Product, Engineering, Design, Go-to-market, Operations, Research, Decisions log, Meeting notes); `INDEX` and
+  `README` are reserved. Pages link with `[[Path]]` or `kb:Path`, and each page lists its backlinks.
+- **`[restricted]`.** A heading ending ` [restricted]` (executives) or ` [restricted: <roles>]` hides that section and every
+  subsection from other readers, in reads, search, backlinks, old revisions and the mirror. An agent that cannot see every
+  section must edit one section at a time. An edit that would change a hidden section, open a code fence over one or add a
+  heading at its level is refused.
+- **Leases.** Agents write with `kb_write` for a work item they own or lease. The write takes the page's edit lease for 2
+  active hours, and every edit names the revision it read (compare-and-swap). Agents read with `kb_read` and search with
+  `search_kb`.
+- **Auto pages.** Org chart, Roster, Decisions log, Release history and Sprint summaries are generated from live data
+  every 60 active seconds when their inputs change, and no one can edit them. The decisions log shows decided asks by
+  title only, reserved matters under a restricted section, and never terminations.
+- **Export.** `brahma kb <co> export --to <empty dir>` writes Markdown files with front matter and an `INDEX.md`. A company
+  export (`brahma export`) includes `handbook/`.
+- **The `.brahma/kb` mirror.** The workspace gets a read-only Markdown copy for Bash and Read. It holds untainted pages
+  only, with restricted sections removed. Each refresh sweeps it and rewrites any file that changed. A planted link raises
+  an engine alert and wipes the mirror: it fails closed, so stale content is never kept.
+
+You manage pages in the app (sidebar **Handbook**: the tree, revisions, backlinks, edit, export, and the **MEMORY** tab for
+remembered facts and episodes with CONTRADICTED and TAINTED chips) or with `brahma kb`.
+
+**Resources.** You give the company files, folders, zips and links by dropping them on any composer in the app (an
+owner DM, a channel, an agent's question in the Inbox, or Work › **Resources**) or with `brahma resource`. One Send
+is one message: a link goes on its own.
+
+- **Scopes.** A drop defaults to the place it was dropped in: a DM to that agent, a channel to its members now, an Inbox
+  answer to the asker, and the library and the CLI to the whole company. The scope is one of company, `team:<team>`,
+  `agent:@<handle>` or `item:<KEY>`:
+  - an agent scope is exactly that agent;
+  - an item scope is the item's owner, lease holder, reviewer, the owner's manager and the agent that wrote it;
+  - a channel or DM drop is never wider than the conversation;
+  - team and company scopes follow the org as it changes.
+
+  A drop is refused if anyone its announcement reaches could not read it. A folder's scope, trust and purge cascade to its
+  files. Change a scope later with `brahma resource <co> scope F-<n> <scope>`.
+- **The vault.** The bytes are copied into the vault under `<data home>/vault/` as `F-<n>.<ext>` (read-only, named by the
+  engine), and every open checks the sha256. The bytes stored are the bytes that were inspected. Agents read a resource
+  through `recall(ref: "F-n")`, which returns the indexed text of text files. They cannot read binaries until a later
+  plan, and never a flagged file.
+- **The mirror.** Company-scope, untainted, unflagged files are also copied read-only to `.brahma/resources/company` in
+  the workspace. Each refresh sweeps the mirror and puts back any file that changed, from the vault. A planted link raises
+  an engine alert and wipes the mirror (it fails closed).
+- **Checks, before anything is stored.** Symlinks are refused, and so are executables (by extension and by content).
+  Zips must be under 200 MB unpacked, with a compression ratio of at most 100, at most 10 000 entries and no `../` or link
+  entries. `.git/` is skipped and names are cleaned. A file is EXTERNAL (tainted, read as untrusted data) when it is a
+  document type (PDF, Office, HTML, SVG, mail, RTF, zip), a text file over 64 KB, or a download macOS quarantined.
+  PDFs therefore default to untrusted. Everything else you add is FROM YOU. `--vouch` or `--untrusted` overrides this.
+- **The secret sheet.** A file that looks like it holds a secret needs a choice: **Upload redacted**, **Upload anyway**
+  (stored flagged, so agents never read it), **Store it as a secret instead** (one small text file), or **Cancel**. A
+  value already stored in your Keychain can never be uploaded raw. The CLI's equivalents are `--redact` and `--anyway`.
+- **Announcements.** A DM, channel or Inbox drop sends one owner message, answer or comment after the rows commit.
+  A library or CLI drop appears in each reader's next orientation under "New resources". A tainted resource is announced
+  by ref and engine fields only, never by its name. A link is named only as `[link F-n]` and is never fetched.
+- **Purge.** `brahma resource <co> purge F-<n> --yes` (or the app's Purge) removes:
+  - the vault bytes;
+  - the mirror copy;
+  - the index entries, including the search text left in the database file (secure delete, FTS optimize, WAL
+    checkpoint).
+
+  A single file inside a folder can be purged on its own. Mentions the engine built are rewritten to `[purged F-n]`, and
+  the row stays as a tombstone. Backups and transcripts made since the add are **reported, not rewritten**: the purge
+  lists them so you can delete or re-create them. In the app, a transcript of a turn that a purge report lists shows "This
+  transcript was captured while a since-purged resource existed; it may still contain that content."
+
+Resource scopes, lab privacy and mirror integrity are enforced only by Brahma's tools under the Workspace and Full profiles; an agent's shell can read or change them. The Sandboxed profile enforces them.
+
+**Replay.** Replay shows what an agent did on one day (turns, tool calls, messages, item events, asks, handbook and memory
+writes, resources announced to it, and captured transcripts) or an item's whole history (events, turns, check runs, asks,
+handbook revisions, hand-offs, and messages naming it). It is computed on each read and shows at most 2000 lines of up to
+300 characters each. A purged resource shows only `[purged F-n]`, and a link never shows its URL. In the app, Replay is the
+REPLAY tab of an agent's inspector (with a day stepper) and the HISTORY tab of an item's inspector. A transcript line opens
+the redacted transcript. The transcript pane shows its own error if the transcript can't be opened (for example, a
+failed hash check), and shows the purge notice above when it applies.
+
+**Budget and the storage meter.** The sidebar **Budget** view shows the week's pace, the spend by mode and a STORAGE
+panel for the company. The panel lists the database (estimated), workspace, resources (the vault), transcripts, archive
+and total, then backups for all companies and free disk (in warning colour below 10 GB). It re-measures at most every
+600 active seconds, or when you press Refresh. It reads sizes only and never follows links. Everything stays in the hot
+tier: Brahma deletes nothing automatically.
+
+**CLI** (owner only; each refuses to run inside an agent turn):
+
+```
+brahma memory <co> search <query> [--as @h]          search as the owner, or as that agent would
+brahma memory <co> list [--agent @h] [--kind semantic|episodic]
+brahma memory <co> rm mem:<n>                        delete an entry (securely; its tombstone stays)
+brahma memory <co> inherit @old @new                 copy @old's private facts to @new (taint kept)
+
+brahma kb <co> list | show <path> [--rev n] | export --to <dir> [--force]
+brahma kb <co> rollback <path> --to <n> | vouch <path> | status <path> draft|active|deprecated
+
+brahma resource <co> add <path…> [--scope <s>] [--untrusted|--vouch] [--redact|--anyway]
+brahma resource <co> link <url> [--scope <s>]       a link (never fetched)
+brahma resource <co> list | vouch F-<n> | scope F-<n> <s> | purge F-<n> --yes
+
+brahma replay <co> @handle [--day yyyy-MM-dd]       an agent's day (default today, your time zone)
+brahma replay <co> <KEY>                             an item's history
+brahma transcript <co> <turn id>|@handle [--last N]
+```
+
+**Scripted demos.** Set `BRAHMA_SECRET_STORE=file` (with `BRAHMA_OWNER_KEY_STORE=file`) so scripts never touch the login
+Keychain. Secrets then go to a 0600 file vault under the data home, and this is refused for the default data home. The
+CLI refuses `BRAHMA_SECRET_STORE=memory`; that store is only for in-process tests. `scripts/seed-demo.sh` uses the file
+stores and seeds Initech's handbook, memory, resources and replay. Its developer hooks (`brahma dev …`, with
+`BRAHMA_DEV=1`) act as an agent, or as you dropping a file in a DM.
+
 ## Backups
 
 Backups live under `<data home>/backups/` and are made by the engine (the app, or `brahma run`) while it runs:

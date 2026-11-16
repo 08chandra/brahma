@@ -19,7 +19,7 @@ struct DevGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
         subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self, Tool.self,
-                      SeedTurn.self])
+                      SeedTurn.self, Drop.self, AutoPagesNow.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -223,6 +223,57 @@ struct DevGroup: AsyncParsableCommand {
             _ = try store.finishTurn(id: turn.id, outcome: .succeeded, summary: summary, costUSD: nil)
             guard case .captured = outcome else { throw fail("turn \(turn.id) recorded, but its transcript was not captured: \(outcome)") }
             print(turn.id)
+        }
+    }
+
+    /// Plan ML Task 10 (the seed): the owner drops files into a DM with an agent, as the app's DM drop zone does: the DM's
+    /// default scope (that agent only), the drop's own trust, and the engine's announcement in the DM. The owner CLI's
+    /// `resource add` has no conversation context; this hook exists so the seed can show a DM drop.
+    struct Drop: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Drop files into a DM with an agent as the owner.")
+        @Argument var company: String
+        @Option(help: "Handle of the agent whose DM it is.") var dm: String
+        @Option(help: "The owner's words sent with the drop.") var message: String?
+        @Argument(help: "Files to drop.") var files: [String]
+
+        func run() throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: dm)
+            let secretVault = try cliSecretVault(interactive: false)
+            let known = try store.knownSecretValues(companyId: c.id, vault: secretVault)
+            let plan = try ResourceIntake.inspect(urls: files.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) },
+                                                  knownValues: known)
+            guard plan.refusals.isEmpty, !plan.items.isEmpty, plan.items.allSatisfy({ $0.findings.isEmpty }) else {
+                throw fail("the dev drop takes plain files only (no refusals, no secret findings)")
+            }
+            do {
+                let context = DropContext.dm(handle: agent.name)
+                let (scope, readers) = try store.defaultScope(for: context, companyId: c.id)
+                let drop = ResourceDrop(context: context, scope: scope, readerSet: readers, message: message)
+                let rows = try store.addResources(companyId: c.id, plan: plan, drop: drop, contentVault: ContentVault(paths: paths),
+                                                  secretVault: secretVault, knownValues: known, paths: paths)
+                for r in rows { print("F-\(r.number)") }
+            } catch let e as ResourceError {
+                throw fail(e.message)
+            } catch let e as WorkError {
+                throw fail(e.message)
+            }
+        }
+    }
+
+    /// Plan ML Task 10 (the seed): one auto-page refresh now, as the engine does every `AutoPages.interval` active seconds.
+    struct AutoPagesNow: ParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "autopages", abstract: "Refresh the handbook's auto pages now.")
+        @Argument var company: String
+
+        func run() throws {
+            try requireDev()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let written = try refusing { try store.refreshAutoPages(companyId: c.id) }
+            print(written.isEmpty ? "no auto page changed" : written.map(\.rawValue).joined(separator: "\n"))
         }
     }
 

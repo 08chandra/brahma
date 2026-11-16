@@ -319,6 +319,180 @@ struct LiveSmokeTests {
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
 
+    // MARK: Plan ML Task 10 — memory end to end
+
+    /// The running sum of `turn.costLE` at which `memoryEndToEnd` stops everything and fails.
+    static let memoryCostAbortLE = 3.0
+
+    /// Plan ML Task 10: a fact travels from a company resource into an agent's memory and the handbook, and survives a fresh
+    /// session through `recall`. Real haiku turns, tier max5x, Balanced; the store is in-process with `MemoryVault()` for every
+    /// vault argument (the turns' `brahma mcp` children read the temp home's file vault, never a Keychain). Aborts at
+    /// `memoryCostAbortLE` of `costLE`; on a timeout or an abort the engine is stopped and its in-flight turns cancelled first.
+    /// `BRAHMA_LIVE=1 DEVELOPER_DIR=… timeout 900 swift test --filter LiveSmokeTests/memoryEndToEnd`.
+    @Test(.timeLimit(.minutes(6)))
+    func memoryEndToEnd() async throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let previousStore = ProcessInfo.processInfo.environment[SecretStore.environmentVariable]
+        setenv(SecretStore.environmentVariable, "file", 1)
+        defer {
+            if let previousStore { setenv(SecretStore.environmentVariable, previousStore, 1) } else { unsetenv(SecretStore.environmentVariable) }
+        }
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        try store.setPlanTier(.max5x)
+        let secretVault = MemoryVault()
+        let mcp = try brahmaExecutable()
+
+        var company = try store.createCompany(name: "Mem", goal: "Keep the team's facts findable.", workspacesRoot: paths.workspaces)
+        company.usageMode = .balanced
+        company.ownerReserve = -1   // weekly pacing depends on the real account's usage; off for this test
+        try store.updateCompany(company)
+        // No sandbox-canary probes in a temp home, so Sandboxed turns could not start: Workspace, as in `goalToLiveURL`.
+        let userHome = root.appending(path: "user", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        try store.updateSandbox(companyId: company.id, SandboxPatch(profile: .workspace), userHome: userHome)
+        let companyId = company.id
+
+        // 1. Hires.
+        let eng = try store.hire(companyId: companyId, name: "eng", role: "engineer", model: "haiku")
+        let eng2 = try store.hire(companyId: companyId, name: "eng2", role: "engineer", model: "haiku")
+
+        // 2. The owner's company resource and the item.
+        let drops = root.appending(path: "Downloads", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: drops, withIntermediateDirectories: true)
+        let notes = drops.appending(path: "notes.md")
+        try Data("# Team notes\n\nThe staging port is 4417.\n".utf8).write(to: notes)
+        let plan = try ResourceIntake.inspect(urls: [notes], knownValues: [])
+        try #require(plan.refusals.isEmpty && plan.items.count == 1, "plan: \(plan.refusals)")
+        let added = try store.addResources(companyId: companyId, plan: plan, drop: ResourceDrop(), contentVault: ContentVault(paths: paths),
+                                           secretVault: secretVault, knownValues: [], paths: paths)
+        let resource = try #require(added.first)
+        #expect(resource.number == 1 && !resource.tainted, "resource: F-\(resource.number) tainted \(resource.tainted)")
+        let item = try store.createWorkItem(companyId: companyId, by: .owner, draft: WorkItemDraft(
+            type: "task", title: "Record the staging port", ownerId: eng.id))
+        try #require(item.key == "MEM-1", "item key \(item.key)")
+
+        // 3. The first DM.
+        let router = MessageRouter(store: store)
+        let firstDM = try router.sendDM(companyId: companyId, from: .owner, to: "eng", text:
+            "Find the staging port in the company resources, remember it with key staging.port, then record it on kb:Engineering/Environments for MEM-1 with kb_write.")
+
+        let orchestrator = Orchestrator(store: store, runner: ClaudeProcessRunner(maxTurnDuration: .seconds(150)), paths: paths,
+                                        mcpExecutable: mcp, vault: secretVault)
+        try await orchestrator.start()
+        let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
+        let started = Date()
+        let deadline = AwakeTime.now + .seconds(320)
+
+        func spentLE() throws -> Double {
+            try store.writer.read { db in
+                try Double.fetchOne(db, sql: "SELECT COALESCE(SUM(costLE), 0) FROM turn WHERE companyId = ?", arguments: [companyId]) ?? 0
+            }
+        }
+        /// Polls `done` every 2 s; nil when it held, else why it stopped waiting (the deadline or the cost abort).
+        func waitFor(_ what: String, _ done: () throws -> Bool) async throws -> String? {
+            while AwakeTime.now < deadline {
+                if try done() { print("MEMORY \(what) at +\(Int(Date().timeIntervalSince(started))) s"); return nil }
+                let spent = try spentLE()
+                if spent > Self.memoryCostAbortLE { return String(format: "cost abort at $%.2f LE waiting for %@", spent, what) }
+                try await Task.sleep(for: .seconds(2))
+            }
+            return "timed out waiting for \(what)"
+        }
+        func engIdle() throws -> Bool {
+            try store.writer.read { db in
+                try Turn.filter(Column("agentId") == eng.id && Column("outcome") == TurnOutcome.inProgress.rawValue).fetchCount(db) == 0
+            }
+        }
+        let freshReason = "live test: a fresh session must recall the port"
+        var secondDM: Message?
+
+        let failure: String?
+        do {
+            failure = try await withTaskCancellationHandler {
+                // 4. Until the fact is remembered and the page holds the port.
+                if let why = try await waitFor("staging.port remembered and recorded on the page", {
+                    let remembered = try store.writer.read { db in
+                        try MemoryEntry.filter(Column("companyId") == companyId && Column("key") == "staging.port").fetchCount(db) > 0
+                    }
+                    let page = try store.kbRead(companyId: companyId, reader: .owner, path: "Engineering/Environments")
+                    return remembered && (page?.text.contains("4417") ?? false)
+                }) { return why }
+                if let why = try await waitFor("eng idle", engIdle) { return why }
+                // 5. A fresh session, then the question.
+                try store.forceFreshSession(agentId: eng.id, itemId: nil, reason: freshReason)
+                let asked = try router.sendDM(companyId: companyId, from: .owner, to: "eng",
+                                              text: "What is the staging port? Use recall and reply to me.")
+                secondDM = asked
+                // 6. Until the owner's DM holds the answer.
+                return try await waitFor("the reply holding 4417", {
+                    guard let dm = try store.channel(companyId: companyId, name: "dm:eng:owner") else { return false }
+                    return try store.messages(channelId: dm.id, limit: 50).contains {
+                        $0.senderId == eng.id && $0.createdAt >= asked.createdAt && $0.text.contains("4417")
+                    }
+                })
+            } onCancel: {
+                loop.cancel()
+            }
+        } catch {
+            _ = try? store.emergencyStop(note: "memoryEndToEnd: \(error)", by: "owner", now: Store.now())
+            loop.cancel()
+            _ = await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value })
+            _ = LiveRunMonitor.killLeftovers(store: store, root: root)
+            throw error
+        }
+
+        let dump = { (try? store.events(afterId: 0).map(\.text).joined(separator: "\n")) ?? "" }
+        if let failure {
+            // Cancel the in-flight turns before failing: the engine stops admitting and cancels what runs, then its task ends.
+            _ = try? store.emergencyStop(note: "memoryEndToEnd: \(failure)", by: "owner", now: Store.now())
+            loop.cancel()
+            let stopped = await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value })
+            let killed = LiveRunMonitor.killLeftovers(store: store, root: root)
+            Issue.record("\(failure) (engine stopped \(stopped); signalled \(killed)); spent $\(String(format: "%.2f", (try? spentLE()) ?? -1)) LE. Events:\n\(dump())")
+            return
+        }
+        // Let the reply's turn finish its bookkeeping, then stop the engine (cancels and awaits in-flight turns).
+        _ = try? await waitFor("eng idle after the reply", engIdle)
+        loop.cancel()
+        #expect(await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value }), "the engine did not stop")
+        try MemoryIngest.run(store: store, companyId: companyId, paths: paths, now: Store.now())
+
+        // The fresh session answered: a turn of eng carrying the reason started after the question.
+        let turns = try await store.writer.read { db in
+            try Turn.filter(Column("companyId") == companyId).order(Column("startedAt")).fetchAll(db)
+        }
+        if let asked = secondDM {
+            #expect(turns.contains { $0.agentId == eng.id && $0.freshSessionReason == freshReason && $0.startedAt >= asked.createdAt },
+                    "no fresh-session turn after the question: \(turns.map { "\($0.kind) \($0.freshSessionReason ?? "-")" })")
+        }
+        // No LLM turn ran other than eng's work and notice turns.
+        let others = turns.filter { $0.agentId != eng.id || !($0.kind == .work || $0.kind == .notice) }
+        #expect(others.isEmpty, "other turns: \(others.map { "\($0.agentId == eng2.id ? "eng2" : $0.agentId) \($0.kind)" })")
+        print(String(format: "MEMORY spent $%.4f LE over %d turn(s)", try spentLE(), turns.count))
+
+        // eng2 finds the page and F-1, never the owner's DMs to eng.
+        let hits = try MemoryIndex(store: store).search(companyId: companyId, scope: .agent(eng2.id), query: "staging port",
+                                                        limit: MemoryPolicy.maxHits, now: Store.now())
+        let shown = hits.map { "\($0.source) \($0.ref)" }
+        #expect(hits.contains { $0.source == .kb && $0.ref.hasPrefix("kb:Engineering/Environments") }, "eng2 hits: \(shown)")
+        #expect(hits.contains { $0.ref == "F-1" }, "eng2 hits: \(shown)")
+        let dmIds = [firstDM.id] + (secondDM.map { [$0.id] } ?? [])
+        let dmDocs = try await store.writer.read { db in
+            try Int64.fetchAll(db, sql: """
+                SELECT id FROM memoryDoc WHERE companyId = ? AND source = 'message' AND sourceId IN (\(dmIds.map { _ in "?" }.joined(separator: ",")))
+                """, arguments: StatementArguments([companyId] + dmIds))
+        }
+        #expect(!dmDocs.isEmpty, "the owner's DM was never indexed, so the check below proves nothing")
+        #expect(!hits.contains { dmDocs.contains($0.docId) }, "eng2 got the owner's DM to eng: \(shown)")
+        #expect(!hits.contains { ($0.snippet ?? "").contains("remember it with key") || $0.title.contains("remember it with key") })
+
+        #expect(await orchestrator.runningCount() == 0)
+        #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
+    }
+
     // MARK: Plan L Task 15 — goal → live URL
 
     /// The running sum of `turn.costUSD` at which the live test stops everything and fails ("cost abort").
