@@ -60,6 +60,32 @@ import GRDB
         #expect(!(w.store.verifyTurnCredential(token: token, companyId: c.id, agentId: ceo.id)), "ended turn")
     }
 
+    /// Plan ML Task 10 fix round 1 (I4): the secret-store choice a turn's `brahma mcp` gets comes from the engine's injected
+    /// `mcpEnvironment`, never from this process's environment, so a host (the live tests) need not change process state.
+    @Test func mcpEnvironmentChoosesTheTurnsSecretStore() async throws {
+        func storeInConfig(_ env: [String: String]) async throws -> String? {
+            final class Box: @unchecked Sendable {
+                private let lock = NSLock(); private var _env: [String: String]?
+                func set(_ e: [String: String]) { lock.withLock { _env = e } }
+                var env: [String: String]? { lock.withLock { _env } }
+            }
+            let w = try World(mcpEnvironment: env); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
+            let box = Box()
+            w.fake.script("ceo", .init(sideEffect: { req in
+                let data = try Data(contentsOf: URL(fileURLWithPath: req.mcpConfigPath))
+                let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+                let server = try #require((json["mcpServers"] as? [String: Any])?["company"] as? [String: Any])
+                box.set(server["env"] as? [String: String] ?? [:])
+            }))
+            try w.dm(c, ceo); try await w.cycle()
+            let seen = try #require(box.env, "the turn never ran")
+            return seen[SecretStore.environmentVariable]
+        }
+        #expect(try await storeInConfig([SecretStore.environmentVariable: "file"]) == "file")
+        #expect(try await storeInConfig([:]) == nil)
+        #expect(try await storeInConfig([SecretStore.environmentVariable: "memory"]) == nil)
+    }
+
     @Test func firstTurnSendsRolePromptThenResumes() async throws {
         let w = try World(); let c = try w.company("Acme"); let ceo = try w.hire(c, "ceo")
         try w.dm(c, ceo); try await w.cycle()

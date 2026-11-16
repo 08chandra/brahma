@@ -326,17 +326,13 @@ struct LiveSmokeTests {
 
     /// Plan ML Task 10: a fact travels from a company resource into an agent's memory and the handbook, and survives a fresh
     /// session through `recall`. Real haiku turns, tier max5x, Balanced; the store is in-process with `MemoryVault()` for every
-    /// vault argument (the turns' `brahma mcp` children read the temp home's file vault, never a Keychain). Aborts at
-    /// `memoryCostAbortLE` of `costLE`; on a timeout or an abort the engine is stopped and its in-flight turns cancelled first.
+    /// vault argument (the turns' `brahma mcp` children read the temp home's file vault through the engine's `mcpEnvironment`,
+    /// never a Keychain). Aborts at `memoryCostAbortLE` of `costLE`; on a timeout or an abort the engine is stopped and its
+    /// in-flight turns cancelled first.
     /// `BRAHMA_LIVE=1 DEVELOPER_DIR=… timeout 900 swift test --filter LiveSmokeTests/memoryEndToEnd`.
     @Test(.timeLimit(.minutes(6)))
     func memoryEndToEnd() async throws {
         setvbuf(stdout, nil, _IOLBF, 0)
-        let previousStore = ProcessInfo.processInfo.environment[SecretStore.environmentVariable]
-        setenv(SecretStore.environmentVariable, "file", 1)
-        defer {
-            if let previousStore { setenv(SecretStore.environmentVariable, previousStore, 1) } else { unsetenv(SecretStore.environmentVariable) }
-        }
         let root = try tempDir()
         let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
@@ -379,8 +375,11 @@ struct LiveSmokeTests {
         let firstDM = try router.sendDM(companyId: companyId, from: .owner, to: "eng", text:
             "Find the staging port in the company resources, remember it with key staging.port, then record it on kb:Engineering/Environments for MEM-1 with kb_write.")
 
+        // The turns' `brahma mcp` children read the temp home's file vault (never a Keychain): the choice rides in each turn's
+        // MCP config through `mcpEnvironment`, not in this process's environment, so a parallel test cannot change it.
         let orchestrator = Orchestrator(store: store, runner: ClaudeProcessRunner(maxTurnDuration: .seconds(150)), paths: paths,
-                                        mcpExecutable: mcp, vault: secretVault)
+                                        mcpExecutable: mcp, vault: secretVault,
+                                        mcpEnvironment: [SecretStore.environmentVariable: "file"])
         try await orchestrator.start()
         let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
         let started = Date()
@@ -407,6 +406,16 @@ struct LiveSmokeTests {
             }
         }
         let freshReason = "live test: a fresh session must recall the port"
+        /// A time as the database stores it (milliseconds, `Store.now()`): rows read back carry that precision, so an in-memory
+        /// `Date.now` must be cut the same way before comparing (the first fix-round live run failed on a sub-ms difference).
+        func stored(_ date: Date) -> Date { Date.fromDatabaseValue(date.databaseValue) ?? date }
+        /// eng's DM to the owner holding 4417, posted at or after `asked`.
+        func reply(after asked: Message) throws -> Message? {
+            guard let dm = try store.channel(companyId: companyId, name: "dm:eng:owner") else { return nil }
+            return try store.messages(channelId: dm.id, limit: 50).first {
+                $0.senderId == eng.id && $0.createdAt >= stored(asked.createdAt) && $0.text.contains("4417")
+            }
+        }
         var secondDM: Message?
 
         let failure: String?
@@ -427,12 +436,7 @@ struct LiveSmokeTests {
                                               text: "What is the staging port? Use recall and reply to me.")
                 secondDM = asked
                 // 6. Until the owner's DM holds the answer.
-                return try await waitFor("the reply holding 4417", {
-                    guard let dm = try store.channel(companyId: companyId, name: "dm:eng:owner") else { return false }
-                    return try store.messages(channelId: dm.id, limit: 50).contains {
-                        $0.senderId == eng.id && $0.createdAt >= asked.createdAt && $0.text.contains("4417")
-                    }
-                })
+                return try await waitFor("the reply holding 4417", { try reply(after: asked) != nil })
             } onCancel: {
                 loop.cancel()
             }
@@ -460,13 +464,19 @@ struct LiveSmokeTests {
         #expect(await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value }), "the engine did not stop")
         try MemoryIngest.run(store: store, companyId: companyId, paths: paths, now: Store.now())
 
-        // The fresh session answered: a turn of eng carrying the reason started after the question.
+        // The fresh session answered: the turn of eng carrying the reason posted the reply. (Its start is not compared with the
+        // question's time: the engine may admit it in the same millisecond the DM commits.)
         let turns = try await store.writer.read { db in
             try Turn.filter(Column("companyId") == companyId).order(Column("startedAt")).fetchAll(db)
         }
         if let asked = secondDM {
-            #expect(turns.contains { $0.agentId == eng.id && $0.freshSessionReason == freshReason && $0.startedAt >= asked.createdAt },
-                    "no fresh-session turn after the question: \(turns.map { "\($0.kind) \($0.freshSessionReason ?? "-")" })")
+            let fresh = turns.first { $0.agentId == eng.id && $0.freshSessionReason == freshReason }
+            let answer = try reply(after: asked)
+            #expect(fresh != nil, "no fresh-session turn: \(turns.map { "\($0.kind) \($0.freshSessionReason ?? "-")" })")
+            if let fresh, let answer {
+                #expect(answer.createdAt >= fresh.startedAt && answer.createdAt <= (fresh.endedAt ?? .distantFuture),
+                        "the reply was not posted during the fresh-session turn")
+            }
         }
         // No LLM turn ran other than eng's work and notice turns.
         let others = turns.filter { $0.agentId != eng.id || !($0.kind == .work || $0.kind == .notice) }
@@ -551,14 +561,10 @@ struct LiveSmokeTests {
         // and each phase line flushes: the first live rerun showed nothing at all until the process ended).
         setvbuf(stdout, nil, _IOLBF, 0)
         // The turns' `brahma mcp` processes resolve their own vault for this temp home: with the file store they load the same
-        // secrets as the engine (`MCPConfig` passes `BRAHMA_SECRET_STORE=file` on). Without it they looked in the platform
-        // vault, found no value for the hosting token and refused every tool call ("secrets are not loaded yet"): the first
-        // live run stalled there. Never the Keychain; refused by the vault for the default home.
-        let previousStore = ProcessInfo.processInfo.environment[SecretStore.environmentVariable]
-        setenv(SecretStore.environmentVariable, "file", 1)
-        defer {
-            if let previousStore { setenv(SecretStore.environmentVariable, previousStore, 1) } else { unsetenv(SecretStore.environmentVariable) }
-        }
+        // secrets as the engine. Without it they looked in the platform vault, found no value for the hosting token and refused
+        // every tool call ("secrets are not loaded yet"): the first live run stalled there. The choice reaches them through the
+        // engine's `mcpEnvironment` (written into each turn's MCP config), never through this process's environment, so a
+        // parallel test cannot see or undo it. Never the Keychain; refused by the vault for the default home.
         let monitor = LiveRunMonitor()
         print("FAKE HOST: this run does not prove a Cloudflare or Vercel deploy (dev host on loopback; see `brahma hosting probe`)")
         let root = try tempDir()
@@ -628,7 +634,8 @@ struct LiveSmokeTests {
         let platform = SandboxRunners.platformDefault(baseline: { Orchestrator.checkBaseline(store: store, paths: paths) }, proxies: proxies)
         let releaseDeps = ReleaseDependencies(sandbox: DevHostSandbox(base: platform, hostDir: hostDir), http: URLSessionHTTPProbe(),
                                               adapters: { _ in adapter })
-        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps)
+        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps,
+                                        mcpEnvironment: [SecretStore.environmentVariable: "file"])
         monitor.set(phase: "engine start")
         try await orchestrator.start()
         let loop = Task { await orchestrator.runForever(interval: .seconds(2)) }

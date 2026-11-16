@@ -732,7 +732,8 @@ holds a stored secret's value, is refused.
 | A company-wide source (items, decisions, hand-offs, retros, company facts, the handbook, company resources) | every agent in the company |
 | A team (a fact remembered with scope `team`, a team resource) | that team, and managers whose subtree contains it |
 | A role | agents holding that role, including a merged executive who covers it |
-| An item (a fact remembered with scope `item`, an item resource) | the item's author, owner, lease holder and reviewer, and the owner's manager |
+| A fact remembered with scope `item` | the item's author, owner, lease holder and reviewer, and every manager up the owner's chain. This set is worked out at each read, so it changes as the item changes hands |
+| A resource scoped to an item | a fixed set taken when it is added or rescoped: the item's owner, lease holder and reviewer, the owner's manager, and the agent that wrote the item (optionally also whoever owns or leases the item later) |
 | An agent's private memory (`remember` with scope `mine`, episodes) | that agent in full; its managers up the chain see the title only (no snippet, and their queries match only the title) |
 | An ask | per party: the agent that filed it, its internal approver and an agent that decided it. Your answer and your notes are yours alone; the asker gets your answer as the DM it already receives, and that DM is indexed as a DM. An ask filed by the engine is yours alone |
 | HR or performance records, and anything owner-only | you alone |
@@ -741,6 +742,10 @@ A restriction is a cap on top of that: a handbook section marked `[restricted]` 
 `[restricted: cfo, cto]` for those roles. Restrictions nest, and every enclosing one must be satisfied. A hit you cannot
 read is not returned at all: no snippet, no title and no count, and a ref you cannot read answers exactly like a missing
 one. Every query is bound to one company; another company's ref is "not found".
+
+These rules are enforced by Brahma's tools (`search_memory`, `recall`, `kb_read`, `search_kb` and the mirrors). Only the
+Sandboxed profile enforces them fully. On Workspace and Full, an agent's shell runs as your user and can read the data home
+(the database and the resource vault) directly; see the note at the end of Resources.
 
 **Session taint is data.** Once an agent's session reads outside content (a web page, an EXTERNAL resource, a tainted
 page or fact), everything it writes in that session is marked tainted: facts, handbook edits, messages and hand-offs, as
@@ -766,7 +771,8 @@ a whole-page edit of your own. In the app, editing a tainted page is an explicit
   every 60 active seconds when their inputs change, and no one can edit them. The decisions log shows decided asks by
   title only, reserved matters under a restricted section, and never terminations.
 - **Export.** `brahma kb <co> export --to <empty dir>` writes Markdown files with front matter and an `INDEX.md`. A company
-  export (`brahma export`) includes `handbook/`.
+  export (`brahma export`) includes `handbook/`, and also `resources/`: each live file's verified vault bytes plus
+  `resources.json` with every row's metadata (purged rows as tombstones, links with their URL).
 - **The `.brahma/kb` mirror.** The workspace gets a read-only Markdown copy for Bash and Read. It holds untainted pages
   only, with restricted sections removed. Each refresh sweeps it and rewrites any file that changed. A planted link raises
   an engine alert and wipes the mirror: it fails closed, so stale content is never kept.
@@ -790,8 +796,9 @@ is one message: a link goes on its own.
   files. Change a scope later with `brahma resource <co> scope F-<n> <scope>`.
 - **The vault.** The bytes are copied into the vault under `<data home>/vault/` as `F-<n>.<ext>` (read-only, named by the
   engine), and every open checks the sha256. The bytes stored are the bytes that were inspected. Agents read a resource
-  through `recall(ref: "F-n")`, which returns the indexed text of text files. They cannot read binaries until a later
-  plan, and never a flagged file.
+  through `recall(ref: "F-n")`, which returns the indexed text of text files. Brahma's tools give them no binaries until
+  a later plan, and never a flagged file. The vault holds plain files in the data home: on Workspace and Full, an agent's
+  shell can read them, flagged files included. Only Sandboxed keeps the shell out.
 - **The mirror.** Company-scope, untainted, unflagged files are also copied read-only to `.brahma/resources/company` in
   the workspace. Each refresh sweeps the mirror and puts back any file that changed, from the vault. A planted link raises
   an engine alert and wipes the mirror (it fails closed).
@@ -801,8 +808,9 @@ is one message: a link goes on its own.
   document type (PDF, Office, HTML, SVG, mail, RTF, zip), a text file over 64 KB, or a download macOS quarantined.
   PDFs therefore default to untrusted. Everything else you add is FROM YOU. `--vouch` or `--untrusted` overrides this.
 - **The secret sheet.** A file that looks like it holds a secret needs a choice: **Upload redacted**, **Upload anyway**
-  (stored flagged, so agents never read it), **Store it as a secret instead** (one small text file), or **Cancel**. A
-  value already stored in your Keychain can never be uploaded raw. The CLI's equivalents are `--redact` and `--anyway`.
+  (stored flagged: never indexed, mirrored or returned by Brahma's tools, though on Workspace and Full an agent's shell can
+  still read the vault copy), **Store it as a secret instead** (one small text file), or **Cancel**. A value already
+  stored in your Keychain can never be uploaded raw. The CLI's equivalents are `--redact` and `--anyway`.
 - **Announcements.** A DM, channel or Inbox drop sends one owner message, answer or comment after the rows commit.
   A library or CLI drop appears in each reader's next orientation under "New resources". A tainted resource is announced
   by ref and engine fields only, never by its name. A link is named only as `[link F-n]` and is never fetched.
@@ -813,9 +821,16 @@ is one message: a link goes on its own.
     checkpoint).
 
   A single file inside a folder can be purged on its own. Mentions the engine built are rewritten to `[purged F-n]`, and
-  the row stays as a tombstone. Backups and transcripts made since the add are **reported, not rewritten**: the purge
-  lists them so you can delete or re-create them. In the app, a transcript of a turn that a purge report lists shows "This
-  transcript was captured while a since-purged resource existed; it may still contain that content."
+  the row stays as a tombstone. Backups and transcripts are **reported, not rewritten**, so you can delete or re-create
+  them:
+  - **backups**: every database and data-home snapshot taken since the resource was added;
+  - **transcripts**: only the captured transcripts of turns that read the resource's indexed text through Brahma's tools
+    (`recall`, or a `search_memory` hit that showed a snippet). The engine records those reads.
+
+  A turn that read the file another way is **not** listed, even though its transcript may hold the content. That covers
+  reading the `.brahma/resources` mirror with its shell or the Read tool, or reading the vault directly on Workspace or
+  Full. In the app, a transcript of a listed turn shows "This transcript was captured while a since-purged resource
+  existed; it may still contain that content."
 
 Resource scopes, lab privacy and mirror integrity are enforced only by Brahma's tools under the Workspace and Full profiles; an agent's shell can read or change them. The Sandboxed profile enforces them.
 
@@ -850,7 +865,7 @@ brahma resource <co> list | vouch F-<n> | scope F-<n> <s> | purge F-<n> --yes
 
 brahma replay <co> @handle [--day yyyy-MM-dd]       an agent's day (default today, your time zone)
 brahma replay <co> <KEY>                             an item's history
-brahma transcript <co> <turn id>|@handle [--last N]
+brahma transcript <co> <turn id>|@handle [--last N] [--raw]   a captured, redacted transcript
 ```
 
 **Scripted demos.** Set `BRAHMA_SECRET_STORE=file` (with `BRAHMA_OWNER_KEY_STORE=file`) so scripts never touch the login

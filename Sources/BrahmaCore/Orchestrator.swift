@@ -16,6 +16,10 @@ public actor Orchestrator {
     let paths: BrahmaPaths
     let config: SchedulerConfig
     let mcpExecutable: String
+    /// The environment each turn's MCP config is written from (`MCPConfig.write(environment:)`): only its
+    /// `BRAHMA_SECRET_STORE=file` is read, and passed to the turn's `brahma mcp` so a dev/demo home's file vault reaches it.
+    /// Defaults to this process's environment; a host (the live tests) passes its own instead of changing process state.
+    let mcpEnvironment: [String: String]
     /// The engine's ceiling on every turn's profile (`brahma run --profile`): nil runs each turn under its company's profile
     /// for the agent's role (`turnProfile`); a value narrows it, never widens it.
     let profileCeiling: PermissionProfile?
@@ -167,7 +171,8 @@ public actor Orchestrator {
                 stopPollSleep: @escaping @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) },
                 previewDeps: PreviewDependencies? = nil,
                 smokeChecks: SmokeChecks? = nil,
-                releaseDeps: ReleaseDependencies? = nil) {
+                releaseDeps: ReleaseDependencies? = nil,
+                mcpEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
         self.stopPollSleep = stopPollSleep
         let engineBlocking = Blocking()
         self.blocking = engineBlocking
@@ -205,6 +210,7 @@ public actor Orchestrator {
         self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
         self.mcpExecutable = mcpExecutable; self.profileCeiling = profile; self.clock = clock
+        self.mcpEnvironment = mcpEnvironment
         self.sandboxEnvironment = sandboxEnvironment
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
         self.claudePath = claudePath
@@ -1202,7 +1208,8 @@ public actor Orchestrator {
             try store.setTurnMode(turnId: turn.id, decision: mode)
             var request = try turnRequest(
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
-                                                   reviewItem: review?.item.key, audit: audit != nil))
+                                                   reviewItem: review?.item.key, audit: audit != nil,
+                                                   environment: mcpEnvironment))
             // The test keys the holder took with `use_secret` (Task 4-wire): only a work turn on the leased item, applied by the
             // runner after `ChildEnvironment`'s drop step; a plan, review, audit or notice turn gets none. Read after the sandbox
             // gate (a read, nothing consumed), never part of the gated shape.
