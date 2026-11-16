@@ -13,8 +13,8 @@ extension Store {
     // MARK: Scopes
 
     /// The scope and reader set a drop gets by default (collab §3.5): a DM → the agent, fixed; a channel → the channel, its
-    /// agent members at drop time; an item card → the item, its holder, lease holder, reviewer and the holder's manager at drop
-    /// time; a question in the Inbox → its requester, fixed; the library and the CLI → the company (dynamic).
+    /// agent members at drop time; an item card → the item, its holder, lease holder, reviewer, author and the holder's
+    /// manager at drop time; a question in the Inbox → its requester, fixed; the library and the CLI → the company (dynamic).
     public func defaultScope(for context: DropContext, companyId: String) throws -> (AccessClass, Set<String>?) {
         try writer.read { db in try Self.defaultScope(db: db, for: context, companyId: companyId) }
     }
@@ -41,8 +41,8 @@ extension Store {
     }
 
     /// The fixed reader set a scope gets, whatever chose it (the app's chooser or the CLI): agent(a) → [a]; item(i) → its
-    /// holder, lease holder, reviewer and the holder's manager now; a channel or DM → its agent members now. Team, role and
-    /// company scopes stay dynamic (nil), and so does owner-only (no agent reads it). The scope's object must be the
+    /// holder, lease holder, reviewer, author and the holder's manager now; a channel or DM → its agent members now. Team,
+    /// role and company scopes stay dynamic (nil), and so does owner-only (no agent reads it). The scope's object must be the
     /// company's, else `ResourceError.notFound`.
     public func readerSet(for scope: AccessClass, companyId: String) throws -> Set<String>? {
         try writer.read { db in try Self.readerSet(db: db, for: scope, companyId: companyId) }
@@ -112,7 +112,8 @@ extension Store {
             return []
         }
         // 3. Context and scope.
-        let resolved = try writer.read { db in try resolveDrop(db: db, companyId: companyId, drop: drop) }
+        let names = ([plan.folderName ?? ""] + plan.items.map(\.displayName)).joined(separator: "\n")
+        let resolved = try writer.read { db in try resolveDrop(db: db, companyId: companyId, drop: drop, names: names) }
         if drop.secretChoice == .uploadRedacted, let binary = plan.items.first(where: { !$0.findings.isEmpty && !$0.isText }) {
             throw ResourceError.invalid("\(binary.displayName) isn't a text file, so a redacted copy can't be made; remove the secret from it and add it again")
         }
@@ -239,10 +240,17 @@ extension Store {
         // 7. Announcement, after commit.
         let text = Self.announcement(rows: rows, folder: folder, message: drop.message)
         let posted = announce(text, drop: drop, companyId: companyId, refs: rows.map(\.ref), now: now)
-        try recordAfterCommit(companyId: companyId, rows: rows, mirrored: mirrored, posted: posted, now: now)
-        return try writer.read { db in
-            try Resource.fetchAll(db, sql: "SELECT * FROM resource WHERE companyId = ? AND id IN (\(rows.map { _ in "?" }.joined(separator: ", "))) ORDER BY number",
-                                  arguments: StatementArguments([companyId]) + StatementArguments(rows.map(\.id)))
+        if let posted { for i in rows.indices { rows[i].messageId = posted.id; rows[i].channelId = posted.channelId } }
+        recordAfterCommit(companyId: companyId, rows: rows, mirrored: mirrored, posted: posted, now: now)
+        do {
+            return try writer.read { db in
+                try Resource.fetchAll(db, sql: "SELECT * FROM resource WHERE companyId = ? AND id IN (\(rows.map { _ in "?" }.joined(separator: ", "))) ORDER BY number",
+                                      arguments: StatementArguments([companyId]) + StatementArguments(rows.map(\.id)))
+            }
+        } catch {
+            // The resources are added and announced: the caller gets them as built rather than an error it would retry.
+            resourceTrace(companyId: companyId, "Added \(rows.first?.ref ?? "")… but could not read the rows back: \(error)", now: now)
+            return rows
         }
     }
 
@@ -251,11 +259,14 @@ extension Store {
     /// Adds a link (owner callers only). It is never fetched: only its URL (user and password removed: `ResourceIntake.link`)
     /// is stored, and its host and path are indexed as the title. Trust: owner, unless marked untrusted. Announced like files.
     @discardableResult
-    public func addLink(companyId: String, url raw: String, drop: ResourceDrop, now: Date = Store.now()) throws -> Resource {
+    public func addLink(companyId: String, url raw: String, drop: ResourceDrop, contentVault: ContentVault,
+                        now: Date = Store.now()) throws -> Resource {
         let url = try ResourceIntake.link(raw)
         guard try company(id: companyId) != nil else { throw ResourceError.notFound("no such company") }
-        let resolved = try writer.read { db in try resolveDrop(db: db, companyId: companyId, drop: drop) }
         let shown = Self.linkShown(url)
+        let resolved = try writer.read { db in try resolveDrop(db: db, companyId: companyId, drop: drop, names: shown) }
+        // Never a number an orphaned vault file holds (the same allocation as file adds).
+        let vaultHighest = try contentVault.highestNumber(companyId: companyId)
         let untrusted = drop.trust == .untrusted
         var link = Resource(companyId: companyId, number: 0, kind: .link, displayName: ResourceIntake.sanitizeName(shown), url: url,
                             scopeKind: resolved.scope.kind, scopeId: resolved.scope.id, readerSet: resolved.readerSet,
@@ -266,7 +277,8 @@ extension Store {
                             addedVia: drop.context.via, channelId: resolved.channelId, askId: resolved.askId,
                             itemId: resolved.itemId, createdAt: now, updatedAt: now)
         try writer.write { db in
-            link.number = (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM resource WHERE companyId = ?", arguments: [companyId]) ?? 0) + 1
+            let dbMax = try Int.fetchOne(db, sql: "SELECT MAX(number) FROM resource WHERE companyId = ?", arguments: [companyId]) ?? 0
+            link.number = max(dbMax, vaultHighest) + 1
             try link.insert(db)
             try ingestResource(db: db, link, text: nil, now: now)
             let label = try Self.scopeLabel(db: db, resolved.scope, companyId: companyId)
@@ -276,8 +288,12 @@ extension Store {
         }
         let text = Self.announcement(rows: [link], folder: nil, message: drop.message)
         let posted = announce(text, drop: drop, companyId: companyId, refs: [link.ref], now: now)
-        try recordAfterCommit(companyId: companyId, rows: [link], mirrored: [:], posted: posted, now: now)
-        return try resource(companyId: companyId, number: link.number) ?? link
+        if let posted { link.messageId = posted.id; link.channelId = posted.channelId }
+        recordAfterCommit(companyId: companyId, rows: [link], mirrored: [:], posted: posted, now: now)
+        do { return try resource(companyId: companyId, number: link.number) ?? link } catch {
+            resourceTrace(companyId: companyId, "Added \(link.ref) but could not read it back: \(error)", now: now)
+            return link
+        }
     }
 
     // MARK: Queries
@@ -386,44 +402,77 @@ extension Store {
         var itemId: String?
     }
 
-    func resolveDrop(db: Database, companyId: String, drop: ResourceDrop) throws -> ResolvedDrop {
+    /// `names`: every name the announcement will carry (the folder's, the files', a link's host and path): an `@handle` in one,
+    /// or in the owner's message, makes that agent a recipient too.
+    func resolveDrop(db: Database, companyId: String, drop: ResourceDrop, names: String) throws -> ResolvedDrop {
         if let id = drop.scope.id, id.isEmpty { throw ResourceError.invalid("the scope names nothing") }
+        let known = Set(try String.fetchAll(db, sql: "SELECT id FROM agent WHERE companyId = ?", arguments: [companyId]))
+        if let given = drop.readerSet, !given.isSubset(of: known) {
+            throw ResourceError.invalid("the reader set names an agent outside this company")
+        }
+        // A caller's reader set never widens the scope: agent and item scopes take the computed set; a channel or DM keeps at
+        // most its members now; team, role and company stay dynamic.
         var readers: Set<String>?
         switch drop.scope {
         case .company, .team, .role, .ownerOnly:
             readers = nil
-        case .agent, .item, .channel, .dm:
-            let fixed = try Self.readerSet(db: db, for: drop.scope, companyId: companyId)   // also checks the scope's object
-            readers = drop.readerSet ?? fixed
-        }
-        if let readers {
-            let known = Set(try String.fetchAll(db, sql: "SELECT id FROM agent WHERE companyId = ?", arguments: [companyId]))
-            guard readers.isSubset(of: known) else { throw ResourceError.invalid("the reader set names an agent outside this company") }
+        case .agent, .item:
+            readers = try Self.readerSet(db: db, for: drop.scope, companyId: companyId)        // also checks the scope's object
+        case .channel, .dm:
+            let members = try Self.readerSet(db: db, for: drop.scope, companyId: companyId) ?? []
+            readers = drop.readerSet.map { $0.intersection(members) } ?? members
         }
         var futureHolders = false
         if case .item = drop.scope { futureHolders = drop.futureHolders }
         var resolved = ResolvedDrop(scope: drop.scope, readerSet: readers, futureHolders: futureHolders)
 
+        // Everyone the announcement reaches must read the drop in full: the engine never sends a resource's name to a
+        // non-reader. Checked before anything is copied.
+        var recipients: Set<String> = []
+        let refusal: String
         switch drop.context {
         case .library, .cli:
-            break
+            return resolved                     // no announcement
         case .dm(let handle):
-            _ = try Self.resourceAgent(db, companyId: companyId, handle: handle)
+            let agent = try Self.resourceAgent(db, companyId: companyId, handle: handle)
+            recipients.insert(agent.id)
+            refusal = "@\(agent.name)"
         case .channel(let name):
-            resolved.channelId = try Self.resourceChannel(db, companyId: companyId, name: name).id
+            let channel = try Self.resourceChannel(db, companyId: companyId, name: name)
+            resolved.channelId = channel.id
+            recipients.formUnion(try Self.channelAgentIds(db, channelId: channel.id, companyId: companyId))
+            refusal = "#\(channel.name)"
         case .item(let id):
-            resolved.itemId = try Self.resourceItem(db, companyId: companyId, id: id).id
+            // Who an owner comment notifies: the holder, the reviewer, the author (and the readers the scope computes).
+            let item = try Self.resourceItem(db, companyId: companyId, id: id)
+            resolved.itemId = item.id
+            recipients.formUnion(try Self.itemReaderIds(db, item: item))
+            refusal = item.key
         case .inbox(let askId):
             // A pending question from an agent of this company, whose requester can read what is dropped on it.
             guard let ask = try Ask.fetchOne(db, key: askId), ask.companyId == companyId, ask.kind == .info,
                   ask.status == .pendingOwner, let requester = try Agent.fetchOne(db, key: ask.requesterId),
                   requester.companyId == companyId
             else { throw ResourceError.invalid(Self.inboxRefusal) }
-            let ctx = try ReaderContext.load(db: db, catalog: catalog, companyId: companyId, reader: .agent(requester.id))
+            resolved.askId = ask.id
+            recipients.insert(requester.id)
+            refusal = ""
+        }
+        // An @handle in the owner's words or in a name wakes (and shows the text to) that agent as well.
+        let text = [drop.message ?? "", names].joined(separator: "\n")
+        for handle in MessageRouter.mentions(in: text) where handle != "owner" {
+            if let id = try String.fetchOne(db, sql: "SELECT id FROM agent WHERE companyId = ? AND name = ?", arguments: [companyId, handle]) {
+                recipients.insert(id)
+            }
+        }
+        for id in recipients.sorted() {
+            let ctx = try ReaderContext.load(db: db, catalog: catalog, companyId: companyId, reader: .agent(id))
             let level = MemoryAccess.level(ctx, access: drop.scope, sensitivity: .normal, readerSet: readers, restrictions: [],
                                            futureHolders: futureHolders)
-            guard level == .full else { throw ResourceError.invalid(Self.inboxRefusal) }
-            resolved.askId = ask.id
+            guard level == .full else {
+                if case .inbox = drop.context { throw ResourceError.invalid(Self.inboxRefusal) }
+                throw ResourceError.invalid("\(refusal) can't all read this; change the scope or drop it in a DM")
+            }
         }
         return resolved
     }
@@ -504,10 +553,11 @@ extension Store {
         return nil
     }
 
-    /// Records the mirror paths and the announcement's message on the rows.
-    private func recordAfterCommit(companyId: String, rows: [Resource], mirrored: [String: String], posted: Message?, now: Date) throws {
+    /// Records the mirror paths and the announcement's message on the rows. Not fatal (the rows are committed and the
+    /// announcement delivered; a retry would duplicate both): a failure is traced.
+    private func recordAfterCommit(companyId: String, rows: [Resource], mirrored: [String: String], posted: Message?, now: Date) {
         guard !mirrored.isEmpty || posted != nil else { return }
-        try writer.write { db in
+        do { try writer.write { db in
             for r in rows {
                 if let path = mirrored[r.id] {
                     try db.execute(sql: "UPDATE resource SET mirrorPath = ?, mirrorSha256 = sha256, updatedAt = ? WHERE companyId = ? AND id = ?",
@@ -518,6 +568,8 @@ extension Store {
                                    arguments: [posted.id, posted.channelId, now, companyId, r.id])
                 }
             }
+        } } catch {
+            resourceTrace(companyId: companyId, "Added \(rows.first?.ref ?? "") but could not record its mirror or announcement: \(error)", now: now)
         }
     }
 
@@ -611,9 +663,10 @@ extension Store {
             """, arguments: [channelId, companyId]))
     }
 
-    /// An item's readers now: its holder (owner), its lease holder, its reviewer and the holder's manager.
+    /// An item's readers now: its holder (owner), its lease holder, its reviewer, its author (an owner comment on the item
+    /// notifies the author too) and the holder's manager.
     private static func itemReaderIds(_ db: Database, item: WorkItem) throws -> Set<String> {
-        var ids: [String?] = [item.ownerId, item.reviewerId]
+        var ids: [String?] = [item.ownerId, item.reviewerId, item.authorId]
         ids += try String.fetchAll(db, sql: "SELECT agentId FROM workLease WHERE itemId = ? AND companyId = ?",
                                    arguments: [item.id, item.companyId]).map(Optional.some)
         if let owner = item.ownerId {
