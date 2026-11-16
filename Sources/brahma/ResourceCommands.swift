@@ -149,7 +149,12 @@ struct ResourceCommand: ParsableCommand {
             case .list:
                 let rows = try store.resources(companyId: c.id, reader: .owner, includePurged: true)
                 guard !rows.isEmpty else { print("no resources"); return }
-                for r in rows { show((r.parentId == nil ? "" : "    ") + line(r, store: store, company: c)) }
+                // A folder counts its live files only (one purged on its own is a tombstone).
+                var live: [String: Int] = [:]
+                for r in rows where r.parentId != nil && r.purgedAt == nil { live[r.parentId!, default: 0] += 1 }
+                for r in rows {
+                    show((r.parentId == nil ? "" : "    ") + line(r, store: store, company: c, files: r.kind == .folder ? live[r.id] ?? 0 : nil))
+                }
             case .vouch(let n):
                 let rows = try store.vouchResource(companyId: c.id, number: n, contentVault: contentVault, paths: paths)
                 print("vouched for F-\(n)" + (rows.count > 1 ? " and its \(rows.count - 1) files" : ""))
@@ -190,12 +195,13 @@ struct ResourceCommand: ParsableCommand {
         }
     }
 
-    /// `F-<n> · <kind> · "<name>" · <size> · <scope> · FROM YOU | EXTERNAL (<why>) [· REDACTED | FLAGGED] [· mirrored <path>]
+    /// `F-<n> · <kind> · "<name>" [· <k> files] · <size> · <scope> · FROM YOU | EXTERNAL (<why>) [· REDACTED | FLAGGED] [· mirrored <path>]
     /// · added <day> [· purged <day> (<k> backups and <t> transcripts still contain it)]`.
-    private func line(_ r: Resource, store: Store, company c: Company) -> String {
+    private func line(_ r: Resource, store: Store, company c: Company, files: Int? = nil) -> String {
         var kind = r.kind.rawValue
         if let fileKind = r.fileKind { kind += " " + fileKind }
         var text = "\(r.ref) · \(kind) · \"\(r.displayName)\""
+        if let files { text += " · \(files) files" }
         if r.kind != .link { text += " · \(ResourceText.size(r.bytes))" }
         text += " · " + ((try? store.resourceScopeLabel(r.scope, companyId: c.id)) ?? r.scopeKind)
         text += r.tainted ? " · EXTERNAL (\(r.taintReason ?? "outside content"))" : " · FROM YOU"

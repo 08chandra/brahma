@@ -187,8 +187,7 @@ import Glibc
         let refusal = ResourceError.invalid("F-2 is part of folder F-1; change the folder")
         #expect(throws: refusal) { try rescope(w, 2, .agent(w.eng1.id)) }
         #expect(throws: refusal) { try vouch(w, 2) }
-        #expect(throws: refusal) { _ = try purge(w, 2) }
-        // Nothing changed.
+        // Nothing changed (purge of a single file is allowed: `purgeOneFileOfAFolder`).
         let child = try #require(try w.store.resource(companyId: w.company.id, number: 2))
         #expect(child.scope == .company); #expect(child.tainted); #expect(child.purgedAt == nil)
         #expect(w.vaultNames() == ["F-2.md", "F-3.md"])
@@ -254,6 +253,62 @@ import Glibc
         _ = try purge(w, 2)
         #expect(w.vaultNames().isEmpty); #expect(mirrorNames(w).isEmpty)
         #expect(try (2...4).allSatisfy { try w.store.resource(companyId: w.company.id, number: $0)?.purgedAt != nil })
+    }
+
+    /// Fix round 1, ruling A: purge is the owner's remedy for a leak, so one file of a folder can be purged on its own.
+    @Test func purgeOneFileOfAFolder() throws {
+        let w = try W()
+        let kit = try Self.folder(w, "kit", [("a.md", "alpha LEAKWORD secret\n"), ("b.md", "beta BITTERN notes and more\n")])
+        let rows = try w.add([kit])
+        #expect(rows.map(\.ref) == ["F-1", "F-2", "F-3"]); #expect(mirrorNames(w) == ["F-2.md", "F-3.md"])
+        let sibling = try #require(rows.last)
+
+        let report = try purge(w, 2)
+        #expect(report == PurgeReport())
+        // The child is a tombstone: bytes, mirror and doc gone, its own report and activity line.
+        let child = try #require(try w.store.resource(companyId: w.company.id, number: 2))
+        #expect(child.purgedAt != nil); #expect(child.purgeReport != nil)
+        #expect(w.vaultNames() == ["F-3.md"]); #expect(mirrorNames(w) == ["F-3.md"])
+        #expect(try w.search(w.eng1, "leakword").isEmpty); #expect(w.recall(w.eng1, "F-2") == "F-2 was purged by the owner.")
+        #expect(try w.activity().contains { $0.kind == .resource && $0.text.hasPrefix("Purged F-2 (") })
+        // Its sibling and the folder stay readable; the folder now counts only its live file.
+        #expect(w.recall(w.eng1, "F-3").contains("BITTERN")); #expect(try w.search(w.eng1, "bittern").count == 1)
+        let folder = try #require(try w.store.resource(companyId: w.company.id, number: 1))
+        #expect(folder.purgedAt == nil); #expect(folder.bytes == sibling.bytes)
+        #expect(w.recall(w.eng1, "F-1").contains("is a folder (\(ResourceText.size(sibling.bytes)))"))
+        #expect(try w.store.resource(companyId: w.company.id, number: 3)?.purgedAt == nil)
+        // The folder's own actions skip the tombstone, and purging the folder later keeps the child's own report.
+        try vouch(w, 1)
+        #expect(try w.store.resource(companyId: w.company.id, number: 2)?.vouchedAt == nil)
+        let childReport = child.purgeReport
+        _ = try purge(w, 1, backups: [("brahma-later-manual.sqlite", Store.now())], now: Store.now().addingTimeInterval(1))
+        #expect(try w.store.resource(companyId: w.company.id, number: 2)?.purgeReport == childReport)
+        #expect(w.vaultNames().isEmpty)
+    }
+
+    /// Fix round 1, ruling B: a link's URL is its content; a purged link keeps only its ref and kind.
+    @Test func purgedLinkKeepsOnlyRefAndKind() throws {
+        let (w, _) = try Self.onDisk()
+        try w.store.addLink(companyId: w.company.id, url: "https://vendor.example.com/deal?k=LINKTOKENQX", drop: ResourceDrop(),
+                            contentVault: w.contentVault)
+        #expect(try w.store.resource(companyId: w.company.id, number: 1)?.url?.contains("LINKTOKENQX") == true)
+        _ = try purge(w, 1)
+        let tomb = try #require(try w.store.resource(companyId: w.company.id, number: 1))
+        #expect(tomb.url == nil); #expect(tomb.sourceDetail == nil); #expect(tomb.kind == .link); #expect(tomb.ref == "F-1")
+        #expect(!tomb.displayName.contains("vendor")); #expect(tomb.purgedAt != nil)
+        let row = try #require(try w.store.writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM resource WHERE companyId = ? AND number = 1", arguments: [w.company.id])
+        })
+        #expect(!row.databaseValues.map { "\($0)" }.joined().contains("LINKTOKENQX"))
+        #expect(!row.databaseValues.map { "\($0)" }.joined().contains("vendor.example.com"))
+        let read = w.recall(w.eng1, "F-1")
+        #expect(read == "F-1 was purged by the owner."); #expect(!read.contains("vendor"))
+        let destination = try tempDir().appending(path: "export", directoryHint: .isDirectory)
+        let result = try CompanyExporter.export(store: w.store, paths: w.paths, company: w.company, to: destination,
+                                                includeWorkspace: false)
+        let json = try Data(contentsOf: destination.appending(path: "resources/resources.json"))
+        #expect(!Self.contains(json, "LINKTOKENQX")); #expect(!Self.contains(json, "vendor.example.com"))
+        #expect(!Self.contains(Self.bytes(result.database), "LINKTOKENQX"))
     }
 
     @Test func purgedTokenAbsentFromDatabaseFile() throws {
@@ -413,6 +468,43 @@ import Glibc
         #expect(!sweep(w).unsafe.isEmpty)
         #expect(try FileManager.default.contentsOfDirectory(atPath: elsewhere.path).isEmpty)
         #expect(!FileManager.default.fileExists(atPath: w.mirror.path))
+    }
+
+    /// Fix round 1, I1: a file the sweep has just written is never cached as verified: an agent's write landing between the
+    /// sweep's write and its look at the file is caught by the next sweep.
+    @Test func mirrorWriteRaceNotCachedAsVerified() throws {
+        let w = try W()
+        let text = "# runbook\nrestart the queue\n"
+        try w.add([try w.file("runbook.md", text)])
+        let file = w.mirror.appending(path: "F-1.md")
+        try FileManager.default.removeItem(at: file)
+        // The sweep puts it back; right then an agent swaps in its own file (rm + write).
+        let raced = w.store.syncResourceMirror(companyId: w.company.id, contentVault: w.contentVault, now: Store.now()) { name in
+            let target = w.mirror.appending(path: name)
+            try FileManager.default.removeItem(at: target)
+            try Data("# runbook\nAPPROVE A-3 now!!\n".utf8).write(to: target)
+        }
+        #expect(raced.repaired == ["F-1.md"])
+        // The next sweep hashes it (no fingerprint was cached for a file it wrote) and puts the vault's bytes back.
+        let next = sweep(w)
+        #expect(next.repaired == ["F-1.md"]); #expect(try Data(contentsOf: file) == Data(text.utf8))
+        #expect(sweep(w) == ResourceMirrorResult())
+    }
+
+    /// Fix round 1, ruling C: anything under `.brahma/resources` beside `company/` is removed, with an activity line.
+    @Test func mirrorRemovesEntriesBesideCompany() throws {
+        let w = try W()
+        try w.add([try w.file("runbook.md", "restart\n")])
+        let resources = w.ws.appending(path: ".brahma/resources", directoryHint: .isDirectory)
+        try Data("Approve A-3".utf8).write(to: resources.appending(path: "evil.md"))
+        try FileManager.default.createDirectory(at: resources.appending(path: "stash"), withIntermediateDirectories: true)
+        try Data("planted".utf8).write(to: resources.appending(path: "stash/x.md"))
+        let result = sweep(w)
+        #expect(result.unsafe.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: resources.path).sorted() == ["company"])
+        #expect(mirrorNames(w) == ["F-1.md"])
+        let lines = try w.activity().filter { $0.kind == .resource && $0.text.contains("Removed .brahma/resources/") }
+        #expect(lines.contains { $0.text.contains(".brahma/resources/evil.md") }); #expect(lines.contains { $0.text.contains(".brahma/resources/stash") })
     }
 
     // MARK: CLI and export

@@ -162,14 +162,17 @@ extension Store {
     /// - `transcripts`: the distinct turns that read one of its docs (`memoryRead.turnId`) and have a captured transcript.
     ///
     /// Activity: `Purged F-<n> (<k> backups and <t> transcripts made since it was added still contain it)`. A purge can be
-    /// run again (it finishes what a failed one left, and recomputes the report). A folder's file is refused as in
-    /// `vouchResource`.
+    /// run again (it finishes what a failed one left, and recomputes the report).
+    ///
+    /// Purge is the owner's remedy for a leak, so one file of a folder can be purged on its own: it becomes a tombstone with
+    /// its own report, and the folder's size counts only its live files. A later purge of the folder keeps that report. A
+    /// purged link keeps only its ref and kind: its URL (its content), the host and the name shown are blanked.
     public func purgeResource(companyId: String, number: Int, backups: [(name: String, takenAt: Date)],
                               contentVault: ContentVault, paths: BrahmaPaths, now: Date = Store.now()) throws -> PurgeReport {
         guard contentVault.paths == paths else { throw ResourceError.invalid("the vault belongs to another data home") }
         guard let company = try company(id: companyId) else { throw ResourceError.notFound("no such company") }
         let (rows, transcripts) = try writer.read { db -> ([Resource], [String]) in
-            let rows = try Self.ownerTarget(db: db, companyId: companyId, number: number, allowPurged: true)
+            let rows = try Self.ownerTarget(db: db, companyId: companyId, number: number, allowPurged: true, allowChild: true)
             let ids = rows.map(\.id)
             let turns = try String.fetchAll(db, sql: """
                 SELECT DISTINCT r.turnId FROM memoryRead r
@@ -194,10 +197,25 @@ extension Store {
         // 1. The tombstones and the docs, under the secure purge.
         try purgeMemoryDocs(companyId: companyId, source: .resource, sourceIds: rows.map(\.id), now: now) { db in
             for r in rows {
+                // A file purged on its own before keeps its own report. A link's URL, host and shown name are its content.
                 try db.execute(sql: """
-                    UPDATE resource SET purgedAt = COALESCE(purgedAt, ?), purgeReport = ?, mirrorPath = NULL, mirrorSha256 = NULL,
-                      textIndexed = 0, updatedAt = ? WHERE companyId = ? AND id = ?
-                    """, arguments: [now, reportText, now, companyId, r.id])
+                    UPDATE resource SET purgedAt = COALESCE(purgedAt, ?),
+                      purgeReport = CASE WHEN purgedAt IS NULL OR id = ? THEN ? ELSE purgeReport END,
+                      mirrorPath = NULL, mirrorSha256 = NULL, textIndexed = 0, url = NULL,
+                      displayName = CASE WHEN kind = 'link' THEN '[purged]' ELSE displayName END,
+                      sourceDetail = CASE WHEN kind = 'link' THEN NULL ELSE sourceDetail END,
+                      updatedAt = ?
+                    WHERE companyId = ? AND id = ?
+                    """, arguments: [now, top.id, reportText, now, companyId, r.id])
+            }
+            // A folder's size counts its live files only.
+            if let folderId = top.parentId {
+                try db.execute(sql: """
+                    UPDATE resource SET bytes = (SELECT COALESCE(SUM(bytes), 0) FROM resource
+                                                 WHERE companyId = ? AND parentId = ? AND purgedAt IS NULL AND removedAt IS NULL),
+                      updatedAt = ?
+                    WHERE companyId = ? AND id = ?
+                    """, arguments: [companyId, folderId, now, companyId, folderId])
             }
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .resource,
                               text: "Purged \(top.ref) (\(report.backups.count) backups and \(report.transcripts.count) transcripts made since it was added still contain it)",
@@ -239,25 +257,36 @@ extension Store {
     /// after every vouch, scope change and purge. Never throws: a failure is traced (an `error` activity line).
     ///
     /// - Entries no resource is mirrored at are removed (a file of a resource rescoped or purged quietly; anything else with
-    ///   an activity line).
-    /// - Each mirrored file is compared with its recorded vault hash. A file whose inode, size, times and mode are unchanged
-    ///   since it was last verified is not read again (a rewrite always changes its ctime); any other is hashed, and a
-    ///   changed or missing one is put back from the vault (`ContentVault.read`, verified) with an activity line.
+    ///   an activity line), and so is anything under `.brahma/resources` beside `company/`.
+    /// - Each mirrored file is compared with its recorded vault hash. It is hashed through one open descriptor, and the
+    ///   descriptor's fingerprint (inode, size, times, mode) is cached as verified only when it matched the hash and was the
+    ///   same before and after the read. A file whose fingerprint equals a cached one is not read again (a rewrite always
+    ///   changes its ctime, which no user can set). A file the sweep has just written is never cached: the next sweep hashes
+    ///   it. A changed or missing file is put back from the vault (`ContentVault.read`, verified) with an activity line.
     /// - It fails closed. A link or any entry that is not a single-link regular file of this user (`UnsafeEngineFile`), at
     ///   any name or in the way of a write, raises 3a's engine-file alert (once per distinct problem until a clean sweep)
     ///   and wipes the whole `.brahma/resources` mirror (by descriptor; a link is unlinked, never followed); the next sweep
     ///   rebuilds it. A file whose vault copy fails its hash is not mirrored.
     @discardableResult
     public func syncResourceMirror(companyId: String, contentVault: ContentVault, now: Date = Store.now()) -> ResourceMirrorResult {
+        syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now, afterWrite: nil)
+    }
+
+    /// `afterWrite`: tests only, called with a file's name right after the sweep wrote it (where an agent's write may land).
+    @discardableResult
+    func syncResourceMirror(companyId: String, contentVault: ContentVault, now: Date,
+                            afterWrite: ((String) throws -> Void)?) -> ResourceMirrorResult {
         var result = ResourceMirrorResult()
-        do { try syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now, into: &result) } catch {
+        do {
+            try syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now, afterWrite: afterWrite, into: &result)
+        } catch {
             resourceTrace(companyId: companyId, "Could not refresh the resource mirror \(Self.resourceMirrorDir): \(error)", now: now)
         }
         return result
     }
 
     private func syncResourceMirror(companyId: String, contentVault: ContentVault, now: Date,
-                                    into result: inout ResourceMirrorResult) throws {
+                                    afterWrite: ((String) throws -> Void)?, into result: inout ResourceMirrorResult) throws {
         guard let company = try company(id: companyId) else { return }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let dirName = Self.resourceMirrorDir
@@ -282,6 +311,26 @@ extension Store {
         let absent = lstat(workspace.appending(path: ".brahma/resources").path, &top) != 0 && errno == ENOENT
         if !(expected.isEmpty && absent) {
             do {
+                // Beside `company/`, nothing belongs under `.brahma/resources`: a planted file or directory goes (a directory
+                // by descriptor, its links unlinked, never followed); a link or odd file there is planted.
+                let parent = try EngineFiles.openWalked(workspace: workspace, ".brahma/resources")
+                let parentShown = workspace.appending(path: ".brahma/resources").path
+                for name in try parent.names().sorted() where name != "company" {
+                    var st = stat()
+                    guard fstatat(parent.fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+                        if errno == ENOENT { continue }
+                        throw UnsafeEngineFile(path: "\(parentShown)/\(name)", problem: "cannot be inspected")
+                    }
+                    if st.st_mode & S_IFMT == S_IFLNK {
+                        throw UnsafeEngineFile(path: "\(parentShown)/\(name)", problem: "is a symbolic link")
+                    }
+                    if st.st_mode & S_IFMT != S_IFDIR, let problem = EngineFiles.copyProblem(st) {
+                        throw UnsafeEngineFile(path: "\(parentShown)/\(name)", problem: problem)
+                    }
+                    try parent.remove(name)
+                    result.removed.append(name)
+                    notes.append("Removed .brahma/resources/\(Store.flat(name, max: 120)) from the resource mirror: nothing is mirrored there")
+                }
                 let dir = try EngineFiles.openWalked(workspace: workspace, dirName)
                 let shown = workspace.appending(path: dirName).path
                 let names = Set(expected.map(\.name))
@@ -310,9 +359,11 @@ extension Store {
                             prints[name] = verified[name]; mirrored[r.id] = sha
                             continue
                         }
-                        let data = try EngineFiles.read(workspace: workspace, dir: dirName, name: name, limit: Int(clamping: r.bytes) + 1)
-                        if let data, SHA256.hex(data) == sha {
-                            prints[name] = "\(print)|\(sha)"; mirrored[r.id] = sha
+                        // Hashed through one descriptor; its fingerprint is cached only when it is the same before and after.
+                        if let read = try MirrorFile.hash(dir: dir, name: name, shown: "\(shown)/\(name)", limit: r.bytes),
+                           read.sha256 == sha {
+                            if let stable = read.fingerprint { prints[name] = "\(stable)|\(sha)" }
+                            mirrored[r.id] = sha
                             continue
                         }
                     }
@@ -339,8 +390,9 @@ extension Store {
                         if present[name] != nil { result.removed.append(name) }
                         continue
                     }
-                    var after = stat()
-                    if fstatat(dir.fd, name, &after, AT_SYMLINK_NOFOLLOW) == 0 { prints[name] = "\(Self.mirrorFingerprint(after))|\(sha)" }
+                    // No fingerprint is cached for a file written now: what is at the name after the rename may already be
+                    // someone else's. The next sweep hashes it once.
+                    try afterWrite?(name)
                     mirrored[r.id] = sha
                     if present[name] != nil || r.mirrorPath != nil {
                         result.repaired.append(name)
@@ -421,22 +473,26 @@ extension Store {
 
     // MARK: Helpers
 
-    /// The rows an owner action on `F-<number>` covers: the resource, then (for a folder) its files by number. Missing or
-    /// removed → `.notFound("no resource F-<n>")`; a folder's file → `.invalid("F-<n> is part of folder F-<m>; change the
-    /// folder")`; purged (unless `allowPurged`) → `.invalid("F-<n> was purged")`.
-    static func ownerTarget(db: Database, companyId: String, number: Int, allowPurged: Bool) throws -> [Resource] {
+    /// The rows an owner action on `F-<number>` covers: the resource, then (for a folder) its files by number (purged ones
+    /// only with `allowPurged`). Missing or removed → `.notFound("no resource F-<n>")`; a folder's file (unless `allowChild`:
+    /// it is then the only row) → `.invalid("F-<n> is part of folder F-<m>; change the folder")`; purged (unless
+    /// `allowPurged`) → `.invalid("F-<n> was purged")`.
+    static func ownerTarget(db: Database, companyId: String, number: Int, allowPurged: Bool,
+                            allowChild: Bool = false) throws -> [Resource] {
         guard let r = try resource(db: db, companyId: companyId, number: number), r.removedAt == nil else {
             throw ResourceError.notFound("no resource F-\(number)")
         }
-        if let parentId = r.parentId {
+        if let parentId = r.parentId, !allowChild {
             let parent = try Int.fetchOne(db, sql: "SELECT number FROM resource WHERE companyId = ? AND id = ?",
                                           arguments: [companyId, parentId])
             throw ResourceError.invalid("\(r.ref) is part of folder \(parent.map { "F-\($0)" } ?? "?"); change the folder")
         }
         guard allowPurged || r.purgedAt == nil else { throw ResourceError.invalid("\(r.ref) was purged") }
+        guard r.parentId == nil else { return [r] }
         let children = try Resource.fetchAll(db, sql: """
-            SELECT * FROM resource WHERE companyId = ? AND parentId = ? AND removedAt IS NULL ORDER BY number
-            """, arguments: [companyId, r.id])
+            SELECT * FROM resource WHERE companyId = ? AND parentId = ? AND removedAt IS NULL AND (? OR purgedAt IS NULL)
+            ORDER BY number
+            """, arguments: [companyId, r.id, allowPurged])
         return [r] + children
     }
 
@@ -463,5 +519,39 @@ extension Store {
                 SELECT * FROM resource WHERE companyId = ? AND id IN (\(ids.map { _ in "?" }.joined(separator: ", "))) ORDER BY number
                 """, arguments: StatementArguments([companyId]) + StatementArguments(ids))
         }
+    }
+}
+
+/// Reading a mirror file outside `Store` (whose `close()` would shadow the descriptor call).
+private enum MirrorFile {
+    /// The SHA-256 of mirror file `name`, read through one descriptor (`O_NOFOLLOW`, `copyProblem` on it), and that
+    /// descriptor's fingerprint when it was the same before and after the read (nil when the file changed meanwhile). Nil
+    /// when the name is missing; a file over `limit` bytes hashes to "" (a mismatch). A link or odd file → `UnsafeEngineFile`.
+    static func hash(dir: EngineFiles.OpenDirectory, name: String, shown: String,
+                               limit: Int64) throws -> (sha256: String, fingerprint: String?)? {
+        let fd = openat(dir.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        if fd < 0 {
+            let err = errno
+            if err == ENOENT { return nil }
+            throw UnsafeEngineFile(path: shown, problem: err == ELOOP ? "is a symbolic link" : "cannot be opened (\(String(cString: strerror(err))))")
+        }
+        defer { close(fd) }
+        var before = stat()
+        guard fstat(fd, &before) == 0 else { throw UnsafeEngineFile(path: shown, problem: "cannot be inspected") }
+        if let problem = EngineFiles.copyProblem(before) { throw UnsafeEngineFile(path: shown, problem: problem) }
+        guard Int64(before.st_size) <= limit else { return ("", nil) }
+        var hasher = SHA256.Hasher()
+        var offset: off_t = 0
+        while true {
+            let piece = try ContentScan.read(fd, at: offset, count: ContentScan.chunkBytes)
+            if piece.isEmpty { break }
+            offset += off_t(piece.count)
+            guard Int64(offset) <= limit else { return ("", nil) }
+            piece.withUnsafeBytes { hasher.update($0) }
+        }
+        var after = stat()
+        guard fstat(fd, &after) == 0 else { throw UnsafeEngineFile(path: shown, problem: "cannot be inspected") }
+        let print = Store.mirrorFingerprint(before)
+        return (SHA256.hex(digest: hasher.finalize()), print == Store.mirrorFingerprint(after) ? print : nil)
     }
 }
