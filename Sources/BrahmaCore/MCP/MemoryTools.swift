@@ -191,7 +191,12 @@ extension CompanyTools {
         if r.secretScan == .flagged { return "\(r.ref) was flagged by the owner as containing a secret; it can't be read by agents." }
         switch r.kind {
         case .link:
-            return "\(r.ref) is a link to \(Store.flat(Store.linkShown(r.url ?? ""), max: 200)); it was not fetched."
+            let shown = Store.flat(Store.linkShown(r.url ?? ""), max: 200)
+            guard r.tainted else { return "\(r.ref) is a link to \(shown); it was not fetched." }
+            // Taint first: an untrusted link's address is shown only once this session is marked (a failed mark refuses).
+            try relayTaint("memory:\(r.ref)")
+            let source = "\(r.ref) (\(Store.flat(r.taintReason ?? "outside content", max: 120)))"
+            return "\(r.ref) is a link; it was not fetched.\n" + UntrustedBlock.render(source: source, text: shown, maxLines: 1)
         case .folder:
             return "\(r.ref) is a folder (\(ResourceText.size(r.bytes))). Its contents can't be read as text yet."
         case .file:
