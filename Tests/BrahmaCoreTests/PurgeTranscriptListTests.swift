@@ -6,7 +6,7 @@ import GRDB
 /// Final-review I-3: a purge lists, conservatively, every captured transcript of a turn by an agent in the resource's reader
 /// set that ran while it existed (reads of the mirror or the vault through a shell leave no record), besides the reads it
 /// tracks. The activity line, the CLI and the app say those transcripts "may" contain it, and `brahma transcript` prints the
-/// app pane's purge notice (refs only).
+/// app pane's purge notice (refs only). A turn still running at the purge has no transcript yet and is listed by id.
 @Suite(.scratch) struct PurgeTranscriptListTests {
     typealias W = ResourceStoreTests.W
 
@@ -43,8 +43,8 @@ import GRDB
         let eng2 = try turn(w, w.eng2, start: t0.addingTimeInterval(200), end: t0.addingTimeInterval(300))
         // Started before the add, ended after it: it ran while the file existed.
         let straddle = try turn(w, w.eng3, start: t0.addingTimeInterval(-30), end: t0.addingTimeInterval(30))
-        // Still running at the purge.
-        let running = try turn(w, w.mgr, start: t0.addingTimeInterval(400), end: nil)
+        // Still running at the purge: as in production, it has no transcript row yet (captured only when it ends).
+        let running = try turn(w, w.mgr, start: t0.addingTimeInterval(400), end: nil, captured: false)
         // Not listed: ended before the add; no transcript; started after the purge.
         try turn(w, w.eng3, start: t0.addingTimeInterval(-200), end: t0.addingTimeInterval(-100))
         try turn(w, w.eng2, start: t0.addingTimeInterval(500), end: t0.addingTimeInterval(600), captured: false)
@@ -68,6 +68,45 @@ import GRDB
                 == Replay.purgedTranscriptNotice + " ([purged F-1])")
         #expect(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: eng1)
                 == Replay.purgedTranscriptNotice + " ([purged F-1], [purged F-2])")
+        // The running turn's transcript is captured when it ends, after the purge: the notice is over it.
+        try ResourcePurgeTests.captured(w, running, w.mgr)
+        try ResourcePurgeTests.endTurn(w, running)
+        #expect(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: running)
+                == Replay.purgedTranscriptNotice + " ([purged F-1])")
+    }
+
+    /// Final re-review I-3: a reader's turn in flight at the purge (no transcript row yet, in production) is listed by id,
+    /// whether it recalled the file (a tracked read) or not (a windowed reader), and once its transcript is captured the
+    /// pane's notice is over it, by ref only. A turn that ended uncaptured is still not listed.
+    @Test func turnRunningAtPurgeGetsTheNoticeOnceCaptured() throws {
+        let w = try W()
+        let t0 = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 3_600).rounded(.down))
+        try w.add([try w.file("PANGOLIN-notes.md", "the PANGOLIN notes\n")], now: t0)
+        // eng-1 recalls it in a turn still running at the purge; eng-2 is a reader whose turn is running too.
+        let tracked = try ResourcePurgeTests.running(w, w.eng1)
+        #expect(w.recall(w.eng1, "F-1").contains("PANGOLIN"))
+        let windowed = try ResourcePurgeTests.running(w, w.eng2)
+        let ended = try turn(w, w.eng3, start: t0.addingTimeInterval(10), end: t0.addingTimeInterval(20), captured: false)
+        let hasTranscript = { (id: String) in
+            try w.store.writer.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM turnTranscript WHERE turnId = ?", arguments: [id]) ?? 0
+            }
+        }
+        #expect(try hasTranscript(tracked) == 0 && hasTranscript(windowed) == 0)
+
+        let report = try purge(w, 1, now: Store.now())
+        #expect(report.transcripts.first == tracked, "the tracked read leads the list")
+        #expect(Set(report.transcripts) == [tracked, windowed]); #expect(!report.transcripts.contains(ended))
+
+        // The turns end and their transcripts are captured after the purge.
+        for (id, agent) in [(tracked, w.eng1), (windowed, w.eng2)] {
+            try ResourcePurgeTests.captured(w, id, agent)
+            try ResourcePurgeTests.endTurn(w, id)
+            let notice = try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: id)
+            #expect(notice == Replay.purgedTranscriptNotice + " ([purged F-1])")
+            #expect(notice?.contains("PANGOLIN") == false)
+        }
+        #expect(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: ended) == nil)
     }
 
     @Test func trackedReadsStillListedFirst() throws {

@@ -59,4 +59,27 @@ import GRDB
         try w.add([try w.file("mid.md", "y\n")], now: t0.addingTimeInterval(50))          // while the turn ran
         #expect(refs(try lines(w, w.eng2)) == ["F-2"])
     }
+
+    /// Final re-review I-2: review and audit turns build no orientation, so one between two work turns does not move the
+    /// window. A library or CLI drop made before (or while) that review ran still reaches the next work turn.
+    @Test func reviewOrAuditTurnBetweenWorkTurnsDoesNotMoveTheWindow() throws {
+        for kind in [TurnKind.review, .audit] {
+            let w = try W()
+            let t0 = Store.now()
+            let work1 = try w.store.startTurn(agentId: w.eng1.id, now: t0.addingTimeInterval(10))
+            try w.add([try w.file("lib.md", "lib\n")], ResourceDrop(context: .library), now: t0.addingTimeInterval(20))
+            _ = try w.store.finishTurn(id: work1.id, outcome: .succeeded, summary: nil, costUSD: nil, now: t0.addingTimeInterval(30))
+            try w.add([try w.file("cli.md", "cli\n")], ResourceDrop(context: .cli), now: t0.addingTimeInterval(35))
+
+            let other = try w.store.startTurn(agentId: w.eng1.id, now: t0.addingTimeInterval(40))
+            try w.store.setTurnContext(turnId: other.id, kind: kind, itemId: nil)
+            _ = try w.store.finishTurn(id: other.id, outcome: .succeeded, summary: nil, costUSD: nil, now: t0.addingTimeInterval(50))
+
+            _ = try w.store.startTurn(agentId: w.eng1.id, now: t0.addingTimeInterval(60))
+            #expect(refs(try lines(w, w.eng1)) == ["F-1", "F-2"], "kind \(kind)")
+            let agent = try #require(try w.store.agent(id: w.eng1.id))
+            let context = try TurnContext.load(store: w.store, paths: w.paths, agent: agent, company: w.company)
+            #expect(refs(context.newResources) == ["F-1", "F-2"], "kind \(kind)")
+        }
+    }
 }

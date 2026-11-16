@@ -382,17 +382,20 @@ extension Store {
         }
     }
 
-    /// The orientation's `## New resources` lines for `agent`: resources added after its previous turn STARTED (else after
-    /// it was hired) that it can read at `full`, oldest first; purged, removed and flagged ones are left out. The previous
-    /// turn's orientation was built when it started, so a drop made while that turn ran is listed now; one made between its
+    /// The orientation's `## New resources` lines for `agent`: resources added after its previous orientation-building turn
+    /// (work, notice or plan; review and audit turns build none) STARTED (else after it was hired) that it can read at
+    /// `full`, oldest first; purged, removed and flagged ones are left out. The previous turn's orientation was built when
+    /// it started, so a drop made while that turn ran is listed now; one made between its
     /// start and its orientation may be listed twice (a repeat is safer than a silent miss). The running turn, whose
     /// orientation this is, has no `endedAt` yet and is not the previous one. A tainted row (or a
     /// file of a tainted folder) shows no name: `- F-<n> · (untrusted) · <kind> — recall(ref: "F-<n>")`; a link never shows
     /// its address: `- F-<n> · link — recall(ref: "F-<n>")`.
     func newResourceLines(agent: Agent) throws -> [String] {
         try writer.read { db in
-            let since = try Date.fetchOne(db, sql: "SELECT MAX(startedAt) FROM turn WHERE agentId = ? AND endedAt IS NOT NULL",
-                                          arguments: [agent.id]) ?? agent.createdAt
+            // Review and audit turns build no orientation, so they never start the window.
+            let since = try Date.fetchOne(db, sql: """
+                SELECT MAX(startedAt) FROM turn WHERE agentId = ? AND endedAt IS NOT NULL AND kind NOT IN ('review', 'audit')
+                """, arguments: [agent.id]) ?? agent.createdAt
             let rows = try Resource.fetchAll(db, sql: """
                 SELECT * FROM resource WHERE companyId = ? AND createdAt > ? AND purgedAt IS NULL AND removedAt IS NULL
                   AND secretScan != 'flagged' ORDER BY number

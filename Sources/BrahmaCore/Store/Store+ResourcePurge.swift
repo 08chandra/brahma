@@ -161,8 +161,10 @@ extension Store {
     /// - `backups`: the names in `backups` (DB and data-home snapshots) taken in `[createdAt, now]`;
     /// - `transcripts`, conservatively (over-listing is safe, under-listing is not): the distinct captured turns that read one
     ///   of its docs through Brahma's tools (`memoryRead.turnId`), plus every captured turn of an agent in its reader set
-    ///   (any agent the access engine lets read it at all, now) that ran while it existed (`[createdAt, now]`). Reads of the
-    ///   mirror or the vault through an agent's shell or the Read tool leave no record, so those transcripts *may* contain it.
+    ///   (any agent the access engine lets read it at all, now) that ran while it existed (`[createdAt, now]`). A turn still
+    ///   running at the purge is listed by id too: its transcript is captured when it ends, and is flagged from then on.
+    ///   Reads of the mirror or the vault through an agent's shell or the Read tool leave no record, so those transcripts
+    ///   *may* contain it.
     ///
     /// Activity: `Purged F-<n> (<k> backups and <t> transcripts made since it was added may still contain it; reads through
     /// an agent's shell or the mirror are not tracked one by one)`. A purge can be run again (it finishes what a failed one
@@ -181,17 +183,22 @@ extension Store {
             let turns = try String.fetchAll(db, sql: """
                 SELECT DISTINCT r.turnId FROM memoryRead r
                 JOIN memoryDoc d ON d.id = r.docId AND d.companyId = r.companyId
-                JOIN turnTranscript t ON t.turnId = r.turnId AND t.companyId = r.companyId
+                JOIN turn tn ON tn.id = r.turnId AND tn.companyId = r.companyId
+                LEFT JOIN turnTranscript t ON t.turnId = r.turnId AND t.companyId = r.companyId
                 WHERE r.companyId = ? AND r.turnId IS NOT NULL AND d.source = ?
+                  AND (t.turnId IS NOT NULL OR tn.endedAt IS NULL)
                   AND d.sourceId IN (\(ids.map { _ in "?" }.joined(separator: ", ")))
                 ORDER BY r.turnId
                 """, arguments: StatementArguments([companyId, MemorySource.resource.rawValue]) + StatementArguments(ids))
             // Untracked reads (the mirror or the vault through a shell): every captured turn of a reader while it existed.
+            // In both lists a turn still running now is kept by id although its transcript is captured only when it ends:
+            // the notice is keyed by turn id, so it shows over that transcript once it is captured.
             let readers = try Self.purgeReaders(db: db, catalog: catalog, companyId: companyId, rows: rows)
             let windowed = readers.isEmpty ? [] : try String.fetchAll(db, sql: """
                 SELECT DISTINCT t.id FROM turn t
-                JOIN turnTranscript tt ON tt.turnId = t.id AND tt.companyId = t.companyId
+                LEFT JOIN turnTranscript tt ON tt.turnId = t.id AND tt.companyId = t.companyId
                 WHERE t.companyId = ? AND t.startedAt <= ? AND (t.endedAt IS NULL OR t.endedAt >= ?)
+                  AND (tt.turnId IS NOT NULL OR t.endedAt IS NULL)
                   AND t.agentId IN (\(readers.map { _ in "?" }.joined(separator: ", ")))
                 """, arguments: [companyId, now, rows[0].createdAt] + StatementArguments(readers))
             var seen = Set<String>()
