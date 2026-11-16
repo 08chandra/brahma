@@ -643,6 +643,7 @@ enum Migrations {
         registerPlan5(&m)
         registerPlanL(&m)
         registerPlan4b(&m)
+        registerPlanML(&m)
         return m
     }
 
@@ -1243,6 +1244,33 @@ enum Migrations {
             try db.create(index: "ultraReservation_ask", on: "ultraReservation", columns: ["askId"])
             try db.alter(table: "company") { t in t.add(column: "ultraShare", .double).notNull().defaults(to: 0.15) }
         }
+    }
+
+    /// Plan 4b migrations: registered after every Plan L migration, never inside `registerPlan5` or `registerPlanL`, in landing order
+    /// v4b-vacancy-note. Never edit an earlier one. Later plans register theirs after this one.
+    static func registerPlan4b(_ m: inout DatabaseMigrator) {
+        m.registerMigration("v4b-vacancy-note") { db in
+            // Plan 4b, Task 1b: the owner's vacancy edits. `note` is owner-only text (redacted before it is stored); `removedAt`
+            // marks a seat the owner took back (never deleted: its handle stays reserved for `nextHandle`, `hire` and `applyOrg`).
+            try db.alter(table: "orgVacancy") { t in
+                t.add(column: "note", .text).notNull().defaults(to: "")
+                t.add(column: "removedAt", .datetime)
+            }
+            // One row per handle per company, enforced from here on. A database that already holds two rows for one handle
+            // fails closed (the whole migration is rolled back, so the columns above are not added either) rather than lose a row.
+            let duplicates = try Row.fetchAll(db, sql: """
+                SELECT companyId, handle FROM orgVacancy GROUP BY companyId, handle HAVING COUNT(*) > 1 ORDER BY companyId, handle
+                """).map { "\($0["companyId"] as String)/\($0["handle"] as String)" }
+            guard duplicates.isEmpty else {
+                throw MigrationRefused("orgVacancy has duplicate handles: " + duplicates.joined(separator: ", "))
+            }
+            try db.create(index: "orgVacancy_company_handle", on: "orgVacancy", columns: ["companyId", "handle"], unique: true)
+        }
+    }
+
+    /// Plan ML migrations: registered after every Plan 4b migration, never inside an earlier plan's function, in landing order
+    /// vML-memory, vML-ingest, vML-remember, vML-kb, vML-sprint-closer, vML-resources. Never edit an earlier one.
+    static func registerPlanML(_ m: inout DatabaseMigrator) {
         m.registerMigration("vML-memory") { db in
             // Plan ML Task 1: one scoped company-memory index over every source. The INTEGER key keeps the FTS rowids stable
             // across `VACUUM` (a TEXT key's implicit rowid may be renumbered). `readerSet`: a JSON array of agent ids (NULL:
@@ -1466,28 +1494,6 @@ enum Migrations {
             }
             try db.create(index: "resource_parent", on: "resource", columns: ["companyId", "parentId"])
             try db.create(index: "resource_created", on: "resource", columns: ["companyId", "createdAt"])
-        }
-    }
-
-    /// Plan 4b migrations: registered after every Plan L migration, never inside `registerPlan5` or `registerPlanL`, in landing order
-    /// v4b-vacancy-note. Never edit an earlier one. Later plans register theirs after this one.
-    static func registerPlan4b(_ m: inout DatabaseMigrator) {
-        m.registerMigration("v4b-vacancy-note") { db in
-            // Plan 4b, Task 1b: the owner's vacancy edits. `note` is owner-only text (redacted before it is stored); `removedAt`
-            // marks a seat the owner took back (never deleted: its handle stays reserved for `nextHandle`, `hire` and `applyOrg`).
-            try db.alter(table: "orgVacancy") { t in
-                t.add(column: "note", .text).notNull().defaults(to: "")
-                t.add(column: "removedAt", .datetime)
-            }
-            // One row per handle per company, enforced from here on. A database that already holds two rows for one handle
-            // fails closed (the whole migration is rolled back, so the columns above are not added either) rather than lose a row.
-            let duplicates = try Row.fetchAll(db, sql: """
-                SELECT companyId, handle FROM orgVacancy GROUP BY companyId, handle HAVING COUNT(*) > 1 ORDER BY companyId, handle
-                """).map { "\($0["companyId"] as String)/\($0["handle"] as String)" }
-            guard duplicates.isEmpty else {
-                throw MigrationRefused("orgVacancy has duplicate handles: " + duplicates.joined(separator: ", "))
-            }
-            try db.create(index: "orgVacancy_company_handle", on: "orgVacancy", columns: ["companyId", "handle"], unique: true)
         }
     }
 }
