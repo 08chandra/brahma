@@ -56,30 +56,5 @@ struct TranscriptCommand: ParsableCommand {
     }
 
     /// A readable line for a record: who said what, tool calls by name. Records that carry no conversation print nothing.
-    static func render(_ line: String) -> String? {
-        guard let data = line.data(using: .utf8), let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let type = object["type"] as? String, type == "user" || type == "assistant",
-              let message = object["message"] as? [String: Any] else { return nil }
-        var parts: [String] = []
-        if let text = message["content"] as? String {
-            parts.append(text)
-        } else if let blocks = message["content"] as? [[String: Any]] {
-            for block in blocks {
-                switch block["type"] as? String {
-                case "text": if let text = block["text"] as? String { parts.append(text) }
-                case "tool_use":
-                    let input = (block["input"]).flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) }
-                        .map { String(decoding: $0, as: UTF8.self) } ?? ""
-                    parts.append("[tool_use \(block["name"] as? String ?? "?") \(input.prefix(300))]")
-                case "tool_result":
-                    let body = (block["content"] as? String) ?? (block["content"]).flatMap { try? JSONSerialization.data(withJSONObject: $0) }
-                        .map { String(decoding: $0, as: UTF8.self) } ?? ""
-                    parts.append("[tool_result \(body.prefix(300))]")
-                default: continue
-                }
-            }
-        }
-        guard !parts.isEmpty else { return nil }
-        return "\(type): " + parts.joined(separator: "\n")
-    }
+    static func render(_ line: String) -> String? { TranscriptCapture.renderRecord(line) }
 }

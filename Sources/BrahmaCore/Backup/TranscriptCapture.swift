@@ -120,13 +120,53 @@ public struct TranscriptCapture: Sendable {
     }
 
     /// The decompressed, verified content of a captured turn.
-    public func read(_ row: TurnTranscript) throws -> Data {
+    public func read(_ row: TurnTranscript) throws -> Data { try Self.read(row, paths: paths) }
+
+    static func read(_ row: TurnTranscript, paths: BrahmaPaths) throws -> Data {
         let url = paths.home.appending(path: row.path)
         guard Self.isInside(url, root: paths.transcriptsDir) else { throw CompressorError.failed("\(row.path) is outside the transcripts directory") }
         let packed = try Data(contentsOf: url)
         let data = try Compressor.forCodec(row.codec).decompress(packed, workDir: paths.tmpDir)
         guard StableHash.fnv1a64(data) == row.sha else { throw CompressorError.failed("\(row.path) does not match its recorded hash") }
         return data
+    }
+
+    /// A company's captured turn as text (JSON lines, redacted when captured): the owner's replay pane (Plan ML Task 9). A
+    /// turn of another company, or one with no capture, is not found. Blocking (decompression): call it off the main actor.
+    public static func read(turnId: String, companyId: String, store: Store, paths: BrahmaPaths) throws -> String {
+        guard let row = try store.transcript(turnId: turnId), row.companyId == companyId else {
+            throw WorkError.notFound("no transcript was captured for that turn")
+        }
+        return String(decoding: try read(row, paths: paths), as: UTF8.self)
+    }
+
+    /// A readable form of one transcript record: who said what, tool calls by name and their input, tool results cut to 300
+    /// characters. Records that carry no conversation are nil. The text is agent-controlled: callers sanitize it for display.
+    public static func renderRecord(_ line: String) -> String? {
+        guard let data = line.data(using: .utf8), let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let type = object["type"] as? String, type == "user" || type == "assistant",
+              let message = object["message"] as? [String: Any] else { return nil }
+        var parts: [String] = []
+        if let text = message["content"] as? String {
+            parts.append(text)
+        } else if let blocks = message["content"] as? [[String: Any]] {
+            for block in blocks {
+                switch block["type"] as? String {
+                case "text": if let text = block["text"] as? String { parts.append(text) }
+                case "tool_use":
+                    let input = (block["input"]).flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) }
+                        .map { String(decoding: $0, as: UTF8.self) } ?? ""
+                    parts.append("[tool_use \(block["name"] as? String ?? "?") \(input.prefix(300))]")
+                case "tool_result":
+                    let body = (block["content"] as? String) ?? (block["content"]).flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+                        .map { String(decoding: $0, as: UTF8.self) } ?? ""
+                    parts.append("[tool_result \(body.prefix(300))]")
+                default: continue
+                }
+            }
+        }
+        guard !parts.isEmpty else { return nil }
+        return "\(type): " + parts.joined(separator: "\n")
     }
 
     // MARK: Redaction

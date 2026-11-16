@@ -16,6 +16,12 @@ public enum SelectTarget: Equatable, Sendable {
     case handbook
     /// Handbook › MEMORY (the memory browser).
     case memory
+    /// Work › Budget (Plan ML).
+    case budget
+    /// `replay:@<handle>[/yyyy-MM-dd]`: People with that agent's REPLAY open on that day (default today, owner's time zone).
+    case replayAgent(handle: String, day: String?)
+    /// `replay:<KEY>`: the backlog with that item's HISTORY open.
+    case replayItem(key: String)
     /// `kb:<path>`: Handbook › PAGES with that page open (the path as given; pages are found case-insensitively).
     case kb(path: String)
     /// `preview:<name>` (a surface, lowercased) or `preview:live`: Mission Control's preview pane on that tab.
@@ -49,6 +55,7 @@ public enum SelectTarget: Equatable, Sendable {
         case "resources": self = .resources
         case "handbook": self = .handbook
         case "memory": self = .memory
+        case "budget": self = .budget
         case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)
@@ -67,10 +74,26 @@ public enum SelectTarget: Equatable, Sendable {
             case "dm": self = .dm(handle: value.lowercased())
             case "search": self = .search(value)
             case "kb": self = .kb(path: value)
+            case "replay":
+                guard let target = Self.replay(value) else { return nil }
+                self = target
             case "preview": self = .preview(name: value.lowercased())
             default: return nil
             }
         }
+    }
+}
+
+extension SelectTarget {
+    /// `@<handle>[/yyyy-MM-dd]` or `<KEY>`.
+    static func replay(_ value: String) -> SelectTarget? {
+        guard value.hasPrefix("@") else { return .replayItem(key: value.uppercased()) }
+        let parts = value.dropFirst().split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard let handle = parts.first, !handle.isEmpty else { return nil }
+        guard parts.count == 2 else { return .replayAgent(handle: handle.lowercased(), day: nil) }
+        // The day is checked as a calendar date (any zone will do for the form).
+        guard Replay.dayInterval(parts[1], tz: TimeZone(identifier: "UTC")!) != nil else { return nil }
+        return .replayAgent(handle: handle.lowercased(), day: parts[1])
     }
 }
 

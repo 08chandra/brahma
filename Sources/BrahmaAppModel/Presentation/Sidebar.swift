@@ -10,6 +10,8 @@ public enum SidebarItem: Hashable, Sendable {
     case resources
     /// Work › Handbook: the company handbook's pages and the memory browser (symbol `book.closed`).
     case handbook
+    /// Work › Budget: this week's pace and spend by mode, and the storage meter (symbol `gauge`).
+    case budget
     /// Inbox › Grants (the ledger and presets) and Inbox › Digest.
     case inboxGrants, inboxDigest
     case settingsBackups

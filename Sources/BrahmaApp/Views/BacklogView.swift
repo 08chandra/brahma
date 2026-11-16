@@ -15,6 +15,10 @@ struct BacklogView: View {
     private static let tierWidth: CGFloat = 32
     private static let ownerWidth: CGFloat = 70
 
+    /// While the inspector shows HISTORY, the table keeps only its Key, Title and Status columns and the inspector takes the
+    /// rest of the width.
+    private var compact: Bool { model.selectedItem.map { model.isReplaying(itemId: $0.id) } ?? false }
+
     var body: some View {
         let rows = model.backlogRows
         HStack(spacing: 0) {
@@ -29,11 +33,12 @@ struct BacklogView: View {
                         .buttonStyle(.brahma)
                 }
             }, content: { table(rows) })
+            .frame(width: compact ? 360 : nil)
             if let key = model.selectedItemKey, let item = model.item(key: key) {
                 Hairline(axis: .vertical)
                 ItemInspector(model: model, item: item)
                     .id(item.key)
-                    .frame(width: 380)
+                    .frame(minWidth: compact ? 420 : 380, maxWidth: compact ? .infinity : 380)
                     .frame(maxHeight: .infinity)
                     .background(BrahmaTheme.bg2)
             }
@@ -49,13 +54,15 @@ struct BacklogView: View {
             VStack(spacing: 0) {
                 HStack(spacing: BrahmaTheme.spaceS) {
                     ColumnHeader("Key").frame(width: Self.keyWidth, alignment: .leading)
-                    ColumnHeader("Type").frame(width: Self.typeWidth, alignment: .leading)
+                    if !compact { ColumnHeader("Type").frame(width: Self.typeWidth, alignment: .leading) }
                     ColumnHeader("Title").frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
                     ColumnHeader("Status").frame(width: Self.statusWidth, alignment: .leading)
-                    ColumnHeader("P").frame(width: Self.pWidth, alignment: .leading)
-                    ColumnHeader("Tier").frame(width: Self.tierWidth, alignment: .leading)
-                    ColumnHeader("Owner").frame(width: Self.ownerWidth, alignment: .leading)
-                    ColumnHeader("Check").frame(width: 100, alignment: .leading)
+                    if !compact {
+                        ColumnHeader("P").frame(width: Self.pWidth, alignment: .leading)
+                        ColumnHeader("Tier").frame(width: Self.tierWidth, alignment: .leading)
+                        ColumnHeader("Owner").frame(width: Self.ownerWidth, alignment: .leading)
+                        ColumnHeader("Check").frame(width: 100, alignment: .leading)
+                    }
                 }
                 .padding(.horizontal, BrahmaTheme.spaceS)
                 .frame(height: BrahmaTheme.rowHeight)
@@ -98,8 +105,10 @@ struct BacklogView: View {
                 Text(verbatim: row.key).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text0).lineLimit(1)
             }
             .frame(width: Self.keyWidth, alignment: .leading)
-            Text(verbatim: row.type).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
-                .frame(width: Self.typeWidth, alignment: .leading)
+            if !compact {
+                Text(verbatim: row.type).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
+                    .frame(width: Self.typeWidth, alignment: .leading)
+            }
             HStack(spacing: 6) {
                 Text(verbatim: row.title)
                     .font(row.hasChildren ? BrahmaTheme.bodyStrong : BrahmaTheme.body)
@@ -112,16 +121,21 @@ struct BacklogView: View {
             .padding(.leading, CGFloat(row.depth) * 14)
             .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             ItemStatusChip(status: row.status).frame(width: Self.statusWidth, alignment: .leading)
-            Text(verbatim: row.priorityLabel).font(BrahmaTheme.monoSmall).foregroundStyle(row.priority < 2 ? BrahmaTheme.warning : BrahmaTheme.text1)
-                .frame(width: Self.pWidth, alignment: .leading)
-            Text(verbatim: row.tier).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1)
-                .frame(width: Self.tierWidth, alignment: .leading)
-            Text(verbatim: row.assignee.map { "@" + $0 } ?? "—").font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1)
-                .lineLimit(1).frame(width: Self.ownerWidth, alignment: .leading)
-            Text(verbatim: row.checkLabel).font(BrahmaTheme.monoSmall).foregroundStyle(checkColor(row.checkLabel))
-                .lineLimit(1).frame(width: 100, alignment: .leading)
+            if !compact { trailingColumns(row) }
         }
         .accessibilityElement(children: .combine)
+    }
+
+    /// P, Tier, Owner and Check (left out of the compact table).
+    @ViewBuilder private func trailingColumns(_ row: ItemRow) -> some View {
+        Text(verbatim: row.priorityLabel).font(BrahmaTheme.monoSmall).foregroundStyle(row.priority < 2 ? BrahmaTheme.warning : BrahmaTheme.text1)
+            .frame(width: Self.pWidth, alignment: .leading)
+        Text(verbatim: row.tier).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1)
+            .frame(width: Self.tierWidth, alignment: .leading)
+        Text(verbatim: row.assignee.map { "@" + $0 } ?? "—").font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1)
+            .lineLimit(1).frame(width: Self.ownerWidth, alignment: .leading)
+        Text(verbatim: row.checkLabel).font(BrahmaTheme.monoSmall).foregroundStyle(checkColor(row.checkLabel))
+            .lineLimit(1).frame(width: 100, alignment: .leading)
     }
 }
 
@@ -137,6 +151,11 @@ private struct ItemInspector: View {
         let row = ItemRows.row(item, handles: model.handles, run: model.work.latestRuns[item.id])
         VStack(alignment: .leading, spacing: 0) {
             PanelHeader(title: item.key) {
+                // HISTORY: the item's whole history (owner only), in place of the detail.
+                Segmented(options: [(false, "Detail"), (true, "History")], selection: model.isReplaying(itemId: item.id),
+                          label: "Inspector view") { on in
+                    if on { model.openReplay(itemKey: item.key) } else { model.closeReplay() }
+                }
                 Button { model.selectedItemKey = nil } label: {
                     Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(BrahmaTheme.text1)
                         .frame(width: 18, height: 18).contentShape(Rectangle())
@@ -144,46 +163,10 @@ private struct ItemInspector: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(Text("Close inspector"))
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: BrahmaTheme.spaceM) {
-                    header(row)
-                    Hairline()
-                    checkSection(row)
-                    Hairline()
-                    where_(row)
-                    if let detail, !detail.dependencies.isEmpty {
-                        Hairline()
-                        CapsLabel("Waits for")
-                        ForEach(detail.dependencies) { dep in
-                            HStack(spacing: BrahmaTheme.spaceS) {
-                                Text(verbatim: dep.key).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text0)
-                                Text(verbatim: dep.title).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
-                                Spacer(minLength: 4)
-                                ItemStatusChip(status: dep.status)
-                            }
-                        }
-                    }
-                    Hairline()
-                    moves
-                    ItemFormFields(form: $form, handles: model.snapshot.agents.filter { $0.state != .killed }.map(\.name).sorted(),
-                                   unconfirmedNote: row.unconfirmedNote)
-                    HStack {
-                        Spacer()
-                        Button("Save") {
-                            saving = true
-                            Task { _ = await model.updateItem(key: item.key, form); saving = false }
-                        }
-                        .buttonStyle(.brahmaPrimary)
-                        .disabled(saving || form == fresh || form.validate(knownHandles: Set(model.snapshot.agents.map(\.name))) != nil)
-                    }
-                    if let detail, !detail.events.isEmpty {
-                        Hairline()
-                        CapsLabel("Last \(detail.events.count) events")
-                        ForEach(detail.events.reversed()) { e in eventLine(e) }
-                    }
-                }
-                .padding(BrahmaTheme.spaceM)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if model.isReplaying(itemId: item.id), let replay = model.replay {
+                ReplayView(replay: replay)
+            } else {
+                detailScroll(row)
             }
         }
         .task(id: item.updatedAt) {
@@ -192,6 +175,50 @@ private struct ItemInspector: View {
         }
         .onChange(of: model.work.latestRuns[item.id]?.status) {
             Task { detail = await model.itemDetail(key: item.key) }
+        }
+    }
+
+    private func detailScroll(_ row: ItemRow) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: BrahmaTheme.spaceM) {
+                header(row)
+                Hairline()
+                checkSection(row)
+                Hairline()
+                where_(row)
+                if let detail, !detail.dependencies.isEmpty {
+                    Hairline()
+                    CapsLabel("Waits for")
+                    ForEach(detail.dependencies) { dep in
+                        HStack(spacing: BrahmaTheme.spaceS) {
+                            Text(verbatim: dep.key).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text0)
+                            Text(verbatim: dep.title).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
+                            Spacer(minLength: 4)
+                            ItemStatusChip(status: dep.status)
+                        }
+                    }
+                }
+                Hairline()
+                moves
+                ItemFormFields(form: $form, handles: model.snapshot.agents.filter { $0.state != .killed }.map(\.name).sorted(),
+                               unconfirmedNote: row.unconfirmedNote)
+                HStack {
+                    Spacer()
+                    Button("Save") {
+                        saving = true
+                        Task { _ = await model.updateItem(key: item.key, form); saving = false }
+                    }
+                    .buttonStyle(.brahmaPrimary)
+                    .disabled(saving || form == fresh || form.validate(knownHandles: Set(model.snapshot.agents.map(\.name))) != nil)
+                }
+                if let detail, !detail.events.isEmpty {
+                    Hairline()
+                    CapsLabel("Last \(detail.events.count) events")
+                    ForEach(detail.events.reversed()) { e in eventLine(e) }
+                }
+            }
+            .padding(BrahmaTheme.spaceM)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

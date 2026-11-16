@@ -111,6 +111,15 @@ BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --args '{"fact":"The chec
 BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --args '{"fact":"The checkout service listens on port 4418 in staging","key":"checkout.port","scope":"company"}' >/dev/null
 BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --taint "web page docs.stripe.com" --args '{"fact":"Stripe test cards start with 4242","key":"stripe.testcard"}' >/dev/null
 
+# Plan ML Task 9: Replay — @eng-1 finishes a turn on INITE-3 (a Bash and a Read call, a captured transcript), posts in
+# #general and comments on the item; the owner DMs it. `dev turn` records the turn and captures its transcript as a real one.
+BRAHMA_DEV=1 "$B" dev turn Initech --by eng-1 --summary "Added the reminder scheduler; one test still flaky" \
+  --prompt "Work on INITE-3: reminders fire twice" --say "Reading the scheduler first." \
+  --say "The timer was registered on every launch; registering it once fixes the duplicate." --tool Read --tool Bash >/dev/null
+"$B" say Initech @eng-1 "Is the duplicate reminder fixed?" >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech comment_work_item --by eng-1 --args '{"key":"INITE-3","text":"Scheduler registers once now; checking the flaky test."}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech post_message --by eng-1 --args '{"channel":"general","text":"Reminder fix is up for INITE-3."}' >/dev/null
+
 # Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
 # folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.
 if [ "${BRAHMA_DEV:-}" = "1" ]; then

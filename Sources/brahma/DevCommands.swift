@@ -18,7 +18,8 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
 struct DevGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self, Tool.self])
+        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self, Tool.self,
+                      SeedTurn.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -173,6 +174,55 @@ struct DevGroup: AsyncParsableCommand {
             } catch let e as WorkError {
                 throw fail(e.message)
             }
+        }
+    }
+
+    /// Plan ML Task 9 (the replay's seed): a finished turn of an agent, its tool calls as activity lines, and a captured
+    /// transcript of what it said. The transcript is a JSON-lines file written for the occasion under the data home's tmp
+    /// directory (removed after) and captured exactly like a real turn's: redacted, compressed, 0600.
+    struct SeedTurn: ParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "turn", abstract: "Record a finished turn with a captured transcript as an agent.")
+        @Argument var company: String
+        @Option(help: "Handle of the agent whose turn it is.") var by: String
+        @Option(help: "The turn's summary.") var summary: String
+        @Option(help: "The task the transcript's prompt states.") var prompt: String = "Continue your work."
+        @Option(help: "A line the agent says in the transcript (repeatable).") var say: [String] = []
+        @Option(help: "A tool the turn called (repeatable): an activity line and a tool_use record.") var tool: [String] = []
+
+        func run() throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: by)
+            // The capture redacts with every secret loaded, or holds (writes nothing).
+            _ = try store.reloadRedactorIfNeeded(vault: try cliSecretVault(interactive: false), logFailures: false)
+            let turn = try store.startTurn(agentId: agent.id)
+            var records: [[String: Any]] = [["type": "user", "message": ["role": "user", "content": prompt]]]
+            for line in say {
+                records.append(["type": "assistant", "message": ["role": "assistant", "content": [["type": "text", "text": line]]]])
+            }
+            for name in tool {
+                try store.appendEvent(ActivityEvent(companyId: c.id, agentId: agent.id, turnId: turn.id, kind: .toolUse,
+                                                    text: "@\(agent.name) \(name)", createdAt: Store.now()))
+                records.append(["type": "assistant", "message": ["role": "assistant",
+                                                                  "content": [["type": "tool_use", "name": name, "input": [:] as [String: Any]]]]])
+            }
+            let dir = try paths.ensureTmpDir().appending(path: "dev-turn-\(UUID().uuidString)", directoryHint: .isDirectory)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let source = TranscriptSource(configDir: dir)
+            let sessionId = UUID().uuidString.lowercased()
+            let file = source.projectsDir.appending(path: "-dev/\(sessionId).jsonl")
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            var data = Data()
+            for record in records {
+                data.append(try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]))
+                data.append(0x0A)
+            }
+            try data.write(to: file)
+            let outcome = TranscriptCapture(paths: paths, source: source).capture(turn: turn, sessionId: sessionId, store: store)
+            _ = try store.finishTurn(id: turn.id, outcome: .succeeded, summary: summary, costUSD: nil)
+            guard case .captured = outcome else { throw fail("turn \(turn.id) recorded, but its transcript was not captured: \(outcome)") }
+            print(turn.id)
         }
     }
 
