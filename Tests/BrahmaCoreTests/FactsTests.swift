@@ -247,7 +247,9 @@ import GRDB
     @Test func factsObserverIsFirst() throws {
         struct Other: WorkItemObserver { func itemCompleted(_ item: WorkItem, db: Database) throws {} }
         let store = try Store.inMemory(observers: [Other()])
-        #expect(store.observers.count == 2); #expect(store.observers.first is OutcomeFactsObserver)
+        // Plan ML: the episode recorder is the second default observer.
+        #expect(store.observers.count == 3); #expect(store.observers.first is OutcomeFactsObserver)
+        #expect(store.observers[1] is EpisodeObserver); #expect(store.observers.last is Other)
     }
 
     // MARK: CLI

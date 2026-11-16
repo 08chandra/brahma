@@ -66,6 +66,9 @@ public struct TurnContext: Sendable {
     public var budget: String? = nil
     /// The company's preview surfaces with their states, in position order (the `Previews:` line).
     public var previews: [(surface: PreviewSurface, state: PreviewState?)] = []
+    /// Resources the owner added since the agent's previous turn started that it can read in full, as orientation lines
+    /// (`Store.newResourceLines`); `TurnDigest` shows at most `maxNewResources`. Never makes a turn actionable by itself.
+    public var newResources: [String] = []
 
     public var scope: SessionScope { item.map { .item($0.id) } ?? .base }
 
@@ -113,6 +116,7 @@ public struct TurnContext: Sendable {
         }
         let states = try store.previewStates(companyId: company.id)
         c.previews = try store.previewSurfaces(companyId: company.id).map { ($0, states[$0.id]) }
+        c.newResources = try store.newResourceLines(agent: agent)
         let notes = NotesFile.path(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), team: agent.team)
         if FileManager.default.fileExists(atPath: notes.path) { c.notesPath = notes.path }
 
@@ -172,6 +176,8 @@ public enum TurnDigest {
     public static let maxPreviewLine = 400
     public static let maxAnsweredTasks = 5
     public static let maxAnswerValue = 300
+    /// `## New resources` lines shown before the rest are counted.
+    public static let maxNewResources = 5
 
     /// `Done human tasks (the owner's answers):` then one line per task — `- A-3 · <template or title> · field = "value" · …`.
     /// Engine-written refs and field names; the title (agent text) and every value (owner text) are flattened, values quoted;
@@ -254,6 +260,7 @@ public enum TurnDigest {
             lines[0] = "## " + (lines[0].hasSuffix(":") ? String(lines[0].dropLast()) : lines[0])
             out.append(lines.joined(separator: "\n"))
         }
+        if let resources = newResourcesBlock(c.newResources) { out.append(resources) }
         // With only work updates there is no "nothing new" line.
         if !(c.inbox.isEmpty && c.channelCounts.isEmpty && !c.notices.isEmpty) {
             out.append("# Inbox")
@@ -265,6 +272,16 @@ public enum TurnDigest {
             }
             out.append(inbox)
         }
+        return out.joined(separator: "\n")
+    }
+
+    /// `## New resources (<n>)`, at most `maxNewResources` engine-built lines (names flattened and quoted), then
+    /// `- … and <k> more (search_memory)`; nil without any.
+    static func newResourcesBlock(_ lines: [String]) -> String? {
+        guard !lines.isEmpty else { return nil }
+        var out = ["## New resources (\(lines.count))"]
+        out += lines.prefix(maxNewResources)
+        if lines.count > maxNewResources { out.append("- … and \(lines.count - maxNewResources) more (search_memory)") }
         return out.joined(separator: "\n")
     }
 

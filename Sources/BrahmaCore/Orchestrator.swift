@@ -16,6 +16,10 @@ public actor Orchestrator {
     let paths: BrahmaPaths
     let config: SchedulerConfig
     let mcpExecutable: String
+    /// The environment each turn's MCP config is written from (`MCPConfig.write(environment:)`): only its
+    /// `BRAHMA_SECRET_STORE=file` is read, and passed to the turn's `brahma mcp` so a dev/demo home's file vault reaches it.
+    /// Defaults to this process's environment; a host (the live tests) passes its own instead of changing process state.
+    let mcpEnvironment: [String: String]
     /// The engine's ceiling on every turn's profile (`brahma run --profile`): nil runs each turn under its company's profile
     /// for the agent's role (`turnProfile`); a value narrows it, never widens it.
     let profileCeiling: PermissionProfile?
@@ -99,6 +103,10 @@ public actor Orchestrator {
     var lastSweep: [String: Date] = [:]
     /// Company-active time of each company's last deadlock/aging scan.
     var lastLiveness: [String: Double] = [:]
+    /// Companies whose handbook skeleton this engine has ensured since it started.
+    var handbookSkeletons: Set<String> = []
+    /// Company-active time of each company's last handbook refresh (auto pages and the `.brahma/kb` mirror).
+    var lastHandbookRefresh: [String: Double] = [:]
     private var lastPressure: MemoryPressure = .normal
     /// Agents whose last turn failed for infrastructure reasons: not eligible before this time (fixed 15 s).
     var infraCooldown: [String: Date] = [:]
@@ -163,7 +171,8 @@ public actor Orchestrator {
                 stopPollSleep: @escaping @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) },
                 previewDeps: PreviewDependencies? = nil,
                 smokeChecks: SmokeChecks? = nil,
-                releaseDeps: ReleaseDependencies? = nil) {
+                releaseDeps: ReleaseDependencies? = nil,
+                mcpEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
         self.stopPollSleep = stopPollSleep
         let engineBlocking = Blocking()
         self.blocking = engineBlocking
@@ -201,6 +210,7 @@ public actor Orchestrator {
         self.turnExpectations = turnExpectations
         self.store = store; self.runner = runner; self.paths = paths; self.config = config
         self.mcpExecutable = mcpExecutable; self.profileCeiling = profile; self.clock = clock
+        self.mcpEnvironment = mcpEnvironment
         self.sandboxEnvironment = sandboxEnvironment
         self.memory = memory; self.connectivity = connectivity; self.disk = disk; self.exec = exec
         self.claudePath = claudePath
@@ -215,6 +225,9 @@ public actor Orchestrator {
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
         self.checkBaseEnvironment = checkBaseEnvironment
+        // Plan ML: a restore resets every memory cursor (every company's: the whole database was swapped), a full idempotent
+        // re-scan on the next ticks.
+        restoreHooks.register(afterRestore: { _ in try MemoryIngest.resetCursors(store: store) })
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -480,6 +493,8 @@ public actor Orchestrator {
         // Leases: reap the expired ones and killed holders' (removing their worktrees), sweep orphaned worktrees, and hand
         // ready items to idle individual contributors. Nothing here waits on git.
         let reaped = try store.reapLeases(now: now)
+        // Handbook page leases past their active-time expiry, or of killed holders (Plan ML).
+        attempt { try store.reapKBLeases(now: now) }
         leaseMaintenance(now: now, companies: companies, reaped: stopped == nil ? reaped : [], held: held)
         // Test-key uses whose lease or item status no longer carries them are closed (Task 4-wire; injection checks the
         // live lease and status as well).
@@ -507,6 +522,34 @@ public actor Orchestrator {
             guard active - (lastLiveness[c.id] ?? -.infinity) >= Liveness.scanInterval else { continue }
             lastLiveness[c.id] = active
             attempt { try store.sweepLiveness(companyId: c.id, now: now) }
+        }
+
+        // Company memory (Plan ML): new messages, items, asks, decisions, hand-offs and retros are indexed from restore-safe
+        // cursors. Held by the owner's stop (caught up on resume) and while secrets are unloaded (ingest redacts, fail closed).
+        if stopped == nil, !store.secretsHeld {
+            for c in companies { attempt { try MemoryIngest.run(store: store, companyId: c.id, paths: paths, now: now) } }
+        }
+        // The pack's handbook sections, once per company per engine start (companies made before Plan ML get theirs here).
+        for c in companies where !handbookSkeletons.contains(c.id) {
+            do {
+                try store.ensureHandbookSkeleton(companyId: c.id, now: now)
+                handbookSkeletons.insert(c.id)
+            } catch {
+                log("handbook skeleton for \(c.id) failed (retried next tick): \(error)")
+            }
+        }
+
+        // Handbook refresh (Plan ML): every `AutoPages.interval` company-active seconds per company, the engine-rendered pages
+        // and then the agent-readable `.brahma/kb` mirror. Held like ingest: by the owner's stop and while secrets are unloaded
+        // (both redact). A failure leaves an activity line; a link planted in the mirror raises the engine-file alert. The
+        // `.brahma/resources` mirror is swept with it (Task 6c): tampered files are put back from the vault.
+        if !HandbookRefresh.isHeld(stopped: stopped != nil, secretsHeld: store.secretsHeld) {
+            for c in companies {
+                let active = store.activeNow(companyId: c.id)
+                guard HandbookRefresh.isDue(active: active, last: lastHandbookRefresh[c.id]) else { continue }
+                lastHandbookRefresh[c.id] = active
+                HandbookRefresh.run(store: store, company: c, now: now, contentVault: ContentVault(paths: paths))
+            }
         }
 
         // Audits of auto-merges (9c): every waiting sample is routed to an auditor (a cheap read when there is nothing to do).
@@ -1165,7 +1208,8 @@ public actor Orchestrator {
             try store.setTurnMode(turnId: turn.id, decision: mode)
             var request = try turnRequest(
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
-                                                   reviewItem: review?.item.key, audit: audit != nil))
+                                                   reviewItem: review?.item.key, audit: audit != nil,
+                                                   environment: mcpEnvironment))
             // The test keys the holder took with `use_secret` (Task 4-wire): only a work turn on the leased item, applied by the
             // runner after `ChildEnvironment`'s drop step; a plan, review, audit or notice turn gets none. Read after the sandbox
             // gate (a read, nothing consumed), never part of the gated shape.
@@ -1445,7 +1489,7 @@ public actor Orchestrator {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
                                       deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use,
-                                      telemetry: telemetry, now: now)
+                                      telemetry: telemetry, taintHome: paths.home, now: now)
         }
         // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
         // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.
@@ -1699,6 +1743,7 @@ extension Store {
     /// `--session-id`, the role prompt and the orientation), the turn is recorded `failed` with `sessionResetReason`, and the
     /// agent is `ready` again at once: no backoff, `consecutiveFailures` unchanged, the inbox undelivered. Budgets, the watchdog
     /// and facts ignore the turn. `sessionUse`: the session the turn ran in, noted for the next turn's warm and size rules.
+    /// `taintHome`: the data home whose taint flag files the episode's taint reads (nil: the store's own).
     ///
     /// A failure whose error text classifies as network/account is recorded `failed` with `infra = true`: the agent
     /// goes back to `ready` with no backoff, `consecutiveFailures` is unchanged and the inbox stays undelivered.
@@ -1707,7 +1752,7 @@ extension Store {
     @discardableResult
     func endTurn(agentId: String, turn: Turn, end: TurnEnd, deliveredItemIds: [Int64], deliveredNoticeIds: [Int64] = [],
                  sessionReset: SessionScope? = nil, sessionUse: SessionUse? = nil, telemetry: TurnTelemetry = TurnTelemetry(),
-                 now: Date) throws -> InfraClass {
+                 taintHome: URL? = nil, now: Date) throws -> InfraClass {
         try writer.write { db in
             var summary: String?
             var cost: Double?
@@ -1759,6 +1804,23 @@ extension Store {
                                           model: use.model, tools: use.tools, cwd: use.cwd)
             }
             if closed, let cost { try Store.recordSpend(db, cost) }
+            // Plan ML: the turn's episode, before any fresh-session reset (the orchestrator's `clearTaintIfRequested` runs after
+            // this transaction), with the session's taint as it stands now. Never fails the turn end; a failure leaves an
+            // `error` activity line.
+            if closed {
+                EpisodeRecorder.nonFatal(db: db, companyId: agent.companyId, agentId: agentId,
+                                         what: "the episode of @\(agent.name)'s turn", now: now) {
+                    guard let ended = try Turn.fetchOne(db, key: turn.id) else { throw StoreError.notFound }
+                    let taint: String?
+                    // Unreadable: tainted (fail closed).
+                    do { taint = try Store.currentTaint(db: db, agentId: agentId, home: taintHome ?? dataHome) } catch { taint = "session" }
+                    // The turn's item, else the item the agent holds.
+                    let itemKey = try String.fetchOne(db, sql: """
+                        SELECT key FROM workItem WHERE id = COALESCE(?, (SELECT itemId FROM workLease WHERE agentId = ? ORDER BY acquiredAt DESC LIMIT 1))
+                        """, arguments: [ended.itemId, agentId])
+                    try EpisodeRecorder.turnEnded(db: db, turn: ended, agent: agent, itemKey: itemKey, taint: taint, now: now)
+                }
+            }
             var watchdogBlock: Blocker?
             var budgeted = completed
             if case .failed(_, _, let partial) = end, partial != nil { budgeted = true }

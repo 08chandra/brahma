@@ -46,6 +46,15 @@ struct TranscriptCommand: ParsableCommand {
             let data: Data
             do { data = try capture.read(row) } catch { throw fail("cannot read the transcript of turn \(row.turnId.prefix(8)): \(error)") }
             print(safe("== turn \(row.turnId) @\(names[row.agentId] ?? row.agentId.prefix(8).description) session \(row.sessionId) =="))
+            // The app pane's purge notice, word for word (refs only, `[purged F-n]`: never a purged name or path). With --raw
+            // it goes to stderr, so stdout stays the stored JSON lines.
+            do {
+                if let notice = try Replay.transcriptNotice(store: store, companyId: c.id, turnId: row.turnId) {
+                    if raw { FileHandle.standardError.write(Data("brahma: \(safe(notice))\n".utf8)) } else { print(safe(notice)) }
+                }
+            } catch {
+                FileHandle.standardError.write(Data("brahma: could not check whether a purge lists this transcript: \(safe("\(error)"))\n".utf8))
+            }
             var lines = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
             if let tail { lines = Array(lines.suffix(tail)) }
             for line in lines {
@@ -56,30 +65,5 @@ struct TranscriptCommand: ParsableCommand {
     }
 
     /// A readable line for a record: who said what, tool calls by name. Records that carry no conversation print nothing.
-    static func render(_ line: String) -> String? {
-        guard let data = line.data(using: .utf8), let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let type = object["type"] as? String, type == "user" || type == "assistant",
-              let message = object["message"] as? [String: Any] else { return nil }
-        var parts: [String] = []
-        if let text = message["content"] as? String {
-            parts.append(text)
-        } else if let blocks = message["content"] as? [[String: Any]] {
-            for block in blocks {
-                switch block["type"] as? String {
-                case "text": if let text = block["text"] as? String { parts.append(text) }
-                case "tool_use":
-                    let input = (block["input"]).flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) }
-                        .map { String(decoding: $0, as: UTF8.self) } ?? ""
-                    parts.append("[tool_use \(block["name"] as? String ?? "?") \(input.prefix(300))]")
-                case "tool_result":
-                    let body = (block["content"] as? String) ?? (block["content"]).flatMap { try? JSONSerialization.data(withJSONObject: $0) }
-                        .map { String(decoding: $0, as: UTF8.self) } ?? ""
-                    parts.append("[tool_result \(body.prefix(300))]")
-                default: continue
-                }
-            }
-        }
-        guard !parts.isEmpty else { return nil }
-        return "\(type): " + parts.joined(separator: "\n")
-    }
+    static func render(_ line: String) -> String? { TranscriptCapture.renderRecord(line) }
 }

@@ -42,6 +42,8 @@ public struct Snapshot: Equatable, Sendable {
     public var releases = ReleasesSnapshot.empty
     /// Pending `deploy` ask id → its release (the deploy cards).
     public var deployReleases: [String: Release] = [:]
+    /// Selected company's Work › Resources (Plan ML), purged tombstones included.
+    public var resources: [ResourceRow] = []
 
     public static let empty = Snapshot(companies: [], agents: [], channels: [], unreadByChannel: [:], lastTurns: [:], usage: nil)
 
@@ -76,6 +78,7 @@ public struct Snapshot: Equatable, Sendable {
             if let company = summaries.first(where: { $0.id == id })?.company {
                 snap.preview = try PreviewSnapshot.load(store: store, company: company)
                 snap.releases = try ReleasesSnapshot.load(store: store, companyId: id)
+                snap.resources = try ResourcesSnapshot.load(store: store, companyId: id)
                 let deployAsks = Set(snap.work.inbox.filter { $0.kind == .deploy }.map(\.id))
                 if !deployAsks.isEmpty {
                     for r in try store.releases(companyId: id) { if let a = r.askId, deployAsks.contains(a) { snap.deployReleases[a] = r } }

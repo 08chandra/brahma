@@ -1,7 +1,8 @@
 import SwiftUI
 import BrahmaAppModel
 
-/// Bordered `bg2` field with a monospace hint line.
+/// Bordered `bg2` field with a monospace hint line. Files, folders and links dropped on it (and images pasted with ⌘V) wait
+/// as chips above the field; Send commits them with the typed text as one message (`ChatModel.drops`).
 struct Composer: View {
     @Bindable var chat: ChatModel
     @FocusState private var focused: Bool
@@ -32,6 +33,7 @@ struct Composer: View {
                     .clipShape(RoundedRectangle(cornerRadius: BrahmaTheme.radius))
                     .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius).strokeBorder(BrahmaTheme.line, lineWidth: 1))
                 }
+                if let drops = chat.drops, !drops.pending.isEmpty { PendingDropChips(model: drops) }
                 TextField(text: $chat.draft, prompt: Text(verbatim: chat.placeholder), axis: .vertical) { EmptyView() }
                     .lineLimit(1...6)
                     .focused($focused)
@@ -49,7 +51,8 @@ struct Composer: View {
                         chat.acceptMention(first)
                         return .handled
                     }
-                Text(verbatim: "↩ SEND · ⇧↩ NEWLINE · @ MENTION · ⇥ COMPLETE")
+                Text(verbatim: chat.drops == nil ? "↩ SEND · ⇧↩ NEWLINE · @ MENTION · ⇥ COMPLETE"
+                                                 : "↩ SEND · ⇧↩ NEWLINE · @ MENTION · ⇥ COMPLETE · DROP FILES · ⌘V IMAGE")
                     .font(BrahmaTheme.monoTiny)
                     .foregroundStyle(BrahmaTheme.text2)
                     .accessibilityHidden(true)
@@ -61,5 +64,10 @@ struct Composer: View {
         .padding(.horizontal, BrahmaTheme.spaceL)
         .padding(.vertical, BrahmaTheme.spaceS)
         .background(BrahmaTheme.bg1)
+        .resourceDrops(chat.drops, enabled: chat.readOnlyReason == nil) { Task { await chat.send() } }
+        .modifier(PasteImageMonitor(active: focused && chat.drops != nil && chat.readOnlyReason == nil) { png in
+            guard let drops = chat.drops else { return }
+            Task { await drops.addPasteboardImage(png) }
+        })
     }
 }

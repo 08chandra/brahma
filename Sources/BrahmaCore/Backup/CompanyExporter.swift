@@ -98,6 +98,27 @@ public enum CompanyExporter {
                          sqlite: tree.name == "archive", tmpDir: paths.tmpDir, skipped: &skipped)
             copied.append(tree.name)
         }
+        // Plan ML: the handbook as Markdown (the owner's view, redacted). Secrets that cannot be loaded leave it out, named in
+        // `skipped`; the rest of the export goes on.
+        do {
+            try HandbookExporter.export(store: store, companyId: company.id, to: staging.appending(path: "handbook", directoryHint: .isDirectory),
+                                        force: true)
+            copied.append("handbook")
+        } catch {
+            // A partial `handbook/` never travels: when it cannot be removed, the export fails.
+            do {
+                let partial = staging.appending(path: "handbook", directoryHint: .isDirectory)
+                if fm.fileExists(atPath: partial.path) { try fm.removeItem(at: partial) }
+            } catch let cleanup {
+                throw ExportError.failed("the handbook export failed (\(error)) and its partial folder could not be removed: \(cleanup)")
+            }
+            skipped.append("handbook: \(error)")
+        }
+        // Plan ML Task 6c: the company's resources.
+        if try exportResources(store: store, paths: paths, company: company,
+                               to: staging.appending(path: "resources", directoryHint: .isDirectory), skipped: &skipped) {
+            copied.append("resources")
+        }
         let manifest = staging.appending(path: "MANIFEST.json")
         if let companyDir = source(["companies", company.id]), HomeFiles.status(companyDir, "MANIFEST.json").map({ $0.st_mode & S_IFMT == S_IFREG }) == true {
             let input = try HomeFiles.openRead(companyDir, "MANIFEST.json", copySource: true)
@@ -124,6 +145,61 @@ public enum CompanyExporter {
         }
         return ExportResult(directory: destination, database: destination.appending(path: "brahma.sqlite"),
                             bundle: bundleName.map { destination.appending(path: $0) }, copied: copied, skipped: skipped)
+    }
+
+    /// `resources/`: every live file's vault bytes as `F-<n>.<ext>` (read through `ContentVault.read`, so verified against the
+    /// hash recorded when it was added; one that fails is left out and named in `skipped`), and `resources.json` with every
+    /// row's metadata, purged rows as tombstones (no file). Files and the JSON are 0600. False when the company has no
+    /// resources (nothing is written).
+    static func exportResources(store: Store, paths: BrahmaPaths, company: Company, to dir: URL,
+                                skipped: inout [String]) throws -> Bool {
+        let rows = try store.resources(companyId: company.id, reader: .owner, includePurged: true)
+        guard !rows.isEmpty else { return false }
+        try BrahmaPaths.ensurePrivateDirectory(dir)
+        let vault = ContentVault(paths: paths)
+        let refs = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0.ref) })
+        let iso = ISO8601DateFormatter()
+        func write(_ data: Data, _ name: String) throws {
+            guard FileManager.default.createFile(atPath: dir.appending(path: name).path, contents: data,
+                                                 attributes: [.posixPermissions: 0o600]) else {
+                throw ExportError.failed("could not write resources/\(name) in the export")
+            }
+        }
+        var entries: [[String: Any]] = []
+        for r in rows {
+            var e: [String: Any] = [
+                "ref": r.ref, "number": r.number, "kind": r.kind.rawValue, "name": r.displayName, "bytes": r.bytes,
+                "scope": r.scopeId.map { "\(r.scopeKind):\($0)" } ?? r.scopeKind, "futureHolders": r.futureHolders,
+                "provenance": r.provenance, "tainted": r.tainted, "secretScan": r.secretScan.rawValue, "addedVia": r.addedVia,
+                "createdAt": iso.string(from: r.createdAt),
+            ]
+            if let parent = r.parentId { e["parent"] = refs[parent] ?? parent }
+            if let ext = r.ext { e["ext"] = ext }
+            if let kind = r.fileKind { e["fileKind"] = kind }
+            if let sha = r.sha256 { e["sha256"] = sha }
+            if let url = r.url { e["url"] = url }
+            if let readers = r.readerSet { e["readerSet"] = readers.sorted() }
+            if let reason = r.taintReason { e["taintReason"] = reason }
+            if let vouched = r.vouchedAt { e["vouchedAt"] = iso.string(from: vouched) }
+            if let purged = r.purgedAt { e["purgedAt"] = iso.string(from: purged) }
+            if let report = r.purgeReport {
+                // As stored when it does not parse (the engine writes it; the text is kept either way).
+                e["purgeReport"] = (try? JSONSerialization.jsonObject(with: Data(report.utf8))) ?? report
+            }
+            if r.kind == .file, r.purgedAt == nil, let path = r.vaultPath, let sha = r.sha256 {
+                let name = (path as NSString).lastPathComponent
+                do {
+                    let data = try vault.read(companyId: company.id, relativePath: path, expectedSHA256: sha, maxBytes: r.bytes)
+                    try write(data, name)
+                    e["file"] = "resources/\(name)"
+                } catch let error as ResourceError {
+                    skipped.append("resources/\(name): \(error.message); left out")
+                }
+            }
+            entries.append(e)
+        }
+        try write(try JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted, .sortedKeys]), "resources.json")
+        return true
     }
 
     /// Reduces a copy of the database to one company.

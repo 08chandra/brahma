@@ -6,7 +6,7 @@ import BrahmaCore
 public final class AppModel {
     public private(set) var store: Store
     public let paths: BrahmaPaths
-    @ObservationIgnored private let clock: @Sendable () -> Date
+    @ObservationIgnored let clock: @Sendable () -> Date
 
     public private(set) var snapshot: Snapshot = .empty
     public private(set) var loaded = false
@@ -59,6 +59,22 @@ public final class AppModel {
     public var highlightedAskId: String?
     /// The release a launch target selected (`release:<ref>`); Work › Releases opens its inspector until the owner picks a row.
     public var selectedReleaseRef: String?
+    /// The secret store this app was booted with (`Booted.secretVault`; a `MemoryVault` in tests): resource drops scan against
+    /// its values (`Store.knownSecretValues`) and store a dropped file as a secret through it.
+    public let secretVault: any SecretVault
+    /// Where the resource drops keep the owner's advisory acknowledgments (`advisoryAck.<companyId>`): `.standard` in the app.
+    @ObservationIgnored public var dropDefaults: UserDefaults = .standard
+    /// The resource the owner confirmed purging in the library's dialog (`purge(resource:)` refuses any other).
+    public var confirmPurge: String?
+    /// Work › Handbook of the selected company (`ensureHandbook()` makes it; dropped when the company or store changes).
+    public internal(set) var handbook: HandbookModel?
+    /// Work › Budget › STORAGE (`ensureStorage()` makes it; it follows the selected company and keeps its per-company cache).
+    public internal(set) var storage: StorageModel?
+    /// How the storage meter sizes the disk (`LiveFileSizing` in the app; tests inject one that touches nothing).
+    @ObservationIgnored public var storageSizing: any FileSizing = LiveFileSizing()
+    /// The open replay: an agent's day (People › agent inspector › REPLAY) or an item's history (Work › item inspector ›
+    /// HISTORY). Dropped when the company or store changes.
+    public internal(set) var replay: ReplayModel?
 
     /// The agent map of the selected company (live), or the installed demo (`--map-demo`); `ensureMapController()` makes it.
     public private(set) var mapController: MapController?
@@ -93,9 +109,10 @@ public final class AppModel {
     /// Owner notices are planned on every 4th tick (about every 2 s at the default poll).
     static let deliveryEvery = 4
 
-    public init(store: Store, paths: BrahmaPaths, clock: @escaping @Sendable () -> Date = { .now }) {
+    public init(store: Store, paths: BrahmaPaths, secretVault: any SecretVault, clock: @escaping @Sendable () -> Date = { .now }) {
         self.store = store
         self.paths = paths
+        self.secretVault = secretVault
         self.clock = clock
         self.search = SearchModel(store: store)
         self.backups = BackupsModel(store: store, paths: paths)
@@ -184,6 +201,9 @@ public final class AppModel {
             access = AccessModel(store: reopened)
             settings = SettingsModel(store: reopened)
             digest = DigestModel(store: reopened)
+            handbook = nil
+            storage = nil
+            replay = nil
             wireSubmodels()
             snapshot = .empty
             activity = []
@@ -228,6 +248,7 @@ public final class AppModel {
             self.cursor = cursor
             // A live map of another company (one built over a reopened store before this reload) is not this selection's.
             if firstId != selectedCompanyId { dropLiveMapController() }
+            if handbook?.companyId != firstId { handbook = nil }
             selectedCompanyId = firstId
             access.companyId = firstId
             settings.companyId = firstId
@@ -328,11 +349,14 @@ public final class AppModel {
         activity = []
         search.query = ""
         highlightedMessageId = nil
+        handbook = nil
+        replay = nil
         do { try await reloadSelected() } catch { report(error) }
     }
 
     public func select(_ item: SidebarItem) {
         sidebarSelection = item
+        if item == .budget { ensureStorage() }
         let target: ChatTarget?
         switch item {
         case .channel(let id): target = .channel(id: id)
@@ -345,6 +369,7 @@ public final class AppModel {
         }
         if chat?.target == target { return }
         let model = ChatModel(store: store, companyId: companyId, target: target)
+        model.drops = dropContext(for: target).map { ResourceDropModel(app: self, context: $0, defaults: dropDefaults) }
         chat = model
         Task { await model.refresh() }
     }
@@ -363,6 +388,23 @@ public final class AppModel {
         case .digest: select(.inboxDigest)
         case .companySettings: select(.companySettings)
         case .releases: select(.releases)
+        case .resources: select(.resources)
+        case .budget: select(.budget)
+        case .replayAgent(let handle, let day):
+            select(.agents)
+            guard let agent = snapshot.agents.first(where: { $0.name.lowercased() == handle }) else {
+                errorMessage = "No agent @\(handle)"
+                return
+            }
+            selectedAgentId = agent.id
+            openReplay(agentId: agent.id, day: day)
+        case .replayItem(let key):
+            select(.backlog)
+            selectedItemKey = key
+            openReplay(itemKey: key)
+        case .handbook: openHandbook(tab: .pages)
+        case .memory: openHandbook(tab: .memory)
+        case .kb(let path): openHandbook(tab: .pages, page: path)
         case .release(let ref):
             select(.releases)
             selectedReleaseRef = ref
@@ -540,6 +582,8 @@ public final class AppModel {
         if new != snapshot { snapshot = new }
         if let c = mapController, c.companyId == id { c.sync(snapshot: snapshot) }
         ticksSinceSnapshot = 0
+        // The Handbook follows the database only while it is shown (its lists are read on demand, never kept in the snapshot).
+        if sidebarSelection == .handbook, let handbook, handbook.companyId == id { await handbook.refresh() }
     }
 
     func report(_ error: Error) {

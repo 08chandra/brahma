@@ -216,6 +216,32 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
 
     private let devEnv = ["BRAHMA_DEV": "1"]
 
+    /// Plan ML Task 10's seed hooks: `dev drop` (an owner DM drop, scoped to that agent and announced in the DM) and
+    /// `dev autopages` (one auto-page refresh). Both refuse without BRAHMA_DEV=1.
+    @Test func devDropAndAutopagesSeedHooks() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let file = home.appending(path: "drops/standup-notes.txt")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "Standup notes\n".write(to: file, atomically: true, encoding: .utf8)
+
+        let refused = try brahma(["dev", "drop", "Acme", "--dm", "eng-1", file.path], home: home)
+        #expect(refused.status != 0); #expect(refused.stderr.contains("dev commands need BRAHMA_DEV=1"))
+        #expect(try brahma(["dev", "autopages", "Acme"], home: home).status != 0)
+
+        let dropped = try brahma(["dev", "drop", "Acme", "--dm", "eng-1", "--message", "From standup", file.path], home: home, env: devEnv)
+        #expect(dropped.status == 0, "\(dropped.stderr)"); #expect(dropped.stdout == "F-1\n")
+        let list = try brahma(["resource", "Acme", "list"], home: home)
+        #expect(list.stdout.contains("F-1") && list.stdout.contains("@eng-1"), "\(list.stdout)")
+        let dm = try brahma(["log", "Acme", "@eng-1"], home: home)
+        #expect(dm.stdout.contains("From standup"), "\(dm.stdout)")
+
+        let first = try brahma(["dev", "autopages", "Acme"], home: home, env: devEnv)
+        #expect(first.status == 0, "\(first.stderr)"); #expect(first.stdout.contains("Company/Roster"))
+        #expect(try brahma(["dev", "autopages", "Acme"], home: home, env: devEnv).stdout == "no auto page changed\n")
+    }
+
     @Test func inboxApproveAnswerRescindFlow() throws {
         // Covers propose, decide, approve, answer, replan and autonomy (rescind is in rescindFlow).
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }

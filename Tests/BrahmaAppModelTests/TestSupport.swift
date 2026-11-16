@@ -1,5 +1,6 @@
 import Foundation
 import BrahmaCore
+import BrahmaAppModel
 import BrahmaKeychain
 
 /// Any Keychain call in this process crashes instead of prompting the owner (see the BrahmaCoreTests twin).
@@ -37,6 +38,13 @@ func seedAcme(_ s: Store, _ p: BrahmaPaths) throws -> (Company, ceo: Agent, cto:
     let engBlocked = try s.transition(agentId: eng.id, to: .blocked, blocker: .owner(reason: "key"))
     _ = try s.createCompany(name: "Globex", goal: "Other", workspacesRoot: p.workspaces)
     return (acme, ceoReady, cto, engBlocked)
+}
+
+extension AppModel {
+    /// The test `AppModel`: its secret store is a `MemoryVault` (no test touches the Keychain).
+    convenience init(store: Store, paths: BrahmaPaths, clock: @escaping @Sendable () -> Date = { .now }) {
+        self.init(store: store, paths: paths, secretVault: MemoryVault(), clock: clock)
+    }
 }
 
 @MainActor

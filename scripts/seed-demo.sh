@@ -91,8 +91,50 @@ git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgs
 "$B" main accept Initech >/dev/null
 "$B" hosting set Initech --provider cloudflare-pages --project initech-demo --account-id 0123456789abcdef0123456789abcdef >/dev/null
 
+# Plan ML: Work › Resources — a note (FROM YOU), a PDF from outside (EXTERNAL, scoped to the engineering team) and a link.
+D="$(mktemp -d)"
+printf '# Habit tracker brand notes\n\nColors: teal and slate. Tone: calm, encouraging.\n' >"$D/brand-notes.md"
+printf '%%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%%%EOF\n' >"$D/competitor-review.pdf"
+"$B" resource Initech add "$D/brand-notes.md" >/dev/null
+"$B" resource Initech add "$D/competitor-review.pdf" --scope team:engineering >/dev/null
+"$B" resource Initech link "https://example.com/habit-research" >/dev/null
+rm -rf "$D"
+
+# Plan ML Task 8: the Handbook and memory. @cto owns INITE-4 and writes two Engineering pages through kb_write (one with an
+# executives-only section, both linking back to kb:Engineering); @eng-1 remembers the checkout port twice under one key (the
+# second contradicts the first) and, after reading a web page, a tainted fact. `dev tool` calls the agent tool directly.
+"$B" items add Initech --type task --title "Checkout flow" --owner cto --description "Cart, payment and confirmation" >/dev/null
+"$B" say Initech '#general' "The checkout page needs a retry when a payment fails" >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech kb_write --by cto --args '{"path":"Engineering/Environments","item":"INITE-4","body":"# Environments\n\nStaging and production for the habit tracker. Conventions live in [[Engineering]]; the checkout service is described in [[Engineering/Checkout service]].\n\n## Staging\n\nDeploys from main on every merge.\n\n## Credentials policy [restricted]\n\nKeys rotate monthly; only executives hold production keys.\n"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech kb_write --by cto --args '{"path":"Engineering/Checkout service","item":"INITE-4","release":true,"body":"# Checkout service\n\nHandles checkout for the premium plan. Environments: [[Engineering/Environments]]. Conventions: [[Engineering]].\n"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --args '{"fact":"The checkout service listens on port 4417 in staging","key":"checkout.port","scope":"company"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --args '{"fact":"The checkout service listens on port 4418 in staging","key":"checkout.port","scope":"company"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --taint "web page docs.stripe.com" --args '{"fact":"Stripe test cards start with 4242","key":"stripe.testcard"}' >/dev/null
+
+# Plan ML Task 9: Replay — @eng-1 finishes a turn on INITE-3 (a Bash and a Read call, a captured transcript), posts in
+# #general and comments on the item; the owner DMs it. `dev turn` records the turn and captures its transcript as a real one.
+BRAHMA_DEV=1 "$B" dev turn Initech --by eng-1 --summary "Added the reminder scheduler; one test still flaky" \
+  --prompt "Work on INITE-3: reminders fire twice" --say "Reading the scheduler first." \
+  --say "The timer was registered on every launch; registering it once fixes the duplicate." --tool Read --tool Bash >/dev/null
+"$B" say Initech @eng-1 "Is the duplicate reminder fixed?" >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech comment_work_item --by eng-1 --args '{"key":"INITE-3","text":"Scheduler registers once now; checking the flaky test."}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech post_message --by eng-1 --args '{"channel":"general","text":"Reminder fix is up for INITE-3."}' >/dev/null
+
+# Plan ML Task 10: a research page written after reading the web (TAINTED, via `dev tool --taint`; @cto's session is
+# tainted from here on, so it writes nothing else below), and the owner's DM drop to @eng-1 (scoped to @eng-1 alone and
+# announced in the DM, as the app's DM drop zone does; the CLI's `resource add` has no conversation, hence `dev drop`).
+BRAHMA_DEV=1 "$B" dev tool Initech kb_write --by cto --taint "web page example.com/habit-apps" --args '{"path":"Research/Competitors","item":"INITE-4","release":true,"body":"# Competitors\n\nThree habit apps lead the store: Streaks, Habitica and Loop. All three have daily streaks; none sends a weekly summary.\n"}' >/dev/null
+D="$(mktemp -d)"
+printf 'Standup notes for @eng-1\n\n- Reminder bug: the timer registers on every launch.\n- Pair with QA on the flaky test.\n' >"$D/standup-notes.txt"
+BRAHMA_DEV=1 "$B" dev drop Initech --dm eng-1 --message "Notes from this morning's standup" "$D/standup-notes.txt" >/dev/null
+rm -rf "$D"
+
 # Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
 # folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.
 if [ "${BRAHMA_DEV:-}" = "1" ]; then
   "$B" dev release-scenario Initech --item INITE-2 --expect-text "Habit tracker" >/dev/null
 fi
+
+# Plan ML Task 10: one auto-page refresh now (the engine does it every 60 active seconds), so the generated pages (roster,
+# org chart, release history, sprint summaries, decisions log) reflect everything seeded above.
+BRAHMA_DEV=1 "$B" dev autopages Initech >/dev/null

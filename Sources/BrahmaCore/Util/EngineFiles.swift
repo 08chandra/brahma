@@ -705,6 +705,124 @@ public enum EngineFiles {
 
     private static let maxRemovalDepth = 512
 
+    // MARK: Clearing what must not stay readable
+
+    /// What `clear` came to.
+    public enum Clearance: Equatable, Sendable {
+        /// Nothing is left (or nothing was there).
+        case removed
+        /// Something could not be removed, but every regular file left in it is empty.
+        case emptied
+        /// Something with content is left, or could not be inspected: why.
+        case failed(String)
+    }
+
+    /// The prefix `removeEntry` gives a directory it is removing: a leftover with it is the remains of a removal that failed.
+    static let removingPrefix = ".brahma-removing-"
+
+    /// Removes `name` (when given) from `<workspace>/<relative>` and every leftover of an earlier removal there
+    /// (`.brahma-removing-*`). When a removal fails part-way (an agent made a directory unwritable, say), what is left is made
+    /// inert and the removal is tried again: through descriptors only, never following a link, each directory of this user
+    /// gets its owner's `rwx` back (`fchmodat(AT_SYMLINK_NOFOLLOW)` in its parent, then `fchmod` on the opened directory), and
+    /// each regular file with a single link that this user owns is truncated to zero bytes (opened `O_NOFOLLOW`, checked to
+    /// be the same file). A file with another hard link or of another user is never written (it may be an owner file): only
+    /// its name is removed. Throws `UnsafeEngineFile` when the directory itself cannot be opened safely.
+    public static func clear(workspace: URL, dir relative: String, name: String?) throws -> Clearance {
+        let dfd = try openDirectory(workspace: workspace, relative)
+        defer { close(dfd) }
+        let base = logical(workspace, relative)
+        if let name {
+            try checkName(name, base.appending(path: name).path)
+            // A failure here is handled below: what is left (under `name` or a `.brahma-removing-*` name) is cleared.
+            do { try removeEntry(dfd: dfd, name: name, shown: base.appending(path: name).path) } catch {}
+        }
+        var targets: [String] = []
+        if let name, exists(dfd, name) { targets.append(name) }
+        targets += try entryNames(fd: dfd, shown: base.path).filter { $0.hasPrefix(removingPrefix) }.sorted()
+        var worst = Clearance.removed
+        for target in targets {
+            let shown = base.appending(path: target).path
+            do {
+                try removeTree(dfd: dfd, name: target, shown: shown, depth: 0)
+                if !exists(dfd, target) { continue }
+            } catch {
+                // Made inert and tried again below; `residue` says what, if anything, stays readable.
+            }
+            makeInert(dfd: dfd, name: target, depth: 0)
+            do {
+                try removeTree(dfd: dfd, name: target, shown: shown, depth: 0)
+                if !exists(dfd, target) { continue }
+            } catch {
+                // Reported through `residue`.
+            }
+            if let why = residue(dfd: dfd, name: target, shown: shown, depth: 0) {
+                worst = .failed(why)
+            } else if worst == .removed {
+                worst = .emptied
+            }
+        }
+        return worst
+    }
+
+    private static func exists(_ dfd: Int32, _ name: String) -> Bool {
+        var st = stat()
+        return fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0
+    }
+
+    /// Makes `name` in `dfd` removable and empty: see `clear`. Best effort: what it cannot do, `residue` reports.
+    private static func makeInert(dfd: Int32, name: String, depth: Int) {
+        guard depth < maxRemovalDepth else { return }
+        var st = stat()
+        guard fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0, st.st_uid == getuid() else { return }
+        switch st.st_mode & S_IFMT {
+        case S_IFDIR:
+            if st.st_mode & 0o700 != 0o700 { _ = fchmodat(dfd, name, (st.st_mode & 0o7777) | 0o700, AT_SYMLINK_NOFOLLOW) }
+            let fd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { return }
+            defer { close(fd) }
+            var opened = stat()
+            guard fstat(fd, &opened) == 0, opened.st_dev == st.st_dev, opened.st_ino == st.st_ino else { return }
+            if opened.st_mode & 0o700 != 0o700 { _ = fchmod(fd, (opened.st_mode & 0o7777) | 0o700) }
+            let names: [String]
+            do { names = try entryNames(fd: fd, shown: "") } catch { return }   // `residue` reports it
+            for child in names { makeInert(dfd: fd, name: child, depth: depth + 1) }
+        case S_IFREG:
+            guard st.st_nlink == 1, st.st_size > 0 else { return }
+            if st.st_mode & 0o200 == 0 { _ = fchmodat(dfd, name, (st.st_mode & 0o7777) | 0o200, AT_SYMLINK_NOFOLLOW) }
+            let fd = openat(dfd, name, O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { return }
+            defer { close(fd) }
+            var opened = stat()
+            guard fstat(fd, &opened) == 0, opened.st_mode & S_IFMT == S_IFREG, opened.st_dev == st.st_dev,
+                  opened.st_ino == st.st_ino, opened.st_nlink == 1, opened.st_uid == getuid() else { return }
+            _ = ftruncate(fd, 0)
+        default:
+            return
+        }
+    }
+
+    /// Why what is left of `name` may still be readable (a regular file with bytes, something that cannot be inspected or
+    /// listed), or nil when nothing with content is left.
+    private static func residue(dfd: Int32, name: String, shown: String, depth: Int) -> String? {
+        var st = stat()
+        guard fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return errno == ENOENT ? nil : "\(shown) cannot be inspected" }
+        switch st.st_mode & S_IFMT {
+        case S_IFREG: return st.st_size > 0 ? "\(shown) still holds \(st.st_size) bytes" : nil
+        case S_IFDIR:
+            guard depth < maxRemovalDepth else { return "\(shown) is nested too deeply" }
+            let fd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { return "\(shown) cannot be opened" }
+            defer { close(fd) }
+            let names: [String]
+            do { names = try entryNames(fd: fd, shown: shown) } catch { return "\(shown) cannot be listed" }
+            for child in names {
+                if let why = residue(dfd: fd, name: child, shown: shown + "/" + child, depth: depth + 1) { return why }
+            }
+            return nil
+        default: return nil
+        }
+    }
+
     /// Removes `name` from `dfd`: a real directory is emptied through its own descriptor and then removed; anything else
     /// (a link included) is unlinked.
     private static func removeTree(dfd: Int32, name: String, shown: String, depth: Int) throws {
@@ -749,18 +867,8 @@ public enum EngineFiles {
     /// The names in the directory open at `fd` (without `.` and `..`), at most `limit` of them, read through a fresh
     /// descriptor of it.
     private static func entryNames(fd: Int32, shown: String, limit: Int = .max) throws -> [String] {
-        let own = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard own >= 0, let dir = fdopendir(own) else {
-            if own >= 0 { close(own) }
+        guard let names = DirectoryListing.names(fd: fd, limit: limit) else {
             throw UnsafeEngineFile(path: shown, problem: "cannot be listed")
-        }
-        defer { closedir(dir) }
-        var names: [String] = []
-        while names.count < limit, let entry = readdir(dir) {
-            let name = withUnsafePointer(to: &entry.pointee.d_name) {
-                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
-            }
-            if name != "." && name != ".." { names.append(name) }
         }
         return names
     }

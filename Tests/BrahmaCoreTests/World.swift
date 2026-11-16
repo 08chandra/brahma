@@ -76,7 +76,7 @@ struct World {
          canSeeSandboxes: @escaping @Sendable () -> Bool = { true }, sandboxCanary: SandboxCanaryGate? = nil,
          stopObservers: [any EmergencyStopObserver] = [], previewDeps: PreviewDependencies = .fake(),
          smokeSandbox: FakeSandbox = FakeSandbox(), smokeUnsandboxed: FakeSandbox = FakeSandbox(),
-         releaseDeps: ReleaseDependencies = .fake()) throws {
+         releaseDeps: ReleaseDependencies = .fake(), mcpEnvironment: [String: String]? = nil) throws {
         self.store = try store ?? Store.inMemory()
         try self.store.setPlanTier(.max20x)   // Plan 1 tests assume the 2/6/16 mode caps
         router = MessageRouter(store: self.store)
@@ -98,7 +98,8 @@ struct World {
                                     stopPollSleep: stopPoll.sleep, previewDeps: previewDeps,
                                     smokeChecks: SmokeChecks(sandbox: smokeSandbox, unsandboxed: smokeUnsandboxed, paths: worldPaths,
                                                              environment: checkEnvironment ?? ProcessInfo.processInfo.environment),
-                                    releaseDeps: releaseDeps)
+                                    releaseDeps: releaseDeps,
+                                    mcpEnvironment: mcpEnvironment ?? ProcessInfo.processInfo.environment)
     }
 
     static func config(hardCap: Int = 16, turnBudget: Int = 30) -> SchedulerConfig {

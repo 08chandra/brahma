@@ -168,6 +168,7 @@ extension Store {
         if lease != nil {
             try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id])
             try Store.endSecretUses(db: db, itemId: item.id, now: now)
+            try Store.releaseKBLeases(db: db, itemId: item.id)
         }
 
         try recordItemEvent(db: db, item: item, actor: "system", kind: .statusChanged,

@@ -319,6 +319,190 @@ struct LiveSmokeTests {
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
 
+    // MARK: Plan ML Task 10 — memory end to end
+
+    /// The running sum of `turn.costLE` at which `memoryEndToEnd` stops everything and fails.
+    static let memoryCostAbortLE = 3.0
+
+    /// Plan ML Task 10: a fact travels from a company resource into an agent's memory and the handbook, and survives a fresh
+    /// session through `recall`. Real haiku turns, tier max5x, Balanced; the store is in-process with `MemoryVault()` for every
+    /// vault argument (the turns' `brahma mcp` children read the temp home's file vault through the engine's `mcpEnvironment`,
+    /// never a Keychain). Aborts at `memoryCostAbortLE` of `costLE`; on a timeout or an abort the engine is stopped and its
+    /// in-flight turns cancelled first.
+    /// `BRAHMA_LIVE=1 DEVELOPER_DIR=… timeout 900 swift test --filter LiveSmokeTests/memoryEndToEnd`.
+    @Test(.timeLimit(.minutes(6)))
+    func memoryEndToEnd() async throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        try store.setPlanTier(.max5x)
+        let secretVault = MemoryVault()
+        let mcp = try brahmaExecutable()
+
+        var company = try store.createCompany(name: "Mem", goal: "Keep the team's facts findable.", workspacesRoot: paths.workspaces)
+        company.usageMode = .balanced
+        company.ownerReserve = -1   // weekly pacing depends on the real account's usage; off for this test
+        try store.updateCompany(company)
+        // No sandbox-canary probes in a temp home, so Sandboxed turns could not start: Workspace, as in `goalToLiveURL`.
+        let userHome = root.appending(path: "user", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        try store.updateSandbox(companyId: company.id, SandboxPatch(profile: .workspace), userHome: userHome)
+        let companyId = company.id
+
+        // 1. Hires.
+        let eng = try store.hire(companyId: companyId, name: "eng", role: "engineer", model: "haiku")
+        let eng2 = try store.hire(companyId: companyId, name: "eng2", role: "engineer", model: "haiku")
+
+        // 2. The owner's company resource and the item.
+        let drops = root.appending(path: "Downloads", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: drops, withIntermediateDirectories: true)
+        let notes = drops.appending(path: "notes.md")
+        try Data("# Team notes\n\nThe staging port is 4417.\n".utf8).write(to: notes)
+        let plan = try ResourceIntake.inspect(urls: [notes], knownValues: [], agentAreas: .none)
+        try #require(plan.refusals.isEmpty && plan.items.count == 1, "plan: \(plan.refusals)")
+        let added = try store.addResources(companyId: companyId, plan: plan, drop: ResourceDrop(), contentVault: ContentVault(paths: paths),
+                                           secretVault: secretVault, knownValues: [], paths: paths)
+        let resource = try #require(added.first)
+        #expect(resource.number == 1 && !resource.tainted, "resource: F-\(resource.number) tainted \(resource.tainted)")
+        let item = try store.createWorkItem(companyId: companyId, by: .owner, draft: WorkItemDraft(
+            type: "task", title: "Record the staging port", ownerId: eng.id))
+        try #require(item.key == "MEM-1", "item key \(item.key)")
+
+        // 3. The first DM.
+        let router = MessageRouter(store: store)
+        let firstDM = try router.sendDM(companyId: companyId, from: .owner, to: "eng", text:
+            "Find the staging port in the company resources, remember it with key staging.port, then record it on kb:Engineering/Environments for MEM-1 with kb_write.")
+
+        // The turns' `brahma mcp` children read the temp home's file vault (never a Keychain): the choice rides in each turn's
+        // MCP config through `mcpEnvironment`, not in this process's environment, so a parallel test cannot change it.
+        let orchestrator = Orchestrator(store: store, runner: ClaudeProcessRunner(maxTurnDuration: .seconds(150)), paths: paths,
+                                        mcpExecutable: mcp, vault: secretVault,
+                                        mcpEnvironment: [SecretStore.environmentVariable: "file"])
+        try await orchestrator.start()
+        let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
+        let started = Date()
+        let deadline = AwakeTime.now + .seconds(320)
+
+        func spentLE() throws -> Double {
+            try store.writer.read { db in
+                try Double.fetchOne(db, sql: "SELECT COALESCE(SUM(costLE), 0) FROM turn WHERE companyId = ?", arguments: [companyId]) ?? 0
+            }
+        }
+        /// Polls `done` every 2 s; nil when it held, else why it stopped waiting (the deadline or the cost abort).
+        func waitFor(_ what: String, _ done: () throws -> Bool) async throws -> String? {
+            while AwakeTime.now < deadline {
+                if try done() { print("MEMORY \(what) at +\(Int(Date().timeIntervalSince(started))) s"); return nil }
+                let spent = try spentLE()
+                if spent > Self.memoryCostAbortLE { return String(format: "cost abort at $%.2f LE waiting for %@", spent, what) }
+                try await Task.sleep(for: .seconds(2))
+            }
+            return "timed out waiting for \(what)"
+        }
+        func engIdle() throws -> Bool {
+            try store.writer.read { db in
+                try Turn.filter(Column("agentId") == eng.id && Column("outcome") == TurnOutcome.inProgress.rawValue).fetchCount(db) == 0
+            }
+        }
+        let freshReason = "live test: a fresh session must recall the port"
+        /// A time as the database stores it (milliseconds, `Store.now()`): rows read back carry that precision, so an in-memory
+        /// `Date.now` must be cut the same way before comparing (the first fix-round live run failed on a sub-ms difference).
+        func stored(_ date: Date) -> Date { Date.fromDatabaseValue(date.databaseValue) ?? date }
+        /// eng's DM to the owner holding 4417, posted at or after `asked`.
+        func reply(after asked: Message) throws -> Message? {
+            guard let dm = try store.channel(companyId: companyId, name: "dm:eng:owner") else { return nil }
+            return try store.messages(channelId: dm.id, limit: 50).first {
+                $0.senderId == eng.id && $0.createdAt >= stored(asked.createdAt) && $0.text.contains("4417")
+            }
+        }
+        var secondDM: Message?
+
+        let failure: String?
+        do {
+            failure = try await withTaskCancellationHandler {
+                // 4. Until the fact is remembered and the page holds the port.
+                if let why = try await waitFor("staging.port remembered and recorded on the page", {
+                    let remembered = try store.writer.read { db in
+                        try MemoryEntry.filter(Column("companyId") == companyId && Column("key") == "staging.port").fetchCount(db) > 0
+                    }
+                    let page = try store.kbRead(companyId: companyId, reader: .owner, path: "Engineering/Environments")
+                    return remembered && (page?.text.contains("4417") ?? false)
+                }) { return why }
+                if let why = try await waitFor("eng idle", engIdle) { return why }
+                // 5. A fresh session, then the question.
+                try store.forceFreshSession(agentId: eng.id, itemId: nil, reason: freshReason)
+                let asked = try router.sendDM(companyId: companyId, from: .owner, to: "eng",
+                                              text: "What is the staging port? Use recall and reply to me.")
+                secondDM = asked
+                // 6. Until the owner's DM holds the answer.
+                return try await waitFor("the reply holding 4417", { try reply(after: asked) != nil })
+            } onCancel: {
+                loop.cancel()
+            }
+        } catch {
+            _ = try? store.emergencyStop(note: "memoryEndToEnd: \(error)", by: "owner", now: Store.now())
+            loop.cancel()
+            _ = await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value })
+            _ = LiveRunMonitor.killLeftovers(store: store, root: root)
+            throw error
+        }
+
+        let dump = { (try? store.events(afterId: 0).map(\.text).joined(separator: "\n")) ?? "" }
+        if let failure {
+            // Cancel the in-flight turns before failing: the engine stops admitting and cancels what runs, then its task ends.
+            _ = try? store.emergencyStop(note: "memoryEndToEnd: \(failure)", by: "owner", now: Store.now())
+            loop.cancel()
+            let stopped = await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value })
+            let killed = LiveRunMonitor.killLeftovers(store: store, root: root)
+            Issue.record("\(failure) (engine stopped \(stopped); signalled \(killed)); spent $\(String(format: "%.2f", (try? spentLE()) ?? -1)) LE. Events:\n\(dump())")
+            return
+        }
+        // Let the reply's turn finish its bookkeeping, then stop the engine (cancels and awaits in-flight turns).
+        _ = try? await waitFor("eng idle after the reply", engIdle)
+        loop.cancel()
+        #expect(await LiveRunMonitor.bounded(Self.engineStopWait, { await loop.value }), "the engine did not stop")
+        try MemoryIngest.run(store: store, companyId: companyId, paths: paths, now: Store.now())
+
+        // The fresh session answered: the turn of eng carrying the reason posted the reply. (Its start is not compared with the
+        // question's time: the engine may admit it in the same millisecond the DM commits.)
+        let turns = try await store.writer.read { db in
+            try Turn.filter(Column("companyId") == companyId).order(Column("startedAt")).fetchAll(db)
+        }
+        if let asked = secondDM {
+            let fresh = turns.first { $0.agentId == eng.id && $0.freshSessionReason == freshReason }
+            let answer = try reply(after: asked)
+            #expect(fresh != nil, "no fresh-session turn: \(turns.map { "\($0.kind) \($0.freshSessionReason ?? "-")" })")
+            if let fresh, let answer {
+                #expect(answer.createdAt >= fresh.startedAt && answer.createdAt <= (fresh.endedAt ?? .distantFuture),
+                        "the reply was not posted during the fresh-session turn")
+            }
+        }
+        // No LLM turn ran other than eng's work and notice turns.
+        let others = turns.filter { $0.agentId != eng.id || !($0.kind == .work || $0.kind == .notice) }
+        #expect(others.isEmpty, "other turns: \(others.map { "\($0.agentId == eng2.id ? "eng2" : $0.agentId) \($0.kind)" })")
+        print(String(format: "MEMORY spent $%.4f LE over %d turn(s)", try spentLE(), turns.count))
+
+        // eng2 finds the page and F-1, never the owner's DMs to eng.
+        let hits = try MemoryIndex(store: store).search(companyId: companyId, scope: .agent(eng2.id), query: "staging port",
+                                                        limit: MemoryPolicy.maxHits, now: Store.now())
+        let shown = hits.map { "\($0.source) \($0.ref)" }
+        #expect(hits.contains { $0.source == .kb && $0.ref.hasPrefix("kb:Engineering/Environments") }, "eng2 hits: \(shown)")
+        #expect(hits.contains { $0.ref == "F-1" }, "eng2 hits: \(shown)")
+        let dmIds = [firstDM.id] + (secondDM.map { [$0.id] } ?? [])
+        let dmDocs = try await store.writer.read { db in
+            try Int64.fetchAll(db, sql: """
+                SELECT id FROM memoryDoc WHERE companyId = ? AND source = 'message' AND sourceId IN (\(dmIds.map { _ in "?" }.joined(separator: ",")))
+                """, arguments: StatementArguments([companyId] + dmIds))
+        }
+        #expect(!dmDocs.isEmpty, "the owner's DM was never indexed, so the check below proves nothing")
+        #expect(!hits.contains { dmDocs.contains($0.docId) }, "eng2 got the owner's DM to eng: \(shown)")
+        #expect(!hits.contains { ($0.snippet ?? "").contains("remember it with key") || $0.title.contains("remember it with key") })
+
+        #expect(await orchestrator.runningCount() == 0)
+        #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
+    }
+
     // MARK: Plan L Task 15 — goal → live URL
 
     /// The running sum of `turn.costUSD` at which the live test stops everything and fails ("cost abort").
@@ -377,14 +561,10 @@ struct LiveSmokeTests {
         // and each phase line flushes: the first live rerun showed nothing at all until the process ended).
         setvbuf(stdout, nil, _IOLBF, 0)
         // The turns' `brahma mcp` processes resolve their own vault for this temp home: with the file store they load the same
-        // secrets as the engine (`MCPConfig` passes `BRAHMA_SECRET_STORE=file` on). Without it they looked in the platform
-        // vault, found no value for the hosting token and refused every tool call ("secrets are not loaded yet"): the first
-        // live run stalled there. Never the Keychain; refused by the vault for the default home.
-        let previousStore = ProcessInfo.processInfo.environment[SecretStore.environmentVariable]
-        setenv(SecretStore.environmentVariable, "file", 1)
-        defer {
-            if let previousStore { setenv(SecretStore.environmentVariable, previousStore, 1) } else { unsetenv(SecretStore.environmentVariable) }
-        }
+        // secrets as the engine. Without it they looked in the platform vault, found no value for the hosting token and refused
+        // every tool call ("secrets are not loaded yet"): the first live run stalled there. The choice reaches them through the
+        // engine's `mcpEnvironment` (written into each turn's MCP config), never through this process's environment, so a
+        // parallel test cannot see or undo it. Never the Keychain; refused by the vault for the default home.
         let monitor = LiveRunMonitor()
         print("FAKE HOST: this run does not prove a Cloudflare or Vercel deploy (dev host on loopback; see `brahma hosting probe`)")
         let root = try tempDir()
@@ -454,7 +634,8 @@ struct LiveSmokeTests {
         let platform = SandboxRunners.platformDefault(baseline: { Orchestrator.checkBaseline(store: store, paths: paths) }, proxies: proxies)
         let releaseDeps = ReleaseDependencies(sandbox: DevHostSandbox(base: platform, hostDir: hostDir), http: URLSessionHTTPProbe(),
                                               adapters: { _ in adapter })
-        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps)
+        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps,
+                                        mcpEnvironment: [SecretStore.environmentVariable: "file"])
         monitor.set(phase: "engine start")
         try await orchestrator.start()
         let loop = Task { await orchestrator.runForever(interval: .seconds(2)) }

@@ -643,6 +643,7 @@ enum Migrations {
         registerPlan5(&m)
         registerPlanL(&m)
         registerPlan4b(&m)
+        registerPlanML(&m)
         return m
     }
 
@@ -1264,6 +1265,235 @@ enum Migrations {
                 throw MigrationRefused("orgVacancy has duplicate handles: " + duplicates.joined(separator: ", "))
             }
             try db.create(index: "orgVacancy_company_handle", on: "orgVacancy", columns: ["companyId", "handle"], unique: true)
+        }
+    }
+
+    /// Plan ML migrations: registered after every Plan 4b migration, never inside an earlier plan's function, in landing order
+    /// vML-memory, vML-ingest, vML-remember, vML-kb, vML-sprint-closer, vML-resources. Never edit an earlier one.
+    static func registerPlanML(_ m: inout DatabaseMigrator) {
+        m.registerMigration("vML-memory") { db in
+            // Plan ML Task 1: one scoped company-memory index over every source. The INTEGER key keeps the FTS rowids stable
+            // across `VACUUM` (a TEXT key's implicit rowid may be renumbered). `readerSet`: a JSON array of agent ids (NULL:
+            // follow the access class); `restrictions`: a JSON `[[role]]`, every element of which must be satisfied.
+            try db.create(table: "memoryDoc") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("source", .text).notNull()
+                t.column("sourceId", .text).notNull()
+                t.column("ref", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("accessKind", .text).notNull()
+                t.column("accessId", .text)
+                t.column("readerSet", .text)
+                t.column("futureHolders", .boolean).notNull().defaults(to: false)
+                t.column("sensitivity", .text).notNull().defaults(to: "normal")
+                t.column("restrictions", .text).notNull().defaults(to: "[]")
+                t.column("provenance", .text).notNull()
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("weight", .double).notNull().defaults(to: 1.0)
+                t.column("authorId", .text)
+                t.column("itemId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.column("lastRecalledAt", .datetime)
+                t.column("expiresActive", .double)
+                t.column("removedAt", .datetime)
+                t.uniqueKey(["companyId", "source", "sourceId"])
+            }
+            try db.create(index: "memoryDoc_access", on: "memoryDoc", columns: ["companyId", "accessKind", "accessId"])
+            try db.create(index: "memoryDoc_ref", on: "memoryDoc", columns: ["companyId", "ref"])
+            // External content: the triggers keep it current. A delete must pass the old values ('delete' form); a doc is
+            // therefore only ever upserted (`ON CONFLICT … DO UPDATE`), never `INSERT OR REPLACE`d, which skips `memoryDoc_ad`.
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE memoryFts USING fts5(title, body, content='memoryDoc', content_rowid='id',
+                    tokenize='unicode61 remove_diacritics 2')
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER memoryDoc_ai AFTER INSERT ON memoryDoc BEGIN INSERT INTO memoryFts(rowid,title,body) VALUES(new.id,new.title,new.body); END;
+                CREATE TRIGGER memoryDoc_ad AFTER DELETE ON memoryDoc BEGIN INSERT INTO memoryFts(memoryFts,rowid,title,body) VALUES('delete',old.id,old.title,old.body); END;
+                CREATE TRIGGER memoryDoc_au AFTER UPDATE OF title, body ON memoryDoc BEGIN
+                  INSERT INTO memoryFts(memoryFts,rowid,title,body) VALUES('delete',old.id,old.title,old.body);
+                  INSERT INTO memoryFts(rowid,title,body) VALUES(new.id,new.title,new.body); END;
+                """)
+            // Where each source's tick ingest left off (Task 2).
+            try db.create(table: "memoryCursor") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("source", .text).notNull()
+                t.column("position", .text).notNull()
+                t.primaryKey(["companyId", "source"])
+            }
+            // Remembered facts and episodes (Tasks 2–3), shown as `mem:<n>`.
+            try db.create(table: "memoryEntry") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("kind", .text).notNull()
+                t.column("type", .text).notNull()
+                t.column("key", .text)
+                t.column("fact", .text).notNull()
+                t.column("factHash", .text).notNull()
+                t.column("accessKind", .text).notNull()
+                t.column("accessId", .text)
+                t.column("confidence", .double).notNull().defaults(to: 0.7)
+                t.column("confirmations", .integer).notNull().defaults(to: 0)
+                t.column("authorId", .text).notNull()
+                t.column("itemId", .text)
+                t.column("turnId", .text)
+                t.column("provenance", .text).notNull()
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("contradictsId", .text)
+                t.column("contradictedById", .text)
+                t.column("inheritedFromId", .text)
+                t.column("expiresActive", .double)
+                t.column("createdAt", .datetime).notNull()
+                t.column("confirmedAt", .datetime)
+                t.column("removedAt", .datetime)
+                t.column("purgedAt", .datetime)
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "memoryEntry_access", on: "memoryEntry", columns: ["companyId", "accessKind", "accessId", "key"])
+            // Who read which doc, and how (`search|recall|kb_read`): written by Tasks 3–4, read by purge (6c).
+            try db.create(table: "memoryRead") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("docId", .integer).notNull()
+                t.column("agentId", .text).notNull()
+                t.column("turnId", .text)
+                t.column("via", .text).notNull()
+                t.column("readAt", .datetime).notNull()
+            }
+            try db.create(index: "memoryRead_doc", on: "memoryRead", columns: ["companyId", "docId"])
+        }
+        m.registerMigration("vML-ingest") { db in
+            // Plan ML Task 2: the message cursor reads `(createdAt, id) > cursor` per company on every tick; without this index
+            // that is a scan of every message.
+            try db.create(index: "message_company_created", on: "message", columns: ["companyId", "createdAt", "id"], ifNotExists: true)
+        }
+        m.registerMigration("vML-remember") { db in
+            // Plan ML Task 3: `remember` is limited per agent per active hour, so each entry records the company-active second it
+            // was created at (durations use active time, never wall-clock differences).
+            try db.alter(table: "memoryEntry") { t in t.add(column: "createdActive", .double) }
+            try db.create(index: "memoryEntry_author", on: "memoryEntry", columns: ["companyId", "authorId", "createdActive"])
+        }
+        m.registerMigration("vML-kb") { db in
+            // Plan ML Task 4: the handbook. A page holds its current revision; revisions are appended, never changed. Paths are
+            // unique per company case-insensitively (NFC is the writer's job: `HandbookPath.normalize`). `restriction`: a
+            // page-level JSON `[role]`; `sources`: a JSON array of one-line strings.
+            try db.create(table: "kbPage") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("path", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("section", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("ownerId", .text).notNull()
+                t.column("status", .text).notNull().defaults(to: "active")
+                t.column("autoKind", .text)
+                t.column("revision", .integer).notNull()
+                t.column("lastReviewed", .datetime)
+                t.column("sources", .text).notNull().defaults(to: "[]")
+                t.column("restriction", .text)
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("vouchedAt", .datetime)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+            }
+            try db.execute(sql: "CREATE UNIQUE INDEX kbPage_path ON kbPage(companyId, path COLLATE NOCASE)")
+            try db.create(table: "kbRevision") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("pageId", .text).notNull().references("kbPage", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("title", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("status", .text).notNull()
+                t.column("authorId", .text).notNull()
+                t.column("itemId", .text)
+                t.column("turnId", .text)
+                t.column("summary", .text)
+                t.column("diffSummary", .text).notNull()
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("rollbackOf", .integer)
+                t.column("createdAt", .datetime).notNull()
+                t.uniqueKey(["pageId", "number"])
+            }
+            // `restrictions`: the linking section's JSON `[[role]]`.
+            try db.create(table: "kbLink") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("fromPageId", .text).notNull().references("kbPage", onDelete: .cascade)
+                t.column("sectionSlug", .text).notNull()
+                t.column("toPath", .text).notNull().collate(.nocase)
+                t.column("restrictions", .text).notNull().defaults(to: "[]")
+                t.primaryKey(["fromPageId", "sectionSlug", "toPath"])
+            }
+            try db.create(index: "kbLink_to", on: "kbLink", columns: ["companyId", "toPath"])
+            // One page, one writer: the agent editing it for an item, until a company-active second.
+            try db.create(table: "kbLease") { t in
+                t.primaryKey("pageId", .text).references("kbPage", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull()
+                t.column("itemId", .text).notNull()
+                t.column("expiresActive", .double).notNull()
+            }
+            try db.create(index: "kbLease_item", on: "kbLease", columns: ["itemId"])
+        }
+        m.registerMigration("vML-sprint-closer") { db in
+            // Plan ML Task 5 (fix round 2): who closed a sprint wrote its summary, so its taint follows that author. Retros are
+            // re-ingested so the ones closed before this (author unknown) are marked untrusted.
+            try db.alter(table: "sprint") { t in t.add(column: "closedById", .text) }
+            try db.execute(sql: "UPDATE memoryCursor SET position = '' WHERE source = 'retro'")
+        }
+        m.registerMigration("vML-resources") { db in
+            // Plan ML Task 6b: owner resources, shown as `F-<number>`. The bytes live in the vault (`vaultPath`, relative to
+            // `<home>/vault/<companyId>`); `displayName` is sanitized and never used as a file name. A folder row owns its
+            // children (`parentId`). `readerSet`: a JSON array of agent ids (NULL: follow the scope). `purgeReport`: JSON
+            // `{backups:[], transcripts:[]}` (Task 6c). Collab adds its snapshot rows here.
+            try db.create(table: "resource") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("kind", .text).notNull()
+                t.column("parentId", .text)
+                t.column("displayName", .text).notNull()
+                t.column("ext", .text)
+                t.column("fileKind", .text)
+                t.column("bytes", .integer).notNull().defaults(to: 0)
+                t.column("sha256", .text)
+                t.column("vaultPath", .text)
+                t.column("mirrorPath", .text)
+                t.column("mirrorSha256", .text)
+                t.column("url", .text)
+                t.column("scopeKind", .text).notNull()
+                t.column("scopeId", .text)
+                t.column("readerSet", .text)
+                t.column("futureHolders", .boolean).notNull().defaults(to: false)
+                t.column("provenance", .text).notNull()
+                t.column("sourceDetail", .text)
+                t.column("tainted", .boolean).notNull()
+                t.column("taintReason", .text)
+                t.column("quarantined", .boolean).notNull().defaults(to: false)
+                t.column("secretScan", .text).notNull().defaults(to: "none")
+                t.column("vouchedAt", .datetime)
+                t.column("addedVia", .text).notNull()
+                t.column("channelId", .text)
+                t.column("messageId", .text)
+                t.column("askId", .text)
+                t.column("itemId", .text)
+                t.column("textIndexed", .boolean).notNull().defaults(to: false)
+                t.column("purgedAt", .datetime)
+                t.column("purgeReport", .text)
+                t.column("removedAt", .datetime)
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "resource_parent", on: "resource", columns: ["companyId", "parentId"])
+            try db.create(index: "resource_created", on: "resource", columns: ["companyId", "createdAt"])
         }
     }
 }

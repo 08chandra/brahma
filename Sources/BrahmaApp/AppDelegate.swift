@@ -99,7 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // or block on a dialog); the engine retries in the background, and the banner's Load secrets asks the owner.
             // `logFailures: false`: the engine logs failures and writes the hold notice; the banner reflects the store's state.
             if store.secretsHeld { _ = try? store.reloadRedactorIfNeeded(vault: secrets.vault, logFailures: false) }
-            let model = AppModel(store: store, paths: paths)
+            let model = AppModel(store: store, paths: paths, secretVault: secrets.vault)
             model.ownerSecretVault = ownerSecrets.vault
             let warnings = [selection.warning, secrets.warning].compactMap { $0 }
             for warning in warnings {

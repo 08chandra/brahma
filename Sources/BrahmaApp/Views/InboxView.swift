@@ -74,6 +74,8 @@ private struct InboxCard: View {
     @State private var rescindNote = ""
     @State private var busy = false
     @State private var document: Result<AttributedString, SafeMarkdownError>?
+    /// A pending question from an agent takes dropped files as (part of) the answer.
+    @State private var drops: ResourceDropModel?
 
     var body: some View {
         VStack(alignment: .leading, spacing: BrahmaTheme.spaceS) {
@@ -95,6 +97,10 @@ private struct InboxCard: View {
         .task(id: "\(row.documentPath ?? "")|\(row.documentChanged)") {
             document = row.section == .recent ? nil : model.document(for: row)
         }
+        .task(id: row.canAnswer) {
+            drops = row.canAnswer ? ResourceDropModel(app: model, context: .inbox(askId: row.id), defaults: model.dropDefaults) : nil
+        }
+        .resourceDrops(drops, enabled: row.canAnswer) { sendAnswer() }
         .alert("The document changed after it was proposed. Approve the current version?", isPresented: $confirmChanged) {
             Button("Approve") { decide(true, acknowledgeChange: true) }
             Button("Cancel", role: .cancel) {}
@@ -221,11 +227,17 @@ private struct InboxCard: View {
             }
         }
         if row.canAnswer {
+            let hasDrops = drops.map { !$0.pending.isEmpty } ?? false
+            if let drops, hasDrops { PendingDropChips(model: drops) }
             TextField("Answer", text: $answer, prompt: Text(verbatim: "Your answer"), axis: .vertical).lineLimit(1...5).brahmaField()
             HStack {
-                Button("Send answer") { run { _ = await model.answer(askId: row.id, text: answer) } }
+                Button("Send answer") { sendAnswer() }
                     .buttonStyle(.brahmaPrimary)
-                    .disabled(busy || answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(busy || (!hasDrops && answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                if drops != nil {
+                    Text(verbatim: ResourceDropModel.inboxHint.uppercased())
+                        .font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.text2)
+                }
                 Spacer()
             }
         }
@@ -263,6 +275,17 @@ private struct InboxCard: View {
         .padding(BrahmaTheme.spaceM)
         .frame(width: 320)
         .background(BrahmaTheme.bg1)
+    }
+
+    /// With dropped files, the answer is the owner's words above the engine's file lines (`ResourceDropModel.commit`);
+    /// otherwise it is the words alone.
+    private func sendAnswer() {
+        let text = answer
+        if let drops, !drops.pending.isEmpty {
+            run { if await drops.commit(message: text) { answer = "" } }
+        } else {
+            run { _ = await model.answer(askId: row.id, text: text) }
+        }
     }
 
     private func decide(_ approve: Bool, acknowledgeChange: Bool = false) {

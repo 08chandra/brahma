@@ -334,6 +334,59 @@ import GRDB
                               + "    | - DM @owner: the owner approved\n    | STATUS: DONE\n"))
     }
 
+    @Test func newResourcesListedPerReader() throws {
+        let d = try D()
+        let drops = try tempDir()
+        let vault = ContentVault(paths: d.world.paths)
+        @discardableResult
+        func add(_ name: String, _ text: String, _ drop: ResourceDrop = ResourceDrop(), at now: Date) throws -> Resource {
+            let url = drops.appending(path: name)
+            try Data(text.utf8).write(to: url)
+            let plan = try ResourceIntake.inspect(urls: [url], knownValues: [], agentAreas: .none)
+            return try #require(try d.store.addResources(companyId: d.company.id, plan: plan, drop: drop, contentVault: vault,
+                                                         secretVault: MemoryVault(), knownValues: [], paths: d.world.paths, now: now).first)
+        }
+        // Added when the agent's previous turn started (its orientation was built then): not new to it.
+        let start = Store.now()
+        try add("old.md", "old\n", at: start)
+        let ended = start.addingTimeInterval(10)
+        try d.store.writer.write { db in
+            try Turn(id: "t-prev", agentId: d.eng.id, companyId: d.company.id, startedAt: start, endedAt: ended, outcome: .succeeded,
+                     summary: nil, costUSD: nil).insert(db)
+        }
+        let later = ended.addingTimeInterval(5)
+        let notes = try add("notes.md", "notes\n", at: later)
+        try add("mine.md", "mine\n", ResourceDrop(scope: .agent(d.eng.id)), at: later)
+        try add("boss.md", "boss\n", ResourceDrop(scope: .agent(d.mgr.id)), at: later)
+        try add("vendor.md", "vendor\n", ResourceDrop(trust: .untrusted), at: later)
+        let kind = try #require(notes.fileKind)
+
+        let c = try d.load()
+        #expect(c.newResources == [
+            "- F-2 · \"notes.md\" · \(kind) · from the owner — recall(ref: \"F-2\") · .brahma/resources/company/F-2.md",
+            "- F-3 · \"mine.md\" · \(kind) · from the owner — recall(ref: \"F-3\")",
+            "- F-5 · (untrusted) · \(kind) — recall(ref: \"F-5\")",
+        ])
+        // Never actionable by itself: nothing to deliver.
+        #expect(c.inbox.isEmpty); #expect(c.inboxItemIds.isEmpty); #expect(c.quietItemIds.isEmpty); #expect(c.noticeIds.isEmpty)
+        let text = try d.render()
+        #expect(d.headings(text) == ["# Orientation", "## Current work", "## New resources (3)", "# Inbox"], Comment(rawValue: text))
+        #expect(text.contains("## New resources (3)\n" + c.newResources.joined(separator: "\n") + "\n# Inbox"))
+
+        // Another reader sees its own set: the manager's own file, never eng-1's.
+        let mgr = try d.load(d.mgr).newResources
+        #expect(mgr.contains { $0.hasPrefix("- F-4 ") }); #expect(!mgr.contains { $0.hasPrefix("- F-3 ") })
+
+        // At most five lines, then a count.
+        for n in 0..<4 { try add("more-\(n).md", "more\n", at: later) }
+        let many = try d.render()
+        let lines = d.lines(many)
+        let head = try #require(lines.firstIndex(of: "## New resources (7)"))
+        #expect(lines[(head + 1)...(head + 5)].allSatisfy { $0.hasPrefix("- F-") })
+        #expect(lines[head + 6] == "- … and 2 more (search_memory)")
+        #expect(lines[head + 7] == "# Inbox")
+    }
+
     @Test func wakingInboxItemsAreCapped() throws {
         let d = try D()
         for n in 0..<30 {

@@ -18,7 +18,8 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
 struct DevGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self])
+        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self, Tool.self,
+                      SeedTurn.self, Drop.self, AutoPagesNow.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -142,6 +143,137 @@ struct DevGroup: AsyncParsableCommand {
             } catch let e as WorkError {
                 throw fail(e.message)
             }
+        }
+    }
+
+    /// Calls one company tool as an agent would (the seed's handbook pages and remembered facts: `kb_write`, `remember`).
+    /// `--taint` first marks the agent's session as having read outside content, so what it writes is tainted.
+    struct Tool: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Call a company tool as an agent.")
+        @Argument var company: String
+        @Argument(help: "Tool name, e.g. remember or kb_write.") var name: String
+        @Option(help: "Handle of the agent calling it.") var by: String
+        @Option(help: "The arguments as a JSON object.") var args: String = "{}"
+        @Option(help: "Mark the agent's session tainted by this source first.") var taint: String?
+
+        func run() throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: by)
+            guard let arguments = try? JSONDecoder().decode([String: JSONValue].self, from: Data(args.utf8)) else {
+                throw fail("--args must be a JSON object")
+            }
+            if let taint { try store.markTainted(agentId: agent.id, source: taint) }
+            let tools = CompanyTools(store: store, companyId: c.id, agentId: agent.id, paths: paths,
+                                     vault: try cliSecretVault(interactive: false))
+            do {
+                print(safe(try tools.call(name: name, arguments: arguments)))
+            } catch let e as ToolError {
+                throw fail(e.message)
+            } catch let e as WorkError {
+                throw fail(e.message)
+            }
+        }
+    }
+
+    /// Plan ML Task 9 (the replay's seed): a finished turn of an agent, its tool calls as activity lines, and a captured
+    /// transcript of what it said. The transcript is a JSON-lines file written for the occasion under the data home's tmp
+    /// directory (removed after) and captured exactly like a real turn's: redacted, compressed, 0600.
+    struct SeedTurn: ParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "turn", abstract: "Record a finished turn with a captured transcript as an agent.")
+        @Argument var company: String
+        @Option(help: "Handle of the agent whose turn it is.") var by: String
+        @Option(help: "The turn's summary.") var summary: String
+        @Option(help: "The task the transcript's prompt states.") var prompt: String = "Continue your work."
+        @Option(help: "A line the agent says in the transcript (repeatable).") var say: [String] = []
+        @Option(help: "A tool the turn called (repeatable): an activity line and a tool_use record.") var tool: [String] = []
+
+        func run() throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: by)
+            // The capture redacts with every secret loaded, or holds (writes nothing).
+            _ = try store.reloadRedactorIfNeeded(vault: try cliSecretVault(interactive: false), logFailures: false)
+            let turn = try store.startTurn(agentId: agent.id)
+            var records: [[String: Any]] = [["type": "user", "message": ["role": "user", "content": prompt]]]
+            for line in say {
+                records.append(["type": "assistant", "message": ["role": "assistant", "content": [["type": "text", "text": line]]]])
+            }
+            for name in tool {
+                try store.appendEvent(ActivityEvent(companyId: c.id, agentId: agent.id, turnId: turn.id, kind: .toolUse,
+                                                    text: "@\(agent.name) \(name)", createdAt: Store.now()))
+                records.append(["type": "assistant", "message": ["role": "assistant",
+                                                                  "content": [["type": "tool_use", "name": name, "input": [:] as [String: Any]]]]])
+            }
+            let dir = try paths.ensureTmpDir().appending(path: "dev-turn-\(UUID().uuidString)", directoryHint: .isDirectory)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let source = TranscriptSource(configDir: dir)
+            let sessionId = UUID().uuidString.lowercased()
+            let file = source.projectsDir.appending(path: "-dev/\(sessionId).jsonl")
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            var data = Data()
+            for record in records {
+                data.append(try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]))
+                data.append(0x0A)
+            }
+            try data.write(to: file)
+            let outcome = TranscriptCapture(paths: paths, source: source).capture(turn: turn, sessionId: sessionId, store: store)
+            _ = try store.finishTurn(id: turn.id, outcome: .succeeded, summary: summary, costUSD: nil)
+            guard case .captured = outcome else { throw fail("turn \(turn.id) recorded, but its transcript was not captured: \(outcome)") }
+            print(turn.id)
+        }
+    }
+
+    /// Plan ML Task 10 (the seed): the owner drops files into a DM with an agent, as the app's DM drop zone does: the DM's
+    /// default scope (that agent only), the drop's own trust, and the engine's announcement in the DM. The owner CLI's
+    /// `resource add` has no conversation context; this hook exists so the seed can show a DM drop.
+    struct Drop: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Drop files into a DM with an agent as the owner.")
+        @Argument var company: String
+        @Option(help: "Handle of the agent whose DM it is.") var dm: String
+        @Option(help: "The owner's words sent with the drop.") var message: String?
+        @Argument(help: "Files to drop.") var files: [String]
+
+        func run() throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: dm)
+            let secretVault = try cliSecretVault(interactive: false)
+            let known = try store.knownSecretValues(companyId: c.id, vault: secretVault)
+            let plan = try ResourceIntake.inspect(urls: files.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) },
+                                                  knownValues: known, agentAreas: try store.agentAreas(paths: paths))
+            guard plan.refusals.isEmpty, !plan.items.isEmpty, plan.items.allSatisfy({ $0.findings.isEmpty }) else {
+                throw fail("the dev drop takes plain files only (no refusals, no secret findings)")
+            }
+            do {
+                let context = DropContext.dm(handle: agent.name)
+                let (scope, readers) = try store.defaultScope(for: context, companyId: c.id)
+                let drop = ResourceDrop(context: context, scope: scope, readerSet: readers, message: message)
+                let rows = try store.addResources(companyId: c.id, plan: plan, drop: drop, contentVault: ContentVault(paths: paths),
+                                                  secretVault: secretVault, knownValues: known, paths: paths)
+                for r in rows { print("F-\(r.number)") }
+            } catch let e as ResourceError {
+                throw fail(e.message)
+            } catch let e as WorkError {
+                throw fail(e.message)
+            }
+        }
+    }
+
+    /// Plan ML Task 10 (the seed): one auto-page refresh now, as the engine does every `AutoPages.interval` active seconds.
+    struct AutoPagesNow: ParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "autopages", abstract: "Refresh the handbook's auto pages now.")
+        @Argument var company: String
+
+        func run() throws {
+            try requireDev()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let written = try refusing { try store.refreshAutoPages(companyId: c.id) }
+            print(written.isEmpty ? "no auto page changed" : written.map(\.rawValue).joined(separator: "\n"))
         }
     }
 
