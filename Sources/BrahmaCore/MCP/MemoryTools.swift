@@ -145,7 +145,7 @@ extension CompanyTools {
         }
         let raw = ref ?? ""
         let now = Store.now()
-        if let answer = try resourceRecall(raw) { return answer }
+        if let answer = try resourceRecall(raw, now: now) { return answer }
         let notFound = "No memory \(Store.flat(MemoryRefs.implied(raw).canonical, max: 80)) you can read."
         guard let doc = try MemoryIndex(store: store).document(companyId: companyId, scope: .agent(agentId), ref: raw, now: now) else {
             return notFound
@@ -179,7 +179,11 @@ extension CompanyTools {
     /// `recall(ref: "F-<n>")` answers the engine gives without the doc text, for a resource this agent can read in full:
     /// purged, flagged (the vault is never read), a link, a folder, or a file whose text is not indexed. Nil otherwise: the
     /// generic path then shows the indexed text (taint first), or answers like a missing ref.
-    private func resourceRecall(_ raw: String) throws -> String? {
+    ///
+    /// A tainted row is read like the generic path reads a tainted doc: this session is marked first (`relayTaint`; a failed
+    /// mark refuses), and anything the row holds that an outside source chose (a link's address) is an `UntrustedBlock`. Every
+    /// answer about the row (not purged or flagged ones, which read nothing) is recorded like a generic recall.
+    private func resourceRecall(_ raw: String, now: Date) throws -> String? {
         let (source, canonical) = MemoryRefs.implied(raw)
         guard source == .resource, canonical.hasPrefix("F-"), let number = Int(canonical.dropFirst(2)), canonical == "F-\(number)",
               let found = try store.resourceForReader(companyId: companyId, number: number, reader: .agent(agentId)),
@@ -189,20 +193,36 @@ extension CompanyTools {
         if r.purgedAt != nil { return "\(r.ref) was purged by the owner." }
         guard r.removedAt == nil else { return nil }
         if r.secretScan == .flagged { return "\(r.ref) was flagged by the owner as containing a secret; it can't be read by agents." }
+        if r.kind == .file, r.textIndexed { return nil }        // the generic path: its text, taint first
+        // Taint first: nothing about an untrusted row is shown before this session is marked (a failed mark refuses).
+        if r.tainted { try relayTaint("memory:\(r.ref)") }
+        let answer: String
         switch r.kind {
         case .link:
             let shown = Store.flat(Store.linkShown(r.url ?? ""), max: 200)
-            guard r.tainted else { return "\(r.ref) is a link to \(shown); it was not fetched." }
-            // Taint first: an untrusted link's address is shown only once this session is marked (a failed mark refuses).
-            try relayTaint("memory:\(r.ref)")
-            let source = "\(r.ref) (\(Store.flat(r.taintReason ?? "outside content", max: 120)))"
-            return "\(r.ref) is a link; it was not fetched.\n" + UntrustedBlock.render(source: source, text: shown, maxLines: 1)
+            if r.tainted {
+                let source = "\(r.ref) (\(Store.flat(r.taintReason ?? "outside content", max: 120)))"
+                answer = "\(r.ref) is a link; it was not fetched.\n" + UntrustedBlock.render(source: source, text: shown, maxLines: 1)
+            } else {
+                answer = "\(r.ref) is a link to \(shown); it was not fetched."
+            }
         case .folder:
-            return "\(r.ref) is a folder (\(ResourceText.size(r.bytes))). Its contents can't be read as text yet."
+            answer = "\(r.ref) is a folder (\(ResourceText.size(r.bytes))). Its contents can't be read as text yet."
         case .file:
-            guard !r.textIndexed else { return nil }
-            return "\(r.ref) is a \(Store.flat(r.fileKind ?? "file", max: 20)) (\(ResourceText.size(r.bytes))). Its contents can't be read as text yet."
+            answer = "\(r.ref) is a \(Store.flat(r.fileKind ?? "file", max: 20)) (\(ResourceText.size(r.bytes))). Its contents can't be read as text yet."
         }
+        try recordRecall(ref: r.ref, now: now)
+        return answer
+    }
+
+    /// Records a recall of the doc `ref` names exactly as the generic path does: its ranking age (`markRecalled`) and the read
+    /// itself (`memoryRead`, with this turn's id).
+    private func recordRecall(ref: String, now: Date) throws {
+        guard let doc = try MemoryIndex(store: store).document(companyId: companyId, scope: .agent(agentId), ref: ref, now: now),
+              doc.hit.level == .full else { return }
+        try store.markRecalled(companyId: companyId, docId: doc.hit.docId, now: now)
+        try store.recordRead(companyId: companyId, docIds: [doc.hit.docId], agentId: agentId, turnId: try runningTurnId(),
+                             via: .recall, now: now)
     }
 
     // MARK: remember

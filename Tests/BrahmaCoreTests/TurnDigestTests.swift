@@ -365,7 +365,7 @@ import GRDB
         #expect(c.newResources == [
             "- F-2 · \"notes.md\" · \(kind) · from the owner — recall(ref: \"F-2\") · .brahma/resources/company/F-2.md",
             "- F-3 · \"mine.md\" · \(kind) · from the owner — recall(ref: \"F-3\")",
-            "- F-5 · \"vendor.md\" · \(kind) · from the owner · untrusted — recall(ref: \"F-5\")",
+            "- F-5 · (untrusted) · \(kind) — recall(ref: \"F-5\")",
         ])
         // Never actionable by itself: nothing to deliver.
         #expect(c.inbox.isEmpty); #expect(c.inboxItemIds.isEmpty); #expect(c.quietItemIds.isEmpty); #expect(c.noticeIds.isEmpty)
