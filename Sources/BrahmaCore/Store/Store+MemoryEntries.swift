@@ -225,13 +225,16 @@ extension Store {
     }
 
     /// The owner deletes `mem:<number>`: the fact, its hash and its key are emptied, `purgedAt` and `removedAt` set, and its doc
-    /// is removed with an emptied body (the FTS trigger drops the old text from the index; Task 6c's secure purge replaces
-    /// this). The tombstone row stays. An entry it contradicted gets its full weight back. Returns false when it was already
-    /// deleted; a number this company does not have is `WorkError.notFound`.
+    /// purged, all in the secure purge's transaction (`purgeMemoryDocs`: `secure_delete`, FTS `optimize`, a WAL checkpoint),
+    /// so the fact's text leaves the database file too. The tombstone row stays. An entry it contradicted gets its full weight
+    /// back. Returns false when it was already deleted; a number this company does not have is `WorkError.notFound`.
     @discardableResult
     public func ownerDeleteMemory(companyId: String, number: Int, now: Date = Store.now()) throws -> Bool {
-        try writer.write { db in
-            guard var entry = try MemoryEntry.filter(Column("companyId") == companyId && Column("number") == number).fetchOne(db) else {
+        guard let id = try writer.read({ db in
+            try String.fetchOne(db, sql: "SELECT id FROM memoryEntry WHERE companyId = ? AND number = ?", arguments: [companyId, number])
+        }) else { throw WorkError.notFound("no memory mem:\(number)") }
+        return try purgeMemoryDocs(companyId: companyId, source: .memory, sourceIds: [id], now: now) { db -> Bool in
+            guard var entry = try MemoryEntry.filter(Column("companyId") == companyId && Column("id") == id).fetchOne(db) else {
                 throw WorkError.notFound("no memory mem:\(number)")
             }
             guard entry.purgedAt == nil else { return false }
@@ -241,9 +244,6 @@ extension Store {
             entry.purgedAt = now
             entry.removedAt = entry.removedAt ?? now
             try entry.update(db)
-            try db.execute(sql: """
-                UPDATE memoryDoc SET body = '', removedAt = COALESCE(removedAt, ?) WHERE companyId = ? AND source = ? AND sourceId = ?
-                """, arguments: [now, companyId, MemorySource.memory.rawValue, entry.id])
             if let oldId = entry.contradictsId, let old = try MemoryEntry.fetchOne(db, key: oldId), old.companyId == companyId {
                 try indexEntry(db: db, old, now: now)
             }

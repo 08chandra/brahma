@@ -296,6 +296,16 @@ public struct Resource: Equatable, Sendable, FetchableRecord, PersistableRecord 
     }
 }
 
+/// What a purge could not reach (Task 6c, ML-7): the DB and data-home snapshots taken since the resource was added (by name),
+/// and the turns whose captured transcripts recorded reading it (by turn id). Stored on the tombstone as `purgeReport`.
+public struct PurgeReport: Codable, Equatable, Sendable {
+    public var backups: [String]
+    /// Turn ids.
+    public var transcripts: [String]
+
+    public init(backups: [String] = [], transcripts: [String] = []) { self.backups = backups; self.transcripts = transcripts }
+}
+
 /// Where the owner dropped: the Resources library, a DM with an agent (by handle), a channel (by name), an agent's question in
 /// the Inbox, an item card, or the CLI. Collab adds `.thread(rootId:)`.
 public enum DropContext: Equatable, Sendable {

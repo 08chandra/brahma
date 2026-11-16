@@ -561,7 +561,7 @@ extension Store {
     }
 
     /// Reads the vault copy; an integrity failure leaves an activity line before it is rethrown.
-    private func readResourceBytes(_ r: Resource, contentVault: ContentVault, now: Date,
+    func readResourceBytes(_ r: Resource, contentVault: ContentVault, now: Date,
                                    expected: (path: String, sha: String)) throws -> Data {
         do {
             return try contentVault.read(companyId: r.companyId, relativePath: expected.path, expectedSHA256: expected.sha,
@@ -575,14 +575,14 @@ extension Store {
     }
 
     /// The mirror's engine-file alert (an activity line, the owner's DM and the alert ask); a failure to raise it goes to stderr.
-    private func alertResourceMirror(_ problem: UnsafeEngineFile, companyId: String, now: Date) {
+    func alertResourceMirror(_ problem: UnsafeEngineFile, companyId: String, now: Date) {
         do { try writer.write { db in try alertEngineFile(db: db, problem, companyId: companyId, now: now) } } catch {
             FileHandle.standardError.write(Data("brahma: could not raise the resource mirror alert (\(problem)): \(error)\n".utf8))
         }
     }
 
     /// A non-fatal step that failed: an `error` activity line (and stderr when even that fails).
-    private func resourceTrace(companyId: String, _ text: String, now: Date) {
+    func resourceTrace(companyId: String, _ text: String, now: Date) {
         FileHandle.standardError.write(Data("brahma: \(text)\n".utf8))
         do {
             try writer.write { db in

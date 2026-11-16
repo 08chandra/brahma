@@ -535,13 +535,14 @@ public actor Orchestrator {
 
         // Handbook refresh (Plan ML): every `AutoPages.interval` company-active seconds per company, the engine-rendered pages
         // and then the agent-readable `.brahma/kb` mirror. Held like ingest: by the owner's stop and while secrets are unloaded
-        // (both redact). A failure leaves an activity line; a link planted in the mirror raises the engine-file alert.
+        // (both redact). A failure leaves an activity line; a link planted in the mirror raises the engine-file alert. The
+        // `.brahma/resources` mirror is swept with it (Task 6c): tampered files are put back from the vault.
         if !HandbookRefresh.isHeld(stopped: stopped != nil, secretsHeld: store.secretsHeld) {
             for c in companies {
                 let active = store.activeNow(companyId: c.id)
                 guard HandbookRefresh.isDue(active: active, last: lastHandbookRefresh[c.id]) else { continue }
                 lastHandbookRefresh[c.id] = active
-                HandbookRefresh.run(store: store, company: c, now: now)
+                HandbookRefresh.run(store: store, company: c, now: now, contentVault: ContentVault(paths: paths))
             }
         }
 

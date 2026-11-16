@@ -452,12 +452,15 @@ extension Store {
 }
 
 /// The orchestrator's "handbook refresh" step: every `AutoPages.interval` company-active seconds per company, the auto pages
-/// and then the `.brahma/kb` mirror. Held by the owner's stop and while secrets are unloaded (it redacts, fail closed). Never
-/// throws: a failure leaves an `error` activity line (once per distinct text) and a line on standard error.
+/// and then the `.brahma/kb` mirror (and, given the vault, the `.brahma/resources` mirror's sweep). Held by the owner's stop
+/// and while secrets are unloaded (it redacts, fail closed). Never throws: a failure leaves an `error` activity line (once per
+/// distinct text) and a line on standard error.
 public enum HandbookRefresh {
     public struct Report: Sendable {
         public var pages: [AutoPageKind] = []
         public var mirror: MirrorResult?
+        /// The `.brahma/resources` mirror sweep (Task 6c), when a content vault was given.
+        public var resources: ResourceMirrorResult?
     }
 
     public static func isHeld(stopped: Bool, secretsHeld: Bool) -> Bool { stopped || secretsHeld }
@@ -468,13 +471,15 @@ public enum HandbookRefresh {
         return active < last || active - last >= AutoPages.interval
     }
 
+    /// `contentVault`: the resource vault, for the `.brahma/resources` mirror's repair sweep (`Store.syncResourceMirror`),
+    /// which runs right after the handbook mirror's.
     @discardableResult
-    public static func run(store: Store, company: Company, now: Date) -> Report {
-        run(store: store, company: company, now: now, mirrorFault: nil)
+    public static func run(store: Store, company: Company, now: Date, contentVault: ContentVault? = nil) -> Report {
+        run(store: store, company: company, now: now, mirrorFault: nil, contentVault: contentVault)
     }
 
     static func run(store: Store, company: Company, now: Date,
-                    mirrorFault: ((HandbookExporter.MirrorPhase, String) throws -> Void)?) -> Report {
+                    mirrorFault: ((HandbookExporter.MirrorPhase, String) throws -> Void)?, contentVault: ContentVault? = nil) -> Report {
         var report = Report()
         do {
             report.pages = try store.refreshAutoPages(companyId: company.id, now: now)
@@ -487,6 +492,9 @@ public enum HandbookRefresh {
                                                         fault: mirrorFault)
         } catch {
             trace(store: store, companyId: company.id, "could not refresh the handbook mirror: \(error)", now: now)
+        }
+        if let contentVault {
+            report.resources = store.syncResourceMirror(companyId: company.id, contentVault: contentVault, now: now)
         }
         return report
     }

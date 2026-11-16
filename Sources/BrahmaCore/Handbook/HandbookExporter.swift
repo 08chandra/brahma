@@ -289,23 +289,25 @@ public enum HandbookExporter {
     static let mirrorAlertCursor = "mirror-alerts"
 
     /// Runs `raise` (in one write with the record of it) unless `key` was alerted since the last clean refresh; a repeat
-    /// goes to standard error only. Never throws: a failure is reported on standard error.
-    static func alertOnce(store: Store, companyId: String, key rawKey: String, _ raise: (Database) throws -> Void) {
+    /// goes to standard error only. Never throws: a failure is reported on standard error. `cursor` holds the keys already
+    /// alerted (the resource mirror keeps its own: `Store.resourceMirrorAlertCursor`); `what` names the mirror on stderr.
+    static func alertOnce(store: Store, companyId: String, key rawKey: String, cursor: String = mirrorAlertCursor,
+                          what: String = "handbook mirror", _ raise: (Database) throws -> Void) {
         let key = Store.flat(rawKey, max: 400)
         do {
             try store.writer.write { db in
-                let seen = try Store.memoryCursorPosition(db: db, companyId: companyId, source: mirrorAlertCursor)
+                let seen = try Store.memoryCursorPosition(db: db, companyId: companyId, source: cursor)
                     .split(separator: "\n").map(String.init)
                 guard !seen.contains(key) else {
-                    FileHandle.standardError.write(Data("brahma: handbook mirror of \(companyId), again: \(key)\n".utf8))
+                    FileHandle.standardError.write(Data("brahma: \(what) of \(companyId), again: \(key)\n".utf8))
                     return
                 }
                 try raise(db)
-                try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: mirrorAlertCursor,
+                try Store.setMemoryCursorPosition(db: db, companyId: companyId, source: cursor,
                                                   (seen + [key]).suffix(50).joined(separator: "\n"))
             }
         } catch {
-            FileHandle.standardError.write(Data("brahma: could not raise the handbook mirror alert (\(key)): \(error)\n".utf8))
+            FileHandle.standardError.write(Data("brahma: could not raise the \(what) alert (\(key)): \(error)\n".utf8))
         }
     }
 
