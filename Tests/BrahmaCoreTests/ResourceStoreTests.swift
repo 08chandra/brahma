@@ -388,6 +388,30 @@ import BrahmaKeychain
         #expect(try w.add([try w.file("f.md", "f\n")], ResourceDrop(context: .channel(name: "general"), scope: .company)).count == 1)
     }
 
+    @Test func scopedItemAnnouncementCarriesRefsOnly() throws {
+        let w = try W()
+        let i = try w.item(owner: w.eng1)
+        // Item scope (eng-1 and its manager): the comment names nothing.
+        try w.add([try w.file("Merger plan HERONSWAN.md", "secret merger\n")], try w.drop(.item(id: i.id)))
+        let folder = w.drops.appending(path: "Layoffs PIPIT")
+        try w.file("list.md", "names\n", in: folder)
+        try w.add([folder], try w.drop(.item(id: i.id)))
+        try w.store.addLink(companyId: w.company.id, url: "https://wiki.example.com/acquisition-target", drop: try w.drop(.item(id: i.id)),
+                            contentVault: w.contentVault)
+        // A company agent outside the reader set reads the item.
+        let shown = try w.tools(w.eng3).call(name: "show_work_item", arguments: ["key": .string(i.key)])
+        #expect(shown.contains("[file F-1]") && shown.contains("[link F-4]"), "\(shown)")
+        for leak in ["HERONSWAN", "PIPIT", "list.md", "acquisition-target", "wiki.example.com", "markdown", "B ·", ".brahma/resources"] {
+            #expect(!shown.contains(leak), "\(leak) in \(shown)")
+        }
+        let comments = try w.store.itemEvents(itemId: i.id, limit: 50).filter { $0.kind == .commented }.map(\.text)
+        #expect(comments == ["[file F-1] read it: recall(ref: \"F-1\")", "[folder F-2, 1 files] files F-3…F-3", "[link F-4]"])
+        // A company-scope drop on the item keeps the full line.
+        try w.add([try w.file("public.md", "public\n")], ResourceDrop(context: .item(id: i.id), scope: .company))
+        let last = try #require(try w.store.itemEvents(itemId: i.id, limit: 50).last { $0.kind == .commented })
+        #expect(last.text.hasPrefix("[file F-5 · \"public.md\" · "))
+    }
+
     @Test func laterJoinerCannotReadChannelDrop() throws {
         let w = try W()
         let r = try #require(try w.add([try w.file("brief.md", "design brief FLAMINGO\n")], try w.drop(.channel(name: "design"))).first)
@@ -553,7 +577,8 @@ import BrahmaKeychain
         let events = try w.store.itemEvents(itemId: i.id, limit: 50)
         let comment = try #require(events.last { $0.kind == .commented })
         #expect(comment.actorId == "owner")
-        #expect(comment.text == "[folder F-3 · \"specs\" · 2 files · 5 B] files F-4…F-5")
+        // Item scope: an item comment is readable company-wide, so it names nothing (refs only).
+        #expect(comment.text == "[folder F-3, 2 files] files F-4…F-5")
 
         // Channel: one owner post.
         try w.add([try w.file("brief.md", "brief\n")], try w.drop(.channel(name: "design")))

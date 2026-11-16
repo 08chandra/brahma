@@ -238,7 +238,7 @@ extension Store {
         }
 
         // 7. Announcement, after commit.
-        let text = Self.announcement(rows: rows, folder: folder, message: drop.message)
+        let text = Self.announcement(rows: rows, folder: folder, message: drop.message, refsOnly: Self.refsOnly(drop))
         let posted = announce(text, drop: drop, companyId: companyId, refs: rows.map(\.ref), now: now)
         if let posted { for i in rows.indices { rows[i].messageId = posted.id; rows[i].channelId = posted.channelId } }
         recordAfterCommit(companyId: companyId, rows: rows, mirrored: mirrored, posted: posted, now: now)
@@ -286,7 +286,7 @@ extension Store {
                               text: try redact("You added \(link.ref) \"\(Store.flat(link.displayName, max: 120))\" (\(label))"),
                               createdAt: now).insert(db)
         }
-        let text = Self.announcement(rows: [link], folder: nil, message: drop.message)
+        let text = Self.announcement(rows: [link], folder: nil, message: drop.message, refsOnly: Self.refsOnly(drop))
         let posted = announce(text, drop: drop, companyId: companyId, refs: [link.ref], now: now)
         if let posted { link.messageId = posted.id; link.channelId = posted.channelId }
         recordAfterCommit(companyId: companyId, rows: [link], mirrored: [:], posted: posted, now: now)
@@ -573,20 +573,36 @@ extension Store {
         }
     }
 
+    /// An item comment is readable by every agent of the company (`show_work_item` shows recent events), so an item-context
+    /// drop whose scope is not the company is announced by refs only.
+    static func refsOnly(_ drop: ResourceDrop) -> Bool {
+        if case .item = drop.context { return drop.scope != .company }
+        return false
+    }
+
     /// The engine's announcement: the owner's words (if any), then one line per file (at most `maxAnnouncedFiles`), or one line
-    /// for a folder, or one for a link.
-    static func announcement(rows: [Resource], folder: Resource?, message: String?) -> String {
+    /// for a folder, or one for a link. `refsOnly`: no display name, size, kind or mirror path, only `[file F-<n>]`,
+    /// `[folder F-<n>, k files]` and `[link F-<n>]` (readers open them with recall).
+    static func announcement(rows: [Resource], folder: Resource?, message: String?, refsOnly: Bool = false) -> String {
         var lines: [String] = []
         if let words = message?.trimmingCharacters(in: .whitespacesAndNewlines), !words.isEmpty { lines.append(words) }
         if let folder {
             let files = rows.filter { $0.parentId == folder.id }.sorted { $0.number < $1.number }
-            var line = "[folder \(folder.ref) · \"\(Store.flat(folder.displayName, max: 120))\" · \(files.count) files · \(ResourceText.size(folder.bytes))]"
+            var line = refsOnly ? "[folder \(folder.ref), \(files.count) files]" : "[folder \(folder.ref) · \"\(Store.flat(folder.displayName, max: 120))\" · \(files.count) files · \(ResourceText.size(folder.bytes))]"
             if let a = files.first, let b = files.last { line += " files \(a.ref)…\(b.ref)" }
             lines.append(line)
             return lines.joined(separator: "\n")
         }
         let shown = rows.prefix(maxAnnouncedFiles)
         for r in shown {
+            if refsOnly {
+                switch r.kind {
+                case .link: lines.append("[link \(r.ref)]")
+                case .folder: lines.append("[folder \(r.ref)]")
+                case .file: lines.append("[file \(r.ref)] read it: recall(ref: \"\(r.ref)\")")
+                }
+                continue
+            }
             switch r.kind {
             case .link:
                 lines.append("[link \(r.ref) · \(Store.flat(cut(linkShown(r.url ?? ""), 60), max: 200)) · from the owner; not fetched]")
