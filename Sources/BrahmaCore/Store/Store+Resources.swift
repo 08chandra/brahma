@@ -321,9 +321,9 @@ extension Store {
             try link.insert(db)
             try ingestResource(db: db, link, text: nil, now: now)
             let label = try Self.scopeLabel(db: db, resolved.scope, companyId: companyId)
+            // A link's address is its content: the activity names it by its ref only (a purge can't leave it behind).
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .resource,
-                              text: try redact("You added \(link.ref) \"\(Store.flat(link.displayName, max: 120))\" (\(label))"),
-                              createdAt: now).insert(db)
+                              text: try redact("You added \(Self.linkTag(link.ref)) (\(label))"), createdAt: now).insert(db)
         }
         let text = Self.announcement(rows: [link], folder: nil, message: drop.message, refsOnly: refsOnly)
         let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: [link.ref], now: now)
@@ -384,7 +384,8 @@ extension Store {
 
     /// The orientation's `## New resources` lines for `agent`: resources added after its previous turn ended (else after it
     /// was hired) that it can read at `full`, oldest first; purged, removed and flagged ones are left out. A tainted row (or a
-    /// file of a tainted folder) shows no name: `- F-<n> · (untrusted) · <kind> — recall(ref: "F-<n>")`.
+    /// file of a tainted folder) shows no name: `- F-<n> · (untrusted) · <kind> — recall(ref: "F-<n>")`; a link never shows
+    /// its address: `- F-<n> · link — recall(ref: "F-<n>")`.
     func newResourceLines(agent: Agent) throws -> [String] {
         try writer.read { db in
             let since = try Date.fetchOne(db, sql: "SELECT MAX(endedAt) FROM turn WHERE agentId = ? AND endedAt IS NOT NULL",
@@ -406,6 +407,9 @@ extension Store {
                 if r.tainted || r.parentId.map(taintedFolders.contains) == true {
                     // A name is text an agent or an outside source chose: only the ref and engine-built fields.
                     line = "- \(r.ref) · (untrusted) · \(kind)"
+                } else if r.kind == .link {
+                    // A link's address is its content: by its ref only.
+                    line = "- \(r.ref) · link"
                 } else {
                     line = "- \(r.ref) · \"\(Store.flat(r.displayName, max: 60))\" · \(kind) · from the owner"
                 }
@@ -651,8 +655,9 @@ extension Store {
     }
 
     /// The engine's announcement: the owner's words (if any), then one line per file (at most `maxAnnouncedFiles`), or one line
-    /// for a folder, or one for a link. `refsOnly`: no display name, size, kind or mirror path, only `[file F-<n>]`,
-    /// `[folder F-<n>, k files]` and `[link F-<n>]` (readers open them with recall).
+    /// for a folder, or one for a link. A link is always just `[link F-<n>]`: its address is its content (Task 6c fix round
+    /// 2), so a purge never has to find it in old messages. `refsOnly`: no display name, size, kind or mirror path, only
+    /// `[file F-<n>]`, `[folder F-<n>, k files]` and `[link F-<n>]` (readers open them with recall).
     ///
     /// A name is text an agent or an outside source chose: a tainted row (a folder: any of its files) shows none, only its ref
     /// and engine-built fields (`(untrusted)`, kind, size, the engine's taint reason). Every name shown goes through
@@ -686,8 +691,7 @@ extension Store {
             }
             switch r.kind {
             case .link:
-                lines.append(r.tainted ? "[link \(r.ref) · (untrusted) · not fetched]"
-                             : "[link \(r.ref) · \(announcedName(cut(linkShown(r.url ?? ""), 60), max: 200)) · from the owner; not fetched]")
+                lines.append(linkTag(r.ref))         // its address is its content: readers open it with recall
             case .folder:
                 lines.append(r.tainted ? "[folder \(r.ref) · (untrusted) · \(ResourceText.size(r.bytes))]"
                              : "[folder \(r.ref) · \"\(announcedName(r.displayName, max: 120))\" · \(ResourceText.size(r.bytes))]")
@@ -718,13 +722,16 @@ extension Store {
                    max: max)
     }
 
+    /// How engine-written text (activity, announcements, orientation) names a link: by its ref only, never its address.
+    static func linkTag(_ ref: String) -> String { "[link \(ref)]" }
+
     /// A link as shown: host and path (no scheme, query or fragment).
     static func linkShown(_ url: String) -> String {
         guard let c = URLComponents(string: url), let host = c.host else { return url }
         return host + c.path
     }
 
-    private static func cut(_ s: String, _ max: Int) -> String { s.count > max ? String(s.prefix(max)) + "…" : s }
+    static func cut(_ s: String, _ max: Int) -> String { s.count > max ? String(s.prefix(max)) + "…" : s }
 
     /// How a scope reads in the owner's activity line.
     static func scopeLabel(db: Database, _ scope: AccessClass, companyId: String) throws -> String {

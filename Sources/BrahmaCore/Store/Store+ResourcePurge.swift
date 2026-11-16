@@ -196,6 +196,8 @@ extension Store {
 
         // 1. The tombstones and the docs, under the secure purge.
         try purgeMemoryDocs(companyId: companyId, source: .resource, sourceIds: rows.map(\.id), now: now) { db in
+            // Its shown name leaves the engine-built text that carries it (a folder's files are never named there).
+            if top.parentId == nil { try scrubShownName(db: db, top) }
             for r in rows {
                 // A file purged on its own before keeps its own report. A link's URL, host and shown name are its content.
                 try db.execute(sql: """
@@ -269,16 +271,18 @@ extension Store {
     ///   rebuilds it. A file whose vault copy fails its hash is not mirrored.
     @discardableResult
     public func syncResourceMirror(companyId: String, contentVault: ContentVault, now: Date = Store.now()) -> ResourceMirrorResult {
-        syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now, afterWrite: nil)
+        syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now, afterWrite: nil, beforeHash: nil)
     }
 
-    /// `afterWrite`: tests only, called with a file's name right after the sweep wrote it (where an agent's write may land).
+    /// Tests only: `afterWrite` is called with a file's name right after the sweep wrote it (where an agent's write may
+    /// land); `beforeHash` as a mirror file is about to be hashed (what it throws counts as a read failure of that file).
     @discardableResult
     func syncResourceMirror(companyId: String, contentVault: ContentVault, now: Date,
-                            afterWrite: ((String) throws -> Void)?) -> ResourceMirrorResult {
+                            afterWrite: ((String) throws -> Void)?, beforeHash: ((String) throws -> Void)? = nil) -> ResourceMirrorResult {
         var result = ResourceMirrorResult()
         do {
-            try syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now, afterWrite: afterWrite, into: &result)
+            try syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now, afterWrite: afterWrite,
+                                   beforeHash: beforeHash, into: &result)
         } catch {
             resourceTrace(companyId: companyId, "Could not refresh the resource mirror \(Self.resourceMirrorDir): \(error)", now: now)
         }
@@ -286,7 +290,8 @@ extension Store {
     }
 
     private func syncResourceMirror(companyId: String, contentVault: ContentVault, now: Date,
-                                    afterWrite: ((String) throws -> Void)?, into result: inout ResourceMirrorResult) throws {
+                                    afterWrite: ((String) throws -> Void)?, beforeHash: ((String) throws -> Void)?,
+                                    into result: inout ResourceMirrorResult) throws {
         guard let company = try company(id: companyId) else { return }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let dirName = Self.resourceMirrorDir
@@ -360,8 +365,17 @@ extension Store {
                             continue
                         }
                         // Hashed through one descriptor; its fingerprint is cached only when it is the same before and after.
-                        if let read = try MirrorFile.hash(dir: dir, name: name, shown: "\(shown)/\(name)", limit: r.bytes),
-                           read.sha256 == sha {
+                        let read: (sha256: String, fingerprint: String?)?
+                        do {
+                            try beforeHash?(name)
+                            read = try MirrorFile.hash(dir: dir, name: name, shown: "\(shown)/\(name)", limit: r.bytes)
+                        } catch let problem as UnsafeEngineFile {
+                            throw problem
+                        } catch {
+                            // Content that can't be read can't be verified: fail closed, like a planted file.
+                            throw UnsafeEngineFile(path: "\(shown)/\(name)", problem: "cannot be read (\(error))")
+                        }
+                        if let read, read.sha256 == sha {
                             if let stable = read.fingerprint { prints[name] = "\(stable)|\(sha)" }
                             mirrored[r.id] = sha
                             continue
@@ -473,6 +487,51 @@ extension Store {
 
     // MARK: Helpers
 
+    /// A purge's rewrite of the resource's shown name, in the purge's secure transaction, wherever engine-built text carries
+    /// it: the activity line `F-<n> "<name>"` and the announcement fragment `F-<n> · "<name>"` (for an old link announcement,
+    /// `F-<n> · <host/path>`) become `F-<n> [purged F-<n>]` / `F-<n> · [purged F-<n>]`. Matched as those exact ref-tagged
+    /// strings (as written and as redacted), never fuzzily, in the activity feed, messages (with `messageFts` kept in step and
+    /// optimized), item events, question answers and memory docs (title and body). The owner's own words are not matched.
+    private func scrubShownName(db: Database, _ r: Resource) throws {
+        let tag = "[purged \(r.ref)]"
+        var raw: [(String, String)] = [
+            ("\(r.ref) \"\(Store.flat(r.displayName, max: 120))\"", "\(r.ref) \(tag)"),
+            ("\(r.ref) · \"\(Self.announcedName(r.displayName, max: 120))\"", "\(r.ref) · \(tag)"),
+        ]
+        if r.kind == .link, let url = r.url {
+            raw.append(("\(r.ref) · \(Self.announcedName(Self.cut(Self.linkShown(url), 60), max: 200))", "\(r.ref) · \(tag)"))
+        }
+        var pairs: [(old: String, new: String)] = []
+        for (old, new) in raw {
+            for variant in [old, try redact(old)] where !pairs.contains(where: { $0.old == variant }) { pairs.append((variant, new)) }
+        }
+        let columns = [("activityEvent", "text"), ("workItemEvent", "text"), ("ask", "ownerAnswer"), ("memoryDoc", "title"),
+                       ("memoryDoc", "body")]
+        for (old, new) in pairs {
+            for (table, column) in columns {
+                try db.execute(sql: """
+                    UPDATE \(table) SET \(column) = replace(\(column), ?, ?) WHERE companyId = ? AND instr(\(column), ?) > 0
+                    """, arguments: [old, new, r.companyId, old])
+            }
+        }
+        // Messages: `messageFts` indexes them as external content with an insert trigger only, so each rewrite takes the old
+        // text out of the index and puts the new one in; the segments are then merged so the old terms go.
+        var rewritten = false
+        for (old, _) in pairs {
+            for row in try Row.fetchAll(db, sql: "SELECT rowid, text FROM message WHERE companyId = ? AND instr(text, ?) > 0",
+                                        arguments: [r.companyId, old]) {
+                let rowid: Int64 = row[0], before: String = row[1]
+                let after = pairs.reduce(before) { $0.replacingOccurrences(of: $1.old, with: $1.new) }
+                guard after != before else { continue }
+                try db.execute(sql: "INSERT INTO messageFts(messageFts, rowid, text) VALUES('delete', ?, ?)", arguments: [rowid, before])
+                try db.execute(sql: "UPDATE message SET text = ? WHERE rowid = ?", arguments: [after, rowid])
+                try db.execute(sql: "INSERT INTO messageFts(rowid, text) VALUES(?, ?)", arguments: [rowid, after])
+                rewritten = true
+            }
+        }
+        if rewritten { try db.execute(sql: "INSERT INTO messageFts(messageFts) VALUES('optimize')") }
+    }
+
     /// The rows an owner action on `F-<number>` covers: the resource, then (for a folder) its files by number (purged ones
     /// only with `allowPurged`). Missing or removed → `.notFound("no resource F-<n>")`; a folder's file (unless `allowChild`:
     /// it is then the only row) → `.invalid("F-<n> is part of folder F-<m>; change the folder")`; purged (unless
@@ -505,9 +564,10 @@ extension Store {
         }
     }
 
-    /// `F-<n> "<name>"`, and ` and its <k> files` for a folder (owner-facing activity text).
+    /// `F-<n> "<name>"`, and ` and its <k> files` for a folder; a link is `[link F-<n>]` (owner-facing activity text).
     private static func named(_ rows: [Resource]) -> String {
         let top = rows[0]
+        if top.kind == .link { return linkTag(top.ref) }       // a link's address is its content
         var text = "\(top.ref) \"\(Store.flat(top.displayName, max: 120))\""
         if top.kind == .folder { text += " and its \(rows.count - 1) files" }
         return text

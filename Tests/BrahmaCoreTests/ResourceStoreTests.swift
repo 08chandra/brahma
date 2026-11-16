@@ -599,7 +599,7 @@ import BrahmaKeychain
         #expect(link.kind == .link); #expect(link.ref == "F-1"); #expect(link.vaultPath == nil)
         #expect(link.url == "https://docs.example.com/guide/start?x=1")
         let text = try #require(try w.store.pendingInbox(agentId: w.eng1.id).first?.1.text)
-        #expect(text == "[link F-1 · docs.example.com/guide/start · from the owner; not fetched]")
+        #expect(text == "[link F-1]")                       // a link is named only by its ref (6c fix round 2)
         #expect(try w.search(w.eng1, "docs.example.com").map(\.ref) == ["F-1"])
         #expect(throws: ResourceError.invalid("only http and https links can be added")) {
             try w.store.addLink(companyId: w.company.id, url: "file:///etc/passwd", drop: ResourceDrop(), contentVault: w.contentVault)
@@ -707,7 +707,7 @@ import BrahmaKeychain
         #expect(dms == [
             "[file F-1 · \"plain WREN.md\" · \(kind) · 6 B · FROM YOU] read it: recall(ref: \"F-1\")",
             "[file F-2 · \(kind) · 2 B · EXTERNAL: marked untrusted by you] read it: recall(ref: \"F-2\")",
-            "[link F-6 · (untrusted) · not fetched]",
+            "[link F-6]",
         ], "\(dms)")
         #expect(posted.count == 1)
         #expect(posted.first?.hasPrefix("[folder F-3 · (untrusted) · 2 files · ") == true, "\(posted)")
@@ -741,7 +741,7 @@ import BrahmaKeychain
         #expect(posted.count == 3)
         #expect(posted.contains { $0.hasPrefix("[file F-1 · \"for eng-9.md\" · ") }, "\(posted)")
         #expect(posted.contains { $0.hasPrefix("[folder F-2 · \"eng-9 kit\" · 1 files · ") }, "\(posted)")
-        #expect(posted.contains("[link F-4 · docs.example.com/eng-9/start · from the owner; not fetched]"), "\(posted)")
+        #expect(posted.contains("[link F-4]"), "\(posted)")
         #expect(!posted.joined().contains("@"))
         #expect(try w.store.pendingInbox(agentId: eng9.id).isEmpty)
         #expect(MessageRouter.mentions(in: posted.joined(separator: "\n")).isEmpty)
