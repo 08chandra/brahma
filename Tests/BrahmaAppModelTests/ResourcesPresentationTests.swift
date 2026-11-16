@@ -22,7 +22,7 @@ import BrahmaCore
         func add(_ name: String, _ text: String, _ drop: ResourceDrop = ResourceDrop(), now: Date = Store.now()) throws -> [Resource] {
             let url = drops.appending(path: name)
             try Data(text.utf8).write(to: url)
-            let plan = try ResourceIntake.inspect(urls: [url], knownValues: [])
+            let plan = try ResourceIntake.inspect(urls: [url], knownValues: [], agentAreas: .none)
             return try store.addResources(companyId: company.id, plan: plan, drop: drop, contentVault: content, secretVault: vault,
                                           knownValues: [], paths: paths, now: now)
         }
@@ -74,10 +74,11 @@ import BrahmaCore
         #expect(rows[5].isPurged)
         #expect(rows[5].name == "[purged]")
         #expect(!rows[5].canPurge && !rows[5].canVouch && !rows[5].canChangeScope)
-        #expect(ResourcesPresentation.purgeNote(rows[5]) == "1 backups and 0 transcripts contain purged content · delete or re-create")
+        #expect(ResourcesPresentation.purgeNote(rows[5]) == "1 backups and 0 transcripts may contain purged content (reads through an "
+                + "agent's shell or the mirror are not tracked one by one) · delete or re-create")
         #expect(ResourcesPresentation.purgeNote(rows[0]) == nil)
         #expect(ResourcesPresentation.purgeConfirmText("F-6")
-                == "Purge F-6? This deletes the file and its search text. Backups and transcripts made since it was added still contain it.")
+                == "Purge F-6? This deletes the file and its search text. Backups made since it was added still contain it, and transcripts made since then may.")
     }
 
     @Test func purgeNeedsConfirm() async throws {

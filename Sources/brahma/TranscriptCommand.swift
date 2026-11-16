@@ -46,6 +46,15 @@ struct TranscriptCommand: ParsableCommand {
             let data: Data
             do { data = try capture.read(row) } catch { throw fail("cannot read the transcript of turn \(row.turnId.prefix(8)): \(error)") }
             print(safe("== turn \(row.turnId) @\(names[row.agentId] ?? row.agentId.prefix(8).description) session \(row.sessionId) =="))
+            // The app pane's purge notice, word for word (refs only, `[purged F-n]`: never a purged name or path). With --raw
+            // it goes to stderr, so stdout stays the stored JSON lines.
+            do {
+                if let notice = try Replay.transcriptNotice(store: store, companyId: c.id, turnId: row.turnId) {
+                    if raw { FileHandle.standardError.write(Data("brahma: \(safe(notice))\n".utf8)) } else { print(safe(notice)) }
+                }
+            } catch {
+                FileHandle.standardError.write(Data("brahma: could not check whether a purge lists this transcript: \(safe("\(error)"))\n".utf8))
+            }
             var lines = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
             if let tail { lines = Array(lines.suffix(tail)) }
             for line in lines {

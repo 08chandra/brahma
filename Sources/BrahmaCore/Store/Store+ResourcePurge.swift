@@ -159,10 +159,14 @@ extension Store {
     /// tombstone (`purgedAt`, `purgeReport`; its name stays in old messages: metadata). Nothing brings it back: ingest and the
     /// mirror sweep skip purged rows. Returns what still holds it:
     /// - `backups`: the names in `backups` (DB and data-home snapshots) taken in `[createdAt, now]`;
-    /// - `transcripts`: the distinct turns that read one of its docs (`memoryRead.turnId`) and have a captured transcript.
+    /// - `transcripts`, conservatively (over-listing is safe, under-listing is not): the distinct captured turns that read one
+    ///   of its docs through Brahma's tools (`memoryRead.turnId`), plus every captured turn of an agent in its reader set
+    ///   (any agent the access engine lets read it at all, now) that ran while it existed (`[createdAt, now]`). Reads of the
+    ///   mirror or the vault through an agent's shell or the Read tool leave no record, so those transcripts *may* contain it.
     ///
-    /// Activity: `Purged F-<n> (<k> backups and <t> transcripts made since it was added still contain it)`. A purge can be
-    /// run again (it finishes what a failed one left, and recomputes the report).
+    /// Activity: `Purged F-<n> (<k> backups and <t> transcripts made since it was added may still contain it; reads through
+    /// an agent's shell or the mirror are not tracked one by one)`. A purge can be run again (it finishes what a failed one
+    /// left, and recomputes the report).
     ///
     /// Purge is the owner's remedy for a leak, so one file of a folder can be purged on its own: it becomes a tombstone with
     /// its own report, and the folder's size counts only its live files. A later purge of the folder keeps that report. A
@@ -182,7 +186,16 @@ extension Store {
                   AND d.sourceId IN (\(ids.map { _ in "?" }.joined(separator: ", ")))
                 ORDER BY r.turnId
                 """, arguments: StatementArguments([companyId, MemorySource.resource.rawValue]) + StatementArguments(ids))
-            return (rows, turns)
+            // Untracked reads (the mirror or the vault through a shell): every captured turn of a reader while it existed.
+            let readers = try Self.purgeReaders(db: db, catalog: catalog, companyId: companyId, rows: rows)
+            let windowed = readers.isEmpty ? [] : try String.fetchAll(db, sql: """
+                SELECT DISTINCT t.id FROM turn t
+                JOIN turnTranscript tt ON tt.turnId = t.id AND tt.companyId = t.companyId
+                WHERE t.companyId = ? AND t.startedAt <= ? AND (t.endedAt IS NULL OR t.endedAt >= ?)
+                  AND t.agentId IN (\(readers.map { _ in "?" }.joined(separator: ", ")))
+                """, arguments: [companyId, now, rows[0].createdAt] + StatementArguments(readers))
+            var seen = Set<String>()
+            return (rows, (turns + windowed.sorted()).filter { seen.insert($0).inserted })
         }
         let top = rows[0]
         var seen = Set<String>()
@@ -220,7 +233,7 @@ extension Store {
                     """, arguments: [companyId, folderId, now, companyId, folderId])
             }
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .resource,
-                              text: "Purged \(top.ref) (\(report.backups.count) backups and \(report.transcripts.count) transcripts made since it was added still contain it)",
+                              text: "Purged \(top.ref) (\(Self.purgeHolders(report)))",
                               createdAt: now).insert(db)
         }
 
@@ -250,6 +263,27 @@ extension Store {
             throw ResourceError.conflict(text)
         }
         return report
+    }
+
+    /// `<k> backups and <t> transcripts made since it was added may still contain it; reads through an agent's shell or the
+    /// mirror are not tracked one by one`: the purge's activity line, the CLI and the app say the same.
+    public static func purgeHolders(_ report: PurgeReport) -> String {
+        "\(report.backups.count) backups and \(report.transcripts.count) transcripts made since it was added may still contain it; "
+            + untrackedReads
+    }
+
+    /// Why a purge's transcript list is a "may contain" list.
+    public static let untrackedReads = "reads through an agent's shell or the mirror are not tracked one by one"
+
+    /// The agents of the company the access engine lets read any of `rows` at all (full or summary), now. A killed agent's
+    /// old turns count too; an agent whose context can't be loaded is kept (fail toward listing).
+    static func purgeReaders(db: Database, catalog: PackCatalog, companyId: String, rows: [Resource]) throws -> [String] {
+        try String.fetchAll(db, sql: "SELECT id FROM agent WHERE companyId = ? ORDER BY id", arguments: [companyId]).filter { id in
+            guard let ctx = try? ReaderContext.load(db: db, catalog: catalog, companyId: companyId, reader: .agent(id)) else {
+                return true
+            }
+            return rows.contains { level(ctx, $0) != .none }
+        }
     }
 
     // MARK: The mirror sweep

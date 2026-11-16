@@ -232,7 +232,8 @@ import Glibc
         let stored = try JSONDecoder().decode(PurgeReport.self, from: Data(try #require(tomb.purgeReport).utf8))
         #expect(stored == report)
         #expect(try w.activity().contains {
-            $0.kind == .resource && $0.text == "Purged F-1 (2 backups and 1 transcripts made since it was added still contain it)"
+            $0.kind == .resource && $0.text == "Purged F-1 (2 backups and 1 transcripts made since it was added may still contain it; "
+                + "reads through an agent's shell or the mirror are not tracked one by one)"
         })
         // Nothing brings it back: not the mirror sweep, not a re-ingest.
         _ = sweep(w)

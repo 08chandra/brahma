@@ -33,7 +33,7 @@ import Glibc
     }
 
     private func inspect(_ urls: URL..., known: [(name: String, value: String)] = []) throws -> DropPlan {
-        try ResourceIntake.inspect(urls: urls, knownValues: known)
+        try ResourceIntake.inspect(urls: urls, knownValues: known, agentAreas: .none)
     }
 
     private func reasons(_ plan: DropPlan) -> [String] { plan.refusals.map(\.reason) }
@@ -222,7 +222,7 @@ import Glibc
     @Test func otherArchivesRefused() throws {
         let dir = try tempDir()
         let urls = try ["a.tar", "b.tar.gz", "c.tgz", "d.bz2", "e.xz", "f.7z", "g.rar"].map { try write("x", dir.appending(path: $0)) }
-        let plan = try ResourceIntake.inspect(urls: urls, knownValues: [])
+        let plan = try ResourceIntake.inspect(urls: urls, knownValues: [], agentAreas: .none)
         #expect(plan.items.isEmpty)
         #expect(reasons(plan) == Array(repeating: "only .zip archives can be added", count: 7))
     }
@@ -242,8 +242,8 @@ import Glibc
         #expect(plan.items.map(\.ext) == ["pdf", "docx", "zip"])
 
         // The rule itself.
-        #expect(DropTrust.defaultProvenance(ext: "svg", bytes: 10, quarantined: false).reason == "SVG from outside (document type)")
-        let owner = DropTrust.defaultProvenance(ext: "swift", bytes: 10, quarantined: false)
+        #expect(DropTrust.defaultProvenance(ext: "svg", bytes: 10, quarantined: false, inAgentArea: false).reason == "SVG from outside (document type)")
+        let owner = DropTrust.defaultProvenance(ext: "swift", bytes: 10, quarantined: false, inAgentArea: false)
         #expect(owner.provenance == .owner && !owner.tainted && owner.reason == nil)
     }
 
@@ -437,7 +437,7 @@ import Glibc
         #expect(Quarantine.interpret(rc: -1, errno: EACCES))
         #expect(Quarantine.interpret(rc: -1, errno: EIO))
         #expect(Quarantine.interpret(rc: 0, errno: 0))
-        #expect(DropTrust.defaultProvenance(ext: "md", bytes: 5, quarantined: true).tainted)
+        #expect(DropTrust.defaultProvenance(ext: "md", bytes: 5, quarantined: true, inAgentArea: false).tainted)
         #else
         #expect(!Quarantine.isQuarantined(fd: -1))
         #endif

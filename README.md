@@ -804,7 +804,9 @@ is one message: a link goes on its own.
   an engine alert and wipes the mirror (it fails closed).
 - **Checks, before anything is stored.** Symlinks are refused, and so are executables (by extension and by content).
   Zips must be under 200 MB unpacked, with a compression ratio of at most 100, at most 10 000 entries and no `../` or link
-  entries. `.git/` is skipped and names are cleaned. A file is EXTERNAL (tainted, read as untrusted data) when it is a
+  entries. `.git/` is skipped and names are cleaned. A file is EXTERNAL (tainted, read as untrusted data) when it comes
+  from inside a company workspace or Brahma's data folder, whatever its type (agents write there, so dragging an agent's
+  file is never a silent vouch; links and `..` in the path don't change this). It is also EXTERNAL when it is a
   document type (PDF, Office, HTML, SVG, mail, RTF, zip), a text file over 64 KB, or a download macOS quarantined.
   PDFs therefore default to untrusted. Everything else you add is FROM YOU. `--vouch` or `--untrusted` overrides this.
 - **The secret sheet.** A file that looks like it holds a secret needs a choice: **Upload redacted**, **Upload anyway**
@@ -812,7 +814,9 @@ is one message: a link goes on its own.
   still read the vault copy), **Store it as a secret instead** (one small text file), or **Cancel**. A value already
   stored in your Keychain can never be uploaded raw. The CLI's equivalents are `--redact` and `--anyway`.
 - **Announcements.** A DM, channel or Inbox drop sends one owner message, answer or comment after the rows commit.
-  A library or CLI drop appears in each reader's next orientation under "New resources". A tainted resource is announced
+  A library or CLI drop appears in each reader's next orientation under "New resources" (anything added since that
+  reader's previous turn started, so a drop made during a turn is listed by the next one, sometimes twice). A tainted
+  resource is announced
   by ref and engine fields only, never by its name. A link is named only as `[link F-n]` and is never fetched.
 - **Purge.** `brahma resource <co> purge F-<n> --yes` (or the app's Purge) removes:
   - the vault bytes;
@@ -824,13 +828,19 @@ is one message: a link goes on its own.
   the row stays as a tombstone. Backups and transcripts are **reported, not rewritten**, so you can delete or re-create
   them:
   - **backups**: every database and data-home snapshot taken since the resource was added;
-  - **transcripts**: only the captured transcripts of turns that read the resource's indexed text through Brahma's tools
-    (`recall`, or a `search_memory` hit that showed a snippet). The engine records those reads.
+  - **transcripts**, a conservative list of those that **may** contain it: the captured transcripts of turns that read
+    the resource's indexed text through Brahma's tools (`recall`, or a `search_memory` hit that showed a snippet; the
+    engine records those reads), plus every captured transcript of a turn by an agent who can read the resource that ran
+    between its add and the purge.
 
-  A turn that read the file another way is **not** listed, even though its transcript may hold the content. That covers
-  reading the `.brahma/resources` mirror with its shell or the Read tool, or reading the vault directly on Workspace or
-  Full. In the app, a transcript of a listed turn shows "This transcript was captured while a since-purged resource
-  existed; it may still contain that content."
+  Reads through an agent's shell or the Read tool (the `.brahma/resources` mirror, or the vault on Workspace or Full) are
+  not tracked one by one, which is why every reader's transcript from that window is listed. The purge's activity line,
+  the CLI and the app say "may still contain it". In the app, and in `brahma transcript`, a listed transcript shows "This
+  transcript was captured while a since-purged resource existed; it may still contain that content." followed by the
+  purge's `[purged F-n]` ref (never its name).
+
+  Claude Code's own unredacted session logs under `~/.claude/projects` are not scrubbed by a purge either, and are not
+  listed: delete them yourself if they matter.
 
 Resource scopes, lab privacy and mirror integrity are enforced only by Brahma's tools under the Workspace and Full profiles; an agent's shell can read or change them. The Sandboxed profile enforces them.
 

@@ -382,13 +382,16 @@ extension Store {
         }
     }
 
-    /// The orientation's `## New resources` lines for `agent`: resources added after its previous turn ended (else after it
-    /// was hired) that it can read at `full`, oldest first; purged, removed and flagged ones are left out. A tainted row (or a
+    /// The orientation's `## New resources` lines for `agent`: resources added after its previous turn STARTED (else after
+    /// it was hired) that it can read at `full`, oldest first; purged, removed and flagged ones are left out. The previous
+    /// turn's orientation was built when it started, so a drop made while that turn ran is listed now; one made between its
+    /// start and its orientation may be listed twice (a repeat is safer than a silent miss). The running turn, whose
+    /// orientation this is, has no `endedAt` yet and is not the previous one. A tainted row (or a
     /// file of a tainted folder) shows no name: `- F-<n> · (untrusted) · <kind> — recall(ref: "F-<n>")`; a link never shows
     /// its address: `- F-<n> · link — recall(ref: "F-<n>")`.
     func newResourceLines(agent: Agent) throws -> [String] {
         try writer.read { db in
-            let since = try Date.fetchOne(db, sql: "SELECT MAX(endedAt) FROM turn WHERE agentId = ? AND endedAt IS NOT NULL",
+            let since = try Date.fetchOne(db, sql: "SELECT MAX(startedAt) FROM turn WHERE agentId = ? AND endedAt IS NOT NULL",
                                           arguments: [agent.id]) ?? agent.createdAt
             let rows = try Resource.fetchAll(db, sql: """
                 SELECT * FROM resource WHERE companyId = ? AND createdAt > ? AND purgedAt IS NULL AND removedAt IS NULL
@@ -544,6 +547,14 @@ extension Store {
               requester.companyId == companyId
         else { throw ResourceError.invalid(inboxRefusal) }
         return (ask, requester)
+    }
+
+    /// Where agents write, for `ResourceIntake.inspect`: every company's workspace, the workspaces root and the data home
+    /// (and the database's folder, when that is elsewhere).
+    /// A file dropped from inside one is EXTERNAL until the owner vouches for it (`DropTrust`).
+    public func agentAreas(paths: BrahmaPaths) throws -> AgentAreas {
+        let workspaces = try companies().map { URL(fileURLWithPath: $0.workspacePath, isDirectory: true) }
+        return AgentAreas(urls: workspaces + [paths.workspaces, paths.home] + (dataHome.map { [$0] } ?? []))
     }
 
     /// The vault must not sit inside this company's workspace (agents can read that).

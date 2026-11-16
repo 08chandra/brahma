@@ -342,11 +342,11 @@ import GRDB
         func add(_ name: String, _ text: String, _ drop: ResourceDrop = ResourceDrop(), at now: Date) throws -> Resource {
             let url = drops.appending(path: name)
             try Data(text.utf8).write(to: url)
-            let plan = try ResourceIntake.inspect(urls: [url], knownValues: [])
+            let plan = try ResourceIntake.inspect(urls: [url], knownValues: [], agentAreas: .none)
             return try #require(try d.store.addResources(companyId: d.company.id, plan: plan, drop: drop, contentVault: vault,
                                                          secretVault: MemoryVault(), knownValues: [], paths: d.world.paths, now: now).first)
         }
-        // Added before the agent's previous turn ended: not new to it.
+        // Added when the agent's previous turn started (its orientation was built then): not new to it.
         let start = Store.now()
         try add("old.md", "old\n", at: start)
         let ended = start.addingTimeInterval(10)

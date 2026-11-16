@@ -59,7 +59,7 @@ import BrahmaKeychain
         }
 
         func plan(_ urls: [URL], known: [(name: String, value: String)] = ResourceStoreTests.known) throws -> DropPlan {
-            try ResourceIntake.inspect(urls: urls, knownValues: known)
+            try ResourceIntake.inspect(urls: urls, knownValues: known, agentAreas: .none)
         }
 
         @discardableResult

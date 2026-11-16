@@ -80,8 +80,9 @@ public enum Replay {
 
     // MARK: Transcripts a purge flagged
 
-    /// What the transcript pane says over a turn's transcript that a purge report lists (Task 6c reports the captured
-    /// transcripts that read a purged resource's docs, by turn id, and does not rewrite them).
+    /// What the transcript pane (and `brahma transcript`) says over a turn's transcript that a purge report lists. A purge
+    /// lists, by turn id, the captured transcripts that read the resource through Brahma's tools and every captured turn of
+    /// one of its readers while it existed (shell and mirror reads are not tracked one by one); it does not rewrite them.
     public static let purgedTranscriptNotice =
         "This transcript was captured while a since-purged resource existed; it may still contain that content."
 

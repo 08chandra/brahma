@@ -233,16 +233,24 @@ public final class ResourceDropModel {
     // MARK: Adding
 
     /// Inspects `urls` (`ResourceIntake.inspect`, off the main actor) and adds what passed as one pending drop. Refusals are
-    /// shown in `app.errorMessage`; a drop with secret findings opens the secret sheet. A folder is added on its own.
+    /// shown in `app.errorMessage`; a drop with secret findings opens the secret sheet. A folder is added on its own. A file
+    /// from a company workspace or the data home is EXTERNAL until vouched for (`Store.agentAreas`).
     public func add(urls: [URL]) async {
+        await add(urls: urls, engineWritten: false)
+    }
+
+    /// `engineWritten`: the app itself just wrote these files from the owner's own input (a pasted image under the data
+    /// home's tmp folder), so where they sit says nothing about who wrote them.
+    private func add(urls: [URL], engineWritten: Bool) async {
         guard !urls.isEmpty, let app, let companyId else { return }
-        let (store, vault) = (app.store, app.secretVault)
+        let (store, vault, paths) = (app.store, app.secretVault, app.paths)
         isInspecting = true
         let inspected: Result<DropPlan, any Error> = await Task.detached {
             Result {
                 // Fail closed: a vault that can't be read means the scan can't be trusted, so nothing is added.
                 let known = try store.knownSecretValues(companyId: companyId, vault: vault)
-                return try ResourceIntake.inspect(urls: urls, knownValues: known)
+                let areas = engineWritten ? AgentAreas.none : try store.agentAreas(paths: paths)
+                return try ResourceIntake.inspect(urls: urls, knownValues: known, agentAreas: areas)
             }
         }.value
         isInspecting = false
@@ -279,7 +287,7 @@ public final class ResourceDropModel {
             return
         }
         let before = Set(pending.map(\.id))
-        await add(urls: [url])
+        await add(urls: [url], engineWritten: true)
         if let added = pending.first(where: { !before.contains($0.id) }) {
             pasted[added.id] = url
         } else {

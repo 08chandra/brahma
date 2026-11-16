@@ -46,13 +46,16 @@ public struct ResourceRow: Equatable, Identifiable, Sendable {
 public enum ResourcesPresentation {
     /// The library's purge dialog, exactly.
     public static func purgeConfirmText(_ ref: String) -> String {
-        "Purge \(ref)? This deletes the file and its search text. Backups and transcripts made since it was added still contain it."
+        "Purge \(ref)? This deletes the file and its search text. Backups made since it was added still contain it, and transcripts made since then may."
     }
 
-    /// What a purged row still lives in, or nil (not purged, or nothing holds it).
+    /// What a purged row may still live in, or nil (not purged, or nothing listed). The transcripts are a conservative
+    /// list (`Store.purgeResource`): every captured turn of a reader while it existed, since shell and mirror reads are not
+    /// tracked one by one.
     public static func purgeNote(_ row: ResourceRow) -> String? {
         guard row.isPurged, row.purgedBackups + row.purgedTranscripts > 0 else { return nil }
-        return "\(row.purgedBackups) backups and \(row.purgedTranscripts) transcripts contain purged content · delete or re-create"
+        return "\(row.purgedBackups) backups and \(row.purgedTranscripts) transcripts may contain purged content ("
+            + Store.untrackedReads + ") · delete or re-create"
     }
 
     /// The scope chip on a pending drop: `SCOPE · @<h> ONLY`, `SCOPE · #<channel> MEMBERS (<n>)`, `SCOPE · <KEY> PEOPLE (<n>)`

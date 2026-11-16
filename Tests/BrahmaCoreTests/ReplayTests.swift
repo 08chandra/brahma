@@ -363,7 +363,7 @@ import GRDB
     }
 
     /// The transcript notice: a turn's transcript a purge report lists is flagged by the purge's ref (a folder once, by the
-    /// folder), never by the resource's name; other turns and other companies are not flagged.
+    /// folder), never by the resource's name; turns that ran before it existed and other companies are not flagged.
     @Test func purgeFlaggedTranscriptNotice() throws {
         let w = try ResourceStoreTests.W()
         try w.add([try w.file("MARMOTNAME.md", "the MARMOT launch plan\n")])
@@ -374,9 +374,14 @@ import GRDB
         #expect(w.recall(w.eng1, "F-3").contains("HERON"))
         try ResourcePurgeTests.captured(w, reader, w.eng1)
         try ResourcePurgeTests.endTurn(w, reader)
-        let bystander = try ResourcePurgeTests.running(w, w.eng2)
+        // A reader's captured turn that ended before anything was added (one that ran while it existed is listed too:
+        // final-review I-3, `PurgeTranscriptListTests`).
+        let bystander = UUID().uuidString
+        try w.store.writer.write { db in
+            try Turn(id: bystander, agentId: w.eng2.id, companyId: w.company.id, startedAt: Store.now().addingTimeInterval(-7200),
+                     endedAt: Store.now().addingTimeInterval(-3600), outcome: .succeeded, summary: nil, costUSD: nil).insert(db)
+        }
         try ResourcePurgeTests.captured(w, bystander, w.eng2)
-        try ResourcePurgeTests.endTurn(w, bystander)
         #expect(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: reader) == nil, "nothing purged yet")
 
         #expect(try w.store.purgeResource(companyId: w.company.id, number: 1, backups: [], contentVault: w.contentVault,

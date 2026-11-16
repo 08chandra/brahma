@@ -103,7 +103,7 @@ struct ResourceCommand: ParsableCommand {
         if redact && anyway { throw ValidationError("choose --redact or --anyway, not both") }
         if yes, !isPurge { throw ValidationError("--yes goes only with purge") }
         if isPurge, !yes {
-            throw ValidationError("purge deletes the file and its search text for good (backups and transcripts made since it was added still contain it); add --yes")
+            throw ValidationError("purge deletes the file and its search text for good (backups made since it was added still contain it, and transcripts made since then may); add --yes")
         }
     }
 
@@ -127,7 +127,7 @@ struct ResourceCommand: ParsableCommand {
                 let secretVault = try cliSecretVault(interactive: false)
                 let known = try store.knownSecretValues(companyId: c.id, vault: secretVault)
                 let urls = files.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-                let plan = try ResourceIntake.inspect(urls: urls, knownValues: known)
+                let plan = try ResourceIntake.inspect(urls: urls, knownValues: known, agentAreas: try store.agentAreas(paths: paths))
                 for refusal in plan.refusals { warn("\(refusal.name): \(refusal.reason)") }
                 for skipped in plan.skipped { warn("skipped \(skipped)") }
                 guard !plan.items.isEmpty else { throw fail("there is nothing to add") }
@@ -169,9 +169,10 @@ struct ResourceCommand: ParsableCommand {
                     + HomeSnapshot.list(paths: paths).map { (name: $0.name, takenAt: $0.date) }
                 let report = try store.purgeResource(companyId: c.id, number: n, backups: backups, contentVault: contentVault,
                                                      paths: paths)
-                print("purged F-\(n); \(report.backups.count) backups and \(report.transcripts.count) transcripts made since it was added still contain it")
+                print("purged F-\(n); " + Store.purgeHolders(report))
                 for name in report.backups { show("  backup \(name) contains purged content · delete or re-create") }
-                for turn in report.transcripts { show("  transcript of turn \(turn)") }
+                for turn in report.transcripts { show("  transcript of turn \(turn) may contain purged content") }
+                print("Claude Code's own unredacted session logs under ~/.claude/projects are not scrubbed by a purge.")
             }
         } catch let e as ResourceError {
             throw fail(e.message)
@@ -196,7 +197,7 @@ struct ResourceCommand: ParsableCommand {
     }
 
     /// `F-<n> · <kind> · "<name>" [· <k> files] · <size> · <scope> · FROM YOU | EXTERNAL (<why>) [· REDACTED | FLAGGED] [· mirrored <path>]
-    /// · added <day> [· purged <day> (<k> backups and <t> transcripts still contain it)]`.
+    /// · added <day> [· purged <day> (<k> backups and <t> transcripts may still contain it)]`.
     private func line(_ r: Resource, store: Store, company c: Company, files: Int? = nil) -> String {
         var kind = r.kind.rawValue
         if let fileKind = r.fileKind { kind += " " + fileKind }
@@ -215,7 +216,7 @@ struct ResourceCommand: ParsableCommand {
         if let purged = r.purgedAt {
             text += " · purged \(day(purged))"
             if let raw = r.purgeReport, let report = try? JSONDecoder().decode(PurgeReport.self, from: Data(raw.utf8)) {
-                text += " (\(report.backups.count) backups and \(report.transcripts.count) transcripts still contain it)"
+                text += " (\(report.backups.count) backups and \(report.transcripts.count) transcripts may still contain it)"
             }
         }
         return text

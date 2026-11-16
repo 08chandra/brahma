@@ -32,9 +32,11 @@ public enum ResourceIntake {
 
     // MARK: Inspect
 
-    public static func inspect(urls: [URL], knownValues: [(name: String, value: String)]) throws -> DropPlan {
+    /// `agentAreas` are where agents write (`Store.agentAreas(paths:)`): a file from inside one defaults to EXTERNAL
+    /// (`DropTrust`), whatever its type.
+    public static func inspect(urls: [URL], knownValues: [(name: String, value: String)], agentAreas: AgentAreas) throws -> DropPlan {
         var plan = DropPlan()
-        for url in urls { inspectTop(url, single: urls.count == 1, knownValues: knownValues, into: &plan) }
+        for url in urls { inspectTop(url, single: urls.count == 1, knownValues: knownValues, areas: agentAreas, into: &plan) }
         plan.totalBytes = plan.items.reduce(0) { $0 + $1.bytes }
         plan.hasKnownValueFinding = plan.items.contains { $0.findings.contains(where: \.isKnownValue) }
         plan.hasPatternFinding = plan.items.contains { $0.findings.contains { !$0.isKnownValue } }
@@ -45,9 +47,12 @@ public enum ResourceIntake {
         let fd: Int32
         let url: URL
         let identity: FileIdentity
+        /// The directory it was opened from, or one above it, is where agents write.
+        let inAgentArea: Bool
     }
 
-    private static func inspectTop(_ url: URL, single: Bool, knownValues: [(name: String, value: String)], into plan: inout DropPlan) {
+    private static func inspectTop(_ url: URL, single: Bool, knownValues: [(name: String, value: String)], areas: AgentAreas,
+                                   into plan: inout DropPlan) {
         let std = url.standardizedFileURL
         let name = std.lastPathComponent
         let shown = sanitizeName(name)
@@ -62,17 +67,19 @@ public enum ResourceIntake {
         guard fstat(rootFd, &rst) == 0, fstatat(rootFd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
             plan.refusals.append((shown, "\(shown) can't be read")); return
         }
-        let root = Root(fd: rootFd, url: parent, identity: FileIdentity(rst))
+        // Where agents write, by the identity of the directory the drop is opened from and every one above it.
+        let root = Root(fd: rootFd, url: parent, identity: FileIdentity(rst), inAgentArea: areas.encloses(dirFd: rootFd))
         switch st.st_mode & S_IFMT {
         case S_IFLNK:
             plan.refusals.append((shown, symlinkRefusal))
         case S_IFREG:
-            inspectFile(root, [name], walked: st, shown: shown, knownValues: knownValues, into: &plan)
+            inspectFile(root, [name], walked: st, shown: shown, inAgentArea: root.inAgentArea, knownValues: knownValues,
+                        into: &plan)
         case S_IFDIR:
             if name == ".git" { plan.skipped.append(shown); return }
             if ResourcePolicy.refusedExt.contains(ArtifactKind.ext(of: name)) { plan.refusals.append((shown, executableRefusal)); return }
             if iWorkPackageExt.contains(ArtifactKind.ext(of: name)) { plan.refusals.append((shown, iWorkPackage(shown))); return }
-            let walked = inspectFolder(root, name, walked: st, shown: shown, knownValues: knownValues, into: &plan)
+            let walked = inspectFolder(root, name, walked: st, shown: shown, areas: areas, knownValues: knownValues, into: &plan)
             if single && walked { plan.folderName = shown }
         default:
             plan.refusals.append((shown, notFileRefusal))
@@ -81,7 +88,7 @@ public enum ResourceIntake {
 
     /// Walks the folder without following anything, then inspects its files. Over the folder caps → refused whole. False
     /// when the folder as a whole was refused.
-    private static func inspectFolder(_ root: Root, _ name: String, walked: stat, shown: String,
+    private static func inspectFolder(_ root: Root, _ name: String, walked: stat, shown: String, areas: AgentAreas,
                                       knownValues: [(name: String, value: String)], into plan: inout DropPlan) -> Bool {
         let fd = openat(root.fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { plan.refusals.append((shown, "\(shown) can't be read")); return false }
@@ -91,13 +98,13 @@ public enum ResourceIntake {
             plan.refusals.append((shown, "\(shown) changed while it was being checked; add it again")); return false
         }
 
-        var files: [(components: [String], st: stat)] = []
+        var files: [(components: [String], st: stat, inAgentArea: Bool)] = []
         var skipped: [String] = []
         var refusals: [(name: String, reason: String)] = []
         var bytes: Int64 = 0, visited = 0
         var over = false, unreadable = false
 
-        func walk(_ dfd: Int32, _ components: [String], depth: Int) {
+        func walk(_ dfd: Int32, _ components: [String], depth: Int, inArea: Bool) {
             guard let names = DirectoryListing.names(fd: dfd, limit: maxWalkEntries - visited + 1) else {
                 // The dropped folder itself: refused. A folder inside it: skipped and listed.
                 if depth == 0 { unreadable = true } else { skipped.append(shownPath(components)) }
@@ -114,7 +121,7 @@ public enum ResourceIntake {
                 switch est.st_mode & S_IFMT {
                 case S_IFREG:
                     if n == ".git" { skipped.append(shownPath(path)); continue }
-                    files.append((path, est))
+                    files.append((path, est, inArea))
                     bytes += Int64(est.st_size)
                     if files.count > ArtifactPolicy.maxFiles || bytes > Int64(ArtifactPolicy.maxFolderBytes) { over = true; return }
                 case S_IFDIR:
@@ -129,7 +136,7 @@ public enum ResourceIntake {
                     guard child >= 0 else { skipped.append(shownPath(path)); continue }
                     var cst = stat()
                     if fstat(child, &cst) == 0, FileIdentity(est).sameFile(cst) {
-                        walk(child, path, depth: depth + 1)
+                        walk(child, path, depth: depth + 1, inArea: inArea || areas.contains(cst))
                     } else {
                         skipped.append(shownPath(path))
                     }
@@ -139,14 +146,15 @@ public enum ResourceIntake {
                 }
             }
         }
-        walk(fd, [name], depth: 0)
+        walk(fd, [name], depth: 0, inArea: root.inAgentArea || areas.contains(st))
         if unreadable { plan.refusals.append((shown, "\(shown) can't be read")); return false }
         if over { plan.refusals.append((shown, folderRefusal)); return false }
 
         plan.skipped += skipped
         plan.refusals += refusals
         for f in files {
-            inspectFile(root, f.components, walked: f.st, shown: shownPath(f.components), knownValues: knownValues, into: &plan)
+            inspectFile(root, f.components, walked: f.st, shown: shownPath(f.components), inAgentArea: f.inAgentArea,
+                        knownValues: knownValues, into: &plan)
         }
         return true
     }
@@ -156,7 +164,7 @@ public enum ResourceIntake {
     /// executable magic, the sniffer, the archive checks (zip and zip containers), quarantine, default trust and the secret
     /// scan. The identity is
     /// read before the reads and must be unchanged after them.
-    private static func inspectFile(_ root: Root, _ components: [String], walked: stat, shown: String,
+    private static func inspectFile(_ root: Root, _ components: [String], walked: stat, shown: String, inAgentArea: Bool,
                                     knownValues: [(name: String, value: String)], into plan: inout DropPlan) {
         func refuse(_ reason: String) { plan.refusals.append((shown, reason)) }
         let raw = components[components.count - 1]
@@ -203,7 +211,7 @@ public enum ResourceIntake {
         }
 
         let quarantined = Quarantine.isQuarantined(fd: fd)
-        let trust = DropTrust.defaultProvenance(ext: ext, bytes: identity.size, quarantined: quarantined)
+        let trust = DropTrust.defaultProvenance(ext: ext, bytes: identity.size, quarantined: quarantined, inAgentArea: inAgentArea)
         let isText = !isZip && ArtifactKind.isText(ext: ext)
         guard let findings = try? ContentScan.scan(fd: fd, isText: isText, knownValues: knownValues) else {
             return refuse("\(display) can't be read")

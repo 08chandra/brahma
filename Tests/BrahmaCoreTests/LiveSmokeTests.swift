@@ -360,7 +360,7 @@ struct LiveSmokeTests {
         try FileManager.default.createDirectory(at: drops, withIntermediateDirectories: true)
         let notes = drops.appending(path: "notes.md")
         try Data("# Team notes\n\nThe staging port is 4417.\n".utf8).write(to: notes)
-        let plan = try ResourceIntake.inspect(urls: [notes], knownValues: [])
+        let plan = try ResourceIntake.inspect(urls: [notes], knownValues: [], agentAreas: .none)
         try #require(plan.refusals.isEmpty && plan.items.count == 1, "plan: \(plan.refusals)")
         let added = try store.addResources(companyId: companyId, plan: plan, drop: ResourceDrop(), contentVault: ContentVault(paths: paths),
                                            secretVault: secretVault, knownValues: [], paths: paths)

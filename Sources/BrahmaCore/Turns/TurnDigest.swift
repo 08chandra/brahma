@@ -66,7 +66,7 @@ public struct TurnContext: Sendable {
     public var budget: String? = nil
     /// The company's preview surfaces with their states, in position order (the `Previews:` line).
     public var previews: [(surface: PreviewSurface, state: PreviewState?)] = []
-    /// Resources the owner added since the agent's previous turn ended that it can read in full, as orientation lines
+    /// Resources the owner added since the agent's previous turn started that it can read in full, as orientation lines
     /// (`Store.newResourceLines`); `TurnDigest` shows at most `maxNewResources`. Never makes a turn actionable by itself.
     public var newResources: [String] = []
 

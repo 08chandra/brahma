@@ -244,7 +244,7 @@ struct DevGroup: AsyncParsableCommand {
             let secretVault = try cliSecretVault(interactive: false)
             let known = try store.knownSecretValues(companyId: c.id, vault: secretVault)
             let plan = try ResourceIntake.inspect(urls: files.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) },
-                                                  knownValues: known)
+                                                  knownValues: known, agentAreas: try store.agentAreas(paths: paths))
             guard plan.refusals.isEmpty, !plan.items.isEmpty, plan.items.allSatisfy({ $0.findings.isEmpty }) else {
                 throw fail("the dev drop takes plain files only (no refusals, no secret findings)")
             }

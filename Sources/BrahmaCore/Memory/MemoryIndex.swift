@@ -127,8 +127,11 @@ public struct MemoryIndex: Sendable {
     /// The doc `ref` names, as the reader may see it: only docs of the source the ref's form implies, with its canonical ref.
     /// The newest one the reader can read at `full` wins (a kb page ref without `#section` joins the page's readable
     /// sections, in order); otherwise the newest at `summary`, title only; otherwise nil, the same for unreadable and missing.
+    ///
+    /// A `kb:` ref is matched like a page is everywhere else (`kbRead`): its path is normalized (`HandbookPath`) and resolved
+    /// to the stored page case-insensitively, and its `#section` to that section's slug.
     public func document(companyId: String, scope: Reader, ref: String, now: Date) throws -> MemoryDocument? {
-        let (source, canonical) = MemoryRefs.implied(ref)
+        let (source, implied) = MemoryRefs.implied(ref)
         guard let source else {
             // An unknown form still checks the reader (another company's agent is refused) before answering "missing".
             _ = try ReaderContext.load(store: store, companyId: companyId, reader: scope)
@@ -137,6 +140,12 @@ public struct MemoryIndex: Sendable {
         return try store.writer.read { db in
             let ctx = try ReaderContext.load(db: db, catalog: store.catalog, companyId: companyId, reader: scope)
             let activeNow = try Store.activeNow(db: db, companyId: companyId)
+            var canonical = implied
+            // A name that is not a page path, or no such page, is left as given (and answers like a missing ref).
+            if source == .kb, let parsed = try? HandbookPath.normalizeRef(implied),
+               let page = try Store.kbPage(db: db, companyId: companyId, path: parsed.path) {
+                canonical = "kb:\(page.path)" + (parsed.section.map { "#" + KBMarkdown.slug($0) } ?? "")
+            }
             let wholePage = source == .kb && !canonical.contains("#")
             var sql = """
                 SELECT * FROM memoryDoc WHERE companyId = ? AND source = ? AND removedAt IS NULL
