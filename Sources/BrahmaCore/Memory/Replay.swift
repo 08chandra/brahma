@@ -78,6 +78,41 @@ public enum Replay {
         }
     }
 
+    // MARK: Transcripts a purge flagged
+
+    /// What the transcript pane says over a turn's transcript that a purge report lists (Task 6c reports the captured
+    /// transcripts that read a purged resource's docs, by turn id, and does not rewrite them).
+    public static let purgedTranscriptNotice =
+        "This transcript was captured while a since-purged resource existed; it may still contain that content."
+
+    /// The purged resources whose purge report lists `turnId`'s transcript, as `[purged F-n]` (a folder purged with its
+    /// files is named once, by the folder), in number order. Only the tombstone's ref is used: never its name, URL or path.
+    public static func purgesFlagging(store: Store, companyId: String, turnId: String) throws -> [String] {
+        try store.writer.read { db in
+            var flagged: [(id: String, parentId: String?, number: Int)] = []
+            for row in try Row.fetchAll(db, sql: """
+                SELECT id, parentId, number, purgeReport FROM resource
+                WHERE companyId = ? AND purgedAt IS NOT NULL AND purgeReport IS NOT NULL AND instr(purgeReport, ?) > 0
+                ORDER BY number
+                """, arguments: [companyId, turnId]) {
+                let raw: String = row["purgeReport"]
+                guard let report = try? JSONDecoder().decode(PurgeReport.self, from: Data(raw.utf8)),
+                      report.transcripts.contains(turnId) else { continue }
+                flagged.append((row["id"], row["parentId"], row["number"]))
+            }
+            let ids = Set(flagged.map(\.id))
+            return flagged.filter { $0.parentId.map { !ids.contains($0) } ?? true }.map { "[purged F-\($0.number)]" }
+        }
+    }
+
+    /// The pane's notice for `turnId`'s transcript (`purgedTranscriptNotice` and the purges' refs), or nil when no purge
+    /// report lists it.
+    public static func transcriptNotice(store: Store, companyId: String, turnId: String) throws -> String? {
+        let refs = try purgesFlagging(store: store, companyId: companyId, turnId: turnId)
+        guard !refs.isEmpty else { return nil }
+        return purgedTranscriptNotice + " (" + refs.joined(separator: ", ") + ")"
+    }
+
     // MARK: Days
 
     /// The owner's calendar day `yyyy-MM-dd` as an interval (23, 24 or 25 hours long), or nil when it is not such a date.

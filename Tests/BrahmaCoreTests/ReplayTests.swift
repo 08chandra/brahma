@@ -272,4 +272,124 @@ import GRDB
         let noOwner = try OwnerTestHome(initOwner: false)
         #expect(try runBrahma(["replay", "acme", "@ceo"], home: noOwner.url).status != 0)
     }
+
+    // MARK: Privacy lines (fix round 1)
+
+    /// 2026-11-16 12:00 UTC plus `seconds` (the resource fixture's owner time zone is UTC).
+    static func utc(_ seconds: TimeInterval) -> Date { Date(timeIntervalSince1970: 1_794_830_400 + seconds) }
+
+    static func eng1Day(_ w: ResourceStoreTests.W) throws -> [ReplayEntry] {
+        try Replay.timeline(store: w.store, companyId: w.company.id, subject: .agentDay(agentId: w.eng1.id, day: "2026-11-16"),
+                            tz: w.store.ownerTimeZone())
+    }
+
+    static func everything(_ entries: [ReplayEntry]) -> String {
+        entries.map { "\($0.actor) \($0.text) \($0.ref ?? "")" }.joined(separator: "\n")
+    }
+
+    /// A purged resource shows only `[purged F-n]`: its name and the path it was dropped from appear nowhere in the timeline,
+    /// though the tombstone keeps its name.
+    @Test func purgedResourceShowsOnlyRef() throws {
+        let w = try ResourceStoreTests.W()
+        let file = try w.file("OCELOTNAME-plan.md", "the plan\n")
+        try w.add([file], try w.drop(.dm(handle: "eng-1")), now: Self.utc(0))
+        let before = try Self.eng1Day(w)
+        #expect(Self.everything(before).contains("OCELOTNAME"), "the live resource is named: \(Self.everything(before))")
+        #expect(before.contains { $0.kind == .resource && $0.ref == "F-1" })
+
+        try w.store.purgeResource(companyId: w.company.id, number: 1, backups: [], contentVault: w.contentVault, paths: w.paths,
+                                  now: Self.utc(600))
+        #expect(try w.store.resource(companyId: w.company.id, number: 1)?.displayName == "OCELOTNAME-plan.md", "the tombstone keeps it")
+        let after = try Self.eng1Day(w)
+        let line = try #require(after.first { $0.kind == .resource })
+        #expect(line.text == "[purged F-1]" && line.ref == "F-1" && line.actor == "owner")
+        let all = Self.everything(after)
+        #expect(after.contains { $0.kind == .message }, "the announcement DM is still in the day")
+        for leak in ["OCELOTNAME", "ocelotname", "-plan.md", w.drops.path, "Downloads", w.vaultFiles.path] {
+            #expect(!all.contains(leak), "\(leak) in \(all)")
+        }
+    }
+
+    /// A link shows `F-n link`: never its URL, host or path.
+    @Test func linkShowsOnlyRef() throws {
+        let w = try ResourceStoreTests.W()
+        try w.store.addLink(companyId: w.company.id, url: "https://hostqzx.example.org/pathtokenqz/a?k=QUERYTOKENQZ",
+                            drop: try w.drop(.dm(handle: "eng-1")), contentVault: w.contentVault, now: Self.utc(0))
+        let entries = try Self.eng1Day(w)
+        let line = try #require(entries.first { $0.kind == .resource })
+        #expect(line.text == "F-1 link" && line.ref == "F-1")
+        let all = Self.everything(entries)
+        for leak in ["hostqzx", "example.org", "pathtokenqz", "QUERYTOKENQZ", "https", "://"] {
+            #expect(!all.contains(leak), "\(leak) in \(all)")
+        }
+        // Purged, it is a ref only too.
+        try w.store.purgeResource(companyId: w.company.id, number: 1, backups: [], contentVault: w.contentVault, paths: w.paths,
+                                  now: Self.utc(600))
+        #expect(try Self.eng1Day(w).first { $0.kind == .resource }?.text == "[purged F-1]")
+    }
+
+    /// A memory entry the owner deleted is marked "(deleted)"; a live one is not.
+    @Test func deletedMemoryEntryMarked() throws {
+        let w = try W()
+        _ = try w.store.remember(companyId: w.company.id, by: w.eng1.id, fact: "Streaks reset at local midnight", knownValues: [],
+                                 now: W.at(100))
+        _ = try w.store.remember(companyId: w.company.id, by: w.eng1.id, fact: "The demo board uses PORTWORD 8443", knownValues: [],
+                                 now: W.at(200))
+        let goneRef = try #require(try w.day(.agentDay(agentId: w.eng1.id, day: "2026-11-16"))
+            .first { $0.kind == .memory && $0.text.contains("PORTWORD") }?.ref)
+        let goneNumber = try #require(Int(goneRef.dropFirst("mem:".count)))
+        #expect(try w.store.ownerDeleteMemory(companyId: w.company.id, number: goneNumber, now: W.at(300)))
+        let memory = try w.day(.agentDay(agentId: w.eng1.id, day: "2026-11-16")).filter { $0.kind == .memory }
+        #expect(memory.count == 2, "the deleted entry stays in the day, marked")
+        let deleted = try #require(memory.first { $0.ref == goneRef })
+        #expect(deleted.text.hasPrefix("\(goneRef) fact (deleted)"), "\(deleted.text)")
+        #expect(!deleted.text.contains("PORTWORD"), "its fact was purged")
+        let live = try #require(memory.first { $0.ref != goneRef })
+        #expect(!live.text.contains("(deleted)") && live.text.contains("Streaks reset at local midnight"))
+    }
+
+    /// A message that mentions @eng-10 is not in @eng-1's day; one that mentions @eng-1 is.
+    @Test func longerHandleMentionNotInDay() throws {
+        let w = try W()
+        _ = try w.store.hire(companyId: w.company.id, name: "eng-10", role: "engineer", model: "sonnet")
+        let router = MessageRouter(store: w.store)
+        _ = try router.post(companyId: w.company.id, channel: "general", from: .agent(w.eng2.id), text: "@eng-10 please take TENTH", now: W.at(10))
+        _ = try router.post(companyId: w.company.id, channel: "general", from: .agent(w.eng2.id), text: "@eng-1 please take FIRST", now: W.at(20))
+        _ = try router.post(companyId: w.company.id, channel: "general", from: .agent(w.eng2.id), text: "ping @eng-10 about it", now: W.at(30))
+        let messages = try w.day(.agentDay(agentId: w.eng1.id, day: "2026-11-16")).filter { $0.kind == .message }
+        #expect(messages.count == 1, "\(messages.map(\.text))")
+        #expect(messages.first?.text.contains("FIRST") == true)
+        #expect(!messages.contains { $0.text.contains("TENTH") || $0.text.contains("ping") })
+    }
+
+    /// The transcript notice: a turn's transcript a purge report lists is flagged by the purge's ref (a folder once, by the
+    /// folder), never by the resource's name; other turns and other companies are not flagged.
+    @Test func purgeFlaggedTranscriptNotice() throws {
+        let w = try ResourceStoreTests.W()
+        try w.add([try w.file("MARMOTNAME.md", "the MARMOT launch plan\n")])
+        let kit = try ResourcePurgeTests.folder(w, "KITNAME", [("a.md", "alpha HERON\n"), ("b.md", "beta\n")])
+        try w.add([kit])                                                      // F-2, with files F-3 and F-4
+        let reader = try ResourcePurgeTests.running(w, w.eng1)
+        #expect(w.recall(w.eng1, "F-1").contains("MARMOT"))
+        #expect(w.recall(w.eng1, "F-3").contains("HERON"))
+        try ResourcePurgeTests.captured(w, reader, w.eng1)
+        try ResourcePurgeTests.endTurn(w, reader)
+        let bystander = try ResourcePurgeTests.running(w, w.eng2)
+        try ResourcePurgeTests.captured(w, bystander, w.eng2)
+        try ResourcePurgeTests.endTurn(w, bystander)
+        #expect(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: reader) == nil, "nothing purged yet")
+
+        #expect(try w.store.purgeResource(companyId: w.company.id, number: 1, backups: [], contentVault: w.contentVault,
+                                          paths: w.paths).transcripts == [reader])
+        #expect(try Replay.purgesFlagging(store: w.store, companyId: w.company.id, turnId: reader) == ["[purged F-1]"])
+        try w.store.purgeResource(companyId: w.company.id, number: 2, backups: [], contentVault: w.contentVault, paths: w.paths)
+        #expect(try Replay.purgesFlagging(store: w.store, companyId: w.company.id, turnId: reader) == ["[purged F-1]", "[purged F-2]"])
+        let notice = try #require(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: reader))
+        #expect(notice == "This transcript was captured while a since-purged resource existed; it may still contain that content. "
+                + "([purged F-1], [purged F-2])")
+        for leak in ["MARMOT", "KITNAME", "a.md", w.drops.path] { #expect(!notice.contains(leak), "\(leak)") }
+        #expect(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: bystander) == nil)
+        let other = try ResourceStoreTests.W(store: w.store, name: "Beta")
+        #expect(try Replay.transcriptNotice(store: w.store, companyId: other.company.id, turnId: reader) == nil)
+    }
 }

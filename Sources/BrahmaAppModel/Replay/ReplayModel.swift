@@ -22,10 +22,16 @@ public final class ReplayModel {
     public private(set) var loaded = false
     /// The last failure, verbatim.
     public var error: String?
-    /// The open transcript pane: its turn, its sanitized text, and whether it was cut.
+    /// The open transcript pane: its turn, its sanitized text, and whether it was cut. The pane is open while
+    /// `transcriptTurnId` is set: with `transcript`, or with `transcriptError` when it could not be read.
     public private(set) var transcript: String?
     public private(set) var transcriptTurnId: String?
     public private(set) var transcriptTruncated = false
+    /// Why the open transcript could not be shown (missing or corrupt file, a hash mismatch, another company's turn), shown
+    /// in the pane itself.
+    public private(set) var transcriptError: String?
+    /// Set when a purge report lists this transcript: it may still hold the purged content (`Replay.transcriptNotice`).
+    public private(set) var transcriptNotice: String?
 
     @ObservationIgnored private let store: Store
     @ObservationIgnored private let paths: BrahmaPaths
@@ -112,29 +118,39 @@ public final class ReplayModel {
     }
 
     /// Opens a turn's captured transcript in the pane: its records rendered, every line sanitized
-    /// (`TerminalText.sanitize`), at most `transcriptLineCap` lines. Returns the text shown (empty when it can't be read; the
-    /// reason is in `error`).
+    /// (`TerminalText.sanitize`), at most `transcriptLineCap` lines, with `transcriptNotice` when a purge report lists it.
+    /// Returns the text shown. When it can't be read the pane still opens, showing the reason (`transcriptError`), and this
+    /// returns "".
     @discardableResult
     public func openTranscript(turnId: String) async -> String {
         transcriptGeneration += 1
         let mine = transcriptGeneration
         let (store, paths, companyId) = (self.store, self.paths, self.companyId)
         do {
-            let (text, cut) = try await Task.detached { () -> (String, Bool) in
+            let (text, cut, notice) = try await Task.detached { () -> (String, Bool, String?) in
                 let raw = try TranscriptCapture.read(turnId: turnId, companyId: companyId, store: store, paths: paths)
-                return Self.pane(raw)
+                let (text, cut) = Self.pane(raw)
+                // A failed check must not hide the warning: say that it could not be made.
+                let notice: String?
+                do { notice = try Replay.transcriptNotice(store: store, companyId: companyId, turnId: turnId) } catch {
+                    notice = "Couldn't check this transcript against purge reports: \(error)"
+                }
+                return (text, cut, notice)
             }.value
             guard mine == transcriptGeneration else { return text }
             transcript = text
             transcriptTurnId = turnId
             transcriptTruncated = cut
+            transcriptError = nil
+            transcriptNotice = notice
             return text
         } catch {
             guard mine == transcriptGeneration else { return "" }
             transcript = nil
-            transcriptTurnId = nil
+            transcriptTurnId = turnId
             transcriptTruncated = false
-            self.error = (error as? WorkError)?.message ?? "Couldn't read the transcript: \(error)"
+            transcriptNotice = nil
+            transcriptError = (error as? WorkError)?.message ?? "Couldn't read the transcript: \(error)"
             return ""
         }
     }
@@ -144,6 +160,8 @@ public final class ReplayModel {
         transcript = nil
         transcriptTurnId = nil
         transcriptTruncated = false
+        transcriptError = nil
+        transcriptNotice = nil
     }
 
     /// The pane's text: each record rendered (a record that carries no conversation is left out), every line sanitized, cut

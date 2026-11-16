@@ -44,7 +44,9 @@ final class ActiveBox: @unchecked Sendable {
         let globex = try #require(try store.companies().first { $0.name == "Globex" })
         let sizing = CountingSizing()
         let active = ActiveBox()
-        let model = StorageModel(store: store, paths: paths, sizing: sizing, activeNow: { _ in active.value })
+        // Each measurement is stamped with its own time (the count of measurements before it), so a report can be told apart.
+        let model = StorageModel(store: store, paths: paths, sizing: sizing, activeNow: { _ in active.value },
+                                 clock: { Date(timeIntervalSince1970: 1_794_837_600 + Double(sizing.measurements)) })
 
         await model.show(companyId: acme.id)
         #expect(sizing.measurements == 1)
@@ -58,14 +60,20 @@ final class ActiveBox: @unchecked Sendable {
         #expect(sizing.measurements == 2)
         await model.refresh()
         #expect(sizing.measurements == 3, "Refresh always measures")
+        let acmeReport = try #require(model.report)
+        #expect(acmeReport.measuredAt == Date(timeIntervalSince1970: 1_794_837_600 + 2), "the third measurement")
         // Per company: another company is measured on its own, and coming back within the interval measures nothing.
         await model.show(companyId: globex.id)
         #expect(sizing.measurements == 4)
         #expect(model.companyId == globex.id)
+        let globexReport = try #require(model.report)
+        #expect(globexReport.measuredAt == Date(timeIntervalSince1970: 1_794_837_600 + 3))
+        #expect(globexReport != acmeReport)
         active.value = StorageMeter.minInterval + 50
         await model.show(companyId: acme.id)
         #expect(sizing.measurements == 4)
-        #expect(model.report?.measuredAt == model.report?.measuredAt)
+        #expect(model.companyId == acme.id)
+        #expect(model.report == acmeReport, "Acme's cached report is shown again, not Globex's and not a new one")
         #expect(model.rows.map(\.label) == ["DATABASE (EST.)", "WORKSPACE", "RESOURCES", "TRANSCRIPTS", "ARCHIVE", "TOTAL",
                                             "BACKUPS (ALL COMPANIES)", "FREE DISK"])
     }

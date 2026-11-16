@@ -15,9 +15,10 @@ struct ReplayView: View {
             chips
             Hairline()
             lines
-            if let transcript = replay.transcript, let turnId = replay.transcriptTurnId {
+            if let turnId = replay.transcriptTurnId {
                 Hairline()
-                TranscriptPane(text: transcript, turnId: turnId, truncated: replay.transcriptTruncated) { replay.closeTranscript() }
+                TranscriptPane(text: replay.transcript, error: replay.transcriptError, notice: replay.transcriptNotice, turnId: turnId,
+                               truncated: replay.transcriptTruncated) { replay.closeTranscript() }
                     .frame(minHeight: 140, idealHeight: 240, maxHeight: 320)
             }
         }
@@ -166,9 +167,13 @@ private struct ReplayRow: View {
     }
 }
 
-/// A turn's captured transcript: mono, sanitized line by line, at most `ReplayModel.transcriptLineCap` lines.
+/// A turn's captured transcript: mono, sanitized line by line, at most `ReplayModel.transcriptLineCap` lines. When it could
+/// not be read the pane shows why (a missing or corrupt file, a hash mismatch); when a purge report lists it, a warning
+/// line says it may still hold the purged content.
 private struct TranscriptPane: View {
-    let text: String
+    let text: String?
+    let error: String?
+    let notice: String?
     let turnId: String
     let truncated: Bool
     let close: () -> Void
@@ -186,15 +191,40 @@ private struct TranscriptPane: View {
                     .accessibilityLabel(Text("Close transcript"))
                 }
             }
-            ScrollView([.vertical, .horizontal]) {
-                Text(verbatim: text.isEmpty ? "(no conversation records)" : text)
-                    .font(BrahmaTheme.monoSmall)
-                    .foregroundStyle(BrahmaTheme.text1)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(BrahmaTheme.spaceS)
+            if let notice {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 10))
+                    Text(verbatim: notice).font(BrahmaTheme.monoSmall).fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(BrahmaTheme.warning)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, BrahmaTheme.spaceS)
+                .padding(.vertical, BrahmaTheme.spaceXS)
+                .background(BrahmaTheme.warning.opacity(0.12))
+                .overlay(alignment: .leading) { Rectangle().fill(BrahmaTheme.warning).frame(width: 2) }
+                .accessibilityElement(children: .combine)
             }
-            .background(BrahmaTheme.bg1)
+            if let error {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Image(systemName: "exclamationmark.octagon.fill").font(.system(size: 10))
+                    Text(verbatim: error).font(BrahmaTheme.monoSmall).textSelection(.enabled)
+                }
+                .foregroundStyle(BrahmaTheme.danger)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(BrahmaTheme.spaceS)
+                .background(BrahmaTheme.bg1)
+                .accessibilityElement(children: .combine)
+            } else {
+                ScrollView([.vertical, .horizontal]) {
+                    Text(verbatim: (text ?? "").isEmpty ? "(no conversation records)" : text ?? "")
+                        .font(BrahmaTheme.monoSmall)
+                        .foregroundStyle(BrahmaTheme.text1)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(BrahmaTheme.spaceS)
+                }
+                .background(BrahmaTheme.bg1)
+            }
         }
     }
 }

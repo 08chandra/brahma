@@ -145,6 +145,97 @@ import BrahmaCore
                                   subject: .item(itemId: "none"), timeZone: w.store.ownerTimeZone(), clock: { Self.at(0) })
         let refused = await foreign.openTranscript(turnId: turn.id)
         #expect(!refused.contains("answer"))
-        #expect(foreign.error != nil)
+        #expect(foreign.transcript == nil && foreign.transcriptTurnId == turn.id)
+        #expect(foreign.transcriptError == "no transcript was captured for that turn")
+        #expect(foreign.error == nil, "the pane carries its own error")
+    }
+
+    /// Captures a one-record transcript for a new turn of @eng and returns the turn and the captured row.
+    func captured(_ w: W, at start: Date, text: String) throws -> (Turn, TurnTranscript) {
+        let source = TranscriptSource(configDir: try tempDir().appending(path: "claude", directoryHint: .isDirectory))
+        let sid = UUID().uuidString
+        let file = source.projectsDir.appending(path: "-ws/\(sid).jsonl")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data((#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"\#(text)"}]}}"# + "\n").utf8)
+            .write(to: file)
+        let turn = try w.store.startTurn(agentId: w.eng.id, now: start)
+        let capture = TranscriptCapture(paths: w.paths, source: source, compressor: .gzip)
+        guard case .captured = capture.capture(turn: turn, sessionId: sid, store: w.store, now: start.addingTimeInterval(5)) else {
+            throw WorkError.invalid("capture failed")
+        }
+        try w.store.finishTurn(id: turn.id, outcome: .succeeded, summary: "s", costUSD: nil, now: start.addingTimeInterval(10))
+        return (turn, try #require(try w.store.transcript(turnId: turn.id)))
+    }
+
+    /// Fix round 1 (review Important 1): a transcript that can't be read opens the pane with the reason, even though the
+    /// timeline has lines (a hash mismatch is a tamper signal; a missing or corrupt file is a loss).
+    @Test func failedTranscriptOpenShowsPaneError() async throws {
+        let w = try world()
+        let (turn, row) = try captured(w, at: Self.at(0), text: "the real answer")
+        let model = ReplayModel(store: w.store, paths: w.paths, companyId: w.acme.id,
+                                subject: .agentDay(agentId: w.eng.id, day: "2026-11-16"), timeZone: w.store.ownerTimeZone(),
+                                clock: { Self.at(3600) })
+        await model.load()
+        #expect(model.entries.contains { $0.kind == .transcript }, "the timeline is not empty")
+        let file = w.paths.home.appending(path: row.path)
+
+        // Tampered: valid gzip of other bytes.
+        let other = try Compressor.gzip.compress(Data("{\"type\":\"assistant\"}\n".utf8), workDir: w.paths.tmpDir)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        try other.write(to: file)
+        #expect(await model.openTranscript(turnId: turn.id) == "")
+        #expect(model.transcriptTurnId == turn.id, "the pane opens")
+        #expect(model.transcript == nil && !model.transcriptTruncated && model.transcriptNotice == nil)
+        #expect(model.transcriptError?.contains("does not match its recorded hash") == true, "\(model.transcriptError ?? "nil")")
+        #expect(model.error == nil)
+
+        // Corrupt: not gzip at all.
+        try Data("not a gzip stream".utf8).write(to: file)
+        await model.openTranscript(turnId: turn.id)
+        #expect(model.transcriptTurnId == turn.id && model.transcript == nil)
+        #expect(model.transcriptError != nil)
+
+        // Missing.
+        try FileManager.default.removeItem(at: file)
+        await model.openTranscript(turnId: turn.id)
+        #expect(model.transcriptTurnId == turn.id && model.transcript == nil)
+        #expect(model.transcriptError != nil)
+
+        // Closing clears it; a good transcript clears an earlier error.
+        model.closeTranscript()
+        #expect(model.transcriptTurnId == nil && model.transcriptError == nil)
+        let (good, _) = try captured(w, at: Self.at(600), text: "a good answer")
+        await model.openTranscript(turnId: turn.id)
+        #expect(model.transcriptError != nil)
+        #expect(await model.openTranscript(turnId: good.id).contains("a good answer"))
+        #expect(model.transcriptError == nil && model.transcriptTurnId == good.id)
+    }
+
+    /// Fix round 1 (controller ruling): a transcript a purge report lists opens with a notice that it may still hold the purged
+    /// content, naming the resource by its ref only.
+    @Test func purgeFlaggedTranscriptShowsNotice() async throws {
+        let w = try world()
+        let (flagged, _) = try captured(w, at: Self.at(0), text: "I read the plan")
+        let (clean, _) = try captured(w, at: Self.at(600), text: "nothing purged here")
+        let report = String(decoding: try JSONEncoder().encode(PurgeReport(backups: [], transcripts: [flagged.id])), as: UTF8.self)
+        try await w.store.writer.write { db in
+            try Resource(companyId: w.acme.id, number: 7, kind: .file, displayName: "SECRETPLANNAME.md", scopeKind: "company",
+                         scopeId: nil, readerSet: nil, provenance: "owner", tainted: false, addedVia: "library",
+                         purgedAt: Self.at(900), purgeReport: report, createdAt: Self.at(-60), updatedAt: Self.at(900)).insert(db)
+        }
+        let model = ReplayModel(store: w.store, paths: w.paths, companyId: w.acme.id,
+                                subject: .agentDay(agentId: w.eng.id, day: "2026-11-16"), timeZone: w.store.ownerTimeZone(),
+                                clock: { Self.at(3600) })
+        #expect(await model.openTranscript(turnId: flagged.id).contains("I read the plan"))
+        let notice = try #require(model.transcriptNotice)
+        #expect(notice == Replay.purgedTranscriptNotice + " ([purged F-7])")
+        #expect(notice == "This transcript was captured while a since-purged resource existed; it may still contain that content. ([purged F-7])")
+        #expect(!notice.contains("SECRETPLANNAME"))
+        #expect(model.transcriptError == nil)
+
+        #expect(await model.openTranscript(turnId: clean.id).contains("nothing purged here"))
+        #expect(model.transcriptNotice == nil, "a transcript no purge report lists has no notice")
+        model.closeTranscript()
+        #expect(model.transcriptNotice == nil)
     }
 }
