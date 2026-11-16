@@ -10,6 +10,8 @@ public enum SelectTarget: Equatable, Sendable {
     case grants, digest, companySettings
     /// Work › Releases.
     case releases
+    /// Work › Resources (Plan ML).
+    case resources
     /// `preview:<name>` (a surface, lowercased) or `preview:live`: Mission Control's preview pane on that tab.
     case preview(name: String)
     case item(key: String)
@@ -38,6 +40,7 @@ public enum SelectTarget: Equatable, Sendable {
         case "digest": self = .digest
         case "settings": self = .companySettings
         case "releases": self = .releases
+        case "resources": self = .resources
         case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)

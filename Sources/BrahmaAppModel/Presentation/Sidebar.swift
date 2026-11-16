@@ -6,6 +6,8 @@ public enum SidebarItem: Hashable, Sendable {
     case backlog, board, inbox
     /// Work › Releases (symbol `shippingbox`; mono chip = open releases).
     case releases
+    /// Work › Resources: the owner's files, folders and links (symbol `paperclip`).
+    case resources
     /// Inbox › Grants (the ledger and presets) and Inbox › Digest.
     case inboxGrants, inboxDigest
     case settingsBackups

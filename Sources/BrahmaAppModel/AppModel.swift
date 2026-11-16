@@ -59,6 +59,13 @@ public final class AppModel {
     public var highlightedAskId: String?
     /// The release a launch target selected (`release:<ref>`); Work › Releases opens its inspector until the owner picks a row.
     public var selectedReleaseRef: String?
+    /// The secret store this app was booted with (`Booted.secretVault`; a `MemoryVault` in tests): resource drops scan against
+    /// its values (`Store.knownSecretValues`) and store a dropped file as a secret through it.
+    public let secretVault: any SecretVault
+    /// Where the resource drops keep the owner's advisory acknowledgments (`advisoryAck.<companyId>`): `.standard` in the app.
+    @ObservationIgnored public var dropDefaults: UserDefaults = .standard
+    /// The resource the owner confirmed purging in the library's dialog (`purge(resource:)` refuses any other).
+    public var confirmPurge: String?
 
     /// The agent map of the selected company (live), or the installed demo (`--map-demo`); `ensureMapController()` makes it.
     public private(set) var mapController: MapController?
@@ -93,9 +100,10 @@ public final class AppModel {
     /// Owner notices are planned on every 4th tick (about every 2 s at the default poll).
     static let deliveryEvery = 4
 
-    public init(store: Store, paths: BrahmaPaths, clock: @escaping @Sendable () -> Date = { .now }) {
+    public init(store: Store, paths: BrahmaPaths, secretVault: any SecretVault, clock: @escaping @Sendable () -> Date = { .now }) {
         self.store = store
         self.paths = paths
+        self.secretVault = secretVault
         self.clock = clock
         self.search = SearchModel(store: store)
         self.backups = BackupsModel(store: store, paths: paths)
@@ -345,6 +353,7 @@ public final class AppModel {
         }
         if chat?.target == target { return }
         let model = ChatModel(store: store, companyId: companyId, target: target)
+        model.drops = dropContext(for: target).map { ResourceDropModel(app: self, context: $0, defaults: dropDefaults) }
         chat = model
         Task { await model.refresh() }
     }
@@ -363,6 +372,7 @@ public final class AppModel {
         case .digest: select(.inboxDigest)
         case .companySettings: select(.companySettings)
         case .releases: select(.releases)
+        case .resources: select(.resources)
         case .release(let ref):
             select(.releases)
             selectedReleaseRef = ref

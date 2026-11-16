@@ -27,6 +27,9 @@ public final class ChatModel {
     public var draft = ""
     /// True while a send is in flight; a second Return in that window is ignored instead of posting twice.
     public private(set) var isSending = false
+    /// Files, folders and links dropped on this conversation's composer (an owner DM or a channel; nil where the owner can't
+    /// drop). While any is pending, Send commits them with the typed text as one message (`ResourceDropModel.commit`).
+    public var drops: ResourceDropModel?
 
     @ObservationIgnored private let store: Store
     @ObservationIgnored private let companyId: String
@@ -202,6 +205,7 @@ public final class ChatModel {
     public func send() async -> Bool {
         guard readOnlyReason == nil, !isSending else { return false }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let drops, !drops.pending.isEmpty { return await sendDrops(drops, text: text) }
         guard !text.isEmpty else { return false }
         let (store, companyId, target) = (self.store, self.companyId, self.target)
         let channelName = channel?.name
@@ -225,6 +229,19 @@ public final class ChatModel {
             return false
         }
         // Keep anything typed while the send was in flight.
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
+        sendError = nil
+        await refresh()
+        await markRead()
+        return true
+    }
+
+    /// The pending drops and the typed text, as one message the engine composes and posts (`Store.addResources`); a refusal
+    /// is shown by the drop model (`AppModel.errorMessage`) and leaves the draft and the drops as they were.
+    private func sendDrops(_ drops: ResourceDropModel, text: String) async -> Bool {
+        isSending = true
+        defer { isSending = false }
+        guard await drops.commit(message: text) else { return false }
         if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
         sendError = nil
         await refresh()

@@ -255,6 +255,8 @@ extension AppModel {
             return value
         } catch let e as WorkError {
             errorMessage = e.message
+        } catch let e as ResourceError {
+            errorMessage = e.message
         } catch let e as OrgError {
             errorMessage = OrgErrorText.message(e)
         } catch {

@@ -91,6 +91,15 @@ git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgs
 "$B" main accept Initech >/dev/null
 "$B" hosting set Initech --provider cloudflare-pages --project initech-demo --account-id 0123456789abcdef0123456789abcdef >/dev/null
 
+# Plan ML: Work › Resources — a note (FROM YOU), a PDF from outside (EXTERNAL, scoped to the engineering team) and a link.
+D="$(mktemp -d)"
+printf '# Habit tracker brand notes\n\nColors: teal and slate. Tone: calm, encouraging.\n' >"$D/brand-notes.md"
+printf '%%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%%%EOF\n' >"$D/competitor-review.pdf"
+"$B" resource Initech add "$D/brand-notes.md" >/dev/null
+"$B" resource Initech add "$D/competitor-review.pdf" --scope team:engineering >/dev/null
+"$B" resource Initech link "https://example.com/habit-research" >/dev/null
+rm -rf "$D"
+
 # Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
 # folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.
 if [ "${BRAHMA_DEV:-}" = "1" ]; then
