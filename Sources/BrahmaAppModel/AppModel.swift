@@ -66,6 +66,8 @@ public final class AppModel {
     @ObservationIgnored public var dropDefaults: UserDefaults = .standard
     /// The resource the owner confirmed purging in the library's dialog (`purge(resource:)` refuses any other).
     public var confirmPurge: String?
+    /// Work › Handbook of the selected company (`ensureHandbook()` makes it; dropped when the company or store changes).
+    public internal(set) var handbook: HandbookModel?
 
     /// The agent map of the selected company (live), or the installed demo (`--map-demo`); `ensureMapController()` makes it.
     public private(set) var mapController: MapController?
@@ -192,6 +194,7 @@ public final class AppModel {
             access = AccessModel(store: reopened)
             settings = SettingsModel(store: reopened)
             digest = DigestModel(store: reopened)
+            handbook = nil
             wireSubmodels()
             snapshot = .empty
             activity = []
@@ -236,6 +239,7 @@ public final class AppModel {
             self.cursor = cursor
             // A live map of another company (one built over a reopened store before this reload) is not this selection's.
             if firstId != selectedCompanyId { dropLiveMapController() }
+            if handbook?.companyId != firstId { handbook = nil }
             selectedCompanyId = firstId
             access.companyId = firstId
             settings.companyId = firstId
@@ -336,6 +340,7 @@ public final class AppModel {
         activity = []
         search.query = ""
         highlightedMessageId = nil
+        handbook = nil
         do { try await reloadSelected() } catch { report(error) }
     }
 
@@ -373,6 +378,9 @@ public final class AppModel {
         case .companySettings: select(.companySettings)
         case .releases: select(.releases)
         case .resources: select(.resources)
+        case .handbook: openHandbook(tab: .pages)
+        case .memory: openHandbook(tab: .memory)
+        case .kb(let path): openHandbook(tab: .pages, page: path)
         case .release(let ref):
             select(.releases)
             selectedReleaseRef = ref
@@ -550,6 +558,8 @@ public final class AppModel {
         if new != snapshot { snapshot = new }
         if let c = mapController, c.companyId == id { c.sync(snapshot: snapshot) }
         ticksSinceSnapshot = 0
+        // The Handbook follows the database only while it is shown (its lists are read on demand, never kept in the snapshot).
+        if sidebarSelection == .handbook, let handbook, handbook.companyId == id { await handbook.refresh() }
     }
 
     func report(_ error: Error) {

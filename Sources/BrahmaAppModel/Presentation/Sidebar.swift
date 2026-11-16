@@ -8,6 +8,8 @@ public enum SidebarItem: Hashable, Sendable {
     case releases
     /// Work › Resources: the owner's files, folders and links (symbol `paperclip`).
     case resources
+    /// Work › Handbook: the company handbook's pages and the memory browser (symbol `book.closed`).
+    case handbook
     /// Inbox › Grants (the ledger and presets) and Inbox › Digest.
     case inboxGrants, inboxDigest
     case settingsBackups

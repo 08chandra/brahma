@@ -46,6 +46,8 @@ struct DetailView: View {
                     ReleasesView(model: model)
                 case .resources:
                     ResourcesView(model: model)
+                case .handbook:
+                    HandbookView(model: model)
                 case .companySettings:
                     CompanySettingsView(model: model)
                 case .channel, .dm:

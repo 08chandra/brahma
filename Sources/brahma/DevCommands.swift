@@ -18,7 +18,7 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
 struct DevGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self])
+        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self, Tool.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -137,6 +137,37 @@ struct DevGroup: AsyncParsableCommand {
             let tools = CompanyTools(store: store, companyId: c.id, agentId: agent.id)
             do {
                 print(safe(try tools.call(name: "claim_lease", arguments: ["key": .string(key)])))
+            } catch let e as ToolError {
+                throw fail(e.message)
+            } catch let e as WorkError {
+                throw fail(e.message)
+            }
+        }
+    }
+
+    /// Calls one company tool as an agent would (the seed's handbook pages and remembered facts: `kb_write`, `remember`).
+    /// `--taint` first marks the agent's session as having read outside content, so what it writes is tainted.
+    struct Tool: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Call a company tool as an agent.")
+        @Argument var company: String
+        @Argument(help: "Tool name, e.g. remember or kb_write.") var name: String
+        @Option(help: "Handle of the agent calling it.") var by: String
+        @Option(help: "The arguments as a JSON object.") var args: String = "{}"
+        @Option(help: "Mark the agent's session tainted by this source first.") var taint: String?
+
+        func run() throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let agent = try resolveAgent(store, company: c, handle: by)
+            guard let arguments = try? JSONDecoder().decode([String: JSONValue].self, from: Data(args.utf8)) else {
+                throw fail("--args must be a JSON object")
+            }
+            if let taint { try store.markTainted(agentId: agent.id, source: taint) }
+            let tools = CompanyTools(store: store, companyId: c.id, agentId: agent.id, paths: paths,
+                                     vault: try cliSecretVault(interactive: false))
+            do {
+                print(safe(try tools.call(name: name, arguments: arguments)))
             } catch let e as ToolError {
                 throw fail(e.message)
             } catch let e as WorkError {

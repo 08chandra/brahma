@@ -100,6 +100,17 @@ printf '%%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 
 "$B" resource Initech link "https://example.com/habit-research" >/dev/null
 rm -rf "$D"
 
+# Plan ML Task 8: the Handbook and memory. @cto owns INITE-4 and writes two Engineering pages through kb_write (one with an
+# executives-only section, both linking back to kb:Engineering); @eng-1 remembers the checkout port twice under one key (the
+# second contradicts the first) and, after reading a web page, a tainted fact. `dev tool` calls the agent tool directly.
+"$B" items add Initech --type task --title "Checkout flow" --owner cto --description "Cart, payment and confirmation" >/dev/null
+"$B" say Initech '#general' "The checkout page needs a retry when a payment fails" >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech kb_write --by cto --args '{"path":"Engineering/Environments","item":"INITE-4","body":"# Environments\n\nStaging and production for the habit tracker. Conventions live in [[Engineering]]; the checkout service is described in [[Engineering/Checkout service]].\n\n## Staging\n\nDeploys from main on every merge.\n\n## Credentials policy [restricted]\n\nKeys rotate monthly; only executives hold production keys.\n"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech kb_write --by cto --args '{"path":"Engineering/Checkout service","item":"INITE-4","release":true,"body":"# Checkout service\n\nHandles checkout for the premium plan. Environments: [[Engineering/Environments]]. Conventions: [[Engineering]].\n"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --args '{"fact":"The checkout service listens on port 4417 in staging","key":"checkout.port","scope":"company"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --args '{"fact":"The checkout service listens on port 4418 in staging","key":"checkout.port","scope":"company"}' >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech remember --by eng-1 --taint "web page docs.stripe.com" --args '{"fact":"Stripe test cards start with 4242","key":"stripe.testcard"}' >/dev/null
+
 # Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
 # folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.
 if [ "${BRAHMA_DEV:-}" = "1" ]; then

@@ -12,6 +12,12 @@ public enum SelectTarget: Equatable, Sendable {
     case releases
     /// Work › Resources (Plan ML).
     case resources
+    /// Handbook › PAGES (Plan ML).
+    case handbook
+    /// Handbook › MEMORY (the memory browser).
+    case memory
+    /// `kb:<path>`: Handbook › PAGES with that page open (the path as given; pages are found case-insensitively).
+    case kb(path: String)
     /// `preview:<name>` (a surface, lowercased) or `preview:live`: Mission Control's preview pane on that tab.
     case preview(name: String)
     case item(key: String)
@@ -41,6 +47,8 @@ public enum SelectTarget: Equatable, Sendable {
         case "settings": self = .companySettings
         case "releases": self = .releases
         case "resources": self = .resources
+        case "handbook": self = .handbook
+        case "memory": self = .memory
         case "new-item": self = .sheet(.newItem)
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)
@@ -58,6 +66,7 @@ public enum SelectTarget: Equatable, Sendable {
             case "channel": self = .channel(name: value.lowercased())
             case "dm": self = .dm(handle: value.lowercased())
             case "search": self = .search(value)
+            case "kb": self = .kb(path: value)
             case "preview": self = .preview(name: value.lowercased())
             default: return nil
             }
