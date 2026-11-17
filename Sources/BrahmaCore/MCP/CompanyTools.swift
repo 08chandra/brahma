@@ -183,7 +183,7 @@ public struct CompanyTools: Sendable {
 
     /// Every tool group's specs (the stable, role-independent list).
     private static func allSpecs() -> [ToolSpec] {
-        baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs() + previewToolSpecs() + deployToolSpecs() + humanTaskToolSpecs()
+        baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs() + previewToolSpecs() + deployToolSpecs() + queueToolSpecs() + humanTaskToolSpecs()
             + extensionToolSpecs() + memoryToolSpecs() + handbookToolSpecs()
     }
 
@@ -386,6 +386,7 @@ public struct CompanyTools: Sendable {
                 if let result = try dispatchExtension(name, args) { return result }
                 if let result = try dispatchPreview(name, args) { return result }
                 if let result = try dispatchDeploy(name, args) { return result }
+                if let result = try dispatchQueue(name, args) { return result }
                 if let result = try dispatchHumanTask(name, args) { return result }
                 if let result = try dispatchMemory(name, args) { return result }
                 if let result = try dispatchHandbook(name, args) { return result }

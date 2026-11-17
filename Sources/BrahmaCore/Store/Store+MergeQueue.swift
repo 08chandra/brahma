@@ -298,7 +298,11 @@ extension Store {
             let batch = try Self.ownedBatch(db, ids: landed.map(\.requestId))
             for ((request, item), mergedCommit) in zip(batch, landed.map(\.mergedCommit)) {
                 var (request, item) = (request, item)
-                guard request.status == .landing || request.status == .running else { continue }
+                guard request.status == .landing || request.status == .running else {
+                    // Recorded already (a recovery finishing a landing): the item still completes below if it has not yet.
+                    if request.status == .merged, item.status != .done { items.append((item, request.mergedCommit ?? mergedCommit)) }
+                    continue
+                }
                 request.status = .merged
                 request.mergedCommit = mergedCommit
                 request.finishedAt = now
@@ -415,6 +419,41 @@ extension Store {
             try notifyOwner(db: db, companyId: request.companyId, kind: .system, urgency: .normal,
                             title: "Merge \(request.ref) (\(item.key)) stopped",
                             body: "\(reason). Retry it from the merge queue or with brahma merge retry.", now: now)
+        }
+    }
+
+    /// The hold the queue puts on itself when the main check fails on `main` itself: nobody is blamed.
+    static let redMainHold = "the main check fails on main itself"
+
+    /// Requests still `running` or `landing` that no unfinished batch holds (an older engine, a lost journal): the recovery puts
+    /// them back.
+    func orphanedMergeRequestIds(companyId: String) throws -> [String] {
+        try writer.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT id FROM mergeRequest WHERE companyId = ? AND status IN ('running', 'landing')
+                AND (batchId IS NULL OR batchId NOT IN (SELECT id FROM mergeBatch WHERE companyId = ? AND step != 'done'))
+                """, arguments: [companyId, companyId])
+        }
+    }
+
+    /// The company's newest main-at-base run (how it failed or passed, and at which commit).
+    func latestMainAtBaseRun(companyId: String) throws -> MergeRun? {
+        try writer.read { db in
+            try MergeRun.filter(Column("companyId") == companyId && Column("kind") == MergeRun.Kind.mainAtBase.rawValue)
+                .order(Column.rowID.desc).fetchOne(db)
+        }
+    }
+
+    static let flakyMergeFlag = "flaky check during merge: failed, then passed"
+
+    /// A check of these items failed and then passed on its one re-run: each item gets the flag once.
+    func flagFlakyMerge(itemIds: [String]) throws {
+        try writer.write { db in
+            for id in itemIds {
+                guard var item = try WorkItem.fetchOne(db, key: id), !item.reviewFlags.contains(Self.flakyMergeFlag) else { continue }
+                item.reviewFlags.append(Self.flakyMergeFlag)
+                try item.update(db)
+            }
         }
     }
 

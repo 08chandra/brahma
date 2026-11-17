@@ -49,6 +49,14 @@ import GRDB
         #expect(CompanyTools.highRiskTools.isSubset(of: TaintPolicy.reviewedHighRisk))
     }
 
+    /// Plan 4a Task 2 (A5): `set_main_check` decides what gates every merge, so a tainted session is refused it; the design tool
+    /// `publish_artifact` is taint-safe (its handler enforces its own rule in Task 6).
+    @Test func queueToolsClassified() {
+        #expect(TaintPolicy.reviewedHighRisk.contains("set_main_check") && TaintPolicy.isHighRisk("set_main_check"))
+        #expect(TaintPolicy.taintSafeTools.contains("publish_artifact") && !TaintPolicy.isHighRisk("publish_artifact"))
+        #expect(CompanyToolNames.ops.allSatisfy { TaintPolicy.reviewedHighRisk.contains($0) })
+    }
+
     @Test func unknownToolIsHighRisk() {
         #expect(TaintPolicy.isHighRisk("future_tool"))
         #expect(TaintPolicy.isHighRisk("decide"))

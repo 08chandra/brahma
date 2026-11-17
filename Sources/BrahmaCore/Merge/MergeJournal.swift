@@ -76,9 +76,11 @@ public struct MergeBatch: Codable, Equatable, Sendable, Identifiable, FetchableR
 /// nothing is cleaned up). Set by `Store.journalProbe`.
 final class JournalProbe: @unchecked Sendable {
     private let lock = NSLock()
-    private var body: (@Sendable (MergeStep) -> Bool)?
-    func set(_ new: (@Sendable (MergeStep) -> Bool)?) { lock.withLock { body = new } }
-    func crashes(after step: MergeStep) -> Bool { lock.withLock { body }?(step) ?? false }
+    private var body: (@Sendable (String) -> Bool)?
+    /// The body is called with a step's raw value (right after the journal wrote it), or `"moved"` (right after `main` moved,
+    /// before `landed` is written); true: crash there.
+    func set(_ new: (@Sendable (String) -> Bool)?) { lock.withLock { body = new } }
+    func crashes(after label: String) -> Bool { lock.withLock { body }?(label) ?? false }
 }
 
 /// Thrown by the queue where `JournalProbe` asked for a simulated crash.
@@ -137,7 +139,9 @@ extension Store {
     }
 
     /// Whether a test asked the engine to stop as if it crashed right after `step` was journaled.
-    func journalCrash(after step: MergeStep) throws {
-        if journalProbe.crashes(after: step) { throw SimulatedCrash() }
+    func journalCrash(after step: MergeStep) throws { try journalCrash(label: step.rawValue) }
+
+    func journalCrash(label: String) throws {
+        if journalProbe.crashes(after: label) { throw SimulatedCrash() }
     }
 }

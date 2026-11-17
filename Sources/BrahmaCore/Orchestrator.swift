@@ -291,6 +291,9 @@ public actor Orchestrator {
             // Releases and rollbacks an earlier engine left in progress end without running again (Task 8, builder-check 5).
             try await releaseExecutor.recover(now: now)
             try await recoverMerges()
+            // The merge queue's journal: a batch an earlier engine left at some step is finished or abandoned before anything is
+            // claimed (the queue also does this by itself before its first batch, and after the owner's stop).
+            for company in try store.companies() { await mergeQueue.recover(company: company) }
             // The engine-owned pre-commit hook of every company workspace (Task 5a); a refusal is logged, never fatal.
             let companies = try store.companies()
             for failure in await blocking.run({ () -> [String] in

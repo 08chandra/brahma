@@ -266,13 +266,14 @@ import GRDB
         #expect(runs.map(\.kind) == [.main, .item])
         // A failing main check bounces with its tail, before the item check runs.
         let j = try await m.approved("Second", by: m.eng2, file: "src/second.txt")
-        m.world.checks.enqueue(FakeCheckRunner.fail("smoke exploded"))
+        // Failing twice (the one re-run) at the first prefix, then passing at the base (the `mainAtBase` run): the candidate is blamed.
+        m.world.checks.enqueue(FakeCheckRunner.fail("smoke exploded"), FakeCheckRunner.fail("smoke exploded"))
         let mark = m.world.checks.calls.count
         let outcome = try #require(try await batch(queue(m), m))
         let r = try request(m, j)
         #expect(outcome.bounced == [r.id] && r.failure == .mainCheckFailed)
         #expect(r.outputTail?.contains("smoke exploded") == true)
-        #expect(m.world.checks.calls.count == mark + 1)
+        #expect(m.world.checks.calls.count == mark + 3)
     }
 
     @Test func mergesVerifiedCommitNotLaterEdits() async throws {
@@ -444,7 +445,7 @@ import GRDB
     @Test func reopenedItemQueuesAgain() async throws {
         let m = try MergeFixture()
         let i = try await m.approved()
-        m.world.checks.enqueue(FakeCheckRunner.fail("a test broke"))
+        m.world.checks.enqueue(FakeCheckRunner.fail("a test broke"), FakeCheckRunner.fail("a test broke"))   // and the one re-run
         let q = queue(m)
         let first = try #require(try await batch(q, m))
         let r1 = try request(m, i)

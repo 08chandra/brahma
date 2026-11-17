@@ -29,6 +29,36 @@ import Foundation
         #expect(Set(p.role("designer")!.playbooks.keys) == ["story", "spike"])
     }
 
+    /// Plan 4a Task 2: the CTO's `set_main_check` is an ops tool (devops, architects and executives have it; the store lets only
+    /// the roles covering `cto` use it).
+    @Test func opsHasSetMainCheck() throws {
+        #expect(CompanyToolNames.ops.contains("set_main_check"))
+        for id in ["devops", "architect", "ceo", "cpo", "cto", "ceo-cpo", "cto-architect"] {
+            #expect(try #require(software.role(id)).companyTools.contains("set_main_check"), "\(id)")
+        }
+        for id in ["director", "manager", "engineer", "designer", "qa", "security"] {
+            #expect(try !#require(software.role(id)).companyTools.contains("set_main_check"), "\(id)")
+        }
+    }
+
+    /// Plan 4a: `publish_artifact` (Task 6) goes to the designer, the architect and every executive.
+    @Test func designList() throws {
+        #expect(CompanyToolNames.design == ["publish_artifact"])
+        #expect(CompanyToolNames.all.contains("publish_artifact"))
+        for id in ["designer", "architect", "ceo", "cpo", "cto", "ceo-cpo", "cto-architect"] {
+            #expect(try #require(software.role(id)).companyTools.contains("publish_artifact"), "\(id)")
+        }
+        for id in ["director", "manager", "engineer", "qa", "devops", "security"] {
+            #expect(try !#require(software.role(id)).companyTools.contains("publish_artifact"), "\(id)")
+        }
+        try software.validate()
+    }
+
+    /// The pack's version is bumped once for the whole of Plan 4a (a later task changes the pack without bumping it again).
+    @Test func packVersionBumpedOnceFor4a() {
+        #expect(software.version == 6)
+    }
+
     /// Plan L Task 13: the path-to-live paragraph (exact copy) sits on the roles that set previews, deploy config and deploys;
     /// every prompt still ends with the status line and stays within `RoleTemplate.maxPrompt` (PR-33).
     @Test func livePathInPrompts() throws {

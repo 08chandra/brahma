@@ -871,7 +871,7 @@ import GRDB
         let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
         _ = try await r.drive(a)
         let mainAfterA = try r.mainHead()
-        r.world.checks.enqueue(FakeCheckRunner.fail())
+        r.world.checks.enqueue(FakeCheckRunner.fail(), FakeCheckRunner.fail())   // fails, and again on its one re-run
         try await r.cycle()
         let back = try r.fresh(b)
         #expect(back.status == .inProgress); #expect(back.mergeState == .none)

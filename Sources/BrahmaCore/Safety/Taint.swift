@@ -17,6 +17,8 @@ public enum TaintPolicy {
         "claim_lease", "release_lease", "submit_for_review", "write_handoff",
         // Plan L (chief review L4): the handler enforces its own tainted-session rule (a template without links only).
         "request_human_task",
+        // Plan 4a Task 6 (A5): the design tool's handler enforces its own tainted-session rule.
+        "publish_artifact",
     ]).union(CompanyToolNames.memory)   // Plan ML: what a tainted session remembers is stored tainted; what it reads taints first.
         .union(CompanyToolNames.kb)     // Plan ML: a tainted session's page edit taints the page; reading a tainted revision taints first.
 
@@ -28,6 +30,8 @@ public enum TaintPolicy {
         // Plan L's ops tools (`CompanyToolNames.ops`): what a preview runs, what a smoke check fetches, how a release builds,
         // and a deploy proposal.
         "set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy",
+        // Plan 4a Task 2: the check every merge runs (what it executes gates what reaches main).
+        "set_main_check",
     ]
 
     public static func isHighRisk(_ tool: String) -> Bool { !taintSafeTools.contains(tool) }

@@ -11,7 +11,7 @@ extension Orchestrator {
     func startMerges(now: Date, config: SchedulerConfig, held: Bool, pressure: MemoryPressure, companies: [Company]) {
         guard !held, pressure != .critical, !stoppedNow else { return }
         mergeBackoff = mergeBackoff.filter { $0.value > now }
-        for company in companies where company.status == .running && company.mergeHold == nil && mergeTasks[company.id] == nil
+        for company in companies where company.status == .running && (company.mergeHold == nil || company.mergeHold == Store.redMainHold) && mergeTasks[company.id] == nil
             && mergeBackoff[company.id] == nil {
             let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
                                             pressure: pressure, held: held)
