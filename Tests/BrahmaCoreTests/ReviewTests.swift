@@ -503,7 +503,7 @@ import GRDB
         let k = try await r.verified("third", by: r.eng3)
         try r.reviewTurn(r.rev, k)
         #expect(try r.reviewTools(r.rev, k).call(name: "review", arguments: ["key": .string(k.key), "decision": .string("approve"), "notes": .string("ok")])
-                == "Approved \(k.key); the engine will merge it into main.")
+                == "Approved \(k.key); it is queued to merge as M-1.")
     }
 
     @Test func checkChangedDuringReviewReturnsItem() async throws {

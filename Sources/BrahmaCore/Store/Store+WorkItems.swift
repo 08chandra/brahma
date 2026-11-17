@@ -373,6 +373,12 @@ extension Store {
         guard !specChanged.isEmpty || checkChanged || assignment != nil || !otherChanged.isEmpty || statusChange != nil else {
             return item
         }
+        // Leaving review (Plan 4a): an item the merge queue is checking or landing stays; one still queued is withdrawn.
+        if statusBefore == .inReview, item.status != .inReview {
+            try Store.refuseWhileMerging(db: db, item: item)
+            try cancelMerge(db: db, itemId: item.id, now: now)
+            item.mergeState = .none
+        }
         // The lease goes when the item leaves the holder's hands: back to ready or backlog, or given to someone else.
         var releasedLease: (lease: WorkLease, why: String)?
         if let lease = try WorkLease.fetchOne(db, key: item.id) {

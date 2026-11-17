@@ -298,6 +298,12 @@ public final class Store: Sendable {
                 kept.smokeCheck = stored.smokeCheck
                 kept.smokeCheckSetById = stored.smokeCheckSetById
                 kept.redBugItemId = stored.redBugItemId
+                // The merge queue's settings change only through their own setters and the engine's merge writes (Plan 4a).
+                kept.mainCheck = stored.mainCheck
+                kept.mainCheckSetById = stored.mainCheckSetById
+                kept.mergeBatchSize = stored.mergeBatchSize
+                kept.mergeStrategy = stored.mergeStrategy
+                kept.mergeHold = stored.mergeHold
                 // Set once at creation (Task 14).
                 kept.importedFrom = stored.importedFrom
                 kept.importedCommit = stored.importedCommit

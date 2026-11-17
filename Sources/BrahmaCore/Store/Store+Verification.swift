@@ -389,9 +389,13 @@ extension Store {
     /// approved here, in the same transaction, through `approveForMerge` (risk-tiered review, 9c): no review turn, no reviewer
     /// woken. Every database condition is checked again here, and the measurement must be of this run's commit and the item's
     /// recorded base.
+    ///
+    /// `enqueue`: for an auto-approval, the engine's measurement of the verified commit against `main` (`mergeEnqueueFacts`,
+    /// computed off the transaction and off the cooperative pool, like `autoMerge`); the approval then puts the item in the
+    /// merge queue. The caller completes an item with nothing ahead of `main` (`completeIfAlreadyInMain`).
     @discardableResult
     func finishVerification(runId: String, outcome: CheckOutcome, autoMerge: AutoMergeAssessment? = nil,
-                            now: Date = Store.now()) throws -> VerificationRun? {
+                            enqueue: MergeEnqueueFacts? = nil, now: Date = Store.now()) throws -> VerificationRun? {
         try writer.write { db in
             guard var run = try VerificationRun.fetchOne(db, key: runId), run.status == .running else { return nil }
             let active = try Self.activeNow(db: db, companyId: run.companyId)
@@ -459,7 +463,8 @@ extension Store {
                     // Risk-tiered review: the pass is the approval. The reviewer is not woken for a review that will not happen.
                     try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed, text: "check passed",
                                         alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, onlyAlsoNotify: true, now: now)
-                    try approveForMerge(db: db, item: item, by: "system", note: ReviewPolicy.autoApprovedNote, auto: true, now: now)
+                    try approveForMerge(db: db, item: item, by: "system", note: ReviewPolicy.autoApprovedNote, auto: true,
+                                       enqueue: enqueue, now: now)
                     return run
                 }
                 try recordItemEvent(db: db, item: item, actor: "system", kind: .verificationPassed,

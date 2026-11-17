@@ -9,7 +9,7 @@ extension CompanyTools {
                                         "description": .string("Required to approve an item that has review flags")])
         return ToolSpec(
             name: "review",
-            description: "Give your decision on the item you are reviewing: approve (the engine then merges the branch into main) or request_changes with concrete notes.",
+            description: "Give your decision on the item you are reviewing: approve (the engine then queues the branch to merge into main) or request_changes with concrete notes.",
             inputSchema: s.schema(["key": s.prop("string", "The item key of this review"),
                                    "decision": s.prop("string", "approve or request_changes"),
                                    "notes": s.prop("string", "Concrete findings; required for request_changes"),
@@ -50,8 +50,18 @@ extension CompanyTools {
         let git = store.gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: companyId)
         // The head is read here from the branch, never taken from the agent.
         let head = try? git.head(of: git.branchRef(key: target.key))
-        _ = try store.review(itemId: target.id, by: agentId, decision: decision, notes: notes, approveFlags: approveFlags,
-                             currentHead: head ?? nil)
-        return decision == .approve ? "Approved \(target.key); the engine will merge it into main." : "Requested changes on \(target.key)."
+        let reviewed = try store.review(itemId: target.id, by: agentId, decision: decision, notes: notes, approveFlags: approveFlags,
+                                        currentHead: head ?? nil)
+        guard decision == .approve else { return "Requested changes on \(target.key)." }
+        if let request = try store.latestMergeRequest(itemId: target.id) {
+            switch request.status {
+            case .queued: return "Approved \(target.key); it is queued to merge as \(request.ref)."
+            case .bounced where reviewed.status == .inProgress:
+                return "Approved \(target.key); it was not queued: \(request.detail ?? "it could not be merged"). It went back to its holder."
+            default: break
+            }
+        }
+        if reviewed.status == .done { return "Approved \(target.key); it has no changes beyond main, so it is done." }
+        return "Approved \(target.key); the engine will merge it into main."
     }
 }

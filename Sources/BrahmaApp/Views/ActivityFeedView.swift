@@ -114,6 +114,7 @@ struct ActivityRow: View {
         case .preview: "play.rectangle"
         case .release: "shippingbox"
         case .resource: "paperclip"
+        case .merge: "arrow.triangle.merge"
         }
     }
 
@@ -131,6 +132,7 @@ struct ActivityRow: View {
         case .preview: BrahmaTheme.running
         case .release: BrahmaTheme.success
         case .resource: BrahmaTheme.accent
+        case .merge: BrahmaTheme.success
         }
     }
 }

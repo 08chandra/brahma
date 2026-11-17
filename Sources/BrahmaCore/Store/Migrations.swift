@@ -1495,6 +1495,64 @@ enum Migrations {
             try db.create(index: "resource_parent", on: "resource", columns: ["companyId", "parentId"])
             try db.create(index: "resource_created", on: "resource", columns: ["companyId", "createdAt"])
         }
+        m.registerMigration("v4a-merge") { db in
+            // Plan 4a Task 1a: the merge queue. `company.mainCommit` predates 4a ("v5-..."), so it is not added again.
+            // `mainCheck`: JSON CheckSpec. `mergeRequest.conflictFiles`: JSON array of file names (agent-controlled text).
+            try db.alter(table: "company") { t in
+                t.add(column: "mainCheck", .text)
+                t.add(column: "mainCheckSetById", .text)
+                t.add(column: "mergeBatchSize", .integer).notNull().defaults(to: 1)
+                t.add(column: "mergeStrategy", .text).notNull().defaults(to: "ff")
+                t.add(column: "mergeHold", .text)
+            }
+            try db.create(table: "mergeRequest") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("status", .text).notNull()
+                t.column("headCommit", .text).notNull()
+                t.column("checkRevision", .integer)
+                t.column("baseCommit", .text)
+                t.column("candidateCommit", .text)
+                t.column("mergedCommit", .text)
+                t.column("batchId", .text)
+                t.column("failure", .text)
+                t.column("detail", .text)
+                t.column("conflictFiles", .text).notNull().defaults(to: "[]")
+                t.column("outputTail", .text)
+                t.column("outputPath", .text)
+                t.column("attempts", .integer).notNull().defaults(to: 0)
+                t.column("requeues", .integer).notNull().defaults(to: 0)
+                t.column("inconclusive", .integer).notNull().defaults(to: 0)
+                t.column("retryRequestedAt", .datetime)
+                t.column("enqueuedAt", .datetime)
+                t.column("startedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "mergeRequest_queue", on: "mergeRequest", columns: ["companyId", "status", "number"])
+            try db.create(table: "mergeRun") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("batchId", .text)
+                t.column("requestId", .text).references("mergeRequest", onDelete: .cascade)
+                t.column("prefix", .integer)
+                t.column("candidateCommit", .text)
+                t.column("kind", .text)                  // main | item | mainAtBase
+                t.column("itemId", .text)
+                t.column("command", .text)
+                t.column("scriptHash", .text)
+                t.column("status", .text)                // VerificationStatus
+                t.column("attempt", .integer).notNull().defaults(to: 1)
+                t.column("flaky", .boolean).notNull().defaults(to: false)
+                t.column("exitCode", .integer)
+                t.column("outputPath", .text)
+                t.column("outputTail", .text)
+                t.column("startedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "mergeRun_request", on: "mergeRun", columns: ["requestId"])
+        }
     }
 }
 

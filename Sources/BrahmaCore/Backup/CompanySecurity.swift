@@ -76,6 +76,11 @@ public enum CompanySecurity {
         "smokeCheckSetById": "who set the smoke check", "redBugItemId": "engine bookkeeping for the red-main bug",
         // Plan L (Task 14): provenance, set once at creation; the import's taint mark lives in `companyTaint`, carried on its own.
         "importedFrom": "provenance of an imported workspace", "importedCommit": "provenance of an imported workspace",
+        // Plan 4a (Task 1a): the main check is agent-set (ops roles) and runs sandboxed like the smoke check; the rest are
+        // queue tuning and engine bookkeeping. Nothing here widens what an agent may do or what main may receive unreviewed.
+        "mainCheck": "agent-set check command, not an owner switch; it runs sandboxed", "mainCheckSetById": "who set the main check",
+        "mergeBatchSize": "queue throughput, not a permission", "mergeStrategy": "how approved work lands; every merge is still approved",
+        "mergeHold": "engine bookkeeping: why the queue is held",
     ]
 
     /// The restored company with every security-relevant field at the stricter of the two, and what that changed.

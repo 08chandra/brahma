@@ -70,6 +70,18 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// `main` as the import left it.
     public var importedCommit: String? = nil
 
+    // Merge queue (Plan 4a, `"v4a-merge"`). Changed only through the owner-checked setters and the engine's merge writes;
+    // `updateCompany` keeps the stored values. (`mainCommit` above predates 4a.)
+    /// The check run on every merge candidate besides the item's own pinned check; nil: none.
+    public var mainCheck: CheckSpec? = nil
+    /// The ops agent who set `mainCheck` (its runs carry that agent's `BRAHMA_AGENT_ID`).
+    public var mainCheckSetById: String? = nil
+    /// How many approved items one merge batch carries (`MergeSettings.batchRange`).
+    public var mergeBatchSize: Int = MergeSettings.defaultBatchSize
+    public var mergeStrategy: MergeStrategy = .ff
+    /// Why the merge queue is held (an engine-written reason); nil: running.
+    public var mergeHold: String? = nil
+
     /// The profile a turn of an agent with this role runs under: the role's override, else the company's.
     public func profile(forRole role: String) -> PermissionProfile { roleProfiles[role] ?? permissionProfile }
 }

@@ -356,7 +356,10 @@ extension Store {
     /// - `.branchMoved`: the branch is not what was checked and reviewed: the item goes back to its holder, nothing merged.
     /// - `.secretsFound`: the merge-step leak scan found something: the item goes back to its holder with the findings
     ///   (never a value), its verification cleared, nothing merged.
-    func finishMerge(itemId: String, result: MergeResult, now: Date = Store.now()) throws {
+    ///
+    /// `triggerAfterLanding: false` (the merge queue's `recordLanded`, which records `main`'s head itself and runs
+    /// `MergeSafety.afterLanding` once for a whole batch) leaves both out of `.merged`.
+    func finishMerge(itemId: String, result: MergeResult, triggerAfterLanding: Bool = true, now: Date = Store.now()) throws {
         guard let item = try workItem(id: itemId), let company = try company(id: item.companyId) else { throw WorkError.notFound("no such work item") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
         // The attempt did not fail: the failure count starts again.
@@ -385,7 +388,12 @@ extension Store {
                                             + "(it was \(wasStatus.title.lowercased())); check that main holds what you intend",
                                         alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
                 }
-                try finalizeMainCommit(db, companyId: company.id, commit: head)
+                // A merge request this landing completes (3a's step landing an item the queue has not claimed) is closed with it.
+                try db.execute(sql: """
+                    UPDATE mergeRequest SET status = 'merged', mergedCommit = ?, finishedAt = ?
+                    WHERE itemId = ? AND status IN ('queued', 'running', 'landing')
+                    """, arguments: [head, now, itemId])
+                if triggerAfterLanding { try finalizeMainCommit(db, companyId: company.id, commit: head) }
                 try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId), Self.mergeHoldAlertReason(company.id)], now: now)
                 return true
             }
@@ -395,7 +403,7 @@ extension Store {
             try? store.removeItemWorktree(git: git, companyId: companyId, key: key)
             try? git.deleteBranch(key: key)
             try? clearBaseCommit(itemId: itemId)
-            try MergeSafety(store: self).afterLanding(companyId: company.id, mergedKey: item.key)
+            if triggerAfterLanding { try MergeSafety(store: self).afterLanding(companyId: company.id, mergedKey: item.key) }
 
         case .rebased(let head):
             let base = try? git.mergeBase(GitWorkspace.mainRef, head)
