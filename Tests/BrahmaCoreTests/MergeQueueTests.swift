@@ -718,6 +718,103 @@ import GRDB
         #expect(sandboxed(route(try await place(.item, itemId: i.id))))
     }
 
+    /// S3b: a merge check runs unsandboxed only if EVERY principal whose code it executes narrows to Full: for the main check its
+    /// setter and the item author(s) (a batch: every item), for the item check the holder and the assignee.
+    @Test func mergeCheckSandboxNeedsEveryPrincipalFull() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        let ops = try m.store.hire(companyId: m.company.id, name: "ops-1", role: "ops", model: "sonnet")
+        let junior = try m.store.hire(companyId: m.company.id, name: "jr", role: "junior", model: "sonnet")
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(profile: .full), userHome: try tempDir())
+        func roles(_ r: [String: PermissionProfile]) throws {
+            try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(roleProfiles: r), userHome: try tempDir())
+        }
+        try roles(["ops": .full, "engineer": .full, "junior": .workspace])
+        try m.exec("UPDATE company SET mainCheckSetById = ? WHERE id = ?", [ops.id, m.company.id])
+        let route = Orchestrator.checkRoute(store: m.store)
+        let company = try #require(try m.store.company(id: m.company.id))
+        func place(_ kind: MergeRun.Kind, itemId: String?, batch: String? = nil) async throws -> String {
+            let runId = UUID().uuidString
+            let dir = try EngineExport.export(store: m.store, company: company, runId: runId, commit: try main(m))
+            let run = MergeRun(id: runId, companyId: company.id, batchId: batch, kind: kind, itemId: itemId, status: .running)
+            try await m.store.writer.write { try run.insert($0) }
+            return dir.path
+        }
+        func sandboxed(_ r: CheckRoute) -> Bool { if case .sandboxed = r { return true } else { return false } }
+        func unsandboxed(_ r: CheckRoute) -> Bool { if case .unsandboxed = r { return true } else { return false } }
+        // Full setter and Full author (holder and assignee): as before, unsandboxed.
+        #expect(unsandboxed(route(try await place(.main, itemId: i.id))))
+        #expect(unsandboxed(route(try await place(.item, itemId: i.id))))
+        // Full setter, Workspace-profile author: the main check runs that author's code, so it is sandboxed.
+        try roles(["ops": .full, "engineer": .workspace, "junior": .workspace])
+        #expect(sandboxed(route(try await place(.main, itemId: i.id))))
+        #expect(sandboxed(route(try await place(.item, itemId: i.id))))
+        // Workspace setter, Full author: sandboxed too.
+        try roles(["ops": .workspace, "engineer": .full, "junior": .workspace])
+        #expect(sandboxed(route(try await place(.main, itemId: i.id))))
+        #expect(unsandboxed(route(try await place(.item, itemId: i.id))))
+        try roles(["ops": .full, "engineer": .full, "junior": .workspace])
+        // The holder and the assignee differ: both count (the assignee is not Full).
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [junior.id, i.id])
+        #expect(sandboxed(route(try await place(.item, itemId: i.id))))
+        #expect(sandboxed(route(try await place(.main, itemId: i.id))))
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [m.eng.id, i.id])
+        #expect(unsandboxed(route(try await place(.main, itemId: i.id))))
+        // A batch: every item counts, one non-Full item makes the run sandboxed.
+        let other = try m.item("Other")
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [junior.id, other.id])
+        var a = MergeRequest(companyId: m.company.id, itemId: i.id, number: 98, headCommit: try main(m), enqueuedAt: m.now)
+        var b = MergeRequest(companyId: m.company.id, itemId: other.id, number: 99, headCommit: try main(m), enqueuedAt: m.now)
+        a.batchId = "batch-1"; b.batchId = "batch-1"
+        let (ra, rb) = (a, b)
+        try await m.store.writer.write { try ra.insert($0); try rb.insert($0) }
+        #expect(sandboxed(route(try await place(.main, itemId: i.id, batch: "batch-1"))))
+        #expect(unsandboxed(route(try await place(.main, itemId: i.id, batch: "no-such-batch"))))
+        // A missing candidate principal: sandboxed (no item, or an item with neither holder nor assignee).
+        #expect(sandboxed(route(try await place(.main, itemId: nil))))
+        try m.exec("DELETE FROM workLease WHERE itemId = ?", [i.id])
+        try m.exec("UPDATE workItem SET ownerId = NULL WHERE id = ?", [i.id])
+        #expect(sandboxed(route(try await place(.main, itemId: i.id))))
+        #expect(sandboxed(route(try await place(.item, itemId: i.id))))
+    }
+
+    /// If the hold cannot be written after `main` moved (and the record worked), the request is not put back in the queue: it
+    /// stays merged, so a retry cannot land it a second time.
+    @Test func holdWriteFailingAfterTheMoveDoesNotRequeue() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        let head = try #require(try m.fresh(i).verifiedCommit)
+        let lock = m.root.appending(path: ".git/index.lock")
+        m.store.mergeRefProbe.set { ref in if ref == "follow" { try? "".write(to: lock, atomically: true, encoding: .utf8) } }
+        defer { m.store.mergeRefProbe.set(nil) }
+        // Writing a hold fails.
+        try m.exec("CREATE TRIGGER no_hold BEFORE UPDATE OF mergeHold ON company BEGIN SELECT RAISE(ABORT, 'no hold'); END")
+        let outcome = try #require(try await batch(queue(m), m))
+        let r = try request(m, i)
+        #expect(outcome.merged == [r.id] && outcome.requeued.isEmpty)
+        #expect(r.status == .merged && r.requeues == 0)
+        #expect(try main(m) == head)
+        #expect(try m.fresh(i).status == .done)
+    }
+
+    /// The owner's stop is read before the root is reset and cleaned for a quarantine (3a's gate): nothing is touched.
+    @Test func stopBeforeQuarantineLeavesTheRootAlone() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        try m.write("notes/owner.txt", "uncommitted", in: m.root)
+        let store = m.store, now = m.now
+        store.mergeRefProbe.set { ref in if ref == "refs/quarantine" { _ = try? store.emergencyStop(note: nil, by: "owner", now: now) } }
+        defer { store.mergeRefProbe.set(nil) }
+        let before = try main(m)
+        try await batch(queue(m), m)
+        #expect(try store.engineStopped() != nil)
+        #expect(try main(m) == before)
+        #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "notes/owner.txt").path), "the root was not cleaned")
+        #expect(try git(m, ["for-each-ref", "refs/brahma/quarantine/"]).isEmpty)
+        let r = try request(m, i)
+        #expect(r.status == .queued && r.requeues == 0)
+    }
+
     /// I5: a candidate is scanned for its own company's secrets only: another company's value in this company's change neither
     /// bounces it nor names that other secret.
     @Test func otherCompaniesSecretsAreNotScanned() async throws {

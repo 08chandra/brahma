@@ -950,8 +950,8 @@ import GRDB
     // MARK: Merge integrity (9b fix round 1: B1, B2, I1-I4, m1, m3)
 
     /// Uncommitted edits in the root checkout, quarantined by the engine's own step (`Store.quarantineRoot`, which an owner's
-    /// accept still works from): they are saved on a ref and asked about, never committed to main. (The merge queue itself no
-    /// longer quarantines: it commits what is at the root as an unattributed commit after scanning it, `MergeQueueTests`.)
+    /// accept still works from): they are saved on a ref and asked about, never committed to main. (The merge queue itself does
+    /// the same on its tick, and never commits the root: `MergeQueueTests.dirtyRootIsQuarantinedNotCommitted`.)
     private func quarantined(_ r: R) async throws -> (item: WorkItem, before: String, ref: String) {
         try r.commitMain(["README.md": "hello\n"])
         let i = try await r.approved(file: "src/a.txt")

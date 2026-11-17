@@ -89,7 +89,7 @@ extension Orchestrator {
                             var recordedDirectory: String?
                             /// A merge queue run: its principal is derived from the record (never from a lease alone) and an
                             /// unknown one runs sandboxed.
-                            var mergeKind: MergeRun.Kind?; var isMergeRun = false }
+                            var mergeKind: MergeRun.Kind?; var batchId: String?; var isMergeRun = false }
             let record: Record
             let place: (GitWorkspace) -> URL
             if let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) {
@@ -105,7 +105,7 @@ extension Orchestrator {
             } else if let run = try? store.writer.read({ try MergeRun.fetchOne($0, key: runId) }) {
                 guard run.status == .running else { return .refused("the merge run \(runId) is not running (\(run.status?.rawValue ?? "unknown"))") }
                 record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: nil, purpose: "merge", recordedDirectory: nil,
-                                mergeKind: run.kind, isMergeRun: true)
+                                mergeKind: run.kind, batchId: run.batchId, isMergeRun: true)
                 place = { $0.exportPath(runId: run.id) }
             } else {
                 return .refused("no engine record of a check running in \(runId)")
@@ -125,18 +125,33 @@ extension Orchestrator {
             func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
             if narrowed(company.permissionProfile) == .full {
                 if record.isMergeRun {
-                    // The principal of a merge run: the ops agent who set the main check (`.main`), or the item's holder, else its
-                    // assignee (`.item`; a lease can be gone, the assignee is not). No principal, or one that is no agent (or is
-                    // gone), is never trusted: sandboxed.
-                    let principal: String?
+                    // A merge check runs unsandboxed only if EVERY principal whose code it executes narrows to Full: for the main
+                    // check its setter and the candidate's item(s) (every item of a batch), for the item check the item's author
+                    // (its lease holder and its assignee, both when both exist). A missing principal, an id that is no agent
+                    // (or is gone), or none at all runs sandboxed.
+                    var itemIds = Set(record.itemId.map { [$0] } ?? [])
+                    if let batchId = record.batchId,
+                       let batch = try? store.writer.read({ try MergeRequest.filter(Column("batchId") == batchId).fetchAll($0) }) {
+                        itemIds.formUnion(batch.map(\.itemId))
+                    }
+                    var ids: [String] = []
+                    var missing = false
                     switch record.mergeKind {
-                    case .main: principal = company.mainCheckSetById
-                    case .item: principal = record.itemId.flatMap { id in (try? store.lease(itemId: id))?.agentId ?? (try? store.workItem(id: id))?.ownerId }
-                    default: principal = nil
+                    case .main: if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
+                    case .item: break
+                    default: missing = true
                     }
-                    if let role = principal.flatMap({ try? store.agent(id: $0) })?.role, narrowed(company.profile(forRole: role)) == .full {
-                        return .unsandboxed
+                    if itemIds.isEmpty { missing = true }
+                    for id in itemIds.sorted() {
+                        let holder = (try? store.lease(itemId: id))?.agentId, author = (try? store.workItem(id: id))?.ownerId
+                        if holder == nil && author == nil { missing = true }
+                        ids.append(contentsOf: [holder, author].compactMap { $0 })
                     }
+                    let allFull = !missing && !ids.isEmpty && ids.allSatisfy { id in
+                        guard let role = (try? store.agent(id: id))?.role else { return false }
+                        return narrowed(company.profile(forRole: role)) == .full
+                    }
+                    if allFull { return .unsandboxed }
                 } else {
                     let holder = record.itemId.flatMap { try? store.lease(itemId: $0) }?.agentId ?? record.requestedBy
                     let role = holder.flatMap { try? store.agent(id: $0) }?.role

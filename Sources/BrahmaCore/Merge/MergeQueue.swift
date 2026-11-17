@@ -157,6 +157,8 @@ public actor MergeQueue: EmergencyStopObserver {
         /// The root checkout had uncommitted changes: 3a's quarantine moved them aside (a ref, an owner ask); nothing is committed
         /// to `main`, and the queue waits for the owner's decision (`quarantineHeld`).
         case quarantined
+        /// The owner's stop was seen before anything moved.
+        case stopped
     }
 
     private func process(_ r: MergeRequest, item: WorkItem, company: Company, git: GitWorkspace) async -> MergeBatchOutcome {
@@ -224,6 +226,9 @@ public actor MergeQueue: EmergencyStopObserver {
                     // Never committed to `main` by the engine (3a's B1): what is uncommitted at the root goes to a quarantine ref
                     // with one owner ask, the checkout is put back to `main`, and it reaches `main` only through the owner's accept.
                     if try git.isDirty(in: root) {
+                        // The owner's stop is read before the root is reset and cleaned (3a's gate, S15).
+                        store.mergeRefProbe.call("refs/quarantine")
+                        if (try? store.engineStopped()) != nil { return .stopped }
                         try store.quarantineRoot(company: company, git: git, expectedMain: base, now: clock())
                         return .quarantined
                     }
@@ -238,6 +243,9 @@ public actor MergeQueue: EmergencyStopObserver {
                 return out
             case .quarantined:
                 requeue(counts: false)
+                return out
+            case .stopped:
+                requeueStopped()
                 return out
             }
             if stopped() { requeueStopped(); return out }
@@ -344,10 +352,17 @@ public actor MergeQueue: EmergencyStopObserver {
                             recorded = false
                             held = "\(item.key) landed but could not be recorded (\(Store.flat("\(error)", max: 200)))"
                         }
+                        // `main` has moved: nothing below may throw, or the request would go back to `queued` with `main` already
+                        // moved. A hold or notice that cannot be written is logged; the outcome still says the queue is held.
                         if let held {
-                            try store.setMergeHold(companyId: company.id, reason: held, now: clock())
-                            try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
-                                                  body: "\(held). Reconcile the workspace root with main, then release the hold.", now: clock())
+                            do {
+                                try store.setMergeHold(companyId: company.id, reason: held, now: clock())
+                                try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
+                                                      body: "\(held). Reconcile the workspace root with main (save your own edits, then reset the root to main), "
+                                                          + "and reject any quarantine of the old files. Then release the hold.", now: clock())
+                            } catch {
+                                FileHandle.standardError.write(Data("brahma merge queue: could not hold the queue after \(item.key) landed: \(error)\n".utf8))
+                            }
                         }
                         return .landed(held: held, recorded: recorded)
                     case .blockedByLocalChanges:
@@ -419,7 +434,7 @@ public actor MergeQueue: EmergencyStopObserver {
                           company: Company, git: GitWorkspace, candidate: String, pinned: [String: Data]) async -> CheckVerdict {
         let (store, blocking, clock, paths, checks) = (self.store, self.blocking, self.clock, self.paths, self.checks)
         let runId = UUID().uuidString
-        var run = MergeRun(id: runId, companyId: company.id, requestId: r.id, candidateCommit: candidate, kind: kind, itemId: item.id,
+        var run = MergeRun(id: runId, companyId: company.id, batchId: r.batchId, requestId: r.id, candidateCommit: candidate, kind: kind, itemId: item.id,
                            command: spec.command, status: .running, startedAt: clock())
         let output = paths.companyDir(company.id).appending(path: "check-output/merge-\(runId).log")
         func finish(_ status: VerificationStatus, exit: Int?, tail: String?) {
