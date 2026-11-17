@@ -142,6 +142,12 @@ struct GitCommand: Sendable {
     /// recorded there until it is reaped, so the owner's stop can signal it even when the engine is wedged.
     var childGroups: ChildGroups?
 
+    /// Variables added to the child's environment after `ChildEnvironment`'s allowlist and before the pinned ones (`GIT_DIR`,
+    /// the config and prompt switches), which win: a caller may add (`SafeGit`: `GIT_LITERAL_PATHSPECS=1`), never override.
+    var extraEnvironment: [String: String] = [:]
+    /// `-c key=value` pairs added after `configFlags` (`SafeGit`: `core.untrackedCache=false`, `core.excludesFile=/dev/null`).
+    var extraConfig: [String] = []
+
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
     static let lockRetryDelay: TimeInterval = 0.2
@@ -247,6 +253,7 @@ struct GitCommand: Sendable {
 
     func environment() -> [String: String] {
         var env = ChildEnvironment.make(base: baseEnvironment ?? ProcessInfo.processInfo.environment, purpose: .general)
+        for (name, value) in extraEnvironment { env[name] = value }
         env["GIT_DIR"] = gitDir.path
         env["GIT_WORK_TREE"] = workTree.path
         // Always pinned: without it git follows a `commondir` file in the git dir (the workspace's own `.git` included) to
@@ -274,9 +281,22 @@ struct GitCommand: Sendable {
 
     /// `attrSource`: the tree attributes are read from (the empty tree of the repository's hash), nil on an older git.
     func arguments(_ args: [String], attrSource: String?) -> [String] {
-        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + Self.configFlags
+        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + Self.configFlags + extraConfig
             + (allowsLocalFetch ? ["-c", "protocol.file.allow=always"] : [])
             + (allowsHTTPSFetch ? ["-c", "protocol.https.allow=always"] : []) + args
+    }
+
+    /// One call's full command line (after `git`) and environment, exactly as `run` would start it, with the repository scanned
+    /// first as before every run (`prepare`: config allowlist, attributes override). For `SafeGit`'s runner seam: a test fake
+    /// records what git would have been given; `LiveGitRunner` hands it to `runPrepared`.
+    func commandLine(_ args: [String]) throws -> (args: [String], environment: [String: String]) {
+        let attrSource = try prepare(args)
+        return (Array(arguments(args, attrSource: attrSource).dropFirst()), environment())
+    }
+
+    /// Runs the command line `commandLine` built (one attempt, no `index.lock` retry; `SafeGit` never takes the index lock).
+    func runPrepared(args: [String], environment: [String: String], maxOutput: Int, stdin: Stdin) throws -> Output {
+        try runOnce(["git"] + args, environment: environment, label: args.joined(separator: " "), maxOutput: maxOutput, stdin: stdin)
     }
 
     /// Before each attempt: an older git may only run tree-free plumbing; the repository's config must hold only allowed
