@@ -416,6 +416,8 @@ extension Store {
                 // rebased commit, so the rebase is applied all the same and the item goes to its reviewer from there.
                 let revoked = current.mergeState == .none && current.reviewedRound < current.reviewRound && current.verifiedCommit != nil
                 guard current.mergeState == .pending || revoked else { return }
+                // The branch now carries a rebased head: a request pinned to the old one is withdrawn (3a's check re-runs on this head).
+                try Self.cancelQueuedMerges(db: db, itemId: itemId, now: now)
                 // Weakening is measured from where the branch now starts.
                 if let base, current.baseCommit != nil { current.baseCommit = base }
                 current.updatedAt = now

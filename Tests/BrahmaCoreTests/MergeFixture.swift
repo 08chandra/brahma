@@ -46,6 +46,9 @@ struct MergeFixture {
     func exec(_ sql: String, _ args: StatementArguments = []) throws {
         try store.writer.write { try $0.execute(sql: sql, arguments: args) }
     }
+    func enqueue(_ item: WorkItem, ahead: Int, secretFindings: [String] = []) throws {
+        try store.writer.write { db in try store.enqueueApproved(db: db, item: item, ahead: ahead, secretFindings: secretFindings, now: now) }
+    }
     func cancelMerges(_ items: [WorkItem]) throws {
         try store.writer.write { db in for i in items { try store.cancelMerge(db: db, itemId: i.id) } }
     }
@@ -81,6 +84,14 @@ struct MergeFixture {
         return try fresh(i)
     }
 
+    /// The holder changes the branch and submits again; the engine check passes (awaiting the reviewer).
+    func resubmit(_ i: WorkItem, by a: Agent? = nil, file: String) async throws {
+        let wt = ws.worktreePath(key: i.key)
+        try write(file, "second try for \(i.key)", in: wt)
+        _ = try tools(a ?? eng).call(name: "submit_for_review", arguments: ["key": .string(i.key), "summary": .string("fixed it")])
+        try await cycle()
+    }
+
     @discardableResult
     func reviewTurn(_ a: Agent, _ i: WorkItem) throws -> Turn {
         let turn = try store.startTurn(agentId: a.id, now: now)
@@ -90,10 +101,10 @@ struct MergeFixture {
 
     /// Approves through the real review tool; the tool's reply.
     @discardableResult
-    func approve(_ i: WorkItem) throws -> String {
+    func approve(_ i: WorkItem, flags: Bool = false) throws -> String {
         try reviewTurn(rev, i)
         return try reviewTools(rev, i).call(name: "review", arguments: [
-            "key": .string(i.key), "decision": .string("approve"), "notes": .string("ok")])
+            "key": .string(i.key), "decision": .string("approve"), "notes": .string("ok"), "approve_flags": .bool(flags)])
     }
 
     /// Verified, then approved through the tool: the item's merge request is queued.

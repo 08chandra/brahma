@@ -5,6 +5,10 @@ import GRDB
 /// how far the verified commit is ahead of `main` and what the leak scan found in it. `Store.enqueueApproved` is given the two
 /// numbers; `commit` lets the transaction check they are of the commit that is being queued.
 struct MergeEnqueueFacts: Equatable, Sendable {
+    /// Whether a check run's outcome is an auto-approval that goes in the merge queue, so the engine measures it: only a
+    /// clean submit pass whose assessment qualifies (a nil assessment never does).
+    static func wanted(for autoMerge: AutoMergeAssessment?) -> Bool { autoMerge.map { $0.reason == nil } ?? false }
+
     var commit: String
     /// `revListCount("main..<commit>")`: 0 means the commit is already part of `main`.
     var ahead: Int
@@ -45,14 +49,14 @@ extension Store {
 
     /// 1 = next to be claimed, counted among the company's queued requests; nil when the request is not queued.
     public func mergePosition(of request: MergeRequest) throws -> Int? {
-        try writer.read { db in Self.queuePosition(db, request: request) }
+        try writer.read { db in try Self.queuePosition(db, request: request) }
     }
 
-    static func queuePosition(_ db: Database, request: MergeRequest) -> Int? {
+    static func queuePosition(_ db: Database, request: MergeRequest) throws -> Int? {
         guard request.status == .queued else { return nil }
-        let ahead = (try? Int.fetchOne(db, sql: "SELECT COUNT(*) FROM mergeRequest WHERE companyId = ? AND status = 'queued' AND number < ?",
-                                       arguments: [request.companyId, request.number])) ?? 0
-        return (ahead ?? 0) + 1
+        let ahead = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM mergeRequest WHERE companyId = ? AND status = 'queued' AND number < ?",
+                                     arguments: [request.companyId, request.number]) ?? 0
+        return ahead + 1
     }
 
     // MARK: Enqueue (at approval)
@@ -81,11 +85,14 @@ extension Store {
         return mergeEnqueueFacts(item: item)
     }
 
-    /// The first finding's rule or secret name (never its place or value), for the owner-facing reason.
+    /// The distinct rules or secret names the findings name (never a place or a value), on one line.
     static func secretLabel(_ findings: [String]) -> String {
-        let first = findings.first ?? "secret"
-        let label = first.components(separatedBy: " in ").first ?? first
-        return flat(label, max: 80)
+        var seen = Set<String>()
+        let labels = findings.compactMap { finding -> String? in
+            let label = flat(finding.components(separatedBy: " in ").first ?? finding, max: 80)
+            return label.isEmpty || !seen.insert(label).inserted ? nil : label
+        }
+        return labels.isEmpty ? "secret" : flat(labels.joined(separator: ", "), max: 200)
     }
 
     static func secretDetail(_ findings: [String]) -> String {
@@ -101,8 +108,16 @@ extension Store {
     @discardableResult
     func enqueueApproved(db: Database, item: WorkItem, ahead: Int, secretFindings: [String], now: Date) throws -> MergeRequest? {
         guard ahead > 0, let commit = item.verifiedCommit else { return nil }
-        if let open = try MergeRequest.filter(Column("itemId") == item.id && Self.openStatuses.contains(Column("status")))
-            .order(Column("number").desc).fetchOne(db) { return open }
+        // A request is only as good as the commit and check revision it was pinned to: a queued one that is not the item's
+        // current approval (the item came back and was approved again) is withdrawn and a fresh one made. One the engine is
+        // already checking or landing is left alone.
+        let open = try MergeRequest.filter(Column("itemId") == item.id && Self.openStatuses.contains(Column("status")))
+            .order(Column("number").desc).fetchAll(db)
+        if let busy = open.first(where: { $0.status != .queued }) { return busy }
+        if let current = open.first(where: { $0.headCommit == commit && $0.checkRevision == item.verifiedRevision }), secretFindings.isEmpty {
+            return current
+        }
+        try Self.cancelQueuedMerges(db: db, itemId: item.id, now: now)
         let number = (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM mergeRequest WHERE companyId = ?", arguments: [item.companyId]) ?? 0) + 1
         var request = MergeRequest(companyId: item.companyId, itemId: item.id, number: number, headCommit: commit,
                                    checkRevision: item.verifiedRevision, enqueuedAt: now)
@@ -116,7 +131,7 @@ extension Store {
             return nil
         }
         try request.insert(db)
-        let position = Self.queuePosition(db, request: request) ?? 1
+        let position = try Self.queuePosition(db, request: request) ?? 1
         try recordItemEvent(db: db, item: item, actor: "system", kind: .mergeQueued,
                             text: "queued to merge as \(request.ref) (position \(position))", now: now)
         return request
@@ -132,13 +147,20 @@ extension Store {
         try writer.write { db in
             guard let company = try Company.fetchOne(db, key: companyId), company.mergeHold == nil else { return [] }
             let size = min(max(size, 1), MergeSettings.batchRange.upperBound)
+            // A queued request whose item is no longer approved and waiting (it was sent back, moved or is another company's)
+            // is stale: it is withdrawn here so it cannot sit at the head of the queue.
+            try db.execute(sql: """
+                UPDATE mergeRequest SET status = 'cancelled', finishedAt = ?
+                WHERE companyId = ? AND status = 'queued' AND NOT EXISTS (
+                    SELECT 1 FROM workItem WHERE workItem.id = mergeRequest.itemId AND workItem.companyId = mergeRequest.companyId
+                        AND workItem.status = 'inReview' AND workItem.mergeState = 'pending')
+                """, arguments: [now, companyId])
             let queued = try MergeRequest.filter(Column("companyId") == companyId && Column("status") == MergeRequestStatus.queued.rawValue)
                 .order(Column("number")).limit(size).fetchAll(db)
             let batchId = UUID().uuidString
             var claimed: [MergeRequest] = []
             for var request in queued {
-                guard var item = try WorkItem.fetchOne(db, key: request.itemId), item.companyId == companyId,
-                      item.status == .inReview, item.mergeState == .pending else { continue }
+                guard var item = try WorkItem.fetchOne(db, key: request.itemId) else { continue }
                 request.status = .running
                 request.attempts += 1
                 request.batchId = batchId
@@ -173,12 +195,11 @@ extension Store {
     /// it) on top of `base`.
     func markLanding(requestIds: [String], candidates: [String: String], base: String, now: Date = Store.now()) throws {
         try writer.write { db in
-            for id in requestIds {
-                var (request, _) = try Self.ownedRequest(db, id: id)
+            for var (request, _) in try Self.ownedBatch(db, ids: requestIds) {
                 guard request.status == .running else { continue }
                 request.status = .landing
                 request.baseCommit = base
-                request.candidateCommit = candidates[id] ?? request.candidateCommit
+                request.candidateCommit = candidates[request.id] ?? request.candidateCommit
                 try request.update(db)
             }
         }
@@ -191,8 +212,10 @@ extension Store {
     func recordLanded(_ landed: [(requestId: String, mergedCommit: String)], mainCommit: String, now: Date = Store.now()) throws -> [WorkItem] {
         var items: [(WorkItem, String)] = []
         try writer.write { db in
-            for (requestId, mergedCommit) in landed {
-                var (request, item) = try Self.ownedRequest(db, id: requestId)
+            // One company per batch: `main` is moved for that company only.
+            let batch = try Self.ownedBatch(db, ids: landed.map(\.requestId))
+            for ((request, item), mergedCommit) in zip(batch, landed.map(\.mergedCommit)) {
+                var (request, item) = (request, item)
                 guard request.status == .landing || request.status == .running else { continue }
                 request.status = .merged
                 request.mergedCommit = mergedCommit
@@ -265,8 +288,7 @@ extension Store {
     /// inconclusive (counts toward `maxInconclusive`). An engine error counts neither (its `attempts` already did).
     func requeueMerge(requestIds: [String], countsAsRequeue: Bool, inconclusive: Bool = false, now: Date = Store.now()) throws {
         try writer.write { db in
-            for id in requestIds {
-                var (request, item) = try Self.ownedRequest(db, id: id)
+            for var (request, item) in try Self.ownedBatch(db, ids: requestIds) {
                 guard request.status == .running || request.status == .landing else { continue }
                 request.status = .queued
                 request.batchId = nil
@@ -316,6 +338,11 @@ extension Store {
     /// The item is leaving review (released, moved or reassigned): its `queued` request is withdrawn. A request that is
     /// `running` or `landing` is left alone (`refuseWhileMerging` stops the move before it gets here).
     func cancelMerge(db: Database, itemId: String, now: Date = Store.now()) throws {
+        try Self.cancelQueuedMerges(db: db, itemId: itemId, now: now)
+    }
+
+    /// Withdraws the item's `queued` requests (never one being checked or landed). Static so a restore's raw database can use it.
+    static func cancelQueuedMerges(db: Database, itemId: String, now: Date) throws {
         try db.execute(sql: """
             UPDATE mergeRequest SET status = 'cancelled', finishedAt = ? WHERE itemId = ? AND status = 'queued'
             """, arguments: [now, itemId])
@@ -339,6 +366,15 @@ extension Store {
         }
         guard item.companyId == request.companyId else { throw WorkError.forbidden("not in your company") }
         return (request, item)
+    }
+
+    /// The requests of one batch and their items. An unknown id is refused, and so is a batch that spans companies (a request
+    /// or its item of another company): nothing is written then.
+    private static func ownedBatch(_ db: Database, ids: [String]) throws -> [(MergeRequest, WorkItem)] {
+        let pairs = try ids.map { try ownedRequest(db, id: $0) }
+        let companies = Set(pairs.flatMap { [$0.0.companyId, $0.1.companyId] })
+        guard companies.count <= 1 else { throw WorkError.forbidden("not in your company") }
+        return pairs
     }
 
     private func redactedTail(_ tail: String?) throws -> String? {

@@ -255,4 +255,158 @@ import GRDB
         #expect(merge["ref"] as? String == "M-1"); #expect(merge["status"] as? String == "queued")
         #expect(merge["failure"] is NSNull); #expect(merge["detail"] is NSNull)
     }
+
+    // MARK: A request follows its item's approval (fix round 1)
+
+    /// Approves an item, sends it back through `trigger`, resubmits and approves again: the first request is withdrawn and the
+    /// second is pinned to the new commit, with its own `mergeQueued` event.
+    private func reapprovalIsFresh(_ m: MergeFixture, trigger: (WorkItem) throws -> Void) async throws {
+        let i = try await m.verified()
+        try m.approve(i)
+        let first = try #require(try m.store.latestMergeRequest(itemId: i.id))
+        #expect(first.status == .queued)
+        try trigger(i)
+        #expect(try m.fresh(i).status == .inProgress)
+        #expect(try m.store.mergeRequests(companyId: m.company.id, statuses: [.queued]).isEmpty, "the returned item's request is withdrawn")
+        try await m.resubmit(i, file: "src/again.txt")
+        let again = try m.fresh(i)
+        #expect(again.verifiedCommit != nil); #expect(again.verifiedCommit != first.headCommit)
+        let text = try m.approve(i, flags: true)   // a check edit leaves a review flag to approve
+        #expect(text == "Approved \(i.key); it is queued to merge as M-2.")
+        let all = try m.store.mergeRequests(companyId: m.company.id)
+        #expect(all.map(\.status) == [.cancelled, .queued])
+        let second = try #require(all.last)
+        #expect(second.ref == "M-2"); #expect(second.headCommit == again.verifiedCommit); #expect(second.checkRevision == again.verifiedRevision)
+        let queuedEvents = try m.store.itemEvents(itemId: i.id, limit: 500).filter { $0.kind == .mergeQueued }.map(\.text)
+        #expect(queuedEvents == ["queued to merge as M-1 (position 1)", "queued to merge as M-2 (position 1)"])
+    }
+
+    @Test func checkEditReturnWithdrawsQueuedRequest() async throws {
+        let m = try MergeFixture()
+        try await reapprovalIsFresh(m) { i in
+            let active = m.store.activeNow(companyId: m.company.id)
+            try m.exec("UPDATE workLease SET expiresActive = ? WHERE itemId = ?", [active + 5, i.id])
+            _ = try m.store.updateWorkItem(id: i.id, by: .owner, patch: WorkItemPatch(
+                checkSpec: .some(CheckSpec(command: "true && true", paths: ["src/p1"]))), now: m.now)
+        }
+    }
+
+    @Test func conflictReturnWithdrawsQueuedRequest() async throws {
+        let m = try MergeFixture()
+        try await reapprovalIsFresh(m) { i in
+            let head = try #require(try m.head(i))
+            let main = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: m.root)
+            try m.store.finishMerge(itemId: i.id, result: .conflict(files: ["src/work.txt"], mergeBase: main, mainCommit: main, itemCommit: head))
+        }
+    }
+
+    @Test func secretsFoundReturnWithdrawsQueuedRequest() async throws {
+        let m = try MergeFixture()
+        try await reapprovalIsFresh(m) { i in
+            try m.store.finishMerge(itemId: i.id, result: .secretsFound(findings: ["aws-key in src/work.txt"]))
+        }
+    }
+
+    @Test func branchMovedReturnWithdrawsQueuedRequest() async throws {
+        let m = try MergeFixture()
+        try await reapprovalIsFresh(m) { i in
+            try m.store.finishMerge(itemId: i.id, result: .branchMoved(head: nil))
+        }
+    }
+
+    @Test func repeatedMergeFailuresWithdrawQueuedRequest() async throws {
+        let m = try MergeFixture()
+        try await reapprovalIsFresh(m) { i in
+            for _ in 0..<Store.maxMergeFailures { try m.store.noteMergeFailure(itemId: i.id, error: "git said no", now: m.now) }
+        }
+    }
+
+    @Test func revokedAutoApprovalWithdrawsQueuedRequest() async throws {
+        let m = try MergeFixture(autoMergeSmall: true)
+        let i = try m.item("small change", tier: .s)
+        try m.claimAndSubmit(i, file: "src/small.txt")
+        try await m.cycle()
+        let first = try #require(try m.store.latestMergeRequest(itemId: i.id))
+        #expect(first.status == .queued)
+        try m.store.setAutoMerge(false)
+        #expect(try m.store.latestMergeRequest(itemId: i.id)?.status == .cancelled)
+        #expect(try m.fresh(i).mergeState == .none)
+        // The reviewer approves the same commit: a fresh request, with its own event.
+        try m.approve(i)
+        let second = try #require(try m.store.latestMergeRequest(itemId: i.id))
+        #expect(second.ref == "M-2"); #expect(second.status == .queued); #expect(second.headCommit == first.headCommit)
+        #expect(try m.kinds(i).filter { $0 == .mergeQueued }.count == 2)
+    }
+
+    @Test func approvingAgainRefreshesAStaleQueuedRequest() async throws {
+        // Defence in depth: a queued request pinned to something else than the item's current approval is replaced.
+        let m = try MergeFixture()
+        let i = try await m.verified()
+        try m.approve(i)
+        let first = try #require(try m.store.latestMergeRequest(itemId: i.id))
+        try m.exec("UPDATE mergeRequest SET headCommit = 'deadbeef' WHERE id = ?", [first.id])
+        let item = try m.fresh(i)
+        try m.enqueue(item, ahead: 1)
+        let all = try m.store.mergeRequests(companyId: m.company.id)
+        #expect(all.map(\.status) == [.cancelled, .queued])
+        #expect(all.last?.headCommit == item.verifiedCommit)
+    }
+
+    @Test func staleHeadRequestDoesNotWedgeTheQueue() async throws {
+        let m = try MergeFixture()
+        let a = try await m.verified("First", file: "src/a.txt")
+        let b = try await m.verified("Second", by: m.eng2, file: "src/b.txt")
+        try m.approve(a); try m.approve(b)
+        // The head request's item is no longer approved (something returned it without withdrawing the request).
+        try m.exec("UPDATE workItem SET mergeState = 'none' WHERE id = ?", [a.id])
+        let claimed = try m.store.claimMergeBatch(companyId: m.company.id, size: 1, now: m.now)
+        #expect(claimed.map(\.ref) == ["M-2"])
+        #expect(try m.store.latestMergeRequest(itemId: a.id)?.status == .cancelled)
+    }
+
+    @Test func onlyQualifyingAutoApprovalsAreMeasured() {
+        #expect(!MergeEnqueueFacts.wanted(for: nil), "a failed or non-submit run has no assessment")
+        #expect(!MergeEnqueueFacts.wanted(for: AutoMergeAssessment(commit: "c", base: "b", lines: 1, reason: "too big")))
+        #expect(MergeEnqueueFacts.wanted(for: AutoMergeAssessment(commit: "c", base: "b", lines: 1, reason: nil)))
+    }
+
+    @Test func batchWritesRefuseMixedCompanies() async throws {
+        let m = try MergeFixture()
+        let a = try await m.verified("First", file: "src/a.txt")
+        try m.approve(a)
+        // A second company in the same store, with a request of its own being landed.
+        let store = m.store
+        let other = try m.world.company("Other")
+        let hired = try store.hire(companyId: other.id, name: "o-eng", role: "engineer", model: "sonnet")
+        let foreignItem = try store.createWorkItem(companyId: other.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Foreign", ownerId: hired.id, status: .ready), now: m.now)
+        try m.exec("UPDATE workItem SET status = 'inReview', mergeState = 'pending' WHERE id = ?", [foreignItem.id])
+        try m.exec("""
+            INSERT INTO mergeRequest (id, companyId, itemId, number, status, headCommit, enqueuedAt)
+            VALUES ('foreign-1', ?, ?, 1, 'landing', 'abc', ?)
+            """, [other.id, foreignItem.id, m.now])
+        let claimed = try #require(try store.claimMergeBatch(companyId: m.company.id, size: 1, now: m.now).first)
+        let ids = [claimed.id, "foreign-1"]
+        let before = try m.store.company(id: m.company.id)?.mainCommit
+        let otherBefore = try store.company(id: other.id)?.mainCommit
+        func refused(_ body: () throws -> Void) -> String {
+            do { try body(); return "no error" } catch let e as WorkError { return e.message } catch { return "\(error)" }
+        }
+        #expect(refused { try store.markLanding(requestIds: ids, candidates: [:], base: "b", now: m.now) } == "not in your company")
+        #expect(refused { _ = try store.recordLanded([(claimed.id, "abc"), ("foreign-1", "abc")], mainCommit: "abc", now: m.now) } == "not in your company")
+        #expect(refused { try store.requeueMerge(requestIds: ids, countsAsRequeue: true, now: m.now) } == "not in your company")
+        #expect(refused { try store.markLanding(requestIds: [claimed.id, "no-such"], candidates: [:], base: "b", now: m.now) } == "no such merge request")
+        // Nothing was written, for either company.
+        #expect(try store.latestMergeRequest(itemId: a.id)?.status == .running)
+        #expect(try store.mergeRequests(companyId: other.id).map(\.status) == [.landing])
+        #expect(try store.company(id: m.company.id)?.mainCommit == before)
+        #expect(try store.company(id: other.id)?.mainCommit == otherBefore)
+    }
+
+    @Test func secretDetailNamesEveryDistinctLabel() {
+        let findings = ["aws-key in src/a.txt (commit abc1234)", "known secret STRIPE_KEY in src/b.txt", "aws-key in src/c.txt"]
+        #expect(Store.secretDetail(findings)
+                == "a possible secret (aws-key, known secret STRIPE_KEY) is in the change; remove it, rotate it if it was real, and resubmit")
+        #expect(Store.secretDetail([]) == "a possible secret (secret) is in the change; remove it, rotate it if it was real, and resubmit")
+    }
 }

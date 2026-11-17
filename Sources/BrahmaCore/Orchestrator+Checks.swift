@@ -175,7 +175,7 @@ extension Orchestrator {
         let assessing = self.store
         let autoMerge = passed && run.purpose == .submit ? await blocking.run { assessing.assessAutoMerge(run: run, git: git) } : nil
         // An auto-approval goes in the merge queue: how far ahead of `main` it is and its leak scan are measured here (git).
-        let facts: MergeEnqueueFacts? = autoMerge?.reason == nil
+        let facts: MergeEnqueueFacts? = MergeEnqueueFacts.wanted(for: autoMerge)
             ? await blocking.run { assessing.mergeEnqueueFacts(forRun: run) } : nil
         do { try store.finishVerification(runId: run.id, outcome: outcome, autoMerge: autoMerge, enqueue: facts, now: clock()) }
         catch { log("could not record the check of run \(run.id): \(error)") }
