@@ -83,29 +83,44 @@ extension Orchestrator {
         { cwd in
             let dir = URL(fileURLWithPath: cwd, isDirectory: true)
             let runId = dir.lastPathComponent
-            guard let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) else {
+            // The engine's record of the run: a verification run (3a's submit and merge checks), or a merge queue run
+            // (`MergeRun`, Plan 4a: recorded `running` before its check starts; its place is always an export).
+            struct Record { var id: String; var companyId: String; var itemId: String?; var requestedBy: String?; var purpose: String
+                            var recordedDirectory: String? }
+            let record: Record
+            let place: (GitWorkspace) -> URL
+            if let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) {
+                guard run.status == .running else { return .refused("the check run \(runId) is not running (\(run.status.rawValue))") }
+                record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: run.requestedBy,
+                                purpose: run.purpose.rawValue, recordedDirectory: run.workingDirectory)
+                // The exact place 3a's engine made for this run, by the run's recorded purpose (exhaustive; a new purpose must
+                // choose a place here rather than fall through to a checkout policy — B-M4).
+                switch run.purpose {
+                case .merge: place = { $0.exportPath(runId: run.id) }
+                case .submit: place = { $0.checkoutPath(runId: run.id) }
+                }
+            } else if let run = try? store.writer.read({ try MergeRun.fetchOne($0, key: runId) }) {
+                guard run.status == .running else { return .refused("the merge run \(runId) is not running (\(run.status?.rawValue ?? "unknown"))") }
+                record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: nil, purpose: "merge", recordedDirectory: nil)
+                place = { $0.exportPath(runId: run.id) }
+            } else {
                 return .refused("no engine record of a check running in \(runId)")
             }
-            guard run.status == .running else { return .refused("the check run \(runId) is not running (\(run.status.rawValue))") }
-            guard let company = try? store.company(id: run.companyId) else { return .refused("the company of run \(runId) is gone") }
+            guard let company = try? store.company(id: record.companyId) else { return .refused("the company of run \(runId) is gone") }
             let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
             let git = store.gitWorkspace(root: ws, companyId: company.id)
-            // The exact place 3a's engine made for this run, by the run's recorded purpose (exhaustive; a new purpose must
-            // choose a place here rather than fall through to a checkout policy — B-M4).
-            let place: URL
-            switch run.purpose {
-            case .merge: place = git.exportPath(runId: run.id)
-            case .submit: place = git.checkoutPath(runId: run.id)
-            }
+            let placeURL = place(git)
             func same(_ a: String, _ b: String) -> Bool {
                 URL(fileURLWithPath: a).standardizedFileURL.path == URL(fileURLWithPath: b).standardizedFileURL.path
             }
-            guard same(place.path, cwd) else { return .refused("\(cwd) is not run \(runId)'s \(run.purpose.rawValue) place") }
-            guard same(run.workingDirectory, cwd) else { return .refused("run \(runId) did not record \(cwd) as its directory") }
+            guard same(placeURL.path, cwd) else { return .refused("\(cwd) is not run \(runId)'s \(record.purpose) place") }
+            if let recorded = record.recordedDirectory {
+                guard same(recorded, cwd) else { return .refused("run \(runId) did not record \(cwd) as its directory") }
+            }
 
             func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
             if narrowed(company.permissionProfile) == .full {
-                let holder = (try? store.lease(itemId: run.itemId))?.agentId ?? run.requestedBy
+                let holder = record.itemId.flatMap { try? store.lease(itemId: $0) }?.agentId ?? record.requestedBy
                 let role = holder.flatMap { try? store.agent(id: $0) }?.role
                 if role.map({ narrowed(company.profile(forRole: $0)) == .full }) ?? true { return .unsandboxed }
             }
@@ -114,8 +129,8 @@ extension Orchestrator {
             let wsReal = ws.resolvedForSandbox
             guard SandboxPath.kind(wsReal.path) == .directory else { return .refused("the workspace of \(company.id) is not a directory") }
             // The engine made the checkout/export; it must be a real directory, named by its resolved path.
-            let checkout = URL(fileURLWithPath: SandboxPath.resolve(place.path), isDirectory: false)
-            guard SandboxPath.kind(checkout.path) == .directory else { return .refused("the \(run.purpose.rawValue) place of \(runId) is missing") }
+            let checkout = URL(fileURLWithPath: SandboxPath.resolve(placeURL.path), isDirectory: false)
+            guard SandboxPath.kind(checkout.path) == .directory else { return .refused("the \(record.purpose) place of \(runId) is missing") }
 
             let network = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []).allowedDomains
             // A check writes only its own checkout/export — no writable shared cache at all (A re-review ruling). Every

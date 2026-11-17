@@ -139,6 +139,87 @@ extension Store {
 
     static let openStatuses = MergeRequestStatus.openRaw
 
+    // MARK: Approvals the queue has no request for (Task 1b)
+
+    /// Items that are approved and waiting (`inReview`, `pending`, a verified commit) with no open merge request: an approval
+    /// 1a could not measure (git failed: it recorded nothing), or an item 3a's `.rebased` path put back to `pending` after
+    /// withdrawing its request. The queue never lands such an item blind: it measures it first (`adoptUnqueuedApprovals`).
+    func unqueuedApprovals(companyId: String) throws -> [WorkItem] {
+        try writer.read { db in
+            try WorkItem.fetchAll(db, sql: """
+                SELECT * FROM workItem w WHERE w.companyId = ? AND w.status = 'inReview' AND w.mergeState = 'pending'
+                AND w.verifiedCommit IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM mergeRequest m WHERE m.itemId = w.id AND m.status IN ('queued', 'running', 'landing'))
+                ORDER BY w.updatedAt, w.number
+                """, arguments: [companyId])
+        }
+    }
+
+    /// Whether some item of the company is being merged by an engine right now (`itemMerge.running`; a start-up clears it).
+    func anyMerging(companyId: String) throws -> Bool {
+        try writer.read { db in
+            try Bool.fetchOne(db, sql: """
+                SELECT EXISTS (SELECT 1 FROM itemMerge m JOIN workItem w ON w.id = m.itemId WHERE w.companyId = ? AND m.running)
+                """, arguments: [companyId]) ?? false
+        }
+    }
+
+    /// Whether the company has anything for its queue to do: a queued request, or an approval with none.
+    func hasMergeWork(companyId: String) throws -> Bool {
+        try writer.read { db in
+            if try MergeRequest.filter(Column("companyId") == companyId && Column("status") == MergeRequestStatus.queued.rawValue).fetchCount(db) > 0 {
+                return true
+            }
+            return try Bool.fetchOne(db, sql: """
+                SELECT EXISTS (SELECT 1 FROM workItem w WHERE w.companyId = ? AND w.status = 'inReview' AND w.mergeState = 'pending'
+                    AND w.verifiedCommit IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM mergeRequest m WHERE m.itemId = w.id AND m.status IN ('queued', 'running', 'landing')))
+                """, arguments: [companyId]) ?? false
+        }
+    }
+
+    /// Measures each unqueued approval at claim time (git: call it in a blocking body) and queues it through `enqueueApproved`
+    /// (which scans for secrets and bounces a leak), or completes it when it is already in `main`. An approval that still cannot
+    /// be measured fails closed: a `failed` request records why, the item is no longer merging, and the owner is told.
+    /// Nothing here lands anything. Returns how many items it dealt with.
+    @discardableResult
+    func adoptUnqueuedApprovals(companyId: String, now: Date = Store.now()) throws -> Int {
+        let items = try unqueuedApprovals(companyId: companyId)
+        for item in items {
+            guard let facts = mergeEnqueueFacts(item: item) else {
+                try failUnmeasured(item: item, now: now)
+                continue
+            }
+            try writer.write { db in
+                _ = try enqueueApproved(db: db, item: item, ahead: facts.ahead, secretFindings: facts.secretFindings, now: now)
+            }
+            if facts.ahead == 0 { try completeIfAlreadyInMain(itemId: item.id, facts: facts, now: now) }
+        }
+        return items.count
+    }
+
+    private func failUnmeasured(item current: WorkItem, now: Date) throws {
+        try writer.write { db in
+            guard var item = try WorkItem.fetchOne(db, key: current.id), item.status == .inReview, item.mergeState == .pending,
+                  let commit = item.verifiedCommit else { return }
+            let number = (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM mergeRequest WHERE companyId = ?", arguments: [item.companyId]) ?? 0) + 1
+            var request = MergeRequest(companyId: item.companyId, itemId: item.id, number: number, status: .failed, headCommit: commit,
+                                       checkRevision: item.verifiedRevision, enqueuedAt: now)
+            request.failure = .engineError
+            request.detail = "Brahma could not measure the approved change against main (no repository or unreadable history), so it will not merge it unseen"
+            request.finishedAt = now
+            try request.insert(db)
+            item.mergeState = .none
+            item.updatedAt = now
+            try item.update(db)
+            try appendActivity(db, ActivityEvent(companyId: request.companyId, agentId: nil, turnId: nil, kind: .merge,
+                                                 text: "Merge \(request.ref) (\(item.key)) stopped: \(request.detail ?? "")", createdAt: now))
+            try notifyOwner(db: db, companyId: request.companyId, kind: .system, urgency: .normal,
+                            title: "Merge \(request.ref) (\(item.key)) stopped",
+                            body: "\(request.detail ?? ""). Retry it from the merge queue or with brahma merge retry.", now: now)
+        }
+    }
+
     // MARK: Engine writes
 
     /// Claims up to `size` queued requests, oldest first, as one batch: they become `running` (`attempts += 1`) and their items
@@ -248,7 +329,8 @@ extension Store {
     /// snapshot. Anything else: the item goes back to `inProgress` with `mergeState = .none`, a `mergeFailed` event carrying
     /// `detail` and a system DM that never carries output.
     func bounceMerge(requestId: String, failure: MergeFailure, detail: String, conflictFiles: [String] = [], mergeBase: String? = nil,
-                     mainSide: String? = nil, outputTail: String? = nil, outputPath: String? = nil, now: Date = Store.now()) throws {
+                     mainSide: String? = nil, findings: [String] = [], outputTail: String? = nil, outputPath: String? = nil,
+                     now: Date = Store.now()) throws {
         let tail = try redactedTail(outputTail)
         let shownDetail = try redact(Self.flat(detail, max: 500))
         let files = try conflictFiles.map { try redact($0) }
@@ -267,6 +349,9 @@ extension Store {
             case .conflict:
                 // 3a's conflict step takes the item from `pending`.
                 if item.mergeState == .verifying { item.mergeState = .pending; try item.update(db) }
+            case .secretFound where !findings.isEmpty:
+                // The queue's own scan found it: 3a's leak step takes the item from `pending` (what to rewrite, never a value).
+                if item.mergeState == .verifying { item.mergeState = .pending; try item.update(db) }
             case .snapshotTampered:
                 let flag = "check snapshot tampered: \(Self.flat(shownDetail, max: 200))"
                 if !item.reviewFlags.contains(flag) { item.reviewFlags.append(flag); try item.update(db) }
@@ -277,7 +362,12 @@ extension Store {
             }
             return (request, item)
         }
-        guard let (request, item) = outcome, failure == .conflict else { return }
+        guard let (request, item) = outcome else { return }
+        if failure == .secretFound, !findings.isEmpty {
+            try finishMerge(itemId: item.id, result: .secretsFound(findings: findings), now: now)
+            return
+        }
+        guard failure == .conflict else { return }
         let main = try mainSide ?? company(id: item.companyId)?.mainCommit ?? request.baseCommit ?? ""
         try finishMerge(itemId: item.id, result: .conflict(files: files, mergeBase: mergeBase ?? request.baseCommit ?? main,
                                                            mainCommit: main, itemCommit: request.headCommit), now: now)
@@ -308,13 +398,13 @@ extension Store {
 
     /// The request will not be retried by the engine: `failed`, an activity line and an owner notice. The item stays approved
     /// but is not merging (`mergeState = .none`) until the owner retries.
-    func failMerge(requestId: String, detail: String, now: Date = Store.now()) throws {
+    func failMerge(requestId: String, detail: String, failure: MergeFailure = .engineError, now: Date = Store.now()) throws {
         let reason = try redact(Self.flat(detail, max: 500))
         try writer.write { db in
             var (request, item) = try Self.ownedRequest(db, id: requestId)
             guard request.status.isOpen else { return }
             request.status = .failed
-            request.failure = request.failure ?? .engineError
+            request.failure = request.failure ?? failure
             request.detail = reason
             request.finishedAt = now
             try request.update(db)

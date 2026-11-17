@@ -4,10 +4,41 @@ extension Orchestrator {
     /// Seconds before a company whose merge could not run (the checkout is not on `main`, git failed) is tried again.
     static let mergeRetry: TimeInterval = 60
 
-    /// Once per tick, after the checks: starts the merge of each company's oldest approved item, one per company, into slots the
-    /// safety cap has free. Nothing starts under a hold, critical memory pressure or for a paused company. The item is marked
-    /// as merging before its task starts, so this tick already launches no work turn for its holder.
+    /// Once per tick, after the checks: starts the merge queue's next batch for each company that has a queued request (or an
+    /// approval with none, which the queue measures first), one batch per company, into slots the safety cap has free (a batch
+    /// counts in `otherChildren`). Nothing starts under a hold, critical memory pressure, the owner's stop, a held queue or a
+    /// paused company. A batch that put its request back without landing anything is not tried again for `mergeRetry` seconds.
     func startMerges(now: Date, config: SchedulerConfig, held: Bool, pressure: MemoryPressure, companies: [Company]) {
+        guard !held, pressure != .critical, !stoppedNow else { return }
+        mergeBackoff = mergeBackoff.filter { $0.value > now }
+        for company in companies where company.status == .running && company.mergeHold == nil && mergeTasks[company.id] == nil
+            && mergeBackoff[company.id] == nil {
+            let slots = Scheduler.freeSlots(config: config, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
+                                            pressure: pressure, held: held)
+            guard slots > 0 else { return }
+            guard (try? store.hasMergeWork(companyId: company.id)) == true else { continue }
+            let queue = mergeQueue
+            mergeTasks[company.id] = Task.detached { [self] in
+                await asEngine {
+                    // (A request the owner's stop put back is no fault: it merges right after the resume.)
+                    if let outcome = await queue.runNextBatch(company: company), outcome.merged.isEmpty,
+                       !outcome.requeued.isEmpty || outcome.held != nil, (try? store.engineStopped()) == nil {
+                        await holdMerges(companyId: company.id, until: clock().addingTimeInterval(Self.mergeRetry))
+                    }
+                }
+                await mergeEnded(companyId: company.id)
+            }
+        }
+    }
+
+    // MARK: 3a's one-item merge step: unreachable since Plan 4a Task 1b
+    //
+    // The merge queue (`MergeQueue`, Plan 4a) replaced the step below. Nothing calls `startThe3aMergeStep` any more; it and
+    // `performMerge` stay in the tree, untouched, until Task 3 removes them with the main guard that still shares their
+    // helpers (`companyMergeFault`, `mergeStopped`, `holdMerges`).
+
+    /// 3a's step: the merge of each company's oldest approved item, one per company. Unreachable (see above).
+    func startThe3aMergeStep(now: Date, config: SchedulerConfig, held: Bool, pressure: MemoryPressure, companies: [Company]) {
         guard !held, pressure != .critical else { return }
         mergeBackoff = mergeBackoff.filter { $0.value > now }
         for company in companies where company.status == .running && mergeTasks[company.id] == nil && mergeBackoff[company.id] == nil {

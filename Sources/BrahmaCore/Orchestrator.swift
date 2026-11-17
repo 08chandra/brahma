@@ -80,6 +80,8 @@ public actor Orchestrator {
     var checkTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Company id → its merge task (one approved item lands at a time per company). Merges are child processes too.
     var mergeTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
+    /// The merge queue (Plan 4a Task 1b): lands the company's queued requests, one batch per company at a time. A stop observer.
+    public nonisolated let mergeQueue: MergeQueue
     /// Companies whose last merge attempt did not land (HEAD not on main, git failed): not tried again before this time.
     var mergeBackoff: [String: Date] = [:]
     /// Company id → merge attempts in a row that failed for the company's own reasons (`MergeInfrastructureError`).
@@ -199,8 +201,16 @@ public actor Orchestrator {
                                      timeouts: PreviewTimeouts(), memory: { memory.current != .normal }, clock: clock,
                                      blocking: engineBlocking, environment: checkBaseEnvironment)
         self.previewRunner = previews
-        // The owner's stop reaches the release executor (its steps and smokes) and every preview (L-5lite-A) too.
-        self.stopObservers = stopObservers + [executor, previews]
+        // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
+        let checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
+        // The merge queue (Plan 4a): it replaced 3a's one-item merge step. It shares this engine's `Blocking`, runs its checks
+        // through the same sandboxed runner, and scans for every company's known secret values.
+        let queue = MergeQueue(store: store, paths: paths, checks: checkRunner,
+                               knownValues: { [store] in ((try? store.companies()) ?? []).flatMap { store.knownSecretValues(companyId: $0.id) } },
+                               clock: clock, blocking: engineBlocking, baseEnvironment: checkBaseEnvironment)
+        self.mergeQueue = queue
+        // The owner's stop reaches the release executor (its steps and smokes), every preview (L-5lite-A) and the merge queue too.
+        self.stopObservers = stopObservers + [executor, previews, queue]
         self.backupTools = backupTools; self.walSleeper = walSleeper; self.sleepGuard = sleepGuard
         // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
         let vault = vault.nonInteractive()
@@ -222,8 +232,7 @@ public actor Orchestrator {
                                                       baseline: Orchestrator.ownerSandboxBaseline(store: store, paths: paths)),
                                 runner: runner, claudePath: claudePath)
             : nil)
-        // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
-        self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
+        self.checkRunner = checkRunner
         self.checkBaseEnvironment = checkBaseEnvironment
         // Plan ML: a restore resets every memory cursor (every company's: the whole database was swapped), a full idempotent
         // re-scan on the next ticks.

@@ -330,7 +330,7 @@ extension Store {
     }
 
     /// One alert per company however often the merge is retried; it resolves itself when the checkout is back on `main`.
-    private func raiseMainHeadAlert(company: Company, ref: String?) throws {
+    func raiseMainHeadAlert(company: Company, ref: String?) throws {
         let reason = Self.mainHeadAlertReason(company.id)
         let open = try writer.read { db in
             try Ask.filter(Column("kind") == AskKind.engineAlert && Column("status") == AskStatus.pendingOwner.rawValue
