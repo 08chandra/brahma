@@ -466,6 +466,32 @@ public enum EngineFiles {
             return OpenDirectory(fd: child, real: path, shown: shownChild)
         }
 
+        /// The `(device, inode)` of the directory itself, from its open descriptor.
+        func identity() throws -> (dev: dev_t, ino: ino_t) {
+            var st = stat()
+            guard fstat(fd, &st) == 0 else { throw UnsafeEngineFile(path: shown.path, problem: "cannot be inspected") }
+            return (st.st_dev, st.st_ino)
+        }
+
+        /// The entry `name` directly in it, opened for reading without following a link (`O_RDONLY | O_NOFOLLOW`), with the
+        /// `fstat` of that open descriptor, for a caller that judges the descriptor itself and refuses by its own rules
+        /// (`SafeFS`: regular, one link, the workspace's device, a size cap). Nothing is read here. Throws `UnsafeEngineFile`
+        /// when the name is a link, does not exist or cannot be opened or inspected. The caller closes `fd`.
+        func openEntry(_ name: String) throws -> (fd: Int32, st: stat) {
+            let shownEntry = shown.appending(path: name).path
+            try EngineFiles.checkName(name, shownEntry)
+            let fd = openat(self.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else {
+                let err = errno
+                if err == ELOOP { throw UnsafeEngineFile(path: shownEntry, problem: "is a symbolic link") }
+                if err == ENOENT { throw UnsafeEngineFile(path: shownEntry, problem: "does not exist") }
+                throw UnsafeEngineFile(path: shownEntry, problem: "cannot be opened (\(String(cString: strerror(err))))")
+            }
+            var st = stat()
+            guard fstat(fd, &st) == 0 else { close(fd); throw UnsafeEngineFile(path: shownEntry, problem: "cannot be inspected") }
+            return (fd, st)
+        }
+
         /// The names in it (without `.` and `..`).
         func names() throws -> [String] { try EngineFiles.entryNames(fd: fd, shown: shown.path) }
 
