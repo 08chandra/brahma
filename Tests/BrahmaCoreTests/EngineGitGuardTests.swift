@@ -9,15 +9,16 @@ import Foundation
         .deletingLastPathComponent()
 
     /// The sanctioned places, listed explicitly:
-    /// - `GitCommand` (the one way git is started) is used only in `Git/GitWorkspace.swift`; everything else goes through
-    ///   `GitWorkspace`.
+    /// - `GitCommand` (the one way git is started) is used only in `Git/GitWorkspace.swift` and Plan C's `Refs/SafeGit.swift`
+    ///   (agent-named revs and worktree diffs, every call built by `GitCommand.commandLine`); everything else goes through
+    ///   `GitWorkspace` or `SafeGit`.
     /// - A git process (`"git"` as a program argument) is started only there too.
     /// - In the engine (`Orchestrator*.swift`) every call that runs git sits inside a `blocking.run` / `blocking.tryRun`
     ///   closure, or inside one of the blocking-only helpers below, which are themselves only called from such a closure.
-    static let gitCommandFiles: Set<String> = ["Sources/BrahmaCore/Git/GitWorkspace.swift"]
+    static let gitCommandFiles: Set<String> = ["Sources/BrahmaCore/Git/GitWorkspace.swift", "Sources/BrahmaCore/Refs/SafeGit.swift"]
     static let blockingOnlyHelpers = ["prepareReview", "prepareAudit", "escalate", "touchesScope", "finishPlanTurn"]
     /// What runs git when called (GitWorkspace methods, the store's git steps, Plan L's `EngineExport` and the helpers above).
-    static let gitCalls = #"\bEngineExport\.(export|remove)\b|\.(ensureRepo|addWorktree|removeWorktree|itemWorktrees|deleteBranch|addRunWorktree|removeRunWorktrees?|addEngineExport|commitAll|headCommit|resetHard|planBarrier|enforcePlanBarrier|isDirty|head\(of|mergeBase|isAncestor|nameStatus|blobs|treeHasDirectory|diff\(base|changeStats|log\(base|commitsBehind|mergeConflicts|fileDiff|checkedOutRef|mainIsSymbolic|landVerified|quarantineRoot|mergeQuarantine|prepareRepo|checkMain|ensureCheckSnapshot|finishMerge|recoverMerges\(\)|assessAutoMerge|acceptMainCommit|installedGitVersion|installedGitMerges|hooksPath|setHooksPath|writeReleaseRefs|adoptMain|restoreMain|swapMainLocked)\b|\bMainGuard\.check\(|\bCompanyHooks\.install\(|\bTurnContext\.load\(|\b(prepareReview|prepareAudit|finishPlanTurn|touchesScope)\(|\bescalate\(itemId:"#
+    static let gitCalls = #"\bEngineExport\.(export|remove)\b|\.(ensureRepo|addWorktree|removeWorktree|itemWorktrees|deleteBranch|addRunWorktree|removeRunWorktrees?|addEngineExport|commitAll|headCommit|resetHard|planBarrier|enforcePlanBarrier|isDirty|head\(of|mergeBase|isAncestor|nameStatus|blobs|treeHasDirectory|diff\(base|changeStats|log\(base|commitsBehind|mergeConflicts|fileDiff|checkedOutRef|mainIsSymbolic|landVerified|quarantineRoot|mergeQuarantine|prepareRepo|checkMain|ensureCheckSnapshot|finishMerge|recoverMerges\(\)|assessAutoMerge|acceptMainCommit|installedGitVersion|installedGitMerges|hooksPath|setHooksPath|writeReleaseRefs|adoptMain|restoreMain|swapMainLocked|verifyRev|blobSize|catFile|lsTree|revList|logShas|recentPaths|hashObject|updateShareRef|deleteShareRef|expireAndPrune|worktreeDiff)\b|\bMainGuard\.check\(|\bCompanyHooks\.install\(|\bTurnContext\.load\(|\b(prepareReview|prepareAudit|finishPlanTurn|touchesScope)\(|\bescalate\(itemId:"#
 
     static func sources(under dir: String) throws -> [(path: String, text: String)] {
         let base = packageRoot.appending(path: dir)
