@@ -142,7 +142,10 @@ public final class Store: Sendable {
         var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
                                mergeDirectory: engineDir("merge", fallback: "brahma-merge"), exportHome: exportHome)
         git.lockTimeout = gitLockTimeout.seconds
-        git.followProbe = { [probe = mergeRefProbe] in probe.call("follow") }
+        git.followProbe = { [probe = mergeRefProbe] in
+            probe.call("follow")
+            if probe.fails("follow") { throw GitError.failed(command: "read-tree", status: -1, stderr: "the root checkout could not follow main") }
+        }
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
         git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }
         git.onWorktreeTamper = { [self] key, detail in
@@ -442,6 +445,10 @@ final class MergeRefProbe: @unchecked Sendable {
     private var body: (@Sendable (String) -> Void)?
     func set(_ new: (@Sendable (String) -> Void)?) { lock.withLock { body = new } }
     func call(_ ref: String) { lock.withLock { body }?(ref) }
+    private var failing: Set<String> = []
+    /// Tests only: the named step reports a failure the next time it asks (`fails`), as if git could not run there.
+    func failOn(_ steps: Set<String>) { lock.withLock { failing = steps } }
+    func fails(_ step: String) -> Bool { lock.withLock { failing.contains(step) } }
 }
 
 final class GitLockTimeout: @unchecked Sendable {

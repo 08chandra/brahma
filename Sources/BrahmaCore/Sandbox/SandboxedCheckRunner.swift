@@ -129,27 +129,37 @@ extension Orchestrator {
                     // check its setter and the candidate's item(s) (every item of a batch), for the item check the item's author
                     // (its lease holder and its assignee, both when both exist). A missing principal, an id that is no agent
                     // (or is gone), or none at all runs sandboxed.
-                    var itemIds = Set(record.itemId.map { [$0] } ?? [])
-                    if let batchId = record.batchId,
-                       let batch = try? store.writer.read({ try MergeRequest.filter(Column("batchId") == batchId).fetchAll($0) }) {
-                        itemIds.formUnion(batch.map(\.itemId))
-                    }
+                    // A database error on any lookup is not an absent row: the principal could be anyone, so the run is sandboxed.
+                    // `mainAtBase` runs main's own scripts at the base, no candidate's code: its principal is the main check's setter
+                    // alone (A5, decided here and not left to a default case); an unknown kind is sandboxed.
+                    let usesItems = record.mergeKind == .main || record.mergeKind == .item
+                    var itemIds = Set(usesItems ? record.itemId.map { [$0] } ?? [] : [])
                     var ids: [String] = []
                     var missing = false
+                    if usesItems, let batchId = record.batchId {
+                        do { itemIds.formUnion(try store.writer.read { try MergeRequest.filter(Column("batchId") == batchId).fetchAll($0) }.map(\.itemId)) }
+                        catch { missing = true }
+                    }
                     switch record.mergeKind {
                     case .main: if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
                     case .item: break
+                    case .mainAtBase: if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
                     default: missing = true
                     }
-                    if itemIds.isEmpty { missing = true }
+                    if usesItems && itemIds.isEmpty { missing = true }
                     for id in itemIds.sorted() {
-                        let holder = (try? store.lease(itemId: id))?.agentId, author = (try? store.workItem(id: id))?.ownerId
-                        if holder == nil && author == nil { missing = true }
-                        ids.append(contentsOf: [holder, author].compactMap { $0 })
+                        do {
+                            let holder = try store.lease(itemId: id)?.agentId, author = try store.workItem(id: id)?.ownerId
+                            if holder == nil && author == nil { missing = true }
+                            ids.append(contentsOf: [holder, author].compactMap { $0 })
+                        } catch { missing = true }
                     }
-                    let allFull = !missing && !ids.isEmpty && ids.allSatisfy { id in
-                        guard let role = (try? store.agent(id: id))?.role else { return false }
-                        return narrowed(company.profile(forRole: role)) == .full
+                    var allFull = !missing && !ids.isEmpty
+                    for id in ids where allFull {
+                        do {
+                            guard let role = try store.agent(id: id)?.role else { allFull = false; break }
+                            if narrowed(company.profile(forRole: role)) != .full { allFull = false }
+                        } catch { allFull = false }
                     }
                     if allFull { return .unsandboxed }
                 } else {

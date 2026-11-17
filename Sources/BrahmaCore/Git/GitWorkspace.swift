@@ -701,7 +701,7 @@ public struct GitWorkspace: Sendable {
     /// Tests only: called right before `git rebase` runs in the merge checkout and right after it returns.
     var rebaseProbe: (@Sendable (RebasePhase) -> Void)?
     /// Tests only: called by the merge queue's `fastForwardMain` right after `main` moved, before the root checkout follows.
-    var followProbe: (@Sendable () -> Void)?
+    var followProbe: (@Sendable () throws -> Void)?
     /// Tests only: called by the merge queue's self-heal with the path (relative to the workspace's git dir) of each directory
     /// it is about to walk into, and with each planted history file's name (`shallow`, `info/grafts`) right before it is removed.
     var healProbe: (@Sendable (String) -> Void)?

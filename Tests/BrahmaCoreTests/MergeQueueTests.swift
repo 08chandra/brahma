@@ -987,6 +987,100 @@ import GRDB
         #expect(DiffStat.parse(shortstat: " 1 file changed, 1 deletion(-)") == DiffStat(files: 1, insertions: 0, deletions: 1))
         #expect(DiffStat.parse(shortstat: "") == .zero)
     }
+    // MARK: Task 2 pre-work (Task 1b review findings)
+
+    /// A `read-tree` that throws after `main` moved is not a failed landing: main moved, so the request is recorded as merged,
+    /// the queue is held and the owner told (`.mainMovedRootBehind`), never put back in `queued`.
+    @Test func followThrowingAfterMainMovedHoldsAndRecords() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        let head = try #require(try m.fresh(i).verifiedCommit)
+        m.store.mergeRefProbe.failOn(["follow"])
+        defer { m.store.mergeRefProbe.failOn([]) }
+        let outcome = try #require(try await batch(queue(m), m))
+        let r = try request(m, i)
+        #expect(outcome.merged == [r.id] && outcome.requeued.isEmpty && outcome.failed.isEmpty)
+        #expect(outcome.held?.contains("did not follow main") == true)
+        #expect(r.status == .merged && r.requeues == 0)
+        #expect(try main(m) == head)
+        #expect(try m.store.company(id: m.company.id)?.mergeHold != nil)
+        #expect(try m.store.allNotices().contains { $0.title.contains("Merges are held") })
+    }
+
+    /// A database read error while the sandbox route looks up a principal is not a missing row: the run is sandboxed.
+    @Test func lookupErrorsForceTheSandbox() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(profile: .full), userHome: try tempDir())
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(roleProfiles: ["engineer": .full]), userHome: try tempDir())
+        let route = Orchestrator.checkRoute(store: m.store)
+        let company = try #require(try m.store.company(id: m.company.id))
+        func place(batch: String? = nil) async throws -> String {
+            let runId = UUID().uuidString
+            let dir = try EngineExport.export(store: m.store, company: company, runId: runId, commit: try main(m))
+            let run = MergeRun(id: runId, companyId: company.id, batchId: batch, kind: .item, itemId: i.id, status: .running)
+            try await m.store.writer.write { try run.insert($0) }
+            return dir.path
+        }
+        func sandboxed(_ r: CheckRoute) -> Bool { if case .sandboxed = r { return true } else { return false } }
+        #expect(!sandboxed(route(try await place())), "control: the holder and the author are Full")
+        // The item row cannot be read (its status is not a status): the author is unknown, not absent.
+        try m.exec("UPDATE workItem SET status = 'garbage' WHERE id = ?", [i.id])
+        #expect(sandboxed(route(try await place())))
+        try m.exec("UPDATE workItem SET status = 'inReview' WHERE id = ?", [i.id])
+        #expect(!sandboxed(route(try await place())), "control again")
+        // The lease row cannot be read.
+        try m.exec("UPDATE workLease SET acquiredAt = 'garbage' WHERE itemId = ?", [i.id])
+        #expect(sandboxed(route(try await place())))
+        try m.exec("UPDATE workLease SET acquiredAt = ? WHERE itemId = ?", [m.now, i.id])
+        #expect(!sandboxed(route(try await place())), "control again")
+        // The batch's requests cannot be read.
+        let other = try m.item("Other")
+        var b = MergeRequest(companyId: m.company.id, itemId: other.id, number: 77, headCommit: try main(m), enqueuedAt: m.now)
+        b.batchId = "batch-x"
+        let rb = b
+        try await m.store.writer.write { try rb.insert($0) }
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [m.eng.id, other.id])
+        #expect(!sandboxed(route(try await place(batch: "batch-x"))), "control: the other item's author is Full too")
+        try m.exec("ALTER TABLE mergeRequest RENAME COLUMN batchId TO batchIdGone")
+        #expect(sandboxed(route(try await place(batch: "batch-x"))))
+    }
+
+    /// If the landing could not be recorded and the hold could not be written, the owner is still told, and the queue does not
+    /// run that company again (the request stays `landing`; it was landed, so landing it again is never right).
+    @Test func doubleFaultAfterTheMoveNotifiesAndStops() async throws {
+        let m = try MergeFixture()
+        let (i, j) = try await twoApproved(m, first: ["src/a.txt": text("a")], second: ["src/b.txt": text("b")])
+        let head = try #require(try m.fresh(i).verifiedCommit)
+        try m.exec("CREATE TRIGGER no_record BEFORE UPDATE OF status ON mergeRequest WHEN NEW.status = 'merged' BEGIN SELECT RAISE(ABORT, 'no record'); END")
+        try m.exec("CREATE TRIGGER no_hold BEFORE UPDATE OF mergeHold ON company BEGIN SELECT RAISE(ABORT, 'no hold'); END")
+        let q = queue(m)
+        let outcome = try #require(try await batch(q, m))
+        let r = try request(m, i)
+        #expect(outcome.failed == [r.id] && outcome.merged.isEmpty && outcome.requeued.isEmpty)
+        #expect(r.status == .landing)
+        #expect(try main(m) == head)
+        #expect(try m.store.allNotices().contains { $0.title.contains("Merges are held") })
+        // Nothing else lands behind it in this process.
+        #expect(try await batch(q, m) == nil)
+        #expect(try main(m) == head)
+        #expect(try request(m, j).status == .queued)
+    }
+
+    /// The owner-stop read before a quarantine fails closed: a read error is not "not stopped".
+    @Test func stopReadErrorDoesNotQuarantine() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        try m.write("notes/owner.txt", "uncommitted", in: m.root)
+        try m.exec("DROP TABLE engineStop")
+        let before = try main(m)
+        try await batch(queue(m), m)
+        #expect(try main(m) == before)
+        #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "notes/owner.txt").path), "the root was not cleaned")
+        #expect(try git(m, ["for-each-ref", "refs/brahma/quarantine/"]).isEmpty)
+        #expect(try request(m, i).status == .queued)
+    }
+
 }
 
 /// Entries a check hook records (the hook runs on the runner's task).

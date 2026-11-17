@@ -57,6 +57,8 @@ public actor MergeQueue: EmergencyStopObserver {
     private var running: [String: Task<MergeBatchOutcome?, Never>] = [:]
     /// Company id → batches in a row that failed for the engine's own reasons.
     private var faults: [String: Int] = [:]
+    /// Companies whose last landing could not be recorded or held: no batch runs for them until `recover` has seen them.
+    private var stuck: Set<String> = []
 
     /// `knownValues` takes the company id; by default it is the company's own loaded secrets (`Store.knownSecretValues`).
     public init(store: Store, paths: BrahmaPaths, checks: any CheckRunning,
@@ -78,7 +80,7 @@ public actor MergeQueue: EmergencyStopObserver {
     /// Takes the company's next queued request through the whole merge. Nil when there was nothing to do: the engine is
     /// stopped, the queue is held, a batch of the company is already running, or nothing is queued.
     public func runNextBatch(company: Company) async -> MergeBatchOutcome? {
-        guard running[company.id] == nil else { return nil }
+        guard running[company.id] == nil, !stuck.contains(company.id) else { return nil }
         let id = company.id
         let task = Task<MergeBatchOutcome?, Never> { await self.batch(companyId: id) }
         running[id] = task
@@ -226,9 +228,9 @@ public actor MergeQueue: EmergencyStopObserver {
                     // Never committed to `main` by the engine (3a's B1): what is uncommitted at the root goes to a quarantine ref
                     // with one owner ask, the checkout is put back to `main`, and it reaches `main` only through the owner's accept.
                     if try git.isDirty(in: root) {
-                        // The owner's stop is read before the root is reset and cleaned (3a's gate, S15).
+                        // The owner's stop is read before the root is reset and cleaned (3a's gate, S15); a read error stops it too.
                         store.mergeRefProbe.call("refs/quarantine")
-                        if (try? store.engineStopped()) != nil { return .stopped }
+                        if try Task.isCancelled || store.engineStopped() != nil { return .stopped }
                         try store.quarantineRoot(company: company, git: git, expectedMain: base, now: clock())
                         return .quarantined
                     }
@@ -323,7 +325,7 @@ public actor MergeQueue: EmergencyStopObserver {
             // 5. The landing, under the lock: `main` must still be the base.
             /// `landed`: `main` moved and the request was recorded under the same lock (so nothing else writes the root, `main` or
             /// refs between the move and its record); `held` is a reason the queue is now held (the root did not follow, or the record failed).
-            enum Landing: Sendable { case landed(held: String?, recorded: Bool), moved, blocked, notFastForward, offMain(String), stopped }
+            enum Landing: Sendable { case landed(held: String?, recorded: Bool, holdFailed: Bool), moved, blocked, notFastForward, offMain(String), stopped }
             let landing = try await blocking.tryRun { () throws -> Landing in
                 try GitLock.withLock(paths: paths, companyId: company.id) {
                     guard try git.revParse("main") == base else { return .moved }
@@ -354,17 +356,22 @@ public actor MergeQueue: EmergencyStopObserver {
                         }
                         // `main` has moved: nothing below may throw, or the request would go back to `queued` with `main` already
                         // moved. A hold or notice that cannot be written is logged; the outcome still says the queue is held.
+                        var holdFailed = false
                         if let held {
+                            do { try store.setMergeHold(companyId: company.id, reason: held, now: clock()) } catch {
+                                holdFailed = true
+                                FileHandle.standardError.write(Data("brahma merge queue: could not hold the queue after \(item.key) landed: \(error)\n".utf8))
+                            }
+                            // Told in any case (best effort): a hold that was not written still needs the owner's eyes.
                             do {
-                                try store.setMergeHold(companyId: company.id, reason: held, now: clock())
                                 try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
                                                       body: "\(held). Reconcile the workspace root with main (save your own edits, then reset the root to main), "
                                                           + "and reject any quarantine of the old files. Then release the hold.", now: clock())
                             } catch {
-                                FileHandle.standardError.write(Data("brahma merge queue: could not hold the queue after \(item.key) landed: \(error)\n".utf8))
+                                FileHandle.standardError.write(Data("brahma merge queue: could not notify the owner after \(item.key) landed: \(error)\n".utf8))
                             }
                         }
-                        return .landed(held: held, recorded: recorded)
+                        return .landed(held: held, recorded: recorded, holdFailed: holdFailed)
                     case .blockedByLocalChanges:
                         try store.clearPendingMainCommit(companyId: company.id, ifEqual: candidate)
                         return .blocked
@@ -378,8 +385,11 @@ public actor MergeQueue: EmergencyStopObserver {
                 }
             }
             switch landing {
-            case .landed(let held, let recorded):
+            case .landed(let held, let recorded, let holdFailed):
                 settled = true
+                // Landed but neither recorded nor held: nothing runs for this company in this process until a restart's
+                // recovery has looked at it (landing it again is never right).
+                if !recorded || holdFailed { stuck.insert(company.id) }
                 if recorded { out.merged.append(r.id) } else { out.failed.append(r.id) }
                 out.mainCommit = candidate
                 out.held = held

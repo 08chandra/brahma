@@ -101,8 +101,14 @@ extension GitWorkspace {
                 }
                 return .notFastForward
             }
-            followProbe?()
-            guard try main.run(["read-tree", "-m", "-u", current, commit], allowFailure: true).status == 0 else {
+            // `main` has moved: from here nothing may throw (the caller would put a landed request back in the queue). A
+            // `read-tree` that cannot run at all (no temporary space, git cannot be started) is the same as one that fails.
+            do {
+                try followProbe?()
+                guard try main.run(["read-tree", "-m", "-u", current, commit], allowFailure: true).status == 0 else {
+                    return .mainMovedRootBehind
+                }
+            } catch {
                 return .mainMovedRootBehind
             }
             return .ok
