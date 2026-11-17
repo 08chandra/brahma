@@ -254,7 +254,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
     // MARK: Ops tool names and the built gate (PR-35 part 2t)
 
     @Test func opsToolsAreNamedAndHighRisk() {
-        #expect(CompanyToolNames.ops == ["set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy"])
+        #expect(CompanyToolNames.ops == ["set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy", "set_main_check"])
         #expect(CompanyToolNames.work.last == "request_human_task")
         #expect(Set(CompanyToolNames.all).isSuperset(of: CompanyToolNames.ops + ["request_human_task"]))
         for tool in CompanyToolNames.ops {

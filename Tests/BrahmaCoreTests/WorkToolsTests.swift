@@ -207,7 +207,7 @@ import GRDB
         let expected: Set<String> = Set(CompanyToolNames.base) ∪ ["list_work", "show_work_item", "create_work_item", "update_work_item",
             "link_dependency", "comment_work_item", "claim_lease", "release_lease", "submit_for_review", "confirm_spec",
             "propose_decision", "request_from_owner", "escalate_decision", "decide", "request_mode", "write_handoff", "plan_sprint", "close_sprint",
-            "request_access", "request_secret", "use_secret", "readopt_branch", "propose_extension", "request_human_task", "set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy"]
+            "request_access", "request_secret", "use_secret", "readopt_branch", "propose_extension", "request_human_task", "set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy", "set_main_check"]
         #expect(names == expected)
         #expect(!names.contains("review"))
         for spec in t.tools(t.eng).specs() {

@@ -89,7 +89,7 @@ extension Orchestrator {
                             var recordedDirectory: String?
                             /// A merge queue run: its principal is derived from the record (never from a lease alone) and an
                             /// unknown one runs sandboxed.
-                            var mergeKind: MergeRun.Kind?; var batchId: String?; var isMergeRun = false }
+                            var mergeKind: MergeRun.Kind?; var batchId: String?; var candidate: String?; var isMergeRun = false }
             let record: Record
             let place: (GitWorkspace) -> URL
             if let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) {
@@ -105,7 +105,7 @@ extension Orchestrator {
             } else if let run = try? store.writer.read({ try MergeRun.fetchOne($0, key: runId) }) {
                 guard run.status == .running else { return .refused("the merge run \(runId) is not running (\(run.status?.rawValue ?? "unknown"))") }
                 record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: nil, purpose: "merge", recordedDirectory: nil,
-                                mergeKind: run.kind, batchId: run.batchId, isMergeRun: true)
+                                mergeKind: run.kind, batchId: run.batchId, candidate: run.candidateCommit, isMergeRun: true)
                 place = { $0.exportPath(runId: run.id) }
             } else {
                 return .refused("no engine record of a check running in \(runId)")
@@ -130,8 +130,9 @@ extension Orchestrator {
                     // (its lease holder and its assignee, both when both exist). A missing principal, an id that is no agent
                     // (or is gone), or none at all runs sandboxed.
                     // A database error on any lookup is not an absent row: the principal could be anyone, so the run is sandboxed.
-                    // `mainAtBase` runs main's own scripts at the base, no candidate's code: its principal is the main check's setter
-                    // alone (A5, decided here and not left to a default case); an unknown kind is sandboxed.
+                    // `mainAtBase` runs the main check's scripts on a commit of `main` itself: its principals are the setter and the
+                    // authors of everything the queue landed since the last green check, and a head the queue did not land has an
+                    // unknown author (sandboxed).
                     let usesItems = record.mergeKind == .main || record.mergeKind == .item
                     var itemIds = Set(usesItems ? record.itemId.map { [$0] } ?? [] : [])
                     var ids: [String] = []
@@ -143,10 +144,15 @@ extension Orchestrator {
                     switch record.mergeKind {
                     case .main: if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
                     case .item: break
-                    case .mainAtBase: if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
+                    case .mainAtBase:
+                        if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
+                        do {
+                            let landed = try store.mainAtBaseAuthors(companyId: company.id, candidate: record.candidate, excluding: record.id)
+                            if landed.complete { itemIds.formUnion(landed.itemIds) } else { missing = true }
+                        } catch { missing = true }
                     default: missing = true
                     }
-                    if usesItems && itemIds.isEmpty { missing = true }
+                    if record.mergeKind != .mainAtBase && itemIds.isEmpty { missing = true }
                     for id in itemIds.sorted() {
                         do {
                             let holder = try store.lease(itemId: id)?.agentId, author = try store.workItem(id: id)?.ownerId

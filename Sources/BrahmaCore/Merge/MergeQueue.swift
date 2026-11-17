@@ -213,7 +213,8 @@ public actor MergeQueue: EmergencyStopObserver {
         case pass
         case fail(Failure)
         /// 3a's inconclusive rule held (an engine hold, a network-looking tail, a check that could not run): nobody is blamed.
-        case inconclusive(String)
+        /// `owner`: the request whose run it was (nil: a run no request owns); only it is charged for it.
+        case inconclusive(String, owner: String?)
         case stopped
     }
 
@@ -299,9 +300,10 @@ public actor MergeQueue: EmergencyStopObserver {
         }
         /// 3a's inconclusive rule: nobody is blamed; each request is put back (`inconclusive += 1`) until it has been
         /// inconclusive `maxInconclusive` times, then it is failed as infrastructure.
-        func inconclusive() {
+        func inconclusive(owner: String?) {
             ledger.batchError = "its check could not run reliably"
             for r in requests where !ledger.settled.contains(r.id) {
+                guard r.id == owner else { requeue(r, counts: false); continue }
                 if r.inconclusive + 1 >= Self.maxInconclusive { fail(r, Store.infraReason) } else { requeue(r, counts: false, inconclusive: true) }
             }
         }
@@ -417,7 +419,7 @@ public actor MergeQueue: EmergencyStopObserver {
             var culprit: (member: Member, failure: MergeFailure, detail: String, tail: String?, path: String?)?
             switch try await testPrefix(k, ctx) {
             case .stopped: requeueStopped(); return ledger.out
-            case .inconclusive: inconclusive(); return finish()
+            case .inconclusive(_, let owner): inconclusive(owner: owner); return finish()
             case .pass: landCount = k
             case .fail(let first):
                 var lo = 1, hi = k
@@ -428,7 +430,7 @@ public actor MergeQueue: EmergencyStopObserver {
                     case .pass: lo = mid + 1
                     case .fail(let f): failures[mid] = f; hi = mid
                     case .stopped: requeueStopped(); return ledger.out
-                    case .inconclusive: inconclusive(); return finish()
+                    case .inconclusive(_, let owner): inconclusive(owner: owner); return finish()
                     }
                 }
                 let failure = failures[lo] ?? first
@@ -439,7 +441,13 @@ public actor MergeQueue: EmergencyStopObserver {
                 case .main:
                     failureKind = .mainCheckFailed
                     if lo == 1 {
-                        // The main check fails with only the first request in it: is main itself red? Run it once at `base`.
+                        // The main check fails with only the first request in it: is main itself red? Run it once at `base`, which
+                        // must be the head the engine recorded (the guard has just checked; if it moved since, nothing runs).
+                        guard (try? store.company(id: company.id))??.mainCommit == base else {
+                            ledger.batchError = "main is not what Brahma recorded"
+                            requeueUnsettled()
+                            return finish()
+                        }
                         switch await runCheck(kind: .mainAtBase, spec: company.mainCheck ?? CheckSpec(command: "true"),
                                               agent: company.mainCheckSetById ?? "merge", requestId: nil, itemId: nil, batchId: batchId,
                                               prefix: nil, attempt: 1, company: company, git: git, candidate: base, pinned: [:]) {
@@ -456,7 +464,7 @@ public actor MergeQueue: EmergencyStopObserver {
                             requeueUnsettled()
                             return finish()
                         case .stopped: requeueStopped(); return ledger.out
-                        case .inconclusive, .unexportable: inconclusive(); return finish()
+                        case .inconclusive, .unexportable: inconclusive(owner: nil); return finish()
                         case .fault(let error): throw error
                         }
                     }
@@ -517,8 +525,15 @@ public actor MergeQueue: EmergencyStopObserver {
                         try store.markLanding(requestIds: ids, candidates: candidates, base: base, now: clock())
                         // The expected next head is recorded before `main` moves (3a's crash record), and cleared if it does not.
                         try store.setPendingMainCommit(companyId: company.id, landCommit)
-                        try store.advanceBatch(id: batchId, to: .landing, now: clock())
-                        try store.journalCrash(after: .landing)
+                        do {
+                            try store.advanceBatch(id: batchId, to: .landing, now: clock())
+                            try store.journalCrash(after: .landing)
+                        } catch is SimulatedCrash {
+                            throw SimulatedCrash()
+                        } catch {
+                            try? store.clearPendingMainCommit(companyId: company.id, ifEqual: landCommit)
+                            throw error
+                        }
                         let move: FastForwardResult
                         do { move = try git.fastForwardMain(to: landCommit) } catch {
                             try? store.clearPendingMainCommit(companyId: company.id, ifEqual: landCommit)
@@ -658,7 +673,7 @@ public actor MergeQueue: EmergencyStopObserver {
         switch await run(attempt: 1) {
         case .passed: return .pass
         case .stopped: return .stopped
-        case .inconclusive(let tail): return .inconclusive(tail)
+        case .inconclusive(let tail): return .inconclusive(tail, owner: owner.request.id)
         case .unexportable(let reason):
             return .fail(Failure(kind: .tree, detail: "its tree cannot be written out for the check: \(reason)", tail: nil, path: nil))
         case .fault(let error): throw error
@@ -672,7 +687,7 @@ public actor MergeQueue: EmergencyStopObserver {
                 try? store.flagFlakyMerge(itemIds: flagged.map(\.item.id))
                 return .pass
             case .stopped: return .stopped
-            case .inconclusive(let tail): return .inconclusive(tail)
+            case .inconclusive(let tail): return .inconclusive(tail, owner: owner.request.id)
             case .unexportable(let reason):
                 return .fail(Failure(kind: .tree, detail: "its tree cannot be written out for the check: \(reason)", tail: nil, path: nil))
             case .fault(let error): throw error
@@ -685,7 +700,10 @@ public actor MergeQueue: EmergencyStopObserver {
     private func releaseRedMainIfFixed(_ company: Company) async {
         let (store, blocking, clock) = (self.store, self.blocking, self.clock)
         let git = workspace(of: company)
-        guard let spec = company.mainCheck, let head = try? await blocking.tryRun({ try git.revParse("main") }),
+        // Only the head the engine recorded is checked: a live `main` that differs was moved outside the queue, which the main
+        // guard and the batch path deal with; nothing unverified runs under the setter's profile here.
+        guard let spec = company.mainCheck, let head = (try? store.company(id: company.id))??.mainCommit,
+              (try? await blocking.tryRun({ try git.revParse("main") })) == head,
               let last = try? store.latestMainAtBaseRun(companyId: company.id), last.candidateCommit != head else { return }
         let verdict = await runCheck(kind: .mainAtBase, spec: spec, agent: company.mainCheckSetById ?? "merge", requestId: nil, itemId: nil,
                                      batchId: nil, prefix: nil, attempt: 1, company: company, git: git, candidate: head, pinned: [:])

@@ -283,6 +283,91 @@ import GRDB
         #expect(journal.step == .done && journal.error != nil)
     }
 
+    /// Controller ruling 1: an inconclusive result is charged only to the request that owns the run; the others go back without
+    /// an inconclusive count, so a flaky item cannot push innocent items into `failed`.
+    @Test func inconclusiveIsChargedOnlyToTheOwnerOfTheRun() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"], ["src/c.txt": "c"]])
+        m.world.checks.onRun { call in
+            call.command == "make test B" ? FakeCheckRunner.fail("npm ERR! getaddrinfo ENOTFOUND registry.npmjs.org") : nil
+        }
+        let q = queue(m)
+        for round in 1...3 {
+            let outcome = try #require(try await batch(q, m))
+            let (ra, rb, rc) = (try request(m, items[0]), try request(m, items[1]), try request(m, items[2]))
+            #expect(ra.status == .queued && rc.status == .queued && ra.inconclusive == 0 && rc.inconclusive == 0, "round \(round)")
+            if round < 3 {
+                #expect(rb.status == .queued && rb.inconclusive == round)
+            } else {
+                #expect(outcome.failed == [rb.id] && rb.status == .failed && rb.detail == "check could not run reliably (infrastructure)")
+            }
+        }
+        // The good ones land once the flaky one is out of the way.
+        m.world.checks.onRun(nil)
+        let last = try #require(try await batch(q, m))
+        #expect(Set(last.merged) == [try request(m, items[0]).id, try request(m, items[2]).id])
+    }
+
+    /// Controller ruling 2: the red-main re-check runs only on the engine-recorded head. A live `main` that differs (someone moved
+    /// it outside the queue) is not checked here.
+    @Test func redMainRecheckOnlyOnTheRecordedHead() async throws {
+        let m = try MergeFixture()
+        _ = try await threeApproved(m, [["src/a.txt": "a"]])
+        try setMainCheck(m, "make smoke")
+        m.world.checks.onRun { call in call.command == "make smoke" ? FakeCheckRunner.fail("red") : nil }
+        let q = queue(m)
+        _ = try await batch(q, m)
+        #expect(try m.store.company(id: m.company.id)?.mergeHold == Store.redMainHold)
+        // main moves outside the queue; the checks would now pass.
+        _ = try GitFixture.plainGit(["commit", "-q", "--allow-empty", "-m", "outside"], in: m.root)
+        m.world.checks.onRun(nil)
+        let before = m.world.checks.calls.count
+        #expect(try await batch(q, m) == nil)
+        #expect(m.world.checks.calls.count == before, "no check ran on an unrecorded head")
+        #expect(try m.store.company(id: m.company.id)?.mergeHold == Store.redMainHold)
+    }
+
+    /// Controller ruling 2: the `mainAtBase` run's principals are the setter and the authors of what landed since; a non-Full
+    /// author, or a main whose latest commit the queue did not land, makes it sandboxed.
+    @Test func mainAtBasePrincipalsIncludeLandedAuthors() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        try await batch(queue(m), m)
+        let head = try main(m)
+        let junior = try m.store.hire(companyId: m.company.id, name: "jr", role: "junior", model: "sonnet")
+        let ops = try m.store.hire(companyId: m.company.id, name: "ops-1", role: "ops", model: "sonnet")
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(profile: .full), userHome: try tempDir())
+        func roles(_ r: [String: PermissionProfile]) throws {
+            try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(roleProfiles: r), userHome: try tempDir())
+        }
+        try roles(["ops": .full, "engineer": .full, "junior": .workspace])
+        try m.exec("UPDATE company SET mainCheckSetById = ? WHERE id = ?", [ops.id, m.company.id])
+        let route = Orchestrator.checkRoute(store: m.store)
+        let company = try #require(try m.store.company(id: m.company.id))
+        func place(at commit: String) async throws -> String {
+            let runId = UUID().uuidString
+            let dir = try EngineExport.export(store: m.store, company: company, runId: runId, commit: commit)
+            let run = MergeRun(id: runId, companyId: company.id, candidateCommit: commit, kind: .mainAtBase, status: .running)
+            try await m.store.writer.write { try run.insert($0) }
+            return dir.path
+        }
+        func sandboxed(_ r: CheckRoute) -> Bool { if case .sandboxed = r { return true } else { return false } }
+        // Full setter, Full author of what landed (the main head is that request's commit): unsandboxed.
+        #expect(!sandboxed(route(try await place(at: head))))
+        // A non-Full author among what landed since: sandboxed.
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [junior.id, i.id])
+        try m.exec("DELETE FROM workLease WHERE itemId = ?", [i.id])
+        #expect(sandboxed(route(try await place(at: head))))
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [m.eng.id, i.id])
+        #expect(!sandboxed(route(try await place(at: head))), "control")
+        // A commit the queue did not land (unknown author): sandboxed.
+        _ = try GitFixture.plainGit(["commit", "-q", "--allow-empty", "-m", "outside"], in: m.root)
+        #expect(sandboxed(route(try await place(at: try main(m)))))
+        // No setter: sandboxed.
+        try m.exec("UPDATE company SET mainCheckSetById = NULL WHERE id = ?", [m.company.id])
+        #expect(sandboxed(route(try await place(at: head))))
+    }
+
     // MARK: Settings and holds
 
     @Test func settingsValidation() throws {

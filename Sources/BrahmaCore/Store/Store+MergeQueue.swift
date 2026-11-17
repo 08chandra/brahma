@@ -444,6 +444,22 @@ extension Store {
         }
     }
 
+    /// Whose code a `mainAtBase` check at `candidate` executes besides the setter's: the items the queue landed since the last
+    /// green main check (all of them when none ever passed). `complete` is false when `candidate` is a head the queue did not
+    /// land (an owner's commit, an outside move): its author is unknown.
+    func mainAtBaseAuthors(companyId: String, candidate: String?, excluding runId: String) throws -> (itemIds: Set<String>, complete: Bool) {
+        try writer.read { db in
+            let green = try Date.fetchOne(db, sql: """
+                SELECT MAX(startedAt) FROM mergeRun WHERE companyId = ? AND kind IN ('main', 'mainAtBase') AND status = 'passed' AND id != ?
+                """, arguments: [companyId, runId])
+            let merged = try MergeRequest.filter(Column("companyId") == companyId && Column("status") == MergeRequestStatus.merged.rawValue).fetchAll(db)
+            guard let candidate else { return ([], false) }
+            if !merged.isEmpty, !merged.contains(where: { $0.mergedCommit == candidate }) { return ([], false) }
+            let since = merged.filter { r in green.map { (r.finishedAt ?? .distantFuture) >= $0 } ?? true }
+            return (Set(since.map(\.itemId)), true)
+        }
+    }
+
     static let flakyMergeFlag = "flaky check during merge: failed, then passed"
 
     /// A check of these items failed and then passed on its one re-run: each item gets the flag once.
