@@ -252,6 +252,7 @@ extension Store {
                 try item.update(db)
                 claimed.append(request)
             }
+            if !claimed.isEmpty { try Self.insertMergeBatch(db, id: batchId, companyId: companyId, requests: claimed, now: now) }
             return claimed
         }
     }

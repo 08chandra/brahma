@@ -1553,6 +1553,28 @@ enum Migrations {
             }
             try db.create(index: "mergeRun_request", on: "mergeRun", columns: ["requestId"])
         }
+        m.registerMigration("v4a-merge-journal") { db in
+            // Plan 4a Task 2: one row per batch of the merge queue, written step by step (`MergeStep`). `requestIds`, `candidates`
+            // and `landedIds` are JSON. `expectedParent` and `preparedCommit` belong to a step the queue never writes (S1).
+            try db.create(table: "mergeBatch") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("base", .text)
+                t.column("step", .text).notNull()
+                t.column("requestIds", .text).notNull()
+                t.column("expectedParent", .text)
+                t.column("preparedCommit", .text)
+                t.column("candidates", .text).notNull().defaults(to: "{}")
+                t.column("landCommit", .text)
+                t.column("landedIds", .text).notNull().defaults(to: "[]")
+                t.column("error", .text)
+                t.column("startedAt", .datetime)
+                t.column("updatedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "mergeBatch_company", on: "mergeBatch", columns: ["companyId", "step", "number"])
+        }
     }
 }
 
