@@ -21,7 +21,7 @@ extension Store {
 
     /// Batch size (1 to 8), strategy and main check, in one write. Owner or system only. A main check set here has no setter
     /// agent, so its runs are sandboxed (an unknown principal never runs unsandboxed).
-    func setMergeSettings(companyId: String, _ settings: MergeSettings, by sender: Sender, now: Date = Store.now()) throws {
+    public func setMergeSettings(companyId: String, _ settings: MergeSettings, by sender: Sender, now: Date = Store.now()) throws {
         try Self.requireOwnerOrSystem(sender)
         guard MergeSettings.batchRange.contains(settings.batchSize) else {
             throw WorkError.invalid("the batch size must be between \(MergeSettings.batchRange.lowerBound) and \(MergeSettings.batchRange.upperBound)")
@@ -75,7 +75,7 @@ extension Store {
     }
 
     /// The merge request an owner names by `M-<n>` or by the item's key (the newest one).
-    func mergeRequest(companyId: String, ref: String) throws -> MergeRequest? {
+    public func mergeRequest(companyId: String, ref: String) throws -> MergeRequest? {
         let ref = ref.trimmingCharacters(in: .whitespaces)
         if ref.hasPrefix("M-"), let number = Int(ref.dropFirst(2)) {
             return try writer.read { db in
@@ -89,7 +89,7 @@ extension Store {
     /// Owner only: a request the engine gave up on (`failed`) is put back in the queue, its counters cleared, provided its item is
     /// still approved and waiting. A bounced request went back to its holder with the reasons; it comes back by being fixed and
     /// approved again, not by a retry.
-    func requestMergeRetry(requestId: String, by sender: Sender, now: Date = Store.now()) throws {
+    public func requestMergeRetry(requestId: String, by sender: Sender, now: Date = Store.now()) throws {
         guard case .owner = sender else { throw WorkError.forbidden("only the owner can retry a merge") }
         try writer.write { db in
             guard var request = try MergeRequest.fetchOne(db, key: requestId) else { throw WorkError.notFound("no such merge request") }
@@ -122,7 +122,7 @@ extension Store {
     /// Owner only: releases the merge hold. A hold set because the root checkout did not follow `main` is released only once the
     /// root matches `main` again (clean checkout on `main`); otherwise the next batch would quarantine the old files as the owner's
     /// edits, and accepting that would revert what landed.
-    func resumeMergeQueue(companyId: String, by sender: Sender, now: Date = Store.now()) throws {
+    public func resumeMergeQueue(companyId: String, by sender: Sender, now: Date = Store.now()) throws {
         guard case .owner = sender else { throw WorkError.forbidden("only the owner can resume the merge queue") }
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         guard let hold = company.mergeHold else { return }
