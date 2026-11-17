@@ -142,6 +142,7 @@ public final class Store: Sendable {
         var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
                                mergeDirectory: engineDir("merge", fallback: "brahma-merge"), exportHome: exportHome)
         git.lockTimeout = gitLockTimeout.seconds
+        git.followProbe = { [probe = mergeRefProbe] in probe.call("follow") }
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
         git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }
         git.onWorktreeTamper = { [self] key, detail in

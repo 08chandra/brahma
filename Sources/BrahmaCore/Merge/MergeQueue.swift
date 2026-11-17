@@ -43,14 +43,12 @@ public actor MergeQueue: EmergencyStopObserver {
     public static let blameReruns = 1
     public static let maxInconclusive = 3
 
-    /// The message of the commit the queue makes of what is uncommitted at the workspace root.
-    static let unattributedMessage = "Brahma: unattributed changes on main"
-    static let rootSecretHold = "possible secret in uncommitted changes at the workspace root"
 
     let store: Store
     let paths: BrahmaPaths
     let checks: any CheckRunning
-    let knownValues: @Sendable () -> [(String, String)]
+    /// The secret values a candidate is scanned for, of the one company being merged (never another's: a finding names the secret).
+    let knownValues: @Sendable (String) -> [(String, String)]
     let clock: @Sendable () -> Date
     let blocking: Blocking
     let baseEnvironment: [String: String]
@@ -60,14 +58,16 @@ public actor MergeQueue: EmergencyStopObserver {
     /// Company id → batches in a row that failed for the engine's own reasons.
     private var faults: [String: Int] = [:]
 
-    public init(store: Store, paths: BrahmaPaths, checks: any CheckRunning, knownValues: @escaping @Sendable () -> [(String, String)],
-                clock: @escaping @Sendable () -> Date = Store.now) {
-        self.init(store: store, paths: paths, checks: checks, knownValues: knownValues, clock: clock, blocking: Blocking(),
+    /// `knownValues` takes the company id; by default it is the company's own loaded secrets (`Store.knownSecretValues`).
+    public init(store: Store, paths: BrahmaPaths, checks: any CheckRunning,
+                knownValues: (@Sendable (String) -> [(String, String)])? = nil, clock: @escaping @Sendable () -> Date = Store.now) {
+        self.init(store: store, paths: paths, checks: checks, knownValues: knownValues ?? { [store] in store.knownSecretValues(companyId: $0) },
+                  clock: clock, blocking: Blocking(),
                   baseEnvironment: ProcessInfo.processInfo.environment)
     }
 
     /// The orchestrator's: its `Blocking` (so the queue's git shares the engine's slots) and its check environment.
-    init(store: Store, paths: BrahmaPaths, checks: any CheckRunning, knownValues: @escaping @Sendable () -> [(String, String)],
+    init(store: Store, paths: BrahmaPaths, checks: any CheckRunning, knownValues: @escaping @Sendable (String) -> [(String, String)],
          clock: @escaping @Sendable () -> Date, blocking: Blocking, baseEnvironment: [String: String]) {
         self.store = store; self.paths = paths; self.checks = checks; self.knownValues = knownValues; self.clock = clock
         self.blocking = blocking; self.baseEnvironment = baseEnvironment
@@ -154,9 +154,9 @@ public actor MergeQueue: EmergencyStopObserver {
         case base(String)
         /// `main` is not what the engine recorded (the main guard's alert is up): nothing is merged.
         case mainChanged
-        /// `main` moved while the root was being committed.
-        case moved
-        case held(String)
+        /// The root checkout had uncommitted changes: 3a's quarantine moved them aside (a ref, an owner ask); nothing is committed
+        /// to `main`, and the queue waits for the owner's decision (`quarantineHeld`).
+        case quarantined
     }
 
     private func process(_ r: MergeRequest, item: WorkItem, company: Company, git: GitWorkspace) async -> MergeBatchOutcome {
@@ -217,21 +217,15 @@ public actor MergeQueue: EmergencyStopObserver {
                     if !repaired.isEmpty { store.reportMergeTamper(company: company, removed: repaired, now: clock()) }
                     do { try store.checkMain(company: company, git: git) }
                     catch let error as WorkError where error.message == Store.mainChangedMessage { return .mainChanged }
-                    guard var base = try git.revParse("main") else {
+                    guard let base = try git.revParse("main") else {
                         throw GitError.failed(command: "rev-parse main", status: -1, stderr: "the workspace has no main branch")
                     }
                     let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-                    if try git.isDirty(in: root), let unattributed = try git.prepareRootCommit(message: Self.unattributedMessage, parent: base) {
-                        guard try SecretScan.check(git: git, base: base, head: unattributed, knownValues: known()).isEmpty else {
-                            return .held(Self.rootSecretHold)
-                        }
-                        try store.setPendingMainCommit(companyId: company.id, unattributed)
-                        guard try git.advanceMain(from: base, to: unattributed) else {
-                            try store.clearPendingMainCommit(companyId: company.id, ifEqual: unattributed)
-                            return .moved
-                        }
-                        try store.writer.write { db in try store.finalizeMainCommit(db, companyId: company.id, commit: unattributed) }
-                        base = unattributed
+                    // Never committed to `main` by the engine (3a's B1): what is uncommitted at the root goes to a quarantine ref
+                    // with one owner ask, the checkout is put back to `main`, and it reaches `main` only through the owner's accept.
+                    if try git.isDirty(in: root) {
+                        try store.quarantineRoot(company: company, git: git, expectedMain: base, now: clock())
+                        return .quarantined
                     }
                     return .base(base)
                 }
@@ -242,15 +236,7 @@ public actor MergeQueue: EmergencyStopObserver {
             case .mainChanged:
                 requeue(counts: false)
                 return out
-            case .moved:
-                requeue(counts: true)
-                return out
-            case .held(let reason):
-                try store.setMergeHold(companyId: company.id, reason: reason, now: clock())
-                try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
-                                      body: "\(reason). Brahma did not commit it. Remove the secret or move it out of the workspace, then release the hold.",
-                                      now: clock())
-                out.held = reason
+            case .quarantined:
                 requeue(counts: false)
                 return out
             }
@@ -276,16 +262,26 @@ public actor MergeQueue: EmergencyStopObserver {
             if stopped() { requeueStopped(); return out }
 
             // 3. The checks, hermetic: the snapshot's integrity first (3a's guard), then the company's main check, then the item's.
-            if let file = try store.snapshotTamper(itemId: item.id, revision: r.checkRevision ?? item.checkRevision) {
-                await bounce(.snapshotTampered, file)
+            //    The item's saved scripts are read, hashed against their manifest and held in memory here, once, at the guard: what is
+            //    overlaid later is these bytes, never the agent-writable directory read again. The main check's scripts are pinned
+            //    from `base` (git objects), so a candidate cannot edit what gates its own landing.
+            let pinnedItem: [String: Data]
+            do {
+                pinnedItem = try await blocking.tryRun { try Self.loadSnapshot(store: store, item: item, revision: r.checkRevision) }
+            } catch let tampered as SnapshotTampered {
+                await bounce(.snapshotTampered, tampered.file)
                 return out
+            }
+            let pinnedMain: [String: Data] = try await blocking.tryRun {
+                guard let spec = company.mainCheck else { return [:] }
+                return try git.blobs(at: base, paths: CheckScripts.candidatePaths(command: spec.command), limit: CheckScripts.maxFiles)
             }
             var specs: [(MergeRun.Kind, CheckSpec, String)] = []
             if let main = company.mainCheck { specs.append((.main, main, company.mainCheckSetById ?? "merge")) }
             if let spec = item.checkSpec { specs.append((.item, spec, "merge")) }
             for (kind, spec, agent) in specs {
                 switch await runCheck(kind: kind, spec: spec, agent: agent, request: r, item: item, company: company, git: git,
-                                      candidate: candidate) {
+                                      candidate: candidate, pinned: kind == .main ? pinnedMain : pinnedItem) {
                 case .passed: break
                 case .stopped:
                     requeueStopped()
@@ -309,7 +305,7 @@ public actor MergeQueue: EmergencyStopObserver {
             }
 
             // 4. The leak scan of what will land.
-            let findings = try await blocking.tryRun { try SecretScan.check(git: git, base: base, head: candidate, knownValues: known()) }
+            let findings = try await blocking.tryRun { try SecretScan.check(git: git, base: base, head: candidate, knownValues: known(company.id)) }
             if !findings.isEmpty {
                 await bounce(.secretFound, Store.secretDetail(findings), findings: findings)
                 return out
@@ -317,7 +313,9 @@ public actor MergeQueue: EmergencyStopObserver {
             if stopped() { requeueStopped(); return out }
 
             // 5. The landing, under the lock: `main` must still be the base.
-            enum Landing: Sendable { case landed, moved, blocked, notFastForward, offMain(String), stopped }
+            /// `landed`: `main` moved and the request was recorded under the same lock (so nothing else writes the root, `main` or
+            /// refs between the move and its record); `held` is a reason the queue is now held (the root did not follow, or the record failed).
+            enum Landing: Sendable { case landed(held: String?, recorded: Bool), moved, blocked, notFastForward, offMain(String), stopped }
             let landing = try await blocking.tryRun { () throws -> Landing in
                 try GitLock.withLock(paths: paths, companyId: company.id) {
                     guard try git.revParse("main") == base else { return .moved }
@@ -337,7 +335,21 @@ public actor MergeQueue: EmergencyStopObserver {
                         throw error
                     }
                     switch result {
-                    case .ok: return .landed
+                    case .ok, .mainMovedRootBehind:
+                        var recorded = true
+                        var held: String? = result == .ok ? nil : "the root checkout did not follow main after \(item.key) landed; its files still hold the old tree"
+                        do {
+                            _ = try store.recordLanded([(requestId: r.id, mergedCommit: candidate)], mainCommit: candidate, now: clock())
+                        } catch {
+                            recorded = false
+                            held = "\(item.key) landed but could not be recorded (\(Store.flat("\(error)", max: 200)))"
+                        }
+                        if let held {
+                            try store.setMergeHold(companyId: company.id, reason: held, now: clock())
+                            try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
+                                                  body: "\(held). Reconcile the workspace root with main, then release the hold.", now: clock())
+                        }
+                        return .landed(held: held, recorded: recorded)
                     case .blockedByLocalChanges:
                         try store.clearPendingMainCommit(companyId: company.id, ifEqual: candidate)
                         return .blocked
@@ -351,11 +363,11 @@ public actor MergeQueue: EmergencyStopObserver {
                 }
             }
             switch landing {
-            case .landed:
+            case .landed(let held, let recorded):
                 settled = true
-                _ = try await blocking.tryRun { try store.recordLanded([(requestId: r.id, mergedCommit: candidate)], mainCommit: candidate, now: clock()) }
-                out.merged.append(r.id)
+                if recorded { out.merged.append(r.id) } else { out.failed.append(r.id) }
                 out.mainCommit = candidate
+                out.held = held
             case .stopped: requeueStopped()
             case .moved, .notFastForward: requeue(counts: true)
             case .blocked: requeue(counts: false)
@@ -364,7 +376,6 @@ public actor MergeQueue: EmergencyStopObserver {
                 requeue(counts: false)
             }
         } catch {
-            if settled { note("\(r.ref) was recorded, then: \(error)"); return out }
             if stopped() || error is StoppedByOwner || error is CancellationError {
                 requeueStopped()
             } else if error is MergeInfrastructureError || error is GitLockError || (error as? GitError)?.isRepositoryRefusal == true {
@@ -405,7 +416,7 @@ public actor MergeQueue: EmergencyStopObserver {
     /// One check on a fresh `.git`-free export of the candidate, run by the sandboxed `checks`, then the export is deleted.
     /// The run is recorded (`MergeRun`, `running` first: the sandbox route reads that record) and its tail redacted.
     private func runCheck(kind: MergeRun.Kind, spec: CheckSpec, agent: String, request r: MergeRequest, item: WorkItem,
-                          company: Company, git: GitWorkspace, candidate: String) async -> CheckVerdict {
+                          company: Company, git: GitWorkspace, candidate: String, pinned: [String: Data]) async -> CheckVerdict {
         let (store, blocking, clock, paths, checks) = (self.store, self.blocking, self.clock, self.paths, self.checks)
         let runId = UUID().uuidString
         var run = MergeRun(id: runId, companyId: company.id, requestId: r.id, candidateCommit: candidate, kind: kind, itemId: item.id,
@@ -422,7 +433,7 @@ public actor MergeQueue: EmergencyStopObserver {
                 dir = try await blocking.tryRun {
                     try GitLock.withLock(paths: paths, companyId: company.id) {
                         let export = try EngineExport.export(store: store, company: company, runId: runId, commit: candidate, now: clock())
-                        if kind == .item { try Self.overlaySnapshot(store: store, item: item, revision: r.checkRevision, into: export) }
+                        try Self.overlay(pinned, into: export)
                         return export
                     }
                 }
@@ -475,24 +486,35 @@ public actor MergeQueue: EmergencyStopObserver {
         }
     }
 
-    /// The item's saved check scripts (the baseline `ensureCheckSnapshot` took from the base commit, already verified unchanged)
-    /// are written over the same paths in the export, so a script the branch weakened cannot weaken the merge check. Read and
-    /// written through descriptors, never following a link; a file that cannot be read is a failure (nothing runs).
-    nonisolated static func overlaySnapshot(store: Store, item: WorkItem, revision: Int?, into export: URL) throws {
-        guard let snapshot = try store.latestCheckSnapshot(itemId: item.id, upTo: revision ?? item.checkRevision),
-              let root = snapshot.dir.range(of: "/.brahma/checks/", options: .backwards)
-                .map({ URL(fileURLWithPath: String(snapshot.dir[..<$0.lowerBound]), isDirectory: true) }) else { return }
+    /// A saved check script no longer matches its manifest hash (missing, unreadable, over the cap, or changed).
+    struct SnapshotTampered: Error { let file: String }
+
+    /// The item's saved check scripts (the baseline `ensureCheckSnapshot` took from the base commit), read through descriptors
+    /// (no link followed) and checked against the manifest hash of each; one that differs is `SnapshotTampered`. No snapshot: none.
+    nonisolated static func loadSnapshot(store: Store, item: WorkItem, revision: Int?) throws -> [String: Data] {
+        guard let snapshot = try store.latestCheckSnapshot(itemId: item.id, upTo: revision ?? item.checkRevision) else { return [:] }
+        let dir = URL(fileURLWithPath: snapshot.dir, isDirectory: true)
+        let root = snapshot.dir.range(of: "/.brahma/checks/", options: .backwards)
+            .map { URL(fileURLWithPath: String(snapshot.dir[..<$0.lowerBound]), isDirectory: true) } ?? dir
+        var out: [String: Data] = [:]
         for name in snapshot.manifest.keys.sorted() {
-            let source = URL(fileURLWithPath: snapshot.dir, isDirectory: true).appending(path: name)
-            guard let data = EngineFiles.readNoFollow(source, under: root, limit: CheckScripts.maxHashedBytes + 1),
-                  data.count <= CheckScripts.maxHashedBytes else {
-                throw GitError.failed(command: "overlay", status: -1, stderr: "the saved check script \(Store.flat(name, max: 120)) cannot be read")
+            guard let data = EngineFiles.readNoFollow(dir.appending(path: name), under: root, limit: CheckScripts.maxHashedBytes + 1),
+                  data.count <= CheckScripts.maxHashedBytes, StableHash.fnv1a64(data) == snapshot.manifest[name] else {
+                throw SnapshotTampered(file: Store.flat(name, max: 200))
             }
+            out[name] = data
+        }
+        return out
+    }
+
+    /// Writes pinned scripts over the same paths in the export through `EngineFiles` (no link followed).
+    nonisolated static func overlay(_ files: [String: Data], into export: URL) throws {
+        for name in files.keys.sorted() {
             let parts = name.split(separator: "/").map(String.init)
             guard let last = parts.last, !parts.contains(".."), !parts.contains(".") else { continue }
             let parent = parts.dropLast().joined(separator: "/")
             try EngineFiles.directory(workspace: export, parent)
-            try EngineFiles.replace(data, workspace: export, dir: parent, name: last)
+            try EngineFiles.replace(files[name] ?? Data(), workspace: export, dir: parent, name: last)
         }
     }
 }

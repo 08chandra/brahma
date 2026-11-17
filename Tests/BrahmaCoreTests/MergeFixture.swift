@@ -16,8 +16,8 @@ struct MergeFixture {
     var ws: GitWorkspace { GitWorkspace(root: root) }
     static let check = "make test"
 
-    init(autoMergeSmall: Bool = false) throws {
-        let w = try World(vault: vault)
+    init(autoMergeSmall: Bool = false, observers: [any WorkItemObserver] = []) throws {
+        let w = try World(store: try Store.inMemory(observers: observers), vault: vault)
         let c = try w.company("Acme")
         if autoMergeSmall { try w.store.setAutoMergeSmall(companyId: c.id, true) }
         let lead = try w.store.hire(companyId: c.id, name: "mgr", role: "manager", model: "sonnet")

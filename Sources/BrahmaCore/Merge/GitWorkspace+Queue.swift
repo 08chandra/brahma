@@ -11,6 +11,10 @@ import Foundation
 /// `GitLock`; the methods that move `main` also take 3a's main lock (shared with owner accepts and quarantines).
 public enum FastForwardResult: Equatable, Sendable {
     case ok
+    /// `main` moved, but the root checkout could not follow it (its files and index still hold the old tree). Nothing is rolled
+    /// back; the caller records the landing and holds the queue for the owner (never an index-only update that would make
+    /// the old files look like the owner's edits).
+    case mainMovedRootBehind
     /// The root checkout's own edits (an untracked file in the way, a modified one) stop the fast-forward; nothing moved.
     case blockedByLocalChanges
     /// `main` is not an ancestor of the commit (it moved): nothing moved.
@@ -66,44 +70,9 @@ extension GitWorkspace {
     }
 
     // MARK: The root checkout
-
-    /// Commits what is uncommitted in the root checkout as a commit on `parent`, moving no ref and touching neither the root's
-    /// index nor its files: a private index, the engine's descriptor-fed staging (`stage`: no `git add` ever reads the root),
-    /// `write-tree`, `commit-tree -p <parent>`. Nil when the resulting tree is the parent's tree (nothing to commit).
-    public func prepareRootCommit(message: String, parent: String) throws -> String? {
-        try Self.validCommit(parent)
-        try? FileManager.default.createDirectory(at: gitTemp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let index = gitTemp.appending(path: "brahma-index-\(UUID().uuidString)")
-        defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
-        let scratch = main.withIndex(index)
-        try scratch.run(["read-tree", parent])
-        try stage(scratch, in: root, relative: "")
-        let tree = try scratch.run(["write-tree"]).text
-        let parentTree = try main.run(["rev-parse", "--verify", "\(parent)^{tree}"]).text
-        if tree == parentTree { return nil }
-        return try scratch.run(["commit-tree", tree, "-p", parent, "-m", message]).text
-    }
-
-    /// Moves `refs/heads/main` from `old` to `new` with a compare-and-swap (`update-ref <ref> <new> <old>`), then makes the root
-    /// checkout and index follow when the root is on `main`: a two-tree `read-tree -u` (which never overwrites a local edit),
-    /// else the index alone, so what the owner has in the files shows as an edit and is never lost. False when `main` was not
-    /// `old` (or `old` is not an ancestor of `new`): nothing moved.
-    public func advanceMain(from old: String, to new: String) throws -> Bool {
-        try Self.validCommit(old); try Self.validCommit(new)
-        return try withMainLock(infrastructure: true) {
-            guard try !mainIsSymbolic() else {
-                throw GitError.failed(command: "update-ref \(Self.mainRef)", status: -1, stderr: "main is a symbolic ref")
-            }
-            guard try isAncestor(old, of: new) else { return false }
-            guard try main.run(["update-ref", "--no-deref", Self.mainRef, new, old], allowFailure: true).status == 0 else { return false }
-            if try checkedOutRef() == Self.mainRef {
-                if try main.run(["read-tree", "-m", "-u", old, new], allowFailure: true).status != 0 {
-                    _ = try main.run(["read-tree", new], allowFailure: true)
-                }
-            }
-            return true
-        }
-    }
+    //
+    // There is deliberately no method that commits what is uncommitted at the root onto `main`: 3a quarantines it
+    // (`quarantineRoot`) and it reaches `main` only through the owner's accept (Plan 4a Task 1b fix round, ruling S1).
 
     /// Fast-forwards `main` to `commit` with the root checkout following, the checkout being on `main` (checked first, under
     /// main's lock). Never overwrites the root's own edits: they stop it (`blockedByLocalChanges`). Nothing moved unless `.ok`.
@@ -132,8 +101,9 @@ extension GitWorkspace {
                 }
                 return .notFastForward
             }
-            if try main.run(["read-tree", "-m", "-u", current, commit], allowFailure: true).status != 0 {
-                _ = try main.run(["read-tree", commit], allowFailure: true)     // index only: the owner's edits stay as edits
+            followProbe?()
+            guard try main.run(["read-tree", "-m", "-u", current, commit], allowFailure: true).status == 0 else {
+                return .mainMovedRootBehind
             }
             return .ok
         }

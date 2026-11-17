@@ -204,9 +204,9 @@ public actor Orchestrator {
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         let checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
         // The merge queue (Plan 4a): it replaced 3a's one-item merge step. It shares this engine's `Blocking`, runs its checks
-        // through the same sandboxed runner, and scans for every company's known secret values.
+        // through the same sandboxed runner, and scans a candidate for its own company's known secret values only.
         let queue = MergeQueue(store: store, paths: paths, checks: checkRunner,
-                               knownValues: { [store] in ((try? store.companies()) ?? []).flatMap { store.knownSecretValues(companyId: $0.id) } },
+                               knownValues: { [store] in store.knownSecretValues(companyId: $0) },
                                clock: clock, blocking: engineBlocking, baseEnvironment: checkBaseEnvironment)
         self.mergeQueue = queue
         // The owner's stop reaches the release executor (its steps and smokes), every preview (L-5lite-A) and the merge queue too.

@@ -11,7 +11,7 @@ import GRDB
 
     static let secretValue = "hunter2-value-xyz-1234567890"
 
-    func queue(_ m: MergeFixture, known: @escaping @Sendable () -> [(String, String)] = { [] },
+    func queue(_ m: MergeFixture, known: @escaping @Sendable (String) -> [(String, String)] = { _ in [] },
                checks: (any CheckRunning)? = nil) -> MergeQueue {
         MergeQueue(store: m.store, paths: m.world.paths, checks: checks ?? m.world.checks, knownValues: known, clock: { m.now })
     }
@@ -219,9 +219,11 @@ import GRDB
         #expect(entry.command == MergeFixture.check)
         #expect(!FileManager.default.fileExists(atPath: entry.dir.path))           // deleted after
         let runs = try m.store.mergeRuns(requestId: try request(m, i).id)
-        #expect(runs.count == 1 && runs[0].kind == .item && runs[0].status == .passed && runs[0].exitCode == 0)
-        #expect(runs[0].candidateCommit == (try request(m, i)).candidateCommit)
-        #expect(entry.dir.lastPathComponent == runs[0].id)
+        #expect(runs.count == 1)
+        let run = try #require(runs.first)
+        #expect(run.kind == .item && run.status == .passed && run.exitCode == 0)
+        #expect(run.candidateCommit == (try request(m, i)).candidateCommit)
+        #expect(entry.dir.lastPathComponent == run.id)
     }
 
     @Test func tamperedSnapshotBounces() async throws {
@@ -295,7 +297,7 @@ import GRDB
         try m.approve(try m.fresh(i))
         let before = try main(m)
         let value = Self.secretValue
-        let outcome = try #require(try await batch(queue(m, known: { [("DEPLOY_TOKEN", value)] }), m))
+        let outcome = try #require(try await batch(queue(m, known: { _ in [("DEPLOY_TOKEN", value)] }), m))
         let r = try request(m, i)
         #expect(outcome.bounced == [r.id] && r.failure == .secretFound)
         #expect(try main(m) == before)
@@ -305,43 +307,56 @@ import GRDB
 
     // MARK: The root checkout
 
-    @Test func dirtyRootCommittedWithoutMovingRefFirst() async throws {
+    /// 3a's rule stays (Task 1b fix round, ruling S1): the queue never commits what is uncommitted at the root to `main`. The
+    /// tick quarantines it (a ref, one owner ask), restores the checkout, lands nothing and creates no commit.
+    @Test func dirtyRootIsQuarantinedNotCommitted() async throws {
         let m = try MergeFixture()
         let i = try await m.approved()
         let oldMain = try main(m)
         try m.write("notes/owner.txt", "the owner's uncommitted note", in: m.root)
-        let outcome = try #require(try await batch(queue(m), m))
+        try await m.cycle()
+        #expect(try main(m) == oldMain)
+        #expect(try m.store.company(id: m.company.id)?.mainCommit == oldMain)
+        #expect(try git(m, ["log", "--format=%s", "main"]).contains("unattributed") == false)
+        let refs = try git(m, ["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"]).split(separator: "\n")
+        #expect(refs.count == 1)
+        let ref = String(try #require(refs.first))
+        #expect(try git(m, ["show", "\(ref):notes/owner.txt"]) == "the owner's uncommitted note")
+        #expect(try git(m, ["rev-parse", "\(ref)^"]) == oldMain)
+        #expect(try git(m, ["status", "--porcelain"]).isEmpty)           // the checkout is main again
+        let asks = try await m.store.writer.read { db in
+            try Ask.filter(Column("companyId") == m.company.id && Column("category") == "engine-code").fetchAll(db)
+        }
+        #expect(asks.count == 1 && asks[0].status == .pendingOwner && asks[0].title == Store.quarantineTitle)
         let r = try request(m, i)
-        #expect(outcome.merged == [r.id])
-        let tip = try main(m)
-        let subjects = try git(m, ["log", "--format=%s", "\(oldMain)..\(tip)"]).split(separator: "\n").map(String.init)
-        #expect(subjects.count == 2 && subjects.last == "Brahma: unattributed changes on main", "\(subjects)")
-        let unattributed = try git(m, ["rev-parse", "\(tip)^"])
-        #expect(try git(m, ["rev-parse", "\(unattributed)^"]) == oldMain)
-        #expect(try git(m, ["show", "\(unattributed):notes/owner.txt"]) == "the owner's uncommitted note")
-        #expect(try m.ws.head(of: "refs/brahma/pre-merge/\(r.number)") == unattributed)   // the base the item landed on
-        #expect(try m.store.company(id: m.company.id)?.mainCommit == tip)
-        #expect(try git(m, ["status", "--porcelain"]).isEmpty)
+        #expect(r.status == .queued && r.requeues == 0)
+        #expect(try m.fresh(i).status == .inReview)
+        // Held: more ticks land nothing and file nothing new, until the owner decides.
+        m.world.clock.advance(120); try await m.cycle()
+        #expect(try main(m) == oldMain)
+        #expect(try request(m, i).status == .queued)
     }
 
-    @Test func secretInDirtyRootHoldsQueue() async throws {
+    @Test func secretInDirtyRootNeverReachesMain() async throws {
         let m = try MergeFixture()
         let i = try await m.approved()
         let before = try main(m)
         try m.write("leak.env", "KEY=AKIAABCDEFGHIJKLMNOP\n", in: m.root)
-        let q = queue(m)
-        let outcome = try await batch(q, m)
+        try await m.cycle()
+        try await m.cycle()
         #expect(try main(m) == before)
-        #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "leak.env").path))   // untouched
-        let hold = try #require(try m.store.company(id: m.company.id)?.mergeHold)
-        #expect(hold == "possible secret in uncommitted changes at the workspace root")
-        #expect(outcome?.held == hold)
+        #expect(try git(m, ["log", "--all", "--format=%H", "--", "leak.env"]).split(separator: "\n").allSatisfy { sha in
+            (try? git(m, ["merge-base", "--is-ancestor", String(sha), "main"])) == nil })   // only a quarantine ref has it
+        #expect(try git(m, ["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"]).split(separator: "\n").count == 1)
+        #expect(try m.store.company(id: m.company.id)?.mainCommit == before)
         let r = try request(m, i)
         #expect(r.status == .queued && r.requeues == 0)
-        #expect(try m.store.allNotices().contains { $0.body.contains("secret") || $0.title.contains("secret") })
-        // Held: nothing is claimed until the owner clears the hold.
-        #expect(try await batch(q, m)?.merged.isEmpty ?? true)
-        #expect(try request(m, i).status == .queued)
+        let asks = try await m.store.writer.read { db in
+            try Ask.filter(Column("companyId") == m.company.id && Column("category") == "engine-code").fetchAll(db)
+        }
+        #expect(asks.count == 1)
+        #expect(!asks[0].summary.contains("AKIAABCDEFGHIJKLMNOP"))      // names only, never a value
+        #expect(try m.store.hasMergeWork(companyId: m.company.id))
     }
 
     @Test func rootOnOtherBranchDoesNotLand() async throws {
@@ -529,7 +544,7 @@ import GRDB
         try m.exec("DELETE FROM mergeRequest WHERE itemId = ?", [i.id])
         let before = try main(m)
         let value = Self.secretValue
-        _ = try await batch(queue(m, known: { [("DEPLOY_TOKEN", value)] }), m)
+        _ = try await batch(queue(m, known: { _ in [("DEPLOY_TOKEN", value)] }), m)
         // The re-measure at claim time sees the leak: the item goes back to its holder and nothing lands.
         #expect(try main(m) == before)
         #expect(try m.fresh(i).status == .inProgress)
@@ -592,6 +607,181 @@ import GRDB
         #expect(refused(route(dir.path)))
     }
 
+    // MARK: Fix round 1
+
+    /// An item's check script, committed on main so its snapshot has something to pin.
+    func scripted(_ m: MergeFixture, script: String = "scripts/check.sh", body: String = "exit 0\n") throws {
+        try m.write(script, body, in: m.root)
+        try git(m, ["add", "-A"]); try git(m, ["commit", "-q", "-m", "add \(script)"])
+        try m.store.recordMainCommit(companyId: m.company.id, commit: try main(m))
+    }
+
+    func scriptedItem(_ m: MergeFixture, command: String = "sh scripts/check.sh") throws -> WorkItem {
+        try m.store.createWorkItem(companyId: m.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Scripted", checkSpec: CheckSpec(command: command, paths: ["src"]), tier: .m,
+            reviewerId: m.rev.id, status: .ready), now: m.now)
+    }
+
+    /// S2: the main check's scripts are read from `base`, so a candidate that edits the script that gates its own landing does
+    /// not change what runs.
+    @Test func mainCheckScriptsArePinnedFromBase() async throws {
+        let m = try MergeFixture()
+        try scripted(m, script: "scripts/smoke.sh", body: "echo base-smoke\n")
+        try await m.store.writer.write { db in
+            var c = try #require(try Company.fetchOne(db, key: m.company.id))
+            c.mainCheck = CheckSpec(command: "sh scripts/smoke.sh")
+            try c.update(db)
+        }
+        let i = try m.item("Weakens the gate")
+        try submit(m, i, files: ["scripts/smoke.sh": text("echo weakened\nexit 0\n"), "src/x.txt": text("x")])
+        try await m.cycle()
+        try m.approve(try m.fresh(i))
+        let ran = Seen()
+        m.world.checks.onRun { call in
+            if call.command == "sh scripts/smoke.sh" {
+                let content = (try? String(contentsOf: call.workingDirectory.appending(path: "scripts/smoke.sh"), encoding: .utf8)) ?? "missing"
+                ran.add(Seen.Entry(dir: call.workingDirectory, hadGit: false, existed: true, agent: nil, dev: nil, command: content))
+            }
+            return nil
+        }
+        defer { m.world.checks.onRun(nil) }
+        try await batch(queue(m), m)
+        #expect(ran.entries.map(\.command) == ["echo base-smoke\n"], "\(ran.entries.map(\.command))")
+        // What lands is still the candidate's own tree.
+        #expect(try String(contentsOf: m.root.appending(path: "scripts/smoke.sh"), encoding: .utf8) == "echo weakened\nexit 0\n")
+    }
+
+    /// S2: the item's saved scripts are hashed at the guard and held; swapping one on disk afterwards (while the main check runs)
+    /// does not change what the item check runs.
+    @Test func snapshotSwappedAfterTheGuardIsNotUsed() async throws {
+        let m = try MergeFixture()
+        try scripted(m)
+        try await m.store.writer.write { db in
+            var c = try #require(try Company.fetchOne(db, key: m.company.id))
+            c.mainCheck = CheckSpec(command: "make smoke")
+            try c.update(db)
+        }
+        let i = try scriptedItem(m)
+        try submit(m, i, files: ["src/x.txt": text("x")])
+        try await m.cycle()
+        try m.approve(try m.fresh(i))
+        let snapshot = m.root.appending(path: ".brahma/checks/\(i.key)/rev\(try m.fresh(i).checkRevision)/scripts/check.sh")
+        let seen = Seen()
+        m.world.checks.onRun { call in
+            if call.command == "make smoke" {
+                try? "exit 1 # swapped after the guard\n".write(to: snapshot, atomically: true, encoding: .utf8)
+            } else {
+                let content = (try? String(contentsOf: call.workingDirectory.appending(path: "scripts/check.sh"), encoding: .utf8)) ?? "missing"
+                seen.add(Seen.Entry(dir: call.workingDirectory, hadGit: false, existed: true, agent: nil, dev: nil, command: content))
+            }
+            return nil
+        }
+        defer { m.world.checks.onRun(nil) }
+        try await batch(queue(m), m)
+        #expect(seen.entries.map(\.command) == ["exit 0\n"], "the guard's bytes ran: \(seen.entries.map(\.command))")
+        // A swap before the guard is a bounce (tamperedSnapshotBounces); a hash that differs is never overlaid.
+        let item = try m.fresh(i)
+        #expect(throws: MergeQueue.SnapshotTampered.self) { try MergeQueue.loadSnapshot(store: m.store, item: item, revision: item.checkRevision) }
+    }
+
+    /// S3: a merge run with no known principal runs sandboxed; a Full-profile principal behaves as before (unsandboxed).
+    @Test func mergeRunPrincipalDecidesTheSandbox() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(profile: .full), userHome: try tempDir())
+        let route = Orchestrator.checkRoute(store: m.store)
+        let company = try #require(try m.store.company(id: m.company.id))
+        func place(_ kind: MergeRun.Kind, itemId: String?) async throws -> String {
+            let runId = UUID().uuidString
+            let dir = try EngineExport.export(store: m.store, company: company, runId: runId, commit: try main(m))
+            let run = MergeRun(id: runId, companyId: company.id, kind: kind, itemId: itemId, status: .running)
+            try await m.store.writer.write { try run.insert($0) }
+            return dir.path
+        }
+        func sandboxed(_ r: CheckRoute) -> Bool { if case .sandboxed = r { return true } else { return false } }
+        func unsandboxed(_ r: CheckRoute) -> Bool { if case .unsandboxed = r { return true } else { return false } }
+        // The item's holder (a Full-profile engineer) is the principal of the item check: as before.
+        #expect(unsandboxed(route(try await place(.item, itemId: i.id))))
+        // ... also after its lease is gone (the assignee is the fallback), and with a sandboxed role it stays sandboxed.
+        try m.exec("DELETE FROM workLease WHERE itemId = ?", [i.id])
+        #expect(unsandboxed(route(try await place(.item, itemId: i.id))))
+        // No item, no principal: sandboxed (never the old `?? true`).
+        #expect(sandboxed(route(try await place(.item, itemId: nil))))
+        // The main check's principal is who set it: nobody, or an agent that does not exist, is sandboxed.
+        #expect(sandboxed(route(try await place(.main, itemId: i.id))))
+        try m.exec("UPDATE company SET mainCheckSetById = 'no-such-agent' WHERE id = ?", [company.id])
+        #expect(sandboxed(route(try await place(.main, itemId: i.id))))
+        try m.exec("UPDATE company SET mainCheckSetById = ? WHERE id = ?", [m.eng.id, company.id])
+        #expect(unsandboxed(route(try await place(.main, itemId: i.id))))
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(roleProfiles: ["engineer": .sandboxed]), userHome: try tempDir())
+        #expect(sandboxed(route(try await place(.main, itemId: i.id))))
+        #expect(sandboxed(route(try await place(.item, itemId: i.id))))
+    }
+
+    /// I5: a candidate is scanned for its own company's secrets only: another company's value in this company's change neither
+    /// bounces it nor names that other secret.
+    @Test func otherCompaniesSecretsAreNotScanned() async throws {
+        let m = try MergeFixture()
+        let beta = try m.world.company("Beta")
+        let value = "beta-only-secret-value-9876543210"
+        try m.store.setSecret(companyId: beta.id, name: "BETA_TOKEN", value: value, isTest: false, vault: m.vault, now: m.now)
+        _ = try m.store.reloadRedactorIfNeeded(vault: m.vault, force: true)
+        #expect(m.store.knownSecretValues(companyId: beta.id).contains { $0.1 == value })
+        #expect(!m.store.knownSecretValues(companyId: m.company.id).contains { $0.1 == value })
+        let i = try m.item("Has the same string")
+        try submit(m, i, files: ["src/config.txt": text("token = \(value)\n")])
+        try await m.cycle()
+        try m.approve(try m.fresh(i))
+        // The default scan (no injected values) is the company's own secrets.
+        let q = MergeQueue(store: m.store, paths: m.world.paths, checks: m.world.checks)
+        let company = try #require(try m.store.company(id: m.company.id))
+        let outcome = try #require(await q.runNextBatch(company: company))
+        #expect(outcome.merged == [try request(m, i).id])
+        #expect(try m.fresh(i).status == .done)
+    }
+
+    /// I6: the landing is recorded under the same `GitLock` as the move of `main`: while `finishMerge` completes the item, a
+    /// second taker of the lock times out.
+    @Test func landingIsRecordedUnderTheGitLock() async throws {
+        let probe = LockProbe()
+        let m = try MergeFixture(observers: [probe])
+        let paths = m.world.paths, company = m.company.id
+        probe.attempt = {
+            do { try GitLock.withLock(paths: paths, companyId: company, wait: .milliseconds(100)) { }; return "free" }
+            catch GitLockError.timeout { return "held" } catch { return "\(error)" }
+        }
+        let i = try await m.approved()
+        try await batch(queue(m), m)
+        #expect(try m.fresh(i).status == .done)
+        #expect(probe.results == ["held"], "\(probe.results)")
+    }
+
+    /// Only the export fails (the data home's exports directory is a file): Brahma's own fault, so nothing is checked or landed,
+    /// and the item is not returned to its holder.
+    @Test func exportFaultAloneRequeuesWithoutLanding() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        let before = try main(m)
+        let export = m.store.gitWorkspace(root: m.root, companyId: m.company.id).exportPath(runId: "probe").deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: export.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: export)
+        try "blocked".write(to: export, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: export) }
+        let mark = m.world.checks.calls.count
+        let outcome = try #require(try await batch(queue(m), m))
+        #expect(outcome.merged.isEmpty && outcome.bounced.isEmpty)
+        #expect(m.world.checks.calls.count == mark, "no check ran without its export")
+        #expect(try main(m) == before)
+        let r = try request(m, i)
+        #expect(r.status == .queued || r.status == .failed)
+        #expect(try m.fresh(i).status == .inReview, "not returned to its holder")
+        #expect(try m.kinds(i).contains(.mergeFailed) == false)
+        // Once the fault clears it lands.
+        try FileManager.default.removeItem(at: export)
+        let after = try #require(try await batch(queue(m), m))
+        #expect(after.merged == [r.id])
+    }
+
     // MARK: Orchestrator
 
     @Test func orchestratorRunsQueueNotThe3aStep() async throws {
@@ -634,27 +824,52 @@ import GRDB
         #expect(try ws.revParse("no-such-ref") == nil)
         #expect(try ws.rootBranch() == "refs/heads/main")
         #expect(try ws.revListCount("main..main") == 0)
-        // Nothing to commit: the tree equals the parent's.
-        #expect(try ws.prepareRootCommit(message: "x", parent: tip) == nil)
+        // A commit on top of main, made with plain git in a scratch clone of the objects (the engine never builds one at the root).
         try m.write("loose.txt", "loose", in: m.root)
-        let c = try #require(try ws.prepareRootCommit(message: "Brahma: unattributed changes on main", parent: tip))
-        #expect(try ws.revParse("main") == tip)                            // no ref moved
+        try git(m, ["add", "-A"]); try git(m, ["commit", "-q", "-m", "next"])
+        let c = try #require(try ws.revParse("main"))
+        try git(m, ["reset", "-q", "--hard", tip])
         #expect(try ws.isAncestor(tip, of: c))
         #expect(try ws.revListCount("\(tip)..\(c)") == 1)
         #expect(try ws.shortstat(base: tip, head: c).contains("1 file changed"))
-        // Compare-and-swap: a stale `from` is refused, the right one moves main and the checkout follows.
-        #expect(try ws.advanceMain(from: c, to: c) == false)
-        #expect(try ws.advanceMain(from: tip, to: c) == true)
-        #expect(try ws.revParse("main") == c)
-        #expect(try ws.advanceMain(from: tip, to: c) == false)
-        #expect(try git(m, ["status", "--porcelain"]).isEmpty)
-        #expect(try ws.fastForwardMain(to: c) == .ok)
+        // Off main: refused; on main: main moves by compare-and-swap and the checkout follows.
         try git(m, ["checkout", "-q", "-b", "elsewhere"])
         #expect(try ws.fastForwardMain(to: c) == .rootNotOnMain(ref: "refs/heads/elsewhere"))
         try git(m, ["checkout", "-q", "main"])
+        #expect(try ws.fastForwardMain(to: c) == .ok)
+        #expect(try ws.revParse("main") == c)
+        #expect(try git(m, ["status", "--porcelain"]).isEmpty)
+        #expect(try ws.fastForwardMain(to: tip) == .notFastForward)
         #expect(throws: (any Error).self) { try ws.updateRef("refs/heads/not-allowed", to: c) }
         try ws.updateRef("refs/brahma/pre-merge/7", to: tip)
         #expect(try ws.revParse("refs/brahma/pre-merge/7") == tip)
+    }
+
+    /// I4: if the root cannot follow `main` after it moved, the queue never falls back to updating only the index (which would
+    /// make the old files look like the owner's edits): the result says so, and the queue records the landing and holds.
+    @Test func rootThatCannotFollowMainHoldsTheQueue() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        let head = try #require(try m.fresh(i).verifiedCommit)
+        let lock = m.root.appending(path: ".git/index.lock")
+        // A lock on the index that appears right after `main` moved: the ref is moved, the two-tree update cannot run.
+        m.store.mergeRefProbe.set { ref in if ref == "follow" { try? "".write(to: lock, atomically: true, encoding: .utf8) } }
+        defer { m.store.mergeRefProbe.set(nil) }
+        let outcome = try #require(try await batch(queue(m), m))
+        let r = try request(m, i)
+        #expect(outcome.merged == [r.id] && outcome.mainCommit == head)
+        let hold = try #require(try m.store.company(id: m.company.id)?.mergeHold)
+        #expect(hold.contains("did not follow main") && outcome.held == hold)
+        #expect(try m.store.allNotices().contains { $0.title.contains("held") })
+        #expect(try main(m) == head)
+        // The root still holds the old tree, and the index was not rewritten to hide that.
+        try FileManager.default.removeItem(at: lock)
+        #expect(!FileManager.default.fileExists(atPath: m.root.appending(path: "src/work.txt").path))
+        #expect(try git(m, ["status", "--porcelain"]).contains("src/work.txt"))
+        // Held: the next batch does not run, so nothing can commit or revert anything.
+        let again = try await batch(queue(m), m)
+        #expect(again == nil)
+        #expect(try main(m) == head)
     }
 
     @Test func branchInfoReadsRepo() async throws {
@@ -686,4 +901,16 @@ final class Seen: @unchecked Sendable {
     private var all: [Entry] = []
     var entries: [Entry] { lock.withLock { all } }
     func add(_ e: Entry) { lock.withLock { all.append(e) } }
+}
+
+/// Tries to take the company's `GitLock` from inside the completion hook (it runs in `finishMerge`'s transaction).
+final class LockProbe: WorkItemObserver, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _results: [String] = []
+    var attempt: (@Sendable () -> String)?
+    var results: [String] { lock.withLock { _results } }
+    func itemCompleted(_ item: WorkItem, db: Database) throws {
+        let r = attempt?() ?? "no probe"
+        lock.withLock { _results.append(r) }
+    }
 }

@@ -86,7 +86,10 @@ extension Orchestrator {
             // The engine's record of the run: a verification run (3a's submit and merge checks), or a merge queue run
             // (`MergeRun`, Plan 4a: recorded `running` before its check starts; its place is always an export).
             struct Record { var id: String; var companyId: String; var itemId: String?; var requestedBy: String?; var purpose: String
-                            var recordedDirectory: String? }
+                            var recordedDirectory: String?
+                            /// A merge queue run: its principal is derived from the record (never from a lease alone) and an
+                            /// unknown one runs sandboxed.
+                            var mergeKind: MergeRun.Kind?; var isMergeRun = false }
             let record: Record
             let place: (GitWorkspace) -> URL
             if let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) {
@@ -101,7 +104,8 @@ extension Orchestrator {
                 }
             } else if let run = try? store.writer.read({ try MergeRun.fetchOne($0, key: runId) }) {
                 guard run.status == .running else { return .refused("the merge run \(runId) is not running (\(run.status?.rawValue ?? "unknown"))") }
-                record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: nil, purpose: "merge", recordedDirectory: nil)
+                record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: nil, purpose: "merge", recordedDirectory: nil,
+                                mergeKind: run.kind, isMergeRun: true)
                 place = { $0.exportPath(runId: run.id) }
             } else {
                 return .refused("no engine record of a check running in \(runId)")
@@ -120,9 +124,24 @@ extension Orchestrator {
 
             func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
             if narrowed(company.permissionProfile) == .full {
-                let holder = record.itemId.flatMap { try? store.lease(itemId: $0) }?.agentId ?? record.requestedBy
-                let role = holder.flatMap { try? store.agent(id: $0) }?.role
-                if role.map({ narrowed(company.profile(forRole: $0)) == .full }) ?? true { return .unsandboxed }
+                if record.isMergeRun {
+                    // The principal of a merge run: the ops agent who set the main check (`.main`), or the item's holder, else its
+                    // assignee (`.item`; a lease can be gone, the assignee is not). No principal, or one that is no agent (or is
+                    // gone), is never trusted: sandboxed.
+                    let principal: String?
+                    switch record.mergeKind {
+                    case .main: principal = company.mainCheckSetById
+                    case .item: principal = record.itemId.flatMap { id in (try? store.lease(itemId: id))?.agentId ?? (try? store.workItem(id: id))?.ownerId }
+                    default: principal = nil
+                    }
+                    if let role = principal.flatMap({ try? store.agent(id: $0) })?.role, narrowed(company.profile(forRole: role)) == .full {
+                        return .unsandboxed
+                    }
+                } else {
+                    let holder = record.itemId.flatMap { try? store.lease(itemId: $0) }?.agentId ?? record.requestedBy
+                    let role = holder.flatMap { try? store.agent(id: $0) }?.role
+                    if role.map({ narrowed(company.profile(forRole: $0)) == .full }) ?? true { return .unsandboxed }
+                }
             }
 
             // The workspace may sit behind a link the owner chose; everything under it is built logically and must be real.
