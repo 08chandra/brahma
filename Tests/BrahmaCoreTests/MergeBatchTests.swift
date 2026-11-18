@@ -542,6 +542,7 @@ import GRDB
         try m.exec("DROP TRIGGER no_hold")
         try m.store.resumeMergeQueue(companyId: m.company.id, by: Sender.owner)
         #expect(try request(m, items[0]).status == .merged)
+        m.world.clock.advance(60)   // the recovery's short pause after the failed tries has passed
         let next = try #require(try await batch(q, m))
         #expect(next.merged == [try request(m, items[1]).id], "recovery finished the stuck batch, then the next item landed")
         try expectDone(m, items)
@@ -560,6 +561,110 @@ import GRDB
         let next = try #require(try await batch(q, m))
         #expect(next.merged == [try request(m, items[1]).id])
         try expectDone(m, items)
+    }
+
+    // MARK: Round 2: liveness through the orchestrator, recovery faults, minors
+
+    /// R2-1: an open journal row is merge work. With a batch of three, a culprit behind an unrecorded landing and nothing else
+    /// queued, the leftovers stay `running` inside the open batch: after the owner's resume the orchestrator's own tick must reach
+    /// the recovery (no restart, no unrelated approval).
+    @Test func openBatchCountsAsMergeWork() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b-bad.txt": "bad"], ["src/c.txt": "c"]])
+        failWhenPresent(m, command: "make test B", file: "src/b-bad.txt")
+        m.exec_noThrow("CREATE TRIGGER no_record BEFORE UPDATE OF status ON mergeRequest WHEN NEW.status = 'merged' BEGIN SELECT RAISE(ABORT, 'no record'); END")
+        let first = try #require(try await batch(queue(m), m))
+        #expect(first.failed.count == 1 && first.merged.isEmpty)
+        #expect(try request(m, items[1]).status == .running && request(m, items[2]).status == .running, "the leftovers stay in the open batch")
+        // Nothing is queued, yet there is work: the open batch.
+        #expect(try m.store.mergeRequests(companyId: m.company.id, statuses: [.queued]).isEmpty)
+        #expect(try m.store.hasMergeWork(companyId: m.company.id))
+        try m.exec("DROP TRIGGER no_record")
+        try m.store.resumeMergeQueue(companyId: m.company.id, by: Sender.owner)
+        // The orchestrator's tick (its own queue instance) finishes the batch and carries on: B is bounced, C lands.
+        try await m.cycle()
+        m.world.clock.advance(3600)
+        try await m.cycle()
+        #expect(try request(m, items[0]).status == .merged)
+        #expect(try request(m, items[1]).status == .bounced)
+        #expect(try request(m, items[2]).status == .merged)
+        #expect(try m.store.openMergeBatches(companyId: m.company.id).isEmpty)
+        #expect(try !m.store.hasMergeWork(companyId: m.company.id))
+    }
+
+    /// R2-2: a recovery that keeps throwing is retried with a backoff (no storm), the owner is told once, and the failure
+    /// reaches the engine alert after `maxAttempts` in a row. A later success clears the streak.
+    @Test func persistentRecoveryFailureBacksOffAndNotifiesOnce() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"]])
+        m.store.journalProbe.set { $0 == "backedUp" }
+        _ = try await batch(queue(m), m)
+        m.store.journalProbe.set(nil)
+        #expect(try m.store.openMergeBatches(companyId: m.company.id).count == 1)
+        let attempts = BatchCounter()
+        m.store.mergeRefProbe.set { ref in if ref == "recover" { _ = attempts.next() } }
+        m.store.mergeRefProbe.failOn(["recover"])
+        defer { m.store.mergeRefProbe.set(nil); m.store.mergeRefProbe.failOn([]) }
+        let q = queue(m)
+        // Many ticks at one instant: one attempt, then the backoff holds.
+        for _ in 0..<10 { #expect(try await batch(q, m) == nil) }
+        #expect(attempts.next() == 2, "ten ticks made one recovery attempt")
+        // As time passes it retries, a bounded number of times; the owner hears of it once.
+        for _ in 0..<6 {
+            m.world.clock.advance(3600)
+            for _ in 0..<5 { _ = try await batch(q, m) }
+        }
+        let told = try m.store.allNotices().filter { $0.title == "Merge recovery is failing" }
+        #expect(told.count == 1, "\(told.count) notices")
+        #expect(told.first?.body.contains("brahma merge") == true)
+        #expect(try m.store.openMergeBatches(companyId: m.company.id).count == 1)
+        // The fault clears: the next due attempt recovers, and the queue moves on.
+        m.store.mergeRefProbe.failOn([])
+        m.world.clock.advance(3600)
+        _ = try await batch(q, m)
+        #expect(try m.store.mergeRequests(companyId: m.company.id, statuses: [.merged]).count == 2, "the recovery finished the landing")
+        #expect(try m.store.openMergeBatches(companyId: m.company.id).isEmpty)
+        _ = items
+    }
+
+    /// A database error on the landing's stop read is the engine's fault, never counted against the items.
+    @Test func stopReadErrorAtTheLandingIsNotChargedToTheItem() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        try m.exec("DROP TABLE engineStop")
+        let q = queue(m)
+        for round in 1...4 {
+            let outcome = try #require(try await batch(q, m))
+            let r = try request(m, i)
+            #expect(outcome.requeued == [r.id] && r.status == .queued && outcome.failed.isEmpty, "round \(round)")
+        }
+        #expect(try m.fresh(i).status == .inReview)
+    }
+
+    /// A landing whose `landed` step was never journaled (the batch is still at `landing`, main already holds it) is recorded
+    /// by the owner's resume too, not silently skipped.
+    @Test func resumeRepairsALandingBeforeItsLandedStep() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"]])
+        m.store.journalProbe.set { $0 == "moved" }
+        _ = try await batch(queue(m), m)
+        m.store.journalProbe.set(nil)
+        let open = try #require(try m.store.openMergeBatches(companyId: m.company.id).first)
+        #expect(open.step == .landing)
+        try m.store.resumeMergeQueue(companyId: m.company.id, by: Sender.owner)
+        #expect(try items.allSatisfy { try request(m, $0).status == .merged })
+        #expect(try m.store.company(id: m.company.id)?.mainCommit == (try main(m)))
+    }
+
+    /// The notice for an unrecorded landing says how to fix that (the database), not how to reconcile the root.
+    @Test func unrecordedLandingNoticeHasItsOwnWording() async throws {
+        let m = try MergeFixture()
+        _ = try await threeApproved(m, [["src/a.txt": "a"]])
+        m.exec_noThrow("CREATE TRIGGER no_record BEFORE UPDATE OF status ON mergeRequest WHEN NEW.status = 'merged' BEGIN SELECT RAISE(ABORT, 'no record'); END")
+        _ = try await batch(queue(m), m)
+        let notice = try #require(try m.store.allNotices().last { $0.title.contains("Merges are held") })
+        #expect(notice.body.contains("brahma merge resume"), "\(notice.body)")
+        #expect(!notice.body.contains("Reconcile the workspace root"), "\(notice.body)")
     }
 
     // MARK: Settings and holds

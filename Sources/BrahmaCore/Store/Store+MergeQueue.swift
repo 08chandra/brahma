@@ -164,10 +164,14 @@ extension Store {
         }
     }
 
-    /// Whether the company has anything for its queue to do: a queued request, or an approval with none.
+    /// Whether the company has anything for its queue to do: a queued request, an unfinished batch, or an approval with none.
     func hasMergeWork(companyId: String) throws -> Bool {
         try writer.read { db in
             if try MergeRequest.filter(Column("companyId") == companyId && Column("status") == MergeRequestStatus.queued.rawValue).fetchCount(db) > 0 {
+                return true
+            }
+            // An unfinished batch is work too: its leftovers (`running` inside the journal) are finished by the queue's recovery.
+            if try MergeBatch.filter(Column("companyId") == companyId && Column("step") != MergeStep.done.rawValue).fetchCount(db) > 0 {
                 return true
             }
             return try Bool.fetchOne(db, sql: """

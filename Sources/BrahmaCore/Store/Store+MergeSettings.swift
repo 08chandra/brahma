@@ -36,8 +36,18 @@ extension Store {
     /// `landingNotRecordedRefusal` when the record still fails.
     func repairUnrecordedLandings(companyId: String, now: Date = Store.now()) throws -> Int {
         var repaired = 0
-        for b in try openMergeBatches(companyId: companyId) where b.step == .landed {
+        let open = try openMergeBatches(companyId: companyId)
+        // `landing` as well as `landed`: if journaling `landed` failed after `main` moved, the batch still stands at `landing`.
+        for b in open where b.step == .landing || b.step == .landed {
             guard let land = b.landCommit else { continue }
+            if b.step == .landing {
+                // Only a landing `main` already holds is recorded; one it does not hold is the engine's recovery (it redoes or abandons).
+                guard let company = try company(id: companyId) else { continue }
+                let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: companyId)
+                do {
+                    guard let head = try git.head(of: GitWorkspace.mainRef), try git.isAncestor(land, of: head) else { continue }
+                } catch { throw WorkError.conflict(Self.landingNotRecordedRefusal) }
+            }
             let pairs = b.landedIds.compactMap { id in b.candidates[id].map { (requestId: id, mergedCommit: $0) } }
             do {
                 _ = try recordLanded(pairs, mainCommit: land, now: now)

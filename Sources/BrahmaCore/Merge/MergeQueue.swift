@@ -60,6 +60,9 @@ public actor MergeQueue: EmergencyStopObserver {
     /// Companies whose journal `recover` has looked at since this process started or since the owner's last stop.
     private var recovered: Set<String> = []
     private var recovering: Set<String> = []
+    /// Recoveries in a row that threw, per company, and when the next one is due (a backoff, so a persistent fault is not a tick storm).
+    private var recoveryFaults: [String: Int] = [:]
+    private var recoveryRetryAt: [String: Date] = [:]
 
     /// `knownValues` takes the company id; by default it is the company's own loaded secrets (`Store.knownSecretValues`).
     public init(store: Store, paths: BrahmaPaths, checks: any CheckRunning,
@@ -539,7 +542,10 @@ public actor MergeQueue: EmergencyStopObserver {
                         guard try git.revParse("main") == base else { return .moved }
                         // The last moment before `main` moves: the owner's stop is read here (S15), and nothing has moved if it is up.
                         store.mergeRefProbe.call(GitWorkspace.mainRef)
-                        if try Task.isCancelled || store.engineStopped() != nil { return .stopped }
+                        // A read error is the engine's fault (requeued uncounted), never the item's.
+                        let stoppedNow: Bool
+                        do { stoppedNow = try Task.isCancelled || store.engineStopped() != nil } catch { throw MergeInfrastructureError(underlying: error) }
+                        if stoppedNow { return .stopped }
                         try git.updateRef("refs/brahma/pre-merge/\(number)", to: base)
                         try store.advanceBatch(id: batchId, to: .backedUp, now: clock())
                         try store.journalCrash(after: .backedUp)
@@ -781,12 +787,18 @@ public actor MergeQueue: EmergencyStopObserver {
             // What is still to do is in the journal, so the next tick (or the owner's resume) finishes it: a record that failed,
             // a hold that could not be written.
             if !recorded || holdFailed { advance(recorded ? .recorded : .landed, error: "\(Store.heldJournalPrefix)\(held)") }
-            // Told once (best effort), even when the hold could not be written.
+            // Told once (best effort), even when the hold could not be written; each cause says how it is mended.
             if !alreadyTold {
+                var remedy: [String] = []
+                if rootBehind {
+                    remedy.append("Reconcile the workspace root with main (save your own edits, then reset the root to main), and reject any quarantine of the old files. Then release the hold.")
+                }
+                if !recorded {
+                    remedy.append("The database refused the record of the landing: fix that (disk space, a locked database), then run brahma merge resume \(company.name). Brahma finishes the record itself as soon as it can.")
+                }
                 do {
                     try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
-                                          body: "\(held). Reconcile the workspace root with main (save your own edits, then reset the root to main), "
-                                              + "and reject any quarantine of the old files. Then release the hold.", now: clock())
+                                          body: "\(held). " + remedy.joined(separator: " "), now: clock())
                 } catch {
                     note("could not notify the owner after \(label) landed: \(error)")
                 }
@@ -822,15 +834,43 @@ public actor MergeQueue: EmergencyStopObserver {
         return await recoverCompany(company)
     }
 
+    /// How one unfinished batch fared in a recovery.
+    private enum Recovery: Sendable {
+        /// Finished or abandoned.
+        case dealt
+        /// Still open for a reason the batch itself records (a record or a hold the database refused): retried later.
+        case pending
+        /// The recovery itself threw (git, the lock, a database read): backed off and escalated.
+        case faulted(String)
+    }
+
     private func recoverCompany(_ company: Company) async -> Int {
-        let (store, clock) = (self.store, self.clock)
+        let (store, blocking, clock, paths) = (self.store, self.blocking, self.clock, self.paths)
         // Nothing is recovered while the owner's stop is up: it runs on the first batch after it clears.
         if (try? store.engineStopped()) != nil || Task.isCancelled { return 0 }
+        // A recovery that keeps failing waits out its backoff instead of taking the lock at every tick.
+        if let due = recoveryRetryAt[company.id], clock() < due { return 0 }
         let git = workspace(of: company)
         var count = 0
+        var fault: String?
+        var pending = false
         do {
-            for batch in try store.openMergeBatches(companyId: company.id) {
-                if await recoverBatch(batch, company: company, git: git) { count += 1 }
+            let open = try store.openMergeBatches(companyId: company.id)
+            if !open.isEmpty {
+                // As every batch starts: stale lock files and a planted `shallow` are repaired (and reported) first.
+                try await blocking.tryRun {
+                    try GitLock.withLock(paths: paths, companyId: company.id) {
+                        let repaired = try git.healWorkspace()
+                        if !repaired.isEmpty { store.reportMergeTamper(company: company, removed: repaired, now: clock()) }
+                    }
+                }
+            }
+            for batch in open {
+                switch await recoverBatch(batch, company: company, git: git) {
+                case .dealt: count += 1
+                case .pending: pending = true
+                case .faulted(let why): fault = fault ?? why
+                }
             }
             for id in try store.orphanedMergeRequestIds(companyId: company.id) {
                 try store.requeueMerge(requestIds: [id], countsAsRequeue: false, now: clock())
@@ -839,13 +879,39 @@ public actor MergeQueue: EmergencyStopObserver {
                 recovered.insert(company.id)
             }
         } catch {
-            note("recovery for \(company.name) failed: \(error)")
+            fault = "\(error)"
+        }
+        if let fault {
+            noteRecoveryFault(company, fault)
+        } else {
+            recoveryFaults[company.id] = nil
+            recoveryRetryAt[company.id] = pending ? clock().addingTimeInterval(Self.recoveryBackoff(1)) : nil
         }
         return count
     }
 
-    /// True when the batch was dealt with (finished or abandoned).
-    private func recoverBatch(_ b: MergeBatch, company: Company, git: GitWorkspace) async -> Bool {
+    /// 30 s, doubling to 15 minutes.
+    static func recoveryBackoff(_ failures: Int) -> TimeInterval { min(30 * pow(2, Double(max(failures, 1) - 1)), 900) }
+
+    /// A recovery threw: it is retried after a backoff, the third failure in a row is one engine alert and one owner notice (the
+    /// streak counter is cleared by the next recovery that does not throw).
+    private func noteRecoveryFault(_ company: Company, _ why: String) {
+        let n = (recoveryFaults[company.id] ?? 0) + 1
+        recoveryFaults[company.id] = n
+        recoveryRetryAt[company.id] = clock().addingTimeInterval(Self.recoveryBackoff(n))
+        note("recovery for \(company.name) failed (\(n) in a row): \(why)")
+        guard n == Self.maxAttempts else { return }
+        let shown = Store.flat(why, max: 300)
+        try? EngineAlerts.raise(
+            store: store, text: "\(company.name): an interrupted merge batch could not be finished (\(shown)); \(n) attempts in a row failed. "
+                + "Merges wait until it can; Brahma keeps trying with a growing pause.", now: clock(), reason: Store.mergeHoldAlertReason(company.id))
+        try? store.notifyOwner(companyId: company.id, title: "Merge recovery is failing",
+                               body: "Brahma could not finish an interrupted merge batch in \(company.name) after \(n) tries (\(shown)). Merges there wait. "
+                                   + "It keeps trying with a growing pause; if it persists, check the workspace and the disk, then run brahma merge resume \(company.name).",
+                               now: clock())
+    }
+
+    private func recoverBatch(_ b: MergeBatch, company: Company, git: GitWorkspace) async -> Recovery {
         let (store, blocking, clock, paths) = (self.store, self.blocking, self.clock, self.paths)
         func abandon(_ why: String) {
             // A pending head recorded for a move that will not be made goes with the abandoned batch.
@@ -856,19 +922,21 @@ public actor MergeQueue: EmergencyStopObserver {
         let landed = b.landedIds.compactMap { id in b.candidates[id].map { (requestId: id, mergedCommit: $0) } }
         switch b.step {
         case .done:
-            return false
+            return .dealt
         case .claimed, .preparing, .prepared, .rebased, .checked:
             abandon("interrupted")
-            return true
+            return .dealt
         case .backedUp, .landing, .landed, .recorded, .cleaned:
             guard let landCommit = b.landCommit, let base = b.base, !landed.isEmpty, landed.count == b.landedIds.count else {
                 abandon("interrupted")
-                return true
+                return .dealt
             }
             let keys = keysOf(b.landedIds)
             enum Resume: Sendable { case abandon, done(complete: Bool) }
             let told = b.error?.hasPrefix(Store.heldJournalPrefix) == true
             do {
+                store.mergeRefProbe.call("recover")
+                if store.mergeRefProbe.fails("recover") { throw GitError.failed(command: "recover", status: -1, stderr: "injected recovery fault") }
                 let resume = try await blocking.tryRun { () throws -> Resume in
                     try GitLock.withLock(paths: paths, companyId: company.id) {
                         var rootBehind = false
@@ -917,7 +985,7 @@ public actor MergeQueue: EmergencyStopObserver {
                 case .abandon:
                     abandon("interrupted")
                 case .done(let complete):
-                    if !complete { return false }
+                    if !complete { return .pending }
                     await blocking.run { self.cleanLanded(b.landedIds.map { ($0, self.keyOf($0) ?? "") }, company: company, git: git) }
                     try? store.advanceBatch(id: b.id, to: .cleaned, now: clock())
                     // What the batch claimed but did not land goes back (the culprit's bounce was not journaled: it is judged again).
@@ -926,10 +994,9 @@ public actor MergeQueue: EmergencyStopObserver {
                     try? store.advanceBatch(id: b.id, to: .done, now: clock())
                 }
             } catch {
-                note("could not recover batch \(b.number) of \(company.name): \(error)")
-                return false
+                return .faulted("batch \(b.number): \(error)")
             }
-            return true
+            return .dealt
         }
     }
 
