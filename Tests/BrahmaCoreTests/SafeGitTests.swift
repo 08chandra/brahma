@@ -19,10 +19,8 @@ import Foundation
         func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
             lock.withLock { recorded.append(Call(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap)) }
             let limit = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
-            if delay > limit {
-                Thread.sleep(forTimeInterval: limit)
-                throw SafeGitError.timedOut
-            }
+            if delay > 0 { Thread.sleep(forTimeInterval: min(delay, limit)) }
+            if delay > limit { throw SafeGitError.timedOut }
             if let respond { return try respond(args) }
             let sub = args.first(where: { !$0.hasPrefix("-") && $0 != "git" && !$0.hasPrefix("/") && !$0.contains("=") }) ?? ""
             let text: String
@@ -282,6 +280,102 @@ import Foundation
         #expect(try r.head("main") == main)
         try git.deleteShareRef("ok")
         #expect(try r.f.git(["rev-parse", "--verify", "-q", "refs/brahma/shares/ok"], allowFailure: true) == "")
+        // A purged share's objects are gone at once: a commit only the share ref kept is pruned by `expireAndPrune`.
+        let tree = try r.f.git(["rev-parse", "\(main)^{tree}"])
+        let secret = try r.f.git(["commit-tree", tree, "-m", "secret"])
+        try git.updateShareRef("s", to: secret)
         try git.expireAndPrune()
+        #expect(try r.f.git(["cat-file", "-e", secret]) == "", "still reachable through the share ref")
+        try git.deleteShareRef("s")
+        try git.expireAndPrune()
+        #expect(try r.f.git(["cat-file", "-e", secret], allowFailure: true) == "")
+        #expect(throws: (any Error).self, "the purged object is still in the repository") { try r.f.git(["cat-file", "-e", secret]) }
+        #expect(try r.f.git(["cat-file", "-e", main]) == "", "a reachable commit survived")
+    }
+
+    /// A fake that answers `worktreeDiff`'s processes: `ls-files` with `untracked`, everything else empty.
+    private func fakeForWorktreeDiff(untracked: [String], delay: TimeInterval = 0) -> RecordingRunner {
+        let runner = RecordingRunner()
+        runner.delay = delay
+        runner.respond = { args in
+            if args.contains("hash-object") { Issue.record("hash-object ran before the caps were checked"); return (1, Data(), Data()) }
+            if args.contains("ls-files") { return (0, Data(untracked.joined(separator: "\u{0}").utf8) + Data([0]), Data()) }
+            return (0, Data(), Data())
+        }
+        return runner
+    }
+
+    @Test func worktreeDiffRefusesTooManyFiles() throws {
+        let r = try Repo()
+        let main = try r.head("main")
+        let names = (1...3).map { "f\($0).txt" }
+        for name in names { try r.f.write(name, "x", in: r.wt) }
+        let runner = fakeForWorktreeDiff(untracked: names)
+        let git = SafeGit(workspace: r.root, runner: runner, maxDiffFiles: 2)
+        #expect(throws: SafeGitError.tooManyChanges(files: 3, bytes: 0)) {
+            try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs)
+        }
+        #expect(SafeGitError.tooManyChanges(files: 2001, bytes: 0).description == "too many/too large changes to diff (2001 files, 0 MB)")
+        #expect(!runner.calls.contains { $0.args.contains("hash-object") })
+        #expect(SafeGit.maxDiffFiles == 2000 && SafeGit.maxDiffBytes == 200 << 20)
+    }
+
+    @Test func worktreeDiffRefusesTooManyBytes() throws {
+        let r = try Repo()
+        let main = try r.head("main")
+        try r.f.write("a.txt", "12345", in: r.wt)
+        try r.f.write("b.txt", "123456", in: r.wt)
+        let runner = fakeForWorktreeDiff(untracked: ["a.txt", "b.txt"])
+        let git = SafeGit(workspace: r.root, runner: runner, maxDiffBytes: 10)
+        #expect(throws: SafeGitError.tooManyChanges(files: 2, bytes: 11)) {
+            try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs)
+        }
+        #expect(!runner.calls.contains { $0.args.contains("hash-object") })
+        #expect(SafeGitError.tooManyChanges(files: 2, bytes: 3 << 20).description == "too many/too large changes to diff (2 files, 3 MB)")
+    }
+
+    @Test func worktreeDiffOverallTimeout() throws {
+        let r = try Repo()
+        let main = try r.head("main")
+        // Every process is well within its own timeout; the call as a whole is not.
+        let runner = fakeForWorktreeDiff(untracked: [], delay: 0.15)
+        let git = SafeGit(workspace: r.root, runner: runner, timeout: .milliseconds(400))
+        let started = Date()
+        #expect(throws: SafeGitError.timedOut) {
+            try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs)
+        }
+        #expect(Date().timeIntervalSince(started) < 1.5)
+        let calls = runner.calls
+        #expect(calls.count >= 2 && calls.count <= 4, "\(calls.count) processes ran on a 0.4 s budget at 0.15 s each")
+        #expect(calls.allSatisfy { $0.timeout <= .milliseconds(400) })
+        #expect(calls.last.map { $0.timeout < .milliseconds(400) } == true, "the last process did not get only what was left")
+    }
+
+    /// Counts the processes a live call runs.
+    final class CountingRunner: GitProcessRunning, @unchecked Sendable {
+        private let live = LiveGitRunner()
+        private let lock = NSLock()
+        private var n = 0
+        var count: Int { lock.withLock { n } }
+        func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+            lock.withLock { n += 1 }
+            return try live.run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap)
+        }
+    }
+
+    @Test func worktreeDiffUsesConstantProcesses() throws {
+        func processes(files: Int) throws -> Int {
+            let r = try Repo()
+            for n in 1...files { try r.f.write("new/f\(n).txt", "line \(n)\n", in: r.wt) }
+            try r.f.write("src/a.txt", "changed\n", in: r.wt)
+            let runner = CountingRunner()
+            let diff = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+            #expect(diff.files.count == files + 1 && diff.blobShas.count == files + 1)
+            #expect(diff.blobShas["new/f1.txt"] == (try r.f.git(["hash-object", "new/f1.txt"], in: r.wt)))
+            return runner.count
+        }
+        let three = try processes(files: 3), thirty = try processes(files: 30)
+        #expect(three == thirty, "\(three) processes for 3 files, \(thirty) for 30")
+        #expect(three <= 9)
     }
 }
