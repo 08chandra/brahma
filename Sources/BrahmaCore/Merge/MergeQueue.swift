@@ -57,8 +57,6 @@ public actor MergeQueue: EmergencyStopObserver {
     private var running: [String: Task<MergeBatchOutcome?, Never>] = [:]
     /// Company id → batches in a row that failed for the engine's own reasons.
     private var faults: [String: Int] = [:]
-    /// Companies whose last landing could not be recorded or held: no batch runs for them until `recover` has seen them.
-    private var stuck: Set<String> = []
     /// Companies whose journal `recover` has looked at since this process started or since the owner's last stop.
     private var recovered: Set<String> = []
     private var recovering: Set<String> = []
@@ -83,7 +81,7 @@ public actor MergeQueue: EmergencyStopObserver {
     /// Takes the company's next queued request through the whole merge. Nil when there was nothing to do: the engine is
     /// stopped, the queue is held, a batch of the company is already running, or nothing is queued.
     public func runNextBatch(company: Company) async -> MergeBatchOutcome? {
-        guard running[company.id] == nil, !recovering.contains(company.id), !stuck.contains(company.id) else { return nil }
+        guard running[company.id] == nil, !recovering.contains(company.id) else { return nil }
         let id = company.id
         let task = Task<MergeBatchOutcome?, Never> { await self.batch(companyId: id) }
         running[id] = task
@@ -110,8 +108,14 @@ public actor MergeQueue: EmergencyStopObserver {
         if (try? store.engineStopped()) != nil || Task.isCancelled { return nil }
         guard var loaded = try? store.company(id: companyId) else { return nil }
         // The first batch of a process (and the first after the owner's stop) starts by recovering what the journal left.
-        if !recovered.contains(companyId) { _ = await recoverCompany(loaded) }
-        if Task.isCancelled || (try? store.engineStopped()) != nil || stuck.contains(companyId) { return nil }
+        // An unfinished batch (a landing that could not be recorded, a hold that could not be written) is retried at every tick;
+        // nothing is claimed while the journal holds one, so a landing is never made twice.
+        let unfinished = ((try? store.openMergeBatches(companyId: companyId))?.isEmpty ?? false) == false
+        if !recovered.contains(companyId) || unfinished { _ = await recoverCompany(loaded) }
+        if Task.isCancelled || (try? store.engineStopped()) != nil { return nil }
+        guard let open = try? store.openMergeBatches(companyId: companyId), open.isEmpty,
+              let reloaded = try? store.company(id: companyId) else { return nil }
+        loaded = reloaded
         // A queue held because the main check fails on main itself is released when main has a new head whose check passes.
         if loaded.mergeHold == Store.redMainHold {
             await releaseRedMainIfFixed(loaded)
@@ -213,8 +217,8 @@ public actor MergeQueue: EmergencyStopObserver {
         case pass
         case fail(Failure)
         /// 3a's inconclusive rule held (an engine hold, a network-looking tail, a check that could not run): nobody is blamed.
-        /// `owner`: the request whose run it was (nil: a run no request owns); only it is charged for it.
-        case inconclusive(String, owner: String?)
+        /// Never charged by default: it is bisected like a failure, and the single member a bisection isolates is charged.
+        case inconclusive(String)
         case stopped
     }
 
@@ -276,7 +280,16 @@ public actor MergeQueue: EmergencyStopObserver {
                 companyId: company.id, agentId: nil, turnId: nil, kind: .error,
                 text: "the merge of \(keys) was stopped by the owner before main moved; it keeps its approval and merges after the resume",
                 createdAt: clock()))
-            ledger.leaveOpen = true
+            // Before the landing's last steps the journal is left for `recover`; inside them (backed up, landing: `main` has not
+            // moved, the requests go back) it ends here, so a recovery never redoes a move for requests that are no longer the
+            // batch's; once `main` has moved the landing is finished by `recover`, never abandoned.
+            let step = (try? store.mergeBatch(id: batchId))?.step ?? .claimed
+            if step.order > MergeStep.checked.order, step.order <= MergeStep.landing.order {
+                ledger.batchError = "interrupted: stopped before main moved"
+                try? store.clearPendingMainCommit(companyId: company.id, ifEqual: nil)
+            } else {
+                ledger.leaveOpen = true
+            }
             requeueUnsettled()
         }
         func bounce(_ r: MergeRequest, _ failure: MergeFailure, _ detail: String, files: [String] = [], mergeBase: String? = nil,
@@ -353,10 +366,10 @@ public actor MergeQueue: EmergencyStopObserver {
                 return finish()
             case .stopped:
                 requeueStopped()
-                return ledger.out
+                return finish()
             }
             try store.advanceBatch(id: batchId, to: .claimed, base: base, now: clock())
-            if stopped() { requeueStopped(); return ledger.out }
+            if stopped() { requeueStopped(); return finish() }
 
             // 2. The snapshot of each item's saved check scripts is verified (3a's guard) and held in memory here, once: what is
             //    overlaid later is these bytes, never the agent-writable directory read again. The main check's scripts are
@@ -384,7 +397,7 @@ public actor MergeQueue: EmergencyStopObserver {
             var members: [Member] = []
             for r in active {
                 guard let item = items[r.id] else { continue }
-                if stopped() { requeueStopped(); return ledger.out }
+                if stopped() { requeueStopped(); return finish() }
                 let from = tip
                 let message = company.mergeStrategy == .merge ? "Merge \(item.key): \(Store.flat(item.title, max: 72))" : nil
                 let built = try await blocking.tryRun { () throws -> CandidateResult in
@@ -409,7 +422,7 @@ public actor MergeQueue: EmergencyStopObserver {
             try store.advanceBatch(id: batchId, to: .rebased, candidates: Dictionary(uniqueKeysWithValues: members.map { ($0.request.id, $0.candidate) }),
                                    now: clock())
             try store.journalCrash(after: .rebased)
-            if stopped() { requeueStopped(); return ledger.out }
+            if stopped() { requeueStopped(); return finish() }
 
             // 4. The checks, hermetic, on fresh exports: the whole batch first, the bisect when that fails.
             let ctx = BatchContext(company: company, git: git, batchId: batchId, base: base, members: members, pinnedMain: pinnedMain,
@@ -417,23 +430,31 @@ public actor MergeQueue: EmergencyStopObserver {
             let k = members.count
             var landCount = 0
             var culprit: (member: Member, failure: MergeFailure, detail: String, tail: String?, path: String?)?
-            switch try await testPrefix(k, ctx) {
-            case .stopped: requeueStopped(); return ledger.out
-            case .inconclusive(_, let owner): inconclusive(owner: owner); return finish()
+            var inconclusiveMember: Member?
+            let top = try await testPrefix(k, ctx)
+            switch top {
+            case .stopped: requeueStopped(); return finish()
             case .pass: landCount = k
-            case .fail(let first):
+            case .fail, .inconclusive:
+                // A failure and an inconclusive result are bisected alike: the first prefix that is not green is the one the
+                // last member makes red (or unrunnable).
                 var lo = 1, hi = k
-                var failures: [Int: Failure] = [k: first]
+                var bad: [Int: Verdict] = [k: top]
                 while lo < hi {
                     let mid = (lo + hi) / 2
-                    switch try await testPrefix(mid, ctx) {
+                    let verdict = try await testPrefix(mid, ctx)
+                    switch verdict {
                     case .pass: lo = mid + 1
-                    case .fail(let f): failures[mid] = f; hi = mid
-                    case .stopped: requeueStopped(); return ledger.out
-                    case .inconclusive(_, let owner): inconclusive(owner: owner); return finish()
+                    case .stopped: requeueStopped(); return finish()
+                    case .fail, .inconclusive: bad[mid] = verdict; hi = mid
                     }
                 }
-                let failure = failures[lo] ?? first
+                guard case .fail(let failure)? = bad[lo] else {
+                    // The check could not run with this member in: nobody is blamed but the member the bisection isolated.
+                    inconclusiveMember = members[lo - 1]
+                    landCount = lo - 1
+                    break
+                }
                 let blamed = members[lo - 1]
                 var failureKind: MergeFailure = .itemCheckFailed
                 var detail = failure.detail
@@ -463,7 +484,7 @@ public actor MergeQueue: EmergencyStopObserver {
                             ledger.out.held = Store.redMainHold
                             requeueUnsettled()
                             return finish()
-                        case .stopped: requeueStopped(); return ledger.out
+                        case .stopped: requeueStopped(); return finish()
                         case .inconclusive, .unexportable: inconclusive(owner: nil); return finish()
                         case .fault(let error): throw error
                         }
@@ -502,7 +523,7 @@ public actor MergeQueue: EmergencyStopObserver {
                     requeueUnsettled()
                     return finish()
                 }
-                if stopped() { requeueStopped(); return ledger.out }
+                if stopped() { requeueStopped(); return finish() }
                 let landCommit = last.candidate
                 try store.advanceBatch(id: batchId, to: .checked, landCommit: landCommit, landedIds: landSet.map(\.request.id), now: clock())
                 try store.journalCrash(after: .checked)
@@ -518,7 +539,7 @@ public actor MergeQueue: EmergencyStopObserver {
                         guard try git.revParse("main") == base else { return .moved }
                         // The last moment before `main` moves: the owner's stop is read here (S15), and nothing has moved if it is up.
                         store.mergeRefProbe.call(GitWorkspace.mainRef)
-                        if (try? store.engineStopped()) != nil { return .stopped }
+                        if try Task.isCancelled || store.engineStopped() != nil { return .stopped }
                         try git.updateRef("refs/brahma/pre-merge/\(number)", to: base)
                         try store.advanceBatch(id: batchId, to: .backedUp, now: clock())
                         try store.journalCrash(after: .backedUp)
@@ -568,11 +589,12 @@ public actor MergeQueue: EmergencyStopObserver {
                     ledger.out.held = held
                     // Landed but neither recorded nor held: nothing runs for this company in this process until a recovery has looked
                     // at it (landing it again is never right).
-                    if !recorded || holdFailed { stuck.insert(company.id) }
-                    if !recorded { ledger.leaveOpen = true; recordFailed = true }
+                    // The journal keeps the batch open: the next tick retries the record or the hold (`recover`).
+                    if !recorded || holdFailed { ledger.leaveOpen = true }
+                    if !recorded { recordFailed = true }
                 case .stopped:
                     requeueStopped()
-                    return ledger.out
+                    return finish()
                 case .moved, .notFastForward:
                     ledger.batchError = "main moved while this was being merged"
                     requeueUnsettled(counting: landIds)
@@ -591,6 +613,7 @@ public actor MergeQueue: EmergencyStopObserver {
 
             // 7. The request behind the landed ones that made a check fail is told; the ones after it go back, not counted.
             if recordFailed { return ledger.out }
+            if let m = inconclusiveMember { inconclusive(owner: m.request.id) }
             if let c = culprit {
                 await bounce(c.member.request, c.failure, c.detail, tail: c.tail, path: c.path)
             }
@@ -608,7 +631,7 @@ public actor MergeQueue: EmergencyStopObserver {
         } catch {
             if stopped() || error is StoppedByOwner || error is CancellationError {
                 requeueStopped()
-                return ledger.out
+                return finish()
             }
             ledger.batchError = Store.flat("\(error)", max: 200)
             if error is MergeInfrastructureError || error is GitLockError || (error as? GitError)?.isRepositoryRefusal == true {
@@ -673,7 +696,7 @@ public actor MergeQueue: EmergencyStopObserver {
         switch await run(attempt: 1) {
         case .passed: return .pass
         case .stopped: return .stopped
-        case .inconclusive(let tail): return .inconclusive(tail, owner: owner.request.id)
+        case .inconclusive(let tail): return .inconclusive(tail)
         case .unexportable(let reason):
             return .fail(Failure(kind: .tree, detail: "its tree cannot be written out for the check: \(reason)", tail: nil, path: nil))
         case .fault(let error): throw error
@@ -687,7 +710,7 @@ public actor MergeQueue: EmergencyStopObserver {
                 try? store.flagFlakyMerge(itemIds: flagged.map(\.item.id))
                 return .pass
             case .stopped: return .stopped
-            case .inconclusive(let tail): return .inconclusive(tail, owner: owner.request.id)
+            case .inconclusive(let tail): return .inconclusive(tail)
             case .unexportable(let reason):
                 return .fail(Failure(kind: .tree, detail: "its tree cannot be written out for the check: \(reason)", tail: nil, path: nil))
             case .fault(let error): throw error
@@ -723,10 +746,11 @@ public actor MergeQueue: EmergencyStopObserver {
     /// Nothing here throws except the test seam that simulates a crash: `main` has moved, so a failure is reported, never
     /// propagated.
     nonisolated func recordLanding(batchId: String, from step: MergeStep, landed: [(requestId: String, mergedCommit: String)],
-                                   landCommit: String, rootBehind: Bool, label: String, company: Company) throws -> LandingRecord {
+                                   landCommit: String, rootBehind: Bool, label: String, company: Company,
+                                   alreadyTold: Bool = false) throws -> LandingRecord {
         let (store, clock) = (self.store, self.clock)
-        func advance(_ to: MergeStep) {
-            do { try store.advanceBatch(id: batchId, to: to, now: clock()) }
+        func advance(_ to: MergeStep, error: String? = nil) {
+            do { try store.advanceBatch(id: batchId, to: to, error: error, now: clock()) }
             catch { note("could not journal \(to.rawValue) of a landing: \(error)") }
         }
         if step.order < MergeStep.landed.order {
@@ -734,7 +758,7 @@ public actor MergeQueue: EmergencyStopObserver {
             try store.journalCrash(after: .landed)
         }
         var recorded = true
-        var held: String? = rootBehind ? "the root checkout did not follow main after \(label) landed; its files still hold the old tree" : nil
+        var held: String? = rootBehind ? "\(Store.rootBehindHoldPrefix) after \(label) landed; its files still hold the old tree" : nil
         if step.order < MergeStep.recorded.order {
             do {
                 _ = try store.recordLanded(landed, mainCommit: landCommit, now: clock())
@@ -744,7 +768,8 @@ public actor MergeQueue: EmergencyStopObserver {
                 throw SimulatedCrash()
             } catch {
                 recorded = false
-                held = "\(label) landed but could not be recorded (\(Store.flat("\(error)", max: 200)))"
+                let text = "\(label) \(Store.unrecordedLandingMarker) (\(Store.flat("\(error)", max: 200)))"
+                held = held.map { "\($0); also \(text)" } ?? text
             }
         }
         var holdFailed = false
@@ -753,13 +778,18 @@ public actor MergeQueue: EmergencyStopObserver {
                 holdFailed = true
                 note("could not hold the queue after \(label) landed: \(error)")
             }
-            // Told in any case (best effort): a hold that was not written still needs the owner's eyes.
-            do {
-                try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
-                                      body: "\(held). Reconcile the workspace root with main (save your own edits, then reset the root to main), "
-                                          + "and reject any quarantine of the old files. Then release the hold.", now: clock())
-            } catch {
-                note("could not notify the owner after \(label) landed: \(error)")
+            // What is still to do is in the journal, so the next tick (or the owner's resume) finishes it: a record that failed,
+            // a hold that could not be written.
+            if !recorded || holdFailed { advance(recorded ? .recorded : .landed, error: "\(Store.heldJournalPrefix)\(held)") }
+            // Told once (best effort), even when the hold could not be written.
+            if !alreadyTold {
+                do {
+                    try store.notifyOwner(companyId: company.id, title: "Merges are held in \(company.name)",
+                                          body: "\(held). Reconcile the workspace root with main (save your own edits, then reset the root to main), "
+                                              + "and reject any quarantine of the old files. Then release the hold.", now: clock())
+                } catch {
+                    note("could not notify the owner after \(label) landed: \(error)")
+                }
             }
         }
         return LandingRecord(held: held, recorded: recorded, holdFailed: holdFailed)
@@ -806,7 +836,6 @@ public actor MergeQueue: EmergencyStopObserver {
                 try store.requeueMerge(requestIds: [id], countsAsRequeue: false, now: clock())
             }
             if try store.openMergeBatches(companyId: company.id).isEmpty {
-                stuck.remove(company.id)
                 recovered.insert(company.id)
             }
         } catch {
@@ -819,6 +848,8 @@ public actor MergeQueue: EmergencyStopObserver {
     private func recoverBatch(_ b: MergeBatch, company: Company, git: GitWorkspace) async -> Bool {
         let (store, blocking, clock, paths) = (self.store, self.blocking, self.clock, self.paths)
         func abandon(_ why: String) {
+            // A pending head recorded for a move that will not be made goes with the abandoned batch.
+            if let land = b.landCommit { try? store.clearPendingMainCommit(companyId: company.id, ifEqual: land) }
             try? store.requeueMerge(requestIds: b.requestIds, countsAsRequeue: false, now: clock())
             try? store.advanceBatch(id: b.id, to: .done, error: why, now: clock())
         }
@@ -835,7 +866,8 @@ public actor MergeQueue: EmergencyStopObserver {
                 return true
             }
             let keys = keysOf(b.landedIds)
-            enum Resume: Sendable { case abandon, done(stuck: Bool) }
+            enum Resume: Sendable { case abandon, done(complete: Bool) }
+            let told = b.error?.hasPrefix(Store.heldJournalPrefix) == true
             do {
                 let resume = try await blocking.tryRun { () throws -> Resume in
                     try GitLock.withLock(paths: paths, companyId: company.id) {
@@ -845,8 +877,10 @@ public actor MergeQueue: EmergencyStopObserver {
                             if let head, try git.isAncestor(landCommit, of: head) {
                                 // `main` moved and the move was not journaled: it goes on from `landed`.
                             } else if head == base {
-                                // `main` has not moved: the fast-forward of the commit that was checked is redone.
-                                if (try? store.engineStopped()) != nil { return .abandon }
+                                // `main` has not moved: the fast-forward of the commit that was checked is redone, but only for requests
+                                // that are still the batch's (not put back in the queue, not withdrawn while the engine was down).
+                                if try store.engineStopped() != nil { return .abandon }
+                                guard try store.batchStillOwns(requestIds: b.landedIds, batchId: b.id) else { return .abandon }
                                 try store.setPendingMainCommit(companyId: company.id, landCommit)
                                 let move: FastForwardResult
                                 do { move = try git.fastForwardMain(to: landCommit) } catch {
@@ -865,15 +899,25 @@ public actor MergeQueue: EmergencyStopObserver {
                             }
                         }
                         let record = try self.recordLanding(batchId: b.id, from: b.step, landed: landed, landCommit: landCommit,
-                                                            rootBehind: rootBehind, label: keys, company: company)
-                        return .done(stuck: !record.recorded || record.holdFailed)
+                                                            rootBehind: rootBehind, label: keys, company: company, alreadyTold: told)
+                        guard record.recorded, !record.holdFailed else { return .done(complete: false) }
+                        // A hold the engine could not write earlier is written now; one set because the record had failed is lifted.
+                        if let text = b.error?.dropFirst(Store.heldJournalPrefix.count).description, b.error?.hasPrefix(Store.heldJournalPrefix) == true {
+                            if text.hasPrefix(Store.rootBehindHoldPrefix) {
+                                try store.setMergeHold(companyId: company.id, reason: text, now: clock())
+                            } else if let hold = try store.company(id: company.id)?.mergeHold, hold.contains(Store.unrecordedLandingMarker),
+                                      !hold.hasPrefix(Store.rootBehindHoldPrefix) {
+                                try store.setMergeHold(companyId: company.id, reason: nil, now: clock())
+                            }
+                        }
+                        return .done(complete: true)
                     }
                 }
                 switch resume {
                 case .abandon:
                     abandon("interrupted")
-                case .done(let isStuck):
-                    if isStuck { stuck.insert(company.id); return true }
+                case .done(let complete):
+                    if !complete { return false }
                     await blocking.run { self.cleanLanded(b.landedIds.map { ($0, self.keyOf($0) ?? "") }, company: company, git: git) }
                     try? store.advanceBatch(id: b.id, to: .cleaned, now: clock())
                     // What the batch claimed but did not land goes back (the culprit's bounce was not journaled: it is judged again).

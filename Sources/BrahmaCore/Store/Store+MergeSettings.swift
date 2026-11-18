@@ -12,6 +12,48 @@ extension Store {
     static let rootBehindRefusal = "the workspace root does not match main yet: save your own edits, reset the root to main "
         + "(git reset --hard main), then resume again. Releasing the hold now would quarantine the old files, and accepting that would undo what landed"
 
+    /// What a hold says when a landing could not be recorded (the queue lifts it itself once the record succeeds).
+    static let unrecordedLandingMarker = "landed but could not be recorded"
+    /// The journal's `error` of a batch whose record or hold is still to be done; the rest is the hold's reason.
+    static let heldJournalPrefix = "hold: "
+    /// What `resumeMergeQueue` says when a landing still cannot be recorded.
+    static let landingNotRecordedRefusal = "a merge that already landed on main could not be recorded yet: the database refused the write. "
+        + "Fix that (disk space, a locked database), then resume again; releasing the hold now would leave the landing unrecorded"
+
+    /// Whether the batch still holds these requests (`running` or `landing`, `batchId` the batch's): ones put back in the queue or
+    /// withdrawn while the engine was down no longer do.
+    func batchStillOwns(requestIds: [String], batchId: String) throws -> Bool {
+        try writer.read { db in
+            for id in requestIds {
+                guard let r = try MergeRequest.fetchOne(db, key: id), r.batchId == batchId,
+                      r.status == .running || r.status == .landing else { return false }
+            }
+            return true
+        }
+    }
+
+    /// Records the landings a batch journaled as `landed` but could not record (the engine's own retry does this too). Throws
+    /// `landingNotRecordedRefusal` when the record still fails.
+    func repairUnrecordedLandings(companyId: String, now: Date = Store.now()) throws -> Int {
+        var repaired = 0
+        for b in try openMergeBatches(companyId: companyId) where b.step == .landed {
+            guard let land = b.landCommit else { continue }
+            let pairs = b.landedIds.compactMap { id in b.candidates[id].map { (requestId: id, mergedCommit: $0) } }
+            do {
+                _ = try recordLanded(pairs, mainCommit: land, now: now)
+                try advanceBatch(id: b.id, to: .recorded, now: now)
+                repaired += 1
+            } catch { throw WorkError.conflict(Self.landingNotRecordedRefusal) }
+        }
+        return repaired
+    }
+
+    /// The holds the engine lifts itself when their cause is gone.
+    static func liftsItself(_ hold: String?) -> Bool {
+        guard let hold else { return false }
+        return hold == redMainHold || (hold.contains(unrecordedLandingMarker) && !hold.hasPrefix(rootBehindHoldPrefix))
+    }
+
     private static func requireOwnerOrSystem(_ sender: Sender) throws {
         switch sender {
         case .owner, .system: return
@@ -53,7 +95,7 @@ extension Store {
             try s.validate()
             spec = s
         }
-        let name: String = try writer.write { db in
+        try writer.write { db in
             guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId else {
                 throw WorkError.forbidden("not in your company")
             }
@@ -64,13 +106,14 @@ extension Store {
             updated.mainCheck = spec
             updated.mainCheckSetById = spec == nil ? nil : agentId
             try updated.update(db)
-            return agent.name
+            // Told in the same write: a change the owner is not told of does not happen.
+            let shown = spec.map { Self.flat($0.command, max: 200) }
+            try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal,
+                            title: spec == nil ? "Main check cleared" : "Main check changed",
+                            body: spec == nil ? "\(agent.name) cleared the main check; merges are no longer gated by it."
+                                              : "\(agent.name) set the main check to: \(shown ?? ""). Every merge is checked with it from now on.",
+                            now: now)
         }
-        let shown = spec.map { Self.flat($0.command, max: 200) }
-        try notifyOwner(companyId: companyId, title: spec == nil ? "Main check cleared" : "Main check changed",
-                        body: spec == nil ? "\(name) cleared the main check; merges are no longer gated by it."
-                                          : "\(name) set the main check to: \(shown ?? ""). Every merge is checked with it from now on.",
-                        now: now)
         return spec
     }
 
@@ -122,10 +165,14 @@ extension Store {
     /// Owner only: releases the merge hold. A hold set because the root checkout did not follow `main` is released only once the
     /// root matches `main` again (clean checkout on `main`); otherwise the next batch would quarantine the old files as the owner's
     /// edits, and accepting that would revert what landed.
-    public func resumeMergeQueue(companyId: String, by sender: Sender, now: Date = Store.now()) throws {
+    @discardableResult
+    public func resumeMergeQueue(companyId: String, by sender: Sender, now: Date = Store.now()) throws -> Bool {
         guard case .owner = sender else { throw WorkError.forbidden("only the owner can resume the merge queue") }
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
-        guard let hold = company.mergeHold else { return }
+        // A landing the engine could not record is recorded first (the engine's next tick finishes that batch): never a silent
+        // half-clear of the hold with the engine still stuck.
+        let repaired = try repairUnrecordedLandings(companyId: companyId, now: now)
+        guard let hold = company.mergeHold else { return repaired > 0 }
         if hold.hasPrefix(Self.rootBehindHoldPrefix) {
             let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: companyId)
             let matches: Bool
@@ -134,5 +181,6 @@ extension Store {
             guard matches else { throw WorkError.conflict(Self.rootBehindRefusal) }
         }
         try setMergeHold(companyId: companyId, reason: nil, now: now)
+        return true
     }
 }

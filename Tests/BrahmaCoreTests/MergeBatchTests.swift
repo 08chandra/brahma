@@ -283,8 +283,9 @@ import GRDB
         #expect(journal.step == .done && journal.error != nil)
     }
 
-    /// Controller ruling 1: an inconclusive result is charged only to the request that owns the run; the others go back without
-    /// an inconclusive count, so a flaky item cannot push innocent items into `failed`.
+    /// Controller ruling 1 / S5: an inconclusive result is never charged by default. It is bisected like a failure; the single
+    /// member the bisection isolates is charged, the green prefix before it lands, the others go back uncounted. (An item
+    /// check case: B's own check cannot run.)
     @Test func inconclusiveIsChargedOnlyToTheOwnerOfTheRun() async throws {
         let m = try MergeFixture()
         let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"], ["src/c.txt": "c"]])
@@ -295,17 +296,81 @@ import GRDB
         for round in 1...3 {
             let outcome = try #require(try await batch(q, m))
             let (ra, rb, rc) = (try request(m, items[0]), try request(m, items[1]), try request(m, items[2]))
-            #expect(ra.status == .queued && rc.status == .queued && ra.inconclusive == 0 && rc.inconclusive == 0, "round \(round)")
+            #expect(ra.inconclusive == 0 && rc.inconclusive == 0 && rc.status == .queued && ra.status == .merged, "round \(round)")
             if round < 3 {
                 #expect(rb.status == .queued && rb.inconclusive == round)
             } else {
                 #expect(outcome.failed == [rb.id] && rb.status == .failed && rb.detail == "check could not run reliably (infrastructure)")
             }
         }
-        // The good ones land once the flaky one is out of the way.
+        // C lands once B is out of the way.
         m.world.checks.onRun(nil)
         let last = try #require(try await batch(q, m))
-        #expect(Set(last.merged) == [try request(m, items[0]).id, try request(m, items[2]).id])
+        #expect(last.merged == [try request(m, items[2]).id])
+    }
+
+    /// S5, the main-check case: member 2's change makes the main check look like a network failure. Only member 2 is charged;
+    /// members 1 and 3 never accumulate a count and never fail (the old default charged the last member, 3).
+    @Test func inconclusiveMainCheckChargesOnlyTheCulprit() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b-net.txt": "b"], ["src/c.txt": "c"]])
+        try setMainCheck(m, "make smoke")
+        m.world.checks.onRun { call in
+            guard call.command == "make smoke",
+                  FileManager.default.fileExists(atPath: call.workingDirectory.appending(path: "src/b-net.txt").path) else { return nil }
+            return FakeCheckRunner.fail("getaddrinfo ENOTFOUND registry.npmjs.org")
+        }
+        let q = queue(m)
+        for round in 1...3 {
+            _ = try #require(try await batch(q, m))
+            let (ra, rb, rc) = (try request(m, items[0]), try request(m, items[1]), try request(m, items[2]))
+            #expect(ra.status == .merged && ra.inconclusive == 0, "round \(round)")
+            #expect(rc.status == .queued && rc.inconclusive == 0 && rc.requeues == 0, "C is never charged (round \(round))")
+            #expect(round < 3 ? (rb.status == .queued && rb.inconclusive == round) : rb.status == .failed, "round \(round)")
+        }
+        m.world.checks.onRun(nil)
+        #expect(try #require(try await batch(q, m)).merged == [try request(m, items[2]).id])
+    }
+
+    /// S4: every principal whose code is in the candidate counts, including every request the queue landed earlier. A
+    /// Workspace-profile author's change that landed earlier makes a later `.main`, `.mainAtBase` and `.item` run sandboxed,
+    /// whoever sets the check and however many green runs came after.
+    @Test func earlierLandedNonFullAuthorForcesTheSandbox() async throws {
+        let m = try MergeFixture()
+        let landed = try await m.approved()
+        try await batch(queue(m), m)
+        let head = try main(m)
+        let junior = try m.store.hire(companyId: m.company.id, name: "jr", role: "junior", model: "sonnet")
+        let ops = try m.store.hire(companyId: m.company.id, name: "ops-1", role: "ops", model: "sonnet")
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(profile: .full), userHome: try tempDir())
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(roleProfiles: ["ops": .full, "engineer": .full, "junior": .workspace]),
+                                  userHome: try tempDir())
+        try m.exec("UPDATE company SET mainCheckSetById = ? WHERE id = ?", [ops.id, m.company.id])
+        let route = Orchestrator.checkRoute(store: m.store)
+        let company = try #require(try m.store.company(id: m.company.id))
+        func place(_ kind: MergeRun.Kind, itemId: String? = nil, batch: String? = nil, at commit: String? = nil) async throws -> String {
+            let runId = UUID().uuidString
+            let at = try commit ?? main(m)
+            let dir = try EngineExport.export(store: m.store, company: company, runId: runId, commit: at)
+            let run = MergeRun(id: runId, companyId: company.id, batchId: batch, candidateCommit: at, kind: kind, itemId: itemId, status: .running)
+            try await m.store.writer.write { try run.insert($0) }
+            return dir.path
+        }
+        func sandboxed(_ r: CheckRoute) -> Bool { if case .sandboxed = r { return true } else { return false } }
+        // The earlier landing's author is Full: unsandboxed (the control).
+        let current = try m.item("Current")
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [m.eng.id, current.id])
+        #expect(!sandboxed(route(try await place(.main, itemId: current.id))), "control")
+        #expect(!sandboxed(route(try await place(.mainAtBase, at: head))), "control")
+        // Now the earlier landing's author is a Workspace-profile agent.
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [junior.id, landed.id])
+        try m.exec("DELETE FROM workLease WHERE itemId = ?", [landed.id])
+        // A green run after that landing does not clear it.
+        let green = MergeRun(companyId: company.id, kind: .main, status: .passed, startedAt: m.now.addingTimeInterval(60))
+        try await m.store.writer.write { try green.insert($0) }
+        #expect(sandboxed(route(try await place(.mainAtBase, at: head))))
+        #expect(sandboxed(route(try await place(.main, itemId: current.id))))
+        #expect(sandboxed(route(try await place(.item, itemId: current.id))))
     }
 
     /// Controller ruling 2: the red-main re-check runs only on the engine-recorded head. A live `main` that differs (someone moved
@@ -366,6 +431,135 @@ import GRDB
         // No setter: sandboxed.
         try m.exec("UPDATE company SET mainCheckSetById = NULL WHERE id = ?", [m.company.id])
         #expect(sandboxed(route(try await place(at: head))))
+    }
+
+    // MARK: Stop during the landing, and a stuck landing
+
+    /// A stop that arrives inside the landing closure, before `main` moves, abandons the batch: the journal ends `done`
+    /// "interrupted", the requests go back, and after the resume nothing redoes a fast-forward for them.
+    @Test func stopInsideTheLandingNeverRedoesTheMove() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"]])
+        let base = try main(m)
+        let (store, now) = (m.store, m.now)
+        store.journalProbe.set { label in
+            if label == "backedUp" { _ = try? store.emergencyStop(note: nil, by: "owner", now: now) }
+            return false
+        }
+        try m.exec("CREATE TRIGGER no_landing BEFORE UPDATE OF status ON mergeRequest WHEN NEW.status = 'landing' BEGIN SELECT RAISE(ABORT, 'no landing'); END")
+        let q = queue(m)
+        _ = try await batch(q, m)
+        store.journalProbe.set(nil)
+        await q.stopAll(reason: "owner")
+        #expect(try main(m) == base)
+        let journal = try #require(try m.store.mergeBatches(companyId: m.company.id).first)
+        #expect(journal.step == .done && journal.error?.contains("interrupted") == true, "\(journal.step) \(journal.error ?? "")")
+        #expect(try items.allSatisfy { try request(m, $0).status == .queued && request(m, $0).requeues == 0 })
+        #expect(try m.store.company(id: m.company.id)?.pendingMainCommit == nil)
+        // Resumed (the fault gone): the recovery finds nothing to redo, and the next batch lands both once.
+        try m.exec("DROP TRIGGER no_landing")
+        try m.store.resumeAfterStop(now: m.now)
+        #expect(await q.recover(company: try #require(try m.store.company(id: m.company.id))) == 0)
+        #expect(try main(m) == base)
+        let next = try #require(try await batch(q, m))
+        #expect(next.merged.count == 2)
+        for i in items { #expect(try m.kinds(i).filter { $0 == .merged }.count == 1) }
+    }
+
+    /// Recovery at `backedUp`/`landing` never redoes the fast-forward for requests that are no longer the batch's (back in the
+    /// queue, withdrawn): it abandons the batch and `main` stays where it was.
+    @Test(arguments: [MergeStep.backedUp, MergeStep.landing])
+    func recoveryDoesNotLandWithdrawnRequests(step: MergeStep) async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"]])
+        let base = try main(m)
+        m.store.journalProbe.set { $0 == step.rawValue }
+        _ = try await batch(queue(m), m)
+        m.store.journalProbe.set(nil)
+        let open = try #require(try m.store.openMergeBatches(companyId: m.company.id).first)
+        #expect(open.step == step)
+        // One request is withdrawn while the engine is down, the other put back in the queue.
+        try m.exec("UPDATE mergeRequest SET status = 'cancelled' WHERE itemId = ?", [items[0].id])
+        try m.exec("UPDATE mergeRequest SET status = 'queued', batchId = NULL WHERE itemId = ?", [items[1].id])
+        #expect(await queue(m).recover(company: try #require(try m.store.company(id: m.company.id))) == 1)
+        #expect(try main(m) == base, "the withdrawn change did not land")
+        #expect(try m.store.company(id: m.company.id)?.pendingMainCommit == nil)
+        let journal = try #require(try m.store.mergeBatches(companyId: m.company.id).first)
+        #expect(journal.step == .done && journal.error == "interrupted")
+        #expect(try request(m, items[0]).status == .cancelled)
+    }
+
+    /// Once `main` has moved the landing always finishes, whatever the owner does next: a stop raised right after the CAS
+    /// changes nothing.
+    @Test func stopAfterTheMoveStillRecords() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"]])
+        let (store, now) = (m.store, m.now)
+        store.journalProbe.set { label in
+            if label == "moved" { _ = try? store.emergencyStop(note: nil, by: "owner", now: now) }
+            return false
+        }
+        let q = queue(m)
+        let outcome = try #require(try await batch(q, m))
+        store.journalProbe.set(nil)
+        #expect(outcome.merged.count == 2)
+        try expectDone(m, items)
+    }
+
+    func expectDone(_ m: MergeFixture, _ items: [WorkItem]) throws {
+        let tip = try main(m)
+        for i in items {
+            #expect(try m.fresh(i).status == .done && request(m, i).status == .merged && m.kinds(i).filter { $0 == .merged }.count == 1)
+        }
+        #expect(try m.store.company(id: m.company.id)?.mainCommit == tip)
+        #expect(try m.store.openMergeBatches(companyId: m.company.id).isEmpty)
+    }
+
+    /// Liveness: a landing that could not be recorded keeps the queue from landing again, and is not stuck for good. While the
+    /// fault lasts the owner's resume is refused (exactly, nothing half-cleared); once it is gone the resume records the landing,
+    /// the engine's next tick finishes the batch and the queue moves on, with no restart.
+    @Test func stuckLandingRecoversAndResumeRepairs() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"]])
+        m.exec_noThrow("CREATE TRIGGER no_record BEFORE UPDATE OF status ON mergeRequest WHEN NEW.status = 'merged' BEGIN SELECT RAISE(ABORT, 'no record'); END")
+        m.exec_noThrow("CREATE TRIGGER no_hold BEFORE UPDATE OF mergeHold ON company BEGIN SELECT RAISE(ABORT, 'no hold'); END")
+        try m.exec("UPDATE company SET mergeBatchSize = 1 WHERE id = ?", [m.company.id])
+        let q = queue(m)
+        let first = try #require(try await batch(q, m))
+        #expect(first.failed.count == 1 && first.merged.isEmpty)
+        let landed = try main(m)
+        let notices = try m.store.allNotices().filter { $0.title.contains("Merges are held") }.count
+        #expect(notices == 1)
+        // Ticks while it stays broken: nothing lands, nobody is told again.
+        #expect(try await batch(q, m) == nil)
+        #expect(try await batch(q, m) == nil)
+        #expect(try main(m) == landed)
+        #expect(try m.store.allNotices().filter { $0.title.contains("Merges are held") }.count == notices)
+        // The owner's resume while the record still fails: refused, exactly.
+        #expect(throws: WorkError.conflict(Store.landingNotRecordedRefusal)) { try m.store.resumeMergeQueue(companyId: m.company.id, by: Sender.owner) }
+        // The fault clears; the owner resumes: the landing is recorded, and the engine carries on.
+        try m.exec("DROP TRIGGER no_record")
+        try m.exec("DROP TRIGGER no_hold")
+        try m.store.resumeMergeQueue(companyId: m.company.id, by: Sender.owner)
+        #expect(try request(m, items[0]).status == .merged)
+        let next = try #require(try await batch(q, m))
+        #expect(next.merged == [try request(m, items[1]).id], "recovery finished the stuck batch, then the next item landed")
+        try expectDone(m, items)
+        #expect(try main(m) != landed)
+    }
+
+    /// The same without the owner: the fault clears by itself and the engine's own next tick repairs it.
+    @Test func stuckLandingRepairsItselfWhenTheFaultClears() async throws {
+        let m = try MergeFixture()
+        let items = try await threeApproved(m, [["src/a.txt": "a"], ["src/b.txt": "b"]])
+        m.exec_noThrow("CREATE TRIGGER no_record BEFORE UPDATE OF status ON mergeRequest WHEN NEW.status = 'merged' BEGIN SELECT RAISE(ABORT, 'no record'); END")
+        try m.exec("UPDATE company SET mergeBatchSize = 1 WHERE id = ?", [m.company.id])
+        let q = queue(m)
+        _ = try await batch(q, m)
+        try m.exec("DROP TRIGGER no_record")
+        let next = try #require(try await batch(q, m))
+        #expect(next.merged == [try request(m, items[1]).id])
+        try expectDone(m, items)
     }
 
     // MARK: Settings and holds

@@ -46,6 +46,7 @@ struct MergeFixture {
     func exec(_ sql: String, _ args: StatementArguments = []) throws {
         try store.writer.write { try $0.execute(sql: sql, arguments: args) }
     }
+    func exec_noThrow(_ sql: String) { try? store.writer.write { try $0.execute(sql: sql) } }
     func enqueue(_ item: WorkItem, ahead: Int, secretFindings: [String] = []) throws {
         try store.writer.write { db in try store.enqueueApproved(db: db, item: item, ahead: ahead, secretFindings: secretFindings, now: now) }
     }

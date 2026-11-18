@@ -125,14 +125,10 @@ extension Orchestrator {
             func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
             if narrowed(company.permissionProfile) == .full {
                 if record.isMergeRun {
-                    // A merge check runs unsandboxed only if EVERY principal whose code it executes narrows to Full: for the main
-                    // check its setter and the candidate's item(s) (every item of a batch), for the item check the item's author
-                    // (its lease holder and its assignee, both when both exist). A missing principal, an id that is no agent
-                    // (or is gone), or none at all runs sandboxed.
-                    // A database error on any lookup is not an absent row: the principal could be anyone, so the run is sandboxed.
-                    // `mainAtBase` runs the main check's scripts on a commit of `main` itself: its principals are the setter and the
-                    // authors of everything the queue landed since the last green check, and a head the queue did not land has an
-                    // unknown author (sandboxed).
+                    // A merge check runs unsandboxed only if EVERY principal whose code it executes narrows to Full.
+                    // Every principal whose code the run executes: the setter (main and main-at-base), the candidate's own members
+                    // (the run's item and every item of its batch), and every item the queue landed earlier (all of it is in the
+                    // candidate or in `main` at the base). Any lookup error, unknown author or missing principal: sandboxed.
                     let usesItems = record.mergeKind == .main || record.mergeKind == .item
                     var itemIds = Set(usesItems ? record.itemId.map { [$0] } ?? [] : [])
                     var ids: [String] = []
@@ -141,18 +137,19 @@ extension Orchestrator {
                         do { itemIds.formUnion(try store.writer.read { try MergeRequest.filter(Column("batchId") == batchId).fetchAll($0) }.map(\.itemId)) }
                         catch { missing = true }
                     }
+                    do { itemIds.formUnion(try store.landedItemIds(companyId: company.id)) } catch { missing = true }
                     switch record.mergeKind {
                     case .main: if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
                     case .item: break
                     case .mainAtBase:
                         if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
-                        do {
-                            let landed = try store.mainAtBaseAuthors(companyId: company.id, candidate: record.candidate, excluding: record.id)
-                            if landed.complete { itemIds.formUnion(landed.itemIds) } else { missing = true }
-                        } catch { missing = true }
+                        // A head the queue did not land has an author the engine does not know.
+                        do { if try !store.isQueueLandedHead(companyId: company.id, candidate: record.candidate) { missing = true } }
+                        catch { missing = true }
                     default: missing = true
                     }
-                    if record.mergeKind != .mainAtBase && itemIds.isEmpty { missing = true }
+                    if record.mergeKind != .mainAtBase && !usesItems { missing = true }
+                    if usesItems && record.itemId == nil && record.batchId == nil { missing = true }
                     for id in itemIds.sorted() {
                         do {
                             let holder = try store.lease(itemId: id)?.agentId, author = try store.workItem(id: id)?.ownerId

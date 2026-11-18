@@ -119,8 +119,9 @@ struct MergeGroup: ParsableCommand {
             try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
-            guard c.mergeHold != nil else { print("The merge queue is not held."); return }
-            do { try store.resumeMergeQueue(companyId: c.id, by: .owner) } catch let e as WorkError { throw fail(e.message) }
+            let changed: Bool
+            do { changed = try store.resumeMergeQueue(companyId: c.id, by: .owner) } catch let e as WorkError { throw fail(e.message) }
+            guard changed else { print("The merge queue is not held."); return }
             print("Merge queue resumed.")
         }
     }
