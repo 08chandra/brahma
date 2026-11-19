@@ -237,11 +237,13 @@ public actor Orchestrator {
         // Plan ML: a restore resets every memory cursor (every company's: the whole database was swapped), a full idempotent
         // re-scan on the next ticks.
         restoreHooks.register(afterRestore: { _ in try MemoryIngest.resetCursors(store: store) })
-        // Plan 4a Task 3: a restore re-adopts git's `main` as the record (`adoptMain` by the engine), so the main guard never
-        // "restores" the head a restore just took up. Git: in a Blocking body.
+        // Plan 4a Task 3: the engine's restore step re-affirms the record of a company whose `main` is exactly what the restored
+        // database recorded (`takeUpRestore` runs the hooks for those only; a stale pending head goes, 3a's alert closes). It
+        // adopts nothing else (B6): a head the restored database did not record is the main guard's to restore. Git: in a
+        // Blocking body.
         let blocking = self.blocking
         restoreHooks.register(afterRestore: { event in
-            guard let head = event.mainHead else { return }
+            guard let head = event.mainHead, try store.company(id: event.companyId)?.mainCommit == head else { return }
             try await blocking.tryRun { try store.adoptMain(companyId: event.companyId, by: .system, commit: head) }
         })
     }

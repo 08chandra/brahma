@@ -65,8 +65,9 @@ extension Store {
 
     // MARK: Adoption (Plan 4a Task 3)
 
-    /// The record takes `main`'s head (`brahma merge adopt-main`, the first-tick adoption of the main guard, the restore hook).
-    /// Owner and engine only (`.agent` is refused); never while a merge batch is open (its journal owns `main`). With `commit`
+    /// The record takes `main`'s head (`brahma merge adopt-main`; the engine's restore step re-affirms a head it recorded).
+    /// Owner and engine only (`.agent` is refused); never while a merge batch is open (its journal owns `main`); never a `main`
+    /// that is a symbolic ref or names no commit (B6). With `commit`
     /// (a commit id or any revision the owner names, a `refs/brahma/foreign/...` tip the guard saved, say) that is not `main`'s
     /// head, `main` is first moved there by compare-and-swap with the root checkout following (refused while the root has
     /// uncommitted edits). Writes activity `main adopted at <sha7> by the owner|the engine`, closes 3a's "main changed
@@ -82,7 +83,10 @@ extension Store {
                 guard try openMergeBatches(companyId: companyId).isEmpty else {
                     throw WorkError.conflict("a merge batch of \(name) is open; wait for it to finish (brahma merge \(name)), then adopt main")
                 }
-                guard let head = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(name) has no main branch") }
+                guard let head = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(name) has no main branch, or its main names no commit") }
+                guard try !git.mainIsSymbolic() else {
+                    throw WorkError.conflict("main of \(name) is a symbolic ref, which Brahma never adopts; make it a plain branch first")
+                }
                 var target = head
                 if let commit {
                     guard let wanted = try git.revParse(commit) else { throw WorkError.invalid("\(Self.flat(commit, max: 80)) names no commit in the workspace of \(name)") }
@@ -107,6 +111,21 @@ extension Store {
             if case .failed(_, _, let stderr) = error { throw WorkError.conflict("could not adopt main of \(name): \(Self.flat(stderr, max: 300))") }
             throw error
         }
+    }
+
+    /// The main guard found no record of `main` (B6): one owner alert (3a's `mainAlertReason` key, so the queue's `checkMain` and
+    /// this never tell twice; `adoptMain` closes it), scoped to the company. Nothing is adopted.
+    func raiseMainUnrecordedAlert(company: Company, now: Date) throws {
+        let reason = Self.mainAlertReason(company.id)
+        let open = try writer.read { db in
+            try Ask.filter(Column("kind") == AskKind.engineAlert && Column("status") == AskStatus.pendingOwner.rawValue
+                           && Column("subjectId") == Store.engineAlertKey(reason) && Column("companyId") == company.id).fetchCount(db)
+        }
+        guard open == 0 else { return }
+        let name = Self.flat(company.name, max: 100)
+        try EngineAlerts.raise(store: self, text: "The main branch of \(name) has no recorded head: Brahma adopts nothing by itself. "
+            + "It starts no new work and merges nothing there until you have reviewed main and accepted it: brahma merge adopt-main \(name)",
+            now: now, reason: reason, companyId: company.id)
     }
 
     /// The main guard put `main` back (`MainGuard.check`): the company's feed, one owner notice, and, with the root checkout off

@@ -52,8 +52,6 @@ extension Orchestrator {
                 switch result {
                 case .success(.restored(let ref, let to)):
                     log("main guard: \(company.name): main restored to \(to.prefix(7)); the other tip is saved as \(ref)")
-                case .success(.adopted(let commit)):
-                    log("main guard: \(company.name): main adopted at \(commit.prefix(7))")
                 case .success:
                     break
                 case .failure(let error):

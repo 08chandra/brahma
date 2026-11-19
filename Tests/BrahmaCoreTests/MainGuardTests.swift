@@ -55,17 +55,59 @@ import GRDB
 
     // MARK: Adoption
 
-    @Test func firstTickAdoptsMain() throws {
+    /// B6: no record is fail-closed. The guard adopts nothing by itself: the owner is alerted once (not once per tick) and
+    /// accepts with `brahma merge adopt-main`; the engine's only automatic record is the one it writes when it creates the company.
+    @Test func noRecordAlertsOnceAndWaitsForTheOwner() throws {
         let m = try MergeFixture()
-        let head = try main(m)
+        let created = try main(m)
+        #expect(try recorded(m) == created, "the company's creation recorded main")
         try m.exec("UPDATE company SET mainCommit = NULL WHERE id = ?", [m.company.id])
+        let moved = try foreignCommit(m, file: "unrecorded.txt", message: "nobody recorded this")
+        #expect(try check(m) == .skipped)
+        #expect(try recorded(m) == nil, "nothing is adopted")
+        #expect(try main(m) == moved, "nothing is restored either: there is no record to restore to")
+        #expect(try m.ws.head(of: "refs/brahma/foreign/\(stamp(m.now))-1") == nil)
+        let alerts = try openAlerts(m, reason: Store.mainAlertReason(m.company.id))
+        #expect(alerts.count == 1)
+        #expect(alerts.first?.summary.contains("brahma merge adopt-main Acme") == true, "\(alerts)")
+        func told() throws -> Int { try m.activity(.error).filter { $0.text.contains("brahma merge adopt-main Acme") }.count }
+        #expect(try told() == 1)
+        // The next ticks say nothing new.
+        #expect(try check(m, now: m.now.addingTimeInterval(60)) == .skipped)
+        #expect(try check(m, now: m.now.addingTimeInterval(120)) == .skipped)
+        #expect(try openAlerts(m, reason: Store.mainAlertReason(m.company.id)).count == 1)
+        #expect(try told() == 1)
         #expect(try recorded(m) == nil)
-        #expect(try check(m) == .adopted(head))
-        #expect(try recorded(m) == head)
-        #expect(try main(m) == head)
-        #expect(try mergeActivity(m).contains("main adopted at \(head.prefix(7)) by the engine"))
-        // From then on the head is the record: nothing to do.
+        // The owner accepts: main as it stands then is the record, the alert is closed, the guard is content.
+        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) == moved)
+        #expect(try recorded(m) == moved)
+        #expect(try openAlerts(m, reason: Store.mainAlertReason(m.company.id)).isEmpty)
+        #expect(try mergeActivity(m).contains("main adopted at \(moved.prefix(7)) by the owner"))
         #expect(try check(m) == .ok)
+    }
+
+    /// B6: a `main` that is a symbolic ref, or that names no commit, is never adopted; with a record, a symbolic `main` is
+    /// foreign (3a: never the engine's) and goes back to a plain ref at the record.
+    @Test func symbolicOrUnresolvableMainRefusesAdoption() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        let f = fixture(m)
+        try f.git(["branch", "--quiet", "x", before])
+        try f.git(["symbolic-ref", "refs/heads/main", "refs/heads/x"])
+        #expect(try m.ws.mainIsSymbolic())
+        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) }
+        #expect(try recorded(m) == before)
+        guard case .restored(let ref, let to) = try check(m) else { Issue.record("expected a restore"); return }
+        #expect(to == before); #expect(try main(m) == before)
+        #expect(!(try m.ws.mainIsSymbolic()), "main is a plain ref again")
+        #expect(try m.ws.head(of: ref) == before)
+        // A ref that names no commit: nothing to adopt, nothing to restore to; the owner is told.
+        try m.exec("UPDATE company SET mainCommit = NULL WHERE id = ?", [m.company.id])
+        try f.git(["update-ref", "-d", "refs/heads/main"])
+        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) }
+        #expect(try recorded(m) == nil)
+        #expect(try check(m) == .skipped)
+        #expect(try recorded(m) == nil)
     }
 
     @Test func adoptMainAcceptsOwnerCommit() throws {
@@ -280,21 +322,30 @@ import GRDB
 
     // MARK: The restore hook
 
+    /// The engine's restore step: for a company whose `main` is exactly what the restored database recorded, the hook re-affirms
+    /// the record (activity, a pending head cleared, 3a's alert closed). A head the restored database did not record is left
+    /// to the main guard (B6: after a restore the record is what the restored database says).
     @Test func restoreHookReadopts() async throws {
         let m = try MergeFixture()
         let head = try main(m)
         let hooks = RestoreHooks()
         _ = Orchestrator(store: m.store, runner: FakeTurnRunner(), paths: m.world.paths, mcpExecutable: "/usr/local/bin/brahma",
                          clock: TestClock().function, vault: MemoryVault(), restoreHooks: hooks)
-        // The restored database recorded an older head; git's main is what the engine runs on now.
         let stale = String(repeating: "a", count: 40)
-        try m.exec("UPDATE company SET mainCommit = ?, pendingMainCommit = ? WHERE id = ?", [stale, stale, m.company.id])
+        try m.exec("UPDATE company SET pendingMainCommit = ? WHERE id = ?", [stale, m.company.id])
+        try EngineAlerts.raise(store: m.store, text: "older alert", now: m.now, reason: Store.mainAlertReason(m.company.id), companyId: m.company.id)
         let event = RestoreEvent(companyId: m.company.id, companyName: m.company.name, workspace: m.root, mainHead: head, snapshotName: "snap")
         for hook in hooks.afterRestore { try await hook(event) }
         #expect(try recorded(m) == head)
         #expect(try m.store.company(id: m.company.id)?.pendingMainCommit == nil)
+        #expect(try openAlerts(m, reason: Store.mainAlertReason(m.company.id)).isEmpty)
         #expect(try mergeActivity(m).contains("main adopted at \(head.prefix(7)) by the engine"))
         #expect(try check(m) == .ok)
+        // The restored database recorded something else: the hook adopts nothing (the guard restores on its tick).
+        try m.exec("UPDATE company SET mainCommit = ? WHERE id = ?", [stale, m.company.id])
+        for hook in hooks.afterRestore { try await hook(event) }
+        #expect(try recorded(m) == stale)
+        #expect(try mergeActivity(m).filter { $0 == "main adopted at \(head.prefix(7)) by the engine" }.count == 1)
     }
 
     // MARK: Who may write the record
