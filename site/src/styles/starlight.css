@@ -1,0 +1,715 @@
+/* Starlight restyle: map every --sl-* variable to the Brahma tokens, then correct the few
+ * places Starlight's own components need the ops-console treatment (hairlines, 2 px radii,
+ * uppercase group labels, mono inline code, zebra tables, flat asides, code frames).
+ * This file is unlayered on purpose: unlayered rules beat Starlight's cascade layers. */
+
+:root,
+:root[data-theme='light'],
+::backdrop {
+  /* Greys */
+  --sl-color-white: var(--text0);
+  --sl-color-gray-1: var(--text0);
+  --sl-color-gray-2: var(--text1);
+  --sl-color-gray-3: var(--text1); /* text2 is below AA for essential text */
+  --sl-color-gray-4: var(--line-strong);
+  --sl-color-gray-5: var(--line);
+  --sl-color-gray-6: var(--bg1);
+  --sl-color-gray-7: var(--bg2);
+  --sl-color-black: var(--bg0);
+
+  /* Accent */
+  --sl-color-accent-low: var(--accent-dim);
+  --sl-color-accent: var(--accent);
+  --sl-color-accent-high: var(--text-link);
+
+  /* Status hues, mapped to the status tokens */
+  --sl-color-orange-low: color-mix(in srgb, var(--warn) 14%, var(--bg2));
+  --sl-color-orange: var(--warn);
+  --sl-color-orange-high: var(--warn);
+  --sl-color-green-low: color-mix(in srgb, var(--ok) 14%, var(--bg2));
+  --sl-color-green: var(--ok);
+  --sl-color-green-high: var(--ok);
+  --sl-color-blue-low: color-mix(in srgb, var(--ready) 14%, var(--bg2));
+  --sl-color-blue: var(--ready);
+  --sl-color-blue-high: var(--text-link);
+  --sl-color-purple-low: var(--bg3);
+  --sl-color-purple: var(--text1);
+  --sl-color-purple-high: var(--text0);
+  --sl-color-red-low: color-mix(in srgb, var(--danger) 14%, var(--bg2));
+  --sl-color-red: var(--danger);
+  --sl-color-red-high: var(--danger);
+
+  /* Semantic */
+  --sl-color-text: var(--text0);
+  --sl-color-text-accent: var(--text-link);
+  --sl-color-text-invert: var(--bg0);
+  --sl-color-bg: var(--bg0);
+  --sl-color-bg-nav: var(--bg1);
+  --sl-color-bg-sidebar: var(--bg1);
+  --sl-color-bg-inline-code: var(--bg3);
+  --sl-color-bg-accent: var(--accent);
+  --sl-color-hairline-light: var(--line);
+  --sl-color-hairline: var(--line);
+  --sl-color-hairline-shade: var(--line);
+  --sl-color-backdrop-overlay: rgb(14 18 23 / 0.7);
+
+  /* No shadows in an instrument panel */
+  --sl-shadow-sm: none;
+  --sl-shadow-md: none;
+  --sl-shadow-lg: none;
+
+  /* Type */
+  --sl-font: var(--font-sans);
+  --sl-font-mono: var(--font-mono);
+  --sl-text-2xs: 0.6875rem;
+  --sl-text-xs: 0.75rem;
+  --sl-text-sm: 0.8125rem;
+  --sl-text-base: var(--step-0);
+  --sl-text-lg: var(--step-1);
+  --sl-text-xl: var(--step-2);
+  --sl-text-2xl: var(--step-2);
+  --sl-text-3xl: var(--step-3);
+  --sl-text-4xl: var(--step-4);
+  --sl-text-5xl: var(--step-4);
+  --sl-text-6xl: var(--step-5);
+  --sl-text-body: var(--step-0);
+  --sl-text-body-sm: var(--sl-text-sm);
+  --sl-text-code: 0.8125rem;
+  --sl-text-code-sm: 0.875em;
+  --sl-text-h1: var(--step-4);
+  --sl-text-h2: var(--step-3);
+  --sl-text-h3: var(--step-2);
+  --sl-text-h4: var(--step-1);
+  --sl-text-h5: var(--step-0);
+  --sl-text-h6: var(--step-0);
+  --sl-line-height: 1.6;
+  --sl-line-height-headings: 1.1;
+
+  /* Layout */
+  --sl-nav-height: 3rem;
+  --sl-nav-pad-x: var(--page-pad);
+  --sl-nav-pad-y: 0.5rem;
+  --sl-sidebar-width: 16rem;
+  --sl-sidebar-pad-x: var(--s-4);
+  --sl-content-width: 46rem;
+  --sl-content-pad-x: var(--page-pad);
+  --sl-content-gap-y: var(--s-4);
+  --sl-main-pad: 0 0 var(--s-8) 0;
+  --sl-menu-button-size: 2rem;
+  --sl-outline-offset-inside: -0.125rem;
+}
+
+html {
+  color-scheme: dark;
+  overflow-x: clip;
+  scrollbar-color: var(--line-strong) transparent;
+}
+body {
+  overflow-x: clip;
+}
+
+/* ---- Focus, links, scrollbars -------------------------------------------------------- */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+
+a {
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  transition: color var(--dur-fast) var(--ease), text-decoration-color var(--dur-fast) var(--ease);
+}
+
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--text-link);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent);
+}
+.sl-markdown-content a:hover:not(:where(.not-content *)) {
+  color: var(--text0);
+  text-decoration-color: var(--text-link);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- Header -------------------------------------------------------------------------- */
+
+.page > header.header {
+  border-bottom: var(--hairline);
+  background: var(--bg1);
+  padding-block: 0;
+  display: flex;
+  align-items: center;
+}
+.site-title {
+  font-family: var(--font-sans);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--text0);
+  text-decoration: none;
+}
+.site-title:hover {
+  color: var(--text0);
+}
+
+site-search button[data-open-modal] {
+  height: 2rem;
+  border: var(--hairline-strong);
+  border-radius: var(--radius);
+  background: var(--bg2);
+  color: var(--text1);
+  font-size: var(--sl-text-sm);
+  padding-inline: var(--s-2) var(--s-2);
+  transition: border-color var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease);
+}
+site-search button[data-open-modal]:hover {
+  border-color: var(--text2);
+  background: var(--bg3);
+  color: var(--text0);
+}
+site-search button[data-open-modal] > kbd {
+  background: var(--bg3);
+  border: var(--hairline);
+  border-radius: var(--radius);
+  color: var(--text1);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  padding-inline: 0.375rem;
+}
+site-search dialog {
+  background: var(--bg1);
+  border: var(--hairline-strong);
+  border-radius: var(--radius);
+  box-shadow: none;
+}
+site-search button[data-close-modal] {
+  border-radius: var(--radius);
+}
+
+.sl-menu-button,
+.sl-menu-button[aria-expanded='true'] {
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text0);
+  box-shadow: none;
+}
+.sl-menu-button:hover {
+  background: var(--bg3);
+}
+
+/* ---- Sidebar ------------------------------------------------------------------------- */
+
+nav.sidebar .sidebar-pane {
+  border-inline-end: var(--hairline);
+  background: var(--bg1);
+}
+nav.sidebar .sidebar-content {
+  padding: var(--s-4) var(--s-4) var(--s-6);
+}
+nav.sidebar .sidebar-content :is(ul, li) {
+  border-color: var(--line);
+}
+nav.sidebar .group-label {
+  display: block;
+  padding-block: var(--s-2);
+}
+nav.sidebar .group-label .large {
+  font-family: var(--font-sans);
+  font-size: var(--text-label);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text1);
+}
+nav.sidebar .top-level > li + li {
+  margin-top: var(--s-3);
+}
+nav.sidebar summary {
+  padding-inline: 0;
+}
+nav.sidebar summary .caret {
+  color: var(--text2);
+}
+nav.sidebar a {
+  border-radius: var(--radius);
+  padding: 0.25rem var(--s-2);
+  font-size: var(--sl-text-sm);
+  line-height: 1.5;
+  color: var(--text1);
+  position: relative;
+  transition: color var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease);
+}
+nav.sidebar a.large {
+  font-size: var(--sl-text-sm);
+  font-weight: 500;
+  color: var(--text1);
+}
+nav.sidebar a:hover,
+nav.sidebar a:focus-visible {
+  color: var(--text0);
+  background: var(--bg2);
+}
+nav.sidebar a[aria-current='page'],
+nav.sidebar a[aria-current='page']:hover,
+nav.sidebar a[aria-current='page']:focus-visible {
+  background: var(--bg3);
+  color: var(--text0);
+  font-weight: 500;
+  box-shadow: inset 2px 0 0 var(--accent); /* selected row: accent left bar, no shadow */
+}
+nav.sidebar .mobile-preferences {
+  border-top: var(--hairline);
+}
+
+/* ---- Right sidebar / table of contents ----------------------------------------------- */
+
+.right-sidebar {
+  border-inline-start: var(--hairline);
+}
+.right-sidebar-panel {
+  padding: var(--s-5) var(--s-4);
+}
+.right-sidebar-panel h2 {
+  font-family: var(--font-sans);
+  font-size: var(--text-label);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text1);
+  line-height: 1.2;
+  margin-bottom: var(--s-2);
+}
+starlight-toc a {
+  --pad-inline: 0.5rem;
+  font-size: var(--sl-text-sm);
+  line-height: 1.45;
+  color: var(--text1);
+  border-radius: var(--radius);
+  transition: color var(--dur-fast) var(--ease);
+}
+starlight-toc a:hover {
+  color: var(--text0);
+}
+starlight-toc a[aria-current='true'] {
+  color: var(--text0);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+mobile-starlight-toc nav {
+  border-bottom: var(--hairline);
+  background: var(--bg1);
+}
+mobile-starlight-toc summary {
+  font-size: var(--sl-text-sm);
+}
+mobile-starlight-toc .dropdown {
+  border: var(--hairline);
+  border-radius: var(--radius);
+  background: var(--bg1);
+  box-shadow: none;
+}
+
+/* ---- Content ------------------------------------------------------------------------- */
+
+.content-panel {
+  padding: var(--s-6) var(--sl-content-pad-x);
+}
+.content-panel + .content-panel {
+  border-top: var(--hairline);
+}
+
+.sl-markdown-content :is(h1, h2):not(:where(.not-content *)) {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: -0.012em;
+  line-height: 1.08;
+}
+.sl-markdown-content h1:not(:where(.not-content *)) {
+  line-height: 1.04;
+}
+.sl-markdown-content :is(h3, h4, h5, h6):not(:where(.not-content *)) {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+.sl-markdown-content :not(h1, h2, h3, h4, h5, h6) + :is(h2):not(:where(.not-content *)) {
+  margin-top: var(--s-7);
+  padding-top: var(--s-5);
+  border-top: var(--hairline);
+}
+.sl-markdown-content :not(h1, h2, h3, h4, h5, h6) + :is(h3, h4):not(:where(.not-content *)) {
+  margin-top: var(--s-6);
+}
+.sl-markdown-content h1 + p:not(:where(.not-content *)) {
+  font-size: var(--step-1);
+  line-height: 1.5;
+  color: var(--text1);
+}
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) code:not(:where(.not-content *)) {
+  font-weight: 400;
+  padding-inline: 0.25em;
+}
+
+.sl-markdown-content code:not(:where(.not-content *)) {
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.0625rem 0.3125rem;
+  margin-block: -0.0625rem;
+  color: var(--text0);
+}
+.sl-markdown-content a code:not(:where(.not-content *)) {
+  color: inherit;
+}
+
+.sl-markdown-content blockquote:not(:where(.not-content *)) {
+  border-inline-start: 2px solid var(--line-strong);
+  padding-inline-start: var(--s-4);
+  color: var(--text1);
+}
+.sl-markdown-content hr:not(:where(.not-content *)) {
+  border-bottom: var(--hairline);
+  margin-block: var(--s-6);
+}
+
+/* Tables: dense rows, uppercase headers, zebra striping, mono numbers */
+.sl-markdown-content table:not(:where(.not-content *)) {
+  font-size: var(--sl-text-sm);
+  border: var(--hairline);
+  border-radius: var(--radius);
+  width: fit-content;
+  max-width: 100%;
+}
+.sl-markdown-content thead:not(:where(.not-content *)) {
+  background: var(--bg3);
+}
+.sl-markdown-content th:not(:where(.not-content *)) {
+  font-size: var(--text-label);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text1);
+  white-space: nowrap;
+}
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+  padding: 0.375rem var(--s-3);
+  border-bottom: var(--hairline);
+}
+.sl-markdown-content :is(th:first-child, td:first-child):not(:where(.not-content *)) {
+  padding-inline-start: var(--s-3);
+}
+.sl-markdown-content :is(th:last-child, td:last-child):not(:where(.not-content *)) {
+  padding-inline-end: var(--s-3);
+}
+.sl-markdown-content tbody tr:nth-child(even):not(:where(.not-content *)) {
+  background: var(--zebra);
+}
+.sl-markdown-content tbody tr:last-child td:not(:where(.not-content *)) {
+  border-bottom: 0;
+}
+.sl-markdown-content td code:not(:where(.not-content *)) {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+/* Asides: flat panel with a 2 px meaning-coloured bar */
+.sl-markdown-content .starlight-aside {
+  border: var(--hairline);
+  border-inline-start: 2px solid var(--sl-color-asides-border);
+  border-radius: var(--radius);
+  padding: var(--s-3) var(--s-4);
+  font-size: var(--sl-text-sm);
+}
+.sl-markdown-content .starlight-aside__title {
+  font-size: var(--text-label);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  gap: var(--s-2);
+}
+.sl-markdown-content .starlight-aside__title svg {
+  font-size: 0.875rem;
+}
+
+/* Details */
+.sl-markdown-content details:not(:where(.not-content *)) {
+  --sl-details-border-color: var(--line-strong);
+  --sl-details-border-color--hover: var(--text1);
+}
+
+/* Steps / cards / link cards from @astrojs/starlight/components */
+.sl-markdown-content .card,
+.sl-link-card {
+  border: var(--hairline);
+  border-radius: var(--radius);
+  background: var(--bg2);
+  box-shadow: none;
+}
+.sl-link-card:hover {
+  background: var(--bg3);
+  border-color: var(--line-strong);
+}
+
+/* Pagination */
+.pagination-links {
+  gap: var(--s-3);
+}
+.pagination-links a {
+  border: var(--hairline);
+  border-radius: var(--radius);
+  padding: var(--s-3) var(--s-4);
+  box-shadow: none;
+  background: var(--bg2);
+  color: var(--text1);
+  font-size: var(--text-label);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  text-decoration: none;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.pagination-links a:hover {
+  background: var(--bg3);
+  border-color: var(--line-strong);
+}
+.pagination-links .link-title {
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  text-transform: none;
+  color: var(--text0);
+  margin-top: var(--s-1);
+}
+.pagination-links svg {
+  color: var(--text2);
+}
+
+/* Footer meta (edit link, last updated) */
+footer .meta {
+  font-size: var(--sl-text-sm);
+  color: var(--text1);
+}
+
+/* Banner */
+.sl-banner {
+  background: var(--bg2);
+  color: var(--text0);
+  border-bottom: var(--hairline);
+  box-shadow: none;
+  font-size: var(--sl-text-sm);
+}
+
+/* ---- Hero (splash template) ---------------------------------------------------------- */
+
+[data-has-hero] .main-pane {
+  background: radial-gradient(ellipse 80% 55% at 30% 0%, var(--bg1) 0%, var(--bg0) 100%);
+}
+.hero {
+  gap: var(--s-6);
+  padding-block: var(--s-7) var(--s-6);
+}
+.hero .stack {
+  text-align: start;
+  gap: var(--s-5);
+}
+.hero .copy {
+  align-items: flex-start;
+  gap: var(--s-4);
+}
+.hero h1 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: var(--step-5);
+  line-height: 1.02;
+  letter-spacing: -0.018em;
+  color: var(--text0);
+  max-width: 18ch;
+}
+.hero .tagline {
+  font-size: var(--step-1);
+  line-height: 1.5;
+  color: var(--text1);
+  max-width: 54ch;
+}
+.hero .actions {
+  justify-content: flex-start;
+  gap: var(--s-3);
+}
+@media (min-width: 50rem) {
+  .hero {
+    padding-block: var(--s-9) var(--s-8);
+  }
+}
+
+/* Link buttons (hero actions) → Button styles */
+.sl-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 2rem;
+  padding: 0 var(--s-3);
+  border: var(--hairline-strong);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text0);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 1;
+  text-decoration: none;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.sl-link-button svg {
+  font-size: 0.875rem;
+  color: var(--text1);
+}
+.sl-link-button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.sl-link-button.primary svg {
+  color: var(--on-accent);
+}
+.sl-link-button.primary:hover {
+  background: color-mix(in srgb, var(--accent) 86%, white);
+  border-color: color-mix(in srgb, var(--accent) 86%, white);
+}
+.sl-link-button.secondary:hover,
+.sl-link-button.minimal:hover {
+  background: var(--bg3);
+  border-color: var(--text2);
+}
+.sl-link-button.minimal {
+  padding-inline: var(--s-3);
+}
+
+/* ---- Expressive Code frames ---------------------------------------------------------- */
+
+.expressive-code {
+  --ec-brdRad: 1px; /* + 1 px border = 2 px outer radius */
+  --ec-brdWd: 1px;
+  --ec-brdCol: var(--line);
+  --ec-codeBg: var(--bg1);
+  --ec-codeFontSize: var(--sl-text-code);
+  --ec-codeLineHt: 1.6;
+  --ec-codePadBlk: var(--s-3);
+  --ec-codePadInl: var(--s-4);
+  --ec-gtrFg: var(--text2);
+  --ec-gtrBrdCol: var(--line);
+  --ec-uiFontFml: var(--font-mono);
+  --ec-uiFontSize: 0.75rem;
+  --ec-focusBrd: var(--accent);
+  --ec-sbThumbCol: var(--line-strong);
+  --ec-sbThumbHoverCol: var(--text2);
+  --ec-frm-edBg: var(--bg1);
+  --ec-frm-edTabBarBg: var(--bg2);
+  --ec-frm-edTabBarBrdCol: var(--line);
+  --ec-frm-edTabBarBrdBtmCol: var(--line);
+  --ec-frm-edActTabBg: var(--bg1);
+  --ec-frm-edActTabFg: var(--text0);
+  --ec-frm-edActTabBrdCol: var(--line);
+  --ec-frm-edActTabIndTopCol: var(--accent);
+  --ec-frm-edActTabIndHt: 2px;
+  --ec-frm-edTabBrdRad: 0px;
+  --ec-frm-trmBg: var(--bg1);
+  --ec-frm-trmTtbBg: var(--bg2);
+  --ec-frm-trmTtbFg: var(--text1);
+  --ec-frm-trmTtbBrdBtmCol: var(--line);
+  --ec-frm-trmTtbDotsFg: transparent; /* no drawn window chrome */
+  --ec-frm-trmTtbDotsOpa: 0;
+  --ec-frm-inlBtnFg: var(--text0);
+  --ec-frm-inlBtnBg: var(--bg3);
+  --ec-frm-inlBtnBgIdleOpa: 1;
+  --ec-frm-inlBtnBgHoverOrFocusOpa: 1;
+  --ec-frm-inlBtnBgActOpa: 1;
+  --ec-frm-inlBtnBrd: var(--line-strong);
+  --ec-frm-inlBtnBrdOpa: 1;
+  --ec-frm-tooltipSuccessBg: var(--bg3);
+  --ec-frm-tooltipSuccessFg: var(--text0);
+  --ec-frm-frameBoxShdCssVal: none;
+  --ec-tm-markBg: color-mix(in srgb, var(--text0) 7%, transparent);
+  --ec-tm-markBrdCol: var(--line-strong);
+  --ec-tm-insBg: color-mix(in srgb, var(--ok) 14%, transparent);
+  --ec-tm-insBrdCol: var(--ok);
+  --ec-tm-insDiffIndCol: var(--ok);
+  --ec-tm-delBg: color-mix(in srgb, var(--danger) 14%, transparent);
+  --ec-tm-delBrdCol: var(--danger);
+  --ec-tm-delDiffIndCol: var(--danger);
+  --ec-tm-lineMarkerAccentWd: 2px;
+  --ec-tm-inlMarkerBrdWd: 1px;
+  --ec-tm-inlMarkerBrdRad: var(--radius);
+}
+.expressive-code .frame .header {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+}
+.expressive-code .frame.is-terminal .header {
+  justify-content: flex-start;
+  padding-inline: var(--s-4);
+  color: var(--text1);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  font-size: var(--text-label);
+}
+.expressive-code .frame.is-terminal .header::before {
+  display: none;
+}
+/* Copy button: 2 px radius, token colours, hidden until hover / keyboard focus, always
+ * visible where there is no hover (touch). */
+.expressive-code .copy button {
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: var(--radius);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease);
+}
+.expressive-code .copy button::after {
+  margin: 0.375rem;
+}
+.expressive-code .frame:hover .copy button,
+.expressive-code .copy button:focus-visible,
+.expressive-code .copy .feedback.show ~ button {
+  opacity: 1;
+}
+.expressive-code .copy button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.expressive-code .copy .feedback {
+  border: var(--hairline-strong);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+@media (hover: none) {
+  .expressive-code .copy button {
+    opacity: 1;
+  }
+}
+
+/* ---- Misc ---------------------------------------------------------------------------- */
+
+.sl-skip-link {
+  border-radius: var(--radius);
+}
+kbd {
+  font-family: var(--font-mono);
+}

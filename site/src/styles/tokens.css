@@ -1,1 +1,88 @@
-/* Design tokens and dark-only theme. Filled in by the theme task. */
+/* Hallmark · genre: modern-minimal (ops console) · theme: custom "Brahma console" · macrostructure: Workbench
+ * paper: dark (bg0 #0E1217) · display: classical-serif (Instrument Serif, roman) · accent: cool (blue 215°)
+ * Hallmark · pre-emit critique: P5 H4 E4 S5 R5 V4
+ *
+ * Design tokens. Values are verbatim from docs/superpowers/specs/2026-10-20-visual-design.md;
+ * see site/docs/design-system.md for the rules. Dark only — there is no light theme.
+ */
+:root {
+  /* Surfaces, darkest → lightest */
+  --bg0: #0e1217; /* page */
+  --bg1: #141a21; /* header, sidebar, code */
+  --bg2: #1a2129; /* panels */
+  --bg3: #212a33; /* panel headers, table headers, hover */
+  --bg4: #2a3540; /* selected */
+  --zebra: #1d252e;
+
+  /* Hairlines */
+  --line: #2f3a45;
+  --line-strong: #3d4a57;
+
+  /* Text */
+  --text0: #e6ebf0;
+  --text1: #a7b3bf;
+  --text2: #6e7c89; /* tertiary: never body copy, see design-system.md */
+  --text-link: #4c90f0; /* AA on bg0–bg3 for text; numerically the `ready` blue */
+  --on-accent: #ffffff; /* text on --accent (4.72:1) */
+
+  /* Accent — selection, focus, primary buttons only */
+  --accent: #2d72d2;
+  --accent-dim: #1f4f91;
+
+  /* Status — colour carries meaning only */
+  --ok: #32a467; /* running / success */
+  --ready: #4c90f0;
+  --danger: #e76a6e; /* blocked / danger */
+  --warn: #ec9a3c;
+  --sleep: #6e7c89;
+  --killed: #404854;
+
+  /* Shape */
+  --radius: 2px;
+  --hairline: 1px solid var(--line);
+  --hairline-strong: 1px solid var(--line-strong);
+
+  /* Spacing scale, 4 px base */
+  --s-1: 0.25rem; /*  4 */
+  --s-2: 0.5rem; /*  8 */
+  --s-3: 0.75rem; /* 12 */
+  --s-4: 1rem; /* 16 */
+  --s-5: 1.5rem; /* 24 */
+  --s-6: 2rem; /* 32 */
+  --s-7: 3rem; /* 48 */
+  --s-8: 4rem; /* 64 */
+  --s-9: 6rem; /* 96 */
+
+  /* Grid (Home) */
+  --grid-max: 75rem; /* 1200 */
+  --grid-gutter: var(--s-5);
+  --page-pad: var(--s-5);
+
+  /* Type scale — base 14 px on docs, 16 px on hero pages; ratio ≈ 1.25, fluid above --step-1 */
+  --base: 0.875rem;
+  --step--1: 0.75rem; /* 12 */
+  --step-0: var(--base);
+  --step-1: calc(var(--base) * 1.2);
+  --step-2: clamp(1.25rem, 1.15rem + 0.5vw, 1.5rem); /* 20 → 24 */
+  --step-3: clamp(1.5rem, 1.3rem + 1vw, 2rem); /* 24 → 32 */
+  --step-4: clamp(2rem, 1.6rem + 2vw, 3rem); /* 32 → 48 */
+  --step-5: clamp(2.75rem, 2rem + 3.75vw, 5rem); /* 44 → 80 */
+  --text-label: 0.6875rem; /* 11 */
+  --text-chip: 0.625rem; /* 10 */
+  --tracking-label: 0.08em;
+
+  /* Fonts (faces declared in typography.css) */
+  --font-display: 'Instrument Serif', 'Instrument Serif Fallback', Georgia, serif;
+  --font-sans: 'Inter Variable', 'Inter Fallback', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono Fallback', 'Courier New', monospace;
+}
+
+:root[data-has-hero] {
+  --base: 1rem;
+}
+
+@media (max-width: 48em) {
+  :root {
+    --page-pad: var(--s-4);
+  }
+}

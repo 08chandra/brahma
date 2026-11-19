@@ -1,0 +1,62 @@
+---
+/**
+ * Starlight `Footer` override: Starlight's own footer (pagination, edit link, last
+ * updated) followed by a one-line colophon — licence, and a source link only when the
+ * repository is public (`site.repoURL !== ''`).
+ */
+import Default from '@astrojs/starlight/components/Footer.astro';
+import { site } from '../../site.config.ts';
+---
+
+<Default />
+<div class="colophon">
+  <span class="colophon__name">{site.title}</span>
+  <span class="colophon__sep" aria-hidden="true">·</span>
+  <a class="colophon__link" href="/license/">{site.license}</a>
+  {
+    site.repoURL !== '' && (
+      <>
+        <span class="colophon__sep" aria-hidden="true">·</span>
+        <a class="colophon__link" href={site.repoURL} rel="noopener">
+          Source on GitHub
+        </a>
+      </>
+    )
+  }
+</div>
+
+<style>
+  .colophon {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--s-2);
+    margin-top: var(--s-7);
+    padding-top: var(--s-4);
+    border-top: var(--hairline);
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text1);
+  }
+  .colophon__name {
+    font-family: var(--font-sans);
+    font-size: var(--text-label);
+    font-weight: 600;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    color: var(--text1);
+  }
+  .colophon__sep {
+    color: var(--text2);
+  }
+  .colophon__link {
+    color: var(--text1);
+    text-decoration: underline;
+    text-decoration-color: var(--line-strong);
+    text-underline-offset: 3px;
+  }
+  .colophon__link:hover {
+    color: var(--text0);
+    text-decoration-color: var(--text-link);
+  }
+</style>

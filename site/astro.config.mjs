@@ -11,7 +11,14 @@ export default defineConfig({
     starlight({
       title: site.title,
       description: site.description,
-      customCss: ['./src/styles/tokens.css'],
+      // Order matters: tokens → faces/type → Starlight remap → motion. Unlayered, so
+      // these rules beat Starlight's cascade layers.
+      customCss: [
+        './src/styles/tokens.css',
+        './src/styles/typography.css',
+        './src/styles/starlight.css',
+        './src/styles/motion.css',
+      ],
       sidebar: [
         { label: 'Using Brahma', items: [{ autogenerate: { directory: 'docs' } }] },
         { label: 'Inside Brahma', items: [{ autogenerate: { directory: 'internals' } }] },
@@ -25,7 +32,14 @@ export default defineConfig({
       credits: false,
       // Social links are added once site.repoURL is set (public repository).
       social: [],
-      components: {},
+      components: {
+        Head: './src/components/SiteHead.astro',
+        Footer: './src/components/SiteFooter.astro',
+        // Dark only: no theme toggle, and no inline script flipping `data-theme`
+        // to the OS preference.
+        ThemeSelect: './src/components/Empty.astro',
+        ThemeProvider: './src/components/Empty.astro',
+      },
     }),
   ],
 });
