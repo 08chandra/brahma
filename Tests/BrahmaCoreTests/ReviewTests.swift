@@ -2329,10 +2329,18 @@ extension ReviewTests {
         let b = try await submitted(r, files: ["src/second.txt": "y\n"])
         #expect(try r.fresh(b).autoApproved)
         _ = try await r.drive(a)
-        // b's merge rebases it onto the new main; the owner switches auto-merge off before the result is recorded.
+        // b is rebased onto the new main (the engine's candidate build, the branch moved to it, as 3a's step did); the owner
+        // switches auto-merge off before the result is recorded.
         let company = try #require(try r.store.company(id: r.company.id))
-        let result = try #require(try r.store.performMerge(item: try r.fresh(b), company: company, now: r.now))
-        guard case .rebased(let head) = result else { Issue.record("expected a rebase, got \(result)"); return }
+        let git = r.store.gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
+        let verified = try #require(try r.fresh(b).verifiedCommit)
+        let mainHead = try #require(try git.head(of: GitWorkspace.mainRef))
+        guard case .built(let head, _) = try git.buildCandidate(key: b.key, head: verified, onto: mainHead, mergeMessage: nil) else {
+            Issue.record("expected a rebase"); return
+        }
+        #expect(head != verified)
+        try GitFixture(existing: URL(fileURLWithPath: company.workspacePath, isDirectory: true)).git(["update-ref", git.branchRef(key: b.key), head, verified])
+        let result = MergeResult.rebased(head: head)
         #expect(try r.head(b) == head, "the branch carries the rebased commit")
         try r.store.setAutoMerge(false)
         #expect(try r.fresh(b).mergeState == .none)

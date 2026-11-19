@@ -3,7 +3,7 @@ import GRDB
 
 /// The engine's record of where `refs/heads/main` stands. `company.mainCommit` advances only from the engine: the repository
 /// import at creation, its merges of verified and reviewed items, and content the owner accepted (`acceptMainCommit`: the
-/// current head, or a quarantine of the root checkout). A dirty root checkout is never committed (`Store.performMerge`
+/// current head, or a quarantine of the root checkout). A dirty root checkout is never committed (the merge queue
 /// quarantines it). An agent that moves `main` by any other route (a reset, a rewrite, or a fast-forward of unreviewed
 /// commits) makes the head differ from the record; claims and merges are then refused and the owner is alerted until the
 /// owner accepts it. Nothing resolves that alert by itself.

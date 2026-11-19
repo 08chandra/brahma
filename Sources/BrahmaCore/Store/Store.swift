@@ -439,8 +439,8 @@ final class GitOutputLimit: @unchecked Sendable {
     var bytes: Int { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }
 
-/// Tests only: called by a merge with each ref's name right before its stop check (`Store.performMerge`; "" for the check
-/// before anything is done), so a test can raise the owner's stop at exactly that seam.
+/// Tests only: called by the merge queue with each ref's name right before its stop check (`MergeQueue`), so a test can
+/// raise the owner's stop at exactly that seam.
 final class MergeRefProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var body: (@Sendable (String) -> Void)?

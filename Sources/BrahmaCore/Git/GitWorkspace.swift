@@ -23,7 +23,7 @@ public enum GitError: Error, Equatable, CustomStringConvertible, LocalizedError 
 }
 
 /// A failure of a company's merge machinery (main's lock, moving `main`, the engine's merge checkout, a quarantine of the
-/// root checkout), not of the item being merged: it never counts against that item (`Store.noteMergeFailure`).
+/// root checkout), not of the item being merged: it never counts against that item (the queue requeues it uncounted).
 struct MergeInfrastructureError: Error, CustomStringConvertible, LocalizedError {
     let underlying: any Error
     var description: String { "\(underlying)" }

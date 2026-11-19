@@ -314,13 +314,6 @@ import GRDB
         }
     }
 
-    @Test func repeatedMergeFailuresWithdrawQueuedRequest() async throws {
-        let m = try MergeFixture()
-        try await reapprovalIsFresh(m) { i in
-            for _ in 0..<Store.maxMergeFailures { try m.store.noteMergeFailure(itemId: i.id, error: "git said no", now: m.now) }
-        }
-    }
-
     @Test func revokedAutoApprovalWithdrawsQueuedRequest() async throws {
         let m = try MergeFixture(autoMergeSmall: true)
         let i = try m.item("small change", tier: .s)
