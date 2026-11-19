@@ -49,9 +49,11 @@ final class ProcessGroupChild: @unchecked Sendable {
     /// `stdin` (`-1`: `/dev/null`) and `stderr` (nil: `output`) override those two; `newSession` makes it the leader of a new
     /// session as well (`setsid`: a turn's `claude`), which is also its own process group.
     /// Throws a message when it cannot be started.
+    /// `workingDirectoryFD`: an open directory descriptor the child `fchdir`s into instead of `workingDirectory`'s path
+    /// (`SafeGit`: an item worktree held `O_NOFOLLOW`, so no path an agent can retarget is ever resolved for it).
     static func spawn(executable: String, arguments: [String], environment: [String: String], workingDirectory: URL,
                       output: Int32, stdin: Int32 = -1, stderr: Int32? = nil, newSession: Bool = false,
-                      observer: Observer? = nil) throws -> ProcessGroupChild {
+                      workingDirectoryFD: Int32? = nil, observer: Observer? = nil) throws -> ProcessGroupChild {
         #if canImport(Darwin)
         var actions: posix_spawn_file_actions_t? = nil
         var attr: posix_spawnattr_t? = nil
@@ -78,7 +80,16 @@ final class ProcessGroupChild: @unchecked Sendable {
         } else {
             posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
         }
-        posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.path)
+        if let workingDirectoryFD {
+            #if canImport(Darwin)
+            posix_spawn_file_actions_addfchdir_np(&actions, workingDirectoryFD)
+            #else
+            // Before exec (so before close-on-exec), the child's own descriptor table still holds it.
+            posix_spawn_file_actions_addchdir_np(&actions, "/proc/self/fd/\(workingDirectoryFD)")
+            #endif
+        } else {
+            posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.path)
+        }
         var defaults = sigset_t(), mask = sigset_t()
         sigfillset(&defaults); sigemptyset(&mask)
         posix_spawnattr_setsigdefault(&attr, &defaults)
