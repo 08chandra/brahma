@@ -124,6 +124,16 @@ const classes = ['btn', `btn--${variant}`, `btn--${size}`, className];
     outline-offset: 2px;
   }
 
+  /* touch: ≥ 40 px targets on coarse pointers */
+  @media (pointer: coarse) {
+    .btn {
+      --btn-h: 2.75rem;
+    }
+    .btn--sm {
+      --btn-h: 2.5rem;
+    }
+  }
+
   /* disabled */
   .btn:disabled,
   .btn[aria-disabled='true'],

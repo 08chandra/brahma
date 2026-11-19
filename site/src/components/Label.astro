@@ -1,12 +1,12 @@
 ---
 /**
  * Small uppercase tracked label — panel titles, section eyebrows, table headers.
- * 11 px, Inter 600, tracking 0.08em, `text1`. Pass `tone="muted"` for tertiary marks
- * (text2 is below AA for essential text, so use it only for non-essential marks).
+ * 11 px, Inter 600, tracking 0.08em, `text1`. There is no text2 tone: text2 is never a
+ * text colour (below AA at label sizes). `tone="accent"` uses the AA link blue.
  */
 interface Props {
   as?: 'span' | 'div' | 'h2' | 'h3' | 'p' | 'dt' | 'th';
-  tone?: 'default' | 'muted' | 'accent';
+  tone?: 'default' | 'accent';
   class?: string;
   id?: string;
 }
@@ -16,9 +16,6 @@ const { as: Tag = 'span', tone = 'default', class: className, id } = Astro.props
 <Tag class:list={['label', `label--${tone}`, className]} id={id}><slot /></Tag>
 
 <style>
-  .label--muted {
-    color: var(--text2);
-  }
   .label--accent {
     color: var(--text-link);
   }

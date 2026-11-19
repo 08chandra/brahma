@@ -164,6 +164,10 @@ a {
 .site-title:hover {
   color: var(--text0);
 }
+/* Starlight draws a 2 rem divider after the social icons even when `social: []`. */
+.header .social-icons:empty {
+  display: none;
+}
 
 site-search button[data-open-modal] {
   height: 2rem;
@@ -609,7 +613,7 @@ footer .meta {
   --ec-codeLineHt: 1.6;
   --ec-codePadBlk: var(--s-3);
   --ec-codePadInl: var(--s-4);
-  --ec-gtrFg: var(--text2);
+  --ec-gtrFg: var(--text1);
   --ec-gtrBrdCol: var(--line);
   --ec-uiFontFml: var(--font-mono);
   --ec-uiFontSize: 0.75rem;
@@ -702,6 +706,30 @@ footer .meta {
 @media (hover: none) {
   .expressive-code .copy button {
     opacity: 1;
+  }
+}
+
+/* ---- Touch: every control ≥ 40 px on coarse pointers ------------------------------- */
+
+@media (pointer: coarse) {
+  :root {
+    --sl-menu-button-size: 2.75rem;
+  }
+  .sl-link-button {
+    height: 2.75rem;
+  }
+  /* <Button> sizes live in Button.astro (scoped styles outrank this file). */
+  site-search button[data-open-modal] {
+    height: 2.75rem;
+    min-width: 2.75rem;
+  }
+  nav.sidebar a,
+  starlight-toc a {
+    padding-block: 0.625rem;
+  }
+  .expressive-code .copy button {
+    width: 2.5rem;
+    height: 2.5rem;
   }
 }
 

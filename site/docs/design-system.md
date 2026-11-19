@@ -58,12 +58,11 @@ offset 3 px. Primary buttons use white text on `--accent` (4.72:1).
 | text-link #4C90F0 | 5.87 | 5.46 | 5.07 | 4.54 | 3.90 |
 | accent #2D72D2 | 3.98 | 3.71 | 3.44 | 3.08 | 2.65 |
 
-Rules that follow: `text0`/`text1` are fine everywhere for any size. `text2` is below the
-4.5:1 AA threshold for normal text on every surface, so it is never used for body copy or
-labels the reader needs; it is reserved for tertiary metadata set in mono at ≥ 14 px on
-bg0/bg1 (4.1–4.4:1), for disabled states, and for non-text marks (ticks, glyphs, hairline
-captions ≥ 11 px uppercase semibold). `accent` is a UI colour (≥ 3:1 for focus rings and
-borders), never a text colour; text on accent is white.
+Rules that follow: `text0`/`text1` are fine everywhere at any size. `text2` is below the
+4.5:1 AA threshold on every surface, so **it is never a text colour**: use it only for
+non-text marks (ticks, glyphs, icon strokes, separators), disabled states, and large text
+≥ 24 px regular / 18.66 px bold (the 3:1 threshold, met on bg0–bg3). `accent` is a UI colour
+(≥ 3:1 for focus rings, borders, fills), never a text colour; text on accent is white.
 
 ## Motion
 
@@ -74,7 +73,7 @@ stops under `prefers-reduced-motion: reduce`. Focus rings never animate.
 
 ## Components
 
-`<Label>` 11 px uppercase tracked `text1` · `<Panel title>` bg2, 28 px bg3 header strip,
+`<Label>` 11 px uppercase tracked `text1` (no text2 tone) · `<Panel title>` bg2, 28 px bg3 header strip,
 1 px line, radius 2 · `<Chip status>` 18 px, 1 px status border + 15 % fill, 6 px dot,
 `text0` label · `<Button variant="primary|ghost" href>` 32 px (sm 26), radius 2. Every
 control has hover, focus-visible (2 px accent ring, offset 2 px), active, disabled; see `/styleguide`.

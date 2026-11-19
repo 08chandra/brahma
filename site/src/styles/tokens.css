@@ -21,7 +21,7 @@
   /* Text */
   --text0: #e6ebf0;
   --text1: #a7b3bf;
-  --text2: #6e7c89; /* tertiary: never body copy, see design-system.md */
+  --text2: #6e7c89; /* never a text colour: marks, disabled, ≥ 24 px only */
   --text-link: #4c90f0; /* AA on bg0–bg3 for text; numerically the `ready` blue */
   --on-accent: #ffffff; /* text on --accent (4.72:1) */
 

@@ -27,7 +27,7 @@ const lines = [
 const texts = [
   ['text0', '#E6EBF0', 'primary · 15.7:1 on bg0'],
   ['text1', '#A7B3BF', 'secondary · 8.8:1'],
-  ['text2', '#6E7C89', 'tertiary · 4.4:1, never body copy'],
+  ['text2', '#6E7C89', 'non-text marks only · 4.4:1'],
   ['text-link', '#4C90F0', 'links · 5.9:1'],
 ];
 const accents = [
@@ -95,7 +95,7 @@ brahma status            # roster, usage, approvals`;
             ['Status', statuses],
           ].map(([group, list]) => (
             <div class="sg__swatch-group">
-              <Label as="h3" tone="muted">{group}</Label>
+              <Label as="h3">{group}</Label>
               <ul class="sg__swatches">
                 {(list as string[][]).map(([name, hex, use]) => (
                   <li class="sg__swatch">
@@ -238,8 +238,7 @@ brahma status            # roster, usage, approvals`;
         <Panel title="Label">
           <div class="sg__labels">
             <Label>default · text1</Label>
-            <Label tone="muted">muted · text2 (marks only)</Label>
-            <Label tone="accent">accent · text-link</Label>
+                        <Label tone="accent">accent · text-link</Label>
           </div>
         </Panel>
 
