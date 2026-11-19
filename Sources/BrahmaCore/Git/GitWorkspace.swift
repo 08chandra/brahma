@@ -145,7 +145,8 @@ struct GitCommand: Sendable {
     /// Variables added to the child's environment after `ChildEnvironment`'s allowlist and before the pinned ones (`GIT_DIR`,
     /// the config and prompt switches), which win: a caller may add (`SafeGit`: `GIT_LITERAL_PATHSPECS=1`), never override.
     var extraEnvironment: [String: String] = [:]
-    /// `-c key=value` pairs added after `configFlags` (`SafeGit`: `core.untrackedCache=false`, `core.excludesFile=/dev/null`).
+    /// `-c key=value` pairs added BEFORE `configFlags`, so a later hardened flag always wins (add, never override; `SafeGit`:
+    /// `core.untrackedCache=false`, `core.excludesFile=/dev/null`).
     var extraConfig: [String] = []
 
     static let timeout: TimeInterval = 60
@@ -281,7 +282,7 @@ struct GitCommand: Sendable {
 
     /// `attrSource`: the tree attributes are read from (the empty tree of the repository's hash), nil on an older git.
     func arguments(_ args: [String], attrSource: String?) -> [String] {
-        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + Self.configFlags + extraConfig
+        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + extraConfig + Self.configFlags
             + (allowsLocalFetch ? ["-c", "protocol.file.allow=always"] : [])
             + (allowsHTTPSFetch ? ["-c", "protocol.https.allow=always"] : []) + args
     }

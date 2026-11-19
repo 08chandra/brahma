@@ -29,6 +29,7 @@ import Foundation
             case "cat-file": text = args.contains("-s") ? "5\n" : "hello"
             case "log", "rev-list", "merge-base": text = Self.sha + "\n"
             case "hash-object": text = Self.sha + "\n"
+            case "ls-files": text = "src/a.txt\u{0}"
             default: text = ""
             }
             return (0, Data(text.utf8), Data())
@@ -70,8 +71,9 @@ import Foundation
         try git.updateShareRef("m1", to: sha)
         try git.deleteShareRef("m1")
         try git.expireAndPrune()
+        _ = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: sha, tempDir: try tempDir(), fs: r.fs)
         let calls = runner.calls
-        #expect(calls.count >= 14)
+        #expect(calls.count >= 22)
         let gitDir = r.root.appending(path: ".git").path
         for call in calls {
             let a = call.args, env = call.env
@@ -88,7 +90,7 @@ import Foundation
                 #expect(a.contains("--no-textconv") && a.contains("--no-ext-diff"), "\(a)")
             }
             // Every rev follows `--end-of-options`; every path follows `--`.
-            if let revIndex = a.firstIndex(where: { $0.contains(sha) }), !a.contains("update-ref") {
+            if let revIndex = a.firstIndex(where: { $0.contains(sha) }) {
                 let end = a.firstIndex(of: "--end-of-options")
                 #expect(end != nil && end! < revIndex, "\(a)")
             }
@@ -96,9 +98,30 @@ import Foundation
                 let dashes = a.firstIndex(of: "--")
                 #expect(dashes != nil && dashes! < pathIndex, "\(a)")
             }
-            #expect(call.outputCap == SafeGit.outputCap && call.timeout == SafeGit.timeout)
+            #expect(call.outputCap == SafeGit.outputCap && call.timeout <= SafeGit.timeout)
         }
         #expect(calls.contains { $0.args.contains("update-ref") && $0.args.contains("refs/brahma/shares/m1") })
+        // worktreeDiff's own processes went the same way: read-tree, ls-files, one hash-object over engine copies, update-index,
+        // diff --cached.
+        func has(_ parts: [String]) -> Bool { calls.contains { c in parts.allSatisfy(c.args.contains) } }
+        #expect(has(["read-tree", "--end-of-options", sha]))
+        #expect(has(["ls-files", "--others", "--exclude-standard"]))
+        #expect(has(["hash-object", "-w", "--no-filters", "--stdin-paths"]))
+        #expect(has(["update-index", "--index-info"]))
+        #expect(has(["diff", "--cached", "--numstat"]) && has(["diff", "--cached", "-p"]))
+        #expect(!calls.contains { $0.args.contains("hash-object") && $0.args.contains(where: { $0.hasSuffix("src/a.txt") }) },
+                "hash-object was given an agent path")
+        #expect(calls.contains { $0.args.contains("repack") && $0.args.contains("-a") && $0.args.contains("-d") })
+        #expect(!calls.contains { $0.args.contains("reflog") && $0.args.contains("--all") }, "reflog expiry must stay on share refs")
+    }
+
+    /// M3: a caller's `extraConfig` is added before `configFlags`, so a hardened flag always wins.
+    @Test func extraConfigCannotOverrideHardening() throws {
+        var g = GitCommand(gitDir: URL(fileURLWithPath: "/x/.git"), workTree: URL(fileURLWithPath: "/x"), commonDir: nil)
+        g.extraConfig = ["-c", "core.hooksPath=/evil", "-c", "core.untrackedCache=false"]
+        let a = g.arguments(["status"], attrSource: nil)
+        let evil = a.firstIndex(of: "core.hooksPath=/evil"), hard = a.lastIndex(of: "core.hooksPath=/dev/null")
+        #expect(evil != nil && hard != nil && evil! < hard!, "\(a)")
     }
 
     @Test func craftedAttributesFilterAndTextconvNotRun() throws {
@@ -216,11 +239,8 @@ import Foundation
         runner.delay = 0
         runner.respond = { _ in (0, Data(repeating: UInt8(ascii: "a"), count: 9 << 20), Data()) }
         #expect(throws: SafeGitError.outputTooLarge) { try git.head("main") }
-        // The live runner, through `GitCommand`: a git that outlives the injected timeout is killed and reported the same way
-        // (the alias sleeps far longer than any load-delayed timer, so the kill always comes first).
-        let r = try Repo()
-        let live = SafeGit(workspace: r.root, timeout: .milliseconds(200))
-        #expect(throws: SafeGitError.timedOut) { try live.testOnlyRun(["-c", "alias.zz=!sleep 30", "zz"]) }
+        // The live runner's kill is `GitCommand`'s timer (3a's tests); under the full suite's load that dispatch timer can be
+        // starved for longer than any sleeping alias here, so no live leg: the seam's mapping is what this test owns.
     }
 
     @Test func worktreeDiffAgainstBase() throws {
@@ -275,6 +295,7 @@ import Foundation
         #expect(throws: SafeGitError.badRef) { try git.updateShareRef("-x", to: main) }
         #expect(throws: SafeGitError.badRef) { try git.deleteShareRef("a/b") }
         #expect(throws: SafeGitError.badRev) { try git.updateShareRef("ok", to: "main") }
+        #expect(throws: SafeGitError.badRev, "an abbreviation is not a verified id") { try git.updateShareRef("ok", to: String(main.prefix(12))) }
         try git.updateShareRef("ok", to: main)
         #expect(try r.f.git(["rev-parse", "refs/brahma/shares/ok"]) == main)
         #expect(try r.head("main") == main)
@@ -284,10 +305,14 @@ import Foundation
         let tree = try r.f.git(["rev-parse", "\(main)^{tree}"])
         let secret = try r.f.git(["commit-tree", tree, "-m", "secret"])
         try git.updateShareRef("s", to: secret)
+        try r.f.git(["repack", "-a", "-d", "-q"])     // an agent's gc may have packed it: a packed copy must die too
         try git.expireAndPrune()
         #expect(try r.f.git(["cat-file", "-e", secret]) == "", "still reachable through the share ref")
+        let itemReflog = try r.f.git(["reflog", "show", "refs/heads/item/ENG-1"])
+        try #require(!itemReflog.isEmpty)
         try git.deleteShareRef("s")
         try git.expireAndPrune()
+        #expect(try r.f.git(["reflog", "show", "refs/heads/item/ENG-1"]) == itemReflog, "an item branch's reflog was expired")
         #expect(try r.f.git(["cat-file", "-e", secret], allowFailure: true) == "")
         #expect(throws: (any Error).self, "the purged object is still in the repository") { try r.f.git(["cat-file", "-e", secret]) }
         #expect(try r.f.git(["cat-file", "-e", main]) == "", "a reachable commit survived")
@@ -318,6 +343,112 @@ import Foundation
         #expect(SafeGitError.tooManyChanges(files: 2001, bytes: 0).description == "too many/too large changes to diff (2001 files, 0 MB)")
         #expect(!runner.calls.contains { $0.args.contains("hash-object") })
         #expect(SafeGit.maxDiffFiles == 2000 && SafeGit.maxDiffBytes == 200 << 20)
+        // A flood of untracked names past git's output cap is the same refusal, never `.outputTooLarge`.
+        let flood = RecordingRunner()
+        flood.respond = { args in args.contains("ls-files") ? (0, Data(repeating: UInt8(ascii: "a"), count: 9 << 20), Data()) : (0, Data(), Data()) }
+        #expect(throws: SafeGitError.tooManyChanges(files: 0, bytes: 0)) {
+            try SafeGit(workspace: r.root, runner: flood).worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs)
+        }
+    }
+
+    /// The descriptors of this process whose kernel path lies under `dir` (other tests' descriptors never do).
+    static func descriptors(under dir: URL) -> [String] {
+        let prefix = realpath(dir.path, nil).map { p in defer { free(p) }; return String(cString: p) } ?? dir.path
+        var found: [String] = []
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd")) ?? [] {
+            guard let fd = Int32(name) else { continue }
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            guard fcntl(fd, F_GETPATH, &buffer) == 0 else { continue }
+            let path = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            if path == prefix || path.hasPrefix(prefix + "/") { found.append(path) }
+        }
+        return found
+    }
+
+    /// Looks at the worktree's open descriptors right before the one hashing process runs.
+    final class ProbingRunner: GitProcessRunning, @unchecked Sendable {
+        private let live = LiveGitRunner()
+        let worktree: URL
+        private(set) var atHashing: [String]?
+        init(worktree: URL) { self.worktree = worktree }
+        func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+            if args.contains("hash-object") { atHashing = SafeGitTests.descriptors(under: worktree) }
+            return try live.run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap)
+        }
+    }
+
+    /// I1: descriptors are released per path: a diff of more files than a 256 `maxfiles` limit allows works, no worktree file
+    /// is open when the hashing process runs, and none is left open afterwards.
+    @Test func worktreeDiffHoldsOneDescriptorAtATime() throws {
+        let r = try Repo()
+        for n in 1...300 { try r.f.write("many/f\(n).txt", "\(n)\n", in: r.wt) }
+        let runner = ProbingRunner(worktree: r.wt)
+        let diff = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(diff.files.count == 300 && diff.blobShas.count == 300)
+        #expect(runner.atHashing == [], "worktree descriptors still open at the hashing step: \(runner.atHashing ?? ["(no hashing ran)"])")
+        #expect(Self.descriptors(under: r.wt) == [], "worktree descriptors left open after the call")
+    }
+
+    /// Runs `inner` (call B) once, right before the first `hash-object` of the call it serves (call A), then forwards to git.
+    final class Interleaver: GitProcessRunning, @unchecked Sendable {
+        private let live = LiveGitRunner()
+        private let lock = NSLock()
+        var inner: (@Sendable () throws -> SafeGit.WorktreeDiff)?
+        private(set) var innerResult: SafeGit.WorktreeDiff?
+        private(set) var innerError: (any Error)?
+        func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+            let body: (@Sendable () throws -> SafeGit.WorktreeDiff)? = lock.withLock { let b = inner; inner = nil; return b }
+            if args.contains("hash-object"), let body {
+                do { let result = try body(); lock.withLock { innerResult = result } } catch { lock.withLock { innerError = error } }
+            } else if let body {
+                lock.withLock { inner = body }
+            }
+            return try live.run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap)
+        }
+    }
+
+    /// I2: two calls on the same key and `tempDir`, one running inside the other's hashing step, keep their own copies and ids.
+    @Test func worktreeDiffCallsAreIndependent() throws {
+        let r = try Repo()
+        let shared = try tempDir()
+        let file = r.wt.appending(path: "shared.txt")
+        try "first\n".write(to: file, atomically: true, encoding: .utf8)
+        let firstSha = try r.f.git(["hash-object", "shared.txt"], in: r.wt)
+        let runner = Interleaver()
+        let root = r.root, wt = r.wt, fs = r.fs
+        runner.inner = {
+            // Call B: the file changes, and B runs to completion (its own call directory) while A waits to hash its copies.
+            try "second\n".write(to: file, atomically: true, encoding: .utf8)
+            return try SafeGit(workspace: root).worktreeDiff(key: "ENG-1", worktree: wt, tempDir: shared, fs: fs)
+        }
+        let a = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: shared, fs: r.fs)
+        if let e = runner.innerError { Issue.record("call B failed: \(e)") }
+        let b = try #require(runner.innerResult)
+        #expect(a.blobShas["shared.txt"] == firstSha, "A reported B's bytes")
+        #expect(b.blobShas["shared.txt"] == (try r.f.git(["hash-object", "shared.txt"], in: r.wt)))
+        #expect(a.patch.contains("+first") && b.patch.contains("+second"))
+        // Nothing of either call is left in the shared directory.
+        #expect(try FileManager.default.contentsOfDirectory(atPath: shared.path).isEmpty)
+    }
+
+    /// I3: the worktree root git is pointed at must be the directory SafeFS holds for the key; a swapped entry is refused and
+    /// nothing from the link's target reaches the error.
+    @Test func worktreeDiffRefusesSwappedWorktree() throws {
+        let r = try Repo()
+        let git = SafeGit(workspace: r.root)
+        let main = try r.head("main")
+        let other = try tempDir().appending(path: "elsewhere", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try "leak".write(to: other.appending(path: "SECRET-NAME.txt"), atomically: true, encoding: .utf8)
+        // A worktree URL that is not `.brahma/wt/<key>` is refused before any git runs.
+        #expect(throws: SafeGitError.self) { try git.worktreeDiff(key: "ENG-1", worktree: other, against: main, tempDir: try tempDir(), fs: r.fs) }
+        // The agent swaps its worktree entry for a link.
+        try FileManager.default.moveItem(at: r.wt, to: r.wt.appendingPathExtension("moved"))
+        try FileManager.default.createSymbolicLink(at: r.wt, withDestinationURL: other)
+        var text = ""
+        do { _ = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs); Issue.record("not refused") }
+        catch { text = "\(error)" }
+        #expect(!text.isEmpty && !text.contains("SECRET-NAME") && !text.contains(other.path), "\(text)")
     }
 
     @Test func worktreeDiffRefusesTooManyBytes() throws {
