@@ -239,12 +239,13 @@ public actor Orchestrator {
         restoreHooks.register(afterRestore: { _ in try MemoryIngest.resetCursors(store: store) })
         // Plan 4a Task 3: the engine's restore step re-affirms the record of a company whose `main` is exactly what the restored
         // database recorded (`takeUpRestore` runs the hooks for those only; a stale pending head goes, 3a's alert closes). It
-        // adopts nothing else (B6): a head the restored database did not record is the main guard's to restore. Git: in a
+        // adopts nothing else and never moves `main` (B6, I2: `adoptMain(by: .system)` re-affirms the live head only when it is
+        // the record, else refuses): a head the restored database did not record is the main guard's to restore. Git: in a
         // Blocking body.
         let blocking = self.blocking
         restoreHooks.register(afterRestore: { event in
             guard let head = event.mainHead, try store.company(id: event.companyId)?.mainCommit == head else { return }
-            try await blocking.tryRun { try store.adoptMain(companyId: event.companyId, by: .system, commit: head) }
+            _ = try await blocking.tryRun { try store.adoptMain(companyId: event.companyId, by: .system) }
         })
     }
 

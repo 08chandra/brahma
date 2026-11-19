@@ -241,8 +241,9 @@ public final class Store: Sendable {
                 // The engine's git output for this init goes under the data home (A-I1b), never the shared per-user temp dir.
                 let git = GitWorkspace(root: dir, exportHome: dataHome)
                 try git.ensureRepo()
-                // The head the engine expects `main` to have; every claim checks it is still an ancestor of the real one.
-                if let head = try git.head(of: GitWorkspace.mainRef) {
+                // The head the engine expects `main` to have (the engine's one automatic record, Plan 4a B6); a symbolic `main` is
+                // never the engine's and is not recorded: the main guard alerts the owner, who adopts a plain branch.
+                if let head = try git.head(of: GitWorkspace.mainRef), try !git.mainIsSymbolic() {
                     try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [head, company.id])
                     company.mainCommit = head
                 }

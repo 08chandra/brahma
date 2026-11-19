@@ -200,16 +200,16 @@ extension Store {
     }
 
     /// One alert per company however often the merge is retried; it resolves itself when the checkout is back on `main`.
-    func raiseMainHeadAlert(company: Company, ref: String?) throws {
+    func raiseMainHeadAlert(company: Company, ref: String?, now: Date = Store.now()) throws {
         let reason = Self.mainHeadAlertReason(company.id)
         let open = try writer.read { db in
             try Ask.filter(Column("kind") == AskKind.engineAlert && Column("status") == AskStatus.pendingOwner.rawValue
-                           && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
+                           && Column("subjectId") == Store.engineAlertKey(reason) && Column("companyId") == company.id).fetchCount(db)
         }
         guard open == 0 else { return }
         try EngineAlerts.raise(
             store: self, text: "\(company.name): main checkout is on \(ref ?? "a detached HEAD"); switch it back to main. "
-                + "Brahma merges nothing there until you do.", now: Store.now(), reason: reason)
+                + "Brahma merges nothing there until you do.", now: now, reason: reason, companyId: company.id)
     }
 
     // MARK: Recording

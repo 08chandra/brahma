@@ -187,8 +187,8 @@ extension Orchestrator {
                 }
             } else {
                 let shown = reading.recorded.map { String($0.prefix(12)) } ?? "none"
-                failure = "main is not the commit the restore recorded (\(shown)), so nothing was adopted; "
-                    + "review main, then accept it (brahma main accept)"
+                failure = "main is not the commit the restore recorded (\(shown)), so nothing was adopted; the main guard restores main "
+                    + "to it and saves the other tip under refs/brahma/foreign/ (brahma merge adopt-main \(company.name) <ref> if that tip was yours)"
             }
             let lines = record.notes.map { "restore: \($0)" }
                 + [failure.map { "restored from \(record.snapshot); \($0)" } ?? "restored from \(record.snapshot); repos re-adopted"]

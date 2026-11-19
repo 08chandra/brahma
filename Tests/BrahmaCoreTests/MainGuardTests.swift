@@ -165,6 +165,7 @@ import GRDB
         let notice = try #require(try m.store.allNotices().last { $0.title == "main restored" })
         #expect(notice.body.contains(text))
         #expect(notice.body.contains("Run brahma merge adopt-main Acme if that change was yours."))
+        #expect(notice.body.contains("(\(ref) is \(foreign))"), "the notice names the saved commit: \(notice.body)")
         // 3a's "main changed outside Brahma" alert, if any, is gone with the restore; nothing else is open.
         #expect(try openAlerts(m, reason: Store.mainAlertReason(m.company.id)).isEmpty)
         #expect(try openAlerts(m, reason: Store.mainHeadAlertReason(m.company.id)).isEmpty)
@@ -252,6 +253,7 @@ import GRDB
 
     @Test func rootOffMainRestoredByRefOnly() throws {
         let m = try MergeFixture()
+        let beta = try m.world.company("Beta")
         let before = try main(m)
         let f = fixture(m)
         try f.git(["checkout", "--quiet", "-b", "x"])
@@ -277,7 +279,51 @@ import GRDB
         #expect(alerts.first?.summary.contains("main checkout is on refs/heads/x; switch it back to main") == true, "\(alerts)")
         #expect(try m.activity(.error).contains { $0.text.contains("main checkout is on refs/heads/x; switch it back to main") })
         #expect(try mergeActivity(m).contains(restoredText(before, ref: ref)))
+        // B4: the other company hears nothing of it (no ask, no activity, no DM).
+        let betaAsks = try m.store.writer.read { db in try Ask.filter(Column("companyId") == beta.id && Column("kind") == AskKind.engineAlert).fetchCount(db) }
+        #expect(betaAsks == 0)
+        #expect(try m.store.events(afterId: 0, limit: 500).filter { $0.companyId == beta.id }.allSatisfy { !$0.text.contains("main checkout is on") })
+        let betaDMs = try m.store.writer.read { db in
+            try Message.filter(Column("companyId") == beta.id && Column("senderId") == "system").fetchAll(db).filter { $0.text.contains("main checkout is on") }.count
+        }
+        #expect(betaDMs == 0)
     }
+
+    /// A detached root: still ref-only, and the alert says so.
+    @Test func rootDetachedRestoredByRefOnly() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        let f = fixture(m)
+        try f.git(["checkout", "--quiet", "--detach"])
+        try f.write("wip.txt", "uncommitted while detached")
+        let foreign = try f.git(["commit-tree", "\(before)^{tree}", "-p", before, "-m", "made elsewhere"])
+        try f.git(["update-ref", "refs/heads/main", foreign])
+        guard case .restored(let ref, let to) = try check(m) else { Issue.record("expected a restore"); return }
+        #expect(to == before); #expect(try main(m) == before)
+        #expect(try m.ws.head(of: ref) == foreign)
+        #expect(try f.git(["symbolic-ref", "--quiet", "HEAD"], allowFailure: true).isEmpty, "still detached")
+        #expect(try f.git(["rev-parse", "HEAD"]) == before)
+        #expect(try String(contentsOf: m.root.appending(path: "wip.txt"), encoding: .utf8) == "uncommitted while detached")
+        let alerts = try openAlerts(m, reason: Store.mainHeadAlertReason(m.company.id))
+        #expect(alerts.first?.summary.contains("main checkout is on a detached HEAD; switch it back to main") == true, "\(alerts)")
+    }
+
+    /// M4: `pendingMainCommit` is written only by the engine's own moves (the queue's journaled landing, the owner's accept) and
+    /// cleared on every failure path; a `main` standing exactly there is the engine's crash record, and 3a's `checkMain` records it.
+    @Test func pendingHeadFromTheEnginesOwnMoveIsRecorded() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        let next = try foreignCommit(m, file: "landing.txt", message: "what the engine was landing")
+        try m.exec("UPDATE company SET pendingMainCommit = ? WHERE id = ?", [next, m.company.id])
+        #expect(try check(m) == .ok)
+        #expect(try recorded(m) == next)
+        #expect(try m.store.company(id: m.company.id)?.pendingMainCommit == nil)
+        #expect(try main(m) == next)
+        #expect(try f(m).git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty)
+        _ = before
+    }
+
+    func f(_ m: MergeFixture) -> GitFixture { fixture(m) }
 
     @Test func foreignRefNamesAreUnique() throws {
         let m = try MergeFixture()
@@ -309,6 +355,55 @@ import GRDB
         try m.store.resumeAfterStop(now: m.now)
         guard case .restored(_, let to) = try check(m) else { Issue.record("expected a restore"); return }
         #expect(to == before); #expect(try main(m) == before)
+    }
+
+    /// C1: while a restore the engine has not taken up names the company (an unconsumed `restoreEvent` and its marker), the
+    /// restore step decides first; the guard looks at `main` on a later tick.
+    @Test func guardSkipsWhileARestoreIsPending() async throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        let foreign = try foreignCommit(m)
+        let nonce = try await m.store.writer.write { db in try BackupService.recordRestoreEvent(db, snapshot: "snap.sqlite", now: m.now) }
+        let marker = BackupService.restoreMarker(paths: m.world.paths)
+        try BrahmaPaths.ensurePrivateDirectory(marker.deletingLastPathComponent())
+        try RestoreMarker.write(nonce: nonce, to: marker)
+        #expect(try check(m) == .skipped)
+        #expect(try main(m) == foreign, "nothing moved")
+        #expect(try f(m).git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty)
+        // The restore is taken up (the event consumed): the guard acts.
+        try m.exec("UPDATE restoreEvent SET consumedAt = ? WHERE nonce = ?", [m.now, nonce])
+        guard case .restored(_, let to) = try check(m) else { Issue.record("expected a restore"); return }
+        #expect(to == before); #expect(try main(m) == before)
+        // An unconsumed event whose marker is gone can never be taken up: it does not hold the guard.
+        let again = try foreignCommit(m, file: "again.txt", message: "again")
+        _ = try await m.store.writer.write { db in try BackupService.recordRestoreEvent(db, snapshot: "snap2.sqlite", now: m.now) }
+        #expect(try check(m, now: m.now.addingTimeInterval(1)) == .skipped)
+        #expect(try main(m) == again)
+        try FileManager.default.removeItem(at: marker)
+        guard case .restored = try check(m, now: m.now.addingTimeInterval(1)) else { Issue.record("expected a restore"); return }
+        #expect(try main(m) == before)
+    }
+
+    /// I1: an owner's adopt that lands between the guard's read of the record and its restore is not undone: the restore
+    /// re-reads the record under main's lock and stands down.
+    @Test func guardDoesNotUndoAnAdoptRacingIt() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        let owners = try foreignCommit(m, file: "owner.txt", message: "the owner's commit")
+        let (store, companyId) = (m.store, m.company.id)
+        store.mergeRefProbe.set { ref in
+            guard ref == "refs/brahma/foreign" else { return }
+            _ = try? store.adoptMain(companyId: companyId, by: .owner)
+        }
+        defer { store.mergeRefProbe.set(nil) }
+        #expect(try check(m) == .skipped)
+        #expect(try main(m) == owners, "the owner's adopt stands")
+        #expect(try recorded(m) == owners)
+        #expect(try f(m).git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty, "nothing was saved as foreign")
+        #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "owner.txt").path))
+        store.mergeRefProbe.set(nil)
+        #expect(try check(m) == .ok)
+        _ = before
     }
 
     /// The orchestrator's tick runs the guard for every company (paused ones too), before the merge step.
@@ -349,6 +444,44 @@ import GRDB
         for hook in hooks.afterRestore { try await hook(event) }
         #expect(try recorded(m) == stale)
         #expect(try mergeActivity(m).filter { $0 == "main adopted at \(head.prefix(7)) by the engine" }.count == 1)
+        // I2: the live main moved after the restore step read it: the hook never moves main back (that is the guard's, with a
+        // saved foreign ref); it refuses, and the record stays.
+        try m.exec("UPDATE company SET mainCommit = ? WHERE id = ?", [head, m.company.id])
+        let moved = try foreignCommit(m, file: "after-restore.txt", message: "moved after the restore read main")
+        var refused = false
+        for hook in hooks.afterRestore { do { try await hook(event) } catch is WorkError { refused = true } }
+        #expect(refused)
+        #expect(try main(m) == moved, "the hook moved nothing")
+        #expect(try recorded(m) == head)
+        #expect(try f(m).git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "after-restore.txt").path))
+        // Nor does the engine ever swap by itself, even when asked by commit.
+        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .system, commit: head) }
+        #expect(try main(m) == moved)
+    }
+
+    /// I4 (B6): the engine's one automatic record, at the company's creation, is refused for a symbolic `main`: the record stays
+    /// nil and the guard's first tick asks the owner.
+    @Test func companyCreationRefusesASymbolicMain() throws {
+        let m = try MergeFixture()
+        let dir = m.world.paths.workspaces.appending(path: "beta", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let f = GitFixture(existing: dir)
+        try f.ws.ensureRepo()
+        let head = try f.git(["rev-parse", "refs/heads/main"])
+        try f.git(["branch", "--quiet", "x", head])
+        try f.git(["symbolic-ref", "refs/heads/main", "refs/heads/x"])
+        let beta = try m.store.createCompany(name: "Beta", goal: "g", workspacesRoot: m.world.paths.workspaces)
+        #expect(beta.workspacePath == dir.path)
+        #expect(beta.mainCommit == nil)
+        #expect(try m.store.company(id: beta.id)?.mainCommit == nil)
+        let result = try MainGuard.check(company: beta, store: m.store, git: m.store.gitWorkspace(root: dir, companyId: beta.id),
+                                         paths: m.world.paths, now: m.now)
+        #expect(result == .skipped)
+        #expect(try m.store.company(id: beta.id)?.mainCommit == nil)
+        // A plain main is recorded, as before.
+        let gamma = try m.world.company("Gamma")
+        #expect(gamma.mainCommit != nil)
     }
 
     // MARK: Who may write the record

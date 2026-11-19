@@ -171,7 +171,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try rig.store.company(id: rig.company.id)?.mainCommit == before)
         let adopted = try brahma(["merge", "adopt-main", "Acme"], home: rig.home)
         #expect(adopted.status == 0, "\(adopted.stderr)")
-        #expect(adopted.stdout.contains("Acme: main adopted at \(head.prefix(7))"), "\(adopted.stdout)")
+        #expect(adopted.stdout.contains("Acme: main adopted at \(head.prefix(7)) (\(head))"), "\(adopted.stdout)")
         #expect(try rig.store.company(id: rig.company.id)?.mainCommit == head)
         // A saved tip, by its ref: main moves there, the checkout follows, the record is written.
         let saved = "refs/brahma/foreign/20260101-000000-1"

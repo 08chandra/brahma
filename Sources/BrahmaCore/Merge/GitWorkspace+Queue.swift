@@ -89,8 +89,10 @@ extension GitWorkspace {
         public var rootRef: String?
     }
 
-    /// The main guard's restore (Plan 4a Task 3), under main's lock: `main` must still be `foreignTip` (nil when it moved
-    /// again meanwhile; the next tick looks at it afresh). Then
+    /// The main guard's restore (Plan 4a Task 3), under main's lock: `main` must still be `foreignTip` and the record must still
+    /// be `recorded` (`recordStillStands`, read under this lock: an owner's `adopt-main`/accept changes `main` and the record
+    /// under main's lock, so one that landed since the guard's read is seen here); nil when either moved (the next tick looks
+    /// at it afresh). Then
     /// 1. with the root on `main` and dirty, its uncommitted edits are committed on top of `foreignTip` in a private index
     ///    (`quarantineRoot`'s way, `.brahma/` left out), so the owner loses nothing;
     /// 2. the tip (that commit, else `foreignTip`) goes under `refs/brahma/foreign/<stamp>-<n>`, `n` the smallest free suffix
@@ -100,13 +102,13 @@ extension GitWorkspace {
     /// 4. a root on `main` is reset to `recorded` (`reset --hard`, `clean -fd` keeping `.brahma/`); a root elsewhere is never
     ///    touched (its files, index and `HEAD` stay).
     /// Authors and subjects are never read: only the record decides what `main` is.
-    func restoreMain(to recorded: String, from foreignTip: String, stamp: String) throws -> ForeignRestore? {
+    func restoreMain(to recorded: String, from foreignTip: String, stamp: String, recordStillStands: () throws -> Bool) throws -> ForeignRestore? {
         try Self.validCommit(recorded); try Self.validCommit(foreignTip)
         guard stamp.range(of: "^[0-9]{8}-[0-9]{6}$", options: .regularExpression) != nil else {
             throw GitError.failed(command: "restore main", status: -1, stderr: "invalid stamp")
         }
         return try withMainLock {
-            guard try head(of: Self.mainRef) == foreignTip, try !mainIsSymbolic() else { return nil }
+            guard try head(of: Self.mainRef) == foreignTip, try !mainIsSymbolic(), try recordStillStands() else { return nil }
             let rootRef = try checkedOutRef()
             let onMain = rootRef == Self.mainRef
             var saved = foreignTip

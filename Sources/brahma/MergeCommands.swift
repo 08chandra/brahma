@@ -124,7 +124,7 @@ struct MergeGroup: ParsableCommand {
             let c = try resolveCompany(store, company)
             let adopted: String
             do { adopted = try store.adoptMain(companyId: c.id, by: .owner, commit: commit) } catch let e as WorkError { throw fail(e.message) }
-            print(safe("\(c.name): main adopted at \(adopted.prefix(7))"))
+            print(safe("\(c.name): main adopted at \(adopted.prefix(7)) (\(adopted))"))
         }
     }
 

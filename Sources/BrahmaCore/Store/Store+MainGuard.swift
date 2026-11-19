@@ -58,7 +58,8 @@ extension Store {
         }
         if open == 0 {
             try EngineAlerts.raise(store: self, text: "The main branch of \(company.name) changed outside Brahma (it was moved, rewritten or reset). "
-                + "Brahma starts no new work and merges nothing there until you have reviewed main and accepted it.", now: Store.now(), reason: reason)
+                + "Brahma starts no new work and merges nothing there until you have reviewed main and accepted it.", now: Store.now(), reason: reason,
+                companyId: company.id)
         }
         throw WorkError.conflict(Self.mainChangedMessage)
     }
@@ -67,7 +68,9 @@ extension Store {
 
     /// The record takes `main`'s head (`brahma merge adopt-main`; the engine's restore step re-affirms a head it recorded).
     /// Owner and engine only (`.agent` is refused); never while a merge batch is open (its journal owns `main`); never a `main`
-    /// that is a symbolic ref or names no commit (B6). With `commit`
+    /// that is a symbolic ref or names no commit (B6). The engine (`.system`) only re-affirms: the live head must be the record
+    /// and `commit` nil or that head, else `conflict`; it never moves `main` (that is the guard's, with a saved foreign ref).
+    /// For the owner, with `commit`
     /// (a commit id or any revision the owner names, a `refs/brahma/foreign/...` tip the guard saved, say) that is not `main`'s
     /// head, `main` is first moved there by compare-and-swap with the root checkout following (refused while the root has
     /// uncommitted edits). Writes activity `main adopted at <sha7> by the owner|the engine`, closes 3a's "main changed
@@ -88,7 +91,11 @@ extension Store {
                     throw WorkError.conflict("main of \(name) is a symbolic ref, which Brahma never adopts; make it a plain branch first")
                 }
                 var target = head
-                if let commit {
+                if case .system = sender {
+                    guard try self.company(id: companyId)?.mainCommit == head, commit == nil || commit == head else {
+                        throw WorkError.conflict("main of \(name) is not the recorded head; the engine adopts nothing by itself (the main guard restores it)")
+                    }
+                } else if let commit {
                     guard let wanted = try git.revParse(commit) else { throw WorkError.invalid("\(Self.flat(commit, max: 80)) names no commit in the workspace of \(name)") }
                     if wanted != head {
                         // `setMain` takes main's lock itself: a nested take would wait on this one, so the swap runs here.
@@ -111,6 +118,21 @@ extension Store {
             if case .failed(_, _, let stderr) = error { throw WorkError.conflict("could not adopt main of \(name): \(Self.flat(stderr, max: 300))") }
             throw error
         }
+    }
+
+    /// A restore the engine has not taken up names the company: an unconsumed `restoreEvent` with a `restoreMain` row for it, and
+    /// its marker still present (`<home>/run/restored-at`; a nonce with no marker can never be taken up and does not hold the
+    /// guard). The restore step decides `main` first (C1).
+    func restorePending(companyId: String, paths: BrahmaPaths) throws -> Bool {
+        let pending = try writer.read { db -> Bool in
+            guard try db.tableExists("restoreEvent"), try db.tableExists("restoreMain") else { return false }
+            return try Int.fetchOne(db, sql: """
+                SELECT count(*) FROM restoreEvent e JOIN restoreMain m ON m.nonce = e.nonce WHERE e.consumedAt IS NULL AND m.companyId = ?
+                """, arguments: [companyId]) ?? 0 > 0
+        }
+        guard pending else { return false }
+        var st = stat()
+        return lstat(BackupService.restoreMarker(paths: paths).path, &st) == 0
     }
 
     /// The main guard found no record of `main` (B6): one owner alert (3a's `mainAlertReason` key, so the queue's `checkMain` and
@@ -139,10 +161,11 @@ extension Store {
             try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .merge, text: text, createdAt: now).insert(db)
             try resolveEngineAlerts(db, reasons: [Self.mainAlertReason(company.id)], now: now)
             try notifyOwner(db: db, companyId: company.id, kind: .system, urgency: .normal, title: "main restored",
-                            body: "\(name): \(text). Run brahma merge adopt-main \(name) if that change was yours.", now: now)
+                            body: "\(name): \(text) (\(restore.ref) is \(restore.savedCommit)). Run brahma merge adopt-main \(name) if that change was yours.",
+                            now: now)
         }
         if !restore.rootReset {
-            try? raiseMainHeadAlert(company: company, ref: restore.rootRef.map { Self.flat($0, max: 200) })
+            try? raiseMainHeadAlert(company: company, ref: restore.rootRef.map { Self.flat($0, max: 200) }, now: now)
         }
     }
 
