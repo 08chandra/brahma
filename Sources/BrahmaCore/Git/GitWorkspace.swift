@@ -148,6 +148,10 @@ struct GitCommand: Sendable {
     /// `-c key=value` pairs added BEFORE `configFlags`, so a later hardened flag always wins (add, never override; `SafeGit`:
     /// `core.untrackedCache=false`, `core.excludesFile=/dev/null`).
     var extraConfig: [String] = []
+    /// When set, git is started inside this open directory (`fchdir` in the child, `ProcessGroupChild.spawn`) and told
+    /// `-C .` / `GIT_WORK_TREE=.`: the work tree is the directory the descriptor holds, never `workTree`'s path, which an
+    /// agent could retarget between a check and git's own `chdir` (`SafeGit.worktreeDiff`). The caller keeps it open.
+    var workTreeDescriptor: Int32? = nil
 
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
@@ -256,7 +260,7 @@ struct GitCommand: Sendable {
         var env = ChildEnvironment.make(base: baseEnvironment ?? ProcessInfo.processInfo.environment, purpose: .general)
         for (name, value) in extraEnvironment { env[name] = value }
         env["GIT_DIR"] = gitDir.path
-        env["GIT_WORK_TREE"] = workTree.path
+        env["GIT_WORK_TREE"] = workTreeDescriptor == nil ? workTree.path : "."
         // Always pinned: without it git follows a `commondir` file in the git dir (the workspace's own `.git` included) to
         // a config, attributes and refs the engine never checked.
         env["GIT_COMMON_DIR"] = (commonDir ?? gitDir).path
@@ -282,7 +286,7 @@ struct GitCommand: Sendable {
 
     /// `attrSource`: the tree attributes are read from (the empty tree of the repository's hash), nil on an older git.
     func arguments(_ args: [String], attrSource: String?) -> [String] {
-        ["git", "-C", workTree.path] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + extraConfig + Self.configFlags
+        ["git", "-C", workTreeDescriptor == nil ? workTree.path : "."] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + extraConfig + Self.configFlags
             + (allowsLocalFetch ? ["-c", "protocol.file.allow=always"] : [])
             + (allowsHTTPSFetch ? ["-c", "protocol.https.allow=always"] : []) + args
     }
@@ -442,15 +446,16 @@ struct GitCommand: Sendable {
         }
         process.standardOutput = outHandle
         process.standardError = errHandle
-        // A merge's git leads its own group, recorded for the owner's stop until it is reaped (`childGroups`).
+        // A merge's git leads its own group, recorded for the owner's stop until it is reaped (`childGroups`); a git anchored
+        // to a work tree descriptor (`workTreeDescriptor`) is spawned the same way, `fchdir`ed into it before exec.
         let grouped: ProcessGroupChild?
         do {
-            if childGroups != nil {
+            if childGroups != nil || workTreeDescriptor != nil {
                 let input = feed.map { $0.pipe.fileHandleForReading.fileDescriptor } ?? -1
                 grouped = try ProcessGroupChild.spawn(
                     executable: "/usr/bin/env", arguments: ["/usr/bin/env"] + argv, environment: environment,
                     workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
-                    output: outHandle.fileDescriptor, stdin: input, stderr: errHandle.fileDescriptor)
+                    output: outHandle.fileDescriptor, stdin: input, stderr: errHandle.fileDescriptor, workingDirectoryFD: workTreeDescriptor)
             } else {
                 try process.run()
                 grouped = nil
