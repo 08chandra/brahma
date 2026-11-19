@@ -1723,7 +1723,10 @@ import GRDB
         #expect(try r.ws.head(of: GitWorkspace.mainRef) == tip)
     }
 
-    @Test func agentFastForwardOfMainRaisesAlertAndNeverResolves() async throws {
+    /// 3a raised one alert and held claims until the owner accepted; since Plan 4a Task 3 the engine's tick restores `main` to
+    /// the record (the foreign tip saved under `refs/brahma/foreign/`), closes that alert and tells the owner, and claims work
+    /// again. Only the owner's `adopt-main` makes the foreign tip the record.
+    @Test func agentFastForwardOfMainIsRestoredByTheGuard() async throws {
         let r = try R()
         let recorded = try #require(try r.store.company(id: r.company.id)?.mainCommit)
         #expect(recorded == (try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)))
@@ -1737,28 +1740,41 @@ import GRDB
         #expect(moved != recorded)
         let i = try r.item("second")
         let message = "main changed outside Brahma; the owner must review it"
+        // Until the engine's tick, 3a's guard holds claims and alerts the owner once.
         #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
         #expect(try r.store.lease(itemId: i.id) == nil)
         func alerts() throws -> [Ask] {
             try r.store.writer.read { try Ask.filter(Column("companyId") == r.company.id && Column("kind") == AskKind.engineAlert).fetchAll($0) }
         }
         #expect(try alerts().count == 1); #expect(try alerts().first?.status == .pendingOwner)
-        // Later claims and ticks refuse again and never resolve or duplicate it.
-        #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
-        try await r.cycle(); try await r.cycle()
-        #expect(try r.store.lease(itemId: i.id) == nil, "the engine does not dispatch into a changed main either")
-        #expect(try alerts().count == 1); #expect(try alerts().first?.status == .pendingOwner)
+        // The tick: main is back at the record, the sneak is saved, the alert is closed, and the record did not move.
+        try await r.cycle()
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root) == recorded)
+        let saved = try GitFixture.plainGit(["for-each-ref", "--format=%(objectname) %(refname)", "refs/brahma/foreign/"], in: r.root)
+        #expect(saved.hasPrefix(moved + " refs/brahma/foreign/"), "\(saved)")
+        #expect(try alerts().count == 1); #expect(try alerts().first?.status != .pendingOwner)
         #expect(try r.store.company(id: r.company.id)?.mainCommit == recorded, "nothing but the engine or the owner moves the record")
-        // A rewrite is refused the same way.
-        try GitFixture.plainGit(["reset", "--hard", recorded], in: r.root)
-        try GitFixture.plainGit(["commit", "--amend", "--allow-empty", "-m", "rewritten"], in: r.root)
-        #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
-        #expect(try alerts().first?.status == .pendingOwner)
-        // The owner accepts the new head: the alert clears and claims work again.
-        try r.store.acceptMainCommit(companyId: r.company.id)
-        #expect(try alerts().first?.status != .pendingOwner)
+        #expect(try r.store.allNotices().contains { $0.title == "main restored" })
+        #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: "evil.txt").path))
+        // Claims work again, on the restored main.
         #expect(try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]).hasPrefix("You hold"))
-        #expect(try r.store.company(id: r.company.id)?.mainCommit == (try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)))
+        #expect(try r.fresh(i).baseCommit == recorded)
+        // A rewrite is a foreign move too: refused until the tick, then restored.
+        try GitFixture.plainGit(["commit", "--amend", "--allow-empty", "-m", "rewritten"], in: r.root)
+        let rewritten = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)
+        let third = try r.item("third")
+        #expect(r.failure { try r.tools(r.eng3).call(name: "claim_lease", arguments: ["key": .string(third.key)]) } == message)
+        try await r.cycle()
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root) == recorded)
+        #expect(try GitFixture.plainGit(["for-each-ref", "refs/brahma/foreign/"], in: r.root).split(separator: "\n").count == 2)
+        #expect(try alerts().allSatisfy { $0.status != .pendingOwner })
+        // The owner adopts the saved sneak by its ref: main moves there and the record follows.
+        let sneakRef = try #require(saved.split(separator: " ").last.map(String.init))
+        #expect(try r.store.adoptMain(companyId: r.company.id, by: .owner, commit: sneakRef) == moved)
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root) == moved)
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == moved)
+        #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "evil.txt").path))
+        _ = rewritten
     }
 
     @Test func companyWithoutRecordedMainRaisesAlert() throws {

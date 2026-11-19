@@ -95,8 +95,8 @@ extension GitWorkspace {
     ///    (`quarantineRoot`'s way, `.brahma/` left out), so the owner loses nothing;
     /// 2. the tip (that commit, else `foreignTip`) goes under `refs/brahma/foreign/<stamp>-<n>`, `n` the smallest free suffix
     ///    (created, never overwritten);
-    /// 3. `main` goes back to `recorded` by compare-and-swap against `foreignTip` (a symbolic `main` is never the engine's and
-    ///    is simply overwritten with a plain ref);
+    /// 3. `main` goes back to `recorded` by compare-and-swap against `foreignTip` (a symbolic `main` is refused: nil, the guard
+    ///    leaves it to 3a's alert);
     /// 4. a root on `main` is reset to `recorded` (`reset --hard`, `clean -fd` keeping `.brahma/`); a root elsewhere is never
     ///    touched (its files, index and `HEAD` stay).
     /// Authors and subjects are never read: only the record decides what `main` is.
@@ -106,8 +106,7 @@ extension GitWorkspace {
             throw GitError.failed(command: "restore main", status: -1, stderr: "invalid stamp")
         }
         return try withMainLock {
-            guard try head(of: Self.mainRef) == foreignTip else { return nil }
-            let symbolic = try mainIsSymbolic()
+            guard try head(of: Self.mainRef) == foreignTip, try !mainIsSymbolic() else { return nil }
             let rootRef = try checkedOutRef()
             let onMain = rootRef == Self.mainRef
             var saved = foreignTip
@@ -134,9 +133,7 @@ extension GitWorkspace {
                 if try main.run(["update-ref", "--no-deref", name, saved, zero], allowFailure: true).status == 0 { ref = name; break }
             }
             guard let ref else { throw GitError.failed(command: "update-ref foreign", status: -1, stderr: "no free foreign ref name") }
-            let swap = symbolic ? ["update-ref", "--no-deref", Self.mainRef, recorded]
-                                : ["update-ref", "--no-deref", Self.mainRef, recorded, foreignTip]
-            let moved = try main.run(swap, allowFailure: true)
+            let moved = try main.run(["update-ref", "--no-deref", Self.mainRef, recorded, foreignTip], allowFailure: true)
             guard moved.status == 0 else {
                 throw GitError.failed(command: "update-ref \(Self.mainRef)", status: moved.status, stderr: String(moved.stderr.prefix(2000)))
             }

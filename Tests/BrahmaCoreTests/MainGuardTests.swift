@@ -86,8 +86,8 @@ import GRDB
         #expect(try check(m) == .ok)
     }
 
-    /// B6: a `main` that is a symbolic ref, or that names no commit, is never adopted; with a record, a symbolic `main` is
-    /// foreign (3a: never the engine's) and goes back to a plain ref at the record.
+    /// B6: a `main` that is a symbolic ref, or that names no commit, is never adopted and never repaired by the guard: 3a's one
+    /// "main changed outside Brahma" alert, nothing moves, the record stays.
     @Test func symbolicOrUnresolvableMainRefusesAdoption() throws {
         let m = try MergeFixture()
         let before = try main(m)
@@ -97,13 +97,16 @@ import GRDB
         #expect(try m.ws.mainIsSymbolic())
         #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) }
         #expect(try recorded(m) == before)
-        guard case .restored(let ref, let to) = try check(m) else { Issue.record("expected a restore"); return }
-        #expect(to == before); #expect(try main(m) == before)
-        #expect(!(try m.ws.mainIsSymbolic()), "main is a plain ref again")
-        #expect(try m.ws.head(of: ref) == before)
+        #expect(try check(m) == .skipped)
+        #expect(try check(m, now: m.now.addingTimeInterval(60)) == .skipped)
+        #expect(try m.ws.mainIsSymbolic(), "the guard does not rewrite a symbolic main")
+        #expect(try f.git(["symbolic-ref", "refs/heads/main"]) == "refs/heads/x")
+        #expect(try recorded(m) == before)
+        #expect(try openAlerts(m, reason: Store.mainAlertReason(m.company.id)).count == 1, "3a's alert, once")
+        #expect(try f.git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty, "nothing saved, nothing moved")
         // A ref that names no commit: nothing to adopt, nothing to restore to; the owner is told.
+        try f.git(["symbolic-ref", "--delete", "refs/heads/main"])
         try m.exec("UPDATE company SET mainCommit = NULL WHERE id = ?", [m.company.id])
-        try f.git(["update-ref", "-d", "refs/heads/main"])
         #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) }
         #expect(try recorded(m) == nil)
         #expect(try check(m) == .skipped)

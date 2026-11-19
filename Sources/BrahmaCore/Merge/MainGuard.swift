@@ -17,7 +17,7 @@ public enum MainGuardResult: Equatable, Sendable {
 /// the owner's `adopt-main` and the restore step). A head that is not the record is foreign, whoever made it and whatever its
 /// subject says: it is saved under a unique `refs/brahma/foreign/<yyyyMMdd-HHmmss UTC>-<n>` and `main` is put back; the owner is
 /// told (activity, a notice, and an alert when the root checkout is off `main`) and can adopt the saved tip with
-/// `brahma merge adopt-main`. A symbolic `main` is never the engine's (3a) and is restored to a plain ref at the record.
+/// `brahma merge adopt-main`. A symbolic `main` is never the engine's (3a) and is refused, not repaired: 3a's alert, `.skipped`.
 /// Uncommitted edits at the root are not a move (they stay); when `main` did move they go with the saved tip, never onto `main`.
 /// No record at all (B6) adopts nothing: one owner alert, and the owner accepts with `adopt-main`.
 ///
@@ -40,14 +40,19 @@ public enum MainGuard {
                 return .skipped
             }
             guard let head = try git.revParse("main") else { return .skipped }
-            if try !git.mainIsSymbolic() {
-                if head == recorded { return .ok }
-                if let pending = current.pendingMainCommit, pending == head {
-                    // 3a's crash record: the engine itself was moving `main` here (an owner accept, say) and did not get to record
-                    // it. `checkMain` records a pending head it finds; anything else it throws for.
-                    try store.checkMain(company: current, git: git)
-                    return .ok
-                }
+            if try git.mainIsSymbolic() {
+                // A symbolic `main` is never the engine's (3a) and is not a plain ref the guard can swap (B6: refused, not
+                // repaired): 3a's one "main changed outside Brahma" alert, and nothing moves until the owner makes it a branch.
+                do { try store.checkMain(company: current, git: git) }
+                catch let error as WorkError where error.message == Store.mainChangedMessage {}
+                return .skipped
+            }
+            if head == recorded { return .ok }
+            if let pending = current.pendingMainCommit, pending == head {
+                // 3a's crash record: the engine itself was moving `main` here (an owner accept, say) and did not get to record
+                // it. `checkMain` records a pending head it finds; anything else it throws for.
+                try store.checkMain(company: current, git: git)
+                return .ok
             }
             guard let restore = try git.restoreMain(to: recorded, from: head, stamp: stamp(now)) else { return .skipped }
             store.reportMainRestored(company: current, restore: restore, recorded: recorded, now: now)
