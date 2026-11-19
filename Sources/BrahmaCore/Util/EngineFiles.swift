@@ -444,6 +444,24 @@ public enum EngineFiles {
 
         enum Kind: Equatable { case missing, directory, link, other }
 
+        /// The `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in it (never following a link); nil when it is not there or the name is
+        /// not a valid entry name.
+        func status(of name: String) -> stat? {
+            guard (try? EngineFiles.checkName(name, shown.appending(path: name).path)) != nil else { return nil }
+            var st = stat()
+            guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return nil }
+            return st
+        }
+
+        /// The target bytes of the symbolic link `name` in it (`readlinkat`, never followed); nil when it is not a link.
+        func linkTarget(of name: String) -> [UInt8]? {
+            guard (try? EngineFiles.checkName(name, shown.appending(path: name).path)) != nil else { return nil }
+            var buffer = [UInt8](repeating: 0, count: Int(PATH_MAX) + 1)
+            let n = readlinkat(fd, name, &buffer, buffer.count - 1)
+            guard n > 0 else { return nil }
+            return Array(buffer[0..<Int(n)])
+        }
+
         /// Creates the directory `name` in it (which must not exist) and opens it.
         func makeDirectory(_ name: String, mode: mode_t = 0o755) throws -> OpenDirectory {
             let shownChild = shown.appending(path: name, directoryHint: .isDirectory)
