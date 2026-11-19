@@ -28,8 +28,10 @@ import Foundation
             case "rev-parse": text = Self.sha + "\n"
             case "cat-file": text = args.contains("--batch-check") ? Self.sha + " missing\n" : args.contains("-s") ? "5\n" : "hello"
             case "log", "rev-list", "merge-base": text = Self.sha + "\n"
-            case "hash-object": text = Self.sha + "\n"
-            case "ls-files": text = "src/a.txt\u{0}"
+            case "hash-object":
+                let paths = stdin.map { $0.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true).count } ?? 1
+                text = String(repeating: Self.sha + "\n", count: max(1, paths))
+            case "check-ignore": return (1, Data(), Data())
             default: text = ""
             }
             return (0, Data(text.utf8), Data())
@@ -74,17 +76,21 @@ import Foundation
         _ = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: sha, tempDir: try tempDir(), fs: r.fs)
         let calls = runner.calls
         #expect(calls.count >= 22)
-        // worktreeDiff's processes are anchored: `-C .` and `GIT_WORK_TREE=.` with the held descriptor, never the path.
-        for call in calls where call.args.contains("read-tree") || call.args.contains("ls-files") || call.args.contains("--stdin-paths") {
-            #expect(call.env["GIT_WORK_TREE"] == "." && call.args.prefix(2) == ["-C", "."], "\(call.args.prefix(3))")
+        // No process of the call has the agent's worktree (or `.`) as its work tree or directory: worktreeDiff's run in the
+        // engine-owned shadow directory of the call, everything else in the workspace.
+        for call in calls {
+            #expect(call.env["GIT_WORK_TREE"] != r.wt.path && call.env["GIT_WORK_TREE"] != "." && call.args[1] != r.wt.path, "\(call.args.prefix(3))")
         }
-        #expect(!calls.contains { $0.env["GIT_WORK_TREE"] == "." && $0.args.contains("rev-parse") }, "a plain call was anchored")
+        #expect(calls.contains { $0.args.contains("read-tree") && $0.env["GIT_WORK_TREE"]!.contains("/shadow") })
+        #expect(!calls.contains { $0.args.contains("ls-files") }, "git enumerated the worktree")
+        #expect(!calls.contains { $0.args.contains("--name-status") && !$0.args.contains("--cached") }, "git compared the worktree")
         let gitDir = r.root.appending(path: ".git").path
         for call in calls {
             let a = call.args, env = call.env
             #expect(env["GIT_DIR"] == gitDir, "\(a)")
             #expect(env["GIT_CONFIG_NOSYSTEM"] == "1" && env["GIT_CONFIG_GLOBAL"] == "/dev/null", "\(a)")
-            #expect(env["GIT_LITERAL_PATHSPECS"] == "1" && env["GIT_TERMINAL_PROMPT"] == "0", "\(a)")
+            // `check-ignore` refuses literal pathspecs; every other process gets them.
+            #expect((env["GIT_LITERAL_PATHSPECS"] == "1") == !a.contains("check-ignore") && env["GIT_TERMINAL_PROMPT"] == "0", "\(a)")
             #expect(env["GIT_COMMON_DIR"] == gitDir, "\(a)")
             for flag in ["core.attributesFile=/dev/null", "core.fsmonitor=false", "core.hooksPath=/dev/null", "diff.external=",
                          "core.untrackedCache=false"] {
@@ -110,7 +116,8 @@ import Foundation
         // diff --cached.
         func has(_ parts: [String]) -> Bool { calls.contains { c in parts.allSatisfy(c.args.contains) } }
         #expect(has(["read-tree", "--end-of-options", sha]))
-        #expect(has(["ls-files", "--others", "--exclude-standard"]))
+        #expect(has(["ls-tree", "-r", "-l", "--end-of-options", sha]))
+        #expect(has(["check-ignore", "-z", "--stdin", "--no-index"]))
         #expect(has(["hash-object", "-w", "--no-filters", "--stdin-paths"]))
         #expect(has(["update-index", "--index-info"]))
         #expect(has(["diff", "--cached", "--numstat"]) && has(["diff", "--cached", "-p"]))
@@ -302,9 +309,13 @@ import Foundation
             #expect(diff.blobShas[path] == (try r.f.git(["hash-object", path], in: r.wt)), "\(path)")
         }
         #expect(diff.blobShas["README.md"] == nil)
-        // A planted link in the worktree refuses the diff: nothing is read through it.
+        // A planted link in the worktree is a link entry (its target string is the blob, as git stores links): never followed.
         try FileManager.default.createSymbolicLink(at: r.wt.appending(path: "leak"), withDestinationURL: URL(fileURLWithPath: "/etc/hosts"))
-        #expect(throws: SafeGitError.self) { try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs) }
+        let withLink = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        let leak = try #require(withLink.files.first { $0.path == "leak" })
+        #expect(leak.status == "A" && leak.bytes == "/etc/hosts".utf8.count)
+        #expect(withLink.blobShas["leak"] == SafeGit.blobId(of: Data("/etc/hosts".utf8), sha256: false))
+        #expect(withLink.patch.contains("+/etc/hosts") && !withLink.patch.contains("localhost"), "the link was followed")
     }
 
     @Test func onlyShareRefsWritable() throws {
@@ -374,6 +385,8 @@ import Foundation
         private let live = LiveGitRunner()
         private let lock = NSLock()
         let trigger: String
+        /// Runs once, right before the first process whose arguments hold `trigger` starts (its startup window).
+        var before: (@Sendable () throws -> Void)?
         var after: (@Sendable () throws -> Void)?
         private(set) var triggered: Data?
         /// Every process's arguments and stdout, in order.
@@ -384,6 +397,7 @@ import Foundation
             try run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: nil)
         }
         func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int, workTreeDescriptor: Int32?) throws -> (status: Int32, stdout: Data, stderr: Data) {
+            if args.contains(trigger), let pre = lock.withLock({ let b = before; before = nil; return b }) { try pre() }
             let out = try live.run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: workTreeDescriptor)
             lock.withLock { captured.append((args, out.stdout)) }
             if args.contains(trigger), let body = lock.withLock({ let b = after; after = nil; return b }) {
@@ -400,18 +414,16 @@ import Foundation
         return (st.st_atimespec.tv_sec, st.st_atimespec.tv_nsec)
     }
 
-    /// R2 (i): after git's first step the agent swaps the worktree's root entry for a link to an outside directory. Every later
-    /// process is anchored to the held descriptor, so git lists the real worktree (never the link's target), and the files are
-    /// read from that descriptor: 3a refuses a directory whose kernel path moved, so the call ends in a generic refusal that
-    /// names nothing outside, and nothing outside is read.
-    @Test func worktreeDiffAnchorIgnoresRootSwap() throws {
+    /// R2/R3: after git's first step the agent swaps the worktree's root entry for a link to an outside directory. The check
+    /// right after that process sees the path no longer is the held directory and refuses the whole diff with the generic text;
+    /// no further process runs, nothing outside is listed or read, and no outside name appears anywhere.
+    @Test func worktreeDiffRefusesRootSwapBetweenProcesses() throws {
         let r = try Repo()
         try r.f.write("src/a.txt", "changed\n", in: r.wt)
         let outside = try tempDir().appending(path: "outside", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: outside.appending(path: "src"), withIntermediateDirectories: true)
         let marker = outside.appending(path: "SECRET-MARKER.txt")
         try "outside bytes\n".write(to: marker, atomically: true, encoding: .utf8)
-        try "outside a\n".write(to: outside.appending(path: "src/a.txt"), atomically: true, encoding: .utf8)
         let markerAtime = Self.atime(marker)
         let moved = r.wt.appendingPathExtension("moved")
         let runner = SwapRunner(trigger: "read-tree")
@@ -422,16 +434,141 @@ import Foundation
         }
         var text = ""
         do {
-            let diff = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
-            // Should 3a ever allow reading from a moved directory, the result must still be the real worktree's.
-            #expect(diff.files.map(\.path) == ["src/a.txt"] && diff.patch.contains("+changed") && !diff.patch.contains("outside"))
+            _ = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+            Issue.record("a swapped worktree root was accepted")
         } catch { text = "\(error)" }
         #expect(runner.triggered != nil, "the swap never ran")
-        // Anchored: git's listing after the swap is the real worktree's (the modified file), not the link target's (the marker).
-        #expect(runner.stdout(of: "--name-status").contains("src/a.txt"))
-        #expect(!runner.stdout(of: "ls-files").contains("SECRET-MARKER") && !runner.stdout(of: "--name-status").contains("SECRET-MARKER"))
-        #expect(!text.contains("SECRET-MARKER") && !text.contains(outside.path) && !text.contains("src/a.txt"), "\(text)")
+        #expect(text == "the worktree of ENG-1 is not in place", "\(text)")
+        #expect(runner.captured.last?.args.contains("read-tree") == true, "a process ran after the swap: \(runner.captured.map(\.args))")
         #expect(Self.atime(marker) == markerAtime, "the outside marker was read")
+    }
+
+    /// R2: an anchored process runs inside the descriptor's directory, whatever path it was given: `rev-parse --show-toplevel`
+    /// names the held directory, not the path's target.
+    @Test func anchoredGitRunsInTheDescriptor() throws {
+        let r = try Repo()
+        let fd = open(r.wt.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        try #require(fd >= 0)
+        defer { close(fd) }
+        let elsewhere = try tempDir()
+        var g = GitCommand(gitDir: r.root.appending(path: ".git"), workTree: elsewhere, commonDir: nil)
+        g.workTreeDescriptor = fd
+        let top = try g.run(["rev-parse", "--show-toplevel"]).text
+        let real = realpath(r.wt.path, nil).map { p in defer { free(p) }; return String(cString: p) } ?? r.wt.path
+        #expect(top == real, "\(top)")
+        #expect(g.arguments(["x"], attrSource: nil).prefix(3) == ["git", "-C", "."] && g.environment()["GIT_WORK_TREE"] == ".")
+    }
+
+    /// R4: a `git` planted in the worktree never runs, however PATH is shaped: the executable is resolved in the engine from
+    /// absolute PATH entries and exec'd by absolute path; relative and empty entries are stripped from the child's PATH.
+    @Test(arguments: [".:/usr/bin:/bin", "/usr/bin::/bin", "bin:/usr/bin:/bin:"]) func plantedGitInWorktreeNeverRuns(_ path: String) throws {
+        let r = try Repo()
+        let scratch = try tempDir()
+        let marker = scratch.appending(path: "planted-marker")
+        try FakeTools.install(at: r.wt.appending(path: "git"), "#!/bin/sh\ntouch \"$TMPDIR/planted-marker\"\necho PLANTED\n")
+        let gitDir = r.root.appending(path: ".git").path
+        // Anchored, through the live runner: the child's working directory IS the worktree holding the planted `git`.
+        let fd = open(r.wt.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        try #require(fd >= 0)
+        defer { close(fd) }
+        let env = ["PATH": path, "TMPDIR": scratch.path, "GIT_DIR": gitDir, "GIT_WORK_TREE": "."]
+        let out = try LiveGitRunner().run(args: ["-C", ".", "rev-parse", "--git-dir"], env: env, stdin: nil, timeout: .seconds(10), outputCap: 1 << 20, workTreeDescriptor: fd)
+        #expect(out.status == 0 && String(decoding: out.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == gitDir)
+        #expect(!FileManager.default.fileExists(atPath: marker.path), "the planted git ran (anchored)")
+        // A plain GitCommand call with the same PATH: argv[0] is absolute and not /usr/bin/env, the child's PATH has only
+        // absolute entries, the marker never appears.
+        final class Seen: @unchecked Sendable { var executable = ""; var argv: [String] = [] }
+        let seen = Seen()
+        var g = GitCommand(gitDir: r.root.appending(path: ".git"), workTree: r.wt, commonDir: nil)
+        g.baseEnvironment = ["PATH": path, "TMPDIR": scratch.path]
+        g.spawnObserver = { exe, argv in seen.executable = exe; seen.argv = argv }
+        #expect(try g.run(["rev-parse", "--git-dir"]).text == gitDir)
+        #expect(seen.executable.hasPrefix("/") && seen.executable.hasSuffix("/git") && seen.executable != "/usr/bin/env" && seen.argv.first == seen.executable, "\(seen.executable)")
+        #expect(g.environment()["PATH"] == "/usr/bin:/bin")
+        #expect(!FileManager.default.fileExists(atPath: marker.path), "the planted git ran (plain)")
+        // The worktree diff itself, with the planted git sitting in the worktree (ignored by name: `FakeTools.install` hard-links
+        // the shared script, which SafeFS would refuse as a file with another link; what matters here is that it never runs).
+        try r.f.write(".gitignore", "git\n", in: r.wt)
+        let diff = try SafeGit(workspace: r.root).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(diff.files.map(\.path) == [".gitignore"])
+        #expect(!FileManager.default.fileExists(atPath: marker.path), "the planted git ran (worktreeDiff)")
+    }
+
+    /// The reviewer's window: the root entry is a link to an outside directory for exactly the time one git process starts and
+    /// runs, and is put back after. No process has the worktree as its work tree, so nothing resolves the name: the result is
+    /// the real worktree's, the outside file is never listed or read, and no outside name appears anywhere.
+    @Test func worktreeDiffImmuneToStartupWindowSwap() throws {
+        let r = try Repo()
+        try r.f.write("src/a.txt", "changed\n", in: r.wt)
+        let outside = try tempDir().appending(path: "outside", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: outside.appending(path: "src"), withIntermediateDirectories: true)
+        let secret = outside.appending(path: "OUTSIDE-SECRET.txt")
+        try "outside bytes\n".write(to: secret, atomically: true, encoding: .utf8)
+        try "outside a\n".write(to: outside.appending(path: "src/a.txt"), atomically: true, encoding: .utf8)
+        let secretAtime = Self.atime(secret)
+        let moved = r.wt.appendingPathExtension("moved")
+        let wt = r.wt
+        for trigger in ["read-tree", "ls-tree", "check-ignore", "--stdin-paths", "--index-info", "--numstat"] {
+            let runner = SwapRunner(trigger: trigger)
+            runner.before = {
+                try FileManager.default.moveItem(at: wt, to: moved)
+                try FileManager.default.createSymbolicLink(at: wt, withDestinationURL: outside)
+            }
+            runner.after = {
+                try FileManager.default.removeItem(at: wt)
+                try FileManager.default.moveItem(at: moved, to: wt)
+            }
+            try r.f.write("new/n.txt", "n\n", in: r.wt)          // a candidate, so check-ignore runs
+            let diff = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+            #expect(runner.triggered != nil, "\(trigger): the swap never ran")
+            #expect(diff.files.map(\.path) == ["new/n.txt", "src/a.txt"] && diff.patch.contains("+changed"), "\(trigger): \(diff.files)")
+            let shown = "\(diff.files) \(diff.patch) \(diff.blobShas) " + runner.captured.map { String(decoding: $0.stdout, as: UTF8.self) }.joined()
+            #expect(!shown.contains("OUTSIDE-SECRET") && !shown.contains("outside"), "\(trigger): outside content surfaced")
+        }
+        #expect(Self.atime(secret) == secretAtime, "the outside file was read")
+    }
+
+    /// Ignore rules: directories a `.gitignore` clearly ignores are pruned from the walk, files get git's own verdict (negations
+    /// included), nested repositories and `.git` entries are never listed.
+    @Test func worktreeDiffHonoursIgnoreRules() throws {
+        let r = try Repo()
+        try r.f.write(".gitignore", "build/\n*.log\n!keep.log\n", in: r.wt)
+        try r.f.write("build/out.bin", "x", in: r.wt)
+        try r.f.write("build/deep/more.bin", "x", in: r.wt)
+        try r.f.write("a.log", "x", in: r.wt)
+        try r.f.write("keep.log", "x", in: r.wt)
+        try r.f.write("src/sub.log", "x", in: r.wt)
+        try r.f.write("keep.txt", "x", in: r.wt)
+        try r.f.write("nested/.git/HEAD", "ref: refs/heads/main\n", in: r.wt)
+        try r.f.write("nested/inner.txt", "x", in: r.wt)
+        let diff = try SafeGit(workspace: r.root).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(diff.files.map(\.path) == [".gitignore", "keep.log", "keep.txt"], "\(diff.files.map(\.path))")
+        // With a negation in force nothing is pruned, yet the verdict is still git's: the same set.
+        var rules = GitIgnoreRules()
+        rules.push("build/\n*.log\n", base: "")
+        #expect(rules.prunes(directory: "build") && rules.prunes(directory: "src/build") && !rules.prunes(directory: "src"))
+        rules.push("!important/\n", base: "src")
+        #expect(!rules.prunes(directory: "build"), "a negation in force must stop pruning")
+        rules.truncate(to: 1)
+        #expect(rules.prunes(directory: "build"))
+    }
+
+    /// The engine's blob ids are git's (a file through `SafeFS`, a link's target), SHA-1 and SHA-256.
+    @Test func blobIdsMatchGit() throws {
+        let r = try Repo()
+        try r.f.write("src/a.txt", "hello\n", in: r.wt)
+        let file = try r.fs.open("src/a.txt", inWorktree: "ENG-1", maxBytes: 100)
+        #expect(try SafeGit.blobId(of: file, sha256: false) == "ce013625030ba8dba906f756967f9e9ca394464a")
+        #expect(try SafeGit.blobId(of: file, sha256: false) == (try r.f.git(["hash-object", "src/a.txt"], in: r.wt)))
+        #expect(SafeGit.blobId(of: Data("hello\n".utf8), sha256: false) == "ce013625030ba8dba906f756967f9e9ca394464a")
+        #expect(SafeGit.blobId(of: Data(), sha256: false) == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+        #expect(SafeGit.blobId(of: Data("hello\n".utf8), sha256: true) == SHA256.hex(Data("blob 6\u{0}hello\n".utf8)))
+        var sha1 = SHA1()
+        sha1.update(Data("abc".utf8))
+        #expect(SHA1.hex(digest: sha1.finalize()) == "a9993e364706816aba3e25717850c26c9cd0d89d")
+        var long = SHA1()
+        for _ in 0..<1000 { long.update(Data(String(repeating: "a", count: 1000).utf8)) }
+        #expect(SHA1.hex(digest: long.finalize()) == "34aa973cd4c4daa4f61eeb2bdbad27316534016f")
     }
 
     /// R2 (ii)/(iii): a subdirectory swapped for a link after git listed its files cannot be read through: the refusal names
@@ -445,7 +582,7 @@ import Foundation
         try "SECRET-BYTES\n".write(to: marker, atomically: true, encoding: .utf8)
         let markerAtime = Self.atime(marker)
         let sub = r.wt.appending(path: "new")
-        let runner = SwapRunner(trigger: "ls-files")
+        let runner = SwapRunner(trigger: "check-ignore")
         runner.after = {
             try FileManager.default.moveItem(at: sub, to: sub.appendingPathExtension("moved"))
             try FileManager.default.createSymbolicLink(at: sub, withDestinationURL: outside)
@@ -455,18 +592,19 @@ import Foundation
             _ = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
             Issue.record("a path behind a planted link was accepted")
         } catch { text = "\(error)" }
-        #expect(runner.triggered.map { String(decoding: $0, as: UTF8.self).contains("new/u.txt") } == true, "the swap came after the listing")
+        #expect(runner.triggered != nil, "the swap never ran")
         #expect(!text.isEmpty && !text.contains("u.txt") && !text.contains("new") && !text.contains(outside.path) && !text.contains("SECRET"), "\(text)")
         #expect(Self.atime(marker) == markerAtime, "the outside file was read")
     }
 
-    /// A fake that answers `worktreeDiff`'s processes: `ls-files` with `untracked`, everything else empty.
-    private func fakeForWorktreeDiff(untracked: [String], delay: TimeInterval = 0) -> RecordingRunner {
+    /// A fake for `worktreeDiff`'s processes: an empty base (`ls-tree`), so every file the walk finds in the real worktree is a
+    /// change; `hash-object` must never be reached.
+    private func fakeForWorktreeDiff(delay: TimeInterval = 0) -> RecordingRunner {
         let runner = RecordingRunner()
         runner.delay = delay
         runner.respond = { args in
             if args.contains("hash-object") { Issue.record("hash-object ran before the caps were checked"); return (1, Data(), Data()) }
-            if args.contains("ls-files") { return (0, Data(untracked.joined(separator: "\u{0}").utf8) + Data([0]), Data()) }
+            if args.contains("check-ignore") { return (1, Data(), Data()) }
             return (0, Data(), Data())
         }
         return runner
@@ -475,19 +613,19 @@ import Foundation
     @Test func worktreeDiffRefusesTooManyFiles() throws {
         let r = try Repo()
         let main = try r.head("main")
-        let names = (1...3).map { "f\($0).txt" }
-        for name in names { try r.f.write(name, "x", in: r.wt) }
-        let runner = fakeForWorktreeDiff(untracked: names)
-        let git = SafeGit(workspace: r.root, runner: runner, maxDiffFiles: 2)
-        #expect(throws: SafeGitError.tooManyChanges(files: 3, bytes: 0)) {
+        // Three new files plus the two the base holds (the fake's base is empty): five changed paths.
+        for name in (1...3).map({ "f\($0).txt" }) { try r.f.write(name, "x", in: r.wt) }
+        let runner = fakeForWorktreeDiff()
+        let git = SafeGit(workspace: r.root, runner: runner, maxDiffFiles: 4)
+        #expect(throws: SafeGitError.tooManyChanges(files: 5, bytes: 0)) {
             try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs)
         }
         #expect(SafeGitError.tooManyChanges(files: 2001, bytes: 0).description == "too many/too large changes to diff (2001 files, 0 MB)")
         #expect(!runner.calls.contains { $0.args.contains("hash-object") })
         #expect(SafeGit.maxDiffFiles == 2000 && SafeGit.maxDiffBytes == 200 << 20)
-        // A flood of untracked names past git's output cap is the same refusal, never `.outputTooLarge`.
+        // A base listing past git's output cap is the same refusal, never `.outputTooLarge`.
         let flood = RecordingRunner()
-        flood.respond = { args in args.contains("ls-files") ? (0, Data(repeating: UInt8(ascii: "a"), count: 9 << 20), Data()) : (0, Data(), Data()) }
+        flood.respond = { args in args.contains("ls-tree") ? (0, Data(repeating: UInt8(ascii: "a"), count: 9 << 20), Data()) : (0, Data(), Data()) }
         #expect(throws: SafeGitError.tooManyChanges(files: 0, bytes: 0)) {
             try SafeGit(workspace: r.root, runner: flood).worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs)
         }
@@ -602,11 +740,12 @@ import Foundation
     @Test func worktreeDiffRefusesTooManyBytes() throws {
         let r = try Repo()
         let main = try r.head("main")
+        // Four changed paths (the base is empty for the fake), copied in path order: README.md (6) + a.txt (5) passes 10.
         try r.f.write("a.txt", "12345", in: r.wt)
         try r.f.write("b.txt", "123456", in: r.wt)
-        let runner = fakeForWorktreeDiff(untracked: ["a.txt", "b.txt"])
+        let runner = fakeForWorktreeDiff()
         let git = SafeGit(workspace: r.root, runner: runner, maxDiffBytes: 10)
-        #expect(throws: SafeGitError.tooManyChanges(files: 2, bytes: 11)) {
+        #expect(throws: SafeGitError.tooManyChanges(files: 4, bytes: 11)) {
             try git.worktreeDiff(key: "ENG-1", worktree: r.wt, against: main, tempDir: try tempDir(), fs: r.fs)
         }
         #expect(!runner.calls.contains { $0.args.contains("hash-object") })
@@ -617,7 +756,7 @@ import Foundation
         let r = try Repo()
         let main = try r.head("main")
         // Every process is well within its own timeout; the call as a whole is not.
-        let runner = fakeForWorktreeDiff(untracked: [], delay: 0.15)
+        let runner = fakeForWorktreeDiff(delay: 0.15)
         let git = SafeGit(workspace: r.root, runner: runner, timeout: .milliseconds(400))
         let started = Date()
         #expect(throws: SafeGitError.timedOut) {
@@ -658,6 +797,6 @@ import Foundation
         }
         let three = try processes(files: 3), thirty = try processes(files: 30)
         #expect(three == thirty, "\(three) processes for 3 files, \(thirty) for 30")
-        #expect(three <= 9)
+        #expect(three <= 10)
     }
 }

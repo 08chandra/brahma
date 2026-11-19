@@ -152,6 +152,8 @@ struct GitCommand: Sendable {
     /// `-C .` / `GIT_WORK_TREE=.`: the work tree is the directory the descriptor holds, never `workTree`'s path, which an
     /// agent could retarget between a check and git's own `chdir` (`SafeGit.worktreeDiff`). The caller keeps it open.
     var workTreeDescriptor: Int32? = nil
+    /// Tests only: handed the executable and argv of every git this command starts.
+    var spawnObserver: (@Sendable (_ executable: String, _ argv: [String]) -> Void)? = nil
 
     static let timeout: TimeInterval = 60
     static let lockRetries = 3
@@ -259,6 +261,8 @@ struct GitCommand: Sendable {
     func environment() -> [String: String] {
         var env = ChildEnvironment.make(base: baseEnvironment ?? ProcessInfo.processInfo.environment, purpose: .general)
         for (name, value) in extraEnvironment { env[name] = value }
+        // Only absolute entries: an empty or relative one names the child's working directory, which may be an agent's.
+        env["PATH"] = Self.absoluteEntries(of: env["PATH"])
         env["GIT_DIR"] = gitDir.path
         env["GIT_WORK_TREE"] = workTreeDescriptor == nil ? workTree.path : "."
         // Always pinned: without it git follows a `commondir` file in the git dir (the workspace's own `.git` included) to
@@ -342,6 +346,7 @@ struct GitCommand: Sendable {
     /// `git config --file <file> --list` with nothing else read: no repository, no includes, no other config.
     fileprivate func listConfig(_ file: URL) throws -> Output {
         var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        env["PATH"] = Self.absoluteEntries(of: env["PATH"])
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_TERMINAL_PROMPT"] = "0"
@@ -415,11 +420,35 @@ struct GitCommand: Sendable {
         var error: (any Error)?
     }
 
+    /// `path` with only its absolute entries (the engine's PATH comes through `ChildEnvironment`; an empty or relative entry
+    /// would be looked up in the child's working directory).
+    static func absoluteEntries(of path: String?) -> String {
+        (path ?? "").split(separator: ":", omittingEmptySubsequences: true).filter { $0.hasPrefix("/") }.joined(separator: ":")
+    }
+
+    /// `git` as an absolute path: the first `<dir>/git` that is a regular executable file in the ABSOLUTE entries of `path`.
+    /// Resolved in the engine, before the spawn, so the child never searches its working directory (an agent's worktree,
+    /// when anchored) for a planted `git`; nil when there is none.
+    static func resolveGit(path: String?) -> String? {
+        for dir in (path ?? "").split(separator: ":", omittingEmptySubsequences: true) where dir.hasPrefix("/") {
+            let candidate = String(dir) + "/git"
+            var st = stat()
+            if stat(candidate, &st) == 0, st.st_mode & S_IFMT == S_IFREG, access(candidate, X_OK) == 0 { return candidate }
+        }
+        return nil
+    }
+
     private func runOnce(_ argv: [String], environment: [String: String], label: String, maxOutput: Int, stdin: Stdin = .none) throws -> Output {
         EngineGitGuard.willRunGit("git \(label)")
+        // The executable is resolved here and exec'd directly: never `/usr/bin/env git` with the child's directory on PATH.
+        guard let executable = Self.resolveGit(path: environment["PATH"]) else {
+            throw GitError.failed(command: label, status: -1, stderr: "no git executable on an absolute PATH entry")
+        }
+        let argv = [executable] + argv.dropFirst()
+        spawnObserver?(executable, argv)
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = argv
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = Array(argv.dropFirst())
         process.environment = environment
         var feed: (pipe: Pipe, result: FeedResult)?
         switch stdin {
@@ -453,7 +482,7 @@ struct GitCommand: Sendable {
             if childGroups != nil || workTreeDescriptor != nil {
                 let input = feed.map { $0.pipe.fileHandleForReading.fileDescriptor } ?? -1
                 grouped = try ProcessGroupChild.spawn(
-                    executable: "/usr/bin/env", arguments: ["/usr/bin/env"] + argv, environment: environment,
+                    executable: executable, arguments: argv, environment: environment,
                     workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
                     output: outHandle.fileDescriptor, stdin: input, stderr: errHandle.fileDescriptor, workingDirectoryFD: workTreeDescriptor)
             } else {
