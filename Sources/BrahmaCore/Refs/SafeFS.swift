@@ -164,6 +164,13 @@ public final class SafeFS: @unchecked Sendable {
         }
     }
 
+    /// The `(device, inode)` of the real directory `.brahma/wt/<KEY>` as the walk opens it (`O_NOFOLLOW`): what a program
+    /// handed that path must land on (`SafeGit.worktreeDiff`).
+    func worktreeIdentity(key: String) throws -> (dev: dev_t, ino: ino_t) {
+        guard (try? GitWorkspace.validKey(key)) != nil else { throw SafeFSError.badPath }
+        do { return try brahma.child("wt").child(key).identity() } catch let e as UnsafeEngineFile { throw Self.map(e) }
+    }
+
     /// Creates `<own lab>/<sub>/<name>` exclusively (never over or through anything there), mode 0444, through `EngineFiles`
     /// (the subdirectory is created when missing, never through a link). Returns the lab-relative path `<sub>/<name>`.
     public func createExclusive(name: String, inOwnLabSubdir sub: String, data: Data) throws -> String {
