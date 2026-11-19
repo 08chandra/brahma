@@ -83,13 +83,7 @@ extension Store {
         let name = Self.flat(company.name, max: 100)
         do {
             return try git.withMainLock { () throws -> String in
-                guard try openMergeBatches(companyId: companyId).isEmpty else {
-                    throw WorkError.conflict("a merge batch of \(name) is open; wait for it to finish (brahma merge \(name)), then adopt main")
-                }
-                guard let head = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(name) has no main branch, or its main names no commit") }
-                guard try !git.mainIsSymbolic() else {
-                    throw WorkError.conflict("main of \(name) is a symbolic ref, which Brahma never adopts; make it a plain branch first")
-                }
+                let head = try adoptableMainHead(companyId: companyId, name: name, git: git)
                 var target = head
                 if case .system = sender {
                     guard try self.company(id: companyId)?.mainCommit == head, commit == nil || commit == head else {
@@ -118,6 +112,20 @@ extension Store {
             if case .failed(_, _, let stderr) = error { throw WorkError.conflict("could not adopt main of \(name): \(Self.flat(stderr, max: 300))") }
             throw error
         }
+    }
+
+    /// The one guard for making `main`'s head the record, shared by `adoptMain` and 3a's `acceptMainCommit` (round 2): refused
+    /// while a merge batch is open (its journal owns `main`), when there is no `main` or it names no commit, and when `main`
+    /// is a symbolic ref (never the engine's). Returns the head. Read under main's lock by `adoptMain`.
+    func adoptableMainHead(companyId: String, name: String, git: GitWorkspace) throws -> String {
+        guard try openMergeBatches(companyId: companyId).isEmpty else {
+            throw WorkError.conflict("a merge batch of \(name) is open; wait for it to finish (brahma merge \(name)), then adopt main")
+        }
+        guard let head = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(name) has no main branch, or its main names no commit") }
+        guard try !git.mainIsSymbolic() else {
+            throw WorkError.conflict("main of \(name) is a symbolic ref, which Brahma never adopts; make it a plain branch first")
+        }
+        return head
     }
 
     /// A restore the engine has not taken up names the company: an unconsumed `restoreEvent` with a `restoreMain` row for it, and
@@ -169,8 +177,10 @@ extension Store {
         }
     }
 
-    /// Owner-only (`brahma main accept`, the app, and the owner's approval of the engine's quarantine ask: `ownerDecide`).
-    /// - Without `ref`: the owner has reviewed `main` and accepts its current head.
+    /// Owner-only (`brahma main accept`, and the owner's approval of the engine's quarantine ask: `ownerDecide`; no app action
+    /// calls it today). Both forms pass `adoptableMainHead` (no open batch, a plain `main` that names a commit), the guard
+    /// `adopt-main` uses.
+    /// - Without `ref`: the owner has reviewed `main` and accepts its current head: exactly `adoptMain(by: .owner)`.
     /// - With a quarantine ref (`refs/brahma/quarantine/<stamp>`, or just `<stamp>`): the commit the engine recorded on its
     ///   own quarantine ask for that ref (never what the ref holds now) is merged into `main` as an engine-recorded merge
     ///   (`mainCommit` advances), and a pending ask is settled `approved` (with `note`, when given), which releases the merge
@@ -184,18 +194,15 @@ extension Store {
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
         guard let ref else {
-            guard let head = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(company.name) has no main branch") }
-            try writer.write { db in
-                try finalizeMainCommit(db, companyId: companyId, commit: head)
-                try resolveEngineAlerts(db, reasons: [Store.mainAlertReason(companyId)], now: Store.now())
-            }
-            return MainAcceptance(head: head, ask: nil, alreadyMerged: false)
+            // Round 2: the same guarded path as `brahma merge adopt-main` (one copy of the rules: `adoptableMainHead`).
+            return MainAcceptance(head: try adoptMain(companyId: companyId, by: .owner), ask: nil, alreadyMerged: false)
         }
         let raw = ref.trimmingCharacters(in: .whitespacesAndNewlines)
         let full = raw.hasPrefix(GitWorkspace.quarantinePrefix) ? raw : GitWorkspace.quarantinePrefix + raw
         guard GitWorkspace.isQuarantineRef(full) else {
             throw WorkError.invalid("\(Self.flat(raw, max: 80)) is not a quarantine ref (refs/brahma/quarantine/<yyyyMMdd-HHmmss>)")
         }
+        _ = try adoptableMainHead(companyId: companyId, name: Self.flat(company.name, max: 100), git: git)
         // The engine's own ask for this ref, and the commit it recorded there (subject and payload must agree).
         let asks = try writer.read { db in try engineQuarantineAsks(db, companyId: companyId, ref: full) }
         func recorded(_ ask: Ask) -> String? {

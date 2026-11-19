@@ -146,6 +146,42 @@ import GRDB
         #expect(try check(m) == .ok)
     }
 
+    /// Round 2: `brahma main accept` (3a's `acceptMainCommit`) and `adopt-main` share one guard: a symbolic `main`, a `main` that
+    /// names no commit and an open merge batch refuse both; the plain accept records the head as an adoption by the owner.
+    @Test func mainAcceptSharesTheAdoptGuard() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        let f = fixture(m)
+        try f.git(["branch", "--quiet", "x", before])
+        try f.git(["symbolic-ref", "refs/heads/main", "refs/heads/x"])
+        #expect(throws: WorkError.self) { try m.store.acceptMainCommit(companyId: m.company.id) }
+        #expect(try recorded(m) == before)
+        try f.git(["symbolic-ref", "--delete", "refs/heads/main"])
+        try f.git(["update-ref", "refs/heads/main", before])
+        #expect(!(try m.ws.mainIsSymbolic()))
+        let batch = MergeBatch(companyId: m.company.id, number: 1, step: .checked, requestIds: ["r"], startedAt: m.now)
+        try m.store.writer.write { db in try batch.insert(db) }
+        let owners = try foreignCommit(m, file: "owner.txt", message: "the owner's commit")
+        #expect(throws: WorkError.self) { try m.store.acceptMainCommit(companyId: m.company.id) }
+        let refusal = (try? m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000")).map { _ in "" }
+        #expect(refusal == nil, "the quarantine path refuses too")
+        do { _ = try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000") }
+        catch let e as WorkError { #expect(e.message.contains("merge batch"), "\(e.message)") } catch { Issue.record("\(error)") }
+        #expect(try recorded(m) == before)
+        try m.exec("UPDATE mergeBatch SET step = 'done' WHERE id = ?", [batch.id])
+        let accepted = try m.store.acceptMainCommit(companyId: m.company.id)
+        #expect(accepted.head == owners && accepted.ask == nil && !accepted.alreadyMerged)
+        #expect(try recorded(m) == owners)
+        #expect(try mergeActivity(m).contains("main adopted at \(owners.prefix(7)) by the owner"))
+        #expect(try check(m) == .ok)
+    }
+
+    /// The guard's git-lock wait is pinned: another engine's batch may hold the company's GitLock for a whole landing, and the
+    /// guard is retried every tick, so it waits 5 s (not GitLock's 30 s) before giving the blocking slot back.
+    @Test func lockWaitIsPinned() {
+        #expect(MainGuard.lockWait == .seconds(5))
+    }
+
     // MARK: Restores
 
     @Test func rewriteRestoredAndReported() throws {
