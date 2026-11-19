@@ -84,16 +84,19 @@ final class ProcessGroupChild: @unchecked Sendable {
         } else {
             posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
         }
+        // A chdir action that cannot be queued must never let the child start in this process's directory instead.
+        let chdirStatus: Int32
         if let workingDirectoryFD {
             #if canImport(Darwin)
-            posix_spawn_file_actions_addfchdir_np(&actions, workingDirectoryFD)
+            chdirStatus = posix_spawn_file_actions_addfchdir_np(&actions, workingDirectoryFD)
             #else
             // Before exec (so before close-on-exec), the child's own descriptor table still holds it.
-            posix_spawn_file_actions_addchdir_np(&actions, "/proc/self/fd/\(workingDirectoryFD)")
+            chdirStatus = posix_spawn_file_actions_addchdir_np(&actions, "/proc/self/fd/\(workingDirectoryFD)")
             #endif
         } else {
-            posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.path)
+            chdirStatus = posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.path)
         }
+        guard chdirStatus == 0 else { throw SpawnFailure(message: "cannot set the working directory (\(String(cString: strerror(chdirStatus))))") }
         var defaults = sigset_t(), mask = sigset_t()
         sigfillset(&defaults); sigemptyset(&mask)
         posix_spawnattr_setsigdefault(&attr, &defaults)
