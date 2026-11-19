@@ -154,6 +154,42 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try rig.store.mergeRequests(companyId: rig.company.id, statuses: [.queued]).count == 1)
     }
 
+    /// `brahma merge adopt-main` (Plan 4a Task 3): the owner makes main's head the record, or moves main to a tip the main
+    /// guard saved and records that; an agent's shell is refused and the record does not move.
+    @Test func mergeAdoptMain() throws {
+        let rig = try Rig()
+        let root = URL(fileURLWithPath: rig.company.workspacePath, isDirectory: true)
+        let f = GitFixture(existing: root)
+        let before = try #require(rig.company.mainCommit)
+        try f.write("owner.txt", "the owner's change")
+        try f.git(["add", "-A", "--", "owner.txt"])
+        try f.git(["commit", "--quiet", "-m", "by hand \(Self.hostile)"])
+        let head = try f.git(["rev-parse", "refs/heads/main"])
+        #expect(head != before)
+        let refused = try brahma(["merge", "adopt-main", "Acme"], home: rig.home, env: ["BRAHMA_AGENT_ID": rig.agent.id])
+        #expect(refused.status == 1 && refused.stderr.contains("owner commands can't run inside an agent turn"), "\(refused.stderr)")
+        #expect(try rig.store.company(id: rig.company.id)?.mainCommit == before)
+        let adopted = try brahma(["merge", "adopt-main", "Acme"], home: rig.home)
+        #expect(adopted.status == 0, "\(adopted.stderr)")
+        #expect(adopted.stdout.contains("Acme: main adopted at \(head.prefix(7))"), "\(adopted.stdout)")
+        #expect(try rig.store.company(id: rig.company.id)?.mainCommit == head)
+        // A saved tip, by its ref: main moves there, the checkout follows, the record is written.
+        let saved = "refs/brahma/foreign/20260101-000000-1"
+        try f.git(["update-ref", saved, head])
+        try f.git(["reset", "--hard", "--quiet", before])
+        try rig.store.writer.write { db in try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [before, rig.company.id]) }
+        let byRef = try brahma(["merge", "adopt-main", "Acme", saved], home: rig.home)
+        #expect(byRef.status == 0, "\(byRef.stderr)")
+        #expect(try f.git(["rev-parse", "refs/heads/main"]) == head)
+        #expect(try rig.store.company(id: rig.company.id)?.mainCommit == head)
+        #expect(FileManager.default.fileExists(atPath: root.appending(path: "owner.txt").path))
+        // Something that names no commit is refused; nothing changes.
+        let bad = try brahma(["merge", "adopt-main", "Acme", "refs/brahma/foreign/none"], home: rig.home)
+        #expect(bad.status == 1 && bad.stderr.contains("names no commit"), "\(bad.stderr)")
+        #expect(try rig.store.company(id: rig.company.id)?.mainCommit == head)
+        #expect(!bad.stderr.contains(Self.esc) && !adopted.stdout.contains(Self.esc))
+    }
+
     @Test func mergeResumeClearsHold() throws {
         let rig = try Rig()
         let none = try brahma(["merge", "resume", "Acme"], home: rig.home)

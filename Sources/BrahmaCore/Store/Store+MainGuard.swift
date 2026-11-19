@@ -63,6 +63,70 @@ extension Store {
         throw WorkError.conflict(Self.mainChangedMessage)
     }
 
+    // MARK: Adoption (Plan 4a Task 3)
+
+    /// The record takes `main`'s head (`brahma merge adopt-main`, the first-tick adoption of the main guard, the restore hook).
+    /// Owner and engine only (`.agent` is refused); never while a merge batch is open (its journal owns `main`). With `commit`
+    /// (a commit id or any revision the owner names, a `refs/brahma/foreign/...` tip the guard saved, say) that is not `main`'s
+    /// head, `main` is first moved there by compare-and-swap with the root checkout following (refused while the root has
+    /// uncommitted edits). Writes activity `main adopted at <sha7> by the owner|the engine`, closes 3a's "main changed
+    /// outside Brahma" alert, and returns the recorded commit. Runs git: call it off the actor.
+    @discardableResult
+    public func adoptMain(companyId: String, by sender: Sender, commit: String? = nil, now: Date = Store.now()) throws -> String {
+        if case .agent = sender { throw WorkError.forbidden("only the owner can adopt main") }
+        guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
+        let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
+        let name = Self.flat(company.name, max: 100)
+        do {
+            return try git.withMainLock { () throws -> String in
+                guard try openMergeBatches(companyId: companyId).isEmpty else {
+                    throw WorkError.conflict("a merge batch of \(name) is open; wait for it to finish (brahma merge \(name)), then adopt main")
+                }
+                guard let head = try git.head(of: GitWorkspace.mainRef) else { throw WorkError.conflict("\(name) has no main branch") }
+                var target = head
+                if let commit {
+                    guard let wanted = try git.revParse(commit) else { throw WorkError.invalid("\(Self.flat(commit, max: 80)) names no commit in the workspace of \(name)") }
+                    if wanted != head {
+                        // `setMain` takes main's lock itself: a nested take would wait on this one, so the swap runs here.
+                        guard try git.swapMainLocked(to: wanted, expecting: head) else {
+                            throw WorkError.conflict("main of \(name) moved while it was being adopted; look at it and try again")
+                        }
+                        target = wanted
+                    }
+                }
+                let who = sender == .owner ? "the owner" : "the engine"
+                try writer.write { db in
+                    try finalizeMainCommit(db, companyId: companyId, commit: target)
+                    try resolveEngineAlerts(db, reasons: [Self.mainAlertReason(companyId)], now: now)
+                    try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .merge,
+                                      text: "main adopted at \(target.prefix(7)) by \(who)", createdAt: now).insert(db)
+                }
+                return target
+            }
+        } catch let error as GitError {
+            if case .failed(_, _, let stderr) = error { throw WorkError.conflict("could not adopt main of \(name): \(Self.flat(stderr, max: 300))") }
+            throw error
+        }
+    }
+
+    /// The main guard put `main` back (`MainGuard.check`): the company's feed, one owner notice, and, with the root checkout off
+    /// `main`, 3a's one self-resolving alert that it is on another ref. 3a's "main changed outside Brahma" alert, if open, is
+    /// closed: `main` is the record again. Nothing here throws (the restore is done; a failed report is logged by the caller's
+    /// activity being absent, not by undoing anything).
+    func reportMainRestored(company: Company, restore: GitWorkspace.ForeignRestore, recorded: String, now: Date) {
+        let name = Self.flat(company.name, max: 100)
+        let text = "main was changed outside the merge queue; restored to \(recorded.prefix(7)), the other tip is saved as \(restore.ref)"
+        try? writer.write { db in
+            try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .merge, text: text, createdAt: now).insert(db)
+            try resolveEngineAlerts(db, reasons: [Self.mainAlertReason(company.id)], now: now)
+            try notifyOwner(db: db, companyId: company.id, kind: .system, urgency: .normal, title: "main restored",
+                            body: "\(name): \(text). Run brahma merge adopt-main \(name) if that change was yours.", now: now)
+        }
+        if !restore.rootReset {
+            try? raiseMainHeadAlert(company: company, ref: restore.rootRef.map { Self.flat($0, max: 200) })
+        }
+    }
+
     /// Owner-only (`brahma main accept`, the app, and the owner's approval of the engine's quarantine ask: `ownerDecide`).
     /// - Without `ref`: the owner has reviewed `main` and accepts its current head.
     /// - With a quarantine ref (`refs/brahma/quarantine/<stamp>`, or just `<stamp>`): the commit the engine recorded on its

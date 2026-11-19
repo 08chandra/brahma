@@ -990,7 +990,7 @@ public struct GitWorkspace: Sendable {
     /// a FIFO; another user's) is never read: the name gets a fresh file holding only the engine's entries. An oversized
     /// file, or one whose read fails part-way, is left as it is. Every odd shape is reported (`onUnsafeEngineFile`) and
     /// nothing throws, so an agent that can write `.git` cannot block `ensureRepo` or `quarantineRoot` (N5).
-    private func ensureExclude() {
+    func ensureExclude() {
         let dir = ".git/info", name = "exclude"
         let report = { (problem: UnsafeEngineFile) in onUnsafeEngineFile?(problem) }
         do {

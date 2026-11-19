@@ -31,6 +31,38 @@ extension Orchestrator {
         }
     }
 
+    /// Once per tick, before the merges: the main guard (`MainGuard.check`) for every company, running or paused, whose
+    /// workspace is a repository, off the actor (one git task per company; a company whose batch this engine is running is
+    /// left to the batch). Nothing starts under a hold or the owner's stop. Never waits on git.
+    func mainGuardTick(now: Date, held: Bool, companies: [Company]) {
+        guard !held, !stoppedNow else { return }
+        let (store, blocking, paths) = (self.store, self.blocking, self.paths)
+        for company in companies where mergeTasks[company.id] == nil {
+            let key = "main-guard:\(company.id)"
+            guard gitTasks[key] == nil else { continue }
+            spawnGit(key) { [self] in
+                let result: Result<MainGuardResult, any Error> = await blocking.run {
+                    let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+                    guard FileManager.default.fileExists(atPath: root.appending(path: ".git").path) else { return .success(.skipped) }
+                    do {
+                        let git = store.gitWorkspace(root: root, companyId: company.id)
+                        return .success(try MainGuard.check(company: company, store: store, git: git, paths: paths, now: now))
+                    } catch { return .failure(error) }
+                }
+                switch result {
+                case .success(.restored(let ref, let to)):
+                    log("main guard: \(company.name): main restored to \(to.prefix(7)); the other tip is saved as \(ref)")
+                case .success(.adopted(let commit)):
+                    log("main guard: \(company.name): main adopted at \(commit.prefix(7))")
+                case .success:
+                    break
+                case .failure(let error):
+                    log("main guard: \(company.name): \(error)")
+                }
+            }
+        }
+    }
+
     // MARK: 3a's one-item merge step: unreachable since Plan 4a Task 1b
     //
     // The merge queue (`MergeQueue`, Plan 4a) replaced the step below. Nothing calls `startThe3aMergeStep` any more; it and

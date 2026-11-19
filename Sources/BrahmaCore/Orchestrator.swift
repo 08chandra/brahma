@@ -237,6 +237,13 @@ public actor Orchestrator {
         // Plan ML: a restore resets every memory cursor (every company's: the whole database was swapped), a full idempotent
         // re-scan on the next ticks.
         restoreHooks.register(afterRestore: { _ in try MemoryIngest.resetCursors(store: store) })
+        // Plan 4a Task 3: a restore re-adopts git's `main` as the record (`adoptMain` by the engine), so the main guard never
+        // "restores" the head a restore just took up. Git: in a Blocking body.
+        let blocking = self.blocking
+        restoreHooks.register(afterRestore: { event in
+            guard let head = event.mainHead else { return }
+            try await blocking.tryRun { try store.adoptMain(companyId: event.companyId, by: .system, commit: head) }
+        })
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -653,6 +660,8 @@ public actor Orchestrator {
 
         // 5. Engine-run checks first (cheap, and they unblock reviews), then select and launch turns around them.
         startChecks(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+        // 5a. The main guard (Plan 4a Task 3): for every company, `main` is where the queue left it, before the merge step.
+        mainGuardTick(now: now, held: held, companies: companies)
         startMerges(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
         // 5b. Previews (Plan L): one reconcile pass at a time, after the merge step.
         previewTick(held: held)

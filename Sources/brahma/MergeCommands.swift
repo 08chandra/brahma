@@ -9,7 +9,7 @@ import BrahmaCore
 struct MergeGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "merge", abstract: "A company's merge queue: list it, change its settings, retry a failed merge, resume a held queue.",
-        subcommands: [List.self, Settings.self, Retry.self, Resume.self], defaultSubcommand: List.self)
+        subcommands: [List.self, Settings.self, Retry.self, Resume.self, AdoptMain.self], defaultSubcommand: List.self)
 
     /// `main <sha7> · batch <n> · <strategy title> · main check: <cmd|none>[ · HELD: <reason>]`.
     static func header(_ c: Company) -> String {
@@ -108,6 +108,23 @@ struct MergeGroup: ParsableCommand {
             print(safe("\(r.ref) is back in the queue as \(fresh?.ref ?? "a new request"); the engine merges it next."))
             // `M-2 queued` for scripts: the new request's ref and status on one line.
             if let fresh { print(safe("\(fresh.ref) \(fresh.status.rawValue)")) }
+        }
+    }
+
+    struct AdoptMain: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "adopt-main",
+            abstract: "Make main as it stands the engine's record (owner only), or move main to a tip the main guard saved (refs/brahma/foreign/...) and record that.")
+        @Argument(help: "Company name or slug.") var company: String
+        @Argument(help: "A commit, or a ref the main guard saved (refs/brahma/foreign/<yyyyMMdd-HHmmss>-<n>). Without it, main's current head.") var commit: String?
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let adopted: String
+            do { adopted = try store.adoptMain(companyId: c.id, by: .owner, commit: commit) } catch let e as WorkError { throw fail(e.message) }
+            print(safe("\(c.name): main adopted at \(adopted.prefix(7))"))
         }
     }
 

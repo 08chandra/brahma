@@ -73,6 +73,102 @@ extension GitWorkspace {
     //
     // There is deliberately no method that commits what is uncommitted at the root onto `main`: 3a quarantines it
     // (`quarantineRoot`) and it reaches `main` only through the owner's accept (Plan 4a Task 1b fix round, ruling S1).
+    // `restoreMain` below commits such edits only onto the *foreign* tip it saves, never onto `main`.
+
+    /// Where the main guard keeps a tip of `main` that was not the engine's (`refs/brahma/foreign/<yyyyMMdd-HHmmss>-<n>`).
+    static let foreignPrefix = "refs/brahma/foreign/"
+
+    /// What the main guard saved and put back (`restoreMain`).
+    public struct ForeignRestore: Equatable, Sendable {
+        /// The engine's ref holding the other tip (with the root's uncommitted edits committed on top, when there were any).
+        public var ref: String
+        public var savedCommit: String
+        /// The root checkout was on `main` and was reset to the recorded head; false when it sat elsewhere and was left alone.
+        public var rootReset: Bool
+        /// The ref the root checkout is on when it is not `main` (nil for a detached `HEAD`, or when `rootReset`).
+        public var rootRef: String?
+    }
+
+    /// The main guard's restore (Plan 4a Task 3), under main's lock: `main` must still be `foreignTip` (nil when it moved
+    /// again meanwhile; the next tick looks at it afresh). Then
+    /// 1. with the root on `main` and dirty, its uncommitted edits are committed on top of `foreignTip` in a private index
+    ///    (`quarantineRoot`'s way, `.brahma/` left out), so the owner loses nothing;
+    /// 2. the tip (that commit, else `foreignTip`) goes under `refs/brahma/foreign/<stamp>-<n>`, `n` the smallest free suffix
+    ///    (created, never overwritten);
+    /// 3. `main` goes back to `recorded` by compare-and-swap against `foreignTip` (a symbolic `main` is never the engine's and
+    ///    is simply overwritten with a plain ref);
+    /// 4. a root on `main` is reset to `recorded` (`reset --hard`, `clean -fd` keeping `.brahma/`); a root elsewhere is never
+    ///    touched (its files, index and `HEAD` stay).
+    /// Authors and subjects are never read: only the record decides what `main` is.
+    func restoreMain(to recorded: String, from foreignTip: String, stamp: String) throws -> ForeignRestore? {
+        try Self.validCommit(recorded); try Self.validCommit(foreignTip)
+        guard stamp.range(of: "^[0-9]{8}-[0-9]{6}$", options: .regularExpression) != nil else {
+            throw GitError.failed(command: "restore main", status: -1, stderr: "invalid stamp")
+        }
+        return try withMainLock {
+            guard try head(of: Self.mainRef) == foreignTip else { return nil }
+            let symbolic = try mainIsSymbolic()
+            let rootRef = try checkedOutRef()
+            let onMain = rootRef == Self.mainRef
+            var saved = foreignTip
+            if onMain, try isDirty(in: root) {
+                ensureExclude()
+                try? FileManager.default.createDirectory(at: gitTemp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                let index = gitTemp.appending(path: "brahma-foreign-\(UUID().uuidString).index")
+                defer { _ = try? EngineFiles.removeNoFollow(index, under: gitTemp) }
+                let staged = main.withIndex(index)
+                try staged.run(["read-tree", foreignTip])
+                try stage(staged, in: root, relative: "")
+                try staged.run(["rm", "-r", "--cached", "--ignore-unmatch", "--quiet", "--", ".brahma"])
+                let tree = try staged.run(["write-tree"]).text
+                let tipTree = try main.run(["rev-parse", "--verify", "\(foreignTip)^{tree}"]).text
+                if tree != tipTree {
+                    saved = try main.run(["commit-tree", tree, "-p", foreignTip, "-m", "Uncommitted changes found in the main checkout when main was restored"]).text
+                    try Self.validCommit(saved)
+                }
+            }
+            let zero = String(repeating: "0", count: saved.count)
+            var ref: String?
+            for n in 1...999 {
+                let name = Self.foreignPrefix + "\(stamp)-\(n)"
+                if try main.run(["update-ref", "--no-deref", name, saved, zero], allowFailure: true).status == 0 { ref = name; break }
+            }
+            guard let ref else { throw GitError.failed(command: "update-ref foreign", status: -1, stderr: "no free foreign ref name") }
+            let swap = symbolic ? ["update-ref", "--no-deref", Self.mainRef, recorded]
+                                : ["update-ref", "--no-deref", Self.mainRef, recorded, foreignTip]
+            let moved = try main.run(swap, allowFailure: true)
+            guard moved.status == 0 else {
+                throw GitError.failed(command: "update-ref \(Self.mainRef)", status: moved.status, stderr: String(moved.stderr.prefix(2000)))
+            }
+            if onMain {
+                try main.run(["reset", "--hard", "--quiet", "--no-recurse-submodules", recorded])
+                try main.run(["clean", "-fd", "--quiet", "-e", ".brahma/"])
+            }
+            return ForeignRestore(ref: ref, savedCommit: saved, rootReset: onMain, rootRef: onMain ? nil : rootRef)
+        }
+    }
+
+    /// The owner's `adopt-main <commit>` (Plan 4a Task 3); the caller holds main's lock (`withMainLock`, not re-entrant).
+    /// `main` moves from `current` to `commit` by compare-and-swap (false when it is no longer `current`, or is symbolic) and a
+    /// root checkout on `main` follows (`reset --hard`); one with uncommitted edits refuses (`GitError`), since they would be
+    /// overwritten. A root elsewhere is left alone. `commit` must exist in the repository.
+    func swapMainLocked(to commit: String, expecting current: String) throws -> Bool {
+        try Self.validCommit(commit); try Self.validCommit(current)
+        guard try head(of: Self.mainRef) == current, try !mainIsSymbolic() else { return false }
+        guard try main.run(["cat-file", "-e", "\(commit)^{commit}"], allowFailure: true).status == 0 else {
+            throw GitError.failed(command: "cat-file -e", status: -1, stderr: "no such commit in the workspace")
+        }
+        let onMain = try checkedOutRef() == Self.mainRef
+        if onMain, try isDirty(in: root) {
+            throw GitError.failed(command: "adopt main", status: -1, stderr: "the main checkout has uncommitted changes; commit or stash them first")
+        }
+        guard try main.run(["update-ref", "--no-deref", Self.mainRef, commit, current], allowFailure: true).status == 0 else { return false }
+        if onMain {
+            try main.run(["reset", "--hard", "--quiet", "--no-recurse-submodules", commit])
+            try main.run(["clean", "-fd", "--quiet", "-e", ".brahma/"])
+        }
+        return true
+    }
 
     /// Fast-forwards `main` to `commit` with the root checkout following, the checkout being on `main` (checked first, under
     /// main's lock). Never overwrites the root's own edits: they stop it (`blockedByLocalChanges`). Nothing moved unless `.ok`.
