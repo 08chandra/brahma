@@ -75,5 +75,6 @@ stops under `prefers-reduced-motion: reduce`. Focus rings never animate.
 
 `<Label>` 11 px uppercase tracked `text1` (no text2 tone) · `<Panel title>` bg2, 28 px bg3 header strip,
 1 px line, radius 2 · `<Chip status>` 18 px, 1 px status border + 15 % fill, 6 px dot,
-`text0` label · `<Button variant="primary|ghost" href>` 32 px (sm 26), radius 2. Every
-control has hover, focus-visible (2 px accent ring, offset 2 px), active, disabled; see `/styleguide`.
+`text0` label · `<Button variant="primary|ghost" href>` 32 px (sm 26; 44 / 40 on coarse
+pointers, where every control is ≥ 40 px), radius 2. Every control has hover, focus-visible
+(2 px accent ring, offset 2 px), active, disabled; see `/styleguide`.

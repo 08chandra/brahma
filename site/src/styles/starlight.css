@@ -724,8 +724,10 @@ footer .meta {
     min-width: 2.75rem;
   }
   nav.sidebar a,
-  starlight-toc a {
-    padding-block: 0.625rem;
+  starlight-toc a,
+  mobile-starlight-toc a {
+    padding-block: 0.6875rem;
+    min-height: 2.5rem;
   }
   .expressive-code .copy button {
     width: 2.5rem;
