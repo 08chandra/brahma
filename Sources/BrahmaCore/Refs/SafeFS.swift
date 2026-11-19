@@ -49,9 +49,9 @@ public final class SafeFile: @unchecked Sendable {
     }
     deinit { close(fd) }
 
-    /// The first `size` bytes (as checked when opened); a file that shrank since gives what is left.
-    public func readAll() throws -> Data {
-        var out = Data(capacity: size)
+    /// The first `size` bytes (as checked when opened), 64 KiB at a time, from the held descriptor (`pread`); a file that shrank
+    /// since gives what is left. Nothing is held in memory beyond one chunk.
+    public func forEachChunk(_ body: (UnsafeRawBufferPointer) throws -> Void) throws {
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         var offset = 0
         while offset < size {
@@ -59,18 +59,23 @@ public final class SafeFile: @unchecked Sendable {
             let n = buffer.withUnsafeMutableBytes { pread(fd, $0.baseAddress, want, at) }
             if n < 0 { if errno == EINTR { continue }; throw SafeFSError.io("cannot be read (\(String(cString: strerror(errno))))") }
             if n == 0 { break }
-            out.append(contentsOf: buffer[0..<n])
+            try buffer.withUnsafeBytes { try body(UnsafeRawBufferPointer(rebasing: $0[0..<n])) }
             offset += n
         }
+    }
+
+    /// The first `size` bytes (as checked when opened).
+    public func readAll() throws -> Data {
+        var out = Data(capacity: size)
+        try forEachChunk { out.append(contentsOf: $0) }
         return out
     }
 
     public func sha256() throws -> String { SHA256.hex(try readAll()) }
 
-    /// Writes the bytes to `toFD` (which the caller owns and closes).
+    /// Writes the bytes to `toFD` (which the caller owns and closes), one chunk at a time.
     public func copy(toFD: Int32) throws {
-        let data = try readAll()
-        try data.withUnsafeBytes { raw in
+        try forEachChunk { raw in
             var offset = 0
             while offset < raw.count {
                 let n = Foundation.write(toFD, raw.baseAddress! + offset, raw.count - offset)
