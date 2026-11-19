@@ -28,6 +28,9 @@ public enum SafeGitError: Error, Equatable, Sendable {
     /// A worktree diff with more changed paths than `maxDiffFiles` or more bytes than `maxDiffBytes`: refused whole, never
     /// partly shown (`bytes` is what had been summed when the cap was passed).
     case tooManyChanges(files: Int, bytes: Int)
+    /// `expireAndPrune` found this many of the purged objects still in the repository afterwards: the purge is incomplete and
+    /// the owner must be told. Never reported as success.
+    case purgeIncomplete(remaining: Int)
 }
 
 extension SafeGitError: CustomStringConvertible {
@@ -42,6 +45,7 @@ extension SafeGitError: CustomStringConvertible {
         case .badPath: return "not a valid path"
         case .git(let s), .io(let s): return s
         case .tooManyChanges(let files, let bytes): return "too many/too large changes to diff (\(files) files, \((bytes + (1 << 20) - 1) >> 20) MB)"
+        case .purgeIncomplete(let remaining): return "purge incomplete: \(remaining) object(s) still in the repository"
         }
     }
 }
@@ -51,6 +55,16 @@ extension SafeGitError: CustomStringConvertible {
 public protocol GitProcessRunning: Sendable {
     /// Runs git. Throws `SafeGitError.timedOut` when the timeout killed it and `.outputTooLarge` when stdout passed `outputCap`.
     func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data)
+    /// As `run`, with the open directory git must be started in (`fchdir`, `-C .`, `GIT_WORK_TREE=.`): a worktree diff's
+    /// processes. A fake that only records may leave this to the default, which forwards to `run`; anything that starts git
+    /// must honour it (the live runner refuses an anchored command line it was not given the descriptor for).
+    func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int, workTreeDescriptor: Int32?) throws -> (status: Int32, stdout: Data, stderr: Data)
+}
+
+extension GitProcessRunning {
+    public func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int, workTreeDescriptor: Int32?) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        try run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap)
+    }
 }
 
 /// Runs the command line through `GitCommand` (`runPrepared`: output to files under `tempRoot`, the timeout, the capture cap).
@@ -61,9 +75,16 @@ public struct LiveGitRunner: GitProcessRunning {
     public init(tempRoot: URL? = nil) { self.tempRoot = tempRoot }
 
     public func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        try run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: nil)
+    }
+
+    public func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int, workTreeDescriptor: Int32?) throws -> (status: Int32, stdout: Data, stderr: Data) {
         guard let gitDir = env["GIT_DIR"], let workTree = env["GIT_WORK_TREE"] else { throw SafeGitError.io("git environment without GIT_DIR") }
+        // An anchored command line (`GIT_WORK_TREE=.`) without its descriptor would run in this process's directory: refused.
+        guard (workTree == ".") == (workTreeDescriptor != nil) else { throw SafeGitError.io("anchored git command line without its work tree descriptor") }
         var git = GitCommand(gitDir: URL(fileURLWithPath: gitDir, isDirectory: true), workTree: URL(fileURLWithPath: workTree, isDirectory: true), commonDir: nil)
         git.timeoutSeconds = SafeGit.seconds(timeout)
+        git.workTreeDescriptor = workTreeDescriptor
         if let tempRoot { git.tempRoot = tempRoot }
         let out: GitCommand.Output
         do {
@@ -273,40 +294,46 @@ public struct SafeGit: Sendable {
         try output(["update-ref", "-d", "--end-of-options", try Self.shareRef(messageRefId)])
     }
 
-    /// Lets go of what deleted or moved share refs kept, now: the reflogs of `refs/brahma/shares/*` only (item branches keep
-    /// theirs), then every unreachable loose object (`prune --expire=now`), then `repack -a -d` so a copy already in a pack
-    /// dies too. A purged secret-bearing blob is gone when this returns.
+    /// Purges `purged` (full object ids the engine knows a deleted or moved share pinned): every reflog of the repository, the
+    /// worktrees' `HEAD` reflogs included (`reflog expire --expire=now --expire-unreachable=now --all`; item-branch reflog
+    /// entries go with it, said plainly), then every unreachable loose object (`prune --expire=now`), then `repack -a -d`
+    /// so a copy already in a pack dies too. Fail-closed: afterwards one `cat-file --batch-check` asks for every id, and any
+    /// object still present (reachable from a branch, an index, a worktree `HEAD`) is `.purgeIncomplete(remaining:)`; success
+    /// is never reported while a purged object survives.
     ///
     /// Its only caller is the owner's purge, which must hold the engine's git lock and must refuse while any turn of the
     /// company is running: pruning while an agent writes the object store can orphan a commit that agent is making.
-    public func expireAndPrune() throws {
-        for ref in Self.lines(try output(["for-each-ref", "--format=%(refname)", "--", Self.sharesPrefix])) where ref.hasPrefix(Self.sharesPrefix) {
-            guard (try? Self.shareRef(String(ref.dropFirst(Self.sharesPrefix.count)))) != nil else { continue }
-            // Share refs are not logged by default (`core.logAllRefUpdates` covers heads, remotes, notes); expire what exists.
-            guard try run(["reflog", "exists", "--end-of-options", ref], allowFailure: true).status == 0 else { continue }
-            try output(["reflog", "expire", "--expire=now", "--end-of-options", ref])
-        }
+    public func expireAndPrune(purged: [String]) throws {
+        for oid in purged { try Self.checkRevShape(oid); guard oid.utf8.count == 40 || oid.utf8.count == 64 else { throw SafeGitError.badRev } }
+        try output(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"])
         try output(["prune", "--expire=now"])
         try output(["repack", "-a", "-d", "-q"])
+        guard !purged.isEmpty else { return }
+        let report = Self.lines(try output(["cat-file", "--batch-check"], stdin: Data((purged.joined(separator: "\n") + "\n").utf8)))
+        let remaining = purged.count - report.filter { $0.hasSuffix(" missing") }.count
+        if remaining > 0 { throw SafeGitError.purgeIncomplete(remaining: remaining) }
     }
 
     // MARK: Worktree diffs
 
     /// The changes in the item worktree `<ws>/.brahma/wt/<KEY>` against `against` (an engine-verified tree-ish; nil: the tip
-    /// of `item/<KEY>`, so only uncommitted changes). Two phases, one private index under a fresh per-call directory in
-    /// `tempDir` (`mkdtemp`, 0700, removed when the call ends; `tempDir` itself must be engine-owned):
+    /// of `item/<KEY>`, so only uncommitted changes). The worktree is the directory `SafeFS` opens for the key (`O_NOFOLLOW`
+    /// at `wt` and at the key) and holds for the whole call: every git process of the call is started inside it
+    /// (`fchdir` on that descriptor, `-C .`, `GIT_WORK_TREE=.`), so no path an agent can retarget is ever resolved for the
+    /// work tree, and every file is read from the same descriptor. `worktree` must be the path 3a names for `key`
+    /// (`GitWorkspace.worktreePath`); it is checked, never handed to git. Two phases, one private index under a fresh per-call
+    /// directory in `tempDir` (`mkdtemp`, 0700, removed when the call ends; `tempDir` itself must be engine-owned):
     /// 1. git lists what changed: `read-tree` the base into the private index, then `diff --name-status` (index against the
-    ///    worktree: git does read the worktree here, by name, as the brief requires) and `ls-files --others`. Before and after,
-    ///    the worktree path must still be the real directory `SafeFS` holds for `.brahma/wt/<KEY>` (same device and inode), and
-    ///    `worktree` must be the path 3a names for `key`, so git never walks a swapped entry for long and never another tree.
-    /// 2. every present path is opened through `SafeFS` (one descriptor at a time), its checked bytes copied to an engine-owned
-    ///    file under the call directory and released; then ONE `hash-object -w --no-filters --stdin-paths` hashes those copies
-    ///    (git never opens an agent path for bytes), one `update-index --index-info` fills the index, and `diff --cached` against
-    ///    the base compares objects only.
+    ///    worktree: git reads the worktree here, by name, inside the anchored directory; git itself never follows a symbolic
+    ///    link on a leading path) and `ls-files --others`.
+    /// 2. every present path is opened through `SafeFS` from the held directory (one descriptor at a time), its checked bytes
+    ///    copied to an engine-owned file under the call directory and released; then ONE `hash-object -w --no-filters
+    ///    --stdin-paths` hashes those copies, one `update-index --index-info` fills the index, and `diff --cached` against the
+    ///    base compares objects only.
     /// Bounded: a constant number of git processes; more than `maxDiffFiles` paths, more than `maxDiffBytes` bytes (summed as
     /// files are copied, before any hashing), a single file over `maxBinaryBytes`, or git output past its cap refuse the whole
-    /// diff with `.tooManyChanges`; the whole call shares one time budget (`timeout`). No agent or git-reported name reaches an
-    /// error's text unsanitized. The agent's own index is never read or written.
+    /// diff with `.tooManyChanges`; the whole call shares one time budget (`timeout`). No agent-controlled or git-reported
+    /// name reaches an error's text. The agent's own index is never read or written.
     public func worktreeDiff(key: String, worktree: URL, against: String? = nil, tempDir: URL, fs: SafeFS) throws -> WorktreeDiff {
         guard (try? GitWorkspace.validKey(key)) != nil else { throw SafeGitError.badRef }
         guard worktree.standardizedFileURL.path == GitWorkspace(root: workspace).worktreePath(key: key).standardizedFileURL.path else {
@@ -315,27 +342,20 @@ public struct SafeGit: Sendable {
         let budget = Budget(limit: callTimeout)
         let base: String
         if let against { try Self.checkRevShape(against); base = against } else { base = try head("item/\(key)", budget: budget) }
-        // The worktree entry SafeFS holds (opened O_NOFOLLOW): git may only be pointed at that very directory.
-        let placeId: (dev: dev_t, ino: ino_t)
-        do { placeId = try fs.worktreeIdentity(key: key) } catch { throw SafeGitError.io("the worktree of \(key) is not in place (\(Self.brief(error)))") }
-        func checkInPlace() throws {
-            var st = stat()
-            guard lstat(worktree.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR, st.st_dev == placeId.dev, st.st_ino == placeId.ino else {
-                throw SafeGitError.io("the worktree of \(key) is not in place")
-            }
-        }
+        // The worktree, opened without following a link and held: git runs inside it, files are read from it.
+        let tree: EngineFiles.OpenDirectory
+        do { tree = try fs.worktreeDirectory(key: key) } catch { throw SafeGitError.io("the worktree of \(key) is not in place (\(Self.brief(error)))") }
         // One directory for this call alone: the private index and the byte copies; gone whatever happens below.
         let callDir = try Self.makeCallDirectory(in: tempDir)
         defer { try? FileManager.default.removeItem(at: callDir) }
         let index = callDir.appending(path: "index")
         @discardableResult
-        func wt(_ args: [String], stdin: Data? = nil) throws -> Data { try output(args, workTree: worktree, index: index, stdin: stdin, budget: budget) }
+        func wt(_ args: [String], stdin: Data? = nil) throws -> Data { try output(args, anchor: tree, index: index, stdin: stdin, budget: budget) }
         var changed: [(status: String, path: String)] = []
         func listing(_ args: [String]) throws -> [Data] {
             do { return try wt(args).split(separator: 0, omittingEmptySubsequences: true) }
             catch SafeGitError.outputTooLarge { throw SafeGitError.tooManyChanges(files: changed.count, bytes: 0) }
         }
-        try checkInPlace()
         try wt(["read-tree", "--end-of-options", base])
         let status = try listing(["diff", "--name-status", "-z"] + Self.noDiffPrograms + ["--"])
         var i = 0
@@ -346,10 +366,9 @@ public struct SafeGit: Sendable {
         for raw in try listing(["ls-files", "--others", "--exclude-standard", "-z", "--"]) {
             changed.append(("A", String(decoding: raw, as: UTF8.self)))
         }
-        try checkInPlace()
         guard changed.count <= maxDiffFiles else { throw SafeGitError.tooManyChanges(files: changed.count, bytes: 0) }
-        // Phase 2: each present path opened through SafeFS, its bytes copied to the call directory, the descriptor released
-        // before the next; the byte cap is judged on the running total before any hashing.
+        // Phase 2: each present path opened through SafeFS from the held directory, its bytes copied to the call directory, the
+        // descriptor released before the next; the byte cap is judged on the running total before any hashing.
         var present: [(path: String, size: Int, executable: Bool)] = []
         var removals = Data()
         var paths = Data()
@@ -359,15 +378,15 @@ public struct SafeGit: Sendable {
         for (status, path) in changed {
             if status.hasPrefix("D") { removals.append(contentsOf: path.utf8); removals.append(0); continue }
             let file: SafeFile
-            do { file = try fs.open(path, inWorktree: key, maxBytes: Self.maxBinaryBytes) } catch SafeFSError.tooLarge(let size) {
+            do { file = try fs.open(path, in: tree, key: key, maxBytes: Self.maxBinaryBytes) } catch SafeFSError.tooLarge(let size) {
                 throw SafeGitError.tooManyChanges(files: changed.count, bytes: total + size)
-            } catch { throw SafeGitError.io("\(SafeFS.sanitized(path)): \(Self.brief(error))") }
+            } catch { throw SafeGitError.io("a changed path cannot be read (\(Self.brief(error)))") }
             total += file.size
             guard total <= maxDiffBytes else { throw SafeGitError.tooManyChanges(files: changed.count, bytes: total) }
             let copy = blobDir.appending(path: "\(present.count)").path
             let fd = open(copy, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
             guard fd >= 0 else { throw SafeGitError.io("cannot create a blob copy") }
-            do { try file.copy(toFD: fd) } catch { close(fd); throw SafeGitError.io("\(SafeFS.sanitized(path)): \(Self.brief(error))") }
+            do { try file.copy(toFD: fd) } catch { close(fd); throw SafeGitError.io("a changed path cannot be copied (\(Self.brief(error)))") }
             close(fd)
             present.append((path, file.size, file.executable))
             paths.append(contentsOf: copy.utf8); paths.append(UInt8(ascii: "\n"))
@@ -398,7 +417,7 @@ public struct SafeGit: Sendable {
             i += 2
         }
         let text: DiffText
-        do { text = try diffText(cached, ["--end-of-options", base, "--"], workTree: worktree, index: index, budget: budget) }
+        do { text = try diffText(cached, ["--end-of-options", base, "--"], anchor: tree, index: index, budget: budget) }
         catch SafeGitError.outputTooLarge { throw SafeGitError.tooManyChanges(files: changed.count, bytes: total) }
         let counts = Dictionary(text.stat.map { ($0.path, ($0.added, $0.removed)) }, uniquingKeysWith: { a, _ in a })
         let sizes = Dictionary(present.map { ($0.path, $0.size) }, uniquingKeysWith: { a, _ in a })
@@ -410,6 +429,8 @@ public struct SafeGit: Sendable {
     private static func makeCallDirectory(in tempDir: URL) throws -> URL {
         do { try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         catch { throw SafeGitError.io("cannot create the diff's temporary directory") }
+        // `hash-object --stdin-paths` takes one path per line: a newline anywhere in the call directory's path is refused.
+        guard !tempDir.path.contains("\n") else { throw SafeGitError.io("the diff's temporary directory path holds a newline") }
         var template = Array((tempDir.path + "/diff-XXXXXX").utf8CString)
         guard mkdtemp(&template) != nil else { throw SafeGitError.io("cannot create the diff's call directory (\(String(cString: strerror(errno))))") }
         return URL(fileURLWithPath: String(cString: template), isDirectory: true)
@@ -437,15 +458,15 @@ public struct SafeGit: Sendable {
 
     // MARK: Running
 
-    private func diffText(_ command: [String], _ tail: [String], workTree: URL? = nil, index: URL? = nil, budget: Budget? = nil) throws -> DiffText {
-        let numstat = try output(command + ["--numstat", "-z"] + tail, workTree: workTree, index: index, budget: budget)
+    private func diffText(_ command: [String], _ tail: [String], anchor: EngineFiles.OpenDirectory? = nil, index: URL? = nil, budget: Budget? = nil) throws -> DiffText {
+        let numstat = try output(command + ["--numstat", "-z"] + tail, anchor: anchor, index: index, budget: budget)
         var stat: [(path: String, added: Int?, removed: Int?)] = []
         for record in numstat.split(separator: 0, omittingEmptySubsequences: true) {
             let fields = String(decoding: record, as: UTF8.self).split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
             guard fields.count == 3 else { continue }
             stat.append((String(fields[2]), Int(fields[0]), Int(fields[1])))
         }
-        let patch = Self.text(try output(command + ["-p"] + tail, workTree: workTree, index: index, budget: budget))
+        let patch = Self.text(try output(command + ["-p"] + tail, anchor: anchor, index: index, budget: budget))
         let lines = patch.split(separator: "\n", omittingEmptySubsequences: false)
         if lines.count > Self.maxDiffLines {
             return DiffText(stat: stat, patch: lines.prefix(Self.maxDiffLines).joined(separator: "\n") + "\n", truncated: true)
@@ -455,15 +476,16 @@ public struct SafeGit: Sendable {
 
     /// Stdout of a successful call; a non-zero status is `.git`.
     @discardableResult
-    private func output(_ args: [String], workTree: URL? = nil, index: URL? = nil, stdin: Data? = nil, outputCap: Int = SafeGit.outputCap,
-                        budget: Budget? = nil) throws -> Data {
-        let r = try run(args, workTree: workTree, index: index, stdin: stdin, outputCap: outputCap, allowFailure: false, budget: budget)
+    private func output(_ args: [String], anchor: EngineFiles.OpenDirectory? = nil, index: URL? = nil, stdin: Data? = nil,
+                        outputCap: Int = SafeGit.outputCap, budget: Budget? = nil) throws -> Data {
+        let r = try run(args, anchor: anchor, index: index, stdin: stdin, outputCap: outputCap, allowFailure: false, budget: budget)
         return r.stdout
     }
 
     /// One git call: the command line and environment come from `GitCommand` (the repository scanned, the forced `-c` flags,
     /// the pinned environment, plus `extraEnvironment`/`extraConfig`), then the runner runs it.
-    private func run(_ args: [String], workTree: URL? = nil, index: URL? = nil, stdin: Data? = nil, outputCap: Int = SafeGit.outputCap,
+    /// `anchor`: the held worktree directory the processes are started in (`GitCommand.workTreeDescriptor`), else the workspace.
+    private func run(_ args: [String], anchor: EngineFiles.OpenDirectory? = nil, index: URL? = nil, stdin: Data? = nil, outputCap: Int = SafeGit.outputCap,
                      allowFailure: Bool, budget: Budget? = nil) throws -> (status: Int32, stdout: Data, stderr: Data) {
         // Within a budgeted call, each process gets what is left of the budget (never more than one call's timeout).
         var timeout = callTimeout
@@ -471,17 +493,21 @@ public struct SafeGit: Sendable {
             try budget.check()
             timeout = min(timeout, budget.remaining)
         }
-        var git = GitCommand(gitDir: workspace.appending(path: ".git", directoryHint: .isDirectory), workTree: workTree ?? workspace, commonDir: nil)
+        var git = GitCommand(gitDir: workspace.appending(path: ".git", directoryHint: .isDirectory), workTree: workspace, commonDir: nil)
+        git.workTreeDescriptor = anchor?.fd
         git.indexFile = index
         git.extraEnvironment = Self.extraEnvironment
         git.extraConfig = Self.extraConfig
         git.timeoutSeconds = Self.seconds(timeout)
         let line: (args: [String], environment: [String: String])
         do { line = try git.commandLine(args) } catch let e as GitError { throw SafeGitError.git(e.description) }
-        let out = try runner.run(args: line.args, env: line.environment, stdin: stdin, timeout: timeout, outputCap: outputCap)
+        let out = try runner.run(args: line.args, env: line.environment, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: anchor?.fd)
         guard out.stdout.count <= outputCap else { throw SafeGitError.outputTooLarge }
         if out.status != 0, !allowFailure {
-            throw SafeGitError.git("git \(args.first ?? "") failed (\(out.status))" + (out.stderr.isEmpty ? "" : ": \(Self.text(out.stderr).prefix(500))"))
+            // An anchored (worktree) process's stderr may echo agent-named paths: dropped. Elsewhere it is ASCII-folded, capped
+            // and stripped of path-like tokens before it is shown.
+            let detail = anchor == nil ? Self.sanitizedStderr(out.stderr) : ""
+            throw SafeGitError.git("git \(args.first ?? "") failed (\(out.status))" + (detail.isEmpty ? "" : ": \(detail)"))
         }
         return out
     }
@@ -542,6 +568,13 @@ public struct SafeGit: Sendable {
     static func fullSha(_ data: Data) -> String? {
         let s = text(data)
         return (s.count == 40 || s.count == 64) && s.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) ? s : nil
+    }
+
+    /// Git's stderr fit for an error: printable ASCII only (anything else `?`), no token holding a `/` (a path), at most 300.
+    static func sanitizedStderr(_ data: Data) -> String {
+        let words = text(data).split(whereSeparator: { $0.isWhitespace }).filter { !$0.contains("/") }
+        let folded = words.joined(separator: " ").unicodeScalars.map { (0x20...0x7E).contains($0.value) ? Character($0) : "?" }
+        return String(folded.prefix(300))
     }
 
     static func text(_ data: Data) -> String { String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }

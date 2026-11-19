@@ -153,22 +153,22 @@ public final class SafeFS: @unchecked Sendable {
 
     /// A file in the item worktree `<ws>/.brahma/wt/<KEY>/` by its worktree-relative path.
     public func open(_ relativePath: String, inWorktree key: String, maxBytes: Int) throws -> SafeFile {
-        let parts = try Self.components(relativePath)
-        guard (try? GitWorkspace.validKey(key)) != nil else { throw SafeFSError.badPath }
-        do {
-            let wt = try brahma.child("wt")
-            let tree = try wt.child(key)
-            return try walk(from: tree, parts, state: .place(.worktree(key: key)), maxBytes: maxBytes)
-        } catch let e as UnsafeEngineFile {
-            throw Self.map(e)
-        }
+        try open(relativePath, in: try worktreeDirectory(key: key), key: key, maxBytes: maxBytes)
     }
 
-    /// The `(device, inode)` of the real directory `.brahma/wt/<KEY>` as the walk opens it (`O_NOFOLLOW`): what a program
-    /// handed that path must land on (`SafeGit.worktreeDiff`).
-    func worktreeIdentity(key: String) throws -> (dev: dev_t, ino: ino_t) {
+    /// The real directory `.brahma/wt/<KEY>`, opened by the walk (`O_NOFOLLOW` at `wt` and at the key) and held by the caller
+    /// for as long as one operation needs the same directory for every step (`SafeGit.worktreeDiff`: git is anchored to it,
+    /// and the files are read from it).
+    func worktreeDirectory(key: String) throws -> EngineFiles.OpenDirectory {
         guard (try? GitWorkspace.validKey(key)) != nil else { throw SafeFSError.badPath }
-        do { return try brahma.child("wt").child(key).identity() } catch let e as UnsafeEngineFile { throw Self.map(e) }
+        do { return try brahma.child("wt").child(key) } catch let e as UnsafeEngineFile { throw Self.map(e) }
+    }
+
+    /// A file in the held worktree directory `tree` (from `worktreeDirectory(key:)`) by its worktree-relative path.
+    func open(_ relativePath: String, in tree: EngineFiles.OpenDirectory, key: String, maxBytes: Int) throws -> SafeFile {
+        let parts = try Self.components(relativePath)
+        do { return try walk(from: tree, parts, state: .place(.worktree(key: key)), maxBytes: maxBytes) }
+        catch let e as UnsafeEngineFile { throw Self.map(e) }
     }
 
     /// Creates `<own lab>/<sub>/<name>` exclusively (never over or through anything there), mode 0444, through `EngineFiles`
