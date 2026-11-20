@@ -157,6 +157,9 @@ public struct SafeGit: Sendable {
     /// `worktreeDiff`: the bytes of path text the walk may keep (and `check-ignore` be given or give back); past it the diff is
     /// `.tooManyChanges`. `outputCap`; tests lower it.
     var listingByteCap = SafeGit.outputCap
+    /// `worktreeDiff`: the bytes of `.gitignore` copies made for git, summed by each opened descriptor's size before any is
+    /// copied; past it the diff is `.tooManyChanges`. `outputCap`; tests lower it.
+    var ignoreCopyByteCap = SafeGit.outputCap
     /// Tests only: handed the size of every chunk hashed for a same-size id comparison in `worktreeDiff`.
     var hashChunkProbe: (@Sendable (Int) -> Void)?
 
@@ -349,7 +352,8 @@ public struct SafeGit: Sendable {
     ///    past it) decides ignores, reading engine-owned copies of the `.gitignore` files in the shadow work tree; each copy's
     ///    bytes come through `SafeFS` (regular, one link, this user's, at most 1 MiB, judged on the opened descriptor's
     ///    `fstat`, copied up to that size) and a `.gitignore` that fails that is not copied: git then sees fewer rules, so more
-    ///    paths are listed, never fewer.
+    ///    paths are listed, never fewer. The copies' sizes are summed against `ignoreCopyByteCap` (`outputCap`) before each
+    ///    copy (`.tooManyChanges` past it, never a partial rule set), the budget checked per file and per chunk.
     /// 2. Changes: a base path not present is deleted; a present path not in the base (and not ignored) is added; a path in
     ///    both is modified when mode or size differ, else when its blob id — computed in the engine (`SHA1`/`SHA256`) from the
     ///    bytes streamed through `SafeFS` in 64 KiB chunks, the time budget checked per chunk — differs, so an unchanged file
@@ -436,14 +440,7 @@ public struct SafeGit: Sendable {
         // (a leading `:`) is never asked about and simply listed as a change.
         let candidates = (found.entries.map(\.path) + found.repositories).filter { baseEntries[$0] == nil && !$0.hasPrefix(":") }
         if !candidates.isEmpty {
-            for rel in found.ignoreFiles {
-                // Through `SafeFS`, judged on the opened descriptor's `fstat` (regular, one link, this user's, at most 1 MiB) and
-                // copied up to that size: one that fails is not copied, so git sees fewer rules and lists more, never less.
-                guard let file = try? fs.open(rel, in: tree, key: key, maxBytes: Self.maxIgnoreFileBytes) else { continue }
-                let copy = shadow.appending(path: rel)
-                try Self.makeShadowDirectory(copy.deletingLastPathComponent())
-                try Self.write(file: file, to: copy.path)
-            }
+            try Self.copyIgnoreFiles(found.ignoreFiles, from: tree, key: key, fs: fs, to: shadow, cap: ignoreCopyByteCap, budget: budget)
             for rel in found.repositories { try Self.makeShadowDirectory(shadow.appending(path: rel, directoryHint: .isDirectory)) }
             var stdin = Data()
             for path in candidates { stdin.append(contentsOf: path.utf8); stdin.append(0) }
@@ -575,12 +572,42 @@ public struct SafeGit: Sendable {
         return SHA1.hex(digest: hash.finalize())
     }
 
-    /// A fresh engine-owned file at `path` (`O_EXCL | O_NOFOLLOW`, 0600) holding the `SafeFile`'s bytes.
-    private static func write(file: SafeFile, to path: String) throws {
+    /// Copies the worktree's `.gitignore` files (`rels`, worktree-relative) to the same paths under `shadow` for git. Each is
+    /// opened through `SafeFS`, judged on the opened descriptor's `fstat` (regular, one link, this user's, at most 1 MiB) and
+    /// copied up to that size: one that fails is not copied, so git sees fewer rules and lists more, never less. The sizes are
+    /// summed against `cap` before each copy: past it the whole diff is `.tooManyChanges` (never a partial rule set). The
+    /// budget is checked per file and per copied chunk.
+    static func copyIgnoreFiles(_ rels: [String], from tree: EngineFiles.OpenDirectory, key: String, fs: SafeFS, to shadow: URL,
+                                cap: Int, budget: Budget) throws {
+        var total = 0
+        for rel in rels {
+            try budget.check()
+            guard let file = try? fs.open(rel, in: tree, key: key, maxBytes: maxIgnoreFileBytes) else { continue }
+            total += file.size
+            guard total <= cap else { throw SafeGitError.tooManyChanges(files: rels.count, bytes: total) }
+            let copy = shadow.appending(path: rel)
+            try makeShadowDirectory(copy.deletingLastPathComponent())
+            try write(file: file, to: copy.path, budget: budget)
+        }
+    }
+
+    /// A fresh engine-owned file at `path` (`O_EXCL | O_NOFOLLOW`, 0600) holding the `SafeFile`'s bytes; with a budget, it is
+    /// checked before each chunk.
+    static func write(file: SafeFile, to path: String, budget: Budget? = nil) throws {
         let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw SafeGitError.io("cannot create a copy of a changed path") }
         defer { close(fd) }
-        do { try file.copy(toFD: fd) } catch { throw SafeGitError.io("a changed path cannot be copied (\(brief(error)))") }
+        do {
+            try file.forEachChunk { raw in
+                try budget?.check()
+                var offset = 0
+                while offset < raw.count {
+                    let n = Foundation.write(fd, raw.baseAddress! + offset, raw.count - offset)
+                    if n < 0 { if errno == EINTR { continue }; throw SafeGitError.io("a changed path cannot be copied") }
+                    offset += n
+                }
+            }
+        } catch let e as SafeGitError { throw e } catch { throw SafeGitError.io("a changed path cannot be copied (\(brief(error)))") }
     }
 
     private static func write(bytes: Data, to path: String) throws {
