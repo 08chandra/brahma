@@ -11,15 +11,22 @@ public struct SHA1 {
     public init() {}
 
     public mutating func update(_ bytes: UnsafeRawBufferPointer) {
+        guard let base = bytes.baseAddress, !bytes.isEmpty else { return }
         length &+= UInt64(bytes.count)
-        var input = Array(bytes)
-        if !buffer.isEmpty { input = buffer + input; buffer = [] }
         var offset = 0
-        while input.count - offset >= 64 {
-            input.withUnsafeBufferPointer { compress($0.baseAddress! + offset) }
+        if !buffer.isEmpty {
+            let take = min(64 - buffer.count, bytes.count)
+            buffer.append(contentsOf: UnsafeRawBufferPointer(rebasing: bytes[0..<take]))
+            offset = take
+            guard buffer.count == 64 else { return }
+            buffer.withUnsafeBytes { compress($0.baseAddress!) }
+            buffer.removeAll(keepingCapacity: true)
+        }
+        while bytes.count - offset >= 64 {
+            compress(UnsafeRawPointer(base + offset))
             offset += 64
         }
-        buffer = Array(input[offset...])
+        if offset < bytes.count { buffer.append(contentsOf: UnsafeRawBufferPointer(rebasing: bytes[offset...])) }
     }
 
     public mutating func update(_ data: Data) { data.withUnsafeBytes { update($0) } }
@@ -29,7 +36,7 @@ public struct SHA1 {
         while tail.count % 64 != 56 { tail.append(0) }
         let bits = length &* 8
         for shift in stride(from: 56, through: 0, by: -8) { tail.append(UInt8((bits >> UInt64(shift)) & 0xFF)) }
-        tail.withUnsafeBufferPointer { p in
+        tail.withUnsafeBytes { p in
             var offset = 0
             while offset < tail.count { compress(p.baseAddress! + offset); offset += 64 }
         }
@@ -41,27 +48,26 @@ public struct SHA1 {
 
     public static func hex(digest: [UInt8]) -> String { digest.map { String(format: "%02x", $0) }.joined() }
 
-    private mutating func compress(_ block: UnsafePointer<UInt8>) {
-        var w = [UInt32](repeating: 0, count: 80)
-        for i in 0..<16 {
-            w[i] = UInt32(block[4 * i]) << 24 | UInt32(block[4 * i + 1]) << 16 | UInt32(block[4 * i + 2]) << 8 | UInt32(block[4 * i + 3])
-        }
-        for i in 16..<80 {
-            let x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]
-            w[i] = x << 1 | x >> 31
-        }
-        var (a, b, c, d, e) = h
-        for i in 0..<80 {
-            let f: UInt32, k: UInt32
-            switch i {
-            case 0..<20: f = (b & c) | (~b & d); k = 0x5A827999
-            case 20..<40: f = b ^ c ^ d; k = 0x6ED9EBA1
-            case 40..<60: f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC
-            default: f = b ^ c ^ d; k = 0xCA62C1D6
+    private mutating func compress(_ block: UnsafeRawPointer) {
+        withUnsafeTemporaryAllocation(of: UInt32.self, capacity: 80) { w in
+            for i in 0..<16 { w[i] = UInt32(bigEndian: block.loadUnaligned(fromByteOffset: 4 * i, as: UInt32.self)) }
+            for i in 16..<80 {
+                let x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]
+                w[i] = x << 1 | x >> 31
             }
-            let t = (a << 5 | a >> 27) &+ f &+ e &+ k &+ w[i]
-            e = d; d = c; c = b << 30 | b >> 2; b = a; a = t
+            var (a, b, c, d, e) = h
+            for i in 0..<80 {
+                let f: UInt32, k: UInt32
+                switch i {
+                case 0..<20: f = (b & c) | (~b & d); k = 0x5A827999
+                case 20..<40: f = b ^ c ^ d; k = 0x6ED9EBA1
+                case 40..<60: f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC
+                default: f = b ^ c ^ d; k = 0xCA62C1D6
+                }
+                let t = (a << 5 | a >> 27) &+ f &+ e &+ k &+ w[i]
+                e = d; d = c; c = b << 30 | b >> 2; b = a; a = t
+            }
+            h = (h.0 &+ a, h.1 &+ b, h.2 &+ c, h.3 &+ d, h.4 &+ e)
         }
-        h = (h.0 &+ a, h.1 &+ b, h.2 &+ c, h.3 &+ d, h.4 &+ e)
     }
 }

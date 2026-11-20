@@ -513,6 +513,15 @@ public enum EngineFiles {
         /// The names in it (without `.` and `..`).
         func names() throws -> [String] { try EngineFiles.entryNames(fd: fd, shown: shown.path) }
 
+        /// The names in it, stopping right after `limit` names or right after the name that takes their summed UTF-8 bytes
+        /// past `byteLimit` (a caller bounding a walk sees the overflow and refuses).
+        func names(limit: Int, byteLimit: Int) throws -> [String] {
+            guard let names = DirectoryListing.names(fd: fd, limit: limit, byteLimit: byteLimit) else {
+                throw UnsafeEngineFile(path: shown.path, problem: "cannot be listed")
+            }
+            return names
+        }
+
         /// Removes `name` from it (`EngineFiles.removeEntry`).
         func remove(_ name: String) throws {
             try EngineFiles.removeEntry(dfd: fd, name: name, shown: shown.appending(path: name).path)
@@ -928,7 +937,7 @@ public enum EngineFiles {
         #if canImport(Darwin)
         var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         guard fcntl(fd, F_GETPATH, &buffer) == 0 else { return nil }
-        return String(cString: buffer)
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         #else
         return resolved("/proc/self/fd/\(fd)")
         #endif
