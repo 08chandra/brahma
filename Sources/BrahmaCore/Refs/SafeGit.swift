@@ -71,6 +71,8 @@ extension GitProcessRunning {
 public struct LiveGitRunner: GitProcessRunning {
     /// Where git's captured output goes; the engine passes its data home's 0700 `tmp` (A-I1b). Nil: the process temp dir.
     public var tempRoot: URL?
+    /// Tests only: handed the executable and argv of every git this runner starts (`GitCommand.spawnObserver`).
+    var spawnObserver: (@Sendable (_ executable: String, _ argv: [String]) -> Void)?
 
     public init(tempRoot: URL? = nil) { self.tempRoot = tempRoot }
 
@@ -85,6 +87,7 @@ public struct LiveGitRunner: GitProcessRunning {
         var git = GitCommand(gitDir: URL(fileURLWithPath: gitDir, isDirectory: true), workTree: URL(fileURLWithPath: workTree, isDirectory: true), commonDir: nil)
         git.timeoutSeconds = SafeGit.seconds(timeout)
         git.workTreeDescriptor = workTreeDescriptor
+        git.spawnObserver = spawnObserver
         if let tempRoot { git.tempRoot = tempRoot }
         let out: GitCommand.Output
         do {
@@ -112,6 +115,8 @@ public struct SafeGit: Sendable {
     public static let maxDiffBytes = 200 << 20
     public static let timeout: Duration = .seconds(10)
     public static let outputCap = 8_388_608
+    /// A `.gitignore` larger than this is not handed to git (`worktreeDiff`): fewer rules, more listed.
+    static let maxIgnoreFileBytes = 1 << 20
     static let extraEnvironment = ["GIT_LITERAL_PATHSPECS": "1"]
     static let extraConfig = ["-c", "core.untrackedCache=false", "-c", "core.excludesFile=/dev/null"]
     static let sharesPrefix = "refs/brahma/shares/"
@@ -149,6 +154,11 @@ public struct SafeGit: Sendable {
     let callTimeout: Duration
     let maxDiffFiles: Int
     let maxDiffBytes: Int
+    /// `worktreeDiff`: the bytes of path text the walk may keep (and `check-ignore` be given or give back); past it the diff is
+    /// `.tooManyChanges`. `outputCap`; tests lower it.
+    var listingByteCap = SafeGit.outputCap
+    /// Tests only: handed the size of every chunk hashed for a same-size id comparison in `worktreeDiff`.
+    var hashChunkProbe: (@Sendable (Int) -> Void)?
 
     public init(workspace: URL, runner: any GitProcessRunning = LiveGitRunner(), timeout: Duration = SafeGit.timeout,
                 maxDiffFiles: Int = SafeGit.maxDiffFiles, maxDiffBytes: Int = SafeGit.maxDiffBytes) {
@@ -327,13 +337,24 @@ public struct SafeGit: Sendable {
     /// in a fresh per-call directory under `tempDir` (`mkdtemp`, 0700, removed when the call ends; `tempDir` must be
     /// engine-owned). Phases:
     /// 1. The base, objects only: `read-tree` into the private index, `ls-tree -r -l` for the base's paths, modes, ids, sizes.
-    ///    The worktree, descriptors only: `WorktreeListing.walk` from the held directory (files, links' targets, `.gitignore`
-    ///    files; `.git` entries and nested repositories skipped; ignored directories pruned conservatively). For paths the base
-    ///    does not track, ONE `git check-ignore --stdin` decides ignores, reading engine-owned copies of the `.gitignore` files
-    ///    (bytes read through `SafeFS`) in the shadow work tree.
+    ///    The worktree, descriptors only: `WorktreeListing.walk` from the held directory. It omits nothing git would list:
+    ///    nothing is pruned (the engine has no gitignore parser of its own), every directory under which the base tracks a
+    ///    path is walked whole, and anything it cannot account for refuses the whole diff — a directory or entry it cannot
+    ///    list, open or read (`io`), a `.git` entry in a directory under which the base tracks paths (`io`), more than
+    ///    `WorktreeListing.maxEntries` entries, `listingByteCap` (`outputCap`) bytes of path text or `maxDepth` levels
+    ///    (`.tooManyChanges`). Not listed, as git lists none: `.git` entries, devices, pipes, sockets, a submodule's directory.
+    ///    An untracked directory holding a nested repository (by a check narrower than git's) is one entry `<dir>/`, status
+    ///    `A`, nothing in it read; any other `.git` there is skipped and the directory walked. For every walked path the base
+    ///    does not track, ONE `git check-ignore --stdin` (stdin and output bounded by `listingByteCap`, `.tooManyChanges`
+    ///    past it) decides ignores, reading engine-owned copies of the `.gitignore` files in the shadow work tree; each copy's
+    ///    bytes come through `SafeFS` (regular, one link, this user's, at most 1 MiB, judged on the opened descriptor's
+    ///    `fstat`, copied up to that size) and a `.gitignore` that fails that is not copied: git then sees fewer rules, so more
+    ///    paths are listed, never fewer.
     /// 2. Changes: a base path not present is deleted; a present path not in the base (and not ignored) is added; a path in
     ///    both is modified when mode or size differ, else when its blob id — computed in the engine (`SHA1`/`SHA256`) from the
-    ///    bytes read through `SafeFS` — differs, so an unchanged file never leaves the engine.
+    ///    bytes streamed through `SafeFS` in 64 KiB chunks, the time budget checked per chunk — differs, so an unchanged file
+    ///    never leaves the engine and never sits in memory whole. The file is opened for at most the size the walk recorded;
+    ///    one that changed size meanwhile counts as modified without being read here (phase 3 takes it under its caps).
     /// 3. Each changed file's checked bytes (a link: its target) are copied to an engine-owned file under the call directory,
     ///    one descriptor at a time, summed against `maxDiffBytes` before any hashing; ONE `hash-object -w --no-filters
     ///    --stdin-paths` hashes the copies, one `update-index --index-info` (and one `--force-remove`) fills the index, and
@@ -384,29 +405,60 @@ public struct SafeGit: Sendable {
             sha256 = sha256 || sha.utf8.count == 64
             baseEntries[String(decoding: record[record.index(after: tab)...], as: UTF8.self)] = (String(meta[0]), sha, Int(meta[3]))
         }
+        // Every directory under which the base tracks a path (the root included) is walked whole and never skipped: a `.git`
+        // entry in one refuses the diff. A submodule's directory (`160000`) is not walked (compared as a gitlink, i.e. skipped).
+        var trackedDirectories: Set<String> = [], gitlinks: Set<String> = []
+        for (path, entry) in baseEntries {
+            if entry.mode == "160000" { gitlinks.insert(path) }
+            var dir = Substring(path)
+            while let slash = dir.lastIndex(of: "/") {
+                dir = dir[..<slash]
+                if !trackedDirectories.insert(String(dir)).inserted { break }
+            }
+        }
         let found: WorktreeListing
-        do { found = try WorktreeListing.walk(tree) { try budget.check() } } catch let e as SafeGitError { throw e } catch { throw unreadable(error) }
-        guard !found.truncated else { throw SafeGitError.tooManyChanges(files: found.entries.count, bytes: 0) }
+        do {
+            found = try WorktreeListing.walk(tree, trackedDirectories: trackedDirectories, gitlinks: gitlinks, maxPathBytes: listingByteCap) { try budget.check() }
+        } catch let e as SafeGitError {
+            throw e
+        } catch WorktreeListing.Refusal.tooLarge(let entries, let bytes) {
+            throw SafeGitError.tooManyChanges(files: entries, bytes: bytes)
+        } catch WorktreeListing.Refusal.repositoryInTrackedDirectory {
+            throw SafeGitError.io("the worktree of \(key) holds a .git entry in a tracked directory")
+        } catch {
+            throw SafeGitError.io("the worktree of \(key) cannot be listed")
+        }
         let present = Dictionary(found.entries.map { ($0.path, $0.kind) }, uniquingKeysWith: { a, _ in a })
-        // Ignore verdicts for what the base does not track: git reads engine-owned copies of the `.gitignore` files.
+        // Ignore verdicts for every walked path the base does not track (nothing was pruned): git reads engine-owned copies of
+        // the `.gitignore` files. A nested repository's directory is made in the shadow too, so git judges it as a directory.
         var ignored: Set<String> = []
         // `check-ignore` refuses `GIT_LITERAL_PATHSPECS` and reads its paths as pathspecs: a name that could carry pathspec magic
         // (a leading `:`) is never asked about and simply listed as a change.
-        let candidates = found.entries.map(\.path).filter { baseEntries[$0] == nil && !$0.hasPrefix(":") }
+        let candidates = (found.entries.map(\.path) + found.repositories).filter { baseEntries[$0] == nil && !$0.hasPrefix(":") }
         if !candidates.isEmpty {
             for rel in found.ignoreFiles {
-                guard let file = try? fs.open(rel, in: tree, key: key, maxBytes: 1 << 20) else { continue }   // unreadable: no rules from it
+                // Through `SafeFS`, judged on the opened descriptor's `fstat` (regular, one link, this user's, at most 1 MiB) and
+                // copied up to that size: one that fails is not copied, so git sees fewer rules and lists more, never less.
+                guard let file = try? fs.open(rel, in: tree, key: key, maxBytes: Self.maxIgnoreFileBytes) else { continue }
                 let copy = shadow.appending(path: rel)
-                try? FileManager.default.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                try Self.makeShadowDirectory(copy.deletingLastPathComponent())
                 try Self.write(file: file, to: copy.path)
             }
+            for rel in found.repositories { try Self.makeShadowDirectory(shadow.appending(path: rel, directoryHint: .isDirectory)) }
             var stdin = Data()
             for path in candidates { stdin.append(contentsOf: path.utf8); stdin.append(0) }
-            let r = try run(["check-ignore", "-z", "--stdin", "--no-index"], workTree: shadow, anchor: anchor, index: index, stdin: stdin, allowFailure: true,
-                            budget: budget, literalPathspecs: false)
+            guard stdin.count <= listingByteCap else { throw SafeGitError.tooManyChanges(files: candidates.count, bytes: stdin.count) }
+            let r: (status: Int32, stdout: Data, stderr: Data)
+            do {
+                r = try run(["check-ignore", "-z", "--stdin", "--no-index"], workTree: shadow, anchor: anchor, index: index, stdin: stdin, outputCap: listingByteCap,
+                            allowFailure: true, budget: budget, literalPathspecs: false)
+            } catch SafeGitError.outputTooLarge {
+                throw SafeGitError.tooManyChanges(files: candidates.count, bytes: stdin.count)
+            }
             guard r.status == 0 || r.status == 1 else { throw SafeGitError.git("git check-ignore failed (\(r.status))") }
             for raw in r.stdout.split(separator: 0, omittingEmptySubsequences: true) { ignored.insert(String(decoding: raw, as: UTF8.self)) }
         }
+        let repositories = found.repositories.filter { !ignored.contains($0) }
         // Phase 2: what changed. Same mode and size: the blob id, computed here, decides.
         for (path, entry) in baseEntries where present[path] == nil && entry.mode != "160000" { changed.append(("D", path, nil)) }
         var compared = 0
@@ -421,14 +473,19 @@ public struct SafeGit: Sendable {
                 if known.mode != (executable ? "100755" : "100644") || known.size != size { changed.append(("M", entry.path, entry.kind)); continue }
                 compared += 1
                 if compared % 64 == 0 { try budget.check() }
+                // Opened for exactly the size the walk saw: a file that grew or shrank meanwhile is modified, unread here.
                 let file: SafeFile
-                do { file = try fs.open(entry.path, in: tree, key: key, maxBytes: .max) } catch { throw unreadable(error) }
-                do { if try Self.blobId(of: file, sha256: sha256) != known.sha { changed.append(("M", entry.path, entry.kind)) } } catch { throw unreadable(error) }
+                do { file = try fs.open(entry.path, in: tree, key: key, maxBytes: size) } catch SafeFSError.tooLarge {
+                    changed.append(("M", entry.path, entry.kind)); continue
+                } catch { throw unreadable(error) }
+                guard file.size == size else { changed.append(("M", entry.path, entry.kind)); continue }
+                do { if try Self.blobId(of: file, sha256: sha256, budget: budget, probe: hashChunkProbe) != known.sha { changed.append(("M", entry.path, entry.kind)) } }
+                catch let e as SafeGitError { throw e } catch { throw unreadable(error) }
             case .link(let target):
                 if known.mode != "120000" || Self.blobId(of: target, sha256: sha256) != known.sha { changed.append(("M", entry.path, entry.kind)) }
             }
         }
-        guard changed.count <= maxDiffFiles else { throw SafeGitError.tooManyChanges(files: changed.count, bytes: 0) }
+        guard changed.count + repositories.count <= maxDiffFiles else { throw SafeGitError.tooManyChanges(files: changed.count + repositories.count, bytes: 0) }
         changed.sort { $0.path < $1.path }
         // Phase 3: each changed path's checked bytes copied to the call directory, one descriptor at a time, summed before hashing.
         var copies: [(path: String, size: Int, mode: String)] = []
@@ -485,22 +542,26 @@ public struct SafeGit: Sendable {
         catch SafeGitError.outputTooLarge { throw SafeGitError.tooManyChanges(files: changed.count, bytes: total) }
         let counts = Dictionary(text.stat.map { ($0.path, ($0.added, $0.removed)) }, uniquingKeysWith: { a, _ in a })
         let sizes = Dictionary(copies.map { ($0.path, $0.size) }, uniquingKeysWith: { a, _ in a })
-        let files = statuses.map { (path: $0.path, status: $0.status, added: counts[$0.path]?.0, removed: counts[$0.path]?.1, bytes: sizes[$0.path] ?? 0) }
+        var files = statuses.map { (path: $0.path, status: $0.status, added: counts[$0.path]?.0, removed: counts[$0.path]?.1, bytes: sizes[$0.path] ?? 0) }
+        // A nested repository: one untracked entry `<dir>/`, as git lists it; nothing in it is read or diffed.
+        files += repositories.map { (path: $0 + "/", status: "A", added: nil, removed: nil, bytes: 0) }
+        files.sort { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
         return WorktreeDiff(files: files, patch: text.patch, blobShas: blobShas, truncated: text.truncated)
     }
 
-    /// Git's blob id of the file's bytes (`blob <size>\0` + bytes), computed in the engine from the held descriptor, one chunk
-    /// at a time (SHA-1; a SHA-256 repository hashes the whole file in memory).
-    static func blobId(of file: SafeFile, sha256: Bool) throws -> String {
+    /// Git's blob id of the file's bytes (`blob <size>\0` + bytes), computed in the engine from the held descriptor in 64 KiB
+    /// chunks (SHA-1, or SHA-256 for such a repository), the time budget checked per chunk; nothing but one chunk is in memory.
+    static func blobId(of file: SafeFile, sha256: Bool, budget: Budget? = nil, probe: (@Sendable (Int) -> Void)? = nil) throws -> String {
         let header = Data("blob \(file.size)\u{0}".utf8)
         if sha256 {
-            var all = header
-            all.append(try file.readAll())
-            return SHA256.hex(all)
+            var hash = SHA256.Hasher()
+            hash.update(header)
+            try file.forEachChunk { chunk in try budget?.check(); probe?(chunk.count); hash.update(chunk) }
+            return SHA256.hex(digest: hash.finalize())
         }
         var hash = SHA1()
         hash.update(header)
-        try file.forEachChunk { hash.update($0) }
+        try file.forEachChunk { chunk in try budget?.check(); probe?(chunk.count); hash.update(chunk) }
         return SHA1.hex(digest: hash.finalize())
     }
 
@@ -553,6 +614,12 @@ public struct SafeGit: Sendable {
         }
     }
 
+    /// `dir` (under the call's shadow work tree) and its missing parents, 0700.
+    private static func makeShadowDirectory(_ dir: URL) throws {
+        do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
+        catch { throw SafeGitError.io("cannot create the diff's directories") }
+    }
+
     /// A fresh 0700 directory `diff-XXXXXX` directly in `tempDir` (`mkdtemp`), this call's alone.
     private static func makeCallDirectory(in tempDir: URL) throws -> URL {
         do { try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
@@ -561,7 +628,7 @@ public struct SafeGit: Sendable {
         guard !tempDir.path.contains("\n") else { throw SafeGitError.io("the diff's temporary directory path holds a newline") }
         var template = Array((tempDir.path + "/diff-XXXXXX").utf8CString)
         guard mkdtemp(&template) != nil else { throw SafeGitError.io("cannot create the diff's call directory (\(String(cString: strerror(errno))))") }
-        return URL(fileURLWithPath: String(cString: template), isDirectory: true)
+        return URL(fileURLWithPath: String(decoding: template.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self), isDirectory: true)
     }
 
     /// An error's text with no agent-named path in it: `SafeFSError` cases carry none (or a sanitized name); anything else

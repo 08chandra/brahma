@@ -461,7 +461,7 @@ import Foundation
 
     /// R4: a `git` planted in the worktree never runs, however PATH is shaped: the executable is resolved in the engine from
     /// absolute PATH entries and exec'd by absolute path; relative and empty entries are stripped from the child's PATH.
-    @Test(arguments: [".:/usr/bin:/bin", "/usr/bin::/bin", "bin:/usr/bin:/bin:"]) func plantedGitInWorktreeNeverRuns(_ path: String) throws {
+    @Test(arguments: [":/usr/bin:/bin", ".:/usr/bin:/bin", "bin:/usr/bin:/bin:"]) func plantedGitInWorktreeNeverRuns(_ path: String) throws {
         let r = try Repo()
         let scratch = try tempDir()
         let marker = scratch.appending(path: "planted-marker")
@@ -486,11 +486,26 @@ import Foundation
         #expect(seen.executable.hasPrefix("/") && seen.executable.hasSuffix("/git") && seen.executable != "/usr/bin/env" && seen.argv.first == seen.executable, "\(seen.executable)")
         #expect(g.environment()["PATH"] == "/usr/bin:/bin")
         #expect(!FileManager.default.fileExists(atPath: marker.path), "the planted git ran (plain)")
+        // The `git --version` probes: resolved the same way (absolute executable, stripped child PATH).
+        let probe = try #require(GitCommand.versionProbe(base: ["PATH": path, "HOME": scratch.path]))
+        #expect(probe.executable.hasPrefix("/") && !probe.executable.hasPrefix(r.wt.path) && probe.0.executableURL?.path == probe.executable)
+        #expect(probe.0.environment?["PATH"] == "/usr/bin:/bin" && probe.0.arguments == ["--version"])
         // The worktree diff itself, with the planted git sitting in the worktree (ignored by name: `FakeTools.install` hard-links
-        // the shared script, which SafeFS would refuse as a file with another link; what matters here is that it never runs).
+        // the shared script, which SafeFS would refuse as a file with another link): every git it starts is an absolute
+        // executable outside the worktree, exec'd as argv[0].
         try r.f.write(".gitignore", "git\n", in: r.wt)
-        let diff = try SafeGit(workspace: r.root).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        final class Spawns: @unchecked Sendable { let lock = NSLock(); var all: [(String, [String])] = [] }
+        let spawns = Spawns()
+        var live = LiveGitRunner()
+        live.spawnObserver = { exe, argv in spawns.lock.withLock { spawns.all.append((exe, argv)) } }
+        let diff = try SafeGit(workspace: r.root, runner: live).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
         #expect(diff.files.map(\.path) == [".gitignore"])
+        let realWt = realpath(r.wt.path, nil).map { p in defer { free(p) }; return String(cString: p) } ?? r.wt.path
+        let started = spawns.lock.withLock { spawns.all }
+        #expect(started.count >= 4, "\(started.count)")
+        for (exe, argv) in started {
+            #expect(exe.hasPrefix("/") && exe.hasSuffix("/git") && argv.first == exe && !exe.hasPrefix(r.wt.path) && !exe.hasPrefix(realWt), "\(exe)")
+        }
         #expect(!FileManager.default.fileExists(atPath: marker.path), "the planted git ran (worktreeDiff)")
     }
 
@@ -500,15 +515,17 @@ import Foundation
     @Test func worktreeDiffImmuneToStartupWindowSwap() throws {
         let r = try Repo()
         try r.f.write("src/a.txt", "changed\n", in: r.wt)
+        try FileManager.default.removeItem(at: r.wt.appending(path: "README.md"))      // a deletion: `update-index --force-remove` runs
         let outside = try tempDir().appending(path: "outside", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: outside.appending(path: "src"), withIntermediateDirectories: true)
+        try "outside readme\n".write(to: outside.appending(path: "README.md"), atomically: true, encoding: .utf8)
         let secret = outside.appending(path: "OUTSIDE-SECRET.txt")
         try "outside bytes\n".write(to: secret, atomically: true, encoding: .utf8)
         try "outside a\n".write(to: outside.appending(path: "src/a.txt"), atomically: true, encoding: .utf8)
         let secretAtime = Self.atime(secret)
         let moved = r.wt.appendingPathExtension("moved")
         let wt = r.wt
-        for trigger in ["read-tree", "ls-tree", "check-ignore", "--stdin-paths", "--index-info", "--numstat"] {
+        for trigger in ["read-tree", "ls-tree", "check-ignore", "--stdin-paths", "--force-remove", "--index-info", "--name-status", "--numstat", "-p"] {
             let runner = SwapRunner(trigger: trigger)
             runner.before = {
                 try FileManager.default.moveItem(at: wt, to: moved)
@@ -521,54 +538,261 @@ import Foundation
             try r.f.write("new/n.txt", "n\n", in: r.wt)          // a candidate, so check-ignore runs
             let diff = try SafeGit(workspace: r.root, runner: runner).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
             #expect(runner.triggered != nil, "\(trigger): the swap never ran")
-            #expect(diff.files.map(\.path) == ["new/n.txt", "src/a.txt"] && diff.patch.contains("+changed"), "\(trigger): \(diff.files)")
+            #expect(diff.files.map { "\($0.status) \($0.path)" } == ["D README.md", "A new/n.txt", "M src/a.txt"] && diff.patch.contains("+changed")
+                    && diff.patch.contains("-hello"), "\(trigger): \(diff.files)")
             let shown = "\(diff.files) \(diff.patch) \(diff.blobShas) " + runner.captured.map { String(decoding: $0.stdout, as: UTF8.self) }.joined()
             #expect(!shown.contains("OUTSIDE-SECRET") && !shown.contains("outside"), "\(trigger): outside content surfaced")
         }
         #expect(Self.atime(secret) == secretAtime, "the outside file was read")
     }
 
-    /// Ignore rules: directories a `.gitignore` clearly ignores are pruned from the walk, files get git's own verdict (negations
-    /// included), nested repositories and `.git` entries are never listed.
+    /// Ignore rules are git's own verdict for every walked path (negations, escapes, trailing spaces, `**` included), the
+    /// engine prunes nothing, a tracked file under an ignored directory is still diffed, a real nested repository is one entry
+    /// `nested/` (as git lists it), an invalid `.git` leaves its directory walked as git walks it, and `.git` entries are never
+    /// listed. The expectation is git's own `ls-files --others --exclude-standard` on the same tree.
     @Test func worktreeDiffHonoursIgnoreRules() throws {
         let r = try Repo()
-        try r.f.write(".gitignore", "build/\n*.log\n!keep.log\n", in: r.wt)
-        try r.f.write("build/out.bin", "x", in: r.wt)
-        try r.f.write("build/deep/more.bin", "x", in: r.wt)
-        try r.f.write("a.log", "x", in: r.wt)
-        try r.f.write("keep.log", "x", in: r.wt)
-        try r.f.write("src/sub.log", "x", in: r.wt)
-        try r.f.write("keep.txt", "x", in: r.wt)
-        try r.f.write("nested/.git/HEAD", "ref: refs/heads/main\n", in: r.wt)
+        try r.f.write("build/keep.txt", "tracked\n", in: r.wt)
+        try r.f.write(".gitignore", "build/\n", in: r.wt)
+        try r.f.git(["add", "-f", "build/keep.txt", ".gitignore"], in: r.wt)
+        try r.f.git(["commit", "-q", "-m", "tracked under an ignored dir"], in: r.wt)
+        try r.f.write(".gitignore", "build/\n*.log\n!keep.log\n\\#lit\nsp\\ \ntrail   \nx/**/y*z/\n", in: r.wt)
+        try r.f.write("build/keep.txt", "changed\n", in: r.wt)
+        for path in ["build/out.bin", "build/deep/more.bin", "a.log", "keep.log", "src/sub.log", "keep.txt", "#lit", "sp ", "trail",
+                     "x/q/yAz/f", "x/y/z/f", "invalid/.git/HEAD", "invalid/inner.txt", "plainfile/.git", "plainfile/inner.txt"] {
+            try r.f.write(path, "x", in: r.wt)
+        }
+        try r.f.git(["init", "-q", "nested"], in: r.wt)
         try r.f.write("nested/inner.txt", "x", in: r.wt)
         let diff = try SafeGit(workspace: r.root).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
-        #expect(diff.files.map(\.path) == [".gitignore", "keep.log", "keep.txt"], "\(diff.files.map(\.path))")
-        // With a negation in force nothing is pruned, yet the verdict is still git's: the same set.
-        var rules = GitIgnoreRules()
-        rules.push("build/\n*.log\n", base: "")
-        #expect(rules.prunes(directory: "build") && rules.prunes(directory: "src/build") && !rules.prunes(directory: "src"))
-        rules.push("!important/\n", base: "src")
-        #expect(!rules.prunes(directory: "build"), "a negation in force must stop pruning")
-        rules.truncate(to: 1)
-        #expect(rules.prunes(directory: "build"))
+        let added = diff.files.filter { $0.status == "A" }.map(\.path).sorted()
+        let git = try Self.untracked(r)
+        #expect(added == git, "engine \(added) vs git \(git)")
+        #expect(added == ["invalid/inner.txt", "keep.log", "keep.txt", "nested/", "plainfile/inner.txt", "x/y/z/f"], "\(added)")
+        #expect(diff.files.filter { $0.status == "M" }.map(\.path) == [".gitignore", "build/keep.txt"], "\(diff.files)")
+        #expect(diff.patch.contains("+changed"))
+        #expect(!diff.files.contains { $0.path.contains(".git/") || $0.path.hasSuffix("/.git") })
+        let nested = try #require(diff.files.first { $0.path == "nested/" })
+        #expect(nested.added == nil && nested.removed == nil && nested.bytes == 0 && diff.blobShas["nested/"] == nil)
+        // Ignored, the nested repository is not listed either (git judges the directory).
+        try r.f.write(".gitignore", "nested/\n", in: r.wt)
+        let hidden = try SafeGit(workspace: r.root).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        let gitAfter = try Self.untracked(r)
+        #expect(!hidden.files.contains { $0.path == "nested/" } && !gitAfter.contains("nested/"))
     }
 
-    /// The engine's blob ids are git's (a file through `SafeFS`, a link's target), SHA-1 and SHA-256.
-    @Test func blobIdsMatchGit() throws {
+    /// Git's untracked, not ignored paths in the item worktree (no global excludes).
+    static func untracked(_ r: Repo) throws -> [String] {
+        try r.f.git(["-c", "core.excludesFile=/dev/null", "ls-files", "-z", "--others", "--exclude-standard"], in: r.wt)
+            .split(separator: "\u{0}").map(String.init).sorted()
+    }
+
+    /// NB1/NB2: a tracked file under an ignored-looking directory is listed as modified (never as deleted); and the differential
+    /// against git: for a table of patterns (anchored, `**`, negation, directory-only, escaped `#` and `*`, trailing spaces) the
+    /// untracked paths the engine lists are exactly git's. With no pruning, any path hidden that git shows (or shown that git
+    /// ignores) fails.
+    @Test func ignoredLookingDirHoldsTrackedFile() throws {
         let r = try Repo()
-        try r.f.write("src/a.txt", "hello\n", in: r.wt)
-        let file = try r.fs.open("src/a.txt", inWorktree: "ENG-1", maxBytes: 100)
-        #expect(try SafeGit.blobId(of: file, sha256: false) == "ce013625030ba8dba906f756967f9e9ca394464a")
-        #expect(try SafeGit.blobId(of: file, sha256: false) == (try r.f.git(["hash-object", "src/a.txt"], in: r.wt)))
-        #expect(SafeGit.blobId(of: Data("hello\n".utf8), sha256: false) == "ce013625030ba8dba906f756967f9e9ca394464a")
-        #expect(SafeGit.blobId(of: Data(), sha256: false) == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
-        #expect(SafeGit.blobId(of: Data("hello\n".utf8), sha256: true) == SHA256.hex(Data("blob 6\u{0}hello\n".utf8)))
+        try r.f.write("build/keep.txt", "tracked\n", in: r.wt)
+        try r.f.write(".gitignore", "build/\n", in: r.wt)
+        try r.f.git(["add", "-f", "build/keep.txt", ".gitignore"], in: r.wt)
+        try r.f.git(["commit", "-q", "-m", "tracked under an ignored dir"], in: r.wt)
+        try r.f.write("build/keep.txt", "changed\n", in: r.wt)
+        try r.f.write("build/junk.o", "x", in: r.wt)
+        let diff = try SafeGit(workspace: r.root).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(diff.files.map { "\($0.status) \($0.path)" } == ["M build/keep.txt"], "\(diff.files)")
+        // The differential, pattern by pattern.
+        let patterns = ["*.log", "/root-only", "a/**/x*y/", "!keep", "dir/", "\\#notcomment", "\\*/", "trail   ", "sp\\ ", "doc/*.txt",
+                        "**/gen", "keep", "!/root-only/not"]
+        try r.f.write(".gitignore", patterns.joined(separator: "\n") + "\n", in: r.wt)
+        let paths = ["x.log", "d/x.log", "keep", "d/keep", "root-only/a", "root-only/not/b", "sub/root-only/c", "a/x/y/f", "a/q/xzy/f",
+                     "a/q/x/z/y/f", "a/xy/f", "dir/f", "d/dir/f", "dirfile", "#notcomment", "notcomment", "*/f", "xfoo/n.txt", "trail",
+                     "trail   x", "sp ", "sp", "doc/a.txt", "doc/sub/a.txt", "gen/f", "d/gen/f", "keep.log", "plain"]
+        for path in paths { try r.f.write(path, "x", in: r.wt) }
+        let listed = try SafeGit(workspace: r.root).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+            .files.filter { $0.status == "A" }.map(\.path).sorted()
+        let git = try Self.untracked(r)
+        #expect(listed == git, "engine \(listed) vs git \(git)")
+        // Path by path against `git check-ignore` itself: listed exactly when git does not ignore it.
+        for path in paths {
+            let ignoredByGit = (try? r.f.git(["-c", "core.excludesFile=/dev/null", "check-ignore", "-q", "--no-index", "--", path], in: r.wt)) != nil
+            #expect(listed.contains(path) == !ignoredByGit, "\(path): engine listed \(listed.contains(path)), git ignored \(ignoredByGit)")
+        }
+        #expect(listed.contains("xfoo/n.txt") && listed.contains("a/q/x/z/y/f") && !listed.contains("*/f"), "\(listed)")
+    }
+
+    /// NB1: whatever the walk cannot account for refuses the whole diff, never a skip: a `.git` entry (a plain file, a case
+    /// variant) in a directory the base tracks paths under, a directory that cannot be opened, a tree deeper than the cap.
+    @Test func walkRefusesWhatItCannotAccountFor() throws {
+        let r = try Repo()
+        let git = SafeGit(workspace: r.root)
+        func refusal() -> String {
+            do { _ = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs); return "" } catch { return "\(error)" }
+        }
+        try r.f.write("src/a.txt", "changed\n", in: r.wt)
+        try r.f.write("src/new.txt", "n\n", in: r.wt)
+        // (a) `src/.git` a plain file: git still lists `src/a.txt` modified; the engine refuses rather than hide it.
+        try r.f.write("src/.git", "hi\n", in: r.wt)
+        #expect(refusal() == "the worktree of ENG-1 holds a .git entry in a tracked directory")
+        try FileManager.default.removeItem(at: r.wt.appending(path: "src/.git"))
+        // ... a nested `git init` there too.
+        try r.f.git(["init", "-q", "src"], in: r.wt)
+        #expect(refusal() == "the worktree of ENG-1 holds a .git entry in a tracked directory")
+        try FileManager.default.removeItem(at: r.wt.appending(path: "src/.git"))
+        #expect(try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs).files.map(\.path) == ["src/a.txt", "src/new.txt"])
+        // (b) A directory that cannot be opened (EACCES): refused, not skipped.
+        let locked = r.wt.appending(path: "locked")
+        try r.f.write("locked/f.txt", "x", in: r.wt)
+        chmod(locked.path, 0)
+        let text = refusal()
+        chmod(locked.path, 0o755)                     // exec-bit fixture: a directory's mode restored after the chmod 000 under test
+        #expect(text == "the worktree of ENG-1 cannot be listed", "\(text)")
+        try FileManager.default.removeItem(at: locked)
+        // A tracked directory that cannot be opened: its files are not reported deleted.
+        chmod(r.wt.appending(path: "src").path, 0)
+        let tracked = refusal()
+        chmod(r.wt.appending(path: "src").path, 0o755)    // exec-bit fixture: a directory's mode restored
+        #expect(tracked == "the worktree of ENG-1 cannot be listed", "\(tracked)")
+        // (c) Deeper than `maxDepth`: refused as too large, never truncated.
+        var deep = "d"
+        for _ in 0..<WorktreeListing.maxDepth { deep += "/d" }
+        try r.f.write(deep + "/f.txt", "x", in: r.wt)
+        #expect(refusal().hasPrefix("too many/too large changes to diff"), "a tree past maxDepth was not refused as too large")
+    }
+
+    /// NB3: the walk's path text is byte-bounded (`listingByteCap`), refusing as `.tooManyChanges`; `check-ignore`'s output past
+    /// the cap is the same refusal, never a raw `.outputTooLarge`.
+    @Test func listingIsByteBounded() throws {
+        let r = try Repo()
+        let long = String(repeating: "n", count: 200)
+        for i in 0..<20 { try r.f.write("\(long)\(i)/\(long).txt", "x", in: r.wt) }
+        var git = SafeGit(workspace: r.root)
+        #expect(try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs).files.count == 20)
+        git.listingByteCap = 4096
+        do {
+            _ = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+            Issue.record("a listing past the byte cap was accepted")
+        } catch let e as SafeGitError {
+            guard case .tooManyChanges(_, let bytes) = e else { Issue.record("\(e)"); return }
+            #expect(bytes > 4096 && bytes < 4096 + 1024, "\(bytes)")
+        }
+        // check-ignore's output overflowing: `.tooManyChanges`.
+        final class Overflow: GitProcessRunning, @unchecked Sendable {
+            let live = LiveGitRunner()
+            func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+                if args.contains("check-ignore") { throw SafeGitError.outputTooLarge }
+                return try live.run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap)
+            }
+        }
+        do {
+            _ = try SafeGit(workspace: r.root, runner: Overflow()).worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+            Issue.record("check-ignore overflow was accepted")
+        } catch let e as SafeGitError {
+            guard case .tooManyChanges = e else { Issue.record("check-ignore overflow surfaced as \(e)"); return }
+        }
+    }
+
+    /// R5: a `.gitignore` the engine cannot read safely (over 1 MiB, or a link) yields no rules: nothing is ignored on its account,
+    /// nothing throws, the files are listed.
+    @Test func unreadableGitignoreIgnoresNothing() throws {
+        let r = try Repo()
+        try r.f.write("sub/.gitignore", "*.log\n", in: r.wt)
+        try r.f.write("sub/a.log", "x", in: r.wt)
+        try r.f.write("sub/keep.txt", "x", in: r.wt)
+        let git = SafeGit(workspace: r.root)
+        #expect(try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs).files.map(\.path) == ["sub/.gitignore", "sub/keep.txt"])
+        // Over 1 MiB: not copied for git; `sub/a.log` is listed again.
+        var big = Data("*.log\n".utf8)
+        big.append(Data(repeating: UInt8(ascii: "#"), count: 2 << 20))
+        try big.write(to: r.wt.appending(path: "sub/.gitignore"))
+        let large = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(large.files.map(\.path) == ["sub/.gitignore", "sub/a.log", "sub/keep.txt"], "\(large.files.map(\.path))")
+        // A second hard link: never read for rules; the file itself is a change SafeFS refuses to read, so the whole diff is
+        // refused (fail closed, the generic text).
+        try "*.log\n".write(to: r.wt.appending(path: "sub/.gitignore"), atomically: true, encoding: .utf8)
+        let other = try tempDir().appending(path: "rules-link")
+        try FileManager.default.linkItem(at: r.wt.appending(path: "sub/.gitignore"), to: other)
+        #expect(throws: SafeGitError.io("a changed path cannot be read (linked)")) {
+            try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        }
+        try FileManager.default.removeItem(at: other)
+        // A link in place of the ignore file: a link entry, no rules from it.
+        try FileManager.default.removeItem(at: r.wt.appending(path: "sub/.gitignore"))
+        let outside = try tempDir().appending(path: "rules")
+        try "*.log\n".write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: r.wt.appending(path: "sub/.gitignore"), withDestinationURL: outside)
+        let linked = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(linked.files.map(\.path) == ["sub/.gitignore", "sub/a.log", "sub/keep.txt"], "\(linked.files.map(\.path))")
+        #expect(linked.blobShas["sub/.gitignore"] == SafeGit.blobId(of: Data(outside.path.utf8), sha256: false), "the link was followed")
+    }
+
+    /// R7: an unchanged file's id is computed in bounded chunks, the budget checked per chunk; a same-size tracked file that
+    /// grows between the walk and its open counts as modified without one byte of it hashed for an id.
+    @Test func idComparisonIsSizePinnedAndChunked() throws {
+        let r = try Repo()
+        final class Chunks: @unchecked Sendable { let lock = NSLock(); var sizes: [Int] = [] }
+        let chunks = Chunks()
+        try Data(repeating: UInt8(ascii: "b"), count: 4 << 20).write(to: r.wt.appending(path: "big.bin"))
+        try Data(repeating: UInt8(ascii: "m"), count: 1 << 20).write(to: r.wt.appending(path: "mid.bin"))
+        try r.f.git(["add", "big.bin", "mid.bin"], in: r.wt)
+        try r.f.git(["commit", "-q", "-m", "big"], in: r.wt)
+        var git = SafeGit(workspace: r.root, timeout: .seconds(60))
+        git.hashChunkProbe = { n in chunks.lock.withLock { chunks.sizes.append(n) } }
+        let quiet = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(quiet.files.isEmpty, "\(quiet.files)")
+        let sizes = chunks.lock.withLock { chunks.sizes }
+        #expect(sizes.reduce(0, +) == (5 << 20) + 10 && sizes.allSatisfy { $0 <= 64 << 10 } && sizes.count >= 80, "chunks: \(sizes.count)")
+        // (README.md and src/a.txt, 10 bytes, are the fixture's other unchanged files.)
+        // The budget is checked inside one file's hashing: an exhausted budget stops it at the first chunk.
+        let file = try r.fs.open("big.bin", inWorktree: "ENG-1", maxBytes: 8 << 20)
+        #expect(throws: SafeGitError.timedOut) { try SafeGit.blobId(of: file, sha256: false, budget: SafeGit.Budget(limit: .zero)) }
+        // mid.bin grows right after the walk: modified, copied, and not one of its bytes hashed for an id (only big.bin's were).
+        try r.f.write("new/n.txt", "n\n", in: r.wt)                      // a candidate, so check-ignore runs (the seam after the walk)
+        chunks.lock.withLock { chunks.sizes = [] }
+        let runner = SwapRunner(trigger: "check-ignore")
+        let mid = r.wt.appending(path: "mid.bin")
+        runner.after = { let h = try FileHandle(forWritingTo: mid); try h.seekToEnd(); try h.write(contentsOf: Data("grown".utf8)); try h.close() }
+        var grownGit = SafeGit(workspace: r.root, runner: runner, timeout: .seconds(60))
+        grownGit.hashChunkProbe = git.hashChunkProbe
+        let grown = try grownGit.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+        #expect(grown.files.map { "\($0.status) \($0.path)" } == ["M mid.bin", "A new/n.txt"], "\(grown.files)")
+        #expect(grown.files.first?.bytes == (1 << 20) + 5)
+        #expect(chunks.lock.withLock { chunks.sizes.reduce(0, +) } == (4 << 20) + 10, "the grown file was read for an id comparison")
+    }
+
+    /// The engine's blob ids are git's: SHA-1 vectors and git's own ids, a multi-chunk (> 64 KiB) file through `SafeFS` and a
+    /// link's target against `git hash-object` in a SHA-1 repository and in a real `--object-format=sha256` one.
+    @Test func blobIdsMatchGit() throws {
         var sha1 = SHA1()
         sha1.update(Data("abc".utf8))
         #expect(SHA1.hex(digest: sha1.finalize()) == "a9993e364706816aba3e25717850c26c9cd0d89d")
         var long = SHA1()
         for _ in 0..<1000 { long.update(Data(String(repeating: "a", count: 1000).utf8)) }
         #expect(SHA1.hex(digest: long.finalize()) == "34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+        var split = SHA1()                                                   // unaligned pieces across block boundaries
+        for piece in ["a", String(repeating: "b", count: 63), String(repeating: "c", count: 65), "", "d"] { split.update(Data(piece.utf8)) }
+        var whole = SHA1()
+        whole.update(Data(("a" + String(repeating: "b", count: 63) + String(repeating: "c", count: 65) + "d").utf8))
+        #expect(SHA1.hex(digest: split.finalize()) == SHA1.hex(digest: whole.finalize()))
+        #expect(SafeGit.blobId(of: Data("hello\n".utf8), sha256: false) == "ce013625030ba8dba906f756967f9e9ca394464a")
+        #expect(SafeGit.blobId(of: Data(), sha256: false) == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+        var bytes = Data(count: 200_003)
+        for i in bytes.indices { bytes[i] = UInt8(truncatingIfNeeded: i &* 31 &+ i >> 7) }
+        // SHA-1: the item worktree's repository.
+        let r = try Repo()
+        try bytes.write(to: r.wt.appending(path: "multi.bin"))
+        let file = try r.fs.open("multi.bin", inWorktree: "ENG-1", maxBytes: 1 << 20)
+        #expect(try SafeGit.blobId(of: file, sha256: false) == (try r.f.git(["hash-object", "multi.bin"], in: r.wt)))
+        // SHA-256: a real repository in that object format.
+        let repo = try tempDir().appending(path: "s256", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        try GitFixture.plainGit(["init", "-q", "--object-format=sha256"], in: repo)
+        try bytes.write(to: repo.appending(path: "multi.bin"))
+        let gitId = try GitFixture.plainGit(["hash-object", "multi.bin"], in: repo)
+        #expect(gitId.count == 64)
+        #expect(try SafeGit.blobId(of: file, sha256: true) == gitId)
+        try "hello\n".write(to: repo.appending(path: "h.txt"), atomically: true, encoding: .utf8)
+        #expect(SafeGit.blobId(of: Data("hello\n".utf8), sha256: true) == (try GitFixture.plainGit(["hash-object", "h.txt"], in: repo)))
     }
 
     /// R2 (ii)/(iii): a subdirectory swapped for a link after git listed its files cannot be read through: the refusal names
