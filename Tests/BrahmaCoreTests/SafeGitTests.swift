@@ -726,6 +726,62 @@ import Foundation
         #expect(linked.blobShas["sub/.gitignore"] == SafeGit.blobId(of: Data(outside.path.utf8), sha256: false), "the link was followed")
     }
 
+    /// Round 5: the `.gitignore` copies made for git are summed by each opened descriptor's size against `ignoreCopyByteCap`
+    /// before a byte is copied; past it the whole diff is `.tooManyChanges` (never a partial rule set). The budget is checked
+    /// per file and per copied chunk. Sparse 1 MiB files (no blocks on disk) would each cost a real MiB of zeros per copy.
+    @Test func gitignoreCopiesAreCapped() throws {
+        let r = try Repo()
+        var rels: [String] = []
+        for i in 0..<6 {
+            let rel = "d\(i)/.gitignore"
+            try r.f.write(rel, "", in: r.wt)
+            let h = try FileHandle(forWritingTo: r.wt.appending(path: rel))
+            try h.truncate(atOffset: 1 << 20)
+            try h.close()
+            rels.append(rel)
+        }
+        #expect(SafeGit(workspace: r.root).ignoreCopyByteCap == SafeGit.outputCap)
+        var git = SafeGit(workspace: r.root)
+        git.ignoreCopyByteCap = 4 << 20
+        do {
+            _ = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: try tempDir(), fs: r.fs)
+            Issue.record("ignore-file copies past the cap were accepted")
+        } catch let e as SafeGitError {
+            guard case .tooManyChanges(_, let bytes) = e else { Issue.record("\(e)"); return }
+            #expect(bytes > 4 << 20 && bytes <= 5 << 20, "\(bytes)")
+        }
+        // The copy step worktreeDiff runs, into a shadow the test can measure.
+        func written(_ dir: URL) throws -> Int {
+            var total = 0
+            for case let url as URL in FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])! {
+                let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+                if values.isRegularFile == true { total += values.fileSize ?? 0 }
+            }
+            return total
+        }
+        let tree = try r.fs.worktreeDirectory(key: "ENG-1")
+        let over = try tempDir()
+        #expect(throws: SafeGitError.tooManyChanges(files: 6, bytes: 5 << 20)) {
+            try SafeGit.copyIgnoreFiles(rels, from: tree, key: "ENG-1", fs: r.fs, to: over, cap: 4 << 20, budget: SafeGit.Budget(limit: .seconds(60)))
+        }
+        #expect(try written(over) <= 4 << 20, "more than the cap was written")
+        // Within the cap: every copy made, byte for byte.
+        let within = try tempDir()
+        try SafeGit.copyIgnoreFiles(rels, from: tree, key: "ENG-1", fs: r.fs, to: within, cap: 6 << 20, budget: SafeGit.Budget(limit: .seconds(60)))
+        #expect(try written(within) == 6 << 20)
+        // An exhausted budget in the copy loop: `.timedOut`, nothing copied.
+        let late = try tempDir()
+        #expect(throws: SafeGitError.timedOut) {
+            try SafeGit.copyIgnoreFiles(rels, from: tree, key: "ENG-1", fs: r.fs, to: late, cap: 6 << 20, budget: SafeGit.Budget(limit: .zero))
+        }
+        #expect(try written(late) == 0)
+        // Per chunk: one file's copy stops at the first chunk once the budget is spent.
+        let file = try r.fs.open("d0/.gitignore", inWorktree: "ENG-1", maxBytes: 1 << 20)
+        let one = try tempDir().appending(path: "one")
+        #expect(throws: SafeGitError.timedOut) { try SafeGit.write(file: file, to: one.path, budget: SafeGit.Budget(limit: .zero)) }
+        #expect((try? FileManager.default.attributesOfItem(atPath: one.path)[.size] as? Int) == 0)
+    }
+
     /// R7: an unchanged file's id is computed in bounded chunks, the budget checked per chunk; a same-size tracked file that
     /// grows between the walk and its open counts as modified without one byte of it hashed for an id.
     @Test func idComparisonIsSizePinnedAndChunked() throws {
