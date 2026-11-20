@@ -53,7 +53,7 @@ function escapeProse(text, table) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/([*_[\]`])/g, '\\$1')
+    .replace(/([*_~[\]`])/g, '\\$1')
     // `--flag` as code: mono, and safe from smart punctuation turning `--` into a dash.
     .replace(/(^|[\s(['"])(--[a-z][a-z0-9-]*)/g, '$1`$2`');
   if (table) out = out.replace(/\|/g, '\\|');
@@ -80,8 +80,11 @@ export function escapeInline(text, { table = false } = {}) {
       })
       .join('');
   }
-  // A leading #, -, + or "1." would start a heading or list.
-  return out.replace(/^([#+-]|\d+[.)])/, '\\$1');
+  // In prose, a leading #, -, + or "1." / "1)" would start a heading or list; escape
+  // the punctuation (a backslash before a digit is literal). Table cells cannot
+  // start a block, so they are left alone.
+  if (table) return out;
+  return out.replace(/^([#+-])/, '\\$1').replace(/^(\d+)([.)])(?=\s|$)/, '$1\\$2');
 }
 
 function argToken(arg) {

@@ -11,6 +11,7 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 
 command -v swift >/dev/null || { echo "site-cli-docs: swift not found on PATH" >&2; exit 1; }
 command -v node >/dev/null || { echo "site-cli-docs: node not found on PATH" >&2; exit 1; }
+command -v timeout >/dev/null || { echo "site-cli-docs: timeout not found on PATH (macOS: brew install coreutils)" >&2; exit 1; }
 
 OUT=site/src/content/docs/docs/cli
 DUMP=site/.reports/cli-dump.json

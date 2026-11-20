@@ -129,6 +129,18 @@ test('escapeInline keeps code spans, escapes markup and table pipes', () => {
   assert.equal(escapeInline('`a|b`', { table: true }), '`a\\|b`');
   assert.equal(escapeInline('[link](x)'), '\\[link\\](x)');
   assert.equal(escapeInline('one ` tick'), 'one \\` tick');
+  assert.equal(escapeInline('~a~ and ~~b~~'), '\\~a\\~ and \\~\\~b\\~\\~');
+});
+
+test('escapeInline escapes block starts in prose only, never before a digit', () => {
+  assert.equal(escapeInline('0.0 to 0.9'), '0.0 to 0.9');
+  assert.equal(escapeInline('1. step'), '1\\. step');
+  assert.equal(escapeInline('2) second'), '2\\) second');
+  assert.equal(escapeInline('# heading'), '\\# heading');
+  assert.equal(escapeInline('- item'), '\\- item');
+  assert.equal(escapeInline('0.0 to 0.9', { table: true }), '0.0 to 0.9');
+  assert.equal(escapeInline('1. step', { table: true }), '1. step');
+  assert.equal(escapeInline('#channel or @handle.', { table: true }), '#channel or @handle.');
 });
 
 test('escapeInline sets --flags in prose as code (no smart-dash rendering)', () => {
