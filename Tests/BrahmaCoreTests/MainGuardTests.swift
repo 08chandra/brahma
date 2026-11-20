@@ -155,7 +155,10 @@ import GRDB
         let f = fixture(m)
         try f.git(["branch", "--quiet", "x", before])
         try f.git(["symbolic-ref", "refs/heads/main", "refs/heads/x"])
-        #expect(throws: WorkError.self) { try m.store.acceptMainCommit(companyId: m.company.id) }
+        do { _ = try m.store.acceptMainCommit(companyId: m.company.id); Issue.record("a symbolic main must be refused") }
+        catch let e as WorkError { #expect(e.message.contains("symbolic ref") && e.message.contains("will not accept"), "the accept names itself: \(e.message)") }
+        do { _ = try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000"); Issue.record("the quarantine form must be refused too") }
+        catch let e as WorkError { #expect(e.message.contains("symbolic ref"), "\(e.message)") }
         #expect(try recorded(m) == before)
         try f.git(["symbolic-ref", "--delete", "refs/heads/main"])
         try f.git(["update-ref", "refs/heads/main", before])
@@ -167,7 +170,7 @@ import GRDB
         let refusal = (try? m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000")).map { _ in "" }
         #expect(refusal == nil, "the quarantine path refuses too")
         do { _ = try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000") }
-        catch let e as WorkError { #expect(e.message.contains("merge batch"), "\(e.message)") } catch { Issue.record("\(error)") }
+        catch let e as WorkError { #expect(e.message.contains("merge batch") && e.message.contains("then accept main"), "\(e.message)") } catch { Issue.record("\(error)") }
         #expect(try recorded(m) == before)
         try m.exec("UPDATE mergeBatch SET step = 'done' WHERE id = ?", [batch.id])
         let accepted = try m.store.acceptMainCommit(companyId: m.company.id)
@@ -413,7 +416,7 @@ import GRDB
         #expect(to == before); #expect(try main(m) == before)
         // A newer unconsumed event holds the guard only while a marker names its nonce (N1); a marker for another nonce, or none,
         // can never be taken up and does not hold it.
-        let again = try foreignCommit(m, file: "again.txt", message: "again")
+        _ = try foreignCommit(m, file: "again.txt", message: "again")
         let second = try await m.store.writer.write { db in try BackupService.recordRestoreEvent(db, snapshot: "snap2.sqlite", now: m.now) }
         #expect(try check(m, now: m.now.addingTimeInterval(1)) == .restored(foreignRef: "refs/brahma/foreign/\(stamp(m.now.addingTimeInterval(1)))-1", to: before),
                 "the old marker names a consumed nonce")
@@ -449,10 +452,37 @@ import GRDB
         _ = before
     }
 
-    /// I1 (3a's quarantine accept): the accept moves `main` and records under main's lock, between the guard's read of the
+    /// I1 (3a's quarantine accept), an accept caught in flight: under main's lock it writes the pending head `Q` and moves `main`
+    /// to `Q`, and its record lands only after. The guard read the record (and a pending head of nil) before that; the restore
+    /// re-reads under main's lock, sees the pending head equal to the tip and stands down. Without that check the guard saves the
+    /// owner's accept as foreign and resets `main`.
+    @Test func guardStandsDownForAQuarantineAcceptInFlight() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        try fixture(m).write("q.txt", "the owner's uncommitted work")
+        let git = m.store.gitWorkspace(root: m.root, companyId: m.company.id)
+        try m.store.quarantineRoot(company: m.company, git: git, expectedMain: before, now: m.now)
+        let ref = try #require(try fixture(m).git(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"]).split(separator: "\n").first.map(String.init))
+        let q = try #require(try m.ws.head(of: ref))
+        let (store, companyId, fx) = (m.store, m.company.id, fixture(m))
+        store.mergeRefProbe.set { label in
+            guard label == "refs/brahma/guard-record" else { return }
+            try? store.setPendingMainCommit(companyId: companyId, q)
+            _ = try? fx.git(["update-ref", "--no-deref", "refs/heads/main", q, before])
+        }
+        defer { store.mergeRefProbe.set(nil) }
+        #expect(try check(m) == .skipped)
+        store.mergeRefProbe.set(nil)
+        #expect(try main(m) == q, "the accept's move stands")
+        #expect(try recorded(m) == before, "its record has not landed yet")
+        #expect(try m.store.company(id: m.company.id)?.pendingMainCommit == q)
+        #expect(try fixture(m).git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty, "nothing was saved as foreign")
+    }
+
+    /// I1 (3a's quarantine accept), a whole accept between the guard's reads: the accept moves `main` and records under main's lock, between the guard's read of the
     /// record and its read of the head; the restore re-reads the record (and the pending head) under main's lock and stands
     /// down, so the owner's accept is never undone.
-    @Test func guardDoesNotUndoAQuarantineAcceptRacingIt() throws {
+    @Test func guardDoesNotUndoAFinishedQuarantineAcceptRacingIt() throws {
         let m = try MergeFixture()
         let before = try main(m)
         try fixture(m).write("q.txt", "the owner's uncommitted work")
@@ -492,6 +522,7 @@ import GRDB
         let accepted = try m.store.acceptMainCommit(companyId: m.company.id, ref: ref)
         #expect(accepted.head == q && !accepted.alreadyMerged)
         #expect(accepted.ask?.status == .approved, "the open ask is settled")
+        #expect(try m.activity(.work).map(\.text).contains("the owner accepted \(ref) (\(q.prefix(12))) into main at \(q.prefix(7))"))
         #expect(try recorded(m) == q)
         #expect(try check(m) == .ok)
     }
