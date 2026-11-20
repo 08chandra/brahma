@@ -192,13 +192,24 @@ struct GitCommand: Sendable {
         return numbers[0] > 2 || numbers[0] == 2 && numbers[1] >= 43
     }
 
+    /// A `git --version` process, not yet run: the executable resolved in the engine from the ABSOLUTE entries of the
+    /// child's PATH (`resolveGit`) and exec'd by absolute path, the child's PATH stripped of empty and relative entries, as
+    /// every other git the engine starts (never `/usr/bin/env git`). Nil when no git is found.
+    static func versionProbe(base: [String: String] = ProcessInfo.processInfo.environment) -> (Process, executable: String)? {
+        var environment = ChildEnvironment.make(base: base, purpose: .general)
+        environment["PATH"] = GitCommand.absoluteEntries(of: environment["PATH"])
+        guard let executable = GitCommand.resolveGit(path: environment["PATH"]) else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["--version"]
+        process.environment = environment
+        return (process, executable)
+    }
+
     /// Asked once per process.
     static let installedSupportsAttrSource: Bool = {
         EngineGitGuard.willRunGit("git --version (attr-source probe)")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["git", "--version"]
-        process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        guard let (process, _) = versionProbe() else { return false }
         let out = Pipe()
         process.standardOutput = out; process.standardError = FileHandle.nullDevice; process.standardInput = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return false }
@@ -210,10 +221,7 @@ struct GitCommand: Sendable {
     /// The installed git's version as `git --version` prints it (`2.52.0`), read once; nil when it cannot be read.
     static let gitVersionText: String? = {
         EngineGitGuard.willRunGit("git --version")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["git", "--version"]
-        process.environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        guard let (process, _) = versionProbe() else { return nil }
         let pipe = Pipe()
         process.standardOutput = pipe; process.standardError = FileHandle.nullDevice; process.standardInput = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return nil }
@@ -519,7 +527,7 @@ struct GitCommand: Sendable {
         if let sizeWatch {
             let stop = GitStopper(process: process, grouped: grouped)
             let outputCap = Int64(maxOutput) + Self.maxWatchedStderr
-            func bytes(_ url: URL) -> Int64 {
+            @Sendable func bytes(_ url: URL) -> Int64 {
                 var st = stat()
                 return lstat(url.path, &st) == 0 ? Int64(st.st_size) : 0
             }
@@ -2395,7 +2403,7 @@ public struct GitWorkspace: Sendable {
         // `--no-deref`: should the item ref have become symbolic meanwhile, it is overwritten, never followed to its target.
         try git.run(["update-ref", "--no-deref", "-m", message, ref, commit, tip])
         // The worktree's own index follows the branch, so the checkout is clean afterwards.
-        try? git.run(["read-tree", commit])
+        _ = try? git.run(["read-tree", commit])
         try verifyAfter(key: key)
         return (tip, commit)
     }
@@ -3083,7 +3091,7 @@ public struct GitWorkspace: Sendable {
     private static func realPath(_ path: [UInt8]) -> String? {
         var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
         let real = (path + [0]).withUnsafeBytes { raw in realpath(raw.baseAddress!.assumingMemoryBound(to: CChar.self), &buffer) }
-        return real == nil ? nil : String(cString: buffer)
+        return real == nil ? nil : String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     /// Every directory on the way is opened from the checkout's own descriptor without following a link
