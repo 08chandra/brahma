@@ -19,6 +19,10 @@ export default defineConfig({
         './src/styles/starlight.css',
         './src/styles/motion.css',
       ],
+      // "Using Brahma" autogenerates docs/, which includes the generated CLI reference
+      // (docs/cli/, scripts/site-cli-docs.sh). src/route-data.mjs shows that directory's
+      // group as a collapsed "CLI reference" subgroup instead of "cli"; a second
+      // autogenerate entry would list every CLI page twice (autogenerate cannot exclude).
       sidebar: [
         { label: 'Using Brahma', items: [{ autogenerate: { directory: 'docs' } }] },
         { label: 'Inside Brahma', items: [{ autogenerate: { directory: 'internals' } }] },
@@ -27,6 +31,7 @@ export default defineConfig({
       // The 404 page is src/content/docs/404.md, rendered by the regular docs
       // route; Starlight's built-in /404 route would conflict with it.
       disable404Route: true,
+      routeMiddleware: './src/route-data.mjs',
       pagefind: true,
       lastUpdated: false,
       credits: false,

@@ -428,6 +428,9 @@ mobile-starlight-toc .dropdown {
   border: 0;
   padding: 0;
   margin: 0;
+  /* Flags and values (`--dry-run`, `<from-repo>`) never break at a hyphen; a wide
+     table scrolls inside itself. */
+  white-space: nowrap;
 }
 
 /* Asides: flat panel with a 2 px meaning-coloured bar */
