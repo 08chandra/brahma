@@ -1895,8 +1895,11 @@ public struct GitWorkspace: Sendable {
     /// The owner accepts a quarantine: `main` takes exactly `commit`, the quarantine commit the engine recorded when it made
     /// `ref` (a fast-forward when `main` has not moved since, else a merge commit built with `merge-tree`, refused on a
     /// conflict). Under main's lock `ref` must still be `commit` (`refMoved` otherwise), `main` must be `expectedMain`, and
-    /// its checkout clean and on `main`. Only `commit` is ever merged, never what the ref holds.
-    func mergeQuarantine(ref: String, commit: String, expectedMain: String, recordPending: (String) throws -> Void) throws -> QuarantineOutcome {
+    /// its checkout clean and on `main`. Only `commit` is ever merged, never what the ref holds. `recordMerged` runs with the
+    /// new head while main's lock is still held (Plan 4a Task 3: the record is written under the lock the main guard's restore
+    /// re-reads it under, so the guard never sees the move without its record).
+    func mergeQuarantine(ref: String, commit: String, expectedMain: String, recordPending: (String) throws -> Void,
+                         recordMerged: (String) throws -> Void = { _ in }) throws -> QuarantineOutcome {
         guard Self.isQuarantineRef(ref) else { throw GitError.failed(command: "accept", status: -1, stderr: "not a quarantine ref") }
         try Self.validCommit(expectedMain)
         guard commit.range(of: "^[0-9a-f]{40}([0-9a-f]{24})?$", options: .regularExpression) != nil else {
@@ -1908,7 +1911,10 @@ public struct GitWorkspace: Sendable {
             guard let mainHead = try head(of: Self.mainRef), mainHead == expectedMain else {
                 throw GitError.failed(command: "accept", status: -1, stderr: "main is not where the engine expects it")
             }
-            if try isAncestor(commit, of: mainHead) { return .merged(mainHead: mainHead) }
+            if try isAncestor(commit, of: mainHead) {
+                try recordMerged(mainHead)      // nothing moves; the ask is still settled under the lock
+                return .merged(mainHead: mainHead)
+            }
             let checkedOut = try checkedOutRef()
             guard checkedOut == Self.mainRef else {
                 throw GitError.failed(command: "accept", status: -1, stderr: "the main checkout is on \(checkedOut ?? "a detached HEAD"); switch it back to main")
@@ -1928,6 +1934,7 @@ public struct GitWorkspace: Sendable {
                 try Self.validCommit(next)
             }
             try moveMainLocked(from: mainHead, to: next, recordPending: recordPending)
+            try recordMerged(next)
             return .merged(mainHead: next)
         }
     }

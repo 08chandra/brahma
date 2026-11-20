@@ -129,18 +129,20 @@ extension Store {
     }
 
     /// A restore the engine has not taken up names the company: an unconsumed `restoreEvent` with a `restoreMain` row for it, and
-    /// its marker still present (`<home>/run/restored-at`; a nonce with no marker can never be taken up and does not hold the
-    /// guard). The restore step decides `main` first (C1).
+    /// the marker (`<home>/run/restored-at`) naming that nonce (a nonce with no such marker can never be taken up and does not
+    /// hold the guard). The restore step decides `main` first (C1).
     func restorePending(companyId: String, paths: BrahmaPaths) throws -> Bool {
-        let pending = try writer.read { db -> Bool in
-            guard try db.tableExists("restoreEvent"), try db.tableExists("restoreMain") else { return false }
-            return try Int.fetchOne(db, sql: """
-                SELECT count(*) FROM restoreEvent e JOIN restoreMain m ON m.nonce = e.nonce WHERE e.consumedAt IS NULL AND m.companyId = ?
-                """, arguments: [companyId]) ?? 0 > 0
+        let nonces = try writer.read { db -> [String] in
+            guard try db.tableExists("restoreEvent"), try db.tableExists("restoreMain") else { return [] }
+            return try String.fetchAll(db, sql: """
+                SELECT e.nonce FROM restoreEvent e JOIN restoreMain m ON m.nonce = e.nonce WHERE e.consumedAt IS NULL AND m.companyId = ?
+                """, arguments: [companyId])
         }
-        guard pending else { return false }
-        var st = stat()
-        return lstat(BackupService.restoreMarker(paths: paths).path, &st) == 0
+        guard !nonces.isEmpty else { return false }
+        // Only a marker the restore step would take up (`RestoreMarker.read`: a regular private file naming this nonce) holds
+        // the guard; a stray, stale or malformed marker does not (N1).
+        guard case .nonce(let named) = RestoreMarker.read(BackupService.restoreMarker(paths: paths)) else { return false }
+        return nonces.contains(named)
     }
 
     /// The main guard found no record of `main` (B6): one owner alert (3a's `mainAlertReason` key, so the queue's `checkMain` and
@@ -224,18 +226,34 @@ extension Store {
         try checkMain(company: company, git: git)
         guard let expected = try self.company(id: companyId)?.mainCommit else { throw WorkError.conflict(Self.mainChangedMessage) }
         var pending: String?
+        let now = Store.now()
+        // The record, the activity and the ask's settlement, written while main's lock is still held (I1: the main guard's
+        // restore re-reads the record under that lock).
+        let record: (String) throws -> Void = { head in
+            try self.writer.write { db in
+                try self.finalizeMainCommit(db, companyId: companyId, commit: head)
+                let earlier = open ? "" : " (\(ask.ref) was \(ask.status.rawValue) earlier)"
+                try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work,
+                                  text: "the owner accepted \(full) (\(commit.prefix(12))) into main at \(head.prefix(7))\(earlier)",
+                                  createdAt: now).insert(db)
+                guard var current = try Ask.fetchOne(db, key: ask.id), Self.openAskStatuses.contains(current.status.rawValue) else { return }
+                current.ownerNote = note.map { Self.flat($0, max: Self.maxAskField) }
+                    ?? "accepted with brahma main accept; \(commit.prefix(12)) merged into main at \(head.prefix(7))"
+                current.ownerDecidedAt = now
+                try self.settle(db, ask: &current, status: .approved, decidedBy: "owner", tellRequesterToo: false, now: now)
+            }
+        }
         let outcome: GitWorkspace.QuarantineOutcome
         do {
             outcome = try git.mergeQuarantine(ref: full, commit: commit, expectedMain: expected, recordPending: { next in
                 try self.setPendingMainCommit(companyId: companyId, next)
                 pending = next
-            })
+            }, recordMerged: record)
         } catch let error as GitError {
             if let pending { try? clearPendingMainCommit(companyId: companyId, ifEqual: pending) }
             if case .failed(_, _, let stderr) = error { throw WorkError.conflict("could not accept \(full): \(Self.flat(stderr, max: 300))") }
             throw error
         }
-        let now = Store.now()
         switch outcome {
         case .refMoved(let current):
             let now7 = current.map { "it now points at \($0)" } ?? "it was deleted"
@@ -246,18 +264,7 @@ extension Store {
             }
             throw WorkError.conflict("\(full) moved since Brahma recorded it (\(now7); recorded \(commit.prefix(12))); nothing was merged")
         case .merged(let head):
-            try writer.write { db in
-                try finalizeMainCommit(db, companyId: companyId, commit: head)
-                let earlier = open ? "" : " (\(ask.ref) was \(ask.status.rawValue) earlier)"
-                try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work,
-                                  text: "the owner accepted \(full) (\(commit.prefix(12))) into main at \(head.prefix(7))\(earlier)",
-                                  createdAt: now).insert(db)
-                guard var current = try Ask.fetchOne(db, key: ask.id), Self.openAskStatuses.contains(current.status.rawValue) else { return }
-                current.ownerNote = note.map { Self.flat($0, max: Self.maxAskField) }
-                    ?? "accepted with brahma main accept; \(commit.prefix(12)) merged into main at \(head.prefix(7))"
-                current.ownerDecidedAt = now
-                try settle(db, ask: &current, status: .approved, decidedBy: "owner", tellRequesterToo: false, now: now)
-            }
+            // Recorded by `recordMerged` under main's lock (also when `main` already held the commit).
             return MainAcceptance(head: head, ask: try self.ask(id: ask.id) ?? ask, alreadyMerged: false)
         }
     }

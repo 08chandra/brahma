@@ -140,7 +140,8 @@ import GRDB
         guard case .restored(let ref, let to) = try check(m) else { Issue.record("expected a restore"); return }
         #expect(to == owners); #expect(try main(m) == owners)
         #expect(!FileManager.default.fileExists(atPath: m.root.appending(path: "later.txt").path))
-        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, commit: try #require(try m.ws.head(of: ref)), now: m.now) == later)
+        let savedTip = try #require(try m.ws.head(of: ref))
+        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, commit: savedTip, now: m.now) == later)
         #expect(try main(m) == later); #expect(try recorded(m) == later)
         #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "later.txt").path))
         #expect(try check(m) == .ok)
@@ -410,13 +411,19 @@ import GRDB
         try m.exec("UPDATE restoreEvent SET consumedAt = ? WHERE nonce = ?", [m.now, nonce])
         guard case .restored(_, let to) = try check(m) else { Issue.record("expected a restore"); return }
         #expect(to == before); #expect(try main(m) == before)
-        // An unconsumed event whose marker is gone can never be taken up: it does not hold the guard.
+        // A newer unconsumed event holds the guard only while a marker names its nonce (N1); a marker for another nonce, or none,
+        // can never be taken up and does not hold it.
         let again = try foreignCommit(m, file: "again.txt", message: "again")
-        _ = try await m.store.writer.write { db in try BackupService.recordRestoreEvent(db, snapshot: "snap2.sqlite", now: m.now) }
-        #expect(try check(m, now: m.now.addingTimeInterval(1)) == .skipped)
-        #expect(try main(m) == again)
+        let second = try await m.store.writer.write { db in try BackupService.recordRestoreEvent(db, snapshot: "snap2.sqlite", now: m.now) }
+        #expect(try check(m, now: m.now.addingTimeInterval(1)) == .restored(foreignRef: "refs/brahma/foreign/\(stamp(m.now.addingTimeInterval(1)))-1", to: before),
+                "the old marker names a consumed nonce")
+        #expect(try main(m) == before)
+        let third = try foreignCommit(m, file: "third.txt", message: "third")
+        try RestoreMarker.write(nonce: second, to: marker)
+        #expect(try check(m, now: m.now.addingTimeInterval(2)) == .skipped)
+        #expect(try main(m) == third)
         try FileManager.default.removeItem(at: marker)
-        guard case .restored = try check(m, now: m.now.addingTimeInterval(1)) else { Issue.record("expected a restore"); return }
+        guard case .restored = try check(m, now: m.now.addingTimeInterval(2)) else { Issue.record("expected a restore"); return }
         #expect(try main(m) == before)
     }
 
@@ -440,6 +447,67 @@ import GRDB
         store.mergeRefProbe.set(nil)
         #expect(try check(m) == .ok)
         _ = before
+    }
+
+    /// I1 (3a's quarantine accept): the accept moves `main` and records under main's lock, between the guard's read of the
+    /// record and its read of the head; the restore re-reads the record (and the pending head) under main's lock and stands
+    /// down, so the owner's accept is never undone.
+    @Test func guardDoesNotUndoAQuarantineAcceptRacingIt() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        try fixture(m).write("q.txt", "the owner's uncommitted work")
+        let git = m.store.gitWorkspace(root: m.root, companyId: m.company.id)
+        try m.store.quarantineRoot(company: m.company, git: git, expectedMain: before, now: m.now)
+        let ref = try #require(try fixture(m).git(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"]).split(separator: "\n").first.map(String.init))
+        #expect(try main(m) == before)
+        let (store, companyId) = (m.store, m.company.id)
+        store.mergeRefProbe.set { label in
+            guard label == "refs/brahma/guard-record" else { return }
+            _ = try? store.acceptMainCommit(companyId: companyId, ref: ref)
+        }
+        defer { store.mergeRefProbe.set(nil) }
+        let result = try check(m)
+        store.mergeRefProbe.set(nil)
+        let merged = try main(m)
+        #expect(merged != before, "the owner's accept moved main")
+        #expect(result == .skipped || result == .ok, "\(result)")
+        #expect(try recorded(m) == merged, "the accept's record stands")
+        #expect(try m.store.company(id: m.company.id)?.pendingMainCommit == nil)
+        #expect(try fixture(m).git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty, "nothing was saved as foreign")
+        #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "q.txt").path))
+        #expect(try check(m) == .ok)
+    }
+
+    /// A quarantine whose commit `main` already holds (the owner adopted it) is still accepted while its ask is open: the ask is
+    /// settled and the activity written, under main's lock like any accept (nothing moves, so no record changes).
+    @Test func acceptOfAnAlreadyMergedQuarantineStillSettlesItsOpenAsk() throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        try fixture(m).write("q.txt", "the owner's uncommitted work")
+        let git = m.store.gitWorkspace(root: m.root, companyId: m.company.id)
+        try m.store.quarantineRoot(company: m.company, git: git, expectedMain: before, now: m.now)
+        let ref = try #require(try fixture(m).git(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"]).split(separator: "\n").first.map(String.init))
+        let q = try #require(try m.ws.head(of: ref))
+        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, commit: q, now: m.now) == q)
+        let accepted = try m.store.acceptMainCommit(companyId: m.company.id, ref: ref)
+        #expect(accepted.head == q && !accepted.alreadyMerged)
+        #expect(accepted.ask?.status == .approved, "the open ask is settled")
+        #expect(try recorded(m) == q)
+        #expect(try check(m) == .ok)
+    }
+
+    /// N1: only a marker that names the pending nonce holds the guard; a stray or stale marker does not.
+    @Test func restorePendingMatchesTheMarkersNonce() async throws {
+        let m = try MergeFixture()
+        let before = try main(m)
+        let foreign = try foreignCommit(m)
+        _ = try await m.store.writer.write { db in try BackupService.recordRestoreEvent(db, snapshot: "snap.sqlite", now: m.now) }
+        let marker = BackupService.restoreMarker(paths: m.world.paths)
+        try BrahmaPaths.ensurePrivateDirectory(marker.deletingLastPathComponent())
+        try RestoreMarker.write(nonce: RestoreMarker.makeNonce(), to: marker)      // some other restore's marker
+        guard case .restored(_, let to) = try check(m) else { Issue.record("a marker for another nonce must not hold the guard"); return }
+        #expect(to == before); #expect(try main(m) == before)
+        _ = foreign
     }
 
     /// The orchestrator's tick runs the guard for every company (paused ones too), before the merge step.

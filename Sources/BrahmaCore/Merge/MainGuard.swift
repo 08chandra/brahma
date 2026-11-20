@@ -27,8 +27,10 @@ public enum MainGuardResult: Equatable, Sendable {
 /// `checkMain` records it, as it always did.
 ///
 /// Runs under the company's `GitLock` (so it never interleaves with a landing of this or another engine) and skips while any
-/// batch is open, a restore is pending, or the owner's stop is up; the restore itself re-reads the record under main's lock,
-/// the lock `adopt-main` and 3a's accept take. Blocking (git): call it in a `Blocking` body.
+/// batch is open, a restore is pending, or the owner's stop is up. The restore itself re-reads the record and the pending head
+/// under main's lock: `adopt-main` and 3a's quarantine accept write the record under that lock (and the accept writes its
+/// pending head there before `main` moves), so a move of theirs is never mistaken for a foreign one. Blocking (git): call it
+/// in a `Blocking` body.
 public enum MainGuard {
     /// How long the guard waits for a company's git lock (a batch of another engine may hold it; the next tick tries again).
     static let lockWait = Duration.seconds(5)
@@ -41,6 +43,7 @@ public enum MainGuard {
             if try store.engineStopped() != nil { return .skipped }
             guard try store.openMergeBatches(companyId: company.id).isEmpty, try !store.restorePending(companyId: company.id, paths: paths),
                   let current = try store.company(id: company.id) else { return .skipped }
+            store.mergeRefProbe.call("refs/brahma/guard-record")     // the test seam between the record read and the head read
             guard let recorded = current.mainCommit else {
                 // Fail closed (B6): nothing is adopted by itself. The owner hears once and accepts with `adopt-main`.
                 try store.raiseMainUnrecordedAlert(company: current, now: now)
@@ -63,7 +66,10 @@ public enum MainGuard {
             }
             store.mergeRefProbe.call("refs/brahma/foreign")      // the test seam between the record read and the restore
             let restore = try git.restoreMain(to: recorded, from: head, stamp: stamp(now)) {
-                try store.company(id: company.id)?.mainCommit == recorded
+                // The record as it stands under main's lock; a pending head equal to the tip names the engine's or the owner's
+                // own move in flight, never a foreign one.
+                let fresh = try store.company(id: company.id)
+                return fresh?.mainCommit == recorded && fresh?.pendingMainCommit != head
             }
             guard let restore else { return .skipped }
             store.reportMainRestored(company: current, restore: restore, recorded: recorded, now: now)
