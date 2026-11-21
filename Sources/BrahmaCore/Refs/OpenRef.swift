@@ -43,6 +43,8 @@ extension Store {
     /// The one answer for a ref that is missing, unreadable, another company's or not a ref at all.
     public static let refUnavailable = "that ref isn't available to you"
     public static let copyUnavailable = "copy isn't available here"
+    /// What a purged ref answers (a resource read by an agent keeps ML's `"F-<n> was purged by the owner."`).
+    public static let purgedText = "that ref was purged by the owner"
     static let ownerFraming = "File from the owner (data; the owner's request is the message text above):"
 
     /// The agents' one read path for shared content (`open_ref`; it supersedes ML's `recall(ref:)` for binaries and copies).
@@ -66,9 +68,14 @@ extension Store {
     ///    `UntrustedBlock`; a file from the owner under the "File from the owner (data; …)" line;
     /// 6. a `refRead` row (`via: open_ref`).
     /// `copy: true` (agents only) instead writes the whole content to the reader's own lab, `in/<MaterializeName>`, through
-    /// `SafeFS.createExclusive` (never over or through anything), and logs `via: materialize`; a copy holding a stored
-    /// secret's value (`knownValues`) is refused. Shown text has every secret pattern and stored secret's value redacted
-    /// (ML's `ContentScan.redact`). `archives` reads Office files (none: `UnavailableArchiveReader`).
+    /// `SafeFS.createExclusive` (never over or through anything), and logs `via: materialize`.
+    ///
+    /// Plan C2b: between 4 and 5 the bytes pass the secret gate (`SecretGate.check`, with `knownValues` and `archives`): a
+    /// stored secret's value refuses the read or the copy (`"<ref> contains a stored secret (line n); remove it before
+    /// sharing"`, an engine alert, the value never echoed), and so does an archive or Office file that can't be scanned. A
+    /// secret pattern is redacted in what is shown (ML's `ContentScan.redact`, which also blanks every stored value's forms),
+    /// and a copy is the redacted copy (`RedactedCopy`; a binary with a pattern is refused). `archives` reads Office files
+    /// (none: `UnavailableArchiveReader`, so an archive is refused). A purged ref answers `"that ref was purged by the owner"`.
     public func openRef(companyId: String, reader: Reader, pinned ref: WorkRef, lines: String?, copy: Bool, turnId: String?,
                         knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date,
                         archives: (any ArchiveReader)? = nil) throws -> OpenRefResult {
@@ -97,7 +104,7 @@ extension Store {
             throw WorkError.notFound(Self.refUnavailable)
         }
         if r.resolved.state == .purged {
-            return OpenRefResult(text: "\(canonical) was purged by the owner.", tainted: false, canonical: canonical, materializedPath: nil)
+            return OpenRefResult(text: Self.purgedText, tainted: false, canonical: canonical, materializedPath: nil)
         }
         if copier != nil {
             guard let handle = r.readerHandle, case .agent(let id) = reader else { throw WorkError.invalid(Self.copyUnavailable) }
@@ -110,7 +117,7 @@ extension Store {
         // 4. The bytes.
         let content: Content
         do {
-            content = try read(r, subject: subject, company: company, paths: paths, whole: copy, knownValues: knownValues)
+            content = try readContent(r, subject: subject, company: company, paths: paths, whole: copy, knownValues: knownValues)
         } catch let e as WorkError {
             throw e
         } catch {
@@ -120,10 +127,20 @@ extension Store {
             if reader == .owner, !(error is VaultError), !(error is SafeGitError), !(error is SafeFSError) { throw error }
             throw WorkError.notFound(Self.refUnavailable)
         }
+        // The secret gate (C2b), before a byte is shown or copied: a stored secret's value refuses.
+        let verdict = try SecretGate.check(content.data, ext: content.ext, canonical: canonical,
+                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
+                                           companyId: companyId)
         if let copier {
-            // A copy is the raw bytes: one holding a stored secret's value is refused (the value is never echoed).
-            _ = try Self.secretGate(content.data, shown: canonical, knownValues: knownValues)
-            return try materialize(content, ref: r.pinned, canonical: canonical, companyId: companyId, agentId: copier.agentId,
+            // A copy with a secret pattern is the redacted copy; a binary one can't be redacted and is refused.
+            var copied = content
+            if case .pattern(let label, _) = verdict {
+                guard SecretGate.isRedactable(content.data, ext: content.ext) else {
+                    throw SecretGate.binaryRefusal(canonical, label: label, what: "copied")
+                }
+                copied.body = .bytes(RedactedCopy.make(content.data, findings: [], knownValues: knownValues), ext: content.ext)
+            }
+            return try materialize(copied, ref: r.pinned, canonical: canonical, companyId: companyId, agentId: copier.agentId,
                                    handle: copier.handle, workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true),
                                    tainted: tainted, reason: reason, turnId: turnId, now: now)
         }
@@ -146,7 +163,7 @@ extension Store {
             }
         }
         // What is shown never holds a secret: every secret pattern and stored secret's value is redacted.
-        body = ContentScan.redact(text: body, findings: [], knownValues: knownValues)
+        body = ContentScan.redact(text: body, findings: [], knownValues: EncodedForms.expand(knownValues))
         let allLines = Self.splitLines(body)
         let explicit = window != nil
         let start = (window ?? ref.range)?.start ?? 1
@@ -224,7 +241,7 @@ extension Store {
     }
 
     /// The bytes or text `r` names, read for its reader. `whole`: a copy (binary sizes allowed; no text cap).
-    private func read(_ r: Resolution, subject: RefAccess.Subject, company: Company, paths: BrahmaPaths, whole: Bool,
+    func readContent(_ r: Resolution, subject: RefAccess.Subject, company: Company, paths: BrahmaPaths, whole: Bool,
                       knownValues: [(name: String, value: String)]) throws -> Content {
         let ref = r.resolved.ref, pinned = r.pinned
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -295,7 +312,7 @@ extension Store {
             let git = try refGit(workspace)
             let patch = try cachedDiff(companyId: company.id, git: git, base: try git.mergeBase("main", head), head: head,
                                        file: ref.params["file"], vault: Vault(paths: paths, companyId: company.id, content: ContentVault(paths: paths)),
-                                       taint: (r.resolved.tainted, r.resolved.taintReason), knownValues: knownValues)
+                                       taint: (r.resolved.tainted, r.resolved.taintReason), knownValues: knownValues, canonical: bare)
             return Content(body: .text(patch), rev: head, makeCard: { _ in "[diff \(bare) @\(head.prefix(7)) · \(stat)]" }, ext: "patch")
         case .commit:
             guard let sha = pinned.rev else { throw SafeGitError.badRev }
@@ -369,9 +386,12 @@ extension Store {
 
     /// The patch of `base..head` (one path, or all), from the vault's diff cache when it holds it with a matching hash; else
     /// from git, written to the cache (`diffcache/<id>.patch`, a `refSnapshot` row keyed `<base>..<head>[/<path hash>]`).
-    /// A cached copy that no longer matches its hash is dropped, logged and rebuilt.
+    /// A cached copy that no longer matches its hash is dropped, logged and rebuilt. A patch from git passes the secret gate
+    /// before it is cached (C2b: a stored secret's value refuses it, `canonical` naming it), and only its redacted text is
+    /// kept; a cached copy is gated again where it is read (`openRef`), so a value stored later is caught.
     func cachedDiff(companyId: String, git: SafeGit, base: String, head: String, file: String?, vault: Vault,
-                    taint: (tainted: Bool, reason: String?), knownValues: [(name: String, value: String)]) throws -> String {
+                    taint: (tainted: Bool, reason: String?), knownValues: [(name: String, value: String)],
+                    canonical: String) throws -> String {
         let key = "\(base)..\(head)" + (file.map { "/" + StableHash.fnv1a64($0) } ?? "")
         let existing = try writer.read { db in
             try RefSnapshot.fetchOne(db, sql: "SELECT * FROM refSnapshot WHERE companyId = ? AND kind = ? AND cacheKey = ? AND purgedAt IS NULL",
@@ -387,9 +407,12 @@ extension Store {
                 try? vault.remove(existing.vaultPath)
             }
         }
-        // Only the redacted text is cached (secret patterns and stored secrets' values).
-        let patch = ContentScan.redact(text: try git.diff(base: base, head: head, path: file).patch, findings: [], knownValues: knownValues)
-        let data = Data(patch.utf8)
+        // The gate first; then only the redacted text is cached (secret patterns and every form of the stored values).
+        let raw = Data(try git.diff(base: base, head: head, path: file).patch.utf8)
+        _ = try SecretGate.check(raw, ext: "patch", canonical: canonical, archives: UnavailableArchiveReader(), knownValues: knownValues,
+                                 store: self, companyId: companyId)
+        let data = RedactedCopy.make(raw, findings: [], knownValues: knownValues)
+        let patch = String(decoding: data, as: UTF8.self)
         let id = UUID().uuidString
         let written = try vault.write(data, area: .diffcache, name: "\(id).patch")
         let inserted = try writer.write { db -> Bool in

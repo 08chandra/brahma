@@ -142,6 +142,7 @@ import Glibc
     }
 
     // MARK: Fix round 1 (I5): nothing is vaulted, cached or hashed into git without a secret scan.
+    // (C2b: the scan is `SecretGate`; a stored value is `WorkError.invalid`, a pattern in a text pin is a redacted copy.)
 
     static let known: [(name: String, value: String)] = [("STRIPE_KEY", "sk_test_51abcdefgh")]
     static let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not itself trip a scanner
@@ -158,7 +159,7 @@ import Glibc
                                              readers: [cf.fx.qa2.id], knownValues: Self.known, paths: cf.paths, now: cf.now)
         }
         // A stored secret's value refuses the snapshot; nothing is written.
-        #expect(throws: WorkError.forbidden("known.txt contains a stored secret (line 1); remove it before sharing")) { try snapshot("known.txt") }
+        #expect(throws: WorkError.invalid("known.txt contains a stored secret (line 1); remove it before sharing")) { try snapshot("known.txt") }
         #expect(try cf.store.resource(companyId: cf.c.id, number: 4) == nil)
         #expect(!FileManager.default.fileExists(atPath: cf.vault.root.appending(path: "resources/F-4.txt").path))
         // A secret pattern in text: a redacted copy (REDACTED), never the original bytes.
@@ -180,37 +181,49 @@ import Glibc
                                 knownValues: Self.known, paths: cf.paths)
         }
         // The file is never hashed into git, and no share ref is made.
-        #expect(throws: WorkError.forbidden("ENG-1:src/a.ts@worktree contains a stored secret (line 1); remove it before sharing")) {
+        #expect(throws: WorkError.invalid("ENG-1:src/a.ts@worktree contains a stored secret (line 1); remove it before sharing")) {
             try pin("ENG-1:src/a.ts@worktree", "mr-s1")
         }
         #expect((try? cf.fx.git.git(["rev-parse", "--verify", "--quiet", "refs/brahma/shares/mr-s1"])) == nil)
+        // A secret pattern: a redacted copy in the vault (C2b), and still no share ref.
         try cf.fx.git.write("src/a.ts", "const k = '\(Self.aws)'\n", in: wt)
-        #expect(throws: WorkError.self) { try pin("ENG-1:src/a.ts@worktree", "mr-s2") }
-        // A worktree diff keeps only its redacted text.
+        let copy = try pin("ENG-1:src/a.ts@worktree", "mr-s2")
+        #expect(copy.kind == .resource && copy.params["source"] == "ENG-1:src/a.ts@worktree")
+        #expect((try? cf.fx.git.git(["rev-parse", "--verify", "--quiet", "refs/brahma/shares/mr-s2"])) == nil)
+        // A worktree diff holding a stored value is refused; one with a pattern keeps only its redacted text.
         try cf.fx.git.write("src/a.ts", "one\nTWO\nthree\nsk_test_51abcdefgh\n\(Self.aws)\n", in: wt)
+        #expect(throws: WorkError.self) { try pin("ENG-1:diff@worktree", "mr-s4") }
+        try cf.fx.git.write("src/a.ts", "one\nTWO\nthree\n\(Self.aws)\n", in: wt)
         let diff = try pin("ENG-1:diff@worktree", "mr-s3")
+        #expect(diff.params["redacted"] == "1")
         let cId = cf.c.id, id = try #require(diff.params["snapshot"])
         let row = try #require(try cf.store.writer.read { db in
             try RefSnapshot.fetchOne(db, sql: "SELECT * FROM refSnapshot WHERE companyId = ? AND id = ?", arguments: [cId, id])
         })
         let patch = String(decoding: try cf.vault.read(row.vaultPath, sha256: row.sha256, maxBytes: row.bytes), as: UTF8.self)
         #expect(patch.contains("src/a.ts") && !patch.contains("sk_test_51abcdefgh") && !patch.contains(Self.aws))
-        #expect(patch.contains("[redacted stored secret STRIPE_KEY]"))
+        #expect(patch.contains("[redacted aws-key]"))
+        #expect(try cf.store.resolveRef(diff, for: .agent(cf.fx.qa2.id), companyId: cId).state == .redacted)
     }
 
     @Test func openRefRedactsSecrets() throws {
         let cf = try CollabFixture()
-        try cf.commit(["src/conf.ts": Data("token = sk_test_51abcdefgh\naws = \(Self.aws)\n".utf8)])
-        let out = try cf.store.openRef(companyId: cf.c.id, reader: .agent(cf.fx.eng1.id), ref: "src/conf.ts", lines: nil, copy: false,
-                                       turnId: nil, context: cf.fx.ctx, knownValues: Self.known, paths: cf.paths, now: cf.now)
-        #expect(!out.text.contains("sk_test_51abcdefgh") && !out.text.contains(Self.aws))
-        #expect(out.text.contains("    | token = [redacted stored secret STRIPE_KEY]"))
-        // A copy of a file holding a stored secret is refused.
-        #expect(throws: WorkError.self) {
-            try cf.store.openRef(companyId: cf.c.id, reader: .agent(cf.fx.eng1.id), ref: "src/conf.ts", lines: nil, copy: true,
+        try cf.commit(["src/conf.ts": Data("token = sk_test_51abcdefgh\naws = \(Self.aws)\n".utf8),
+                       "src/aws.ts": Data("region = eu\naws = \(Self.aws)\n".utf8)])
+        func open(_ ref: String, copy: Bool = false) throws -> OpenRefResult {
+            try cf.store.openRef(companyId: cf.c.id, reader: .agent(cf.fx.eng1.id), ref: ref, lines: nil, copy: copy,
                                  turnId: nil, context: cf.fx.ctx, knownValues: Self.known, paths: cf.paths, now: cf.now)
         }
+        // A stored secret's value refuses the read (C2b's gate) and the copy; a pattern is redacted in what is shown.
+        #expect(throws: WorkError.invalid("src/conf.ts contains a stored secret (line 1); remove it before sharing")) { try open("src/conf.ts") }
+        #expect(throws: WorkError.self) { try open("src/conf.ts", copy: true) }
         let inbox = cf.workspace.appending(path: ".brahma/labs/eng-1/in").path
         #expect(((try? FileManager.default.contentsOfDirectory(atPath: inbox)) ?? []).isEmpty)
+        let out = try open("src/aws.ts")
+        #expect(!out.text.contains(Self.aws) && out.text.contains("    | aws = [redacted aws-key]"))
+        // A copy of text with a pattern is the redacted copy.
+        let copied = try open("src/aws.ts", copy: true)
+        let path = try #require(copied.materializedPath)
+        #expect(try String(contentsOf: cf.workspace.appending(path: path), encoding: .utf8) == "region = eu\naws = [redacted aws-key]\n")
     }
 }

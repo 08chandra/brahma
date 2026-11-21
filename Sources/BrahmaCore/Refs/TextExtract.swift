@@ -48,8 +48,9 @@ public struct UnavailableArchiveReader: ArchiveReader {
 /// archive in a vault temp directory (`scratch`), write access to one output directory, each member's output cut by `head -c`.
 /// Before anything runs, ML's `ArchiveRatio.stats` reads the central directory (nothing inflated): a ratio, size or entry count
 /// over the limits, a symlink entry or an unsafe name refuses the read, as 4a's publish does. Only members whose names are
-/// plain (`[A-Za-z0-9._/-]`, no `..`) are asked for, so `unzip` sees no pattern characters. The temp directory is removed
-/// whatever happens.
+/// plain (`[A-Za-z0-9._/-]` plus `[` and `]`, no `..`) are asked for; a `[` is passed as `[[]`, so `unzip`'s wildcard
+/// matching takes every name literally (Office's `[Content_Types].xml` included). The temp directory is removed whatever
+/// happens.
 public struct SandboxedUnzipReader: ArchiveReader {
     public static let unzip = "/usr/bin/unzip"
     public static let timeout: Duration = .seconds(60)
@@ -93,7 +94,7 @@ public struct SandboxedUnzipReader: ArchiveReader {
         let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
         let copy = heldDir.appending(path: "archive.zip").path
         let command = names.enumerated().map { i, name in
-            "\(q(Self.unzip)) -p \(q(copy)) \(q(name)) 2>/dev/null | /usr/bin/head -c \(limits.bytes + 1) > \(q(outDir.appending(path: "m\(i)").path))"
+            "\(q(Self.unzip)) -p \(q(copy)) \(q(Self.literal(name))) 2>/dev/null | /usr/bin/head -c \(limits.bytes + 1) > \(q(outDir.appending(path: "m\(i)").path))"
         }.joined(separator: " && ")
         let policy = SandboxPolicy(writable: [outDir], readable: [heldDir], network: .none, toolchain: false)
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
@@ -115,13 +116,17 @@ public struct SandboxedUnzipReader: ArchiveReader {
         return result
     }
 
-    /// A member name `unzip` reads literally: `[A-Za-z0-9._/-]` only, no empty, `.` or `..` component, not absolute.
+    /// A member name `unzip` can be asked for literally: `[A-Za-z0-9._/-[]]` only, no empty, `.` or `..` component, not
+    /// absolute (`literal` escapes its `[`).
     static func isPlain(_ name: String) -> Bool {
         guard !name.isEmpty, name.utf8.count <= 512, !name.hasPrefix("/"), !name.hasPrefix("-"),
-              name.utf8.allSatisfy({ (0x30...0x39).contains($0) || (0x41...0x5A).contains($0) || (0x61...0x7A).contains($0) || [0x2E, 0x2D, 0x5F, 0x2F].contains($0) })
+              name.utf8.allSatisfy({ (0x30...0x39).contains($0) || (0x41...0x5A).contains($0) || (0x61...0x7A).contains($0) || [0x2E, 0x2D, 0x5F, 0x2F, 0x5B, 0x5D].contains($0) })
         else { return false }
         return name.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
+
+    /// `name` as an `unzip` pattern that matches only itself: each `[` becomes the class `[[]` (a lone `]` is literal).
+    static func literal(_ name: String) -> String { name.replacingOccurrences(of: "[", with: "[[]") }
 
     /// Runs the sandboxed command to completion from synchronous code (the store's callers are synchronous): the runner's own
     /// timeout ends it; nil only if it never reported back.

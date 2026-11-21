@@ -830,10 +830,12 @@ extension Store {
     /// vault file holds), the bytes through `Vault.write(…, area: .resources, …)` where `ContentVault` reads them. A session
     /// that read outside content makes a tainted snapshot (`provenance .external("tainted-session:<source>")`); otherwise its
     /// provenance is the agent. Not ML's `addResources` (the owner's drop path). The bytes pass the secret gate first
-    /// (`secretGate`): a stored secret's value refuses the snapshot, a secret pattern stores a redacted copy (text) or refuses
-    /// (binary).
+    /// (`SecretGate.check`, C2b): a stored secret's value (raw, encoded or in an archive member) refuses the snapshot, as does
+    /// an archive that can't be scanned (`archives`); a secret pattern stores a redacted copy (text; `secretScan = redacted`,
+    /// `sourceDetail` = the lab path, the owner's original) or refuses (binary).
     public func snapshotPrivateFile(companyId: String, agentId: String, workspacePath: String, readers: [String],
-                                    knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date) throws -> WorkRef {
+                                    knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date,
+                                    archives: (any ArchiveReader)? = nil) throws -> WorkRef {
         guard !readers.isEmpty else { throw WorkError.invalid("a private snapshot needs at least one reader") }
         let (agent, company, readerSet) = try writer.read { db -> (Agent, Company, Set<String>) in
             guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId,
@@ -862,17 +864,32 @@ extension Store {
         var data = try file.readAll()
         // The secret gate, before anything is written: a stored secret's value refuses; a secret pattern in text stores a
         // redacted copy (REDACTED), in a binary refuses (it can't be redacted).
-        let scan = try Self.secretGate(data, shown: fileName, knownValues: knownValues)
+        let verdict = try SecretGate.check(data, ext: ArtifactKind.ext(of: fileName), canonical: fileName,
+                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
+                                           companyId: companyId)
         var secretScan = SecretScanState.none
-        if let pattern = scan.findings.first {
-            guard scan.isText else {
-                throw WorkError.forbidden("\(Store.flat(fileName, max: 120)) looks like it contains a secret (\(pattern.label)); a binary "
-                                          + "file can't be redacted, so it isn't sent")
+        if case .pattern(let label, _) = verdict {
+            guard SecretGate.isRedactable(data, ext: ArtifactKind.ext(of: fileName)) else {
+                throw SecretGate.binaryRefusal(fileName, label: label, what: "sent")
             }
-            data = Data(ContentScan.redact(text: String(decoding: data, as: UTF8.self), findings: scan.findings, knownValues: knownValues).utf8)
+            data = RedactedCopy.make(data, findings: [], knownValues: knownValues)
             secretScan = .redacted
         }
         let taint = try currentTaint(agentId: agentId, paths: paths)
+        let number = try vaultShareCopy(companyId: companyId, data: data, fileName: fileName,
+                                        sourceDetail: secretScan == .redacted ? workspacePath : fileName, scope: .agent(agentId),
+                                        readerSet: readerSet, futureHolders: false, provenance: .agent(agentId), taint: taint,
+                                        secretScan: secretScan, paths: paths, now: now)
+        return WorkRef(kind: .resource, id: String(number))
+    }
+
+    /// Writes `data` into the vault as the next `F-<n>` (`addedVia = "share"`): ML's `resource` table, the next number of the
+    /// same `UNIQUE(companyId, number)` sequence (never one an orphaned vault file holds), the bytes through
+    /// `Vault.write(…, area: .resources, …)` where `ContentVault` reads them, indexed by title. A session that read outside
+    /// content (`taint`) makes it tainted (`provenance .external("tainted-session:<source>")`). Returns the number.
+    func vaultShareCopy(companyId: String, data: Data, fileName: String, sourceDetail: String, scope: AccessClass,
+                        readerSet: Set<String>?, futureHolders: Bool, provenance: Provenance, taint: String?,
+                        secretScan: SecretScanState, paths: BrahmaPaths, now: Date) throws -> Int {
         let found = ArtifactKind.ext(of: fileName)
         let ext = ContentVault.validExt(found) ? found : "bin"
         let content = ContentVault(paths: paths)
@@ -886,9 +903,10 @@ extension Store {
             do { written = try vault.write(data, area: .resources, name: "F-\(number).\(ext)") } catch WorkError.conflict(_) { continue }
             let row = Resource(companyId: companyId, number: number, kind: .file, displayName: ResourceIntake.sanitizeName(fileName),
                                ext: ext, fileKind: ArtifactKind.from(ext: ext)?.rawValue, bytes: Int64(data.count), sha256: written.sha256,
-                               vaultPath: written.path, scopeKind: AccessClass.agent(agentId).kind, scopeId: agentId, readerSet: readerSet,
-                               provenance: taint.map { Provenance.external("tainted-session:\($0)") }?.raw ?? Provenance.agent(agentId).raw,
-                               sourceDetail: ResourceIntake.sanitizeName(fileName), tainted: taint != nil,
+                               vaultPath: written.path, scopeKind: scope.kind, scopeId: scope.id, readerSet: readerSet,
+                               futureHolders: futureHolders,
+                               provenance: taint.map { Provenance.external("tainted-session:\($0)") }?.raw ?? provenance.raw,
+                               sourceDetail: ResourceIntake.sanitizeName(sourceDetail), tainted: taint != nil,
                                taintReason: taint.map(Self.sessionReason), secretScan: secretScan, addedVia: "share",
                                createdAt: now, updatedAt: now)
             do {
@@ -903,28 +921,9 @@ extension Store {
                 try? vault.remove(written.path)
                 throw error
             }
-            return WorkRef(kind: .resource, id: String(number))
+            return number
         }
         throw WorkError.conflict("no free resource number; try again")
-    }
-}
-
-extension Store {
-    /// The secret scan every byte the engine vaults, caches or hashes into git for a share goes through (design §4.5, ruling
-    /// 2): ML's `ContentScan` over `data` with the stored secrets' values (`knownValues`) and the secret patterns (a binary,
-    /// NUL in the first 8 KB, is pattern-scanned as text too). A stored secret's value refuses at once (`"<shown> contains a stored secret (line n); remove
-    /// it before sharing"`; the value is never echoed); pattern findings are returned for the caller to redact or refuse.
-    static func secretGate(_ data: Data, shown: String, knownValues: [(name: String, value: String)]) throws
-        -> (findings: [ScanFinding], isText: Bool) {
-        let isText = !data.prefix(OpenRefLimits.binarySniffBytes).contains(0)
-        var findings = try ContentScan.scan(data: data, isText: isText, knownValues: knownValues)
-        // A binary is scanned for the patterns too (as text): ML's binary scan looks only for the stored values.
-        if !isText { findings += try ContentScan.scan(data: data, isText: true, knownValues: []).filter { !$0.isKnownValue } }
-        if let known = findings.first(where: \.isKnownValue) {
-            throw WorkError.forbidden("\(Store.flat(shown, max: 200)) contains a stored secret\(known.line > 0 ? " (line \(known.line))" : ""); "
-                                      + "remove it before sharing")
-        }
-        return (findings, isText)
     }
 }
 
