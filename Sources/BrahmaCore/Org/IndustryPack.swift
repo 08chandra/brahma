@@ -248,6 +248,17 @@ public struct IndustryPack: Codable, Equatable, Sendable {
         roles.filter { $0.id == id || $0.covers.contains(id) }.map(\.id)
     }
 
+    /// Item key prefixes a team or company may not take: the bare ref forms `A-<n>` (ask), `AR-<n>` (artifact) and `F-<n>`
+    /// (resource) of ML's `MemoryRefs` and Collab's `RefGrammar` (Plan C Task C1b).
+    public static let reservedKeyPrefixes: Set<String> = ["A", "AR", "F"]
+
+    /// Refuses a reserved item key prefix (`reservedKeyPrefixes`) with `PackError.invalid(pack:, reason:)`.
+    public static func validateKeyPrefix(_ prefix: String, pack: String) throws {
+        if reservedKeyPrefixes.contains(prefix.uppercased()) {
+            throw PackError.invalid(pack: pack, reason: "key prefixes A, AR and F are reserved")
+        }
+    }
+
     /// Warnings `validate()` never fails on: unknown or legacy extension refs (Task 5a).
     public var warnings: [String] { roles.flatMap(\.extensionWarnings) }
 
