@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-Rules that hold whatever an agent does. `SecretVault` holds secret values (the database, names only); `Redactor` matches those values in stored text; `SecretScan` finds secret-like text. `TaintPolicy` is the prompt-injection rule: once a turn reads outside content, its session is tainted and every tool outside the taint-safe list is refused until a fresh session. `EmergencyStop` is the owner's stop: while its row exists nothing runs anywhere. `SandboxCanary` runs owner-written probes the sandbox must deny, keyed to the installed `claude` binary. `DataHomeGuard` and `OwnerShellGuard` keep the data home out of every agent's reach. `SleepGuard` keeps the Mac awake while agents run.
+Rules that hold whatever an agent does. `SecretVault` holds secret values (the database, names only); `Redactor` matches those values in stored text; `SecretScan` finds secret-like text. `TaintPolicy` is the prompt-injection rule: once a turn reads outside content, it is tainted and every company tool outside the taint-safe list is refused until a fresh session. `EmergencyStop` is the owner's stop: while its row exists nothing runs anywhere. `SandboxCanary` runs owner-written probes the sandbox must deny, keyed to the installed `claude` binary. `DataHomeGuard` and `OwnerShellGuard` keep the data home out of every agent's reach. `SleepGuard` keeps the Mac awake while agents run.
 
 ## Key types
 
