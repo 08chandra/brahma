@@ -699,6 +699,70 @@ brahma task decline <co> A-<n> --note <text>
 brahma milestones <co>                                         the path-to-live scorecard
 ```
 
+## Merge queue and main
+
+Plan 4a replaces the one-item merge step with a merge queue and makes one rule of `main`: only the queue moves it.
+
+**Done means merged.** An approved item is not done when its reviewer says so; it is done when its verified commit is on
+`main`. The approval queues a merge request (`M-<n>`; Work › Merge queue in the app, `brahma merge <co>`), pinned to the
+exact commit the engine checked and the reviewer saw (never a branch re-resolved later). The queue takes requests in order:
+it rebases the pinned commit onto `main` in the engine's own repository under the data home (never in a checkout an agent can
+write), re-runs the item's check and the company's **main check** (`set_main_check`, CTO only; or Settings… on the panel) in a
+fresh, `.git`-free export under the sandboxed check runner, scans the candidate for the company's known secret values, writes
+`refs/brahma/pre-merge/<n>` at the old head, and lands by fast-forward (`ff`, the default) or with a merge commit (`merge`).
+A rebase conflict, a failing check or a leaked secret **bounces** the item back to its holder with the files (3a's conflict
+brief) or the redacted tail; the holder fixes and submits again, and the reviewer approves again.
+
+**Flakes, infrastructure and a red main.** No innocent item is bounced: a check that fails once is re-run once, and a pass
+after a fail is a pass flagged `flaky`; a run the engine could not complete (an export that failed, a network drop, a stop)
+is inconclusive and re-queued, up to 3 times, before it is returned as uncheckable; a candidate whose main check fails is
+charged only after the same check passes at the base, else `main` itself is red, the queue is **held** ("the main check fails
+on main itself"), you are told, and the hold lifts by itself when a new head passes. `main` moving under a batch re-queues it
+(3 times). **Batching and bisect.** With a batch size above 1 (`brahma merge settings <co> --batch <n>`, 1–8) up to `n`
+requests are rebased onto each other and checked as a whole; a failure is bisected to the first culprit, which is bounced
+alone, and the rest land. **The journal.** Every step of a batch (`claimed`, `rebased`, `checked`, `backedUp`, `landing`,
+`landed`, `recorded`, `cleaned`, `done`) is written as the batch passes it; after a crash or the emergency stop the engine
+resumes from the journal, so nothing lands twice or is lost (an unfinished batch shows as `BATCH AT <STEP>` on the panel).
+A `failed` request (the engine's own fault, 3 attempts) is yours to retry from the panel or `brahma merge retry`.
+
+**The main policy.** `company.mainCommit` is the engine's record of `main`; it is written at the company's creation, by the
+queue's journaled landing, by a restore of a backup, and by you (`adopt-main`). Every tick the main guard compares
+`refs/heads/main` with the record: a head that is not the record is **foreign**, whoever made it (an agent's commit at the
+root, a reset, an amend, a hand commit of yours, a forged "unattributed" commit) and whatever its subject says. The other tip
+is saved under a unique `refs/brahma/foreign/<yyyyMMdd-HHmmss>-<n>`, `main` is put back by a ref compare-and-swap (the root
+checkout is never touched when it is off `main`), and you are told in the activity feed and a notice. Uncommitted edits at the
+root are not a move; when a batch finds them it quarantines them (3a, `refs/brahma/quarantine/*`) and the queue waits for
+your decision. The engine's own journaled commit is accepted; a database restore re-adopts the head the restored record names.
+`brahma merge adopt-main <co> [<commit|ref>]` makes `main` as it stands (or a saved foreign tip) the record.
+`refs/brahma/pre-merge/<n>` marks what `main` was before batch `n` landed (the queue's); `refs/brahma/main-backup` is L's
+record of the last deployed commit (the release executor's); neither is a tag and neither moves `main`.
+
+```
+brahma merge <co>                                              the settings line, then each request (M-<n>, key, status, owner, detail)
+brahma merge settings <co> [--batch 1..8] [--strategy ff|merge] [--main-check <cmd> [--main-timeout <s>] | --clear-main-check]
+brahma merge retry <co> M-<n>|<KEY>                            put a failed merge back in the queue (owner only)
+brahma merge resume <co>                                       release a held queue (owner only; a root-behind hold lifts once the root is on main)
+brahma merge adopt-main <co> [<commit>|refs/brahma/foreign/…]  make main as it stands (or a saved tip) the engine's record (owner only)
+brahma artifacts <co>                                          published artifacts, newest first (AR-<n>; asks keep A-<n>)
+brahma artifacts publish <co> <path> [--title <t>]             publish a workspace file or folder (owner only; agents use publish_artifact)
+brahma artifacts rm <co> AR-<n>                                delete an artifact and its copy (owner only)
+brahma preview set <co> <name> --kind web|backend|cli|ios|macos … set a preview the engine builds from main (owner only)
+```
+
+**Previews beyond the web.** The preview pane shows one tab per surface and one for artifacts. A `cli` preview runs a demo
+command (120 s, in the sandbox) and shows its sealed output as a terminal (ANSI colors mapped to the theme, 2000 lines, 4096
+bytes a line); a `backend` preview shows its smoke rows, log tail and, when the server publishes one, its OpenAPI operations
+(≤ 2 MB, read inside the run). A `macos` preview launches the built app under the sandbox's GUI policy and captures its window
+(≤ 10 fps); an `ios` preview boots the app in the Simulator and polls screenshots (500 ms). **The iOS owner gate:** the
+Simulator runs outside Seatbelt, so an iOS surface stays unavailable until you approve the engine's ask in the Inbox, which
+states that risk; the approval belongs to that exact build, and a change of kind, path or bundle id asks again. Window capture
+needs macOS **Screen Recording** permission for Brahma; without it the pane says so and shows nothing. **Artifacts** are files
+agents publish from their worktree (`publish_artifact`, a copy only, never a URL): HTML (confined to `file:`), Markdown, PDF,
+images (decoded in process only up to 64 Mpx), tables (CSV, 2000 × 100), spreadsheets and documents (Quick Look), 3D models
+(glTF in process up to 20 MB, 2 M vertices), **CAD files as cards** (name, size, format; opened in your own app), video (a 9:16
+clip plays inside a **phone frame**), text and code. Content is sniffed, not trusted by extension; playlists, FIFOs and
+symlinks that leave the run are refused; a company holds 2 GB of artifacts and an agent publishes 20 an hour.
+
 ## Memory, Handbook and Resources
 
 Agents and you can find anything the company already knows. One search index covers every source, and the engine filters

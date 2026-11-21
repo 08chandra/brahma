@@ -23,6 +23,8 @@ public struct MergeRow: Equatable, Identifiable, Sendable {
     /// `M-<n>`.
     public var ref: String
     public var itemKey: String
+    /// The item's title (agent-controlled: `Text(verbatim:)`), or "" when the item is gone.
+    public var title: String
     /// "@handle" of the item's holder, or "—".
     public var holder: String
     public var statusTitle: String
@@ -32,6 +34,9 @@ public struct MergeRow: Equatable, Identifiable, Sendable {
     /// One engine-composed line: where it stands, what landed, or why it failed or bounced (conflict names are agent-controlled:
     /// one line each, at most `MergeOrientation.maxConflictFiles`; `Text(verbatim:)`).
     public var detail: String
+    /// The commit the row is about, sha7: what landed, else the candidate being landed, else the pinned verified head.
+    public var commit: String
+    /// When the request was queued (the QUEUED column), `yyyy-MM-dd HH:mm` in the owner's zone.
     public var when: String
     /// Only a `failed` request is retried from here; a bounce goes back to its holder.
     public var canRetry: Bool
@@ -40,8 +45,8 @@ public struct MergeRow: Equatable, Identifiable, Sendable {
 
 public enum MergeRows {
     /// Running and landing first, then the queue in order, then the history newest first.
-    public static func make(_ m: MergeSnapshot, itemKeys: [String: String], holders: [String: String], handles: [String: String],
-                            timeZone: TimeZone = .current) -> [MergeRow] {
+    public static func make(_ m: MergeSnapshot, itemKeys: [String: String], itemTitles: [String: String] = [:], holders: [String: String],
+                            handles: [String: String], timeZone: TimeZone = .current) -> [MergeRow] {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = timeZone
@@ -51,10 +56,10 @@ public enum MergeRows {
         func row(_ r: MergeRequest) -> MergeRow {
             let position = queued.firstIndex(where: { $0.id == r.id }).map { $0 + 1 }
             let holder = holders[r.itemId].map { "@" + (handles[$0] ?? $0) } ?? "—"
-            return MergeRow(id: r.id, ref: r.ref, itemKey: itemKeys[r.itemId] ?? r.itemId, holder: holder,
-                            statusTitle: r.status.title.uppercased(), tone: MergeTone(r.status), position: position,
-                            detail: detail(r, position: position), when: f.string(from: r.finishedAt ?? r.startedAt ?? r.enqueuedAt),
-                            canRetry: r.status == .failed, status: r.status)
+            return MergeRow(id: r.id, ref: r.ref, itemKey: itemKeys[r.itemId] ?? r.itemId, title: itemTitles[r.itemId].map(oneLine) ?? "",
+                            holder: holder, statusTitle: r.status.title.uppercased(), tone: MergeTone(r.status), position: position,
+                            detail: detail(r, position: position), commit: sha7(r.mergedCommit ?? r.candidateCommit ?? r.headCommit),
+                            when: f.string(from: r.enqueuedAt), canRetry: r.status == .failed, status: r.status)
         }
         return (active + queued + m.recent).map(row)
     }
@@ -114,19 +119,102 @@ public enum MergeRows {
 public struct MergeHeader: Equatable, Sendable {
     public var title: String
     public var tone: MergeTone
+    /// One line: the hold's reason (engine-written) when held, then any unfinished batch, then `main`'s head.
     public var detail: String
     public var canResume: Bool
+    /// `MAIN <sha7>`, or `MAIN —` before the first engine-accepted commit.
+    public var main: String
+    /// `BATCH <n>`: the owner's batch size.
+    public var batch: String
+    /// The strategy's title ("Rebase + fast-forward").
+    public var strategy: String
+    /// `MAIN CHECK <command>` (agent-controlled: `Text(verbatim:)`), or `MAIN CHECK NONE`.
+    public var mainCheck: String
+    /// `HELD: <reason>` while the queue is held (a `warning` chip with the Resume button).
+    public var held: String?
+    /// `BATCH AT <STEP>` while the engine is still finishing a batch from its journal (a `running` chip).
+    public var unfinishedBatch: String?
 
-    public init(title: String, tone: MergeTone, detail: String, canResume: Bool) {
+    public init(title: String, tone: MergeTone, detail: String, canResume: Bool, main: String = "MAIN —", batch: String = "BATCH 1",
+                strategy: String = MergeStrategy.ff.title, mainCheck: String = "MAIN CHECK NONE", held: String? = nil,
+                unfinishedBatch: String? = nil) {
         self.title = title; self.tone = tone; self.detail = detail; self.canResume = canResume
+        self.main = main; self.batch = batch; self.strategy = strategy; self.mainCheck = mainCheck; self.held = held
+        self.unfinishedBatch = unfinishedBatch
     }
 
     public static func make(_ m: MergeSnapshot) -> MergeHeader {
-        if let hold = m.hold { return MergeHeader(title: "QUEUE HELD", tone: .warning, detail: hold, canResume: true) }
         var detail = m.mainCommit.map { "main at " + MergeRows.sha7($0) } ?? "no main yet"
         if let b = m.unfinishedBatch { detail = "batch #\(b.number) at \(b.step.rawValue) · " + detail }
-        guard !m.open.isEmpty else { return MergeHeader(title: "QUEUE IDLE", tone: .muted, detail: detail, canResume: false) }
-        return MergeHeader(title: "\(m.open.count) IN QUEUE", tone: .ready, detail: detail, canResume: false)
+        var h = MergeHeader(title: "QUEUE IDLE", tone: .muted, detail: detail, canResume: false,
+                            main: "MAIN " + (m.mainCommit.map(MergeRows.sha7) ?? "—"), batch: "BATCH \(m.settings.batchSize)",
+                            strategy: m.settings.strategy.title,
+                            mainCheck: "MAIN CHECK " + (m.settings.mainCheck.map { MergeRows.oneLine($0.command) } ?? "NONE"),
+                            unfinishedBatch: m.unfinishedBatch.map { "BATCH AT " + $0.step.rawValue.uppercased() })
+        if let hold = m.hold {
+            // Held: the reason first, and still `main` and any unfinished batch (they matter most now).
+            h.title = "QUEUE HELD"; h.tone = .warning; h.detail = hold + " · " + detail; h.canResume = true; h.held = "HELD: " + hold
+        } else if !m.open.isEmpty {
+            h.title = "\(m.open.count) IN QUEUE"; h.tone = .ready
+        }
+        return h
+    }
+}
+
+/// The item inspector's MERGE strip (Plan 4a Task 10): the item's branch against `main`, its pinned verified commit, its latest
+/// merge request (any status: a merged item reads MERGED, which is what Done means) and, for a failed or bounced check, the
+/// redacted tail the engine stored. A conflict shows the engine's conflict line only (3a's brief to the holder has the files).
+public struct ItemMergeDetail: Equatable, Sendable {
+    public var branch: BranchInfo?
+    public var verifiedCommit: String?
+    public var request: MergeRequest?
+    /// 1 = next to be claimed; nil unless the request is queued.
+    public var position: Int?
+
+    public init(branch: BranchInfo? = nil, verifiedCommit: String? = nil, request: MergeRequest? = nil, position: Int? = nil) {
+        self.branch = branch; self.verifiedCommit = verifiedCommit; self.request = request; self.position = position
+    }
+
+    /// Reads the store and (when the workspace is a repository) git: call it off the main actor.
+    public static func load(store: Store, item: WorkItem, workspace: String) throws -> ItemMergeDetail {
+        var d = ItemMergeDetail(verifiedCommit: item.verifiedCommit)
+        if let request = try store.latestMergeRequest(itemId: item.id) {
+            d.request = request
+            d.position = request.status == .queued ? try store.mergePosition(of: request) : nil
+        }
+        let root = URL(fileURLWithPath: workspace, isDirectory: true)
+        if !workspace.isEmpty, FileManager.default.fileExists(atPath: root.appending(path: ".git").path),
+           item.everStarted || item.linkedBranch != nil {
+            d.branch = try BranchInspector.info(git: GitWorkspace(root: root), key: item.key)
+        }
+        return d
+    }
+
+    // MARK: Presentation
+
+    /// `item/ACME-3 @abc1234`, or `item/ACME-3 (gone)` once the branch is deleted (landed), or "—" before any work.
+    public var branchLine: String {
+        guard let b = branch else { return "—" }
+        return b.branch + (b.head.map { " @" + MergeRows.sha7($0) } ?? " (gone)")
+    }
+    /// `2 / 0` (ahead / behind), or "—".
+    public var aheadBehind: String { branch.flatMap { $0.head == nil ? nil : "\($0.ahead) / \($0.behind)" } ?? "—" }
+    /// `3 files +10 −2`, or "—".
+    public var diffLine: String {
+        guard let b = branch, b.head != nil else { return "—" }
+        return "\(b.diff.files) \(b.diff.files == 1 ? "file" : "files") +\(b.diff.insertions) −\(b.diff.deletions)"
+    }
+    public var verifiedLine: String { verifiedCommit.map(MergeRows.sha7) ?? "—" }
+    /// The request's status chip label (`MERGED`), or nil when the item has never been queued.
+    public var statusTitle: String? { request.map { $0.status.title.uppercased() } }
+    public var tone: MergeTone? { request.map { MergeTone($0.status) } }
+    /// Where it stands or what happened: `MergeRows.detail`'s line (`2nd in queue`, `main at abc1234`, `conflicts in a.swift`).
+    public var mergeLine: String? { request.map { MergeRows.detail($0, position: position) } }
+    /// The redacted output tail of a failed or bounced check; nil for a conflict (its files are on `mergeLine`).
+    public var failureTail: String? {
+        guard let r = request, r.status == .failed || r.status == .bounced, r.failure != .conflict,
+              let tail = r.outputTail, !tail.isEmpty else { return nil }
+        return tail
     }
 }
 

@@ -63,15 +63,7 @@ private struct Shell: View {
                 case .newItem: ItemEditorSheet(model: model)
                 case .vacancy(let managerHandle): VacancySheet(model: model, managerHandle: managerHandle)
                 case .fillVacancy(let handle): FillVacancySheet(model: model, handle: handle)
-                case .mergeSettings:
-                    // Plan 4a Task 9a builds the settings sheet over `MergeSettingsForm`; this placeholder only closes.
-                    VStack(spacing: BrahmaTheme.spaceM) {
-                        MonoEmptyState("MERGE SETTINGS")
-                        Button("Close") { model.presentedSheet = nil }
-                            .buttonStyle(.brahma)
-                            .keyboardShortcut(.cancelAction)
-                    }
-                    .padding(BrahmaTheme.spaceM)
+                case .mergeSettings: MergeSettingsSheet(model: model)
                 }
             }
             .background(BrahmaTheme.bg1)

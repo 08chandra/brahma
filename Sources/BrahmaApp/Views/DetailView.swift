@@ -45,8 +45,7 @@ struct DetailView: View {
                 case .releases:
                     ReleasesView(model: model)
                 case .mergeQueue:
-                    // Plan 4a Task 9a builds the queue view; the model (`mergeRows`, `mergeHeader`) is ready for it.
-                    MonoEmptyState("MERGE QUEUE", detail: model.mergeHeader.title)
+                    MergeQueueView(model: model)
                 case .resources:
                     ResourcesView(model: model)
                 case .handbook:

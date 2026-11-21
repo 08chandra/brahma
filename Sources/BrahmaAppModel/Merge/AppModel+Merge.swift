@@ -5,12 +5,13 @@ import BrahmaCore
 /// or sets a request's status (the engine is the referee).
 extension AppModel {
     public var mergeRows: [MergeRow] {
-        var keys: [String: String] = [:], holders: [String: String] = [:]
+        var keys: [String: String] = [:], titles: [String: String] = [:], holders: [String: String] = [:]
         for item in snapshot.work.items {
             keys[item.id] = item.key
+            titles[item.id] = item.title
             if let holder = item.ownerId { holders[item.id] = holder }
         }
-        return MergeRows.make(snapshot.merge, itemKeys: keys, holders: holders, handles: handles, timeZone: ownerTimeZone)
+        return MergeRows.make(snapshot.merge, itemKeys: keys, itemTitles: titles, holders: holders, handles: handles, timeZone: ownerTimeZone)
     }
 
     public var mergeHeader: MergeHeader { MergeHeader.make(snapshot.merge) }
@@ -39,7 +40,20 @@ extension AppModel {
         await ownerWrite("resume the merge queue") { store in try store.resumeMergeQueue(companyId: companyId, by: .owner) }
     }
 
-    /// The item inspector's MERGE strip: the item's open (or just-finished) request and its queue position, loaded detached.
+    /// The item inspector's MERGE section (Task 10): branch against `main`, verified commit, latest request and its tail, loaded
+    /// detached (store and git).
+    public func itemMergeDetail(itemKey: String) async -> ItemMergeDetail? {
+        guard let item = item(key: itemKey) else { return nil }
+        let store = self.store, workspace = work.workspace
+        do {
+            return try await Task.detached { try ItemMergeDetail.load(store: store, item: item, workspace: workspace) }.value
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
+    /// The item's open (or just-finished) request and its queue position as an agent's orientation shows it, loaded detached.
     public func itemMerge(itemKey: String) async -> MergeOrientation? {
         guard let companyId = selectedCompanyId else { return nil }
         let store = self.store

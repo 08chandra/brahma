@@ -322,6 +322,172 @@ struct LiveSmokeTests {
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
 
+    // MARK: Plan 4a Task 10 — merge queue to deploy
+
+    /// Plan 4a Task 10: the merge queue end to end with real turns, then a deploy of what it landed. `eng` (haiku) claims
+    /// `SMOKE-1`, writes `hello.txt` and submits; the engine checks it; `lead` (haiku) reviews it in a fresh session; the
+    /// approval queues `M-1`, which the queue rebases, re-checks (the pinned item check and the owner's main check, both in
+    /// `.git`-free exports under the data home that are gone afterwards) and lands by fast-forward, journaling the batch and
+    /// `refs/brahma/pre-merge/1`. Then the main smoke for the new head passes, `cto` (sonnet) proposes `0.1.0`, the owner
+    /// approves it in the Inbox, and the release executor deploys it through L's `FakeHostingAdapter` (its `fake deploy` copies
+    /// the upload into a folder the loopback `DevHostServer` serves; nothing contacts a provider). Tier max5x, Balanced, never
+    /// opus. `BRAHMA_LIVE=1 DEVELOPER_DIR=… swift test --filter LiveSmokeTests/mergeQueueEndToEnd`.
+    @Test(.timeLimit(.minutes(10)))
+    func mergeQueueEndToEnd() async throws {
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        try store.setPlanTier(.max5x)
+        let mcp = try brahmaExecutable()
+        let runner = ClaudeProcessRunner(maxTurnDuration: .seconds(150))
+        // As goalToLiveURL: `tools-present` fails on current Claude Code builds (no `Skill` in a `--disable-slash-commands` turn's
+        // init tools) and is reported, not gating; the mode-canary's control sessions may miss their deadline once on a busy machine.
+        func gating(_ r: DoctorReport) -> [DoctorItem] { r.items.filter { $0.status == .fail && $0.name != "tools-present" } }
+        var report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp)
+        if !gating(report).isEmpty { report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp) }
+        for item in report.items where item.status != .pass { print("DOCTOR \(item.name)=\(item.status): \(item.detail)") }
+        #expect(gating(report).isEmpty, "doctor: \(report.items.map { "\($0.name)=\($0.status) \($0.detail)" })")
+        guard gating(report).isEmpty else { return }
+        try store.saveProbe(report)
+
+        // 1. The company: eng (engineer, haiku), lead (manager, haiku), cto (sonnet). Balanced; pacing off (see workItemLoopEndToEnd).
+        var company = try store.createCompany(name: "Smoke", goal: "Ship small files.", workspacesRoot: paths.workspaces)
+        company.ownerReserve = -1
+        company.usageMode = .balanced
+        try store.updateCompany(company)
+        let companyId = company.id
+        let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        let lead = try store.hire(companyId: companyId, name: "lead", role: "manager", model: "haiku")
+        let eng = try store.hire(companyId: companyId, name: "eng", role: "engineer", model: "haiku", managerId: lead.id)
+        let cto = try store.hire(companyId: companyId, name: "cto", role: "cto", model: "sonnet")
+        let oldMain = try #require(try store.company(id: companyId)?.mainCommit, "no engine-accepted main")
+
+        // 2. The main check, L's smoke check, and the deploy config with a build into a subfolder (fix 5). The smoke check runs
+        //    at main's commit in an export, before any build: it checks the source file (the deploy's own smoke GETs dist/).
+        try store.setMergeSettings(companyId: companyId, MergeSettings(mainCheck: CheckSpec(command: "test -f hello.txt")), by: .owner)
+        try store.setSmokeCheck(companyId: companyId, by: cto.id, check: CheckSpec(command: "grep -qx hello hello.txt"))
+        try store.setHosting(companyId: companyId, by: .owner, project: "smoke", accountId: "acct-1")
+        try store.setDeployConfig(companyId: companyId, by: cto.id, build: "mkdir -p dist && cp hello.txt dist/", outputDir: "dist",
+                                  smoke: [SmokeRequest(method: "GET", path: "/hello.txt")], expectText: nil)
+
+        // 3. L's FakeHostingAdapter over a loopback dev host; its token in a MemoryVault through Store.setSecret (the engine's vault).
+        //    The token goes in once the turns are over: the turns' `brahma mcp` children read no in-process vault, and a company
+        //    secret they cannot load would make them refuse every tool call.
+        let vault = MemoryVault()
+        let hostRoot = paths.home.appending(path: "dev-host", directoryHint: .isDirectory)
+        try BrahmaPaths.ensurePrivateDirectory(hostRoot)
+        let hostDir = try EngineFiles.directory(workspace: hostRoot, company.slug, mode: 0o700)
+        let server = try DevHostServer(base: hostDir)
+        defer { server.stop() }
+        //    The deploy's steps (the build, the fake `npm`, `fake deploy`) run as real processes through `FakeSandbox`, not under
+        //    Seatbelt: the fake CLI writes the host folder itself, which the engine's deploy policy opens only to L's dev-host
+        //    `cp` (`DevHostSandbox`); goalToLiveURL is the sandboxed deploy. Merge checks and main smokes here stay sandboxed.
+        let adapter = FakeHostingAdapter(server: server.url, hostRoot: hostDir)
+        let toolsPath = try FakeHostingAdapter.tools().path + ":/usr/bin:/bin"
+        let releaseDeps = ReleaseDependencies(sandbox: FakeSandbox(), unsandboxed: FakeSandbox(), http: URLSessionHTTPProbe(),
+                                              adapters: { _ in adapter }, sleep: { _ in }, environment: ["PATH": toolsPath, "LANG": "C"])
+
+        // 4. SMOKE-1, ready for eng with lead as reviewer; 5. the DM with 3a's live-test instruction.
+        let item = try store.createWorkItem(companyId: companyId, by: .owner, draft: WorkItemDraft(
+            type: "task", title: "Create hello.txt containing hello",
+            checkSpec: CheckSpec(command: "grep -qx hello hello.txt", paths: ["."]), tier: .s,
+            ownerId: eng.id, reviewerId: lead.id, status: .ready))
+        #expect(item.key == "SMOKE-1")
+        _ = try MessageRouter(store: store).sendDM(
+            companyId: companyId, from: .owner, to: "eng",
+            text: "Claim \(item.key) with claim_lease, work in the worktree it gives you, make its check pass, then call submit_for_review.")
+
+        // 6. The real engine until the item is done.
+        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps)
+        try await orchestrator.start()
+        let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
+        func waitFor(_ what: String, seconds: Int, _ done: () throws -> Bool) async throws -> Bool {
+            let deadline = AwakeTime.now + .seconds(seconds)
+            while AwakeTime.now < deadline {
+                if try done() { return true }
+                try await Task.sleep(for: .seconds(2))
+            }
+            print("TIMED OUT waiting for \(what)")
+            return false
+        }
+        var deployed: Release?
+        let finished = try await waitFor("\(item.key) done", seconds: 330) { try store.workItem(id: item.id)?.status == .done }
+        if finished {
+            try await Task.sleep(for: .seconds(3))   // the post-merge bookkeeping and the main smoke start
+            let mainHead = try GitFixture.plainGit(["rev-parse", "main"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+            // The main smoke for the new head (reason `merge`), then the deploy proposed by cto and approved by the owner.
+            let smoked = try await waitFor("the main smoke at \(mainHead.prefix(7))", seconds: 120) {
+                try store.mainSmokeRuns(companyId: companyId).contains { $0.commit == mainHead && $0.status == .passed }
+            }
+            let smokes = try store.mainSmokeRuns(companyId: companyId).map { "\($0.reason.rawValue) \($0.status.rawValue) \($0.sha7)" }
+            #expect(smoked, "no passed main smoke at \(mainHead.prefix(7)): \(smokes)")
+            try store.setSecret(companyId: companyId, name: adapter.tokenSecret, value: Self.fakeHostToken, isTest: false, vault: vault)
+            try store.reloadRedactorIfNeeded(vault: vault)
+            let (release, ask) = try store.proposeDeploy(companyId: companyId, by: cto.id, version: "0.1.0", notes: "hello.txt on main",
+                                                         vault: vault, adapters: { _ in adapter }, npmPresent: true)
+            server.serve(folder: release.ref)
+            _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+            let live = try await waitFor("\(release.ref) deployed", seconds: 180) {
+                guard let r = try store.release(companyId: companyId, ref: release.ref) else { return false }
+                return !r.status.isOpen
+            }
+            deployed = try store.release(companyId: companyId, ref: release.ref)
+            #expect(live, "\(release.ref) still open: \(deployed?.status.rawValue ?? "gone")")
+        }
+        loop.cancel()
+        await loop.value   // cancels and awaits in-flight turns, checks, merges and the release
+        let dump = try store.events(afterId: 0).map(\.text).joined(separator: "\n")
+        guard finished else { Issue.record("timed out; item not done. Events:\n\(dump)"); return }
+
+        // main holds hello.txt; the item is done because it merged.
+        let shown = try GitFixture.plainGit(["show", "main:hello.txt"], in: ws)
+        #expect(shown == "hello")
+        let done = try #require(try store.workItem(id: item.id))
+        #expect(done.status == .done && done.mergedCommit != nil, "events:\n\(dump)")
+        let mainHead = try GitFixture.plainGit(["rev-parse", "main"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // One merged request; its main and item merge runs passed, each in an export that is gone; its batch is done.
+        let requests = try store.mergeRequests(companyId: companyId)
+        #expect(requests.count == 1 && requests.first?.status == .merged, "requests: \(requests.map { "\($0.ref) \($0.status.rawValue) \($0.detail ?? "")" })\n\(dump)")
+        let request = try #require(requests.first)
+        #expect(request.mergedCommit == mainHead)
+        let runs = try store.mergeRuns(requestId: request.id)
+        let git = GitWorkspace(root: ws)
+        for kind in [MergeRun.Kind.main, .item] {
+            let run = runs.first { $0.kind == kind && $0.status == .passed }
+            #expect(run != nil, "no passed \(kind.rawValue) merge run: \(runs.map { "\($0.kind?.rawValue ?? "?") \($0.status?.rawValue ?? "?")" })")
+            if let run { #expect(!FileManager.default.fileExists(atPath: git.exportPath(runId: run.id).path), "export of \(run.id) left behind") }
+        }
+        let batches = try await store.writer.read { db in try MergeBatch.filter(Column("companyId") == companyId).fetchAll(db) }
+        #expect(batches.count == 1 && batches.first?.step == .done, "batches: \(batches.map { "#\($0.number) \($0.step.rawValue)" })")
+        #expect(try store.openMergeBatches(companyId: companyId).isEmpty)
+
+        // refs/brahma/pre-merge/1 is the old main; the record is main; the guard sees nothing foreign.
+        let preMerge = try GitFixture.plainGit(["rev-parse", "refs/brahma/pre-merge/1"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(preMerge == oldMain, "pre-merge \(preMerge.prefix(7)) != old main \(oldMain.prefix(7))")
+        company = try #require(try store.company(id: companyId))
+        #expect(company.mainCommit == mainHead)
+        let guardResult = try MainGuard.check(company: company, store: store, git: store.gitWorkspace(root: ws, companyId: companyId),
+                                              paths: paths, now: Store.now())
+        #expect(guardResult == .ok, "main guard: \(guardResult)")
+
+        // The release deployed through the fake adapter, at main's head, with the fake host's URL.
+        let r1 = try #require(deployed, "no release proposed\n\(dump)")
+        #expect(r1.status == .deployed, "\(r1.ref) \(r1.status.rawValue): \(r1.failedReason ?? "")\n\(dump)")
+        #expect(r1.commit == mainHead)
+        #expect(r1.productionURL?.hasPrefix("https://fake-") == true, "productionURL \(r1.productionURL ?? "nil")")
+        #expect(FileManager.default.fileExists(atPath: hostDir.appending(path: "\(r1.ref)/hello.txt").path), "the fake host has no hello.txt")
+
+        // Never opus; nothing left running.
+        for agent in try store.agents(companyId: companyId) { #expect(!agent.model.contains("opus"), "\(agent.name) on \(agent.model)") }
+        let turns = try await store.writer.read { db in try Turn.filter(Column("companyId") == companyId).fetchAll(db) }
+        #expect(!turns.contains { ($0.modelsUsed ?? "").lowercased().contains("opus") }, "an opus turn ran")
+        #expect(turns.filter { $0.kind == .review && $0.itemId == item.id }.count == 1, "review turns: \(turns.filter { $0.kind == .review }.count)")
+        #expect(await orchestrator.runningCount() == 0)
+        #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
+    }
+
     // MARK: Plan ML Task 10 — memory end to end
 
     /// The running sum of `turn.costLE` at which `memoryEndToEnd` stops everything and fails.

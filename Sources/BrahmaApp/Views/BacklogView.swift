@@ -145,6 +145,7 @@ private struct ItemInspector: View {
     let item: WorkItem
     @State private var form = ItemForm()
     @State private var detail: ItemDetail?
+    @State private var merge: ItemMergeDetail?
     @State private var saving = false
 
     var body: some View {
@@ -172,9 +173,14 @@ private struct ItemInspector: View {
         .task(id: item.updatedAt) {
             form = fresh
             detail = await model.itemDetail(key: item.key)
+            merge = await model.itemMergeDetail(itemKey: item.key)
         }
         .onChange(of: model.work.latestRuns[item.id]?.status) {
             Task { detail = await model.itemDetail(key: item.key) }
+        }
+        // The queue moves without touching the item until it lands or bounces: follow the snapshot's merge state too.
+        .onChange(of: model.snapshot.merge) {
+            Task { merge = await model.itemMergeDetail(itemKey: item.key) }
         }
     }
 
@@ -186,6 +192,8 @@ private struct ItemInspector: View {
                 checkSection(row)
                 Hairline()
                 where_(row)
+                Hairline()
+                ItemMergeSection(detail: merge)
                 if let detail, !detail.dependencies.isEmpty {
                     Hairline()
                     CapsLabel("Waits for")

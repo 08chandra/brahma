@@ -91,7 +91,9 @@ import GRDB
         try w.store.setMergeHold(companyId: w.company.id, reason: "main is red")
         await w.refresh()
         #expect(w.model.mergeRows.map(\.ref) == ["M-1"] && w.model.mergeRows[0].canRetry)
-        #expect(w.model.mergeHeader.title == "QUEUE HELD" && w.model.mergeHeader.detail == "main is red")
+        // Held: the reason, then `main` (Task 10; 8b review Minor 10).
+        #expect(w.model.mergeHeader.title == "QUEUE HELD" && w.model.mergeHeader.detail.hasPrefix("main is red · main at "))
+        #expect(w.model.mergeHeader.held == "HELD: main is red")
 
         await w.model.retryMerge(requestId: failed.id)
         #expect(w.model.errorMessage == nil)

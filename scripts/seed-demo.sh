@@ -55,13 +55,13 @@ BRAHMA_DEV=1 "$B" dev propose Initech --by cto --kind other --category pricing -
 BRAHMA_DEV=1 "$B" dev decide Initech A-2 --by ceo --approve >/dev/null
 "$B" items add Initech --type epic --title "Streaks" --description "Daily streak tracking" >/dev/null
 "$B" items add Initech --type task --title "Streak counter" --parent INITE-1 --tier s --priority 1 \
-  --check "test -f streak.txt" --path . --description "Count consecutive days" >/dev/null
+  --check "test -f streak.txt" --path streak.txt --description "Count consecutive days" >/dev/null
 "$B" items add Initech --type bug --title "Reminder fires twice" --owner eng-1 --priority 1 >/dev/null
 
 # Agent map (Plan 4b): INITE-3 in progress with eng-1 as owner and the CTO as reviewer (a dashed reviewer line on the chart,
 # `dev claim` takes the work lease as the agent), and one open ENGINEER seat under the CTO (an `OPEN · ENGINEER` card).
 # Not INITE-2: with BRAHMA_DEV=1 the release scenario below links a human task to INITE-2 and blocks it.
-"$B" items edit Initech INITE-3 --reviewer cto --status ready --check "test -f reminder.txt" --path . >/dev/null
+"$B" items edit Initech INITE-3 --reviewer cto --status ready --check "test -f reminder.txt" --path reminder.txt >/dev/null
 BRAHMA_DEV=1 "$B" dev claim Initech INITE-3 --by eng-1 >/dev/null
 "$B" org vacancy add Initech --role engineer --manager cto --note "Backend, streaks service" >/dev/null
 
@@ -141,6 +141,19 @@ D="$(mktemp -d)"
 printf 'Standup notes for @eng-1\n\n- Reminder bug: the timer registers on every launch.\n- Pair with QA on the flaky test.\n' >"$D/standup-notes.txt"
 BRAHMA_DEV=1 "$B" dev drop Initech --dm eng-1 --message "Notes from this morning's standup" "$D/standup-notes.txt" >/dev/null
 rm -rf "$D"
+
+# Plan 4a Task 10: the merge queue. The main check every candidate must pass, then `dev merge-scenario`: INITE-2 (claimed only
+# for streak.txt, so it runs beside INITE-3's reminder.txt) is claimed, worked, submitted, checked and approved through the real
+# tools and merged by the real queue (M-1, MERGED); a second item written on the old main that touches streak.txt too bounces
+# on the conflict (M-2, BOUNCED) and is back with its holder. The app's merge snapshots (`merge`, `item:INITE-2`) rely on it.
+# The queue lands nothing while the root checkout has uncommitted changes (3a quarantines them and waits for the owner), so the
+# PRD and the fixtures left in docs/ go on main first, as index.html did: the engine identity, then `main accept`.
+git -C "$W" add docs
+git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgsign=false commit -q -m "PRD and demo fixtures" >/dev/null
+"$B" main accept Initech >/dev/null
+"$B" merge settings Initech --main-check "test -f index.html" >/dev/null
+"$B" items edit Initech INITE-2 --status ready >/dev/null
+BRAHMA_DEV=1 "$B" dev merge-scenario Initech --item INITE-2 --file streak.txt >/dev/null
 
 # Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
 # folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.
