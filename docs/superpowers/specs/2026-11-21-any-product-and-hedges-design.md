@@ -755,7 +755,7 @@ Each is `BRAHMA_LIVE=1` and owner-provided:
 - **HTTPS is required (builder-check resolution).** WebAuthn works only in a secure context, so plain HTTP over a LAN or a tailnet IP cannot register or use a passkey.
   - The page is served through **Tailscale Serve with the tailnet's own certificate** for the Mac's MagicDNS name (`<mac>.<tailnet>.ts.net`). That name is the passkey's relying-party id.
   - Owner prerequisites: Tailscale on the Mac and the phone, with MagicDNS and HTTPS certificates enabled in the tailnet.
-  - **The local-network option is dropped.** There is no Brahma CA on the phone and no native companion app in v1 (theirs question Q2).
+  - **The local-network option is dropped.** There is no Brahma CA on the phone and no native companion app in v1 (owner, decision 17: Tailscale HTTPS is the accepted prerequisite).
 - **Not reachable.** Without Tailscale HTTPS the feature is unavailable. **There is never a public listener.** Tailscale Funnel (public exposure) is refused by the doctor check.
 - **Approving.** A push notification links to the page. The page shows the same card as the Inbox, rendered from the engine with untrusted text escaped. Approval is a passkey assertion **over the ask id and its payload hash**, so a replayed or altered approval fails.
 - **What the phone may decide (owner, decision 17: "Phone can do more").**
@@ -1013,7 +1013,7 @@ Task ids such as `X1-T7` are provisional. Each sub-plan fixes its own numbering,
 | **Vendor-native depth** (Anthropic or OpenAI can integrate deeper into their own CLIs) | Brahma uses public CLIs only and never spoofs a harness | Multi-runtime with parity proofs; governance that stays useful even if a vendor ships agent teams with worktrees (research conclusion) |
 | **Team collaboration in one shared workspace** | Multi-user is a non-goal (v2 §1.5) | PR mode puts Brahma's work into the team's existing GitHub review flow |
 | **Approvals from Slack** | It would weaken approval identity (safety model) | Passkey approvals on a paired phone |
-| **Codex on a ChatGPT subscription (until proven)** | Parity rules P1 and P7 fail under whole-process Seatbelt | Codex through an API key via the proxy; revisit by gate (Q1) |
+| **Codex on a ChatGPT subscription (until proven)** | Parity rules P1 and P7 fail under whole-process Seatbelt | Codex through an API key via the proxy; revisit by gate (owner, decision 16) |
 
 ---
 
@@ -1035,7 +1035,8 @@ brahma accounts pause|resume <co> <channel>;  brahma accounts off|on
 brahma accounts dry-run <co> <channel> on|off
 brahma accounts log <co> [--channel <c>] [--verify]
 brahma company landing <co> local|pr [--engine-merge]
-brahma issues <co> link github <owner/repo> [--label <l>] | link linear <team> | trust <login>… | list
+brahma issues <co> link github <owner/repo> [--label <l>] | link linear <team> | trust|untrust <login>… | list
+brahma settings phone-raise-max <factor>            Mac only; default 2
 brahma measure <co> [--since <date>] [--format md|json] [--verify-landings]
 brahma bench run <scenario> [--runtime …] | bench verify <result> | bench list
 brahma release export <co> R-<n> --to <dir>
