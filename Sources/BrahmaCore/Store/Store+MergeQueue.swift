@@ -456,24 +456,31 @@ extension Store {
         }
     }
 
-    /// The items whose code is in `main` through the queue: every request the queue landed. A merge check (the main check, an
-    /// item's check on a rebased candidate, the main check at the base) executes that code too, so the authors of these items are
-    /// principals of every such run. (The simplification the review allowed: every agent that ever landed code in the company,
-    /// not only the ancestors of one candidate.)
+    /// The items whose code is in `main`, by any path: every request the queue landed, and every `done` item (its code reached
+    /// `main` before the queue existed, through 3a's merge, or with the queue: final review I3). A merge check (the main check,
+    /// an item's check on a rebased candidate, the main check at the base) executes that code too, so the authors of these items
+    /// are principals of every such run. (The simplification the review allowed: every agent that ever landed code in the
+    /// company, not only the ancestors of one candidate.)
     func landedItemIds(companyId: String) throws -> Set<String> {
         try writer.read { db in
-            Set(try String.fetchAll(db, sql: "SELECT DISTINCT itemId FROM mergeRequest WHERE companyId = ? AND status = 'merged'",
-                                    arguments: [companyId]))
+            Set(try String.fetchAll(db, sql: """
+                SELECT itemId FROM mergeRequest WHERE companyId = ? AND status = 'merged'
+                UNION SELECT id FROM workItem WHERE companyId = ? AND status = 'done'
+                """, arguments: [companyId, companyId]))
         }
     }
 
-    /// Whether `candidate` is a head the queue landed (or the company has landed nothing yet). Another head (an owner's commit, an
-    /// outside move) has an author the engine does not know: a check at it runs sandboxed.
+    /// Whether `candidate` is a head the queue landed, or the company is fresh (nothing landed by the queue and no `done` item).
+    /// Another head (an owner's commit, an outside move, or a `main` whose code landed before the queue: final review I3) has
+    /// an author the engine does not know: a check at it runs sandboxed.
     func isQueueLandedHead(companyId: String, candidate: String?) throws -> Bool {
         guard let candidate else { return false }
         return try writer.read { db in
             let merged = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM mergeRequest WHERE companyId = ? AND status = 'merged'", arguments: [companyId]) ?? 0
-            if merged == 0 { return true }
+            if merged == 0 {
+                let done = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM workItem WHERE companyId = ? AND status = 'done'", arguments: [companyId]) ?? 0
+                return done == 0
+            }
             return try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM mergeRequest WHERE companyId = ? AND status = 'merged' AND mergedCommit = ?",
                                     arguments: [companyId, candidate]) ?? 0 > 0
         }

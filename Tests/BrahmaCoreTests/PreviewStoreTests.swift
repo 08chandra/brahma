@@ -359,7 +359,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(Set(columns.0) == ["id", "companyId", "name", "kind", "position", "build", "run", "url", "smoke", "setById", "createdAt", "updatedAt",
                                    "demo", "openapiPath", "appPath", "bundleId", "device", "outsideSandboxAskId", "outsideSandboxApprovedAt"])
         #expect(Set(columns.1) == ["surfaceId", "companyId", "status", "commit", "port", "resolvedURL", "pid", "message", "logPath", "exits",
-                                   "restartRequestedAt", "startedAt", "updatedAt", "simulatorId", "outputPath", "smokeResults"])
+                                   "restartRequestedAt", "startedAt", "updatedAt", "simulatorId", "outputPath", "smokeResults", "pidStart"])
         // UNIQUE(companyId, name): the same name in two companies is fine; in one it is an upsert, never a second row.
         let draft = PreviewDraft(name: "web", kind: "web", run: "npm start", url: "http://127.0.0.1:{port}/")
         _ = try t.store.upsertPreviewSurface(companyId: t.acme.id, by: .owner, draft)

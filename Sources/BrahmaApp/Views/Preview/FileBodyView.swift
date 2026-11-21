@@ -20,22 +20,26 @@ struct FileBodyView: View {
     /// chip's toggles go; with no `onPhoneFrame` the video view keeps the choice itself.
     var phoneFrameOverride: Bool? = nil
     var onPhoneFrame: ((Bool) -> Void)? = nil
+    /// Whether a web body's page may run scripts (`AppModel.artifactScriptsEnabled`, final review C1). Off unless the host
+    /// says so; the web view also needs WebRTC verified off before it runs any.
+    var scripts = false
 
     init(body: FileBody, provenance: Provenance, builtBy: String = "", publishedBy: String = "",
-         phoneFrameOverride: Bool? = nil, onPhoneFrame: ((Bool) -> Void)? = nil) {
+         phoneFrameOverride: Bool? = nil, onPhoneFrame: ((Bool) -> Void)? = nil, scripts: Bool = false) {
         self.file = body
         self.provenance = provenance
         self.builtBy = builtBy
         self.publishedBy = publishedBy
         self.phoneFrameOverride = phoneFrameOverride
         self.onPhoneFrame = onPhoneFrame
+        self.scripts = scripts
     }
 
     /// Stats the file (never reads it) and shows it.
     init(url: URL, kind: ArtifactKind, root: URL, provenance: Provenance, builtBy: String = "", publishedBy: String = "",
-         phoneFrameOverride: Bool? = nil, onPhoneFrame: ((Bool) -> Void)? = nil) {
+         phoneFrameOverride: Bool? = nil, onPhoneFrame: ((Bool) -> Void)? = nil, scripts: Bool = false) {
         self.init(body: FileBody.make(url: url, kind: kind, root: root), provenance: provenance, builtBy: builtBy, publishedBy: publishedBy,
-                  phoneFrameOverride: phoneFrameOverride, onPhoneFrame: onPhoneFrame)
+                  phoneFrameOverride: phoneFrameOverride, onPhoneFrame: onPhoneFrame, scripts: scripts)
     }
 
     private var isAgentMade: Bool {
@@ -53,8 +57,10 @@ struct FileBodyView: View {
         Group {
             switch file.effectiveMode(for: provenance) {
             case .web:
-                // SVG runs with JavaScript off; an HTML page keeps it, confined by the rule list and the navigation policy.
-                let web = ArtifactWebView(entry: file.url, root: file.root, javaScript: file.kind != .image)
+                // SVG never runs scripts; an HTML page runs them only as the host says (`scripts`: off for an agent's, an outside
+                // or a tainted page until the owner turns them on), confined by the rule list and the navigation policy, and
+                // only once WebRTC is verified off.
+                let web = ArtifactWebView(entry: file.url, root: file.root, javaScript: scripts && file.kind != .image)
                 if isAgentMade {
                     AgentBuiltFrame(label: builtBy) { web }
                 } else {
@@ -137,11 +143,15 @@ enum ByteCount {
 /// file-only content rule list (`PreviewGuards.artifactRuleList`: block everything, then `file:` and `about:`) has compiled,
 /// loading the entry with `loadFileURL(_:allowingReadAccessTo: root)`, navigating only where
 /// `PreviewNavigationPolicy.allowsArtifact` passes, opening no windows and taking focus only through the owner's input.
+/// WebRTC is always off (`WebRTCGuard`); when it cannot be turned off the page runs without scripts and says so. A change of
+/// `javaScript` makes a new web view (WebKit reads it only when the view is made).
 private struct ArtifactWebView: View {
     let entry: URL
     let root: URL
     let javaScript: Bool
     @State private var rules: RulesState?
+    /// Whether WebRTC can be turned off in this WebKit (a probe of fresh preferences); nil until asked.
+    @State private var webRTCSwitch: Bool?
 
     private enum RulesState {
         case ready(WKContentRuleList)
@@ -158,10 +168,19 @@ private struct ArtifactWebView: View {
                 MonoEmptyState("PREVIEW NOT SHOWN", detail: message)
             case .ready(let list)?:
                 ArtifactFileWebView(entry: entry, root: root, javaScript: javaScript, rules: list)
+                    .id(javaScript)
+                if javaScript, webRTCSwitch == false {
+                    VStack {
+                        StatusChip(label: ArtifactScripts.webRTCRefusal, color: BrahmaTheme.warning)
+                            .padding(BrahmaTheme.spaceS)
+                        Spacer(minLength: 0)
+                    }
+                }
             }
         }
         .clipped()
         .task {
+            if webRTCSwitch == nil { webRTCSwitch = WebRTCGuard.disable(WKPreferences()) }
             guard rules == nil else { return }
             do {
                 rules = .ready(try await Self.compile())
@@ -194,7 +213,10 @@ private struct ArtifactFileWebView: NSViewRepresentable {
         config.websiteDataStore = .nonPersistent()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         config.preferences.isFraudulentWebsiteWarningEnabled = false
-        config.defaultWebpagePreferences.allowsContentJavaScript = javaScript
+        // WebRTC off whatever the scripts setting (final review C1): STUN/TURN never passes the rule list. Not verified off:
+        // no scripts at all.
+        let webRTCOff = WebRTCGuard.disable(config.preferences)
+        config.defaultWebpagePreferences.allowsContentJavaScript = ArtifactScripts.effective(allowed: javaScript, webRTCOff: webRTCOff)
         let content = WKUserContentController()
         content.add(rules)
         config.userContentController = content
@@ -246,6 +268,10 @@ private struct ArtifactFileWebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
                      initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor (String?) -> Void) { completionHandler(nil) }
+
+        /// Camera and microphone: never (final review M5).
+        func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo,
+                     type: WKMediaCaptureType, decisionHandler: @escaping @MainActor (WKPermissionDecision) -> Void) { decisionHandler(.deny) }
     }
 }
 

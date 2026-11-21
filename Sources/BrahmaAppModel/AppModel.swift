@@ -56,6 +56,10 @@ public final class AppModel {
     public var selectedArtifactId: String?
     /// Artifact id → the owner's "PHONE FRAME" choice for a video (Plan 4a); unset keeps `VideoLayout`'s detection. Per company.
     public var phoneFrameOverride: [String: Bool] = [:]
+    /// Artifact ids whose page the owner let run scripts ("Enable scripts for this artifact", `setArtifactScripts`): an agent's,
+    /// an outside or a tainted HTML artifact runs without them otherwise (`ArtifactScripts`). Read-only outside the model, kept
+    /// for this session and company only, never stored, and written by no agent path.
+    public internal(set) var scriptEnabledArtifacts: Set<String> = []
     /// An artifact older than the snapshot's newest ones, opened by `artifact:AR-n` (`openArtifact(number:)`); per company.
     var pinnedArtifact: PinnedArtifact?
     /// Shown in the ARTIFACTS tab beside the list (never in its place): the pinned artifact was deleted outside the app
@@ -364,6 +368,7 @@ public final class AppModel {
         pinnedArtifact = nil
         artifactNotice = nil
         phoneFrameOverride = [:]
+        scriptEnabledArtifacts = []
         openAPICache = [:]
         stopObservingTurnStream()
         boardSprintId = nil

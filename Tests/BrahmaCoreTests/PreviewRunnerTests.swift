@@ -436,13 +436,12 @@ import Glibc
     @Test func engineStartKillsOrphanGroup() async throws {
         let x = try Fx()
         await x.pass()
-        var record = try x.state()
+        let record = try x.state()
         let orphan = try #require(record.pid)
         #expect(Self.alive(orphan))
-        // The record's times bracket the real process start whatever the load (the test clock is not wall time).
-        record.startedAt = Date().addingTimeInterval(-3600)
-        record.updatedAt = Date().addingTimeInterval(3600)
-        try x.store.savePreviewState(record)
+        // The spawn recorded the leader's exact start (final review I2): that, not a time window, is what proves it ours.
+        #expect(record.pidStart != nil && PreviewRunner.orphanGroup(pid: orphan, pidStart: record.pidStart))
+        #expect(EmergencyStop.previewGroups(store: x.store) == [orphan])
         let (fresh, sandbox) = x.freshRunner()
         await fresh.reconcile(now: x.now)
         await fresh.waitForStarts()
@@ -453,32 +452,56 @@ import Glibc
         await x.stop()
     }
 
-    /// Fix I3 (b): a recorded pid that is not its group's leader, or whose start is outside the record, is never signalled;
-    /// the record still becomes `stopped`.
+    /// Fix I3 (b), final review I2: a recorded pid that is not its group's leader, a reused pid (a live leader of ours whose
+    /// start is not the one recorded at the spawn, even one well inside the old `startedAt…updatedAt` window), and a legacy
+    /// record with no start are never signalled, by the engine-start recovery or by the stop set; the record still becomes
+    /// `stopped`.
     @Test func engineStartSparesForeignProcesses() async throws {
         let x = try Fx(run: "sleep 300 & echo $! > child.pid; wait")
         await x.pass()
         let leader = try #require(try x.state().pid)
+        let start = try #require(try x.state().pidStart)
         let cwd = try #require(x.spawns.last?.cwd)
         #expect(await Self.waitUntil { ((try? String(contentsOf: cwd.appending(path: "child.pid"), encoding: .utf8)) ?? "").hasSuffix("\n") })
         let child = try #require(Int32(try String(contentsOf: cwd.appending(path: "child.pid"), encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)))
         let wide = (Date().addingTimeInterval(-3600), Date().addingTimeInterval(3600))
-        for (pid, startedAt) in [(child, wide.0), (leader, Date().addingTimeInterval(1800))] {
+        let cases: [(String, Int32, Double?)] = [
+            ("not its group's leader", child, start),
+            ("a reused pid: another start inside the old window", leader, start - 0.5),
+            ("a reused pid: a later start", leader, start + 1),
+            ("a legacy record without a start", leader, nil),
+        ]
+        for (what, pid, pidStart) in cases {
             var record = try x.state()
-            record.status = .running; record.pid = pid; record.startedAt = startedAt; record.updatedAt = wide.1
+            record.status = .running; record.pid = pid; record.pidStart = pidStart; record.startedAt = wide.0; record.updatedAt = wide.1
             try x.store.savePreviewState(record)
+            #expect(!PreviewRunner.orphanGroup(pid: pid, pidStart: pidStart), "\(what)")
+            #expect(EmergencyStop.previewGroups(store: x.store).isEmpty, "\(what): not in the stop set")
             let (fresh, sandbox) = x.freshRunner(memory: { true })   // under pressure: recovered, not restarted
             await fresh.reconcile(now: x.now)
             await fresh.waitForStarts()
             try? await AwakeTime.sleep(for: .milliseconds(300))
-            #expect(kill(child, 0) == 0 && Self.alive(leader), "pid \(pid) was not signalled")
+            #expect(kill(child, 0) == 0 && Self.alive(leader), "\(what): pid \(pid) was not signalled")
             let s = try x.state()
-            #expect(s.status == .stopped && s.pid == nil, "\(s)")
+            #expect(s.status == .stopped && s.pid == nil && s.pidStart == nil, "\(what): \(s)")
             #expect(sandbox.calls.isEmpty)
         }
         await x.stop()
         #expect(await Self.waitUntil { !Self.alive(leader) })
+    }
+
+    /// Final review I2: the record's start follows its pid. A different pid drops it (no start is ever paired with a process it
+    /// was not read from); the same pid keeps it. (The database round trip is exact: `engineStartKillsOrphanGroup`.)
+    @Test func pidStartFollowsItsPid() throws {
+        var state = PreviewState(surfaceId: "s", companyId: "c", pid: 4242, updatedAt: Date(), pidStart: 1_800_000_000.123456)
+        state.pid = 4242
+        #expect(state.pidStart == 1_800_000_000.123456)
+        state.pid = 4243
+        #expect(state.pidStart == nil)
+        state.pidStart = 5
+        state.pid = nil
+        #expect(state.pidStart == nil)
     }
 
     @Test func stopAllOnShutdown() async throws {
@@ -542,23 +565,27 @@ import Glibc
     }
 
     /// L-5lite-A: `brahma stop` (and the app's STOP EVERYTHING) signal the recorded groups themselves, so a wedged engine
-    /// cannot keep a preview up: a running preview's group is among them, a record whose pid does not match its times is not.
+    /// cannot keep a preview up: a running preview's group is among them, a record whose start is not exactly its process's
+    /// (final review I2: a recycled pid), or that has none, is not.
     @Test func recordedGroupsIncludePreviews() async throws {
         let x = try Fx()
         await x.pass()
         let state = try x.state()
         let pid = try #require(state.pid)
+        let start = try #require(state.pidStart)
         #expect(state.status == .running && Self.alive(pid))
         #if canImport(Darwin)
-        // The record's times bracket the real process start whatever the load (the test clock is not wall time).
-        var record = state
-        record.startedAt = Date().addingTimeInterval(-3600)
-        record.updatedAt = Date().addingTimeInterval(3600)
-        try x.store.savePreviewState(record)
         #expect(EmergencyStop.recordedGroups(store: x.store).contains(pid))
-        record.startedAt = Date().addingTimeInterval(1800)
+        var record = state
+        record.pidStart = start + 0.25
         try x.store.savePreviewState(record)
         #expect(!EmergencyStop.recordedGroups(store: x.store).contains(pid), "a recycled pid is never signalled")
+        record.pidStart = nil
+        try x.store.savePreviewState(record)
+        #expect(!EmergencyStop.recordedGroups(store: x.store).contains(pid), "a record without a start is never signalled")
+        record.pidStart = start
+        try x.store.savePreviewState(record)
+        #expect(EmergencyStop.recordedGroups(store: x.store).contains(pid))
         #endif
         await x.stop()
     }
@@ -716,6 +743,7 @@ struct GatedProcess: SandboxedProcess {
     let inner: any SandboxedProcess
     let gate: ExitGate
     var pid: Int32 { inner.pid }
+    var leaderStart: Double? { inner.leaderStart }
     func isAlive() -> Bool { gate.looksDead ? false : inner.isAlive() }
     func exitStatus() -> Int32? { gate.looksDead ? 0 : inner.exitStatus() }
     func terminate(grace: Duration) async {

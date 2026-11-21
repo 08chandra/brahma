@@ -373,6 +373,59 @@ import GRDB
         #expect(sandboxed(route(try await place(.item, itemId: current.id))))
     }
 
+    /// Final review I3 (S4 reopened): code that reached `main` before the queue (a `done` item with no merge request, 3a's path)
+    /// is a principal of every merge check too, and an empty queue history counts as "queue-landed" only for a company with no
+    /// `done` item. A Full company with a narrowed role whose code landed before 4a runs `.main`, `.item` and `.mainAtBase`
+    /// sandboxed.
+    @Test func preQueueDoneItemsArePrincipals() async throws {
+        let m = try MergeFixture()
+        let head = try main(m)
+        let junior = try m.store.hire(companyId: m.company.id, name: "jr", role: "junior", model: "sonnet")
+        let ops = try m.store.hire(companyId: m.company.id, name: "ops-1", role: "ops", model: "sonnet")
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(profile: .full), userHome: try tempDir())
+        try m.store.updateSandbox(companyId: m.company.id, SandboxPatch(roleProfiles: ["ops": .full, "engineer": .full, "junior": .workspace]),
+                                  userHome: try tempDir())
+        try m.exec("UPDATE company SET mainCheckSetById = ? WHERE id = ?", [ops.id, m.company.id])
+        let route = Orchestrator.checkRoute(store: m.store)
+        let company = try #require(try m.store.company(id: m.company.id))
+        func place(_ kind: MergeRun.Kind, itemId: String? = nil, at commit: String? = nil) async throws -> String {
+            let runId = UUID().uuidString
+            let at = try commit ?? main(m)
+            let dir = try EngineExport.export(store: m.store, company: company, runId: runId, commit: at)
+            let run = MergeRun(id: runId, companyId: company.id, candidateCommit: at, kind: kind, itemId: itemId, status: .running)
+            try await m.store.writer.write { try run.insert($0) }
+            return dir.path
+        }
+        func sandboxed(_ r: CheckRoute) -> Bool { if case .sandboxed = r { return true } else { return false } }
+        let current = try m.item("Current")
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [m.eng.id, current.id])
+        // A fresh company (nothing landed, nothing done) with every principal Full: unsandboxed (the control).
+        try m.exec("UPDATE workItem SET status = 'backlog' WHERE companyId = ? AND status = 'done'", [m.company.id])
+        #expect(try m.store.landedItemIds(companyId: m.company.id).isEmpty)
+        #expect(try m.store.isQueueLandedHead(companyId: m.company.id, candidate: head))
+        #expect(!sandboxed(route(try await place(.main, itemId: current.id))), "control")
+        #expect(!sandboxed(route(try await place(.item, itemId: current.id))), "control")
+        #expect(!sandboxed(route(try await place(.mainAtBase, at: head))), "control")
+        // An item a Full engineer finished before the queue existed: a principal, and `main` no longer counts as queue-landed,
+        // so the main check at the base runs sandboxed; the others stay unsandboxed while every principal is Full.
+        let shipped = try m.item("Shipped before 4a")
+        try m.exec("UPDATE workItem SET status = 'done', ownerId = ? WHERE id = ?", [m.eng.id, shipped.id])
+        #expect(try m.store.landedItemIds(companyId: m.company.id) == [shipped.id])
+        #expect(try !m.store.isQueueLandedHead(companyId: m.company.id, candidate: head))
+        #expect(sandboxed(route(try await place(.mainAtBase, at: head))))
+        #expect(!sandboxed(route(try await place(.main, itemId: current.id))))
+        #expect(!sandboxed(route(try await place(.item, itemId: current.id))))
+        // Its author is the narrowed role: every kind runs sandboxed.
+        try m.exec("UPDATE workItem SET ownerId = ? WHERE id = ?", [junior.id, shipped.id])
+        try m.exec("DELETE FROM workLease WHERE itemId = ?", [shipped.id])
+        #expect(sandboxed(route(try await place(.main, itemId: current.id))))
+        #expect(sandboxed(route(try await place(.item, itemId: current.id))))
+        #expect(sandboxed(route(try await place(.mainAtBase, at: head))))
+        // A done item with no known author or holder is a missing principal: sandboxed too.
+        try m.exec("UPDATE workItem SET ownerId = NULL WHERE id = ?", [shipped.id])
+        #expect(sandboxed(route(try await place(.main, itemId: current.id))))
+    }
+
     /// Controller ruling 2: the red-main re-check runs only on the engine-recorded head. A live `main` that differs (someone moved
     /// it outside the queue) is not checked here.
     @Test func redMainRecheckOnlyOnTheRecordedHead() async throws {
@@ -616,7 +669,8 @@ import GRDB
         }
         let told = try m.store.allNotices().filter { $0.title == "Merge recovery is failing" }
         #expect(told.count == 1, "\(told.count) notices")
-        #expect(told.first?.body.contains("brahma merge") == true)
+        // Final review M3: it names no command that does nothing (`merge resume` only releases a held queue).
+        #expect(told.first?.body.contains("brahma merge list") == true && told.first?.body.contains("merge resume") == false)
         #expect(try m.store.openMergeBatches(companyId: m.company.id).count == 1)
         // The fault clears: the next due attempt recovers, and the queue moves on.
         m.store.mergeRefProbe.failOn([])
@@ -627,18 +681,27 @@ import GRDB
         _ = items
     }
 
-    /// A database error on the landing's stop read is the engine's fault, never counted against the items.
-    @Test func stopReadErrorAtTheLandingIsNotChargedToTheItem() async throws {
+    /// Final review M1: a stop that cannot be read counts as a stop (as `PreviewRunner.ownerStopHolds`). When the read starts
+    /// failing during a check, that batch is stopped and its request goes back uncounted; while it keeps failing nothing is
+    /// claimed, recovered or merged. Never charged to the item.
+    @Test func unreadableStopHoldsTheQueue() async throws {
         let m = try MergeFixture()
         let i = try await m.approved()
-        try m.exec("DROP TABLE engineStop")
-        let q = queue(m)
-        for round in 1...4 {
-            let outcome = try #require(try await batch(q, m))
-            let r = try request(m, i)
-            #expect(outcome.requeued == [r.id] && r.status == .queued && outcome.failed.isEmpty, "round \(round)")
+        let before = try main(m)
+        m.world.checks.onRun { _ in
+            m.exec_noThrow("DROP TABLE engineStop")
+            return nil
         }
-        #expect(try m.fresh(i).status == .inReview)
+        let q = queue(m)
+        let first = try #require(try await batch(q, m))
+        var r = try request(m, i)
+        #expect(first.merged.isEmpty && first.failed.isEmpty && r.status == .queued && r.requeues == 0 && r.inconclusive == 0, "\(r)")
+        m.world.checks.onRun(nil)
+        let calls = m.world.checks.calls.count
+        for round in 1...3 { #expect(try await batch(q, m) == nil, "round \(round)") }
+        r = try request(m, i)
+        #expect(r.status == .queued && r.requeues == 0 && r.inconclusive == 0 && m.world.checks.calls.count == calls)
+        #expect(try main(m) == before && m.fresh(i).status == .inReview)
     }
 
     /// A landing whose `landed` step was never journaled (the batch is still at `landing`, main already holds it) is recorded

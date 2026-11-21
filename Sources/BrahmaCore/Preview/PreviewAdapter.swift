@@ -36,7 +36,7 @@ public struct PreviewContext: Sendable {
     /// The start runs through `PreviewDependencies.unsandboxed` (a Full company, PR-5): use `deps.runner(for:)`.
     public var unsandboxed: Bool = false
     /// Hears the pid of a long-running process as soon as it is spawned (the runner records it, so a stop reaches it).
-    public var onSpawn: (@Sendable (Int32) async -> Void)? = nil
+    public var onSpawn: (@Sendable (Int32, Double) async -> Void)? = nil
     /// What scrubs the captured output, the build log and the smoke results before anything keeps them (the runner passes
     /// `Store.redactor`; Plan 4a Task 5). Nil, or not loaded: nothing that would need it is kept (fail closed).
     public var redactor: Redactor? = nil
@@ -47,7 +47,7 @@ public struct PreviewContext: Sendable {
     public init(surface: PreviewSurface, company: Company, layout: EngineLayout, run: URL, commit: String, port: Int,
                 policy: SandboxPolicy, environment: [String: String], logURL: URL, timeouts: PreviewTimeouts = PreviewTimeouts(),
                 outputURL: URL? = nil, appPolicy: SandboxPolicy? = nil, unsandboxed: Bool = false,
-                onSpawn: (@Sendable (Int32) async -> Void)? = nil, redactor: Redactor? = nil) {
+                onSpawn: (@Sendable (Int32, Double) async -> Void)? = nil, redactor: Redactor? = nil) {
         self.surface = surface; self.company = company; self.layout = layout; self.run = run; self.commit = commit
         self.port = port; self.policy = policy; self.environment = environment; self.logURL = logURL; self.timeouts = timeouts
         self.outputURL = outputURL ?? layout.previewOutput(name: surface.name)

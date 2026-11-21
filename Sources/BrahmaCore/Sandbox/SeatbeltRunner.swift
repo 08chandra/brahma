@@ -229,6 +229,7 @@ public final class SeatbeltProcess: SandboxedProcess, @unchecked Sendable {
     }
 
     public var pid: Int32 { child.pid }
+    public var leaderStart: Double? { child.leaderStart }
 
     public func isAlive() -> Bool { !child.hasExited() }
 

@@ -1591,6 +1591,8 @@ enum Migrations {
                 t.add(column: "simulatorId", .text)
                 t.add(column: "outputPath", .text)
                 t.add(column: "smokeResults", .text).notNull().defaults(to: "[]")
+                // The recorded pid's exact start time (final review I2): only a process with exactly this start is signalled.
+                t.add(column: "pidStart", .double)
             }
         }
         m.registerMigration("v4a-artifacts") { db in

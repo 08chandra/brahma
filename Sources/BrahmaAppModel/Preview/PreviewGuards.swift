@@ -136,6 +136,12 @@ public enum PreviewGuardState<RuleList> {
         if case .ready = self { return true }
         return false
     }
+
+    /// This state when WebRTC was verified off (`WebRTCGuard.disable`), else `.failed`: a page that could reach the network
+    /// over STUN/TURN is never shown (final review I1, fail closed).
+    public func requiringWebRTCOff(_ off: Bool) -> PreviewGuardState {
+        off ? self : .failed(WebRTCGuard.previewRefusal)
+    }
 }
 
 /// What the focus guard needs from an `NSEvent` (I1), so the rule is testable without AppKit.

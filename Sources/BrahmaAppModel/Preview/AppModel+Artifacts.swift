@@ -67,14 +67,16 @@ extension AppModel {
         guard let pinned = pinnedArtifact, let companyId = selectedCompanyId else { return }
         let store = self.store
         let (number, id) = (pinned.artifact.number, pinned.artifact.id)
-        guard let stillThere = try? await Task.detached { try store.artifact(companyId: companyId, number: number) != nil }.value,
-              !stillThere, pinnedArtifact?.artifact.id == id, companyId == selectedCompanyId else { return }
+        let lookup = Task.detached { try store.artifact(companyId: companyId, number: number) != nil }
+        guard let stillThere = try? await lookup.value, !stillThere,
+              pinnedArtifact?.artifact.id == id, companyId == selectedCompanyId else { return }
         pinnedArtifact = nil
         if selectedArtifactId == id {
             selectedArtifactId = nil
             artifactNotice = Self.artifactDeletedNotice
         }
         phoneFrameOverride[id] = nil
+        scriptEnabledArtifacts.remove(id)
     }
 
     /// Owner only: removes the artifact's row, memory doc and copy (`Store.deleteArtifact`). The selection and the phone-frame
@@ -89,6 +91,7 @@ extension AppModel {
         if pinnedArtifact?.artifact.id == a.id { pinnedArtifact = nil }
         artifactNotice = nil
         phoneFrameOverride[a.id] = nil
+        scriptEnabledArtifacts.remove(a.id)
     }
 
     /// Whether a video artifact sits in the phone frame: the owner's override for it, else what `VideoLayout` detected.
@@ -98,6 +101,26 @@ extension AppModel {
 
     /// The owner's "PHONE FRAME" toggle for one artifact (kept until the company changes).
     public func setPhoneFrame(_ on: Bool, artifactId: String) { phoneFrameOverride[artifactId] = on }
+
+    // MARK: Scripts (final review C1)
+
+    /// Whether this artifact's page may run scripts (`ArtifactScripts.enabled`, with the owner's choice for it). The web view
+    /// still runs them only once WebRTC is verified off.
+    public func artifactScriptsEnabled(_ a: Artifact) -> Bool {
+        ArtifactScripts.enabled(kind: a.kind, provenance: a.provenance, tainted: a.tainted, ownerEnabled: scriptEnabledArtifacts.contains(a.id))
+    }
+
+    /// Whether the header shows "Enable scripts for this artifact": an agent's, an outside or a tainted HTML artifact.
+    public func artifactScriptsNeedOwner(_ a: Artifact) -> Bool {
+        ArtifactScripts.ownerMustEnable(kind: a.kind, provenance: a.provenance, tainted: a.tainted)
+    }
+
+    /// The owner's choice for one artifact's scripts (kept until the company changes or the artifact is deleted). Only for
+    /// artifacts whose scripts are off by default; the owner's own HTML needs none.
+    public func setArtifactScripts(_ on: Bool, artifact a: Artifact) {
+        guard artifactScriptsNeedOwner(a) else { return }
+        if on { scriptEnabledArtifacts.insert(a.id) } else { scriptEnabledArtifacts.remove(a.id) }
+    }
 
     // MARK: OpenAPI (the one parser the model runs)
 

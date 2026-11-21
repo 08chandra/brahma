@@ -192,14 +192,15 @@ public enum EmergencyStop {
     }
 
     /// The groups of the preview servers recorded `building`, `starting` or `running`, each only while its pid still leads
-    /// its own group of ours with a start time inside the record (`PreviewRunner.orphanGroup`, PR-4): a recycled pid is never
-    /// signalled. What reaches previews when the engine itself cannot (`brahma stop`, the app's STOP EVERYTHING).
+    /// its own group of ours with exactly the start time recorded at the spawn (`PreviewRunner.orphanGroup`, final review
+    /// I2): a recycled pid, or a record without a start (an older engine's), is never signalled. What reaches previews when
+    /// the engine itself cannot (`brahma stop`, the app's STOP EVERYTHING).
     static func previewGroups(store: Store) -> Set<Int32> {
         var groups = Set<Int32>()
         for company in (try? store.companies()) ?? [] {
             for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values
             where [.building, .starting, .running].contains(state.status) {
-                if let pid = state.pid, PreviewRunner.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
+                if let pid = state.pid, PreviewRunner.orphanGroup(pid: pid, pidStart: state.pidStart) {
                     groups.insert(pid)
                 }
             }

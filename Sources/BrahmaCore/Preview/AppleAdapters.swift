@@ -309,7 +309,13 @@ public struct MacAppAdapter: PreviewAdapter {
             return PreviewUpdate(status: .failed, message: "could not launch the app: \(Store.flat(PreviewRunner.text(error), max: 160))")
         }
         deps.processes.insert(process)
-        await c.onSpawn?(process.pid)
+        // As a server (final review I2): no exact start time, no recorded pid; the app is stopped now.
+        guard let start = process.leaderStart else {
+            await process.terminate(grace: WebAdapter.stopGrace)
+            deps.processes.remove(process.pid)
+            return PreviewUpdate(status: .failed, message: WebAdapter.startNotRecordedMessage)
+        }
+        await c.onSpawn?(process.pid, start)
         try? await AwakeTime.sleep(for: c.timeouts.poll)
         if Task.isCancelled {
             await process.terminate(grace: WebAdapter.stopGrace)

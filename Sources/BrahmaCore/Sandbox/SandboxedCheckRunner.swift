@@ -127,8 +127,9 @@ extension Orchestrator {
                 if record.isMergeRun {
                     // A merge check runs unsandboxed only if EVERY principal whose code it executes narrows to Full.
                     // Every principal whose code the run executes: the setter (main and main-at-base), the candidate's own members
-                    // (the run's item and every item of its batch), and every item the queue landed earlier (all of it is in the
-                    // candidate or in `main` at the base). Any lookup error, unknown author or missing principal: sandboxed.
+                    // (the run's item and every item of its batch), and every item whose code reached `main` earlier, by the
+                    // queue or before it (`landedItemIds`: all of it is in the candidate or in `main` at the base). Any lookup
+                    // error, unknown author or missing principal: sandboxed.
                     let usesItems = record.mergeKind == .main || record.mergeKind == .item
                     var itemIds = Set(usesItems ? record.itemId.map { [$0] } ?? [] : [])
                     var ids: [String] = []

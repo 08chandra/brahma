@@ -138,7 +138,16 @@ struct MergeGroup: ParsableCommand {
             let c = try resolveCompany(store, company)
             let changed: Bool
             do { changed = try store.resumeMergeQueue(companyId: c.id, by: .owner) } catch let e as WorkError { throw fail(e.message) }
-            guard changed else { print("The merge queue is not held."); return }
+            guard changed else {
+                // Final review M3: an interrupted batch the engine is still finishing needs no command; say so.
+                if try !store.openMergeBatches(companyId: c.id).isEmpty {
+                    print("The merge queue is not held. An interrupted merge batch is still open: Brahma finishes it by itself, "
+                          + "pausing longer after each failure, and merges go on once it does.")
+                } else {
+                    print("The merge queue is not held.")
+                }
+                return
+            }
             print("Merge queue resumed.")
         }
     }

@@ -8,7 +8,8 @@ import BrahmaAppModel
 /// owner's `path`, navigates only where `PreviewNavigationPolicy.allowsWeb` passes, opens no windows and never takes
 /// keyboard focus by itself. `reloadKey` changes (surface commit, live release, path, viewport) reload the page.
 /// Every load the page makes is held to the origin of the URL it loads (`PreviewGuards`: a content rule list plus a meta
-/// CSP); when those can't be prepared, no web view is made (fail closed).
+/// CSP), and WebRTC is off (`WebRTCGuard`, final review I1: STUN/TURN never passes either); when any of those can't be
+/// prepared, no web view is made (fail closed).
 struct WebPreviewView: View {
     let url: URL
     let origin: URL
@@ -84,7 +85,7 @@ struct WebPreviewView: View {
             let prepared = await PreviewGuards.prepare(origin: loadOrigin) { id, json in
                 try await Self.compile(id, json)
             }
-            if guardsOrigin == key { guards = prepared }
+            if guardsOrigin == key { guards = prepared.requiringWebRTCOff(WebRTCGuard.disable(WKPreferences())) }
         }
     }
 
@@ -147,6 +148,9 @@ private struct LoopbackWebView: NSViewRepresentable {
         config.websiteDataStore = .nonPersistent()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         config.preferences.isFraudulentWebsiteWarningEnabled = false
+        // WebRTC off (final review I1); the view is made only after the same probe passed (`requiringWebRTCOff`), and should
+        // this configuration still refuse, the page gets no scripts rather than a peer connection.
+        if !WebRTCGuard.disable(config.preferences) { config.defaultWebpagePreferences.allowsContentJavaScript = false }
         let content = WKUserContentController()
         content.add(rules)
         content.addUserScript(WKUserScript(source: cspScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -210,6 +214,10 @@ private struct LoopbackWebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
                      initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor (String?) -> Void) { completionHandler(nil) }
+
+        /// Camera and microphone: never (final review M5).
+        func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo,
+                     type: WKMediaCaptureType, decisionHandler: @escaping @MainActor (WKPermissionDecision) -> Void) { decisionHandler(.deny) }
     }
 }
 

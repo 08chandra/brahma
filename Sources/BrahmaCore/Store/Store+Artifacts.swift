@@ -384,7 +384,7 @@ extension Store {
         #if canImport(Darwin)
         var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         guard fcntl(fd, F_GETPATH, &buffer) == 0 else { return nil }
-        return String(cString: buffer)
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         #else
         return try? FileManager.default.destinationOfSymbolicLink(atPath: "/proc/self/fd/\(fd)")
         #endif

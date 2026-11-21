@@ -104,18 +104,24 @@ public actor MergeQueue: EmergencyStopObserver {
         for task in tasks { _ = await task.value }
     }
 
+    /// Whether the owner's stop holds: an error reading it counts as stopped (final review M1, as `PreviewRunner.ownerStopHolds`),
+    /// so a database fault never lets a batch, a recovery or a check go on past a stop it could not see.
+    static func stopHolds(_ store: Store) -> Bool {
+        do { return try store.engineStopped() != nil } catch { return true }
+    }
+
     // MARK: One batch
 
     private func batch(companyId: String) async -> MergeBatchOutcome? {
         let (store, blocking, clock) = (self.store, self.blocking, self.clock)
-        if (try? store.engineStopped()) != nil || Task.isCancelled { return nil }
+        if Self.stopHolds(store) || Task.isCancelled { return nil }
         guard var loaded = try? store.company(id: companyId) else { return nil }
         // The first batch of a process (and the first after the owner's stop) starts by recovering what the journal left.
         // An unfinished batch (a landing that could not be recorded, a hold that could not be written) is retried at every tick;
         // nothing is claimed while the journal holds one, so a landing is never made twice.
         let unfinished = ((try? store.openMergeBatches(companyId: companyId))?.isEmpty ?? false) == false
         if !recovered.contains(companyId) || unfinished { _ = await recoverCompany(loaded) }
-        if Task.isCancelled || (try? store.engineStopped()) != nil { return nil }
+        if Task.isCancelled || Self.stopHolds(store) { return nil }
         guard let open = try? store.openMergeBatches(companyId: companyId), open.isEmpty,
               let reloaded = try? store.company(id: companyId) else { return nil }
         loaded = reloaded
@@ -258,7 +264,7 @@ public actor MergeQueue: EmergencyStopObserver {
         let ledger = BatchLedger()
         let batchId = requests.first?.batchId ?? ""
         let (store, blocking, clock, paths, known) = (self.store, self.blocking, self.clock, self.paths, self.knownValues)
-        func stopped() -> Bool { Task.isCancelled || (try? store.engineStopped()) != nil }
+        func stopped() -> Bool { Task.isCancelled || Self.stopHolds(store) }
         func requeue(_ r: MergeRequest, counts: Bool, inconclusive: Bool = false) {
             ledger.settled.insert(r.id)
             if counts, r.requeues >= Self.maxRequeues {
@@ -847,7 +853,7 @@ public actor MergeQueue: EmergencyStopObserver {
     private func recoverCompany(_ company: Company) async -> Int {
         let (store, blocking, clock, paths) = (self.store, self.blocking, self.clock, self.paths)
         // Nothing is recovered while the owner's stop is up: it runs on the first batch after it clears.
-        if (try? store.engineStopped()) != nil || Task.isCancelled { return 0 }
+        if Self.stopHolds(store) || Task.isCancelled { return 0 }
         // A recovery that keeps failing waits out its backoff instead of taking the lock at every tick.
         if let due = recoveryRetryAt[company.id], clock() < due { return 0 }
         let git = workspace(of: company)
@@ -907,7 +913,8 @@ public actor MergeQueue: EmergencyStopObserver {
                 + "Merges wait until it can; Brahma keeps trying with a growing pause.", now: clock(), reason: Store.mergeHoldAlertReason(company.id))
         try? store.notifyOwner(companyId: company.id, title: "Merge recovery is failing",
                                body: "Brahma could not finish an interrupted merge batch in \(company.name) after \(n) tries (\(shown)). Merges there wait. "
-                                   + "It keeps trying with a growing pause; if it persists, check the workspace and the disk, then run brahma merge resume \(company.name).",
+                                   + "It keeps trying with a growing pause and needs no command: merges go on by themselves once it succeeds. "
+                                   + "If it persists, check the workspace and the disk; brahma merge list \(company.name) shows the waiting merges.",
                                now: clock())
     }
 
@@ -1072,7 +1079,7 @@ public actor MergeQueue: EmergencyStopObserver {
                 catch { return false }
             }
             if !scrubbed { outcome = CheckOutcome(exitCode: outcome.exitCode, timedOut: outcome.timedOut, tail: Orchestrator.withheldCheckTail) }
-            if Task.isCancelled || (try? store.engineStopped()) != nil {
+            if Task.isCancelled || Self.stopHolds(store) {
                 finish(.error, exit: nil, tail: "stopped by the owner before the check finished")
                 return .stopped
             }

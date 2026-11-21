@@ -24,9 +24,9 @@ import Glibc
 /// - a failed start sends one system DM to its setter (an agent) with the engine's reason and the log's path, never the
 ///   log's text, and an activity line; a successful one an activity line.
 /// The first pass of a runner treats every `building`, `starting` or `running` record as an earlier engine's: its process
-/// group is killed when the recorded pid is still that group's leader with a start time inside the record (3a's
-/// `ProcessTable`, PR-4), the surface becomes `stopped` and is started again from a fresh export (the engine's startup sweep
-/// deleted every export).
+/// group is killed when the recorded pid is still that group's leader with exactly the start time recorded at the spawn
+/// (`pidStart`, final review I2), the surface becomes `stopped` and is started again from a fresh export (the engine's
+/// startup sweep deleted every export).
 ///
 /// The owner's emergency stop (5-lite 7c, L-5lite-A): the runner is one of the engine's stop observers. `stopAll(reason:)`
 /// stops every surface of every company (`"stopped by the owner"`); while `store.engineStopped()` holds (or cannot be read)
@@ -430,7 +430,7 @@ public actor PreviewRunner: EmergencyStopObserver {
                                      policy: policies.policy, environment: environment, logURL: logURL, timeouts: timeouts,
                                      outputURL: layout.previewOutput(name: surface.name), appPolicy: policies.appPolicy,
                                      unsandboxed: Self.unsandboxed(store: engineStore, company: company, surface: surface),
-                                     onSpawn: { pid in await self.spawned(id, pid: pid) }, redactor: engineStore.redactor)
+                                     onSpawn: { pid, start in await self.spawned(id, pid: pid, start: start) }, redactor: engineStore.redactor)
         runs[id]?.context = context
         let update = await adapter.start(context)
         if Task.isCancelled || epoch != stopEpoch || update.status == .stopped {
@@ -472,10 +472,11 @@ public actor PreviewRunner: EmergencyStopObserver {
 
     struct ExportFailure: Error, Sendable { var message: String }
 
-    private func spawned(_ id: String, pid: Int32) {
+    /// The adapter spawned the server (or app): its pid and its exact start time, read while it was unreaped (final review I2).
+    private func spawned(_ id: String, pid: Int32, start: Double) {
         pending.remove(id)
         runs[id]?.pid = pid
-        _ = try? store.updatePreviewState(surfaceId: id, now: clock()) { $0.status = .starting; $0.pid = pid }
+        _ = try? store.updatePreviewState(surfaceId: id, now: clock()) { $0.status = .starting; $0.pid = pid; $0.pidStart = start }
     }
 
     static func text(_ error: any Error) -> String {
@@ -589,13 +590,15 @@ public actor PreviewRunner: EmergencyStopObserver {
                     _ = try? store.updatePreviewState(surfaceId: state.surfaceId, now: now) { $0.simulatorId = nil }
                 }
                 guard [.building, .starting, .running].contains(state.status) else { continue }
-                if let pid = state.pid, Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
+                // Signalled only while the recorded pid is still exactly the process the engine spawned (a legacy record
+                // without `pidStart` never is); the record becomes `stopped` either way.
+                if let pid = state.pid, Self.orphanGroup(pid: pid, pidStart: state.pidStart) {
                     killpg(pid, SIGTERM)
                     let deadline = AwakeTime.deadline(after: WebAdapter.stopGrace)
-                    while AwakeTime.now < deadline, Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
+                    while AwakeTime.now < deadline, Self.orphanGroup(pid: pid, pidStart: state.pidStart) {
                         try? await AwakeTime.sleep(for: .milliseconds(50))
                     }
-                    if Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) { killpg(pid, SIGKILL) }
+                    if Self.orphanGroup(pid: pid, pidStart: state.pidStart) { killpg(pid, SIGKILL) }
                 }
                 _ = try? store.updatePreviewState(surfaceId: state.surfaceId, now: now) {
                     $0.status = .stopped; $0.message = Self.engineRestartedMessage; $0.pid = nil; $0.resolvedURL = nil; $0.simulatorId = nil
@@ -605,14 +608,15 @@ public actor PreviewRunner: EmergencyStopObserver {
         await blocking.run { _ = try? simulator.shutdownLeftovers() }
     }
 
-    /// Whether `pid` is still the leader of its own process group, ours, alive, and started between the record's start and
-    /// its last write (3a's `ProcessTable`, PR-4: pgid and start time, so a recycled pid is never signalled). Off Darwin the
-    /// table's start times are not wall-clock, so nothing is claimed.
-    static func orphanGroup(pid: Int32, startedAt: Date?, updatedAt: Date) -> Bool {
+    /// Whether `pid` is still exactly the process the engine spawned: the leader of its own process group, ours, alive, and
+    /// started at exactly `pidStart`, the start time read at the spawn while the child was unreaped (final review I2; the
+    /// rule turns, child groups and litestream follow). A recycled pid has another start, so it is never signalled, and a
+    /// record without `pidStart` (an older engine's) proves nothing, so it never is either. Off Darwin nothing is claimed.
+    static func orphanGroup(pid: Int32, pidStart: Double?) -> Bool {
         #if canImport(Darwin)
-        guard pid > 1, let startedAt, let entry = ProcessTable.entry(pid), entry.pgid == pid, entry.uid == getuid(), !entry.isZombie
+        guard pid > 1, let pidStart, let entry = ProcessTable.entry(pid), entry.pgid == pid, entry.uid == getuid(), !entry.isZombie
         else { return false }
-        return entry.start >= startedAt.timeIntervalSince1970 - 2 && entry.start <= updatedAt.timeIntervalSince1970 + 2
+        return entry.start == pidStart
         #else
         return false
         #endif
@@ -705,6 +709,7 @@ final class PlainGroupProcess: SandboxedProcess, @unchecked Sendable {
     }
 
     var pid: Int32 { child.pid }
+    var leaderStart: Double? { child.leaderStart }
     func isAlive() -> Bool { !child.hasExited() }
 
     func exitStatus() -> Int32? {

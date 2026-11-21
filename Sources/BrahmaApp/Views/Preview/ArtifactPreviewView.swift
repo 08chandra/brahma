@@ -13,6 +13,10 @@ import BrahmaAppModel
 /// file card's "Open in…" (`openCopy`, Finder as the opener, any artifact kind): Finder is never pointed at the agent's path. An
 /// entry that fails the vetting (a link, a bundle, an execute bit, a launch-capable name) has the button disabled, with the
 /// engine-written reason as its help and a chip beside it.
+///
+/// Scripts (final review C1): an agent's, an outside or a tainted HTML artifact runs without scripts until the owner presses
+/// "Enable scripts for this artifact" here (`AppModel.setArtifactScripts`); a `SCRIPTS OFF`/`SCRIPTS ON` chip says which. The
+/// body is made again when that changes.
 struct ArtifactPreviewView: View {
     let artifact: Artifact
     let all: [Artifact]
@@ -44,7 +48,8 @@ struct ArtifactPreviewView: View {
             if let fileBody {
                 FileBodyView(body: fileBody, provenance: artifact.provenance, builtBy: byHandle, publishedBy: byHandle,
                              phoneFrameOverride: model.phoneFrameOverride[artifact.id],
-                             onPhoneFrame: { model.setPhoneFrame($0, artifactId: artifact.id) })
+                             onPhoneFrame: { model.setPhoneFrame($0, artifactId: artifact.id) },
+                             scripts: model.artifactScriptsEnabled(artifact))
                     .id(artifact.id)
             } else {
                 MonoEmptyState("NO WORKSPACE", detail: "The company's workspace isn't known yet, so the artifact can't be opened.")
@@ -79,6 +84,7 @@ struct ArtifactPreviewView: View {
                 }
             }
             Spacer(minLength: 0)
+            if model.artifactScriptsNeedOwner(artifact) { scriptsToggle(compact: compact) }
             if let url = fileBody?.url {
                 if let revealRefusal, !compact {
                     Text(verbatim: revealRefusal).font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.warning).lineLimit(1)
@@ -93,6 +99,22 @@ struct ArtifactPreviewView: View {
                 .task(id: url) { revealRefusal = OpenInHandoff.vet(url, kinds: nil).map(OpenInHandoff.message) }
             }
         }
+    }
+
+    /// The owner's per-artifact scripts switch: a chip with the state, then a small bordered button that flips it; its help
+    /// says what turning scripts on means (engine-written).
+    @ViewBuilder private func scriptsToggle(compact: Bool) -> some View {
+        let on = model.artifactScriptsEnabled(artifact)
+        StatusChip(label: on ? ArtifactScripts.onChip : ArtifactScripts.offChip, color: on ? BrahmaTheme.warning : BrahmaTheme.text2)
+        let title = on ? ArtifactScripts.disableTitle : ArtifactScripts.enableTitle
+        Button { model.setArtifactScripts(!on, artifact: artifact) } label: {
+            Label(title, systemImage: on ? "curlybraces.square.fill" : "curlybraces.square")
+                .labelStyle(compact ? AnyLabelStyle.iconOnly : .titleAndIcon)
+        }
+        .buttonStyle(.brahma)
+        .fixedSize()
+        .help(on ? title : ArtifactScripts.warning)
+        .accessibilityLabel(Text(verbatim: title))
     }
 
     /// The copy is made off the main actor; Finder is given the copy on it (`activateFileViewerSelecting` has no result, so a

@@ -192,7 +192,15 @@ public struct PreviewState: Codable, Equatable, Sendable, FetchableRecord, Persi
     public var commit: String?
     public var port: Int?
     public var resolvedURL: String?
-    public var pid: Int32?
+    /// The server's (or app's) process, the leader of its own group. A different pid drops `pidStart`, so a start time is
+    /// never paired with a process it was not read from.
+    public var pid: Int32? {
+        didSet { if pid != oldValue { pidStart = nil } }
+    }
+    /// `pid`'s exact start time (`ProcessTable`), read at the spawn while the child was still unreaped and so provably the
+    /// engine's (final review I2). Every stop path signals the group only when the live process has exactly this start; a
+    /// record without one (an older engine's) is never signalled.
+    public var pidStart: Double? = nil
     public var message: String?
     public var logPath: String?
     /// When the process exited on its own, recently (the crash-loop window).
@@ -210,11 +218,11 @@ public struct PreviewState: Codable, Equatable, Sendable, FetchableRecord, Persi
     public init(surfaceId: String, companyId: String, status: PreviewStatus = .idle, commit: String? = nil, port: Int? = nil,
                 resolvedURL: String? = nil, pid: Int32? = nil, message: String? = nil, logPath: String? = nil, exits: [Date] = [],
                 restartRequestedAt: Date? = nil, startedAt: Date? = nil, updatedAt: Date, simulatorId: String? = nil,
-                outputPath: String? = nil, smokeResults: [SmokeResult] = []) {
+                outputPath: String? = nil, smokeResults: [SmokeResult] = [], pidStart: Double? = nil) {
         self.surfaceId = surfaceId; self.companyId = companyId; self.status = status; self.commit = commit; self.port = port
         self.resolvedURL = resolvedURL; self.pid = pid; self.message = message; self.logPath = logPath; self.exits = exits
         self.restartRequestedAt = restartRequestedAt; self.startedAt = startedAt; self.updatedAt = updatedAt
-        self.simulatorId = simulatorId; self.outputPath = outputPath; self.smokeResults = smokeResults
+        self.simulatorId = simulatorId; self.outputPath = outputPath; self.smokeResults = smokeResults; self.pidStart = pidStart
     }
 }
 

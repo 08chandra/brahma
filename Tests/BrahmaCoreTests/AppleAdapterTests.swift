@@ -321,7 +321,7 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         #expect(PreviewDependencies.live(sandbox: FakeSandbox()).macApps.availability() == ProcessMacAppLauncher.guiResidual)
         let heard = Heard()
         var context = s.context
-        context.onSpawn = { pid in heard.set(pid) }
+        context.onSpawn = { pid, _ in heard.set(pid) }
         let update = await adapter.start(context)
         let pid = try #require(update.process)
         #expect(update.status == .running && update.message == nil, "\(update)")
