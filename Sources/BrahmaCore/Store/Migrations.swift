@@ -1763,6 +1763,29 @@ enum Migrations {
                 BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'status', NEW.itemId); END
                 """)
         }
+        m.registerMigration("vC-restore-epoch") { db in
+            // Plan C, P2 fix round 5 (Ruling 22): a restore over a live database that could not be read records, per company,
+            // an epoch: what the restored database can't place (commits it has no row for, off the snapshot's recorded main)
+            // reads tainted until the owner vouches for it. `listed`: the restore listed those commits as `taintedCommit` rows
+            // (`restoreEpoch` names the epoch); otherwise every commit off `mainCommit` (none: every commit) is tainted.
+            try db.create(table: "restoreEpoch") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("mainCommit", .text)                    // the restored database's recorded main at the restore
+                t.column("listed", .boolean).notNull()
+                t.column("source", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("clearedBy", .text)                     // owner
+                t.column("clearedAt", .datetime)
+            }
+            try db.alter(table: "taintedCommit") { t in t.add(column: "restoreEpoch", .text) }
+            // Ruling 19: the owner's clearing of an epoch is ordered like a commit's.
+            try db.execute(sql: """
+                CREATE TRIGGER taintOrder_epochClear AFTER UPDATE OF clearedBy ON restoreEpoch
+                WHEN OLD.clearedBy IS NULL AND NEW.clearedBy IS NOT NULL
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'clear', 'restore-epoch:' || NEW.id); END
+                """)
+        }
     }
 }
 

@@ -146,6 +146,26 @@ public struct TaintedCommit: Codable, Equatable, Sendable, FetchableRecord, Pers
     }
 }
 
+/// Ruling 22 (P2 R5-1): a restore over a live database that could not be read, for one company. What the restored database
+/// can't place reads tainted until the owner vouches (`Store.vouchRestoredCommits`): when `listed`, the commits off
+/// `mainCommit` that every ref and worktree held at the restore, recorded as `taintedCommit` rows naming this epoch; otherwise
+/// every commit not in `mainCommit`'s history (no `mainCommit`: every commit).
+public struct RestoreEpoch: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "restoreEpoch"
+
+    public var id: String
+    public var companyId: String
+    public var mainCommit: String?
+    public var listed: Bool
+    public var source: String
+    public var createdAt: Date
+    public var clearedBy: String?
+    public var clearedAt: Date?
+
+    /// The `taintOrder` subject of the epoch's clearing.
+    public var orderSubject: String { "restore-epoch:\(id)" }
+}
+
 /// What one purge deleted (written by C2b's `Store.purge`). The list columns are JSON arrays.
 public struct PurgeLog: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "purgeLog"
