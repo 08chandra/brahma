@@ -1616,6 +1616,23 @@ enum Migrations {
             }
             try db.create(index: "artifact_publisher", on: "artifact", columns: ["companyId", "publishedById", "createdAt"])
         }
+        m.registerMigration("v4a-demos") { db in
+            // Plan 4a Task 7: what each preview (and the latest artifact) showed at a sprint's review demo. `line` is
+            // engine-composed and redacted; `surfaceId` is nil for the artifact demo and for the one row of an empty demo.
+            try db.create(table: "previewDemo") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("sprintId", .text).notNull()
+                t.column("surfaceId", .text)
+                t.column("surfaceName", .text).notNull()
+                t.column("commit", .text)
+                t.column("ok", .boolean).notNull()
+                t.column("line", .text).notNull()
+                t.column("outputPath", .text)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "previewDemo_sprint", on: "previewDemo", columns: ["sprintId"])
+        }
     }
 }
 

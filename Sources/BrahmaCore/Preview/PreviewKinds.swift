@@ -169,6 +169,13 @@ public protocol SimulatorControlling: Sendable {
     func terminate(_ udid: String, bundleId: String) throws
     func shutdown(_ udid: String) throws
     func screenshot(_ udid: String, to: URL) throws
+    /// Shuts down every booted device of the engine's own (`Brahma …`) that an earlier engine left (Task 7, obligation b);
+    /// never an owner device. Returns their ids. The default does nothing.
+    func shutdownLeftovers() throws -> [String]
+}
+
+extension SimulatorControlling {
+    public func shutdownLeftovers() throws -> [String] { [] }
 }
 
 /// Resolves a built macOS app's executable inside its run (Task 7's `ProcessMacAppLauncher`).
@@ -201,11 +208,13 @@ public struct UnavailableMacApps: MacAppLaunching {
 
 // MARK: Adapters
 
-/// The adapters a `PreviewRunner` uses by default, by kind. Plan L's web adapter, Task 5's backend and CLI adapters; Task 7
-/// (ios, macos) adds its own here. A kind with no adapter is `unavailable` (`PreviewRunner.noAdapterMessage`).
+/// The adapters a `PreviewRunner` uses by default, by kind. Plan L's web adapter, Task 5's backend and CLI adapters, Task 7's
+/// iOS and macOS adapters (available where `deps.simulator` / `deps.macApps` are). A kind with no adapter is `unavailable`
+/// (`PreviewRunner.noAdapterMessage`).
 public enum PreviewAdapters {
     public static func defaults(_ deps: PreviewDependencies) -> [PreviewKind: any PreviewAdapter] {
-        [.web: WebAdapter(deps: deps), .backend: BackendAdapter(deps: deps), .cli: CLIAdapter(deps: deps)]
+        [.web: WebAdapter(deps: deps), .backend: BackendAdapter(deps: deps), .cli: CLIAdapter(deps: deps),
+         .ios: IOSAdapter(deps: deps), .macos: MacAppAdapter(deps: deps)]
     }
 }
 

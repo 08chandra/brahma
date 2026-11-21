@@ -40,6 +40,9 @@ public struct PreviewContext: Sendable {
     /// What scrubs the captured output, the build log and the smoke results before anything keeps them (the runner passes
     /// `Store.redactor`; Plan 4a Task 5). Nil, or not loaded: nothing that would need it is kept (fail closed).
     public var redactor: Redactor? = nil
+    /// The sprint a `demo` is for (its number), set by the sprint-review demo (Plan 4a Task 7): names a Simulator screenshot
+    /// `<name>-demo-<sprint>.png`. Nil outside a sprint demo.
+    public var demoSprint: Int? = nil
 
     public init(surface: PreviewSurface, company: Company, layout: EngineLayout, run: URL, commit: String, port: Int,
                 policy: SandboxPolicy, environment: [String: String], logURL: URL, timeouts: PreviewTimeouts = PreviewTimeouts(),
@@ -125,8 +128,10 @@ public struct PreviewDependencies: Sendable {
     /// there (`PreviewContext.unsandboxed`, PR-5), else the sandbox.
     public func runner(for c: PreviewContext) -> any SandboxedRunner { c.unsandboxed ? unsandboxed : sandbox }
 
-    /// The real probes (`URLSessionHTTPProbe`, `LsofListenProbe`) and a fresh process table around `sandbox`.
+    /// The real probes (`URLSessionHTTPProbe`, `LsofListenProbe`), a fresh process table around `sandbox`, the real Simulator
+    /// controller (`xcrun simctl`) and macOS app launcher (Plan 4a Task 7; each says when it cannot work here).
     public static func live(sandbox: any SandboxedRunner) -> PreviewDependencies {
-        PreviewDependencies(sandbox: sandbox, http: URLSessionHTTPProbe(), listen: LsofListenProbe(), processes: SpawnedProcesses())
+        PreviewDependencies(sandbox: sandbox, http: URLSessionHTTPProbe(), listen: LsofListenProbe(), processes: SpawnedProcesses(),
+                            simulator: SimctlController(), macApps: ProcessMacAppLauncher())
     }
 }

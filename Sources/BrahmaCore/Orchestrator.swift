@@ -135,6 +135,8 @@ public actor Orchestrator {
     /// Plan L previews: the runner (one for the engine's life) and its reconcile pass in flight (`previewTick`).
     let previewRunner: PreviewRunner
     var previewTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
+    /// Whether the last preview pass was a sprint-review demo (Plan 4a Task 7): demos and reconciles alternate.
+    var lastPreviewTickWasDemo = false
     /// Plan L main smokes (`smokeTick`): what they run through, one slot per company shared with a release's smoke (PR-36),
     /// and the run in flight per company.
     nonisolated let smokeChecks: SmokeChecks

@@ -5,9 +5,23 @@ extension Orchestrator {
     /// task (part of `isIdle`; its starts are the runner's own tracked tasks, and the processes they leave running count in
     /// the safety cap through `previewRunner.activeChildren`). Nothing starts under an engine hold. All git and file work of a
     /// pass runs inside the shared `Blocking` (the runner holds this engine's).
+    ///
+    /// Plan 4a Task 7, the "demos" step: when a sprint in `review` has no demo yet (`DemoRunner.pending`), the pass is its
+    /// sprint-review demo instead (`PreviewRunner.demo(sprint:)`, which reconciles first), one sprint per pass and never on two
+    /// passes in a row (`lastPreviewTickWasDemo`), so a demo that cannot complete never starves the reconcile pass. Nothing
+    /// while the owner's stop holds: `held` covers it here, and the runner reads the stop again before it runs or writes.
     func previewTick(held: Bool) {
         guard !held, previewTask == nil else { return }
-        let (runner, clock) = (previewRunner, self.clock)
+        let (runner, clock, store) = (previewRunner, self.clock, self.store)
+        if !lastPreviewTickWasDemo, let sprint = ((try? DemoRunner.pending(store: store)) ?? []).first {
+            lastPreviewTickWasDemo = true
+            previewTask = Task.detached { [self] in
+                await asEngine { _ = await runner.demo(sprint: sprint) }
+                await previewEnded()
+            }
+            return
+        }
+        lastPreviewTickWasDemo = false
         previewTask = Task.detached { [self] in
             await asEngine { await runner.reconcile(now: clock()) }
             await previewEnded()

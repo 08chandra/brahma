@@ -61,13 +61,16 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
 
         /// A company with `main` committed and a runner whose adapters for `kinds` are recorders (the web one too when listed;
         /// otherwise L's real web adapter from `PreviewAdapters.defaults`).
-        init(kinds: [PreviewKind] = [.web, .backend, .cli, .ios, .macos], results: [PreviewKind: PreviewUpdate] = [:]) throws {
+        init(kinds: [PreviewKind] = [.web, .backend, .cli, .ios, .macos], results: [PreviewKind: PreviewUpdate] = [:],
+             simulator: (any SimulatorControlling)? = nil) throws {
             let root = try tempDir()
             let data = root.appending(path: "data", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
             let store = try Store(path: data.appending(path: "brahma.sqlite").path)
             sandbox = FakeSandbox()
-            deps = PreviewDependencies.fake(sandbox: sandbox)
+            var fakeDeps = PreviewDependencies.fake(sandbox: sandbox)
+            if let simulator { fakeDeps.simulator = simulator }
+            deps = fakeDeps
             w = try World(store: store, previewDeps: deps)
             company = try w.company("Acme")
             devops = try w.hire(company, "devops")
@@ -292,10 +295,11 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
     // MARK: Runner
 
     @Test func injectedAdaptersUsed() async throws {
-        // Task 5 registers the backend and CLI adapters next to L's web one.
+        // Task 5 registers the backend and CLI adapters next to L's web one; Task 7 the iOS and macOS ones.
         let defaults = PreviewAdapters.defaults(PreviewDependencies.fake())
-        #expect(Set(defaults.keys) == [.web, .backend, .cli] && defaults[.web] is WebAdapter)
+        #expect(Set(defaults.keys) == [.web, .backend, .cli, .ios, .macos] && defaults[.web] is WebAdapter)
         #expect(defaults[.backend] is BackendAdapter && defaults[.cli] is CLIAdapter)
+        #expect(defaults[.ios] is IOSAdapter && defaults[.macos] is MacAppAdapter)
         // An injected web adapter replaces L's: no server is spawned.
         let x = try Fx(kinds: [.web])
         #expect(x.set(["name": .string("web"), "kind": .string("web"), "run": .string("npm start"), "url": .string("http://127.0.0.1:{port}/")]).ok)

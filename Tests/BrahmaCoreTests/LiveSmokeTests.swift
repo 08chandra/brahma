@@ -1,6 +1,9 @@
 import Testing
 import Foundation
 import GRDB
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 @testable import BrahmaCore
 
 /// The live goal-to-URL test's owner policy (Plan L Task 15; fix round 1, I2): what it does with each pending-owner ask.
@@ -890,6 +893,91 @@ struct LiveSmokeTests {
         let stall = try store.stallReport(companyId: companyId)
         print("STALL: running \(stall.running); reasons: \(stall.reasons.joined(separator: " | "))")
     }
+
+    // MARK: Plan 4a Task 7
+
+    /// A tiny AppKit app, built with `swiftc` into a run directory and launched through the real 5-lite `SeatbeltRunner`
+    /// under `PreviewPolicy.guiApp` (the macOS preview adapter's exact spawn), shows a window owned by the spawned pid within
+    /// 10 s. If this fails, macOS previews stay `unavailable` with the reason
+    /// `"macOS app previews need the sandbox to allow GUI apps"` (the brief's residual).
+    /// `BRAHMA_LIVE=1 DEVELOPER_DIR=… swift test --filter macAppShowsWindowUnderPolicy`.
+    @Test(.timeLimit(.minutes(3)), .enabled(if: Toolchain.seatbeltAvailable, "no /usr/bin/sandbox-exec"))
+    func macAppShowsWindowUnderPolicy() async throws {
+        #if canImport(CoreGraphics)
+        let home = try Scratch.homeDir().resolvedForSandbox
+        let paths = BrahmaPaths(home: home.appending(path: "data"), workspaces: home.appending(path: "wss"))
+        let ws = home.appending(path: "wss/acme", directoryHint: .isDirectory)
+        let run = home.appending(path: "data/run/exports/prev-live", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: run.appending(path: "Build/Live.app/Contents/MacOS"), withIntermediateDirectories: true)
+        // The fixture: one window, titled with the pid, kept open.
+        let source = run.appending(path: "main.swift")
+        try """
+            import AppKit
+            let app = NSApplication.shared
+            app.setActivationPolicy(.regular)
+            let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 320, height: 160), styleMask: [.titled, .closable],
+                                  backing: .buffered, defer: false)
+            window.title = "Brahma live \\(getpid())"
+            window.makeKeyAndOrderFront(nil)
+            app.run()
+            """.write(to: source, atomically: true, encoding: .utf8)
+        let plist: [String: Any] = ["CFBundleExecutable": "Live", "CFBundleIdentifier": "dev.brahma.live", "CFBundlePackageType": "APPL"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: run.appending(path: "Build/Live.app/Contents/Info.plist"))
+        let compile = Process()
+        compile.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        compile.arguments = ["swiftc", "-O", "-o", run.appending(path: "Build/Live.app/Contents/MacOS/Live").path, source.path]
+        compile.environment = ["DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer", "PATH": "/usr/bin:/bin"]
+        let err = Pipe(); compile.standardError = err; compile.standardOutput = FileHandle.nullDevice
+        try compile.run(); compile.waitUntilExit()
+        try #require(compile.terminationStatus == 0, Comment(rawValue: String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)))
+        ScratchScope.current?.allowExecutable(named: "Live")   // the built fixture app is what is under test
+
+        let now = Date()
+        let company = Company(id: "live", name: "Acme", slug: "acme", goal: "g", workspacePath: ws.path, status: .running,
+                              usageMode: .low, priorityWeight: 1, createdAt: now)
+        let layout = EngineLayout(workspace: ws)
+        try PreviewPolicy.prepareAppData(layout, surface: "mac")
+        let policy = PreviewPolicy.guiApp(layout, run: run, company: company, sandbox: SandboxLayout(paths: paths, company: company, agentHandle: "preview"),
+                                          surface: "mac")
+        let executable = try ProcessMacAppLauncher().executable(inApp: run.appending(path: "Build/Live.app"), run: run)
+        let baseline = SandboxBaseline.current(paths: paths, otherWorkspaces: [], backupTargets: [])
+        let proxies = EgressProxyPool()
+        let runner = SeatbeltRunner(baseline: { baseline }, proxies: proxies)
+        let log = home.appending(path: "data/mac.log")
+        let process = try runner.spawn(command: MacAppAdapter.launchCommand(executable), cwd: run,
+                                       environment: PreviewContext.environment(port: 0), logURL: log, policy: policy)
+        let deadline = AwakeTime.deadline(after: .seconds(10))
+        var seen = false
+        while !seen, AwakeTime.now < deadline {
+            seen = Self.windowOwned(by: process.pid)
+            if !seen { try await Task.sleep(for: .milliseconds(250)) }
+        }
+        let alive = process.isAlive()
+        await process.terminate(grace: .seconds(2))
+        try await Task.sleep(for: .seconds(1))   // the log is flushed by the reaper
+        let tail = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        print("LIVE macAppShowsWindowUnderPolicy: pid \(process.pid) alive \(alive) exit \(String(describing: process.exitStatus())) window \(seen); log: \(tail.suffix(400))")
+        #expect(seen, "no window owned by pid \(process.pid) (or its group) within 10 s; exit \(String(describing: process.exitStatus())); log tail: \(tail.suffix(400))")
+        await proxies.stopAll()
+        #else
+        Issue.record("macOS only")
+        #endif
+    }
+
+    #if canImport(CoreGraphics)
+    /// Whether any on-screen window belongs to `pid`, or to a process in `pid`'s own process group (sandbox-exec execs the
+    /// shell, which execs the app, so the pid normally stays the same).
+    static func windowOwned(by pid: Int32) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return false }
+        for info in list {
+            guard let owner = info[kCGWindowOwnerPID as String] as? Int32 else { continue }
+            if owner == pid || getpgid(owner) == pid { return true }
+        }
+        return false
+    }
+    #endif
 }
 
 /// How the live test's owner loop ended.

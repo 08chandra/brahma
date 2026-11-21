@@ -76,16 +76,16 @@ public actor PreviewRunner: EmergencyStopObserver {
     private nonisolated let pending = PendingStarts()
     /// Surface id → its start task.
     private var starts: [String: Task<Void, Never>] = [:]
-    /// Surface id → the run it has now (its export and, once spawned, its process).
-    private var runs: [String: Run] = [:]
+    /// Surface id → the run it has now (its export and, once spawned, its process). Read by the sprint demo (`demo(sprint:)`).
+    var runs: [String: Run] = [:]
     /// Company id → the `main` last seen and when it was first seen (the debounce).
     private var mainSeen: [String: (commit: String, at: Date)] = [:]
     /// Surface id → when a crashed server may start again.
     private var restartAt: [String: Date] = [:]
     private var startCounter = 0
     private var recovered = false
-    /// While `stopAll` runs, `reconcile` does nothing.
-    private var stopping = 0
+    /// While `stopAll` runs, `reconcile` (and the sprint demo) does nothing.
+    var stopping = 0
     /// Bumped by every `stopAll` (Task 3 M1): a pass that began before it brings nothing up after it (`launch` and the
     /// pass's own writes check that the epoch they started in is still current).
     private var stopEpoch = 0
@@ -123,7 +123,10 @@ public actor PreviewRunner: EmergencyStopObserver {
 
     // MARK: The pass
 
-    public func reconcile(now: Date) async {
+    public func reconcile(now: Date) async { await reconcile(now: now, settled: false) }
+
+    /// `settled`: treat a moved `main` as past its debounce (the sprint-review demo wants the current `main` now).
+    func reconcile(now: Date, settled: Bool) async {
         guard stopping == 0 else { return }
         let epoch = stopEpoch
         if !recovered {
@@ -150,7 +153,7 @@ public actor PreviewRunner: EmergencyStopObserver {
             }
             guard let main = company.mainCommit else { continue }
             if mainSeen[company.id]?.commit != main { mainSeen[company.id] = (main, now) }
-            let mainSettled = now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
+            let mainSettled = settled || now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
             for surface in surfaces {
                 guard let kind = surface.previewKind, kind != .artifact else { continue }
                 let state = states[surface.id] ?? PreviewState(surfaceId: surface.id, companyId: company.id, updatedAt: now)
@@ -184,7 +187,7 @@ public actor PreviewRunner: EmergencyStopObserver {
     }
 
     /// Whether the owner's stop holds now; a database error reads as stopped (nothing starts by mistake).
-    private var ownerStopHolds: Bool {
+    var ownerStopHolds: Bool {
         do { return try store.engineStopped() != nil } catch { return true }
     }
 
@@ -541,11 +544,18 @@ public actor PreviewRunner: EmergencyStopObserver {
     // MARK: Engine start
 
     /// Every record an earlier engine left building, starting or running: its group is killed if it still is that record's
-    /// (`orphanGroup`), and it becomes `stopped`, so this pass starts it again.
+    /// (`orphanGroup`), and it becomes `stopped`, so this pass starts it again. A Simulator device an earlier engine left
+    /// (Task 7, obligation b): the recorded `simulatorId` is shut down and cleared, and every booted `Brahma …` device is shut
+    /// down too (`shutdownLeftovers`; the owner's own simulators are never touched).
     private func recover(now: Date) async {
+        let simulator = deps.simulator
         for company in (try? store.companies()) ?? [] {
-            for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values
-            where [.building, .starting, .running].contains(state.status) {
+            for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values {
+                if let udid = state.simulatorId {
+                    await blocking.run { _ = try? simulator.shutdown(udid) }
+                    _ = try? store.updatePreviewState(surfaceId: state.surfaceId, now: now) { $0.simulatorId = nil }
+                }
+                guard [.building, .starting, .running].contains(state.status) else { continue }
                 if let pid = state.pid, Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
                     killpg(pid, SIGTERM)
                     let deadline = AwakeTime.deadline(after: WebAdapter.stopGrace)
@@ -555,10 +565,11 @@ public actor PreviewRunner: EmergencyStopObserver {
                     if Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) { killpg(pid, SIGKILL) }
                 }
                 _ = try? store.updatePreviewState(surfaceId: state.surfaceId, now: now) {
-                    $0.status = .stopped; $0.message = Self.engineRestartedMessage; $0.pid = nil; $0.resolvedURL = nil
+                    $0.status = .stopped; $0.message = Self.engineRestartedMessage; $0.pid = nil; $0.resolvedURL = nil; $0.simulatorId = nil
                 }
             }
         }
+        await blocking.run { _ = try? simulator.shutdownLeftovers() }
     }
 
     /// Whether `pid` is still the leader of its own process group, ours, alive, and started between the record's start and

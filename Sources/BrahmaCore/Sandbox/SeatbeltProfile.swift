@@ -102,15 +102,22 @@ public enum SeatbeltProfile {
     /// `proxyPort` is the egress proxy's port (`.outbound` and `.loopbackListen`; ignored for `.none`). `marker`, when set, is
     /// a per-run unique mach global name the profile allows (and no service answers), so the engine can recognize the run's
     /// processes afterwards by their sandbox alone (B-I4).
-    public static func render(policy: SandboxPolicy, baseline: SandboxBaseline, proxyPort: UInt16?, marker: String? = nil) -> String {
+    ///
+    /// `resolvePolicyPaths`: whether the policy's own paths are resolved here. `SeatbeltRunner.prepare` passes false: it has
+    /// just checked that every policy path is already resolved (`SandboxPolicyCheck`), and rendering from the checked spelling
+    /// means a link planted between the check and the render cannot put its target into the profile (Task 7, obligation d).
+    /// Baseline paths are always resolved (they are the engine's own).
+    public static func render(policy: SandboxPolicy, baseline: SandboxBaseline, proxyPort: UInt16?, marker: String? = nil,
+                              resolvePolicyPaths: Bool = true) -> String {
         func r(_ url: URL) -> String { SandboxPath.resolve(url.path) }
+        func checked(_ url: URL) -> String { resolvePolicyPaths ? r(url) : url.path }
         func subpath(_ p: String) -> String { "(subpath \(quote(p)))" }
         func unique(_ paths: [String]) -> [String] {
             var seen = Set<String>()
             return paths.filter { seen.insert($0).inserted }
         }
-        let writable = unique(policy.writable.map(r))
-        let readable = unique(policy.readable.map(r))
+        let writable = unique(policy.writable.map(checked))
+        let readable = unique(policy.readable.map(checked))
         let home = r(baseline.userHome)
 
         var lines = ["(version 1)", "(allow default)"]
