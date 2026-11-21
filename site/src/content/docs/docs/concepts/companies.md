@@ -7,7 +7,7 @@ sidebar:
 
 ## What it is
 
-A company is the unit Brahma runs. It has one goal, one workspace repository, one org chart of agents, and its own settings: usage mode, autonomy, profile, weight and reserve. Several companies can run at once under one engine and share its slots.
+A company is the unit Brahma governs and runs: one goal, one workspace repository and one org chart of agents that propose work, with the engine verifying it, merging it into main and bringing you what only you can decide. Each company has its own settings: usage mode, autonomy, profile, weight and reserve. Several companies can run at once under one engine and share its slots.
 
 You create a company with `brahma company create` or the app's New company sheet. The engine (`brahma run`, or the app) then schedules its agents.
 

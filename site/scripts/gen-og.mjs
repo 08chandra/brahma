@@ -16,8 +16,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const ORIGIN = 'http://og.localhost';
 
 export const CARDS = [
-  { name: 'home', kicker: 'Mac app · brahma CLI', title: 'Run a company of AI agents on your Mac.' },
-  { name: 'start', kicker: 'Quick start', title: 'From nothing to a running company.' },
+  { name: 'home', kicker: 'Mac app · brahma CLI', title: 'The governed local AI org.' },
+  { name: 'start', kicker: 'Quick start', title: 'From source to a running company.' },
   { name: 'docs', kicker: 'Using Brahma', title: 'Concepts, guides and the full CLI reference.' },
   { name: 'internals', kicker: 'Inside Brahma', title: 'How the engine, sandbox and app fit together.' },
   { name: 'api', kicker: 'API reference', title: 'Every public Swift symbol, generated with DocC.' },

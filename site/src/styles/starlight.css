@@ -190,6 +190,21 @@ site-search button[data-open-modal]:hover {
   background: var(--bg3);
   color: var(--text0);
 }
+/* Below 50 rem Starlight drops the label and keeps the icon: borderless, like the menu button
+ * beside it, so a 44 px box no longer sits two pixels inside the 48 px header. The 44 px
+ * target stays (see the coarse-pointer block). */
+@media (max-width: 49.99rem) {
+  site-search button[data-open-modal] {
+    border-color: transparent;
+    background: transparent;
+    padding-inline: var(--s-2);
+    justify-content: center;
+  }
+  site-search button[data-open-modal]:hover {
+    border-color: transparent;
+    background: var(--bg3);
+  }
+}
 site-search button[data-open-modal] > kbd {
   background: var(--bg3);
   border: var(--hairline);
@@ -370,6 +385,16 @@ mobile-starlight-toc .dropdown {
 .sl-markdown-content :is(h1, h2, h3, h4, h5, h6) code:not(:where(.not-content *)) {
   font-weight: 400;
   padding-inline: 0.25em;
+}
+/* Heading anchors: a mark, not text — text2 (always shown on touch, on hover elsewhere);
+ * the link blue only when it is the thing being pointed at. */
+.sl-markdown-content .sl-anchor-link {
+  color: var(--text2);
+  transition: color var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease);
+}
+.sl-markdown-content .sl-anchor-link:hover,
+.sl-markdown-content .sl-anchor-link:focus-visible {
+  color: var(--text-link);
 }
 
 .sl-markdown-content code:not(:where(.not-content *)) {
@@ -748,6 +773,11 @@ footer .meta {
   .expressive-code .copy button {
     width: 2.5rem;
     height: 2.5rem;
+  }
+  /* The always-visible 40 px button would sit on the first lines of code (and stay there while
+   * the block scrolls sideways); give it a strip of its own above the code instead. */
+  .expressive-code pre > code {
+    padding-block-start: calc(var(--ec-codePadBlk) + 2.5rem + var(--s-1));
   }
 }
 

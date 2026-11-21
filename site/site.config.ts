@@ -3,7 +3,7 @@
 export const site = {
   title: 'Brahma',
   description:
-    'Run a company of sandboxed AI agents on your Mac. A native macOS app and a brahma CLI over one engine.',
+    'The governed local AI org on your Mac. Agents propose, the engine verifies and lands the work, and you approve what only you can decide.',
   // Public repository URL. Empty until the repository is public; components
   // that link to source or show a GitHub icon are gated on this being non-empty.
   repoURL: '' as string,

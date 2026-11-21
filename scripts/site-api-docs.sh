@@ -4,8 +4,10 @@
 # with swift-symbolgraph-extract into .build/symbol-graphs (synthesized members skipped), then
 # runs `docc convert` once per Brahma module into site/public/api/<module-lowercase>/ (static
 # hosting, served at /api/<module>/documentation/<module>/), copies site/api-theme/theme-settings.json
-# into each, writes the /api/ index page and site/src/generated/modules.json (module facts for
-# ModuleFacts.astro) with site/scripts/gen-module-facts.mjs. All output is gitignored; never commit it.
+# into each, links the site's self-hosted fonts (site/api-theme/fonts.css + the three woff2 files,
+# served under /api/) from every page, writes the /api/ index page and site/src/generated/modules.json
+# (module facts for ModuleFacts.astro) with site/scripts/gen-module-facts.mjs. All output is
+# gitignored; never commit it.
 #
 # The build is a plain `swift build` sharing .build/ with the other scripts, so it reuses their
 # work. A module whose graph holds no public symbols (today the executables brahma and BrahmaApp)
@@ -34,6 +36,14 @@ GRAPHS=.build/symbol-graphs
 STAGE=.build/site-api-docs
 FACTS=site/src/generated/modules.json
 THEME=site/api-theme/theme-settings.json
+FONTS_CSS=site/api-theme/fonts.css
+FONT_DIR=site/node_modules
+FONT_DISPLAY=@fontsource/instrument-serif/files/instrument-serif-latin-400-normal.woff2
+FONT_SANS=@fontsource-variable/inter/files/inter-latin-wght-normal.woff2
+FONT_MONO=@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2
+for f in "$FONT_DISPLAY" "$FONT_SANS" "$FONT_MONO"; do
+  [ -f "$FONT_DIR/$f" ] || { echo "site-api-docs: $FONT_DIR/$f not found (run npm ci in site/)" >&2; exit 1; }
+done
 if [ "${BRAHMA_API_SPLIT:-0}" = "1" ]; then
   # Two-project deployment (site/README.md): the reference is its own Cloudflare Pages project.
   # DocC's pages hard-code /api/<module>/, so the deploy directory keeps an api/ child and the
@@ -98,6 +108,7 @@ mkdir -p "$OUT" "$STAGE"
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 documented=()
+symbols=() # public symbol count per documented module, same order (bash 3.2: no associative arrays)
 for module in "${MODULES[@]}"; do
   lc=$(lower "$module")
   graphs="$STAGE/$module/graphs"
@@ -129,6 +140,7 @@ for module in "${MODULES[@]}"; do
   cp "$THEME" "$OUT/$lc/theme-settings.json"
   echo "site-api-docs: $module: $(find "$OUT/$lc" -type f | wc -l | tr -d ' ') files in $(( $(date +%s) - t0 ))s"
   documented+=("$module")
+  symbols+=("$count")
 done
 
 if [ "${#documented[@]}" -eq 0 ]; then
@@ -136,7 +148,18 @@ if [ "${#documented[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# The /api/ index: a plain static page outside Astro, using the site's token values inline.
+# The site's fonts for every DocC page: theme-settings.json names the families, this declares
+# them. One stylesheet and three woff2 files under /api/, linked from each page's <head>
+# (DocC's static hosting writes one index.html per page, so every copy gets the link).
+mkdir -p "$OUT/fonts"
+cp "$FONTS_CSS" "$OUT/fonts.css"
+cp "$FONT_DIR/$FONT_DISPLAY" "$OUT/fonts/display.woff2"
+cp "$FONT_DIR/$FONT_SANS" "$OUT/fonts/sans.woff2"
+cp "$FONT_DIR/$FONT_MONO" "$OUT/fonts/mono.woff2"
+find "$OUT" -name '*.html' -print0 | xargs -0 sed -i '' 's#</head>#<link rel="stylesheet" href="/api/fonts.css"></head>#'
+
+# The /api/ index: a plain static page outside Astro in the site's own language (tokens inline,
+# the display serif for the title, mono module names and symbol counts in hairline rows).
 {
   cat <<'HTML'
 <!doctype html>
@@ -144,40 +167,63 @@ fi
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0E1217">
 <title>API reference | Brahma</title>
 <meta name="description" content="DocC reference for Brahma's Swift modules.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" as="font" type="font/woff2" href="/api/fonts/sans.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/api/fonts/display.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/api/fonts/mono.woff2" crossorigin>
+<link rel="stylesheet" href="/api/fonts.css">
 <style>
   :root { color-scheme: dark; }
-  body { margin: 0; background: #0E1217; color: #E6EBF0; font: 16px/1.6 'Inter Variable', 'Inter Fallback', Arial, sans-serif; }
-  main { max-width: 40rem; margin: 0 auto; padding: 4rem 1.5rem; }
-  h1 { margin: 0 0 0.5rem; font-size: 2rem; font-weight: 600; }
-  p { margin: 0 0 2rem; color: #A7B3BF; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0E1217; color: #E6EBF0; font: 16px/1.6 'Inter Variable', 'Inter Fallback', Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+  main { max-width: 46rem; margin: 0 auto; padding: 4rem 1.5rem 3rem; }
+  .kicker { margin: 0 0 1rem; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #A7B3BF; }
+  h1 { margin: 0 0 0.75rem; font-family: 'Instrument Serif', 'Instrument Serif Fallback', Georgia, serif; font-weight: 400; font-size: clamp(2rem, 1.6rem + 2vw, 3rem); line-height: 1.04; letter-spacing: -0.012em; }
+  .lede { margin: 0 0 2rem; max-width: 58ch; font-size: 1.2rem; line-height: 1.5; color: #A7B3BF; }
   ul { margin: 0; padding: 0; list-style: none; border: 1px solid #2F3A45; border-radius: 2px; background: #1A2129; }
   li { border-top: 1px solid #2F3A45; }
   li:first-child { border-top: 0; }
-  a { display: block; padding: 0.75rem 1rem; color: #4C90F0; font-family: 'JetBrains Mono Variable', 'JetBrains Mono Fallback', 'Courier New', monospace; text-decoration: none; }
-  a:hover { background: #212A33; text-decoration: underline; }
-  a:focus-visible { outline: 2px solid #2D72D2; outline-offset: -2px; }
-  .back { display: inline; padding: 0; font-family: inherit; }
-  .back:hover { background: none; }
+  li a { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; min-height: 2.75rem; padding: 0.625rem 1rem; color: #E6EBF0; text-decoration: none; font-family: 'JetBrains Mono Variable', 'JetBrains Mono Fallback', 'Courier New', monospace; font-size: 0.875rem; transition: background-color 120ms cubic-bezier(.2,.7,.2,1); }
+  li a:hover { background: #212A33; }
+  li a:focus-visible { outline: 2px solid #2D72D2; outline-offset: -2px; }
+  .name { color: #4C90F0; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-color: rgb(76 144 240 / 0.45); }
+  li a:hover .name { color: #E6EBF0; text-decoration-color: #4C90F0; }
+  .count { font-size: 0.75rem; color: #A7B3BF; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .colophon { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #2F3A45; font-family: 'JetBrains Mono Variable', 'JetBrains Mono Fallback', 'Courier New', monospace; font-size: 0.75rem; color: #A7B3BF; }
+  .colophon .brand { font-family: 'Inter Variable', 'Inter Fallback', Arial, sans-serif; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+  .colophon .sep { color: #6E7C89; }
+  .colophon a { color: #A7B3BF; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-color: #3D4A57; }
+  .colophon a:hover { color: #E6EBF0; text-decoration-color: #4C90F0; }
+  a:focus-visible { outline: 2px solid #2D72D2; outline-offset: 2px; border-radius: 2px; }
+  @media (pointer: coarse) { .colophon a { display: inline-block; padding-block: 0.6875rem; margin-block: -0.6875rem; } }
 </style>
 </head>
 <body>
 <main>
+<p class="kicker">Inside Brahma · Swift modules</p>
 <h1>API reference</h1>
+<p class="lede">Every public symbol of each module, generated with DocC from the Swift interface of this build.</p>
+<ul>
 HTML
-  if [ "$SPLIT" = "1" ]; then
-    echo '<p>Generated with DocC from the public Swift interface of each module.</p>'
-  else
-    echo '<p>Generated with DocC from the public Swift interface of each module. <a class="back" href="/">Back to the site</a>.</p>'
-  fi
-  echo '<ul>'
-  for module in "${documented[@]}"; do
+  for i in "${!documented[@]}"; do
+    module=${documented[$i]}
     lc=$(lower "$module")
-    printf '<li><a href="/api/%s/documentation/%s/">%s</a></li>\n' "$lc" "$lc" "$module"
+    printf '<li><a href="/api/%s/documentation/%s/"><span class="name">%s</span><span class="count">%s public symbols</span></a></li>\n' "$lc" "$lc" "$module" "${symbols[$i]}"
   done
+  echo '</ul>'
+  echo '<footer class="colophon"><span class="brand">Brahma</span><span class="sep" aria-hidden="true">·</span>'
+  if [ "$SPLIT" = "1" ]; then
+    # Its own origin: no site-relative links.
+    echo '<span>Apache-2.0</span>'
+  else
+    echo '<a href="/license/">Apache-2.0</a><span class="sep" aria-hidden="true">·</span><a href="/">Back to the site</a><span class="sep" aria-hidden="true">·</span><a href="/internals/">Inside Brahma</a>'
+  fi
   cat <<'HTML'
-</ul>
+</footer>
 </main>
 </body>
 </html>

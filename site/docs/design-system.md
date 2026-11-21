@@ -18,7 +18,9 @@ narrow, high-contrast letters sit closest to a mono's rhythm and read as engrave
 instrument, not as a magazine. Titles only. Fallback faces (`Inter Fallback` → Arial,
 `Instrument Serif Fallback` → Georgia, `JetBrains Mono Fallback` → Courier New) carry
 `size-adjust`/`ascent-override`/`descent-override` measured in Chromium, so the swap shifts
-no layout (CLS 0). The three above-the-fold woff2 files are preloaded in `SiteHead`.
+no layout (CLS 0). The three above-the-fold woff2 files are preloaded in `SiteHead`. The generated
+API reference (`/api`, DocC, outside Astro) gets the same faces from `api-theme/fonts.css`, which
+`scripts/site-api-docs.sh` links from every page.
 
 ## Type scale (`--step--1 … --step-5`, ratio ≈ 1.25, fluid at the top)
 
@@ -65,9 +67,10 @@ offset 3 px. Primary buttons use white text on `--accent` (4.72:1); hover darken
 
 Rules that follow: `text0`/`text1` are fine everywhere at any size. `text2` is below the
 4.5:1 AA threshold on every surface, so **it is never a text colour**: use it only for
-non-text marks (ticks, glyphs, icon strokes, separators), disabled states, and large text
-≥ 24 px regular / 18.66 px bold (the 3:1 threshold, met on bg0–bg3). `accent` is a UI colour
-(≥ 3:1 for focus rings, borders, fills), never a text colour; text on accent is white.
+non-text marks (ticks, glyphs, icon strokes, separators, the `aria-hidden` `$` prompt, the
+docs' heading-anchor icon), disabled states, and large text ≥ 24 px regular / 18.66 px bold
+(the 3:1 threshold, met on bg0–bg3). `accent` is a UI colour (≥ 3:1 for focus rings, borders,
+fills), never a text colour; text on accent is white.
 
 ## Motion
 
@@ -83,4 +86,11 @@ stops under `prefers-reduced-motion: reduce`. Focus rings never animate.
 1 px line, radius 2 · `<Chip status>` 18 px, 1 px status border + 15 % fill, 6 px dot,
 `text0` label · `<Button variant="primary|ghost" href>` 32 px (sm 26; 44 / 40 on coarse
 pointers, where every control is ≥ 40 px), radius 2. Every control has hover, focus-visible
-(2 px accent ring, offset 2 px), active, disabled; see `/styleguide`.
+(2 px accent ring, offset 2 px), active, disabled; see `/styleguide`. Screen-reader-only text
+uses Starlight's `.sr-only` (no local copies). On coarse pointers an inline link grows its
+target with `padding-block` taken back by a negative `margin-block`, so rows keep their height.
+
+## Titles
+
+The root page alone puts the name first (`Brahma · The governed local AI org`); every other page
+is Starlight's `<page> | Brahma`.

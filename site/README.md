@@ -137,8 +137,10 @@ still yields every graph). It runs `docc convert` once per module
 `public/api/<module-lowercase>/` for static hosting, so a module's reference is at
 `/api/<module>/documentation/<module>/`. A module whose graph has no public symbols (today the
 executables `BrahmaApp` and `brahma`) is skipped with a message; a missing graph fails the run.
-Each output gets `api-theme/theme-settings.json` (the site's dark tokens and font stacks),
-`public/api/index.html` lists the modules, and `scripts/gen-module-facts.mjs` writes
+Each output gets `api-theme/theme-settings.json` (the site's dark tokens and font stacks), every
+DocC page links `/api/fonts.css` (`api-theme/fonts.css`, the site's three self-hosted faces, copied
+with their woff2 files to `public/api/fonts/`), `public/api/index.html` lists the modules with their
+public-symbol counts, and `scripts/gen-module-facts.mjs` writes
 `src/generated/modules.json`: per module, the public-symbol count and, per area (BrahmaCore: the
 first directory under `Sources/BrahmaCore/`, top-level files → `Orchestrator`; other modules: one
 area), the source files and top-level types with their `/api` links.

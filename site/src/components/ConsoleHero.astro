@@ -177,9 +177,27 @@ const kinds = ['message', 'turnStarted', 'turnFinished', 'tool', 'state', 'work'
     flex-direction: column;
     justify-content: flex-end;
   }
+  /* Desktop: the console fills its grid row, so its foot lines up with the intro column's
+   * whatever the lede's length; the window grows from its minimum and stays anchored at the
+   * newest line. */
   @media (min-width: 64em) {
     .feed__window {
       --feed-h: 17.5rem;
+      flex: 1 1 auto; /* the basis stays the definite height, so the row is sized by the intro */
+    }
+    .console,
+    .console :global(.console__panel) {
+      height: 100%;
+    }
+    .console :global(.console__panel) {
+      display: flex;
+      flex-direction: column;
+    }
+    .console :global(.console__panel > .panel__body) {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
     }
   }
   .feed {

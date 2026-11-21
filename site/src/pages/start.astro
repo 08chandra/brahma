@@ -85,7 +85,6 @@ const next = [
     description,
     template: 'splash',
     hero: {},
-    head: [{ tag: 'title', content: `${site.title} · ${title}` }],
   }}
 >
   <div class="start not-content">
@@ -97,7 +96,8 @@ const next = [
           </h1>
           <p class="start__lede reveal" style="--i: 1">
             Five steps on your Mac: build Brahma, connect the <code>claude</code> CLI you already use, create a
-            company, then start the engine and watch it work.
+            company, then start the engine and watch agents propose work, the engine verify and land it, and your
+            Inbox hold what only you can decide.
           </p>
           <p class="start__proof reveal" style="--i: 2">
             <span class="start__tick" aria-hidden="true"></span>
@@ -138,7 +138,7 @@ const next = [
       <section class="step grid" id="install" aria-labelledby="install-title" data-scroll-root>
         <div class="step__aside">
           <span class="step__num" aria-hidden="true">1</span>
-          <h2 id="install-title" class="step__title"><span class="visually-hidden">Step 1: </span>Install</h2>
+          <h2 id="install-title" class="step__title"><span class="sr-only">Step 1: </span>Install</h2>
           <p class="step__brief">
             Until the first stable release, Brahma is built from source: the <code>brahma</code> CLI with Swift, and the
             Mac app with one optional script.
@@ -192,7 +192,7 @@ const next = [
         <div class="step__aside">
           <span class="step__num" aria-hidden="true">2</span>
           <h2 id="connect-title" class="step__title">
-            <span class="visually-hidden">Step 2: </span>Connect the <code>claude</code> CLI
+            <span class="sr-only">Step 2: </span>Connect the <code>claude</code> CLI
           </h2>
           <p class="step__brief">
             Every agent turn is a headless run of the <code>claude</code> CLI you already use, on your own plan. Brahma
@@ -234,7 +234,7 @@ const next = [
       <section class="step grid" id="company" aria-labelledby="company-title">
         <div class="step__aside">
           <span class="step__num" aria-hidden="true">3</span>
-          <h2 id="company-title" class="step__title"><span class="visually-hidden">Step 3: </span>Create your first company</h2>
+          <h2 id="company-title" class="step__title"><span class="sr-only">Step 3: </span>Create your first company</h2>
           <p class="step__brief">
             A company is a git workspace, its channels and an org of agents, all on your Mac. Give it a goal when you
             create it; that is what the org works toward.
@@ -273,7 +273,7 @@ const next = [
       <section class="step grid" id="run" aria-labelledby="run-title">
         <div class="step__aside">
           <span class="step__num" aria-hidden="true">4</span>
-          <h2 id="run-title" class="step__title"><span class="visually-hidden">Step 4: </span>Run it and watch</h2>
+          <h2 id="run-title" class="step__title"><span class="sr-only">Step 4: </span>Run it and watch</h2>
           <p class="step__brief">
             Start the engine and the company works toward its goal: agents take turns, claim items and review each
             other’s work, and the engine merges what passes. What only you can decide waits in your Inbox.
@@ -316,7 +316,7 @@ const next = [
       <section class="step grid" id="next" aria-labelledby="next-title">
         <div class="step__aside">
           <span class="step__num" aria-hidden="true">5</span>
-          <h2 id="next-title" class="step__title"><span class="visually-hidden">Step 5: </span>Next steps</h2>
+          <h2 id="next-title" class="step__title"><span class="sr-only">Step 5: </span>Next steps</h2>
           <p class="step__brief">How work moves, what a turn may touch, and every command in one place.</p>
         </div>
         <div class="step__main">
@@ -774,15 +774,5 @@ const next = [
   }
   .next__link:hover .next__path {
     text-decoration-color: var(--text-link);
-  }
-
-  .visually-hidden {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    margin: -1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
   }
 </style>

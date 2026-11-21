@@ -113,7 +113,7 @@ test('step commands have copy buttons that copy the command', async () => {
     const script = await page.evaluate(
       () => [...document.querySelectorAll('script:not([src])')].find((s) => s.textContent.includes('.step__copy')).textContent.trim().length,
     );
-    assert.ok(script <= 400, `copy script is ${script} bytes`);
+    assert.ok(script <= 520, `copy script is ${script} bytes`); // budget: a hand-written listener with a live region and a failure path, no library
   } finally {
     await context.close();
   }
