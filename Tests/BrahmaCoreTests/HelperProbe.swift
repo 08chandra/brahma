@@ -85,7 +85,9 @@ enum HelperProbe {
 
     private static func compile() -> URL? {
         do {
-            let dir = Scratch.root.appending(path: "probe-\(UUID().uuidString.prefix(8))", directoryHint: .isDirectory)
+            // Under the shared fake-tool directory (round 5: not loose in the scratch root, where `ScratchHygieneTests`
+            // counts it as a directory that outlived its test).
+            let dir = FakeTools.toolsDir.appending(path: "probe-\(UUID().uuidString.prefix(8))", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let source = dir.appending(path: "probe.c"), binary = dir.appending(path: "brahma-pdf-probe")
             try Data(Self.source.utf8).write(to: source)
