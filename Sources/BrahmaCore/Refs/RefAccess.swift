@@ -157,7 +157,8 @@ public enum RefAccess {
             }
             return s
         case .artifact:
-            // 4a's published artifact (company class, like the preview pane that shows it). Its taint is its row's.
+            // 4a's published artifact (company class, like the preview pane that shows it). Its taint is `Store.artifactTaint`'s:
+            // the row's flag, and its source's provenance (rulings 16 and 17).
             guard let n = Int(ref.id), let artifact = try artifact(db, companyId, number: n) else { return nil }
             return Subject(record: .artifact(artifact))
         case .resource:

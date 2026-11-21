@@ -1133,6 +1133,117 @@ import GRDB
         #expect(try cf.store.refTaint(try cf.fx.ref(a.storedPath + "/" + a.entryFile), companyId: cf.c.id).tainted)
     }
 
+    // MARK: P2 fix round 2 (Ruling 17: a worktree source's item taint at publish time, or now)
+
+    /// A designer's worktree artifact of a fresh item (with its branch), published a second after the fixture's clock; with
+    /// `taintedCommit`, the branch first gets a commit a tainted session made (recorded tainted, and cleared by review before
+    /// the publish when `clearBeforePublish`).
+    static func worktreeArtifact(_ cf: CollabFixture, taintedCommit: Bool, clearBeforePublish: Bool = false) throws
+        -> (designer: Agent, item: WorkItem, artifact: Artifact) {
+        let cId = cf.c.id
+        let designer = try Self.designer(cf)
+        let (item, wt) = try Self.leased(cf, designer)
+        try cf.fx.git.git(["branch", "item/\(item.key)", "main"])
+        if taintedCommit {
+            let sha = try cf.commit(["src/mock.html": Data("<p>evil</p>\n".utf8)], on: "item/\(item.key)", message: "mock")
+            try cf.store.recordTaintedCommits(companyId: cId, itemId: item.id, agentId: cf.fx.eng3.id, turnId: nil,
+                                              headBefore: try cf.fx.head(), headAfter: sha, source: "docs.swift.org",
+                                              git: SafeGit(workspace: cf.workspace), now: cf.now)
+            if clearBeforePublish { try cf.store.clearTaintedCommits(itemId: item.id, by: "review", now: cf.now) }
+        }
+        try Data("<p>mock</p>\n".utf8).write(to: wt.appending(path: "mock.html"))
+        // Published a second after the record and any clearing (the store's clock is millisecond-precise).
+        let a = try cf.store.publishArtifact(companyId: cId, by: .agent(designer.id), sourcePath: "mock.html", title: "Mock",
+                                             itemKey: nil, baseDirectory: wt, now: cf.now.addingTimeInterval(1))
+        #expect(!a.tainted)
+        return (designer, item, a)
+    }
+
+    /// Ruling 17: tainted when published, then cleared by review (the rows stay, with `clearedAt`): still tainted.
+    @Test func worktreeArtifactTaintedAtPublishStaysTainted() throws {
+        let cf = try CollabFixture()
+        let (_, item, a) = try Self.worktreeArtifact(cf, taintedCommit: true)
+        try Self.expectArtifact(cf, a, tainted: true)
+        try cf.store.clearTaintedCommits(itemId: item.id, by: "review", now: cf.now.addingTimeInterval(60))
+        let rows = try cf.store.writer.read { db in
+            try TaintedCommit.fetchAll(db, sql: "SELECT * FROM taintedCommit WHERE companyId = ? AND itemId = ?", arguments: [cf.c.id, item.id])
+        }
+        #expect(!rows.isEmpty && rows.allSatisfy { $0.clearedBy == "review" && $0.clearedAt != nil })   // cleared, not deleted
+        try Self.expectArtifact(cf, a, tainted: true)
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id) == (true, Store.sessionReason("docs.swift.org")))
+        #expect(try cf.open(.qa2, a.ref).tainted)
+        // The owner's vouch is a clearing too: still tainted.
+        try cf.store.vouchItem(itemId: item.id, now: cf.now.addingTimeInterval(120))
+        try Self.expectArtifact(cf, a, tainted: true)
+    }
+
+    /// Ruling 17: never tainted (or every row cleared before it was published), and nothing since that could have hidden a
+    /// sticky mark: clean.
+    @Test func worktreeArtifactNeverTaintedIsClean() throws {
+        let cf = try CollabFixture()
+        let (_, _, a) = try Self.worktreeArtifact(cf, taintedCommit: false)
+        try Self.expectArtifact(cf, a, tainted: false)
+        let cf2 = try CollabFixture()
+        let (_, _, b) = try Self.worktreeArtifact(cf2, taintedCommit: true, clearBeforePublish: true)
+        try Self.expectArtifact(cf2, b, tainted: false)
+    }
+
+    /// Ruling 17: when the history can't say whether the item was tainted when it was published, the artifact is tainted: a
+    /// row cleared at the publish instant (equal times count), a row marked cleared without a time, a company row with no
+    /// item, an item done now or whose status changed since (the sticky mark may have dropped on the way to done), or a
+    /// lookup that fails.
+    @Test func worktreeArtifactUndeterminableIsTainted() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let (_, item, a) = try Self.worktreeArtifact(cf, taintedCommit: true, clearBeforePublish: true)
+        try Self.expectArtifact(cf, a, tainted: false)
+        func set(_ sql: String, _ args: StatementArguments) throws { try cf.store.writer.write { db in try db.execute(sql: sql, arguments: args) } }
+        let cleared = try #require(try cf.store.writer.read { db in
+            try Date.fetchOne(db, sql: "SELECT clearedAt FROM taintedCommit WHERE companyId = ? AND itemId = ?", arguments: [cId, item.id])
+        })
+        // Cleared at the very instant it was published.
+        try set("UPDATE taintedCommit SET clearedAt = ? WHERE companyId = ? AND itemId = ?", [a.createdAt, cId, item.id])
+        try Self.expectArtifact(cf, a, tainted: true)
+        // Marked cleared with no time.
+        try set("UPDATE taintedCommit SET clearedAt = NULL WHERE companyId = ? AND itemId = ?", [cId, item.id])
+        try Self.expectArtifact(cf, a, tainted: true)
+        try set("UPDATE taintedCommit SET clearedAt = ? WHERE companyId = ? AND itemId = ?", [cleared, cId, item.id])
+        try Self.expectArtifact(cf, a, tainted: false)
+        // A company row whose item is unknown (`itemId` NULL), not cleared before the publish.
+        try set("""
+            INSERT INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt) VALUES (?, ?, NULL, NULL, NULL, ?, ?)
+            """, [cId, String(repeating: "e", count: 40), "docs.swift.org", cf.now.addingTimeInterval(30)])
+        try Self.expectArtifact(cf, a, tainted: true)
+        try set("UPDATE taintedCommit SET clearedBy = 'owner', clearedAt = ? WHERE companyId = ? AND itemId IS NULL",
+                [cf.now.addingTimeInterval(-60), cId])
+        try Self.expectArtifact(cf, a, tainted: false)
+        // A status change since the publish, or the item done now.
+        try set("""
+            INSERT INTO workItemEvent (companyId, itemId, actorId, kind, text, createdAt, createdActive) VALUES (?, ?, 'owner', 'statusChanged', 'x', ?, 0)
+            """, [cId, item.id, a.createdAt.addingTimeInterval(5)])
+        try Self.expectArtifact(cf, a, tainted: true)
+        try set("DELETE FROM workItemEvent WHERE companyId = ? AND itemId = ? AND kind = 'statusChanged' AND text = 'x'", [cId, item.id])
+        try Self.expectArtifact(cf, a, tainted: false)
+        try set("UPDATE workItem SET status = 'done' WHERE companyId = ? AND id = ?", [cId, item.id])
+        try Self.expectArtifact(cf, a, tainted: true)
+        try set("UPDATE workItem SET status = 'inProgress' WHERE companyId = ? AND id = ?", [cId, item.id])
+        try Self.expectArtifact(cf, a, tainted: false)
+        // The history can't be read.
+        try set("CREATE TEMP TABLE workItemEvent (broken INTEGER)", [])
+        try Self.expectArtifact(cf, a, tainted: true)
+    }
+
+    /// R2-2: the read path creates nothing: with `.brahma/artifacts` gone, the artifact reads tainted and the folder stays gone.
+    @Test func artifactCheckCreatesNothing() throws {
+        let cf = try CollabFixture()
+        let a = try cf.publishCommitted("page.html", "<p>x</p>\n")
+        try Self.expectArtifact(cf, a, tainted: false)
+        let dir = cf.workspace.appending(path: ".brahma/artifacts", directoryHint: .isDirectory)
+        try FileManager.default.removeItem(at: dir)
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id) == (true, Store.artifactSourceReason))
+        #expect(!FileManager.default.fileExists(atPath: dir.path))
+    }
+
     /// R1-5: a tainted session publishing through 4a's real path: the row is tainted, and so is every read of it.
     @Test func taintedSessionPublishReadsTainted() throws {
         let cf = try CollabFixture()
