@@ -416,6 +416,151 @@ import GRDB
         #expect(rows.allSatisfy { $0.itemId == h.item.id && $0.source == "docs.swift.org" })
     }
 
+
+    // MARK: Fix round 2
+
+    /// R2-1 (ruling 8): a key-less `.brahma/…` path at any rev but `main`'s engine-recorded head is tainted: the item-branch
+    /// commit that force-added it, a pinned blob of it, and `main` before the engine recorded it; at the recorded head, clean.
+    @Test func keylessBrahmaRevCarriesTaint() throws {
+        let cf = try CollabFixture()
+        try cf.fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try cf.fx.git.write(".brahma/handoffs/x.md", "planted\n")
+        try cf.fx.git.git(["add", "-f", "--", ".brahma/handoffs/x.md"])
+        try cf.fx.git.git(["commit", "-q", "-m", "handoff"])
+        try cf.fx.git.git(["checkout", "-q", "main"])
+        let onItem = try cf.fx.head("item/ENG-1")
+        func taint(_ s: String) throws -> (tainted: Bool, reason: String?) { try cf.store.refTaint(try cf.fx.ref(s), companyId: cf.c.id) }
+        #expect(try taint(".brahma/handoffs/x.md@\(onItem)") == (true, Store.brahmaRevReason))
+        #expect(try cf.fx.resolve(.qa2, try cf.fx.ref(".brahma/handoffs/x.md@\(onItem)")).tainted)
+        // The same path on main: tainted until the engine records main's head, then clean at exactly that head.
+        try cf.fx.git.write(".brahma/handoffs/x.md", "on main\n")
+        try cf.fx.git.git(["add", "-f", "--", ".brahma/handoffs/x.md"])
+        try cf.fx.git.git(["commit", "-q", "-m", "main handoff"])
+        let main = try cf.fx.head()
+        #expect(try taint(".brahma/handoffs/x.md@\(main)").tainted)
+        try cf.store.recordMainCommit(companyId: cf.c.id, commit: main)
+        #expect(try taint(".brahma/handoffs/x.md@\(main)") == (false, nil))
+        #expect(try taint(".brahma/handoffs/x.md@\(main.prefix(7))").tainted)            // only the exact recorded head
+        // A share-pinned blob of a `.brahma` file is tainted too.
+        var pinned = try cf.fx.ref(".brahma/handoffs/x.md@\(main)")
+        pinned.rev = try cf.fx.git.git(["rev-parse", "\(main):.brahma/handoffs/x.md"])
+        pinned.params["share"] = "mr-x"
+        #expect(try cf.store.refTaint(pinned, companyId: cf.c.id).tainted)
+    }
+
+    /// R2-3 (ruling 7): a partial rewrite (one tainted commit amended, another kept) leaves no commit of the item's branch
+    /// provably clean: its files, the rewritten commit and key-less refs of it read tainted.
+    @Test func partialRewriteKeepsTaint() throws {
+        let cf = try CollabFixture()
+        try Self.taintItemCommit(cf)                                              // T: src/a.ts, src/b.ts
+        let t = try cf.fx.head("item/ENG-1")
+        let t2 = try cf.commit(["src/d.ts": Data("d\n".utf8)], on: "item/ENG-1", message: "second")
+        try cf.store.recordTaintedCommits(companyId: cf.c.id, itemId: cf.fx.item.id, agentId: cf.fx.eng3.id, turnId: nil,
+                                          headBefore: t, headAfter: t2, source: "docs.swift.org",
+                                          git: SafeGit(workspace: cf.workspace), now: cf.now)
+        // A later session amends T2 only (T stays on the branch).
+        try cf.fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try cf.fx.git.write("src/d.ts", "d amended\n")
+        try cf.fx.git.git(["commit", "-q", "--amend", "-a", "-m", "second, amended"])
+        try cf.fx.git.git(["checkout", "-q", "main"])
+        let amended = try cf.fx.head("item/ENG-1")
+        func taint(_ s: String) throws -> Bool { try cf.store.refTaint(try cf.fx.ref(s), companyId: cf.c.id).tainted }
+        #expect(try taint("ENG-1:src/d.ts"))
+        #expect(try taint("ENG-1:diff"))
+        #expect(try taint("commit:\(amended)"))
+        #expect(try taint("src/d.ts@\(amended)"))
+        #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("commit:\(amended)")).tainted)
+        // Main is untouched by it.
+        #expect(!(try taint("src/a.ts")))
+        #expect(!(try taint("commit:\(try cf.fx.head())")))
+    }
+
+    /// R2-2 (ruling 6): claim, commit and release inside one tainted turn is recorded.
+    @Test func claimCommitReleaseInOneTurnRecorded() async throws {
+        let h = try Holder(claim: false)
+        let (store, engId, companyId, key, wt) = (h.store, h.eng.id, h.company.id, h.item.key, h.worktree(h.item))
+        let shas = ShaBox()
+        try await h.turn {
+            try store.markTainted(agentId: engId, source: "docs.swift.org")
+            let tools = CompanyTools(store: store, companyId: companyId, agentId: engId)
+            _ = try tools.call(name: "claim_lease", arguments: ["key": .string(key)])
+            shas.append(try Holder.commit(wt, "src/gone.ts", "gone\n"))
+            _ = try tools.call(name: "release_lease", arguments: ["key": .string(key)])
+        }
+        #expect(try store.lease(itemId: h.item.id) == nil)
+        #expect(Set(try h.rows().map(\.sha)).isSuperset(of: Set(shas.all)))
+    }
+
+    /// R2-2 (ruling 6): a release and a re-claim in the same turn can't move the start past commits made before them.
+    @Test func reclaimKeepsEarlierCommits() async throws {
+        let h = try Holder(claim: false)
+        let (store, engId, companyId, key, wt) = (h.store, h.eng.id, h.company.id, h.item.key, h.worktree(h.item))
+        let shas = ShaBox()
+        try await h.turn {
+            try store.markTainted(agentId: engId, source: "docs.swift.org")
+            let tools = CompanyTools(store: store, companyId: companyId, agentId: engId)
+            _ = try tools.call(name: "claim_lease", arguments: ["key": .string(key)])
+            shas.append(try Holder.commit(wt, "src/one.ts", "1\n"))
+            _ = try tools.call(name: "release_lease", arguments: ["key": .string(key)])
+            _ = try tools.call(name: "claim_lease", arguments: ["key": .string(key)])
+            shas.append(try Holder.commit(wt, "src/two.ts", "2\n"))
+        }
+        #expect(Set(try h.rows().map(\.sha)).isSuperset(of: Set(shas.all)))
+    }
+
+    /// R2-2 (ruling 6): a branch moved while nobody held it never becomes the start of the record: the commit made before
+    /// the claim is recorded with the turn's.
+    @Test func movedBranchIsNotTheStart() async throws {
+        let h = try Holder(claim: true)
+        let (store, engId, companyId, key) = (h.store, h.eng.id, h.company.id, h.item.key)
+        _ = try CompanyTools(store: store, companyId: companyId, agentId: engId).call(name: "release_lease", arguments: ["key": .string(key)])
+        // Someone moves item/<KEY> while nobody holds it.
+        try GitFixture.plainGit(["worktree", "add", "-q", "--detach", "moved", "item/\(key)"], in: h.root)
+        let movedDir = h.root.appending(path: "moved")
+        let moved = try Holder.commit(movedDir, "src/planted.ts", "planted\n")
+        try GitFixture.plainGit(["update-ref", "refs/heads/item/\(key)", moved], in: h.root)
+        try GitFixture.plainGit(["worktree", "remove", "--force", movedDir.path], in: h.root)
+        let wt = h.worktree(h.item)
+        let shas = ShaBox()
+        try await h.turn {
+            try store.markTainted(agentId: engId, source: "docs.swift.org")
+            _ = try CompanyTools(store: store, companyId: companyId, agentId: engId).call(name: "claim_lease", arguments: ["key": .string(key)])
+            shas.append(try Holder.commit(wt, "src/after.ts", "after\n"))
+        }
+        #expect(try store.lease(itemId: h.item.id)?.claimHead == nil)
+        let rows = Set(try h.rows().map(\.sha))
+        #expect(rows.contains(moved))
+        #expect(rows.isSuperset(of: Set(shas.all)))
+    }
+
+    /// Folded minors: a start that can't be used records every commit from the merge base with `main`; an item whose commits
+    /// can't be listed gets an `unrecorded-…` marker, so all of its committed content reads tainted, and the owner is alerted.
+    @Test func recordFallbacksFailClosed() throws {
+        let cf = try CollabFixture()
+        let head = try cf.fx.head("item/ENG-1")
+        cf.store.recordTurnTaint(companyId: cf.c.id, itemId: cf.fx.item.id, agentId: cf.fx.eng3.id, turnId: "t-x",
+                                 start: "0123456789abcdef0123456789abcdef01234567", source: "docs.swift.org", workspace: cf.workspace,
+                                 now: cf.now)
+        let cId = cf.c.id
+        func shas() throws -> [String] {
+            try cf.store.writer.read { db in try String.fetchAll(db, sql: "SELECT sha FROM taintedCommit WHERE companyId = ?", arguments: [cId]) }
+        }
+        #expect(try shas() == [head])
+        // A workspace whose git can't be read: the marker, the item mark and the alert.
+        let other = try CollabFixture()
+        other.store.recordTurnTaint(companyId: other.c.id, itemId: other.fx.item.id, agentId: other.fx.eng3.id, turnId: "t-y",
+                                    start: nil, source: "docs.swift.org", workspace: try tempDir(), now: other.now)
+        let oId = other.c.id
+        let marker = try #require(try other.store.writer.read { db in
+            try TaintedCommit.fetchOne(db, sql: "SELECT * FROM taintedCommit WHERE companyId = ?", arguments: [oId])
+        })
+        #expect(marker.sha.hasPrefix(TaintedCommit.unrecordedPrefix))
+        #expect(try other.store.workItem(id: other.fx.item.id)?.taintedOrigin == true)
+        #expect(try other.store.refTaint(try other.fx.ref("ENG-1:src/a.ts"), companyId: oId) == (true, Self.reason))
+        #expect(try other.store.refTaint(try other.fx.ref("commit:\(try other.fx.head("item/ENG-1"))"), companyId: oId).tainted)
+        #expect(try other.store.events(afterId: 0, companyId: oId).contains { $0.kind == .error && $0.text.contains("could not all be recorded") })
+    }
+
 }
 
 /// Shas a turn's side effect records, read by the test afterwards.

@@ -6,6 +6,9 @@ import GRDB
 /// opens them (`openRef`). "Now" is ML's `Store.currentTaint`, a past moment `Store.taintAt`: taint is per session and
 /// survives resumed turns, so no turn's own `taintedAt` decides it. C has no taint reader of its own.
 extension Store {
+    /// The reason a `.brahma/…` file at a rev other than `main`'s recorded head is tainted (ruling 8).
+    static let brahmaRevReason = "a .brahma file outside main's recorded head"
+
     /// The reason a session's taint gives what it produced.
     static func sessionReason(_ source: String) -> String { "from a session that read \(source)" }
 
@@ -70,7 +73,9 @@ extension Store {
     ///   any more (a rewrite nothing carried the taint through), until the review gate or the owner clears them. The engine's
     ///   own rebase carries the rows to the new commits (`carryTaintThroughRebase`);
     /// - a key-less file at a rev: any uncleared row in `log <merge-base main>..<rev> -- <path>` (so a tainted commit is not
-    ///   laundered by naming it without its item); `main`'s head is clean (what reached it went through the review gate);
+    ///   laundered by naming it without its item); `main`'s head is clean (what reached it went through the review gate); a
+    ///   `.brahma/…` path at any rev but `main`'s engine-recorded head (`company.mainCommit`) is tainted, a pinned blob of one
+    ///   included (ruling 8);
     /// - `@worktree` content: the lease holder's session is tainted now, or a tainted session held the item (5-lite's sticky
     ///   `taintedOrigin`), or (a file) the branch history it holds is tainted; a pinned worktree diff: its snapshot's.
     public func refTaint(_ ref: WorkRef, companyId: String) throws -> (tainted: Bool, reason: String?) {
@@ -100,7 +105,13 @@ extension Store {
             return try commitRowSource(companyId: companyId, sha: ref.rev ?? ref.id).map { (true, Self.sessionReason($0)) } ?? (false, nil)
         case .file, .diff:
             if ref.kind == .file, ref.itemKey == nil {
-                guard let rev = ref.rev, !ref.id.hasPrefix(".brahma/") else { return (false, nil) }
+                guard let rev = ref.rev else { return (false, nil) }
+                // Ruling 8: a `.brahma/…` path at any rev but `main`'s engine-recorded head is tainted (it can be force-added on
+                // an item branch, and a pinned blob of a live `.brahma` file carries no record of who wrote it).
+                if ref.id.hasPrefix(".brahma/") {
+                    let main = try company(id: companyId)?.mainCommit
+                    return main != nil && rev == main ? (false, nil) : (true, Self.brahmaRevReason)
+                }
                 return try keylessSource(ref, rev: rev, companyId: companyId).map { (true, Self.sessionReason($0)) } ?? (false, nil)
             }
             guard let key = ref.kind == .diff ? ref.id : ref.itemKey,
@@ -144,20 +155,47 @@ extension Store {
         }
     }
 
-    /// An uncleared row's source for `sha`, or for any sha it prefixes (7–64 lowercase hex; anything else names no row).
+    /// Items with uncleared rows none of whose commits is provably clean any more: one of their rows (not carried by the
+    /// engine's rebase) is not on the item's branch (a rewrite nothing carried the taint through, ruling 7), or is an
+    /// `unrecorded-…` marker. Item id → (the newest row's source, every commit on its branch now). Throws when a branch can't
+    /// be listed (callers fail closed).
+    private func orphanedItems(companyId: String, rows: [TaintedCommit]) throws -> [String: (source: String, commits: Set<String>)] {
+        let byItem = Dictionary(grouping: rows.filter { $0.itemId != nil && $0.carriedTo == nil }, by: { $0.itemId ?? "" })
+        guard !byItem.isEmpty else { return [:] }
+        guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
+        let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+        var out: [String: (source: String, commits: Set<String>)] = [:]
+        for (itemId, itemRows) in byItem {
+            guard let item = try workItem(id: itemId), item.companyId == companyId, let newest = itemRows.first else { continue }
+            let branch: Set<String>
+            if let head = try? git.head("item/\(item.key)") {
+                branch = Set(try git.revList(try git.mergeBase("main", head), head))
+            } else {
+                branch = []      // no branch (gone): nothing of it is on one
+            }
+            if itemRows.contains(where: { !branch.contains($0.sha) }) { out[itemId] = (newest.source, branch) }
+        }
+        return out
+    }
+
+    /// An uncleared row's source for `sha`, or for any sha it prefixes (7–64 lowercase hex; anything else names no row); else
+    /// the source of an orphaned item whose branch holds it (fail closed when that can't be listed).
     private func commitRowSource(companyId: String, sha: String) throws -> String? {
         guard (7...64).contains(sha.utf8.count), sha.utf8.allSatisfy({ (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }) else {
             return nil
         }
-        return try writer.read { db in
-            try String.fetchOne(db, sql: """
-                SELECT source FROM taintedCommit WHERE companyId = ? AND clearedBy IS NULL AND substr(sha, 1, ?) = ?
-                ORDER BY createdAt DESC, rowid DESC LIMIT 1
-                """, arguments: [companyId, sha.utf8.count, sha])
+        let rows = try unclearedCommits(companyId: companyId)
+        guard let newest = rows.first else { return nil }
+        if let hit = rows.first(where: { $0.sha.hasPrefix(sha) }) { return hit.source }
+        do {
+            return try orphanedItems(companyId: companyId, rows: rows).values.first(where: { $0.commits.contains { $0.hasPrefix(sha) } })?.source
+        } catch {
+            return newest.source
         }
     }
 
-    /// A key-less file ref at `rev`: its history from the merge base with `main` to `rev` against the uncleared rows.
+    /// A key-less file ref at `rev`: its history from the merge base with `main` to `rev` against the uncleared rows and the
+    /// orphaned items' commits.
     private func keylessSource(_ ref: WorkRef, rev: String, companyId: String) throws -> String? {
         let rows = try unclearedCommits(companyId: companyId)
         guard let newest = rows.first else { return nil }
@@ -167,7 +205,9 @@ extension Store {
             let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
             let base = try git.mergeBase("main", rev)
             let history = try git.logShas(range: "\(base)..\(rev)", path: ref.id)
-            return history.first(where: { bySha[$0] != nil }).flatMap { bySha[$0] }
+            if let hit = history.first(where: { bySha[$0] != nil }) { return bySha[hit] }
+            let orphaned = try orphanedItems(companyId: companyId, rows: rows)
+            return orphaned.values.first(where: { item in history.contains { item.commits.contains($0) } })?.source
         } catch {
             return newest.source      // the history can't be read: fail closed
         }
@@ -180,41 +220,38 @@ extension Store {
         let bySha = Dictionary(rows.map { ($0.sha, $0.source) }, uniquingKeysWith: { first, _ in first })
         let itemRows = rows.filter { $0.itemId == item.id }
         do {
+            // None of the item's commits is provably clean (a rewrite nothing carried, an unrecorded turn): all of it is tainted.
+            if let orphan = try orphanedItems(companyId: item.companyId, rows: itemRows)[item.id] { return orphan.source }
             guard let company = try company(id: item.companyId) else { throw WorkError.notFound("no such company") }
             let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
             let head = try ref.rev ?? git.head("item/\(item.key)")
             let base = try git.mergeBase("main", head)
-            let branch = try git.revList(base, head)
-            let history = ref.kind == .diff ? branch : try git.logShas(range: "\(base)..\(head)", path: ref.id)
-            if let hit = history.first(where: { bySha[$0] != nil }) { return bySha[hit] }
-            // The item's tainted work is no longer on its branch at all (a rewrite the engine did not carry the taint through,
-            // such as the holder's own squash): every diff and file of it stays tainted.
-            let onBranch = Set(branch)
-            guard !itemRows.contains(where: { onBranch.contains($0.sha) }) else { return nil }
-            return itemRows.first?.source
+            let history = ref.kind == .diff ? try git.revList(base, head) : try git.logShas(range: "\(base)..\(head)", path: ref.id)
+            return history.first(where: { bySha[$0] != nil }).flatMap { bySha[$0] }
         } catch {
             // The history can't be read (the branch is gone, git failed): any uncleared commit of the item taints it.
             return itemRows.first?.source
         }
     }
 
-    /// After the engine rebased an item (`finishMerge(.rebased)`; ruling 5): every new commit whose pre-rebase original was a
-    /// tainted commit is recorded tainted too. The engine's rebase replays exactly the commits of `<base>..<before>` in order
-    /// (`GitWorkspace.checkRebase`), so old and new map by position; `before` is the item's verified (else recorded) head
-    /// before the rebase. When that mapping can't be established, every new commit of the item is recorded tainted (fail
-    /// closed); when even that fails, the new head is. Never throws.
+    /// After the engine rebased an item (`finishMerge(.rebased)`; rulings 5 and 7): every new commit whose pre-rebase original
+    /// was a tainted commit is recorded tainted too, and the originals are marked carried (`carriedTo`). The engine's rebase
+    /// replays exactly the commits of `<base>..<before>` in order (`GitWorkspace.checkRebase`), so old and new map by
+    /// position; `before` is the item's verified (else recorded) head before the rebase. When that mapping can't be
+    /// established, every new commit of the item is recorded tainted (fail closed); when not even the new commits can be
+    /// listed, an `unrecorded-…` marker makes the whole item tainted. Never throws.
     func carryTaintThroughRebase(item: WorkItem, rebased: String, now: Date) {
         guard let rows = try? unclearedCommits(companyId: item.companyId).filter({ $0.itemId == item.id }), let newest = rows.first
         else { return }
         let source = Dictionary(rows.map { ($0.sha, $0.source) }, uniquingKeysWith: { first, _ in first })
-        var carried: [(sha: String, source: String)] = [(rebased, newest.source)]
+        var carried: [(old: String?, sha: String, source: String)] = [(nil, TaintedCommit.unrecordedPrefix + UUID().uuidString, newest.source)]
         if let company = try? company(id: item.companyId), let git = try? refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)),
            let newBase = try? git.mergeBase("main", rebased), let fresh = try? git.revList(newBase, rebased) {
-            carried = fresh.map { ($0, newest.source) }
+            carried = fresh.map { (nil, $0, newest.source) }
             let before = item.verifiedCommit ?? item.leaseHeadCommit
             if let before, before != rebased, let oldBase = try? git.mergeBase(before, rebased),
                let old = try? git.revList(oldBase, before), old.count == fresh.count {
-                carried = zip(old, fresh).compactMap { o, n in source[o].map { (n, $0) } }
+                carried = zip(old, fresh).compactMap { o, n in source[o].map { (o, n, $0) } }
             }
         }
         do {
@@ -224,9 +261,14 @@ extension Store {
                         INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt)
                         VALUES (?, ?, ?, NULL, NULL, ?, ?)
                         """, arguments: [item.companyId, c.sha, item.id, c.source, now])
+                    if let old = c.old {
+                        try db.execute(sql: "UPDATE taintedCommit SET carriedTo = ? WHERE companyId = ? AND sha = ?",
+                                       arguments: [c.sha, item.companyId, old])
+                    }
                 }
             }
         } catch {
+            // The originals stay uncleared and off the branch: the item reads tainted all the same (`orphanedItems`).
             FileHandle.standardError.write(Data("brahma: could not carry the taint of \(item.key) through its rebase: \(error)\n".utf8))
         }
     }
@@ -248,40 +290,91 @@ extension Store {
         return heads
     }
 
-    /// At a holder turn's end (fail closed): records `<start>..head(item/<KEY>)` as tainted commits of the item (`start` nil:
-    /// the merge base with `main`, so a lease taken during the turn loses nothing). When that can't be done, the branch head is
-    /// still recorded if it can be read, the item is marked (5-lite's sticky `taintedOrigin`, which taints its worktree) and
-    /// the owner gets an engine alert. Never throws.
+    /// At the end of a turn of a tainted session (ruling 6): records the commits it made on every item branch it touched —
+    /// the union of the items it held as the turn started (`heldAtStart`: item id → head then), every item it claimed during
+    /// the turn (the claim log, even one released since), the leases it holds now and the turn's own leased item. Each starts
+    /// at its head at turn start, else the trusted head of its first claim in the turn, else the lease's trusted claim head,
+    /// else the merge base with `main` (never a head an agent could have moved). A read that fails falls back to what is known
+    /// and alerts the owner. Never throws.
+    public func recordTurnTaints(companyId: String, agentId: String, turnId: String, heldAtStart: [String: String],
+                                 leasedItemId: String?, source: String, now: Date) {
+        var targets: [String: String?] = heldAtStart.mapValues { Optional($0) }
+        if let leasedItemId, targets[leasedItemId] == nil { targets[leasedItemId] = .some(nil) }
+        do {
+            let (claims, leases) = try writer.read { db in
+                (try Row.fetchAll(db, sql: "SELECT itemId, claimHead FROM leaseClaim WHERE agentId = ? AND turnId = ? ORDER BY id",
+                                  arguments: [agentId, turnId]),
+                 try WorkLease.fetchAll(db, sql: "SELECT * FROM workLease WHERE agentId = ?", arguments: [agentId]))
+            }
+            for claim in claims {
+                let itemId: String = claim["itemId"]
+                if targets[itemId] == nil { targets[itemId] = .some(claim["claimHead"] as String?) }    // the turn's first claim
+            }
+            for lease in leases where targets[lease.itemId] == nil { targets[lease.itemId] = .some(lease.claimHead) }
+        } catch {
+            alertTaintRecord(companyId: companyId, itemId: nil, what: "the items this turn touched could not be read (\(error))", now: now)
+        }
+        guard let company = try? company(id: companyId) else {
+            alertTaintRecord(companyId: companyId, itemId: nil, what: "the company could not be read", now: now)
+            return
+        }
+        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        for (itemId, start) in targets {
+            recordTurnTaint(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, start: start, source: source,
+                            workspace: workspace, now: now)
+        }
+    }
+
+    /// Records `<start>..head(item/<KEY>)` of one item as tainted commits (`start` nil: the merge base with `main`). Fail
+    /// closed: when that can't be done, every commit from the merge base is recorded instead; when not even that, an
+    /// `unrecorded-…` marker makes all of the item's commits tainted (`orphanedItems`), the item is marked (5-lite's sticky
+    /// `taintedOrigin`, which taints its worktree) and the owner gets an engine alert. Never throws.
     public func recordTurnTaint(companyId: String, itemId: String, agentId: String, turnId: String?, start: String?,
                                 source: String, workspace: URL, now: Date) {
-        var head: String?
+        var failure: (any Error)?
         do {
             guard let item = try workItem(id: itemId), item.companyId == companyId else { return }
             let git = try refGit(workspace)
             let after = try git.head("item/\(item.key)")
-            head = after
-            let before = try start ?? git.mergeBase("main", after)
-            try recordTaintedCommits(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, headBefore: before,
-                                     headAfter: after, source: source, git: git, now: now)
-        } catch {
+            let base = try git.mergeBase("main", after)
             do {
-                try writer.write { db in
-                    if let head {
-                        try db.execute(sql: """
-                            INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """, arguments: [companyId, head, itemId, agentId, turnId, Store.flat(source, max: 200), now])
-                    }
-                    try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND id = ?", arguments: [companyId, itemId])
-                    let key = try String.fetchOne(db, sql: "SELECT key FROM workItem WHERE companyId = ? AND id = ?",
-                                                  arguments: [companyId, itemId]) ?? "an item"
-                    try EngineAlerts.raise(store: self, db: db, text: "The commits a tainted session made on \(key) could not be recorded "
-                                           + "(\(error)); \(key) is treated as tainted until it is merged or you vouch for it.",
-                                           now: now, reason: "taint-record:\(itemId)", companyId: companyId)
-                }
+                try recordTaintedCommits(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, headBefore: start ?? base,
+                                         headAfter: after, source: source, git: git, now: now)
+                return
             } catch {
-                FileHandle.standardError.write(Data("brahma: could not record the tainted commits of item \(itemId): \(error)\n".utf8))
+                failure = error
+                try recordTaintedCommits(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, headBefore: base,
+                                         headAfter: after, source: source, git: git, now: now)
+                return
             }
+        } catch {
+            failure = failure ?? error
+        }
+        do {
+            try writer.write { db in
+                try db.execute(sql: """
+                    INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, arguments: [companyId, TaintedCommit.unrecordedPrefix + UUID().uuidString, itemId, agentId, turnId,
+                                     Store.flat(source, max: 200), now])
+                try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND id = ?", arguments: [companyId, itemId])
+            }
+        } catch {
+            FileHandle.standardError.write(Data("brahma: could not mark item \(itemId) tainted: \(error)\n".utf8))
+        }
+        alertTaintRecord(companyId: companyId, itemId: itemId, what: "its commits could not be listed (\(failure.map { "\($0)" } ?? "unknown"))",
+                         now: now)
+    }
+
+    /// The owner's engine alert for a taint record that could not be made as it should (stderr when even that fails).
+    private func alertTaintRecord(companyId: String, itemId: String?, what: String, now: Date) {
+        let key = (try? itemId.flatMap { try workItem(id: $0)?.key }) ?? nil
+        let text = "The commits a session that read outside content made\(key.map { " on \($0)" } ?? "") could not all be recorded: \(what). "
+            + (key.map { "\($0) is treated as tainted until it is merged or you vouch for it." } ?? "Check the items this agent worked on.")
+        do {
+            try EngineAlerts.raise(store: self, text: text, now: now, reason: "taint-record:\(itemId ?? companyId)", companyId: companyId)
+        } catch {
+            FileHandle.standardError.write(Data("brahma: \(text) (the alert failed too: \(error))\n".utf8))
         }
     }
 

@@ -1570,26 +1570,19 @@ public actor Orchestrator {
             }
         }
 
-        // Plan C2a: a turn of a session that read outside content records the commits it made on every item branch it held
-        // (`<head at start>..<head now>` on `item/<KEY>`; a lease claimed during the turn from its head at claim, else from the
-        // merge base with `main`) as tainted. The taint is the session's now (ML's `currentTaint`, so a resumed turn that read
-        // nothing itself still counts; unreadable: tainted), read before any fresh-session reset below. A record that fails
-        // marks the item and alerts the owner (`recordTurnTaint`, fail closed). Git, off the cooperative pool.
+        // Plan C2a: a turn of a session that read outside content records the commits it made on every item branch it touched
+        // (rulings 4 and 6: what it held as it started, everything it claimed during the turn, even released since, and what it
+        // holds now; `recordTurnTaints`). The taint is the session's now (ML's `currentTaint`, so a resumed turn that read
+        // nothing itself still counts; unreadable: tainted), read before any fresh-session reset below. Git, off the
+        // cooperative pool.
         if launched {
             let (store, paths, turnId, started, leasedItem) = (self.store, self.paths, turn.id, heldAtStart, leaseHead?.item.id)
             await blocking.run {
                 let source: String?
                 do { source = try store.currentTaint(agentId: agent.id, paths: paths) } catch { source = "session" }
-                guard let source, let company = try? store.company(id: agent.companyId) else { return }
-                var targets: [(itemId: String, start: String?)] = []
-                let leases = (try? store.leases(agentId: agent.id)) ?? []
-                for lease in leases { targets.append((lease.itemId, started[lease.itemId] ?? lease.claimHead)) }
-                if let leasedItem, !leases.contains(where: { $0.itemId == leasedItem }) { targets.append((leasedItem, started[leasedItem])) }
-                for target in targets {
-                    store.recordTurnTaint(companyId: agent.companyId, itemId: target.itemId, agentId: agent.id, turnId: turnId,
-                                          start: target.start, source: source,
-                                          workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), now: now)
-                }
+                guard let source else { return }
+                store.recordTurnTaints(companyId: agent.companyId, agentId: agent.id, turnId: turnId, heldAtStart: started,
+                                       leasedItemId: leasedItem, source: source, now: now)
             }
         }
 
