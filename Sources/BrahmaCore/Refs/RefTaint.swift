@@ -73,6 +73,27 @@ extension Store {
         }
     }
 
+    /// Ruling 22 (P2 R5-1): the owner vouches for what a restore over an unreadable database could not place in the company:
+    /// every uncleared restore epoch, and every uncleared tainted-commit row one recorded, is cleared (`clearedBy = "owner"`;
+    /// each clearing gets its `taintOrder` sequence from the triggers), and the activity log says so. An item's own rows
+    /// (a turn's, a marker) are not: those clear through the review gate or `vouchItem`. Owner callers only (the app and the
+    /// owner CLI).
+    public func vouchRestoredCommits(companyId: String, now: Date) throws {
+        try writer.write { db in
+            guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+            try db.execute(sql: """
+                UPDATE taintedCommit SET clearedBy = 'owner', clearedAt = ?
+                WHERE companyId = ? AND restoreEpoch IS NOT NULL AND clearedBy IS NULL
+                """, arguments: [now, companyId])
+            let commits = db.changesCount
+            try db.execute(sql: "UPDATE restoreEpoch SET clearedBy = 'owner', clearedAt = ? WHERE companyId = ? AND clearedBy IS NULL",
+                           arguments: [now, companyId])
+            guard commits + db.changesCount > 0 else { return }
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .access,
+                              text: "Owner vouched for the commits a restore could not place (\(commits))", createdAt: now).insert(db)
+        }
+    }
+
     // MARK: A ref's taint
 
     /// Whether `ref` carries outside content, and why (design §4.3). Fail closed: a history that can't be read is tainted
@@ -90,6 +111,10 @@ extension Store {
     ///   laundered by naming it without its item); `main`'s head is clean (what reached it went through the review gate); a
     ///   `.brahma/…` path at any rev but `main`'s engine-recorded head (`company.mainCommit`) is tainted, a pinned blob of one
     ///   included (ruling 8);
+    /// - after a restore over a database that could not be read (Ruling 22, `RestoreEpoch`), until the owner vouches
+    ///   (`vouchRestoredCommits`): each commit the restore listed off the snapshot's recorded `main` has a row (above); when it
+    ///   could list nothing, a commit ref, a key-less file's history or an item's history holding any commit not in that
+    ///   `main`'s history is tainted;
     /// - `@worktree` content: the lease holder's session is tainted now, or a tainted session held the item (5-lite's sticky
     ///   `taintedOrigin`), or (a file) the branch history it holds is tainted; a pinned worktree diff: its snapshot's.
     public func refTaint(_ ref: WorkRef, companyId: String) throws -> (tainted: Bool, reason: String?) {
@@ -270,7 +295,7 @@ extension Store {
         let unverified = (true, Optional(Self.artifactSourceReason))
         let companyId = item.companyId
         let read = try writer.read { db -> (rows: [TaintedCommit], current: WorkItem?, publish: Int64?, clears: [String: Int64],
-                                              statusAfter: Int) in
+                                              statusAfter: Int, epochs: [RestoreEpoch]) in
             let rows = try TaintedCommit.fetchAll(db, sql: """
                 SELECT * FROM taintedCommit WHERE companyId = ? ORDER BY createdAt DESC, rowid DESC
                 """, arguments: [companyId])
@@ -290,9 +315,16 @@ extension Store {
                     SELECT COUNT(*) FROM taintOrder WHERE companyId = ? AND kind = 'status' AND subject = ? AND seq > ?
                     """, arguments: [companyId, item.id, seq]) ?? 0
             } ?? 0
-            return (rows, current, publish, clears, statusAfter)
+            let epochs = try RestoreEpoch.fetchAll(db, sql: "SELECT * FROM restoreEpoch WHERE companyId = ? AND listed = 0 ORDER BY rowid",
+                                                   arguments: [companyId])
+            return (rows, current, publish, clears, statusAfter, epochs)
         }
         guard let publish = read.publish else { return unverified }
+        // The unlisted restore epochs not cleared before the publish (R5-1), by the same rule as the rows.
+        let epochsAtPublish = read.epochs.filter { e in
+            guard e.clearedBy != nil, e.clearedAt != nil, let cleared = read.clears[e.orderSubject] else { return true }
+            return cleared > publish
+        }
         // The rows uncleared at the publish.
         let atPublish = read.rows.filter { row in
             guard row.clearedBy != nil, row.clearedAt != nil, let cleared = read.clears[row.sha] else { return true }
@@ -303,7 +335,7 @@ extension Store {
             return (true, Self.sessionReason(row.source))
         }
         guard let current = read.current, current.status != .done, read.statusAfter == 0 else { return unverified }
-        if let source = try commitSource(WorkRef(kind: .diff, id: item.key), item: item, rows: atPublish) {
+        if let source = try commitSource(WorkRef(kind: .diff, id: item.key), item: item, rows: atPublish, epochs: epochsAtPublish) {
             return (true, Self.sessionReason(source))
         }
         return (false, nil)
@@ -373,6 +405,48 @@ extension Store {
             try TaintedCommit.fetchAll(db, sql: """
                 SELECT * FROM taintedCommit WHERE companyId = ? AND clearedBy IS NULL ORDER BY createdAt DESC, rowid DESC
                 """, arguments: [companyId])
+        }
+    }
+
+    /// Ruling 22 (P2 R5-1): the company's restore epochs whose commits were not listed and that the owner has not cleared.
+    private func unlistedRestoreEpochs(companyId: String) throws -> [RestoreEpoch] {
+        try writer.read { db in
+            try RestoreEpoch.fetchAll(db, sql: """
+                SELECT * FROM restoreEpoch WHERE companyId = ? AND listed = 0 AND clearedBy IS NULL ORDER BY rowid
+                """, arguments: [companyId])
+        }
+    }
+
+    /// The source of the first of `epochs` (unlisted restore epochs) under which a commit of `history` (commits reachable from
+    /// `tip`) is tainted: one not in the history of the epoch's `mainCommit` (none: any commit). Nil when `history` is empty or
+    /// every commit of it is in each epoch's `main`. A git failure: the epoch's source (fail closed). Never throws.
+    private func restoreEpochSource(_ epochs: [RestoreEpoch], history: [String], tip: String, git: SafeGit) -> String? {
+        guard !history.isEmpty else { return nil }
+        for epoch in epochs {
+            guard let main = epoch.mainCommit else { return epoch.source }
+            do {
+                let off = Set(try git.revList(main, tip))
+                if history.contains(where: off.contains) { return epoch.source }
+            } catch {
+                return epoch.source
+            }
+        }
+        return nil
+    }
+
+    /// `restoreEpochSource` for a commit ref (`sha`, 7–64 hex): tainted unless it is in each unlisted epoch's `main`.
+    private func restoreEpochSource(companyId: String, commit sha: String) throws -> String? {
+        let epochs = try unlistedRestoreEpochs(companyId: companyId)
+        guard let first = epochs.first else { return nil }
+        do {
+            guard let company = try company(id: companyId) else { return first.source }
+            let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+            for epoch in epochs {
+                guard let main = epoch.mainCommit, try git.isAncestor(sha, of: main) else { return epoch.source }
+            }
+            return nil
+        } catch {
+            return first.source
         }
     }
 
@@ -495,8 +569,9 @@ extension Store {
             return nil
         }
         let rows = try unclearedCommits(companyId: companyId)
-        guard let newest = rows.first else { return nil }
         if let hit = rows.first(where: { $0.sha.hasPrefix(sha) }) { return hit.source }
+        if let source = try restoreEpochSource(companyId: companyId, commit: sha) { return source }
+        guard let newest = rows.first else { return nil }
         do {
             return try orphanedItems(companyId: companyId, rows: rows).values.first(where: { $0.commits.contains { $0.hasPrefix(sha) } })?.source
         } catch {
@@ -508,7 +583,8 @@ extension Store {
     /// orphaned items' commits.
     private func keylessSource(_ ref: WorkRef, rev: String, companyId: String) throws -> String? {
         let rows = try unclearedCommits(companyId: companyId)
-        guard let newest = rows.first else { return nil }
+        let epochs = try unlistedRestoreEpochs(companyId: companyId)
+        guard let newest = rows.first?.source ?? epochs.first?.source else { return nil }
         let bySha = Dictionary(rows.map { ($0.sha, $0.source) }, uniquingKeysWith: { first, _ in first })
         do {
             guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
@@ -516,22 +592,24 @@ extension Store {
             let base = try git.mergeBase("main", rev)
             let history = try git.logShas(range: "\(base)..\(rev)", path: ref.id)
             if let hit = history.first(where: { bySha[$0] != nil }) { return bySha[hit] }
+            if let source = restoreEpochSource(epochs, history: history, tip: rev, git: git) { return source }
             let orphaned = try orphanedItems(companyId: companyId, rows: rows)
             return orphaned.values.first(where: { item in history.contains { item.commits.contains($0) } })?.source
         } catch {
-            return newest.source      // the history can't be read: fail closed
+            return newest      // the history can't be read: fail closed
         }
     }
 
     /// The taint the item's commits give a committed diff or item-branch file ref (see `refTaint`).
     private func commitSource(_ ref: WorkRef, item: WorkItem) throws -> String? {
-        try commitSource(ref, item: item, rows: try unclearedCommits(companyId: item.companyId))
+        try commitSource(ref, item: item, rows: try unclearedCommits(companyId: item.companyId),
+                         epochs: try unlistedRestoreEpochs(companyId: item.companyId))
     }
 
-    /// `commitSource` against a given set of the company's rows (newest first): the uncleared ones now, or (ruling 17) the ones
-    /// not cleared before an artifact was published.
-    private func commitSource(_ ref: WorkRef, item: WorkItem, rows: [TaintedCommit]) throws -> String? {
-        guard !rows.isEmpty else { return nil }
+    /// `commitSource` against a given set of the company's rows (newest first) and unlisted restore epochs (R5-1): the
+    /// uncleared ones now, or (ruling 17) the ones not cleared before an artifact was published.
+    private func commitSource(_ ref: WorkRef, item: WorkItem, rows: [TaintedCommit], epochs: [RestoreEpoch]) throws -> String? {
+        guard !rows.isEmpty || !epochs.isEmpty else { return nil }
         let bySha = Dictionary(rows.map { ($0.sha, $0.source) }, uniquingKeysWith: { first, _ in first })
         let itemRows = rows.filter { $0.itemId == item.id }
         do {
@@ -544,13 +622,14 @@ extension Store {
             let base = try git.mergeBase("main", head)
             let history = ref.kind == .diff ? try git.revList(base, head) : try git.logShas(range: "\(base)..\(head)", path: ref.id)
             if let hit = history.first(where: { bySha[$0] != nil }) { return bySha[hit] }
+            if let source = restoreEpochSource(epochs, history: history, tip: head, git: git) { return source }
             // A commit of another orphaned item's branch on this one (a reset onto it, a cherry-pick that reused it).
             return orphaned.values.first(where: { other in history.contains { other.commits.contains($0) } })?.source
         } catch {
             // The history can't be read (this item's branch is gone, git failed on it or on any orphan candidate's branch, e.g.
             // one reset onto an unrelated root): fail closed for the whole query (ruling 11). The item's own newest source,
-            // else the company's newest uncleared one (`rows` is non-empty here).
-            return itemRows.first?.source ?? rows.first?.source ?? Self.taintCheckFailedSource
+            // else the company's newest uncleared one, else an epoch's (one of them is non-empty here).
+            return itemRows.first?.source ?? rows.first?.source ?? epochs.first?.source ?? Self.taintCheckFailedSource
         }
     }
 

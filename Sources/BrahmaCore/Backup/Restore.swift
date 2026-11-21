@@ -405,7 +405,12 @@ extension BackupService {
         // database's grant ends and taint marks, the machine-wide lab mark. Done before the rename, so the database at the live
         // path never lacks them; a failure here changes nothing.
         do {
-            warnings += try Self.carryForward(carried, into: staging, snapshot: plan.snapshot.lastPathComponent, now: now())
+            // Git's captured output for the restore's listing (Ruling 22) goes under the data home's `tmp`; without it, nothing
+            // is listed (the restore epoch then fails closed).
+            let gitTemp = home.appending(path: "tmp", directoryHint: .isDirectory)
+            let gitTempRoot: URL? = (try? BrahmaPaths.ensurePrivateDirectory(gitTemp)) != nil ? gitTemp : nil
+            warnings += try Self.carryForward(carried, into: staging, snapshot: plan.snapshot.lastPathComponent, now: now(),
+                                              gitTempRoot: gitTempRoot)
             try Self.syncFile(staging)
         } catch {
             if !alreadyStaged { try? fm.removeItem(at: staging) }
@@ -478,12 +483,13 @@ extension BackupService {
 
     /// Migrates the staged snapshot and writes `RestoreCarry.apply` into it in one transaction, then empties its log and closes
     /// it, so the file renamed into place holds everything. Returns the notes for the owner.
-    static func carryForward(_ live: RestoreCarry.Live, into staged: URL, snapshot: String, now: Date) throws -> [String] {
+    static func carryForward(_ live: RestoreCarry.Live, into staged: URL, snapshot: String, now: Date,
+                             gitTempRoot: URL? = nil) throws -> [String] {
         let queue = try DatabaseQueue(path: staged.path)
         var closed = false
         defer { if !closed { try? queue.close() } }
         try Migrations.migrator().migrate(queue)
-        let notes = try queue.write { db in try RestoreCarry.apply(live, to: db, snapshot: snapshot, now: now) }
+        let notes = try queue.write { db in try RestoreCarry.apply(live, to: db, snapshot: snapshot, now: now, gitTempRoot: gitTempRoot) }
         let row = try queue.writeWithoutTransaction { db in try Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)") }
         let busy: Int = row?[0] ?? 0
         guard busy == 0 else { throw RestoreError.failed("the staged snapshot's log could not be emptied") }
