@@ -289,13 +289,29 @@ final class OutputCapture: @unchecked Sendable {
 enum MemoryFootprint {
     /// The summed footprint of every process in process group `pgid`, or nil when the group can't be listed.
     static func ofGroup(_ pgid: pid_t) -> Int? {
+        members(ofGroup: pgid).map { $0.reduce(0) { $0 + (of($1) ?? 0) } }
+    }
+
+    /// C2b fix round 4 (R4-4): the summed footprint of a run, `leader` itself (by its pid, whichever group it is in: its pid
+    /// can't be recycled while it is unreaped) and every process in its process group, each once. Never nil on Darwin.
+    static func ofRun(leader: pid_t) -> Int? {
+        #if canImport(Darwin)
+        let pids = Set((members(ofGroup: leader) ?? []) + [leader])
+        return pids.reduce(0) { $0 + (of($1) ?? 0) }
+        #else
+        return nil
+        #endif
+    }
+
+    /// The pids in process group `pgid`, or nil when it can't be listed.
+    static func members(ofGroup pgid: pid_t) -> [pid_t]? {
         #if canImport(Darwin)
         var pids = [pid_t](repeating: 0, count: 512)
         let listed = pids.withUnsafeMutableBufferPointer { buffer in
             proc_listpgrppids(pgid, buffer.baseAddress, Int32(buffer.count * MemoryLayout<pid_t>.stride))
         }
         guard listed >= 0 else { return nil }
-        return pids.filter { $0 > 0 }.reduce(0) { $0 + (of($1) ?? 0) }
+        return pids.filter { $0 > 0 }
         #else
         return nil
         #endif
@@ -321,6 +337,8 @@ enum MemoryFootprint {
 enum GroupRun {
     /// The last line of the tail of a run its memory limit stopped (C2b fix round 3).
     static let memoryExceeded = "the run used more memory than it may, and was stopped"
+    /// The last line of the tail of a run whose standard output passed its cap (C2b fix round 4, R4-4).
+    static let outputExceeded = "the run wrote more output than it may, and was stopped"
 
     final class CancelFlag: @unchecked Sendable {
         private let lock = NSLock()
@@ -342,10 +360,14 @@ enum GroupRun {
         return String(text.suffix(ProcessCheckRunner.tailChars))
     }
 
+    /// `stdout` (C2b fix round 4, R4-4): the run's standard output goes to that file (created anew), at most `cap` bytes;
+    /// one byte more and the run is killed (`outputExceeded`); its standard error then goes to `outputURL` alone. An output
+    /// that never ends (a descriptor held elsewhere) makes the run inconclusive. `newSession`: the child leads a new session
+    /// (`setsid`), so it can't leave its process group. The memory watchdog sums the child itself and its group.
     static func run(executable: String, arguments: [String], workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
                     environment: [String: String], termGrace: TimeInterval, clock: @Sendable () -> TimeInterval,
                     cancel: CancelFlag, observer: ProcessGroupChild.Observer? = nil, groups: ChildGroups? = nil,
-                    memoryLimit: Int? = nil) -> CheckOutcome {
+                    memoryLimit: Int? = nil, stdout: (url: URL, cap: Int)? = nil, newSession: Bool = false) -> CheckOutcome {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: workingDirectory.path, isDirectory: &isDir), isDir.boolValue else {
@@ -365,32 +387,56 @@ enum GroupRun {
         let (readEnd, writeEnd) = (fds[0], fds[1])
         // Neither end may leak into children spawned meanwhile (a leaked write end would hold the pipe open).
         _ = fcntl(readEnd, F_SETFD, FD_CLOEXEC); _ = fcntl(writeEnd, F_SETFD, FD_CLOEXEC)
+        // The standard output apart (round 4): its own file and pipe.
+        var out: (file: Int32, read: Int32, write: Int32)?
+        if let stdout {
+            let outFile = open(stdout.url.path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            var outFds: [Int32] = [0, 0]
+            guard outFile >= 0, pipe(&outFds) == 0 else {
+                if outFile >= 0 { close(outFile) }
+                close(readEnd); close(writeEnd); close(file)
+                return fail("could not start the check: no place for its standard output", outputURL: outputURL)
+            }
+            _ = fcntl(outFds[0], F_SETFD, FD_CLOEXEC); _ = fcntl(outFds[1], F_SETFD, FD_CLOEXEC)
+            out = (outFile, outFds[0], outFds[1])
+        }
+        func closeOut() { if let out { close(out.file); close(out.read); close(out.write) } }
 
         let child: ProcessGroupChild
         do {
             child = try ProcessGroupChild.spawn(executable: executable, arguments: arguments, environment: environment,
-                                                workingDirectory: workingDirectory, output: writeEnd, observer: observer)
+                                                workingDirectory: workingDirectory, output: out?.write ?? writeEnd,
+                                                stderr: out == nil ? nil : writeEnd, newSession: newSession, observer: observer)
         } catch {
-            close(writeEnd); close(readEnd); close(file)
+            close(writeEnd); close(readEnd); close(file); closeOut()
             return fail("could not start the check: \(error)", outputURL: outputURL)
         }
         close(writeEnd)
+        if let out { close(out.write) }
         // Recorded for the owner's stop (`EmergencyStop.recordedGroups`) until it is reaped.
         let record = groups?.record(child.pid)
         defer { groups?.forget(record, pid: child.pid) }
-        // From here the reader owns `readEnd` and `file`.
+        // From here the readers own `readEnd` and `file`, and the standard output's two descriptors.
         let capture = OutputCapture(readEnd: readEnd, file: file, cap: ProcessCheckRunner.outputCap,
                                     tailBytes: ProcessCheckRunner.tailChars * 4, marker: ProcessCheckRunner.truncationMarker)
+        let capped = out.map { CappedCapture(readEnd: $0.read, file: $0.file, cap: stdout?.cap ?? 0) }
 
         let deadline = clock() + timeout
-        var timedOut = false, cancelled = false, overMemory = false
+        var timedOut = false, cancelled = false, overMemory = false, overOutput = false
         var termSentAt: TimeInterval?, killSent = false
         while !child.hasExited() {
             let now = clock()
             if cancel.isSet && !cancelled { cancelled = true; child.signalGroup(SIGKILL); killSent = true }
-            // The memory watchdog (C2b fix round 3): the group's summed footprint, every 10 ms; past the limit, SIGKILL.
-            if let memoryLimit, !overMemory, let used = MemoryFootprint.ofGroup(child.pid), used > memoryLimit {
+            // The memory watchdog (C2b fix round 3; round 4: the child itself too, whatever group it is in): every 10 ms;
+            // past the limit, SIGKILL.
+            if let memoryLimit, !overMemory, let used = MemoryFootprint.ofRun(leader: child.pid), used > memoryLimit {
                 overMemory = true
+                child.signalGroup(SIGKILL)
+                killSent = true
+            }
+            // Round 4: standard output past its cap, SIGKILL.
+            if let capped, !overOutput, capped.exceeded {
+                overOutput = true
                 child.signalGroup(SIGKILL)
                 killSent = true
             }
@@ -408,8 +454,11 @@ enum GroupRun {
         // The leader is gone (still unreaped): whatever it left in its group goes too, then it is reaped.
         let status = child.finish()
         let tail = tailText(capture.finish(drain: 2))
+        let outputEnded = capped?.finish(drain: 2) ?? true
+        if capped?.exceeded == true { overOutput = true }
 
         if overMemory { return CheckOutcome(exitCode: nil, timedOut: false, tail: (tail.isEmpty ? "" : tail + "\n") + memoryExceeded) }
+        if overOutput { return CheckOutcome(exitCode: nil, timedOut: false, tail: (tail.isEmpty ? "" : tail + "\n") + outputExceeded) }
         if cancelled { return CheckOutcome(exitCode: nil, timedOut: false, tail: tail) }
         if timedOut { return CheckOutcome(exitCode: nil, timedOut: true, tail: tail) }
         // Its exit was lost (reaped from under us): inconclusive, never a pass (B-M1).
@@ -417,7 +466,67 @@ enum GroupRun {
             let note = tail.isEmpty ? "lost track of the check process" : tail + "\nlost track of the check process"
             return CheckOutcome(exitCode: nil, timedOut: false, tail: note)
         }
+        // Round 4: a standard output that did not end with the run (something else held it) was not read whole.
+        if !outputEnded {
+            let note = "the run's output did not end with it"
+            return CheckOutcome(exitCode: nil, timedOut: false, tail: tail.isEmpty ? note : tail + "\n" + note)
+        }
         return CheckOutcome(exitCode: ProcessGroupChild.exitCode(status), timedOut: false, tail: tail)
+    }
+}
+
+/// C2b fix round 4 (R4-4): a run's standard output, read by the engine into `file`: at most `cap` bytes are kept; once more
+/// arrives the reader stops (`exceeded`) and the runner kills the run. The reader thread owns both descriptors and closes
+/// them itself when it is done.
+final class CappedCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var over = false
+    private var ended = false
+    private var stopFlag = false
+    private let done = DispatchSemaphore(value: 0)
+
+    init(readEnd: Int32, file: Int32, cap: Int) {
+        Thread.detachNewThread { [self] in
+            var kept = 0
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            reading: while !stopped {
+                var pfd = pollfd(fd: readEnd, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&pfd, 1, 100)
+                if ready < 0 { if errno == EINTR { continue }; break }
+                if ready == 0 { continue }
+                let n = buffer.withUnsafeMutableBytes { read(readEnd, $0.baseAddress, $0.count) }
+                if n < 0 { if errno == EINTR || errno == EAGAIN { continue }; break reading }
+                if n == 0 { lock.withLock { ended = true }; break reading }
+                let take = min(n, max(0, cap - kept))
+                var written = 0
+                while written < take {
+                    let w = buffer.withUnsafeBytes { write(file, $0.baseAddress! + written, take - written) }
+                    if w < 0 { if errno == EINTR { continue }; break }
+                    written += w
+                }
+                kept += written
+                // More than the cap, or bytes that could not be kept: the run is stopped and its output refused.
+                if n > take || written < take { lock.withLock { over = true }; break reading }
+            }
+            close(readEnd)
+            close(file)
+            done.signal()
+        }
+    }
+
+    private var stopped: Bool { lock.withLock { stopFlag } }
+
+    /// The output passed the cap (or could not be kept).
+    var exceeded: Bool { lock.withLock { over } }
+
+    /// Waits up to `drain` seconds for the reader to finish, then stops it; true when the output ended (or passed its cap)
+    /// before that.
+    func finish(drain: TimeInterval) -> Bool {
+        if done.wait(timeout: .now() + drain) == .timedOut {
+            lock.withLock { stopFlag = true }
+            done.wait()
+        }
+        return lock.withLock { ended || over }
     }
 }
 

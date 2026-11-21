@@ -262,27 +262,24 @@ public enum SeatbeltProfile {
 
     /// C2b fix round 3 (m-C): a deny-default profile for one engine helper (the PDF reader), written out in full (no system
     /// profile imported):
-    /// - run only `confinement.executables`, `/bin/sh` and the shell `/bin/sh` hands off to (`/private/var/select/sh`);
-    ///   fork (the shell's pipeline);
+    /// - run only `confinement.executables` (round 4, R4-4: the helper itself, which `sandbox-exec` execs in place); no
+    ///   shell, no other program, no fork;
     /// - read the system's libraries, frameworks and their data (`confinedSystemReads`), `/` and the few devices and
     ///   files libSystem opens, the programs above, `confinement.readableFiles` and `listableDirectories` (the directory
     ///   itself), and every tree in `readable`; stat only the ancestors of those paths;
     /// - map code only from the system's frameworks and libraries and the programs above;
-    /// - write only `confinement.writableFiles` (and `/dev/null`, its own descriptors);
+    /// - write only `confinement.writableFiles` (none for the PDF reader: its output is the engine's pipe), `/dev/null`
+    ///   and its own descriptors;
     /// - no network, no IPC, no mach service except the run's marker (`marker`), no signals but to itself.
     static func renderConfined(_ confinement: SandboxConfinement, readable: [String], marker: String?) -> String {
         func literal(_ p: String) -> String { "(literal \(quote(p)))" }
         func subpath(_ p: String) -> String { "(subpath \(quote(p)))" }
-        var programs = ["/bin/sh"] + confinement.executables.map(\.path)
-        let shell = SandboxPath.resolve("/private/var/select/sh")
-        if shell != "/private/var/select/sh" { programs.append(shell) }
         var seen = Set<String>()
-        programs = programs.filter { seen.insert($0).inserted }
+        let programs = confinement.executables.map(\.path).filter { seen.insert($0).inserted }
         let files = confinement.readableFiles.map(\.path) + confinement.listableDirectories.map(\.path)
         let writes = confinement.writableFiles.map(\.path)
         var lines = ["(version 1)", "(deny default)"]
-        lines.append("(allow process-exec " + programs.map(literal).joined(separator: " ") + ")")
-        lines.append("(allow process-fork)")
+        if !programs.isEmpty { lines.append("(allow process-exec " + programs.map(literal).joined(separator: " ") + ")") }
         lines.append("(allow signal (target self))")
         lines.append("(allow sysctl-read)")
         lines.append("(allow system-fcntl (fcntl-command F_ADDFILESIGS_RETURN F_CHECK_LV F_GETPATH))")
@@ -290,7 +287,7 @@ public enum SeatbeltProfile {
         lines.append("(allow file-read-metadata " + (["/private", "/private/var", "/private/tmp", "/private/etc", "/tmp", "/var", "/etc"].map(literal)
             + ancestors).joined(separator: " ") + ")")
         lines.append("(allow file-read* " + ([literal("/")] + confinedSystemReads.map(subpath)
-            + ["/private/etc/localtime", "/dev/urandom", "/dev/random", "/private/var/select/sh"].map(literal)
+            + ["/private/etc/localtime", "/dev/urandom", "/dev/random"].map(literal)
             + (programs + files).map(literal) + readable.map(subpath)).joined(separator: " ") + ")")
         lines.append("(allow file-map-executable (subpath \"/System\") (subpath \"/usr/lib\") " + programs.map(literal).joined(separator: " ") + ")")
         lines.append("(allow file-read-data file-write-data (literal \"/dev/null\") (subpath \"/dev/fd\"))")

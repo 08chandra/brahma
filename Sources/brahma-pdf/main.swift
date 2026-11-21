@@ -1,32 +1,39 @@
-// brahma-pdf: the PDF extraction helper (Plan C task C2b, fix rounds 2 and 3, controller ruling 33).
+// brahma-pdf: the PDF extraction helper (Plan C task C2b, fix rounds 2–4, controller rulings 33 and 34).
 //
-// The engine never parses a PDF. It runs this helper under Seatbelt (`SandboxedPDFReader`: a deny-default profile that lets
-// it read the system's libraries, this binary and the one input file, write only its two outputs, and nothing else; a hard
-// time limit; a memory watchdog; the output cut at a byte cap) and scans what it hands back under the gate's one budget.
+// The engine never parses a PDF. It runs this helper directly under Seatbelt (`SandboxedPDFReader`: a deny-default profile
+// that lets it read the system's libraries, this binary and the one input file, and nothing else: no other program, no
+// fork, no file written; the leader of its own session; a hard time limit; a memory watchdog; its standard output read by
+// the engine up to a byte cap, past which it is killed) and scans what it hands back under the gate's one budget.
 //
 //     brahma-pdf <input.pdf> <max output bytes> [<memory limit in bytes>]
 //
 // What it does, with Apple's own reader (CoreGraphics, PDFKit):
-// 1. Counts every `stream` keyword in the file (a `stream` that no regular character comes before, whatever follows it),
-//    notes every `<n> <g> obj` header and every `/Size` (the highest object number the file can use), and where each
-//    revision ends (every `%%EOF`).
-// 2. For EVERY revision (the file cut after each `%%EOF`, and the whole file): opens it (an encrypted one is refused);
+// 1. Lexes the file: every `<n> <g> obj` header (its exact byte offset) and the `endobj` that closes it, every `stream`
+//    keyword (one that no regular character comes before, whatever follows it) and the header whose object it is in, every
+//    `/Size` (the highest object number the file can use), every in-use entry of every classic cross-reference section
+//    (number, generation, offset), and where each revision ends: after every `startxref <offset>` (and its `%%EOF`, when
+//    one follows) and every `%%EOF` (round 4, R4-1: a revision need not end with `%%EOF`).
+// 2. For EVERY revision (the file cut at each of those ends, and the whole file): opens it (an encrypted one is refused);
 //    appends an incremental update (in memory) whose catalog lists every object number up to that highest one (and every
-//    non-zero generation seen), in the same kind of cross-reference section as the revision's last one, then opens that.
-//    The reader's own parse then reaches every object that revision holds, used or not: objects in object streams, the
-//    cross-reference and object streams themselves, objects nothing refers to. A revision the reader can't open adds
-//    nothing (step 5 still has to account for its streams).
+//    non-zero generation seen), and, under fresh numbers, every object holding a stream whose body lies inside that cut,
+//    each pinned at its header's exact offset; in the same kind of cross-reference section as the revision's last one;
+//    then opens that. The reader's own parse then reaches every object that revision holds, used or not (objects in object
+//    streams, the cross-reference and object streams themselves, objects nothing refers to), and every stream body by its
+//    place in the file. A revision the reader can't open adds nothing (step 5 still has to place its streams).
 // 3. Walks every object from that list: every stream decoded (`CGPDFStreamCopyData`; a stream that does not decode is
 //    refused), every string (its bytes, and as text), every name. A cross-reference stream naming objects past the
-//    highest number is refused. Each decoded stream is kept once, by its digest (round 3: two object numbers that name
-//    one object are one stream, never two).
+//    highest number is refused; its in-use rows (number, generation, offset) are kept. Each decoded stream is written once,
+//    by its digest.
 // 4. Runs CoreGraphics' content-stream scanner over every content stream (page contents, every annotation appearance and
 //    appearance state, every Form XObject, Type 3 glyph procedures, tiling patterns) and keeps every string a text or
 //    marked-content operator takes (`Tj`, `TJ`, `'`, `"`, `BDC`, `DP`), escapes decoded. A content stream it can't scan
-//    is refused.
-// 5. Refuses unless the distinct streams decoded across all revisions are exactly the `stream` keywords the file holds: a
-//    stray stream, or a second body of one object in one revision, is data no walk reaches. An object whose stream reads
-//    differently in a later revision must have a new body in that revision's bytes, else it is refused.
+//    is refused, and so is one marked that the walk never decoded.
+// 5. Places every stream (round 4, R4-1, ruling 34): each `stream` keyword must sit in exactly one object (a header, no
+//    `endobj` between), one per object; that header must be named at its EXACT offset, with its number and generation, by
+//    an in-use entry of some cross-reference section; and some revision's walk must have decoded, under that number and
+//    generation, exactly what the body pinned at that offset decodes to in the same revision. Every in-use entry of every
+//    section must name exactly the offset of a header with its own number and generation (an offset one byte off, offset
+//    0, another number or generation: refused). Anything else is data no walk is known to reach: refused.
 // 6. Adds the page text of the last revision as PDFKit extracts it.
 // A thread checks the process's own memory footprint every 20 ms and exits (status 9) past the limit (default 1 GiB);
 // the engine's watchdog kills the whole run at its own limit too.
@@ -107,6 +114,28 @@ final class Output {
     }
 }
 
+/// An object by its number and generation (round 4, ruling 34: identity is always both).
+struct ObjectKey: Hashable, Comparable {
+    let number: Int
+    let generation: Int
+    static func < (a: ObjectKey, b: ObjectKey) -> Bool { (a.number, a.generation) < (b.number, b.generation) }
+}
+
+/// An in-use cross-reference entry: which object it says starts at `offset`.
+struct Entry: Hashable {
+    let key: ObjectKey
+    let offset: Int
+}
+
+/// A lexed `<n> <g> obj` header: where it starts, where its object ends (its `endobj`, or the next header), and how many
+/// `stream` keywords lie between.
+struct Header {
+    let key: ObjectKey
+    let offset: Int
+    var end: Int?
+    var streams = 0
+}
+
 /// One run over one file (steps 1–6 above).
 final class Extraction {
     /// At most this many object numbers are listed (a larger file is refused).
@@ -119,18 +148,18 @@ final class Extraction {
     let original: Data
     let bytes: [UInt8]
     let output: Output
-    var streamTokens = 0
-    var headers: [(number: Int, offset: Int)] = []
-    var generations = Set<[Int]>()   // (number, generation) of every header with a generation other than 0
-    /// The numbers of the generations listed after objects 1…highest, in the update's order.
-    var generationNumbers: [Int] { generations.sorted { $0.lexicographicallyPrecedes($1) }.map { $0[0] } }
+    var headers: [Header] = []
+    var headerAt: [Int: Int] = [:]   // a header's offset → its index
+    var stray = false                // a `stream` keyword outside every object
+    var generations = Set<ObjectKey>()   // every header with a generation other than 0
+    /// The non-zero generations, listed after objects 1…highest in the update's order.
+    lazy var generationList: [ObjectKey] = generations.sorted()
     var highest = 0                  // the highest object number the file can use
-    var revisionEnds: [Int] = []
+    var revisionEnds = Set<Int>()
     var strings = Data(), texts = Data(), names = Data()
     var keptEntries = Set<Data>()    // every string, text and name kept once
     var digests = Set<Data>()        // every decoded stream, across every revision, written once
-    var streamObjects = Set<String>() // every stream object read: its number and its digest, across every revision
-    var numbersAt: [Int: Set<Int>] = [:]   // every offset a cross-reference section names, and the numbers it names there
+    var entries = Set<Entry>()       // every in-use entry of every cross-reference section (classic and stream)
 
     init(original: Data, cap: Int) {
         self.original = original
@@ -141,33 +170,37 @@ final class Extraction {
     func run() -> Never {
         lex()
         guard highest < Self.maxObjects else { fail(.tooMany) }
-        var ends = revisionEnds
+        var ends = revisionEnds.sorted()
         if ends.last != bytes.count { ends.append(bytes.count) }
         guard ends.count <= Self.maxRevisions else { fail(.tooMany) }
+        let bodies = headers.filter { $0.streams == 1 }
+        var placed = Set<Int>()   // the header offsets of the stream bodies some revision placed
         var opened = false
-        var previous: (end: Int, streams: [Int: Data])?
         for end in ends {
             let prefix = original.prefix(end)
-            guard let provider = CGDataProvider(data: prefix as CFData), let document = CGPDFDocument(provider) else { continue }
-            if document.isEncrypted { fail(.encrypted) }
-            guard let walked = Revision(of: self, prefix: prefix)?.read() else { continue }
-            opened = true
-            // An object whose stream reads differently from the revision before must have a new body in this revision.
-            if let previous {
-                let rewritten = Set(headers.filter { $0.offset >= previous.end && $0.offset < end }.map(\.number))
-                for (number, digest) in walked where previous.streams[number].map({ $0 != digest }) == true && !rewritten.contains(number) {
-                    fail(.unaccounted)
-                }
+            if let provider = CGDataProvider(data: prefix as CFData), let document = CGPDFDocument(provider), document.isEncrypted {
+                fail(.encrypted)
             }
-            previous = (end, walked)
+            // Every stream body wholly inside this revision, pinned at its offset (a generation a cross-reference row
+            // can't carry is never pinned, so it is never placed).
+            let pins = bodies.filter { ($0.end ?? bytes.count) <= end && $0.key.generation <= 65_535 }
+            guard let walked = Revision(of: self, prefix: prefix, pins: pins)?.read() else { continue }
+            opened = true
+            for pin in pins {
+                if let digest = walked.pinned[pin.offset], walked.byKey[pin.key] == digest { placed.insert(pin.offset) }
+            }
         }
         guard opened else { fail(.unreadable) }
-        // Two object numbers naming one object (the offset where its `n g obj` header starts) would let one stream stand in
-        // for another: refused (round 3, C-1). Entries naming offsets where no object starts name nothing.
-        let bodies = Set(headers.map(\.offset))
-        guard numbersAt.allSatisfy({ !bodies.contains($0.key) || $0.value.count == 1 }) else { fail(.unaccounted) }
-        // Every stream keyword in the file is a distinct stream object (number and content) some revision's walk decoded.
-        guard streamObjects.count == streamTokens else { fail(.unaccounted) }
+        // Step 5 (after the walks, so a stream that can't be decoded says so first): every `stream` keyword in one object,
+        // one per object; every stream body named exactly and placed by some revision's walk; every in-use entry exactly a
+        // header.
+        guard !stray, headers.allSatisfy({ $0.streams <= 1 }) else { fail(.unaccounted) }
+        for body in bodies {
+            guard placed.contains(body.offset), entries.contains(Entry(key: body.key, offset: body.offset)) else { fail(.unaccounted) }
+        }
+        for entry in entries {
+            guard let i = headerAt[entry.offset], headers[i].key == entry.key else { fail(.unaccounted) }
+        }
         // The page text of the last revision.
         guard let pdf = PDFDocument(data: original) else { fail(.unreadable) }
         if pdf.isEncrypted || pdf.isLocked { fail(.encrypted) }
@@ -182,18 +215,35 @@ final class Extraction {
         exit(0)
     }
 
-    /// Step 1: the `stream` keywords, the object headers, the `/Size` values and the revision ends in the file's bytes.
+    /// Step 1: the object headers and their ends, the `stream` keywords and their objects, the `/Size` values, the classic
+    /// cross-reference entries and the revision ends in the file's bytes.
     func lex() {
         let streamWord = Array("stream".utf8), objWord = Array("obj".utf8), sizeWord = Array("/Size".utf8), eofWord = Array("%%EOF".utf8)
-        let xrefWord = Array("xref".utf8)
+        let xrefWord = Array("xref".utf8), endobjWord = Array("endobj".utf8), startxrefWord = Array("startxref".utf8)
+        var open: Int?   // the header whose object the lexer is in
+        func endsToken(_ k: Int) -> Bool { k == bytes.count || !isRegular(bytes[k]) }
         var i = 0
         while i < bytes.count {
             let c = bytes[i]
-            if c == 0x73, matches(streamWord, at: i, in: bytes), i == 0 || !isRegular(bytes[i - 1]) {
+            let starts = i == 0 || !isRegular(bytes[i - 1])
+            if c == 0x73, starts, matches(streamWord, at: i, in: bytes) {
                 // Round 3 (m-B): whatever follows it, data straight after the keyword included.
-                streamTokens += 1
-            } else if c == 0x6F, i > 0, matches(objWord, at: i, in: bytes), !isRegular(bytes[i - 1]),
-                      i + objWord.count == bytes.count || !isRegular(bytes[i + objWord.count]) {
+                if let open { headers[open].streams += 1 } else { stray = true }
+            } else if c == 0x73, starts, matches(startxrefWord, at: i, in: bytes), endsToken(i + startxrefWord.count) {
+                // Round 4 (R4-1): a revision ends after `startxref <offset>` (and after its `%%EOF`, when one follows).
+                var j = i + startxrefWord.count
+                while j < bytes.count, isWhite(bytes[j]) { j += 1 }
+                var digits = 0
+                while j < bytes.count, isDigit(bytes[j]), digits < 12 { j += 1; digits += 1 }
+                if digits > 0 {
+                    var k = j
+                    while k < bytes.count, isWhite(bytes[k]) { k += 1 }
+                    revisionEnds.insert(matches(eofWord, at: k, in: bytes) ? afterEOF(k + eofWord.count) : j)
+                }
+            } else if c == 0x65, starts, matches(endobjWord, at: i, in: bytes), endsToken(i + endobjWord.count) {
+                if let o = open { headers[o].end = i + endobjWord.count }
+                open = nil
+            } else if c == 0x6F, i > 0, matches(objWord, at: i, in: bytes), !isRegular(bytes[i - 1]), endsToken(i + objWord.count) {
                 // Back over white space, the generation, white space, the number.
                 var j = i - 1
                 while j >= 0, isWhite(bytes[j]) { j -= 1 }
@@ -206,8 +256,13 @@ final class Extraction {
                 while j >= 0, isDigit(bytes[j]), nDigits < 9 { number += Int(bytes[j] - 0x30) * scale; scale *= 10; j -= 1; nDigits += 1 }
                 if gDigits > 0, nDigits > 0, afterNumber > j, j < 0 || !isRegular(bytes[j]) {
                     highest = max(highest, number)
-                    headers.append((number, j + 1))
-                    if generation != 0 { generations.insert([number, generation]) }
+                    // An object left open ends where the next header starts.
+                    if let o = open { headers[o].end = j + 1 }
+                    let key = ObjectKey(number: number, generation: generation)
+                    headerAt[j + 1] = headers.count
+                    headers.append(Header(key: key, offset: j + 1))
+                    open = headers.count - 1
+                    if generation != 0 { generations.insert(key) }
                 }
             } else if c == 0x2F, matches(sizeWord, at: i, in: bytes) {
                 var j = i + sizeWord.count
@@ -217,16 +272,21 @@ final class Extraction {
                     while j < bytes.count, isDigit(bytes[j]), digits < 9 { size = size * 10 + Int(bytes[j] - 0x30); j += 1; digits += 1 }
                     if digits > 0 { highest = max(highest, size - 1) }
                 }
-            } else if c == 0x78, matches(xrefWord, at: i, in: bytes), i == 0 || !isRegular(bytes[i - 1]),
+            } else if c == 0x78, starts, matches(xrefWord, at: i, in: bytes),
                       i + xrefWord.count < bytes.count, isWhite(bytes[i + xrefWord.count]) {
                 classicSection(at: i + xrefWord.count)
             } else if c == 0x25, matches(eofWord, at: i, in: bytes) {
-                var end = i + eofWord.count
-                while end < bytes.count, bytes[end] == 0x0D || bytes[end] == 0x0A { end += 1 }
-                revisionEnds.append(end)
+                revisionEnds.insert(afterEOF(i + eofWord.count))
             }
             i += 1
         }
+    }
+
+    /// Where a revision ends after a `%%EOF` ending at `end`: past its line ends.
+    func afterEOF(_ end: Int) -> Int {
+        var end = end
+        while end < bytes.count, bytes[end] == 0x0D || bytes[end] == 0x0A { end += 1 }
+        return end
     }
 
     /// The rows of a classic cross-reference section starting at `i` (after `xref`): `<first> <count>` subsections of
@@ -249,10 +309,10 @@ final class Extraction {
                 skipWhite()
                 guard let offset = number() else { return }
                 skipWhite()
-                guard number() != nil else { return }
+                guard let generation = number() else { return }
                 skipWhite()
                 guard i < bytes.count else { return }
-                if bytes[i] == 0x6E { record(number: first + k, offset: offset) }   // n
+                if bytes[i] == 0x6E { record(number: first + k, generation: generation, offset: offset) }   // n
                 i += 1
                 rows += 1
                 guard rows <= Self.maxObjects * 4 else { fail(.tooMany) }
@@ -260,7 +320,9 @@ final class Extraction {
         }
     }
 
-    func record(number: Int, offset: Int) { numbersAt[offset, default: []].insert(number) }
+    func record(number: Int, generation: Int, offset: Int) {
+        entries.insert(Entry(key: ObjectKey(number: number, generation: generation), offset: offset))
+    }
 
     /// Strings, texts and names, each kept once.
     func keep(_ data: Data, in kind: UInt8) {
@@ -278,7 +340,7 @@ final class Extraction {
         if let t = CGPDFStringCopyTextString(s) { keep(Data((t as String).utf8), in: 0x55) }
     }
 
-    /// A decoded stream, kept once by its digest; true when it is new.
+    /// A decoded stream, written once by its digest; returns the digest.
     @discardableResult
     func keepStream(_ data: Data, format: CGPDFDataFormat) -> Data {
         let kind: UInt8 = format == .raw ? 0x44 : format == .jpegEncoded ? 0x4A : 0x50
@@ -293,6 +355,7 @@ final class Revision {
     let owner: Extraction
     let document: CGPDFDocument
     let listed: CGPDFArrayRef
+    let pins: [Header]
     var seen = Set<Int>()
     var visits = 0
     var contentStreams = Set<Int>()
@@ -309,10 +372,13 @@ final class Revision {
     var pending: [Item] = []
     let lock = NSLock()
 
-    /// The revision `prefix` with the update that lists every object; nil when the reader can't open that.
-    init?(of owner: Extraction, prefix: Data) {
+    /// The revision `prefix` with the update that lists every object and pins every body in `pins`; nil when the reader
+    /// can't open that.
+    init?(of owner: Extraction, prefix: Data, pins: [Header]) {
         self.owner = owner
-        guard let augmented = Self.augmented(prefix, highest: owner.highest, generations: owner.generations),
+        self.pins = pins
+        guard let augmented = Self.augmented(prefix, highest: owner.highest, generations: owner.generationList,
+                                             pins: pins.map { ($0.offset, $0.key.generation) }),
               let provider = CGDataProvider(data: augmented as CFData), let document = CGPDFDocument(provider),
               let catalog = document.catalog else { return nil }
         if document.isEncrypted { fail(.encrypted) }
@@ -322,9 +388,10 @@ final class Revision {
         self.listed = listed
     }
 
-    /// The prefix plus an update whose catalog (`/BrahmaAll`) lists objects 1…`highest` and every non-zero generation seen,
-    /// in the same kind of cross-reference section as the prefix's last; nil when it ends with no `startxref`.
-    static func augmented(_ prefix: Data, highest: Int, generations: Set<[Int]>) -> Data? {
+    /// The prefix plus an update whose catalog (`/BrahmaAll`) lists objects 1…`highest`, every non-zero generation seen,
+    /// and then fresh numbers whose entries name exactly each pinned body's offset (with its generation), in the same kind
+    /// of cross-reference section as the prefix's last; nil when it ends with no `startxref`.
+    static func augmented(_ prefix: Data, highest: Int, generations: [ObjectKey], pins: [(offset: Int, generation: Int)]) -> Data? {
         let bytes = [UInt8](prefix)
         let tail = Array(bytes.suffix(1024))
         let key = Array("startxref".utf8)
@@ -337,9 +404,10 @@ final class Revision {
         while j < tail.count, isDigit(tail[j]), digits < 12 { previous = previous * 10 + Int(tail[j] - 0x30); j += 1; digits += 1 }
         guard digits > 0, previous < bytes.count else { return nil }
         let classic = matches(Array("xref".utf8), at: previous, in: bytes)
-        let first = highest + 1
+        let first = highest + 1, firstPin = highest + 4
         var refs = highest >= 1 ? (1...highest).map { "\($0) 0 R" } : []
-        refs += generations.sorted { $0.lexicographicallyPrecedes($1) }.map { "\($0[0]) \($0[1]) R" }
+        refs += generations.map { "\($0.number) \($0.generation) R" }
+        refs += pins.enumerated().map { "\(firstPin + $0.offset) \($0.element.generation) R" }
         var update = Data("\n".utf8)
         var offsets: [Int] = []
         func object(_ n: Int, _ body: String) {
@@ -350,16 +418,25 @@ final class Revision {
         object(first + 1, "<< /Type /Pages /Kids [\(first + 2) 0 R] /Count 1 >>")
         object(first + 2, "<< /Type /Page /Parent \(first + 1) 0 R /MediaBox [0 0 1 1] >>")
         let xref = prefix.count + update.count
+        func padded(_ v: Int, _ width: Int) -> String { String(repeating: "0", count: max(0, width - String(v).count)) + "\(v)" }
         if classic {
             var table = "xref\n\(first) 3\n"
-            for o in offsets { table += String(repeating: "0", count: max(0, 10 - String(o).count)) + "\(o) 00000 n \n" }
-            table += "trailer\n<< /Size \(first + 3) /Root \(first) 0 R /Prev \(previous) >>\nstartxref\n\(xref)\n%%EOF\n"
+            for o in offsets { table += padded(o, 10) + " 00000 n \n" }
+            if !pins.isEmpty {
+                table += "\(firstPin) \(pins.count)\n"
+                for pin in pins { table += padded(pin.offset, 10) + " " + padded(pin.generation, 5) + " n \n" }
+            }
+            table += "trailer\n<< /Size \(firstPin + pins.count) /Root \(first) 0 R /Prev \(previous) >>\nstartxref\n\(xref)\n%%EOF\n"
             update += Data(table.utf8)
         } else {
             var rows = Data()
             func bigEndian(_ v: Int, _ n: Int) { for k in (0..<n).reversed() { rows.append(UInt8((v >> (8 * k)) & 0xFF)) } }
-            for o in offsets + [xref] { rows.append(1); bigEndian(o, 8); bigEndian(0, 2) }
-            update += Data(("\(first + 3) 0 obj\n<< /Type /XRef /Size \(first + 4) /Index [\(first) 4] /W [1 8 2] /Root \(first) 0 R "
+            let me = firstPin + pins.count
+            for o in offsets { rows.append(1); bigEndian(o, 8); bigEndian(0, 2) }
+            for pin in pins { rows.append(1); bigEndian(pin.offset, 8); bigEndian(pin.generation, 2) }
+            rows.append(1); bigEndian(xref, 8); bigEndian(0, 2)
+            let index = pins.isEmpty ? "\(first) 3 \(me) 1" : "\(first) 3 \(firstPin) \(pins.count + 1)"
+            update += Data(("\(me) 0 obj\n<< /Type /XRef /Size \(me + 1) /Index [\(index)] /W [1 8 2] /Root \(first) 0 R "
                             + "/Prev \(previous) /Length \(rows.count) >>\nstream\n").utf8)
             update += rows
             update += Data("\nendstream\nendobj\nstartxref\n\(xref)\n%%EOF\n".utf8)
@@ -368,10 +445,11 @@ final class Revision {
     }
 
     /// Walks every listed object, then scans every content stream; returns the digest of the stream each listed object
-    /// number names (object streams can't hold streams, so every stream has a number of its own).
-    func read() -> [Int: Data] {
-        var byNumber: [Int: Data] = [:]
+    /// (number, generation) names, and of the body pinned at each offset.
+    func read() -> (byKey: [ObjectKey: Data], pinned: [Int: Data]) {
+        var byKey: [ObjectKey: Data] = [:], pinned: [Int: Data] = [:]
         var digestOf: [Int: Data] = [:]
+        let generations = owner.generationList
         let count = CGPDFArrayGetCount(listed)
         for i in 0..<count {
             var o: CGPDFObjectRef? = nil
@@ -380,15 +458,20 @@ final class Revision {
             let root = CGPDFObjectGetValue(o, .stream, &s) ? s : nil
             walk(o, digests: &digestOf)
             guard let root, let digest = digestOf[unsafeBitCast(root, to: Int.self)] else { continue }
-            let number = i < owner.highest ? i + 1 : owner.generationNumbers[i - owner.highest]
-            if i < owner.highest { byNumber[number] = digest }
-            owner.streamObjects.insert("\(number) \(digest.base64EncodedString())")
+            if i < owner.highest {
+                byKey[ObjectKey(number: i + 1, generation: 0)] = digest
+            } else if i - owner.highest < generations.count {
+                byKey[generations[i - owner.highest]] = digest
+            } else if i - owner.highest - generations.count < pins.count {
+                pinned[pins[i - owner.highest - generations.count].offset] = digest
+            }
         }
         for key in contentStreams.sorted() {
-            guard let stream = streams[key] else { continue }
+            // Round 4: a content stream marked but never decoded is refused, never skipped.
+            guard let stream = streams[key] else { fail(.unaccounted) }
             scanContent(stream)
         }
-        return byNumber
+        return (byKey, pinned)
     }
 
     // MARK: The walk
@@ -473,7 +556,7 @@ final class Revision {
     }
 
     /// A cross-reference stream may only describe objects up to the highest number the update listed.
-    /// Its rows (decoded) record which number each in-use (type 1) entry's offset is.
+    /// Its rows (decoded) record which object (number, generation) each in-use (type 1) entry says starts at its offset.
     func checkCrossReference(_ d: CGPDFDictionaryRef, rows: Data) {
         var type: UnsafePointer<CChar>? = nil
         guard CGPDFDictionaryGetName(d, "Type", &type), let type, String(cString: type) == "XRef" else { return }
@@ -518,8 +601,8 @@ final class Revision {
                 guard b.count - at >= row else { fail(.unaccounted) }
                 let kind = w[0] == 0 ? 1 : field(w[0])
                 let offset = field(w[1])
-                _ = field(w[2])
-                if kind == 1 { owner.record(number: range.start + k, offset: offset) }
+                let generation = field(w[2])
+                if kind == 1 { owner.record(number: range.start + k, generation: generation, offset: offset) }
             }
         }
     }

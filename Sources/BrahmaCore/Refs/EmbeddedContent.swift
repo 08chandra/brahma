@@ -26,7 +26,7 @@ enum EmbeddedContent {
     /// give none. Throws `ArchiveReadError`.
     static func scan(_ data: Data, ext: String, archives: any ArchiveReader, expanded: [(name: String, value: String)],
                      budget: ArchiveScanBudget, level: Int, chunk: Int) throws -> [ScanFinding] {
-        let archive = ArchiveMemberScan.isArchive(data, ext: ext), pdf = isPDF(data, ext: ext), png = isPNG(data)
+        let archive = ArchiveMemberScan.isArchive(data, ext: ext, deadline: budget.deadline), pdf = isPDF(data, ext: ext), png = isPNG(data)
         guard archive || pdf || png else { return [] }
         try budget.ensure(level < budget.depth)
         var found: [ScanFinding] = []
@@ -196,6 +196,57 @@ enum EmbeddedContent {
         let b = [UInt8](data)
         guard b.count >= 2, b[0] & 0x0F == 8, (Int(b[0]) << 8 | Int(b[1])) % 31 == 0, b[1] & 0x20 == 0 else { throw failure }
         return try inflateRaw(Data(b[2...]), cap: cap, failure: failure)
+    }
+
+    /// What a deflate probe saw (R4-3).
+    enum ProbeResult: Equatable {
+        /// The stream ended (its last block decoded).
+        case ended
+        /// A data error: not deflate.
+        case dataError
+        /// The input ran out before the stream ended (a cut stream, or the probe's slice).
+        case needsInput
+        /// More output than `outputCap`.
+        case overOutput
+    }
+
+    /// Raw DEFLATE `data` (read in place, never copied) decoded at most to `outputCap` bytes of output, which are thrown
+    /// away: whether it ends, fails with a data error, runs out of input, or passes the cap. No flush is asked for, so input
+    /// that stops mid-stream is told apart from data that is wrong. Where there is no `Compression` (Linux) every probe is a
+    /// data error (no zip is detected by its local header alone there; the end record and the extension still are).
+    static func deflateProbe(_ data: Data, outputCap: Int) -> ProbeResult {
+        #if canImport(Compression)
+        guard !data.isEmpty else { return .needsInput }
+        let chunk = 65_536
+        let dst = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { dst.deallocate() }
+        var stream = compression_stream(dst_ptr: dst, dst_size: 0, src_ptr: UnsafePointer(dst), src_size: 0, state: nil)
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else { return .needsInput }
+        defer { compression_stream_destroy(&stream) }
+        return data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> ProbeResult in
+            guard let base = src.bindMemory(to: UInt8.self).baseAddress else { return .needsInput }
+            stream.src_ptr = base
+            stream.src_size = src.count
+            var total = 0
+            while true {
+                stream.dst_ptr = dst
+                stream.dst_size = chunk
+                let status = compression_stream_process(&stream, 0)
+                let produced = chunk - stream.dst_size
+                total += max(0, produced)
+                if total > outputCap { return .overOutput }
+                switch status {
+                case COMPRESSION_STATUS_END: return .ended
+                case COMPRESSION_STATUS_OK:
+                    // No progress with all the input given: it needs more than there is.
+                    if produced == 0 && stream.src_size == 0 { return .needsInput }
+                default: return .dataError
+                }
+            }
+        }
+        #else
+        return .dataError
+        #endif
     }
 
     /// Raw DEFLATE through Apple's bounded `Compression` stream; where there is none (Linux), nothing compressed is decoded

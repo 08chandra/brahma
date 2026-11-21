@@ -60,7 +60,14 @@ public struct SeatbeltRunner: SandboxedRunner {
     /// directories) without following a link. The profile is rendered from the very paths the check saw (no second resolve:
     /// `resolvePolicyPaths: false`), so a link swapped in between the check and the render cannot widen it (Task 7, obligation
     /// d); the `TMPDIR` step then opens the writable entry with `O_NOFOLLOW`, so a swapped writable entry fails here.
+    /// `prepare(program:)` for a shell command (`/bin/sh -c <command>`).
     func prepare(command: String, environment: [String: String], policy: SandboxPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
+        try prepare(program: Self.shell(command), environment: environment, policy: policy, proxyPort: proxyPort, marker: marker)
+    }
+
+    /// `program` is what `sandbox-exec` runs (argv): `/bin/sh -c <command>` (`shell`), or one program as itself (C2b fix
+    /// round 4, `runProgramBlocking`).
+    func prepare(program: [String], environment: [String: String], policy: SandboxPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
         let base = baseline()
         try SandboxPolicyCheck.validate(policy, baseline: base)
         afterValidate?()
@@ -92,7 +99,7 @@ public struct SeatbeltRunner: SandboxedRunner {
                 env[name] = nil
             }
         }
-        return Prepared(arguments: [Self.sandboxExec, "-p", profile, "/bin/sh", "-c", command], environment: env)
+        return Prepared(arguments: [Self.sandboxExec, "-p", profile] + program, environment: env)
     }
 
     /// Ensures `<entry>/<sub>` without following a link at `entry` itself: the walk is anchored at `entry`'s parent (an
@@ -124,7 +131,7 @@ public struct SeatbeltRunner: SandboxedRunner {
         let outcome = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<CheckOutcome, Never>) in
                 let thread = Thread { [self] in
-                    continuation.resume(returning: runHere(command: command, cwd: cwd, environment: environment, timeout: timeout,
+                    continuation.resume(returning: runHere(program: Self.shell(command), cwd: cwd, environment: environment, timeout: timeout,
                                                            outputURL: outputURL, policy: policy, port: port, cancel: cancel, groups: groups))
                 }
                 thread.name = "brahma-sandboxed-check"
@@ -142,13 +149,32 @@ public struct SeatbeltRunner: SandboxedRunner {
         do { port = try policy.allowedDomains.map { try proxies.proxyNow(for: $0).port } } catch {
             return GroupRun.fail("could not run the check: the egress proxy did not start (\(error))", outputURL: outputURL)
         }
-        return runHere(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy,
-                       port: port, cancel: GroupRun.CancelFlag(), groups: ChildGroups.current)
+        return runHere(program: Self.shell(command), cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL,
+                       policy: policy, port: port, cancel: GroupRun.CancelFlag(), groups: ChildGroups.current)
     }
 
+    /// C2b fix round 4 (R4-4): one program as itself under the policy (no shell), on the calling thread, as the leader of a
+    /// new session, its standard output capped (`SandboxedRunner.runProgramBlocking`). No network. A confined policy runs
+    /// only one of its own programs.
+    public func runProgramBlocking(arguments: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                                   stdoutURL: URL, stdoutCap: Int, policy: SandboxPolicy) -> CheckOutcome {
+        guard let program = arguments.first, policy.allowedDomains == nil, stdoutCap >= 0 else {
+            return GroupRun.fail("could not run the program in the sandbox: no program, or a network it may not have", outputURL: outputURL)
+        }
+        if let confined = policy.confined, !confined.executables.contains(where: { $0.path == program }) {
+            return GroupRun.fail("could not run the program in the sandbox: \(program) is not one its policy runs", outputURL: outputURL)
+        }
+        return runHere(program: arguments, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy,
+                       port: nil, cancel: GroupRun.CancelFlag(), groups: ChildGroups.current, stdout: (stdoutURL, stdoutCap), newSession: true)
+    }
+
+    /// `command` as `sandbox-exec` runs it: through `/bin/sh -c`.
+    static func shell(_ command: String) -> [String] { ["/bin/sh", "-c", command] }
+
     /// One run, start to end, on the current thread: `prepare`, the run, the B-I4 sweep, the temp removal.
-    func runHere(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL, policy: SandboxPolicy,
-                 port: UInt16?, cancel: GroupRun.CancelFlag, groups: ChildGroups?) -> CheckOutcome {
+    func runHere(program: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL, policy: SandboxPolicy,
+                 port: UInt16?, cancel: GroupRun.CancelFlag, groups: ChildGroups?, stdout: (url: URL, cap: Int)? = nil,
+                 newSession: Bool = false) -> CheckOutcome {
         let (grace, clock) = (termGrace, self.clock)
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
         // Everything the run starts is newer than this; it bounds the B-I4 sweep so a recycled pid is never killed.
@@ -156,14 +182,14 @@ public struct SeatbeltRunner: SandboxedRunner {
         // The per-run marker the profile allows and the sweep probes for; survives the check deleting its own checkout.
         let marker = Self.runMarker()
         let prepared: Prepared
-        do { prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port, marker: marker) } catch {
+        do { prepared = try prepare(program: program, environment: environment, policy: policy, proxyPort: port, marker: marker) } catch {
             Self.removeTemp(policy)   // a partly created TMPDIR goes too (N6)
             return GroupRun.fail("could not run the check in the sandbox: \(error)", outputURL: outputURL)
         }
         var result = GroupRun.run(executable: Self.sandboxExec, arguments: prepared.arguments,
                                   workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
                                   environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel,
-                                  groups: groups, memoryLimit: policy.memoryLimit)
+                                  groups: groups, memoryLimit: policy.memoryLimit, stdout: stdout, newSession: newSession)
         // B-I4: kill anything the run left behind, recognized by the run's marker (even if it deleted its
         // checkout). N2: killed stragglers leave the outcome as it is (tools that daemonize are normal) and are
         // reported; only ones that could not be killed or classified, or an unreadable process table, make the
@@ -184,7 +210,7 @@ public struct SeatbeltRunner: SandboxedRunner {
     public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
         let port = try policy.allowedDomains.map { try proxies.proxyNow(for: $0).port }
         let marker = Self.runMarker()
-        let prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port, marker: marker)
+        let prepared = try prepare(program: Self.shell(command), environment: environment, policy: policy, proxyPort: port, marker: marker)
         try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let file = open(logURL.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard file >= 0 else { throw SandboxError.invalidPath("cannot open the log \(logURL.path)") }
