@@ -1082,3 +1082,8 @@ Migration `vS-canary-auto`:
 - `site/src/content/docs/docs/troubleshooting.md` `#sandbox-denial`: the reasons "missing probe file" and "no probes" are gone, and `sandbox-rules` and `claude-build` are new.
 - `site/src/content/docs/docs/safety/sandbox.md` and the CLI reference pages for `canary edit`, `doctor` and the new `settings claude-updates`, via `internals/modules/brahma-cli.mdx`.
 - `internals/modules/brahmacore/safety.mdx`.
+- **The installed CLI lacks a tool the profile names (from 4a's final review, 11/21).** `claude` 2.1.325 has no `Skill` tool, but the Sandboxed profile's `--tools` names it. The Doctor's `tools-present` check therefore fails, and on today's CLI Sandboxed companies can't run turns.
+  - Plan S must compile `--tools` from the intersection of the profile's tools and the tools the installed CLI reports. A tool the profile names but the CLI lacks is dropped and reported as a Doctor warning, never as a block. This is safe because a missing tool only shrinks what the agent can do.
+  - It must never add a tool the profile doesn't name.
+  - The canary key already includes the CLI build, so the reduced shape gets its own canary pass.
+- **WebRTC egress (from 4a's final review C1/I1, fixed on plan4a-previews):** every WKWebView Brahma hosts must disable WebRTC with a fail-closed guard. Add it to the safety lint as a forbidden-API check: a WKWebView created without the guard fails the lint.
