@@ -931,3 +931,8 @@ Results are recorded in the final task report. A canary failure blocks the merge
 - **S1 is the re-baseline.** It records the shipped names and counts, which later tasks treat as authoritative over this spec's C-tree counts.
 - **Parallel lane.** S13 → S14a → S14b (prompts and tool outputs) are independent of S8–S12 (helper) and may run as a parallel lane after S4. Everything else is sequential: S1 → S2 → S3 → S4 → S5 → S6 → S7 → S8 → S9 → S9b → S10 → S10b → S11 → S12 → S15 → S16. S16 starts only after S14b.
 - **4b and dogfood.** Plan S must merge before the dogfood run. A 4b lane that lands meanwhile must pass `SafetyLintTests`. The baseline is not raised for it without a controller ruling.
+
+## Controller addendum, 2026-11-21 (from Plan C's C2a review)
+
+- **Taint copied through an agent's own git** (cherry-pick, update-ref, re-applying a patch) is not caught by Plan C's per-commit taint rows. Plan S must add engine-side detection at submit and review: a commit whose `git patch-id` matches a tainted commit's patch-id (company-scoped) is tainted. With helper-mediated git (this plan's helper), also record taint on objects the helper materialises for a tainted session.
+- **Performance note:** Plan C's `refTaint` for `commit:` and key-less revs runs about 3 git subprocesses per tainted item per resolve. Fold these into the helper's batched git calls.
