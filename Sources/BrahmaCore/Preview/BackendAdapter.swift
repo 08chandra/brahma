@@ -6,9 +6,11 @@ import Glibc
 #endif
 
 /// A backend preview (Plan 4a Task 5): L's web start (`WebAdapter.startServer`: build, server, readiness, loopback-only), then
-/// the surface's smoke requests, each once with its own `requestTimeout`, against the preview's own origin — the loopback
-/// host and port it answered on, whatever path the surface's URL has. A request whose path would leave that origin is never
-/// sent, and a redirect is the answer (`HTTPProbing` follows none). A request is ok when it got a status, and that status is
+/// the surface's smoke requests, each once with its own `requestTimeout`, against the preview's own origin: always
+/// `http://127.0.0.1:<c.port>`, the engine's port, which L's start verified listens on the loopback only (fix round 1, I1).
+/// When the surface's URL names another port (a literal port), no smoke request is sent at all (`ownPortOnly`): the engine
+/// runs unsandboxed, and agent-chosen methods, paths and bodies must never reach another local service. A request whose path
+/// would leave the origin is never sent, and a redirect is the answer (`HTTPProbing` follows none). A request is ok when it got a status, and that status is
 /// its `expectStatus`, or below 400 when it has none. The result is `running` with `"<ok>/<n> smoke requests ok"`; the
 /// requests run again on every start (so every restart) and for every `demo`.
 ///
@@ -18,7 +20,7 @@ import Glibc
 /// `openapi_path`, when set, is resolved at every start: its real path must be inside the run, and it must be a regular file
 /// of at most `openapiMaxBytes`. The engine copies it (read without following a link, checked on the open descriptor) to
 /// `EngineLayout.previewOpenAPI(name:)`, the only copy the app reads, scrubbed with the context's redactor; otherwise the
-/// message says why and no copy is left.
+/// message says why and no copy is left. A start that does not end `running` removes any copy an earlier start left.
 public struct BackendAdapter: PreviewAdapter {
     /// Each smoke request's own timeout.
     public static let requestTimeout: Duration = .seconds(10)
@@ -27,6 +29,7 @@ public struct BackendAdapter: PreviewAdapter {
     static let openapiRefusal = "openapi_path must be a regular file of at most 2 MB inside the repo"
     static let openapiWithheld = "openapi_path was not copied: secrets could not be loaded to scrub it"
     static let offOrigin = "the smoke path does not stay on the preview's origin"
+    static let ownPortOnly = "smoke requests run only against the preview's own port"
 
     public let deps: PreviewDependencies
 
@@ -40,10 +43,19 @@ public struct BackendAdapter: PreviewAdapter {
         var routed = deps
         routed.sandbox = deps.runner(for: c)
         var update = await WebAdapter.startServer(c, deps: routed, onSpawn: c.onSpawn)
-        guard update.status == .running, let resolved = update.resolvedURL else { return update }
+        guard update.status == .running, let resolved = update.resolvedURL else {
+            Self.removeOpenAPICopy(c)
+            return update
+        }
         var notes: [String] = []
         if !c.surface.smoke.isEmpty {
-            let results = await Self.smoke(c, resolvedURL: resolved, http: deps.http)
+            guard let base = Self.origin(resolvedURL: resolved, port: c.port) else {
+                notes.append(Self.ownPortOnly)
+                if let refusal = Self.copyOpenAPI(c) { notes.append(refusal) }
+                update.message = notes.joined(separator: "; ")
+                return update
+            }
+            let results = await Self.smoke(c, base: base, http: deps.http)
             if Task.isCancelled { return PreviewUpdate(status: .stopped, message: nil, process: update.process) }
             update.smokeResults = results
             notes.append(Self.summary(results))
@@ -63,7 +75,10 @@ public struct BackendAdapter: PreviewAdapter {
         let name = c.surface.name
         if c.surface.smoke.isEmpty { return await WebAdapter(deps: deps).demo(c, state: state) }
         guard state.status == .running, let resolved = state.resolvedURL else { return DemoCapture(ok: false, line: "\(name): not running") }
-        let results = await Self.smoke(c, resolvedURL: resolved, http: deps.http)
+        guard let base = Self.origin(resolvedURL: resolved, port: c.port) else {
+            return DemoCapture(ok: false, line: "\(name): \(Self.ownPortOnly)")
+        }
+        let results = await Self.smoke(c, base: base, http: deps.http)
         return DemoCapture(ok: results.allSatisfy(\.ok), line: "\(name): \(Self.summary(results))")
     }
 
@@ -73,18 +88,17 @@ public struct BackendAdapter: PreviewAdapter {
 
     // MARK: Smoke requests
 
-    /// The origin of a started preview: its resolved URL (the one that answered, on the port it was started on) without
-    /// user, path, query or fragment; nil unless its host is the loopback.
-    static func origin(resolvedURL: String) -> URL? {
-        guard var parts = URLComponents(string: resolvedURL), let host = parts.host, LoopbackURL.isLoopback(host: host),
-              parts.port != nil else { return nil }
-        parts.user = nil; parts.password = nil; parts.path = ""; parts.query = nil; parts.fragment = nil
-        return parts.url
+    /// The smoke origin of a started preview: `http://127.0.0.1:<port>`, `port` being the engine's (`c.port`), never one the
+    /// agent wrote. Nil (no smoke request is sent) when the resolved URL is not a loopback URL on that same port, or the port
+    /// is not one the engine allocates.
+    static func origin(resolvedURL: String, port: Int) -> URL? {
+        guard let parts = URLComponents(string: resolvedURL), let host = parts.host, LoopbackURL.isLoopback(host: host),
+              parts.port == port, (1024...65535).contains(port) else { return nil }
+        return URL(string: "http://127.0.0.1:\(port)")
     }
 
     /// Each request once, in order; cancellation stops before the next one.
-    static func smoke(_ c: PreviewContext, resolvedURL: String, http: any HTTPProbing) async -> [SmokeResult] {
-        let base = origin(resolvedURL: resolvedURL)
+    static func smoke(_ c: PreviewContext, base: URL, http: any HTTPProbing) async -> [SmokeResult] {
         var results: [SmokeResult] = []
         for request in c.surface.smoke {
             if Task.isCancelled { break }
@@ -94,8 +108,8 @@ public struct BackendAdapter: PreviewAdapter {
     }
 
     /// One request: ok = `status != nil && (expectStatus.map { $0 == status } ?? status! < 400)`.
-    static func probe(base: URL?, request: SmokeRequest, http: any HTTPProbing, redactor: Redactor?) async -> SmokeResult {
-        guard let base, let url = DeploySmoke.url(base: base, path: request.path), url.user == nil else {
+    static func probe(base: URL, request: SmokeRequest, http: any HTTPProbing, redactor: Redactor?) async -> SmokeResult {
+        guard let url = DeploySmoke.url(base: base, path: request.path), url.user == nil else {
             return SmokeResult(url: redacted(Store.flat(request.path, max: 200), redactor) ?? "", method: request.method, status: nil,
                                millis: 0, bodyPrefix: "", ok: false, error: offOrigin)
         }
@@ -139,14 +153,13 @@ public struct BackendAdapter: PreviewAdapter {
         let name = c.surface.name
         let logs = ".brahma/preview/logs"
         let copyName = c.layout.previewOpenAPI(name: name).lastPathComponent
+        // Whatever an earlier start left goes first, so a refusal or a failure below never leaves an old copy.
+        removeOpenAPICopy(c)
         func refuse() -> String {
-            try? EngineFiles.remove(workspace: c.layout.workspace, dir: logs, name: copyName)
+            removeOpenAPICopy(c)
             return openapiRefusal
         }
-        guard let relative = c.surface.openapiPath else {
-            try? EngineFiles.remove(workspace: c.layout.workspace, dir: logs, name: copyName)
-            return nil
-        }
+        guard let relative = c.surface.openapiPath else { return nil }
         guard PreviewSurface.isRelativePath(relative), let run = realpath(c.run.path),
               let real = realpath(c.run.appending(path: relative).path), real.hasPrefix(run + "/") else { return refuse() }
         guard let data = EngineFiles.readNoFollow(URL(fileURLWithPath: real), under: URL(fileURLWithPath: run, isDirectory: true),
@@ -158,9 +171,18 @@ public struct BackendAdapter: PreviewAdapter {
         } catch {
             return refuse()
         }
-        // Scrubbed like every engine-kept output; when it cannot be, the copy is gone (`seal` removed it).
+        // Scrubbed like every engine-kept output; when it cannot be, the copy is gone (`seal` removed it). A redaction that
+        // took it over the limit the app accepts removes it too.
         guard CLIAdapter.seal(c.layout.previewOpenAPI(name: name), redactor: c.redactor, cap: .max).kept else { return openapiWithheld }
+        var st = stat()
+        guard lstat(c.layout.previewOpenAPI(name: name).path, &st) == 0, Int(st.st_size) <= openapiMaxBytes else { return refuse() }
         return nil
+    }
+
+    /// Removes the engine's OpenAPI copy of the surface, if any (the entry itself, by descriptor, never through a link).
+    static func removeOpenAPICopy(_ c: PreviewContext) {
+        try? EngineFiles.remove(workspace: c.layout.workspace, dir: ".brahma/preview/logs",
+                                name: c.layout.previewOpenAPI(name: c.surface.name).lastPathComponent)
     }
 
     private static func realpath(_ path: String) -> String? {

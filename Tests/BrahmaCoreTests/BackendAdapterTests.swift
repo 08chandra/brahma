@@ -139,6 +139,25 @@ import Glibc
         #expect(sent.count == 3)          // the readiness GET, /go, /@evil.example/
         #expect(sent.allSatisfy { $0.url.host == "127.0.0.1" && $0.url.port == 47100 && $0.url.user == nil }, "\(sent)")
         await s.stop(update)
+
+        // Fix round 1 (I1): a literal port in the URL that is not the engine's port. L's start already checked that the
+        // preview listens on `c.port` (47100) only; the smoke requests (agent-chosen methods, paths and bodies) never go to
+        // the literal port, where another local service may listen. None is sent, and the message says why.
+        let literal = FakeHTTPProbe([FakeHTTPProbe.ok()])
+        let l = try Self.setup(smoke: [SmokeRequest(method: "POST", path: "/admin/delete", body: "{\"all\":true}"),
+                                       SmokeRequest(method: "GET", path: "/health")],
+                               url: "http://127.0.0.1:47199/", http: literal)
+        let lu = await l.adapter.start(l.context)
+        #expect(lu.status == .running && lu.smokeResults.isEmpty, "\(lu)")
+        #expect(lu.message == "smoke requests run only against the preview's own port", "\(lu)")
+        // Only L's readiness GET reached the URL; no smoke request went anywhere.
+        #expect(literal.requests.allSatisfy { $0.method == "GET" && $0.url.path == "/" && $0.body == nil }, "\(literal.requests)")
+        #expect(!literal.requests.contains { $0.url.path == "/health" || $0.url.path.hasPrefix("/admin") })
+        let before = literal.requests.count
+        let ld = await l.adapter.demo(l.context, state: Self.running(lu))
+        #expect(!ld.ok && ld.line == "api: smoke requests run only against the preview's own port", "\(ld)")
+        #expect(literal.requests.count == before)
+        await l.stop(lu)
     }
 
     @Test func unreachableRequestRecordsError() async throws {
@@ -155,8 +174,11 @@ import Glibc
         let dead = try Self.setup(smoke: [SmokeRequest(method: "GET", path: "/health")], http: FakeHTTPProbe())
         var c = dead.context
         c.surface.run = "exit 4"
+        // Fix round 1: an OpenAPI copy an earlier start left is removed when a start fails.
+        try Data("stale".utf8).write(to: c.layout.previewOpenAPI(name: "api"))
         let failed = await dead.adapter.start(c)
         #expect(failed.status == .failed && failed.smokeResults.isEmpty, "\(failed)")
+        #expect(!FileManager.default.fileExists(atPath: c.layout.previewOpenAPI(name: "api").path))
     }
 
     @Test func openapiConfined() async throws {
