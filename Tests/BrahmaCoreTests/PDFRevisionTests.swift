@@ -189,6 +189,81 @@ import Foundation
             #expect(outcome { try check(cf, file, canonical: name, archives: reader) } == "clean", "\(name)")
         }
     }
+
+    /// C2b-carry (a), the last breaker review's Critical: a number padded with leading zeros is read in full, as poppler
+    /// reads it (its lexer takes leading zeros without limit, and its table rebuild reads a header's number with atoi).
+    /// The reviewer's `mkh.py` files, rebuilt here:
+    /// - `hid_ref9.pdf`: the page content (the key, Flate) says `/Filter 0000000000008 0 R`, and `0000000008 0 obj
+    ///   /FlateDecode endobj` sits in the body, named by no table row (`/Size 9`). The helper read it clean and `pdftotext`
+    ///   printed the key.
+    /// - `hid_gen9.pdf`: the generation padded instead (`/Filter 8 0000000000000 R`).
+    /// - `hid_plainref9.pdf`: the plain reference to the same padded header (rule (b) refused it already; it still must).
+    /// - a padded header placed after the real object of the same number (poppler's rebuild takes the last header for a
+    ///   number), and a padded reference inside an object-stream member.
+    /// All refused (Ruling 35's refusal). Controls (`lin_ok` and the rest in the tests above) are unchanged; here a padded
+    /// reference to an object the table does name reads clean, as it reads the same for every reader.
+    @Test func paddedNumbersRefused() throws {
+        guard EmbeddedContentTests.helperReady else { return }
+        let cf = try CollabFixture()
+        let reader = try EmbeddedContentTests.reader(cf)
+        let refused: [(String, Data)] = [
+            ("hid_ref9.pdf", PaddedBuild.hidden(filter: "0000000000008 0 R", header: "0000000008 0 obj")),
+            ("hid_gen9.pdf", PaddedBuild.hidden(filter: "8 0000000000000 R", header: "0000000008 0 obj")),
+            ("hid_plainref9.pdf", PaddedBuild.hidden(filter: "8 0 R", header: "0000000008 0 obj")),
+            ("hid_ref_noh9.pdf", PaddedBuild.hidden(filter: "0000000000008 0 R", header: nil)),
+            ("hid_after.pdf", PaddedBuild.paddedAfterReal()),
+            ("member_padded.pdf", PDFBuild.objectStreams(hidden: "<< /See 0000000000012 0 R >>")),
+            ("huge_ref.pdf", SplitBuild.referring("<< /See 99999999999999999999999 0 R >>")),
+        ]
+        for (name, file) in refused {
+            #expect(!String(decoding: file, as: UTF8.self).contains(Self.aws))
+            #expect(unverifiable { try check(cf, file, canonical: name, archives: reader) },
+                    "\(name): \(outcome { try check(cf, file, canonical: name, archives: reader) })")
+        }
+        #expect(outcome { try check(cf, SplitBuild.referring("<< /See 0000000000005 0 R >>"), canonical: "padded_seen.pdf", archives: reader) }
+                == "clean")
+        let control = PaddedBuild.hidden(filter: "8 0 R", header: "8 0 obj", listed: true)
+        let caught = outcome { try check(cf, control, canonical: "hid_ctrl.pdf", archives: reader) }
+        #expect(caught.contains("looks like it contains a secret"), "\(caught)")
+    }
+}
+
+/// C2b-carry (a): the last breaker review's `mkh.py`.
+enum PaddedBuild {
+    /// One revision: catalog, pages, a page whose content 4 (the key, Flate) says `/Filter <filter>`, a font, then (with
+    /// `header`) object 8 `/FlateDecode` under that header text; the table names 1–5 (and 8 when `listed`), `/Size 9`.
+    static func hidden(filter: String, header: String?, listed: Bool = false) -> Data {
+        let secret = PDFBuild.zlib(Data("BT /F1 24 Tf 20 100 Td (\(SecretGateTests.aws)) Tj ET".utf8))
+        var w = SplitBuild.Writer()
+        w.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        w.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+        w.obj(4, "<< /Length \(secret.count) /Filter \(filter) >>", stream: secret)
+        w.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        if let header {
+            w.offsets[8] = w.out.count
+            w.out += Data("\(header)\n/FlateDecode\nendobj\n".utf8)
+        }
+        w.table(listed ? [1, 2, 3, 4, 5, 8] : [1, 2, 3, 4, 5], size: 9)
+        return w.out
+    }
+
+    /// `SplitBuild.referring` with a clean object 6, then `0000000006 0 obj` (a note whose string, hex, holds the key) after
+    /// it, named by no row: the lexer saw no header there, poppler's rebuild takes it for object 6.
+    static func paddedAfterReal() -> Data {
+        var w = SplitBuild.Writer()
+        w.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        w.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+        let clean = PDFBuild.zlib(PDFBuild.text("hello"))
+        w.obj(4, "<< /Length \(clean.count) /Filter /FlateDecode >>", stream: clean)
+        w.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        w.obj(6, "<< /Note (real) >>")
+        let hex = Data(SecretGateTests.aws.utf8).map { String(format: "%02X", $0) }.joined()
+        w.out += Data("0000000006 0 obj\n<< /Note <\(hex)> >>\nendobj\n".utf8)
+        w.table([1, 2, 3, 4, 5, 6], size: 7)
+        return w.out
+    }
 }
 
 /// Breaker B-1: the reviewer's `mk4.py` (split) and `mk.py` (norev) of re-review 5, and the rule-by-rule files.

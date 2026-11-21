@@ -57,6 +57,11 @@
 //    an object in use with that generation (missing, free, out of range); (c) an object header or object-stream member
 //    inside the view's bytes that the view does not resolve to exactly that body; and, to see what the reader did, any
 //    number the view's sections and the reader's resolution disagree on (an object `null` in its own bytes aside).
+//    C2b-carry (a): every number these checks read (an object header's number and generation, a reference's, a table
+//    row's, `/Size`, `startxref`, an object stream's header) is read in full, however many digits, leading zeros
+//    included (`appendingDigit`, saturating at `Int.max`), as poppler reads it: `0000000000008 0 R` is a reference to 8
+//    and `0000000008 0 obj` a header of 8, so a padded reference to a padded header no row names is an anomaly, and so
+//    is a padded header after a real object of its number (one number, two bodies).
 // 6. Adds the page text of the last revision as PDFKit extracts it.
 // A thread checks the process's own memory footprint every 20 ms and exits (status 9) past the limit (default 1 GiB);
 // the engine's watchdog kills the whole run at its own limit too.
@@ -89,6 +94,22 @@ func isRegular(_ c: UInt8) -> Bool {
     }
 }
 func isDigit(_ c: UInt8) -> Bool { c >= 0x30 && c <= 0x39 }
+
+/// C2b-carry (a): `value` with one more decimal digit `c`, saturating at `Int.max`. Every number the structure checks read
+/// is read in full, however many digits (leading zeros included), as poppler reads it: a number no reader can place
+/// saturates, and so resolves nowhere (an anomaly), or is past every object number the helper walks (refused).
+func appendingDigit(_ value: Int, _ c: UInt8) -> Int {
+    let (times, o1) = value.multipliedReportingOverflow(by: 10)
+    let (sum, o2) = times.addingReportingOverflow(Int(c - 0x30))
+    return o1 || o2 ? Int.max : sum
+}
+
+/// The value of the digit run `b[from..<to]` (all digits), saturating.
+func digitValue(_ b: [UInt8], from: Int, to: Int) -> Int {
+    var v = 0
+    for k in from..<to { v = appendingDigit(v, b[k]) }
+    return v
+}
 func isWhite(_ c: UInt8) -> Bool { c == 0x00 || c == 0x09 || c == 0x0A || c == 0x0C || c == 0x0D || c == 0x20 }
 func matches(_ word: [UInt8], at i: Int, in b: [UInt8]) -> Bool {
     guard i >= 0, word.count <= b.count - i else { return false }
@@ -297,9 +318,9 @@ struct Tokenizer {
             let signed = text.first == 0x2B || text.first == 0x2D
             let digits = signed ? text.dropFirst() : text[...]
             if !digits.isEmpty, digits.allSatisfy(isDigit) {
-                guard digits.count <= 12 else { return (.number, start) }
+                // C2b-carry (a): any number of digits, leading zeros included (saturating), as poppler reads them.
                 var v = 0
-                for d in digits { v = v * 10 + Int(d - 0x30) }
+                for d in digits { v = appendingDigit(v, d) }
                 return (.integer(text.first == 0x2D ? -v : v), start)
             }
             if text.allSatisfy({ isDigit($0) || $0 == 0x2B || $0 == 0x2D || $0 == 0x2E }) { return (.number, start) }
@@ -368,18 +389,22 @@ func references(_ b: [UInt8], from: Int, to: Int) -> [(key: ObjectKey, at: Int)]
         guard b[k] == 0x52, k > from, isWhite(b[k - 1]), k + 1 == end || !isRegular(b[k + 1]) else { continue }
         var j = k - 1
         while j >= from, isWhite(b[j]) { j -= 1 }
-        var g = 0, scale = 1, gd = 0
-        while j >= from, isDigit(b[j]), gd < 12 { g += Int(b[j] - 0x30) * scale; scale *= 10; j -= 1; gd += 1 }
+        // C2b-carry (a): each digit run read in full, however long (leading zeros included), saturating.
+        let gEnd = j + 1
+        while j >= from, isDigit(b[j]) { j -= 1 }
+        let gd = gEnd - (j + 1)
+        var g = digitValue(b, from: j + 1, to: gEnd)
         if j >= from, b[j] == 0x2D { g = -g }
         if j >= from, b[j] == 0x2B || b[j] == 0x2D { j -= 1 }
         guard gd > 0, j >= from, isWhite(b[j]) else { continue }
         while j >= from, isWhite(b[j]) { j -= 1 }
-        var n = 0, nd = 0
-        scale = 1
-        while j >= from, isDigit(b[j]), nd < 12 { n += Int(b[j] - 0x30) * scale; scale *= 10; j -= 1; nd += 1 }
+        let nEnd = j + 1
+        while j >= from, isDigit(b[j]) { j -= 1 }
+        let nd = nEnd - (j + 1)
+        var n = digitValue(b, from: j + 1, to: nEnd)
         if j >= from, b[j] == 0x2D { n = -n }
         if j >= from, b[j] == 0x2B || b[j] == 0x2D { j -= 1 }
-        guard nd > 0, nd < 12, gd < 12, j < from || !isRegular(b[j]) else { continue }
+        guard nd > 0, j < from || !isRegular(b[j]) else { continue }
         found.append((ObjectKey(number: n, generation: g), j + 1))
     }
     return found
@@ -806,7 +831,7 @@ final class Extraction {
                 var j = i + startxrefWord.count
                 while j < bytes.count, isWhite(bytes[j]) { j += 1 }
                 var digits = 0, value = 0
-                while j < bytes.count, isDigit(bytes[j]), digits < 12 { value = value * 10 + Int(bytes[j] - 0x30); j += 1; digits += 1 }
+                while j < bytes.count, isDigit(bytes[j]) { value = appendingDigit(value, bytes[j]); j += 1; digits += 1 }
                 if digits > 0 {
                     startxrefs.append(value)
                     var k = j
@@ -818,15 +843,20 @@ final class Extraction {
                 open = nil
             } else if c == 0x6F, i > 0, matches(objWord, at: i, in: bytes), !isRegular(bytes[i - 1]), endsToken(i + objWord.count) {
                 // Back over white space, the generation, white space, the number.
+                // C2b-carry (a): each number read in full, however many digits (leading zeros included), saturating:
+                // poppler's rebuild reads `0000000008 0 obj` as object 8, and so does this lexer now.
                 var j = i - 1
                 while j >= 0, isWhite(bytes[j]) { j -= 1 }
-                var generation = 0, scale = 1, gDigits = 0
-                while j >= 0, isDigit(bytes[j]), gDigits < 6 { generation += Int(bytes[j] - 0x30) * scale; scale *= 10; j -= 1; gDigits += 1 }
+                let gEnd = j + 1
+                while j >= 0, isDigit(bytes[j]) { j -= 1 }
+                let gDigits = gEnd - (j + 1)
+                let generation = digitValue(bytes, from: j + 1, to: gEnd)
                 let afterNumber = j
                 while j >= 0, isWhite(bytes[j]) { j -= 1 }
-                var number = 0, nDigits = 0
-                scale = 1
-                while j >= 0, isDigit(bytes[j]), nDigits < 9 { number += Int(bytes[j] - 0x30) * scale; scale *= 10; j -= 1; nDigits += 1 }
+                let nEnd = j + 1
+                while j >= 0, isDigit(bytes[j]) { j -= 1 }
+                let nDigits = nEnd - (j + 1)
+                let number = digitValue(bytes, from: j + 1, to: nEnd)
                 if gDigits > 0, nDigits > 0, afterNumber > j, j < 0 || !isRegular(bytes[j]) {
                     highest = max(highest, number)
                     // An object left open ends where the next header starts.
@@ -842,7 +872,7 @@ final class Extraction {
                 if j == bytes.count || !isRegular(bytes[j]) || isDigit(bytes[j]) {
                     while j < bytes.count, isWhite(bytes[j]) { j += 1 }
                     var size = 0, digits = 0
-                    while j < bytes.count, isDigit(bytes[j]), digits < 9 { size = size * 10 + Int(bytes[j] - 0x30); j += 1; digits += 1 }
+                    while j < bytes.count, isDigit(bytes[j]) { size = appendingDigit(size, bytes[j]); j += 1; digits += 1 }
                     if digits > 0 { highest = max(highest, size - 1) }
                 }
             } else if c == 0x78, starts, matches(xrefWord, at: i, in: bytes),
@@ -883,7 +913,7 @@ final class Extraction {
         func skipWhite() { while i < bytes.count, isWhite(bytes[i]) { i += 1 } }
         func number() -> Int? {
             var n = 0, digits = 0
-            while i < bytes.count, isDigit(bytes[i]), digits < 12 { n = n * 10 + Int(bytes[i] - 0x30); i += 1; digits += 1 }
+            while i < bytes.count, isDigit(bytes[i]) { n = appendingDigit(n, bytes[i]); i += 1; digits += 1 }
             return digits > 0 ? n : nil
         }
         var table = Table()
@@ -892,7 +922,8 @@ final class Extraction {
             skipWhite()
             guard let first = number() else { break }
             skipWhite()
-            guard let count = number(), count <= Self.maxObjects * 4 else { table.wellFormed = false; break }
+            // (C2b-carry (a): numbers are read in full now, so the subsection's last number must not overflow.)
+            guard let count = number(), count <= Self.maxObjects * 4, first <= Int.max - count else { table.wellFormed = false; break }
             for k in 0..<count {
                 skipWhite()
                 guard let offset = number() else { table.wellFormed = false; break sections }
@@ -1027,7 +1058,7 @@ final class Revision {
         var j = at + key.count
         while j < tail.count, isWhite(tail[j]) { j += 1 }
         var previous = 0, digits = 0
-        while j < tail.count, isDigit(tail[j]), digits < 12 { previous = previous * 10 + Int(tail[j] - 0x30); j += 1; digits += 1 }
+        while j < tail.count, isDigit(tail[j]) { previous = appendingDigit(previous, tail[j]); j += 1; digits += 1 }
         guard digits > 0, previous < bytes.count else { return nil }
         let classic = matches(Array("xref".utf8), at: previous, in: bytes)
         let first = highest + 1, firstPin = highest + 4
@@ -1304,7 +1335,7 @@ final class Revision {
         while values.count < 2 * count {
             while i < b.count, isWhite(b[i]) { i += 1 }
             var v = 0, digits = 0
-            while i < b.count, isDigit(b[i]), digits < 12 { v = v * 10 + Int(b[i] - 0x30); i += 1; digits += 1 }
+            while i < b.count, isDigit(b[i]) { v = appendingDigit(v, b[i]); i += 1; digits += 1 }
             guard digits > 0, i == b.count || isWhite(b[i]) else { return .some(nil) }
             values.append(v)
         }
@@ -1351,7 +1382,7 @@ final class Revision {
                     if let members = header {
                         var first: CGPDFInteger = 0
                         _ = CGPDFDictionaryGetInteger(d, "First", &first)
-                        let starts = members.map { first + $0.offset }
+                        let starts = members.map { first.addingReportingOverflow($0.offset).overflow ? Int.max : first + $0.offset }
                         let sorted = Set(starts + [decoded.count]).sorted()
                         owner.objectStreams[digest] = zip(members, starts).map { member, start in
                             let stop = sorted.first { $0 > start } ?? decoded.count
