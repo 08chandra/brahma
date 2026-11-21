@@ -17,7 +17,7 @@ Run the engine in a terminal, watch what it does, and steer the companies from a
 
 ## Steps
 
-1. Check the `claude` CLI, the sandbox, your backups and `npm`. One line per check: `PASS`, `WARN` or `FAIL`.
+1. Check the `claude` CLI (`version`, `flags`, a `probe` turn), your `plan-tier`, the sandbox items (`sandbox-backend`, `sandbox-canary`), `backup-targets`, `wal-shipping` and `npm`. One line per check: `PASS`, `WARN` or `FAIL`.
 
    ```text
    brahma doctor

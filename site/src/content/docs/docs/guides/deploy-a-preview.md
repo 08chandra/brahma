@@ -11,7 +11,7 @@ Have a preview of `main` the engine builds, runs on `127.0.0.1` and restarts whe
 
 ## Before you start
 
-- `brahma preview set`, `remove` and `restart` are owner commands. Agents usually set the preview themselves with `set_preview_command`; use the CLI when you want to set or replace it by hand.
+- `brahma preview set`, `remove` and `restart` are owner commands. Agents can set the preview themselves with `set_preview_command`; use the CLI when you want to set or replace it by hand.
 - `main` has a web server to run: a start command that listens on a port you pass it, and a URL where it answers.
 - The engine is running (the app, or `brahma run`). A preview is built and started by the engine in a fresh `.git`-free export of `main`, sandboxed except on a Full-profile company; the CLI only records what to run.
 - A company may have at most `8` previews. Ports come from `47100`–`47999`.

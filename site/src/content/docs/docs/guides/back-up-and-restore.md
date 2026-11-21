@@ -60,7 +60,7 @@ Have a snapshot you took yourself, a copy of the backups outside the Mac, and a 
 
    The current database is kept next to it as `brahma.sqlite.pre-restore-<time>`. The CLI lists each setting it kept stricter and each row it brought back; read that list.
 
-7. Start the engine again and end the stop. A restore comes back stopped: nothing runs until you resume.
+7. End the stop, then start the engine again (the app, or `brahma run`). A restore comes back stopped: nothing runs until you resume, and the engine re-adopts the repositories after the resume.
 
    ```text
    brahma resume

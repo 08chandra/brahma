@@ -7,7 +7,7 @@ sidebar:
 
 ## Goal
 
-Have a smoke check on `main`, so that `main` is red while it fails and no deploy can start.
+Have an ops-role agent set a smoke check on `main`, so that `main` is red while it fails and no deploy can start.
 
 ## Before you start
 
@@ -25,7 +25,7 @@ Have a smoke check on `main`, so that `main` is red while it fails and no deploy
 
    With no check it ends `main <commit>: smoke no smoke check`.
 
-2. Ask an ops-role agent to set it. Name the command you want and say that it must pass on `main`. The agent calls `set_smoke_check`; the engine runs that command sandboxed in a clean export of `main`, with a `600` second timeout by default and at most `3600`.
+2. Ask an ops-role agent to set it. Name the command you want and say that it must pass on `main`. The agent calls `set_smoke_check`; the engine runs that command sandboxed (except on a Full-profile company) in a clean export of `main`, with a `600` second timeout by default and at most `3600`.
 
    ```text
    brahma say <company> @cto "Set the smoke check on main to: npm ci && npm test. It must pass on main as it is now."
@@ -44,7 +44,7 @@ Have a smoke check on `main`, so that `main` is red while it fails and no deploy
    ```
 
 :::caution
-While the check fails, `main` is red: the engine files a bug and refuses deploys until a merge turns it green. A check that fails for a reason outside the code (the network, your account, the disk) is re-run and not counted. Before you ask for a strict check, make sure it passes on `main` as it is.
+While the check fails, `main` is red: the engine files a bug and refuses deploys until a run passes. A run that could not start at all (the export failed, or the engine stopped) is recorded as `error`, does not count against `main`, and a merge run is queued again. Anything the command itself does counts: a non-zero exit or a timeout is a failure, a flaky network call included. Before you ask for a strict check, make sure it passes on `main` as it is.
 :::
 
 ## Check it worked
