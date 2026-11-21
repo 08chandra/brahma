@@ -99,6 +99,35 @@ test('console hero shows its final frame when JavaScript is off', async () => {
   }
 });
 
+test('step commands have copy buttons that copy the command', async () => {
+  const { context, page } = await openPage('/');
+  try {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: BASE_URL });
+    const buttons = page.locator('.step__copy');
+    assert.equal(await buttons.count(), 4, 'one copy button per step');
+    const first = buttons.first();
+    assert.ok(await first.isVisible(), 'copy buttons are shown once the script runs');
+    assert.match(await first.getAttribute('aria-label'), /^Copy command: /);
+    await first.click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), await first.getAttribute('data-copy'));
+    const script = await page.evaluate(
+      () => [...document.querySelectorAll('script:not([src])')].find((s) => s.textContent.includes('.step__copy')).textContent.trim().length,
+    );
+    assert.ok(script <= 400, `copy script is ${script} bytes`);
+  } finally {
+    await context.close();
+  }
+});
+
+test('copy buttons stay hidden when JavaScript is off', async () => {
+  const { context, page } = await openPage('/', { javaScriptEnabled: false });
+  try {
+    assert.equal(await page.locator('.step__copy:visible').count(), 0);
+  } finally {
+    await context.close();
+  }
+});
+
 test('404 renders the designed page', async () => {
   const { context, page, response } = await openPage('/does-not-exist');
   try {

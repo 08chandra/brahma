@@ -150,13 +150,19 @@ const kinds = ['message', 'turnStarted', 'turnFinished', 'tool', 'state', 'work'
     color: var(--text1);
     white-space: nowrap;
   }
+  /* Agent-state chips: one row when they fit, an aligned 2 × 2 below 30 em (never 3 + 1). */
   .console__bar {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(2, max-content);
     gap: var(--s-2);
     padding: var(--s-1) var(--s-1) var(--s-3);
     margin-bottom: var(--s-2);
     border-bottom: var(--hairline);
+  }
+  @media (min-width: 30em) {
+    .console__bar {
+      grid-template-columns: repeat(4, max-content);
+    }
   }
   .console__count :global(.chip__label) {
     font-variant-numeric: tabular-nums;

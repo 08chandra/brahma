@@ -164,6 +164,12 @@ a {
 .site-title:hover {
   color: var(--text0);
 }
+/* ≥ 40 px tap target on touch. */
+@media (pointer: coarse) {
+  .site-title {
+    min-height: 2.5rem;
+  }
+}
 /* Starlight draws a 2 rem divider after the social icons even when `social: []`. */
 .header .social-icons:empty {
   display: none;

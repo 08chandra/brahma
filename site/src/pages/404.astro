@@ -71,8 +71,8 @@ const destinations = [
             <div class="kv__row">
               <dt class="label">Search</dt>
               <dd class="kv__hint">
-                Press <kbd>⌘</kbd><kbd>K</kbd> (<kbd>Ctrl</kbd><kbd>K</kbd> on other keyboards) or use the search box
-                above.
+                Press <kbd>⌘</kbd><kbd>K</kbd> (<kbd>Ctrl</kbd><kbd>K</kbd> on other keyboards) or use Search at the
+                top of the page.
               </dd>
             </div>
           </dl>
@@ -110,7 +110,7 @@ const destinations = [
     content: '';
     position: absolute;
     z-index: -1;
-    inset: calc(-1 * var(--s-5)) calc(50% - 50vw) 0;
+    inset: calc(-1 * var(--s-6)) calc(50% - 50vw) 0; /* up under the header */
     /* Two 1 px line patterns, not a colour gradient: the app's map grid. */
     background-image:
       linear-gradient(to right, var(--grid-line) 1px, transparent 1px),

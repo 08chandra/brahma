@@ -3,8 +3,12 @@
  * The four-step strip on Home: Install → Connect `claude` → Create a company → Give it a
  * goal. One hairline band split into four cells; each cell has an engraved serif numeral
  * (text2 at ≥ 48 px, the large-text exception), a sans title, one sentence and the command
- * that does it, in mono. Four across from 64 em, two across from 40 em, stacked below.
+ * that does it, in mono, with a Copy button. The buttons stay hidden until the inline
+ * script (< 400 bytes) finds the Clipboard API, so no-JS readers never see a dead control.
+ * Four across from 64 em, two across from 40 em, stacked below.
  */
+import Button from './Button.astro';
+
 interface Props {
   headingId: string;
 }
@@ -13,8 +17,8 @@ const { headingId } = Astro.props;
 const steps = [
   {
     title: 'Install',
-    body: 'Build the Mac app and the brahma CLI from source with Swift 6 on macOS 14 or later. An installer arrives with the first stable release.',
-    command: 'swift build',
+    body: 'Build the brahma CLI and the Mac app, .build/Brahma.app, from source with Xcode’s Swift 6 on macOS 14 or later. An installer arrives with the first stable release.',
+    command: 'scripts/make-app.sh',
   },
   {
     title: 'Connect claude',
@@ -23,8 +27,8 @@ const steps = [
   },
   {
     title: 'Create a company',
-    body: 'A git workspace, channels and a six-agent org from the software pack, all on your Mac.',
-    command: 'brahma company create Initech --goal "Build a habit tracker"',
+    body: 'A git workspace, channels and a twelve-agent org from the software pack, all on your Mac.',
+    command: 'brahma company create Initech --goal "Build a habit tracker" --agents 12',
   },
   {
     title: 'Give it a goal',
@@ -33,7 +37,7 @@ const steps = [
   },
 ];
 // Command names in the copy are set in mono.
-const codeWords = /(brahma doctor|brahma|claude)/g;
+const codeWords = /(brahma doctor|brahma|claude|\.build\/Brahma\.app)/g;
 const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: part, code: i % 2 === 1 }));
 ---
 
@@ -49,14 +53,39 @@ const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: 
           {parts(step.title).map((p) => (p.code ? <code>{p.text}</code> : p.text))}
         </h3>
         <p class="step__body">{parts(step.body).map((p) => (p.code ? <code>{p.text}</code> : p.text))}</p>
-        <code class="step__cmd">
-          <span class="step__prompt" aria-hidden="true">$</span>
-          <span>{step.command}</span>
-        </code>
+        <div class="step__cmd">
+          <code class="step__code">
+            <span class="step__prompt" aria-hidden="true">$</span>
+            <span>
+              {step.command.split(' ').map((token, i) => (
+                <>
+                  {i > 0 && ' '}
+                  <span class="step__tok">{token}</span>
+                </>
+              ))}
+            </span>
+          </code>
+          <Button size="sm" class="step__copy" data-copy={step.command} aria-label={`Copy command: ${step.command}`} hidden>
+            Copy
+          </Button>
+        </div>
       </li>
     ))
   }
 </ol>
+
+<script is:inline>
+  if (navigator.clipboard)
+    for (const b of document.querySelectorAll('.step__copy[data-copy]')) {
+      const label = b.querySelector('.btn__label');
+      b.hidden = false;
+      b.onclick = () =>
+        navigator.clipboard.writeText(b.dataset.copy).then(() => {
+          label.textContent = 'Copied';
+          setTimeout(() => (label.textContent = 'Copy'), 1500);
+        });
+    }
+</script>
 
 <style>
   .steps {
@@ -142,22 +171,43 @@ const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: 
   }
   .step__title code,
   .step__body code {
+    padding: 1px 5px;
+    border-radius: var(--radius);
+    background: var(--bg3);
     font-size: 0.92em;
     color: var(--text0);
   }
   .step__cmd {
     display: flex;
     gap: var(--s-2);
-    align-items: baseline;
+    align-items: flex-start;
+    justify-content: space-between;
     min-width: 0;
-    padding: var(--s-2) var(--s-3);
+    padding: var(--s-2) var(--s-2) var(--s-2) var(--s-3);
     background: var(--bg1);
     border: var(--hairline);
     border-radius: var(--radius);
+  }
+  .step__code {
+    display: flex;
+    gap: var(--s-2);
+    align-items: baseline;
+    min-width: 0;
+    padding-block: 0.25rem;
     font-size: var(--step--1);
     line-height: 1.5;
     color: var(--text0);
     overflow-wrap: anywhere;
+  }
+  /* Lines break only between tokens, so a flag never splits from its dashes. */
+  .step__tok {
+    white-space: nowrap;
+  }
+  .step__cmd :global(.step__copy) {
+    flex: none;
+  }
+  .step__cmd :global(.step__copy[hidden]) {
+    display: none;
   }
   .step__prompt {
     color: var(--text2);

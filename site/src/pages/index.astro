@@ -170,7 +170,8 @@ import { site } from '../../site.config.ts';
     content: '';
     position: absolute;
     z-index: -1;
-    inset: 0 calc(50% - 50vw);
+    /* Up under the header: Starlight's content panel pads the page top by 32 px. */
+    inset: calc(-1 * var(--s-6)) calc(50% - 50vw) 0;
     /* Two 1 px line patterns, not a colour gradient: the app's map grid. */
     background-image:
       linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
@@ -221,9 +222,15 @@ import { site } from '../../site.config.ts';
     text-wrap: pretty;
   }
   .home__lede code,
-  .section__text code,
-  .facts code {
+  .section__text code {
+    padding: 1px 5px;
+    border-radius: var(--radius);
+    background: var(--bg3);
     font-size: 0.9em;
+    color: var(--text0);
+  }
+  .facts code {
+    font-size: inherit; /* the dd is already mono at 12 px */
     color: var(--text0);
   }
 

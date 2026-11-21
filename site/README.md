@@ -11,24 +11,29 @@ Node and npm are used only inside this directory. The rest of the repository is 
 From the repository root:
 
 ```
-scripts/site-build.sh                     # generators (if present) → npm ci → build → checks
+scripts/site-build.sh                     # generators (if present) → npm ci → Chromium → OG images → build → checks
 scripts/site-build.sh --skip-generators   # fast content iteration; skips screenshots, CLI and API reference
 ```
 
 The script runs each generator that exists and is executable (`scripts/site-screenshots.sh`,
 `scripts/site-cli-docs.sh`, `scripts/site-api-docs.sh`), printing `== <step>` before each and
-failing with the step's name if one fails. It then runs `npm ci`, `npm run build` and `npm run check`
-in `site/`.
+failing with the step's name if one fails. It then runs `npm ci`, `npx playwright install chromium`
+(the browser the OG generator and the UI tests drive; a no-op once installed), `npm run og`,
+`npm run build` and `npm run check` in `site/`.
 
 Inside `site/`:
 
 ```
 npm ci              # install the exact versions in package-lock.json
+npx playwright install chromium   # once per machine: the browser for og, screenshots and test:ui
+npm run og          # generate public/og/*.png (Open Graph cards, gitignored)
 npm run dev         # local dev server with live reload
 npm run build       # static build into dist/
 npm run preview     # serve dist/ locally
 npm run check:links # verify every root-relative href/src in dist/ resolves
 npm run check       # all checks (currently check:links)
+npm test            # unit tests (node:test, tests/*.test.mjs)
+npm run test:ui     # browser tests (tests/*.spec.mjs) against a preview it starts on port 4321; build first
 ```
 
 Every dependency is pinned to an exact version in `package.json`; `package-lock.json` is committed.

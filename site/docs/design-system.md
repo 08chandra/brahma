@@ -71,7 +71,8 @@ non-text marks (ticks, glyphs, icon strokes, separators), disabled states, and l
 
 ## Motion
 
-`--dur-fast` 120 ms (hover), `--dur` 200 ms (state), `--dur-slow` 600 ms (reveals), one
+`--dur-fast` 120 ms (hover), `--dur` 200 ms (state and the `.reveal`), `--dur-slow` 600 ms (only the
+console's new-line flash, a hold-then-fade the visual spec fixes at 600 ms), one
 easing `--ease: cubic-bezier(.2,.7,.2,1)`. Only `opacity`/`transform` animate. `.reveal`
 fades and rises 6 px, staggered 60 ms by `--i`; the running chip's dot pulses. Everything
 stops under `prefers-reduced-motion: reduce`. Focus rings never animate.
