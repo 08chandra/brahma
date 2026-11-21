@@ -9,14 +9,20 @@ extension AppModel {
     public var previewBody: PreviewBody { previewBody(forTab: selectedPreviewTab) }
 
     /// The body of any tab id, for surfaces other than the pane (chat's inspector split, Collab). The ARTIFACTS tab shows the
-    /// selected (possibly pinned) artifact; a backend body carries the parsed OpenAPI copy (`previewForBodies`).
+    /// selected (possibly pinned) artifact, with the list and picker always present (`artifactNotice` is shown beside them, never
+    /// in their place); a backend body carries the parsed OpenAPI copy (`previewForBodies`).
     public func previewBody(forTab tabId: String?) -> PreviewBody {
         let p = previewForBodies
-        if let notice = artifactNotice, PreviewTabs.resolve(tabId, PreviewTabs.make(p)) == PreviewTabID.artifacts {
-            return .status(title: Self.artifactDeletedTitle, detail: notice, logTail: [])
-        }
         let tails = p.logTails
         return PreviewBodies.body(for: tabId, snapshot: p, logTail: { tails[$0.path] ?? [] }, selectedArtifactId: selectedArtifactId)
+    }
+
+    /// The owner picks a tab (the pane's chips, `preview:<name>` targets). The one way a pick happens: it supersedes any artifact
+    /// lookup still running (`openArtifact`), so a late result cannot pull the pane back to ARTIFACTS, and clears the deleted-artifact notice.
+    public func selectPreviewTab(_ id: String?) {
+        selectedPreviewTab = id
+        artifactNotice = nil
+        artifactSelectionGeneration += 1
     }
 
     /// Asks the engine to restart a surface (owner).

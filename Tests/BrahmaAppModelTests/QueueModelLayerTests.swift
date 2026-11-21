@@ -304,29 +304,72 @@ import GRDB
         #expect(failingRows == [SmokeRow(method: "GET", path: "/health", statusTitle: "500", millis: 7, ok: false, error: "expected 200, got 500")])
     }
 
-    @Test func pinnedArtifactDeletedOutsideTheAppIsUnpinnedAndSaidSo() async throws {
+    @Test func pinnedArtifactDeletedOutsideTheAppIsUnpinnedAndSaidSoBesideTheList() async throws {
         let w = try await WorkWorld.make()
         var all: [Artifact] = []
         for n in 1...25 { all.append(try Self.insertArtifact(w, number: n)) }
         await w.refresh()
+        let newest = w.model.snapshot.preview.artifacts
+        let notice = "This artifact was deleted"
         await w.model.openArtifact(number: 3)
-        #expect(w.model.previewBody == .artifact(all[2], all: w.model.snapshot.preview.artifacts + [all[2]]))
-        #expect(w.model.fileBody(for: all[2]) != nil)
-        // The CLI (or anything but this app) removes the row: the next refresh unpins it and the tab says so, instead of a body
-        // over a path that is gone.
+        #expect(w.model.previewBody == .artifact(all[2], all: newest + [all[2]]))
+        #expect(w.model.fileBody(for: all[2]) != nil && w.model.artifactNotice == nil)
+        // The CLI (or anything but this app) removes the row: the next refresh unpins it and says so beside the list. The body
+        // falls back to the newest artifact, so the list and the picker stay and the owner can reach every other artifact.
         try Self.deleteRow(w, id: "ar3")
         await w.refresh()
-        #expect(w.model.previewBody == .status(title: "ARTIFACT DELETED", detail: "This artifact was deleted", logTail: []))
+        #expect(w.model.artifactNotice == notice)
+        #expect(w.model.previewBody == .artifact(all[24], all: newest))
+        #expect(w.model.previewBody(forTab: PreviewTabID.artifacts) == .artifact(all[24], all: newest))
         #expect(w.model.pinnedArtifact == nil && w.model.selectedArtifactId == nil && w.model.fileBody(for: all[2]) == nil)
-        #expect(w.model.previewBody(forTab: PreviewTabID.artifacts) == .status(title: "ARTIFACT DELETED", detail: "This artifact was deleted", logTail: []))
-        #expect(w.model.snapshot.preview.artifacts.count == 20, "the list itself is untouched")
-        // The next pick clears the notice.
-        w.model.selectArtifact(all[24])
-        #expect(w.model.artifactNotice == nil && w.model.previewBody == .artifact(all[24], all: w.model.snapshot.preview.artifacts))
-        // A pinned artifact that still exists stays pinned across refreshes.
-        await w.model.openArtifact(number: 4)
+        #expect(w.model.previewTabs.map(\.title) == ["ARTIFACTS"], "the tab is still there")
+        // It is not sticky: another refresh keeps it only while nothing is selected …
         await w.refresh()
-        #expect(w.model.selectedArtifactId == "ar4" && w.model.pinnedArtifact?.artifact.id == "ar4")
+        #expect(w.model.artifactNotice == notice)
+        // … a pick through the reachable path (a deep link to an artifact in the list) clears it …
+        w.model.apply(.artifact(number: 25))
+        #expect(w.model.artifactNotice == nil && w.model.previewBody == .artifact(all[24], all: newest))
+        // … so does a tab pick (the pane's chips go through `selectPreviewTab`) …
+        await w.model.openArtifact(number: 4)
+        try Self.deleteRow(w, id: "ar4")
+        await w.refresh()
+        #expect(w.model.artifactNotice == notice && w.model.pinnedArtifact == nil)
+        w.model.selectPreviewTab(PreviewTabID.artifacts)
+        #expect(w.model.artifactNotice == nil)
+        // … and so does a refresh that finds something selected (here through the `preview:artifacts` + `artifact:` targets).
+        await w.model.openArtifact(number: 5)
+        try Self.deleteRow(w, id: "ar5")
+        await w.refresh()
+        #expect(w.model.artifactNotice == notice)
+        w.model.apply(.artifact(number: 24))
+        await w.refresh()
+        #expect(w.model.artifactNotice == nil && w.model.selectedArtifactId == "ar24")
+        // A pinned artifact (older than the list) that still exists stays pinned across refreshes.
+        await w.model.openArtifact(number: 2)
+        await w.refresh()
+        #expect(w.model.selectedArtifactId == "ar2" && w.model.pinnedArtifact?.artifact.id == "ar2" && w.model.artifactNotice == nil)
+    }
+
+    @Test func tabPickSupersedesALateLookup() async throws {
+        let w = try await WorkWorld.make()
+        var all: [Artifact] = []
+        for n in 1...25 { all.append(try Self.insertArtifact(w, number: n)) }
+        let web = try w.store.upsertPreviewSurface(companyId: w.company.id, by: .owner,
+                                                   PreviewDraft(name: "web", run: "npm start", url: "http://127.0.0.1:{port}/"))
+        await w.refresh()
+        let ws = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
+        let stale = PinnedArtifact(artifact: all[2], body: PreviewBodies.fileBody(all[2], workspace: ws))
+        // A lookup for AR-3 is running (its generation captured); the owner clicks the WEB chip meanwhile.
+        let generation = w.model.artifactSelectionGeneration
+        w.model.selectPreviewTab(PreviewTabID.surface(web.id))
+        #expect(w.model.artifactSelectionGeneration > generation)
+        w.model.applyLookup(stale, number: 3, companyId: w.company.id, generation: generation)
+        #expect(w.model.selectedPreviewTab == PreviewTabID.surface(web.id), "the late result does not pull the pane back to ARTIFACTS")
+        #expect(w.model.pinnedArtifact == nil && w.model.selectedArtifactId == nil)
+        // The `preview:` target is a tab pick too.
+        let g2 = w.model.artifactSelectionGeneration
+        w.model.apply(.preview(name: "artifacts"))
+        #expect(w.model.artifactSelectionGeneration > g2 && w.model.selectedPreviewTab == PreviewTabID.artifacts)
     }
 
     @Test func lateLookupNeverOverridesTheOwnersPick() async throws {
@@ -350,6 +393,18 @@ import GRDB
         // A current result lands.
         w.model.applyLookup(stale, number: 3, companyId: w.company.id, generation: w.model.artifactSelectionGeneration)
         #expect(w.model.selectedArtifactId == "ar3" && w.model.pinnedArtifact == stale)
+        // Two overlapping `artifact:` requests: each lookup bumps the generation at its start, so the later request wins and the
+        // earlier one's result, landing afterwards, is dropped rather than the other way round.
+        let before = w.model.artifactSelectionGeneration
+        await w.model.openArtifact(number: 4)
+        let fourth = w.model.artifactSelectionGeneration
+        #expect(fourth > before && w.model.selectedArtifactId == "ar4")
+        let staleTwo = PinnedArtifact(artifact: all[1], body: PreviewBodies.fileBody(all[1], workspace: ws))
+        w.model.applyLookup(staleTwo, number: 2, companyId: w.company.id, generation: before)
+        #expect(w.model.selectedArtifactId == "ar4" && w.model.pinnedArtifact?.artifact.id == "ar4", "the earlier request's late result loses")
+        await w.model.openArtifact(number: 5)
+        w.model.applyLookup(staleTwo, number: 2, companyId: w.company.id, generation: fourth)
+        #expect(w.model.selectedArtifactId == "ar5", "a result from before the latest request loses too")
     }
 
     @Test func phoneFrameOverrideToggles() async throws {

@@ -45,7 +45,7 @@ struct PreviewPane<Accessory: View>: View {
             HStack(spacing: BrahmaTheme.spaceXS) {
                 ForEach(tabs) { tab in
                     let isSelected = tab.id == selected
-                    Button { model.selectedPreviewTab = tab.id } label: {
+                    Button { model.selectPreviewTab(tab.id) } label: {
                         HStack(spacing: 5) {
                             Circle().fill(Self.toneColor(tab.tone)).frame(width: 6, height: 6)
                             Text(verbatim: tab.title).font(BrahmaTheme.monoTiny)

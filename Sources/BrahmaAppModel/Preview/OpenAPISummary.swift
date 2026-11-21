@@ -40,8 +40,6 @@ public enum OpenAPISummary {
         return operations
     }
 
-    /// The operations of the file at `url` (the engine's copy): nil when it is missing, a link, not a regular file, over
-    /// `maxBytes` (checked before reading), or not an OpenAPI JSON document.
     /// Newlines flattened to spaces, trimmed, cut at the line cap; nil when nothing is left.
     static func oneLine(_ s: String) -> String? {
         let flat = s.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespaces)

@@ -23,7 +23,7 @@ extension AppModel {
     /// `artifact:AR-n`: the artifact among the newest ones the snapshot holds (when that snapshot is this company's), else
     /// looked up in the Store (detached, with the company's workspace read in the same task) and pinned so the tab can show one
     /// older than the snapshot's list. "No artifact AR-n" only when the company has none by that number. A result that lands
-    /// after the owner picked something else is dropped.
+    /// after the owner picked something else, or after a later `artifact:AR-n` request, is dropped.
     public func openArtifact(number: Int) async {
         select(.missionControl)
         guard let companyId = selectedCompanyId else { return }
@@ -31,6 +31,8 @@ extension AppModel {
             selectArtifact(a)
             return
         }
+        // This request is the latest: an older lookup still running loses to it, and a newer one will win over it.
+        artifactSelectionGeneration += 1
         let generation = artifactSelectionGeneration
         let store = self.store
         do {
@@ -58,8 +60,9 @@ extension AppModel {
         selectArtifact(found.artifact)
     }
 
-    /// After each snapshot refresh: a pinned artifact deleted outside the app (the CLI) is unpinned and the tab says so, rather
-    /// than keeping a body over a missing path. One indexed read, only while something is pinned.
+    /// After each snapshot refresh: a pinned artifact deleted outside the app (the CLI) is unpinned and the tab says so beside its
+    /// list (`artifactNotice`; the body falls back to the newest artifact, list and picker still present), rather than keeping a
+    /// body over a missing path. One indexed read, only while something is pinned.
     func checkPinnedArtifact() async {
         guard let pinned = pinnedArtifact, let companyId = selectedCompanyId else { return }
         let store = self.store

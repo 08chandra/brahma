@@ -58,8 +58,8 @@ public final class AppModel {
     public var phoneFrameOverride: [String: Bool] = [:]
     /// An artifact older than the snapshot's newest ones, opened by `artifact:AR-n` (`openArtifact(number:)`); per company.
     var pinnedArtifact: PinnedArtifact?
-    /// Shown in the ARTIFACTS tab in place of a body: the pinned artifact was deleted outside the app (`checkPinnedArtifact`).
-    /// Cleared by the next selection.
+    /// Shown in the ARTIFACTS tab beside the list (never in its place): the pinned artifact was deleted outside the app
+    /// (`checkPinnedArtifact`). Cleared by the next artifact pick, tab pick or a refresh that has something selected.
     public internal(set) var artifactNotice: String?
     /// Bumped by every artifact selection, so a lookup result that lands after the owner picked something else is dropped.
     @ObservationIgnored var artifactSelectionGeneration = 0
@@ -433,9 +433,9 @@ public final class AppModel {
         case .preview(let name):
             select(.missionControl)
             if name == PreviewTabID.live || name == PreviewTabID.artifacts {
-                selectedPreviewTab = name
+                selectPreviewTab(name)
             } else if let s = snapshot.preview.surfaces.first(where: { $0.name.lowercased() == name }) {
-                selectedPreviewTab = PreviewTabID.surface(s.id)
+                selectPreviewTab(PreviewTabID.surface(s.id))
             } else {
                 errorMessage = "No preview \(name)"
             }
@@ -612,6 +612,8 @@ public final class AppModel {
         if new != snapshot { snapshot = new }
         refreshOpenAPI()
         await checkPinnedArtifact()
+        // The deleted-artifact notice lasts until something is selected again (a pick, a tab, or a refresh that left one selected).
+        if artifactNotice != nil, selectedArtifactId != nil { artifactNotice = nil }
         if let c = mapController, c.companyId == id { c.sync(snapshot: snapshot) }
         ticksSinceSnapshot = 0
         // The Handbook follows the database only while it is shown (its lists are read on demand, never kept in the snapshot).
