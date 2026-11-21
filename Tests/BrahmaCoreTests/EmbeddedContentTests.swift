@@ -276,7 +276,7 @@ struct SeededBytes {
         do {
             return try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: known, store: cf.store,
                                         companyId: cf.c.id)
-        } catch let e as WorkError { throw FileVouchTests.withoutCommand(e, cf.c, canonical) }
+        } catch let e as WorkError { throw FileVouchTests.withoutCommand(e, cf.c, canonical, data) }
     }
 
     /// The helper is built with the package (SwiftPM builds every executable product for `swift test`).
@@ -533,7 +533,10 @@ struct SeededBytes {
         // The helper's own answers.
         #expect(throws: SandboxedPDFReader.encrypted) { try scripted(ScriptedRunner(parts: Data(), outcome: exit(3))).parts(of: pdf, maxBytes: 1000) }
         #expect(throws: SandboxedPDFReader.undecodable) { try scripted(ScriptedRunner(parts: Data(), outcome: exit(4))).parts(of: pdf, maxBytes: 1000) }
-        #expect(throws: SandboxedPDFReader.unaccounted) { try scripted(ScriptedRunner(parts: Data(), outcome: exit(5))).parts(of: pdf, maxBytes: 1000) }
+        // Breaker B-3: an anomaly whose output does not hold together, and a file with more than 64 revisions (nothing read),
+        // can't be vouched for (not the structure refusal, which names the vouch).
+        #expect(throws: SandboxedPDFReader.unverifiedUnread) { try scripted(ScriptedRunner(parts: Data(), outcome: exit(5))).parts(of: pdf, maxBytes: 1000) }
+        #expect(throws: SandboxedPDFReader.tooManyRevisions) { try scripted(ScriptedRunner(parts: Data(), outcome: exit(10))).parts(of: pdf, maxBytes: 1000) }
         #expect(throws: ArchiveMemberScan.overBudget) { try scripted(ScriptedRunner(parts: Data(), outcome: exit(6))).parts(of: pdf, maxBytes: 1000) }
         // More output than allowed is over the budget whatever the helper says.
         #expect(throws: ArchiveMemberScan.overBudget) {

@@ -401,7 +401,7 @@ public enum SecretGate {
         let name = shown(canonical, knownValues: knownValues)
         func structural(_ reason: String) -> WorkError {
             store.recordStructureRefusal(companyId: companyId, canonical: canonical, shown: name, sha256: sha, reason: reason, now: Store.now())
-            return WorkError.invalid(reason + vouchHint(store: store, companyId: companyId, shown: name))
+            return WorkError.invalid(reason + vouchHint(store: store, companyId: companyId, shown: name, sha256: sha))
         }
         if let version, let refused = ScanCache.shared.refusal(sha256: sha, version: version) {
             if refused.hasPrefix(structureMark) {
@@ -451,12 +451,20 @@ public enum SecretGate {
     }
 
     /// The end of a structure refusal: the exact command by which the owner can vouch for the file (`brahma vouch file
-    /// <company slug> <name as shown>`, the name quoted for the shell when it needs it); the Inbox when the name is withheld.
-    static func vouchHint(store: Store, companyId: String, shown: String) -> String {
+    /// <company slug> --sha256 <the refused bytes' full sha256> <name as shown>`, the name quoted for the shell when
+    /// it needs it); the Inbox when the name is withheld. Breaker B-2: the command names the version it was printed for, so
+    /// pasted after the file changed it vouches nothing (`Store.vouchFile`).
+    static func vouchHint(store: Store, companyId: String, shown: String, sha256: String) -> String {
         guard shown != withheldName, let company = try? store.company(id: companyId) else {
-            return " — the owner can vouch for this exact file from the Inbox"
+            return " — the owner can vouch for this exact file (sha256 \(sha256)) from the Inbox"
         }
-        return " — the owner can vouch for this exact file: brahma vouch file \(company.slug) \(shellQuoted(shown))"
+        return " — the owner can vouch for this exact file: " + vouchCommand(slug: company.slug, shown: shown, sha256: sha256)
+    }
+
+    /// `brahma vouch file <slug> --sha256 <the full 64 hex digits> <name>` (the option before the name, which may follow
+    /// `--`). Ruling 40 (B-4): the full hash, which the vouch must match exactly.
+    static func vouchCommand(slug: String, shown: String, sha256: String) -> String {
+        "brahma vouch file \(slug) --sha256 \(sha256) \(shellQuoted(shown))"
     }
 
     /// `text` as one shell word for the vouch command's last argument: as is when it holds only characters no shell treats

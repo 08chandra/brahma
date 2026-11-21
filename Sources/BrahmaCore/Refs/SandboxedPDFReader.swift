@@ -58,6 +58,12 @@ public struct SandboxedPDFReader: Sendable {
     /// the gate adds the exact command by which the owner can vouch for the file (`SecretGate.vouchHint`).
     static let unaccounted = ArchiveReadError.refused("this PDF's structure couldn't be verified")
     static let tooMany = ArchiveReadError.refused("this PDF has too many objects to scan for secrets")
+    /// Breaker B-3: the refusals a vouch can't lift, since a vouch only lets the gate scan what the helper read, and here
+    /// it read nothing usable. Not structure refusals (`SecretGate.isStructural`): they name no vouch command, record no
+    /// refused version and raise no alert. An anomaly (exit 5) whose output does not hold together; a file with more
+    /// revisions than the helper walks at all (exit 10, nothing read).
+    static let unverifiedUnread = ArchiveReadError.refused("this PDF's structure couldn't be verified and nothing the PDF reader read of it holds together, so it can't be scanned for secrets, and it can't be vouched for: a vouch only lets Brahma scan what it read")
+    static let tooManyRevisions = ArchiveReadError.refused("this PDF has more than 64 revisions, so it can't be scanned for secrets, and it can't be vouched for: nothing in it was read")
     static let tooMuchMemory = ArchiveReadError.refused("this PDF needs too much memory to scan for secrets")
     /// The two that may pass on another try (not cached by the gate).
     static let tooLong = ArchiveReadError.refused("this PDF took too long to scan for secrets")
@@ -136,13 +142,14 @@ public struct SandboxedPDFReader: Sendable {
         case 5:
             // Round 5 (ruling 38): a structural anomaly, with everything the helper could read written out in full. The
             // parts are handed up as `UnverifiedPDF`: refused unless the owner vouched for these exact bytes. Output that
-            // does not hold together is the plain refusal.
+            // does not hold together can't be vouched for (breaker B-3: it says so, and names no vouch).
             guard let output = EngineFiles.readNoFollow(outDir.appending(path: Self.partsName), under: outDir, limit: maxBytes + 1),
-                  let parts = try? Self.parse(output, maxBytes: maxBytes) else { throw Self.unaccounted }
+                  let parts = try? Self.parse(output, maxBytes: maxBytes) else { throw Self.unverifiedUnread }
             throw UnverifiedPDF(parts: parts)
         case 6: throw ArchiveMemberScan.overBudget
         case 8: throw Self.tooMany
         case 9: throw Self.tooMuchMemory
+        case 10: throw Self.tooManyRevisions
         default: throw Self.unreadable
         }
         guard let output = EngineFiles.readNoFollow(outDir.appending(path: Self.partsName), under: outDir, limit: maxBytes + 1) else {

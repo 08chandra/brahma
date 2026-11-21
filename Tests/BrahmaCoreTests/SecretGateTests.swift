@@ -64,7 +64,7 @@ struct StubArchiveReader: ArchiveReader {
         do {
             return try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: known, store: cf.store,
                                         companyId: cf.c.id, chunk: chunk)
-        } catch let e as WorkError { throw FileVouchTests.withoutCommand(e, cf.c, canonical) }
+        } catch let e as WorkError { throw FileVouchTests.withoutCommand(e, cf.c, canonical, data) }
     }
 
     @Test(arguments: ["raw", "percent", "percent-lower", "hex", "HEX", "base64-0", "base64-1", "base64-2"])

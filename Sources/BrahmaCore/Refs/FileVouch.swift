@@ -7,7 +7,7 @@ import GRDB
 /// canonical form; the name itself is never kept, only `shown`, as messages show it) and the bytes' SHA-256: any byte
 /// changed, another name or another company, and the vouch does not apply. A vouch lets the gate past those structure
 /// refusals only: every byte it can read is still scanned (a stored value or a secret pattern refuses as before), and no
-/// taint is touched. Owner callers only: `brahma vouch file <company> <path>` and the refusal alert's Inbox action
+/// taint is touched. Owner callers only: `brahma vouch file <company> --sha256 <64 hex> <path>` and the refusal alert's Inbox action
 /// (`AppModel.vouchFile`); no agent tool reaches it.
 public struct FileVouch: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "fileVouch"
@@ -64,8 +64,20 @@ extension Store {
                 let hash = Self.canonicalHash(canonical)
                 var row = try FileVouch.fetchOne(db, sql: "SELECT * FROM fileVouch WHERE companyId = ? AND canonicalHash = ? AND sha256 = ?",
                                                  arguments: [companyId, hash, sha256])
-                if row == nil {
-                    let fresh = FileVouch(companyId: companyId, canonicalHash: hash, shown: shown, sha256: sha256, reason: reason, refusedAt: now)
+                // Breaker B-2: `refusedAt` is the version's LAST refusal, always after every other version's under the name, so
+                // the version refused last is one (the only one `vouchFile` takes).
+                let others = try Date.fetchOne(db, sql: """
+                    SELECT MAX(refusedAt) FROM fileVouch WHERE companyId = ? AND canonicalHash = ? AND sha256 != ?
+                    """, arguments: [companyId, hash, sha256])
+                let at = others.map { max(now, $0.addingTimeInterval(0.002)) } ?? now
+                if var existing = row {
+                    if existing.vouchedAt == nil, existing.refusedAt != at {
+                        existing.refusedAt = at
+                        try existing.update(db)
+                        row = existing
+                    }
+                } else {
+                    let fresh = FileVouch(companyId: companyId, canonicalHash: hash, shown: shown, sha256: sha256, reason: reason, refusedAt: at)
                     try fresh.insert(db)
                     row = fresh
                 }
@@ -77,8 +89,8 @@ extension Store {
                 guard open == 0 else { return }
                 let how = shown == SecretGate.withheldName
                     ? "use Vouch for this file here"
-                    : "run brahma vouch file \(company.slug) \(SecretGate.shellQuoted(shown)), or use Vouch for this file here"
-                let text = "\(shown) was refused: \(reason). If you trust this exact file (sha256 \(sha256.prefix(12))…), \(how). "
+                    : "run \(SecretGate.vouchCommand(slug: company.slug, shown: shown, sha256: sha256)), or use Vouch for this file here"
+                let text = "\(shown) was refused: \(reason). If you trust this exact file (sha256 \(sha256)), \(how). "
                     + "A vouch skips only this check: Brahma still scans what it can read of the file and refuses a stored secret "
                     + "or a secret pattern in it, and any change to the file ends the vouch."
                 try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: reasonKey, companyId: companyId)
@@ -88,36 +100,62 @@ extension Store {
         }
     }
 
-    /// The owner vouches for the file the gate refused under `canonical` (the ref's name, or the name as the refusal showed
-    /// it) in the company: those exact bytes (`sha256`, a prefix of at least 12 hex digits, picks one when the name was
-    /// refused as more than one version) then pass the gate's structure refusals. An owner activity line; the refusal's
-    /// alert is closed. Owner callers only (the owner CLI, `brahma vouch file`). Vouching again is a no-op that returns
-    /// the vouch.
+    /// The owner vouches for the file the gate refused under `canonical` in the company, naming the refused bytes by their
+    /// full `sha256` (all 64 hex digits, as the refusal and the alert print them). Ruling 40 (B-4): the file is identified
+    /// by its canonical name only (`canonicalHash`); the name as a refusal showed it is accepted only when it shows exactly
+    /// one refused file (else the refusal lists them as ambiguous), and never steers the vouch to another file. The hash
+    /// must match a recorded version exactly: a prefix never vouches. Breaker B-2 (Ruling 28's class): only the version the
+    /// gate refused LAST for that file can be vouched this way, so a command printed for an earlier version, pasted after the
+    /// file was rewritten and refused again, vouches nothing; the refusal shows the version refused last and its own
+    /// command. Those exact bytes then pass the gate's structure refusals. An owner activity line; the refusal's alert is
+    /// closed. Owner callers only (the owner CLI, `brahma vouch file`). Vouching the last version again is a no-op that
+    /// returns the vouch.
     @discardableResult
-    public func vouchFile(companyId: String, canonical: String, sha256: String? = nil, now: Date) throws -> FileVouch {
-        try writer.write { db in
-            guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+    public func vouchFile(companyId: String, canonical: String, sha256: String, now: Date) throws -> FileVouch {
+        let hash = sha256.lowercased()
+        guard hash.count == 64, hash.allSatisfy(\.isHexDigit) else {
+            throw WorkError.invalid("give the file's full sha256 (all 64 hex digits), as the refusal prints it")
+        }
+        return try writer.write { db in
+            guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
             var rows = try FileVouch.fetchAll(db, sql: """
-                SELECT * FROM fileVouch WHERE companyId = ? AND (canonicalHash = ? OR shown = ?) ORDER BY refusedAt DESC
-                """, arguments: [companyId, Self.canonicalHash(canonical), canonical])
-            if let sha256 {
-                let prefix = sha256.lowercased()
-                guard prefix.count >= 12, prefix.allSatisfy(\.isHexDigit) else {
-                    throw WorkError.invalid("give at least 12 hex digits of the file's sha256")
+                SELECT * FROM fileVouch WHERE companyId = ? AND canonicalHash = ? ORDER BY refusedAt DESC
+                """, arguments: [companyId, Self.canonicalHash(canonical)])
+            if rows.isEmpty {
+                // The name as a refusal showed it: only when it is one file's.
+                let shown = try FileVouch.fetchAll(db, sql: """
+                    SELECT * FROM fileVouch WHERE companyId = ? AND shown = ? ORDER BY refusedAt DESC
+                    """, arguments: [companyId, canonical])
+                let files = Dictionary(grouping: shown, by: \.canonicalHash)
+                if files.count > 1 {
+                    let listed = files.values.compactMap(\.first).sorted { $0.refusedAt > $1.refusedAt }
+                        .map { "one last refused as sha256 \($0.sha256.prefix(12))… (\($0.reason))" }.joined(separator: "; ")
+                    throw WorkError.invalid("more than one file Brahma refused is shown as \(shown[0].shown) (\(listed)), so the name doesn't "
+                                            + "say which; vouch for the one you mean from its alert in the Inbox, which names it exactly")
                 }
-                rows = rows.filter { $0.sha256.hasPrefix(prefix) }
+                rows = shown
             }
-            guard !rows.isEmpty else {
+            guard let newest = rows.first else {
                 // (The name is not echoed: it is the caller's own text, and may hold anything.)
-                throw WorkError.notFound("Brahma has not refused a file by that name\(sha256 == nil ? "" : " with that sha256") for its "
-                                         + "structure in this company, so there is nothing to vouch for")
+                throw WorkError.notFound("Brahma has not refused a file by that name for its structure in this company, so there is "
+                                         + "nothing to vouch for")
             }
-            let pending = rows.filter { $0.vouchedAt == nil }
-            guard var row = pending.first else { return rows[0] }
-            guard Set(pending.map(\.sha256)).count == 1 else {
-                let versions = pending.map { String($0.sha256.prefix(12)) }.joined(separator: ", ")
-                throw WorkError.invalid("\(pending[0].shown) was refused as more than one version; say which with its sha256: \(versions)")
+            // The version refused last.
+            let last = rows.filter { $0.refusedAt == newest.refusedAt }
+            guard Set(last.map(\.sha256)).count == 1 else {
+                throw WorkError.invalid("\(newest.shown) was refused as more than one version at once; check the file and try again")
             }
+            guard newest.sha256 == hash else {
+                let how = newest.vouchedAt == nil
+                    ? "if you trust the file as it is now, run \(SecretGate.vouchCommand(slug: company.slug, shown: newest.shown, sha256: newest.sha256))"
+                    : "that version is already vouched for"
+                let what = rows.contains { $0.sha256 == hash }
+                    ? "that sha256 is not the version of \(newest.shown) Brahma refused last: the file changed since that command was printed"
+                    : "Brahma never refused \(newest.shown) with that sha256"
+                throw WorkError.invalid("\(what), and was last refused as sha256 \(newest.sha256); \(how)")
+            }
+            var row = newest
+            guard row.vouchedAt == nil else { return row }
             return try vouch(db, &row, now: now)
         }
     }
