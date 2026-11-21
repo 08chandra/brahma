@@ -1,0 +1,32 @@
+---
+title: Sandbox
+description: "What one turn may touch, compiled into the Claude Code settings and shell prefix the claude process runs with, and into the Seatbelt profile for checks and previews with an egress proxy as their only way out."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+The sandbox is the structural wall between an agent's turn and the owner's data, the engine's database and files, the common git dir and the other agents. `SandboxScope.forTurn` computes what one turn may read and write. `ClaudeSettingsCompiler` turns that scope, the profile and the mode into the settings file every turn runs with (`--settings <file>`, `--setting-sources ""`), including the permission deny rules for the high-risk company tools. `ShellPrefix` is the Bash prefix. For commands the engine runs itself, `SeatbeltRunner` runs `sandbox-exec -p <profile> /bin/sh -c <command>` with a `SeatbeltProfile` built from the same scope, and `EgressProxy` is an HTTP CONNECT proxy on loopback that admits TLS to allowed domains on port 443 only. Off macOS, `UnavailableSandboxRunner` fails closed.
+
+## Key types
+
+- [`SandboxScope`](/api/brahmacore/documentation/brahmacore/sandboxscope/) and [`GrantInputs`](/api/brahmacore/documentation/brahmacore/grantinputs/) — what a turn may touch, and the grants that widen it.
+- [`ClaudeSettings`](/api/brahmacore/documentation/brahmacore/claudesettings/) and [`ClaudeSettingsCompiler`](/api/brahmacore/documentation/brahmacore/claudesettingscompiler/) — the settings file and its compiler.
+- [`SandboxedRunner`](/api/brahmacore/documentation/brahmacore/sandboxedrunner/) and [`SeatbeltRunner`](/api/brahmacore/documentation/brahmacore/seatbeltrunner/) — the protocol and its macOS implementation.
+- [`SeatbeltProfile`](/api/brahmacore/documentation/brahmacore/seatbeltprofile/) — the SBPL rules of one command.
+- [`EgressProxy`](/api/brahmacore/documentation/brahmacore/egressproxy/) — the loopback CONNECT proxy.
+- [`SandboxedCheckRunner`](/api/brahmacore/documentation/brahmacore/sandboxedcheckrunner/) — checks under the sandbox.
+
+## How it connects
+
+- **Called by Orchestrator.** Before a turn, `Orchestrator+Sandbox` builds the `SandboxLayout`, writes the `ShellPrefix` and computes `SandboxScope.forTurn`.
+- **Called by Turns.** `TurnProfileCompiler` calls `ClaudeSettingsCompiler.compile`, and a `ClaudeCommand` carries its `SandboxScope`.
+- **Called by Preview, Extensions and Release.** Preview adapters run under a `SandboxPolicy`; the extension importer unzips under the `SandboxedRunner`; the smoke check on `main` reclassifies nested-sandbox failures through `SandboxedCheckRunner`.
+- **Calls Verify.** `SandboxedCheckRunner` implements the verify area's `CheckRunning` and falls back to `ProcessCheckRunner`.
+- **Calls MCP and Safety.** The settings deny `CompanyTools.highRiskTools`; the Seatbelt runner records its child in `ChildGroups`.
+
+<ModuleFacts module="BrahmaCore" area="Sandbox" />
+
+<SourceLink path="Sources/BrahmaCore/Sandbox" />

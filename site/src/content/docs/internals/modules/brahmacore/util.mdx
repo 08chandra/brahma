@@ -1,0 +1,31 @@
+---
+title: Util
+description: "The awake-time clock, the blocking-work thread pool, descriptor-relative engine files, the engine-git guard, pure-Swift SHA-256 and FNV hashing, and the owner key."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+Small pieces the rest of the library stands on. `AwakeTime` is the one clock every timeout counts on: it stands still while the Mac sleeps, so a backstop that spans a night does not fire on wake. `Blocking` runs git, `waitUntilExit` and lock polling on threads of their own so they never occupy a Swift concurrency worker; `EngineGitGuard` reports a git launch that happened outside one. `EngineFiles` opens, creates and removes engine files under a workspace's `.brahma` by descriptor only, so a planted link can never redirect it; `UnsafeEngineFile` is what it refuses. `SHA256` is pure Swift for security-relevant hashes; `StableHash` is FNV-1a for stable ids. `OwnerKey` and `OwnerKeyStore` are the owner's key and where its hash lives.
+
+## Key types
+
+- [`AwakeTime`](/api/brahmacore/documentation/brahmacore/awaketime/) — `uptime()`, `deadline(after:)`, `sleep(for:)`.
+- [`EngineFiles`](/api/brahmacore/documentation/brahmacore/enginefiles/) and [`UnsafeEngineFile`](/api/brahmacore/documentation/brahmacore/unsafeenginefile/) — descriptor-relative file work and its refusal.
+- [`SHA256`](/api/brahmacore/documentation/brahmacore/sha256/) and [`StableHash`](/api/brahmacore/documentation/brahmacore/stablehash/) — the two hashes.
+- [`OwnerKey`](/api/brahmacore/documentation/brahmacore/ownerkey/) and [`OwnerKeyStore`](/api/brahmacore/documentation/brahmacore/ownerkeystore/) — the owner key and the store protocol.
+
+## How it connects
+
+- **Called by Orchestrator.** The engine owns one `Blocking` and runs every git, check and merge body on it.
+- **Called by Git.** `GitWorkspace` reports each launch to `EngineGitGuard` and surfaces `UnsafeEngineFile`s.
+- **Called by Backup, Resources and Work.** `HomeFiles`, `ContentVault` and `ProgressFile` all go through `EngineFiles`.
+- **Called by Verify and Safety.** `ProcessCheckRunner` and `SleepGuard` count on `AwakeTime`.
+- **Called by Extensions.** Package tree hashes are `SHA256.hex`.
+- **Implemented by BrahmaKeychain and used by the CLI and the app.** `PlatformOwnerKeyStore` picks the `OwnerKeyStore`; owner commands pass `OwnerKey.verify`, and the app's engine host holds the store.
+
+<ModuleFacts module="BrahmaCore" area="Util" />
+
+<SourceLink path="Sources/BrahmaCore/Util" />

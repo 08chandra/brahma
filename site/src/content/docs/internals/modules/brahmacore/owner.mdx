@@ -1,0 +1,31 @@
+---
+title: Owner
+description: "What reaches the owner and how: notices, the daily digest, human tasks with paste-back fields, and phone pushes within rate limits."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+An `OwnerNotice` is a message from the engine to the owner that is not an ask. `OwnerPrefs` holds the owner's notification, quiet-hours, digest and sleep settings. `DigestBuilder` renders the daily digest with agent text escaped so it can never form markup. `HumanTask` templates are the tasks the owner does by hand (an account, a domain, test keys), with engine-written steps, links and paste-back fields. `NoticeDelivery` plans which banners and pushes go out; `PushDispatcher` sends them through an ntfy or Pushover channel, coalesced outside quiet hours, capped per day, and marks them pushed only after a 2xx. `AskQuota` caps how many open owner requests one agent may hold at a time.
+
+## Key types
+
+- [`OwnerNotice`](/api/brahmacore/documentation/brahmacore/ownernotice/) and [`OwnerPrefs`](/api/brahmacore/documentation/brahmacore/ownerprefs/) — a notice, and the owner's settings.
+- [`DigestBuilder`](/api/brahmacore/documentation/brahmacore/digestbuilder/) — the daily digest.
+- [`HumanTask`](/api/brahmacore/documentation/brahmacore/humantask/) and [`HumanTaskTemplate`](/api/brahmacore/documentation/brahmacore/humantasktemplate/) — tasks for the owner's hands.
+- [`NoticeDelivery`](/api/brahmacore/documentation/brahmacore/noticedelivery/) — the delivery plan.
+- [`PushDispatcher`](/api/brahmacore/documentation/brahmacore/pushdispatcher/) and [`PushChannel`](/api/brahmacore/documentation/brahmacore/pushchannel/) — sending phone pushes.
+- [`AskQuota`](/api/brahmacore/documentation/brahmacore/askquota/) — the per-agent ask limit.
+
+## How it connects
+
+- **Called by Orchestrator.** The engine constructs the `PushDispatcher` and ticks it as a detached task after the timers step.
+- **Called by Store.** `Store+Digest` builds the digest through `DigestBuilder.build`; `Store+HumanTasks` files templates from `HumanTasks`; ask creation takes an `AskQuota.Exemption`.
+- **Calls Safety.** A push channel reads the owner's credential from the `SecretVault`, never from the database.
+- **Calls Timers.** Quiet hours and the digest time are computed with `TimerSchedule.daily`.
+
+<ModuleFacts module="BrahmaCore" area="Owner" />
+
+<SourceLink path="Sources/BrahmaCore/Owner" />

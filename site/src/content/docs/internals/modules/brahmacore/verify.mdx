@@ -1,0 +1,29 @@
+---
+title: Verify
+description: "Running an item's check command in a detached checkout or a .git-free export, in its own process group with a timeout, and recording the outcome."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+An item's `CheckSpec` is a shell command. `CheckRunning` runs it and never throws: whatever went wrong is part of the `CheckOutcome` (exit code, timed out, the tail of its output). `ProcessCheckRunner` is the plain runner: its own process group, a timeout counted in awake time, SIGTERM then SIGKILL to the group, and never a signal to a group it has reaped. Checks never run in the workspace: a submission's run uses a detached checkout under the data home and a merge check a `.git`-free export. `CheckScripts` is where the engine keeps a check's saved scripts in the workspace, and `CheckReach` and `PathRules` classify what a check touches.
+
+## Key types
+
+- [`CheckRunning`](/api/brahmacore/documentation/brahmacore/checkrunning/) and [`ProcessCheckRunner`](/api/brahmacore/documentation/brahmacore/processcheckrunner/) — the protocol and the plain runner.
+- [`CheckOutcome`](/api/brahmacore/documentation/brahmacore/checkoutcome/) — what one run came to.
+- [`CheckScripts`](/api/brahmacore/documentation/brahmacore/checkscripts/) and [`CheckPaths`](/api/brahmacore/documentation/brahmacore/checkpaths/) — where a check's files live.
+- [`CheckReach`](/api/brahmacore/documentation/brahmacore/checkreach/) and [`PathRules`](/api/brahmacore/documentation/brahmacore/pathrules/) — what a check reaches.
+
+## How it connects
+
+- **Called by Orchestrator.** The engine holds a `CheckRunning` (by default a sandboxed one built over the store and paths) and `Orchestrator+Checks` finishes each `VerificationRun` with a `CheckOutcome`.
+- **Implemented by Sandbox.** `SandboxedCheckRunner` implements `CheckRunning` and falls back to `ProcessCheckRunner`.
+- **Called by Store, Release and Preview.** The smoke check on `main` and the audit's reach classification record `CheckOutcome`s and call `CheckScripts.checkReach`; preview builds report a `CheckOutcome` too.
+- **Calls Util and Safety.** Timeouts use `AwakeTime.uptime`; the spawned group is recorded in `ChildGroups`.
+
+<ModuleFacts module="BrahmaCore" area="Verify" />
+
+<SourceLink path="Sources/BrahmaCore/Verify" />

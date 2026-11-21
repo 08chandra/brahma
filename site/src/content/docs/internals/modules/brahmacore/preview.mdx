@@ -1,0 +1,32 @@
+---
+title: Preview
+description: "Running a company's preview surfaces from main: a fresh .git-free engine export per start, a sandboxed build and server, loopback-only ports, and the probes that say when it is ready."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+`PreviewRunner` runs every company's preview surfaces from the engine-accepted `main`. Each start is a fresh export of that commit under the data home, with no `.git`, keyed by surface, commit and start, so nothing a build left behind carries over. `WebAdapter` runs the surface's build to completion and then its server as a long-running process, both under the context's sandbox policy; a preview is ready once its URL answers and only if it listens on the loopback. `PortAllocator` hands out ports; `PreviewLog` writes the log through descriptor-safe opens; `EngineLayout` names the engine-owned places under a workspace's `.brahma`. The HTTP probe never follows a redirect.
+
+## Key types
+
+- [`PreviewRunner`](/api/brahmacore/documentation/brahmacore/previewrunner/) — reconcile, start, stop, and the per-surface state.
+- [`PreviewSurface`](/api/brahmacore/documentation/brahmacore/previewsurface/) and [`PreviewState`](/api/brahmacore/documentation/brahmacore/previewstate/) — one surface and where it stands.
+- [`PreviewAdapter`](/api/brahmacore/documentation/brahmacore/previewadapter/) and [`WebAdapter`](/api/brahmacore/documentation/brahmacore/webadapter/) — how a kind of surface is run.
+- [`EngineExport`](/api/brahmacore/documentation/brahmacore/engineexport/) — the safe export of one commit.
+- [`HTTPProbing`](/api/brahmacore/documentation/brahmacore/httpprobing/) and [`SmokeRequest`](/api/brahmacore/documentation/brahmacore/smokerequest/) — one HTTP request and its expectation.
+- [`PortAllocator`](/api/brahmacore/documentation/brahmacore/portallocator/) — engine-wide preview ports.
+
+## How it connects
+
+- **Called by Orchestrator.** The engine constructs the `PreviewRunner` and counts its children and starts in flight toward its awake work.
+- **Called by MCP.** `set_preview_command` writes a surface through `store.upsertPreviewSurface`.
+- **Called by Release.** Deploy smoke reuses `SmokeRequest` and `HTTPProbing`, and the release executor removes its exports through `EngineExport.remove`.
+- **Calls Git.** `EngineExport` is a thin wrapper over `GitWorkspace`'s engine export.
+- **Calls Sandbox.** A preview context carries a `SandboxPolicy`; Full companies use `UnsandboxedPreviewRunner`, which still implements `SandboxedRunner`.
+
+<ModuleFacts module="BrahmaCore" area="Preview" />
+
+<SourceLink path="Sources/BrahmaCore/Preview" />

@@ -1,0 +1,33 @@
+---
+title: Extensions
+description: "Extension packages: the plugin-folder format, the decomposing importer, the allowlist validator, install and per-role mounts, built-ins and ext try."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+An extension is a Claude Code plugin folder reduced to what Brahma runs: skills, commands, agents and assets. `ExtensionImporter` copies a source into staging under size and name limits and drops every part Brahma does not run. `ExtensionValidator` is an allowlist over the staged package; hooks, MCP and LSP servers, binaries outside `assets/` and unparseable frontmatter are refused. `ExtensionLibrary` runs the install pipeline (validate, one owner-only ask, materialize read-only, bind) and computes the per-role mounts from `RoleBundle`. `BuiltinExtensions` are Brahma's own, pinned by tree hash. `ExtensionTry` runs a working folder in one throwaway turn.
+
+## Key types
+
+- [`ExtensionManifest`](/api/brahmacore/documentation/brahmacore/extensionmanifest/) and [`ExtensionLock`](/api/brahmacore/documentation/brahmacore/extensionlock/) — the package's `plugin.json` and its hashed file list.
+- [`ExtensionImporter`](/api/brahmacore/documentation/brahmacore/extensionimporter/) — copy, limit and decompose a source into staging.
+- [`ExtensionValidator`](/api/brahmacore/documentation/brahmacore/extensionvalidator/) — the allowlist and the lint issues it raises.
+- [`ExtensionLibrary`](/api/brahmacore/documentation/brahmacore/extensionlibrary/) — install, materialize, bind and mount.
+- [`RoleBundle`](/api/brahmacore/documentation/brahmacore/rolebundle/) — which extensions a role gets.
+- [`BuiltinExtensions`](/api/brahmacore/documentation/brahmacore/builtinextensions/) — Brahma's own, publisher `brahma`.
+
+## How it connects
+
+- **Called by MCP.** `propose_extension` hands a lab folder to the library and files the `extension` ask.
+- **Called by the CLI.** `brahma ext try` runs a folder under the engine's owner sandbox runner.
+- **Calls Store.** The library writes `ExtensionPackage` rows (by tree hash) and each company's `CompanyExtension` rows.
+- **Calls Sandbox.** A zip is unpacked under the `SandboxedRunner`, never in the engine's own process context.
+- **Calls Util.** Tree and file hashes are `SHA256.hex`.
+- **Read by Orchestrator.** The turn's protected paths include other agents' extension review directories under `ExtensionLibrary.reviewDir`.
+
+<ModuleFacts module="BrahmaCore" area="Extensions" />
+
+<SourceLink path="Sources/BrahmaCore/Extensions" />

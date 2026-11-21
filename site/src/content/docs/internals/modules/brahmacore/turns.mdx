@@ -1,0 +1,33 @@
+---
+title: Turns
+description: "One claude -p process per agent turn: the profile compiled into argv, settings and environment, the prompts, the stream-json parser, the turn-start digest, the PreToolUse hook and the audit."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+A turn is one `claude -p` child process: prompt on stdin, `stream-json` on stdout. `TurnProfile` is everything that decides how it is launched, and `TurnProfileCompiler` is the only place that becomes argv, a settings file and the engine-set child environment. `ClaudeProcessRunner` is the production `TurnRunning`; `StreamParser` turns each output line into typed events and `TurnStreamState` adds them up (the last result is the outcome, usage is summed). `RolePrompt` and `OperatingRules` are the system prompt; `TurnDigest` is the turn-start orientation built from the store and the workspace. `PreToolHook` is the engine's `PreToolUse` hook on `Agent`, `Task` and `Workflow`. `TurnAudit` is what the engine expects the CLI to report and checks afterwards.
+
+## Key types
+
+- [`TurnRunning`](/api/brahmacore/documentation/brahmacore/turnrunning/) and [`ClaudeProcessRunner`](/api/brahmacore/documentation/brahmacore/claudeprocessrunner/) — the protocol and the real process.
+- [`TurnRequest`](/api/brahmacore/documentation/brahmacore/turnrequest/) and [`TurnResult`](/api/brahmacore/documentation/brahmacore/turnresult/) — what a turn is asked and what it came to.
+- [`TurnProfile`](/api/brahmacore/documentation/brahmacore/turnprofile/) and [`TurnProfileCompiler`](/api/brahmacore/documentation/brahmacore/turnprofilecompiler/) — how a turn is launched.
+- [`StreamParser`](/api/brahmacore/documentation/brahmacore/streamparser/) and [`StreamEvent`](/api/brahmacore/documentation/brahmacore/streamevent/) — the output, typed.
+- [`TurnDigest`](/api/brahmacore/documentation/brahmacore/turndigest/) — the turn-start orientation.
+- [`PermissionProfile`](/api/brahmacore/documentation/brahmacore/permissionprofile/) — `sandboxed`, `workspace` or `full`.
+
+## How it connects
+
+- **Called by Orchestrator.** The engine builds a `TurnRequest`, renders `RolePrompt` and `TurnDigest`, iterates `runner.run(request)` and feeds a `TurnStreamState`.
+- **Called by Engine and Modes.** The doctor, the mode canary and the control probe start the CLI through `TurnRunning`.
+- **Calls Sandbox.** The compiler calls `ClaudeSettingsCompiler.compile`, and a `ClaudeCommand` carries its `SandboxScope`.
+- **Calls Work, Safety and Org.** A command carries a `ModeDecision`; the child environment passes the `SecretStore` choice through; the default tool list comes from `CompanyToolNames`.
+- **Calls Store.** The digest reads the agent's `WorkLease` and `PendingNotice`s.
+- **Read by Git.** Git child processes take their environment from `ChildEnvironment`.
+
+<ModuleFacts module="BrahmaCore" area="Turns" />
+
+<SourceLink path="Sources/BrahmaCore/Turns" />

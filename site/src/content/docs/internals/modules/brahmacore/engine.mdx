@@ -1,0 +1,32 @@
+---
+title: Engine
+description: "Engine-wide health: the claude doctor and its mode canary, holds and alerts, the plan tier and the company-active clock."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+What the engine knows about itself as a whole, across companies. `Doctor` checks that the installed `claude` still behaves the way the engine's argv and stream parsing assume, and `ModeCanary` does the same for each compiled settings shape without calling a model. `EngineHealth` classifies failures and decides when the whole engine pauses on a hold (`HoldReason`: the CLI changed, disk is low, the network or account is down), and `EngineAlerts` puts those holds in front of the owner as asks. `PlanTier` is the owner's plan setting, which sizes the per-mode caps and new companies. `CompanyClock` is the company-active clock every timeout in the work system counts on.
+
+## Key types
+
+- [`Doctor`](/api/brahmacore/documentation/brahmacore/doctor/) and [`DoctorReport`](/api/brahmacore/documentation/brahmacore/doctorreport/) — the CLI checks and their result.
+- [`ModeCanary`](/api/brahmacore/documentation/brahmacore/modecanary/) — zero-inference probe of each mode's compiled profile.
+- [`EngineHealth`](/api/brahmacore/documentation/brahmacore/enginehealth/), [`HoldReason`](/api/brahmacore/documentation/brahmacore/holdreason/) and [`EngineHold`](/api/brahmacore/documentation/brahmacore/enginehold/) — why the engine is paused.
+- [`EngineAlerts`](/api/brahmacore/documentation/brahmacore/enginealerts/) — the `engineAlert` asks filed for a hold.
+- [`PlanTier`](/api/brahmacore/documentation/brahmacore/plantier/) — the owner-wide plan setting.
+- [`CompanyClock`](/api/brahmacore/documentation/brahmacore/companyclock/) — company-active seconds.
+
+## How it connects
+
+- **Called by Orchestrator.** The health step runs `Doctor.run` in the background and sets or clears holds on the store, using `EngineHealth.diskHoldBytes` for the disk rule.
+- **Called by the CLI.** `brahma doctor` runs the same `Doctor.run`.
+- **Calls Turns.** The doctor and the mode canary start the CLI through the `TurnRunning` protocol, never a second process launcher.
+- **Calls Messaging.** `EngineAlerts` sends its owner DMs through `MessageRouter`.
+- **Read by Scheduler.** `SchedulerConfig` carries the `PlanTier`, which fixes the per-mode caps.
+
+<ModuleFacts module="BrahmaCore" area="Engine" />
+
+<SourceLink path="Sources/BrahmaCore/Engine" />

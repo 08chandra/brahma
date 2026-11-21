@@ -1,0 +1,28 @@
+---
+title: Lifecycle
+description: "The legal agent state transitions, and the one store call that validates, persists and announces a transition."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+An agent is `ready`, `running`, `blocked`, `sleeping` or `killed`. `AgentLifecycle` is the table of legal moves between those states; anything else is a `LifecycleError`. The store extension in this area, `Store.transition`, validates the move, writes the new state and a `stateChanged` event in one transaction, and, when the agent leaves the company, offboards it: asks and reviews re-routed, leases expired, items unassigned with an auto hand-off, reports reparented. `Store+Control` holds the owner's pause and the per-agent readers the app and CLI use.
+
+## Key types
+
+- [`AgentLifecycle`](/api/brahmacore/documentation/brahmacore/agentlifecycle/) — `canTransition(from:to:)`, the legal set.
+- [`LifecycleError`](/api/brahmacore/documentation/brahmacore/lifecycleerror/) — an illegal move.
+- `Store.transition(agentId:to:blocker:now:)` — the one write path; see [Store](/internals/modules/brahmacore/store/).
+
+## How it connects
+
+- **Called by Orchestrator.** Each tick moves agents between `ready`, `blocked` and `sleeping` through `store.transition`, for example when the usage gate blocks a company or a turn budget is spent.
+- **Called by the CLI and the app.** `brahma pause` and the app's agent detail call `store.setPaused`.
+- **Calls Store.** The transition runs inside the store's writer and throws `StoreError` when the agent is missing.
+- **Reads Model.** The states are `AgentState`; the reason an agent waits is a `Blocker`.
+
+<ModuleFacts module="BrahmaCore" area="Lifecycle" />
+
+<SourceLink path="Sources/BrahmaCore/Lifecycle" />

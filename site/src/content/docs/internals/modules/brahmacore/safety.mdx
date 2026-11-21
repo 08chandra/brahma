@@ -1,0 +1,33 @@
+---
+title: Safety
+description: "Secrets and the redactor, the prompt-injection taint rule, the owner's emergency stop, the sandbox canary and its probes, the data-home and owner-shell guards, and the sleep guard."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+The rules that hold whatever an agent does. `SecretVault` is where secret values live (the database holds names only); `Redactor` matches those values in stored text, in raw, percent-encoded and JSON-escaped forms; `SecretScan` finds secret-like text. `TaintPolicy` is the prompt-injection rule: once a turn has read outside content its session is tainted and every company tool outside the taint-safe list is refused until a fresh session. `EmergencyStop` is the owner's stop: while the row exists nothing runs in any company. `SandboxCanary` runs owner-written probes the sandbox must deny and keys the pass to the installed `claude` by path, size, inode and times. `DataHomeGuard` and `OwnerShellGuard` keep the data home out of every agent's reach. `SleepGuard` keeps the Mac awake while agents run.
+
+## Key types
+
+- [`SecretVault`](/api/brahmacore/documentation/brahmacore/secretvault/) and [`Redactor`](/api/brahmacore/documentation/brahmacore/redactor/) — where values live, and how they are hidden in text.
+- [`SecretScan`](/api/brahmacore/documentation/brahmacore/secretscan/) and [`ScanFinding`](/api/brahmacore/documentation/brahmacore/scanfinding/) — finding secret-like text.
+- [`TaintPolicy`](/api/brahmacore/documentation/brahmacore/taintpolicy/) and [`TaintFlag`](/api/brahmacore/documentation/brahmacore/taintflag/) — the taint rule and its on-disk flag.
+- [`EmergencyStop`](/api/brahmacore/documentation/brahmacore/emergencystop/) — the owner's stop.
+- [`SandboxCanary`](/api/brahmacore/documentation/brahmacore/sandboxcanary/) and [`CLIFingerprint`](/api/brahmacore/documentation/brahmacore/clifingerprint/) — the canary and what keys it.
+- [`SleepGuard`](/api/brahmacore/documentation/brahmacore/sleepguard/) — `caffeinate` while agents run.
+
+## How it connects
+
+- **Called by Orchestrator.** The per-launch gate holds a `SandboxCanaryRunning` and a `CLIFingerprint` reader; a running turn's supervision polls the stop every `EmergencyStop.pollInterval`; the engine owns the `SleepGuard`.
+- **Called by MCP.** `CompanyTools` refuses high-risk tools in a tainted session through `TaintPolicy` and holds the `SecretVault` for `request_secret`.
+- **Called by Store.** `Store+Secrets` loads the redactor from the vault and writes provided secrets into it; `Store+Taint` records lab taint.
+- **Called by the CLI.** `brahma stop` signals the recorded process groups through `EmergencyStop`.
+- **Implemented by BrahmaKeychain.** `KeychainVault` is the production `SecretVault`.
+- **Read by Turns.** The PreToolUse hook checks `TaintFlag.exists`.
+
+<ModuleFacts module="BrahmaCore" area="Safety" />
+
+<SourceLink path="Sources/BrahmaCore/Safety" />

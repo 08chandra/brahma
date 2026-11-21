@@ -7,4 +7,48 @@ sidebar:
 
 One page per Swift target and per `BrahmaCore` area. The [architecture](/internals/architecture/) page shows how they fit together; the [API reference](/api/) lists the public types.
 
-Module pages arrive here as the documentation is written.
+## Swift targets
+
+| Target | What it is | Page |
+| --- | --- | --- |
+| `BrahmaCore` | The library every other target links: engine, work system, store, sandbox. Split into 29 areas. | [BrahmaCore](/internals/modules/brahmacore/) |
+| `BrahmaAppModel` | The Mac app's state, with no AppKit or SwiftUI import. | [BrahmaAppModel](/internals/modules/brahmaappmodel/) |
+| `BrahmaApp` | The SwiftUI views and the menu bar extra. | [BrahmaApp](/internals/modules/brahmaapp/) |
+| `BrahmaMapKit` | SpriteKit rendering of the live agent map. | [BrahmaMapKit](/internals/modules/brahmamapkit/) |
+| `BrahmaKeychain` | The macOS Keychain behind two `BrahmaCore` protocols. | [BrahmaKeychain](/internals/modules/brahmakeychain/) |
+| `CSandboxCheck` | Three C functions over `sandbox_check`. | [CSandboxCheck](/internals/modules/csandboxcheck/) |
+| `brahma` | The command-line executable over the same library. | [brahma](/internals/modules/brahma-cli/) |
+
+## BrahmaCore areas
+
+Each area page has the same shape: what the area is for, its key types, which areas call it and which it calls, and the public API facts for the area (symbol count, types with links into the API reference, source files).
+
+[Access](/internals/modules/brahmacore/access/) ·
+[Backup](/internals/modules/brahmacore/backup/) ·
+[Engine](/internals/modules/brahmacore/engine/) ·
+[Extensions](/internals/modules/brahmacore/extensions/) ·
+[Git](/internals/modules/brahmacore/git/) ·
+[Handbook](/internals/modules/brahmacore/handbook/) ·
+[Hosting](/internals/modules/brahmacore/hosting/) ·
+[Lifecycle](/internals/modules/brahmacore/lifecycle/) ·
+[MCP](/internals/modules/brahmacore/mcp/) ·
+[Memory](/internals/modules/brahmacore/memory/) ·
+[Messaging](/internals/modules/brahmacore/messaging/) ·
+[Model](/internals/modules/brahmacore/model/) ·
+[Modes](/internals/modules/brahmacore/modes/) ·
+[Orchestrator](/internals/modules/brahmacore/orchestrator/) ·
+[Org](/internals/modules/brahmacore/org/) ·
+[Owner](/internals/modules/brahmacore/owner/) ·
+[Platform](/internals/modules/brahmacore/platform/) ·
+[Preview](/internals/modules/brahmacore/preview/) ·
+[Release](/internals/modules/brahmacore/release/) ·
+[Resources](/internals/modules/brahmacore/resources/) ·
+[Safety](/internals/modules/brahmacore/safety/) ·
+[Sandbox](/internals/modules/brahmacore/sandbox/) ·
+[Scheduler](/internals/modules/brahmacore/scheduler/) ·
+[Store](/internals/modules/brahmacore/store/) ·
+[Timers](/internals/modules/brahmacore/timers/) ·
+[Turns](/internals/modules/brahmacore/turns/) ·
+[Util](/internals/modules/brahmacore/util/) ·
+[Verify](/internals/modules/brahmacore/verify/) ·
+[Work](/internals/modules/brahmacore/work/)
