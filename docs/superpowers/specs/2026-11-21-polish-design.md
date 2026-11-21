@@ -1,10 +1,11 @@
 # Plan P — Polish before dogfood (design)
 
-**Status:** design, 2026-11-21. The owner approved the scope (design analysis items 1–3). Build order: 4a → C → 4b leftovers → S → R → **P** → first dogfood run.
+**Status:** design, 2026-11-21, revised after the owner's decisions of 01:13 and 01:16 (see below). The owner approved the scope (design analysis items 1–3). Build order: 4a → C → 4b leftovers → S → R → **P** → first dogfood run.
 **Plan:** `docs/superpowers/plans/2026-11-21-planP-polish.md`.
 **Inputs:**
 - `2026-11-21-design-analysis-input.md` (*analysis §n*)
 - `2026-10-21-brahma-design-v2.md` §1.3 (concept budget), §4.12 (app layout)
+- `docs/superpowers/specs/2026-10-20-visual-design.md` (the binding look for the polish pass)
 - `2026-10-20-visual-design.md` (BrahmaTheme)
 - Plan R spec (`2026-11-21-restructure-service-design.md`, *R §n*)
 - Ledgers under `*/.superpowers/sdd/` (4a, C, 5-lite, L)
@@ -14,85 +15,45 @@ P builds on R. It uses R's module split, R's in-process service host for tests, 
 
 ---
 
-## Owner questions (recommended defaults; the plan builds the defaults unless you say otherwise)
+## Owner decisions, 2026-11-21
 
-### PQ1 — The new sidebar (recommended: layout A)
+### 01:13 — the app keeps its layouts; P polishes them
 
-Today: 14 fixed rows (Mission Control, Activity, Agents, Backlog, Board, Releases, Handbook, Resources, Budget, Inbox, Grants, Digest, Company, Backups), then channels and DMs. Plan C adds a CHANGES view and the ⌘K Show bar.
+- **Rejected:**
+  - the navigation restructure, meaning the former layout A: a 7-row five-noun sidebar with tabs, the Mission Control strip and the Insights pane;
+  - folding the standalone Activity page.
+- **Kept:** today's sidebar (14 fixed rows plus channels and DMs) and every screen's layout, with their detailed, dense look. Nothing moves and nothing is removed from a screen.
+- **Instead:**
+  - a **polish pass** on the existing layouts (§5.1);
+  - a **performance pass** on heavy views (§5.1.5);
+  - a **usability review**. Its findings are written up for the owner, and each one is changed **only after the owner approves it** (§5.1.6).
 
-**Layout A (recommended): the five nouns, plus Settings and Insights pinned at the bottom. That is 7 fixed rows.**
-```
-┌────┬──────────────────────────┬────────────────────────────────────────────────────────────────┐
-│ ▣A │ ◉ Mission Control        │ WORK   Backlog · Board · Changes · Releases · Handbook · Resources│  ← tab strip (28 pt header)
-│ ▣B │ ▸ Inbox               5  │ ───────────────────────────────────────────────────────────────│
-│ ＋ │ ▸ Work                   │  KEY    TITLE                         STATUS     OWNER   UPDATED │
-│    │ ▸ People                 │  A-12   Login form                    inReview   @eng-1  09:41   │
-│    │ ▸ Budget                 │  …                                                             │
-│    │                          │                                                                │
-│    │ CHANNELS                 │                                                                │
-│    │  # general            2  │                                                                │
-│    │  # eng                   │                                                                │
-│    │ DIRECT MESSAGES       ＋ │                                                                │
-│    │  @ceo                 1  │                                                                │
-│    │ ▸ Agent conversations    │                                                                │
-│    │                          │                                                                │
-│    │ ─────────────────────    │                                                                │
-│    │ ⚙ Settings               │                                                                │
-│    │ ◌ Insights               │                                                                │
-└────┴──────────────────────────┴────────────────────────────────────────────────────────────────┘
- ⌘1 Mission Control  ⌘2 Inbox  ⌘3 Work  ⌘4 People  ⌘5 Budget  ⌘, Settings  ⌘K Show/search (Plan C)
-```
+### 01:16 — the CLI keeps every command as it is
 
-| Noun row | Tabs (left to right; the first is the default) | Comes from |
-|---|---|---|
-| Mission Control | — (one page: NEEDS YOU · STUCK · SHIPPED strip, PREVIEW + MAP, ACTIVITY) | Mission Control, Activity |
-| Inbox | Asks · Requests (access, files, human tasks, secrets) · Grants · Digest | Inbox, Grants, Digest |
-| Work | Backlog · Board · Changes (C) · Releases · Handbook · Resources | Backlog, Board, Releases, Handbook, Resources, C's CHANGES |
-| People | Roster · Org chart (4b map, full size) | Agents |
-| Budget | Pace · Spend · Storage | Budget |
-| Settings | Company · Engine (R) · Backups · App | Company, Backups, R's engine panel |
-| Insights (read-only) | Activity log · Merge queue (4a) · Timers · Health · Sandbox canary · Outcome facts | Activity (full log), plus read-only views of what today only the CLI shows |
+- **Rejected:** regrouping commands under nouns, a `brahma dev …` namespace, renames, and deprecation aliases.
+- **Kept:** every command name, path, option, argument, exit code and stdout format.
+- **Instead:** P improves the CLI's **help text, examples and error messages** only (§5.2).
 
-- **Layout B (alternative):** the same seven rows, with Insights as a tab inside Settings instead of a row. That gives one fewer row, but Insights becomes hard to find.
-- **Layout C (alternative):** keep today's rows and only group them under headers. This is the smallest change, and it still has 14 rows.
+### 01:16 — Plan R engine defaults confirmed
 
-### PQ2 — Namespace for internal and recovery CLI commands
-**Recommended: `brahma dev …`, the name you used.**
-- It is listed in `brahma --help` as one line: "dev — internals, diagnostics and recovery".
-- Its contents show only under `brahma dev --help`.
-- Today's hidden `BRAHMA_DEV=1` test hooks move to `brahma dev test …` and stay gated.
-- The alternative is `brahma admin …`, which reads better for recovery commands such as `main accept`.
-
-### PQ3 — Top-level shortcuts that stay forever
-**Recommended: keep `status`, `why`, `say`, `approve`, `answer`, `stop`, `resume` and `doctor` as permanent top-level verbs.**
-- They are what you type daily, or in an emergency.
-- Each is also reachable under its noun, for example `inbox approve`.
-- The alternative is strict nouns only, where `brahma approve` becomes a deprecated alias.
-
-### PQ4 — How long old command names keep working
-**Recommended: until the first tagged release after the dogfood week, and at least 30 days.**
-- Old names run the new command unchanged.
-- On an interactive terminal only, they print one stderr line: `note: 'brahma items list' is now 'brahma work list'`.
-- Scripts and pipes see no change in stdout or stderr.
-- `brahma help moved` prints the whole old → new table.
-
-### PQ5 — The standalone Activity page
-**Recommended: fold it.**
-- Mission Control keeps the live ACTIVITY panel, with filters.
-- Insights › Activity log has the full searchable history.
-- The People inspector shows the agent's own lines.
-- Launch targets `--select activity` keep working and open Insights › Activity log.
-
-The defaults change only what you see. No capability is removed: every view and every command remains reachable (§5 anti-goals).
+- Quitting the app leaves agents working. ⌥ Quit or the menu's Stop engine stops them. Desktop notifications pause while the app is closed.
+- The engine starts at login.
+- On an update, in-flight work gets up to 10 minutes to finish, then the engine restarts.
+- `brahma run` / `brahma engine run` stays, for development.
 
 ---
 
 ## 1. Why
 
-- **The owner surfaces leak engine internals** (*analysis §2, §4, §8 #13*).
-  - The sidebar has 14 fixed destinations (`BrahmaAppModel/Presentation/Sidebar.swift:4-22`, `BrahmaApp/Views/Sidebar.swift:15-31`).
+- **The app is built screen by screen across eight plans and has never had one consistency pass** (*analysis §4, §5*). It has 41 top-level view files in `BrahmaApp/Views`, plus Handbook, Map, Preview, Resources, Refs and Changes subfolders. Plans 2, 3a, 5-lite, L, ML, 4a, 4b and C each added screens against the visual-design brief.
+  - The token contrast fails WCAG AA for the most-used secondary text. `text2` #6E7C89 measures 4.39 : 1 on `bg0`, 3.79 on `bg2` (panels), 3.40 on `bg3` (headers, hovered rows) and 2.92 on `bg4` (selected rows). `accent` #2D72D2 used as text (mentions) measures 3.44 on `bg2`. The `killed` color #404854 as text measures 1.76.
+  - Empty, loading and error states differ from screen to screen, and agent text can overflow tables.
+  - The analysis did not run the app (*analysis §4*), so a real audit is the first step.
+  - The owner keeps the dense ops-console layouts (decision 01:13). Polish makes them consistent and fast without moving anything.
+- **The CLI is hard to learn from its own help** (*analysis §2, §5 "CLI"*).
   - The CLI has 43 command files and 58 top-level entries (`Sources/brahma/Brahma.swift`). The help tree has 130 visible leaf commands on `planC-collab`, counted by walking `--help`. That is before the hidden `dev`/`hook` groups and before 4a's `artifacts`.
-  - The v2 spec's concept budget (§1.3) says the owner operates five nouns, with internals read-only under Insights. The README is stale ("This is Plan 3a").
+  - Only 15 commands have a `discussion`, and only one source file contains an example. There are 204 `fail(` and 34 `ValidationError(` messages, and many say what failed without saying what to do next.
+  - The owner keeps the command tree as it is (decision 01:16), so P improves the help and the errors in place. The README is stale ("This is Plan 3a").
 - **There is no golden-path test** (*analysis §2 must-haves, §6, §8 #7*). No test runs goal → org → backlog → work → check → review → merge → preview → owner Inbox on every plan merge. The real version (`LiveSmokeTests/goalToLiveURL`) needs `BRAHMA_LIVE=1` and real `claude`, and has never run as a gate.
 - **The suite is slow and flaky** (*analysis §5*).
   - About 3,200 tests: 2,759 core, 411 app-model and 45 map.
@@ -103,25 +64,38 @@ The defaults change only what you see. No capability is removed: every view and 
 
 ## 2. Goals
 
-1. **G1 App IA.** Seven fixed sidebar rows (layout A). The views become tabs under their noun. Mission Control answers, in order: what needs me, what is stuck and why, what shipped. Launch targets and deep links keep working.
-2. **G2 CLI IA.** `brahma --help` shows the five nouns plus about ten system verbs (≈ 16 lines, down from 58). Internals move under `brahma dev`. Every old command path keeps working through a single rewrite table with a deprecation note, and every hint string the product prints names the new path.
-3. **G3 Golden path.** One deterministic end-to-end test runs in the default suite in under 30 s. A black-box script version (`scripts/golden-path.sh`) runs on every plan merge.
-4. **G4 Determinism and speed.** The ten listed flakes are fixed at the root. The default ("unit") tier has no wall-clock sleeps or real ports. Process, sandbox and timing tests move to an opt-in `process` tier, alongside the existing `live` tier. The unit tier runs in **under 90 s** on an idle machine (*analysis §8 #7*), and two worktrees can run it at the same time.
-5. **G5 Change notifications.** The app refreshes from engine-pushed change topics instead of a 500 ms timer. Each refresh reads only the parts of the snapshot whose topics changed, and a change shows up within 250 ms. A cheap fallback keeps the app correct when the service is unreachable.
+1. **G1 App polish.**
+   - Every existing screen matches `2026-10-20-visual-design.md`: spacing, alignment, type scale, hairlines, chips, and empty, loading and error states.
+   - Every screen gets consistent hover, focus and keyboard behaviour, safe truncation and overflow, dark-mode contrast at **WCAG AA**, and the brief's micro-interactions.
+   - Heavy views render and scroll within budget (§5.1.5).
+   - **What is on each screen and where it lives do not change** (§4).
+2. **G1b Usability write-up.** Anything that is hard to use is written up for the owner (screen, problem, why, proposed fix, effort) and left unchanged until the owner approves it. Polish proceeds on everything else.
+3. **G2 CLI help and errors.**
+   - Every command has a clear one-line abstract and every leaf has runnable examples.
+   - Every error message says what failed and the exact next step.
+   - Every `brahma …` hint the product prints names a command that exists.
+   - Command names, paths, options, exit codes and stdout formats do not change (decision 01:16).
+4. **G3 Golden path.** One deterministic end-to-end test runs in the default suite in under 30 s. A black-box script version (`scripts/golden-path.sh`) runs on every plan merge.
+5. **G4 Determinism and speed.** The ten listed flakes are fixed at the root. The default ("unit") tier has no wall-clock sleeps or real ports. Process, sandbox and timing tests move to an opt-in `process` tier, alongside the existing `live` tier. The unit tier runs in **under 90 s** on an idle machine (*analysis §8 #7*), and two worktrees can run it at the same time.
+6. **G5 Change notifications.** The app refreshes from engine-pushed change topics instead of a 500 ms timer. Each refresh reads only the parts of the snapshot whose topics changed, and a change shows up within 250 ms. A cheap fallback keeps the app correct when the service is unreachable.
 
 ## 3. Non-goals
 
 - **The cost-per-outcome view** (*analysis §2 must-haves*). The owner did not include it in P. It is listed as the first post-dogfood candidate.
-- New owner features, new nouns, and redesigning any individual view's content beyond moving it into a tab. The exception is Mission Control's top strip, which reuses `why`/stall data that already exists (`Store+StallReport`).
+- **Any navigation or layout restructure** (owner decision 01:13). That rules out a new sidebar, tabs that replace rows, a Mission Control strip, an Insights pane, and moving or folding the Activity page.
+- New owner features or new nouns. Usability fixes are **proposals** until the owner approves them one by one (§5.1.6). An approved fix is built in a follow-up task, or in P only if approval arrives before Task 15 ends.
 - Changing the agent-facing CLI: `brahma mcp` and `brahma hook pre-tool|post-tool` keep their names and argv, because canary keys include the settings shape.
 - Moving engine DB reads off the actor (R non-goal) and push-based map animation changes (the map keeps its render loop; only its data poll changes).
-- Removing old CLI names before the window in PQ4 ends.
+- **Any CLI regrouping, rename, alias or removal** (owner decision 01:16).
 
 ## 4. Anti-goals (binding)
 
-- **No capability lost.** Every current sidebar destination is reachable in at most two clicks. Every current command is reachable under its new path and under its old path. `IACoverageTests` enumerates both.
-- **No script breakage.** The stdout of every command is byte-identical, and the deprecation note is TTY-only. `--json` output is unchanged.
-- **No weakened owner gating.** Moved commands keep `requireOwnerShell()` and `BRAHMA_AGENT_ID` refusals. `CLIOwnerGateTests` checks every new path against the old path's gate.
+- **No layout change.**
+  - Every screen keeps its panels, columns, controls, rows and order, and the sidebar keeps its 14 fixed rows.
+  - `ScreenInventoryTests` compares the accessibility inventory of every screen before and after the polish (§5.1.1). Polish may add labels, help text and focus order. It may not add, remove or move elements.
+  - **No CLI change beyond text.** The command tree, options, exit codes and the stdout of every non-help command are unchanged. `CLITreeFrozenTests` pins the tree from Task 8.
+- **No script breakage.** Normal stdout and `--json` output stay byte-identical, and exit codes do not change. Only `--help` output and stderr error text change.
+- **No weakened owner gating.** Error-message edits never move or reorder a `requireOwnerShell()`/`BRAHMA_AGENT_ID` check. Agent text in errors still goes through `safe()`.
 - **No safety by notification.**
   - Change notifications are a latency optimization, never a correctness or safety signal.
   - Holds, stops and Inbox counts are still read from the DB.
@@ -132,106 +106,133 @@ The defaults change only what you see. No capability is removed: every view and 
 
 ## 5. Architecture and decisions
 
-### 5.1 App information architecture (architect's call within PQ1)
+### 5.1 App polish on the existing layouts (architect's call within decision 01:13)
 
-**Model.** `SidebarItem` becomes:
-```swift
-public enum SidebarItem: Hashable, Sendable {
-    case missionControl
-    case inbox(InboxTab)        // .asks, .requests, .grants, .digest
-    case work(WorkTab)          // .backlog, .board, .changes, .releases, .handbook, .resources
-    case people(PeopleTab)      // .roster, .org
-    case budget(BudgetTab)      // .pace, .spend, .storage
-    case settings(SettingsTab)  // .company, .engine, .backups, .app
-    case insights(InsightsTab)  // .activity, .mergeQueue, .timers, .health, .canary, .facts
-    case channel(id: String)
-    case dm(handle: String)
-}
-```
-- Each noun remembers its last tab (`AppModel.lastTab[Noun]`).
-- `SidebarItem.legacy(_:)` maps every old case: `.backlog → .work(.backlog)`, `.inboxGrants → .inbox(.grants)`, `.settingsBackups → .settings(.backups)`, `.activity → .insights(.activity)`, and so on.
-- `SelectTarget` (launch options, notification deep links, `--select …`) keeps every existing spelling and maps it through `legacy`.
+#### 5.1.1 Audit first, against a frozen inventory
 
-**Views.**
-- The new `NounHeader` component is the 28 pt panel header strip with uppercase tab labels, the accent underline on the selected tab, and a mono count chip per tab where one applies (Inbox › Asks count, Work › Changes count).
-- Tabs reuse today's views unchanged (`BacklogView`, `BoardView`, `ReleasesView`, `HandbookView`, `ResourcesView`, `GrantsView`, `DigestView`, `BackupsView`, `CompanySettingsView`, `BudgetView` and `StoragePanel`, plus C's `ChangesBoardView`).
-- `DetailView`'s switch moves from 14 cases to 7 noun views.
+- **Screens in scope** (every one of today's, plus whatever 4a, C and the 4b leftovers add by P's start):
+  - Rail, sidebar, top bar.
+  - Mission Control: preview, agent map and activity panels.
+  - Activity, Agents with the agent inspector and replay, Backlog with the item inspector, Board.
+  - Releases, Handbook with pages, memory and the edit sheet, Resources, Budget with storage.
+  - Inbox with the cards (access, deploy, human task, file request, live fallback), Grants, Digest.
+  - Company settings, Backups.
+  - Chat with the composer and the DM picker.
+  - The search results.
+  - C's Changes board and diff, its Show bar and palette, and its ref views.
+  - The preview pane.
+  - Every sheet: new company, hire, item editor, secret, KB edit, fill vacancy.
+  - The menu bar extra, the engine banner, the startup error.
+- **States per screen:** seeded (`scripts/seed-demo.sh`), empty (a fresh home), loading (a slowed store through the existing harness), error (an injected store failure), long content (generated agent text of 2,000 characters, 500 rows, handles of 64 characters), and the window at its minimum size (1100 × 700) and at full screen.
+- **Inventory:**
+  - A new harness flag, `--ui-inventory <out.json>`, dumps every screen's accessibility tree: role, identifier, label and frame order, without values.
+  - `scripts/ui-inventory.sh` writes `Tests/Fixtures/ui-inventory/<screen>.json` **before** any polish.
+  - `ScreenInventoryTests` (process tier, it launches the app) diffs the current tree against that baseline. Allowed: added labels, help and identifiers. Anything else fails.
+- **Audit sheet:** `docs/superpowers/audits/2026-11-planP-ui-audit.md`, one row per finding: screen, state, finding, rule broken (§5.1.2–§5.1.4 or the visual-design spec line), and class.
+  - **Polish** means it is fixed in P without changing content or location.
+  - **Usability** means it goes to the owner write-up (§5.1.6) and is not fixed.
+  - **Perf** means it goes to §5.1.5.
 
-**Mission Control top strip** (*analysis §4*: "make Mission Control answer three questions in order"). Three equal cards, about 96 pt tall, above the PREVIEW + MAP panels:
+#### 5.1.2 Tokens and one shared set of components
 
-```
-┌ NEEDS YOU ─────────────── 5 ┐┌ STUCK ──────────────────── 2 ┐┌ SHIPPED (7 days) ─────────── ┐
-│ A-14 deploy v0.3 to prod    ││ nothing running: weekly pace ││ ▲ preview web · a1b2c3d 09:12│
-│ A-15 grant npm registry     ││   closed until Thu 09:00     ││ ▲ v0.2 deployed  Tue 17:40   │
-│ F-2  file request from @pm  ││ @eng-2 blocked on A-9 (you)  ││ 12 items merged              │
-│ Open Inbox →                ││ Why? →  (brahma why)         ││ Releases →                   │
-└─────────────────────────────┘└──────────────────────────────┘└──────────────────────────────┘
-```
-- **NEEDS YOU:** `WorkSnapshot.inbox`, the top 3 by the Inbox's own order.
-- **STUCK:** `store.stallReport(companyId:).reasons` (already computed per company in `Snapshot.load`), plus agents blocked on the owner.
-- **SHIPPED:** preview surfaces with their commits, the latest releases, and the merged count over 7 wall days.
-- Only existing Store reads are used. 4b's deferred "Mission Control slot swap" lands before P. P places the strip **above** whatever slot layout 4b leaves, and Task 11 reads the merged layout first.
+- **Type scale** (from the brief): 10 pt uppercase labels (+0.6 tracking), 11 pt panel titles (semibold uppercase), 12 pt body, 13 pt body-strong, 11–12 pt SF Mono data, and 15 pt semibold for the company name only. These become `BrahmaTheme.Font.{label,panelTitle,body,bodyStrong,mono,monoSmall,companyName}`.
+- **Spacing scale:** 2, 4, 8, 12, 16 (`spaceXXS…spaceL`, extending today's `spaceS/M/L`). Corner radius 2–3. Hairline 1 px using `line` and `lineStrong`. Rows are 22–24 pt in tables and 24 pt in the sidebar. Chips are 18 pt with radius 2, a 1 px status border and a 15 % fill.
+- **Contrast fix (architect's call, token values only):**
+  - `text2` #6E7C89 → **#84919E**. Measured: 5.84 on `bg0`, 5.44 on `bg1`, 5.04 on `bg2`, 4.52 on `bg3`. It keeps its place in the grey ramp below `text1` (8.21 on `bg1`).
+  - On `bg4` (selected rows) tertiary text uses `text1`, because #84919E measures 3.88 there.
+  - A new `accentText` **#609FF3** is used for accent-coloured *text* (mentions, links, "Open Inbox →"). It measures 5.99 on `bg2` and 4.61 on `bg4`. The `accent` fill and focus colour stay #2D72D2: as a UI component it needs 3 : 1, and it measures 3.44 on `bg2`.
+  - A killed agent's *name* uses the new `text2` with a strikethrough. The `killed` colour #404854 stays for dots and glyphs only.
+  - All status colours as text already pass on `bg0`–`bg3` (`ready` 4.54, `running` 4.60, `blocked` 4.63, `warning` 6.41 on `bg3`).
+  - `ThemeContrastTests` computes WCAG contrast for every (text token × background token) pair the theme allows, from `ThemeHex`. It requires 4.5 : 1 for text and 3 : 1 for UI components. Disallowed pairs, such as `text2` on `bg4`, are listed explicitly.
+- **Shared state components:** `EmptyState(text:)` (mono `text2` uppercase, per the brief), `LoadingState` (a mono "LOADING…" after 300 ms, with nothing shown before that so fast loads do not flicker), and `ErrorState(message:retry:)` (`danger` hairline, verbatim message, a Retry button). Every list and panel uses them.
+- **`ThemeLintTests`** (static, with a shrink-only baseline like S's lint) scans `Sources/BrahmaApp` and `Sources/BrahmaMapKit/Views`. Outside `Theme/` it bans:
+  - colour literals (`Color(red:`, `Color(hex:`, `NSColor(`);
+  - `.font(.system(size:` off the type scale;
+  - `.cornerRadius(`/`RoundedRectangle(cornerRadius:` outside 2–3;
+  - numeric `.padding(`/`spacing:` literals off the spacing scale.
 
-**The Insights pane** shows read-only views over existing data:
-- Activity log: today's `ActivityFeedView` with its filter, full height.
-- Merge queue: 4a's `merge list` data.
-- Timers: `brahma timers`.
-- Health: the hold history.
-- Sandbox canary: the last result per key.
-- Outcome facts: `perf facts`.
+#### 5.1.3 Interaction
 
-No action buttons, except "Copy command" for the matching `brahma dev …` line. That is the v2 §4.12.4 rule.
+- **Hover:** rows and buttons use `bg3` with a 120 ms ease.
+- **Focus:** the accent focus ring is visible on every focusable control.
+- **Keyboard:**
+  - Tab and Shift-Tab follow reading order. Arrow keys move the selection in tables and lists. Return opens the selected item, and Esc closes sheets and popovers.
+  - ⌘F focuses the screen's existing filter or search field, where it has one.
+  - Shortcuts that exist today are kept. **No new navigation shortcuts.**
+- **Icon-only buttons** get `.help` plus an accessibility label.
+- **Reduce Motion** is respected: no flash, no pulse, and instant transitions.
 
-**Keyboard:** ⌘1–⌘5 select the nouns, ⌘, selects Settings, ⌃Tab and ⌃⇧Tab cycle tabs, and ⌘K stays C's Show bar.
+#### 5.1.4 Truncation and overflow
 
-### 5.2 CLI information architecture (architect's call within PQ2–PQ4)
+- Agent text in table cells is one line with tail truncation. The full text is in `.help`, shown with `Text(verbatim:)`.
+- Ids, paths and URLs use middle truncation.
+- Multi-line cells cap at 3 lines, with a "more" disclosure where the screen already has an inspector.
+- **Top bar at narrow widths:** the collapse order is fixed. First the usage meter's resets go, then the sprint line, then the state chips (which collapse to counts). The company name and the mode control never collapse.
+- At the minimum window size, nothing overlaps or clips mid-glyph (checked by the inventory frames).
 
-**`brahma --help` after P:**
-```
-USAGE: brahma <command>
+#### 5.1.5 Performance of heavy views
 
-NOUNS
-  company     Create, list, pause and configure companies (settings, secrets, extensions, hosting)
-  people      Hire, list, move, pause, wake and kill agents; vacancies; the org chart
-  work        Items, sprints, previews, releases, merges, artifacts, handbook, resources, memory
-  inbox       Asks and requests waiting for you; grants; digest; notices
-  budget      Weekly share, plan tier, pace and spend, storage
+| View | Load | Budget |
+|---|---|---|
+| Backlog, Board | 500 items | first render ≤ 150 ms; scroll p95 frame ≤ 16.7 ms |
+| Activity panel and page | 500 lines + 50 lines/s | append without a full relayout; p95 ≤ 16.7 ms |
+| Chat | 5,000 messages | open ≤ 200 ms; scroll p95 ≤ 16.7 ms |
+| Inbox | 200 cards with documents | first render ≤ 200 ms |
+| Handbook page | 200,000 bytes (ML cap) | render ≤ 300 ms |
+| Changes diff (C) | 5,000 lines | scroll p95 ≤ 16.7 ms |
+| Search results | 500 hits | ≤ 150 ms |
 
-DAILY
-  status      Every company's agents and usage          why       Why a company has nothing running
-  say         Post to a #channel or DM an @agent         log       Recent messages in a channel or DM
-  search      Search everything in a company (C)         approve   Approve or reject an ask
-  answer      Answer an agent's question
+- **Method:**
+  - A harness flag, `--perf-bench=<view>`, seeds the load into a temp home and measures with `os_signpost` and the existing `FrameStats` (4b), then prints JSON.
+  - `PerfGate` tests (`BRAHMA_PERF=1`, existing gate) pin the presentation builders in `BrahmaAppModel`.
+- **Allowed fixes:**
+  - lazy containers with stable ids;
+  - presentation rows precomputed off the main actor;
+  - `Equatable` views;
+  - no DB read on the main actor;
+  - no per-row formatters (shared, cached).
+- **Not allowed:** paging or truncating content the screen shows today. That would change what is on the screen.
 
-SYSTEM
-  stop / resume   Emergency stop and resume              engine    The background engine (R)
-  doctor          Check Claude Code and the engine       backup    Snapshots, targets, WAL; `backup restore`
-  settings        Owner-wide preferences                 dev       Internals, diagnostics and recovery
-```
+#### 5.1.6 Usability review (owner-gated)
 
-**Placement rules** (the full old → new table is Appendix A):
-1. A command that changes or lists a **company-level setting** goes under `company` (`mode`, `weight`, `autonomy`, `auto`, `set`, `profile`, `network`, `presets`, `hosting`, `secret`, `ext`, `trust-import`, `export`).
-2. An **agent or org** command goes under `people` (`hire`, `kill`, `pause`, `wake`, `org …`).
-3. Anything **produced or shipped** goes under `work` (`items`, `sprint`, `preview`, `release`, `merge list|retry|resume|settings`, `artifacts`, `kb`→`handbook`, `resource`, `memory`, `replay item`).
-4. Anything **waiting on the owner** goes under `inbox` (`inbox`, `approve`, `answer`, `rescind`, `task`, `access`, `grants`, `secret provide`, `digest`, `notices`).
-5. **Usage** goes under `budget` (`settings plan|share|ultra-share`, `company reserve`, the spend view).
-6. **Diagnostics and recovery** go under `dev`. That covers `canary`, `mode gates|ultra-status`, `perf facts`, `timers`, `transcript`, `replay agent`, `lab clear-taint`, `items readopt`, `main accept`, `merge adopt-main`, `settings hot-paths|auto-merge-paths`, `milestones` and `push test`, plus `dev test …` (today's `BRAHMA_DEV=1` hooks, still gated).
-7. **Agent-facing commands** stay exactly as they are, hidden: `mcp`, `hook pre-tool`, `hook post-tool`.
+- During the audit, every **usability** finding goes to `docs/superpowers/audits/2026-11-planP-usability-findings.md`. A finding is anything hard to find, hard to understand, easy to get wrong, or slow to do. Each entry has:
 
-**Mechanism: one rewrite table.**
-- `LegacyRoutes.rewrite(_ argv: [String]) -> (argv: [String], note: String?)` runs before ArgumentParser.
-- It matches the longest old prefix (`["items","list"] → ["work","list"]`, `["settings","plan"] → ["budget","plan"]`, …) and passes options through untouched.
-- This is the architect's call over per-command `aliases:`, which cannot move a command between groups, and over wrapper structs, which would mean 130 new types.
-- The note is printed only when `isatty(STDERR_FILENO)` and `BRAHMA_NO_MOVED_NOTE` is unset.
-- `LegacyRoutesTests` checks three things:
-  - every old path in the frozen `Appendix A` fixture parses to the same command type as its new path;
-  - no new path is shadowed;
-  - the table has no cycles.
+| Field | Content |
+|---|---|
+| Screen | the view and state, plus a snapshot path |
+| Problem | what the owner would struggle with, in one sentence |
+| Why | the evidence: steps or clicks counted, a misleading label, a hidden state, an error that does not say what to do, a design-analysis citation |
+| Proposed fix | the smallest change, with a before/after sketch (ASCII or a snapshot) |
+| Effort | S (≤ ½ day), M (≤ 2 days), L (more) |
+| Status | `proposed` → `approved` / `rejected` (by the owner, with date) |
 
-**Hint strings.**
-- 283 `brahma <verb>` hint strings in 125 files under `Sources/` tell the owner what to run (for example "run 'brahma main accept'", "See: brahma restore --list"). P rewrites them to the new paths.
-- `CLIHintTests` scans every string literal in `Sources/` that matches `brahma [a-z-]+( [a-z-]+)*`. Each must resolve to a **non-legacy** command path in the parsed tree (`mcp` and `hook` excepted).
-- The README has 162 `brahma …` lines and is rewritten in the same task. `scripts/smoke-app.sh` has 3.
+- **Nothing in this file is built until the owner marks it `approved`.** Polish continues on everything else in the meantime.
+- Navigation restructure is out of scope (decision 01:13) and is not re-proposed.
+- When P ends, the controller sends the file to the owner. Fixes approved before Task 15 finishes may be built in P, as a task appended by the controller. Later approvals become a follow-up plan.
+
+### 5.2 CLI help, examples and errors (architect's call within decision 01:16)
+
+The command tree is frozen. Plan P Task 8 records `swift run brahma` `--help` for every command path into `Tests/BrahmaCLITests/Fixtures/cli-tree.tsv`, giving path, options and arguments without the prose. `CLITreeFrozenTests` fails on any added, removed or renamed path, option or argument. A command added by a later plan updates the fixture in that plan.
+
+**Help text:**
+- **Abstract:** one line of at most 80 characters, starting with a verb in the imperative ("Show …", "Approve …"). Owner-only commands end with "(owner only)", as many already do. A command that needs the app or the engine running says so.
+- **Examples:** every leaf command's `discussion` gets an `EXAMPLES:` block with 1–3 runnable lines that use the seeded demo names (`acme`, `@eng-1`, `A-3`).
+  - Commands with destructive effects (`kill`, `stop`, `restore`, `grants revoke`, `secret rm`, `resource purge`, `memory delete`) add one line saying what cannot be undone.
+- **Options and arguments:** each `help:` states its unit and default, for example "minutes, default 30", and its allowed values where it takes an enum.
+- **Root help:** `brahma --help` keeps its flat list and order, with a better abstract and a 4-line "Start here" discussion (`status`, `inbox`, `why`, `doctor`). There are no new groups or headings, per decision 01:16.
+
+**Errors:**
+- **Shape:** `brahma: <what failed>: <why, if known>. <what to do>`. The "what to do" part names an exact command or app location, for example "Run 'brahma doctor' for details." or "Open Brahma › Settings › Company".
+- The exit codes and stream (stderr) stay the same. Messages with agent or user text keep `safe()`.
+- **Scope:** the 204 `fail(` and 34 `ValidationError(` messages in `Sources/brahma` (counted on `planC-collab`), plus `StoreError`, `WorkError` and `RestoreError` descriptions where the CLI prints them verbatim. Each one either already has the shape or is rewritten.
+- **The engine's own hint strings:** 283 `brahma <verb>` strings in 125 files under `Sources/` tell the owner what to run. `CLIHintTests` checks that each one resolves to an existing command path and option. Today there is no such check, so a stale hint survives a rename.
+
+**Tests:**
+- `CLIHelpTests.everyCommandHasAbstract` (≤ 80 characters, imperative) and `everyLeafHasExamples`.
+- `CLIHelpTests.examplesParse`: every example line parses with `Brahma.parseAsRoot`, so no example can rot.
+- `CLIErrorStyleTests` checks every literal passed to `fail(`/`ValidationError(` against the shape: it ends with a sentence that starts with Run/Open/Use/Check/Try/Set or with a quoted command. A shrink-only allowlist covers messages where no next step exists, with a reason each.
+- `CLIHintTests.everyHintResolves`.
+- `CLITreeFrozenTests`.
 
 ### 5.3 Golden-path end-to-end test (architect's call)
 
@@ -256,7 +257,7 @@ Two layers, one scenario:
    - It runs as part of the default suite on every task.
 2. **`scripts/golden-path.sh` (process tier, about 2–4 minutes).**
    - The same scenario as a black box: a temp home, `brahma engine serve --unmanaged` (R), `BRAHMA_CLAUDE=scripts/fake-claude.sh` extended with a role script (`scripts/fake-claude-roles/`), real `sandbox-exec`, and a real loopback preview.
-   - It asserts through the CLI only: `brahma status`, `brahma work list --json`, `brahma work preview list` reaching `running`, HTTP 200 from the preview URL, and `brahma inbox` showing the deploy ask.
+   - It asserts through the CLI only: `brahma status`, `brahma items list --json`, `brahma preview list` reaching `running`, HTTP 200 from the preview URL, and `brahma inbox` showing the deploy ask.
    - It is run by the controller at every plan merge, and it is listed in the Global Constraints of every future plan.
 
 `LiveSmokeTests/goalToLiveURL` (real `claude`, `BRAHMA_LIVE=1`) stays unchanged as the third, manual layer.
@@ -346,84 +347,39 @@ CREATE TRIGGER ct_workItem_u AFTER UPDATE ON workItem BEGIN UPDATE changeTopic S
 
 | What | Count | How |
 |---|---|---|
-| `SidebarItem` cases | 17 (14 fixed + channel, dm + …) | New enum plus `legacy(_:)`. The `DetailView` switch has 15 cases. `SelectTarget` cases are all kept. |
-| Sidebar rows in `BrahmaApp/Views/Sidebar.swift` | 14 `NavRow`s | 7 rows plus the existing chat sections |
-| CLI top-level entries | 58 | ≈ 16 visible plus `dev` |
-| CLI leaf paths | 130 visible (+ `dev`'s 5, `hook`'s 2, 4a's `artifacts`) | All rows in Appendix A, frozen as a test fixture |
-| Hint strings naming commands | 283 in 125 files | Rewritten. `CLIHintTests` keeps them current. |
-| README `brahma …` lines | 162 | Rewritten (Task 12). The stale "This is Plan 3a" header is replaced. |
-| Tests invoking the CLI | 19 files | Left on old names, which proves the aliases. New tests use new names. |
-| `scripts/*.sh` CLI uses | 4 (`smoke-app.sh` 3, `fake-claude.sh` 1) | Moved to the new names |
+| Screens in the polish pass | 41 top-level view files + 6 subfolders (`planC-collab`) | Audit → polish, layout frozen by `ScreenInventoryTests` |
+| Theme literals outside `Theme/` | counted by `ThemeLintTests` in Task 12 | Shrink-only baseline |
+| Contrast-failing tokens | `text2` (2.92–4.39), `accent` as text (2.65–3.98), `killed` as text (1.35–2.03) | Fixed via two token value changes and one new token (§5.1.2) |
+| CLI command tree | 58 top-level entries, 130 visible leaves (+ hidden `dev`, `hook`; 4a's `artifacts`) | Frozen (`CLITreeFrozenTests`) |
+| CLI abstracts / discussions / option help | 169 / 15 / 310 | Abstracts rewritten where they break the style; examples added to every leaf; option help states units and defaults |
+| CLI error messages | 204 `fail(` + 34 `ValidationError(` | Rewritten to the §5.2 shape where needed |
+| Hint strings naming commands | 283 in 125 files | Verified by `CLIHintTests`; fixed only if stale |
+| README `brahma …` lines | 162 | The CLI section is rewritten (Task 9). The stale "This is Plan 3a" header is replaced. |
+| Tests asserting CLI stderr text | counted in Task 8 Step 1 (19 files invoke the CLI) | Updated in the same commit as each message change, and listed in the commit body |
 | App polling loops | `AppModel` 500 ms, `MapController`, map header and panel `.task` loops (4) | Topic-driven (§5.5) |
 | Flaky tests | 10 | §5.4 table |
 | Unit-tier sleep/process constructs | 51 `Task.sleep`, 12 `Thread.sleep`, 9 `usleep`, 65 `Process()`, 90 shell `sleep` | Baseline allowlist; shrink-only |
 
 **Rollback:** each P area is a separate task.
 - The rewrite table and new command paths can be reverted on their own.
-- The sidebar enum keeps `legacy(_:)`.
+- Polish commits are per screen group, and token values change in one commit, so each is revertible on its own.
 - Change notifications sit behind `AppModel.updateMode` (`.notifications` or `.polling`; default `.notifications`). Flipping it restores the 500 ms poll without a rebuild of the engine side.
 
 ## 7. Risks
 
 | Risk | Mitigation |
 |---|---|
-| The IA moves something the owner uses daily one click deeper | ⌘1–⌘5, last-tab memory, PQ3 shortcuts. The dogfood week is the real test; tab order is a one-line change. |
-| Hidden CLI breakage in owner scripts | Stdout is byte-identical, the note is TTY-only, the aliases stay for the PQ4 window, and the Appendix A fixture is tested. |
+| Polish drifts into redesign (moves, removals, "while I'm here") | The `ScreenInventoryTests` baseline is frozen before the first polish commit. Usability items are a separate, owner-gated file. The reviewer rejects any inventory change. |
+| The `text2` change makes the dense look feel lighter | It is one token. The before/after snapshots are in the Task 12 commit, and the owner can veto it by reverting one commit. AA requires ≥ 4.5, so the alternative is darker backgrounds, which is a bigger change. |
+| Hidden CLI breakage in owner scripts | Only `--help` and stderr text change. `CLITreeFrozenTests` pins paths and options, and exit codes are unchanged. |
 | Trigger overhead on hot tables | Bench test; per-table opt-out to cursor polling |
 | The golden path becomes a slow, flaky test itself | Unit tier is in-process with `ScriptedTurnRunner`, `TestClock` and a tick loop, so it has no sleeps. The real-process version is a script run per merge, not per task. |
 | Splitting heavy suites loses coverage | No deletions (anti-goal). Every moved test keeps a unit sibling. The reviewer checks the test-count diff per task (`scripts/test.sh --report` prints counts per tier). |
-| 4b's Mission Control slot swap or C's views change before P | Tasks 10–11 re-read the merged views. Tabs reuse views as they are. |
+| 4b's Mission Control slot swap or C's views change before P | The inventory baseline is taken on merged `main` at P's start, so P polishes whatever layout landed. |
 
 ---
 
-## Appendix A — CLI old → new (frozen fixture `Tests/BrahmaCLITests/Fixtures/cli-moves.tsv`)
-
-The old and new forms stay identical for: `status`, `why`, `say`, `log`, `search`, `approve`, `answer`, `stop`, `resume`, `doctor`, `mcp`, `hook …`, `backup …` (except `restore`), and `settings timezone`.
-
-| Old | New |
-|---|---|
-| `company create\|list\|pause\|resume` | same |
-| `company mode\|weight\|autonomy\|auto\|set\|profile\|trust-import` | `company set mode\|…` (`company mode` etc. kept as hidden spellings of `company set`) · `company import` (for `trust-import`) |
-| `company reserve` | `budget reserve` |
-| `network`, `presets` | `company network`, `company presets` |
-| `hosting show\|set` (+ hidden probe) | `company hosting show\|set\|probe` |
-| `secret set\|list\|rm\|load` | `company secret set\|list\|rm\|load` |
-| `secret provide` | `inbox provide-secret` |
-| `ext new\|lint\|add\|import-claude\|add-skill\|list\|show\|bind\|unbind\|rm\|rollback\|try` | `company ext …` (same verbs) |
-| `export` | `company export` |
-| `hire`, `kill`, `pause`, `wake` | `people hire\|kill\|pause\|wake` |
-| `org show\|move\|vacancies\|vacancy add\|vacancy remove\|fill\|acting` | `people org\|move\|vacancies\|vacancy add\|vacancy remove\|fill\|acting` |
-| `items list\|show\|add\|edit\|depend\|confirm` | `work list\|show\|add\|edit\|depend\|confirm` |
-| `items readopt` | `dev readopt` |
-| `sprint show\|list` | `work sprint show\|list` |
-| `preview list\|set\|remove\|restart` | `work preview list\|set\|remove\|restart` |
-| `release list\|show\|rollback\|smoke` | `work release list\|show\|rollback\|smoke` |
-| `merge list\|settings\|retry\|resume` | `work merge list\|settings\|retry\|resume` |
-| `merge adopt-main`, `main accept` | `dev adopt-main`, `dev main accept` |
-| `artifacts …` (4a) | `work artifacts …` |
-| `kb …` | `work handbook …` |
-| `resource …`, `memory …` | `work resource …`, `work memory …` |
-| `replay` | `work replay` (item) · `dev replay` (agent day); one command, both paths |
-| `inbox` | `inbox` (= `inbox list`) |
-| `rescind` | `inbox rescind` (`approve`, `answer` also as `inbox approve\|answer`) |
-| `task list\|show\|done\|decline` | `inbox task list\|show\|done\|decline` |
-| `access list\|approve`, `grants list\|revoke` | `inbox access list\|approve`, `inbox grants list\|revoke` |
-| `digest`, `notices` | `inbox digest`, `inbox notices` |
-| `settings plan\|share\|ultra-share` | `budget plan\|share\|ultra-share` |
-| `settings auto-merge` | `company set auto-merge` (owner-wide form `settings auto-merge` kept visible) |
-| `settings hot-paths\|auto-merge-paths` | `dev hot-paths\|auto-merge-paths` |
-| `prefs show\|set quiet\|digest\|prevent-sleep\|notifications\|push\|push-detail` | `settings show\|quiet\|digest\|prevent-sleep\|notifications\|push\|push-detail` |
-| `push test` | `dev push-test` |
-| `owner init` | `settings owner-key init` |
-| `restore` | `backup restore` |
-| `transcript`, `timers`, `perf facts`, `milestones` | `dev transcript\|timers\|facts\|milestones` |
-| `canary edit\|run`, `mode gates\|ultra-status`, `lab clear-taint` | `dev canary edit\|run`, `dev mode gates\|ultra-status`, `dev lab clear-taint` |
-| `run` (R: `engine run`) | `engine run` |
-| `dev release-scenario\|turn\|autopages\|digest` (`BRAHMA_DEV=1`) | `dev test release-scenario\|turn\|autopages\|digest` (still gated) |
-
-Commands that Plan C adds after this table was written (for example `search`) are placed by the §5.2 rules in Task 8 Step 1, and the fixture is regenerated from the merged tree.
-
-## Appendix B — Ledger evidence for the flaky tests
+## Appendix — Ledger evidence for the flaky tests
 
 Roots:
 - `WT=/Users/chandra/agent-company/.claude/worktrees`

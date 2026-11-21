@@ -3,7 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Before the first dogfood run:
-- the owner sees five nouns: 7 sidebar rows, and a CLI of about 16 visible verbs, with every old name still working;
+- every existing screen gets a polish pass against the visual-design spec, keeping its layout and content (owner decision 01:13). Hard-to-use spots go to the owner as a write-up and are not changed until approved;
+- every CLI command, kept exactly as it is, gets clear help, examples and actionable errors (owner decision 01:16);
 - a deterministic goal-to-preview test runs on every task;
 - the ten recurring flakes are fixed at the root, and the unit tier runs in under 90 s;
 - the app updates from engine change notifications instead of a 500 ms poll.
@@ -11,12 +12,15 @@
 **Architecture:**
 - **Test tiers.** There are three: `.unit` (the default, no sleeps or real processes), `.process` and `.live`. Event waits and injected clocks replace sleeps, a shrink-only hygiene scan holds the line, and a `scripts/test.sh` wrapper runs each tier.
 - **Change notifications.** Change topics are SQLite trigger counters, so they work across processes. R's service pushes them over its socket, and the app reloads only the snapshot parts whose topics moved. A 2 s topic poll and a 60 s full refresh are the fallback.
-- **App.** The sidebar becomes a seven-case noun enum with tabs. Old cases map through `legacy(_:)`.
-- **CLI.** A single argv rewrite table keeps old command paths working. It prints a TTY-only note.
+- **App.**
+  - A frozen accessibility inventory per screen guards the layout.
+  - The theme gets type and spacing scale tokens, two contrast-fixing token values (`text2`, `accentText`) and shared empty/loading/error components, enforced by a shrink-only theme lint.
+  - Heavy views are measured with `--perf-bench`.
+- **CLI.** The command tree is frozen by a fixture. Help text gets examples that a test parses, error messages follow one shape, and hint strings are checked to resolve.
 
 **Tech Stack:** Swift 6.2 toolchain (manifest `swift-tools-version: 6.0`, `.macOS(.v14)`), GRDB.swift 7.x (SQLite triggers, `PRAGMA data_version`), swift-argument-parser 1.5+, Swift Testing, SwiftUI/AppKit (app targets only), bash for scripts.
 
-**Spec:** `/Users/chandra/agent-company/.claude/worktrees/plan-refactor-polish/docs/superpowers/specs/2026-11-21-polish-design.md` (cited as *spec §n*). It builds on the Plan R spec `2026-11-21-restructure-service-design.md` (*R §n*) and on R's plan.
+**Spec:** `/Users/chandra/agent-company/.claude/worktrees/plan-refactor-polish/docs/superpowers/specs/2026-11-21-polish-design.md` (cited as *spec §n*), including its "Owner decisions, 2026-11-21" (01:13 app, 01:16 CLI and engine). It builds on the Plan R spec `2026-11-21-restructure-service-design.md` (*R §n*) and on R's plan.
 
 **Builds on, all merged first:** 4a, C, the 4b leftovers, S and **R**. P uses these R deliverables:
 - the module and test targets;
@@ -56,8 +60,14 @@ P additions:
   - mono count chips; zebra tables;
   - no ad-hoc colors, fonts or radii.
 - **Agent-facing CLI is frozen.** `brahma mcp`, `brahma hook pre-tool` and `brahma hook post-tool` keep their names and argv.
-- **The stdout of every command stays byte-identical.** The moved-command note goes to stderr, only when `isatty(STDERR_FILENO)` and `BRAHMA_NO_MOVED_NOTE` is unset. Its text is exactly `note: 'brahma <old>' is now 'brahma <new>'`.
-- **Owner gates do not change.** A moved command keeps its `requireOwnerShell()` and its `BRAHMA_AGENT_ID` refusal.
+- **The CLI is frozen except for text** (decision 01:16).
+  - No command is added, removed, renamed or regrouped, and no option or argument changes.
+  - Exit codes, normal stdout and `--json` output stay byte-identical. Only `--help` output and stderr error text change.
+- **The app's layouts are frozen** (decision 01:13).
+  - Every screen keeps its panels, columns, controls, rows and order, and the sidebar keeps its 14 fixed rows.
+  - The `ScreenInventoryTests` baseline (Task 10) may gain labels, help and identifiers only.
+- **Usability findings are proposals.** Nothing in `docs/superpowers/audits/2026-11-planP-usability-findings.md` is built until the owner marks it `approved`.
+- **Owner gates do not change.** Message edits never move a `requireOwnerShell()` or `BRAHMA_AGENT_ID` check.
 - **Tests are never deleted or `.disabled`** to fix a flake. A test moved to `.process` keeps a unit-tier sibling that covers its logic.
 - **Tiers.**
   - `.unit` is the default and has no trait. It allows no `Task.sleep`, `Thread.sleep`, `usleep`, shell `sleep N`, `Process()`, real port bind, or `Date()` deadline, except for entries on the shrink-only baseline (Task 1).
@@ -77,16 +87,19 @@ P additions:
 | App safety full refresh | 60 s | `ChangeSubscription.safetyRefresh` |
 | Notice delivery | on `inbox` topic + safety refresh | `AppModel` |
 | Trigger overhead gate | insert throughput on `activityEvent`, `message` ≥ 80 % of no-trigger | `ChangeTopicsBenchTests` |
-| Mission Control strip | 3 cards, ≈ 96 pt, top 3 items each, SHIPPED window 7 wall days | `MissionStrip` |
+| `text2` / new `accentText` | #84919E / #609FF3 (`accent` fill stays #2D72D2) | `ThemeHex` |
+| Contrast minimums | text 4.5 : 1, UI components 3 : 1 (WCAG AA) | `ThemeContrastTests` |
+| `LoadingState` delay | 300 ms | `LoadingState.delay` |
+| Heavy-view budgets | spec §5.1.5 table (first render 150–300 ms by view; scroll p95 ≤ 16.7 ms) | `PerfBudgets` |
+| Help abstract | ≤ 80 chars, imperative | `CLIHelpTests` |
 | Sleep detector in `scripts/test.sh` | awake vs wall divergence > 30 s → "machine slept during run: rerun" | script |
-| Old CLI names kept | until first tagged release after dogfood, ≥ 30 days (PQ4) | `LegacyRoutes.sunset` comment + README |
 
 ## Review Focus
 
-1. **An old command path reaches a different command, or loses its owner gate, after the move.** Examples: `brahma secret provide A-3` vs `brahma secret set`; `brahma replay` with an item argument vs an agent argument; `brahma items readopt`. Expected: the same command type, the same gate, the same stdout. → Task 9 `LegacyRoutesTests.everyOldPathParsesToSameCommand`, `CLIOwnerGateTests.gatesUnchanged`, `longestPrefixWins`.
+1. **Polish quietly changes a screen.** Examples: a removed column, a reordered panel, a control moved into an overflow menu, agent text cut with no way to read the rest. Expected: the inventory diff shows only added labels and help, and full text stays reachable through `.help`. → Task 10 `ScreenInventoryTests.inventoryUnchanged`; Task 12 `TruncationTests.fullTextInHelp`.
 2. **A change made by another process never shows up** (a CLI `brahma approve`, an agent's `brahma mcp` write, a restore), or the app keeps a stale Inbox count. Expected: visible within 250 ms with the service up and within 2 s without it. A restore forces a full reload. → Task 5 `ChangeTopicsTests.crossProcessWriteBumpsTopic`; Task 7 `ChangeSubscriptionTests.epochChangeReloadsAll`, `fallbackPollsWithoutService`.
 3. **A new table added by a later plan is silently not observed.** Expected: the build fails until the table is mapped or marked unobserved with a reason. → Task 5 `ChangeTopicsTests.everyTableMapped`.
-4. **Deep links and notification banners open the wrong place after the IA change.** Examples: `--select backups`, `ask:<id>`, `release:<ref>`, `replay agent`, `kb:<path>`. Expected: the same content, now under its noun tab. → Task 10 `SidebarLegacyTests.everySelectTargetLands`.
+4. **A help example or hint names a command or option that does not exist,** or an improved error message leaks agent text unescaped or drops the original cause. Expected: every example parses, every hint resolves, `safe()` still wraps agent text, and the cause is still present. → Task 8 `CLIHelpTests.examplesParse`; Task 9 `CLIHintTests.everyHintResolves`, `CLIErrorStyleTests.causeKept`, `agentTextStillSafe`.
 5. **A flake fix that only hides the race.** Examples: a longer timeout, or a test that now passes because it checks less. Expected: every fixed test asserts at least what it asserted before, plus the positive leg where one was missing. The unit tier has no wall-clock waits. → Tasks 2–4 (each fix lists the kept assertions); Task 1 `UnitTierHygieneTests.baselineOnlyShrinks`.
 
 ---
@@ -109,13 +122,18 @@ Sources/BrahmaService/ChangeFeed.swift              data_version watch, push `ch
 Sources/BrahmaEngineClient/Wire/Messages.swift      Stream.changes, ChangedEvent
 Sources/BrahmaAppModel/Live/ChangeSubscription.swift
 Sources/BrahmaAppModel/Live/SnapshotParts.swift     split of Snapshot.load + dependencies
-Sources/BrahmaAppModel/Presentation/Sidebar.swift   SidebarItem nouns/tabs, legacy(_:)
-Sources/BrahmaAppModel/Presentation/MissionStrip.swift
-Sources/BrahmaAppModel/Insights/InsightsModel.swift
-Sources/BrahmaApp/Views/{Sidebar,DetailView,MissionControlView}.swift (modified); Views/NounHeader.swift, Views/Insights/*.swift, Views/MissionStripView.swift (new)
-Sources/brahma/Groups/{CompanyGroup,PeopleGroup,WorkGroup,InboxGroup,BudgetGroup,SettingsGroup,DevGroup}.swift   new tree; leaf commands unchanged and re-parented
-Sources/brahma/LegacyRoutes.swift                   rewrite table + note
-Tests/BrahmaCLITests/{LegacyRoutesTests,CLIOwnerGateTests,CLIHintTests}.swift + Fixtures/cli-moves.tsv
+Sources/BrahmaApp/Theme/{BrahmaTheme,ThemeHex}.swift   type/spacing scale tokens, text2/accentText values
+Sources/BrahmaApp/Theme/States.swift                EmptyState, LoadingState, ErrorState
+Sources/BrahmaApp/Harness.swift                     --ui-inventory, --ui-state, --perf-bench
+Sources/BrahmaApp/Views/**                          polish edits only (no layout change)
+Sources/BrahmaAppModel/Presentation/PerfBudgets.swift
+Tests/BrahmaAppModelTests/{ThemeContrastTests,TruncationTests,PresentationPerfTests}.swift
+Tests/BrahmaGuardTests/ThemeLintTests.swift         + Fixtures/theme-lint-baseline.json
+Tests/Fixtures/ui-inventory/<screen>.json           frozen before polish; scripts/ui-inventory.sh; Tests/BrahmaAppTests/ScreenInventoryTests.swift
+docs/superpowers/audits/2026-11-planP-ui-audit.md, 2026-11-planP-usability-findings.md
+Sources/brahma/*.swift                              abstracts, discussions (EXAMPLES), option help, error text only
+Tests/BrahmaCLITests/{CLITreeFrozenTests,CLIHelpTests,CLIErrorStyleTests,CLIHintTests}.swift + Fixtures/cli-tree.tsv
+scripts/{cli-tree,perf-bench}.sh
 Sources/BrahmaEngine/Testing/ScriptedTurnRunner.swift   (package; test support for the golden path)
 Tests/BrahmaEngineTests/GoldenPathTests.swift
 scripts/golden-path.sh, scripts/fake-claude-roles/{ceo,lead,eng,reviewer}.sh
@@ -326,137 +344,186 @@ README.md
 - [ ] **Step 4:** Run the full suite and `scripts/smoke-app.sh`. Expected: green, `SMOKE OK`.
 - [ ] **Step 5: Commit.**
 
-### Task 8: CLI tree restructure
+### Task 8: CLI tree freeze, help text and examples
 
 **Files:**
-- Create: `Sources/brahma/Groups/{CompanyGroup,PeopleGroup,WorkGroup,InboxGroup,BudgetGroup,SettingsGroup,DevGroup}.swift`. Each re-parents existing leaf command types: no leaf `run()` body changes, only `commandName` where the spec renames, for example `trust-import` → `import` and `kb` → `handbook`.
-- Modify: `Sources/brahma/Brahma.swift`. The visible `subcommands` become exactly the spec §5.2 list. `mcp`, `hook` and old group types are kept with `shouldDisplay: false` where an old spelling must still parse natively, for example `company mode`.
-- Create: `Tests/BrahmaCLITests/Fixtures/cli-moves.tsv` (spec Appendix A, completed from the merged tree)
+- Create: `Tests/BrahmaCLITests/{CLITreeFrozenTests,CLIHelpTests}.swift`, `Tests/BrahmaCLITests/Fixtures/cli-tree.tsv`, `scripts/cli-tree.sh` (walks `--help` recursively and prints `path<TAB>options<TAB>arguments`, with no prose)
+- Modify: `Sources/brahma/*.swift`, changing `abstract:`, `discussion:` and `help:` strings **only**
+
+**Interfaces:**
+- Produces: `enum CommandTree { static func all() -> [(path: [String], type: ParsableCommand.Type)] }`, a test helper that walks `Brahma.configuration` including hidden commands.
+
+- [ ] **Step 1:** Run `scripts/cli-tree.sh` on merged `main` and write `cli-tree.tsv`. Record the counts (top-level entries, leaves, abstracts, discussions, option help) in the commit body.
+- [ ] **Step 2: Write the tests:**
+  - `CLITreeFrozenTests.treeMatchesFixture`: `CommandTree.all()` plus each command's option and argument names equal the fixture.
+  - `CLIHelpTests.everyCommandHasAbstract`: non-empty, ≤ 80 characters, first word is an imperative verb from a fixed list (Show, List, Set, Add, Remove, Create, Approve, Answer, Run, Stop, Resume, Hire, Kill, Pause, Wake, Move, …; extend the list when a real abstract needs it).
+  - `everyLeafHasExamples`: the `discussion` contains `EXAMPLES:` followed by 1–3 lines starting with `brahma `.
+  - `examplesParse`: every example line parses with `Brahma.parseAsRoot`.
+  - `destructiveCommandsWarn`: `kill`, `stop`, `restore`, `grants revoke`, `secret rm`, `resource purge` and `memory` delete each say what cannot be undone.
+  - `optionHelpStatesUnits`: options whose names end in `-minutes`, `-seconds`, `timeout`, `cap`, `share` or `weight` mention a unit or range.
+- [ ] **Step 3:** Run them. Expected: `treeMatchesFixture` PASS, the others FAIL with a list.
+- [ ] **Step 4:** Rewrite the strings. Add the root `discussion` "Start here: brahma status · brahma inbox · brahma why <company> · brahma doctor". Keep the root's flat list and order. Use seeded demo names in examples (`acme`, `@eng-1`, `A-3`).
+- [ ] **Step 5:** Run the tests and the full suite. Tests that snapshot `--help` text get the same string updates, counted in the commit body. Expected: green, and `treeMatchesFixture` still PASS.
+- [ ] **Step 6: Commit.**
+
+### Task 9: CLI error messages and hint strings
+
+**Files:**
+- Create: `Tests/BrahmaCLITests/{CLIErrorStyleTests,CLIHintTests}.swift`, `Fixtures/cli-error-allowlist.tsv`
+- Modify: `fail(`/`ValidationError(` literals in `Sources/brahma` (204 + 34 on `planC-collab`); `description`s of `StoreError`, `WorkError` and `RestoreError` printed verbatim by the CLI; stale hint strings found in Step 3; `README.md` (CLI section: the stale "This is Plan 3a" header, a "Start here" block, and examples)
+
+**Interfaces:**
+- Consumes: Task 8 `CommandTree`.
+
+- [ ] **Step 1: Write `CLIErrorStyleTests`.**
+  - `everyErrorSaysWhatToDo`: each literal argument of `fail(`/`ValidationError(` ends with a sentence that starts with Run/Open/Use/Check/Try/Set/Ask/Wait or contains a quoted `'brahma …'`, unless it is listed in `cli-error-allowlist.tsv` with a reason. The allowlist is shrink-only.
+  - `causeKept`: for 10 representative errors (doctor fail, owner key missing, engine running, database check failed, not found, forbidden, invalid timezone, no such company, secret held, merge refused), the new message still contains the original cause text. Use golden strings.
+  - `agentTextStillSafe`: an error built from an agent-controlled name containing `\u{1b}[31m` and `\n` prints escaped.
+  - Exit codes are unchanged for the same 10 cases.
+- [ ] **Step 2: Write `CLIHintTests.everyHintResolves`.** Scan string literals in `Sources/**/*.swift` and `README.md` for `brahma ([a-z][a-z-]*)( [a-z][a-z-]*)*( --[a-z-]+)*`. The longest command prefix must exist in `CommandTree`, and each `--option` must exist on it. `mcp` and `hook` are excepted.
+- [ ] **Step 3:** Run them. Expected: FAIL with lists.
+- [ ] **Step 4:** Rewrite the messages to the spec §5.2 shape: `brahma: <what failed>: <why>. <what to do>`. Fix stale hints. Update the README's CLI section. Tests asserting stderr text get the same updates, listed in the commit body.
+- [ ] **Step 5:** Run the tests and the full suite. Expected: green, and `CLITreeFrozenTests` still PASS.
+- [ ] **Step 6: Commit.**
+
+### Task 10: UI audit and the frozen screen inventory
+
+**Files:**
+- Modify: `Sources/BrahmaApp/Harness.swift`. Add `--ui-inventory <out.json>`, which walks the key window's accessibility tree and writes role, identifier, label and order, with no values, then quits. Add the states `--ui-state=empty|loading|error|long` (it seeds or injects through the existing harness: a fresh home, a slowed store, a failing store, generated long content).
+- Create: `scripts/ui-inventory.sh` (every screen × state, through the existing `--select` targets), `Tests/Fixtures/ui-inventory/*.json`, `Tests/BrahmaAppTests/ScreenInventoryTests.swift` (`.processTier`; it launches the built app), `docs/superpowers/audits/2026-11-planP-ui-audit.md`
 
 **Interfaces:**
 - Produces:
-  - the new command tree;
-  - `cli-moves.tsv` rows `old path<TAB>new path`;
-  - `enum CommandTree { static func resolve(_ path: [String]) -> ParsableCommand.Type? }`, a helper that walks `Brahma.configuration`, for tests.
+  - the frozen inventory baseline;
+  - the audit sheet, whose rows have the columns screen, state, finding, rule, class (Polish/Usability/Perf) and screenshot path.
 
-- [ ] **Step 1:** Walk `--help` on merged `main` (the method in spec §1). Complete `cli-moves.tsv` for every visible leaf, plus `dev`, `hook`, 4a's `artifacts`, and anything C added. Place each one by the spec §5.2 rules 1–7. Any leaf the rules do not place goes to the controller as a question before Step 2.
-- [ ] **Step 2: Write `CLITreeTests`:**
-  - `topLevelHelpMatchesSpec`: `brahma --help` lists exactly the spec's noun, daily and system names, plus `dev`.
-  - `everyNewPathResolves`: every right-hand side of the fixture resolves.
-  - `agentFacingUnchanged`: `mcp`, `hook pre-tool` and `hook post-tool` resolve to the same types as before.
-- [ ] **Step 3:** Run them. Expected: FAIL. Implement the groups. Run again. Expected: PASS.
-- [ ] **Step 4: Commit.**
+- [ ] **Step 1:** `scripts/make-app.sh debug`, then `scripts/ui-inventory.sh --write-baseline`. Commit the baseline **before any visual change**.
+- [ ] **Step 2: Write `ScreenInventoryTests.inventoryUnchanged`.** It runs the script without `--write-baseline` and diffs the result. Allowed: added labels, help and identifiers. Anything else fails, and the diff is printed. Run it. Expected: PASS.
+- [ ] **Step 3:** Run `scripts/ui-snapshot.sh` for every screen × state of spec §5.1.1, and read every PNG. Fill the audit sheet against spec §5.1.2–§5.1.5 and the visual-design spec lines. Classify each finding. A finding that changes content, location or flow is **Usability**, never Polish.
+- [ ] **Step 4: Commit** the audit sheet, its screenshots (`docs/superpowers/audits/img/`) and the harness flags.
 
-### Task 9: Legacy routes and owner-gate parity
+### Task 11: Usability write-up for the owner (owner-gated)
 
 **Files:**
-- Create: `Sources/brahma/LegacyRoutes.swift`, `Tests/BrahmaCLITests/{LegacyRoutesTests,CLIOwnerGateTests}.swift`
-- Modify: `Sources/brahma/Brahma.swift`. Add a `static func main()` that calls `LegacyRoutes.rewrite(CommandLine.arguments.dropFirst())`, prints the note, then `parseAsRoot`/`run`. Add the `help moved` subcommand, which prints the table.
+- Create: `docs/superpowers/audits/2026-11-planP-usability-findings.md`
+
+**Interfaces:**
+- Consumes: Task 10's audit rows classed **Usability**.
+- Produces: the owner-facing file in the spec §5.1.6 format.
+
+- [ ] **Step 1:** For each Usability row, write one entry:
+  - **Screen:** the view and state, plus a snapshot path.
+  - **Problem:** one sentence.
+  - **Why:** the evidence, such as clicks or steps counted, a misleading label, a hidden state, an error without a next step, or a citation to the analysis.
+  - **Proposed fix:** the smallest change, with an ASCII before/after sketch.
+  - **Effort:** S, M or L.
+  - **Status:** `proposed`.
+
+  Order the entries by impact on the dogfood week, highest first. Leave out any navigation restructure (decision 01:13).
+- [ ] **Step 2:** Check that no polish task touches a screen element named in a `proposed` entry's fix. List those elements at the top of the file under "Hold: do not polish". Tasks 13–15 skip them.
+- [ ] **Step 3: Commit**, then tell the controller that the file is ready for the owner. **Do not build any entry.** If an entry is marked `approved` before Task 15 ends, the controller appends a task for it. Later approvals become a follow-up plan.
+
+### Task 12: Theme tokens, contrast, shared states, theme lint
+
+**Files:**
+- Modify: `Sources/BrahmaApp/Theme/BrahmaTheme.swift` and `ThemeHex` (wherever 4b put the single source). Add the type and spacing scale tokens of spec §5.1.2. Set `text2` = #84919E, add `accentText` = #609FF3, and add `killedName` (= `text2` + strikethrough modifier).
+- Create: `Sources/BrahmaApp/Theme/States.swift`, `Tests/BrahmaAppModelTests/ThemeContrastTests.swift` (tests `ThemeHex` in the model target), `Tests/BrahmaGuardTests/ThemeLintTests.swift`, `Fixtures/theme-lint-baseline.json`, `Tests/BrahmaAppModelTests/TruncationTests.swift`
 
 **Interfaces:**
 - Produces:
-  - `enum LegacyRoutes { static let table: [(old: [String], new: [String])]; static func rewrite(_ argv: [String], isTTY: Bool, environment: [String: String]) -> (argv: [String], note: String?) }`. The table is loaded from the same rows as `cli-moves.tsv`, embedded as a Swift literal generated by `scripts/cli-moves-gen.sh`. A test checks the literal matches the fixture.
-  - The note is exactly `note: 'brahma \(old.joined(" "))' is now 'brahma \(new.joined(" "))'`.
+  - `BrahmaTheme.Font.{label, panelTitle, body, bodyStrong, mono, monoSmall, companyName}`
+  - `BrahmaTheme.space{XXS=2, XS=4, S=8, M=12, L=16}`, keeping existing names as aliases where the values match
+  - `struct EmptyState: View { init(_ text: String) }`
+  - `struct LoadingState: View { static let delay: Duration = .milliseconds(300) }`
+  - `struct ErrorState: View { init(_ message: String, retry: (() -> Void)?) }`
+  - `enum ThemeContrast { static func ratio(_ a: String, _ b: String) -> Double; static let allowedPairs: [(text: String, background: String, kind: Kind)] }`
+  - `enum TruncatedText { static func cell(_ s: String) -> (shown: String, help: String) }`. This is the model-side helper for one-line cells. The help always carries the full verbatim text.
 
 - [ ] **Step 1: Write the tests:**
-  - `LegacyRoutesTests.everyOldPathParsesToSameCommand`: for each fixture row, `CommandTree.resolve(rewrite(old).argv)` equals `CommandTree.resolve(new)`.
-  - `longestPrefixWins`: `settings auto-merge-paths` → `dev auto-merge-paths`, not `company set auto-merge`.
-  - `optionsPassThrough`: `items list --json --status ready` → `work list --json --status ready`.
-  - `noteOnlyOnTTY`.
-  - `noteSuppressedByEnv`.
-  - `noCycles`.
-  - `literalMatchesFixture`.
-  - `CLIOwnerGateTests.gatesUnchanged`: for each fixture row, run old and new under `BRAHMA_AGENT_ID=a1` in a temp home through the built binary, using R's `BrahmaCLITests` helper. Both refuse with the same stderr first line, or both succeed. Mark it `.processTier` (it spawns the binary), and pair it with a unit sibling that compares `requiresOwner` flags on the resolved types.
-  - `stdoutByteIdentical`: for 10 read-only rows, old and new stdout are equal.
-- [ ] **Step 2:** Run them. Expected: FAIL. Implement. Run again. Expected: PASS.
-- [ ] **Step 3:** Run the 19 existing CLI test files unchanged, on old names. Expected: green, which proves the aliases.
+  - `ThemeContrastTests.textPairsMeetAA` (≥ 4.5) and `componentPairsMeet3to1`.
+  - `disallowedPairsListed`: `text2` on `bg4` is not in `allowedPairs`.
+  - `measuredValues`: `ratio("84919E","1A2129")` is between 5.03 and 5.05, and `ratio("609FF3","2A3540")` is between 4.60 and 4.62.
+  - `ThemeLintTests.baselineOnlyShrinks` and `noNewFileHits`.
+  - `TruncationTests.fullTextInHelp`.
+- [ ] **Step 2:** Run them. Expected: the contrast tests FAIL (old `text2`). Generate the lint baseline. It is expected to be non-empty.
+- [ ] **Step 3:** Change the token values. Add the states and tokens. Replace every `accent` used as a text colour with `accentText`, which `grep` lists. On `bg4` rows use `text1` for tertiary text.
+- [ ] **Step 4:** Run the tests and `ScreenInventoryTests`. Take before/after snapshots of Mission Control, Backlog and Inbox for the owner. Expected: PASS, with the inventory unchanged.
+- [ ] **Step 5: Commit**, with the before/after PNG paths in the body. This is the one commit to revert if the owner vetoes the lighter `text2`.
+
+### Task 13: Polish A — shell, Mission Control, Activity, Agents, chat
+
+**Files:**
+- Modify: `Sources/BrahmaApp/Views/{CompanyRail,Sidebar,TopBar,MenuBarContent,EngineBanner,StartupErrorView,MissionControlView,ActivityFeedView,AgentsView,ReplayView,ChatView,Composer,NewDMPicker,HireSheet,OrgPreview}.swift`, `Views/Map/{AgentMapPanel,MapHeader,MapHoverCardView,FillVacancySheet}.swift`, `Views/Preview/*`
+
+**Interfaces:**
+- Consumes: Task 12's tokens, states and `TruncatedText`. Task 11's "Hold" list.
+
+- [ ] **Step 1:** For every audit row classed Polish on these screens, apply the fix: spacing, alignment, type scale, hairlines, chips, states, hover (`bg3`, 120 ms), focus ring, keyboard (Tab order, arrows in lists, Return opens, Esc closes), `.help` and accessibility labels on icon-only buttons, truncation per spec §5.1.4, the top-bar collapse order, and Reduce Motion. Mark each audit row `done` with its commit.
+- [ ] **Step 2:** Micro-interactions per the brief:
+  - activity lines flash `bg3` for 600 ms;
+  - a status chip pulses only for `running`;
+  - list insert and remove animate in 120–200 ms;
+  - copy actions confirm inline for 1.5 s.
+
+  All of these are off under Reduce Motion.
+- [ ] **Step 3:** Run `ThemeLintTests` (its baseline must shrink, so update it down), `ScreenInventoryTests` and the full suite. Take UI snapshots of each screen and read them. Expected: green, with the inventory unchanged.
 - [ ] **Step 4: Commit.**
 
-### Task 10: App IA: sidebar nouns, tabs, deep links
+### Task 14: Polish B — Work screens
 
 **Files:**
-- Modify:
-  - `Sources/BrahmaAppModel/Presentation/Sidebar.swift` (the spec §5.1 enum, plus `InboxTab`, `WorkTab`, `PeopleTab`, `BudgetTab`, `SettingsTab`, `InsightsTab`, plus `legacy(_:)`)
-  - `AppModel.swift` (`select`, `apply(_ target:)`, `lastTab`)
-  - `LaunchOptions.swift` (old spellings kept)
-  - `Sources/BrahmaApp/Views/Sidebar.swift` (7 rows + chats + bottom Settings/Insights)
-  - `DetailView.swift` (7 noun views)
-  - `BrahmaApp.swift` (⌘1–⌘5, ⌘,, ⌃Tab/⌃⇧Tab)
-- Create: `Sources/BrahmaApp/Views/NounHeader.swift`, `Tests/BrahmaAppModelTests/{SidebarLegacyTests,IACoverageTests}.swift`
+- Modify: `Views/{BacklogView,BoardView,WorkComponents,ItemEditorSheet,ReleasesView,DeployCardView,HostingPanel,BudgetView,StoragePanel,SearchResultsView}.swift`, `Views/Handbook/*`, `Views/Resources/*`, `Views/Changes/*` (C), `Views/Refs/*` (C)
 
-**Interfaces:**
-- Produces:
-  - `SidebarItem.legacy(_ old: LegacySidebarItem) -> SidebarItem`, where `LegacySidebarItem` is today's enum, renamed and kept for mapping.
-  - `AppModel.lastTab: [Noun: AnyTab]`
-  - `struct NounHeader<Tab: Hashable & CaseIterable>: View { title: String; selection: Binding<Tab>; counts: [Tab: Int] }`
+- [ ] **Step 1:** Run the same cycle as Task 13, Steps 1–3, for these screens.
+- [ ] **Step 2: Commit.**
 
-- [ ] **Step 1: Write the tests:**
-  - `SidebarLegacyTests.everyOldCaseMapsUniquely`: all 14 fixed cases map, and no two map to the same noun and tab.
-  - `everySelectTargetLands`: for every `SelectTarget` case and parsed spelling (`backups`, `grants`, `digest`, `activity`, `releases`, `resources`, `budget`, `ask:<id>`, `release:<ref>`, `kb:<path>`, `replay` agent/item, `preview:<name>`, `map`), `apply` selects the expected noun and tab and sets the same side state as today (`selectedReleaseRef`, `highlightedAskId`, …).
-  - `IACoverageTests.everyOldDestinationWithinTwoClicks`.
-  - `lastTabRemembered`.
-  - `fixedRowsAreSeven`: `Sidebar.fixedRows.count == 7` (layout A).
-- [ ] **Step 2:** Run them. Expected: FAIL. Implement the model, then the views. Tabs reuse the existing views unchanged.
-- [ ] **Step 3:** `scripts/make-app.sh debug && scripts/ui-snapshot.sh taskP10 mission work inbox settings insights`, then read the PNGs. Expected: 7 fixed rows, tab strips per noun, BrahmaTheme only.
-- [ ] **Step 4:** Run the full suite. Commit.
-
-### Task 11: Mission Control strip and Insights pane
+### Task 15: Polish C — Inbox, Grants, Digest, Settings, Backups, sheets
 
 **Files:**
-- Create: `Sources/BrahmaAppModel/Presentation/MissionStrip.swift`, `Sources/BrahmaAppModel/Insights/InsightsModel.swift`, `Sources/BrahmaApp/Views/MissionStripView.swift`, `Sources/BrahmaApp/Views/Insights/{InsightsView,MergeQueueInsight,TimersInsight,HealthInsight,CanaryInsight,FactsInsight}.swift`, `Tests/BrahmaAppModelTests/{MissionStripTests,InsightsModelTests}.swift`
-- Modify: `MissionControlView.swift` (the strip goes above the slot layout as 4b left it)
+- Modify: `Views/{InboxView,AccessCardView,HumanTaskCardView,LiveCardFallbackView,GrantsView,DigestView,CompanySettingsView,BackupsView,SecretSheet,NewCompanySheet}.swift`, plus any sheet not covered by Tasks 13–14
 
-**Interfaces:**
-- Produces:
-  - `struct MissionStrip: Equatable { needsYou: [StripLine]; needsYouCount: Int; stuck: [StripLine]; stuckCount: Int; shipped: [StripLine]; static func make(snapshot: Snapshot, now: Date, timeZone: TimeZone) -> MissionStrip }`. Lines are `Text(verbatim:)`-ready strings with an optional `SelectTarget`.
-  - `@MainActor final class InsightsModel { func load(_ tab: InsightsTab, companyId: String) async }`. It is read-only, and each tab loads through the same Store calls its CLI command uses (`merge list`, `timers`, holds, canary results, `perf facts`).
-  - Each Insights row has a "Copy command" button with the `brahma dev …` line.
+- [ ] **Step 1:** Run the same cycle as Task 13, Steps 1–3, for these screens.
+- [ ] **Step 2:** Confirm every audit row classed Polish is `done`, or moved to Usability with a reason.
+- [ ] **Step 3: Commit.**
 
-- [ ] **Step 1: Write the tests:**
-  - `MissionStripTests.needsYouTopThreeInInboxOrder`.
-  - `stuckUsesStallReasonsAndOwnerBlocked`.
-  - `shippedWindowIsSevenWallDays`.
-  - `emptyStatesSayNothingNeedsYou` (copy: "Nothing needs you", "Nothing stuck", "Nothing shipped this week").
-  - `agentTextIsVerbatim`: an item title `"**bold** [x](y)"` appears unparsed.
-  - `InsightsModelTests.everyTabLoadsReadOnly` (a write spy on the Store sees 0 writes).
-  - `copyCommandsResolve`: every copied command resolves through `CommandTree`.
-- [ ] **Step 2:** Run them. Expected: FAIL. Implement. Run again. Expected: PASS.
-- [ ] **Step 3:** UI snapshot `scripts/ui-snapshot.sh taskP11 mission insights`, then read the PNGs.
-- [ ] **Step 4: Commit.**
-
-### Task 12: Hint strings, README, scripts
+### Task 16: Heavy-view performance
 
 **Files:**
-- Modify: the 125 `Sources/` files containing `brahma <verb>` hints (283 strings on `planC-collab`; Step 1 recounts), `README.md` (162 lines, plus the stale "This is Plan 3a" header), `scripts/smoke-app.sh`, `scripts/fake-claude.sh`
-- Create: `Tests/BrahmaCLITests/CLIHintTests.swift`
+- Modify: `Sources/BrahmaApp/Harness.swift` (`--perf-bench=<view>`: seeds spec §5.1.5's load into a temp home, opens the view, scrolls with a synthetic scroll for 5 s, and prints JSON `{firstRenderMs, p95FrameMs}` measured with `os_signpost` and 4b's `FrameStats`). Also modify the presentation builders and views that miss their budget.
+- Create: `Sources/BrahmaAppModel/Presentation/PerfBudgets.swift`, `Tests/BrahmaAppModelTests/PresentationPerfTests.swift` (`BRAHMA_PERF=1`, existing `PerfGate`), `scripts/perf-bench.sh`
 
 **Interfaces:**
-- Consumes: Task 8 `CommandTree`, Task 9 `LegacyRoutes.table`.
+- Produces: `enum PerfBudgets { static let firstRenderMs: [PerfView: Double]; static let p95FrameMs = 16.7 }`, where `PerfView` is `backlog`, `board`, `activity`, `chat`, `inbox`, `handbookPage`, `changesDiff` or `search`.
 
-- [ ] **Step 1: Write `CLIHintTests`.**
-  - `everyHintIsCanonical`: scan string literals in `Sources/**/*.swift` for `brahma ([a-z][a-z-]*)( [a-z][a-z-]*)*`. Take the longest word prefix that `CommandTree.resolve` accepts. It must resolve, and it must not be the left side of a `LegacyRoutes` row. `mcp` and `hook` are excepted.
-  - `readmeHintsCanonical`: the same check on `README.md`.
-- [ ] **Step 2:** Run it. Expected: FAIL, with the list of hints.
-- [ ] **Step 3:** Rewrite each listed hint to its new path, changing the hint text only. The tests that assert hint text get the same string update, counted in the commit body.
-- [ ] **Step 4:** Run the full suite. Expected: green.
+- [ ] **Step 1:** Run `scripts/perf-bench.sh` for every view and record the "before" table in the commit body.
+- [ ] **Step 2: Write `PresentationPerfTests`.** For each view's presentation builder (for example `WorkPresentation.rows` for 500 items), time it with `ContinuousClock` over 20 runs. The median must be ≤ 25 % of the view's `firstRenderMs` budget.
+- [ ] **Step 3:** Fix the misses using only the spec §5.1.5 allowed fixes:
+  - lazy containers with stable ids;
+  - presentation rows precomputed off the main actor;
+  - `Equatable` views;
+  - no DB read on the main actor;
+  - shared cached formatters.
+
+  **Never page or truncate what the screen shows.**
+- [ ] **Step 4:** Run `scripts/perf-bench.sh` again (the "after" table), then `ScreenInventoryTests` and the full suite. Expected: every view within budget, or listed in the commit body with the reason and remaining gap. Inventory unchanged.
 - [ ] **Step 5: Commit.**
 
-### Task 13: Golden path, in process
+### Task 17: Golden path, in process
 
 **Files:**
-- Create: `Sources/BrahmaEngine/Testing/ScriptedTurnRunner.swift` (`package`; compiled into the engine target so tests and `scripts/golden-path.sh`'s Swift helper can share it), `Tests/BrahmaEngineTests/GoldenPathTests.swift`
+- Create: `Sources/BrahmaEngine/Testing/ScriptedTurnRunner.swift` (`package`, compiled into the engine target so tests can share it), `Tests/BrahmaEngineTests/GoldenPathTests.swift`
 
 **Interfaces:**
-- Consumes: R's in-process `EngineService` (or `Orchestrator` directly), the real `CompanyTools` dispatch used by `brahma mcp`, `FakeSandbox`, `FakeHTTPProbe`, `TestClock`, `TemplateRepo`.
-- Produces: `package final class ScriptedTurnRunner: TurnRunning { init(script: [RoleKey: [TurnScript]], tools: (Agent) -> CompanyToolDispatch) }`. `TurnScript` is a list of `ToolCall(name: String, arguments: JSONValue)` plus optional file writes and commits in the agent's worktree. The runner emits the same stream-json result lines `StreamParser` reads.
+- Consumes: R's in-process `EngineService` (or `Orchestrator` directly), the real `CompanyTools` dispatch used by `brahma mcp`, `FakeSandbox`, `FakeHTTPProbe` or S's helper fake for loopback probes, `TestClock`, and `TemplateRepo`.
+- Produces: `package final class ScriptedTurnRunner: TurnRunning { init(script: [RoleKey: [TurnScript]], tools: (Agent) -> CompanyToolDispatch) }`. A `TurnScript` is a list of `ToolCall(name: String, arguments: JSONValue)`, plus optional file writes and commits in the agent's worktree. The runner emits the stream-json result lines `StreamParser` reads.
 
-- [ ] **Step 1: Write `GoldenPathTests.goalToPreviewAndDeployAsk`.** It is `@Test(.timeLimit(.minutes(1)))`, drives `orchestrator.tick()` up to `maxTicks = 400`, and advances `TestClock` 1 s per tick. It asserts the spec §5.3 phases in order:
+- [ ] **Step 1: Write `GoldenPathTests.goalToPreviewAndDeployAsk`.** It is `@Test(.timeLimit(.minutes(1)))`, drives `orchestrator.tick()` up to `maxTicks = 400`, and advances `TestClock` 1 s per tick. It asserts these phases in order:
   1. The company exists with the software pack, and the org has a CEO, a lead, `@eng-1` and a reviewer.
   2. The brief exists, and the backlog has A-1 with a check spec.
   3. A-1 is leased to `@eng-1` with a worktree.
   4. A-1 is `inReview` after submit.
-  5. A verification run is `passed`.
-  6. The review is approved.
+  5. A verification run `passed`.
+  6. The review was approved.
   7. `main` contains the engineer's commit (real git `rev-parse`).
   8. The web preview is `running` at that commit.
   9. `WorkSnapshot.load(...).inbox` contains a `deploy` ask.
@@ -468,73 +535,75 @@ README.md
 - [ ] **Step 4:** Run them, then `scripts/test.sh unit --report`. Expected: PASS, golden path < 30 s.
 - [ ] **Step 5: Commit.**
 
-### Task 14: Golden path, black box
+### Task 18: Golden path, black box
 
 **Files:**
 - Create: `scripts/golden-path.sh`, `scripts/fake-claude-roles/{ceo,lead,eng,reviewer}.sh`
-- Modify: `scripts/fake-claude.sh`. It dispatches to a role script by `BRAHMA_AGENT_ID`'s role, read through `brahma mcp`'s tools like a real agent. Its existing doctor/canary answers stay.
+- Modify: `scripts/fake-claude.sh`. It dispatches to a role script by the agent's role, read through `brahma mcp`'s tools like a real agent. Its existing doctor and canary answers stay.
 
 **Interfaces:**
-- Consumes: R's `brahma engine serve --unmanaged`, the Task 8 CLI paths.
-- Produces: `scripts/golden-path.sh [--keep]`, which exits 0 on success. It prints one `PHASE n OK <name>` line per phase, and on failure prints the last 50 lines of `engine.log`.
+- Consumes: R's `brahma engine serve --unmanaged` and today's CLI commands (unchanged).
+- Produces: `scripts/golden-path.sh [--keep]`, which exits 0 on success. It prints `PHASE n OK <name>` lines, and on failure the last 50 lines of `engine.log`.
 
 - [ ] **Step 1:** Write the script.
-  - Make a temp home under a short root (`/tmp/bgp-XXXX`) with `BRAHMA_OWNER_KEY_STORE=file` and `BRAHMA_SECRET_STORE=memory`, then `brahma settings owner-key init`.
-  - Run `brahma company create … --pack software` with the Workspace profile, as `goalToLiveURL` does, because temp homes have no canary probes.
+  - Create a temp home under a short root (`/tmp/bgp-XXXX`) with `BRAHMA_OWNER_KEY_STORE=file` and `BRAHMA_SECRET_STORE=memory`, then run `brahma owner init`.
+  - Run `brahma company create … --pack software` with the Workspace profile, as `goalToLiveURL` does, because a temp home has no canary probes.
   - Start `brahma engine serve --unmanaged` with `BRAHMA_CLAUDE=scripts/fake-claude.sh`.
-  - Poll `brahma work list --json` and `brahma work preview list` every 1 s, up to 240 s.
-  - Check the preview with `curl -sf` (expect 200), then `brahma inbox` lists the deploy ask, then `brahma approve`, then the release is `deployed`.
+  - Poll `brahma items list --json` and `brahma preview list` every 1 s, for up to 240 s.
+  - Check the preview with `curl -sf` (expect 200). Check that `brahma inbox` lists the deploy ask, run `brahma approve`, and check that the release is `deployed`.
   - Run `brahma engine stop`, and remove the home unless `--keep`.
-  - Never kill anything but the service pid it started.
+  - Never kill anything but the service pid the script started.
 - [ ] **Step 2:** Run `scripts/golden-path.sh`. Expected: `PHASE 10 OK release deployed` and exit 0, in about 2–4 minutes.
 - [ ] **Step 3:** Add one line to the README's "Before merging a plan" section: run `scripts/golden-path.sh`.
 - [ ] **Step 4: Commit.**
 
-### Task 15: Heavy suites to budget
+### Task 19: Heavy suites to budget
 
 **Files:**
-- Modify: the suites `scripts/test.sh unit --report` lists above 10 s after Tasks 1–4. Expect, from the C2a log: ReviewTests, BackupTargetTests, MergeBatchTests, MergeQueueTests, SecretWireTests, SeatbeltRunnerTests, VerificationTests, MergeRecoveryTests, SessionTests and OrchestratorTests.
+- Modify: the suites that `scripts/test.sh unit --report` lists above 10 s after Tasks 1–4. From the C2a log, expect ReviewTests, BackupTargetTests, MergeBatchTests, MergeQueueTests, SecretWireTests, SeatbeltRunnerTests, VerificationTests, MergeRecoveryTests, SessionTests and OrchestratorTests.
 
 **Interfaces:**
-- Consumes: Task 1 `TemplateRepo`, `.processTier`.
+- Consumes: Task 1 `TemplateRepo` and `.processTier`.
 
 - [ ] **Step 1:** Run `scripts/test.sh unit --report` and save the slowest-15 list in the commit body.
 - [ ] **Step 2:** For each listed suite:
   - git fixtures use `TemplateRepo.clone`;
   - tests that spawn real processes or `sandbox-exec` move to `.processTier`, each with a unit sibling on fakes, named `<original>_logic`;
-  - Mac-wide resources (pasteboard, `/private/tmp`) are already isolated by Task 1.
-  - One commit per suite, with the test count unchanged across tiers (`--report` prints the per-tier counts).
-- [ ] **Step 3:** Run `scripts/test.sh unit --report` on an idle machine, 3 times. Expected: each run < 90 s. Record the three times. If a run exceeds 90 s, list the top 5 remaining suites in the commit body and continue with Step 2 on them.
-- [ ] **Step 4:** Run the cross-worktree check: start `scripts/test.sh unit` in this worktree and in a scratch clone at the same time. Expected: both green. This is the only time two suites run at once, and it is deliberate. Do it only when no other lane is testing.
+  - commit once per suite, with the test count unchanged across tiers (`--report` prints counts per tier).
+- [ ] **Step 3:** Run `scripts/test.sh unit --report` 3 times on an idle machine. Expected: each run < 90 s. Record the times. If a run is over 90 s, list the top 5 remaining suites in the commit body and continue Step 2 on them.
+- [ ] **Step 4:** Cross-worktree check: run `scripts/test.sh unit` in this worktree and in a scratch clone at the same time. Expected: both green. This is the only deliberate concurrent run. Do it only when no other lane is testing.
 - [ ] **Step 5: Commit.**
 
-### Task 16: Final docs and review
+### Task 20: Final docs and review
 
 **Files:**
-- Modify: `README.md` (CLI overview from the new `--help`, the "moved commands" note with the PQ4 window, test tiers and `scripts/test.sh`, golden path). Append an "After Plan P" note to v2 §4.12.2 (sidebar) without rewriting the original.
+- Modify: `README.md` (test tiers and `scripts/test.sh`, golden path, theme token notes). Append an "After Plan P" note to v2 §4.12.1 (tokens: `text2`, `accentText`) without rewriting the original.
 
 - [ ] **Step 1:** Run the full verification:
   - `scripts/test.sh all` (with `BRAHMA_LIVE` unset);
   - `scripts/golden-path.sh`;
   - `scripts/make-app.sh debug && scripts/smoke-app.sh`;
-  - UI snapshots of all seven nouns.
+  - `ScreenInventoryTests`;
+  - `scripts/perf-bench.sh`;
+  - UI snapshots of every screen, read one by one.
 
-  Expected: all green, and the snapshots read.
-- [ ] **Step 2:** Final review (Opus, per the owner's model policy) of the branch against spec §4 anti-goals and the Review Focus.
-- [ ] **Step 3: Commit.**
+  Expected: all green, every budget met or explained, and the inventory unchanged.
+- [ ] **Step 2:** Hand the usability file (Task 11) to the controller for the owner, with each entry's status.
+- [ ] **Step 3:** Final review (Opus, per the owner's model policy) of the branch against spec §4 anti-goals, the owner decisions and the Review Focus.
+- [ ] **Step 4: Commit.**
 
 ---
 
 ## Self-review notes (done inline)
 
 - **Spec coverage:**
-  - §5.1 IA → Tasks 10, 11
-  - §5.2 CLI → Tasks 8, 9, 12
-  - §5.3 golden path → Tasks 13, 14
-  - §5.4 determinism and speed → Tasks 1–4, 15
-  - §5.5 notifications → Tasks 5–7
-  - §6 migration → Tasks 1, 5, 8, 12
-  - Owner questions PQ1–PQ5 → the defaults are built in Tasks 10 (layout A, Activity folded), 8 (`dev`, shortcuts kept) and 9 (TTY note, window)
-- **Execution order:** 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16. Determinism comes first, so every later task runs on a fast, stable suite.
-- **Name consistency:** `Topic`, `ChangeTopics`, `ChangedEvent`, `ChangeFeed`, `ChangeSubscription`, `SnapshotPart`, `LegacyRoutes`, `CommandTree`, `SidebarItem.legacy`, `NounHeader`, `MissionStrip`, `ScriptedTurnRunner`, `PortAllocating`, `ProcessInspecting`, `Signal`, `TemplateRepo`, `TestTier`.
-- **Estimated build effort:** 16 tasks. Tasks 1, 5–7, 9 and 13 carry most of the design risk; Tasks 12 and 15 are long but mechanical. That is about 7–9 implementer-days, roughly 1.5 calendar weeks with review rounds.
+  - §5.1 polish: Task 10 (audit and inventory), Task 12 (tokens and contrast), Tasks 13–15 (screens), Task 16 (performance), Task 11 (usability).
+  - §5.2 CLI: Tasks 8–9.
+  - §5.3 golden path: Tasks 17–18.
+  - §5.4 determinism and speed: Tasks 1–4 and 19.
+  - §5.5 notifications: Tasks 5–7.
+  - §6 migration: Tasks 1, 5, 8–10 and 12.
+  - Owner decisions: 01:13 is covered by Tasks 10–16 with the frozen inventory. 01:16 CLI is covered by Tasks 8–9 with the frozen tree. 01:16 engine is in Plan R.
+- **Execution order:** 1 → 20 as numbered. Determinism comes first, so every later task runs on a fast, stable suite. The usability write-up (Task 11) goes to the owner early, so approvals can land while polish runs.
+- **Name consistency:** `Topic`, `ChangeTopics`, `ChangedEvent`, `ChangeFeed`, `ChangeSubscription`, `SnapshotPart`, `CommandTree`, `PortAllocating`, `ProcessInspecting`, `Signal`, `TemplateRepo`, `TestTier`, `EmptyState`/`LoadingState`/`ErrorState`, `ThemeContrast`, `TruncatedText`, `PerfBudgets`, `ScriptedTurnRunner`.
+- **Estimated build effort:** 20 tasks. Tasks 1, 5–7, 12, 16 and 17 carry most of the design risk. Tasks 8–9 and 13–15 are long but mechanical. Roughly 9–11 implementer-days, or about 2 calendar weeks with review rounds.

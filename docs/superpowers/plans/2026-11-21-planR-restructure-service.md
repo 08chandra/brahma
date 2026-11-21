@@ -64,7 +64,7 @@ R additions:
 | Shutdown bound (⌥ Quit, `engine stop`) | 15 s (today's `EngineHost.stop`) |
 | launchd | `RunAtLoad true`, `KeepAlive {SuccessfulExit false}`, `ThrottleInterval 10`, `ExitTimeOut 30`, `ProcessType Standard`, `LimitLoadToSessionType Aqua` |
 | Label | `dev.brahma.engine` (default home) or `dev.brahma.engine.<fnv1a64(canonicalHomePath) lowercase hex, first 8>` |
-| Owner defaults (spec RQ1–RQ4) | `keepRunningOnQuit = true`, `autostart = true`, `upgradePolicy = .drain`, `foregroundRunAllowed = true` |
+| Owner decisions (01:16, spec RQ1–RQ4) | `keepRunningOnQuit = true`, `autostart = true`, `upgradePolicy = .drain`, `foregroundRunAllowed = true` |
 
 ## Review Focus
 

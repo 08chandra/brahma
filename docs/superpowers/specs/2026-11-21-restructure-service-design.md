@@ -8,16 +8,18 @@ R is a **refactor plus a hosting change**. Nothing the owner or an agent does ch
 
 ---
 
-## Owner questions (recommended defaults; the plan builds the defaults unless you say otherwise)
+## Owner decisions, 2026-11-21
 
-| # | Question | Recommended default | Why |
+**01:16: the owner confirmed RQ1, RQ2 and RQ3 as recommended. RQ4 is the default and stands. The plan builds exactly these defaults.** The table below records each question with its reasoning.
+
+| # | Question | Decision (01:16) | Why |
 |---|---|---|---|
 | RQ1 | When you quit the Brahma app, do agents keep working? | **Yes.** Quit closes the window and menu bar only. The engine keeps running as a background service. The menu bar and Settings › Engine get **Stop engine**, and **⌥ Quit** ("Quit and stop agents") does what Quit does today. Desktop notifications pause until you reopen the app. Phone alerts (`brahma prefs set push`) keep coming from the engine. | This is the point of item 5 (*analysis §3 Engine lifetime*). Keeping the old behaviour on ⌥ Quit costs one menu item. |
 | RQ2 | Does the engine start at login? | **Yes, on by default.** Toggle in Settings › Engine (and `brahma engine autostart on|off`). Paused companies cost nothing, and an idle engine ticks once a second. | Agents survive a reboot without you opening the app. |
 | RQ3 | What happens to running turns when a new Brahma build is installed? | **Drain, then restart.** New work is held. The engine waits up to **10 minutes** (awake time) for running turns, checks and merges to finish, then restarts on the new build. Anything still running is interrupted exactly as Quit interrupts it today (agents go back to ready). The banner has a **Restart now** button. | No work is lost, and no turn runs for long on an old binary. |
 | RQ4 | Keep a foreground terminal engine (`brahma run`)? | **Keep it** as `brahma engine run`, for development. `brahma run` stays as an alias. It refuses while the service runs and tells you to `brahma engine stop` first. | Developers and the live tests use it. It is the same code as the service. |
 
-None of these change safety. Each one is a switch in `EngineServiceConfig`, so a different answer is a one-line change in the plan.
+None of these change safety. Each one is a switch in `EngineServiceConfig`, so a later change of mind is a one-line change.
 
 ---
 
