@@ -53,6 +53,8 @@ public struct WorkSnapshot: Equatable, Sendable {
     public var timeZone: TimeZone = .current
     /// The company's workspace, where documents named by asks live.
     public var workspace: String = ""
+    /// The company has a restore epoch the owner has not cleared (Plan C P2, Ruling 26): its restore alert offers the vouch.
+    public var restoreVouchOpen = false
 
     public static let empty = WorkSnapshot()
 
@@ -89,6 +91,7 @@ public struct WorkSnapshot: Equatable, Sendable {
         w.reservedCategories = store.catalog.pack(company.packId)?.reservedCategories ?? []
         w.timeZone = store.ownerTimeZone()
         w.workspace = company.workspacePath
+        w.restoreVouchOpen = try store.hasOpenRestoreEpoch(companyId: companyId)
         let info = try store.latestRateLimit()
         w.pace = UsageGate.pace(info, reserve: company.ownerReserve ?? (1 - store.weeklyShare()), now: now)
         w.costByMode = try store.costByMode(companyId: companyId, since: now.addingTimeInterval(-7 * 86_400))

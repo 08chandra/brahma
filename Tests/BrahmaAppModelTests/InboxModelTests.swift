@@ -71,6 +71,48 @@ import GRDB
         #expect(try String(contentsOf: ws.appending(path: "scratch.txt"), encoding: .utf8) == "the owner was here\n")
     }
 
+    /// Plan C P2 breaker fix B-3 (Ruling 26): the restore alert of a company with an uncleared restore epoch offers the owner's
+    /// vouch; it calls `Store.vouchRestoredCommits` (the epoch and its rows cleared, an owner activity line). No other alert
+    /// offers it, the action refuses any other ask, and once nothing is left to clear the restore alert no longer offers it.
+    @Test func restoreAlertOffersTheRestoreVouch() async throws {
+        let w = try await WorkWorld.make()
+        let sha = String(repeating: "f6", count: 20)
+        let company = w.company
+        try await w.store.writer.write { db in
+            try RestoreEpoch(id: "epoch-app", companyId: company.id, mainCommit: nil, listed: false,
+                             source: RestoreCarry.unreadableCommitTaintSource, createdAt: Date(), clearedBy: nil, clearedAt: nil).insert(db)
+            try db.execute(sql: "INSERT INTO taintedCommit (companyId, sha, source, createdAt, restoreEpoch) VALUES (?, ?, ?, ?, 'epoch-app')",
+                           arguments: [company.id, sha, RestoreCarry.unreadableCommitTaintSource, Date()])
+            try RestoreCarry.raiseRestoreAlert(db, snapshot: "snap.sqlite", summary: "nothing you had turned off was rolled back", now: Date())
+            try Store.fileEngineAlert(db, company: company, reason: "other-alert",
+                                      text: "something else", now: Date())
+        }
+        await w.refresh()
+        let alert = try #require(w.model.inboxRows.first { $0.kind == .engineAlert && $0.title.contains("was restored from") })
+        let other = try #require(w.model.inboxRows.first { $0.kind == .engineAlert && $0.title.contains("something else") })
+        #expect(alert.canVouchRestore, "the restore alert does not offer the vouch")
+        #expect(!other.canVouchRestore)
+        // Another ask: refused, nothing cleared.
+        await w.model.vouchRestoredCommits(askId: other.id)
+        #expect(w.model.errorMessage != nil)
+        #expect(try w.store.refTaint(WorkRef(kind: .commit, id: sha), companyId: w.company.id).tainted)
+        w.model.errorMessage = nil
+        await w.model.vouchRestoredCommits(askId: alert.id)
+        #expect(w.model.errorMessage == nil, "\(w.model.errorMessage ?? "")")
+        let (epoch, commit) = try await w.store.writer.read { db in
+            (try String.fetchOne(db, sql: "SELECT clearedBy FROM restoreEpoch WHERE id = 'epoch-app'"),
+             try String.fetchOne(db, sql: "SELECT clearedBy FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [company.id, sha]))
+        }
+        #expect(epoch == "owner" && commit == "owner")
+        #expect(try !w.store.refTaint(WorkRef(kind: .commit, id: sha), companyId: w.company.id).tainted)
+        let lines = try await w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND kind = 'access'", arguments: [company.id])
+        }
+        #expect(lines.contains { $0.contains("Owner vouched for the commits a restore could not place") })
+        let after = try #require(w.model.inboxRows.first { $0.id == alert.id })
+        #expect(!after.canVouchRestore, "the vouch is still offered with nothing left to clear")
+    }
+
     @Test func changedDocumentRequiresAck() async throws {
         let w = try await WorkWorld.make()
         try w.writeDoc("docs/prd.md", "# Plan\n\nOriginal.")

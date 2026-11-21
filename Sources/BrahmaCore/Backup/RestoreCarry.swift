@@ -388,7 +388,9 @@ struct RestoreCarry {
     /// database stays uncleared (an uncleared live row undoes the snapshot's clearing of it); everything else of a row the
     /// snapshot has stays as the snapshot has it. Ruling 19's sequences are not carried: the two databases' sequences are not
     /// comparable, so a clearing carried in has none in the restored database and counts as uncleared at every publish
-    /// (fail closed).
+    /// (fail closed). A merged row keeps a restore epoch only when both rows carry one (P2 breaker B-4): a row a turn (or a
+    /// marker, or a rebase carry) wrote in either database is never epoch-only, so the owner's restore vouch
+    /// (`vouchRestoredCommits`, which clears only epoch rows) can't clear it.
     static func carryItemCommitTaints(_ rows: [ItemCommitTaint], into db: Database) throws {
         guard !rows.isEmpty, try db.tableExists("taintedCommit") else { return }
         for r in rows {
@@ -399,7 +401,8 @@ struct RestoreCarry {
                 ON CONFLICT(companyId, sha) DO UPDATE SET
                   clearedBy = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE taintedCommit.clearedBy END,
                   clearedAt = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE taintedCommit.clearedAt END,
-                  restoreEpoch = COALESCE(taintedCommit.restoreEpoch, excluded.restoreEpoch)
+                  restoreEpoch = CASE WHEN taintedCommit.restoreEpoch IS NULL OR excluded.restoreEpoch IS NULL THEN NULL
+                                      ELSE taintedCommit.restoreEpoch END
                 """, arguments: [r.companyId, r.sha, r.itemId, r.agentId, r.turnId, r.source, r.createdAt, r.clearedBy, r.clearedAt,
                                  r.carriedTo, r.restoreEpoch, r.companyId])
         }
@@ -429,12 +432,14 @@ extension RestoreCarry {
     /// Ruling 22 (P2 R5-1), when the live database can't be read: its tainted commits are unknown, and git is not rolled back,
     /// so a commit made after the snapshot (on the branch of an item the snapshot doesn't have, or of one it has as done) has
     /// no row here and would read clean. Each company of the restored database gets a restore epoch:
-    /// - its repository is listed now: every commit any ref or worktree `HEAD` holds that is not in the history of `main` as
-    ///   the snapshot recorded it (`company.mainCommit`; none recorded: every commit) is recorded as a tainted commit naming
-    ///   the epoch (an existing row is kept as it is), of the item whose `item/<KEY>` branch holds it when this database has
-    ///   that item, else of no item; the epoch is `listed`;
-    /// - when that listing fails (no repository, git fails, past git's output cap, no data-home temp folder), nothing is
-    ///   recorded and the epoch is not `listed`: every commit not in that `main`'s history reads tainted (`RefTaint`).
+    /// - every commit not in the history of `main` as the snapshot recorded it (`company.mainCommit`; none recorded: every
+    ///   commit) reads tainted (`RefTaint`), and every file or diff whose range from that `main` holds one, listed or not
+    ///   (Rulings 24 and 25: a dangling or reflog-only commit the listing can't see may be made reachable later);
+    /// - its repository is listed now, to attribute what it holds: every commit any ref or worktree `HEAD` holds that is not
+    ///   in that `main`'s history is recorded as a tainted commit naming the epoch (an existing row is kept as it is), of the
+    ///   item whose `item/<KEY>` branch holds it when this database has that item, else of no item; the epoch is `listed`.
+    ///   When that listing fails (no repository, git fails, past git's output cap, no data-home temp folder), nothing is
+    ///   recorded and the epoch is not `listed`; either way the rule above applies, so the listing never makes a commit clean.
     /// Either way it stands until the owner vouches (`Store.vouchRestoredCommits`). Never throws for git; a database error
     /// throws (the restore then changes nothing).
     static func recordRestoreEpochs(_ db: Database, now: Date, gitTempRoot: URL?) throws {
