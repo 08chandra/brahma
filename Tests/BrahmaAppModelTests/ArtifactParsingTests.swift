@@ -32,12 +32,25 @@ import Testing
         #expect(wideHeader.rows[0].count == CSVTable.maxColumns)
         #expect(wideHeader.truncated)
 
-        // A physical line over 4 KB is cut: the row keeps what fit, and the next line parses normally.
+        // A physical line over 4 KB is cut: the row keeps its structure (later cells empty), and the next line parses.
         let longLine = (1...100).map { _ in String(repeating: "z", count: 60) }.joined(separator: ",")
         let cut = CSVTable.parse("h\n" + longLine + "\nnext")
-        #expect(cut.rows[0].count < 100 && cut.rows[0].count > 50)
+        #expect(cut.rows[0].count == 100)
+        #expect(cut.rows[0][0] == String(repeating: "z", count: 60))
+        #expect(cut.rows[0][99] == "")
         #expect(cut.rows[1] == ["next"])
         #expect(cut.truncated)
+
+        // A quoted cell over 4 KB still closes, so the row keeps its shape and the rows after it parse (RFC 4180 kept).
+        // The cell beside it sits past the 4 KB cut of the same physical line, so its text is not kept.
+        let quoted = CSVTable.parse("h1,h2\n\"" + String(repeating: "x", count: 5000) + "\",b\nr2a,r2b\nr3a,r3b\n")
+        #expect(quoted.rows.count == 3)
+        #expect(quoted.rows[0].count == 2 && quoted.rows[0][0].count == CSVTable.maxCellChars && quoted.rows[0][1] == "")
+        #expect(quoted.rows[1] == ["r2a", "r2b"] && quoted.rows[2] == ["r3a", "r3b"])
+        #expect(quoted.truncated)
+        // The same with the cell's closing quote escaped inside the cut region, and a newline inside the quotes.
+        let tricky = CSVTable.parse("h\n\"" + String(repeating: "y", count: 4500) + "\"\"q\"\"\nz\",after\nnext,row\n")
+        #expect(tricky.rows == [[String(repeating: "y", count: CSVTable.maxCellChars), "after"], ["next", "row"]])
 
         let empty = CSVTable.parse("")
         #expect(empty.header.isEmpty && empty.rows.isEmpty && !empty.truncated)
@@ -60,23 +73,67 @@ import Testing
 
         #expect(try await RendererCaps.parse { 42 } == 42)
 
+        // The timeout on a manual clock: deterministic whatever the load. The body sleeps until it is cancelled (it would
+        // run for 10 s of wall time otherwise); the clock is moved past `parseTimeout` and the caller gets `timedOut`.
         final class Flag: @unchecked Sendable { var cancelled = false }
         let flag = Flag()
-        let clock = SuspendingClock()
-        let start = clock.now
-        await #expect(throws: RendererError.timedOut) {
-            try await RendererCaps.parse { () -> Int in
+        let clock = ManualClock()
+        let running = Gate()
+        let waiting = Task.detached { () async throws -> Int in   // scope-escape: awaits parse off the main actor; makes no files
+            try await RendererCaps.parse(clock: clock) { () -> Int in
+                running.openUp()
                 let deadline = Date().addingTimeInterval(10)
                 while Date() < deadline {
                     if Task.isCancelled { flag.cancelled = true; return 0 }
-                    Thread.sleep(forTimeInterval: 0.05)
+                    Thread.sleep(forTimeInterval: 0.01)
                 }
                 return 1
             }
         }
-        #expect(clock.now - start < .seconds(6))
-        try await Task.sleep(for: .milliseconds(200))
+        await running.wait()
+        clock.advance(by: RendererCaps.parseTimeout - .milliseconds(1))
+        #expect(!flag.cancelled, "short of the timeout nothing fires")
+        clock.advance(by: .milliseconds(1))
+        await #expect(throws: RendererError.timedOut) { try await waiting.value }
+        let settle = SuspendingClock.now + .seconds(10)
+        while !flag.cancelled, SuspendingClock.now < settle { try await Task.sleep(for: .milliseconds(10)) }
         #expect(flag.cancelled)
+    }
+
+    /// A clock that moves only when told to; `Task.sleep(for:clock:)` on it waits for `advance`.
+    final class ManualClock: Clock, @unchecked Sendable {
+        struct Instant: InstantProtocol, Hashable {
+            typealias Duration = Swift.Duration
+            var offset: Duration
+            func advanced(by duration: Duration) -> Instant { Instant(offset: offset + duration) }
+            func duration(to other: Instant) -> Duration { other.offset - offset }
+            static func < (a: Instant, b: Instant) -> Bool { a.offset < b.offset }
+        }
+        private let lock = NSLock()
+        private var current = Instant(offset: .zero)
+        private var waiting: [(deadline: Instant, continuation: CheckedContinuation<Void, any Error>)] = []
+        var now: Instant { lock.withLock { current } }
+        var minimumResolution: Duration { .zero }
+        var sleepers: Int { lock.withLock { waiting.count } }
+        func sleep(until deadline: Instant, tolerance: Duration?) async throws {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, any Error>) in
+                let due: Bool = lock.withLock {
+                    if deadline <= current { return true }
+                    waiting.append((deadline, c))
+                    return false
+                }
+                if due { c.resume() }
+            }
+        }
+        func advance(by duration: Duration) {
+            let due: [CheckedContinuation<Void, any Error>] = lock.withLock {
+                current = current.advanced(by: duration)
+                let fired = waiting.filter { $0.deadline <= current }.map(\.continuation)
+                waiting.removeAll { $0.deadline <= current }
+                return fired
+            }
+            due.forEach { $0.resume() }
+        }
     }
 
     // MARK: OpenAPI
@@ -103,6 +160,10 @@ import Testing
         var many: [String: Any] = [:]
         for i in 0..<600 { many["/r\(i)"] = ["get": [:]] }
         #expect(OpenAPISummary.parse(Self.openAPI(paths: many))?.count == OpenAPISummary.maxOperations)
+
+        // A path key is agent text too: a newline in it cannot forge a second row.
+        let forged = OpenAPISummary.parse(Self.openAPI(paths: ["/pets\nDELETE /admin": ["get": [:]]]))
+        #expect(forged == [OpenAPIOperation(method: "GET", path: "/pets DELETE /admin", summary: nil)])
 
         #expect(OpenAPISummary.parse(Self.openAPI(paths: [:])) == [])
         #expect(OpenAPISummary.parse(Data("openapi: 3.0.0\npaths: {}\n".utf8)) == nil)
@@ -336,6 +397,8 @@ import Testing
             ("view byteOffset Int.max", { doc in Self.bufferView(&doc, 0) { $0["byteOffset"] = Int.max } }),
             ("view byteLength Int.max", { doc in Self.bufferView(&doc, 0) { $0["byteLength"] = Int.max } }),
             ("stride Int.max", { doc in Self.bufferView(&doc, 0) { $0["byteStride"] = Int.max } }),
+            ("boolean count", { doc in Self.accessor(&doc, 0) { $0["count"] = true } }),
+            ("boolean offset", { doc in Self.accessor(&doc, 0) { $0["byteOffset"] = false } }),
             ("negative count", { doc in Self.accessor(&doc, 0) { $0["count"] = -1 } }),
             ("negative offset", { doc in Self.accessor(&doc, 0) { $0["byteOffset"] = -4 } }),
             ("fractional count", { doc in Self.accessor(&doc, 0) { $0["count"] = 2.5 } }),
@@ -346,6 +409,101 @@ import Testing
             let url = try Asset().writeGLTF(to: dir, mutate: mutate)
             #expect(Self.gltfError(url) != nil, "\(label)")
         }
+    }
+
+    /// Fix round 1 (M6): the aggregate caps are on what is held, and a FIFO cannot hang the reader.
+    @Test func gltfAggregateCapsAndFIFO() throws {
+        let dir = try tempDir()
+        let asset = Asset()
+        let binSize = asset.buffer.count
+        try asset.buffer.write(to: dir.appending(path: "tri.bin"))
+
+        // An oversized sibling is refused on its size, before any read.
+        try (asset.buffer + Data(repeating: 0, count: 64)).write(to: dir.appending(path: "big.bin"))
+        let oversized = try asset.writeGLTF(to: dir, name: "big.gltf", uri: "big.bin")
+        #expect(Self.gltfError(oversized) == .invalid("buffer big.bin is larger than its byteLength"))
+
+        // Many buffers on one sibling: the file is read once and counted once.
+        var doc = asset.json(uri: "tri.bin")
+        doc["buffers"] = (0..<50).map { _ in ["byteLength": binSize, "uri": "tri.bin"] as [String: Any] }
+        var document = GLTFMesh.Document(root: doc, bin: nil, directory: dir)
+        for i in 0..<50 { #expect(try document.buffer(i).count == binSize) }
+        #expect(document.loadedBytes == binSize)
+        #expect(document.siblings.count == 1)
+
+        // Total indices are capped across primitives sharing one accessor: 3 × 3 000 000 u8 indices > maxIndices.
+        let indexCount = 3_000_000
+        let zeros = Data(count: indexCount)
+        let shared: [String: Any] = [
+            "asset": ["version": "2.0"],
+            "buffers": [["byteLength": zeros.count, "uri": "zeros.bin"], ["byteLength": binSize, "uri": "tri.bin"]],
+            "bufferViews": [["buffer": 0, "byteLength": zeros.count], ["buffer": 1, "byteOffset": 0, "byteLength": 36]],
+            "accessors": [["bufferView": 0, "componentType": 5121, "count": indexCount, "type": "SCALAR"],
+                          ["bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"]],
+            "meshes": [["primitives": (0..<3).map { _ in ["attributes": ["POSITION": 1], "indices": 0] as [String: Any] }]],
+        ]
+        try zeros.write(to: dir.appending(path: "zeros.bin"))
+        let sharedURL = dir.appending(path: "shared.gltf")
+        try JSONSerialization.data(withJSONObject: shared).write(to: sharedURL)
+        #expect(Self.gltfError(sharedURL) == .tooLarge)
+        // Two of them fit exactly (6 000 000 indices), so the cap is the total, not the primitive.
+        var two = shared
+        two["meshes"] = [["primitives": (0..<2).map { _ in ["attributes": ["POSITION": 1], "indices": 0] as [String: Any] }]]
+        let twoURL = dir.appending(path: "two.gltf")
+        try JSONSerialization.data(withJSONObject: two).write(to: twoURL)
+        #expect(try GLTFMesh.load(twoURL).indices.count == GLTFMesh.maxIndices)
+
+        // The primitive walk is capped.
+        var many = asset.json(uri: "tri.bin")
+        many["meshes"] = [["primitives": (0...GLTFMesh.maxPrimitives).map { _ in ["attributes": ["POSITION": 0], "mode": 0] as [String: Any] }]]
+        let manyURL = dir.appending(path: "many.gltf")
+        try JSONSerialization.data(withJSONObject: many).write(to: manyURL)
+        #expect(Self.gltfError(manyURL) == .tooLarge)
+
+        // A FIFO as the model or as a sibling is refused at once instead of blocking the open.
+        let fifo = dir.appending(path: "pipe.glb")
+        #expect(mkfifo(fifo.path, 0o600) == 0)
+        let began = SuspendingClock.now
+        #expect(Self.gltfError(fifo) == .invalid("pipe.glb is not a regular file"))
+        #expect(Self.gltfError(try asset.writeGLTF(to: dir, name: "f.gltf", uri: "pipe.glb")) == .invalid("buffer pipe.glb is not a regular file"))
+        #expect(OpenAPISummary.load(fifo) == nil)
+        #expect(SuspendingClock.now - began < .seconds(2))
+    }
+
+    /// Fix round 1 (I2): glTF 2.0's accessor rule admits the usual interleaved layout.
+    @Test func gltfInterleavedStride() throws {
+        let dir = try tempDir()
+        let asset = Asset()
+        // One view, stride 24: position (12 bytes) then normal (12 bytes) per vertex; indices in a second view.
+        var buffer = Data()
+        for v in 0..<3 {
+            for c in 0..<3 { buffer.append(contentsOf: withUnsafeBytes(of: asset.positions[v * 3 + c].bitPattern.littleEndian, Array.init)) }
+            for c in 0..<3 { buffer.append(contentsOf: withUnsafeBytes(of: asset.normals![v * 3 + c].bitPattern.littleEndian, Array.init)) }
+        }
+        asset.indices.forEach { buffer.append(contentsOf: withUnsafeBytes(of: $0.littleEndian, Array.init)) }
+        buffer.append(contentsOf: [0, 0])
+        let doc: [String: Any] = [
+            "asset": ["version": "2.0"],
+            "buffers": [["byteLength": buffer.count, "uri": "data:application/octet-stream;base64," + buffer.base64EncodedString()]],
+            "bufferViews": [["buffer": 0, "byteOffset": 0, "byteLength": 72, "byteStride": 24],
+                            ["buffer": 0, "byteOffset": 72, "byteLength": 6]],
+            "accessors": [["bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"],
+                          ["bufferView": 0, "byteOffset": 12, "componentType": 5126, "count": 3, "type": "VEC3"],
+                          ["bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"]],
+            "meshes": [["primitives": [["attributes": ["POSITION": 0, "NORMAL": 1], "indices": 2]]]],
+        ]
+        let url = dir.appending(path: "interleaved.gltf")
+        try JSONSerialization.data(withJSONObject: doc).write(to: url)
+        let mesh = try GLTFMesh.load(url)
+        #expect(mesh.positions == asset.positions && mesh.normals == asset.normals && mesh.indices == [0, 1, 2])
+        // One element past the view (count 4 at stride 24 needs 12 + 3 × 24 + 12 = 96 > 72) is still an overrun.
+        var over = doc
+        var accessors = over["accessors"] as! [[String: Any]]
+        accessors[1]["count"] = 4
+        over["accessors"] = accessors
+        let overURL = dir.appending(path: "over.gltf")
+        try JSONSerialization.data(withJSONObject: over).write(to: overURL)
+        #expect(Self.gltfError(overURL) == .invalid("accessor 1 overruns its bufferView"))
     }
 
     // MARK: Video

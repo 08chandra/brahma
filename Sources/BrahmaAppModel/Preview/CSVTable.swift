@@ -1,9 +1,11 @@
 import Foundation
 
 /// A bounded RFC 4180 table (Plan 4a Task 8a): the first record is the header, then at most `maxRows` rows of at most
-/// `maxColumns` cells of at most `maxCellChars` scalars each, and no physical line is read past `RendererCaps.maxLineBytes`.
-/// Quoted fields may hold the separator, doubled quotes and newlines; CRLF and LF both end a record; blank lines are
-/// skipped. `truncated` says something was left out (rows, columns, the tail of a cell or of a line).
+/// `maxColumns` cells of at most `maxCellChars` scalars each, and no physical line adds to a cell past
+/// `RendererCaps.maxLineBytes`. Quoted fields may hold the separator, doubled quotes and newlines; CRLF and LF both end a
+/// record; blank lines are skipped. Past the line cut the quote, separator and record state machine keeps running (so a
+/// long quoted cell still closes and the records after it still parse); only the appending of text stops. `truncated`
+/// says something was left out (rows, columns, the tail of a cell or of a line).
 public struct CSVTable: Equatable, Sendable {
     public var header: [String]
     public var rows: [[String]]
@@ -28,10 +30,13 @@ public struct CSVTable: Equatable, Sendable {
         var inQuotes = false
         var truncated = false
         var lineBytes = 0
-        var skippingLine = false
+        /// Set once the physical line passed the cap: structure is still tracked, text is no longer kept.
+        var lineCut = false
 
         func append(_ c: Unicode.Scalar) {
-            if fieldScalars < maxCellChars {
+            if lineCut {
+                truncated = true
+            } else if fieldScalars < maxCellChars {
                 field.append(c)
                 fieldScalars += 1
             } else {
@@ -65,17 +70,12 @@ public struct CSVTable: Equatable, Sendable {
             }
             if c == "\n" {
                 lineBytes = 0
-                skippingLine = false
-            } else if skippingLine {
-                i = scalars.index(after: i)
-                continue
-            } else {
+                lineCut = false
+            } else if !lineCut {
                 lineBytes += c.utf8.count
                 if lineBytes > RendererCaps.maxLineBytes {
                     truncated = true
-                    skippingLine = true
-                    i = scalars.index(after: i)
-                    continue
+                    lineCut = true
                 }
             }
             if inQuotes {

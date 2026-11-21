@@ -66,6 +66,21 @@ import Testing
         #expect(AnsiText.parse("").isEmpty)
     }
 
+    @Test func longProgressLineShowsLastState() {
+        // 1501 `\r`-separated updates, ~9 KB on one line: the last state shows, with the color set shortly before it.
+        var updates = (0...1500).map { "\r\($0)%" }
+        updates[1400] = "\r\u{1B}[32m1400%"
+        let lines = AnsiText.parse(updates.joined() + "\nnext")
+        #expect(lines[0] == [AnsiSpan(text: "1500%", color: .green, bold: false)])
+        #expect(Self.plain(lines)[1] == "next")
+        // Trailing escape-only segments do not count as an overwrite: the last printed state stays.
+        let trailing = AnsiText.parse(updates.joined() + "\r\u{1B}[0m")
+        #expect(Self.plain(trailing) == ["1500%"])
+        // A long line without `\r` is still cut from its start.
+        let long = AnsiText.parse(String(repeating: "x", count: 5000))
+        #expect(Self.plain(long)[0].hasSuffix("…") && Self.plain(long)[0].utf8.count <= RendererCaps.maxLineBytes + 3)
+    }
+
     @Test func longLineCut() {
         let long = String(repeating: "é", count: 5000)   // 10 000 bytes
         let lines = AnsiText.parse(long + "\nshort")

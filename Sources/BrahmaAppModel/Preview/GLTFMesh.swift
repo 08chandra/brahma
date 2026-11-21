@@ -7,23 +7,37 @@ public enum GLTFError: Error, Equatable, Sendable {
     /// Well-formed but outside what the viewer renders (non-triangle modes, sparse accessors, non-float positions,
     /// buffer URIs that are not a bare sibling name or `data:` base64).
     case unsupported(String)
-    /// Over a cap: the file (`RendererCaps.maxInProcessModelBytes`), `maxVertices` or `maxBufferBytes`.
+    /// Over a cap: the file (`RendererCaps.maxInProcessModelBytes`), `maxVertices`, `maxIndices`, `maxPrimitives` or
+    /// `maxBufferBytes`.
     case tooLarge
 }
 
-/// The triangles of a glTF 2.0 asset (`.gltf` JSON or `.glb`), flattened for one `SCNGeometry` (Plan 4a Task 8a). Every
-/// triangle primitive (mode 4) of every mesh is concatenated, without node transforms. Positions and normals are VEC3
-/// float; indices are u8, u16 or u32, re-based onto the concatenated vertices. The file is hostile input: every count,
-/// offset and stride is parsed as a non-negative `Int`, combined with overflow-reporting arithmetic, and checked against
-/// the bufferView, then the bufferView against its buffer, then the buffer against its bytes, before one byte is read;
-/// every index is checked against its primitive's vertex count. Buffer URIs are a bare sibling file name (no path, no
-/// scheme, no hidden file, read without following a link) or `data:…;base64,…`.
+/// The triangles of a glTF 2.0 asset (`.gltf` JSON or `.glb`), flattened for one `SCNGeometry` (Plan 4a Task 8a).
+///
+/// **Node transforms are ignored** (an accepted MVP limitation; 9a/9b's UI says "geometry preview, no transforms"): every
+/// triangle primitive (mode 4) of every mesh is concatenated in its own coordinates, so a multi-part model positioned by
+/// its nodes shows its parts at the origin. Positions and normals are VEC3 float; indices are u8, u16 or u32, re-based
+/// onto the concatenated vertices.
+///
+/// The file is hostile input. Every count, offset and stride is parsed as a non-negative `Int` (never a boolean),
+/// combined with overflow-reporting arithmetic, and checked against the bufferView (`byteOffset + (count − 1) × stride +
+/// elementSize ≤ byteLength`, glTF 2.0's rule), then the bufferView against its buffer, then the buffer against its bytes,
+/// before one byte is read; every index is checked against its primitive's vertex count. The caps bound what is held, not
+/// what is declared: `maxBufferBytes` counts the bytes actually loaded (a sibling file is read once however many buffers
+/// name it, its size is checked on the open descriptor against the declared `byteLength` before any read, and only
+/// `byteLength` bytes are kept); `maxVertices` and `maxIndices` bound the totals across primitives; `maxPrimitives` bounds
+/// the walk. Buffer URIs are a bare sibling file name (no path, no scheme, no hidden file, read without following a link)
+/// or `data:…;base64,…`.
 public struct GLTFMesh: Equatable, Sendable {
     public var positions: [Float]
     public var normals: [Float]?
     public var indices: [UInt32]
 
     public static let maxVertices = 2_000_000
+    /// Three per vertex at the vertex cap: the most indices held across all primitives.
+    public static let maxIndices = 3 * maxVertices
+    /// The most primitives walked (triangle or not).
+    public static let maxPrimitives = 65_536
     public static let maxBufferBytes = 67_108_864
 
     public init(positions: [Float], normals: [Float]?, indices: [UInt32]) {
@@ -85,6 +99,7 @@ public struct GLTFMesh: Equatable, Sendable {
 
     // MARK: Files
 
+    /// `url` as a regular file of at most `maxBytes` (checked on the open descriptor before reading); over it → `tooLarge`.
     static func read(_ url: URL, maxBytes: Int, what: String) throws -> Data {
         do {
             return try RendererCaps.readRegularFile(url, maxBytes: maxBytes)
@@ -113,7 +128,11 @@ public struct GLTFMesh: Equatable, Sendable {
         let root: [String: Any]
         let bin: Data?
         let directory: URL
+        /// Buffer index → its `byteLength` bytes (a prefix of the loaded data).
         var buffers: [Int: Data] = [:]
+        /// Sibling file name → the bytes read, once per file however many buffers name it.
+        var siblings: [String: Data] = [:]
+        /// Bytes actually held, bounded by `GLTFMesh.maxBufferBytes`.
         var loadedBytes = 0
 
         init(root: [String: Any], bin: Data?, directory: URL) {
@@ -124,14 +143,21 @@ public struct GLTFMesh: Equatable, Sendable {
 
         func array(_ key: String) -> [[String: Any]] { root[key] as? [[String: Any]] ?? [] }
 
-        /// A non-negative integer field (absent → `default`); anything else (negative, fractional, huge, a string) is invalid.
+        /// A non-negative integer field (absent → `default`); anything else (negative, fractional, huge, a string, a
+        /// boolean) is invalid.
         static func int(_ dict: [String: Any], _ key: String, default value: Int? = nil, in what: String) throws -> Int {
             guard let raw = dict[key] else {
                 if let value { return value }
                 throw GLTFError.invalid("\(what) has no \(key)")
             }
-            guard let n = raw as? Int, n >= 0 else { throw GLTFError.invalid("\(what) has a bad \(key)") }
+            guard !isBoolean(raw), let n = raw as? Int, n >= 0 else { throw GLTFError.invalid("\(what) has a bad \(key)") }
             return n
+        }
+
+        /// JSON `true`/`false` arrive as `NSNumber`s that bridge to `Int` 1/0; they are told apart by their CF type.
+        static func isBoolean(_ raw: Any) -> Bool {
+            guard let number = raw as? NSNumber else { return false }
+            return CFGetTypeID(number) == CFBooleanGetTypeID()
         }
 
         static func times(_ a: Int, _ b: Int, in what: String) throws -> Int {
@@ -148,34 +174,58 @@ public struct GLTFMesh: Equatable, Sendable {
 
         // MARK: Buffers and views
 
-        /// The bytes of buffer `index`, loaded once, after its `byteLength` is checked against the caps and the bytes.
+        /// Counts `count` bytes now held against the cap.
+        mutating func hold(_ count: Int) throws {
+            guard count <= GLTFMesh.maxBufferBytes - loadedBytes else { throw GLTFError.tooLarge }
+            loadedBytes += count
+        }
+
+        /// The `byteLength` bytes of buffer `index`, loaded once. The declared length is checked against the remaining
+        /// budget before anything is read, the bytes actually loaded are counted, and a sibling file is read at most once
+        /// and only when its size (on the open descriptor) is exactly what the buffer declares.
         mutating func buffer(_ index: Int) throws -> Data {
             if let data = buffers[index] { return data }
             let all = array("buffers")
             guard all.indices.contains(index) else { throw GLTFError.invalid("buffer \(index) does not exist") }
             let what = "buffer \(index)"
             let byteLength = try Self.int(all[index], "byteLength", in: what)
-            guard byteLength <= GLTFMesh.maxBufferBytes, GLTFMesh.maxBufferBytes - loadedBytes >= byteLength else { throw GLTFError.tooLarge }
-            let data: Data
+            guard byteLength <= GLTFMesh.maxBufferBytes - loadedBytes else { throw GLTFError.tooLarge }
+            var data: Data
             if let uri = all[index]["uri"] as? String {
                 if uri.hasPrefix("data:") {
-                    guard let comma = uri.range(of: ";base64,"),
-                          let decoded = Data(base64Encoded: String(uri[comma.upperBound...])) else {
+                    guard let marker = uri.range(of: ";base64,"),
+                          let decoded = Data(base64Encoded: String(uri[marker.upperBound...])) else {
                         throw GLTFError.unsupported("\(what) data URI must be base64")
                     }
                     data = decoded
+                    try hold(data.count)
                 } else {
                     guard let name = GLTFMesh.siblingName(uri) else {
                         throw GLTFError.unsupported("\(what) uri must be a sibling file name or a data URI")
                     }
-                    data = try GLTFMesh.read(directory.appending(path: name), maxBytes: GLTFMesh.maxBufferBytes, what: "buffer \(name)")
+                    if let cached = siblings[name] {
+                        data = cached
+                    } else {
+                        do {
+                            data = try RendererCaps.readRegularFile(directory.appending(path: name), maxBytes: byteLength)
+                        } catch RendererCaps.FileReadFailure.tooLarge {
+                            throw GLTFError.invalid("buffer \(name) is larger than its byteLength")
+                        } catch RendererCaps.FileReadFailure.notRegular {
+                            throw GLTFError.invalid("buffer \(name) is not a regular file")
+                        } catch {
+                            throw GLTFError.invalid("buffer \(name) could not be read")
+                        }
+                        try hold(data.count)
+                        siblings[name] = data
+                    }
                 }
             } else {
                 guard index == 0, let bin else { throw GLTFError.invalid("\(what) has no uri and no glb BIN chunk") }
                 data = bin
+                try hold(data.count)
             }
             guard data.count >= byteLength else { throw GLTFError.invalid("\(what) is shorter than its byteLength") }
-            loadedBytes += byteLength
+            data = data.prefix(byteLength)
             buffers[index] = data
             return data
         }
@@ -227,8 +277,9 @@ public struct GLTFMesh: Equatable, Sendable {
         static let componentSizes = [5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4]
         static let componentCounts = ["SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16]
 
-        /// Accessor `index`, with `byteOffset + count × stride ≤ byteLength` of its bufferView (the plan's rule) checked
-        /// with overflow-reporting arithmetic. `maxCount` is checked first, so a count past it is `tooLarge`, not an overrun.
+        /// Accessor `index`, with glTF 2.0's `byteOffset + (count − 1) × stride + elementSize ≤ byteLength` checked against
+        /// its bufferView with overflow-reporting arithmetic (interleaved views pass; one element past the view does not).
+        /// `maxCount` is checked first, so a count past it is `tooLarge`, not an overrun.
         mutating func accessor(_ index: Int, maxCount: Int) throws -> Accessor {
             let all = array("accessors")
             guard all.indices.contains(index) else { throw GLTFError.invalid("accessor \(index) does not exist") }
@@ -249,7 +300,7 @@ public struct GLTFMesh: Equatable, Sendable {
             let elementSize = components * componentSize
             let stride = view.byteStride ?? elementSize
             guard stride >= elementSize else { throw GLTFError.invalid("\(what) is wider than its bufferView stride") }
-            let span = try Self.times(count, stride, in: what)
+            let span = try Self.plus(try Self.times(count - 1, stride, in: what), elementSize, in: what)
             guard try Self.plus(byteOffset, span, in: what) <= view.byteLength else {
                 throw GLTFError.invalid("\(what) overruns its bufferView")
             }
@@ -257,7 +308,7 @@ public struct GLTFMesh: Equatable, Sendable {
                             type: type, base: view.byteOffset + byteOffset, stride: stride, elementSize: elementSize)
         }
 
-        /// `count × components` little-endian floats of a VEC3 FLOAT accessor.
+        /// `count × 3` little-endian floats of a VEC3 FLOAT accessor.
         mutating func floats(_ a: Accessor) throws -> [Float] {
             guard a.type == "VEC3", a.componentType == 5126 else {
                 throw GLTFError.unsupported("accessor \(a.index) must be VEC3 float")
@@ -316,16 +367,21 @@ public struct GLTFMesh: Equatable, Sendable {
 
         // MARK: Mesh
 
+        /// Every triangle primitive of every mesh, concatenated (no node transforms). Vertices, indices and primitives are
+        /// each bounded in total, so a document sharing one accessor across many primitives stays within the caps.
         mutating func triangles() throws -> GLTFMesh {
             var positions: [Float] = []
             var normals: [Float]? = []
             var indices: [UInt32] = []
             var vertices = 0
-            var primitives = 0
+            var walked = 0
+            var triangles = 0
             for mesh in array("meshes") {
                 for primitive in mesh["primitives"] as? [[String: Any]] ?? [] {
                     if Task.isCancelled { throw CancellationError() }
-                    let what = "primitive \(primitives)"
+                    walked += 1
+                    guard walked <= GLTFMesh.maxPrimitives else { throw GLTFError.tooLarge }
+                    let what = "primitive \(walked - 1)"
                     guard try Self.int(primitive, "mode", default: 4, in: what) == 4 else { continue }
                     guard let attributes = primitive["attributes"] as? [String: Any] else {
                         throw GLTFError.invalid("\(what) has no attributes")
@@ -341,20 +397,22 @@ public struct GLTFMesh: Equatable, Sendable {
                     } else {
                         normals = nil
                     }
+                    let remainingIndices = GLTFMesh.maxIndices - indices.count
                     if primitive["indices"] != nil {
-                        let index = try accessor(try Self.int(primitive, "indices", in: what), maxCount: 3 * GLTFMesh.maxVertices)
+                        let index = try accessor(try Self.int(primitive, "indices", in: what), maxCount: remainingIndices)
                         indices += try self.indices(index, vertexCount: position.count, vertexBase: vertices)
                     } else {
+                        guard position.count <= remainingIndices else { throw GLTFError.tooLarge }
                         guard position.count % 3 == 0 else {
                             throw GLTFError.invalid("\(what) has \(position.count) vertices, not whole triangles")
                         }
                         indices += (vertices ..< vertices + position.count).map { UInt32($0) }
                     }
                     vertices += position.count
-                    primitives += 1
+                    triangles += 1
                 }
             }
-            guard primitives > 0 else { throw GLTFError.unsupported("no triangle primitives") }
+            guard triangles > 0 else { throw GLTFError.unsupported("no triangle primitives") }
             return GLTFMesh(positions: positions, normals: normals, indices: indices)
         }
     }

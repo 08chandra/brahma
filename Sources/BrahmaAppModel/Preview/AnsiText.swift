@@ -21,10 +21,11 @@ public struct AnsiSpan: Equatable, Sendable {
 
 /// A pure, bounded parser for terminal output (Plan 4a Task 8a; Collab reuses it for run logs). Only SGR 0, 1, 22,
 /// 30–37, 39 and 90–97 apply. Every other CSI, OSC, DCS and lone ESC is dropped, `\r` with text after it on the same line
-/// erases what came before (a progress bar's last state), and other control characters are removed (a tab stays: it is
-/// log alignment). Lines are cut at `RendererCaps.maxLineBytes` and only the last `maxLines` are built: the tail is found
-/// by scanning the bytes backwards, so a 50 MB flood costs the same as 2000 lines (fix 11). Styles set before the kept
-/// tail are not seen, so the first kept line starts unstyled.
+/// erases what came before (a progress bar's last state), and other control characters are removed. **A tab is kept**
+/// (a deliberate exception to "other controls are removed": tab-aligned log output would be mangled without it, and it is
+/// harmless in `Text(verbatim:)`). Lines are cut at `RendererCaps.maxLineBytes` and only the last `maxLines` are built:
+/// the tail is found by scanning the bytes backwards, so a 50 MB flood costs the same as 2000 lines (fix 11). Styles set
+/// before the kept tail are not seen, so the first kept line starts unstyled.
 public enum AnsiText {
     public static let maxLines = 2000
 
@@ -50,9 +51,75 @@ public enum AnsiText {
         var lines: [[AnsiSpan]] = []
         lines.reserveCapacity(min(newlines + 1, maxLines))
         for raw in utf8[start..<end].split(separator: 0x0A, omittingEmptySubsequences: false) {
-            lines.append(parseLine(RendererCaps.truncateLine(Substring(raw)), state: &state))
+            var line = raw
+            if raw.count > RendererCaps.maxLineBytes, let overwrite = lastOverwrite(raw) {
+                // A long `\r` progress line shows its last state, not its first 4 KB: the text from the last overwrite is
+                // what a terminal leaves, and the 4 KB before it are walked for style only (an SGR set earlier is lost).
+                let before = raw[raw.startIndex..<overwrite]
+                var styleStart = before.index(before.endIndex, offsetBy: -min(RendererCaps.maxLineBytes, before.count))
+                while styleStart < before.endIndex, before[styleStart] & 0xC0 == 0x80 { styleStart = before.index(after: styleStart) }
+                _ = parseLine(String(Substring(before[styleStart...])), state: &state)
+                line = raw[overwrite...]
+            }
+            lines.append(parseLine(RendererCaps.truncateLine(Substring(line)), state: &state))
         }
         return lines
+    }
+
+    /// The start of the text a terminal would leave on this line: the position after the last `\r` whose segment holds
+    /// printable text (escape sequences do not count). Nil when there is no such `\r`.
+    static func lastOverwrite(_ raw: Substring.UTF8View) -> String.Index? {
+        var segmentEnd = raw.endIndex
+        var i = raw.endIndex
+        while i > raw.startIndex {
+            let previous = raw.index(before: i)
+            if raw[previous] == 0x0D {
+                if hasPrintable(raw[i..<segmentEnd]) { return i }
+                segmentEnd = previous
+            }
+            i = previous
+        }
+        return nil
+    }
+
+    /// Whether `bytes` holds anything that would print once escape sequences and controls are dropped.
+    static func hasPrintable(_ bytes: Substring.UTF8View) -> Bool {
+        var i = bytes.startIndex
+        func at(_ j: String.Index) -> UInt8 { bytes[j] }
+        while i < bytes.endIndex {
+            let b = at(i)
+            i = bytes.index(after: i)
+            guard b == 0x1B else {
+                if b == 0x09 || (b >= 0x20 && b != 0x7F) { return true }
+                continue
+            }
+            guard i < bytes.endIndex else { return false }
+            let kind = at(i)
+            i = bytes.index(after: i)
+            switch kind {
+            case 0x5B:   // CSI: parameters, intermediates, one final byte
+                while i < bytes.endIndex, (0x30...0x3F).contains(at(i)) { i = bytes.index(after: i) }
+                while i < bytes.endIndex, (0x20...0x2F).contains(at(i)) { i = bytes.index(after: i) }
+                if i < bytes.endIndex, (0x40...0x7E).contains(at(i)) { i = bytes.index(after: i) }
+            case 0x5D, 0x50, 0x58, 0x5E, 0x5F:   // OSC, DCS, SOS, PM, APC: to BEL or ST
+                while i < bytes.endIndex {
+                    let c = at(i)
+                    if c == 0x07 { i = bytes.index(after: i); break }
+                    if c == 0x1B {
+                        let next = bytes.index(after: i)
+                        if next < bytes.endIndex, at(next) == 0x5C { i = bytes.index(after: next) }
+                        break
+                    }
+                    i = bytes.index(after: i)
+                }
+            case 0x20...0x2F:   // nF: intermediates then one final byte
+                while i < bytes.endIndex, (0x20...0x2F).contains(at(i)) { i = bytes.index(after: i) }
+                if i < bytes.endIndex, (0x30...0x7E).contains(at(i)) { i = bytes.index(after: i) }
+            default:   // a two-byte escape, or a lone ESC before a control (which is then dropped on its own)
+                break
+            }
+        }
+        return false
     }
 
     struct Style: Equatable {

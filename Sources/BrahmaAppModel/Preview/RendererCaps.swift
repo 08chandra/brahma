@@ -37,16 +37,20 @@ public enum RendererCaps {
         case notRegular, tooLarge, unreadable
     }
 
-    /// The whole content of `url` when it is a regular file of at most `maxBytes`, opened without following a link and
-    /// checked on the open descriptor (a link swapped in is `.notRegular`; a bigger file is `.tooLarge` before any read).
+    /// The whole content of `url` when it is a regular file of at most `maxBytes`. The one file opener of every preview
+    /// reader: `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` (a link swapped in is `.notRegular`; a FIFO cannot block the open),
+    /// then `fstat` on the descriptor requires `S_IFREG` and a size within `maxBytes` before any read (`.tooLarge`
+    /// otherwise), then `O_NONBLOCK` is cleared and the file is read.
     static func readRegularFile(_ url: URL, maxBytes: Int) throws -> Data {
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw errno == ELOOP ? FileReadFailure.notRegular : FileReadFailure.unreadable }
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else { throw FileReadFailure.unreadable }
         guard (st.st_mode & S_IFMT) == S_IFREG else { throw FileReadFailure.notRegular }
         guard st.st_size <= maxBytes else { throw FileReadFailure.tooLarge }
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) >= 0 else { throw FileReadFailure.unreadable }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
         let data: Data
         do { data = try handle.read(upToCount: maxBytes + 1) ?? Data() } catch { throw FileReadFailure.unreadable }
@@ -57,11 +61,21 @@ public enum RendererCaps {
     /// Runs `body` detached from the caller (a synchronous parser off the main actor) and returns its value, or throws
     /// `RendererError.timedOut` once `parseTimeout` passes, cancelling the body's task: a parser that loops checks
     /// `Task.isCancelled` and stops early. Cancelling the caller cancels the body the same way and throws `CancellationError`.
+    /// The timeout counts awake time (`SuspendingClock`, the engine's rule for every deadline).
     public static func parse<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await parse(clock: SuspendingClock(), body)
+    }
+
+    /// `parse` on an explicit clock (tests drive a manual one).
+    public static func parse<T: Sendable, C: Clock>(clock: C, _ body: @escaping @Sendable () throws -> T) async throws -> T
+    where C.Duration == Duration {
         let race = ParseRace<T>()
+        let timeout = parseTimeout
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, any Error>) in
-                race.begin(continuation: continuation, body: body, timeout: parseTimeout)
+                race.begin(continuation: continuation, body: body) {
+                    try await Task.sleep(for: timeout, tolerance: nil, clock: clock)
+                }
             }
         } onCancel: {
             race.finish(with: .failure(CancellationError()))
@@ -82,7 +96,9 @@ private final class ParseRace<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var state = State.waiting(nil)
 
-    func begin(continuation: CheckedContinuation<T, any Error>, body: @escaping @Sendable () throws -> T, timeout: Duration) {
+    /// `wait` sleeps for the timeout on the caller's clock; it throws when the timer task is cancelled.
+    func begin(continuation: CheckedContinuation<T, any Error>, body: @escaping @Sendable () throws -> T,
+               wait: @escaping @Sendable () async throws -> Void) {
         let early: Result<T, any Error>? = lock.withLock {
             guard case .waiting(let early) = state else { return nil }
             state = .running(continuation, work: nil, timer: nil)
@@ -96,7 +112,7 @@ private final class ParseRace<T: Sendable>: @unchecked Sendable {
             self.finish(with: Result { try body() })
         }
         let timer = Task.detached { [self] in
-            try? await Task.sleep(for: timeout)
+            do { try await wait() } catch { return }
             guard !Task.isCancelled else { return }
             self.finish(with: .failure(RendererError.timedOut))
         }

@@ -33,7 +33,8 @@ public enum OpenAPISummary {
                 guard let operation = item[method] as? [String: Any] else { continue }
                 guard operations.count < maxOperations else { return operations }
                 let summary = (operation["summary"] as? String).flatMap(oneLine)
-                operations.append(OpenAPIOperation(method: method.uppercased(), path: RendererCaps.truncateLine(Substring(path)), summary: summary))
+                // The path key is agent-controlled too: one line, so it cannot pose as a second row.
+                operations.append(OpenAPIOperation(method: method.uppercased(), path: oneLine(path) ?? "", summary: summary))
             }
         }
         return operations
