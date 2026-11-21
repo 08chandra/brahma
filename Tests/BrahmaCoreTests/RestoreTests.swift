@@ -629,6 +629,30 @@ import GRDB
             return try store.refTaint(try #require(WorkRef.parse(ref, context: ctx)), companyId: acme.id).tainted
         }
 
+        /// A ref's taint as another company (`companyId`) reads it.
+        func tainted(_ store: Store, _ ref: String, companyId: String) throws -> Bool {
+            let company = try #require(try store.company(id: companyId))
+            let ctx = RefContext(companyId: companyId, keyPrefixes: [Store.keyPrefix(slug: company.slug)])
+            return try store.refTaint(try #require(WorkRef.parse(ref, context: ctx)), companyId: companyId).tainted
+        }
+
+        /// The engine records `main`'s head (as a merge does): `main`'s history up to it is what the snapshot knows is clean.
+        @discardableResult
+        func recordMain() throws -> String {
+            let head = try env.mainHead(acme)
+            try env.store.recordMainCommit(companyId: acme.id, commit: head)
+            return head
+        }
+
+        /// Restores the snapshot over a live database that can't be read (its file overwritten), and opens the restored one.
+        func restoreOverUnreadable(_ snapshot: URL) throws -> Store {
+            try env.store.close()
+            for suffix in ["-wal", "-shm"] { try? FileManager.default.removeItem(atPath: env.paths.database.path + suffix) }
+            try Data(repeating: 0x5a, count: 8192).write(to: env.paths.database)
+            _ = try service.restore(try service.planRestore(snapshot: snapshot))
+            return try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        }
+
         /// Edits the snapshot file itself (an older or damaged backup).
         func editSnapshot(_ snapshot: URL, _ sql: String, _ arguments: StatementArguments = []) throws {
             let queue = try DatabaseQueue(path: snapshot.path)
@@ -698,7 +722,7 @@ import GRDB
             let triggers = try restored.writer.read { db in
                 try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'taintOrder_%' ORDER BY name")
             }
-            #expect(triggers == ["taintOrder_clear", "taintOrder_publish", "taintOrder_status"])
+            #expect(triggers == ["taintOrder_clear", "taintOrder_epochClear", "taintOrder_publish", "taintOrder_status"])
         }
     }
 
@@ -756,6 +780,139 @@ import GRDB
         let restored = try Store(path: w.env.paths.database.path, backupsDir: w.env.paths.backupsDir)
         #expect(try w.tainted(restored, "commit:\(sha)"), "a commit of an item reads clean though its taint record was lost")
         #expect(try w.tainted(restored, "\(item.key):diff"))
+    }
+
+    // MARK: Plan C P2 fix round 5: the restore epoch (R5-1: Ruling 22; R5-2) and the carry across companies (R5-4)
+
+    /// R5-1 (Ruling 22): after a restore over an unreadable live database, a commit the restored database has no row for (on
+    /// the branch of an item created after the snapshot) reads tainted: its commit ref, abbreviated, and a key-less file at it;
+    /// a commit already on `main` in the snapshot does not. The owner's vouch clears it, each clearing with a `taintOrder`
+    /// sequence.
+    @Test func unreadableLiveRestoreTaintsCommitsTheSnapshotCannotPlace() throws {
+        let w = try TaintWorld()
+        let onMain = try w.recordMain()
+        let snapshot = try w.service.snapshot(reason: .manual)
+        let (late, _) = try w.item("Late")          // created after the snapshot: unknown to the restored database
+        let sha = try w.commit(on: late, "src/late.ts", tainted: true)
+        let restored = try w.restoreOverUnreadable(snapshot)
+        #expect(try restored.workItem(id: late.id) == nil)
+        #expect(try w.tainted(restored, "commit:\(sha)"), "a commit no snapshot row places reads clean")
+        #expect(try w.tainted(restored, "commit:\(sha.prefix(7))"))
+        #expect(try w.tainted(restored, "src/late.ts@\(sha)"), "a key-less file at it reads clean")
+        #expect(try !w.tainted(restored, "commit:\(onMain)"), "a commit on main in the snapshot reads tainted")
+        #expect(try !w.tainted(restored, "README.md@\(onMain)"))
+        let epochs = try restored.writer.read { db in
+            try Row.fetchAll(db, sql: "SELECT id, listed, mainCommit, clearedBy FROM restoreEpoch WHERE companyId = ?", arguments: [w.acme.id])
+        }
+        #expect(epochs.count == 1)
+        #expect(epochs.first?["listed"] as Bool? == true)
+        #expect(epochs.first?["mainCommit"] as String? == onMain)
+        try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        #expect(try !w.tainted(restored, "commit:\(sha)"), "the owner's vouch did not clear it")
+        #expect(try !w.tainted(restored, "src/late.ts@\(sha)"))
+        let epochId = try #require(epochs.first?["id"] as String?)
+        let clears = try restored.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT subject FROM taintOrder WHERE companyId = ? AND kind = 'clear'", arguments: [w.acme.id])
+        }
+        #expect(clears.contains(sha), "the commit's clearing has no taintOrder sequence")
+        #expect(clears.contains("restore-epoch:\(epochId)"), "the epoch's clearing has no taintOrder sequence")
+    }
+
+    /// R5-1: when the restore can't list the repository's commits (here its `.git` is away during the restore), every commit
+    /// off the snapshot's recorded `main` reads tainted until the owner vouches; `main`'s own history stays clean.
+    @Test func unreadableLiveRestoreWithoutAListingTaintsEveryCommitOffMain() throws {
+        let w = try TaintWorld()
+        let onMain = try w.recordMain()
+        let snapshot = try w.service.snapshot(reason: .manual)
+        let (late, _) = try w.item("Late")
+        let sha = try w.commit(on: late, "src/late.ts", tainted: false)
+        let gitDir = URL(fileURLWithPath: w.acme.workspacePath, isDirectory: true).appending(path: ".git")
+        let away = URL(fileURLWithPath: w.acme.workspacePath, isDirectory: true).appending(path: ".git-away")
+        try FileManager.default.moveItem(at: gitDir, to: away)
+        let restored: Store
+        do {
+            defer { try? FileManager.default.moveItem(at: away, to: gitDir) }
+            restored = try w.restoreOverUnreadable(snapshot)
+        }
+        #expect(try w.tainted(restored, "commit:\(sha)"), "an unlisted restore let a commit off main read clean")
+        #expect(try w.tainted(restored, "src/late.ts@\(sha)"))
+        #expect(try !w.tainted(restored, "commit:\(onMain)"))
+        #expect(try !w.tainted(restored, "README.md@\(onMain)"))
+        let listed = try restored.writer.read { db in
+            try Bool.fetchOne(db, sql: "SELECT listed FROM restoreEpoch WHERE companyId = ?", arguments: [w.acme.id])
+        }
+        #expect(listed == false)
+        try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        #expect(try !w.tainted(restored, "commit:\(sha)"))
+        #expect(try !w.tainted(restored, "src/late.ts@\(sha)"))
+    }
+
+    /// R5-2: an item done in the snapshot, reopened and worked by a tainted session after it, with the live database unreadable
+    /// at the restore: the restored database has it done (no marker), yet its later commit reads tainted.
+    @Test func unreadableLiveRestoreTaintsADoneItemsLaterCommits() throws {
+        let w = try TaintWorld()
+        _ = try w.recordMain()
+        let (item, _) = try w.item("Reopened")
+        try w.env.store.writer.write { db in
+            try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id])
+            try db.execute(sql: "UPDATE workItem SET status = 'done' WHERE id = ?", arguments: [item.id])
+        }
+        let snapshot = try w.service.snapshot(reason: .manual)
+        try w.env.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET status = 'inProgress' WHERE id = ?", arguments: [item.id])
+        }
+        let sha = try w.commit(on: item, "src/reopened.ts", tainted: true)
+        let restored = try w.restoreOverUnreadable(snapshot)
+        #expect(try restored.workItem(id: item.id)?.status == .done)
+        #expect(try w.tainted(restored, "commit:\(sha)"), "a done item's later commit reads clean")
+        #expect(try w.tainted(restored, "src/reopened.ts@\(sha)"))
+        #expect(try w.tainted(restored, "\(item.key):diff"))
+    }
+
+    /// R5-4: the carry keeps each company's `taintedCommit` rows apart: the same sha in Acme and Beta, with different taint
+    /// and clearing states in the snapshot and the live database, comes back per company.
+    @Test func restoreCarriesTaintedCommitsPerCompany() throws {
+        let w = try TaintWorld()
+        let beta = try w.env.company("Beta")
+        let (a, b) = (w.acme.id, beta.id)
+        let (s, t, u) = (String(repeating: "a1", count: 20), String(repeating: "b2", count: 20), String(repeating: "c3", count: 20))
+        func put(_ company: String, _ sha: String, cleared: Bool) throws {
+            try w.env.store.writer.write { db in
+                try db.execute(sql: """
+                    INSERT INTO taintedCommit (companyId, sha, source, createdAt, clearedBy, clearedAt) VALUES (?, ?, ?, ?, ?, ?)
+                    """, arguments: [company, sha, "src-\(company == a ? "acme" : "beta")", Date(), cleared ? "owner" : nil, cleared ? Date() : nil])
+            }
+        }
+        // In the snapshot: s uncleared in Acme only; t uncleared in Acme, cleared in Beta.
+        try put(a, s, cleared: false)
+        try put(a, t, cleared: false)
+        try put(b, t, cleared: true)
+        let snapshot = try w.service.snapshot(reason: .manual)
+        // After it, live only: Acme clears s; Beta records s uncleared; u cleared in Acme, uncleared in Beta.
+        try w.env.store.writer.write { db in
+            try db.execute(sql: "UPDATE taintedCommit SET clearedBy = 'owner', clearedAt = ? WHERE companyId = ? AND sha = ?", arguments: [Date(), a, s])
+        }
+        try put(b, s, cleared: false)
+        try put(a, u, cleared: true)
+        try put(b, u, cleared: false)
+        let restored = try w.restore(snapshot)
+        func row(_ company: String, _ sha: String) throws -> Row? {
+            try restored.writer.read { db in
+                try Row.fetchOne(db, sql: "SELECT clearedBy, source FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [company, sha])
+            }
+        }
+        let expected: [(company: String, sha: String, clearedBy: String?, tainted: Bool)] = [
+            (a, s, nil, true), (b, s, nil, true),          // uncleared in the snapshot stays uncleared; Beta's live-only row arrives
+            (a, t, nil, true), (b, t, "owner", false),     // Acme's uncleared row does not un-clear Beta's
+            (a, u, "owner", false), (b, u, nil, true),     // live-only rows of both companies, each as it is
+        ]
+        for e in expected {
+            let r = try #require(try row(e.company, e.sha), "\(e.company == a ? "Acme" : "Beta")'s row for \(e.sha.prefix(4)) is missing")
+            #expect(r["clearedBy"] as String? == e.clearedBy, "\(e.company == a ? "Acme" : "Beta") \(e.sha.prefix(4))")
+            #expect(r["source"] as String == (e.company == a ? "src-acme" : "src-beta"))
+            #expect(try w.tainted(restored, "commit:\(e.sha)", companyId: e.company) == e.tainted,
+                    "\(e.company == a ? "Acme" : "Beta") commit:\(e.sha.prefix(4))")
+        }
     }
 
     @Test func cliRestoreOwnerOnly() throws {

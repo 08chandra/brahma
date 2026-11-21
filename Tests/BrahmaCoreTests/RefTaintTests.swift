@@ -550,22 +550,51 @@ import GRDB
         try await heldAtStartReleasedMidTurn(headReadable: false)
     }
 
-    /// R4-2: the three `vC-taint-order` triggers exist, on their tables, after the whole migration chain (a fresh database and
-    /// the store's own). A later migration that rebuilds `artifact`, `taintedCommit` or `workItemEvent` drops its triggers
-    /// silently; for `workItemEvent` that fails open (status sequences stop), so it must fail here.
+    /// R4-2, R5-3: the `taintOrder` triggers (`vC-taint-order`'s three and `vC-restore-epoch`'s one) exist, on their tables,
+    /// with exactly their definitions (the SQL compared with whitespace runs folded), after the whole migration chain (a fresh
+    /// database and the store's own). A later migration that rebuilds `artifact`, `taintedCommit`, `workItemEvent` or
+    /// `restoreEpoch` drops its triggers silently, and one that recreates a trigger with a narrower `WHEN` or another body
+    /// stops some sequences; either fails open, so it must fail here.
     @Test func taintOrderTriggersSurviveTheMigrationChain() throws {
-        let expected = [["taintOrder_clear", "taintedCommit"], ["taintOrder_publish", "artifact"], ["taintOrder_status", "workItemEvent"]]
+        let expected: [[String]] = [
+            ["taintOrder_clear", "taintedCommit", """
+                CREATE TRIGGER taintOrder_clear AFTER UPDATE OF clearedBy ON taintedCommit
+                WHEN OLD.clearedBy IS NULL AND NEW.clearedBy IS NOT NULL
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'clear', NEW.sha); END
+                """],
+            ["taintOrder_epochClear", "restoreEpoch", """
+                CREATE TRIGGER taintOrder_epochClear AFTER UPDATE OF clearedBy ON restoreEpoch
+                WHEN OLD.clearedBy IS NULL AND NEW.clearedBy IS NOT NULL
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'clear', 'restore-epoch:' || NEW.id); END
+                """],
+            ["taintOrder_publish", "artifact", """
+                CREATE TRIGGER taintOrder_publish AFTER INSERT ON artifact
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'publish', NEW.id); END
+                """],
+            ["taintOrder_status", "workItemEvent", """
+                CREATE TRIGGER taintOrder_status AFTER INSERT ON workItemEvent
+                WHEN NEW.kind IN ('statusChanged', 'merged')
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'status', NEW.itemId); END
+                """],
+        ].map { [$0[0], $0[1], Self.foldedSQL($0[2])] }
         func triggers(_ db: Database) throws -> [[String]] {
+            // Every trigger that writes `taintOrder` or is named for it, so a renamed or an extra one shows too.
             try Row.fetchAll(db, sql: """
-                SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger' AND name IN ('taintOrder_publish', 'taintOrder_clear', 'taintOrder_status')
+                SELECT name, tbl_name, sql FROM sqlite_master
+                WHERE type = 'trigger' AND (name LIKE 'taintOrder%' OR sql LIKE '%taintOrder%')
                 ORDER BY name
-                """).map { [$0["name"], $0["tbl_name"]] }
+                """).map { [$0["name"], $0["tbl_name"], Self.foldedSQL($0["sql"])] }
         }
         let queue = try DatabaseQueue()
         try Migrations.migrator().migrate(queue)
         #expect(try queue.read(triggers) == expected)
         let store = try Store.inMemory()
         #expect(try store.writer.read(triggers) == expected)
+    }
+
+    /// SQL with every run of whitespace folded to one space and the ends trimmed.
+    static func foldedSQL(_ sql: String) -> String {
+        sql.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }
 
     /// R2-2 (ruling 6), R3-4: a release and a re-claim in the same turn can't move the start past commits made before them.

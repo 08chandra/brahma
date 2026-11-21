@@ -34,6 +34,8 @@ struct RestoreCarry {
     struct ItemCommitTaint {
         var companyId: String, sha: String, itemId: String?, agentId: String?, turnId: String?, source: String, createdAt: Date
         var clearedBy: String?, clearedAt: Date?, carriedTo: String?
+        /// The restore epoch that recorded it (P2 R5-1), or nil.
+        var restoreEpoch: String? = nil
     }
 
     var grants: [GrantEnd] = []
@@ -54,6 +56,8 @@ struct RestoreCarry {
     /// Plan C's tainted commits (P2 R4-4): git is not rolled back, so a commit recorded tainted after the snapshot is still on
     /// its branch; without its row, refs to it (a commit ref, a key-less file at it, its item's diff) would read clean.
     var itemCommitTaints: [ItemCommitTaint] = []
+    /// Ruling 22's restore epochs (P2 R5-1): an earlier restore over an unreadable database; an uncleared one must not be lost.
+    var restoreEpochs: [BrahmaCore.RestoreEpoch] = []
 
     /// What the live database says, or why it could not be read.
     enum Live {
@@ -112,13 +116,18 @@ struct RestoreCarry {
             c.taintedItems = try String.fetchAll(db, sql: "SELECT id FROM workItem WHERE taintedOrigin = 1")
         }
         if try has("taintedCommit") {
+            let epoch = try db.columns(in: "taintedCommit").contains { $0.name == "restoreEpoch" } ? "restoreEpoch" : "NULL"
             c.itemCommitTaints = try Row.fetchAll(db, sql: """
-                SELECT companyId, sha, itemId, agentId, turnId, source, createdAt, clearedBy, clearedAt, carriedTo FROM taintedCommit
+                SELECT companyId, sha, itemId, agentId, turnId, source, createdAt, clearedBy, clearedAt, carriedTo,
+                  \(epoch) AS restoreEpoch FROM taintedCommit
                 """).map {
                     ItemCommitTaint(companyId: $0["companyId"], sha: $0["sha"], itemId: $0["itemId"], agentId: $0["agentId"],
                                     turnId: $0["turnId"], source: $0["source"], createdAt: $0["createdAt"], clearedBy: $0["clearedBy"],
-                                    clearedAt: $0["clearedAt"], carriedTo: $0["carriedTo"])
+                                    clearedAt: $0["clearedAt"], carriedTo: $0["carriedTo"], restoreEpoch: $0["restoreEpoch"])
                 }
+        }
+        if try has("restoreEpoch") {
+            c.restoreEpochs = try BrahmaCore.RestoreEpoch.fetchAll(db, sql: "SELECT * FROM restoreEpoch")
         }
         return c
     }
@@ -126,7 +135,7 @@ struct RestoreCarry {
     /// Writes into the staged (migrated) snapshot: the stop, the live database's grant ends and taint marks (or, when it could
     /// not be read, every grant revoked and every session and open item marked), and the machine-wide lab mark. Returns the
     /// notes the owner should see.
-    static func apply(_ live: Live, to db: Database, snapshot: String, now: Date) throws -> [String] {
+    static func apply(_ live: Live, to db: Database, snapshot: String, now: Date, gitTempRoot: URL? = nil) throws -> [String] {
         var notes: [String] = []
         // What the restore rolled back of what the owner had turned off (F2), read before anything is written.
         let rolledBack: [String]
@@ -162,8 +171,10 @@ struct RestoreCarry {
                 """)
             try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE status <> 'done'")
             try markEveryOpenItemsCommits(db, now: now)
+            try recordRestoreEpochs(db, now: now, gitTempRoot: gitTempRoot)
             notes.append("the current database could not be read (\(Store.flat(why, max: 160))): every grant was revoked and every "
-                + "agent's session and open item marked as having read outside content")
+                + "agent's session and open item marked as having read outside content; every commit this database can't place "
+                + "(off main as the snapshot recorded it) reads as outside content until you vouch for it")
         }
 
         // The machine-wide lab mark, kept with an earlier source if one stands; the owner's last clear time is kept too.
@@ -352,7 +363,24 @@ struct RestoreCarry {
         for id in c.taintedItems {
             try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE id = ?", arguments: [id])
         }
+        try carryRestoreEpochs(c.restoreEpochs, into: db)
         try carryItemCommitTaints(c.itemCommitTaints, into: db)
+    }
+
+    /// P2 R5-1: the live database's restore epochs come back like its tainted commits (`carryItemCommitTaints`): one only it
+    /// has is inserted as it is there (when its company is in the snapshot); one uncleared in either database stays uncleared.
+    /// A clearing carried in has no `taintOrder` sequence here, so it counts as uncleared at every publish (fail closed).
+    static func carryRestoreEpochs(_ epochs: [BrahmaCore.RestoreEpoch], into db: Database) throws {
+        guard !epochs.isEmpty, try db.tableExists("restoreEpoch") else { return }
+        for e in epochs {
+            try db.execute(sql: """
+                INSERT INTO restoreEpoch (id, companyId, mainCommit, listed, source, createdAt, clearedBy, clearedAt)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM company WHERE id = ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  clearedBy = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE restoreEpoch.clearedBy END,
+                  clearedAt = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE restoreEpoch.clearedAt END
+                """, arguments: [e.id, e.companyId, e.mainCommit, e.listed, e.source, e.createdAt, e.clearedBy, e.clearedAt, e.companyId])
+        }
     }
 
     /// P2 R4-4: the live database's tainted commits come back, so a restore never loses one (git is not rolled back). A row
@@ -365,13 +393,15 @@ struct RestoreCarry {
         guard !rows.isEmpty, try db.tableExists("taintedCommit") else { return }
         for r in rows {
             try db.execute(sql: """
-                INSERT INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt, clearedBy, clearedAt, carriedTo)
-                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM company WHERE id = ?)
+                INSERT INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt, clearedBy, clearedAt, carriedTo,
+                  restoreEpoch)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM company WHERE id = ?)
                 ON CONFLICT(companyId, sha) DO UPDATE SET
                   clearedBy = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE taintedCommit.clearedBy END,
-                  clearedAt = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE taintedCommit.clearedAt END
+                  clearedAt = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE taintedCommit.clearedAt END,
+                  restoreEpoch = COALESCE(taintedCommit.restoreEpoch, excluded.restoreEpoch)
                 """, arguments: [r.companyId, r.sha, r.itemId, r.agentId, r.turnId, r.source, r.createdAt, r.clearedBy, r.clearedAt,
-                                 r.carriedTo, r.companyId])
+                                 r.carriedTo, r.restoreEpoch, r.companyId])
         }
     }
 
@@ -396,6 +426,53 @@ struct RestoreCarry {
 }
 
 extension RestoreCarry {
+    /// Ruling 22 (P2 R5-1), when the live database can't be read: its tainted commits are unknown, and git is not rolled back,
+    /// so a commit made after the snapshot (on the branch of an item the snapshot doesn't have, or of one it has as done) has
+    /// no row here and would read clean. Each company of the restored database gets a restore epoch:
+    /// - its repository is listed now: every commit any ref or worktree `HEAD` holds that is not in the history of `main` as
+    ///   the snapshot recorded it (`company.mainCommit`; none recorded: every commit) is recorded as a tainted commit naming
+    ///   the epoch (an existing row is kept as it is), of the item whose `item/<KEY>` branch holds it when this database has
+    ///   that item, else of no item; the epoch is `listed`;
+    /// - when that listing fails (no repository, git fails, past git's output cap, no data-home temp folder), nothing is
+    ///   recorded and the epoch is not `listed`: every commit not in that `main`'s history reads tainted (`RefTaint`).
+    /// Either way it stands until the owner vouches (`Store.vouchRestoredCommits`). Never throws for git; a database error
+    /// throws (the restore then changes nothing).
+    static func recordRestoreEpochs(_ db: Database, now: Date, gitTempRoot: URL?) throws {
+        guard try db.tableExists("restoreEpoch"), try db.tableExists("taintedCommit") else { return }
+        let source = unreadableCommitTaintSource
+        for company in try Row.fetchAll(db, sql: "SELECT id, workspacePath, mainCommit FROM company") {
+            let (companyId, workspace, main): (String, String, String?) = (company["id"], company["workspacePath"], company["mainCommit"])
+            let epoch = UUID().uuidString
+            var listing: [(sha: String, itemId: String?)]?
+            if let gitTempRoot {
+                do {
+                    let git = SafeGit(workspace: URL(fileURLWithPath: workspace, isDirectory: true), runner: LiveGitRunner(tempRoot: gitTempRoot))
+                    var keys: [String: String] = [:]
+                    for row in try Row.fetchAll(db, sql: "SELECT id, key FROM workItem WHERE companyId = ?", arguments: [companyId]) {
+                        keys[row["key"]] = row["id"]
+                    }
+                    var found: [(sha: String, itemId: String?)] = []
+                    for (branch, head) in try git.branchHeads(prefix: "item/").sorted(by: { $0.key < $1.key }) {
+                        guard let itemId = keys[String(branch.dropFirst("item/".count))] else { continue }
+                        found += try git.commits(from: head, excluding: main).map { ($0, itemId) }
+                    }
+                    found += try git.commits(from: nil, excluding: main).map { ($0, nil) }
+                    listing = found
+                } catch {
+                    listing = nil
+                }
+            }
+            for c in listing ?? [] {
+                try db.execute(sql: """
+                    INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt, restoreEpoch)
+                    VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)
+                    """, arguments: [companyId, c.sha, c.itemId, source, now, epoch])
+            }
+            try BrahmaCore.RestoreEpoch(id: epoch, companyId: companyId, mainCommit: main, listed: listing != nil, source: source,
+                                        createdAt: now, clearedBy: nil, clearedAt: nil).insert(db)
+        }
+    }
+
     /// The settings the owner turns off to make Brahma safer (fix-wave F2), read from one database. Tables an older schema
     /// lacks read as empty.
     struct Settings {

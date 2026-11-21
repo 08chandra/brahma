@@ -306,6 +306,36 @@ public struct SafeGit: Sendable {
         return Self.lines(try output(["log", "--format=%H", "--no-textconv", "--no-ext-diff", "--end-of-options", rangeArg, "--", try Self.checkPath(path)]))
     }
 
+    /// The commits reachable from `tip` (a sha; nil: every ref and every worktree's `HEAD`, `--all`) and not from `base` (a
+    /// sha; nil: none left out), newest first. Past the output cap: `.outputTooLarge`.
+    public func commits(from tip: String?, excluding base: String?) throws -> [String] {
+        var args = ["rev-list"]
+        if tip == nil { args.append("--all") }
+        args.append("--end-of-options")
+        if let tip { args.append(try Self.sha(tip)) }
+        if let base { args.append("^" + (try Self.sha(base))) }
+        return Self.lines(try output(args))
+    }
+
+    /// Branch name (`item/<KEY>`) → its commit, for every branch under `refs/heads/<prefix>` (`prefix` a ref-name prefix
+    /// ending in `/`).
+    public func branchHeads(prefix: String) throws -> [String: String] {
+        guard prefix.hasSuffix("/") else { throw SafeGitError.badRef }
+        let qualified = try Self.qualifiedRef(String(prefix.dropLast()))
+        guard qualified.hasPrefix("refs/heads/") else { throw SafeGitError.badRef }
+        var heads: [String: String] = [:]
+        // The pattern matches `<qualified>/…` (and `<qualified>` itself, left out below).
+        for line in Self.lines(try output(["for-each-ref", "--format=%(objectname) %(refname)", qualified])) {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let sha = Self.fullSha(Data(parts[0].utf8)), parts[1].hasPrefix("refs/heads/") else {
+                throw SafeGitError.git("git for-each-ref gave an unexpected line")
+            }
+            let name = String(parts[1].dropFirst("refs/heads/".count))
+            if name.hasPrefix(prefix) { heads[name] = sha }
+        }
+        return heads
+    }
+
     /// Path → unix time of the most recent of the last `commits` commits from `rev` that touched it.
     public func recentPaths(rev: String, commits: Int) throws -> [String: Int] {
         let out = Self.text(try output(["log", "--format=%x01%ct", "--name-only", "--no-textconv", "--no-ext-diff", "--no-renames",
