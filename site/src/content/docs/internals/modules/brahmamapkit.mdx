@@ -21,8 +21,8 @@ SpriteKit rendering of the live agent map, and the only target besides the app t
 
 ## How it connects
 
-- **Calls BrahmaAppModel.** `OrgScene` runs `controller.frame(now:)` each frame and plays the events, and lays out with `OrgLayout.make`; `MapSKView` builds its context menu from `controller.actions(for:)`; `MapPalette` reads `ThemeHex`; card text goes through `MapText.clean`; `MapBench` times frames with `FrameStats.make`.
-- **Calls BrahmaCore** for the model types it colours and groups: `MapPalette.status` takes an `AgentState` and `MapPalette.department` a `Department`.
+- **Calls BrahmaAppModel.** `OrgScene` runs `controller.frame(now:)` each frame and plays the events, and lays out with `OrgLayout.make`; `MapSKView` builds its context menu from `controller.actions(for:)`; `MapPalette` reads `ThemeHex` and colours a `Department`; card text goes through `MapText.clean`; `MapBench` times frames with `FrameStats.make`.
+- **Calls BrahmaCore** for the agent model: `MapPalette.status` takes an `AgentState`.
 - **Called by BrahmaApp.** `AgentMapPanel` mounts an `OrgView`; `Harness` finds the `MapSKView` for `--map-bench`. Nothing else links this target.
 
 <ModuleFacts module="BrahmaMapKit" />

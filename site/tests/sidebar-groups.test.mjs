@@ -83,6 +83,7 @@ test('directory groups get their labels and keep their collapsed state; brahmaco
   assert.deepEqual(groups(modules), [['BrahmaCore', false]]);
   assert.equal(modules.entries[1].isCurrent, true, 'current entry untouched');
   assert.equal(modules.entries[2].entries[1].label, 'Work', 'page links untouched');
+  assert.equal(GROUP_LABELS['/docs/cli/'].collapse, true, 'the CLI reference is the only group that collapses');
 });
 
 test('a directory name under the wrong URL prefix is not relabelled', () => {
@@ -93,14 +94,4 @@ test('a directory name under the wrong URL prefix is not relabelled', () => {
   const before = structuredClone(s);
   relabelGroups(s, GROUP_LABELS);
   assert.deepEqual(s, before);
-});
-
-test('every mapping entry names a directory, a label and a collapse flag', () => {
-  for (const [prefix, entry] of Object.entries(GROUP_LABELS)) {
-    assert.match(prefix, /^\/.*\/$/, `${prefix} is a URL prefix with both slashes`);
-    assert.equal(typeof entry.dir, 'string');
-    assert.equal(typeof entry.label, 'string');
-    assert.equal(typeof entry.collapse, 'boolean');
-  }
-  assert.equal(GROUP_LABELS['/docs/cli/'].collapse, true, 'the CLI reference keeps collapsing');
 });

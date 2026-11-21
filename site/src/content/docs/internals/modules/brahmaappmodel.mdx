@@ -8,7 +8,7 @@ import SourceLink from '../../../../components/SourceLink.astro';
 
 ## Purpose
 
-The Mac app's state, with no AppKit or SwiftUI import. `AppModel` holds a `Store` and polls it on a tick into an immutable `Snapshot` the views render; `WorkSnapshot`, `PreviewSnapshot`, `ReleasesSnapshot` and `HandbookSnapshot` are its parts. `EngineHost` runs the orchestrator inside the app under the per-home `OrchestratorLock`. `MapController` feeds one company's map: snapshots in, traffic in, animations out. `LaunchOptions` parses the app's command-line flags. Presentation types turn store rows into strings and rows; the forms validate owner input. Everything here is testable without a window.
+The Mac app's state, with no AppKit or SwiftUI import. `AppModel` holds a `Store` and polls it on a tick into a value-type `Snapshot` the views render; `WorkSnapshot`, `PreviewSnapshot`, `ReleasesSnapshot` and `HandbookSnapshot` are its parts. `EngineHost` runs the orchestrator inside the app under the per-home `OrchestratorLock`. `MapController` feeds one company's map: snapshots in, traffic in, animations out. `LaunchOptions` parses the app's command-line flags. Presentation types turn store rows into strings and rows; the forms validate owner input. Everything here is testable without a window.
 
 ## Key types
 

@@ -8,7 +8,7 @@ import SourceLink from '../../../../components/SourceLink.astro';
 
 ## Purpose
 
-The macOS Keychain behind two `BrahmaCore` protocols, kept out of the core so it stays portable. `PlatformSecretVault.resolve` picks the process's `SecretVault` in one place: the Keychain unless `BRAHMA_SECRET_STORE` is `file` or `memory`, both refused for the default data home. `KeychainVault` stores one generic-password item per secret under service `dev.brahma.secrets`, with an access list that trusts only the running Brahma binary and its sibling (`KeychainTrust`); background reads never prompt. `PlatformOwnerKeyStore` does the same for the owner key's hash (`dev.brahma.owner`). `KeychainAccessLog` counts every Security call, so tests can prove they never touched the Keychain.
+The macOS Keychain behind two `BrahmaCore` protocols, kept out of the core so it stays portable. `PlatformSecretVault.resolve` picks the `SecretVault` once: the Keychain unless `BRAHMA_SECRET_STORE` is `file` or `memory`, both refused for the default data home. `KeychainVault` stores one generic-password item per secret under service `dev.brahma.secrets`, with an access list that trusts only the running Brahma binary and its sibling (`KeychainTrust`); background reads never prompt. `KeychainOwnerKeyStore` keeps the owner key's hash as one item under `dev.brahma.owner`, keyed by the data-home path, readable by any application. `KeychainAccessLog` counts every Security call, so tests can prove they never touched the Keychain.
 
 ## Key types
 
