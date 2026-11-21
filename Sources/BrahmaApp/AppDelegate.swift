@@ -143,11 +143,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let model = booted.model
             let options = self.options
             // A harness run never reads or writes the owner's office unlock (spec §4.3): the map keeps its mode and unlock in
-            // a volatile per-process suite, cleared at launch.
+            // a volatile per-process suite, fresh at launch and emptied at exit. Every way out of a run ends in `exit()` (the
+            // harness's `terminateAndExit` and fail paths call it; `NSApp.terminate` after Quit or SIGTERM calls it too), so
+            // the `atexit` hook covers them all. The preferences daemon may write the emptied suite's plist back after exit
+            // (its deferred write lands ~10 s later), so the next harness launch sweeps every plist of a dead run.
             if options.isHarness {
-                let suite = "brahma.harness.\(ProcessInfo.processInfo.processIdentifier)"
-                UserDefaults.standard.removePersistentDomain(forName: suite)
-                model.mapDefaults = UserDefaults(suiteName: suite)!
+                HarnessDefaults.sweep()
+                model.mapDefaults = HarnessDefaults.make(pid: ProcessInfo.processInfo.processIdentifier)
+                atexit { HarnessDefaults.clear(pid: getpid()) }
             }
             // The live map reloads the redactor from this engine's vault too (`AppModel.mapVault`), so a secret set while the
             // engine is not running here (a terminal `brahma run` owns it) is still redacted on the map.
