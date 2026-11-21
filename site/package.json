@@ -8,11 +8,17 @@
     "build": "astro build",
     "preview": "astro preview",
     "check:links": "node scripts/check-links.mjs dist",
-    "check": "npm run check:links",
+    "check:forbidden": "node scripts/check-forbidden.mjs dist",
+    "check:generated": "node scripts/check-generated.mjs dist",
+    "check:ui": "npm run test:ui",
+    "check": "npm run check:links && npm run check:forbidden && npm run check:generated && npm run check:ui",
+    "check:lighthouse": "node scripts/lighthouse.mjs dist",
     "test": "node --test \"tests/**/*.test.mjs\"",
+    "test:ui": "node scripts/test-ui.mjs",
     "screenshots": "node scripts/screenshots.mjs",
-    "og": "node scripts/gen-og.mjs",
-    "test:ui": "node scripts/test-ui.mjs"
+    "screenshots:all": "node scripts/all-pages.mjs dist | node scripts/screenshots.mjs --serve .reports/screenshots -",
+    "screenshots:final": "node scripts/screenshots.mjs --serve .screenshots/final / /start /docs/concepts/companies/ /docs/cli/company/create/ /internals/modules/brahmacore/work/ /404",
+    "og": "node scripts/gen-og.mjs"
   },
   "dependencies": {
     "@astrojs/starlight": "0.43.1",
@@ -23,6 +29,7 @@
     "sharp": "0.35.5"
   },
   "devDependencies": {
+    "lighthouse": "13.6.0",
     "playwright": "1.65.1"
   }
 }

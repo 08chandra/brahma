@@ -32,7 +32,10 @@ const PNG = { palette: true, compressionLevel: 9, effort: 10 };
 
 const SRC = { width: 2560, height: 1600 };
 // Rows [top, bottom) are removed for x >= left; `rgb` is the banner background, probed at column `probeX`.
-const BANNER = { top: 140, bottom: 224, left: 548, rgb: [49, 39, 31], probeX: 1200 };
+// The probe allows `tolerance` per channel: the same banner captured under another display profile
+// (built-in vs external display, True Tone) came out as 47,39,30 against the 49,39,31 measured first.
+// The rows around it (hairline 47,58,69 and bg0 14,18,23) stay far outside that band.
+const BANNER = { top: 140, bottom: 224, left: 548, rgb: [49, 39, 31], tolerance: 6, probeX: 1200 };
 const BG0 = { r: 14, g: 18, b: 23, alpha: 1 };
 const KEEP_BANNER = process.env.BRAHMA_SITE_SHOTS_KEEP_BANNER === '1';
 
@@ -58,7 +61,7 @@ async function checkInput(src) {
     .extract({ left: BANNER.probeX, top: BANNER.top, width: 1, height: BANNER.bottom - BANNER.top + 1 })
     .removeAlpha().raw().toBuffer();
   const rgbAt = (row) => [...column.subarray(row * 3, row * 3 + 3)];
-  const isBanner = (row) => rgbAt(row).every((v, i) => v === BANNER.rgb[i]);
+  const isBanner = (row) => rgbAt(row).every((v, i) => Math.abs(v - BANNER.rgb[i]) <= BANNER.tolerance);
   const lastBg = BANNER.bottom - BANNER.top - 3; // row 221: the last background row above the hairline
   if (!isBanner(0) || !isBanner(lastBg) || isBanner(BANNER.bottom - BANNER.top)) {
     fail(`${src}: the dev/demo banner is not at rows ${BANNER.top}-${BANNER.bottom - 1} (x >= ${BANNER.left}); ` +

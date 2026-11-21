@@ -11,15 +11,19 @@ Node and npm are used only inside this directory. The rest of the repository is 
 From the repository root:
 
 ```
-scripts/site-build.sh                     # generators (if present) → npm ci → Chromium → OG images → build → checks
+scripts/site-build.sh                     # generators (if present) → npm ci → Chromium → OG images → build → checks → Lighthouse
 scripts/site-build.sh --skip-generators   # fast content iteration; skips screenshots, CLI and API reference
+scripts/site-build.sh --skip-lighthouse   # everything but the Lighthouse gate (about three minutes)
 ```
 
 The script runs each generator that exists and is executable (`scripts/site-screenshots.sh`,
 `scripts/site-cli-docs.sh`, `scripts/site-api-docs.sh`), printing `== <step>` before each and
 failing with the step's name if one fails. It then runs `npm ci`, `npx playwright install chromium`
-(the browser the OG generator and the UI tests drive; a no-op once installed), `npm run og`,
-`npm run build` and `npm run check` in `site/`.
+(the browser the OG generator, the screenshot scripts, Lighthouse and the UI tests drive; a no-op
+once installed), `npm run og`, `npm run build`, `npm run check` and `npm run check:lighthouse` in
+`site/`. With `--skip-generators` the generated-output check would fail by construction, so the
+script runs `check:links`, `check:forbidden` and `check:ui` individually and skips `check:generated`
+with a warning. The flags combine.
 
 Inside `site/`:
 
@@ -30,11 +34,50 @@ npm run og          # generate public/og/*.png (Open Graph cards, gitignored)
 npm run dev         # local dev server with live reload
 npm run build       # static build into dist/
 npm run preview     # serve dist/ locally
-npm run check:links # verify every root-relative href/src in dist/ resolves
-npm run check       # all checks (currently check:links)
-npm test            # unit tests (node:test, tests/*.test.mjs)
-npm run test:ui     # browser tests (tests/*.spec.mjs) against a preview it starts on port 4321; build first
+npm run check:links     # verify every root-relative href/src in dist/ resolves
+npm run check:forbidden # fail on private content or forbidden branding in dist/ (see below)
+npm run check:generated # fail when the generators' output is missing from dist/
+npm run check:ui        # = test:ui
+npm run check           # check:links && check:forbidden && check:generated && check:ui
+npm run check:lighthouse  # Lighthouse gate (see below); writes .reports/lighthouse/
+npm test                # unit tests (node:test, tests/*.test.mjs)
+npm run test:ui         # browser tests (tests/*.spec.mjs) against a preview it starts on port 4321; build first
+npm run screenshots:all   # every page at 1440 and 390 px into .reports/screenshots/; fails on horizontal overflow
+npm run screenshots:final # the owner's "show me the site" set into .screenshots/final/ (12 PNGs)
 ```
+
+## Quality gate
+
+`npm run check` runs after every build (`scripts/site-build.sh`); `npm run check:lighthouse` runs
+after it unless `--skip-lighthouse`. All four read `dist/`, so build first.
+
+- **`check:forbidden`** (`scripts/check-forbidden.mjs dist`) scans every text file in `dist/`.
+  Everywhere, including the generated `/api` reference: build-machine paths (`/Users/`),
+  `.superpowers`, the `BRAHMA_OWNER_KEY` token, email addresses, and the login name of the user
+  running the check (`$USER`, compared but never printed). Outside `dist/api/`: the brand words
+  `Palantir` and `Anthropic` (case-sensitive) and empty links (`href=""`). Hits print as
+  `path:line: <pattern>` without the matched text. The only allowances, each an exact token, are
+  listed at the top of the script: the `claude` CLI's environment-variable names
+  (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`) and the translator credits
+  inside Pagefind's vendored search UI. When the checker hits a hand-written page, fix the page;
+  do not widen the checker.
+- **`check:generated`** (`scripts/check-generated.mjs dist`) requires at least 50 files under
+  `dist/docs/cli/`, `dist/api/index.html` and the BrahmaCore DocC index, the seven app
+  screenshots (`.png` and `@2x.png`) and the five OG images.
+- **`check:ui`** is `test:ui`.
+- **`check:lighthouse`** (`scripts/lighthouse.mjs dist`) serves `dist/` itself
+  (`scripts/serve-dist.mjs`, a small `node:http` static server on a free port, gzip for text, never
+  `astro preview`) and runs the pinned `lighthouse` CLI with Playwright's Chromium (`CHROME_PATH`)
+  on `/`, `/start`, `/docs/concepts/companies/`, `/docs/cli/` and `/internals/architecture/`,
+  mobile and desktop. Every category must score at least 95 and CLS must be 0. One warm-up run is
+  discarded and a run that misses is repeated once (the repeat counts; both are recorded). Output:
+  `.reports/lighthouse/<page>-<preset>.json` and `.reports/lighthouse/summary.md`.
+
+Screenshots: `scripts/screenshots.mjs <baseURL | --serve[=distDir]> <outDir> [paths… | -]` captures
+each path at 1440×900 and 390×844 and fails on horizontal overflow at either width, naming the page
+and the widest element. `--serve` serves `dist/` itself for the run; `-` reads paths from stdin,
+which is how `screenshots:all` feeds it `scripts/all-pages.mjs dist` (every `dist/**/index.html`
+route except `/api/**`). Both output directories are gitignored.
 
 Every dependency is pinned to an exact version in `package.json`; `package-lock.json` is committed.
 Use `npm ci`, not `npm install`, unless you are deliberately changing a dependency.
@@ -56,6 +99,12 @@ src/content/i18n/en.json         UI string overrides (none yet)
 src/styles/tokens.css            design tokens and the dark-only theme
 public/                          static files served as-is (favicon)
 scripts/check-links.mjs          zero-dependency link checker over dist/
+scripts/check-forbidden.mjs      private-content and branding checker over dist/
+scripts/check-generated.mjs      generated-output presence checker over dist/
+scripts/all-pages.mjs            lists every page route in dist/ (except /api/)
+scripts/screenshots.mjs          page screenshots at 1440 and 390 px + overflow assertion
+scripts/serve-dist.mjs           static server for dist/ used by screenshots and Lighthouse
+scripts/lighthouse.mjs           Lighthouse gate (five pages, mobile + desktop)
 ```
 
 The sidebar has two autogenerated groups, "Using Brahma" (`docs/`) and "Inside Brahma"

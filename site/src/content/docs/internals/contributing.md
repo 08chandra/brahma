@@ -26,7 +26,7 @@ The live smoke tests run real `claude` turns and use subscription quota. Everyth
 ## Conventions
 
 - **Plans and specs** live under `docs/superpowers/`: design specs in `docs/superpowers/specs/`, implementation plans in `docs/superpowers/plans/`. The [Decisions](/internals/decisions/) pages distil the specs; the specs themselves are the source of truth.
-- **`.superpowers/`** is local and private.
+- **Local scratch directories** listed in `.gitignore` are private to the machine and never committed.
 - **`BrahmaCore` stays portable.** Mac-only behaviour (Keychain, Seatbelt, AppKit, SpriteKit) lives in the other targets or behind protocols; see the [architecture](/internals/architecture/) page for which target owns what.
 - **Public API** is what the [API reference](/api/) shows. Types that the app or the CLI do not need stay internal.
 

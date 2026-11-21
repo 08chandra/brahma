@@ -383,6 +383,13 @@ mobile-starlight-toc .dropdown {
 .sl-markdown-content a code:not(:where(.not-content *)) {
   color: inherit;
 }
+/* /license renders the repository's LICENSE file verbatim in a bare <pre> (80-column text).
+ * Wrap it on narrow screens instead of widening the page; fenced code blocks are Expressive
+ * Code and scroll on their own. */
+.sl-markdown-content pre.license-text:not(:where(.not-content *)) {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 
 .sl-markdown-content blockquote:not(:where(.not-content *)) {
   border-inline-start: 2px solid var(--line-strong);

@@ -2,8 +2,15 @@
 // Full-page screenshots of a running site at desktop (1440×900) and mobile (390×844)
 // widths, plus a horizontal-overflow assertion on every page.
 //
-// Usage: node scripts/screenshots.mjs <baseURL> <outDir> [paths…]
+// Usage: node scripts/screenshots.mjs <baseURL | --serve[=distDir]> <outDir> [paths… | -]
 //   e.g. node scripts/screenshots.mjs http://localhost:4321 .reports/task-2 / /styleguide/
+//        node scripts/screenshots.mjs --serve .screenshots/final / /start /404
+//        node scripts/all-pages.mjs dist | node scripts/screenshots.mjs --serve .reports/screenshots -
+//
+// `--serve` (default directory `dist`) serves the built site itself on a free port
+// (scripts/serve-dist.mjs) for the duration of the run, so no preview server is needed,
+// relied on or touched. A single path argument `-` reads the paths from stdin, one per
+// line (the output of scripts/all-pages.mjs).
 //
 // Writes <outDir>/<slug>-desktop.png and <outDir>/<slug>-mobile.png, where <slug> is the
 // path with "/" replaced by "-" (leading/trailing dashes trimmed) and the root is `home`.
@@ -12,9 +19,13 @@
 // Default paths: "/". Requires the `playwright` devDependency and Chromium
 // (`npx playwright install chromium`).
 
-import { mkdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { serveDist } from './serve-dist.mjs';
+
+const siteRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const VIEWPORTS = {
   desktop: { width: 1440, height: 900 },
@@ -22,8 +33,18 @@ const VIEWPORTS = {
 };
 
 function usage() {
-  console.error('usage: node scripts/screenshots.mjs <baseURL> <outDir> [paths…]');
+  console.error('usage: node scripts/screenshots.mjs <baseURL | --serve[=distDir]> <outDir> [paths… | -]');
   process.exit(2);
+}
+
+function readPaths(rest) {
+  if (rest.length === 1 && rest[0] === '-') {
+    return readFileSync(0, 'utf8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '');
+  }
+  return rest.length > 0 ? rest : ['/'];
 }
 
 export function slugFor(path) {
@@ -32,11 +53,24 @@ export function slugFor(path) {
 }
 
 async function main() {
-  const [baseURL, outDir, ...rest] = process.argv.slice(2);
-  if (!baseURL || !outDir) usage();
-  const paths = rest.length > 0 ? rest : ['/'];
+  const [target, outDir, ...rest] = process.argv.slice(2);
+  if (!target || !outDir) usage();
+  const paths = readPaths(rest);
+  if (paths.length === 0) {
+    console.error('screenshots: no paths given');
+    process.exit(2);
+  }
   const out = resolve(outDir);
   mkdirSync(out, { recursive: true });
+
+  let server = null;
+  let baseURL = target;
+  if (target === '--serve' || target.startsWith('--serve=')) {
+    const distDir = target === '--serve' ? 'dist' : target.slice('--serve='.length);
+    server = await serveDist(resolve(siteRoot, distDir));
+    baseURL = server.baseURL;
+    console.log(`screenshots: serving ${resolve(siteRoot, distDir)} at ${baseURL}`);
+  }
 
   const browser = await chromium.launch();
   const offenders = [];
@@ -107,16 +141,20 @@ async function main() {
     }
   } finally {
     await browser.close();
+    if (server) await server.close();
   }
 
   if (offenders.length > 0) {
-    console.error('\nHorizontal overflow on:');
+    console.error(`\nHorizontal overflow on ${offenders.length} page(s):`);
     for (const o of offenders) console.error(`  ${o}`);
     process.exit(1);
   }
+  console.log(`screenshots: ${paths.length} page(s) × ${Object.keys(VIEWPORTS).length} viewports, no horizontal overflow`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
