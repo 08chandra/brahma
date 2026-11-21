@@ -558,6 +558,206 @@ import GRDB
         #expect(try restored.machineLabTaint()?.source != nil)
     }
 
+    // MARK: Plan C P2 fix round 4: C's taint data through a backup and restore (R4-1: Ruling 21; R4-4)
+
+    /// A file-backed data home with company Acme (a git workspace, one commit on `main`), for C's tainted-commit rows, Ruling
+    /// 19's `taintOrder` and 4a's worktree artifacts through a snapshot and a restore.
+    private struct TaintWorld {
+        let env: BackupEnv
+        let service: BackupService
+        let acme: Company
+        let git: GitFixture
+
+        init() throws {
+            env = try BackupEnv()
+            acme = try env.company("Acme")
+            git = GitFixture(existing: URL(fileURLWithPath: acme.workspacePath, isDirectory: true))
+            try env.commit(acme, file: "README.md", text: "hello\n")
+            service = env.service()
+        }
+
+        /// A ready item leased by a designer of its own (the lease row as `claimLease` writes it; 4a publishes only from the
+        /// publisher's own leased worktree), its branch at `main` and its worktree folder.
+        func item(_ title: String) throws -> (item: WorkItem, worktree: URL) {
+            let designer = try env.store.hire(companyId: acme.id, name: "design-\(title.lowercased())", role: "designer", model: "sonnet")
+            let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(
+                type: .task, title: title, checkSpec: CheckSpec(command: "true", paths: ["src/\(UUID().uuidString.prefix(8))"]),
+                status: .ready))
+            let lease = WorkLease(itemId: item.id, companyId: acme.id, agentId: designer.id, acquiredAt: Date(), expiresActive: 1e9)
+            let designerId = designer.id
+            try env.store.writer.write { db in
+                try lease.insert(db)
+                try db.execute(sql: "UPDATE workItem SET status = 'inProgress', ownerId = ? WHERE id = ?", arguments: [designerId, item.id])
+            }
+            try git.git(["branch", "item/\(item.key)", "main"])
+            let wt = URL(fileURLWithPath: acme.workspacePath, isDirectory: true).appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: wt, withIntermediateDirectories: true)
+            return (item, wt)
+        }
+
+        /// A commit on the item's branch (`main` stays checked out); recorded as a tainted commit when `tainted`.
+        @discardableResult
+        func commit(on item: WorkItem, _ path: String, tainted: Bool) throws -> String {
+            let before = try git.git(["rev-parse", "refs/heads/item/\(item.key)"])
+            try git.git(["checkout", "-q", "item/\(item.key)"])
+            try git.write(path, "\(path) \(UUID().uuidString)\n")
+            try git.git(["add", "--", path])
+            try git.git(["commit", "-q", "-m", "work on \(path)"])
+            let sha = try git.git(["rev-parse", "HEAD"])
+            try git.git(["checkout", "-q", "main"])
+            if tainted {
+                try env.store.recordTaintedCommits(companyId: acme.id, itemId: item.id, agentId: try env.store.workItem(id: item.id)?.ownerId ?? "", turnId: nil,
+                                                   headBefore: before, headAfter: sha, source: "docs.swift.org",
+                                                   git: SafeGit(workspace: URL(fileURLWithPath: acme.workspacePath, isDirectory: true)),
+                                                   now: Date())
+            }
+            return sha
+        }
+
+        /// The item's designer publishes `mock.html` from its worktree (4a's publish: a clean session, so the row says clean).
+        func publish(from wt: URL, _ title: String) throws -> Artifact {
+            try Data("<p>\(title)</p>\n".utf8).write(to: wt.appending(path: "mock.html"))
+            let designer = try #require(try env.store.agents(companyId: acme.id).first { $0.name == "design-\(title.lowercased())" })
+            let a = try env.store.publishArtifact(companyId: acme.id, by: .agent(designer.id), sourcePath: "mock.html", title: title,
+                                                  itemKey: nil, baseDirectory: wt)
+            #expect(!a.tainted)
+            return a
+        }
+
+        func tainted(_ store: Store, _ ref: String) throws -> Bool {
+            let ctx = RefContext(companyId: acme.id, keyPrefixes: [Store.keyPrefix(slug: acme.slug)])
+            return try store.refTaint(try #require(WorkRef.parse(ref, context: ctx)), companyId: acme.id).tainted
+        }
+
+        /// Edits the snapshot file itself (an older or damaged backup).
+        func editSnapshot(_ snapshot: URL, _ sql: String, _ arguments: StatementArguments = []) throws {
+            let queue = try DatabaseQueue(path: snapshot.path)
+            try queue.write { db in try db.execute(sql: sql, arguments: arguments) }
+            try queue.close()
+        }
+
+        /// Restores the snapshot (the live store closed first) and opens the restored database as the engine would.
+        func restore(_ snapshot: URL) throws -> Store {
+            try env.store.close()
+            _ = try service.restore(try service.planRestore(snapshot: snapshot))
+            return try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        }
+    }
+
+    /// R4-1 (Ruling 21) (a): a snapshot taken after `vC-taint-order` carries the publish and clearing sequences, so a worktree
+    /// artifact restored from it reads as it did: never tainted, or tainted and cleared before its publish (clean only while
+    /// the clearing's sequence is below the publish's), reads clean; tainted at its publish and cleared after it reads tainted.
+    @Test func restoreKeepsTaintOrderSequence() throws {
+        let w = try TaintWorld()
+        let (never, neverWt) = try w.item("Never")
+        let a = try w.publish(from: neverWt, "Never")
+        let (before, beforeWt) = try w.item("Before")
+        try w.commit(on: before, "src/before.html", tainted: true)
+        try w.env.store.clearTaintedCommits(itemId: before.id, by: "review", now: Date())
+        let b = try w.publish(from: beforeWt, "Before")
+        let (after, afterWt) = try w.item("After")
+        try w.commit(on: after, "src/after.html", tainted: true)
+        let c = try w.publish(from: afterWt, "After")
+        try w.env.store.clearTaintedCommits(itemId: after.id, by: "review", now: Date())
+        _ = never
+        for (artifact, expected) in [(a, false), (b, false), (c, true)] {
+            #expect(try w.tainted(w.env.store, artifact.ref) == expected, "\(artifact.ref) before the snapshot")
+        }
+        let snapshot = try w.service.snapshot(reason: .manual)
+        let restored = try w.restore(snapshot)
+        let sequences = try restored.writer.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM taintOrder") } ?? 0
+        #expect(sequences >= 4, "the restored database lost the publish and clearing sequences")
+        for (artifact, expected) in [(a, false), (b, false), (c, true)] {
+            #expect(try w.tainted(restored, artifact.ref) == expected, "\(artifact.ref) after the restore")
+            #expect(try w.tainted(restored, artifact.storedPath + "/" + artifact.entryFile) == expected, "\(artifact.ref)'s file after the restore")
+        }
+    }
+
+    /// R4-1 (Ruling 21) (b): a snapshot without the sequences (taken before `vC-taint-order`, or with its rows gone) restores
+    /// with no publish sequence for any artifact: every worktree artifact reads tainted (fail closed), the live database's
+    /// sequences are not borrowed, and the restored database has the migration's triggers again.
+    @Test func restoreWithoutTaintOrderFailsClosed() throws {
+        for preMigration in [false, true] {
+            let w = try TaintWorld()
+            let (_, wt) = try w.item("Never")
+            let a = try w.publish(from: wt, "Never")
+            #expect(try !w.tainted(w.env.store, a.ref))
+            let snapshot = try w.service.snapshot(reason: .manual)
+            if preMigration {
+                try w.editSnapshot(snapshot, """
+                    DROP TRIGGER taintOrder_publish; DROP TRIGGER taintOrder_clear; DROP TRIGGER taintOrder_status;
+                    DROP TABLE taintOrder; DELETE FROM grdb_migrations WHERE identifier = 'vC-taint-order'
+                    """)
+            } else {
+                try w.editSnapshot(snapshot, "DELETE FROM taintOrder")
+            }
+            let restored = try w.restore(snapshot)
+            #expect(try restored.writer.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM taintOrder") } == 0)
+            #expect(try w.tainted(restored, a.ref), "pre-migration \(preMigration): an artifact with no publish sequence read clean")
+            #expect(try w.tainted(restored, a.storedPath + "/" + a.entryFile))
+            let triggers = try restored.writer.read { db in
+                try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'taintOrder_%' ORDER BY name")
+            }
+            #expect(triggers == ["taintOrder_clear", "taintOrder_publish", "taintOrder_status"])
+        }
+    }
+
+    /// R4-4: a restore never loses C's tainted commits. A commit recorded tainted after the snapshot (git is not rolled back,
+    /// so it is still on the item's branch) reads tainted after restoring the older snapshot: its commit ref, abbreviated, a
+    /// key-less file at it, and the item's diff.
+    @Test func restoreKeepsTaintedCommitsRecordedAfterTheSnapshot() throws {
+        let w = try TaintWorld()
+        let (item, _) = try w.item("Work")
+        let snapshot = try w.service.snapshot(reason: .manual)
+        let sha = try w.commit(on: item, "src/late.ts", tainted: true)
+        #expect(try w.tainted(w.env.store, "commit:\(sha)"))
+        let restored = try w.restore(snapshot)
+        #expect(try w.tainted(restored, "commit:\(sha)"), "a tainted commit reads clean after the restore")
+        #expect(try w.tainted(restored, "commit:\(sha.prefix(7))"))
+        #expect(try w.tainted(restored, "src/late.ts@\(sha)"))
+        #expect(try w.tainted(restored, "\(item.key):diff"))
+    }
+
+    /// R4-4: the clearing of a carried row: a row uncleared in either database stays uncleared; a row only the live database
+    /// has comes back as it is there (cleared there: cleared).
+    @Test func restoreKeepsTaintedCommitClearingStricter() throws {
+        let w = try TaintWorld()
+        let (one, _) = try w.item("One")
+        let (two, _) = try w.item("Two")
+        let x = try w.commit(on: one, "src/x.ts", tainted: true)     // uncleared live, cleared in the snapshot (below)
+        let y = try w.commit(on: two, "src/y.ts", tainted: true)     // uncleared in the snapshot, cleared live
+        let snapshot = try w.service.snapshot(reason: .manual)
+        try w.editSnapshot(snapshot, "UPDATE taintedCommit SET clearedBy = 'review', clearedAt = ? WHERE sha = ?", [Date(), x])
+        try w.env.store.clearTaintedCommits(itemId: two.id, by: "review", now: Date())
+        let (three, _) = try w.item("Three")
+        let z = try w.commit(on: three, "src/z.ts", tainted: true)   // only live, cleared there
+        try w.env.store.clearTaintedCommits(itemId: three.id, by: "owner", now: Date())
+        let restored = try w.restore(snapshot)
+        #expect(try w.tainted(restored, "commit:\(x)"), "a row uncleared live came back cleared")
+        #expect(try w.tainted(restored, "commit:\(y)"), "a row uncleared in the snapshot came back cleared")
+        let carried = try restored.writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT clearedBy, itemId FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [w.acme.id, z])
+        }
+        #expect(carried?["clearedBy"] as String? == "owner", "a live-only row was not carried as it is")
+        #expect(carried?["itemId"] as String? == three.id)
+    }
+
+    /// R4-4: when the live database can't be read its tainted commits can't be carried, so every open item of the restored
+    /// database reads tainted: a commit made and recorded tainted after the snapshot still reads tainted.
+    @Test func unreadableLiveDatabaseTaintsEveryItemsCommits() throws {
+        let w = try TaintWorld()
+        let (item, _) = try w.item("Work")
+        let snapshot = try w.service.snapshot(reason: .manual)
+        let sha = try w.commit(on: item, "src/late.ts", tainted: true)
+        try w.env.store.close()
+        for suffix in ["-wal", "-shm"] { try? FileManager.default.removeItem(atPath: w.env.paths.database.path + suffix) }
+        try Data(repeating: 0x5a, count: 8192).write(to: w.env.paths.database)
+        _ = try w.service.restore(try w.service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: w.env.paths.database.path, backupsDir: w.env.paths.backupsDir)
+        #expect(try w.tainted(restored, "commit:\(sha)"), "a commit of an item reads clean though its taint record was lost")
+        #expect(try w.tainted(restored, "\(item.key):diff"))
+    }
+
     @Test func cliRestoreOwnerOnly() throws {
         let home = try OwnerTestHome(initOwner: false)
         // No owner key in this data home: refused.

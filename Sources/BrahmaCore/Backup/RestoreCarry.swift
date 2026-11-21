@@ -30,6 +30,11 @@ struct RestoreCarry {
     struct MachineMark { var source: String?; var markedAt: Date?; var clearedAt: Date? }
     struct TaintedCommit { var agentId: String; var sha: String; var turnId: String?; var recordedAt: Date }
     struct AgentTaint { var id: String; var sources: String; var fresh: Bool }
+    /// A row of Plan C's `taintedCommit` (P2 R4-4).
+    struct ItemCommitTaint {
+        var companyId: String, sha: String, itemId: String?, agentId: String?, turnId: String?, source: String, createdAt: Date
+        var clearedBy: String?, clearedAt: Date?, carriedTo: String?
+    }
 
     var grants: [GrantEnd] = []
     /// Grants not live in the live database at restore time for any reason `GrantResolver.isLive` knows (revoked, used up,
@@ -46,6 +51,9 @@ struct RestoreCarry {
     var taintedCommits: [TaintedCommit] = []
     var taintedAgents: [AgentTaint] = []
     var taintedItems: [String] = []
+    /// Plan C's tainted commits (P2 R4-4): git is not rolled back, so a commit recorded tainted after the snapshot is still on
+    /// its branch; without its row, refs to it (a commit ref, a key-less file at it, its item's diff) would read clean.
+    var itemCommitTaints: [ItemCommitTaint] = []
 
     /// What the live database says, or why it could not be read.
     enum Live {
@@ -103,6 +111,15 @@ struct RestoreCarry {
         if try db.columns(in: "workItem").contains(where: { $0.name == "taintedOrigin" }) {
             c.taintedItems = try String.fetchAll(db, sql: "SELECT id FROM workItem WHERE taintedOrigin = 1")
         }
+        if try has("taintedCommit") {
+            c.itemCommitTaints = try Row.fetchAll(db, sql: """
+                SELECT companyId, sha, itemId, agentId, turnId, source, createdAt, clearedBy, clearedAt, carriedTo FROM taintedCommit
+                """).map {
+                    ItemCommitTaint(companyId: $0["companyId"], sha: $0["sha"], itemId: $0["itemId"], agentId: $0["agentId"],
+                                    turnId: $0["turnId"], source: $0["source"], createdAt: $0["createdAt"], clearedBy: $0["clearedBy"],
+                                    clearedAt: $0["clearedAt"], carriedTo: $0["carriedTo"])
+                }
+        }
         return c
     }
 
@@ -144,6 +161,7 @@ struct RestoreCarry {
                   taintSources = CASE WHEN taintSources = '' THEN 'restore: the previous database could not be read' ELSE taintSources END
                 """)
             try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE status <> 'done'")
+            try markEveryOpenItemsCommits(db, now: now)
             notes.append("the current database could not be read (\(Store.flat(why, max: 160))): every grant was revoked and every "
                 + "agent's session and open item marked as having read outside content")
         }
@@ -333,6 +351,46 @@ struct RestoreCarry {
         }
         for id in c.taintedItems {
             try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE id = ?", arguments: [id])
+        }
+        try carryItemCommitTaints(c.itemCommitTaints, into: db)
+    }
+
+    /// P2 R4-4: the live database's tainted commits come back, so a restore never loses one (git is not rolled back). A row
+    /// only the live database has is inserted as it is there (when its company is in the snapshot); a row uncleared in either
+    /// database stays uncleared (an uncleared live row undoes the snapshot's clearing of it); everything else of a row the
+    /// snapshot has stays as the snapshot has it. Ruling 19's sequences are not carried: the two databases' sequences are not
+    /// comparable, so a clearing carried in has none in the restored database and counts as uncleared at every publish
+    /// (fail closed).
+    static func carryItemCommitTaints(_ rows: [ItemCommitTaint], into db: Database) throws {
+        guard !rows.isEmpty, try db.tableExists("taintedCommit") else { return }
+        for r in rows {
+            try db.execute(sql: """
+                INSERT INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt, clearedBy, clearedAt, carriedTo)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM company WHERE id = ?)
+                ON CONFLICT(companyId, sha) DO UPDATE SET
+                  clearedBy = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE taintedCommit.clearedBy END,
+                  clearedAt = CASE WHEN excluded.clearedBy IS NULL THEN NULL ELSE taintedCommit.clearedAt END
+                """, arguments: [r.companyId, r.sha, r.itemId, r.agentId, r.turnId, r.source, r.createdAt, r.clearedBy, r.clearedAt,
+                                 r.carriedTo, r.companyId])
+        }
+    }
+
+    /// The source of the fail-closed markers when the live database's tainted commits can't be carried (P2 R4-4).
+    static let unreadableCommitTaintSource = "restore: the previous database could not be read"
+
+    /// P2 R4-4, when the live database can't be read: its tainted commits are unknown, so every open item of the restored
+    /// database gets an `unrecorded-…` marker, as a turn-end record that failed does: none of the item's commits is provably
+    /// clean, so its diff, its files and a commit ref to anything on its branch read tainted until it is merged through review
+    /// or the owner vouches for it.
+    static func markEveryOpenItemsCommits(_ db: Database, now: Date) throws {
+        guard try db.tableExists("taintedCommit") else { return }
+        for row in try Row.fetchAll(db, sql: "SELECT id, companyId FROM workItem WHERE status <> 'done'") {
+            let (itemId, companyId): (String, String) = (row["id"], row["companyId"])
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt)
+                VALUES (?, ?, ?, NULL, NULL, ?, ?)
+                """, arguments: [companyId, BrahmaCore.TaintedCommit.unrecordedPrefix + UUID().uuidString, itemId,
+                                 unreadableCommitTaintSource, now])
         }
     }
 }
