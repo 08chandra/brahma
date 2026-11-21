@@ -1,0 +1,31 @@
+---
+title: BrahmaKeychain
+description: "The macOS Keychain behind two BrahmaCore protocols: the secrets vault and the owner-key hash store, the one place each process picks them, and the access log tests use."
+---
+
+import ModuleFacts from '../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../components/SourceLink.astro';
+
+## Purpose
+
+The macOS Keychain behind two `BrahmaCore` protocols, kept out of the core so it stays portable. `PlatformSecretVault.resolve` picks the process's `SecretVault` in one place: the Keychain unless `BRAHMA_SECRET_STORE` is `file` or `memory`, both refused for the default data home. `KeychainVault` stores one generic-password item per secret under service `dev.brahma.secrets`, with an access list that trusts only the running Brahma binary and its sibling (`KeychainTrust`); background reads never prompt. `PlatformOwnerKeyStore` does the same for the owner key's hash (`dev.brahma.owner`). `KeychainAccessLog` counts every Security call, so tests can prove they never touched the Keychain.
+
+## Key types
+
+- [`PlatformSecretVault`](/api/brahmakeychain/documentation/brahmakeychain/platformsecretvault/) — resolves the vault from the environment; `refuseMemory` for the production entry points.
+- [`KeychainVault`](/api/brahmakeychain/documentation/brahmakeychain/keychainvault/) — the `SecretVault`: one item per secret, replaced by delete-then-add, read non-interactively unless the owner asked.
+- [`KeychainTrust`](/api/brahmakeychain/documentation/brahmakeychain/keychaintrust/) — the trusted-application list: the running executable and its sibling, never `/usr/bin/security`.
+- [`PlatformOwnerKeyStore`](/api/brahmakeychain/documentation/brahmakeychain/platformownerkeystore/) — resolves the owner-key store; `BRAHMA_OWNER_KEY_STORE=file` only for non-default homes.
+- [`KeychainOwnerKeyStore`](/api/brahmakeychain/documentation/brahmakeychain/keychainownerkeystore/) — the `OwnerKeyStore`: the hash, keyed by the canonical data-home path, updated in place.
+- [`KeychainAccessLog`](/api/brahmakeychain/documentation/brahmakeychain/keychainaccesslog/) — the process-wide count of Security calls; `forbid()` arms a trap.
+
+## How it connects
+
+- **Implements BrahmaCore protocols.** `KeychainVault` conforms to `SecretVault` and `KeychainOwnerKeyStore` to `OwnerKeyStore`; the non-Keychain choices it hands back (`FileVault`, `MemoryVault`, `HomeFileOwnerKeyStore`) are BrahmaCore types.
+- **Called by the `brahma` CLI.** `openStore()` refuses a bad store choice before anything else; `cliSecretVault` resolves the vault, interactive only for `brahma secret set|rm|load`; `ownerKeyStore(for:)` resolves the owner-key store; `brahma mcp` resolves its vault non-interactively.
+- **Called by BrahmaApp.** `AppDelegate.makeBoot` resolves the owner-key store and two vaults: a non-interactive one for the engine and an interactive one for the owner's "Load secrets".
+- **Not imported by BrahmaAppModel**, although `Package.swift` lists the dependency: the model takes the results as `SecretVault` and `OwnerKeyStore` values.
+
+<ModuleFacts module="BrahmaKeychain" />
+
+<SourceLink path="Sources/BrahmaKeychain" />
