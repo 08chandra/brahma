@@ -937,3 +937,10 @@ Results are recorded in the final task report. A canary failure blocks the merge
 - **Taint copied through an agent's own git** (cherry-pick, update-ref, re-applying a patch) is not caught by Plan C's per-commit taint rows. Plan S must add engine-side detection at submit and review: a commit whose `git patch-id` matches a tainted commit's patch-id (company-scoped) is tainted. With helper-mediated git (this plan's helper), also record taint on objects the helper materialises for a tainted session.
 - **Performance note:** Plan C's `refTaint` for `commit:` and key-less revs runs about 3 git subprocesses per tainted item per resolve. Fold these into the helper's batched git calls.
 - **Artifact integrity:** 4a's Artifact rows store no hash, so Plan C's `open_ref` reads artifact bytes without checking them. That is acceptable for now, because turns can't write to `.brahma/artifacts` and the read follows no links. Plan S's helper must record a sha256 when it registers an artifact, check it on every open, and treat a mismatch as tainted plus an owner alert.
+- **GitSpawn-class regression test** (Manifold, Sep 2026: a repo-supplied `.git/config` command runs before the trust prompt in agent CLIs). Brahma is already covered by two things:
+  - Engine git runs with `core.fsmonitor=false`, `core.hooksPath=/dev/null`, `core.sshCommand=/usr/bin/false`, no pager or external diff, system and global config ignored, and a config-key allowlist (GitWorkspace).
+  - The whole `claude` process, including any git it spawns, runs inside the turn's Seatbelt profile.
+
+  Plan S adds a regression test for each:
+  - A workspace or worktree with planted `core.fsmonitor`, `core.sshCommand`, `core.pager`, `diff.external`, `filter.*.process` and `includeIf` keys must run nothing under any engine git call or helper path.
+  - Planted config must be refused by the allowlist check on adopt and import.
