@@ -1,0 +1,139 @@
+import Foundation
+
+/// One part of a PDF as the sandboxed helper extracted it (`SandboxedPDFReader`): a stream decoded through its filters (or
+/// left as the JPEG / JPEG 2000 data an image codec holds), every string's bytes, every string as text, every name, and the
+/// page text.
+public struct PDFPart: Equatable, Sendable {
+    public enum Kind: UInt8, Sendable {
+        case decodedStream = 0x44   // D
+        case jpeg = 0x4A            // J
+        case jpeg2000 = 0x50        // P
+        case strings = 0x53         // S
+        case texts = 0x55           // U
+        case names = 0x4E           // N
+        case pageText = 0x54        // T
+
+        /// A stream's own bytes, which may hold another file (an archive, a PDF, an image) and are checked again.
+        public var isStream: Bool { self == .decodedStream || self == .jpeg || self == .jpeg2000 }
+    }
+
+    public var kind: Kind
+    public var data: Data
+
+    public init(kind: Kind, data: Data) { self.kind = kind; self.data = data }
+}
+
+/// C2b fix round 2 (controller ruling 33): the engine never parses a PDF. `brahma-pdf` (PDFKit and CoreGraphics; see its
+/// `main.swift`) runs under the engine's sandbox exactly like `SandboxedUnzipReader`'s unzip: no network, read access to
+/// one private copy of the file in a vault temp directory (`scratch`) and to the helper itself, write access to one output
+/// directory, a hard time limit, and its output cut by `head -c` at the byte cap. Its exit status is recorded apart from the
+/// pipe (a `status` file), so a helper that was killed, crashed or timed out never reads as done. Its output must hold
+/// together exactly (`parse`); anything else refuses. The temp directory is removed whatever happens.
+public struct SandboxedPDFReader: Sendable {
+    public static let helperName = "brahma-pdf"
+    public static let timeout: Duration = .seconds(60)
+    static let partsName = "parts"
+    static let statusName = "status"
+    static let header = Data("BRAHMA-PDF/1\n".utf8)
+
+    static let unavailable = ArchiveReadError.refused("PDFs can't be scanned on this machine")
+    static let unreadable = ArchiveReadError.refused("this PDF can't be read, so it can't be scanned for secrets")
+    static let encrypted = ArchiveReadError.refused("this PDF is encrypted, so it can't be scanned for secrets")
+    static let undecodable = ArchiveReadError.refused("this PDF has a stream that can't be decoded for scanning")
+    static let unaccounted = ArchiveReadError.refused(
+        "this PDF holds data outside its objects (an earlier revision or a stray stream), so it can't be scanned for secrets")
+    static let tooMany = ArchiveReadError.refused("this PDF has too many objects to scan for secrets")
+
+    let runner: any SandboxedRunner
+    let helper: URL
+    let scratch: @Sendable () throws -> URL
+
+    /// `helper` is the `brahma-pdf` binary (`locate`); `scratch` makes a fresh private directory for one read
+    /// (`Vault.makeTempDir`).
+    public init(runner: any SandboxedRunner, helper: URL, scratch: @escaping @Sendable () throws -> URL) {
+        self.runner = runner; self.helper = helper; self.scratch = scratch
+    }
+
+    /// `brahma-pdf` beside `executable` (the engine's own binary: the CLI, or the app's, whose bundle carries it in
+    /// `Contents/Helpers`), or nil.
+    public static func locate(executable: URL, isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> URL? {
+        let dir = executable.deletingLastPathComponent()
+        let candidates = [dir.appending(path: helperName), dir.deletingLastPathComponent().appending(path: "Helpers/\(helperName)")]
+        return candidates.first { isExecutable($0.path) }
+    }
+
+    /// The parts of the PDF `data`, at most `maxBytes` of output in all (`ArchiveMemberScan.overBudget` past it), within
+    /// `timeout` (at most `SandboxedPDFReader.timeout`). Throws `ArchiveReadError`.
+    public func parts(of data: Data, maxBytes: Int, timeout: Duration = SandboxedPDFReader.timeout) throws -> [PDFPart] {
+        guard maxBytes > Self.header.count else { throw ArchiveMemberScan.overBudget }
+        let dir = try scratch()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let held = dir.appending(path: "held", directoryHint: .isDirectory)
+        let out = dir.appending(path: "out", directoryHint: .isDirectory)
+        for d in [held, out] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        }
+        guard FileManager.default.createFile(atPath: held.appending(path: "input.pdf").path, contents: data,
+                                             attributes: [.posixPermissions: 0o400]) else { throw Self.unreadable }
+        let q = ExtensionValidator.shellQuote
+        let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
+        let program = helper.resolvedForSandbox
+        let input = heldDir.appending(path: "input.pdf").path
+        let status = outDir.appending(path: Self.statusName).path
+        // The helper's own status is written apart from the pipe (whose status is head's); head cuts the output at the cap.
+        let command = "{ \(q(program.path)) \(q(input)) \(maxBytes); echo $? > \(q(status)); } | /usr/bin/head -c \(maxBytes + 1) > "
+            + q(outDir.appending(path: Self.partsName).path)
+        let policy = SandboxPolicy(writable: [outDir], readable: [heldDir, program], network: .none, toolchain: false)
+        let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        let limit = min(timeout, Self.timeout)
+        let outcome = runner.runBlocking(command: command, cwd: outDir, environment: environment, timeout: limit,
+                                         outputURL: dir.appending(path: "helper.log"), policy: policy)
+        guard !outcome.timedOut, outcome.exitCode == 0,
+              let said = EngineFiles.readNoFollow(outDir.appending(path: Self.statusName), under: outDir, limit: 16),
+              let code = Int32(String(decoding: said, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw Self.unreadable
+        }
+        switch code {
+        case 0: break
+        case 3: throw Self.encrypted
+        case 4: throw Self.undecodable
+        case 5: throw Self.unaccounted
+        case 6: throw ArchiveMemberScan.overBudget
+        case 8: throw Self.tooMany
+        default: throw Self.unreadable
+        }
+        guard let output = EngineFiles.readNoFollow(outDir.appending(path: Self.partsName), under: outDir, limit: maxBytes + 1) else {
+            throw Self.unreadable
+        }
+        return try Self.parse(output, maxBytes: maxBytes)
+    }
+
+    /// The helper's output: `BRAHMA-PDF/1\n`, records (a kind byte, a 4-byte big-endian length, the payload), and an `E`
+    /// record whose 8-byte payload counts the records before it, ending the output exactly. At most `maxBytes` in all.
+    /// Anything else (a cut, an unknown kind, a wrong count, bytes after the end) is `unreadable`. Every length is checked
+    /// against what is left before it is used: no input can make this trap.
+    static func parse(_ output: Data, maxBytes: Int) throws -> [PDFPart] {
+        guard output.count <= maxBytes else { throw ArchiveMemberScan.overBudget }
+        let b = [UInt8](output)
+        guard b.count >= header.count, Data(b[0..<header.count]) == header else { throw unreadable }
+        var i = header.count
+        var parts: [PDFPart] = []
+        while true {
+            guard b.count - i >= 5 else { throw unreadable }
+            let kind = b[i]
+            let length = Int(b[i + 1]) << 24 | Int(b[i + 2]) << 16 | Int(b[i + 3]) << 8 | Int(b[i + 4])
+            i += 5
+            guard length <= b.count - i else { throw unreadable }
+            if kind == 0x45 {   // E
+                guard length == 8 else { throw unreadable }
+                var count: UInt64 = 0
+                for k in 0..<8 { count = count << 8 | UInt64(b[i + k]) }
+                guard i + 8 == b.count, count == UInt64(parts.count) else { throw unreadable }
+                return parts
+            }
+            guard let k = PDFPart.Kind(rawValue: kind) else { throw unreadable }
+            parts.append(PDFPart(kind: k, data: Data(b[i..<(i + length)])))
+            i += length
+        }
+    }
+}

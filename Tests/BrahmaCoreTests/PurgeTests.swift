@@ -268,4 +268,26 @@ import GRDB
         }
         #expect(alerts.contains { $0.title.contains("purge") && $0.title.contains("incomplete") })
     }
+
+    /// R2-6: the purge log keeps the ref's name with every stored value redacted (it is a log), like every message does.
+    @Test func purgeLogNeverHoldsAValue() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        let file = "src/\(SecretGateTests.value).ts"
+        try cf.fx.git.write(file, "export const fine = 1\n", in: wt)
+        let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1:\(file)@worktree"), for: .agent(cf.fx.eng1.id), companyId: cId,
+                                         messageRefId: "mr-n", knownValues: [], paths: cf.paths)
+        try Self.record(cf, pinned, id: "mr-n", at: cf.now)
+        _ = try cf.store.purge(companyId: cId, ref: pinned, contentVault: ContentVault(paths: cf.paths), paths: cf.paths,
+                               knownValues: SecretGateTests.known, now: cf.now)
+        let log = try #require(try cf.store.writer.read { db in
+            try PurgeLog.fetchOne(db, sql: "SELECT * FROM purgeLog WHERE companyId = ?", arguments: [cId])
+        })
+        #expect(log.canonical == "ENG-1:src/[redacted stored secret STRIPE_KEY].ts@worktree")
+        let texts = try cf.store.events(afterId: 0, companyId: cId).map(\.text) + [log.canonical]
+        for text in texts { for piece in SecretGateTests.pieces(SecretGateTests.value) { #expect(!text.contains(piece)) } }
+        // The tombstone still answers for the ref (the share is found by its ref, not by the logged name).
+        #expect(try Self.state(cf, "mr-n") == "purged")
+    }
 }

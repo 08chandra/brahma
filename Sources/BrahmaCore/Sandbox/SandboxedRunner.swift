@@ -52,8 +52,35 @@ public protocol SandboxedRunner: Sendable {
     /// Runs `command` (`/bin/sh -c`) to completion or `timeout`; never throws (whatever goes wrong is the outcome).
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
              policy: SandboxPolicy) async -> CheckOutcome
+    /// `run` for a synchronous caller (C2b fix round 2: the secret gate's archive and PDF readers): it never blocks waiting
+    /// on the cooperative pool, which callers blocked on it could exhaust. The default runs `run` on a detached task and
+    /// waits for it, at most `timeout` + 30 s (then an outcome that timed out); a runner whose work is blocking anyway does
+    /// it on the calling thread.
+    func runBlocking(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                     policy: SandboxPolicy) -> CheckOutcome
     /// Starts `command` as a long-running process (a preview); its output goes to `logURL`.
     func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess
+}
+
+extension SandboxedRunner {
+    public func runBlocking(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                            policy: SandboxPolicy) -> CheckOutcome {
+        let box = BlockingRunBox()
+        Task.detached {
+            box.value = await run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy)
+            box.done.signal()
+        }
+        guard box.done.wait(timeout: .now() + SafeGit.seconds(timeout) + 30) == .success, let value = box.value else {
+            return CheckOutcome(exitCode: nil, timedOut: true, tail: "the sandboxed run never reported back")
+        }
+        return value
+    }
+}
+
+/// The default `runBlocking`'s hand-off between the detached run and the waiting caller.
+final class BlockingRunBox: @unchecked Sendable {
+    let done = DispatchSemaphore(value: 0)
+    var value: CheckOutcome?
 }
 
 /// A process `SandboxedRunner.spawn` started: the leader of its own process group.
@@ -169,6 +196,11 @@ public struct UnavailableSandboxRunner: SandboxedRunner {
 
     public func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
                     policy: SandboxPolicy) async -> CheckOutcome {
+        GroupRun.fail(Self.tail, outputURL: outputURL)
+    }
+
+    public func runBlocking(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                            policy: SandboxPolicy) -> CheckOutcome {
         GroupRun.fail(Self.tail, outputURL: outputURL)
     }
 

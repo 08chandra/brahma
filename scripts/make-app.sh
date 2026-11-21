@@ -6,6 +6,7 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 C="${1:-release}"
 
 swift build -c "$C" --product brahma
+swift build -c "$C" --product brahma-pdf
 swift build -c "$C" --product BrahmaApp
 BIN="$(swift build -c "$C" --show-bin-path)"
 
@@ -14,6 +15,8 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 cp "$BIN/BrahmaApp" "$APP/Contents/MacOS/Brahma"
 cp "$BIN/brahma" "$APP/Contents/Helpers/brahma"
+# The sandboxed PDF extraction helper the secret gate runs (SandboxedPDFReader.locate finds it beside the CLI).
+cp "$BIN/brahma-pdf" "$APP/Contents/Helpers/brahma-pdf"
 for b in "$BIN"/*.bundle; do
   [ -e "$b" ] || continue
   case "$b" in *Tests.bundle) continue ;; esac
@@ -43,6 +46,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --sign - "$APP/Contents/Helpers/brahma"
+codesign --force --sign - "$APP/Contents/Helpers/brahma-pdf"
 codesign --force --sign - --identifier dev.brahma.app "$APP"
 codesign --verify --strict "$APP"
 echo "built $APP"

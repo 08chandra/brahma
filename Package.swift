@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "BrahmaCore", targets: ["BrahmaCore"]),
         .executable(name: "brahma", targets: ["brahma"]),
+        .executable(name: "brahma-pdf", targets: ["brahma-pdf"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
@@ -32,6 +33,9 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
+        // The sandboxed PDF extraction helper (C2b, ruling 33): PDFKit and CoreGraphics decode a PDF outside the engine, under
+        // Seatbelt; BrahmaCore never parses a PDF. Foundation, PDFKit and CoreGraphics only (nothing of Brahma's own).
+        .executableTarget(name: "brahma-pdf"),
         .testTarget(
             name: "BrahmaCoreTests",
             dependencies: ["BrahmaCore", "BrahmaKeychain"],

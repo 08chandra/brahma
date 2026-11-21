@@ -248,8 +248,17 @@ struct CollabFixture {
         let nul = try cf.open(.eng1, "nul.txt").text
         #expect(nul.contains("text · 17 bytes; open_ref can't read its text — use copy: true and your own tools"))
         #expect(!nul.contains("binary"))
-        let doc = try cf.open(.eng1, "doc.pdf").text
-        #expect(doc.contains("pdf · 100 bytes; open_ref can't read its text — use copy: true and your own tools"))
+        // C2b fix round 2: a PDF is read only through the sandboxed PDF helper. Without it (no reader) it is refused; a
+        // file that only carries a PDF header can't be read by it either; a real PDF opens as its metadata line.
+        #expect(cf.failure { try cf.open(.eng1, "doc.pdf") } == "PDFs can't be scanned on this machine")
+        if EmbeddedContentTests.helperReady {
+            let reader = try EmbeddedContentTests.reader(cf)
+            #expect(cf.failure { try cf.open(.eng1, "doc.pdf", archives: reader) } == "this PDF can't be read, so it can't be scanned for secrets")
+            let real = PDFBuild.flate("hello")
+            try cf.commit(["real.pdf": real])
+            #expect(try cf.open(.eng1, "real.pdf", archives: reader).text
+                .contains("pdf · \(real.count) bytes; open_ref can't read its text — use copy: true and your own tools"))
+        }
         // TextExtract directly: lossy text, and images by their header.
         #expect(try TextExtract.extract(kind: .text, ext: "txt", data: Data([0x68, 0xC3]), archives: UnavailableArchiveReader()) == "h\u{FFFD}")
         var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13]) + Data("IHDR".utf8)
