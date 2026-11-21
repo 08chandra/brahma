@@ -108,10 +108,15 @@ import WebKit
         let allowed = ArtifactScripts.enabled(kind: .html, provenance: .owner, tainted: false, ownerEnabled: false)
         #expect(allowed && !ArtifactScripts.effective(allowed: allowed, webRTCOff: WebRTCGuard.disable(NoSwitch())))
         #expect(ArtifactScripts.effective(allowed: allowed, webRTCOff: WebRTCGuard.disable(WorkingSwitch())))
-        // The web preview: no verified switch, no web view.
+        // The owner is told, in the owner's words, never left with a page that silently lost its scripts (controller addendum).
+        let message = "web previews disabled: this macOS can't turn off WebRTC"
+        #expect(ArtifactScripts.webRTCNotice(kind: .html, webRTCOff: WebRTCGuard.disable(NoSwitch())) == message)
+        #expect(ArtifactScripts.webRTCNotice(kind: .html, webRTCOff: WebRTCGuard.disable(WorkingSwitch())) == nil)
+        #expect(ArtifactScripts.webRTCNotice(kind: .image, webRTCOff: false) == nil, "an SVG never runs scripts: nothing lost")
+        // The web preview: no verified switch, no web view, and the same message as its reason.
         let ready = PreviewGuardState<Int>.ready(1, cspScript: "csp")
         #expect(!ready.requiringWebRTCOff(WebRTCGuard.disable(NoSwitch())).showsWebView)
-        if case .failed(let why) = ready.requiringWebRTCOff(false) { #expect(why == WebRTCGuard.previewRefusal) } else { Issue.record("not failed") }
+        if case .failed(let why) = ready.requiringWebRTCOff(WebRTCGuard.disable(StuckSwitch())) { #expect(why == message) } else { Issue.record("not failed") }
         #expect(ready.requiringWebRTCOff(WebRTCGuard.disable(WorkingSwitch())).showsWebView)
         #expect(!PreviewGuardState<Int>.failed("rules").requiringWebRTCOff(true).showsWebView)
     }

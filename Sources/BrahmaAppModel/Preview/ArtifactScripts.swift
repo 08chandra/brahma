@@ -16,8 +16,6 @@ public enum ArtifactScripts {
     /// The enable button's help: engine-written, what turning scripts on means.
     public static let warning = "This page was built by an agent or came from outside. Its scripts run inside the app with "
         + "network loads blocked and WebRTC off. Turn them on only if you need the page to be interactive."
-    /// Shown over the page when scripts were asked for but WebRTC could not be turned off (they stay off).
-    public static let webRTCRefusal = "SCRIPTS OFF · WEBRTC CAN'T BE TURNED OFF ON THIS MACOS"
 
     /// Scripts stay off until the owner turns them on: HTML from an agent or from outside, or any tainted HTML. The header
     /// shows the toggle exactly for these.
@@ -40,6 +38,13 @@ public enum ArtifactScripts {
     /// What the web view gets: scripts only when the policy allows them and WebRTC was verified off in its configuration
     /// (`WebRTCGuard.disable`). A missing switch keeps scripts off (fail closed).
     public static func effective(allowed: Bool, webRTCOff: Bool) -> Bool { allowed && webRTCOff }
+
+    /// What an HTML artifact's body says over the page when WebRTC could not be turned off (`WebRTCGuard.unavailableMessage`;
+    /// the page then runs without scripts), so the owner is told rather than left with a page that silently lost them. Nil
+    /// otherwise, and for anything but HTML (an SVG never runs scripts).
+    public static func webRTCNotice(kind: ArtifactKind, webRTCOff: Bool) -> String? {
+        kind == .html && !webRTCOff ? WebRTCGuard.unavailableMessage : nil
+    }
 }
 
 /// Turns WebRTC (`RTCPeerConnection`) off in a web view's preferences (Plan 4a final review C1, I1). Content rule lists and
@@ -53,8 +58,10 @@ public enum WebRTCGuard {
     public static let key = "peerConnectionEnabled"
     static let setter = "_setPeerConnectionEnabled:"
     static let getter = "_peerConnectionEnabled"
+    /// What the owner is told, in the web preview and the artifact view, when the switch is missing (engine-written).
+    public static let unavailableMessage = "web previews disabled: this macOS can't turn off WebRTC"
     /// Why a web preview is not shown when the switch is missing.
-    public static let previewRefusal = "WebRTC can't be turned off in this version of macOS, so the preview isn't shown."
+    public static let previewRefusal = unavailableMessage
 
     /// Sets the preference off on `preferences` and returns whether it now reads back off.
     @discardableResult

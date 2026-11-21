@@ -681,6 +681,25 @@ import GRDB
         _ = items
     }
 
+    /// A database error on the landing's own stop read (S15, the last moment before `main` moves) is the engine's fault: the
+    /// landing does not happen, and the request goes back uncounted, never charged to the item. (The read is made to fail
+    /// right there through the landing's probe, since every earlier read now treats an error as a stop: M1.)
+    @Test func stopReadErrorAtTheLandingIsNotChargedToTheItem() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        let before = try main(m)
+        m.store.mergeRefProbe.set { ref in
+            if ref == GitWorkspace.mainRef { m.exec_noThrow("DROP TABLE IF EXISTS engineStop") }
+        }
+        defer { m.store.mergeRefProbe.set(nil) }
+        let outcome = try #require(try await batch(queue(m), m))
+        let r = try request(m, i)
+        #expect(outcome.requeued == [r.id] && outcome.merged.isEmpty && outcome.failed.isEmpty, "\(outcome)")
+        #expect(r.status == .queued && r.requeues == 0 && r.inconclusive == 0, "\(r)")
+        #expect(try main(m) == before, "main did not move")
+        #expect(try m.fresh(i).status == .inReview)
+    }
+
     /// Final review M1: a stop that cannot be read counts as a stop (as `PreviewRunner.ownerStopHolds`). When the read starts
     /// failing during a check, that batch is stopped and its request goes back uncounted; while it keeps failing nothing is
     /// claimed, recovered or merged. Never charged to the item.

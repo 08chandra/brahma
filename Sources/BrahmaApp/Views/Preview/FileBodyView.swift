@@ -60,7 +60,7 @@ struct FileBodyView: View {
                 // SVG never runs scripts; an HTML page runs them only as the host says (`scripts`: off for an agent's, an outside
                 // or a tainted page until the owner turns them on), confined by the rule list and the navigation policy, and
                 // only once WebRTC is verified off.
-                let web = ArtifactWebView(entry: file.url, root: file.root, javaScript: scripts && file.kind != .image)
+                let web = ArtifactWebView(entry: file.url, root: file.root, kind: file.kind, javaScript: scripts && file.kind != .image)
                 if isAgentMade {
                     AgentBuiltFrame(label: builtBy) { web }
                 } else {
@@ -143,11 +143,12 @@ enum ByteCount {
 /// file-only content rule list (`PreviewGuards.artifactRuleList`: block everything, then `file:` and `about:`) has compiled,
 /// loading the entry with `loadFileURL(_:allowingReadAccessTo: root)`, navigating only where
 /// `PreviewNavigationPolicy.allowsArtifact` passes, opening no windows and taking focus only through the owner's input.
-/// WebRTC is always off (`WebRTCGuard`); when it cannot be turned off the page runs without scripts and says so. A change of
-/// `javaScript` makes a new web view (WebKit reads it only when the view is made).
+/// WebRTC is always off (`WebRTCGuard`); when it cannot be turned off an HTML page runs without scripts and the body says so
+/// (`ArtifactScripts.webRTCNotice`). A change of `javaScript` makes a new web view (WebKit reads it only when the view is made).
 private struct ArtifactWebView: View {
     let entry: URL
     let root: URL
+    let kind: ArtifactKind
     let javaScript: Bool
     @State private var rules: RulesState?
     /// Whether WebRTC can be turned off in this WebKit (a probe of fresh preferences); nil until asked.
@@ -169,9 +170,9 @@ private struct ArtifactWebView: View {
             case .ready(let list)?:
                 ArtifactFileWebView(entry: entry, root: root, javaScript: javaScript, rules: list)
                     .id(javaScript)
-                if javaScript, webRTCSwitch == false {
+                if let webRTCSwitch, let notice = ArtifactScripts.webRTCNotice(kind: kind, webRTCOff: webRTCSwitch) {
                     VStack {
-                        StatusChip(label: ArtifactScripts.webRTCRefusal, color: BrahmaTheme.warning)
+                        StatusChip(label: notice, color: BrahmaTheme.warning)
                             .padding(BrahmaTheme.spaceS)
                         Spacer(minLength: 0)
                     }
