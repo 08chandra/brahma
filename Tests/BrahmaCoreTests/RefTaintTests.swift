@@ -673,6 +673,18 @@ import GRDB
         #expect(try leftover(clean, claimedBy: clean.fx.eng1) == nil)
         let unknown = try CollabFixture()
         #expect(try leftover(unknown, claimedBy: nil) != nil)
+        // R4-3: a session tainted while it held the item and reset since is caught by the item's sticky mark alone.
+        let reset = try CollabFixture()
+        let (resetItem, resetCompany) = (reset.fx.item.id, reset.c.id)
+        try reset.store.markTainted(agentId: reset.fx.eng1.id, source: "docs.swift.org")
+        try reset.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND id = ?", arguments: [resetCompany, resetItem])
+        }
+        try reset.store.requestFreshSession(agentId: reset.fx.eng1.id)
+        #expect(try reset.store.clearTaintIfRequested(agentId: reset.fx.eng1.id, scope: .base))
+        #expect(try reset.agent(reset.fx.eng1).sessionTainted == false)
+        #expect(try leftover(reset, claimedBy: reset.fx.eng1) == "outside content")
+        #expect(try reset.store.refTaint(try reset.fx.ref("ENG-1:src/leftover.ts"), companyId: resetCompany).tainted)
     }
 
     /// R3-6 (ruling 9): a rev-less `.brahma/…` file read from disk takes the taint of the item it belongs to: a hand-off a
@@ -704,6 +716,84 @@ import GRDB
         #expect(try cf.store.refTaint(try cf.fx.ref(".brahma/artifacts/page.html"), companyId: cId).tainted)
         try cf.fx.git.write(".brahma/progress/ENG-99.md", "# ?\n")
         #expect(try cf.store.refTaint(try cf.fx.ref(".brahma/progress/ENG-99.md"), companyId: cId).tainted)
+    }
+
+    // MARK: Fix round 4
+
+    /// A second, in-progress item `key` whose branch is at `commit`; it has no taint rows of its own.
+    @discardableResult
+    static func rowlessItem(_ cf: CollabFixture, at commit: String, title: String = "Other") throws -> WorkItem {
+        let other = try cf.store.createWorkItem(companyId: cf.c.id, by: .owner, draft: WorkItemDraft(type: .task, title: title))
+        try cf.fx.git.git(["branch", "item/\(other.key)", commit])
+        let otherId = other.id
+        try cf.store.writer.write { db in try db.execute(sql: "UPDATE workItem SET status = 'inProgress' WHERE id = ?", arguments: [otherId]) }
+        return other
+    }
+
+    /// R4-1 (ruling 11): when the orphan check throws, an item with no rows of its own whose branch holds a tainted commit
+    /// reads tainted, not clean.
+    @Test func rowlessItemFailsClosedWhenOrphanCheckThrows() throws {
+        let cf = try CollabFixture()
+        let sha = try Self.taintItemCommit(cf)
+        let other = try Self.rowlessItem(cf, at: sha)
+        #expect(other.key == "ENG-2")
+        cf.store.refHooks.setGitRunner(FailingItemRefRunner())
+        defer { cf.store.refHooks.setGitRunner(nil) }
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cf.c.id).tainted)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:src/a.ts"), companyId: cf.c.id).tainted)
+    }
+
+    /// R4-1: another item's branch reset onto an unrelated root (no merge base with `main`, so the orphan check throws) does
+    /// not skip the checks of a row-less item that holds a recorded tainted commit.
+    @Test func unrelatedRootOnAnotherBranchFailsClosed() throws {
+        let cf = try CollabFixture()
+        let sha = try Self.taintItemCommit(cf)
+        try Self.rowlessItem(cf, at: sha)                                   // ENG-2: row-less, holds ENG-1's tainted commit
+        // ENG-3: a tainted commit of its own, then its branch is reset onto an unrelated root.
+        let third = try Self.rowlessItem(cf, at: try cf.fx.head(), title: "Third")
+        #expect(third.key == "ENG-3")
+        let own = try cf.commit(["src/e.ts": Data("e\n".utf8)], on: "item/ENG-3", message: "third")
+        try cf.store.recordTaintedCommits(companyId: cf.c.id, itemId: third.id, agentId: cf.fx.eng3.id, turnId: nil,
+                                          headBefore: try cf.fx.head(), headAfter: own, source: "docs.swift.org",
+                                          git: SafeGit(workspace: cf.workspace), now: cf.now)
+        let root = try cf.fx.git.git(["commit-tree", try cf.fx.git.git(["mktree"]), "-m", "unrelated root"])
+        try cf.fx.git.git(["update-ref", "refs/heads/item/ENG-3", root])
+        #expect(throws: (any Error).self) { try SafeGit(workspace: cf.workspace).mergeBase("main", root) }
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cf.c.id).tainted)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:src/a.ts"), companyId: cf.c.id).tainted)
+        #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("ENG-2:src/a.ts")).tainted)
+    }
+
+    /// R4-2: when the engine's auto-commit can't be recorded as it should (here the claim log can't be read), it fails closed:
+    /// the commit is recorded tainted, the item is marked, and the owner is alerted; the error still reaches the caller.
+    @Test func engineAutoCommitRecordFailureFailsClosed() throws {
+        let cf = try CollabFixture()
+        let (itemId, cId, now) = (cf.fx.item.id, cf.c.id, cf.now)
+        let agentId = cf.fx.eng1.id
+        try cf.store.writer.write { db in
+            try db.execute(sql: "INSERT INTO leaseClaim (companyId, agentId, itemId, createdAt) VALUES (?, ?, ?, ?)",
+                           arguments: [cId, agentId, itemId, now])
+            // Shadows the claim log on the writer's connection: its read in `recordEngineAutoCommit` throws.
+            try db.execute(sql: "CREATE TEMP TABLE leaseClaim (broken INTEGER)")
+        }
+        defer { try? cf.store.writer.write { db in try db.execute(sql: "DROP TABLE IF EXISTS temp.leaseClaim") } }
+        let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        try cf.fx.git.write("src/leftover.ts", "left\n", in: wt)
+        let git = cf.store.gitWorkspace(root: cf.workspace, companyId: cId)
+        #expect(throws: (any Error).self) { try cf.store.removeItemWorktree(git: git, companyId: cId, key: "ENG-1") }
+        try cf.store.writer.write { db in try db.execute(sql: "DROP TABLE IF EXISTS temp.leaseClaim") }
+        let made = try cf.fx.head("item/ENG-1")
+        let row = try cf.store.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT itemId FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [cId, made])
+        }
+        #expect(row == itemId)
+        #expect(try cf.store.workItem(id: itemId)?.taintedOrigin == true)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/leftover.ts"), companyId: cId).tainted)
+        let alerts = try cf.store.writer.read { db in
+            try Ask.filter(Column("kind") == AskKind.engineAlert && Column("subjectId") == EngineAlerts.askSubject(reason: "taint-record:\(itemId)"))
+                .fetchCount(db)
+        }
+        #expect(alerts == 1)
     }
 
 }

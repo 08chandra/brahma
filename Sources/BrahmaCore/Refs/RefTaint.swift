@@ -12,6 +12,9 @@ extension Store {
     /// The reason a `.brahma/…` file on disk that no item or hand-off accounts for is tainted (ruling 9).
     static let unplacedBrahmaReason = "a .brahma file no item accounts for"
 
+    /// The source recorded when a taint check or record could not be made and nothing better is known (fail closed, ruling 11).
+    static let taintCheckFailedSource = "a taint check that failed"
+
     /// The reason a session's taint gives what it produced.
     static func sessionReason(_ source: String) -> String { "from a session that read \(source)" }
 
@@ -271,8 +274,10 @@ extension Store {
             // A commit of another orphaned item's branch on this one (a reset onto it, a cherry-pick that reused it).
             return orphaned.values.first(where: { other in history.contains { other.commits.contains($0) } })?.source
         } catch {
-            // The history can't be read (the branch is gone, git failed): any uncleared commit of the item taints it.
-            return itemRows.first?.source
+            // The history can't be read (this item's branch is gone, git failed on it or on any orphan candidate's branch, e.g.
+            // one reset onto an unrelated root): fail closed for the whole query (ruling 11). The item's own newest source,
+            // else the company's newest uncleared one (`rows` is non-empty here).
+            return itemRows.first?.source ?? rows.first?.source ?? Self.taintCheckFailedSource
         }
     }
 
@@ -413,7 +418,7 @@ extension Store {
     }
 
     /// The owner's engine alert for a taint record that could not be made as it should (stderr when even that fails).
-    private func alertTaintRecord(companyId: String, itemId: String?, what: String, now: Date) {
+    func alertTaintRecord(companyId: String, itemId: String?, what: String, now: Date) {
         let key = (try? itemId.flatMap { try workItem(id: $0)?.key }) ?? nil
         let text = "The commits a session that read outside content made\(key.map { " on \($0)" } ?? "") could not all be recorded: \(what). "
             + (key.map { "\($0) is treated as tainted until it is merged or you vouch for it." } ?? "Check the items this agent worked on.")
