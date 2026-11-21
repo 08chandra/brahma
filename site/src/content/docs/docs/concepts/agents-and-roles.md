@@ -9,7 +9,7 @@ sidebar:
 
 An agent is a seat in a company's org chart. It has a handle (`@eng-1`), a role (`ceo`, `cto`, `engineer` and so on), a model, and usually a manager and a team. Each turn an agent takes runs the `claude` CLI with the company's tools attached over MCP.
 
-Agents talk in channels and direct messages, claim work items, review each other's work and file asks. They never deploy, merge or approve anything themselves; the engine does that when you say so.
+Agents talk in channels and direct messages, claim work items, review each other's work and file asks. They never deploy or merge anything themselves, and never take an owner decision; the engine does those things when you say so.
 
 ## How it works
 

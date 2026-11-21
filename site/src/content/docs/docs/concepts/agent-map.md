@@ -27,7 +27,7 @@ Messages travel as particles along the reporting lines. Hires, terminations, reo
 
 **Bursts.** Messages between the same pair within half a second are coalesced. Above `30` messages per second the map switches to aggregate mode: no particles, the edge pulses instead, with an `AGGREGATE · <rate> MSG/S` label. It drops back below `20`. The particle queue is capped at `400`, oldest traffic first.
 
-**What it shows about agents.** Item titles and blocker reasons are redacted by the store's redactor and cleaned before they are drawn. Vacancy notes are owner-only and redacted. `system` traffic is not drawn. After a database restore the map starts fresh. While its window is closed the map keeps its chart current but queues no animations. Actions taken in the map window (select an agent, message, add or fill a vacancy, hire) bring the main window to the front, where they open.
+**Redaction and windows.** Item titles and blocker reasons are redacted by the store's redactor and cleaned before they are drawn. Vacancy notes are owner-only and redacted. `system` traffic is not drawn. After a database restore the map starts fresh. While its window is closed the map keeps its chart current but queues no animations. Actions taken in the map window (select an agent, message, add or fill a vacancy, hire) bring the main window to the front, where they open.
 
 **Demo.** `Brahma --map-demo --map-demo-agents=300` runs the map against a read-only synthetic company in a temporary home, with no write actions.
 

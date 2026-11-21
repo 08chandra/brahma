@@ -29,7 +29,7 @@ If a proposed document changes after it was proposed, approval requires acknowle
 - `important` (the default) asks you for the ones that matter and shows internally approved PRDs as waiting for you.
 - `auto` lets ordinary asks go through once the C-suite approves and gives you an FYI.
 
-**Reserved matters** always need you, under every setting: access requests, grants, deploys, human tasks, spending, staffing, stage changes, role changes and extensions. Questions always need you too.
+**Reserved matters** always need you, under every setting: access requests, grants, deploys, human tasks, spending, staffing, stage changes, role changes and extensions. Questions (`info` asks) always need you too.
 
 **Gates.** Four ask kinds are gates: the PRD, the architecture, a sprint plan and a release. Each is a prerequisite for later work.
 
