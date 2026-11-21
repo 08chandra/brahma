@@ -25,10 +25,18 @@ extension Store {
     /// - Taint at pin time: a pin made by a session that read outside content (ML's `currentTaint`), or of tainted `@worktree`
     ///   content (`refTaint`'s rules), carries `params["taint"] = <source>` (`refTaint`: tainted; provenance
     ///   `.external("tainted-session:<source>")`).
-    /// - The secret gate (`secretGate`, with `knownValues`) runs before git or the vault sees a byte: a file with a stored
-    ///   secret's value or a secret pattern is not pinned (`WorkError.forbidden`); a diff keeps only its redacted text.
+    /// - Plan C2b: the secret gate (`SecretGate.check`, with `knownValues` and `archives`) runs before git or the vault sees a
+    ///   byte. A stored secret's value (raw, encoded or in an archive member) refuses the pin (`WorkError.invalid("<ref>
+    ///   contains a stored secret (line n); remove it before sharing")`, an engine alert, the value never echoed), and so
+    ///   does an archive that can't be scanned. A secret pattern in a text file makes the share a redacted copy instead: a
+    ///   new `F-<n>` in the vault (`secretScan = redacted`, the file's access class, `sourceDetail` = the file's canonical
+    ///   ref, which the owner's `viewOriginal` reads), returned as `WorkRef(kind: .resource, id: "<n>")` with
+    ///   `params["source"]` (and `params["taint"]`); the worktree blob is never hashed into git and no share ref is made. A
+    ///   binary with a pattern is refused. A diff keeps only its redacted text (`params["redacted"] = "1"` when the gate
+    ///   found a pattern in it).
     public func pinRef(_ ref: WorkRef, for reader: Reader, companyId: String, messageRefId: String,
-                       knownValues: [(name: String, value: String)], paths: BrahmaPaths? = nil) throws -> WorkRef {
+                       knownValues: [(name: String, value: String)], paths: BrahmaPaths? = nil,
+                       archives: (any ArchiveReader)? = nil) throws -> WorkRef {
         let r = try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: messageRefId)
         guard r.resolved.visibility == .full, let company = r.company, let subject = r.subject else {
             throw WorkError.forbidden("there is no such ref you can read")
@@ -57,10 +65,31 @@ extension Store {
             // The secret gate before git sees a byte: the company-readable object store never holds a secret. These exact bytes
             // are scanned and hashed (never read again from the file).
             let data = try file.readAll()
-            let scan = try Self.secretGate(data, shown: ref.canonical, knownValues: knownValues)
-            if let finding = scan.findings.first {
-                throw WorkError.forbidden("\(ref.canonical) looks like it contains a secret (\(finding.label)"
-                                          + (finding.line > 0 ? ", line \(finding.line)" : "") + "); remove it before sharing")
+            let ext = ArtifactKind.ext(of: ref.id)
+            let verdict = try SecretGate.check(data, ext: ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
+                                               knownValues: knownValues, store: self, companyId: companyId)
+            if case .pattern(let label, _) = verdict {
+                // A redacted copy in the vault, never a git blob.
+                guard SecretGate.isRedactable(data, ext: ext) else { throw SecretGate.binaryRefusal(ref.canonical, label: label, what: "shared") }
+                guard let paths else { throw WorkError.invalid("a redacted copy is kept in the vault; it needs the data home") }
+                if ref.isWorktree, source == nil, let item = try writer.read({ db in try RefAccess.item(db, companyId, ref.itemKey ?? "") }) {
+                    source = try contentSource(ref, item: item)
+                }
+                let provenance: Provenance
+                switch reader {
+                case .agent(let id): provenance = .agent(id)
+                case .owner: provenance = .owner
+                case .concierge: provenance = .engine
+                }
+                let fileName = ref.id.split(separator: "/").last.map(String.init) ?? ref.id
+                let number = try vaultShareCopy(companyId: companyId, data: RedactedCopy.make(data, findings: [], knownValues: knownValues),
+                                                fileName: fileName, sourceDetail: Self.unpinned(ref).canonical, scope: subject.access,
+                                                readerSet: subject.readerSet, futureHolders: subject.futureHolders, provenance: provenance,
+                                                taint: source, secretScan: .redacted, paths: paths, now: Store.now())
+                var copy = WorkRef(kind: .resource, id: String(number))
+                copy.params["source"] = Self.unpinned(ref).canonical
+                if let source { copy.params["taint"] = source }
+                return copy
             }
             let git = try refGit(workspace)
             let blob = try git.hashObject(data: data)
@@ -78,11 +107,15 @@ extension Store {
             defer { try? FileManager.default.removeItem(at: temp) }
             let worktree = workspace.appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
             let diff = try refGit(workspace).worktreeDiff(key: item.key, worktree: worktree, tempDir: temp, fs: fs)
+            // The gate (a stored value refuses), then only the redacted text is kept.
+            let raw = Data(diff.patch.utf8)
+            let verdict = try SecretGate.check(raw, ext: "patch", canonical: ref.canonical, archives: UnavailableArchiveReader(),
+                                               knownValues: knownValues, store: self, companyId: companyId)
+            if case .pattern = verdict { pinned.params["redacted"] = "1" }
             let taint = try source ?? contentSource(ref, item: item)
             let id = UUID().uuidString
             let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
-            // Only the redacted text is kept (secret patterns and stored secrets' values).
-            let data = Data(ContentScan.redact(text: diff.patch, findings: [], knownValues: knownValues).utf8)
+            let data = RedactedCopy.make(raw, findings: [], knownValues: knownValues)
             let written = try vault.write(data, area: .snapshots, name: "\(id).patch")
             do {
                 try writer.write { db in
@@ -95,13 +128,46 @@ extension Store {
                 throw error
             }
             pinned.params["snapshot"] = id
+        case .file:
+            // A committed file: nothing is written, but a stored secret's value in it refuses the share (C2b). One over the
+            // binary cap is not read here (open_ref shows it as metadata only).
+            // A ref pinned before (a share's blob) is read from its blob.
+            if let sha = pinned.rev {
+                let git = try refGit(workspace)
+                let data: Data?
+                if ref.params["share"] != nil {
+                    data = try git.catBlob(sha, binary: true)
+                } else {
+                    data = try git.blobSize(rev: sha, path: ref.id) <= SafeGit.maxBinaryBytes ? try git.catFile(rev: sha, path: ref.id, binary: true) : nil
+                }
+                if let data {
+                    _ = try SecretGate.check(data, ext: ArtifactKind.ext(of: ref.id), canonical: Self.unpinned(ref).canonical,
+                                             archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
+                                             companyId: companyId)
+                }
+            }
+        case .commit:
+            if let sha = pinned.rev {
+                let shown = try refGit(workspace).show(commit: sha)
+                _ = try SecretGate.check(Data("\(shown.subject)\nAuthor: \(shown.author)\n\n\(shown.diff.patch)".utf8), ext: "patch",
+                                         canonical: Self.unpinned(ref).canonical, archives: UnavailableArchiveReader(),
+                                         knownValues: knownValues, store: self, companyId: companyId)
+            }
+        case .diff where !ref.isWorktree && paths == nil:
+            if let head = pinned.rev {
+                let git = try refGit(workspace)
+                let raw = try git.diff(base: try git.mergeBase("main", head), head: head, path: ref.params["file"]).patch
+                _ = try SecretGate.check(Data(raw.utf8), ext: "patch", canonical: Self.unpinned(ref).canonical,
+                                         archives: UnavailableArchiveReader(), knownValues: knownValues, store: self, companyId: companyId)
+            }
         case .diff where !ref.isWorktree:
             // The patch as shared, kept in the vault's diff cache (verified by its hash when read).
             if let paths, let head = pinned.rev {
                 let git = try refGit(workspace)
                 _ = try cachedDiff(companyId: companyId, git: git, base: try git.mergeBase("main", head), head: head,
                                    file: ref.params["file"], vault: Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths)),
-                                   taint: try refTaint(pinned, companyId: companyId), knownValues: knownValues)
+                                   taint: try refTaint(pinned, companyId: companyId), knownValues: knownValues,
+                                   canonical: Self.unpinned(ref).canonical)
             }
         default:
             break
@@ -168,7 +234,12 @@ extension Store {
         }
         var details: Details
         do {
-            details = try self.details(ref, found.subject, company: found.company, readerHandle: found.handle)
+            // A pin the owner purged (C2b): a tombstone, whatever is left of its bytes.
+            if try isPurgedPin(ref, companyId: companyId) {
+                details = Details(title: Self.safe(Self.unpinned(ref).canonical), subtitle: "purged by the owner", state: .purged, pinned: ref)
+            } else {
+                details = try self.details(ref, found.subject, company: found.company, readerHandle: found.handle)
+            }
         } catch Outcome.refused {
             return blank(.refused)
         } catch is Outcome, is SafeGitError, is SafeFSError, is VaultError {
@@ -228,7 +299,7 @@ extension Store {
         case .resource(let r):
             let state: RefState = r.purgedAt != nil ? .purged : r.secretScan == .redacted ? .redacted : .ok
             return Details(title: r.tainted ? "\(r.ref) (untrusted)" : Self.safe(r.displayName),
-                           subtitle: "\(r.ref) · \(r.fileKind ?? r.kind.rawValue)", bytes: Int(r.bytes),
+                           subtitle: "\(r.ref) · \(r.fileKind ?? r.kind.rawValue)", bytes: r.purgedAt != nil ? nil : Int(r.bytes),
                            provenance: Provenance(raw: r.provenance) ?? .external(r.provenance), tainted: r.tainted,
                            taintReason: r.taintReason, state: state, pinned: ref)
         case .artifact(let a):
@@ -337,7 +408,8 @@ extension Store {
                     """, arguments: [item.companyId, id, RefSnapshot.worktreeDiff])
             }) else { throw Outcome.missing }
             return Details(title: Self.safe(title + " (uncommitted, as shared)"), subtitle: "\(snapshot.bytes) bytes", bytes: snapshot.bytes,
-                           tainted: snapshot.tainted, taintReason: snapshot.taintReason, pinned: ref)
+                           tainted: snapshot.tainted, taintReason: snapshot.taintReason,
+                           state: ref.params["redacted"] == "1" ? .redacted : .ok, pinned: ref)
         }
         if ref.isWorktree {
             let fs = try SafeFS(workspace: workspace, ownHandle: nil)
@@ -363,6 +435,27 @@ extension Store {
         var pinned = ref
         pinned.rev = head
         return Details(title: title, subtitle: Self.diffStat(diff), newer: newer, state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
+    }
+
+    /// Whether `ref` is a pin whose bytes the owner purged (`Store.purge`): its share's `messageRef` row is `purged` or a
+    /// purge log names its share ref, or its vault snapshot row is purged. Bound to the company.
+    func isPurgedPin(_ ref: WorkRef, companyId: String) throws -> Bool {
+        let share = ref.params["share"], snapshot = ref.params["snapshot"]
+        guard share != nil || snapshot != nil else { return false }
+        return try writer.read { db in
+            if let share {
+                if try Bool.fetchOne(db, sql: """
+                    SELECT EXISTS(SELECT 1 FROM messageRef WHERE companyId = ? AND id = ? AND state = 'purged')
+                        OR EXISTS(SELECT 1 FROM purgeLog WHERE companyId = ? AND instr(gitRefs, ?) > 0)
+                    """, arguments: [companyId, share, companyId, "\"\(SafeGit.sharesPrefix)\(share)\""]) == true { return true }
+            }
+            if let snapshot {
+                if try Bool.fetchOne(db, sql: """
+                    SELECT EXISTS(SELECT 1 FROM refSnapshot WHERE companyId = ? AND id = ? AND purgedAt IS NOT NULL)
+                    """, arguments: [companyId, snapshot]) == true { return true }
+            }
+            return false
+        }
     }
 
     /// `main` and the branches of the company's open items: what an agent-named sha must be reachable from.
