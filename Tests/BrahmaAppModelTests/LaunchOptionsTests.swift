@@ -84,6 +84,28 @@ import BrahmaCore
         #expect(SelectTarget("map") == .map)
     }
 
+    @Test func mapSkin() {
+        #expect(LaunchOptions.parse(["/x", "--map-skin=office"]).mapSkin == .office)
+        #expect(LaunchOptions.parse(["/x", "--map-skin=org"]).mapSkin == .org)
+        #expect(LaunchOptions.parse(["/x", "--map-skin=hive"]).mapSkin == nil)
+        #expect(LaunchOptions.parse(["/x", "--map-skin="]).mapSkin == nil)
+        #expect(LaunchOptions.parse(["/x"]).mapSkin == nil)
+        // `--map-skin` implies nothing else.
+        var expected = LaunchOptions()
+        expected.mapSkin = .office
+        #expect(LaunchOptions.parse(["/x", "--map-skin=office"]) == expected)
+    }
+
+    @Test func isHarness() {
+        #expect(!LaunchOptions().isHarness)
+        #expect(!LaunchOptions.parse(["/x", "-psn_0_123", "--company", "Acme", "--select", "map"]).isHarness)
+        #expect(!LaunchOptions.parse(["/x", "--map-skin=office"]).isHarness)
+        #expect(LaunchOptions.parse(["/x", "--smoke-test"]).isHarness)
+        #expect(LaunchOptions.parse(["/x", "--ui-snapshot", "/tmp/a.png"]).isHarness)
+        #expect(LaunchOptions.parse(["/x", "--map-demo"]).isHarness)
+        #expect(LaunchOptions.parse(["/x", "--map-bench=20"]).isHarness)
+    }
+
     @Test func applyMapSelectsMissionControlAndEnsuresTheController() async throws {
         let (store, paths) = try makeHome()
         let seeded = try seedAcme(store, paths)

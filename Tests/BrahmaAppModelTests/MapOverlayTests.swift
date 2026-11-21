@@ -45,6 +45,23 @@ import Foundation
         #expect((long.first?.text.count ?? 999) < 80)
     }
 
+    @Test func revealChipForThreeSeconds() {
+        #expect(MapOverlay.revealDuration == 3)
+        let reveal = MapChip(text: "YOU FOUND THE OFFICE", isWarning: false, dismissible: false)
+        let at: TimeInterval = 50
+        #expect(MapOverlay.chips(stats: stats(), followHandle: nil, now: at, revealAt: at) == [reveal])
+        #expect(MapOverlay.chips(stats: stats(), followHandle: nil, now: at + 2.9, revealAt: at) == [reveal])
+        #expect(MapOverlay.chips(stats: stats(), followHandle: nil, now: at + 3.0, revealAt: at) == [])
+        #expect(MapOverlay.chips(stats: stats(), followHandle: nil, now: at + 2.9, revealAt: nil) == [])
+        #expect(MapOverlay.chips(stats: stats(), followHandle: nil, now: at + 2.9) == [])
+        // Not before the reveal (map time never runs backwards, but a stale value must not show it early).
+        #expect(MapOverlay.chips(stats: stats(), followHandle: nil, now: at - 0.1, revealAt: at) == [])
+        // First, ahead of the other chips.
+        let all = MapOverlay.chips(stats: stats(aggregate: true, rate: 9, dropped: 2, lastDropAt: at), followHandle: "cto",
+                                   now: at + 1, revealAt: at)
+        #expect(all.map(\.text) == ["YOU FOUND THE OFFICE", "AGGREGATE · 9 MSG/S", "FOLLOWING @cto", "DROPPED 2"])
+    }
+
     @Test func hoverCardClampedIntoPanel() {
         let bounds = MapPoint2(x: 800, y: 600)
         let size = MapPoint2(x: 240, y: 160)

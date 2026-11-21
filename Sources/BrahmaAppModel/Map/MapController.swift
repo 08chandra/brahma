@@ -52,6 +52,8 @@ public final class MapController {
     nonisolated static let feedPages = 10
 
     public static func modeKey(_ id: String) -> String { "brahma.map.mode.\(id)" }
+    /// The owner's office unlock (Plan 4c), this Mac's user, independent of company.
+    public static let officeUnlockedKey = "brahma.map.office.unlocked"
 
     // MARK: Setup
 
@@ -60,7 +62,7 @@ public final class MapController {
     @ObservationIgnored let source: MapSource
     @ObservationIgnored let people: (any MapPeopleProviding)?
     @ObservationIgnored let vault: (any SecretVault)?
-    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored let defaults: UserDefaults
     @ObservationIgnored let clock: @Sendable () -> Date
     @ObservationIgnored private let createdAt: Date
 
@@ -92,6 +94,11 @@ public final class MapController {
     public internal(set) var isRunning = false
     public internal(set) var isInvalidated = false
     public internal(set) var reseeds = 0
+    /// The owner has found the office (`unlockOffice()`); read from `defaults` in `init`, never cleared (no re-lock in 4c).
+    public internal(set) var officeUnlocked: Bool
+    /// The map time of the unlock in this controller, for the reveal chip (`MapOverlay.revealDuration`); nil otherwise.
+    public internal(set) var officeRevealAt: TimeInterval?
+    @ObservationIgnored var officeUnlock = OfficeUnlock()
 
     // Live feed bookkeeping.
     /// The last live snapshot `sync` took (7b's `exitReplay` re-syncs it; `poll` re-applies it when vacancies or people change).
@@ -169,7 +176,11 @@ public final class MapController {
                                        items: made.currentItems, blockers: made.blockers, traffic: SyntheticTraffic(seed: seed),
                                        rng: SplitMix64(seed: seed &+ 0x5EED), rate: Swift.max(0, rate), last: now, lastReorg: now)
         }
-        mode = defaults.string(forKey: Self.modeKey(companyId)).flatMap(MapMode.init(rawValue:)) ?? .org
+        let unlocked = defaults.bool(forKey: Self.officeUnlockedKey)
+        officeUnlocked = unlocked
+        let stored = defaults.string(forKey: Self.modeKey(companyId)).flatMap(MapMode.init(rawValue:)) ?? .org
+        // A stored office for an owner who has not unlocked it falls back to org.
+        mode = stored == .office && !unlocked ? .org : stored
         if let world = synthetic { model.apply(Self.inputs(world), now: mapNow()) }
     }
 
@@ -181,9 +192,11 @@ public final class MapController {
 
     // MARK: Derived
 
-    /// The subtrees drawn as stubs: the tree's default collapse, the owner's overrides, and every ancestor of the followed
-    /// or highlighted agent expanded.
+    /// The subtrees drawn as stubs (none in the office): the tree's default collapse, the owner's overrides, and every
+    /// ancestor of the followed or highlighted agent expanded.
     public var collapsed: Set<String> {
+        // The office has no stubs: every agent has a desk.
+        if mode == .office { return [] }
         var active = 0
         for a in model.agents.values where a.state != .killed { active += 1 }
         return model.tree.collapsed(defaults: model.tree.defaultCollapsed(activeCount: active), overrides: orgOverrides,

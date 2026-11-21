@@ -1,13 +1,16 @@
 import Foundation
 import BrahmaCore
 
-/// The map's view of the company. Plan 4c appends `hive` and `village`.
+/// The map's view of the company: the org chart, or (Plan 4c) the office. `org` stays first.
 public enum MapMode: String, Codable, CaseIterable, Equatable, Sendable {
     case org
+    /// The easter-egg office skin (Plan 4c): shown only once the owner has unlocked it (`MapController.officeUnlocked`).
+    case office
 
     public var title: String {
         switch self {
         case .org: "ORG"
+        case .office: "OFFICE"
         }
     }
 }

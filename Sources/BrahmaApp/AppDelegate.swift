@@ -142,6 +142,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .success(let booted):
             let model = booted.model
             let options = self.options
+            // A harness run never reads or writes the owner's office unlock (spec §4.3): the map keeps its mode and unlock in
+            // a volatile per-process suite, cleared at launch.
+            if options.isHarness {
+                let suite = "brahma.harness.\(ProcessInfo.processInfo.processIdentifier)"
+                UserDefaults.standard.removePersistentDomain(forName: suite)
+                model.mapDefaults = UserDefaults(suiteName: suite)!
+            }
             // The live map reloads the redactor from this engine's vault too (`AppModel.mapVault`), so a secret set while the
             // engine is not running here (a terminal `brahma run` owns it) is still redacted on the map.
             let engine = EngineHost(paths: model.paths, store: model.store, ownerKeyStore: booted.ownerKeyStore,
@@ -195,7 +202,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `--map-demo`: the deterministic synthetic company (read-only: no write actions, clicks never change the selection)
     /// replaces the map's controller, and the map window opens as soon as the main window has registered how to open it.
     private func launchMapDemo(model: AppModel, options: LaunchOptions) {
-        model.installMapController(MapController(source: .synthetic(agents: options.mapDemoAgents, rate: 50, seed: 42)))
+        model.installMapController(MapController(source: .synthetic(agents: options.mapDemoAgents, rate: 50, seed: 42),
+                                                 defaults: model.mapDefaults))
         Task { @MainActor [weak self] in
             let deadline = AwakeTime.deadline(after: .seconds(20))
             while self?.openMapWindow == nil, AwakeTime.now < deadline { try? await Task.sleep(for: .milliseconds(50)) }

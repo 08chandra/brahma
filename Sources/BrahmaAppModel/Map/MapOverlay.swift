@@ -17,12 +17,19 @@ public enum MapOverlay {
     /// The DROPPED chip shows this long after the queue last dropped traffic.
     public static let droppedChipSeconds: TimeInterval = 10
     static let handleLimit = 40
+    /// The `YOU FOUND THE OFFICE` chip shows this long after the unlock (Plan 4c).
+    public static let revealDuration: TimeInterval = 3
 
+    /// `YOU FOUND THE OFFICE` first for `revealDuration` from `revealAt` (`MapController.officeRevealAt`),
     /// `AGGREGATE · <rate> MSG/S` while the queue aggregates, `FOLLOWING @h` while following (`followHandle` is the raw handle,
     /// without the `@`; it is cleaned here), `DROPPED <n>` for `droppedChipSeconds` after `stats.lastDropAt`. `now` and
     /// `lastDropAt` are map time.
-    public static func chips(stats: MapStats, followHandle: String?, now: TimeInterval) -> [MapChip] {
+    public static func chips(stats: MapStats, followHandle: String?, now: TimeInterval,
+                             revealAt: TimeInterval? = nil) -> [MapChip] {
         var chips: [MapChip] = []
+        if let revealAt, now >= revealAt, now - revealAt < revealDuration {
+            chips.append(MapChip(text: "YOU FOUND THE OFFICE", isWarning: false, dismissible: false))
+        }
         if stats.aggregate {
             let rate = stats.rate.isFinite ? Int(max(0, stats.rate).rounded()) : 0
             chips.append(MapChip(text: "AGGREGATE · \(rate) MSG/S", isWarning: true, dismissible: false))

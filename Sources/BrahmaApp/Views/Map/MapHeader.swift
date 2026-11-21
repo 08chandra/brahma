@@ -49,7 +49,7 @@ struct MapHeader: View {
 
             followMenu
 
-            if MapMode.allCases.count > 1 {
+            if false { // Task 11
                 Segmented(options: MapMode.allCases.map { ($0, $0.title) }, selection: controller.mode, label: "Map mode") {
                     controller.mode = $0
                 }

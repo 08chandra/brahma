@@ -124,8 +124,15 @@ public struct LaunchOptions: Equatable, Sendable {
     /// `--map-bench=<seconds>`: run the map benchmark for that long. It implies `--map-demo` (the bench runs on the demo
     /// company's map window), so `--map-demo` need not be given with it.
     public var mapBench: Double?
+    /// `--map-skin=org|office`: the demo/bench/snapshot map opens in that mode without unlocking or persisting anything
+    /// (Plan 4c). Implies nothing else.
+    public var mapSkin: MapMode?
 
     public init() {}
+
+    /// A scripted run (smoke, snapshot, map demo, map bench): the map controller gets a volatile defaults suite, so it never
+    /// reads or writes the owner's office unlock (spec §4.3).
+    public var isHarness: Bool { smokeTest || snapshotPath != nil || mapDemo || mapBench != nil }
 
     public static func parse(_ args: [String]) -> LaunchOptions {
         var o = LaunchOptions()
@@ -147,6 +154,11 @@ public struct LaunchOptions: Equatable, Sendable {
             }
             if args[i].hasPrefix("--map-bench=") {
                 if let v = Double(args[i].dropFirst("--map-bench=".count)), v.isFinite, v > 0 { o.mapBench = v }
+                i += 1
+                continue
+            }
+            if args[i].hasPrefix("--map-skin=") {
+                o.mapSkin = MapMode(rawValue: String(args[i].dropFirst("--map-skin=".count)))
                 i += 1
                 continue
             }

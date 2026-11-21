@@ -84,6 +84,9 @@ public final class AppModel {
     public let secretVault: any SecretVault
     /// Where the resource drops keep the owner's advisory acknowledgments (`advisoryAck.<companyId>`): `.standard` in the app.
     @ObservationIgnored public var dropDefaults: UserDefaults = .standard
+    /// Where every map controller this model builds keeps its mode and the owner's office unlock: `.standard` in the app, a
+    /// volatile `brahma.harness.<pid>` suite in a harness run (`LaunchOptions.isHarness`).
+    @ObservationIgnored public var mapDefaults: UserDefaults = .standard
     /// The resource the owner confirmed purging in the library's dialog (`purge(resource:)` refuses any other).
     public var confirmPurge: String?
     /// Work › Handbook of the selected company (`ensureHandbook()` makes it; dropped when the company or store changes).
@@ -491,7 +494,7 @@ public final class AppModel {
         }
         guard !storeClosed, let id = selectedCompanyId else { return nil }
         let controller = MapController(source: .live(store: store, companyId: id), people: mapPeopleProvider,
-                                       vault: mapVault, clock: clock)
+                                       vault: mapVault, defaults: mapDefaults, clock: clock)
         controller.sync(snapshot: snapshot)
         mapController = controller
         return controller
