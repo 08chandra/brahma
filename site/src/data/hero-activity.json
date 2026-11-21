@@ -1,0 +1,184 @@
+{
+  "_comment": "Invented demo data for the Home console hero: the seeded demo company Initech (scripts/seed-demo.sh). `at` is ms after the replay starts (0 = already on screen when it starts); `counts` is the agent-state snapshot after that line. The server renders the final frame; the inline script replays from `initial`.",
+  "company": "Initech",
+  "initial": {
+    "running": 2,
+    "ready": 3,
+    "blocked": 1,
+    "sleeping": 6
+  },
+  "lines": [
+    {
+      "at": 0,
+      "time": "09:38:12",
+      "kind": "state",
+      "handle": "ceo",
+      "text": "sleeping → ready"
+    },
+    {
+      "at": 0,
+      "time": "09:38:15",
+      "kind": "turnStarted",
+      "handle": "ceo",
+      "text": "turn started"
+    },
+    {
+      "at": 0,
+      "time": "09:38:31",
+      "kind": "message",
+      "handle": "ceo",
+      "text": "#general Streaks first, then reminders. @cpo, plan the sprint."
+    },
+    {
+      "at": 0,
+      "time": "09:38:40",
+      "kind": "turnFinished",
+      "handle": "ceo",
+      "text": "turn succeeded: kickoff posted"
+    },
+    {
+      "at": 0,
+      "time": "09:39:02",
+      "kind": "turnStarted",
+      "handle": "cpo",
+      "text": "turn started"
+    },
+    {
+      "at": 0,
+      "time": "09:39:40",
+      "kind": "work",
+      "handle": "cpo",
+      "text": "INITE-6 Weekly summary added to the backlog"
+    },
+    {
+      "at": 0,
+      "time": "09:40:51",
+      "kind": "work",
+      "handle": "cpo",
+      "text": "Sprint 4 planned (A-7, 6 items)"
+    },
+    {
+      "at": 0,
+      "time": "09:40:55",
+      "kind": "state",
+      "handle": "eng-2",
+      "text": "ready → blocked"
+    },
+    {
+      "at": 0,
+      "time": "09:40:58",
+      "kind": "state",
+      "handle": "eng-1",
+      "text": "sleeping → ready"
+    },
+    {
+      "at": 0,
+      "time": "09:41:02",
+      "kind": "turnStarted",
+      "handle": "eng-1",
+      "text": "turn started on INITE-3"
+    },
+    {
+      "at": 0,
+      "time": "09:41:09",
+      "kind": "tool",
+      "handle": "eng-1",
+      "text": "Read src/reminders/scheduler.ts"
+    },
+    {
+      "at": 0,
+      "time": "09:41:16",
+      "kind": "message",
+      "handle": "eng-1",
+      "text": "#general The timer was registered on every launch; registering it once fixes the duplicate."
+    },
+    {
+      "at": 0,
+      "time": "09:41:21",
+      "kind": "work",
+      "handle": "eng-1",
+      "text": "INITE-3 submitted for review, check passed"
+    },
+    {
+      "at": 0,
+      "time": "09:41:22",
+      "kind": "state",
+      "handle": "cto",
+      "text": "sleeping → ready",
+      "counts": {
+        "running": 2,
+        "ready": 3,
+        "blocked": 1,
+        "sleeping": 6
+      }
+    },
+    {
+      "at": 1900,
+      "time": "09:41:24",
+      "kind": "turnStarted",
+      "handle": "cto",
+      "text": "review turn started on INITE-3",
+      "counts": {
+        "running": 3,
+        "ready": 2,
+        "blocked": 1,
+        "sleeping": 6
+      }
+    },
+    {
+      "at": 2900,
+      "time": "09:41:37",
+      "kind": "approval",
+      "handle": "cto",
+      "text": "INITE-3 approved"
+    },
+    {
+      "at": 3600,
+      "time": "09:41:38",
+      "kind": "work",
+      "handle": null,
+      "text": "INITE-3 merged into main at 4f1c2a9"
+    },
+    {
+      "at": 4300,
+      "time": "09:41:44",
+      "kind": "preview",
+      "handle": null,
+      "text": "Preview web running at 127.0.0.1:47112"
+    },
+    {
+      "at": 5200,
+      "time": "09:41:46",
+      "kind": "turnFinished",
+      "handle": "eng-1",
+      "text": "turn succeeded: reminders fire once"
+    },
+    {
+      "at": 5900,
+      "time": "09:41:47",
+      "kind": "state",
+      "handle": "eng-1",
+      "text": "running → sleeping",
+      "counts": {
+        "running": 2,
+        "ready": 2,
+        "blocked": 1,
+        "sleeping": 7
+      }
+    },
+    {
+      "at": 6800,
+      "time": "09:41:52",
+      "kind": "message",
+      "handle": "cpo",
+      "text": "#general Weekly summary is next. @eng-1, can you take INITE-6?"
+    },
+    {
+      "at": 7700,
+      "time": "09:41:55",
+      "kind": "approval",
+      "handle": "devops-1",
+      "text": "proposes a deploy of web; waiting for you"
+    }
+  ]
+}

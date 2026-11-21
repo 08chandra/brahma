@@ -1,0 +1,34 @@
+{
+  "metadata": { "formatVersion": { "major": 0, "minor": 6, "patch": 0 }, "generator": "fixture: hand-trimmed from a real swiftc symbol graph" },
+  "module": { "name": "BrahmaCore", "platform": { "architecture": "arm64", "vendor": "apple", "operatingSystem": { "name": "macosx", "minimumVersion": { "major": 14, "minor": 0 } } } },
+  "symbols": [
+    {
+      "kind": { "identifier": "swift.struct", "displayName": "Structure" },
+      "identifier": { "precise": "s:10BrahmaCore3FooV", "interfaceLanguage": "swift" },
+      "pathComponents": ["Foo"],
+      "names": { "title": "Foo" },
+      "docComment": { "uri": "file:///Users/example/repo/Sources/BrahmaCore/Work/Foo.swift", "lines": [{ "text": "A unit of work." }] },
+      "accessLevel": "public",
+      "location": { "uri": "file:///Users/example/repo/Sources/BrahmaCore/Work/Foo.swift", "position": { "line": 3, "character": 14 } }
+    },
+    {
+      "kind": { "identifier": "swift.method", "displayName": "Instance Method" },
+      "identifier": { "precise": "s:10BrahmaCore3FooV3baryyF", "interfaceLanguage": "swift" },
+      "pathComponents": ["Foo", "bar()"],
+      "names": { "title": "bar()" },
+      "accessLevel": "public",
+      "location": { "uri": "file:///Users/example/repo/Sources/BrahmaCore/Work/Foo.swift", "position": { "line": 5, "character": 16 } }
+    },
+    {
+      "kind": { "identifier": "swift.class", "displayName": "Class" },
+      "identifier": { "precise": "s:10BrahmaCore12OrchestratorC", "interfaceLanguage": "swift" },
+      "pathComponents": ["Orchestrator"],
+      "names": { "title": "Orchestrator" },
+      "accessLevel": "public",
+      "location": { "uri": "file:///Users/example/repo/Sources/BrahmaCore/Orchestrator.swift", "position": { "line": 10, "character": 19 } }
+    }
+  ],
+  "relationships": [
+    { "kind": "memberOf", "source": "s:10BrahmaCore3FooV3baryyF", "target": "s:10BrahmaCore3FooV" }
+  ]
+}

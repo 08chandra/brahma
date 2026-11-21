@@ -1,0 +1,15 @@
+{
+  "metadata": { "formatVersion": { "major": 0, "minor": 6, "patch": 0 }, "generator": "fixture: a dependency graph that must be ignored" },
+  "module": { "name": "ArgumentParser", "platform": {} },
+  "symbols": [
+    {
+      "kind": { "identifier": "swift.protocol", "displayName": "Protocol" },
+      "identifier": { "precise": "s:14ArgumentParser15ParsableCommandP", "interfaceLanguage": "swift" },
+      "pathComponents": ["ParsableCommand"],
+      "names": { "title": "ParsableCommand" },
+      "accessLevel": "public",
+      "location": { "uri": "file:///Users/example/repo/.build/checkouts/swift-argument-parser/Sources/ArgumentParser/ParsableCommand.swift", "position": { "line": 1, "character": 1 } }
+    }
+  ],
+  "relationships": []
+}

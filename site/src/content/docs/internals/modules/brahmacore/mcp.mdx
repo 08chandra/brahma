@@ -1,0 +1,32 @@
+---
+title: MCP
+description: "A minimal MCP server over newline-delimited JSON-RPC on stdio, and the company tools agents call: work, messages, asks, memory, handbook, safety, deploy."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+`MCPServer` speaks JSON-RPC lines on stdin and stdout; nothing else goes to stdout. It serves `CompanyTools`, the tools one agent may call: items, dependencies, comments, leases; messages; decisions and asks to the owner; memory and handbook; `request_access`, `request_secret` and `use_secret`; previews and deploys; `propose_extension`. Every call is attributed to the acting agent, checked against the store's live turn credential, filtered by role, and refused while the session is tainted unless the tool is taint-safe. Agent-written text is listed as sorted-key JSON or quoted blocks, so no title can forge another entry. It runs as `brahma mcp`, one process per turn.
+
+## Key types
+
+- [`MCPServer`](/api/brahmacore/documentation/brahmacore/mcpserver/) — the JSON-RPC loop, `serve(input:output:)`.
+- [`CompanyTools`](/api/brahmacore/documentation/brahmacore/companytools/) — the tool set and its authorisation.
+- [`ToolSpec`](/api/brahmacore/documentation/brahmacore/toolspec/) — one tool's name, description and schema.
+- [`ToolError`](/api/brahmacore/documentation/brahmacore/toolerror/) — a failure the agent sees as an `isError` result.
+- [`JSONValue`](/api/brahmacore/documentation/brahmacore/jsonvalue/) — the JSON the server reads and writes.
+
+## How it connects
+
+- **Called by the CLI.** `brahma mcp` resolves the turn credential from the store and builds `MCPServer(tools: CompanyTools(...))`.
+- **Calls Store.** Every tool writes straight to the shared store; a call first checks `store.turnCredentialIsLive`.
+- **Calls Messaging.** Posts go through `MessageRouter`.
+- **Calls Safety and Org.** `TaintPolicy` decides which tools a tainted session may still call; the role filter is built from `CompanyToolNames`.
+- **Calls Memory.** `search_memory` and `recall` query `MemoryIndex`.
+- **Read by Sandbox.** The compiled `claude` settings file denies the high-risk tool names as `mcp__company__<tool>` permission rules.
+
+<ModuleFacts module="BrahmaCore" area="MCP" />
+
+<SourceLink path="Sources/BrahmaCore/MCP" />

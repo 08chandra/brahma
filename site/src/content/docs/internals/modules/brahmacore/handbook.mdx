@@ -1,0 +1,32 @@
+---
+title: Handbook
+description: "The company handbook: pages with append-only revisions, per-section access, engine-rendered auto pages, and the mirror written into the workspace."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+The handbook is the company's own documentation: pages named by a normalised path, each a chain of append-only revisions, split into sections by heading. `KBAccess` decides who may read which section, through the same access engine company memory uses, so a restriction marker on a heading caps everything under it. `AutoPages` are the pages the engine renders from live data and nobody else writes. `HandbookExporter` mirrors the handbook into the workspace as Markdown files. `HandbookPath` normalises page names so the same name typed two ways is one page.
+
+## Key types
+
+- [`KBPage`](/api/brahmacore/documentation/brahmacore/kbpage/), [`KBRevision`](/api/brahmacore/documentation/brahmacore/kbrevision/) and [`KBSection`](/api/brahmacore/documentation/brahmacore/kbsection/) — a page, one revision, one section.
+- [`KBAccess`](/api/brahmacore/documentation/brahmacore/kbaccess/) — who may read a page or a section.
+- [`KBView`](/api/brahmacore/documentation/brahmacore/kbview/) — a page as one reader may see it.
+- [`AutoPages`](/api/brahmacore/documentation/brahmacore/autopages/) and [`HandbookRefresh`](/api/brahmacore/documentation/brahmacore/handbookrefresh/) — the engine-rendered pages and when they refresh.
+- [`HandbookExporter`](/api/brahmacore/documentation/brahmacore/handbookexporter/) — the Markdown mirror.
+- [`HandbookPath`](/api/brahmacore/documentation/brahmacore/handbookpath/) — a normalised page name.
+
+## How it connects
+
+- **Called by Store.** `Store+Handbook` filters every read and backlink through `KBAccess.canReadPage` and `KBAccess.canRead`.
+- **Called by MCP.** `search_kb`, `kb_read` and `kb_write` call `store.kbRead` and `store.kbWrite`.
+- **Called by Orchestrator.** Each tick, `HandbookRefresh.run` re-renders the auto pages of companies whose interval is due.
+- **Called by Backup.** A company export writes the mirror through `HandbookExporter.export`.
+- **Calls Memory.** `KBAccess` loads the reader's `ReaderContext`; `AutoPages` reads taint through `MemoryIngest`.
+
+<ModuleFacts module="BrahmaCore" area="Handbook" />
+
+<SourceLink path="Sources/BrahmaCore/Handbook" />

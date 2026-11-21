@@ -1,0 +1,29 @@
+---
+title: Git
+description: "One company workspace as a git repository: a worktree per leased item, engine merges into main, safe exports, repository import, and the worktree-records lock."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+`GitWorkspace` is the engine's view of one company workspace as a git repository. The workspace is the repository, on branch `main`; each leased item gets a worktree under `.brahma/wt/<KEY>` on branch `item/<KEY>`. Every git command runs with a timeout, a controlled child environment and `core.hooksPath=/dev/null`, so nothing an agent commits can run as an engine hook. The area also does the engine's merges into `main`, the `.git`-free exports previews and checks run in, repository import at company creation, and `RepositoryGate`, the in-process half of the worktree-records lock shared by every engine task and MCP tool call.
+
+## Key types
+
+- [`GitWorkspace`](/api/brahmacore/documentation/brahmacore/gitworkspace/) — the repository, its worktrees, merges, exports and imports.
+- [`GitError`](/api/brahmacore/documentation/brahmacore/giterror/) — a git command that did not succeed.
+- [`GitChange`](/api/brahmacore/documentation/brahmacore/gitchange/) — one line of `git diff --name-status`.
+- [`ChangeStats`](/api/brahmacore/documentation/brahmacore/changestats/) — what `changeStats` measured.
+
+## How it connects
+
+- **Called by Orchestrator.** A turn with a lease holds a `GitWorkspace` for its worktree; plan turns record a barrier head.
+- **Called by Store.** `Store+Merge` refuses merges when the installed git is too old (`GitWorkspace.installedGitMerges`), and the main guard compares the recorded `main` with the real head.
+- **Called by Preview and Org.** `EngineExport` wraps the workspace's export; `RepoImport` imports a repository through `GitWorkspace.importRepository`.
+- **Calls Turns and Util.** Child processes get their environment from `ChildEnvironment`; every git launch reports to `EngineGitGuard`, and the safe-file errors are `UnsafeEngineFile`.
+
+<ModuleFacts module="BrahmaCore" area="Git" />
+
+<SourceLink path="Sources/BrahmaCore/Git" />
