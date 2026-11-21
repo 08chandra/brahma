@@ -67,6 +67,17 @@
 18. **PR-mode trust is a trust list the owner controls.** Changes authored by a listed GitHub account, or merged through PRs a listed account approved, are trusted. The list starts with only the connecting account. Everything else is tainted until `trust-import` (§8.5.3).
 19. **Dogfood #2 is the content pack's 15–25-page cited research report,** built to PDF/EPUB (§13.3).
 
+### Later decision (owner, binding)
+
+20. **"I want Brahma to be able to use any LLM API."** The design is a controller's call, recorded in §8.2.5:
+    - X1's engine-side model proxy becomes a **provider gateway**. Every runtime talks only to the gateway, and the gateway routes to the configured provider. It translates between the Anthropic Messages wire format (what `claude` speaks) and each provider's format, including tool calls and streaming.
+    - Providers: the Anthropic API; any OpenAI-compatible endpoint (OpenAI, OpenRouter, Together, Groq, DeepSeek, Mistral, xAI and similar); Google Gemini; AWS Bedrock; Google Vertex; Azure OpenAI; and local servers (Ollama, LM Studio, llama.cpp, vLLM).
+    - Keys stay in the Keychain through `brahma secret set`, and agents never see them, as in decision 1.
+    - Models can be chosen per company, per role and per agent. Subscription login stays Claude-only; every other provider is API-key or local.
+    - A capability probe gates each model before use. A model that fails is unavailable for agent turns (fail closed), but may still serve tool-free requests if it passes that subset. The owner sees the probe results.
+    - Safety is unchanged: the sandbox, taint tracking, P1–P8, egress only through the gateway, and per-provider spend caps. Fully local models let a company run offline.
+    - Sequencing: the gateway with the Anthropic API and OpenAI-compatible providers is in X1. Gemini, Bedrock, Vertex, Azure OpenAI and local servers are a new sub-plan, **X1b**, right after X1 (§13).
+
 ### Standing constraints (unchanged)
 
 - The owner never pastes tokens in chat. Agents never handle secrets.
@@ -97,10 +108,11 @@ Brahma's edge, per the research, is **governance and git discipline on the owner
 
 The research also finds three weaknesses that could end the product, whatever its features:
 
-1. **One vendor controls everything.** Anthropic sets the model, the price, the limits, the authentication rules, and runs a fast-improving competing product (Claude Code Projects). If metered `claude -p` use resumes, or the terms are read more strictly, Brahma's economics and access change overnight. Decisions 1–3 and 9 hedge this:
+1. **One vendor controls everything.** Anthropic sets the model, the price, the limits, the authentication rules, and runs a fast-improving competing product (Claude Code Projects). If metered `claude -p` use resumes, or the terms are read more strictly, Brahma's economics and access change overnight. Decisions 1–3, 9 and 20 hedge this:
    - an API-key path that is always legitimate;
    - pacing that looks like ordinary individual use;
-   - a second runtime.
+   - a second runtime;
+   - any model API through one governed gateway (decision 20), so no single vendor's model is required.
 2. **It only does software, and only inside one repo on one awake laptop.** The v2 yardstick (v2 §1.2) has always been "any industry". Decision 7 makes that real now, without diluting the engine. Decisions 10–12 take Brahma off the single awake laptop and into the tools teams already use.
 3. **No proof.** No public benchmark measures multi-agent delivery into an existing repo (research). Whoever publishes measured results first gains an advantage that bundled vendor features do not cancel. Decisions 5 and 13 make Brahma measurable.
 
@@ -114,6 +126,7 @@ The riskiest addition is decision 8. Brahma acting in the world — sending emai
 - **Tagline:** *Brahma is the governed local AI org. Agents propose, the engine verifies and lands, you approve.*
 - **What we say:**
   - "runs Claude Code and Codex on your own plans";
+  - "uses any model API you choose, per role, through one governed gateway" (decision 20);
   - "builds software, documents, media, product designs and business plans";
   - "acts in the world only through accounts you connect, within limits you set";
   - "measured, not claimed".
@@ -129,6 +142,7 @@ The riskiest addition is decision 8. Brahma acting in the world — sending emai
 |---|---|---|
 | G1 | **Runtime seam.** One `AgentRuntime` interface owns everything runtime-specific: argv, environment, settings, stream parsing, session resume, usage signals, taint signal, probe gates and canary shape. The Claude adapter moves onto it with byte-identical turns. Gemini and others can be added as one adapter each. | X1 |
 | G2 | **API-key billing** per company: `subscription`, `apiKey`, or `subscription → apiKey` fallback under an owner dollar cap. The key is engine-held and injected by an engine model proxy, never put in an agent-reachable environment. | X1 |
+| G2b | **Any LLM API** (decision 20). The proxy is a provider gateway: Anthropic and OpenAI-compatible providers in X1; Gemini, Bedrock, Vertex, Azure OpenAI and local servers in X1b. Model routes per company, role and agent; a capability probe gates each model; per-provider caps. | X1, X1b |
 | G3 | **Conservative pacing default**, as an owner-wide ceiling over company modes. Opt-up presets are `standard` and `full`. | X1 |
 | G4 | **Codex adapter** with the same sandbox and taint guarantees, enforced by probe gates. Where a guarantee cannot be proven, the runtime is unavailable for that shape. | X2 |
 | G5 | **Any product.** Pack schema v2 (model classes, land gates, rubrics, check kits, editions); four new built-in packs (`content`, `media`, `physical`, `business`); a sandboxed check kit; engine-installed pinned toolchains; new previews (audio, EPUB, STEP, image diff); a size policy and blob store for large media; "land" and "edition" defined for non-code work. | X3 |
@@ -273,6 +287,7 @@ On **Workspace** and **Full** profiles the existing caveats apply unchanged: age
   - Claude: `deep=opus`, `standard=sonnet`, `fast=haiku` (today's behaviour);
   - Codex: set by the X2 probe from the CLI's model list, and owner-editable with `brahma settings runtime-models codex deep=<model> …` (new).
 - **A missing class blocks.** If a class has no mapping on a runtime, that runtime is unavailable for agents needing it. It never falls back to another class **(controller's call)**.
+- **Model routes override the mapping (decision 20, §8.2.5).** A company, a role or an agent may route a class to a gateway model (`<provider>/<model>`). The most specific route wins: agent, then role, then company, then the runtime's mapping above.
 
 #### 8.1.5 Codex adapter (X2)
 
@@ -327,7 +342,7 @@ Nothing is built for Gemini in Plan X. X2's acceptance includes **a written adap
 |---|---|---|
 | `subscription` (default) | `claude` with its own login (the binary's Keychain item; Brahma never reads it) | Always, under the pacing preset |
 | `api-key` | `claude` through the model proxy with the company's engine-held `ANTHROPIC_API_KEY` | Always, under the dollar caps |
-| `fallback` | Subscription first. When the subscription gate is closed (five-hour, weekly pace, reserve, or rejection), new turns run in API mode until the gate reopens or a dollar cap is reached | Needs a monthly cap |
+| `fallback` | Subscription first (Anthropic models only; routes to other providers always use the gateway, §8.2.5). When the subscription gate is closed (five-hour, weekly pace, reserve, or rejection), new turns run in API mode until the gate reopens or a dollar cap is reached | Needs a monthly cap |
 
 - **No cap, no API turns.** `api-key` and `fallback` are refused until a monthly cap is set. When a cap is reached, API turns stop. A reached cap is a usage closure like any other: it shows in `brahma why`, the Budget view and the usage meter. **Defaults: monthly cap required; daily cap = monthly ÷ 20 (controller's call).**
 - **The key is stored through the existing flow:** `brahma secret set <co> ANTHROPIC_API_KEY`. It is engine-held, never a test key; `SecretName.isInjectable` already refuses `ANTHROPIC_*` as a test key. One key per company lets the owner use Anthropic Console workspaces with their own spend limits, a second cap outside Brahma's control. An owner-wide key is not offered in v1 **(controller's call)**.
@@ -343,7 +358,7 @@ Nothing is built for Gemini in Plan X. X2's acceptance includes **a written adap
 
 #### 8.2.3 The model proxy (controller's call)
 
-`brahma` gains an engine-side **model proxy**: one loopback HTTP listener per engine, bound to `127.0.0.1` on an ephemeral port.
+`brahma` gains an engine-side **model proxy**: one loopback HTTP listener per engine, bound to `127.0.0.1` on an ephemeral port. Under decision 20 the proxy is the **provider gateway** (§8.2.5). This section describes its Anthropic route, which is also the route `api-key` and `fallback` billing use. Every rule here applies to every provider route.
 
 - **Per turn,** the engine mints a random token bound to that turn: its company, runtime, vendor host, caps and expiry at turn end. The runtime gets `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/t/` (or the Codex equivalent) and the per-turn token as its "API key". **The real key never enters the turn's process tree.**
 - **The proxy:**
@@ -370,6 +385,54 @@ An owner-wide ceiling, `brahma settings pacing conservative|standard|full` (new;
 
 - **Precedence:** the reserve is the larger of the preset's and the company override (`brahma company reserve`). Weekly-only accounts (Ultra, no five-hour window) use the daily share as the short-window guard.
 - **API mode** follows the dollar caps, not these rows. The concurrency ceiling applies to both modes together.
+
+#### 8.2.5 The provider gateway: any LLM API (owner, decision 20; design is controller's call)
+
+**Shape.** The model proxy of §8.2.3 is generalized into one gateway with two sides:
+- **Inbound dialects** are what a runtime speaks. X1 has `anthropic-messages` (`/v1/messages`, `/v1/messages/count_tokens`), which `claude` uses. X2 adds `openai-responses` for Codex. Nothing else is accepted.
+- **Provider adapters** are what the gateway sends. Each adapter translates the gateway's canonical request, which is Anthropic Messages-shaped, to and from one provider's wire format: messages, system text, tool definitions, tool calls and tool results, stop reasons, usage, errors, and streaming (server-sent events in both directions). Content a provider cannot represent (thinking blocks, cache-control markers, citations) is dropped on the way out and never invented on the way back.
+
+| Adapter | Providers | Auth | Plan |
+|---|---|---|---|
+| `anthropic` | Anthropic API | `x-api-key` from the vault | X1 |
+| `openai-compatible` | OpenAI, OpenRouter, Together, Groq, DeepSeek, Mistral, xAI and any endpoint speaking Chat Completions with tools | Bearer key from the vault | X1 |
+| `gemini` | Google Gemini API (native) | API key from the vault | X1b |
+| `bedrock` | AWS Bedrock (Converse API) | SigV4 signed in the gateway with an access key pair from the vault | X1b |
+| `vertex` | Google Vertex AI | a service-account key from the vault; the gateway mints short-lived tokens | X1b |
+| `azure-openai` | Azure OpenAI | `api-key` from the vault, per deployment | X1b |
+| `local` | Ollama, LM Studio, llama.cpp server, vLLM (their OpenAI-compatible endpoints) | none, or a key from the vault | X1b |
+
+**Providers and keys.**
+- A provider is an owner-wide record: an id, its adapter, a base URL and the pinned host it may reach. It is added with `brahma providers add <id> --adapter <a> --base-url <url>` (new; Mac only). The four built-ins `anthropic`, `openai`, `openrouter` and `groq` exist without setup.
+- Keys are per company, stored with the existing flow: `brahma secret set <co> <NAME>`, engine-held, never a test key. The provider record names the secret (`--key-secret OPENROUTER_API_KEY`). `SecretName.isInjectable` refuses every name a provider record uses, so no key can be handed to a check as a test key.
+- **Host pinning.** A remote provider's base URL must be `https` with a host name, and the gateway reaches only that host, through the egress policy (public addresses only). A `local` provider must be `http://127.0.0.1:<port>` or `http://localhost:<port>`. A LAN host needs an explicit owner flag, `--lan`, and is never a public address. The agent sandbox never reaches any provider host or port: the canary gains a probe for each configured local port.
+
+**Routes: who uses which model.**
+- A **route** maps a model class (`deep`, `standard`, `fast`) to `<provider>/<model>`. Routes are set per company (`brahma company models <co> deep=<p/m> …`), per role (`… --role <role>`) and per agent (`brahma agent model <co> <handle> <class>=<p/m>|inherit`), all new. The most specific wins: agent, then role, then company, then the runtime's default mapping (§8.1.4). Example: `fast` agents on a local model, the CTO and reviewers on a frontier model.
+- **Subscription login stays Claude-only.** An agent whose resolved route names a non-Anthropic provider runs every turn through the gateway, under that provider's caps, whatever the company's billing mode. `subscription` and `fallback` apply only to Anthropic models.
+- **Fallback never changes the model.** `fallback` moves an Anthropic turn from the subscription to the Anthropic API for the same model. The engine never moves a turn to another provider or another model on its own; that would be a silent weaker path (anti-goal).
+- **How `claude` reaches a routed model.** The turn gets `ANTHROPIC_BASE_URL` (the gateway, with the per-turn token), `--model brahma-<class>` and, for Claude Code's own background calls, `ANTHROPIC_DEFAULT_HAIKU_MODEL=brahma-fast` *(probe, X1-0)*. The gateway resolves the alias from the token's route table, never from the request's model string. Turns with no route keep today's argv byte for byte.
+
+**Capability probe (fail closed).**
+- Before a `<provider>/<model>` serves any agent turn, `brahma providers probe <id> <model>` (new; also run automatically on first use, as an owner-visible job) runs, through the real gateway and adapter:
+  1. **streaming**: a streamed reply arrives in order and ends with usage;
+  2. **context**: a prompt at the declared context size (or 64k tokens if smaller) is accepted, and the declared size is recorded;
+  3. **tool calls**: 20 scripted single-turn tool calls against Brahma-shaped tool schemas, scored for schema-valid arguments; and 5 multi-step exchanges with tool results fed back. Pass needs ≥ 19 of 20 and 5 of 5 **(controller's call)**;
+  4. **agentic smoke**: a short real `claude` turn on the Sandboxed profile in a throwaway home, through the gateway, with the routed model: read a file, change one line, run a provided check and call one company tool. Pass means the check passes and the tool call is recorded.
+- **Levels.** `agent` (all four pass): any role. `textOnly` (streaming and context pass, tools fail): the gateway serves it **only requests that carry no tool definitions**, in practice the `fast` class background calls; a request with tools is refused. `unavailable`: nothing.
+- **Results are records.** Keyed by provider, model, adapter version and Claude Code version, so a CLI or gateway upgrade re-probes. They are shown in `brahma providers` and Company › Settings › MODELS, with the per-step results. A route to a model that is not `agent` for that use leaves the agent waiting with the reason in `brahma why` (`model openrouter/x: tool calls 14/20 (needs 19)`).
+
+**Money.**
+- Every provider route has caps. A company's monthly and daily caps are per provider (`brahma billing <co> caps <provider> --monthly-cap <usd> [--daily-cap <usd>]`, new). No cap, no turns on that provider, as in §8.2.1.
+- Prices: the pinned table ships rows for the built-in providers; any other model needs an owner row (`brahma settings model-price <provider>/<model> <in> <out>`). An unpriced remote model is refused. A `local` provider's models are priced at zero by its record, explicitly, never by omission.
+- Usage is read from each provider's response through its adapter. A provider response without usage is charged at the request's `max_tokens` for output and an estimate for input, so caps stay bounded **(controller's call)**.
+
+**Safety (unchanged rules, new ground).**
+- P1–P8 do not change. Routed turns are runtime turns like any other; the canary runs on each routed shape before first use.
+- The real key exists only in the vault and in the gateway's memory, as in §8.2.3. The gateway refuses every non-model endpoint of every provider (files, batches, fine-tuning, assistants, admin).
+- Taint is unchanged: model output is never a trust source. The provider is not a trust boundary for content.
+- **Offline.** A company whose every route is `local`, with an empty network allowlist and no web search, runs with no internet. `claude` gets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` on gateway turns *(probe, X1b-0: confirm no other host is contacted)*.
+- **Data exposure is the owner's choice.** Sending a company's context to a third-party provider is the same exposure as today's Anthropic turns, to a different vendor. The connect card for a provider names its host and states this.
 
 ### 8.3 Any product (X3; owner, decision 7)
 
@@ -672,6 +735,7 @@ Commits that arrive on remote `main` from teammates are fetched by the hardened 
 | **queue health** | median and p95 time from approval to land; bisect isolations; flake rate | merge queue |
 | **safety** | taint-refusals, channel refusals, DLP hits, canary passes, reserve breaches (target 0), cap overruns (target 0) | engine records |
 | **non-code acceptance** | owner sign-off rate on `landGate: owner` items; rubric pass rate | asks, reviews |
+| **model ranking per role** (decision 20) | for each (role, `<provider>/<model>`): first-pass rate, review catch rate, rework turns and $ per landed item, with denominators | outcome facts joined to the turn's recorded route |
 
 #### 8.6.2 `brahma measure` (new; read-only, owner)
 
@@ -882,6 +946,7 @@ Each is `BRAHMA_LIVE=1` and owner-provided:
 - **The model proxy** limits each turn token to one vendor, the model endpoints only, the turn's lifetime and the caps. It is unreachable from Sandboxed agent Bash (a canary probe).
 - **Residual risk:** on Workspace and Full, agent Bash can spend within a turn's caps through the proxy. That is documented; the key itself is never exposed.
 - **Ambient environment:** auth variables are never inherited (§8.2.2).
+- **Provider gateway (decision 20):** every provider is reached only by the gateway, only on its model endpoints, only at its pinned host; keys never leave the vault and the gateway's memory; a model serves agent turns only after its capability probe passes; per-provider caps; local provider ports are canary-probed as unreachable from agent Bash.
 
 ### 9.3 Approved channels and the lethal trifecta
 
@@ -960,7 +1025,7 @@ DLP is advisory in the same sense as the command classifier: it errs toward aski
 
 ### 9.6 What the security reviews must cover (Opus, per model policy)
 
-- X1's proxy and environment removal;
+- X1's proxy and environment removal, and the gateway's provider adapters and routes (X1b's adapters likewise);
 - X2's parity gates;
 - X4 as a whole: policy order, executor idempotency, the audit chain, kill switches, DLP;
 - X5's push and fetch;
@@ -990,6 +1055,7 @@ Task ids such as `X1-T7` are provisional. Each sub-plan fixes its own numbering,
 | 9 | **Atoms / MGX:** full apps deployed with login, database and payments | **Deployable templates on the owner's own accounts** (Cloudflare + D1, or Vercel + Neon), with passkey login and Stripe Checkout. The code lives in the owner's repository, and every deploy is smoke-tested with rollback. **Governed payments**: agent money actions go through the `stripe` channel, per transaction unless capped, and live keys are an owner decision. Atoms deploys into its own cloud; Brahma leaves the owner with no lock-in | (1) `LiveTemplates/fullStackCheckout`: goal → deployed app (owner approves the deploy) whose live smoke signs up, logs in, writes and reads a record, completes a Stripe **test** checkout and records the webhook. (2) Owner touches ≤ 4 (hosting task, Stripe test keys, database account, deploy approval). (3) Refusal test: no path deploys or switches to live keys without an owner approval | X11-T1..T8; X10-T5 (Stripe) |
 | 10 | **Paradev / Conductor:** polished parallel UI | A dense ops console with the live map, Inbox, CHANGES tab, previews of every kind and Replay. P's measured UI budgets and usability fixes. Native, not Electron | P's budgets pass (P §5.1.5); P's golden-path end-to-end test passes; the owner's usability review is signed off | P; X3-T15 (new previews in P's components) |
 | 11 | **Vibe Kanban:** built-in browser preview | Previews of every product type: web, backend, CLI, iOS, macOS, documents, media, 3D, BOMs. All are built from `main` or the candidate in a sandbox, with walkthroughs | The P golden path plus `LivePreviews/allKinds`: one artifact of each kind renders in the pane | 4a; X3-T15; X9 |
+| 12 | **Paperclip, Gas Town and other multi-runtime tools** (decision 20): many runtimes and providers through adapters, each with its own keys and limits | **Any provider through one governed gateway**: every model call of every runtime goes through one engine-side gateway that holds the keys (agents never see one), pins each provider's host, enforces per-provider dollar caps before a request is sent, and records usage per turn. **Per-role choice**: a cheap or local model for routine roles and a frontier model for the CTO and reviewers, set per company, role or agent. **Probe gating**: a model serves agent turns only after a recorded capability probe (streaming, context, tool calls, an agentic smoke), where other tools let any configured model run and fail mid-task. **Same safety on every model**: P1–P8, taint and the canary do not depend on the provider. **Measured choice**: `measure` ranks models per role on the owner's real work. **Offline**: a fully local company runs with no internet | (1) `LiveGateway/providerMatrix` (owner keys): the same small scenario lands an item on Anthropic API, one OpenAI-compatible provider and (X1b) one local server, with `cap overruns = 0` per provider. (2) Unit: a model whose probe is `textOnly` or `unavailable` never receives a request with tools, and an agent routed to it waits with the reason. (3) Unit: a gateway turn's process tree, files and transcript contain no provider key (the key-leak scan of §9.2). (4) `measure` shows the per-role model ranking with denominators. (5) `LiveGateway/offline` (X1b): a fully local company lands an item with the network off | X1 (gateway, Anthropic + OpenAI-compatible, routes, probe); X1b (other adapters, local, offline); X6 (ranking) |
 
 **Gap rows from the research's "where Brahma is behind" list** (each has a priority and an effort; see §13 for sequencing):
 
@@ -1014,6 +1080,8 @@ Task ids such as `X1-T7` are provisional. Each sub-plan fixes its own numbering,
 | **Team collaboration in one shared workspace** | Multi-user is a non-goal (v2 §1.5) | PR mode puts Brahma's work into the team's existing GitHub review flow |
 | **Approvals from Slack** | It would weaken approval identity (safety model) | Passkey approvals on a paired phone |
 | **Codex on a ChatGPT subscription (until proven)** | Parity rules P1 and P7 fail under whole-process Seatbelt | Codex through an API key via the proxy; revisit by gate (owner, decision 16) |
+| **Frontier-level agentic work on any model** (decision 20) | Weaker and smaller models do worse on long agentic work: more failed tool calls, more rework, lower review pass rates. No gateway changes that. Translation also drops provider features the Anthropic format lacks, and vice versa | The capability probe keeps models that cannot call tools reliably off agent turns. `measure` ranks models per role on the owner's real tasks, so the owner picks by data: a local or cheap model where it holds up (routine roles, `fast` background calls), a frontier model where it does not. Brahma never claims a model is "as good" without that ranking |
+| **Subscription billing for non-Claude models** | Only Claude Code has a subscription login Brahma uses; other providers are API-key or local (decision 20) | Per-provider caps make API spend bounded and visible; local models cost nothing per token |
 
 ---
 
@@ -1028,6 +1096,10 @@ brahma settings runtime-models <runtime> deep=<m> standard=<m> fast=<m>
 brahma settings model-price <model> <usd per Mtok in> <usd per Mtok out>
 brahma billing <co> subscription|api-key|fallback [--monthly-cap <usd>] [--daily-cap <usd>]
 brahma settings pacing conservative|standard|full
+brahma billing <co> caps <provider> --monthly-cap <usd> [--daily-cap <usd>]      decision 20
+brahma providers [list] | add <id> --adapter <a> --base-url <url> [--key-secret <NAME>] [--lan] | remove <id> | probe <id> <model>
+brahma company models <co> [--role <role>] deep=<p/m> standard=<p/m> fast=<p/m> | clear
+brahma agent model <co> <handle> <class>=<p/m>|inherit
 brahma accounts <co>                                  connected channels, grants, state
 brahma accounts connect <co> <type> [--secret-stdin]
 brahma accounts grant <co> <channel> <types> [limits…] | revoke <co> G-<n>
@@ -1047,7 +1119,7 @@ brahma toolchains [list|install <id>]
 ```
 
 **App placement:**
-- Company › Settings gains BILLING, RUNTIME, APPROVED CHANNELS, LANDING, ISOLATION and ISSUES panels.
+- Company › Settings gains BILLING, RUNTIME, MODELS (routes and probe results, decision 20), APPROVED CHANNELS, LANDING, ISOLATION and ISSUES panels.
 - People › agent inspector gains a RUNTIME row.
 - Inbox gains the channel, outbox, spend and edition cards.
 - Insights gains MEASURE and the CHANNEL LOG.
@@ -1064,7 +1136,8 @@ All of it uses P's shared components and the ops-console tokens. There is no new
 
 | Plan | Scope | Priority | Effort (tasks) | Depends on |
 |---|---|---|---|---|
-| **X1 Runtime seam, billing, pacing** | `BrahmaRuntime` + Claude adapter (golden parity); auth-path removal; model proxy; billing modes and caps; pacing presets; doctor lines; X1-0 probes | **P0** | M–L (~14) | S, R |
+| **X1 Runtime seam, billing, pacing, gateway** | `BrahmaRuntime` + Claude adapter (golden parity); auth-path removal; the provider gateway with the `anthropic` and `openai-compatible` adapters (decision 20); routes per company, role and agent; the capability probe; billing modes and per-provider caps; pacing presets; doctor lines; X1-0 probes | **P0** | L (~19) | S, R |
+| **X1b More providers** (decision 20) | X1b-0 probes; `gemini`, `bedrock`, `vertex`, `azure-openai` and `local` adapters; local-server host rules and canary probes; offline mode | **P1**; before dogfood #1 if cheap | M (~8) | X1 |
 | **X6a Measure** | `brahma measure`, metric definitions, Insights MEASURE, landing audit, and the minimal 72 h soak harness (crash/reboot checks) that dogfood #1 runs | **P0** | S (~6) | R (store split) |
 | **X3 Any product** | Pack schema v2; `content`/`media`/`physical`/`business` packs; `brahma-check` kits; toolchain registry; blob store and size policy; audio, EPUB, STEP previews and image/PDF diff; editions; recurring items | **P0** (decision 7) | L (~20) | X1 (model classes), S (helper ops) |
 | **X2 Codex adapter** | X2-0 probes; adapter; engine-side MCP endpoint; whole-process Seatbelt purpose; gates C-1..C-9; canary shapes; adding-a-runtime checklist | P1 | M (~10) | X1 |
@@ -1077,13 +1150,14 @@ All of it uses P's shared components and the ops-console tokens. There is no new
 | **X10 More channels** | `slack` bridge, `bluesky`, `cloudflare-dns`, `shopify`, `stripe` | P2 | M (~3 each, ~15 total) | X4 proven in dogfood #2 |
 | **X11 Full-stack templates** | `cf-fullstack`, `vercel-fullstack`, `database-account` task, migration flags, template smoke and walkthroughs | P3 | M (~8) | X10 (`stripe`), X9 |
 
-**Total:** about 150 tasks, roughly S + R + P combined, twice over.
+**Total:** about 165 tasks, roughly S + R + P combined, twice over.
 
 ### 13.2 How much is planned now (builder-check resolution, controller's call)
 
 - **Full task-level plans now:** X1 and X6a. Both start with an R-style **Task 0: re-read S, R and P as merged and record every drift**.
-- **Research tasks now** (reports only, no Brahma code): X1-0, X2-0 and X8-0 probes; X3-0 toolchain licence checks; X3 pack content as JSON files under `docs/packs/`; the X6b benchmark design document; X11 template repositories.
+- **Research tasks now** (reports only, no Brahma code): X1-0, X1b-0, X2-0 and X8-0 probes; X3-0 toolchain licence checks; X3 pack content as JSON files under `docs/packs/`; the X6b benchmark design document; X11 template repositories.
 - **Scoped outlines now, full plans later:**
+  - X1b is planned in full right after X1 lands (decision 20);
   - X2, X3 and X6b are planned in full after dogfood #1;
   - X4 and X5 after dogfood #1 and X3;
   - X7, X8, X9, X10 and X11 after dogfood #2.
@@ -1098,7 +1172,8 @@ Existing: 4a → C → 4b leftovers → S → R → P → dogfood.
 
 ```
 4a → C → 4b leftovers → S → R → P
-   → X1 (runtime seam, API-key billing, conservative pacing)   ← the vendor hedge before anyone else runs Brahma
+   → X1 (runtime seam, API-key billing, conservative pacing, provider gateway: Anthropic + OpenAI-compatible)   ← the vendor hedge before anyone else runs Brahma
+   → X1b (Gemini, Bedrock, Vertex, Azure OpenAI, local servers)   ← before dogfood #1 if cheap; otherwise beside X3 (decision 20)
    → X6a (measure)                                              ← so the first dogfood is measured
    → DOGFOOD #1 (software company, conservative pacing, measured; 72 h soak inside it)
    → X3 (any product)  ∥  X2 (Codex)  ∥  X6b (bench)
@@ -1129,15 +1204,15 @@ Existing: 4a → C → 4b leftovers → S → R → P → dogfood.
 ### 13.4 What can run in parallel
 
 - **Now, alongside S, R and P, with no Swift conflicts:**
-  - X2-0, X1-0 and X8-0 probes (research tasks writing reports only);
+  - X2-0, X1-0, X1b-0 and X8-0 probes (research tasks writing reports only);
   - X3 pack **content** (role cards, item types and rubrics as JSON pack files under `docs/packs/`, validated later by the schema);
   - the X6b benchmark design document;
   - X11 template repositories (outside Brahma's code).
-- **After P:** X1 and X6a can run as two lanes (different modules).
+- **After P:** X1 and X6a can run as two lanes (different modules). X1b follows X1 in the same lane (it adds adapters to X1's gateway).
 - **After dogfood #1:** X3, X2 and X6b are three lanes. X3 touches Org and Preview, X2 touches Runtime, X6b touches Measure and the CLI.
 - **X4 runs alone,** because it is security-critical and touches the Inbox, store, MCP and taint layers.
 - **X9, X7 and X8 are three lanes.** They share only S's helper `Purpose` enum, so merge order matters.
-- **Model policy:** Fable for drivers, implementers and routine reviews; Opus for every security review (X1 proxy, X2 gates, all of X4, X5 push, X7 phone/runner, X8) and for final reviews. **Never Sonnet or Haiku** (owner, 2026-11-21).
+- **Model policy:** Fable for drivers, implementers and routine reviews; Opus for every security review (X1 proxy and gateway, X1b adapters, X2 gates, all of X4, X5 push, X7 phone/runner, X8) and for final reviews. **Never Sonnet or Haiku** (owner, 2026-11-21).
 
 ---
 
@@ -1156,6 +1231,9 @@ Existing: 4a → C → 4b leftovers → S → R → P → dogfood.
 | Phone approval page as an attack surface | Tailnet HTTPS only (Serve, never Funnel), a fresh passkey assertion per action over the exact amount, recipient or limit, bounded raises with cooling-off, a Mac-only list (accounts, secrets, trust-import, resume, channels on, cap removal), an Opus security review and red team |
 | Benchmark gaming or contamination | Post-cutoff issues, hidden tests, published raw results, baselines, three runs, open scorer |
 | Concept-budget creep | Every surface placed in §12; P's usability review gate applies to new panels |
+| Translation drift between the Anthropic format and a provider's (decision 20) | Golden request/response fixtures per adapter, including streamed tool calls; the capability probe re-runs on every adapter or CLI version change; a model that regresses drops to `textOnly` or `unavailable`, never runs degraded |
+| A provider or a local server returns no usage, or wrong usage | Missing usage is charged at `max_tokens` (bounded); caps are checked before each request; `measure` shows $ per provider |
+| Claude Code rejects or mishandles a non-Anthropic model alias | X1-0 probes the alias and the background-model variable; if a probe fails, routes to non-Anthropic models are unavailable for `claude` turns with the reason, and X2's Codex or a later runtime carries them |
 
 ## 15. Left to the builder
 
