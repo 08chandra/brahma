@@ -187,9 +187,10 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
         _ = await w.orchestrator.shutdown(bound: .seconds(8))
     }
 
-    /// Fix round 1, I1: every source of the stop set is start-time checked. A turn record whose `leaderStart` no longer
-    /// matches, a check record whose leader is gone, and a database row naming a pid whose process started before the turn
-    /// (a crash's leftover row, the pid reused since) are all skipped: the live processes behind them are never signalled.
+    /// Fix rounds 1 and 2, I1: every source of the stop set matches a recorded start time. A turn record whose `leaderStart`
+    /// no longer matches, a check record whose leader is gone, and a database in-progress row whose pid now belongs to a
+    /// younger process (a crash's leftover row, the pid reused since: the realistic direction) are all skipped: the live
+    /// processes behind them are never signalled. The database row is not a source at all any more.
     @Test func staleOrReusedRecordsAreNeverSignalled() async throws {
         let root = try tempDir()
         let data = root.appending(path: "data", directoryHint: .isDirectory)
@@ -204,8 +205,8 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
             try ProcessGroupChild.spawn(executable: "/bin/sh", arguments: ["/bin/sh", "-c", "sleep 600"], environment: [:],
                                         workingDirectory: root, output: devnull)
         }
-        let reusedTurn = try sleeper(), staleLeader = try sleeper(), reusedRow = try sleeper()
-        defer { for p in [reusedTurn, staleLeader, reusedRow] { p.signalGroup(SIGKILL); _ = p.finish() } }
+        let reusedTurn = try sleeper(), staleLeader = try sleeper()
+        defer { for p in [reusedTurn, staleLeader] { p.signalGroup(SIGKILL); _ = p.finish() } }
 
         // 1. A turn record with the wrong start time (the pid was reused since the record was written).
         let turns = w.paths.runDir.appending(path: "turns", directoryHint: .isDirectory)
@@ -218,8 +219,7 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
         #expect(groups.record(staleLeader.pid) != nil)
         staleLeader.signalGroup(SIGKILL)
         _ = staleLeader.finish()
-        // 3. An in-progress turn row whose pid belongs to a process that started before the turn did.
-        w.clock.advance(1000)   // the turn starts 1000 s "after" the sleeper was spawned
+        // 3. An in-progress turn row (older) whose pid now belongs to a process spawned after the turn started: a reused pid.
         let running = Gate()
         w.fake.script("eng", FakeTurnRunner.Script(gate: Gate()))
         w.fake.onRun = { _ in running.open() }
@@ -227,8 +227,12 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
         await w.orchestrator.tick()
         await running.wait()
         let turn = try #require(try w.turns(agent).last)
+        let reusedRow = try sleeper()   // younger than the row, as a reused pid always is
+        defer { reusedRow.signalGroup(SIGKILL); _ = reusedRow.finish() }
         try store.setTurnPid(turnId: turn.id, pid: reusedRow.pid)
-        #expect(try store.runningTurnPids() == [reusedRow.pid], "the unfiltered row names the reused pid")
+        #expect(try store.runningTurnPids() == [reusedRow.pid], "the informational row names the reused pid")
+        #expect(try #require(ProcessTable.entry(reusedRow.pid)).start >= turn.startedAt.timeIntervalSince1970 - 2,
+                "the live process is younger than the row, the direction a reused pid takes")
 
         #expect(EmergencyStop.engineGroups(store: store, paths: w.paths).isEmpty)
         let killed = EngineShutdown.killEngineProcesses(store: store, paths: w.paths)
@@ -244,7 +248,10 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
     /// (on its own thread), the shutdown returns at the bound naming it, and the expired bound's kill ends the process.
     @Test func hungLitestreamStopStaysInsideTheBound() async throws {
         let env = try BackupEnv()
-        let bin = try FakeTools.bin(["litestream": "trap '' TERM\ni=0\nwhile [ $i -lt 6000 ]; do sleep 0.1; i=$((i+1)); done"])
+        // The script says when its trap is in place (`<script>.trapped`): a SIGTERM before that would just end it.
+        let bin = try FakeTools.bin(["litestream": "trap '' TERM\n: > \"$0.trapped\"\ni=0\nwhile [ $i -lt 6000 ]; do sleep 0.1; i=$((i+1)); done"])
+        let trapped = bin.appending(path: "litestream.trapped")
+        try? FileManager.default.removeItem(at: trapped)
         let tools = BackupTools(searchPath: bin.path + ":/usr/bin:/bin", environment: [:])
         let replica = env.root.appending(path: "wal", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: replica, withIntermediateDirectories: true)
@@ -260,6 +267,8 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
         while recordedPID() == nil, AwakeTime.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
         let pid = try #require(recordedPID())
         #expect(kill(pid, 0) == 0)
+        while !FileManager.default.fileExists(atPath: trapped.path), AwakeTime.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        try #require(FileManager.default.fileExists(atPath: trapped.path), "the fake litestream has its SIGTERM trap in place")
 
         let left = await engine.shutdown(bound: .milliseconds(300))
         #expect(left.contains("litestream"), "the hung stop is named, not waited out: \(left)")

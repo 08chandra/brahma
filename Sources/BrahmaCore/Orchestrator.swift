@@ -351,7 +351,14 @@ public actor Orchestrator {
             log("WAL shipping config could not be written: \(error)")
             return
         }
-        let shipper = WALShipper(executable: litestream, paths: paths, tools: backupTools, sleeper: walSleeper) { [self] in log($0) }
+        let store = self.store, clock = self.clock
+        let shipper = WALShipper(executable: litestream, paths: paths, tools: backupTools, sleeper: walSleeper, note: { [self] in log($0) },
+                                 onPaused: { pid in
+                                     // An unproven litestream for this database (Task 9c fix round 2): shipping stays paused and the
+                                     // owner is told once a day, in engine-written text.
+                                     let notice = WALShipper.pausedNotice(pid: pid)
+                                     try? BackupTargets.noticeOncePerDay(store: store, title: notice.title, body: notice.body, now: clock())
+                                 })
         walShipper = shipper
         shipper.start()
     }

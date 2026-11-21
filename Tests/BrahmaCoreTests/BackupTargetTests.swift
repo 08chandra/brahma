@@ -732,11 +732,14 @@ import GRDB
         let (_, tools) = try fakeBin(["litestream": Self.longLoop])
         let litestream = try #require(tools.litestream)
         try BrahmaPaths.ensurePrivateDirectory(env.paths.runDir)
-        func writePID(_ pid: Int32) throws {
-            try Data("\(pid)\n\(WALShipping.configURL(paths: env.paths).path)\n".utf8).write(to: WALShipper.pidFile(paths: env.paths))
+        /// The record this engine writes: pid, config, and the leader's start time (`start` nil: the two-line form of older engines).
+        func writePID(_ pid: Int32, start: Double?) throws {
+            let third = start.map { "\($0)\n" } ?? ""
+            try Data("\(pid)\n\(WALShipping.configURL(paths: env.paths).path)\n\(third)".utf8).write(to: WALShipper.pidFile(paths: env.paths))
         }
-        // A litestream for this config left behind by a crashed engine: killed before a new one starts. Both children are
-        // `OutsideChild`ren, watched by pid: Foundation's `Process.isRunning` reported a long-dead child as running here.
+        // A litestream for this config left behind by a crashed engine, recorded with its start time: killed before a new one
+        // starts. Both children are `OutsideChild`ren, watched by pid: Foundation's `Process.isRunning` reported a long-dead
+        // child as running here.
         let stale = try OutsideChild(executable: litestream, arguments: WALShipping.replicateArguments(paths: env.paths))
         defer { stale.end() }
         // The scenario needs a stale process that IS litestream for this config by the time the shipper looks: wait on that
@@ -744,7 +747,7 @@ import GRDB
         let config = WALShipping.configURL(paths: env.paths).path
         try await waitUntil { ProcessArguments.of(stale.pid).map { WALShipper.isLitestream($0, config: config) } ?? false }
         try #require(ProcessArguments.of(stale.pid).map { WALShipper.isLitestream($0, config: config) } == true)
-        try writePID(stale.pid)
+        try writePID(stale.pid, start: try #require(ProcessTable.entry(stale.pid)?.start))
         // An unrelated process whose pid sits in the file is never killed.
         let unrelated = try OutsideChild(executable: "/bin/sleep", arguments: ["600"])
         defer { unrelated.end() }
@@ -757,8 +760,28 @@ import GRDB
         try await waitUntil { recordedPID(env.paths).map { $0 != stale.pid } ?? false }
         first.stop()
 
+        // Task 9c fix round 2: a two-line record (no start time) is stale. A live litestream for this config behind it is not
+        // signalled (nothing proves this engine started it), the record is removed, no second litestream is started, and the
+        // owner is told (`onPaused`). The same for a record whose start time is not that process's.
+        let unproven = try OutsideChild(executable: litestream, arguments: WALShipping.replicateArguments(paths: env.paths))
+        defer { unproven.end() }
+        try await waitUntil { ProcessArguments.of(unproven.pid).map { WALShipper.isLitestream($0, config: config) } ?? false }
+        for start in [nil, (try #require(ProcessTable.entry(unproven.pid)?.start)) - 7] as [Double?] {
+            try writePID(unproven.pid, start: start)
+            let paused = Paused()
+            let shipper = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5, onPaused: { paused.set($0) })
+            shipper.start()
+            #expect(paused.pid == unproven.pid, "the owner is told which process holds WAL shipping (start \(start.map { "\($0)" } ?? "missing"))")
+            #expect(!shipper.isSupervising, "no second litestream was started")
+            #expect(unproven.isRunning && pidAlive(unproven.pid), "the unproven litestream was never signalled")
+            #expect(!FileManager.default.fileExists(atPath: WALShipper.pidFile(paths: env.paths).path), "the stale record is gone")
+            shipper.stop()
+        }
+        let notice = WALShipper.pausedNotice(pid: unproven.pid)
+        #expect(notice.title == "WAL shipping paused" && notice.body.contains("pid \(unproven.pid)"))
+
         try await waitUntil { ProcessArguments.of(unrelated.pid)?.first == "/bin/sleep" }
-        try writePID(unrelated.pid)
+        try writePID(unrelated.pid, start: nil)
         let second = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5)
         second.start()
         try await waitUntil { recordedPID(env.paths).map { $0 != unrelated.pid } ?? false }
@@ -814,4 +837,12 @@ private final class Delays: @unchecked Sendable {
     func add(_ d: Duration) { lock.withLock { values.append(d) } }
     var count: Int { lock.withLock { values.count } }
     var all: [Duration] { lock.withLock { values } }
+}
+
+/// What `WALShipper.start` reported through `onPaused`.
+private final class Paused: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _pid: Int32?
+    func set(_ pid: Int32) { lock.withLock { _pid = pid } }
+    var pid: Int32? { lock.withLock { _pid } }
 }

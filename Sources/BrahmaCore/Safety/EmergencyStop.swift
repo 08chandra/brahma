@@ -162,13 +162,13 @@ public enum EmergencyStop {
         return out
     }
 
-    /// The groups of every turn the database records as in progress (`Store.runningTurnLeaders`: each turn's `claude` leads
-    /// its own session and group; only pids that still lead a group of ours started no earlier than the turn, Task 9c fix round
-    /// 1), and of every check and merge child the engine recorded at spawn (`ChildGroups`, under the data home's
+    /// The groups of every check and merge child the engine recorded at spawn (`ChildGroups`, under the data home's
     /// `run/children`; only leaders whose start time still matches), and of every preview server Plan L's `previewState`
-    /// records (`previewGroups`, L-5lite-A). Every source is start-time checked: a recycled pid is never in the set.
+    /// records (`previewGroups`, L-5lite-A). The database's in-progress turn rows are not a source (Task 9c fix round 2): a row
+    /// carries no start time, so a pid reused after its turn started would pass any one-sided check; the turns' leaders come
+    /// from the runner's records instead (`Store.recordedTurnLeaders`, in `engineGroups`), which hold the exact start.
     public static func recordedGroups(store: Store) -> Set<Int32> {
-        var groups = (try? store.runningTurnLeaders()) ?? []
+        var groups = Set<Int32>()
         if let home = store.dataHome {
             groups.formUnion(ChildGroups.liveLeaders(in: ChildGroups.directory(runDir: home.appending(path: "run", directoryHint: .isDirectory))))
         }
@@ -177,9 +177,9 @@ public enum EmergencyStop {
     }
 
     /// Every process group the engine recorded, for the stop paths (Task 9c fix round 1, controller ruling 1): `recordedGroups`
-    /// plus the turn leaders the runner recorded at spawn under `<runDir>/turns` (`Store.recordedTurnLeaders`, start-time
-    /// checked). The latter still names a `claude` whose turn the engine already recorded `interrupted` but which is winding
-    /// down, which no database row does any more.
+    /// plus the turn leaders the runner recorded at spawn under `<runDir>/turns` (`Store.recordedTurnLeaders`: every production
+    /// turn is recorded there with its exact start, and a record still names a `claude` whose turn the engine already recorded
+    /// `interrupted` but which is winding down). Every source matches a recorded start time exactly.
     public static func engineGroups(store: Store, paths: BrahmaPaths) -> Set<Int32> {
         recordedGroups(store: store).union(Store.recordedTurnLeaders(paths: paths))
     }

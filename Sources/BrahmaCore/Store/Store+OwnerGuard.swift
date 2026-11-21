@@ -25,7 +25,8 @@ extension Store {
     }
 
     /// The processes of the turns still in progress, as the database recorded them (informational: no start-time check, so a
-    /// crash's leftover row could name a reused pid). The owner-command guard uses `recordedTurnLeaders` instead.
+    /// crash's leftover row could name a reused pid). The owner-command guard and every stop path use `recordedTurnLeaders`
+    /// instead; nothing signals from this set.
     public func runningTurnPids() throws -> Set<Int32> {
         try writer.read { db in try Self.runningTurnPids(db) }
     }
@@ -35,26 +36,6 @@ extension Store {
                                arguments: [TurnOutcome.inProgress.rawValue]))
     }
 
-    /// The in-progress turns' pids that still lead their own process group of this user and started no earlier than their
-    /// turn (Task 9c fix round 1, I1): a crash's leftover row naming a pid that was reused since is dropped, so the stop
-    /// paths never signal an unrelated process. Off Darwin the table's start times are not wall-clock, so nothing is claimed.
-    public func runningTurnLeaders() throws -> Set<Int32> {
-        let rows = try writer.read { db in
-            try Row.fetchAll(db, sql: "SELECT pid, startedAt FROM turn WHERE outcome = ? AND pid IS NOT NULL",
-                             arguments: [TurnOutcome.inProgress.rawValue])
-        }
-        var out = Set<Int32>()
-        #if canImport(Darwin)
-        let uid = getuid()
-        for row in rows {
-            guard let pid: Int32 = row["pid"], let startedAt: Date = row["startedAt"], pid > 1,
-                  let entry = ProcessTable.entry(pid), entry.pgid == pid, entry.uid == uid, !entry.isZombie,
-                  entry.start >= startedAt.timeIntervalSince1970 - 2 else { continue }
-            out.insert(pid)
-        }
-        #endif
-        return out
-    }
 
     /// The live leaders of the turns the runner recorded under `<runDir>/turns` (`TurnRecords`), read without changing
     /// anything (a damaged record is skipped, never quarantined): what an owner command run from a shell checks its ancestry

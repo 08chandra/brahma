@@ -271,6 +271,9 @@ public final class WALShipper: @unchecked Sendable {
     private let grace: TimeInterval
     private let sleeper: Sleeper
     private let note: @Sendable (String) -> Void
+    /// Told when `start` found a live litestream for this config that it cannot prove it started (no recorded start time, or
+    /// another one), with its pid: no second litestream is started, and the caller tells the owner (Task 9c fix round 2).
+    private let onPaused: (@Sendable (Int32) -> Void)?
     private let launchProbe: (@Sendable () -> Void)?
     /// Awake seconds, for how long one run lasted (`ShipperBackoff.healthyRun`); a test seam.
     private let awakeUptime: @Sendable () -> TimeInterval
@@ -287,7 +290,9 @@ public final class WALShipper: @unchecked Sendable {
                 launchProbe: (@Sendable () -> Void)? = nil,
                 sleeper: @escaping Sleeper = { try await AwakeTime.sleep(for: $0) },
                 note: @escaping @Sendable (String) -> Void = { _ in },
-                awakeUptime: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }) {
+                awakeUptime: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() },
+                onPaused: (@Sendable (Int32) -> Void)? = nil) {
+        self.onPaused = onPaused
         self.executable = executable
         self.arguments = WALShipping.replicateArguments(paths: paths)
         self.environment = tools.litestreamEnvironment
@@ -302,13 +307,23 @@ public final class WALShipper: @unchecked Sendable {
     /// How many times litestream has been started.
     public var startCount: Int { lock.withLock { starts } }
 
-    /// Blocking for at most about `grace` + 2 s when a stale litestream has to be stopped first.
+    /// Blocking for at most about `grace` + 2 s when a stale litestream has to be stopped first. When the pid file names a live
+    /// litestream for this config that this engine cannot prove it started (`StaleOutcome.unprovenLive`), nothing is started:
+    /// two litestreams must not replicate one database, and nothing unproven is ever signalled; `onPaused` tells the owner.
     public func start() {
         lock.lock(); defer { lock.unlock() }
         guard task == nil else { return }
-        if let text = Self.reapStale(paths: paths, grace: grace) { note(text) }
+        let outcome = Self.reapStale(paths: paths, grace: grace)
+        if let text = outcome.text { note(text) }
+        if case .unprovenLive(let pid) = outcome {
+            onPaused?(pid)
+            return
+        }
         task = Task.detached { [self] in await supervise() }
     }
+
+    /// Whether `start` is supervising a litestream (false before `start`, after `stop`, or while paused on an unproven one).
+    public var isSupervising: Bool { lock.withLock { task != nil } }
 
     /// Stops supervising and ends the child (SIGTERM, `grace`, SIGKILL); returns when it is gone. Blocking.
     public func stop() {
@@ -405,40 +420,66 @@ public final class WALShipper: @unchecked Sendable {
     /// The litestream the pid file names, ended now (SIGTERM, then SIGKILL at once) when its argv shows it is litestream
     /// `replicate -config <this config>` and its start time is the one recorded: the forced exit's and the expired bound's best
     /// effort (Task 9c fix round 1, M2). Returns a line for the log, or nil when there was no pid file.
-    public static func killRecorded(paths: BrahmaPaths) -> String? { reapStale(paths: paths, grace: 0, requireStart: true) }
+    public static func killRecorded(paths: BrahmaPaths) -> String? { reapStale(paths: paths, grace: 0).text }
+
+    /// What `reapStale` found in the pid file.
+    enum StaleOutcome: Equatable {
+        /// No pid file, or the process it named is gone.
+        case nothing
+        case removedUnreadable
+        /// A litestream for this config whose recorded start time matched: signalled.
+        case stopped(Int32)
+        /// Not litestream for this config (another process holds the pid now): never signalled.
+        case leftAlone(Int32)
+        /// Litestream for this config, alive, but without proof this engine started it (an older two-line record, or a start
+        /// time that does not match): never signalled; the caller must not start a second one.
+        case unprovenLive(Int32)
+
+        var text: String? {
+            switch self {
+            case .nothing: nil
+            case .removedUnreadable: "removed an unreadable litestream.pid"
+            case .stopped(let pid): "stopped litestream pid \(pid), left running by an earlier engine"
+            case .leftAlone(let pid): "litestream.pid named pid \(pid), which is not litestream for this config; it was left alone"
+            case .unprovenLive(let pid):
+                "litestream.pid named pid \(pid), litestream for this config with no recorded start time to match; it was left alone"
+                + " and WAL shipping is paused until it is stopped"
+            }
+        }
+    }
 
     /// A litestream an earlier engine left running for this config (named by the pid file): stopped (SIGTERM, `grace`, SIGKILL)
-    /// only when its argv shows it is litestream `replicate -config <this config>` and, when the record carries the leader's
-    /// start time (every record this engine writes does; `requireStart` demands it), that time still matches. The pid file is
-    /// removed either way. Returns a line for the log, or nil when there was no pid file.
-    static func reapStale(paths: BrahmaPaths, grace: TimeInterval, requireStart: Bool = false) -> String? {
+    /// only when its argv shows it is litestream `replicate -config <this config>` and the record's start time (the third line,
+    /// written at spawn) is still that process's. A record without a start time (the two-line form of engines before Task 9c)
+    /// or with another is stale: the process is never signalled (`unprovenLive`). The pid file is removed in every case.
+    static func reapStale(paths: BrahmaPaths, grace: TimeInterval) -> StaleOutcome {
         let file = pidFile(paths: paths)
-        guard let data = EngineFiles.readNoFollow(file, under: paths.runDir, limit: 4096) else { return nil }
+        guard let data = EngineFiles.readNoFollow(file, under: paths.runDir, limit: 4096) else { return .nothing }
         defer { unlink(file.path) }
         let config = WALShipping.configURL(paths: paths).path
         let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
-        guard let pid = lines.first.flatMap({ Int32($0) }), pid > 1 else {
-            return "removed an unreadable \(file.lastPathComponent)"
-        }
-        guard kill(pid, 0) == 0 || errno == EPERM else { return nil }          // gone already
-        guard let argv = ProcessArguments.of(pid), isLitestream(argv, config: config) else {
-            return "\(file.lastPathComponent) named pid \(pid), which is not litestream for this config; it was left alone"
-        }
-        let recordedStart = lines.count > 2 ? Double(lines[2]) : nil
-        if requireStart || recordedStart != nil {
-            guard let recordedStart, ProcessTable.entry(pid)?.start == recordedStart else {
-                return "\(file.lastPathComponent) named pid \(pid), whose start time is not the recorded one; it was left alone"
-            }
-        }
+        guard let pid = lines.first.flatMap({ Int32($0) }), pid > 1 else { return .removedUnreadable }
+        guard kill(pid, 0) == 0 || errno == EPERM else { return .nothing }          // gone already
+        guard let argv = ProcessArguments.of(pid), isLitestream(argv, config: config) else { return .leftAlone(pid) }
+        guard lines.count > 2, let recordedStart = Double(lines[2]), recordedStart > 0,
+              ProcessTable.entry(pid)?.start == recordedStart else { return .unprovenLive(pid) }
         kill(pid, SIGTERM)
         let soft = AwakeTime.uptime() + grace
         while kill(pid, 0) == 0, AwakeTime.uptime() < soft { Thread.sleep(forTimeInterval: 0.01) }
-        if kill(pid, 0) == 0, ProcessArguments.of(pid).map({ isLitestream($0, config: config) }) == true {
+        if kill(pid, 0) == 0, ProcessArguments.of(pid).map({ isLitestream($0, config: config) }) == true,
+           ProcessTable.entry(pid)?.start == recordedStart {
             kill(pid, SIGKILL)
             let hard = AwakeTime.uptime() + 2
             while kill(pid, 0) == 0, AwakeTime.uptime() < hard { Thread.sleep(forTimeInterval: 0.01) }
         }
-        return "stopped litestream pid \(pid), left running by an earlier engine"
+        return .stopped(pid)
+    }
+
+    /// The owner's notice when `start` paused on an unproven litestream (engine-written; the pid is the engine's own number).
+    public static func pausedNotice(pid: Int32) -> (title: String, body: String) {
+        ("WAL shipping paused",
+         "A litestream for this database (pid \(pid)) is running that this engine did not start, so no second one was started. "
+         + "Stop that process, then relaunch Brahma or save the backup settings again.")
     }
 
     /// litestream (directly, or a script run by its interpreter: the name is the first or second argument) running
