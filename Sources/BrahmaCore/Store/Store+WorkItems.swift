@@ -113,9 +113,18 @@ extension Store {
         }
     }
 
+    /// The company's item key prefix: up to 5 letters and digits of its slug, uppercased (`ITEM` when none). A prefix that
+    /// is a bare ref form (`IndustryPack.reservedKeyPrefixes`: `A`, `AR`, `F`) gets an `X` (`AX`, `ARX`, `FX`), so `A-<n>`,
+    /// `AR-<n>` and `F-<n>` always mean an ask, an artifact and a resource. Items stored before keep their keys (ML's
+    /// `item:<KEY>` still reaches them).
     static func keyPrefix(slug: String) -> String {
         let letters = String(slug.filter { $0.isASCII && ($0.isLetter || $0.isNumber) }.uppercased().prefix(5))
-        return letters.isEmpty ? "ITEM" : letters
+        let derived = letters.isEmpty ? "ITEM" : letters
+        let prefix = IndustryPack.reservedKeyPrefixes.contains(derived) ? derived + "X" : derived
+        guard (try? IndustryPack.validateKeyPrefix(prefix, pack: "company")) != nil else {
+            preconditionFailure("derived a reserved item key prefix \(prefix)")
+        }
+        return prefix
     }
 
     /// The agent holding the item's lease, if any.

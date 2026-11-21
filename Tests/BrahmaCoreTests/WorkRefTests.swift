@@ -94,6 +94,23 @@ import Foundation
         #expect(throws: Never.self) { try IndustryPack.validateKeyPrefix("ENG", pack: "software") }
     }
 
+    /// The engine never derives a reserved prefix: A, AR and F get an X.
+    @Test func derivedKeyPrefixesAvoidReservedForms() throws {
+        #expect(Store.keyPrefix(slug: "a") == "AX")
+        #expect(Store.keyPrefix(slug: "ar") == "ARX")
+        #expect(Store.keyPrefix(slug: "f") == "FX")
+        #expect(Store.keyPrefix(slug: "arcade") == "ARCAD")
+        #expect(Store.keyPrefix(slug: "acme") == "ACME")
+        let store = try Store.inMemory()
+        let company = try store.createCompany(name: "A", goal: "g", workspacesRoot: try tempDir())
+        let item = try store.createWorkItem(companyId: company.id, by: .owner, draft: WorkItemDraft(type: .task, title: "t"))
+        #expect(item.key == "AX-1")
+        let context = RefContext(companyId: company.id, keyPrefixes: [Store.keyPrefix(slug: company.slug)])
+        let diff = try #require(WorkRef.parse("AX-1:diff", context: context))
+        #expect(diff.kind == .diff && diff.id == "AX-1" && diff.canonical == "AX-1:diff")
+        #expect(WorkRef.parse("A-1", context: context)?.kind == .ask)
+    }
+
     @Test func grammarAgreesWithMemoryRefs() throws {
         func source(_ kind: WorkRefKind) -> MemorySource? {
             switch kind {

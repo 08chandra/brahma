@@ -122,13 +122,14 @@ struct RefFixture {
         case .item: try ref("ENG-1")
         case .file: try ref("src/a.ts")
         case .engChannel: try ref("#eng")
+        case .home: try ref(".brahma/home/qa-2/t")
         }
     }
 
     func canRead(_ who: Who, _ target: Target) throws -> RefDecision {
         let r = try ref(target)
         let reader = reader(who)
-        return try store.writer.read { db in try RefAccess.canRead(reader, r, companyId: c.id, db: db) }
+        return try store.writer.read { db in try RefAccess.canRead(reader, r, companyId: c.id, db: db, catalog: store.catalog) }
     }
 
     func resolve(_ who: Who, _ ref: WorkRef) throws -> ResolvedRef {
@@ -139,7 +140,7 @@ struct RefFixture {
 
     enum Who: String, Sendable { case owner, concierge, cto, eng1, qa2 }
     enum Target: String, Sendable {
-        case f1, f2, secret, engMessage, engThread, dmMessage, a5, qa2Lab, hrMemory, restrictedKB, item, file, engChannel
+        case f1, f2, secret, engMessage, engThread, dmMessage, a5, qa2Lab, hrMemory, restrictedKB, item, file, engChannel, home
     }
 }
 
@@ -180,6 +181,8 @@ enum AccessFixture {
         Row(who: .qa2, target: .file, expected: .allowed(.company)),
         Row(who: .eng1, target: .engChannel, expected: .allowed(.channel)),
         Row(who: .qa2, target: .engChannel, expected: .locked(approverRole: "owner")),
+        Row(who: .qa2, target: .home, expected: .refused),
+        Row(who: .owner, target: .home, expected: .refused),
     ]
 }
 
@@ -195,10 +198,10 @@ enum AccessFixture {
         let fx = try RefFixture()
         let outsider = try fx.store.hire(companyId: fx.d.id, name: "spy", role: "engineer", model: "sonnet")
         let ref = try fx.ref("F-2")
-        let decision = try fx.store.writer.read { db in try RefAccess.canRead(.agent(outsider.id), ref, companyId: fx.c.id, db: db) }
+        let decision = try fx.store.writer.read { db in try RefAccess.canRead(.agent(outsider.id), ref, companyId: fx.c.id, db: db, catalog: fx.store.catalog) }
         #expect(decision == .refused)
         let missing = try fx.ref("F-99")
-        #expect(try fx.store.writer.read { db in try RefAccess.canRead(.owner, missing, companyId: fx.c.id, db: db) } == .refused)
+        #expect(try fx.store.writer.read { db in try RefAccess.canRead(.owner, missing, companyId: fx.c.id, db: db, catalog: fx.store.catalog) } == .refused)
     }
 
     /// D's object of every kind, resolved for a C reader, is `.missing` with nothing in it: the same as an id no company has.
