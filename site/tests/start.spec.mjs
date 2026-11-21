@@ -81,6 +81,34 @@ test('the #source and #installer hashes select their tab', async () => {
   }
 });
 
+test('landing on /start/#source shows the step and the tab strip under the header', async () => {
+  for (const viewport of [
+    { width: 1440, height: 900 },
+    { width: 390, height: 844 },
+  ]) {
+    const { context, page } = await openPage('/start/#source', { viewport, isMobile: viewport.width < 500, hasTouch: viewport.width < 500 });
+    try {
+      await page.waitForLoadState('load');
+      const m = await page.evaluate(() => {
+        const box = (s) => document.querySelector(s).getBoundingClientRect();
+        return {
+          header: box('header.header').bottom,
+          tablist: box('[role="tablist"]'),
+          title: box('#install-title'),
+          num: box('#install .step__num'),
+        };
+      });
+      const where = `at ${viewport.width} px`;
+      assert.ok(m.tablist.top >= m.header, `${where}: tab strip top ${m.tablist.top} is under the header (${m.header})`);
+      assert.ok(m.tablist.bottom <= viewport.height, `${where}: tab strip is in the viewport`);
+      assert.ok(m.num.top >= m.header && m.title.bottom <= viewport.height, `${where}: the step number and title are in view`);
+      assert.equal(await page.$$eval('[role="tabpanel"]', (ps) => ps.filter((p) => p.tabIndex >= 0).length), 0, 'panels are not tab stops');
+    } finally {
+      await context.close();
+    }
+  }
+});
+
 test('without JavaScript both install panels show, stacked, and the tab strip stays hidden', async () => {
   const { context, page } = await openPage('/start/', { javaScriptEnabled: false });
   try {

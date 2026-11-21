@@ -1,4 +1,5 @@
-# The claude CLI you already use, logged in. Brahma drives it headless.
+# The claude CLI you already use. Brahma drives it headless, on your plan.
+# Not signed in yet? Run `claude auth login` first.
 claude --version
 
 # The owner key that owner commands require. Run it in Terminal: it needs an

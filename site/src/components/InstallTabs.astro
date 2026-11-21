@@ -8,6 +8,11 @@
  * `role="tablist"`, roving tabindex, ←/→ and Home/End move and select (automatic
  * activation), a click or key press updates the URL hash without scrolling, and a hash
  * change selects the matching tab. Build from source is selected when the hash names neither.
+ *
+ * Landing on a panel's hash (Home's "Build from source" goes to /start/#source) scrolls to the
+ * panel with a scroll-margin that the script sets to the distance from the enclosing
+ * `[data-scroll-root]` (the quick start's step) to the panel. Starlight's `scroll-padding-top`
+ * clears the header, so the step's number, title and the tab strip land in view at any width.
  */
 interface Props {
   headingLevel?: 'h3' | 'h4';
@@ -75,15 +80,25 @@ const initial = 'source';
       select(id, focus);
       history.replaceState(null, '', `#${id}`);
     };
-    for (const p of panels) {
-      p.setAttribute('role', 'tabpanel');
-      p.tabIndex = 0;
-    }
+    for (const p of panels) p.setAttribute('role', 'tabpanel');
     root.classList.add('is-tabbed');
     root.querySelector('[role="tablist"]').hidden = false;
     select(root.dataset.initial, false);
     fromHash();
-    addEventListener('hashchange', fromHash);
+    // Scroll-margin for hash landings: the distance from the scroll root's top to the panel's top.
+    const scrollRoot = root.closest('[data-scroll-root]') ?? root;
+    const fit = () => {
+      const shown = panels.find((p) => !p.hidden);
+      if (!shown) return;
+      const gap = shown.getBoundingClientRect().top - scrollRoot.getBoundingClientRect().top;
+      for (const p of panels) p.style.scrollMarginTop = `${Math.round(gap)}px`;
+    };
+    fit();
+    addEventListener('resize', fit);
+    addEventListener('hashchange', () => {
+      fromHash();
+      fit();
+    });
     root.addEventListener('click', (e) => {
       const t = e.target.closest('[role="tab"]');
       if (t) pick(t.dataset.tab, false);
@@ -167,11 +182,6 @@ const initial = 'source';
 
   .itabs__panel {
     min-width: 0;
-  }
-  .itabs__panel:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 4px;
-    border-radius: var(--radius);
   }
   /* Stacked (no JavaScript): each panel under its own label, a hairline between them. */
   .itabs:not(.is-tabbed) .itabs__panel + .itabs__panel {

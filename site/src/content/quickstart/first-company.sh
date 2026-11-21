@@ -1,4 +1,5 @@
-# A git workspace, channels and an org from the software pack (six seats).
+# A git workspace, channels and the software pack's default org:
+# five agents and one open seat.
 brahma company create Acme --goal "Build a todo app"
 
 # Add one more agent: a designer on the haiku model.

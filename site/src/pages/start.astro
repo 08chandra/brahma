@@ -15,7 +15,6 @@
  */
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 import { Code } from '@astrojs/starlight/components';
-import Label from '../components/Label.astro';
 import Panel from '../components/Panel.astro';
 import InstallTabs from '../components/InstallTabs.astro';
 import { site } from '../../site.config.ts';
@@ -27,7 +26,7 @@ import watchSh from '../content/quickstart/watch.sh?raw';
 
 const title = 'Quick start';
 const description =
-  'Build Brahma from source, connect the claude CLI, create your first company and start the engine. Every command on the page is checked against this tree.';
+  'Build Brahma from source, connect the claude CLI, create your first company and start the engine. Each shell file on the page is run by a check script against this tree.';
 
 // The clone line exists only once the repository is public (site.repoURL).
 const cloneDir = site.repoURL.replace(/\/+$/, '').split('/').pop()?.replace(/\.git$/, '') ?? '';
@@ -38,7 +37,7 @@ const route = [
   { id: 'connect', title: 'Connect the claude CLI', command: 'brahma doctor' },
   { id: 'company', title: 'Create your first company', command: 'brahma company create' },
   { id: 'run', title: 'Run it and watch', command: 'brahma run' },
-  { id: 'next', title: 'Next steps', command: 'docs' },
+  { id: 'next', title: 'Next steps', command: '' },
 ];
 
 const canarySh = `# Write at least one probe line: a command the sandbox must deny.
@@ -68,7 +67,7 @@ const shots = [
     title: 'Backlog · Initech',
     alt: 'The Backlog of the demo company Initech: four work items with key, type, title, status, priority, tier, owner and check columns; one bug is in progress.',
     caption:
-      'The Backlog of the seeded demo company: every work item with its key, status, priority, tier, owner and the check that must pass before it merges.',
+      'The Backlog of the seeded demo company: every work item with its key, status, priority, tier, owner and the check that must pass before the engine merges it.',
   },
 ];
 
@@ -103,8 +102,9 @@ const next = [
           <p class="start__proof reveal" style="--i: 2">
             <span class="start__tick" aria-hidden="true"></span>
             <span>
-              Each shell block below is a file that <code>scripts/site-quickstart-check.sh</code> runs as it is, in a
-              throwaway data home, against a stand-in for the <code>claude</code> CLI.
+              Each block titled <code>*.sh</code> below is a file that <code>scripts/site-quickstart-check.sh</code> runs as
+              it is, in a throwaway data home, against a stand-in for the <code>claude</code> CLI; for the other
+              <code>brahma</code> commands it checks that they exist in this build.
             </span>
           </p>
         </div>
@@ -122,7 +122,7 @@ const next = [
                       <span class="route__title">
                         {step.title.split(/(claude)/).map((part, i) => (i % 2 === 1 ? <code>{part}</code> : part))}
                       </span>
-                      <code class="route__cmd">{step.command}</code>
+                      {step.command !== '' && <code class="route__cmd">{step.command}</code>}
                     </a>
                   </li>
                 ))
@@ -135,7 +135,7 @@ const next = [
 
     <div class="steps">
       <!-- 1 · Install -->
-      <section class="step grid" id="install" aria-labelledby="install-title">
+      <section class="step grid" id="install" aria-labelledby="install-title" data-scroll-root>
         <div class="step__aside">
           <span class="step__num" aria-hidden="true">1</span>
           <h2 id="install-title" class="step__title"><span class="visually-hidden">Step 1: </span>Install</h2>
@@ -163,17 +163,17 @@ const next = [
                 </div>
                 <div class="kv__row">
                   <dt class="label">claude CLI</dt>
-                  <dd>on your PATH, logged in to your plan</dd>
+                  <dd>on your PATH, signed in to your plan</dd>
                 </div>
               </dl>
               {
                 cloneSh !== '' ? (
-                  <Code code={cloneSh} lang="sh" title="Terminal" wrap />
+                  <Code code={cloneSh} lang="sh" title="Terminal" wrap hangingIndent={4} />
                 ) : (
                   <p class="prose note">The repository is not public yet.</p>
                 )
               }
-              <Code code={buildSh} lang="sh" title="build.sh" wrap />
+              <Code code={buildSh} lang="sh" title="build.sh" wrap hangingIndent={4} />
               <p class="prose">
                 <code>swift build</code> builds the CLI only. The Mac app, <code>.build/Brahma.app</code>, comes from{' '}
                 <code>scripts/make-app.sh</code>; it runs the same engine on the same data.
@@ -196,11 +196,12 @@ const next = [
           </h2>
           <p class="step__brief">
             Every agent turn is a headless run of the <code>claude</code> CLI you already use, on your own plan. Brahma
-            needs it on your PATH and logged in, and an owner key for the commands only you may run.
+            needs it on your PATH and signed in (<code>claude auth login</code>), and an owner key for the commands only
+            you may run.
           </p>
         </div>
         <div class="step__main stack">
-          <Code code={connectSh} lang="sh" title="connect.sh" wrap />
+          <Code code={connectSh} lang="sh" title="connect.sh" wrap hangingIndent={4} />
           <Panel title="What brahma doctor checks" titleAs="h3" dense>
             <dl class="kv kv--flush">
               <div class="kv__row">
@@ -217,7 +218,7 @@ const next = [
               </div>
               <div class="kv__row">
                 <dt class="label">Sandbox</dt>
-                <dd>reports the missing canary probes until you write them in step 3</dd>
+                <dd>a sandboxed read of the data home is refused; the canary items warn until you write probes in step 3</dd>
               </div>
             </dl>
           </Panel>
@@ -240,7 +241,7 @@ const next = [
           </p>
         </div>
         <div class="step__main stack">
-          <Code code={firstCompanySh} lang="sh" title="first-company.sh" wrap />
+          <Code code={firstCompanySh} lang="sh" title="first-company.sh" wrap hangingIndent={4} />
           <p class="prose">
             Reference: <a href="/docs/cli/company/create/">company create</a> · <a href="/docs/cli/hire/">hire</a> ·{' '}
             <a href="/docs/cli/say/">say</a>
@@ -253,7 +254,7 @@ const next = [
                 <code>claude</code> CLI, and the canary’s probes are yours to write. Until it passes, the agents wait and you
                 get a sandbox-check alert naming the reason.
               </p>
-              <Code code={canarySh} lang="sh" title="Terminal" wrap />
+              <Code code={canarySh} lang="sh" title="Terminal" wrap hangingIndent={4} />
               <p class="prose">
                 The engine also runs the canary itself while a Sandboxed agent waits. To run a company without the sandbox,{' '}
                 <code>brahma company profile Acme workspace</code> lets its agents’ shells run anywhere you can; read{' '}
@@ -274,13 +275,13 @@ const next = [
           <span class="step__num" aria-hidden="true">4</span>
           <h2 id="run-title" class="step__title"><span class="visually-hidden">Step 4: </span>Run it and watch</h2>
           <p class="step__brief">
-            Start the engine and the company works toward its goal: agents take turns, claim items, review each other’s
-            work and merge. What only you can decide waits in your Inbox.
+            Start the engine and the company works toward its goal: agents take turns, claim items and review each
+            other’s work, and the engine merges what passes. What only you can decide waits in your Inbox.
           </p>
         </div>
         <div class="step__main stack">
-          <Code code={runSh} lang="sh" title="run.sh" wrap />
-          <Code code={watchSh} lang="sh" title="watch.sh" wrap />
+          <Code code={runSh} lang="sh" title="run.sh" wrap hangingIndent={4} />
+          <Code code={watchSh} lang="sh" title="watch.sh" wrap hangingIndent={4} />
           <p class="prose">
             In the terminal, <code>brahma run</code> prints a line for each state change, turn and message. The app runs
             the same engine: while <code>brahma run</code> holds it, the app shows a banner and takes over when the
@@ -502,14 +503,15 @@ const next = [
   .step {
     margin: 0;
     padding-top: var(--s-6);
-    border-top: var(--hairline-strong);
-    scroll-margin-top: calc(var(--sl-nav-height) + var(--s-4));
+    border-top: var(--hairline-strong); /* anchors clear the header through Starlight's scroll-padding-top */
   }
   .step + .step {
     margin-top: var(--step-gap);
   }
+  /* The band's foot rule already separates the first step: no second rule under it. */
   .steps > .step:first-child {
-    margin-top: var(--s-7);
+    border-top: 0;
+    padding-top: var(--s-7);
   }
   .step__aside {
     display: grid;
@@ -601,12 +603,15 @@ const next = [
     color: var(--text0);
     text-decoration-color: var(--text-link);
   }
+  /* Touch: inline links grow a ≥ 40 px target without moving the text around them. */
   @media (pointer: coarse) {
     .prose a,
     .license a {
       display: inline-block;
+      min-width: 2.5rem;
       padding-block: 0.6875rem;
       margin-block: -0.6875rem;
+      text-align: center;
     }
   }
 
@@ -614,7 +619,6 @@ const next = [
   .kv {
     margin: 0;
     display: grid;
-    border-top: var(--hairline);
   }
   .kv__row {
     display: grid;
@@ -632,9 +636,6 @@ const next = [
     font-size: var(--text-ui);
     line-height: 1.5;
     color: var(--text0);
-  }
-  .kv--flush {
-    border-top: 0;
   }
   .kv--flush .kv__row {
     padding-inline: var(--s-2);
@@ -706,7 +707,6 @@ const next = [
     padding: 0;
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    border-top: var(--hairline);
   }
   @media (min-width: 48em) {
     .next {
@@ -758,6 +758,7 @@ const next = [
     line-height: 1.5;
     color: var(--text1);
   }
+  /* The path reads as the link, underlined like Home's card paths. */
   .next__path {
     justify-self: start;
     margin-top: var(--s-1);
@@ -765,6 +766,14 @@ const next = [
     background: none;
     font-size: var(--step--1);
     color: var(--text-link);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent);
+    transition: text-decoration-color var(--dur-fast) var(--ease);
+  }
+  .next__link:hover .next__path {
+    text-decoration-color: var(--text-link);
   }
 
   .visually-hidden {

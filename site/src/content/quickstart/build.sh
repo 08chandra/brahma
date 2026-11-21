@@ -1,5 +1,5 @@
 # Needs macOS 14 or later, Swift 6 (Xcode or its command line tools)
-# and the claude CLI on your PATH, logged in to your plan.
+# and the claude CLI on your PATH, signed in to your plan.
 # Run from the root of your Brahma checkout.
 
 swift build
