@@ -14,8 +14,8 @@ public enum RefDecision: Equatable, Sendable {
 /// shows an unknown or another company's object as `.missing`). Every row lookup is still bound to the company
 /// (`companyId = ?`), a row it does not find is `.refused`, and so is a reader of another company.
 ///
-/// The class per kind: file, diff, commit, item, run, preview, release, agent and sprint are company; a `.brahma` lab, home
-/// or notes path is private to its agent; a message or thread follows its channel (members, else locked) or DM
+/// The class per kind: file, diff, commit, item, run, artifact, preview, release, agent and sprint are company; a `.brahma`
+/// lab, home or notes path is private to its agent; a message or thread follows its channel (members, else locked) or DM
 /// (participants, else refused); a channel its members; a resource its stored scope, reader set and future holders (a
 /// flagged one is secret); a kb page its page restriction (and a named section's markers); a memory entry its memory doc;
 /// an ask ML's per-party class (owner, requester, internal approver, decider; else refused); a fact the owner's.
@@ -78,6 +78,8 @@ public enum RefAccess {
         case kb(KBPage, section: String?)
         case memory(MemoryEntry, authorHandle: String)
         case resource(Resource)
+        /// 4a's `AR-<n>`: its copy under `.brahma/artifacts/<number>-<slug>/`, opened at its entry file.
+        case artifact(Artifact)
         case preview(PreviewSurface, status: PreviewStatus?)
         case run(VerificationRun, itemKey: String)
         case release(version: String, status: String)
@@ -88,7 +90,7 @@ public enum RefAccess {
         case fact
     }
 
-    /// The object of this company `ref` names, or nil (unknown, another company's, or a 4a artifact).
+    /// The object of this company `ref` names, or nil (unknown or another company's).
     static func subject(_ ref: WorkRef, companyId: String, db: Database) throws -> Subject? {
         switch ref.kind {
         case .file:
@@ -155,9 +157,10 @@ public enum RefAccess {
             }
             return s
         case .artifact:
-            // 4a-gap: Artifact (4a Task 6). No artifact rows exist yet: every AR-<n> is unknown (refused here, missing when
-            // resolved), the answer the design gives an unknown object.
-            return nil
+            // 4a's published artifact (company class, like the preview pane that shows it). Its taint is its row's.
+            guard let n = Int(ref.id), let artifact = try Artifact.fetchOne(db, sql: "SELECT * FROM artifact WHERE companyId = ? AND number = ?",
+                                                                            arguments: [companyId, n]) else { return nil }
+            return Subject(record: .artifact(artifact))
         case .resource:
             guard let n = Int(ref.id), let r = try Store.resource(db: db, companyId: companyId, number: n), r.removedAt == nil
             else { return nil }

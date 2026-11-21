@@ -229,6 +229,11 @@ extension Store {
                            subtitle: "\(r.ref) · \(r.fileKind ?? r.kind.rawValue)", bytes: Int(r.bytes),
                            provenance: Provenance(raw: r.provenance) ?? .external(r.provenance), tainted: r.tainted,
                            taintReason: r.taintReason, state: state, pinned: ref)
+        case .artifact(let a):
+            // 4a's title is agent-controlled: sanitized here; a tainted publisher's title is never shown (4a's digest rule).
+            return Details(title: a.tainted ? "\(a.ref) (untrusted)" : Self.safe(a.title), subtitle: "\(a.ref) · \(a.kind.rawValue)",
+                           bytes: Int(clamping: a.bytes), provenance: a.provenance, tainted: a.tainted,
+                           taintReason: a.tainted ? a.taintReason ?? "outside content" : nil, pinned: ref)
         case .preview(let surface, let status):
             var pinned = ref
             pinned.params["was"] = (status ?? .idle).rawValue

@@ -96,6 +96,11 @@ extension Store {
             }) else { return (false, nil) }
             if m.fromTaintedSession || m.taintedOrigin { return (true, Self.sessionReason(m.taintSource ?? "outside content")) }
             return (false, nil)
+        case .artifact:
+            guard let n = Int(ref.id), let a = try writer.read({ db in
+                try Artifact.fetchOne(db, sql: "SELECT * FROM artifact WHERE companyId = ? AND number = ?", arguments: [companyId, n])
+            }) else { return (false, nil) }
+            return a.tainted ? (true, a.taintReason ?? "outside content") : (false, nil)
         case .item:
             guard let item = try writer.read({ db in try RefAccess.item(db, companyId, ref.id) }) else { return (false, nil) }
             return item.taintedOrigin ? (true, "outside content") : (false, nil)
@@ -145,8 +150,11 @@ extension Store {
     /// - `handoffs/<KEY>/…`: the hand-off row's own mark (its writer's session when it was written), or the item's as above;
     ///   a file no hand-off row names can't be attributed: tainted;
     /// - `resources/company/…`: clean (the engine mirrors only untainted, unflagged owner resources there);
+    /// - `artifacts/<number>-<slug>/…`: the taint of this company's artifact row whose `storedPath` is that folder (4a's
+    ///   `tainted`/`taintReason`; the folder is engine-written, write-denied to every turn); a folder no row names (a
+    ///   leftover, a staging copy, another company's), a file beside the folders, or a lookup that fails: tainted;
     /// - an agent's lab or notes (private: only it and the owner read them): its own place, not judged here;
-    /// - anything else (`artifacts`, an unknown item): it can't be determined, so tainted (fail closed).
+    /// - anything else (an unknown item): it can't be determined, so tainted (fail closed).
     private func onDiskBrahmaTaint(_ ref: WorkRef, companyId: String) throws -> (tainted: Bool, reason: String?) {
         let unknown = (true, Optional(Self.unplacedBrahmaReason))
         if RefAccess.privatePlace(ref) != nil { return (false, nil) }
@@ -159,6 +167,20 @@ extension Store {
         switch parts[1] {
         case "resources" where parts[2] == "company":
             return (false, nil)
+        case "artifacts":
+            guard parts.count >= 4, parts.dropFirst(2).allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }),
+                  !parts[2].hasPrefix(".") else { return unknown }
+            let folder = ".brahma/artifacts/\(parts[2])"
+            let row: Artifact?
+            do {
+                row = try writer.read { db in
+                    try Artifact.fetchOne(db, sql: "SELECT * FROM artifact WHERE companyId = ? AND storedPath = ?", arguments: [companyId, folder])
+                }
+            } catch {
+                return unknown
+            }
+            guard let row else { return unknown }
+            return row.tainted ? (true, row.taintReason ?? "outside content") : (false, nil)
         case "progress" where parts.count == 3 && parts[2].hasSuffix(".md"):
             guard let item = try item(String(parts[2].dropLast(3))) else { return unknown }
             return try itemSource(item).map { (true, Self.sessionReason($0)) } ?? (false, nil)
@@ -206,7 +228,7 @@ extension Store {
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
         var out: [String: (source: String, commits: Set<String>)] = [:]
-        var failure: (any Error)?, readable: [String] = []
+        var failure: (any Error)?, readable: [WorkItem] = []
         for (itemId, itemRows) in byItem {
             guard let item = try workItem(id: itemId), item.companyId == companyId, let newest = itemRows.first else { continue }
             let branch: Set<String>
@@ -223,10 +245,10 @@ extension Store {
                 failure = failure ?? error
                 continue
             }
-            readable.append(itemId)
+            readable.append(item)
             if itemRows.contains(where: { !branch.contains($0.sha) }) { out[itemId] = (newest.source, branch) }
         }
-        noteReadableBranches(companyId: companyId, itemIds: readable)
+        noteReadableBranches(companyId: companyId, items: readable)
         if let failure { throw failure }
         return out
     }
@@ -235,16 +257,17 @@ extension Store {
     static func unreadableBranchAlertReason(_ itemId: String) -> String { "taint-branch:\(itemId)" }
 
     /// Ruling 12: an item branch the orphan check can't read makes every item ref in the company read tainted (fail closed);
-    /// the owner gets one alert naming it per break, not one per resolve: none while the newest alert for it is open or was
-    /// answered by the owner, a new one only after it answered itself ("resolved") when the branch read again. Never throws.
+    /// the owner gets one alert naming it per break, not one per resolve: none while the newest alert for it is open, or was
+    /// answered by the owner and the branch has not read cleanly since; a new one once the branch read cleanly after its last
+    /// alert (which then answered itself, or, answered by the owner, was re-armed: `noteReadableBranches`). Never throws.
     private func noteUnreadableBranch(companyId: String, item: WorkItem, error: any Error) {
         let reason = Self.unreadableBranchAlertReason(item.id)
+        let key = item.key
         @Sendable func alerted(_ db: Database) throws -> Bool {
-            let newest = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
-                                        && Column("subjectId") == Store.engineAlertKey(reason))
-                .order(Column("number").desc).fetchOne(db)
-            guard let newest else { return false }
-            return newest.status == .pendingOwner || newest.decidedBy != "system"
+            guard let newest = try Self.newestBranchAlert(db, companyId: companyId, itemId: item.id) else { return false }
+            if newest.status == .pendingOwner { return true }
+            if newest.decidedBy == "system" { return false }
+            return try !Self.branchAlertRearmed(db, companyId: companyId, key: key, alert: newest)
         }
         do {
             if try writer.read(alerted) { return }      // the usual case on a later resolve: no write
@@ -260,17 +283,51 @@ extension Store {
         }
     }
 
-    /// Branches that read again: their open ruling-12 alerts answer themselves. One read when none is open. Never throws.
-    private func noteReadableBranches(companyId: String, itemIds: [String]) {
-        guard !itemIds.isEmpty else { return }
-        let reasons = itemIds.map(Self.unreadableBranchAlertReason)
-        let keys = reasons.map(Store.engineAlertKey)
-        let open = (try? writer.read { db in
-            try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
-                           && Column("status") == AskStatus.pendingOwner.rawValue && keys.contains(Column("subjectId"))).fetchCount(db)
-        }) ?? 0
-        guard open > 0 else { return }
-        try? writer.write { db in try resolveEngineAlerts(db, reasons: reasons, now: Store.now()) }
+    /// The newest ruling-12 alert about the item's branch, or nil.
+    private static func newestBranchAlert(_ db: Database, companyId: String, itemId: String) throws -> Ask? {
+        try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
+                       && Column("subjectId") == Store.engineAlertKey(unreadableBranchAlertReason(itemId)))
+            .order(Column("number").desc).fetchOne(db)
+    }
+
+    /// The activity line that re-arms an owner-answered ruling-12 alert: the branch read cleanly after the owner answered it.
+    /// It names the alert, so each answered alert is re-armed once, by a clean read after it.
+    static func branchReadableAgainText(key: String, alert: Ask) -> String {
+        "item/\(key) can be read again for the taint check; a new break will alert again (after \(alert.ref))"
+    }
+
+    private static func branchAlertRearmed(_ db: Database, companyId: String, key: String, alert: Ask) throws -> Bool {
+        try ActivityEvent.filter(Column("companyId") == companyId && Column("kind") == ActivityKind.access.rawValue
+                                 && Column("agentId") == nil && Column("text") == branchReadableAgainText(key: key, alert: alert))
+            .fetchCount(db) > 0
+    }
+
+    /// Branches that read again: their open ruling-12 alerts answer themselves, and an alert the owner answered is re-armed
+    /// (an `access` activity line), so the next break raises a new one. One read when there is nothing to do. Never throws.
+    private func noteReadableBranches(companyId: String, items: [WorkItem]) {
+        guard !items.isEmpty else { return }
+        let pending: (open: [String], rearm: [(key: String, alert: Ask)])? = try? writer.read { db in
+            var open: [String] = [], rearm: [(key: String, alert: Ask)] = []
+            for item in items {
+                guard let newest = try Self.newestBranchAlert(db, companyId: companyId, itemId: item.id) else { continue }
+                if newest.status == .pendingOwner {
+                    open.append(Self.unreadableBranchAlertReason(item.id))
+                } else if newest.decidedBy != "system", try !Self.branchAlertRearmed(db, companyId: companyId, key: item.key, alert: newest) {
+                    rearm.append((item.key, newest))
+                }
+            }
+            return (open, rearm)
+        }
+        guard let pending, !pending.open.isEmpty || !pending.rearm.isEmpty else { return }
+        try? writer.write { db in
+            let now = Store.now()
+            if !pending.open.isEmpty { try resolveEngineAlerts(db, reasons: pending.open, now: now) }
+            for (key, alert) in pending.rearm {
+                guard try !Self.branchAlertRearmed(db, companyId: companyId, key: key, alert: alert) else { continue }
+                try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .access,
+                                  text: Self.branchReadableAgainText(key: key, alert: alert), createdAt: now).insert(db)
+            }
+        }
     }
 
     /// An uncleared row's source for `sha`, or for any sha it prefixes (7–64 lowercase hex; anything else names no row); else

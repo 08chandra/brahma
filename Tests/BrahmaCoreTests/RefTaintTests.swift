@@ -876,6 +876,93 @@ import GRDB
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/leftover.ts"), companyId: cId).tainted)
     }
 
+    // MARK: P2 artifact de-stub
+
+    /// Ruling 9 for artifacts: a rev-less `.brahma/artifacts/<number>-<slug>/…` file takes its taint from the company's artifact
+    /// row with that folder (`tainted`/`taintReason`); a folder no row of this company names, or a lookup that fails, is tainted.
+    @Test func artifactFolderTaintFollowsItsRow() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let reason = "written by a session that read docs.swift.org"
+        let a = try cf.publish("page.html", "<p>x</p>\n", title: "Clean page")
+        let entry = try cf.fx.ref(a.storedPath + "/" + a.entryFile)
+        #expect(try cf.store.refTaint(entry, companyId: cId) == (false, nil))
+        let clean = try cf.open(.qa2, a.storedPath + "/" + a.entryFile)
+        #expect(!clean.tainted && clean.text.contains("    | <p>x</p>"))
+        #expect(try !cf.agent(cf.fx.qa2).sessionTainted)
+        // The row says tainted: so does every file of its folder, and its reader.
+        try cf.taintArtifact(1, reason: reason)
+        #expect(try cf.store.refTaint(entry, companyId: cId) == (true, reason))
+        #expect(try cf.fx.resolve(.qa2, entry).tainted)
+        #expect(try cf.open(.qa2, a.storedPath + "/" + a.entryFile).tainted)
+        #expect(try cf.agent(cf.fx.qa2).sessionTainted)
+        // A folder no row names (a leftover, a staging copy, a file beside the folders) stays tainted.
+        for path in [".brahma/artifacts/9-ghost/index.html", ".brahma/artifacts/.staging-x/index.html", ".brahma/artifacts/page.html"] {
+            try cf.fx.git.write(path, "<p>?</p>\n")
+            #expect(try cf.store.refTaint(try cf.fx.ref(path), companyId: cId) == (true, Store.unplacedBrahmaReason), "\(path)")
+        }
+        // Another company's row never vouches for this company's folder.
+        let d = try cf.publish("d.html", "<p>d</p>\n", title: "D page", in: cf.fx.d)
+        try cf.fx.git.write(d.storedPath + "/" + d.entryFile, "<p>d?</p>\n")
+        #expect(try cf.store.refTaint(try cf.fx.ref(d.storedPath + "/" + d.entryFile), companyId: cId) == (true, Store.unplacedBrahmaReason))
+        // A clean row again, then a lookup that fails: tainted.
+        try cf.store.writer.write { db in
+            try db.execute(sql: "UPDATE artifact SET tainted = 0, taintReason = NULL WHERE companyId = ?", arguments: [cId])
+        }
+        #expect(try cf.store.refTaint(entry, companyId: cId) == (false, nil))
+        try cf.store.writer.write { db in try db.execute(sql: "CREATE TEMP TABLE artifact (broken INTEGER)") }
+        #expect(try cf.store.refTaint(entry, companyId: cId) == (true, Store.unplacedBrahmaReason))
+    }
+
+    /// Parked R5-1 (ruling 12): an alert the owner answered silences that break only. A clean read of the branch re-arms it,
+    /// so a later break raises a new alert; while it stays broken, answering it adds nothing.
+    @Test func answeredBranchAlertReArmsAfterCleanRead() throws {
+        let cf = try CollabFixture()
+        let (_, own) = try Self.unrelatedRootOnENG3(cf)
+        let cId = cf.c.id
+        func alerts() throws -> [Ask] {
+            try cf.store.writer.read { db in
+                try Ask.filter(Column("companyId") == cId && Column("kind") == AskKind.engineAlert).order(Column("number")).fetchAll(db)
+                    .filter { $0.title.contains("item/ENG-3") }
+            }
+        }
+        func resolve() throws {
+            for _ in 0..<2 { #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId).tainted) }
+        }
+        func heal() throws {
+            try cf.fx.git.git(["update-ref", "refs/heads/item/ENG-3", own])
+            _ = try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId)
+            _ = try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId)
+        }
+        func breakAgain(_ n: Int) throws {
+            let root = try cf.fx.git.git(["commit-tree", try cf.fx.git.git(["mktree"]), "-m", "unrelated root \(n)"])
+            try cf.fx.git.git(["update-ref", "refs/heads/item/ENG-3", root])
+        }
+        try resolve()
+        let first = try #require(try alerts().first)
+        #expect(try alerts().count == 1 && first.status == .pendingOwner)
+        // The owner answers it while the branch is still broken: this break stays answered.
+        _ = try cf.store.acknowledge(askId: first.id)
+        try resolve()
+        #expect(try alerts().count == 1)
+        // The branch reads cleanly: nothing new, and the answered alert is re-armed.
+        try heal()
+        #expect(try alerts().count == 1)
+        #expect(try alerts().first?.ownerAnswer == "acknowledged" && alerts().first?.decidedBy == "owner")
+        // Broken again: exactly one new pending alert.
+        try breakAgain(2)
+        try resolve()
+        #expect(try alerts().count == 2 && alerts().filter { $0.status == .pendingOwner }.count == 1)
+        // That one answered too: silent until the next clean read, then one more on the next break.
+        _ = try cf.store.acknowledge(askId: try #require(try alerts().last).id)
+        try resolve()
+        #expect(try alerts().count == 2)
+        try heal()
+        try breakAgain(3)
+        try resolve()
+        #expect(try alerts().count == 3 && alerts().filter { $0.status == .pendingOwner }.count == 1)
+    }
+
 }
 
 /// A git runner that fails (status 128, as a broken repository does) every call naming an item branch.

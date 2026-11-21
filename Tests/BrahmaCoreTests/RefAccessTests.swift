@@ -144,6 +144,19 @@ struct RefFixture {
     }
 }
 
+extension RefFixture {
+    /// 4a's `AR-<number>` row, inserted as is (C's tests need titles no publish accepts); its folder is not on disk.
+    @discardableResult
+    func seedArtifact(_ number: Int, title: String, companyId: String? = nil, tainted: Bool = false, taintReason: String? = nil,
+                      publishedById: String = "owner") throws -> Artifact {
+        let a = Artifact(id: UUID().uuidString, companyId: companyId ?? c.id, number: number, title: title, kind: .html,
+                         storedPath: ".brahma/artifacts/\(number)-seeded", entryFile: "index.html", sourcePath: "/seeded/index.html",
+                         publishedById: publishedById, itemId: nil, bytes: 12, createdAt: now, tainted: tainted, taintReason: taintReason)
+        try store.writer.write { db in try a.insert(db) }
+        return a
+    }
+}
+
 enum AccessFixture {
     struct Row: Sendable, CustomTestStringConvertible {
         var who: RefFixture.Who
@@ -223,11 +236,9 @@ enum AccessFixture {
             var (x, y) = (a, b)
             x.opaqueId = ""; y.opaqueId = ""
             #expect(x == y, "\(k) \(who)")
-            // And D's own reader sees it (it exists), except the artifact, which has no rows yet.
-            if k != .artifact {
-                let own = try fx.store.resolveRef(foreign, for: .owner, companyId: fx.d.id)
-                #expect(own.visibility == .full, "\(k) in D")
-            }
+            // And D's own reader sees it (it exists).
+            let own = try fx.store.resolveRef(foreign, for: .owner, companyId: fx.d.id)
+            #expect(own.visibility == .full, "\(k) in D")
         }
     }
 }
@@ -275,7 +286,9 @@ enum CrossCompany {
                 try db.execute(sql: "UPDATE memoryDoc SET ref = 'mem:50' WHERE companyId = ? AND ref = ?", arguments: [d.id, entry.ref])
             }
             return ref(.memory, "50")
-        case .artifact: return ref(.artifact, "1")
+        case .artifact:
+            try fx.seedArtifact(1, title: "D page", companyId: d.id)
+            return ref(.artifact, "1")
         case .resource:
             try s.writer.write { db in
                 try Resource(companyId: d.id, number: 50, kind: .file, displayName: "d.pdf", ext: "pdf", bytes: 9, scopeKind: "company",
