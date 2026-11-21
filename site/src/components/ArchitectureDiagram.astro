@@ -1,0 +1,392 @@
+---
+/**
+ * The "Inside Brahma" architecture diagram: a hand-authored inline SVG schematic of the
+ * processes (the Mac app, the `brahma` CLI, the children the engine starts) over the one
+ * library (BrahmaCore) and the one database. Every box is a Package.swift target, a
+ * BrahmaCore area or a process; every arrow is a call or dependency the report for this page
+ * points at in the source (task-11-report.md lists them with file:line).
+ *
+ * Tokens only (tokens.css): hairline 1 px strokes, 2 px radii, mono uppercase tracked labels,
+ * colour only for meaning (accent = the one engine; nothing else is coloured). text2 is used
+ * for wires and chevrons only — non-text marks (4.4:1 on bg0, above the 3:1 graphics floor).
+ * No gradients, shadows or client JS. The SVG keeps its intrinsic 736×512 ratio (CLS 0);
+ * below 736 px it scrolls inside the bordered figure instead of shrinking its 10–11 px labels.
+ */
+interface Node {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  label: string;
+  sub?: string;
+  accent?: boolean;
+  h?: number;
+}
+interface Frame {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+  tag: string;
+}
+interface Edge {
+  d: string;
+  dashed?: boolean;
+}
+interface Boundary {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+}
+
+const W = 736;
+const H = 512;
+const NODE_H = 30;
+
+const frames: Frame[] = [
+  { x: 0, y: 0, w: 224, h: 172, label: 'Brahma.app', tag: 'BrahmaApp' },
+  { x: 256, y: 0, w: 224, h: 172, label: 'brahma CLI', tag: 'brahma' },
+  { x: 512, y: 0, w: 224, h: 404, label: 'Child processes', tag: 'turns · checks' },
+  { x: 0, y: 212, w: 480, h: 192, label: 'BrahmaCore', tag: 'library · 29 areas' },
+];
+
+// Dashed = an OS sandbox boundary (Seatbelt), drawn like a fieldset with its legend on the edge.
+const boundaries: Boundary[] = [
+  { x: 518, y: 24, w: 200, h: 90, label: 'Sandbox · default profile' },
+  { x: 518, y: 246, w: 200, h: 42, label: 'Seatbelt' },
+];
+
+const nodes: Node[] = [
+  // Brahma.app
+  { id: 'app-views', x: 12, y: 30, w: 200, label: 'BrahmaApp', sub: 'SwiftUI views · menu bar' },
+  { id: 'app-map', x: 92, y: 78, w: 120, label: 'BrahmaMapKit', sub: 'SpriteKit agent map' },
+  { id: 'app-model', x: 12, y: 126, w: 200, label: 'BrahmaAppModel', sub: 'AppModel · EngineHost' },
+  // brahma CLI
+  { id: 'cli-run', x: 268, y: 30, w: 200, label: 'brahma run', sub: 'the engine in a terminal' },
+  { id: 'cli-cmd', x: 268, y: 78, w: 200, label: 'brahma <command>', sub: 'owner commands · exit when done' },
+  // Child processes
+  { id: 'turn', x: 524, y: 30, w: 188, label: 'claude -p', sub: 'one agent turn · stream-json' },
+  { id: 'bash', x: 524, y: 78, w: 188, label: 'Bash · shell prefix', sub: 'sandbox-exec per command' },
+  { id: 'check', x: 524, y: 252, w: 188, label: 'checks · previews', sub: 'sandbox-exec · egress proxy' },
+  { id: 'mcp-proc', x: 524, y: 304, w: 188, label: 'brahma mcp', sub: 'company tools · stdio' },
+  // BrahmaCore
+  { id: 'orch', x: 128, y: 252, w: 140, label: 'Orchestrator', sub: 'actor · one per machine', accent: true },
+  { id: 'turns', x: 300, y: 252, w: 72, label: 'Turns', sub: 'TurnRunner' },
+  { id: 'sandbox', x: 392, y: 252, w: 76, label: 'Sandbox', sub: 'Seatbelt' },
+  { id: 'sched', x: 128, y: 304, w: 140, label: 'Scheduler', sub: 'select · UsageGate' },
+  { id: 'mcp', x: 300, y: 304, w: 168, label: 'MCP', sub: 'MCPServer · CompanyTools' },
+  { id: 'store', x: 12, y: 356, w: 456, label: 'Store', sub: 'every process reads and writes through it' },
+  // Outside the library
+  { id: 'sqlite', x: 12, y: 436, w: 280, label: 'brahma.sqlite', sub: 'one database · WAL' },
+  { id: 'keychain', x: 316, y: 436, w: 152, label: 'BrahmaKeychain', sub: 'macOS Keychain' },
+  { id: 'csc', x: 512, y: 436, w: 212, label: 'CSandboxCheck', sub: 'C · sandbox_check' },
+];
+
+// Paths end 1 px short of the target edge so the chevron sits on the hairline, not over it.
+const edges: Edge[] = [
+  // Brahma.app: views → map → model, views → model
+  { d: 'M152 60 V77' },
+  { d: 'M42 60 V125' },
+  { d: 'M152 108 V125' },
+  // processes → the library
+  { d: 'M170 156 V251' }, // AppModel/EngineHost hosts the Orchestrator while it holds the lock
+  { d: 'M60 156 V355' }, // AppModel holds a Store
+  { d: 'M268 45 H240 V251' }, // brahma run builds the Orchestrator
+  { d: 'M284 108 V355' }, // owner commands open the Store
+  // inside the library
+  { d: 'M268 267 H299' }, // Orchestrator → runner.run
+  { d: 'M372 267 H391' }, // Turns compile the SandboxScope into settings + shell prefix
+  { d: 'M198 282 V303' }, // Orchestrator → Scheduler.select / UsageGate
+  { d: 'M128 274 H112 V355' }, // Orchestrator → Store, every tick
+  { d: 'M384 334 V355' }, // CompanyTools → Store
+  // the library ↔ child processes
+  { d: 'M336 252 V190 H496 V45 H523', dashed: true }, // TurnRunner spawns claude -p
+  { d: 'M468 267 H523', dashed: true }, // SeatbeltRunner spawns checks and previews
+  { d: 'M618 60 V77' }, // claude wraps each Bash command in the shell prefix
+  { d: 'M712 45 H722 V319 H713', dashed: true }, // claude spawns brahma mcp over stdio
+  { d: 'M524 319 H469' }, // brahma mcp runs MCPServer(CompanyTools(store:))
+  // outside the library
+  { d: 'M152 386 V435' }, // Store → GRDB → brahma.sqlite
+  { d: 'M392 436 V405' }, // BrahmaKeychain implements BrahmaCore's SecretVault / OwnerKeyStore
+  { d: 'M440 404 V451 H511' }, // BrahmaCore links CSandboxCheck (Turns/TurnProcess)
+];
+
+const legend = [
+  { kind: 'solid', label: 'in-process call' },
+  { kind: 'dashed', label: 'spawns · stdio' },
+  { kind: 'accent', label: 'the one engine' },
+  { kind: 'boundary', label: 'OS sandbox' },
+];
+
+// Mono at 10 px is ~6.2 px per glyph with the label tracking; the legend backing rect uses it.
+const legendBacking = (label: string) => Math.round(label.length * 6.2 + 10);
+---
+
+<figure class="arch not-content">
+  <div class="arch__scroll" tabindex="0">
+    <svg
+      class="arch__svg"
+      viewBox={`0 0 ${W} ${H}`}
+      width={W}
+      height={H}
+      role="img"
+      aria-labelledby="arch-title arch-desc"
+      focusable="false"
+    >
+      <title id="arch-title">How Brahma's processes, library and database fit together</title>
+      <desc id="arch-desc">
+        Three kinds of process sit over one library. The Mac app (BrahmaApp views, BrahmaMapKit's agent map,
+        BrahmaAppModel) and the brahma CLI (brahma run, owner commands) both link BrahmaCore. In BrahmaCore one
+        Orchestrator actor per machine calls the Scheduler, the Turns area and the Store; Turns compile each
+        turn's Sandbox scope. The Orchestrator's TurnRunner spawns a claude -p child process for each agent turn,
+        whose Bash runs through a shell prefix (sandbox-exec) and which spawns brahma mcp over stdio; brahma mcp
+        runs the MCP area's CompanyTools against the Store. The Sandbox area spawns checks and previews under
+        Seatbelt. Every process reads and writes the one brahma.sqlite database through the Store (GRDB).
+        BrahmaKeychain implements BrahmaCore's secret-vault and owner-key protocols; BrahmaCore links the
+        CSandboxCheck C target.
+      </desc>
+      <defs>
+        <marker
+          id="arch-chevron"
+          viewBox="0 0 6 6"
+          markerWidth="6"
+          markerHeight="6"
+          refX="5"
+          refY="3"
+          orient="auto"
+          markerUnits="userSpaceOnUse"
+        >
+          <path d="M0.5 0.5 L5 3 L0.5 5.5" class="arch__chevron" />
+        </marker>
+      </defs>
+
+      {/* Frames: process boundaries and the library */}
+      {
+        frames.map((f) => (
+          <g class="arch__frame">
+            <rect x={f.x + 0.5} y={f.y + 0.5} width={f.w - 1} height={f.h - 1} rx="2" class="arch__frame-bg" />
+            <rect x={f.x + 1} y={f.y + 1} width={f.w - 2} height="19" class="arch__frame-head" />
+            <text x={f.x + 8} y={f.y + 14} class="arch__label arch__label--frame">
+              {f.label}
+            </text>
+            <text x={f.x + f.w - 8} y={f.y + 14} class="arch__tag" text-anchor="end">
+              {f.tag}
+            </text>
+          </g>
+        ))
+      }
+
+      {/* OS sandbox boundaries (dashed, legend on the edge) */}
+      {
+        boundaries.map((b) => (
+          <g class="arch__boundary">
+            <rect x={b.x + 0.5} y={b.y + 0.5} width={b.w - 1} height={b.h - 1} rx="2" class="arch__boundary-line" />
+            <rect x={b.x + 6} y={b.y - 6} width={legendBacking(b.label)} height="12" class="arch__legend-bg" />
+            <text x={b.x + 10} y={b.y + 4} class="arch__tag">
+              {b.label}
+            </text>
+          </g>
+        ))
+      }
+
+      {/* Wires */}
+      <g class="arch__wires" aria-hidden="true">
+        {
+          edges.map((e) => (
+            <path d={e.d} class:list={['arch__wire', { 'arch__wire--dashed': e.dashed }]} marker-end="url(#arch-chevron)" />
+          ))
+        }
+      </g>
+
+      {/* Wire labels */}
+      <g aria-hidden="true">
+        <text x="160" y="416" class="arch__tag">GRDB</text>
+        <text x="384" y="426" class="arch__tag" text-anchor="end">SecretVault · OwnerKeyStore</text>
+        <text x="714" y="186" class="arch__tag" text-anchor="end">spawns · stdio</text>
+        <text x="416" y="184" class="arch__tag" text-anchor="middle">settings · shell prefix</text>
+      </g>
+
+      {/* Nodes */}
+      {
+        nodes.map((n) => (
+          <g class:list={['arch__node', { 'arch__node--accent': n.accent }]} id={`arch-${n.id}`}>
+            <rect x={n.x + 0.5} y={n.y + 0.5} width={n.w - 1} height={(n.h ?? NODE_H) - 1} rx="2" class="arch__node-bg" />
+            <text x={n.x + 8} y={n.y + 13} class="arch__label">
+              {n.label}
+            </text>
+            {n.sub && (
+              <text x={n.x + 8} y={n.y + 24} class="arch__sub">
+                {n.sub}
+              </text>
+            )}
+          </g>
+        ))
+      }
+
+      {/* Note inside the child-process frame */}
+      <g class="arch__note">
+        <text x="524" y="368" class="arch__sub">Every child runs in its own process group,</text>
+        <text x="524" y="382" class="arch__sub">which the engine reaps. CSandboxCheck asks the</text>
+        <text x="524" y="396" class="arch__sub">kernel what each child's sandbox allows.</text>
+      </g>
+
+      {/* Legend */}
+      <g class="arch__key" aria-hidden="true">
+        {
+          legend.map((item, i) => {
+            const x = 12 + i * 184;
+            return (
+              <g>
+                {item.kind === 'solid' && <path d={`M${x} 496 H${x + 24}`} class="arch__wire" marker-end="url(#arch-chevron)" />}
+                {item.kind === 'dashed' && (
+                  <path d={`M${x} 496 H${x + 24}`} class="arch__wire arch__wire--dashed" marker-end="url(#arch-chevron)" />
+                )}
+                {item.kind === 'accent' && <rect x={x + 0.5} y="490.5" width="23" height="11" rx="2" class="arch__key-accent" />}
+                {item.kind === 'boundary' && <rect x={x + 0.5} y="490.5" width="23" height="11" rx="2" class="arch__boundary-line" />}
+                <text x={x + 32} y="500" class="arch__tag">
+                  {item.label}
+                </text>
+              </g>
+            );
+          })
+        }
+      </g>
+    </svg>
+  </div>
+  <figcaption class="arch__caption">
+    <slot />
+  </figcaption>
+</figure>
+
+<style>
+  /* Hallmark · component: diagram (inline SVG) · genre: modern-minimal (ops console) · theme: custom "Brahma console"
+   * states: static (no interactive element; the scroll box is keyboard-focusable with the site's focus ring)
+   * contrast: text0/bg2 13.5 · text1/bg2 7.6 · text-link/bg2 5.1 · text2 wires/bg1 4.1 (graphics ≥ 3:1) · accent/bg2 3.4 (border)
+   * Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V4 */
+  .arch {
+    margin: var(--s-6) 0;
+    border: var(--hairline);
+    border-radius: var(--radius);
+    background: var(--bg0);
+  }
+  .arch__scroll {
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: var(--s-3);
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+  .arch__scroll:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  /* The SVG fills the docs column (46 rem minus the figure's padding) and never shrinks below
+     704 px, so labels stay ≥ 10 px; narrower screens scroll the figure. The width/height
+     attributes give it an intrinsic ratio, so the box is reserved before paint (CLS 0). */
+  .arch__svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    min-width: 704px;
+    font-variant-numeric: tabular-nums;
+  }
+  .arch__caption {
+    padding: var(--s-2) var(--s-4);
+    border-top: var(--hairline);
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    line-height: 1.5;
+    color: var(--text1);
+  }
+  @media (max-width: 48em) {
+    .arch__scroll {
+      padding: var(--s-3);
+    }
+    /* Narrow screens: say that the figure scrolls, in the caption's own voice. */
+    .arch__caption::before {
+      content: 'scroll → ';
+      color: var(--text0);
+    }
+  }
+
+  /* Frames */
+  .arch__frame-bg {
+    fill: var(--bg1);
+    stroke: var(--line-strong);
+    stroke-width: 1;
+  }
+  .arch__frame-head {
+    fill: var(--bg3);
+  }
+  /* Nodes */
+  .arch__node-bg {
+    fill: var(--bg2);
+    stroke: var(--line-strong);
+    stroke-width: 1;
+  }
+  .arch__node--accent .arch__node-bg {
+    stroke: var(--accent);
+  }
+  .arch__node--accent .arch__label {
+    fill: var(--text-link);
+  }
+  /* Type: labels mono 11 px uppercase tracked (text0); frame titles text1; sublines Inter 10 px text1 */
+  .arch__label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    fill: var(--text0);
+  }
+  .arch__label--frame {
+    fill: var(--text1);
+    font-weight: 600;
+  }
+  .arch__tag {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    fill: var(--text1);
+  }
+  .arch__sub {
+    font-family: var(--font-sans);
+    font-size: 10px;
+    fill: var(--text1);
+  }
+  /* Wires and chevrons: text2 as a non-text mark only */
+  .arch__wire {
+    fill: none;
+    stroke: var(--text2);
+    stroke-width: 1;
+  }
+  .arch__wire--dashed {
+    stroke-dasharray: 4 3;
+  }
+  .arch__chevron {
+    fill: none;
+    stroke: var(--text2);
+    stroke-width: 1;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  /* Sandbox boundaries */
+  .arch__boundary-line {
+    fill: none;
+    stroke: var(--line-strong);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+  }
+  .arch__legend-bg {
+    fill: var(--bg1);
+  }
+  .arch__key-accent {
+    fill: var(--bg2);
+    stroke: var(--accent);
+    stroke-width: 1;
+  }
+</style>

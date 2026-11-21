@@ -9,4 +9,7 @@ Explanations for people who want to understand or change Brahma: the engine,
 the sandbox around each `claude` CLI turn, the scheduler, the work system and
 the Mac app.
 
-More pages arrive here as the documentation is written.
+- [Architecture](/internals/architecture/) — one library, one database, three kinds of process, with a diagram.
+- [Modules](/internals/modules/) — the Swift targets and `BrahmaCore` areas, one page each.
+- [Decisions](/internals/decisions/) — why the design is this way, distilled from the design specs.
+- [Contributing](/internals/contributing/) — how to build, test and document a change.
