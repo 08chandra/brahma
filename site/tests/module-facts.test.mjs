@@ -9,11 +9,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildFacts, repoRelative } from '../scripts/gen-module-facts.mjs';
+import { buildFacts, docPath, missingPages, repoRelative } from '../scripts/gen-module-facts.mjs';
 
 const GRAPHS = fileURLToPath(new URL('./fixtures/symbol-graphs', import.meta.url));
 
@@ -148,4 +148,31 @@ test('repoRelative strips everything through /Sources/ and rejects other paths',
   assert.equal(repoRelative('file:///Users/example/repo/Other/BrahmaCore/X.swift', 'BrahmaCore'), null);
   assert.equal(repoRelative('file:///Users/example/repo/Sources/BrahmaApp/X.swift', 'BrahmaCore'), null);
   assert.equal(repoRelative(undefined, 'BrahmaCore'), null);
+});
+
+test('docPath lowercases, joins path components and percent-encodes', () => {
+  assert.equal(docPath('BrahmaCore', ['Foo']), '/api/brahmacore/documentation/brahmacore/foo/');
+  assert.equal(docPath('BrahmaCore', ['Outer', 'Inner']), '/api/brahmacore/documentation/brahmacore/outer/inner/');
+  assert.equal(docPath('BrahmaMapKit', ['A B?']), '/api/brahmamapkit/documentation/brahmamapkit/a%20b%3F/');
+});
+
+test('missingPages reports type links with no generated page, and only those', () => {
+  const r = run();
+  const apiDir = mkdtempSync(join(tmpdir(), 'module-facts-api-'));
+  try {
+    // Pages for Foo and KeyStore exist; Orchestrator's does not.
+    for (const rel of ['brahmacore/documentation/brahmacore/foo', 'brahmakeychain/documentation/brahmakeychain/keystore']) {
+      mkdirSync(join(apiDir, ...rel.split('/')), { recursive: true });
+      writeFileSync(join(apiDir, ...rel.split('/'), 'index.html'), '<!doctype html>');
+    }
+    assert.deepEqual(missingPages(r.facts, apiDir), ['/api/brahmacore/documentation/brahmacore/orchestrator/']);
+    // A page whose directory name needs decoding is found.
+    const facts = { M: { symbols: 1, byArea: { M: { symbols: 1, files: [], types: [{ name: 'A B', kind: 'struct', path: '/api/m/documentation/m/a%20b/' }] } } } };
+    mkdirSync(join(apiDir, 'm', 'documentation', 'm', 'a b'), { recursive: true });
+    writeFileSync(join(apiDir, 'm', 'documentation', 'm', 'a b', 'index.html'), '<!doctype html>');
+    assert.deepEqual(missingPages(facts, apiDir), []);
+  } finally {
+    r.cleanup();
+    rmSync(apiDir, { recursive: true, force: true });
+  }
 });

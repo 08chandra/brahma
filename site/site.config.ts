@@ -7,8 +7,9 @@ export const site = {
   // Public repository URL. Empty until the repository is public; components
   // that link to source or show a GitHub icon are gated on this being non-empty.
   repoURL: '' as string,
-  // Base path of the generated API reference (DocC output). Set to a full URL
-  // if the API reference is deployed as a separate project.
+  // Base path of the generated API reference (DocC output). For the two-project
+  // deployment (site/README.md) set it to the API project's URL followed by /api,
+  // e.g. 'https://brahma-api.pages.dev/api': DocC's pages live under /api/ there too.
   apiBase: '/api' as string,
   license: 'Apache-2.0',
 };

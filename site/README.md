@@ -75,19 +75,23 @@ commit them:
 
 ### API reference
 
-`scripts/site-api-docs.sh` builds every target (debug)
-with swiftc symbol-graph emission into `.build/symbol-graphs`, then runs `docc convert` once per
-module (`BrahmaCore BrahmaAppModel BrahmaApp BrahmaMapKit BrahmaKeychain CSandboxCheck brahma`)
-into `public/api/<module-lowercase>/` for static hosting, so a module's reference is at
-`/api/<module>/documentation/<module>/`. A module with no Swift symbol graph (a C target, or an
-executable with no public API) is skipped with a message. Each output gets
-`api-theme/theme-settings.json` (the site's dark tokens and font stacks), `public/api/index.html`
-lists the modules, and `scripts/gen-module-facts.mjs` writes `src/generated/modules.json`:
-per module, the public-symbol count and, per area (BrahmaCore: the first directory under
-`Sources/BrahmaCore/`, top-level files → `Orchestrator`; other modules: one area), the source files
-and top-level types with their `/api` links. `<ModuleFacts module="BrahmaCore" area="Work" />`
-renders that as a "Public API" panel, and says the reference was not generated when the file is
-absent. Only repo-relative paths are written; the script fails if any output contains `/Users/`.
+`scripts/site-api-docs.sh` builds every target (debug, a plain `swift build`), then extracts each
+module's public symbol graph from the built modules with `swift-symbolgraph-extract` into
+`.build/symbol-graphs` (synthesized members skipped; extracted on every run, so an up-to-date build
+still yields every graph). It runs `docc convert` once per module
+(`BrahmaCore BrahmaAppModel BrahmaApp BrahmaMapKit BrahmaKeychain CSandboxCheck brahma`) into
+`public/api/<module-lowercase>/` for static hosting, so a module's reference is at
+`/api/<module>/documentation/<module>/`. A module whose graph has no public symbols (today the
+executables `BrahmaApp` and `brahma`) is skipped with a message; a missing graph fails the run.
+Each output gets `api-theme/theme-settings.json` (the site's dark tokens and font stacks),
+`public/api/index.html` lists the modules, and `scripts/gen-module-facts.mjs` writes
+`src/generated/modules.json`: per module, the public-symbol count and, per area (BrahmaCore: the
+first directory under `Sources/BrahmaCore/`, top-level files → `Orchestrator`; other modules: one
+area), the source files and top-level types with their `/api` links.
+`<ModuleFacts module="BrahmaCore" area="Work" />` renders that as a "Public API" panel. It says the
+reference was not generated when the file is absent, and fails the build for an unknown module or
+area. Only repo-relative paths are written; the script fails if any output contains `/Users/`,
+`/private/var/` or a `file://` URL.
 
 ## Deploy (owner only)
 
@@ -108,21 +112,33 @@ wrangler pages deploy site/dist --project-name brahma
 
 Cloudflare Pages caps a deployment at 20,000 files. The DocC API reference under `public/api/`
 is large: DocC writes two files per documented symbol (a page shell and its JSON). Measured on
-2026-11-20: `scripts/site-api-docs.sh` printed `api files: 15977`, and the whole `site/dist/` held
-16,342 files. That figure depends on `-symbol-graph-skip-synthesized-members`; with synthesized
+2026-11-20: `scripts/site-api-docs.sh` printed `api files: 16035`, and the whole `site/dist/` held
+16,400 files. That figure depends on `-symbol-graph-skip-synthesized-members`; with synthesized
 members (inherited `Equatable`/`Codable`/collection defaults) the same sources gave 39,879 files.
 The generator fails when `public/api/` holds more than 19,000 files, leaving headroom for the rest
-of the site. If that happens, deploy the API reference as a second project, point the site at it
-and rerun the generator with `BRAHMA_API_SPLIT=1`, which lifts the check:
+of the site. If that happens, deploy the API reference as a second Cloudflare Pages project. DocC's
+pages load their scripts and data from `/api/<module>/...`, so the second project must serve the
+reference under `/api/` too; split mode writes it to `site/.api-deploy/api/` (gitignored) with a
+`_redirects` file that sends the project root to `/api/`. From the repository root:
 
 ```
 wrangler pages project create brahma-api --production-branch main  # once
-wrangler pages deploy site/dist/api --project-name brahma-api
+BRAHMA_API_SPLIT=1 scripts/site-api-docs.sh                         # writes site/.api-deploy/, removes site/public/api
+wrangler pages deploy site/.api-deploy --project-name brahma-api
 ```
 
-Then set `apiBase` in `site.config.ts` to the `brahma-api` project's URL, remove `public/api/`
-from the main build (do not run `scripts/site-api-docs.sh`, or delete `site/dist/api` before the
-main deploy) and redeploy `brahma`.
+Then set `apiBase` in `site.config.ts` to the `brahma-api` project's URL followed by `/api`
+(for example `https://brahma-api.pages.dev/api`, no trailing slash) and build and deploy the main site
+with the split still set, so the generators do not recreate `site/public/api`:
+
+```
+BRAHMA_API_SPLIT=1 scripts/site-build.sh
+wrangler pages deploy site/dist --project-name brahma
+```
+
+The sidebar's "API reference" link and every `ModuleFacts` type link are built from `apiBase`, so
+they point at `<apiBase>/<module>/documentation/<module>/...` on the second project. In split mode
+the cap applies to the reference alone: the generator fails above 19,990 files there.
 
 ### Domain
 
@@ -138,7 +154,8 @@ replaces it with the real domain; it affects canonical URLs, the sitemap and soc
   Components that link to source, show a repository icon or offer "edit this page" are gated on it
   being non-empty; set it to the repository URL and rebuild.
 - **API reference.** `apiBase` in `site.config.ts` defaults to `/api`, the path the DocC generator
-  writes under `public/`. Change it only for the two-project deployment above.
+  writes under `public/`. Change it only for the two-project deployment above, to
+  `<brahma-api project URL>/api`.
 
 ## License
 

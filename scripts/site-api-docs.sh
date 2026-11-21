@@ -1,24 +1,25 @@
 #!/bin/bash
 # API reference for the public site. Usage: scripts/site-api-docs.sh
-# Builds every target (debug) with swiftc symbol-graph emission into .build/symbol-graphs
-# (synthesized members such as inherited Equatable/Codable defaults are skipped: they were 60% of
-# BrahmaCore's symbols and pushed the output past the deployment file cap), then
+# Builds every target (debug), extracts each module's public symbol graph from the built modules
+# with swift-symbolgraph-extract into .build/symbol-graphs (synthesized members skipped), then
 # runs `docc convert` once per Brahma module into site/public/api/<module-lowercase>/ (static
 # hosting, served at /api/<module>/documentation/<module>/), copies site/api-theme/theme-settings.json
 # into each, writes the /api/ index page and site/src/generated/modules.json (module facts for
 # ModuleFacts.astro) with site/scripts/gen-module-facts.mjs. All output is gitignored; never commit it.
 #
-# The build shares .build/ with the other scripts (a separate scratch path would re-fetch the
-# dependencies and their submodules over the network); changing the swiftc flags makes the next
-# plain `swift build` recompile the package's own targets. Each module's
+# The build is a plain `swift build` sharing .build/ with the other scripts, so it reuses their
+# work. A module whose graph holds no public symbols (today the executables brahma and BrahmaApp)
+# is skipped with a message; a missing graph fails the run. Each module's
 # graphs (<Module>.symbols.json plus its <Module>@*.symbols.json extension graphs) are staged
-# into a directory of their own before `docc convert`, because the shared symbol-graph
-# directory also holds the dependencies' graphs and DocC documents one module per archive.
+# into a directory of their own before `docc convert`, because DocC documents one module per
+# archive and would otherwise load every module's graphs.
 #
-# Fails when any generated file contains a /Users/ path, when a module-facts type link has no
-# DocC page, and when site/public/api holds more than 19,000 files (Cloudflare Pages caps a
-# deployment at 20,000; see site/README.md). BRAHMA_API_SPLIT=1 allows the larger output for
-# the documented two-project deployment, where the API reference is deployed on its own.
+# Fails when a Swift module's symbol graph is missing, when any generated file contains a
+# build-machine path (/Users/, /private/var/) or a file:// URL, when a module-facts type link has
+# no DocC page, and when site/public/api holds more than 19,000 files (Cloudflare Pages caps a
+# deployment at 20,000; see site/README.md). BRAHMA_API_SPLIT=1 is the documented two-project
+# deployment: the reference goes to site/.api-deploy/api/ (deployed as its own project, with a
+# root _redirects to /api/) instead of site/public/api, and the cap applies to it alone.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
@@ -31,19 +32,65 @@ DOCC=$(xcrun --find docc) || { echo "site-api-docs: docc not found (xcrun --find
 MODULES=(BrahmaCore BrahmaAppModel BrahmaApp BrahmaMapKit BrahmaKeychain CSandboxCheck brahma)
 GRAPHS=.build/symbol-graphs
 STAGE=.build/site-api-docs
-OUT=site/public/api
 FACTS=site/src/generated/modules.json
 THEME=site/api-theme/theme-settings.json
-LIMIT=19000
+if [ "${BRAHMA_API_SPLIT:-0}" = "1" ]; then
+  # Two-project deployment (site/README.md): the reference is its own Cloudflare Pages project.
+  # DocC's pages hard-code /api/<module>/, so the deploy directory keeps an api/ child and the
+  # site's apiBase is set to <api-project-url>/api. The main build gets no public/api.
+  SPLIT=1
+  DEPLOY=site/.api-deploy
+  OUT=$DEPLOY/api
+  LIMIT=19990 # the whole Cloudflare deployment: api/ plus _redirects, under 20,000
+  rm -rf site/public/api "$DEPLOY"
+else
+  SPLIT=0
+  OUT=site/public/api
+  rm -rf site/.api-deploy
+  LIMIT=19000 # leaves room for the rest of the site in the same deployment
+fi
 
 start=$(date +%s)
 
-echo "site-api-docs: building all targets (debug) with symbol graphs"
+echo "site-api-docs: building all targets (debug)"
+timeout 1200 swift build
+BIN=$(swift build --show-bin-path)
+SDK=$(xcrun --sdk macosx --show-sdk-path)
+EXTRACT=$(xcrun --find swift-symbolgraph-extract)
+# The clang module maps SwiftPM passed to swiftc (CSandboxCheck's generated map, GRDB's SQLite
+# system library), read from the build description it just wrote.
+mapflags=()
+while IFS= read -r map; do
+  mapflags+=(-Xcc "-fmodule-map-file=$map")
+done < <(grep -oE -- '-fmodule-map-file=[^", ]+' .build/debug.yaml | sed 's/^-fmodule-map-file=//' | sort -u)
+if [ "${#mapflags[@]}" -eq 0 ]; then
+  echo "site-api-docs: no -fmodule-map-file in .build/debug.yaml; cannot extract symbol graphs" >&2
+  exit 1
+fi
+incflags=()
+for inc in Sources/*/include; do
+  [ -d "$inc" ] && incflags+=(-Xcc -I -Xcc "$PWD/$inc")
+done
+
+# Symbol graphs are extracted from the built modules on every run, independent of whether
+# `swift build` recompiled anything (swiftc's -emit-symbol-graph only writes for targets it
+# rebuilds). Synthesized members (inherited Equatable/Codable/collection defaults) are skipped:
+# they were 60% of BrahmaCore's symbols and pushed the output past the deployment file cap.
 rm -rf "$GRAPHS"
 mkdir -p "$GRAPHS"
-timeout 1200 swift build \
-  -Xswiftc -emit-symbol-graph -Xswiftc -emit-symbol-graph-dir -Xswiftc "$PWD/$GRAPHS" \
-  -Xswiftc -symbol-graph-skip-synthesized-members
+for module in "${MODULES[@]}"; do
+  if ! timeout 300 "$EXTRACT" -module-name "$module" \
+    -target "$(uname -m)-apple-macosx14.0" -sdk "$SDK" \
+    -I "$BIN/Modules" "${mapflags[@]}" ${incflags[@]+"${incflags[@]}"} \
+    -module-cache-path "$BIN/ModuleCache" \
+    -minimum-access-level public -skip-synthesized-members \
+    -output-dir "$GRAPHS" >"$STAGE.extract.log" 2>&1; then
+    cat "$STAGE.extract.log" >&2
+    echo "site-api-docs: swift-symbolgraph-extract failed for $module" >&2
+    exit 1
+  fi
+done
+rm -f "$STAGE.extract.log"
 
 rm -rf "$OUT" "$STAGE"
 mkdir -p "$OUT" "$STAGE"
@@ -60,8 +107,8 @@ for module in "${MODULES[@]}"; do
   files=("$GRAPHS/$module.symbols.json" "$GRAPHS/$module"@*.symbols.json)
   shopt -u nullglob
   if [ ! -f "$GRAPHS/$module.symbols.json" ]; then
-    echo "site-api-docs: no symbol graph for $module (not a Swift module); skipped"
-    continue
+    echo "site-api-docs: no symbol graph for $module" >&2
+    exit 1
   fi
   count=$(node -e 'let n = 0; for (const f of process.argv.slice(1)) n += (JSON.parse(require("fs").readFileSync(f, "utf8")).symbols ?? []).length; console.log(n)' "${files[@]}")
   if [ "$count" -eq 0 ]; then
@@ -118,9 +165,13 @@ fi
 <body>
 <main>
 <h1>API reference</h1>
-<p>Generated with DocC from the public Swift interface of each module. <a class="back" href="/">Back to the site</a>.</p>
-<ul>
 HTML
+  if [ "$SPLIT" = "1" ]; then
+    echo '<p>Generated with DocC from the public Swift interface of each module.</p>'
+  else
+    echo '<p>Generated with DocC from the public Swift interface of each module. <a class="back" href="/">Back to the site</a>.</p>'
+  fi
+  echo '<ul>'
   for module in "${documented[@]}"; do
     lc=$(lower "$module")
     printf '<li><a href="/api/%s/documentation/%s/">%s</a></li>\n' "$lc" "$lc" "$module"
@@ -135,16 +186,25 @@ HTML
 
 node site/scripts/gen-module-facts.mjs "$GRAPHS" "$FACTS" "$OUT"
 
-if grep -rl '/Users/' "$OUT" "$FACTS" >&2; then
-  echo "site-api-docs: generated files contain a /Users/ path (listed above)" >&2
+if grep -rlE '/Users/|file://|/private/var/' "$OUT" "$FACTS" >&2; then
+  echo "site-api-docs: generated files contain a build-machine path or file:// URL (listed above)" >&2
   exit 1
 fi
 
 N=$(find "$OUT" -type f | wc -l | tr -d ' ')
 echo "api files: $N"
 echo "site-api-docs: done in $(( $(date +%s) - start ))s"
-if [ "$N" -gt "$LIMIT" ] && [ "${BRAHMA_API_SPLIT:-0}" != "1" ]; then
+if [ "$N" -gt "$LIMIT" ]; then
   echo "site-api-docs: $N files exceeds $LIMIT (Cloudflare Pages caps a deployment at 20,000)." >&2
-  echo "site-api-docs: deploy the API reference as its own project (site/README.md) and rerun with BRAHMA_API_SPLIT=1" >&2
+  if [ "$SPLIT" = "1" ]; then
+    echo "site-api-docs: the reference alone is over the cap even as its own project" >&2
+  else
+    echo "site-api-docs: deploy the API reference as its own project (site/README.md) and rerun with BRAHMA_API_SPLIT=1" >&2
+  fi
   exit 1
+fi
+if [ "$SPLIT" = "1" ]; then
+  # The project root has no page of its own; send it to the index.
+  printf '/ /api/ 302\n' > "$DEPLOY/_redirects"
+  echo "site-api-docs: split mode: deploy $DEPLOY as its own project and set apiBase to <its URL>/api (site/README.md)"
 fi

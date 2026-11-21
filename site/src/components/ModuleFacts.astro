@@ -8,12 +8,14 @@
  *
  * Renders an existing <Panel>: the public symbol count (mono), the top-level types linked to
  * their DocC page under `apiBase`, and the source files. Without `area`, every area of the
- * module is merged. When modules.json is absent (generators skipped) or has no entry, the
- * panel says the reference was not generated instead of failing the build.
+ * module is merged. When modules.json is absent (generators skipped) or has no entry for the
+ * module (it has no public API), the panel says the reference was not generated. An unknown
+ * module name, or an area the module does not have, fails the build.
  */
 import Panel from './Panel.astro';
 import Label from './Label.astro';
 import { site } from '../../site.config';
+import { MODULES } from '../../scripts/gen-module-facts.mjs';
 
 interface Type {
   name: string;
@@ -43,6 +45,16 @@ const generated = import.meta.glob<Record<string, Module>>('../generated/modules
 });
 const facts = Object.values(generated)[0];
 const mod = facts?.[module];
+
+// A typo must fail the build, not render "not generated".
+if (!MODULES.includes(module)) {
+  throw new Error(`ModuleFacts: unknown module "${module}" (expected one of ${MODULES.join(', ')})`);
+}
+if (mod && area && !(area in mod.byArea)) {
+  throw new Error(
+    `ModuleFacts: ${module} has no area "${area}" (areas: ${Object.keys(mod.byArea).join(', ')})`,
+  );
+}
 
 let entry: Area | undefined;
 if (mod && area) {

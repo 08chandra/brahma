@@ -13,3 +13,6 @@ public/api/
 public/screenshots/
 public/og/
 src/generated/
+
+# Split API deployment (scripts/site-api-docs.sh with BRAHMA_API_SPLIT=1)
+.api-deploy/
